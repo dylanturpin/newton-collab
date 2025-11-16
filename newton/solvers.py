@@ -113,6 +113,7 @@ Supported Features
 # solver types
 from ._src.solvers import (
     SolverBase,
+    SolverFeatherPGS,
     SolverFeatherstone,
     SolverImplicitMPM,
     SolverMuJoCo,
@@ -128,6 +129,7 @@ from ._src.solvers.flags import SolverNotifyFlags
 
 __all__ = [
     "SolverBase",
+    "SolverFeatherPGS",
     "SolverFeatherstone",
     "SolverImplicitMPM",
     "SolverMuJoCo",
