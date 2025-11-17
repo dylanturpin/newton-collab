@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import warp as wp
 
 from ...core.types import override
@@ -36,6 +38,7 @@ from .kernels import (
     accumulate_contact_velocity,
     apply_hinv_Jt_multi_rhs,
     build_contact_rows_normal,
+    build_joint_target_rows,
     clamp_contact_counts,
     compute_com_transforms,
     compute_contact_bias,
@@ -112,6 +115,9 @@ class SolverFeatherPGS(SolverBase):
         pgs_omega: float = 1.0,
         pgs_max_constraints: int = 32,
         pgs_warmstart: bool = False,
+        pgs_use_joint_targets: bool = False,
+        pgs_joint_beta: Optional[float] = None,
+        pgs_joint_cfm: Optional[float] = None,
     ):
         """
         Args:
@@ -125,6 +131,9 @@ class SolverFeatherPGS(SolverBase):
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             pgs_max_constraints (int, optional): Maximum number of contact constraints stored per articulation. Defaults to 32.
             pgs_warmstart (bool, optional): Re-use impulses from the previous frame when contacts persist. Defaults to False.
+            pgs_use_joint_targets (bool, optional): Whether to include joint drive targets as PGS equality constraints. Defaults to False.
+            pgs_joint_beta (float, optional): ERP override for joint-target constraints (defaults to auto-mapped from gains when None).
+            pgs_joint_cfm (float, optional): CFM override for joint-target constraints (defaults to auto-mapped from gains when None).
         """
         super().__init__(model)
 
@@ -137,6 +146,9 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_omega = pgs_omega
         self.pgs_max_constraints = pgs_max_constraints
         self.pgs_warmstart = pgs_warmstart
+        self.pgs_use_joint_targets = pgs_use_joint_targets
+        self.pgs_joint_beta = pgs_joint_beta
+        self.pgs_joint_cfm = pgs_joint_cfm
 
         self._step = 0
 
@@ -313,6 +325,18 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_impulses = wp.zeros(
             (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
+        self.pgs_types = wp.zeros(
+            (total_constraints,), dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.pgs_row_beta = wp.zeros(
+            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.pgs_row_cfm = wp.zeros(
+            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.pgs_target_velocity = wp.zeros(
+            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
         self.pgs_contact_matrix = wp.zeros(
             (total_matrix,), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
@@ -325,7 +349,7 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_v_hat = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
         self.pgs_v_out = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
 
-    def solve_contacts_pgs(self, state_in: State, state_aug, contacts: Contacts, dt: float):
+    def solve_contacts_pgs(self, state_in: State, state_aug, control: Control, contacts: Contacts, dt: float):
         model = self.model
         if not model.joint_count or model.articulation_count == 0:
             return
@@ -376,11 +400,54 @@ class SolverFeatherPGS(SolverBase):
                     self.J,
                     self.pgs_max_constraints,
                     self.articulation_max_dofs,
+                    self.pgs_beta,
+                    self.pgs_cfm,
                 ],
                 outputs=[
                     self.pgs_counts,
                     self.pgs_Jc,
                     self.pgs_phi,
+                    self.pgs_row_beta,
+                    self.pgs_row_cfm,
+                    self.pgs_types,
+                    self.pgs_target_velocity,
+                ],
+                device=device,
+            )
+
+        if self.pgs_use_joint_targets and control is not None and self.articulation_max_dofs > 0:
+            beta_override = self.pgs_joint_beta if self.pgs_joint_beta is not None else -1.0
+            cfm_override = self.pgs_joint_cfm if self.pgs_joint_cfm is not None else -1.0
+            wp.launch(
+                build_joint_target_rows,
+                dim=model.articulation_count,
+                inputs=[
+                    model.articulation_start,
+                    self.articulation_H_rows,
+                    self.articulation_dof_start,
+                    model.joint_type,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_target_ke,
+                    model.joint_target_kd,
+                    state_in.joint_q,
+                    control.joint_target_pos,
+                    control.joint_target_vel,
+                    self.pgs_counts,
+                    self.pgs_max_constraints,
+                    self.articulation_max_dofs,
+                    self.pgs_row_beta,
+                    self.pgs_row_cfm,
+                    self.pgs_types,
+                    self.pgs_target_velocity,
+                    self.pgs_phi,
+                    self.pgs_Jc,
+                    dt,
+                    self.pgs_beta,
+                    self.pgs_cfm,
+                    beta_override,
+                    cfm_override,
                 ],
                 device=device,
             )
@@ -410,7 +477,8 @@ class SolverFeatherPGS(SolverBase):
 
         wp.launch(
             form_contact_matrix,
-            dim=model.articulation_count,
+            #dim=model.articulation_count,
+            dim=model.articulation_count * self.pgs_max_constraints,
             inputs=[
                 self.articulation_H_rows,
                 self.pgs_max_constraints,
@@ -418,7 +486,7 @@ class SolverFeatherPGS(SolverBase):
                 self.pgs_counts,
                 self.pgs_Jc,
                 self.pgs_Y,
-                self.pgs_cfm,
+                self.pgs_row_cfm,
             ],
             outputs=[
                 self.pgs_diag,
@@ -439,7 +507,9 @@ class SolverFeatherPGS(SolverBase):
                 self.pgs_Jc,
                 self.pgs_v_hat,
                 self.pgs_phi,
-                self.pgs_beta,
+                self.pgs_row_beta,
+                self.pgs_types,
+                self.pgs_target_velocity,
                 dt,
             ],
             outputs=[self.pgs_rhs],
@@ -466,6 +536,7 @@ class SolverFeatherPGS(SolverBase):
                 self.pgs_impulses,
                 self.pgs_iterations,
                 self.pgs_omega,
+                self.pgs_types,
             ],
             device=device,
         )
@@ -652,6 +723,7 @@ class SolverFeatherPGS(SolverBase):
                 if model.articulation_count:
                     # evaluate joint torques
                     state_aug.body_ft_s.zero_()
+                    use_joint_targets_flag = 0 if self.pgs_use_joint_targets else 1
                     wp.launch(
                         eval_rigid_tau,
                         dim=model.articulation_count,
@@ -677,6 +749,7 @@ class SolverFeatherPGS(SolverBase):
                             state_aug.joint_S_s,
                             state_aug.body_f_s,
                             body_f,
+                            use_joint_targets_flag,
                         ],
                         outputs=[
                             state_aug.body_ft_s,
@@ -781,7 +854,7 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
 
-                    self.solve_contacts_pgs(state_in, state_aug, contacts, dt)
+                    self.solve_contacts_pgs(state_in, state_aug, control, contacts, dt)
                     # print("joint_qdd:")
                     # print(state_aug.joint_qdd.numpy())
                     # print("\n\n")
