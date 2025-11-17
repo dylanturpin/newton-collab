@@ -36,14 +36,20 @@ from ..semi_implicit.kernels_particle import (
 from ..solver import SolverBase
 from .kernels import (
     accumulate_contact_velocity,
+    apply_augmented_joint_tau,
+    apply_augmented_mass_diagonal,
     apply_hinv_Jt_multi_rhs,
+    build_augmented_joint_rows,
     build_contact_rows_normal,
     build_joint_target_rows,
+    build_mass_update_mask,
     clamp_contact_counts,
     compute_com_transforms,
     compute_contact_bias,
     compute_spatial_inertia,
     compute_velocity_predictor,
+    copy_int_array_masked,
+    detect_limit_count_changes,
     eval_crba,
     eval_dense_cholesky_batched,
     eval_dense_solve_batched,
@@ -116,6 +122,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_max_constraints: int = 32,
         pgs_warmstart: bool = False,
         pgs_use_joint_targets: bool = False,
+        pgs_joint_target_mode: Optional[str] = None,
         pgs_joint_beta: Optional[float] = None,
         pgs_joint_cfm: Optional[float] = None,
     ):
@@ -132,6 +139,7 @@ class SolverFeatherPGS(SolverBase):
             pgs_max_constraints (int, optional): Maximum number of contact constraints stored per articulation. Defaults to 32.
             pgs_warmstart (bool, optional): Re-use impulses from the previous frame when contacts persist. Defaults to False.
             pgs_use_joint_targets (bool, optional): Whether to include joint drive targets as PGS equality constraints. Defaults to False.
+            pgs_joint_target_mode (str, optional): Override for how joint targets are enforced (\"off\", \"pgs\", or \"augmented\"). Defaults to deriving from ``pgs_use_joint_targets``.
             pgs_joint_beta (float, optional): ERP override for joint-target constraints (defaults to auto-mapped from gains when None).
             pgs_joint_cfm (float, optional): CFM override for joint-target constraints (defaults to auto-mapped from gains when None).
         """
@@ -145,12 +153,21 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_cfm = pgs_cfm
         self.pgs_omega = pgs_omega
         self.pgs_max_constraints = pgs_max_constraints
+        if pgs_joint_target_mode is None:
+            pgs_joint_target_mode = "pgs" if pgs_use_joint_targets else "off"
+        if pgs_joint_target_mode not in ("off", "pgs", "augmented"):
+            raise ValueError(f"Invalid joint target mode '{pgs_joint_target_mode}'")
+
         self.pgs_warmstart = pgs_warmstart
-        self.pgs_use_joint_targets = pgs_use_joint_targets
+        self.pgs_joint_target_mode = pgs_joint_target_mode
+        self.pgs_use_joint_targets = pgs_joint_target_mode == "pgs"
+        self.pgs_use_augmented_targets = pgs_joint_target_mode == "augmented"
         self.pgs_joint_beta = pgs_joint_beta
         self.pgs_joint_cfm = pgs_joint_cfm
 
         self._step = 0
+        self._force_mass_update = False
+        self._last_step_dt = None
 
         self.compute_articulation_indices(model)
         self.build_body_maps(model)
@@ -265,6 +282,12 @@ class SolverFeatherPGS(SolverBase):
 
             # zero since only upper triangle is set which can trigger NaN detection
             self.L = wp.zeros_like(self.H)
+            self.mass_update_mask = wp.zeros(
+                (model.articulation_count,), dtype=wp.int32, device=model.device, requires_grad=model.requires_grad
+            )
+            self.limit_change_mask = wp.zeros(
+                (model.articulation_count,), dtype=wp.int32, device=model.device, requires_grad=model.requires_grad
+            )
 
         if model.body_count:
             self.body_I_m = wp.empty(
@@ -289,6 +312,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
         self.allocate_pgs_buffers(model)
+        self.allocate_augmented_joint_buffers(model)
 
     def allocate_pgs_buffers(self, model):
         if not model.articulation_count or not model.joint_count:
@@ -348,6 +372,146 @@ class SolverFeatherPGS(SolverBase):
         )
         self.pgs_v_hat = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
         self.pgs_v_out = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
+
+    def allocate_augmented_joint_buffers(self, model):
+        if not self.pgs_use_augmented_targets:
+            return
+        if not model.articulation_count or not model.joint_count:
+            return
+
+        max_dofs = self.articulation_max_dofs
+        if max_dofs == 0:
+            return
+
+        device = model.device
+        requires_grad = model.requires_grad
+        articulation_count = model.articulation_count
+        total_rows = articulation_count * max_dofs
+
+        self.aug_row_counts = wp.zeros(
+            (articulation_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.aug_limit_counts = wp.zeros(
+            (articulation_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.aug_prev_limit_counts = wp.zeros_like(self.aug_limit_counts)
+        self.limit_change_mask = wp.zeros_like(self.aug_limit_counts)
+        self.aug_row_dof_index = wp.zeros(
+            (total_rows,), dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.aug_row_beta = wp.zeros(
+            (total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.aug_row_cfm = wp.zeros(
+            (total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.aug_row_phi = wp.zeros(
+            (total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.aug_row_target_velocity = wp.zeros(
+            (total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.aug_limit_change_flag = wp.zeros((1,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+
+    def build_augmented_joint_targets(self, state_in: State, control: Control, dt: float):
+        if not self.pgs_use_augmented_targets:
+            return
+
+        model = self.model
+        if model.articulation_count == 0 or self.articulation_max_dofs == 0:
+            return
+        if dt <= 0.0:
+            self.aug_row_counts.zero_()
+            self.aug_limit_counts.zero_()
+            return
+
+        device = model.device
+
+        self.aug_row_counts.zero_()
+        self.aug_limit_counts.zero_()
+
+        beta_override = self.pgs_joint_beta if self.pgs_joint_beta is not None else -1.0
+        cfm_override = self.pgs_joint_cfm if self.pgs_joint_cfm is not None else -1.0
+
+        wp.launch(
+            build_augmented_joint_rows,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self.articulation_dof_start,
+                self.articulation_H_rows,
+                model.joint_type,
+                model.joint_q_start,
+                model.joint_qd_start,
+                model.joint_dof_dim,
+                model.joint_target_ke,
+                model.joint_target_kd,
+                model.joint_limit_lower,
+                model.joint_limit_upper,
+                model.joint_limit_ke,
+                model.joint_limit_kd,
+                state_in.joint_q,
+                control.joint_target_pos,
+                control.joint_target_vel,
+                self.articulation_max_dofs,
+                dt,
+                self.pgs_beta,
+                self.pgs_cfm,
+                beta_override,
+                cfm_override,
+            ],
+            outputs=[
+                self.aug_row_counts,
+                self.aug_row_dof_index,
+                self.aug_row_beta,
+                self.aug_row_cfm,
+                self.aug_row_phi,
+                self.aug_row_target_velocity,
+                self.aug_limit_counts,
+            ],
+            device=device,
+        )
+
+        wp.launch(
+            detect_limit_count_changes,
+            dim=model.articulation_count,
+            inputs=[
+                self.aug_limit_counts,
+                self.aug_prev_limit_counts,
+            ],
+            outputs=[
+                self.limit_change_mask,
+            ],
+            device=device,
+        )
+
+    def apply_augmented_joint_tau(self, state_in: State, state_aug: State, dt: float):
+        if not self.pgs_use_augmented_targets:
+            return
+        if dt <= 0.0:
+            return
+
+        model = self.model
+        if model.articulation_count == 0 or self.articulation_max_dofs == 0:
+            return
+
+        wp.launch(
+            apply_augmented_joint_tau,
+            dim=model.articulation_count,
+            inputs=[
+                self.articulation_max_dofs,
+                self.aug_row_counts,
+                self.aug_row_dof_index,
+                self.aug_row_beta,
+                self.aug_row_cfm,
+                self.aug_row_phi,
+                self.aug_row_target_velocity,
+                state_in.joint_qd,
+                dt,
+            ],
+            outputs=[state_aug.joint_tau],
+            device=model.device,
+        )
 
     def solve_contacts_pgs(self, state_in: State, state_aug, control: Control, contacts: Contacts, dt: float):
         model = self.model
@@ -615,6 +779,15 @@ class SolverFeatherPGS(SolverBase):
     ):
         requires_grad = state_in.requires_grad
 
+        if self.pgs_use_augmented_targets:
+            if self._last_step_dt is None:
+                self._last_step_dt = dt
+            elif abs(self._last_step_dt - dt) > 1.0e-8:
+                self._force_mass_update = True
+                self._last_step_dt = dt
+            else:
+                self._last_step_dt = dt
+
         # optionally create dynamical auxiliary variables
         if requires_grad:
             state_aug = state_out
@@ -723,7 +896,7 @@ class SolverFeatherPGS(SolverBase):
                 if model.articulation_count:
                     # evaluate joint torques
                     state_aug.body_ft_s.zero_()
-                    use_joint_targets_flag = 0 if self.pgs_use_joint_targets else 1
+                    use_joint_targets_flag = 0 if self.pgs_joint_target_mode in ("pgs", "augmented") else 1
                     wp.launch(
                         eval_rigid_tau,
                         dim=model.articulation_count,
@@ -758,6 +931,10 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
 
+                    if self.pgs_use_augmented_targets:
+                        self.build_augmented_joint_targets(state_in, control, dt)
+                        self.apply_augmented_joint_tau(state_in, state_aug, dt)
+
                     # print("joint_tau:")
                     # print(state_aug.joint_tau.numpy())
                     # print("body_q:")
@@ -765,7 +942,33 @@ class SolverFeatherPGS(SolverBase):
                     # print("body_qd:")
                     # print(state_in.body_qd.numpy())
 
-                    if self._step % self.update_mass_matrix_interval == 0:
+                    global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
+                    if self.pgs_use_augmented_targets:
+                        mass_update = True
+                        wp.launch(
+                            build_mass_update_mask,
+                            dim=model.articulation_count,
+                            inputs=[
+                                global_flag,
+                                self.limit_change_mask,
+                            ],
+                            outputs=[self.mass_update_mask],
+                            device=model.device,
+                        )
+                    else:
+                        mass_update = bool(global_flag)
+                        if mass_update:
+                            wp.launch(
+                                build_mass_update_mask,
+                                dim=model.articulation_count,
+                                inputs=[
+                                    global_flag,
+                                    self.limit_change_mask,
+                                ],
+                                outputs=[self.mass_update_mask],
+                                device=model.device,
+                            )
+                    if mass_update:
                         # build J
                         wp.launch(
                             eval_rigid_jacobian,
@@ -773,6 +976,7 @@ class SolverFeatherPGS(SolverBase):
                             inputs=[
                                 model.articulation_start,
                                 self.articulation_J_start,
+                                self.mass_update_mask,
                                 model.joint_ancestor,
                                 model.joint_qd_start,
                                 state_aug.joint_S_s,
@@ -788,6 +992,7 @@ class SolverFeatherPGS(SolverBase):
                             inputs=[
                                 model.articulation_start,
                                 self.articulation_M_start,
+                                self.mass_update_mask,
                                 state_aug.body_I_s,
                             ],
                             outputs=[self.M_blocks],
@@ -800,6 +1005,7 @@ class SolverFeatherPGS(SolverBase):
                             dim=model.articulation_count,
                             inputs=[
                                 model.articulation_start,
+                                self.mass_update_mask,
                                 model.joint_ancestor,
                                 model.joint_qd_start,
                                 self.articulation_H_start,
@@ -811,6 +1017,24 @@ class SolverFeatherPGS(SolverBase):
                             device=model.device,
                         )
 
+                        if self.pgs_use_augmented_targets:
+                            wp.launch(
+                                apply_augmented_mass_diagonal,
+                                dim=model.articulation_count,
+                                inputs=[
+                                    self.articulation_H_start,
+                                    self.articulation_H_rows,
+                                    self.articulation_dof_start,
+                                    self.articulation_max_dofs,
+                                    self.mass_update_mask,
+                                    self.aug_row_counts,
+                                    self.aug_row_dof_index,
+                                    self.aug_row_cfm,
+                                    self.H,
+                                ],
+                                device=model.device,
+                            )
+
                         # compute decomposition
                         wp.launch(
                             eval_dense_cholesky_batched,
@@ -820,10 +1044,22 @@ class SolverFeatherPGS(SolverBase):
                                 self.articulation_H_rows,
                                 self.H,
                                 model.joint_armature,
+                                self.mass_update_mask,
                             ],
                             outputs=[self.L],
                             device=model.device,
                         )
+
+                        if self.pgs_use_augmented_targets:
+                            wp.launch(
+                                copy_int_array_masked,
+                                dim=model.articulation_count,
+                                inputs=[self.aug_limit_counts, self.mass_update_mask],
+                                outputs=[self.aug_prev_limit_counts],
+                                device=model.device,
+                            )
+
+                        self._force_mass_update = False
 
                         # print("joint_target:")
                         # print(control.joint_target.numpy())
