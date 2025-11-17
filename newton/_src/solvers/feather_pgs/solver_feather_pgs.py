@@ -115,6 +115,7 @@ class SolverFeatherPGS(SolverBase):
         angular_damping: float = 0.05,
         update_mass_matrix_interval: int = 1,
         friction_smoothing: float = 1.0,
+        enable_contact_friction: bool = True,
         pgs_iterations: int = 12,
         pgs_beta: float = 0.2,
         pgs_cfm: float = 1.0e-6,
@@ -132,6 +133,7 @@ class SolverFeatherPGS(SolverBase):
             angular_damping (float, optional): Angular damping factor. Defaults to 0.05.
             update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the :meth:`step` function gets called). Defaults to 1.
             friction_smoothing (float, optional): The delta value for the Huber norm (see :func:`warp.math.norm_huber`) used for the friction velocity normalization. Defaults to 1.0.
+            enable_contact_friction (bool, optional): Enables Coulomb friction contacts inside the PGS solve. Defaults to True.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_beta (float, optional): ERP style position correction factor. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
@@ -148,6 +150,7 @@ class SolverFeatherPGS(SolverBase):
         self.angular_damping = angular_damping
         self.update_mass_matrix_interval = update_mass_matrix_interval
         self.friction_smoothing = friction_smoothing
+        self.enable_contact_friction = enable_contact_friction
         self.pgs_iterations = pgs_iterations
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
@@ -172,6 +175,12 @@ class SolverFeatherPGS(SolverBase):
         self.compute_articulation_indices(model)
         self.build_body_maps(model)
         self.allocate_model_aux_vars(model)
+        if model.shape_material_mu is not None:
+            self.shape_material_mu = model.shape_material_mu
+        else:
+            self.shape_material_mu = wp.zeros(
+                (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
+            )
 
     def compute_articulation_indices(self, model):
         # calculate total size and offsets of Jacobian and mass matrices for entire system
@@ -361,6 +370,12 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_target_velocity = wp.zeros(
             (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
+        self.pgs_parent = wp.full(
+            (total_constraints,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.pgs_mu = wp.zeros(
+            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
         self.pgs_contact_matrix = wp.zeros(
             (total_matrix,), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
@@ -539,6 +554,7 @@ class SolverFeatherPGS(SolverBase):
             and getattr(contacts, "rigid_contact_count", None) is not None
             and contacts.rigid_contact_max > 0
         ):
+            enable_friction_flag = 1 if self.enable_contact_friction else 0
             wp.launch(
                 build_contact_rows_normal,
                 dim=contacts.rigid_contact_max,
@@ -554,6 +570,7 @@ class SolverFeatherPGS(SolverBase):
                     model.shape_body,
                     state_in.body_q,
                     model.shape_transform,
+                    self.shape_material_mu,
                     model.articulation_start,
                     self.articulation_J_start,
                     self.articulation_H_rows,
@@ -566,6 +583,7 @@ class SolverFeatherPGS(SolverBase):
                     self.articulation_max_dofs,
                     self.pgs_beta,
                     self.pgs_cfm,
+                    enable_friction_flag,
                 ],
                 outputs=[
                     self.pgs_counts,
@@ -575,6 +593,8 @@ class SolverFeatherPGS(SolverBase):
                     self.pgs_row_cfm,
                     self.pgs_types,
                     self.pgs_target_velocity,
+                    self.pgs_parent,
+                    self.pgs_mu,
                 ],
                 device=device,
             )
@@ -607,6 +627,8 @@ class SolverFeatherPGS(SolverBase):
                     self.pgs_target_velocity,
                     self.pgs_phi,
                     self.pgs_Jc,
+                    self.pgs_parent,
+                    self.pgs_mu,
                     dt,
                     self.pgs_beta,
                     self.pgs_cfm,
@@ -691,19 +713,21 @@ class SolverFeatherPGS(SolverBase):
         wp.launch(
             pgs_solve_contacts,
             dim=model.articulation_count,
-            inputs=[
-                self.pgs_counts,
-                self.pgs_max_constraints,
-                self.pgs_diag,
-                self.pgs_contact_matrix,
-                self.pgs_rhs,
-                self.pgs_impulses,
-                self.pgs_iterations,
-                self.pgs_omega,
-                self.pgs_types,
-            ],
-            device=device,
-        )
+                inputs=[
+                    self.pgs_counts,
+                    self.pgs_max_constraints,
+                    self.pgs_diag,
+                    self.pgs_contact_matrix,
+                    self.pgs_rhs,
+                    self.pgs_impulses,
+                    self.pgs_iterations,
+                    self.pgs_omega,
+                    self.pgs_types,
+                    self.pgs_parent,
+                    self.pgs_mu,
+                ],
+                device=device,
+            )
 
         wp.launch(
             accumulate_contact_velocity,

@@ -26,6 +26,7 @@ from ..semi_implicit.kernels_body import joint_force
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 PGS_CONSTRAINT_TYPE_JOINT_TARGET = 1
+PGS_CONSTRAINT_TYPE_FRICTION = 2
 
 
 @wp.kernel
@@ -1281,6 +1282,17 @@ def update_qdd_from_velocity(
 
 
 @wp.func
+def contact_tangent_basis(n: wp.vec3):
+    # pick an arbitrary perpendicular vector and orthonormalize
+    tangent0 = wp.cross(n, wp.vec3(1.0, 0.0, 0.0))
+    if wp.length_sq(tangent0) < 1.0e-12:
+        tangent0 = wp.cross(n, wp.vec3(0.0, 1.0, 0.0))
+    tangent0 = wp.normalize(tangent0)
+    tangent1 = wp.normalize(wp.cross(n, tangent0))
+    return tangent0, tangent1
+
+
+@wp.func
 def accumulate_contact_body(
     articulation: int,
     body_index: int,
@@ -1344,6 +1356,7 @@ def build_contact_rows_normal(
     shape_body: wp.array(dtype=int),
     body_q: wp.array(dtype=wp.transform),
     shape_transform: wp.array(dtype=wp.transform),
+    shape_material_mu: wp.array(dtype=float),
     articulation_start: wp.array(dtype=int),
     articulation_J_start: wp.array(dtype=int),
     articulation_H_rows: wp.array(dtype=int),
@@ -1356,6 +1369,7 @@ def build_contact_rows_normal(
     max_dofs: int,
     contact_beta: float,
     contact_cfm: float,
+    enable_friction: int,
     # outputs
     constraint_counts: wp.array(dtype=int),
     Jc_out: wp.array(dtype=float),
@@ -1364,6 +1378,8 @@ def build_contact_rows_normal(
     row_cfm: wp.array(dtype=float),
     row_types: wp.array(dtype=int),
     target_velocity: wp.array(dtype=float),
+    row_parent: wp.array(dtype=int),
+    row_mu: wp.array(dtype=float),
 ):
     tid = wp.tid()
     total_contacts = contact_count[0]
@@ -1399,6 +1415,16 @@ def build_contact_rows_normal(
         
     thickness_a = contact_thickness0[tid]
     thickness_b = contact_thickness1[tid]
+    mu = 0.0
+    mat_count = 0
+    if shape_a >= 0:
+        mu += shape_material_mu[shape_a]
+        mat_count += 1
+    if shape_b >= 0:
+        mu += shape_material_mu[shape_b]
+        mat_count += 1
+    if mat_count > 0:
+        mu /= float(mat_count)
     
     # These are points in the *SHAPE* local frame
     point_a_local = contact_point0[tid]
@@ -1450,6 +1476,8 @@ def build_contact_rows_normal(
     row_cfm[phi_index] = contact_cfm
     row_types[phi_index] = PGS_CONSTRAINT_TYPE_CONTACT
     target_velocity[phi_index] = 0.0
+    row_parent[phi_index] = -1
+    row_mu[phi_index] = mu
     row_base = (articulation * max_constraints + slot) * max_dofs
     for col in range(max_dofs):
         Jc_out[row_base + col] = 0.0
@@ -1490,6 +1518,64 @@ def build_contact_rows_normal(
         Jc_out,
     )
 
+    if enable_friction == 0 or mu <= 0.0 or dof_count == 0:
+        return
+
+    t0, t1 = contact_tangent_basis(n)
+
+    for tangent_index in range(2):
+        tangent = t0
+        if tangent_index == 1:
+            tangent = t1
+        tangent_slot = wp.atomic_add(constraint_counts, articulation, 1)
+        if tangent_slot >= max_constraints:
+            return
+
+        row_index = articulation * max_constraints + tangent_slot
+        tangent_base = row_index * max_dofs
+        for col in range(max_dofs):
+            Jc_out[tangent_base + col] = 0.0
+
+        row_beta[row_index] = 0.0
+        row_cfm[row_index] = contact_cfm
+        row_types[row_index] = PGS_CONSTRAINT_TYPE_FRICTION
+        target_velocity[row_index] = 0.0
+        phi_out[row_index] = 0.0
+        row_parent[row_index] = phi_index
+        row_mu[row_index] = mu
+
+        accumulate_contact_body(
+            articulation,
+            body_a,
+            weight,
+            r_a,
+            joint_start,
+            dof_count,
+            J_offset,
+            body_to_joint,
+            body_to_articulation,
+            J_spatial,
+            tangent_base,
+            tangent,
+            Jc_out,
+        )
+
+        accumulate_contact_body(
+            articulation,
+            body_b,
+            -weight,
+            r_b,
+            joint_start,
+            dof_count,
+            J_offset,
+            body_to_joint,
+            body_to_articulation,
+            J_spatial,
+            tangent_base,
+            tangent,
+            Jc_out,
+        )
+
 
 @wp.kernel
 def build_joint_target_rows(
@@ -1515,6 +1601,8 @@ def build_joint_target_rows(
     target_velocity: wp.array(dtype=float),
     phi_out: wp.array(dtype=float),
     J_rows: wp.array(dtype=float),
+    row_parent: wp.array(dtype=int),
+    row_mu: wp.array(dtype=float),
     dt: float,
     default_beta: float,
     default_cfm: float,
@@ -1578,6 +1666,8 @@ def build_joint_target_rows(
             phi_out[row_index] = phi
             target_velocity[row_index] = joint_target_vel[dof_index]
             row_types[row_index] = PGS_CONSTRAINT_TYPE_JOINT_TARGET
+            row_parent[row_index] = -1
+            row_mu[row_index] = 0.0
 
             denom = kd + dt * ke
             beta_drive = default_beta
@@ -2062,6 +2152,8 @@ def compute_contact_bias(
             if gap < 0.0 and dt > 0.0:
                 rhs += beta_val * gap / dt
             rhs_out[rhs_base + i] = rhs
+        elif constraint_type == PGS_CONSTRAINT_TYPE_FRICTION:
+            rhs_out[rhs_base + i] = rel_vel - target_vel
         elif constraint_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
             correction = 0.0
             if dt > 0.0:
@@ -2099,6 +2191,8 @@ def pgs_solve_contacts(
     iterations: int,
     omega: float,
     row_types: wp.array(dtype=int),
+    row_parent: wp.array(dtype=int),
+    row_mu: wp.array(dtype=float),
 ):
     articulation = wp.tid()
     m = constraint_counts[articulation]
@@ -2124,8 +2218,23 @@ def pgs_solve_contacts(
 
             delta = -w / denom
             new_impulse = impulses[idx] + omega * delta
-            if row_types[idx] == PGS_CONSTRAINT_TYPE_CONTACT and new_impulse < 0.0:
-                new_impulse = 0.0
+            row_type = row_types[idx]
+
+            if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+                if new_impulse < 0.0:
+                    new_impulse = 0.0
+            elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+                parent_idx = row_parent[idx]
+                limit = 0.0
+                if parent_idx >= 0:
+                    limit = wp.max(row_mu[idx] * impulses[parent_idx], 0.0)
+                if limit <= 0.0:
+                    new_impulse = 0.0
+                else:
+                    if new_impulse > limit:
+                        new_impulse = limit
+                    elif new_impulse < -limit:
+                        new_impulse = -limit
 
             impulses[idx] = new_impulse
 
