@@ -38,6 +38,8 @@ Headless benchmark with MuJoCo:
 """
 
 import time
+from typing import Optional
+
 import numpy as np
 
 import warp as wp
@@ -66,6 +68,9 @@ class Example:
         pgs_cfm: float = 1.0e-6,
         pgs_omega: float = 1.0,
         pgs_warmstart: bool = False,
+        pgs_use_joint_targets: bool = False,
+        pgs_joint_beta: Optional[float] = None,
+        pgs_joint_cfm: Optional[float] = None,
     ):
         self.fps = 60.0
         self.frame_dt = 1.0 / self.fps
@@ -129,8 +134,18 @@ class Example:
                 pgs_omega=pgs_omega,
                 pgs_max_constraints=pgs_max_constraints,
                 pgs_warmstart=pgs_warmstart,
+                pgs_use_joint_targets=pgs_use_joint_targets,
+                pgs_joint_beta=pgs_joint_beta,
+                pgs_joint_cfm=pgs_joint_cfm,
             )
             self.solver = newton.solvers.SolverFeatherPGS(self.model, **solver_kwargs)
+            print("PGS params:",
+                "iter", self.solver.pgs_iterations,
+                "beta", self.solver.pgs_beta,
+                "cfm", self.solver.pgs_cfm,
+                "omega", self.solver.pgs_omega,
+                "max_constraints", self.solver.pgs_max_constraints,
+                "pgs_warmstart", self.solver.pgs_warmstart)
 
         elif solver_type == "mujoco":
             self.solver = newton.solvers.SolverMuJoCo(
@@ -139,7 +154,7 @@ class Example:
                 solver="newton",
                 integrator="implicit",
                 njmax=210,
-                ncon_per_env=35,
+                nconmax=8,
                 ls_parallel=True,
                 iterations=100,
                 ls_iterations=50,
@@ -147,13 +162,6 @@ class Example:
         else:
             raise ValueError(f"Unknown solver type: {solver_type}")
 
-        print("PGS params:",
-            "iter", self.solver.pgs_iterations,
-            "beta", self.solver.pgs_beta,
-            "cfm", self.solver.pgs_cfm,
-            "omega", self.solver.pgs_omega,
-            "max_constraints", self.solver.pgs_max_constraints,
-            "pgs_warmstart", self.solver.pgs_warmstart)
 
         # ------------------------------------------------------------------
         # Allocate state/control/contacts
@@ -173,6 +181,7 @@ class Example:
     # ----------------------------------------------------------------------
     def capture_cuda_graph(self):
         self.graph = None
+        return
         device = wp.get_device()
         if device.is_cuda:
             with wp.ScopedCapture() as capture:
@@ -183,6 +192,7 @@ class Example:
     # Simulation / stepping
     # ----------------------------------------------------------------------
     def simulate(self):
+
         for _ in range(self.sim_substeps):
             # Broad/narrow-phase collision for current state
             self.contacts = self.model.collide(self.state_0, rigid_contact_margin=0.1)
@@ -349,6 +359,23 @@ if __name__ == "__main__":
         help="Re-use impulses from the previous frame when contacts persist.",
     )
     parser.add_argument(
+        "--pgs-use-joint-targets",
+        action="store_true",
+        help="Include joint drive targets as equality constraints in the PGS solve.",
+    )
+    parser.add_argument(
+        "--pgs-joint-beta",
+        type=float,
+        default=None,
+        help="ERP override for joint-target PGS constraints (auto-derived from gains when omitted).",
+    )
+    parser.add_argument(
+        "--pgs-joint-cfm",
+        type=float,
+        default=None,
+        help="CFM override for joint-target PGS constraints (auto-derived from gains when omitted).",
+    )
+    parser.add_argument(
         "--update-mass-matrix-interval",
         type=int,
         default=1,
@@ -399,17 +426,21 @@ if __name__ == "__main__":
         pgs_cfm=args.pgs_cfm,
         pgs_omega=args.pgs_omega,
         pgs_warmstart=args.pgs_warmstart,
+        pgs_use_joint_targets=args.pgs_use_joint_targets,
+        pgs_joint_beta=args.pgs_joint_beta,
+        pgs_joint_cfm=args.pgs_joint_cfm,
     )
 
     if args.benchmark:
         # Headless-style benchmark run (viewer may still exist but is not used)
-        run_benchmark(
-            example,
-            warmup_frames=args.warmup_frames,
-            measure_frames=args.measure_frames,
-            check_stability=args.check_stability,
-            stability_threshold=args.stability_threshold,
-        )
+        with wp.ScopedTimer("benchmark", cuda_filter=wp.TIMING_ALL):
+            run_benchmark(
+                example,
+                warmup_frames=args.warmup_frames,
+                measure_frames=args.measure_frames,
+                check_stability=args.check_stability,
+                stability_threshold=args.stability_threshold,
+            )
         if viewer is not None:
             viewer.close()
     else:

@@ -24,6 +24,10 @@ from ...sim.articulation import (
 from ..semi_implicit.kernels_body import joint_force
 
 
+PGS_CONSTRAINT_TYPE_CONTACT = 0
+PGS_CONSTRAINT_TYPE_JOINT_TARGET = 1
+
+
 @wp.kernel
 def compute_spatial_inertia(
     body_inertia: wp.array(dtype=wp.mat33),
@@ -357,6 +361,7 @@ def jcalc_tau(
     lin_axis_count: int,
     ang_axis_count: int,
     body_f_s: wp.spatial_vector,
+    use_joint_targets: int,
     # outputs
     tau: wp.array(dtype=float),
 ):
@@ -401,7 +406,20 @@ def jcalc_tau(
             target_pos = joint_target_pos[j]
             target_vel = joint_target_vel[j]
 
-            drive_f = joint_force(q, qd, target_pos, target_vel, target_ke, target_kd, lower, upper, limit_ke, limit_kd)
+            drive_f = 0.0
+            if use_joint_targets:
+                drive_f = joint_force(
+                    q,
+                    qd,
+                    target_pos,
+                    target_vel,
+                    target_ke,
+                    target_kd,
+                    lower,
+                    upper,
+                    limit_ke,
+                    limit_kd,
+                )
 
             # total torque / force on the joint
             t = -wp.dot(S_s, body_f_s) + drive_f + joint_f[j]
@@ -824,6 +842,7 @@ def eval_rigid_tau(
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     body_fb_s: wp.array(dtype=wp.spatial_vector),
     body_f_ext: wp.array(dtype=wp.spatial_vector),
+    use_joint_targets: int,
     # outputs
     body_ft_s: wp.array(dtype=wp.spatial_vector),
     tau: wp.array(dtype=float),
@@ -874,6 +893,7 @@ def eval_rigid_tau(
             lin_axis_count,
             ang_axis_count,
             f_s,
+            use_joint_targets,
             tau,
         )
 
@@ -1306,10 +1326,16 @@ def build_contact_rows_normal(
     J_spatial: wp.array(dtype=float),
     max_constraints: int,
     max_dofs: int,
+    contact_beta: float,
+    contact_cfm: float,
     # outputs
     constraint_counts: wp.array(dtype=int),
     Jc_out: wp.array(dtype=float),
     phi_out: wp.array(dtype=float),
+    row_beta: wp.array(dtype=float),
+    row_cfm: wp.array(dtype=float),
+    row_types: wp.array(dtype=int),
+    target_velocity: wp.array(dtype=float),
 ):
     tid = wp.tid()
     total_contacts = contact_count[0]
@@ -1392,6 +1418,10 @@ def build_contact_rows_normal(
         
     phi_index = articulation * max_constraints + slot
     phi_out[phi_index] = phi
+    row_beta[phi_index] = contact_beta
+    row_cfm[phi_index] = contact_cfm
+    row_types[phi_index] = PGS_CONSTRAINT_TYPE_CONTACT
+    target_velocity[phi_index] = 0.0
     row_base = (articulation * max_constraints + slot) * max_dofs
     for col in range(max_dofs):
         Jc_out[row_base + col] = 0.0
@@ -1431,6 +1461,117 @@ def build_contact_rows_normal(
         n,
         Jc_out,
     )
+
+
+@wp.kernel
+def build_joint_target_rows(
+    articulation_start: wp.array(dtype=int),
+    articulation_H_rows: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    joint_type: wp.array(dtype=int),
+    joint_q_start: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_dof_dim: wp.array(dtype=int, ndim=2),
+    joint_target_ke: wp.array(dtype=float),
+    joint_target_kd: wp.array(dtype=float),
+    joint_q: wp.array(dtype=float),
+    joint_target_pos: wp.array(dtype=float),
+    joint_target_vel: wp.array(dtype=float),
+    # in-out
+    constraint_counts: wp.array(dtype=int),
+    max_constraints: int,
+    max_dofs: int,
+    row_beta: wp.array(dtype=float),
+    row_cfm: wp.array(dtype=float),
+    row_types: wp.array(dtype=int),
+    target_velocity: wp.array(dtype=float),
+    phi_out: wp.array(dtype=float),
+    J_rows: wp.array(dtype=float),
+    dt: float,
+    default_beta: float,
+    default_cfm: float,
+    beta_override: float,
+    cfm_override: float,
+):
+    articulation = wp.tid()
+    dof_count = articulation_H_rows[articulation]
+    if dof_count == 0:
+        return
+
+    joint_start = articulation_start[articulation]
+    joint_end = articulation_start[articulation + 1]
+    slot = constraint_counts[articulation]
+    dof_start = articulation_dof_start[articulation]
+
+    for joint_index in range(joint_start, joint_end):
+        type = joint_type[joint_index]
+        if (
+            type != JointType.PRISMATIC
+            and type != JointType.REVOLUTE
+            and type != JointType.D6
+        ):
+            continue
+
+        lin_axis_count = joint_dof_dim[joint_index, 0]
+        ang_axis_count = joint_dof_dim[joint_index, 1]
+        axis_count = lin_axis_count + ang_axis_count
+
+        qd_start = joint_qd_start[joint_index]
+        coord_start = joint_q_start[joint_index]
+
+        for axis in range(axis_count):
+            if slot >= max_constraints:
+                break
+
+            dof_index = qd_start + axis
+            coord_index = coord_start + axis
+
+            ke = joint_target_ke[dof_index]
+            kd = joint_target_kd[dof_index]
+
+            if ke <= 0.0 and kd <= 0.0:
+                continue
+
+            local_dof = dof_index - dof_start
+            if local_dof < 0 or local_dof >= max_dofs:
+                continue
+
+            row_index = articulation * max_constraints + slot
+            row_base = row_index * max_dofs
+
+            for col in range(max_dofs):
+                J_rows[row_base + col] = 0.0
+
+            J_rows[row_base + local_dof] = 1.0
+
+            phi = joint_q[coord_index] - joint_target_pos[coord_index]
+            phi_out[row_index] = phi
+            target_velocity[row_index] = joint_target_vel[dof_index]
+            row_types[row_index] = PGS_CONSTRAINT_TYPE_JOINT_TARGET
+
+            denom = kd + dt * ke
+            beta_drive = default_beta
+            cfm_drive = default_cfm
+
+            if beta_override >= 0.0:
+                beta_drive = beta_override
+            elif denom > 0.0:
+                beta_drive = dt * ke / denom
+
+            if cfm_override >= 0.0:
+                cfm_drive = cfm_override
+            elif denom > 0.0:
+                cfm_drive = 1.0 / denom
+
+            row_beta[row_index] = beta_drive
+            row_cfm[row_index] = cfm_drive
+
+            slot += 1
+
+            if slot >= max_constraints:
+                break
+
+    constraint_counts[articulation] = slot
 
 
 @wp.kernel
@@ -1509,7 +1650,6 @@ def apply_hinv_Jt_multi_rhs(
     for row in range(n, max_dofs):
         Y_rows[row_base + row] = 0.0
 
-
 @wp.kernel
 def form_contact_matrix(
     articulation_H_rows: wp.array(dtype=int),
@@ -1518,38 +1658,81 @@ def form_contact_matrix(
     constraint_counts: wp.array(dtype=int),
     J_rows: wp.array(dtype=float),
     Y_rows: wp.array(dtype=float),
-    cfm: float,
+    row_cfm: wp.array(dtype=float),
     # outputs
     diag_out: wp.array(dtype=float),
     matrix_out: wp.array(dtype=float),
 ):
-    articulation = wp.tid()
+    idx = wp.tid()
+    articulation = idx // max_constraints
+    i_row = idx % max_constraints
+
     m = constraint_counts[articulation]
     n = articulation_H_rows[articulation]
-
-    if m == 0 or n == 0:
+    if i_row >= m or n == 0:
         return
 
     diag_base = articulation * max_constraints
-    mat_base = articulation * max_constraints * max_constraints
+    mat_base  = articulation * max_constraints * max_constraints
 
-    for i in range(m):
-        row_i = (articulation * max_constraints + i) * max_dofs
+    row_i = (articulation * max_constraints + i_row) * max_dofs
 
-        diag_val = float(0.0)
+    # diag
+    diag_val = float(0.0)
+    for k in range(n):
+        diag_val += J_rows[row_i + k] * Y_rows[row_i + k]
+    cfm = row_cfm[diag_base + i_row]
+    diag_out[diag_base + i_row] = diag_val + cfm
+
+    # off-diagonals
+    for j in range(m):
+        row_j = (articulation * max_constraints + j) * max_dofs
+        s = float(0.0)
         for k in range(n):
-            diag_val += J_rows[row_i + k] * Y_rows[row_i + k]
+            s += J_rows[row_i + k] * Y_rows[row_j + k]
+        matrix_out[mat_base + i_row * max_constraints + j] = s
 
-        diag_out[diag_base + i] = diag_val + cfm
 
-        for j in range(m):
-            row_j = (articulation * max_constraints + j) * max_dofs
+# @wp.kernel
+# def form_contact_matrix(
+#     articulation_H_rows: wp.array(dtype=int),
+#     max_constraints: int,
+#     max_dofs: int,
+#     constraint_counts: wp.array(dtype=int),
+#     J_rows: wp.array(dtype=float),
+#     Y_rows: wp.array(dtype=float),
+#     row_cfm: wp.array(dtype=float),
+#     # outputs
+#     diag_out: wp.array(dtype=float),
+#     matrix_out: wp.array(dtype=float),
+# ):
+#     articulation = wp.tid()
+#     m = constraint_counts[articulation]
+#     n = articulation_H_rows[articulation]
 
-            s = float(0.0)
-            for k in range(n):
-                s += J_rows[row_i + k] * Y_rows[row_j + k]
+#     if m == 0 or n == 0:
+#         return
 
-            matrix_out[mat_base + i * max_constraints + j] = s
+#     diag_base = articulation * max_constraints
+#     mat_base = articulation * max_constraints * max_constraints
+
+#     for i in range(m):
+#         row_i = (articulation * max_constraints + i) * max_dofs
+
+#         diag_val = float(0.0)
+#         for k in range(n):
+#             diag_val += J_rows[row_i + k] * Y_rows[row_i + k]
+
+#         diag_out[diag_base + i] = diag_val + row_cfm[diag_base + i]
+
+#         for j in range(m):
+#             row_j = (articulation * max_constraints + j) * max_dofs
+
+#             s = float(0.0)
+#             for k in range(n):
+#                 s += J_rows[row_i + k] * Y_rows[row_j + k]
+
+#             matrix_out[mat_base + i * max_constraints + j] = s
 
 
 @wp.kernel
@@ -1562,7 +1745,9 @@ def compute_contact_bias(
     J_rows: wp.array(dtype=float),
     v_hat: wp.array(dtype=float),
     phi: wp.array(dtype=float),
-    beta: float,
+    row_beta: wp.array(dtype=float),
+    row_types: wp.array(dtype=int),
+    target_velocity: wp.array(dtype=float),
     dt: float,
     # outputs
     rhs_out: wp.array(dtype=float),
@@ -1585,10 +1770,22 @@ def compute_contact_bias(
             rel_vel += J_rows[row_base + k] * v_hat[dof_start + k]
 
         gap = phi[rhs_base + i]
-        if gap < 0.0:
-            rhs_out[rhs_base + i] = rel_vel + beta * gap / dt
+        beta_val = row_beta[rhs_base + i]
+        constraint_type = row_types[rhs_base + i]
+        target_vel = target_velocity[rhs_base + i]
+
+        if constraint_type == PGS_CONSTRAINT_TYPE_CONTACT:
+            rhs = rel_vel - target_vel
+            if gap < 0.0 and dt > 0.0:
+                rhs += beta_val * gap / dt
+            rhs_out[rhs_base + i] = rhs
+        elif constraint_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+            correction = 0.0
+            if dt > 0.0:
+                correction = beta_val * gap / dt
+            rhs_out[rhs_base + i] = rel_vel - target_vel + correction
         else:
-            rhs_out[rhs_base + i] = rel_vel 
+            rhs_out[rhs_base + i] = rel_vel
 
 
 @wp.kernel
@@ -1618,6 +1815,7 @@ def pgs_solve_contacts(
     impulses: wp.array(dtype=float),
     iterations: int,
     omega: float,
+    row_types: wp.array(dtype=int),
 ):
     articulation = wp.tid()
     m = constraint_counts[articulation]
@@ -1643,7 +1841,7 @@ def pgs_solve_contacts(
 
             delta = -w / denom
             new_impulse = impulses[idx] + omega * delta
-            if new_impulse < 0.0:
+            if row_types[idx] == PGS_CONSTRAINT_TYPE_CONTACT and new_impulse < 0.0:
                 new_impulse = 0.0
 
             impulses[idx] = new_impulse
