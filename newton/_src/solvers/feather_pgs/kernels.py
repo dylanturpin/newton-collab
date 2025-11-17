@@ -1342,14 +1342,6 @@ def build_contact_rows_normal(
     if articulation < 0:
         return
         
-    slot = wp.atomic_add(constraint_counts, articulation, 1)
-    if slot >= max_constraints:
-        return
-        
-    phi_index = articulation * max_constraints + slot
-    row_base = (articulation * max_constraints + slot) * max_dofs
-    for col in range(max_dofs):
-        Jc_out[row_base + col] = 0.0
         
     thickness_a = contact_thickness0[tid]
     thickness_b = contact_thickness1[tid]
@@ -1387,11 +1379,22 @@ def build_contact_rows_normal(
     else:
         point_b_world = point_b_local + thickness_b * n
 
-    phi_out[phi_index] = wp.dot(n, point_a_world - point_b_world)
+    phi = wp.dot(n, point_a_world - point_b_world)
     
     weight = float(1.0)
-    if phi_out[phi_index] > 0.0:
-        weight = 0.0
+    if phi > 0.0:
+        return
+        #weight = 0.0
+
+    slot = wp.atomic_add(constraint_counts, articulation, 1)
+    if slot >= max_constraints:
+        return
+        
+    phi_index = articulation * max_constraints + slot
+    phi_out[phi_index] = phi
+    row_base = (articulation * max_constraints + slot) * max_dofs
+    for col in range(max_dofs):
+        Jc_out[row_base + col] = 0.0
         
     dof_count = articulation_H_rows[articulation]
     J_offset = articulation_J_start[articulation]
@@ -1440,7 +1443,6 @@ def clamp_contact_counts(
     if count > max_constraints:
         constraint_counts[articulation] = max_constraints
 
-
 @wp.kernel
 def apply_hinv_Jt_multi_rhs(
     articulation_H_start: wp.array(dtype=int),
@@ -1453,43 +1455,59 @@ def apply_hinv_Jt_multi_rhs(
     # outputs
     Y_rows: wp.array(dtype=float),
 ):
-    articulation = wp.tid()
+    # One thread per (articulation, local_constraint)
+    tid = wp.tid()
+
+    articulation = tid // max_constraints
+    local_constraint = tid - articulation * max_constraints  # tid % max_constraints
+
     m = constraint_counts[articulation]
     n = articulation_H_rows[articulation]
 
-    if m == 0 or n == 0:
+    # Nothing to do if no dofs or this constraint index is unused
+    if n == 0 or local_constraint >= m:
         return
 
     L_start = articulation_H_start[articulation]
     stride = n
 
-    for constraint in range(m):
-        row_base = (articulation * max_constraints + constraint) * max_dofs
+    # Base index into the flattened [articulation, constraint, dof] buffer
+    row_base = (articulation * max_constraints + local_constraint) * max_dofs
 
-        for row in range(n):
-            s = J_rows[row_base + row]
-            for k in range(row):
-                s -= L[L_start + dense_index(stride, row, k)] * Y_rows[row_base + k]
+    # ----------------------------------------------------------------------
+    # Forward substitution: solve L * y = J_row
+    # ----------------------------------------------------------------------
+    for row in range(n):
+        s = J_rows[row_base + row]
 
-            diag = L[L_start + dense_index(stride, row, row)]
-            if diag != 0.0:
-                Y_rows[row_base + row] = s / diag
-            else:
-                Y_rows[row_base + row] = 0.0
+        # subtract contributions from previously solved entries
+        for k in range(row):
+            s -= L[L_start + dense_index(stride, row, k)] * Y_rows[row_base + k]
 
-        for row in range(n - 1, -1, -1):
-            s = Y_rows[row_base + row]
-            for k in range(row + 1, n):
-                s -= L[L_start + dense_index(stride, k, row)] * Y_rows[row_base + k]
-
-            diag = L[L_start + dense_index(stride, row, row)]
-            if diag != 0.0:
-                Y_rows[row_base + row] = s / diag
-            else:
-                Y_rows[row_base + row] = 0.0
-
-        for row in range(n, max_dofs):
+        diag = L[L_start + dense_index(stride, row, row)]
+        if diag != 0.0:
+            Y_rows[row_base + row] = s / diag
+        else:
             Y_rows[row_base + row] = 0.0
+
+    # ----------------------------------------------------------------------
+    # Backward substitution: solve L^T * x = y
+    # ----------------------------------------------------------------------
+    for row in range(n - 1, -1, -1):
+        s = Y_rows[row_base + row]
+
+        for k in range(row + 1, n):
+            s -= L[L_start + dense_index(stride, k, row)] * Y_rows[row_base + k]
+
+        diag = L[L_start + dense_index(stride, row, row)]
+        if diag != 0.0:
+            Y_rows[row_base + row] = s / diag
+        else:
+            Y_rows[row_base + row] = 0.0
+
+    # Zero-pad up to max_dofs for safety / consistency
+    for row in range(n, max_dofs):
+        Y_rows[row_base + row] = 0.0
 
 
 @wp.kernel
