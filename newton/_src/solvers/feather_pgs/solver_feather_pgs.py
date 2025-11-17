@@ -394,7 +394,7 @@ class SolverFeatherPGS(SolverBase):
 
         wp.launch(
             apply_hinv_Jt_multi_rhs,
-            dim=model.articulation_count,
+            dim=model.articulation_count * self.pgs_max_constraints,
             inputs=[
                 self.articulation_H_start,
                 self.articulation_H_rows,
