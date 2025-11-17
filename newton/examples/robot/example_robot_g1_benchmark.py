@@ -69,6 +69,7 @@ class Example:
         pgs_omega: float = 1.0,
         pgs_warmstart: bool = False,
         pgs_use_joint_targets: bool = False,
+        pgs_joint_target_mode: Optional[str] = None,
         pgs_joint_beta: Optional[float] = None,
         pgs_joint_cfm: Optional[float] = None,
     ):
@@ -82,6 +83,11 @@ class Example:
         self.num_worlds = num_worlds
         self.viewer = viewer
         self.solver_type = solver_type
+
+        if pgs_joint_target_mode is None:
+            self.pgs_joint_target_mode = "pgs" if pgs_use_joint_targets else "off"
+        else:
+            self.pgs_joint_target_mode = pgs_joint_target_mode
 
         # ------------------------------------------------------------------
         # Build G1 model
@@ -135,6 +141,7 @@ class Example:
                 pgs_max_constraints=pgs_max_constraints,
                 pgs_warmstart=pgs_warmstart,
                 pgs_use_joint_targets=pgs_use_joint_targets,
+                pgs_joint_target_mode=self.pgs_joint_target_mode,
                 pgs_joint_beta=pgs_joint_beta,
                 pgs_joint_cfm=pgs_joint_cfm,
             )
@@ -145,7 +152,8 @@ class Example:
                 "cfm", self.solver.pgs_cfm,
                 "omega", self.solver.pgs_omega,
                 "max_constraints", self.solver.pgs_max_constraints,
-                "pgs_warmstart", self.solver.pgs_warmstart)
+                "pgs_warmstart", self.solver.pgs_warmstart,
+                "joint_target_mode", getattr(self.solver, "pgs_joint_target_mode", "off"))
 
         elif solver_type == "mujoco":
             self.solver = newton.solvers.SolverMuJoCo(
@@ -181,7 +189,6 @@ class Example:
     # ----------------------------------------------------------------------
     def capture_cuda_graph(self):
         self.graph = None
-        return
         device = wp.get_device()
         if device.is_cuda:
             with wp.ScopedCapture() as capture:
@@ -364,6 +371,13 @@ if __name__ == "__main__":
         help="Include joint drive targets as equality constraints in the PGS solve.",
     )
     parser.add_argument(
+        "--pgs-joint-target-mode",
+        type=str,
+        choices=["off", "pgs", "augmented"],
+        default=None,
+        help="Override how joint drive targets are enforced (default derives from --pgs-use-joint-targets).",
+    )
+    parser.add_argument(
         "--pgs-joint-beta",
         type=float,
         default=None,
@@ -427,20 +441,21 @@ if __name__ == "__main__":
         pgs_omega=args.pgs_omega,
         pgs_warmstart=args.pgs_warmstart,
         pgs_use_joint_targets=args.pgs_use_joint_targets,
+        pgs_joint_target_mode=args.pgs_joint_target_mode,
         pgs_joint_beta=args.pgs_joint_beta,
         pgs_joint_cfm=args.pgs_joint_cfm,
     )
 
     if args.benchmark:
         # Headless-style benchmark run (viewer may still exist but is not used)
-        with wp.ScopedTimer("benchmark", cuda_filter=wp.TIMING_ALL):
-            run_benchmark(
-                example,
-                warmup_frames=args.warmup_frames,
-                measure_frames=args.measure_frames,
-                check_stability=args.check_stability,
-                stability_threshold=args.stability_threshold,
-            )
+        #with wp.ScopedTimer("benchmark", cuda_filter=wp.TIMING_ALL):
+        run_benchmark(
+            example,
+            warmup_frames=args.warmup_frames,
+            measure_frames=args.measure_frames,
+            check_stability=args.check_stability,
+            stability_threshold=args.stability_threshold,
+        )
         if viewer is not None:
             viewer.close()
     else:
