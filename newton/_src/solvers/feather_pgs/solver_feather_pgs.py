@@ -126,6 +126,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_joint_target_mode: Optional[str] = None,
         pgs_joint_beta: Optional[float] = None,
         pgs_joint_cfm: Optional[float] = None,
+        enable_timers: bool = False,
     ):
         """
         Args:
@@ -144,6 +145,7 @@ class SolverFeatherPGS(SolverBase):
             pgs_joint_target_mode (str, optional): Override for how joint targets are enforced (\"off\", \"pgs\", or \"augmented\"). Defaults to deriving from ``pgs_use_joint_targets``.
             pgs_joint_beta (float, optional): ERP override for joint-target constraints (defaults to auto-mapped from gains when None).
             pgs_joint_cfm (float, optional): CFM override for joint-target constraints (defaults to auto-mapped from gains when None).
+            enable_timers (bool, optional): Enable NVTX profiling ranges for solver sub-sections. Defaults to False.
         """
         super().__init__(model)
 
@@ -167,6 +169,7 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_use_augmented_targets = pgs_joint_target_mode == "augmented"
         self.pgs_joint_beta = pgs_joint_beta
         self.pgs_joint_cfm = pgs_joint_cfm
+        self.enable_timers = enable_timers
 
         self._step = 0
         self._force_mass_update = False
@@ -181,6 +184,9 @@ class SolverFeatherPGS(SolverBase):
             self.shape_material_mu = wp.zeros(
                 (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
             )
+
+    def _timer(self, label: str):
+        return wp.ScopedTimer(label, active=self.enable_timers, use_nvtx=True, synchronize=True)
 
     def compute_articulation_indices(self, model):
         # calculate total size and offsets of Jacobian and mass matrices for entire system
@@ -535,184 +541,187 @@ class SolverFeatherPGS(SolverBase):
 
         device = model.device
 
-        wp.launch(
-            compute_velocity_predictor,
-            dim=model.joint_dof_count,
-            inputs=[
-                state_in.joint_qd,
-                state_aug.joint_qdd,
-                dt,
-            ],
-            outputs=[self.pgs_v_hat],
-            device=device,
-        )
-
-        self.pgs_counts.zero_()
-
-        if (
-            contacts is not None
-            and getattr(contacts, "rigid_contact_count", None) is not None
-            and contacts.rigid_contact_max > 0
-        ):
-            enable_friction_flag = 1 if self.enable_contact_friction else 0
+        with self._timer("Contact assembly"):
             wp.launch(
-                build_contact_rows_normal,
-                dim=contacts.rigid_contact_max,
+                compute_velocity_predictor,
+                dim=model.joint_dof_count,
                 inputs=[
-                    contacts.rigid_contact_count,
-                    contacts.rigid_contact_point0,
-                    contacts.rigid_contact_point1,
-                    contacts.rigid_contact_normal,
-                    contacts.rigid_contact_shape0,
-                    contacts.rigid_contact_shape1,
-                    contacts.rigid_contact_thickness0,
-                    contacts.rigid_contact_thickness1,
-                    model.shape_body,
-                    state_in.body_q,
-                    model.shape_transform,
-                    self.shape_material_mu,
-                    model.articulation_start,
-                    self.articulation_J_start,
+                    state_in.joint_qd,
+                    state_aug.joint_qdd,
+                    dt,
+                ],
+                outputs=[self.pgs_v_hat],
+                device=device,
+            )
+
+            self.pgs_counts.zero_()
+
+            if (
+                contacts is not None
+                and getattr(contacts, "rigid_contact_count", None) is not None
+                and contacts.rigid_contact_max > 0
+            ):
+                enable_friction_flag = 1 if self.enable_contact_friction else 0
+                wp.launch(
+                    build_contact_rows_normal,
+                    dim=contacts.rigid_contact_max,
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        contacts.rigid_contact_point0,
+                        contacts.rigid_contact_point1,
+                        contacts.rigid_contact_normal,
+                        contacts.rigid_contact_shape0,
+                        contacts.rigid_contact_shape1,
+                        contacts.rigid_contact_thickness0,
+                        contacts.rigid_contact_thickness1,
+                        model.shape_body,
+                        state_in.body_q,
+                        model.shape_transform,
+                        self.shape_material_mu,
+                        model.articulation_start,
+                        self.articulation_J_start,
+                        self.articulation_H_rows,
+                        self.articulation_dof_start,
+                        self.body_to_joint,
+                        self.body_to_articulation,
+                        model.joint_ancestor,
+                        self.J,
+                        self.pgs_max_constraints,
+                        self.articulation_max_dofs,
+                        self.pgs_beta,
+                        self.pgs_cfm,
+                        enable_friction_flag,
+                    ],
+                    outputs=[
+                        self.pgs_counts,
+                        self.pgs_Jc,
+                        self.pgs_phi,
+                        self.pgs_row_beta,
+                        self.pgs_row_cfm,
+                        self.pgs_types,
+                        self.pgs_target_velocity,
+                        self.pgs_parent,
+                        self.pgs_mu,
+                    ],
+                    device=device,
+                )
+
+            if self.pgs_use_joint_targets and control is not None and self.articulation_max_dofs > 0:
+                beta_override = self.pgs_joint_beta if self.pgs_joint_beta is not None else -1.0
+                cfm_override = self.pgs_joint_cfm if self.pgs_joint_cfm is not None else -1.0
+                wp.launch(
+                    build_joint_target_rows,
+                    dim=model.articulation_count,
+                    inputs=[
+                        model.articulation_start,
+                        self.articulation_H_rows,
+                        self.articulation_dof_start,
+                        model.joint_type,
+                        model.joint_q_start,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_target_ke,
+                        model.joint_target_kd,
+                        state_in.joint_q,
+                        control.joint_target_pos,
+                        control.joint_target_vel,
+                        self.pgs_counts,
+                        self.pgs_max_constraints,
+                        self.articulation_max_dofs,
+                        self.pgs_row_beta,
+                        self.pgs_row_cfm,
+                        self.pgs_types,
+                        self.pgs_target_velocity,
+                        self.pgs_phi,
+                        self.pgs_Jc,
+                        self.pgs_parent,
+                        self.pgs_mu,
+                        dt,
+                        self.pgs_beta,
+                        self.pgs_cfm,
+                        beta_override,
+                        cfm_override,
+                    ],
+                    device=device,
+                )
+
+            wp.launch(
+                clamp_contact_counts,
+                dim=model.articulation_count,
+                inputs=[self.pgs_counts, self.pgs_max_constraints],
+                device=device,
+            )
+
+        with self._timer("Contact system build (HinvJt + K + bias)"):
+            wp.launch(
+                apply_hinv_Jt_multi_rhs,
+                dim=model.articulation_count * self.pgs_max_constraints,
+                inputs=[
+                    self.articulation_H_start,
                     self.articulation_H_rows,
-                    self.articulation_dof_start,
-                    self.body_to_joint,
-                    self.body_to_articulation,
-                    model.joint_ancestor,
-                    self.J,
                     self.pgs_max_constraints,
                     self.articulation_max_dofs,
-                    self.pgs_beta,
-                    self.pgs_cfm,
-                    enable_friction_flag,
+                    self.pgs_counts,
+                    self.L,
+                    self.pgs_Jc,
+                ],
+                outputs=[self.pgs_Y],
+                device=device,
+            )
+
+            wp.launch(
+                form_contact_matrix,
+                #dim=model.articulation_count,
+                dim=model.articulation_count * self.pgs_max_constraints,
+                inputs=[
+                    self.articulation_H_rows,
+                    self.pgs_max_constraints,
+                    self.articulation_max_dofs,
+                    self.pgs_counts,
+                    self.pgs_Jc,
+                    self.pgs_Y,
+                    self.pgs_row_cfm,
                 ],
                 outputs=[
-                    self.pgs_counts,
-                    self.pgs_Jc,
-                    self.pgs_phi,
-                    self.pgs_row_beta,
-                    self.pgs_row_cfm,
-                    self.pgs_types,
-                    self.pgs_target_velocity,
-                    self.pgs_parent,
-                    self.pgs_mu,
+                    self.pgs_diag,
+                    self.pgs_contact_matrix,
                 ],
                 device=device,
             )
 
-        if self.pgs_use_joint_targets and control is not None and self.articulation_max_dofs > 0:
-            beta_override = self.pgs_joint_beta if self.pgs_joint_beta is not None else -1.0
-            cfm_override = self.pgs_joint_cfm if self.pgs_joint_cfm is not None else -1.0
             wp.launch(
-                build_joint_target_rows,
+                compute_contact_bias,
                 dim=model.articulation_count,
                 inputs=[
-                    model.articulation_start,
-                    self.articulation_H_rows,
                     self.articulation_dof_start,
-                    model.joint_type,
-                    model.joint_q_start,
-                    model.joint_qd_start,
-                    model.joint_dof_dim,
-                    model.joint_target_ke,
-                    model.joint_target_kd,
-                    state_in.joint_q,
-                    control.joint_target_pos,
-                    control.joint_target_vel,
+                    self.articulation_H_rows,
                     self.pgs_counts,
                     self.pgs_max_constraints,
                     self.articulation_max_dofs,
+                    self.pgs_Jc,
+                    self.pgs_v_hat,
+                    self.pgs_phi,
                     self.pgs_row_beta,
-                    self.pgs_row_cfm,
                     self.pgs_types,
                     self.pgs_target_velocity,
-                    self.pgs_phi,
-                    self.pgs_Jc,
-                    self.pgs_parent,
-                    self.pgs_mu,
                     dt,
-                    self.pgs_beta,
-                    self.pgs_cfm,
-                    beta_override,
-                    cfm_override,
                 ],
+                outputs=[self.pgs_rhs],
                 device=device,
             )
 
-        wp.launch(
-            clamp_contact_counts,
-            dim=model.articulation_count,
-            inputs=[self.pgs_counts, self.pgs_max_constraints],
-            device=device,
-        )
-
-        wp.launch(
-            apply_hinv_Jt_multi_rhs,
-            dim=model.articulation_count * self.pgs_max_constraints,
-            inputs=[
-                self.articulation_H_start,
-                self.articulation_H_rows,
-                self.pgs_max_constraints,
-                self.articulation_max_dofs,
-                self.pgs_counts,
-                self.L,
-                self.pgs_Jc,
-            ],
-            outputs=[self.pgs_Y],
-            device=device,
-        )
-
-        wp.launch(
-            form_contact_matrix,
-            #dim=model.articulation_count,
-            dim=model.articulation_count * self.pgs_max_constraints,
-            inputs=[
-                self.articulation_H_rows,
-                self.pgs_max_constraints,
-                self.articulation_max_dofs,
-                self.pgs_counts,
-                self.pgs_Jc,
-                self.pgs_Y,
-                self.pgs_row_cfm,
-            ],
-            outputs=[
-                self.pgs_diag,
-                self.pgs_contact_matrix,
-            ],
-            device=device,
-        )
-
-        wp.launch(
-            compute_contact_bias,
-            dim=model.articulation_count,
-            inputs=[
-                self.articulation_dof_start,
-                self.articulation_H_rows,
-                self.pgs_counts,
-                self.pgs_max_constraints,
-                self.articulation_max_dofs,
-                self.pgs_Jc,
-                self.pgs_v_hat,
-                self.pgs_phi,
-                self.pgs_row_beta,
-                self.pgs_types,
-                self.pgs_target_velocity,
-                dt,
-            ],
-            outputs=[self.pgs_rhs],
-            device=device,
-        )
-
         warmstart_flag = 1 if self.pgs_warmstart else 0
-        wp.launch(
-            prepare_impulses,
-            dim=model.articulation_count,
-            inputs=[self.pgs_counts, self.pgs_max_constraints, warmstart_flag, self.pgs_impulses],
-            device=device,
-        )
+        with self._timer("PGS iterations"):
+            wp.launch(
+                prepare_impulses,
+                dim=model.articulation_count,
+                inputs=[self.pgs_counts, self.pgs_max_constraints, warmstart_flag, self.pgs_impulses],
+                device=device,
+            )
 
-        wp.launch(
-            pgs_solve_contacts,
-            dim=model.articulation_count,
+            wp.launch(
+                pgs_solve_contacts,
+                dim=model.articulation_count,
                 inputs=[
                     self.pgs_counts,
                     self.pgs_max_constraints,
@@ -729,30 +738,31 @@ class SolverFeatherPGS(SolverBase):
                 device=device,
             )
 
-        wp.launch(
-            accumulate_contact_velocity,
-            dim=model.articulation_count,
-            inputs=[
-                self.articulation_dof_start,
-                self.articulation_H_rows,
-                self.pgs_counts,
-                self.pgs_max_constraints,
-                self.articulation_max_dofs,
-                self.pgs_Y,
-                self.pgs_v_hat,
-                self.pgs_impulses,
-            ],
-            outputs=[self.pgs_v_out],
-            device=device,
-        )
+        with self._timer("Contact apply (v, qdd)"):
+            wp.launch(
+                accumulate_contact_velocity,
+                dim=model.articulation_count,
+                inputs=[
+                    self.articulation_dof_start,
+                    self.articulation_H_rows,
+                    self.pgs_counts,
+                    self.pgs_max_constraints,
+                    self.articulation_max_dofs,
+                    self.pgs_Y,
+                    self.pgs_v_hat,
+                    self.pgs_impulses,
+                ],
+                outputs=[self.pgs_v_out],
+                device=device,
+            )
 
-        wp.launch(
-            update_qdd_from_velocity,
-            dim=model.joint_dof_count,
-            inputs=[state_in.joint_qd, self.pgs_v_out, 1.0 / dt],
-            outputs=[state_aug.joint_qdd],
-            device=device,
-        )
+            wp.launch(
+                update_qdd_from_velocity,
+                dim=model.joint_dof_count,
+                inputs=[state_in.joint_qd, self.pgs_v_out, 1.0 / dt],
+                outputs=[state_aug.joint_qdd],
+                device=device,
+            )
 
     def allocate_state_aux_vars(self, model, target, requires_grad):
         # allocate auxiliary variables that vary with state
@@ -835,140 +845,148 @@ class SolverFeatherPGS(SolverBase):
             if state_in.body_count:
                 body_f = state_in.body_f
 
-            # damped springs
-            eval_spring_forces(model, state_in, particle_f)
+            with self._timer("Unconstrained dynamics"):
+                # damped springs
+                eval_spring_forces(model, state_in, particle_f)
 
-            # triangle elastic and lift/drag forces
-            eval_triangle_forces(model, state_in, control, particle_f)
+                # triangle elastic and lift/drag forces
+                eval_triangle_forces(model, state_in, control, particle_f)
 
-            # triangle bending
-            eval_bending_forces(model, state_in, particle_f)
+                # triangle bending
+                eval_bending_forces(model, state_in, particle_f)
 
-            # tetrahedral FEM
-            eval_tetrahedra_forces(model, state_in, control, particle_f)
+                # tetrahedral FEM
+                eval_tetrahedra_forces(model, state_in, control, particle_f)
 
-            # particle-particle interactions
-            eval_particle_contact_forces(model, state_in, particle_f)
+                # particle-particle interactions
+                eval_particle_contact_forces(model, state_in, particle_f)
 
-            # particle shape contact
-            eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True)
+                # particle shape contact
+                eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True)
 
-            # muscles
-            if False:
-                eval_muscle_forces(model, state_in, control, body_f)
+                # muscles
+                if False:
+                    eval_muscle_forces(model, state_in, control, body_f)
 
             # ----------------------------
             # articulations
 
             if model.joint_count:
-                # evaluate body transforms
-                wp.launch(
-                    eval_rigid_fk,
-                    dim=model.articulation_count,
-                    inputs=[
-                        model.articulation_start,
-                        model.joint_type,
-                        model.joint_parent,
-                        model.joint_child,
-                        model.joint_q_start,
-                        model.joint_qd_start,
-                        state_in.joint_q,
-                        model.joint_X_p,
-                        model.joint_X_c,
-                        self.body_X_com,
-                        model.joint_axis,
-                        model.joint_dof_dim,
-                    ],
-                    outputs=[state_in.body_q, state_aug.body_q_com],
-                    device=model.device,
-                )
+                with self._timer("Articulation dynamics (FK/ID/drives)"):
+                    with self._timer("FK + ID"):
+                        # evaluate body transforms
+                        wp.launch(
+                            eval_rigid_fk,
+                            dim=model.articulation_count,
+                            inputs=[
+                                model.articulation_start,
+                                model.joint_type,
+                                model.joint_parent,
+                                model.joint_child,
+                                model.joint_q_start,
+                                model.joint_qd_start,
+                                state_in.joint_q,
+                                model.joint_X_p,
+                                model.joint_X_c,
+                                self.body_X_com,
+                                model.joint_axis,
+                                model.joint_dof_dim,
+                            ],
+                            outputs=[state_in.body_q, state_aug.body_q_com],
+                            device=model.device,
+                        )
 
-                # print("body_X_sc:")
-                # print(state_in.body_q.numpy())
+                        # print("body_X_sc:")
+                        # print(state_in.body_q.numpy())
 
-                # evaluate joint inertias, motion vectors, and forces
-                state_aug.body_f_s.zero_()
+                        # evaluate joint inertias, motion vectors, and forces
+                        state_aug.body_f_s.zero_()
 
-                wp.launch(
-                    eval_rigid_id,
-                    dim=model.articulation_count,
-                    inputs=[
-                        model.articulation_start,
-                        model.joint_type,
-                        model.joint_parent,
-                        model.joint_child,
-                        model.joint_qd_start,
-                        state_in.joint_qd,
-                        model.joint_axis,
-                        model.joint_dof_dim,
-                        self.body_I_m,
-                        state_in.body_q,
-                        state_aug.body_q_com,
-                        model.joint_X_p,
-                        model.gravity,
-                    ],
-                    outputs=[
-                        state_aug.joint_S_s,
-                        state_aug.body_I_s,
-                        state_aug.body_v_s,
-                        state_aug.body_f_s,
-                        state_aug.body_a_s,
-                    ],
-                    device=model.device,
-                )
+                        wp.launch(
+                            eval_rigid_id,
+                            dim=model.articulation_count,
+                            inputs=[
+                                model.articulation_start,
+                                model.joint_type,
+                                model.joint_parent,
+                                model.joint_child,
+                                model.joint_qd_start,
+                                state_in.joint_qd,
+                                model.joint_axis,
+                                model.joint_dof_dim,
+                                self.body_I_m,
+                                state_in.body_q,
+                                state_aug.body_q_com,
+                                model.joint_X_p,
+                                model.gravity,
+                            ],
+                            outputs=[
+                                state_aug.joint_S_s,
+                                state_aug.body_I_s,
+                                state_aug.body_v_s,
+                                state_aug.body_f_s,
+                                state_aug.body_a_s,
+                            ],
+                            device=model.device,
+                        )
 
-                if model.articulation_count:
-                    # evaluate joint torques
-                    state_aug.body_ft_s.zero_()
-                    use_joint_targets_flag = 0 if self.pgs_joint_target_mode in ("pgs", "augmented") else 1
-                    wp.launch(
-                        eval_rigid_tau,
-                        dim=model.articulation_count,
-                        inputs=[
-                            model.articulation_start,
-                            model.joint_type,
-                            model.joint_parent,
-                            model.joint_child,
-                            model.joint_q_start,
-                            model.joint_qd_start,
-                            model.joint_dof_dim,
-                            control.joint_target_pos,
-                            control.joint_target_vel,
-                            state_in.joint_q,
-                            state_in.joint_qd,
-                            control.joint_f,
-                            model.joint_target_ke,
-                            model.joint_target_kd,
-                            model.joint_limit_lower,
-                            model.joint_limit_upper,
-                            model.joint_limit_ke,
-                            model.joint_limit_kd,
-                            state_aug.joint_S_s,
-                            state_aug.body_f_s,
-                            body_f,
-                            use_joint_targets_flag,
-                        ],
-                        outputs=[
-                            state_aug.body_ft_s,
-                            state_aug.joint_tau,
-                        ],
-                        device=model.device,
-                    )
+                    if model.articulation_count:
+                        with self._timer("Drives + augmentation"):
+                            # evaluate joint torques
+                            state_aug.body_ft_s.zero_()
+                            use_joint_targets_flag = 0 if self.pgs_joint_target_mode in ("pgs", "augmented") else 1
+                            wp.launch(
+                                eval_rigid_tau,
+                                dim=model.articulation_count,
+                                inputs=[
+                                    model.articulation_start,
+                                    model.joint_type,
+                                    model.joint_parent,
+                                    model.joint_child,
+                                    model.joint_q_start,
+                                    model.joint_qd_start,
+                                    model.joint_dof_dim,
+                                    control.joint_target_pos,
+                                    control.joint_target_vel,
+                                    state_in.joint_q,
+                                    state_in.joint_qd,
+                                    control.joint_f,
+                                    model.joint_target_ke,
+                                    model.joint_target_kd,
+                                    model.joint_limit_lower,
+                                    model.joint_limit_upper,
+                                    model.joint_limit_ke,
+                                    model.joint_limit_kd,
+                                    state_aug.joint_S_s,
+                                    state_aug.body_f_s,
+                                    body_f,
+                                    use_joint_targets_flag,
+                                ],
+                                outputs=[
+                                    state_aug.body_ft_s,
+                                    state_aug.joint_tau,
+                                ],
+                                device=model.device,
+                            )
 
-                    if self.pgs_use_augmented_targets:
-                        self.build_augmented_joint_targets(state_in, control, dt)
-                        self.apply_augmented_joint_tau(state_in, state_aug, dt)
+                            if self.pgs_use_augmented_targets:
+                                self.build_augmented_joint_targets(state_in, control, dt)
+                                self.apply_augmented_joint_tau(state_in, state_aug, dt)
 
-                    # print("joint_tau:")
-                    # print(state_aug.joint_tau.numpy())
-                    # print("body_q:")
-                    # print(state_in.body_q.numpy())
-                    # print("body_qd:")
-                    # print(state_in.body_qd.numpy())
+                            # print("joint_tau:")
+                            # print(state_aug.joint_tau.numpy())
+                            # print("body_q:")
+                            # print(state_in.body_q.numpy())
+                            # print("body_qd:")
+                            # print(state_in.body_qd.numpy())
 
-                    global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
-                    if self.pgs_use_augmented_targets:
-                        mass_update = True
+                global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
+                if self.pgs_use_augmented_targets:
+                    mass_update = True
+                else:
+                    mass_update = bool(global_flag)
+                if mass_update:
+                    with self._timer("Mass matrix build (CRBA + prep)"):
                         wp.launch(
                             build_mass_update_mask,
                             dim=model.articulation_count,
@@ -979,20 +997,6 @@ class SolverFeatherPGS(SolverBase):
                             outputs=[self.mass_update_mask],
                             device=model.device,
                         )
-                    else:
-                        mass_update = bool(global_flag)
-                        if mass_update:
-                            wp.launch(
-                                build_mass_update_mask,
-                                dim=model.articulation_count,
-                                inputs=[
-                                    global_flag,
-                                    self.limit_change_mask,
-                                ],
-                                outputs=[self.mass_update_mask],
-                                device=model.device,
-                            )
-                    if mass_update:
                         # build J
                         wp.launch(
                             eval_rigid_jacobian,
@@ -1059,22 +1063,6 @@ class SolverFeatherPGS(SolverBase):
                                 device=model.device,
                             )
 
-                        # compute decomposition
-                        wp.launch(
-                            eval_dense_cholesky_batched,
-                            dim=model.articulation_count,
-                            inputs=[
-                                self.articulation_H_start,
-                                self.articulation_H_rows,
-                                self.H,
-                                model.joint_armature,
-                                self.mass_update_mask,
-                            ],
-                            outputs=[self.L],
-                            device=model.device,
-                        )
-
-                        if self.pgs_use_augmented_targets:
                             wp.launch(
                                 copy_int_array_masked,
                                 dim=model.articulation_count,
@@ -1093,6 +1081,22 @@ class SolverFeatherPGS(SolverBase):
                         # print(self.H.numpy())
                         # print("L:")
                         # print(self.L.numpy())
+
+                with self._timer("Mass solve (Cholesky + backsolve)"):
+                    if mass_update:
+                        wp.launch(
+                            eval_dense_cholesky_batched,
+                            dim=model.articulation_count,
+                            inputs=[
+                                self.articulation_H_start,
+                                self.articulation_H_rows,
+                                self.H,
+                                model.joint_armature,
+                                self.mass_update_mask,
+                            ],
+                            outputs=[self.L],
+                            device=model.device,
+                        )
 
                     # solve for qdd
                     state_aug.joint_qdd.zero_()
@@ -1114,15 +1118,16 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
 
-                    self.solve_contacts_pgs(state_in, state_aug, control, contacts, dt)
-                    # print("joint_qdd:")
-                    # print(state_aug.joint_qdd.numpy())
-                    # print("\n\n")
+                self.solve_contacts_pgs(state_in, state_aug, control, contacts, dt)
+                # print("joint_qdd:")
+                # print(state_aug.joint_qdd.numpy())
+                # print("\n\n")
 
-            # -------------------------------------
-            # integrate bodies
+        # -------------------------------------
+        # integrate bodies
 
-            if model.joint_count:
+        if model.joint_count:
+            with self._timer("Integration + FK_out"):
                 wp.launch(
                     kernel=integrate_generalized_joints,
                     dim=model.joint_count,
@@ -1143,8 +1148,8 @@ class SolverFeatherPGS(SolverBase):
                 # update maximal coordinates
                 eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
 
-            self.integrate_particles(model, state_in, state_out, dt)
+        self.integrate_particles(model, state_in, state_out, dt)
 
-            self._step += 1
+        self._step += 1
 
-            return state_out
+        return state_out
