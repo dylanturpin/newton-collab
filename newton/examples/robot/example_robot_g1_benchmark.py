@@ -72,6 +72,7 @@ class Example:
         pgs_joint_target_mode: Optional[str] = None,
         pgs_joint_beta: Optional[float] = None,
         pgs_joint_cfm: Optional[float] = None,
+        enable_timers: bool = False,
     ):
         self.fps = 60.0
         self.frame_dt = 1.0 / self.fps
@@ -83,6 +84,7 @@ class Example:
         self.num_worlds = num_worlds
         self.viewer = viewer
         self.solver_type = solver_type
+        self.enable_timers = enable_timers
 
         if pgs_joint_target_mode is None:
             self.pgs_joint_target_mode = "pgs" if pgs_use_joint_targets else "off"
@@ -97,7 +99,8 @@ class Example:
         # Register attributes used by the MuJoCo-style import, regardless of solver
         newton.solvers.SolverMuJoCo.register_custom_attributes(g1)
 
-        g1.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=1.0e3, limit_kd=2.5, friction=1e-5)
+        #g1.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=1.0e3, limit_kd=2.5, friction=1e-5)
+        g1.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=0., limit_kd=0., friction=0.)
         g1.default_shape_cfg.ke = 5.0e4
         g1.default_shape_cfg.kd = 5.0e2
         g1.default_shape_cfg.kf = 1.0e3
@@ -116,8 +119,10 @@ class Example:
 
         # Joint drive gains for actuated joints
         for i in range(6, g1.joint_dof_count):
-            g1.joint_target_ke[i] = 1000.0
-            g1.joint_target_kd[i] = 5.0
+            # g1.joint_target_ke[i] = 1000.0
+            # g1.joint_target_kd[i] = 5.0
+            g1.joint_target_ke[i] = 100.0
+            g1.joint_target_kd[i] = 0.5
 
         # Approximate meshes for faster collision detection
         g1.approximate_meshes("bounding_box")
@@ -144,6 +149,8 @@ class Example:
                 pgs_joint_target_mode=self.pgs_joint_target_mode,
                 pgs_joint_beta=pgs_joint_beta,
                 pgs_joint_cfm=pgs_joint_cfm,
+                enable_contact_friction = True,
+                enable_timers=enable_timers,
             )
             self.solver = newton.solvers.SolverFeatherPGS(self.model, **solver_kwargs)
             print("PGS params:",
@@ -189,6 +196,7 @@ class Example:
     # ----------------------------------------------------------------------
     def capture_cuda_graph(self):
         self.graph = None
+        #return
         device = wp.get_device()
         if device.is_cuda:
             with wp.ScopedCapture() as capture:
@@ -201,8 +209,14 @@ class Example:
     def simulate(self):
 
         for _ in range(self.sim_substeps):
-            # Broad/narrow-phase collision for current state
-            self.contacts = self.model.collide(self.state_0, rigid_contact_margin=0.1)
+            with wp.ScopedTimer(
+                "Collision detection",
+                active=self.enable_timers,
+                use_nvtx=True,
+                synchronize=True,
+            ):
+                # Broad/narrow-phase collision for current state
+                self.contacts = self.model.collide(self.state_0, rigid_contact_margin=0.1)
 
             # Clear forces from previous step
             self.state_0.clear_forces()
@@ -211,8 +225,14 @@ class Example:
             if self.viewer is not None:
                 self.viewer.apply_forces(self.state_0)
 
-            # Advance solver
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            with wp.ScopedTimer(
+                "step",
+                active=self.enable_timers,
+                use_nvtx=True,
+                synchronize=True,
+            ):
+                # Advance solver
+                self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
             # Swap states
             self.state_0, self.state_1 = self.state_1, self.state_0
@@ -395,6 +415,11 @@ if __name__ == "__main__":
         default=1,
         help="How often to update the mass matrix (every n-th step).",
     )
+    parser.add_argument(
+        "--enable-timers",
+        action="store_true",
+        help="Enable NVTX profiling ranges for collision detection and solver sections.",
+    )
 
     # Benchmark options
     parser.add_argument(
@@ -444,18 +469,26 @@ if __name__ == "__main__":
         pgs_joint_target_mode=args.pgs_joint_target_mode,
         pgs_joint_beta=args.pgs_joint_beta,
         pgs_joint_cfm=args.pgs_joint_cfm,
+        enable_timers=args.enable_timers,
     )
 
     if args.benchmark:
         # Headless-style benchmark run (viewer may still exist but is not used)
         #with wp.ScopedTimer("benchmark", cuda_filter=wp.TIMING_ALL):
-        run_benchmark(
-            example,
-            warmup_frames=args.warmup_frames,
-            measure_frames=args.measure_frames,
-            check_stability=args.check_stability,
-            stability_threshold=args.stability_threshold,
-        )
+        with wp.ScopedTimer(
+            "benchmark",
+            active=example.enable_timers,
+            use_nvtx=True,
+            synchronize=True,
+            color="red",
+        ):
+            run_benchmark(
+                example,
+                warmup_frames=args.warmup_frames,
+                measure_frames=args.measure_frames,
+                check_stability=args.check_stability,
+                stability_threshold=args.stability_threshold,
+            )
         if viewer is not None:
             viewer.close()
     else:
