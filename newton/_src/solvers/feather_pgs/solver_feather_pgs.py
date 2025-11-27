@@ -44,6 +44,7 @@ from .kernels import (
     build_joint_target_rows,
     build_mass_update_mask,
     clamp_contact_counts,
+    clamp_joint_tau,
     compute_com_transforms,
     compute_contact_bias,
     compute_spatial_inertia,
@@ -420,19 +421,12 @@ class SolverFeatherPGS(SolverBase):
         self.aug_row_dof_index = wp.zeros(
             (total_rows,), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
-        self.aug_row_beta = wp.zeros(
+        self.aug_row_K = wp.zeros(
             (total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.aug_row_cfm = wp.zeros(
+        self.aug_row_u0 = wp.zeros(
             (total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.aug_row_phi = wp.zeros(
-            (total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.aug_row_target_velocity = wp.zeros(
-            (total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.aug_limit_change_flag = wp.zeros((1,), dtype=wp.int32, device=device, requires_grad=requires_grad)
 
     def build_augmented_joint_targets(self, state_in: State, control: Control, dt: float):
         if not self.pgs_use_augmented_targets:
@@ -451,9 +445,6 @@ class SolverFeatherPGS(SolverBase):
         self.aug_row_counts.zero_()
         self.aug_limit_counts.zero_()
 
-        beta_override = self.pgs_joint_beta if self.pgs_joint_beta is not None else -1.0
-        cfm_override = self.pgs_joint_cfm if self.pgs_joint_cfm is not None else -1.0
-
         wp.launch(
             build_augmented_joint_rows,
             dim=model.articulation_count,
@@ -467,27 +458,18 @@ class SolverFeatherPGS(SolverBase):
                 model.joint_dof_dim,
                 model.joint_target_ke,
                 model.joint_target_kd,
-                model.joint_limit_lower,
-                model.joint_limit_upper,
-                model.joint_limit_ke,
-                model.joint_limit_kd,
                 state_in.joint_q,
+                state_in.joint_qd,
                 control.joint_target_pos,
                 control.joint_target_vel,
                 self.articulation_max_dofs,
                 dt,
-                self.pgs_beta,
-                self.pgs_cfm,
-                beta_override,
-                cfm_override,
             ],
             outputs=[
                 self.aug_row_counts,
                 self.aug_row_dof_index,
-                self.aug_row_beta,
-                self.aug_row_cfm,
-                self.aug_row_phi,
-                self.aug_row_target_velocity,
+                self.aug_row_K,
+                self.aug_row_u0,
                 self.aug_limit_counts,
             ],
             device=device,
@@ -523,12 +505,7 @@ class SolverFeatherPGS(SolverBase):
                 self.articulation_max_dofs,
                 self.aug_row_counts,
                 self.aug_row_dof_index,
-                self.aug_row_beta,
-                self.aug_row_cfm,
-                self.aug_row_phi,
-                self.aug_row_target_velocity,
-                state_in.joint_qd,
-                dt,
+                self.aug_row_u0,
             ],
             outputs=[state_aug.joint_tau],
             device=model.device,
@@ -969,9 +946,27 @@ class SolverFeatherPGS(SolverBase):
                                 device=model.device,
                             )
 
+                            # Clamp explicit PD torques to joint effort limits (MuJoCo-style forcerange)
+                            if self.pgs_joint_target_mode == "off":
+                                wp.launch(
+                                    clamp_joint_tau,
+                                    dim=model.joint_dof_count,
+                                    inputs=[state_aug.joint_tau, model.joint_effort_limit],
+                                    device=model.device,
+                                )
+
+
                             if self.pgs_use_augmented_targets:
                                 self.build_augmented_joint_targets(state_in, control, dt)
                                 self.apply_augmented_joint_tau(state_in, state_aug, dt)
+
+                                wp.launch(
+                                    clamp_joint_tau,
+                                    dim=model.joint_dof_count,
+                                    inputs=[state_aug.joint_tau, model.joint_effort_limit],
+                                    device=model.device,
+                                )
+
 
                             # print("joint_tau:")
                             # print(state_aug.joint_tau.numpy())
@@ -1049,19 +1044,19 @@ class SolverFeatherPGS(SolverBase):
                             wp.launch(
                                 apply_augmented_mass_diagonal,
                                 dim=model.articulation_count,
-                                inputs=[
-                                    self.articulation_H_start,
-                                    self.articulation_H_rows,
-                                    self.articulation_dof_start,
-                                    self.articulation_max_dofs,
-                                    self.mass_update_mask,
-                                    self.aug_row_counts,
-                                    self.aug_row_dof_index,
-                                    self.aug_row_cfm,
-                                    self.H,
-                                ],
-                                device=model.device,
-                            )
+                            inputs=[
+                                self.articulation_H_start,
+                                self.articulation_H_rows,
+                                self.articulation_dof_start,
+                                self.articulation_max_dofs,
+                                self.mass_update_mask,
+                                self.aug_row_counts,
+                                self.aug_row_dof_index,
+                                self.aug_row_K,
+                                self.H,
+                            ],
+                            device=model.device,
+                        )
 
                             wp.launch(
                                 copy_int_array_masked,

@@ -1662,7 +1662,7 @@ def build_joint_target_rows(
 
             J_rows[row_base + local_dof] = 1.0
 
-            phi = joint_q[coord_index] - joint_target_pos[coord_index]
+            phi = joint_q[coord_index] - joint_target_pos[dof_index]
             phi_out[row_index] = phi
             target_velocity[row_index] = joint_target_vel[dof_index]
             row_types[row_index] = PGS_CONSTRAINT_TYPE_JOINT_TARGET
@@ -1705,30 +1705,21 @@ def build_augmented_joint_rows(
     joint_dof_dim: wp.array(dtype=int, ndim=2),
     joint_target_ke: wp.array(dtype=float),
     joint_target_kd: wp.array(dtype=float),
-    joint_limit_lower: wp.array(dtype=float),
-    joint_limit_upper: wp.array(dtype=float),
-    joint_limit_ke: wp.array(dtype=float),
-    joint_limit_kd: wp.array(dtype=float),
     joint_q: wp.array(dtype=float),
+    joint_qd: wp.array(dtype=float),
     joint_target_pos: wp.array(dtype=float),
     joint_target_vel: wp.array(dtype=float),
     max_dofs: int,
     dt: float,
-    default_beta: float,
-    default_cfm: float,
-    beta_override: float,
-    cfm_override: float,
     # outputs
     row_counts: wp.array(dtype=int),
     row_dof_index: wp.array(dtype=int),
-    row_beta: wp.array(dtype=float),
-    row_cfm: wp.array(dtype=float),
-    row_phi: wp.array(dtype=float),
-    row_target_velocity: wp.array(dtype=float),
+    row_K: wp.array(dtype=float),
+    row_u0: wp.array(dtype=float),
     limit_counts: wp.array(dtype=int),
 ):
     articulation = wp.tid()
-    if max_dofs == 0:
+    if max_dofs == 0 or dt <= 0.0:
         row_counts[articulation] = 0
         limit_counts[articulation] = 0
         return
@@ -1743,7 +1734,7 @@ def build_augmented_joint_rows(
     joint_end = articulation_start[articulation + 1]
 
     slot = int(0)
-    limit_slot = int(0)
+    limit_counts[articulation] = 0
 
     for joint_index in range(joint_start, joint_end):
         type = joint_type[joint_index]
@@ -1764,77 +1755,34 @@ def build_augmented_joint_rows(
         for axis in range(axis_count):
             if slot >= max_dofs:
                 break
-
             dof_index = qd_start + axis
             coord_index = coord_start + axis
-
-            limit_ke_val = joint_limit_ke[dof_index]
-            limit_kd_val = joint_limit_kd[dof_index]
-            limit_active = False
-            phi = float(0.0)
-
-            if limit_ke_val > 0.0 or limit_kd_val > 0.0:
-                q = joint_q[coord_index]
-                lower = joint_limit_lower[dof_index]
-                upper = joint_limit_upper[dof_index]
-                if q < lower:
-                    phi = q - lower
-                    limit_active = True
-                elif q > upper:
-                    phi = q - upper
-                    limit_active = True
-
-                if limit_active:
-                    denom = limit_kd_val + dt * limit_ke_val
-                    if denom > 0.0:
-                        row_index = articulation * max_dofs + slot
-                        row_dof_index[row_index] = dof_index
-                        row_phi[row_index] = phi
-                        row_target_velocity[row_index] = 0.0
-                        row_beta[row_index] = dt * limit_ke_val / denom
-                        row_cfm[row_index] = 1.0 / denom
-                        slot += 1
-                        limit_slot += 1
-                        if slot >= max_dofs:
-                            break
-                    continue
 
             ke = joint_target_ke[dof_index]
             kd = joint_target_kd[dof_index]
             if ke <= 0.0 and kd <= 0.0:
                 continue
 
-            denom = kd + dt * ke
-            if denom <= 0.0:
+            K = ke * dt * dt + kd * dt
+            if K <= 0.0:
                 continue
 
             row_index = articulation * max_dofs + slot
             row_dof_index[row_index] = dof_index
             q = joint_q[coord_index]
-            row_phi[row_index] = q - joint_target_pos[coord_index]
-            row_target_velocity[row_index] = joint_target_vel[dof_index]
-
-            beta_val = default_beta
-            if beta_override >= 0.0:
-                beta_val = beta_override
-            else:
-                beta_val = dt * ke / denom
-
-            cfm_val = default_cfm
-            if cfm_override >= 0.0:
-                cfm_val = cfm_override
-            else:
-                cfm_val = 1.0 / denom
-
-            row_beta[row_index] = beta_val
-            row_cfm[row_index] = cfm_val
+            qd_val = joint_qd[dof_index]
+            target_pos = joint_target_pos[dof_index]
+            target_vel = joint_target_vel[dof_index]
+            u0 = -(ke * (q - target_pos + dt * qd_val) + kd * (qd_val - target_vel))
+            row_K[row_index] = K
+            row_u0[row_index] = u0
 
             slot += 1
             if slot >= max_dofs:
                 break
 
     row_counts[articulation] = slot
-    limit_counts[articulation] = limit_slot
+    limit_counts[articulation] = 0
 
 
 @wp.kernel
@@ -1883,7 +1831,7 @@ def apply_augmented_mass_diagonal(
     mass_update_mask: wp.array(dtype=int),
     row_counts: wp.array(dtype=int),
     row_dof_index: wp.array(dtype=int),
-    row_cfm: wp.array(dtype=float),
+    row_K: wp.array(dtype=float),
     # outputs
     H: wp.array(dtype=float),
 ):
@@ -1909,12 +1857,12 @@ def apply_augmented_mass_diagonal(
         if local < 0 or local >= n:
             continue
 
-        cfm = row_cfm[row_index]
-        if cfm <= 0.0:
+        K = row_K[row_index]
+        if K <= 0.0:
             continue
 
         diag_index = H_start + dense_index(n, local, local)
-        H[diag_index] += 1.0 / cfm
+        H[diag_index] += K
 
 
 @wp.kernel
@@ -1922,40 +1870,26 @@ def apply_augmented_joint_tau(
     max_dofs: int,
     row_counts: wp.array(dtype=int),
     row_dof_index: wp.array(dtype=int),
-    row_beta: wp.array(dtype=float),
-    row_cfm: wp.array(dtype=float),
-    row_phi: wp.array(dtype=float),
-    row_target_velocity: wp.array(dtype=float),
-    joint_qd: wp.array(dtype=float),
-    dt: float,
+    row_u0: wp.array(dtype=float),
     # outputs
     joint_tau: wp.array(dtype=float),
 ):
     articulation = wp.tid()
-    if max_dofs == 0 or dt <= 0.0:
+    if max_dofs == 0:
         return
 
     count = row_counts[articulation]
     if count == 0:
         return
 
-    inv_dt = 1.0 / dt
-
     for i in range(count):
         row_index = articulation * max_dofs + i
         dof = row_dof_index[row_index]
-        cfm = row_cfm[row_index]
-        if cfm <= 0.0:
+        u0 = row_u0[row_index]
+        if u0 == 0.0:
             continue
 
-        beta = row_beta[row_index]
-        phi = row_phi[row_index]
-        target_vel = row_target_velocity[row_index]
-        qd = joint_qd[dof]
-
-        rhs_acc = (qd - target_vel + beta * phi * inv_dt) * inv_dt
-        delta = (1.0 / cfm) * rhs_acc
-        wp.atomic_add(joint_tau, dof, -delta)
+        wp.atomic_add(joint_tau, dof, u0)
 
 @wp.kernel
 def apply_hinv_Jt_multi_rhs(
@@ -2269,3 +2203,26 @@ def accumulate_contact_velocity(
             v += Y_rows[row_base + k] * impulse
 
         v_out[dof_start + k] = v
+
+@wp.kernel
+def clamp_joint_tau(
+    joint_tau: wp.array(dtype=float),
+    joint_effort_limit: wp.array(dtype=float),
+):
+    tid = wp.tid()
+
+    # Per-DoF effort limit (same convention as you use for MuJoCo actuators)
+    limit = joint_effort_limit[tid]
+
+    # If limit <= 0, treat as unlimited
+    if limit <= 0.0:
+        return
+
+    t = joint_tau[tid]
+
+    if t > limit:
+        t = limit
+    elif t < -limit:
+        t = -limit
+
+    joint_tau[tid] = t
