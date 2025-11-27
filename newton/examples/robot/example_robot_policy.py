@@ -204,9 +204,9 @@ class Example:
         physx_to_mjc: list[int],
     ):
         # Setup simulation parameters first
-        fps = 200
+        fps = 50
         self.frame_dt = 1.0e0 / fps
-        self.decimation = 4
+        self.decimation = 1
         self.cycle_time = 1 / fps * self.decimation
 
         # Group related attributes by prefix
@@ -248,7 +248,8 @@ class Example:
             joint_ordering="dfs",
             hide_collision_shapes=True,
         )
-        builder.approximate_meshes("convex_hull")
+        #builder.approximate_meshes("convex_hull")
+        #builder.approximate_meshes("bounding_box")
 
         builder.add_ground_plane()
         # builder's gravity isn't a vec3. use model.set_gravity()
@@ -258,22 +259,60 @@ class Example:
         builder.joint_q[3:7] = [0.0, 0.0, 0.7071, 0.7071]
         builder.joint_q[7:] = config["mjw_joint_pos"]
 
+        #config["action_scale"] = 0.0
+        # stiffness_scale = 1.5
+        # damping_scale = 1.2
+        stiffness_scale = 1.0
+        damping_scale = 1.0
         for i in range(len(config["mjw_joint_stiffness"])):
-            builder.joint_target_ke[i + 6] = config["mjw_joint_stiffness"][i]
-            builder.joint_target_kd[i + 6] = config["mjw_joint_damping"][i]
+            builder.joint_target_ke[i + 6] = config["mjw_joint_stiffness"][i] * stiffness_scale
+            builder.joint_target_kd[i + 6] = config["mjw_joint_damping"][i] * damping_scale
             builder.joint_armature[i + 6] = config["mjw_joint_armature"][i]
             builder.joint_act_mode[i + 6] = int(ActuatorMode.POSITION)
+
 
         self.model = builder.finalize()
         self.model.set_gravity((0.0, 0.0, -9.81))
 
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            use_mujoco_cpu=self.use_mujoco,
-            solver="newton",
-            nconmax=30,
-            njmax=100,
+        # self.solver = newton.solvers.SolverMuJoCo(
+        #     self.model,
+        #     use_mujoco_cpu=self.use_mujoco,
+        #     solver="newton",
+        #     nconmax=30,
+        #     njmax=100,
+        # )
+
+        # from "original benchmark" script
+        # self.solver = newton.solvers.SolverMuJoCo(
+        #     self.model,
+        #     use_mujoco_cpu=False,
+        #     solver="newton",
+        #     integrator="implicit",
+        #     njmax=210,
+        #     nconmax=35,
+        #     ls_parallel=True,
+        #     iterations=100,
+        #     ls_iterations=50,
+        # )
+
+
+        solver_kwargs = dict(
+            update_mass_matrix_interval=1,
+            pgs_iterations=4,
+            pgs_beta=0.1,
+            pgs_cfm=1e-6,
+            pgs_omega=1.4,
+            pgs_max_constraints=24,
+            pgs_warmstart=True,
+            pgs_use_joint_targets=True,
+            pgs_joint_target_mode="augmented",
+            # pgs_joint_beta=0.07,
+            # pgs_joint_cfm=0.1,
+            #pgs_joint_beta=0.01,
+            #pgs_joint_cfm=pgs_joint_cfm,
         )
+        self.solver = newton.solvers.SolverFeatherPGS(self.model, **solver_kwargs)
+ 
 
         # Initialize state objects
         self.state_temp = self.model.state()
@@ -357,6 +396,47 @@ class Example:
         newton.eval_fk(self.model, self.state_1.joint_q, self.state_1.joint_qd, self.state_1)
 
     def step(self):
+        # # --- FLOATING ORIGIN FIX ---
+        # # Check if we have drifted far from the origin
+        # root_pos = self.state_0.joint_q.numpy()[:3]
+        # dist_sq = root_pos[0]**2 + root_pos[1]**2
+        
+        # # If we are more than 2 meters away, teleport back
+        # if dist_sq > 0.05:
+        #     # Calculate the offset
+        #     offset_x = root_pos[0]
+        #     offset_y = root_pos[1]
+            
+        #     # Teleport state_0
+        #     # Note: We do NOT touch Z (index 2), orientation, or velocities
+        #     current_q_0 = self.state_0.joint_q.numpy()
+        #     current_q_0[0] -= offset_x
+        #     current_q_0[1] -= offset_y
+        #     self.state_0.joint_q.assign(current_q_0)
+            
+        #     # Teleport state_1 (to keep integration consistent)
+        #     current_q_1 = self.state_1.joint_q.numpy()
+        #     current_q_1[0] -= offset_x
+        #     current_q_1[1] -= offset_y
+        #     self.state_1.joint_q.assign(current_q_1)
+            
+        #     # Teleport the camera so the viewer doesn't see the snap
+        #     # (Optional, depends on how your viewer camera is implemented)
+        #     # if hasattr(self.viewer, "camera_pos"):
+        #     #      cam_pos = list(self.viewer.camera_pos)
+        #     #      cam_pos[0] -= offset_x
+        #     #      cam_pos[1] -= offset_y
+        #     #      self.viewer.camera_pos = tuple(cam_pos)
+                 
+        #     #      tgt_pos = list(self.viewer.camera_look_at)
+        #     #      tgt_pos[0] -= offset_x
+        #     #      tgt_pos[1] -= offset_y
+        #     #      self.viewer.camera_look_at = tuple(tgt_pos)
+
+        #     # Important: Re-evaluate FK immediately so body transforms 
+        #     # match the new joint positions before the physics step
+        #     newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
+        # ---------------------------
         # Build command from viewer keyboard
         if hasattr(self.viewer, "is_key_down"):
             fwd = 1.0 if self.viewer.is_key_down("i") else (-1.0 if self.viewer.is_key_down("k") else 0.0)
