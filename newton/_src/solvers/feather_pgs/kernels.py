@@ -2226,3 +2226,160 @@ def clamp_joint_tau(
         t = -limit
 
     joint_tau[tid] = t
+
+
+# --- Tile configuration for contact system build ---
+
+# Max generalized dofs per articulation we support in the tiled path.
+# joint_dof_count per articulation must be <= TILE_DOF or we use fall back
+TILE_DOF = wp.constant(49)
+
+# Max constraints per articulation we support in the tiled path.
+# pgs_max_constraints must be <= TILE_CONSTRAINTS or we use fall back
+TILE_CONSTRAINTS = wp.constant(24)
+
+# Threads per tile/block for tile kernels
+TILE_THREADS = 64
+
+@wp.kernel
+def apply_hinv_Jt_multi_rhs_tiled(
+    articulation_H_start: wp.array(dtype=int),
+    articulation_H_rows: wp.array(dtype=int),
+    max_constraints: int,
+    max_dofs: int,
+    constraint_counts: wp.array(dtype=int),
+    L: wp.array(dtype=float),
+    J_rows: wp.array(dtype=float),
+    # outputs
+    Y_rows: wp.array(dtype=float),
+):
+    """
+    Tiled version of H^{-1} J^T application.
+
+    For each articulation 'a', we:
+      - load the lower Cholesky factor L_a (n x n) into a tile (padded to TILE_DOF)
+      - load J_a rows (m x n) into a RHS tile as columns
+      - solve L_a L_a^T X = J^T for X using tile_lower_solve + tile_upper_solve
+      - write X back into Y_rows in the same layout as before
+
+    Assumes:
+      articulation_H_rows[a] <= TILE_DOF
+      constraint_counts[a]   <= TILE_CONSTRAINTS
+    """
+    articulation = wp.tid()
+
+    m = constraint_counts[articulation]
+    n = articulation_H_rows[articulation]
+
+    # Tile for L: (TILE_DOF x TILE_DOF)
+    L_tile = wp.tile_zeros(shape=(TILE_DOF, TILE_DOF), dtype=wp.float32)
+
+    # RHS tile holds J^T: (TILE_DOF x TILE_CONSTRAINTS)
+    RHS_tile = wp.tile_zeros(shape=(TILE_DOF, TILE_CONSTRAINTS), dtype=wp.float32)
+
+    # --- 1. Load L for this articulation into L_tile (padded) ---
+
+    L_start = articulation_H_start[articulation]
+
+    # copy n x n block
+    # (not using tile_load since stored flat to support varied sizes)
+    for row in range(n):
+        for col in range(n):
+            val = L[L_start + dense_index(n, row, col)]
+            L_tile[row, col] = val
+
+    # pad the remainder as identity
+    for i in range(n, TILE_DOF):
+        L_tile[i, i] = 1.0
+
+    # --- 2. Load J rows into RHS_tile as columns: RHS[:, ci] = J_row(ci)^T ---
+    for ci in range(m):
+        row_base = (articulation * max_constraints + ci) * max_dofs
+        for k in range(n):
+            RHS_tile[k, ci] = J_rows[row_base + k]
+
+    # --- 3. Solve L * Z = RHS (forward) ---
+    Z_tile = wp.tile_lower_solve(L_tile, RHS_tile)
+
+    # --- 4. Solve L^T * X = Z (backward) ---
+    U_tile = wp.tile_transpose(L_tile)          # U is upper-triangular
+    X_tile = wp.tile_upper_solve(U_tile, Z_tile)
+
+    # --- 5. Write back X into Y_rows in the original packed layout ---
+    for ci in range(m):
+        row_base = (articulation * max_constraints + ci) * max_dofs
+
+        # meaningful dofs
+        for k in range(n):
+            Y_rows[row_base + k] = X_tile[k, ci]
+
+        # zero-pad
+        for k in range(n, max_dofs):
+            Y_rows[row_base + k] = 0.0
+
+@wp.kernel
+def form_contact_matrix_tiled(
+    articulation_H_rows: wp.array(dtype=int),
+    max_constraints: int,
+    max_dofs: int,
+    constraint_counts: wp.array(dtype=int),
+    J_rows: wp.array(dtype=float),
+    Y_rows: wp.array(dtype=float),
+    row_cfm: wp.array(dtype=float),
+    # outputs
+    diag_out: wp.array(dtype=float),
+    matrix_out: wp.array(dtype=float),
+):
+    """
+    Tiled version of Delassus matrix build:
+        W = J H^{-1} J^T  (plus CFM on diagonal)
+
+    We treat J and Y as (m x n) blocks per articulation, pad them into tiles of
+    size (TILE_CONSTRAINTS x TILE_DOF), and then compute:
+
+        W = J * Y^T
+
+    with tile_matmul.
+    """
+    articulation = wp.tid()
+
+    m = constraint_counts[articulation]
+    n = articulation_H_rows[articulation]
+
+    # constraints (rows) x dofs (cols)
+    J_tile = wp.tile_zeros(shape=(TILE_CONSTRAINTS, TILE_DOF), dtype=wp.float32)
+    Y_tile = wp.tile_zeros(shape=(TILE_CONSTRAINTS, TILE_DOF), dtype=wp.float32)
+
+    # --- 1. Load J and Y into tiles  ---
+    # (not using tile_load since stored flat to support varied sizes)
+
+    for i in range(m):
+        row_i = (articulation * max_constraints + i) * max_dofs
+        for k in range(n):
+            J_tile[i, k] = J_rows[row_i + k]
+            Y_tile[i, k] = Y_rows[row_i + k]
+
+    # --- 2. Compute W = J * Y^T ---
+
+    Y_T = wp.tile_transpose(Y_tile)  # (TILE_DOF x TILE_CONSTRAINTS)
+
+    W_tile = wp.tile_zeros(
+        shape=(TILE_CONSTRAINTS, TILE_CONSTRAINTS),
+        dtype=wp.float32,
+    )
+
+    wp.tile_matmul(J_tile, Y_T, W_tile)
+
+    # --- 3. Write back to diag_out and matrix_out (only m x m) ---
+
+    diag_base = articulation * max_constraints
+    mat_base = articulation * max_constraints * max_constraints
+
+    for i in range(m):
+        # diag
+        diag_val = W_tile[i, i] + row_cfm[diag_base + i]
+        diag_out[diag_base + i] = diag_val
+
+        # full row
+        for j in range(m):
+            matrix_out[mat_base + i * max_constraints + j] = W_tile[i, j]
