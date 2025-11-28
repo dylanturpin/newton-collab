@@ -39,6 +39,7 @@ from .kernels import (
     apply_augmented_joint_tau,
     apply_augmented_mass_diagonal,
     apply_hinv_Jt_multi_rhs,
+    apply_hinv_Jt_multi_rhs_tiled,
     build_augmented_joint_rows,
     build_contact_rows_normal,
     build_joint_target_rows,
@@ -60,10 +61,14 @@ from .kernels import (
     eval_rigid_mass,
     eval_rigid_tau,
     form_contact_matrix,
+    form_contact_matrix_tiled,
     integrate_generalized_joints,
     pgs_solve_contacts,
     prepare_impulses,
     update_qdd_from_velocity,
+    TILE_DOF,
+    TILE_CONSTRAINTS,
+    TILE_THREADS,
 )
 
 
@@ -128,6 +133,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_joint_beta: Optional[float] = None,
         pgs_joint_cfm: Optional[float] = None,
         enable_timers: bool = False,
+        use_tiled_contact_build: bool = True,
     ):
         """
         Args:
@@ -147,6 +153,7 @@ class SolverFeatherPGS(SolverBase):
             pgs_joint_beta (float, optional): ERP override for joint-target constraints (defaults to auto-mapped from gains when None).
             pgs_joint_cfm (float, optional): CFM override for joint-target constraints (defaults to auto-mapped from gains when None).
             enable_timers (bool, optional): Enable NVTX profiling ranges for solver sub-sections. Defaults to False.
+            use_tiled_contact_build (bool, optional): Enable use of fast tiled kernels for building constraint matrix. Defaults to True.
         """
         super().__init__(model)
 
@@ -171,12 +178,26 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_joint_beta = pgs_joint_beta
         self.pgs_joint_cfm = pgs_joint_cfm
         self.enable_timers = enable_timers
+        self.use_tiled_contact_build = use_tiled_contact_build
 
         self._step = 0
         self._force_mass_update = False
         self._last_step_dt = None
 
         self.compute_articulation_indices(model)
+        # Validate tile-based path constraints (if enabled)
+        if self.use_tiled_contact_build and model.articulation_count:
+            if self.articulation_max_dofs > int(TILE_DOF):
+                raise ValueError(
+                    f"articulation_max_dofs={self.articulation_max_dofs} exceeds TILE_DOF={int(TILE_DOF)} "
+                    "for tiled contact system build. Increase TILE_DOF or disable use_tiled_contact_build."
+                )
+            if self.pgs_max_constraints > int(TILE_CONSTRAINTS):
+                raise ValueError(
+                    f"pgs_max_constraints={self.pgs_max_constraints} exceeds TILE_CONSTRAINTS={int(TILE_CONSTRAINTS)} "
+                    "for tiled contact system build. Increase TILE_CONSTRAINTS or reduce pgs_max_constraints."
+                )
+
         self.build_body_maps(model)
         self.allocate_model_aux_vars(model)
         if model.shape_material_mu is not None:
@@ -630,41 +651,79 @@ class SolverFeatherPGS(SolverBase):
             )
 
         with self._timer("Contact system build (HinvJt + K + bias)"):
-            wp.launch(
-                apply_hinv_Jt_multi_rhs,
-                dim=model.articulation_count * self.pgs_max_constraints,
-                inputs=[
-                    self.articulation_H_start,
-                    self.articulation_H_rows,
-                    self.pgs_max_constraints,
-                    self.articulation_max_dofs,
-                    self.pgs_counts,
-                    self.L,
-                    self.pgs_Jc,
-                ],
-                outputs=[self.pgs_Y],
-                device=device,
-            )
+            if self.use_tiled_contact_build:
+                wp.launch_tiled(
+                    apply_hinv_Jt_multi_rhs_tiled,
+                    dim=[model.articulation_count],
+                    inputs=[
+                        self.articulation_H_start,
+                        self.articulation_H_rows,
+                        self.pgs_max_constraints,
+                        self.articulation_max_dofs,
+                        self.pgs_counts,
+                        self.L,
+                        self.pgs_Jc,
+                    ],
+                    outputs=[self.pgs_Y],
+                    block_dim=TILE_THREADS,
+                    device=device,
+                )
 
-            wp.launch(
-                form_contact_matrix,
-                #dim=model.articulation_count,
-                dim=model.articulation_count * self.pgs_max_constraints,
-                inputs=[
-                    self.articulation_H_rows,
-                    self.pgs_max_constraints,
-                    self.articulation_max_dofs,
-                    self.pgs_counts,
-                    self.pgs_Jc,
-                    self.pgs_Y,
-                    self.pgs_row_cfm,
-                ],
-                outputs=[
-                    self.pgs_diag,
-                    self.pgs_contact_matrix,
-                ],
-                device=device,
-            )
+                wp.launch_tiled(
+                    form_contact_matrix_tiled,
+                    dim=[model.articulation_count],
+                    inputs=[
+                        self.articulation_H_rows,
+                        self.pgs_max_constraints,
+                        self.articulation_max_dofs,
+                        self.pgs_counts,
+                        self.pgs_Jc,
+                        self.pgs_Y,
+                        self.pgs_row_cfm,
+                    ],
+                    outputs=[
+                        self.pgs_diag,
+                        self.pgs_contact_matrix,
+                    ],
+                    block_dim=TILE_THREADS,
+                    device=device,
+                )
+            else:
+                wp.launch(
+                    apply_hinv_Jt_multi_rhs,
+                    dim=model.articulation_count * self.pgs_max_constraints,
+                    inputs=[
+                        self.articulation_H_start,
+                        self.articulation_H_rows,
+                        self.pgs_max_constraints,
+                        self.articulation_max_dofs,
+                        self.pgs_counts,
+                        self.L,
+                        self.pgs_Jc,
+                    ],
+                    outputs=[self.pgs_Y],
+                    device=device,
+                )
+
+                wp.launch(
+                    form_contact_matrix,
+                    #dim=model.articulation_count,
+                    dim=model.articulation_count * self.pgs_max_constraints,
+                    inputs=[
+                        self.articulation_H_rows,
+                        self.pgs_max_constraints,
+                        self.articulation_max_dofs,
+                        self.pgs_counts,
+                        self.pgs_Jc,
+                        self.pgs_Y,
+                        self.pgs_row_cfm,
+                    ],
+                    outputs=[
+                        self.pgs_diag,
+                        self.pgs_contact_matrix,
+                    ],
+                    device=device,
+                )
 
             wp.launch(
                 compute_contact_bias,
