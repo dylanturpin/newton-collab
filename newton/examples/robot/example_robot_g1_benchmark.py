@@ -38,9 +38,11 @@ Headless benchmark with MuJoCo:
 """
 
 import time
+from collections import defaultdict
 from typing import Optional
 
 import numpy as np
+import string
 
 import warp as wp
 
@@ -73,6 +75,7 @@ class Example:
         pgs_joint_beta: Optional[float] = None,
         pgs_joint_cfm: Optional[float] = None,
         enable_timers: bool = False,
+        summary_timer: bool = False,
     ):
         self.fps = 60.0
         self.frame_dt = 1.0 / self.fps
@@ -85,6 +88,7 @@ class Example:
         self.viewer = viewer
         self.solver_type = solver_type
         self.enable_timers = enable_timers
+        self.summary_timer = summary_timer
 
         if pgs_joint_target_mode is None:
             self.pgs_joint_target_mode = "pgs" if pgs_use_joint_targets else "off"
@@ -196,7 +200,7 @@ class Example:
     # ----------------------------------------------------------------------
     def capture_cuda_graph(self):
         self.graph = None
-        #return
+        return
         device = wp.get_device()
         if device.is_cuda:
             with wp.ScopedCapture() as capture:
@@ -338,6 +342,59 @@ def run_benchmark(
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
+def print_kernel_summary(results, indent: str = ""):
+    kernel_results = [r for r in results if r.name.startswith(("forward kernel", "backward kernel"))]
+    if not kernel_results:
+        print(f"{indent}No kernel activity recorded.")
+        return
+
+    def normalize_kernel_name(name: str) -> str:
+        if " kernel " in name:
+            _, rest = name.split(" kernel ", 1)
+        else:
+            rest = name
+        parts = rest.split("_")
+        if len(parts) > 1 and len(parts[-1]) == 8 and all(c in string.hexdigits for c in parts[-1]):
+            parts = parts[:-1]
+        return "_".join(parts)
+
+    totals = defaultdict(float)
+    for r in kernel_results:
+        totals[normalize_kernel_name(r.name)] += r.elapsed
+
+    total_time = sum(totals.values())
+    if total_time <= 0.0:
+        print(f"{indent}No kernel time recorded.")
+        return
+
+    sorted_items = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+    top = sorted_items[:10]
+    other_time = total_time - sum(t for _, t in top)
+
+    rows = []
+    cumulative = 0.0
+    for name, t in top:
+        pct = (t / total_time) * 100.0
+        cumulative += pct
+        rows.append((name, t, pct, cumulative))
+
+    if other_time > 0.0:
+        pct = (other_time / total_time) * 100.0
+        rows.append(("Everything else", other_time, pct, 100.0))
+
+    name_width = min(max(len(name) for name, *_ in rows), 40)
+    print(f"{indent}{'Kernel':<{name_width}}  {'Time (ms)':>10}  {'% of total':>11}  {'Cumulative %':>13}")
+    print(f"{indent}{'-' * (name_width + 2 + 10 + 2 + 11 + 2 + 13)}")
+    for name, t, pct, cum in rows:
+        label = name if len(name) <= name_width else name[: name_width - 3] + "..."
+        print(
+            f"{indent}{label:<{name_width}}  "
+            f"{round(t):>10d}  "
+            f"{pct:>10.1f} %  "
+            f"{cum:>12.1f} %"
+        )
+
+
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
 
@@ -420,6 +477,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable NVTX profiling ranges for collision detection and solver sections.",
     )
+    parser.add_argument(
+        "--summary-timer",
+        action="store_true",
+        help="Enable a CUDA kernel summary for the benchmark run.",
+    )
 
     # Benchmark options
     parser.add_argument(
@@ -470,17 +532,19 @@ if __name__ == "__main__":
         pgs_joint_beta=args.pgs_joint_beta,
         pgs_joint_cfm=args.pgs_joint_cfm,
         enable_timers=args.enable_timers,
+        summary_timer=args.summary_timer,
     )
 
     if args.benchmark:
         # Headless-style benchmark run (viewer may still exist but is not used)
-        #with wp.ScopedTimer("benchmark", cuda_filter=wp.TIMING_ALL):
         with wp.ScopedTimer(
             "benchmark",
-            active=example.enable_timers,
+            active=example.summary_timer,
+            cuda_filter=wp.TIMING_ALL,
             use_nvtx=True,
             synchronize=True,
             color="red",
+            report_func=print_kernel_summary
         ):
             run_benchmark(
                 example,
