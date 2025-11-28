@@ -2383,3 +2383,47 @@ def form_contact_matrix_tiled(
         # full row
         for j in range(m):
             matrix_out[mat_base + i * max_constraints + j] = W_tile[i, j]
+
+@wp.kernel
+def eval_dense_cholesky_batched_tiled(
+    A_starts: wp.array(dtype=int),
+    A_dim: wp.array(dtype=int),
+    A: wp.array(dtype=float),
+    R: wp.array(dtype=float),
+    mass_update_mask: wp.array(dtype=int),
+    L: wp.array(dtype=float),
+):
+    # articulation index
+    batch = wp.tid()
+
+    if mass_update_mask[batch] == 0:
+        return
+
+    n       = A_dim[batch]
+
+    A_start = A_starts[batch]
+    R_start = n * batch
+
+    # 1. Tile buffer for H+R
+    H_tile = wp.tile_zeros(shape=(TILE_DOF, TILE_DOF), dtype=wp.float32)
+
+    # 2. Load the nxn block of H and add armature R on the diagonal
+    # (not using tile_load since stored flat to support varied sizes)
+    for i in range(n):
+        for j in range(n):
+            val = A[A_start + dense_index(n, i, j)]
+            if i == j:
+                val += R[R_start + i]
+            H_tile[i, j] = val
+
+    # Pad
+    for i in range(n, TILE_DOF):
+        H_tile[i, i] = 1.0
+
+    L_tile = wp.tile_cholesky(H_tile)
+
+    # Write
+    L_start = A_start
+    for i in range(n):
+        for j in range(i + 1):
+            L[L_start + dense_index(n, i, j)] = L_tile[i, j]
