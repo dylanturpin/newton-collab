@@ -54,6 +54,7 @@ from .kernels import (
     detect_limit_count_changes,
     eval_crba,
     eval_dense_cholesky_batched,
+    eval_dense_cholesky_batched_tiled,
     eval_dense_solve_batched,
     eval_rigid_fk,
     eval_rigid_id,
@@ -134,6 +135,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_joint_cfm: Optional[float] = None,
         enable_timers: bool = False,
         use_tiled_contact_build: bool = True,
+        use_tiled_cholesky: bool = True,
     ):
         """
         Args:
@@ -179,6 +181,7 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_joint_cfm = pgs_joint_cfm
         self.enable_timers = enable_timers
         self.use_tiled_contact_build = use_tiled_contact_build
+        self.use_tiled_cholesky = use_tiled_cholesky
 
         self._step = 0
         self._force_mass_update = False
@@ -1138,19 +1141,35 @@ class SolverFeatherPGS(SolverBase):
 
                 with self._timer("Mass solve (Cholesky + backsolve)"):
                     if mass_update:
-                        wp.launch(
-                            eval_dense_cholesky_batched,
-                            dim=model.articulation_count,
-                            inputs=[
-                                self.articulation_H_start,
-                                self.articulation_H_rows,
-                                self.H,
-                                model.joint_armature,
-                                self.mass_update_mask,
-                            ],
-                            outputs=[self.L],
-                            device=model.device,
-                        )
+                        if self.use_tiled_cholesky:
+                            wp.launch_tiled(
+                                eval_dense_cholesky_batched_tiled,
+                                dim=[model.articulation_count],
+                                inputs=[
+                                    self.articulation_H_start,
+                                    self.articulation_H_rows,
+                                    self.H,
+                                    model.joint_armature,
+                                    self.mass_update_mask,
+                                ],
+                                outputs=[self.L],
+                                block_dim=TILE_THREADS,
+                                device=model.device,
+                            )
+                        else:
+                            wp.launch(
+                                eval_dense_cholesky_batched,
+                                dim=model.articulation_count,
+                                inputs=[
+                                    self.articulation_H_start,
+                                    self.articulation_H_rows,
+                                    self.H,
+                                    model.joint_armature,
+                                    self.mass_update_mask,
+                                ],
+                                outputs=[self.L],
+                                device=model.device,
+                            )
 
                     # solve for qdd
                     state_aug.joint_qdd.zero_()
