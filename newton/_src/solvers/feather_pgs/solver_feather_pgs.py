@@ -1124,17 +1124,21 @@ class SolverFeatherPGS(SolverBase):
                 with self._timer("Mass solve (Cholesky + backsolve)"):
                     if mass_update:
                         if self.use_tiled_cholesky:
+                            H_tiled = self.H.reshape((model.articulation_count, TILE_DOF, TILE_DOF))
+                            R_tiled = model.joint_armature.reshape((model.articulation_count, TILE_DOF))
+                            L_tiled = self.L.reshape((model.articulation_count, TILE_DOF, TILE_DOF))
+
                             wp.launch_tiled(
                                 eval_dense_cholesky_batched_tiled,
                                 dim=[model.articulation_count],
                                 inputs=[
                                     self.articulation_H_start,
                                     self.articulation_H_rows,
-                                    self.H,
-                                    model.joint_armature,
+                                    H_tiled,
+                                    R_tiled,
                                     self.mass_update_mask,
                                 ],
-                                outputs=[self.L],
+                                outputs=[L_tiled],
                                 block_dim=TILE_THREADS,
                                 device=model.device,
                             )
