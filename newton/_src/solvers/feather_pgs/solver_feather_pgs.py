@@ -13,14 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
 
 import warp as wp
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, State, eval_fk
 from ..semi_implicit.kernels_contact import (
-    eval_body_contact,
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
 )
@@ -35,6 +33,9 @@ from ..semi_implicit.kernels_particle import (
 )
 from ..solver import SolverBase
 from .kernels import (
+    TILE_CONSTRAINTS,
+    TILE_DOF,
+    TILE_THREADS,
     accumulate_contact_velocity,
     apply_augmented_joint_tau,
     apply_augmented_mass_diagonal,
@@ -67,9 +68,6 @@ from .kernels import (
     pgs_solve_contacts,
     prepare_impulses,
     update_qdd_from_velocity,
-    TILE_DOF,
-    TILE_CONSTRAINTS,
-    TILE_THREADS,
 )
 
 
@@ -130,9 +128,9 @@ class SolverFeatherPGS(SolverBase):
         pgs_max_constraints: int = 32,
         pgs_warmstart: bool = False,
         pgs_use_joint_targets: bool = False,
-        pgs_joint_target_mode: Optional[str] = None,
-        pgs_joint_beta: Optional[float] = None,
-        pgs_joint_cfm: Optional[float] = None,
+        pgs_joint_target_mode: str | None = None,
+        pgs_joint_beta: float | None = None,
+        pgs_joint_cfm: float | None = None,
         enable_timers: bool = False,
         use_tiled_contact_build: bool = True,
         use_tiled_cholesky: bool = True,
@@ -311,12 +309,13 @@ class SolverFeatherPGS(SolverBase):
         self.body_to_joint = wp.array(body_to_joint, dtype=wp.int32, device=device)
         self.body_to_articulation = wp.array(body_to_articulation, dtype=wp.int32, device=device)
 
-
     def allocate_model_aux_vars(self, model):
         # allocate mass, Jacobian matrices, and other auxiliary variables pertaining to the model
         if model.joint_count:
             # system matrices
-            self.M_blocks = wp.zeros((self.M_size,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad)
+            self.M_blocks = wp.zeros(
+                (self.M_size,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
+            )
             self.J = wp.zeros((self.J_size,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad)
             self.H = wp.empty((self.H_size,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad)
 
@@ -374,48 +373,24 @@ class SolverFeatherPGS(SolverBase):
         total_constraints = articulation_count * constraint_capacity
         total_matrix = articulation_count * self.pgs_matrix_stride
 
-        self.pgs_counts = wp.zeros(
-            (articulation_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self.pgs_phi = wp.zeros(
-            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.pgs_diag = wp.zeros(
-            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.pgs_rhs = wp.zeros(
-            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.pgs_impulses = wp.zeros(
-            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.pgs_types = wp.zeros(
-            (total_constraints,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self.pgs_row_beta = wp.zeros(
-            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.pgs_row_cfm = wp.zeros(
-            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
+        self.pgs_counts = wp.zeros((articulation_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.pgs_phi = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.pgs_diag = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.pgs_rhs = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.pgs_impulses = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.pgs_types = wp.zeros((total_constraints,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.pgs_row_beta = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.pgs_row_cfm = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.pgs_target_velocity = wp.zeros(
             (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.pgs_parent = wp.full(
-            (total_constraints,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self.pgs_mu = wp.zeros(
-            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
+        self.pgs_parent = wp.full((total_constraints,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.pgs_mu = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.pgs_contact_matrix = wp.zeros(
             (total_matrix,), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.pgs_Jc = wp.zeros(
-            (total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.pgs_Y = wp.zeros(
-            (total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
+        self.pgs_Jc = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.pgs_Y = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.pgs_v_hat = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
         self.pgs_v_out = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
 
@@ -442,15 +417,9 @@ class SolverFeatherPGS(SolverBase):
         )
         self.aug_prev_limit_counts = wp.zeros_like(self.aug_limit_counts)
         self.limit_change_mask = wp.zeros_like(self.aug_limit_counts)
-        self.aug_row_dof_index = wp.zeros(
-            (total_rows,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self.aug_row_K = wp.zeros(
-            (total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.aug_row_u0 = wp.zeros(
-            (total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
+        self.aug_row_dof_index = wp.zeros((total_rows,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.aug_row_K = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.aug_row_u0 = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
 
     def build_augmented_joint_targets(self, state_in: State, control: Control, dt: float):
         if not self.pgs_use_augmented_targets:
@@ -655,6 +624,10 @@ class SolverFeatherPGS(SolverBase):
 
         with self._timer("Contact system build (HinvJt + K + bias)"):
             if self.use_tiled_contact_build:
+                L_tiled = self.L.reshape((model.articulation_count, TILE_DOF, TILE_DOF))
+                J_tiled = self.pgs_Jc.reshape((model.articulation_count, TILE_CONSTRAINTS, TILE_DOF))
+                Y_tiled = self.pgs_Y.reshape((model.articulation_count, TILE_CONSTRAINTS, TILE_DOF))
+
                 wp.launch_tiled(
                     apply_hinv_Jt_multi_rhs_tiled,
                     dim=[model.articulation_count],
@@ -664,10 +637,10 @@ class SolverFeatherPGS(SolverBase):
                         self.pgs_max_constraints,
                         self.articulation_max_dofs,
                         self.pgs_counts,
-                        self.L,
-                        self.pgs_Jc,
+                        L_tiled,
+                        J_tiled,
                     ],
-                    outputs=[self.pgs_Y],
+                    outputs=[Y_tiled],
                     block_dim=TILE_THREADS,
                     device=device,
                 )
@@ -710,7 +683,7 @@ class SolverFeatherPGS(SolverBase):
 
                 wp.launch(
                     form_contact_matrix,
-                    #dim=model.articulation_count,
+                    # dim=model.articulation_count,
                     dim=model.articulation_count * self.pgs_max_constraints,
                     inputs=[
                         self.articulation_H_rows,
@@ -901,7 +874,9 @@ class SolverFeatherPGS(SolverBase):
                 eval_particle_contact_forces(model, state_in, particle_f)
 
                 # particle shape contact
-                eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True)
+                eval_particle_body_contact_forces(
+                    model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True
+                )
 
                 # muscles
                 if False:
@@ -1017,7 +992,6 @@ class SolverFeatherPGS(SolverBase):
                                     device=model.device,
                                 )
 
-
                             if self.pgs_use_augmented_targets:
                                 self.build_augmented_joint_targets(state_in, control, dt)
                                 self.apply_augmented_joint_tau(state_in, state_aug, dt)
@@ -1029,7 +1003,6 @@ class SolverFeatherPGS(SolverBase):
                                     device=model.device,
                                 )
 
-
                             # print("joint_tau:")
                             # print(state_aug.joint_tau.numpy())
                             # print("body_q:")
@@ -1037,7 +1010,9 @@ class SolverFeatherPGS(SolverBase):
                             # print("body_qd:")
                             # print(state_in.body_qd.numpy())
 
-                global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
+                global_flag = (
+                    1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
+                )
                 if self.pgs_use_augmented_targets:
                     mass_update = True
                 else:
@@ -1106,19 +1081,19 @@ class SolverFeatherPGS(SolverBase):
                             wp.launch(
                                 apply_augmented_mass_diagonal,
                                 dim=model.articulation_count,
-                            inputs=[
-                                self.articulation_H_start,
-                                self.articulation_H_rows,
-                                self.articulation_dof_start,
-                                self.articulation_max_dofs,
-                                self.mass_update_mask,
-                                self.aug_row_counts,
-                                self.aug_row_dof_index,
-                                self.aug_row_K,
-                                self.H,
-                            ],
-                            device=model.device,
-                        )
+                                inputs=[
+                                    self.articulation_H_start,
+                                    self.articulation_H_rows,
+                                    self.articulation_dof_start,
+                                    self.articulation_max_dofs,
+                                    self.mass_update_mask,
+                                    self.aug_row_counts,
+                                    self.aug_row_dof_index,
+                                    self.aug_row_K,
+                                    self.H,
+                                ],
+                                device=model.device,
+                            )
 
                             wp.launch(
                                 copy_int_array_masked,
