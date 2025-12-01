@@ -1,4 +1,18 @@
-#!/usr/bin/env python
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import csv
 import datetime as dt
@@ -21,6 +35,7 @@ RE_SOLVER = re.compile(r"Solver:\s*([A-Za-z0-9_]+)")
 
 def parse_summary(text: str) -> dict:
     """Extract key numbers from the printed benchmark summary."""
+
     def get_float(regex, default=None):
         m = regex.search(text)
         if not m:
@@ -50,13 +65,19 @@ def run_one(solver: str, num_worlds: int, args) -> dict:
         "uv",
         "run",
         BENCH_SCRIPT,
-        "--solver", solver,
+        "--solver",
+        solver,
         "--benchmark",
-        "--viewer", "null",
-        "--num-worlds", str(num_worlds),
-        "--sim-substeps", str(args.sim_substeps),
-        "--warmup-frames", str(args.warmup_frames),
-        "--measure-frames", str(args.measure_frames),
+        "--viewer",
+        "null",
+        "--num-worlds",
+        str(num_worlds),
+        "--sim-substeps",
+        str(args.sim_substeps),
+        "--warmup-frames",
+        str(args.warmup_frames),
+        "--measure-frames",
+        str(args.measure_frames),
     ]
 
     print(f"\n=== Running {solver} with num-worlds={num_worlds} ===")
@@ -64,6 +85,7 @@ def run_one(solver: str, num_worlds: int, args) -> dict:
 
     proc = subprocess.run(
         cmd,
+        check=False,
         capture_output=True,
         text=True,
     )
@@ -138,7 +160,7 @@ def main():
 
     solvers = [s.strip() for s in args.solvers.split(",") if s.strip()]
     log2_values = range(args.min_log2_worlds, args.max_log2_worlds + 1)
-    num_worlds_list = [2 ** k for k in log2_values]
+    num_worlds_list = [2**k for k in log2_values]
 
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = Path(args.out or f"g1_bench_{timestamp}.csv")

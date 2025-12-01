@@ -5,7 +5,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -37,13 +37,11 @@ Headless benchmark with MuJoCo:
         --solver mujoco --benchmark --viewer null --num-worlds 1024
 """
 
+import string
 import time
 from collections import defaultdict
-from typing import Optional
 
 import numpy as np
-import string
-
 import warp as wp
 
 import newton
@@ -71,9 +69,9 @@ class Example:
         pgs_omega: float = 1.0,
         pgs_warmstart: bool = False,
         pgs_use_joint_targets: bool = False,
-        pgs_joint_target_mode: Optional[str] = None,
-        pgs_joint_beta: Optional[float] = None,
-        pgs_joint_cfm: Optional[float] = None,
+        pgs_joint_target_mode: str | None = None,
+        pgs_joint_beta: float | None = None,
+        pgs_joint_cfm: float | None = None,
         enable_timers: bool = False,
         summary_timer: bool = False,
     ):
@@ -103,8 +101,8 @@ class Example:
         # Register attributes used by the MuJoCo-style import, regardless of solver
         newton.solvers.SolverMuJoCo.register_custom_attributes(g1)
 
-        #g1.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=1.0e3, limit_kd=2.5, friction=1e-5)
-        g1.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=0., limit_kd=0., friction=0.)
+        # g1.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=1.0e3, limit_kd=2.5, friction=1e-5)
+        g1.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=0.0, limit_kd=0.0, friction=0.0)
         g1.default_shape_cfg.ke = 5.0e4
         g1.default_shape_cfg.kd = 5.0e2
         g1.default_shape_cfg.kf = 1.0e3
@@ -141,30 +139,39 @@ class Example:
         # Create solver
         # ------------------------------------------------------------------
         if solver_type == "feather_pgs":
-            solver_kwargs = dict(
-                update_mass_matrix_interval=update_mass_matrix_interval,
-                pgs_iterations=pgs_iterations,
-                pgs_beta=pgs_beta,
-                pgs_cfm=pgs_cfm,
-                pgs_omega=pgs_omega,
-                pgs_max_constraints=pgs_max_constraints,
-                pgs_warmstart=pgs_warmstart,
-                pgs_use_joint_targets=pgs_use_joint_targets,
-                pgs_joint_target_mode=self.pgs_joint_target_mode,
-                pgs_joint_beta=pgs_joint_beta,
-                pgs_joint_cfm=pgs_joint_cfm,
-                enable_contact_friction = True,
-                enable_timers=enable_timers,
-            )
+            solver_kwargs = {
+                "update_mass_matrix_interval": update_mass_matrix_interval,
+                "pgs_iterations": pgs_iterations,
+                "pgs_beta": pgs_beta,
+                "pgs_cfm": pgs_cfm,
+                "pgs_omega": pgs_omega,
+                "pgs_max_constraints": pgs_max_constraints,
+                "pgs_warmstart": pgs_warmstart,
+                "pgs_use_joint_targets": pgs_use_joint_targets,
+                "pgs_joint_target_mode": self.pgs_joint_target_mode,
+                "pgs_joint_beta": pgs_joint_beta,
+                "pgs_joint_cfm": pgs_joint_cfm,
+                "enable_contact_friction": True,
+                "enable_timers": enable_timers,
+            }
             self.solver = newton.solvers.SolverFeatherPGS(self.model, **solver_kwargs)
-            print("PGS params:",
-                "iter", self.solver.pgs_iterations,
-                "beta", self.solver.pgs_beta,
-                "cfm", self.solver.pgs_cfm,
-                "omega", self.solver.pgs_omega,
-                "max_constraints", self.solver.pgs_max_constraints,
-                "pgs_warmstart", self.solver.pgs_warmstart,
-                "joint_target_mode", getattr(self.solver, "pgs_joint_target_mode", "off"))
+            print(
+                "PGS params:",
+                "iter",
+                self.solver.pgs_iterations,
+                "beta",
+                self.solver.pgs_beta,
+                "cfm",
+                self.solver.pgs_cfm,
+                "omega",
+                self.solver.pgs_omega,
+                "max_constraints",
+                self.solver.pgs_max_constraints,
+                "pgs_warmstart",
+                self.solver.pgs_warmstart,
+                "joint_target_mode",
+                getattr(self.solver, "pgs_joint_target_mode", "off"),
+            )
 
         elif solver_type == "mujoco":
             self.solver = newton.solvers.SolverMuJoCo(
@@ -180,7 +187,6 @@ class Example:
             )
         else:
             raise ValueError(f"Unknown solver type: {solver_type}")
-
 
         # ------------------------------------------------------------------
         # Allocate state/control/contacts
@@ -212,7 +218,6 @@ class Example:
     # Simulation / stepping
     # ----------------------------------------------------------------------
     def simulate(self):
-
         for _ in range(self.sim_substeps):
             with wp.ScopedTimer(
                 "Collision detection",
@@ -388,12 +393,7 @@ def print_kernel_summary(results, indent: str = ""):
     print(f"{indent}{'-' * (name_width + 2 + 10 + 2 + 11 + 2 + 13)}")
     for name, t, pct, cum in rows:
         label = name if len(name) <= name_width else name[: name_width - 3] + "..."
-        print(
-            f"{indent}{label:<{name_width}}  "
-            f"{round(t):>10d}  "
-            f"{pct:>10.1f} %  "
-            f"{cum:>12.1f} %"
-        )
+        print(f"{indent}{label:<{name_width}}  {round(t):>10d}  {pct:>10.1f} %  {cum:>12.1f} %")
 
 
 if __name__ == "__main__":
@@ -545,7 +545,7 @@ if __name__ == "__main__":
             use_nvtx=True,
             synchronize=True,
             color="red",
-            report_func=print_kernel_summary
+            report_func=print_kernel_summary,
         ):
             run_benchmark(
                 example,
