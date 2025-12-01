@@ -2366,44 +2366,26 @@ def form_contact_matrix_tiled(
 
 @wp.kernel
 def eval_dense_cholesky_batched_tiled(
-    A_starts: wp.array(dtype=int),
-    A_dim: wp.array(dtype=int),
-    A: wp.array(dtype=float),
-    R: wp.array(dtype=float),
+    H_starts: wp.array(dtype=int),
+    H_dim: wp.array(dtype=int),
+    H: wp.array3d(dtype=float),
+    R: wp.array2d(dtype=float),
     mass_update_mask: wp.array(dtype=int),
-    L: wp.array(dtype=float),
+    L: wp.array3d(dtype=float),
 ):
     # articulation index
     batch = wp.tid()
 
     if mass_update_mask[batch] == 0:
         return
+    # Load H
+    H_tile = wp.tile_load(H[batch], shape=(TILE_DOF, TILE_DOF))
+    armature = wp.tile_load(R[batch], shape=TILE_DOF)
 
-    n = A_dim[batch]
+    # add armature to the diagonal of H
+    H_tile = wp.tile_diag_add(H_tile, armature)
 
-    A_start = A_starts[batch]
-    R_start = n * batch
-
-    # 1. Tile buffer for H+R
-    H_tile = wp.tile_zeros(shape=(TILE_DOF, TILE_DOF), dtype=wp.float32)
-
-    # 2. Load the nxn block of H and add armature R on the diagonal
-    # (not using tile_load since stored flat to support varied sizes)
-    for i in range(n):
-        for j in range(n):
-            val = A[A_start + dense_index(n, i, j)]
-            if i == j:
-                val += R[R_start + i]
-            H_tile[i, j] = val
-
-    # Pad
-    for i in range(n, TILE_DOF):
-        H_tile[i, i] = 1.0
-
+    # decomposition
     L_tile = wp.tile_cholesky(H_tile)
 
-    # Write
-    L_start = A_start
-    for i in range(n):
-        for j in range(i + 1):
-            L[L_start + dense_index(n, i, j)] = L_tile[i, j]
+    wp.tile_store(L[batch], L_tile)
