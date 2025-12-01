@@ -854,6 +854,8 @@ def eval_rigid_tau(
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     body_fb_s: wp.array(dtype=wp.spatial_vector),
     body_f_ext: wp.array(dtype=wp.spatial_vector),
+    body_q: wp.array(dtype=wp.transform),
+    body_com: wp.array(dtype=wp.vec3),
     use_joint_targets: int,
     # outputs
     body_ft_s: wp.array(dtype=wp.spatial_vector),
@@ -879,11 +881,23 @@ def eval_rigid_tau(
         lin_axis_count = joint_dof_dim[i, 0]
         ang_axis_count = joint_dof_dim[i, 1]
 
-        # total forces on body
+        # body forces in Featherstone frame (origin)
         f_b_s = body_fb_s[child]
         f_t_s = body_ft_s[child]
-        f_ext = body_f_ext[child]
-        f_s = f_b_s + f_t_s + f_ext
+
+        # external wrench is provided at COM in world frame; shift torque to origin
+        f_ext_com = body_f_ext[child]
+        f_ext_f = wp.spatial_bottom(f_ext_com)
+        f_ext_t = wp.spatial_top(f_ext_com)
+
+        X_wb = body_q[child]
+        com_local = body_com[child]
+        com_world = wp.transform_point(X_wb, com_local)
+        tau_origin = f_ext_f + wp.cross(com_world, f_ext_t)
+        f_ext_origin = wp.spatial_vector(f_ext_t, tau_origin)
+
+        # subtract external wrench to get net wrench on body
+        f_s = f_b_s + f_t_s - f_ext_origin
 
         # compute joint-space forces, writes out tau
         jcalc_tau(
@@ -2390,3 +2404,25 @@ def eval_dense_cholesky_batched_tiled(
     L_tile = wp.tile_cholesky(H_tile)
 
     wp.tile_store(L[batch], L_tile)
+
+
+@wp.kernel
+def update_body_qd_from_featherstone(
+    body_v_s: wp.array(dtype=wp.spatial_vector),
+    body_q: wp.array(dtype=wp.transform),
+    body_com: wp.array(dtype=wp.vec3),
+    body_qd_out: wp.array(dtype=wp.spatial_vector),
+):
+    tid = wp.tid()
+
+    twist = body_v_s[tid]  # spatial twist about origin
+    v0 = wp.spatial_top(twist)
+    w = wp.spatial_bottom(twist)
+
+    X_wb = body_q[tid]
+    com_local = body_com[tid]
+    com_world = wp.transform_point(X_wb, com_local)
+
+    v_com = v0 + wp.cross(w, com_world)
+
+    body_qd_out[tid] = wp.spatial_vector(v_com, w)
