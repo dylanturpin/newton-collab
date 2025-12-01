@@ -2262,7 +2262,7 @@ def apply_hinv_Jt_multi_rhs_tiled(
       articulation_H_rows[a] <= TILE_DOF
       constraint_counts[a]   <= TILE_CONSTRAINTS
     """
-    articulation = wp.tid()
+    articulation, thread = wp.tid()
 
     # --- 1. Load L for this articulation into L_tile (padded) ---
     L_tile = wp.tile_load(L[articulation], shape=(TILE_DOF, TILE_DOF))
@@ -2286,14 +2286,15 @@ def apply_hinv_Jt_multi_rhs_tiled(
     wp.tile_matmul(J_tile, X_tile, C_tile)
     wp.tile_store(C[articulation], C_tile)
 
-    constraint_count = constraint_counts[articulation]
-    diag_base = articulation * max_constraints
+    if thread == 0:
+        constraint_count = constraint_counts[articulation]
+        diag_base = articulation * max_constraints
 
-    for i in range(constraint_count):
-        # write diagonal of constraint matrix
-        # todo: remove this since we should already
-        # have it during the PGS solve
-        diag_out[diag_base + i] = C_tile[i, i] + row_cfm[diag_base + i]
+        for i in range(constraint_count):
+            # write diagonal of constraint matrix
+            # todo: remove this since we should already
+            # have it during the PGS solve
+            diag_out[diag_base + i] = C_tile[i, i] + row_cfm[diag_base + i]
 
 
 @wp.kernel
