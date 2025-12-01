@@ -63,7 +63,6 @@ from .kernels import (
     eval_rigid_mass,
     eval_rigid_tau,
     form_contact_matrix,
-    form_contact_matrix_tiled,
     integrate_generalized_joints,
     pgs_solve_contacts,
     prepare_impulses,
@@ -627,6 +626,9 @@ class SolverFeatherPGS(SolverBase):
                 L_tiled = self.L.reshape((model.articulation_count, TILE_DOF, TILE_DOF))
                 J_tiled = self.pgs_Jc.reshape((model.articulation_count, TILE_CONSTRAINTS, TILE_DOF))
                 Y_tiled = self.pgs_Y.reshape((model.articulation_count, TILE_CONSTRAINTS, TILE_DOF))
+                C_tiled = self.pgs_contact_matrix.reshape(
+                    (model.articulation_count, TILE_CONSTRAINTS, TILE_CONSTRAINTS)
+                )
 
                 wp.launch_tiled(
                     apply_hinv_Jt_multi_rhs_tiled,
@@ -639,31 +641,36 @@ class SolverFeatherPGS(SolverBase):
                         self.pgs_counts,
                         L_tiled,
                         J_tiled,
+                        self.pgs_row_cfm,
                     ],
-                    outputs=[Y_tiled],
+                    outputs=[
+                        Y_tiled,
+                        C_tiled,
+                        self.pgs_diag,
+                    ],
                     block_dim=TILE_THREADS,
                     device=device,
                 )
 
-                wp.launch_tiled(
-                    form_contact_matrix_tiled,
-                    dim=[model.articulation_count],
-                    inputs=[
-                        self.articulation_H_rows,
-                        self.pgs_max_constraints,
-                        self.articulation_max_dofs,
-                        self.pgs_counts,
-                        self.pgs_Jc,
-                        self.pgs_Y,
-                        self.pgs_row_cfm,
-                    ],
-                    outputs=[
-                        self.pgs_diag,
-                        self.pgs_contact_matrix,
-                    ],
-                    block_dim=TILE_THREADS,
-                    device=device,
-                )
+                # wp.launch_tiled(
+                #     form_contact_matrix_tiled,
+                #     dim=[model.articulation_count],
+                #     inputs=[
+                #         self.articulation_H_rows,
+                #         self.pgs_max_constraints,
+                #         self.articulation_max_dofs,
+                #         self.pgs_counts,
+                #         self.pgs_Jc,
+                #         self.pgs_Y,
+                #         self.pgs_row_cfm,
+                #     ],
+                #     outputs=[
+                #         self.pgs_diag,
+                #         self.pgs_contact_matrix,
+                #     ],
+                #     block_dim=TILE_THREADS,
+                #     device=device,
+                # )
             else:
                 wp.launch(
                     apply_hinv_Jt_multi_rhs,

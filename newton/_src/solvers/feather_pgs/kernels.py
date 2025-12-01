@@ -2243,8 +2243,11 @@ def apply_hinv_Jt_multi_rhs_tiled(
     constraint_counts: wp.array(dtype=int),
     L: wp.array3d(dtype=float),
     J_rows: wp.array3d(dtype=float),
+    row_cfm: wp.array(dtype=float),
     # outputs
-    Y_rows: wp.array3d(dtype=float),
+    Y: wp.array3d(dtype=float),
+    C: wp.array3d(dtype=float),
+    diag_out: wp.array(dtype=float),
 ):
     """
     Tiled version of H^{-1} J^T application.
@@ -2265,16 +2268,32 @@ def apply_hinv_Jt_multi_rhs_tiled(
     L_tile = wp.tile_load(L[articulation], shape=(TILE_DOF, TILE_DOF))
 
     # --- 2. Load J rows into RHS_tile as columns: RHS[:, ci] = J_row(ci)^T ---
-    RHS_tile = wp.tile_transpose(wp.tile_load(J_rows[articulation], shape=(TILE_CONSTRAINTS, TILE_DOF)))
+    J_tile = wp.tile_load(J_rows[articulation], shape=(TILE_CONSTRAINTS, TILE_DOF))
 
     # --- 3. Solve L * Z = RHS (forward) ---
-    Z_tile = wp.tile_lower_solve(L_tile, RHS_tile)
+    Z_tile = wp.tile_lower_solve(L_tile, wp.tile_transpose(J_tile))
 
     # --- 4. Solve L^T * X = Z (backward) ---
     U_tile = wp.tile_transpose(L_tile)  # U is upper-triangular
     X_tile = wp.tile_upper_solve(U_tile, Z_tile)
 
-    wp.tile_store(Y_rows[articulation], wp.tile_transpose(X_tile))
+    C_tile = wp.tile_zeros(shape=(TILE_CONSTRAINTS, TILE_CONSTRAINTS), dtype=wp.float32)
+
+    # store Y = H^-1 * J^T (will be re-used during impulse application)
+    wp.tile_store(Y[articulation], wp.tile_transpose(X_tile))
+
+    # form C = J * H^-1 * J^T
+    wp.tile_matmul(J_tile, X_tile, C_tile)
+    wp.tile_store(C[articulation], C_tile)
+
+    constraint_count = constraint_counts[articulation]
+    diag_base = articulation * max_constraints
+
+    for i in range(constraint_count):
+        # write diagonal of constraint matrix
+        # todo: remove this since we should already
+        # have it during the PGS solve
+        diag_out[diag_base + i] = C_tile[i, i] + row_cfm[diag_base + i]
 
 
 @wp.kernel
