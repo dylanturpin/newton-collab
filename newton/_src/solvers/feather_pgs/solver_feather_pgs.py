@@ -66,6 +66,7 @@ from .kernels import (
     integrate_generalized_joints,
     pgs_solve_contacts,
     prepare_impulses,
+    update_body_qd_from_featherstone,
     update_qdd_from_velocity,
 )
 
@@ -951,6 +952,15 @@ class SolverFeatherPGS(SolverBase):
                             device=model.device,
                         )
 
+                        if model.body_count:
+                            wp.launch(
+                                update_body_qd_from_featherstone,
+                                dim=model.body_count,
+                                inputs=[state_aug.body_v_s, state_in.body_q, model.body_com],
+                                outputs=[state_out.body_qd],
+                                device=model.device,
+                            )
+
                     if model.articulation_count:
                         with self._timer("Drives + augmentation"):
                             # evaluate joint torques
@@ -981,6 +991,8 @@ class SolverFeatherPGS(SolverBase):
                                     state_aug.joint_S_s,
                                     state_aug.body_f_s,
                                     body_f,
+                                    state_in.body_q,
+                                    model.body_com,
                                     use_joint_targets_flag,
                                 ],
                                 outputs=[
