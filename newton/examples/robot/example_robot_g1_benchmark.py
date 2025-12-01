@@ -172,7 +172,7 @@ class Example:
                 use_mujoco_cpu=False,
                 solver="newton",
                 integrator="implicit",
-                njmax=210,
+                njmax=48,
                 nconmax=8,
                 ls_parallel=True,
                 iterations=100,
@@ -200,7 +200,8 @@ class Example:
     # ----------------------------------------------------------------------
     def capture_cuda_graph(self):
         self.graph = None
-        return
+        if self.enable_timers or self.summary_timer:
+            return
         device = wp.get_device()
         if device.is_cuda:
             with wp.ScopedCapture() as capture:
