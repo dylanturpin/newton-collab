@@ -23,7 +23,6 @@ from ...sim.articulation import (
 )
 from ..semi_implicit.kernels_body import joint_force
 
-
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 PGS_CONSTRAINT_TYPE_JOINT_TARGET = 1
 PGS_CONSTRAINT_TYPE_FRICTION = 2
@@ -1056,7 +1055,6 @@ def eval_crba(
             j = joint_ancestor[j]
 
 
-
 @wp.func
 def dense_cholesky(
     n: int,
@@ -1313,8 +1311,8 @@ def accumulate_contact_body(
     if body_index < 0:
         return
 
-    body_artic = body_to_articulation[body_index]
-    if body_artic != articulation:
+    body_arctic = body_to_articulation[body_index]
+    if body_arctic != articulation:
         return
 
     joint_index = body_to_joint[body_index]
@@ -1385,25 +1383,25 @@ def build_contact_rows_normal(
     total_contacts = contact_count[0]
     if tid >= total_contacts:
         return
-        
+
     n = contact_normal[tid]
     shape_a = contact_shape0[tid]
     shape_b = contact_shape1[tid]
-    
+
     body_a = -1
     body_b = -1
     if shape_a >= 0:
         body_a = shape_body[shape_a]
     if shape_b >= 0:
         body_b = shape_body[shape_b]
-        
+
     articulation_a = -1
     articulation_b = -1
     if body_a >= 0:
         articulation_a = body_to_articulation[body_a]
     if body_b >= 0:
         articulation_b = body_to_articulation[body_b]
-        
+
     articulation = articulation_a
     if articulation < 0:
         articulation = articulation_b
@@ -1411,8 +1409,7 @@ def build_contact_rows_normal(
         return
     if articulation < 0:
         return
-        
-        
+
     thickness_a = contact_thickness0[tid]
     thickness_b = contact_thickness1[tid]
     mu = 0.0
@@ -1425,51 +1422,51 @@ def build_contact_rows_normal(
         mat_count += 1
     if mat_count > 0:
         mu /= float(mat_count)
-    
+
     # These are points in the *SHAPE* local frame
     point_a_local = contact_point0[tid]
     point_b_local = contact_point1[tid]
-    
+
     r_a = wp.vec3(0.0)
     r_b = wp.vec3(0.0)
     point_a_world = wp.vec3(0.0)
     point_b_world = wp.vec3(0.0)
 
     if body_a >= 0:
-        X_wb_a = body_q[body_a]           # World-from-Body transform
-        X_bs_a = shape_transform[shape_a] # Body-from-Shape transform
-        X_ws_a = wp.transform_multiply(X_wb_a, X_bs_a) # World-from-Shape
-        
+        X_wb_a = body_q[body_a]  # World-from-Body transform
+        X_bs_a = shape_transform[shape_a]  # Body-from-Shape transform
+        X_ws_a = wp.transform_multiply(X_wb_a, X_bs_a)  # World-from-Shape
+
         point_a_world = wp.transform_point(X_ws_a, point_a_local) - thickness_a * n
-        origin_a_world = wp.transform_get_translation(X_wb_a)
-        #r_a = point_a_world - origin_a_world # wrong lever arm
+        # origin_a_world = wp.transform_get_translation(X_wb_a)
+        # r_a = point_a_world - origin_a_world # wrong lever arm
         r_a = point_a_world
     else:
         point_a_world = point_a_local - thickness_a * n
-    
+
     if body_b >= 0:
-        X_wb_b = body_q[body_b]           # World-from-Body transform
-        X_bs_b = shape_transform[shape_b] # Body-from-Shape transform
-        X_ws_b = wp.transform_multiply(X_wb_b, X_bs_b) # World-from-Shape
-        
+        X_wb_b = body_q[body_b]  # World-from-Body transform
+        X_bs_b = shape_transform[shape_b]  # Body-from-Shape transform
+        X_ws_b = wp.transform_multiply(X_wb_b, X_bs_b)  # World-from-Shape
+
         point_b_world = wp.transform_point(X_ws_b, point_b_local) + thickness_b * n
-        origin_b_world = wp.transform_get_translation(X_wb_b)
-        #r_b = point_b_world - origin_b_world # wrong lever arm
+        # origin_b_world = wp.transform_get_translation(X_wb_b)
+        # r_b = point_b_world - origin_b_world # wrong lever arm
         r_b = point_b_world
     else:
         point_b_world = point_b_local + thickness_b * n
 
     phi = wp.dot(n, point_a_world - point_b_world)
-    
+
     weight = float(1.0)
     if phi > 0.0:
         return
-        #weight = 0.0
+        # weight = 0.0
 
     slot = wp.atomic_add(constraint_counts, articulation, 1)
     if slot >= max_constraints:
         return
-        
+
     phi_index = articulation * max_constraints + slot
     phi_out[phi_index] = phi
     row_beta[phi_index] = contact_beta
@@ -1481,15 +1478,15 @@ def build_contact_rows_normal(
     row_base = (articulation * max_constraints + slot) * max_dofs
     for col in range(max_dofs):
         Jc_out[row_base + col] = 0.0
-        
+
     dof_count = articulation_H_rows[articulation]
     J_offset = articulation_J_start[articulation]
     joint_start = articulation_start[articulation]
-    
+
     accumulate_contact_body(
         articulation,
         body_a,
-        weight, # 1.0
+        weight,  # 1.0
         r_a,
         joint_start,
         dof_count,
@@ -1501,11 +1498,11 @@ def build_contact_rows_normal(
         n,
         Jc_out,
     )
-    
+
     accumulate_contact_body(
         articulation,
         body_b,
-        -weight, # -1.0
+        -weight,  # -1.0
         r_b,
         joint_start,
         dof_count,
@@ -1623,11 +1620,7 @@ def build_joint_target_rows(
         if slot >= max_dofs:
             break
         type = joint_type[joint_index]
-        if (
-            type != JointType.PRISMATIC
-            and type != JointType.REVOLUTE
-            and type != JointType.D6
-        ):
+        if type != JointType.PRISMATIC and type != JointType.REVOLUTE and type != JointType.D6:
             continue
 
         lin_axis_count = joint_dof_dim[joint_index, 0]
@@ -1738,11 +1731,7 @@ def build_augmented_joint_rows(
 
     for joint_index in range(joint_start, joint_end):
         type = joint_type[joint_index]
-        if (
-            type != JointType.PRISMATIC
-            and type != JointType.REVOLUTE
-            and type != JointType.D6
-        ):
+        if type != JointType.PRISMATIC and type != JointType.REVOLUTE and type != JointType.D6:
             continue
 
         lin_axis_count = joint_dof_dim[joint_index, 0]
@@ -1891,6 +1880,7 @@ def apply_augmented_joint_tau(
 
         wp.atomic_add(joint_tau, dof, u0)
 
+
 @wp.kernel
 def apply_hinv_Jt_multi_rhs(
     articulation_H_start: wp.array(dtype=int),
@@ -1957,6 +1947,7 @@ def apply_hinv_Jt_multi_rhs(
     for row in range(n, max_dofs):
         Y_rows[row_base + row] = 0.0
 
+
 @wp.kernel
 def form_contact_matrix(
     articulation_H_rows: wp.array(dtype=int),
@@ -1980,7 +1971,7 @@ def form_contact_matrix(
         return
 
     diag_base = articulation * max_constraints
-    mat_base  = articulation * max_constraints * max_constraints
+    mat_base = articulation * max_constraints * max_constraints
 
     row_i = (articulation * max_constraints + i_row) * max_dofs
 
@@ -2137,7 +2128,7 @@ def pgs_solve_contacts(
     base = articulation * max_constraints
     mat_base = articulation * max_constraints * max_constraints
 
-    for iter in range(iterations):
+    for _ in range(iterations):
         for i in range(m):
             idx = base + i
             row_offset = mat_base + i * max_constraints
@@ -2145,7 +2136,7 @@ def pgs_solve_contacts(
             w = rhs[idx]
             for j in range(m):
                 w += matrix[row_offset + j] * impulses[base + j]
- 
+
             denom = diag[idx]
             if denom <= 0.0:
                 continue
@@ -2204,6 +2195,7 @@ def accumulate_contact_velocity(
 
         v_out[dof_start + k] = v
 
+
 @wp.kernel
 def clamp_joint_tau(
     joint_tau: wp.array(dtype=float),
@@ -2236,10 +2228,11 @@ TILE_DOF = wp.constant(49)
 
 # Max constraints per articulation we support in the tiled path.
 # pgs_max_constraints must be <= TILE_CONSTRAINTS or we use fall back
-TILE_CONSTRAINTS = wp.constant(24)
+TILE_CONSTRAINTS = wp.constant(32)
 
 # Threads per tile/block for tile kernels
 TILE_THREADS = 64
+
 
 @wp.kernel
 def apply_hinv_Jt_multi_rhs_tiled(
@@ -2248,10 +2241,10 @@ def apply_hinv_Jt_multi_rhs_tiled(
     max_constraints: int,
     max_dofs: int,
     constraint_counts: wp.array(dtype=int),
-    L: wp.array(dtype=float),
-    J_rows: wp.array(dtype=float),
+    L: wp.array3d(dtype=float),
+    J_rows: wp.array3d(dtype=float),
     # outputs
-    Y_rows: wp.array(dtype=float),
+    Y_rows: wp.array3d(dtype=float),
 ):
     """
     Tiled version of H^{-1} J^T application.
@@ -2268,54 +2261,21 @@ def apply_hinv_Jt_multi_rhs_tiled(
     """
     articulation = wp.tid()
 
-    m = constraint_counts[articulation]
-    n = articulation_H_rows[articulation]
-
-    # Tile for L: (TILE_DOF x TILE_DOF)
-    L_tile = wp.tile_zeros(shape=(TILE_DOF, TILE_DOF), dtype=wp.float32)
-
-    # RHS tile holds J^T: (TILE_DOF x TILE_CONSTRAINTS)
-    RHS_tile = wp.tile_zeros(shape=(TILE_DOF, TILE_CONSTRAINTS), dtype=wp.float32)
-
     # --- 1. Load L for this articulation into L_tile (padded) ---
-
-    L_start = articulation_H_start[articulation]
-
-    # copy n x n block
-    # (not using tile_load since stored flat to support varied sizes)
-    for row in range(n):
-        for col in range(n):
-            val = L[L_start + dense_index(n, row, col)]
-            L_tile[row, col] = val
-
-    # pad the remainder as identity
-    for i in range(n, TILE_DOF):
-        L_tile[i, i] = 1.0
+    L_tile = wp.tile_load(L[articulation], shape=(TILE_DOF, TILE_DOF))
 
     # --- 2. Load J rows into RHS_tile as columns: RHS[:, ci] = J_row(ci)^T ---
-    for ci in range(m):
-        row_base = (articulation * max_constraints + ci) * max_dofs
-        for k in range(n):
-            RHS_tile[k, ci] = J_rows[row_base + k]
+    RHS_tile = wp.tile_transpose(wp.tile_load(J_rows[articulation], shape=(TILE_CONSTRAINTS, TILE_DOF)))
 
     # --- 3. Solve L * Z = RHS (forward) ---
     Z_tile = wp.tile_lower_solve(L_tile, RHS_tile)
 
     # --- 4. Solve L^T * X = Z (backward) ---
-    U_tile = wp.tile_transpose(L_tile)          # U is upper-triangular
+    U_tile = wp.tile_transpose(L_tile)  # U is upper-triangular
     X_tile = wp.tile_upper_solve(U_tile, Z_tile)
 
-    # --- 5. Write back X into Y_rows in the original packed layout ---
-    for ci in range(m):
-        row_base = (articulation * max_constraints + ci) * max_dofs
+    wp.tile_store(Y_rows[articulation], wp.tile_transpose(X_tile))
 
-        # meaningful dofs
-        for k in range(n):
-            Y_rows[row_base + k] = X_tile[k, ci]
-
-        # zero-pad
-        for k in range(n, max_dofs):
-            Y_rows[row_base + k] = 0.0
 
 @wp.kernel
 def form_contact_matrix_tiled(
@@ -2384,6 +2344,7 @@ def form_contact_matrix_tiled(
         for j in range(m):
             matrix_out[mat_base + i * max_constraints + j] = W_tile[i, j]
 
+
 @wp.kernel
 def eval_dense_cholesky_batched_tiled(
     A_starts: wp.array(dtype=int),
@@ -2399,7 +2360,7 @@ def eval_dense_cholesky_batched_tiled(
     if mass_update_mask[batch] == 0:
         return
 
-    n       = A_dim[batch]
+    n = A_dim[batch]
 
     A_start = A_starts[batch]
     R_start = n * batch
