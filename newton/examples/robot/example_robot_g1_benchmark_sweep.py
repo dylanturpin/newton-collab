@@ -78,6 +78,17 @@ def run_one(solver: str, num_worlds: int, args) -> dict:
         str(args.warmup_frames),
         "--measure-frames",
         str(args.measure_frames),
+        "--pgs-iterations",
+        str(4),
+        "--pgs-max-constraints",
+        str(32),
+        "--update-mass-matrix-interval",
+        str(1),
+        "--pgs-warmstart",
+        "--pgs-omega",
+        str(1.4),
+        "--pgs-joint-target-mode",
+        "augmented",
     ]
 
     print(f"\n=== Running {solver} with num-worlds={num_worlds} ===")
