@@ -59,7 +59,6 @@ from .kernels import (
     eval_dense_solve_batched,
     eval_rigid_fk,
     eval_rigid_id,
-    eval_rigid_jacobian,
     eval_rigid_mass,
     eval_rigid_tau,
     form_contact_matrix,
@@ -549,13 +548,13 @@ class SolverFeatherPGS(SolverBase):
                         model.shape_transform,
                         self.shape_material_mu,
                         model.articulation_start,
-                        self.articulation_J_start,
                         self.articulation_H_rows,
                         self.articulation_dof_start,
                         self.body_to_joint,
                         self.body_to_articulation,
                         model.joint_ancestor,
-                        self.J,
+                        model.joint_qd_start,
+                        state_aug.joint_S_s,
                         self.pgs_max_constraints,
                         self.articulation_max_dofs,
                         self.pgs_beta,
@@ -1046,21 +1045,6 @@ class SolverFeatherPGS(SolverBase):
                                 self.limit_change_mask,
                             ],
                             outputs=[self.mass_update_mask],
-                            device=model.device,
-                        )
-                        # build J
-                        wp.launch(
-                            eval_rigid_jacobian,
-                            dim=model.articulation_count,
-                            inputs=[
-                                model.articulation_start,
-                                self.articulation_J_start,
-                                self.mass_update_mask,
-                                model.joint_ancestor,
-                                model.joint_qd_start,
-                                state_aug.joint_S_s,
-                            ],
-                            outputs=[self.J],
                             device=model.device,
                         )
 
