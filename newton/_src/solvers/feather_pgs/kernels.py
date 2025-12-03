@@ -958,67 +958,116 @@ def eval_rigid_mass(
 
 
 @wp.kernel
-def eval_crba(
+def compute_composite_inertia(
     articulation_start: wp.array(dtype=int),
     mass_update_mask: wp.array(dtype=int),
     joint_ancestor: wp.array(dtype=int),
-    joint_qd_start: wp.array(dtype=int),
+    body_I_s: wp.array(dtype=wp.spatial_matrix),
+    # outputs
+    body_I_c: wp.array(dtype=wp.spatial_matrix),
+):
+    art_idx = wp.tid()
+
+    if mass_update_mask[art_idx] == 0:
+        return
+
+    start = articulation_start[art_idx]
+    end = articulation_start[art_idx + 1]
+    count = end - start
+
+    for i in range(count):
+        idx = start + i
+        body_I_c[idx] = body_I_s[idx]
+
+    for i in range(count - 1, -1, -1):
+        child_idx = start + i
+        parent_idx = joint_ancestor[child_idx]
+
+        if parent_idx >= start:
+            body_I_c[parent_idx] += body_I_c[child_idx]
+
+
+@wp.kernel
+def eval_crba_fill_parallel(
+    articulation_start: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
     articulation_H_start: wp.array(dtype=int),
     articulation_H_rows: wp.array(dtype=int),
+    mass_update_mask: wp.array(dtype=int),
+    joint_ancestor: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_dof_dim: wp.array(dtype=int, ndim=2),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
-    body_I_s: wp.array(dtype=wp.spatial_matrix),
+    body_I_c: wp.array(dtype=wp.spatial_matrix),
+    max_dofs: int,
     # outputs
     H: wp.array(dtype=float),
 ):
-    articulation = wp.tid()
+    tid = wp.tid()
 
-    if mass_update_mask[articulation] == 0:
+    art_idx = tid // max_dofs
+    col_idx = tid % max_dofs
+
+    if mass_update_mask[art_idx] == 0:
         return
 
-    joint_start = articulation_start[articulation]
-    joint_end = articulation_start[articulation + 1]
-    joint_count = joint_end - joint_start
+    num_dofs = articulation_H_rows[art_idx]
+    if col_idx >= num_dofs:
+        return
 
-    H_offset = articulation_H_start[articulation]
-    dof_count = articulation_H_rows[articulation]
-    articulation_dof_start = joint_qd_start[joint_start]
+    global_dof_start = articulation_dof_start[art_idx]
+    target_dof_global = global_dof_start + col_idx
 
-    for local_index in range(joint_count - 1, -1, -1):
-        joint_index = joint_start + local_index
-        I = body_I_s[joint_index]
-        parent = joint_ancestor[joint_index]
+    joint_start = articulation_start[art_idx]
+    joint_end = articulation_start[art_idx + 1]
 
-        if parent != -1:
-            parent_I = body_I_s[parent]
-            parent_I += I
-            body_I_s[parent] = parent_I
+    pivot_joint = int(-1)
+    int(-1)
 
-        joint_dof_start_0 = joint_qd_start[joint_index]
-        joint_dof_end_0 = joint_qd_start[joint_index + 1]
-        joint_dof_count_0 = joint_dof_end_0 - joint_dof_start_0
-        joint_dof_base_0 = joint_dof_start_0 - articulation_dof_start
+    if pivot_joint == -1:
+        for j in range(joint_start, joint_end):
+            q_start = joint_qd_start[j]
+            q_end = joint_qd_start[j + 1]
+            if target_dof_global >= q_start and target_dof_global < q_end:
+                pivot_joint = j
+                target_dof_global - q_start
+                break
 
-        j = joint_index
-        while j != -1:
-            joint_dof_start_1 = joint_qd_start[j]
-            joint_dof_end_1 = joint_qd_start[j + 1]
-            joint_dof_count_1 = joint_dof_end_1 - joint_dof_start_1
-            joint_dof_base_1 = joint_dof_start_1 - articulation_dof_start
+    if pivot_joint == -1:
+        return
 
-            for dof_0 in range(joint_dof_count_0):
-                row = joint_dof_base_0 + dof_0
-                S_0 = joint_S_s[joint_dof_start_0 + dof_0]
-                F = I * S_0
+    # Compute Force F = I_c[pivot] * S[column]
+    S_col = joint_S_s[target_dof_global]
+    I_comp = body_I_c[pivot_joint]
+    F = I_comp * S_col
 
-                for dof_1 in range(joint_dof_count_1):
-                    col = joint_dof_base_1 + dof_1
-                    S_1 = joint_S_s[joint_dof_start_1 + dof_1]
-                    r = wp.dot(F, S_1)
+    # Walk up the tree and project F onto ancestors
+    # H[row, col] = S[row] * F
 
-                    H[H_offset + dense_index(dof_count, row, col)] = r
-                    H[H_offset + dense_index(dof_count, col, row)] = r
+    curr = pivot_joint
+    H_base = articulation_H_start[art_idx]
+    stride = num_dofs
 
-            j = joint_ancestor[j]
+    while curr != -1:
+        if curr < joint_start:
+            break
+
+        q_start = joint_qd_start[curr]
+        q_dim = joint_dof_dim[curr]
+        count = q_dim[0] + q_dim[1]
+
+        dof_offset_local = q_start - global_dof_start
+
+        for k in range(count):
+            row_idx = dof_offset_local + k
+
+            S_row = joint_S_s[q_start + k]
+            val = wp.dot(S_row, F)
+
+            H[H_base + row_idx * stride + col_idx] = val
+            H[H_base + col_idx * stride + row_idx] = val
+
+        curr = joint_ancestor[curr]
 
 
 @wp.func
