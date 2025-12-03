@@ -2279,10 +2279,10 @@ def apply_hinv_Jt_multi_rhs_tiled(
     articulation, thread = wp.tid()
 
     # --- 1. Load L for this articulation into L_tile (padded) ---
-    L_tile = wp.tile_load(L[articulation], shape=(TILE_DOF, TILE_DOF))
+    L_tile = wp.tile_load(L[articulation], shape=(TILE_DOF, TILE_DOF), bounds_check=False)
 
     # --- 2. Load J rows into RHS_tile as columns: RHS[:, ci] = J_row(ci)^T ---
-    J_tile = wp.tile_load(J_rows[articulation], shape=(TILE_CONSTRAINTS, TILE_DOF))
+    J_tile = wp.tile_load(J_rows[articulation], shape=(TILE_CONSTRAINTS, TILE_DOF), bounds_check=False)
 
     # --- 3. Solve L * Z = RHS (forward) ---
     Z_tile = wp.tile_lower_solve(L_tile, wp.tile_transpose(J_tile))
@@ -2394,8 +2394,8 @@ def eval_dense_cholesky_batched_tiled(
     if mass_update_mask[batch] == 0:
         return
     # Load H
-    H_tile = wp.tile_load(H[batch], shape=(TILE_DOF, TILE_DOF))
-    armature = wp.tile_load(R[batch], shape=TILE_DOF)
+    H_tile = wp.tile_load(H[batch], shape=(TILE_DOF, TILE_DOF), bounds_check=False)
+    armature = wp.tile_load(R[batch], shape=TILE_DOF, bounds_check=False)
 
     # add armature to the diagonal of H
     H_tile = wp.tile_diag_add(H_tile, armature)
