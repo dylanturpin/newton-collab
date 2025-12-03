@@ -928,54 +928,6 @@ def eval_rigid_tau(
             wp.atomic_add(body_ft_s, parent, f_s)
 
 
-# builds spatial Jacobian J which is an (joint_count*6)x(dof_count) matrix
-@wp.kernel
-def eval_rigid_jacobian(
-    articulation_start: wp.array(dtype=int),
-    articulation_J_start: wp.array(dtype=int),
-    mass_update_mask: wp.array(dtype=int),
-    joint_ancestor: wp.array(dtype=int),
-    joint_qd_start: wp.array(dtype=int),
-    joint_S_s: wp.array(dtype=wp.spatial_vector),
-    # outputs
-    J: wp.array(dtype=float),
-):
-    # one thread per-articulation
-    index = wp.tid()
-
-    if mass_update_mask[index] == 0:
-        return
-
-    joint_start = articulation_start[index]
-    joint_end = articulation_start[index + 1]
-    joint_count = joint_end - joint_start
-
-    J_offset = articulation_J_start[index]
-
-    articulation_dof_start = joint_qd_start[joint_start]
-    articulation_dof_end = joint_qd_start[joint_end]
-    articulation_dof_count = articulation_dof_end - articulation_dof_start
-
-    for i in range(joint_count):
-        row_start = i * 6
-
-        j = joint_start + i
-        while j != -1:
-            joint_dof_start = joint_qd_start[j]
-            joint_dof_end = joint_qd_start[j + 1]
-            joint_dof_count = joint_dof_end - joint_dof_start
-
-            # fill out each row of the Jacobian walking up the tree
-            for dof in range(joint_dof_count):
-                col = (joint_dof_start - articulation_dof_start) + dof
-                S = joint_S_s[joint_dof_start + dof]
-
-                for k in range(6):
-                    J[J_offset + dense_index(articulation_dof_count, row_start + k, col)] = S[k]
-
-            j = joint_ancestor[j]
-
-
 @wp.kernel
 def eval_rigid_mass(
     articulation_start: wp.array(dtype=int),
@@ -1304,55 +1256,51 @@ def contact_tangent_basis(n: wp.vec3):
     return tangent0, tangent1
 
 
+# Computes J*v contribution on the fly by walking the tree
+# This keeps the S vectors in L2 cache and avoids reading the large J matrix.
 @wp.func
-def accumulate_contact_body(
+def accumulate_contact_jacobian_matrix_free(
     articulation: int,
     body_index: int,
     weight: float,
-    r_vec: wp.vec3,
-    joint_start: int,
-    dof_count: int,
-    J_offset: int,
-    # inputs
+    point_world: wp.vec3,
+    n_vec: wp.vec3,
     body_to_joint: wp.array(dtype=int),
     body_to_articulation: wp.array(dtype=int),
-    J_spatial: wp.array(dtype=float),
-    row_base: int,
-    n_vec: wp.vec3,
-    # outputs
+    joint_ancestor: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_S_s: wp.array(dtype=wp.spatial_vector),
+    articulation_dof_start: int,
+    # Outputs
+    row_base_index: int,
     Jc_out: wp.array(dtype=float),
 ):
     if body_index < 0:
         return
 
-    body_arctic = body_to_articulation[body_index]
-    if body_arctic != articulation:
-        return
+    curr_joint = body_to_joint[body_index]
 
-    joint_index = body_to_joint[body_index]
-    if joint_index < 0:
-        return
+    while curr_joint != -1:
+        dof_start = joint_qd_start[curr_joint]
+        dof_end = joint_qd_start[curr_joint + 1]
+        dof_count = dof_end - dof_start
 
-    local_index = joint_index - joint_start
-    if local_index < 0:
-        return
+        for k in range(dof_count):
+            global_dof = dof_start + k
 
-    row_start = local_index * 6
+            S = joint_S_s[global_dof]
 
-    for col in range(dof_count):
-        lx = J_spatial[J_offset + dense_index(dof_count, row_start + 0, col)]
-        ly = J_spatial[J_offset + dense_index(dof_count, row_start + 1, col)]
-        lz = J_spatial[J_offset + dense_index(dof_count, row_start + 2, col)]
-        wx = J_spatial[J_offset + dense_index(dof_count, row_start + 3, col)]
-        wy = J_spatial[J_offset + dense_index(dof_count, row_start + 4, col)]
-        wz = J_spatial[J_offset + dense_index(dof_count, row_start + 5, col)]
+            linear = wp.vec3(S[0], S[1], S[2])
+            angular = wp.vec3(S[3], S[4], S[5])
 
-        linear = wp.vec3(lx, ly, lz)
-        angular = wp.vec3(wx, wy, wz)
+            lin_vel_at_point = linear + wp.cross(angular, point_world)
+            proj = wp.dot(n_vec, lin_vel_at_point)
 
-        lin_cp = linear + wp.cross(angular, r_vec)
-        coeff = weight * wp.dot(n_vec, lin_cp)
-        Jc_out[row_base + col] += coeff
+            local_dof = global_dof - articulation_dof_start
+
+            Jc_out[row_base_index + local_dof] += weight * proj
+
+        curr_joint = joint_ancestor[curr_joint]
 
 
 @wp.kernel
@@ -1370,19 +1318,19 @@ def build_contact_rows_normal(
     shape_transform: wp.array(dtype=wp.transform),
     shape_material_mu: wp.array(dtype=float),
     articulation_start: wp.array(dtype=int),
-    articulation_J_start: wp.array(dtype=int),
     articulation_H_rows: wp.array(dtype=int),
     articulation_dof_start: wp.array(dtype=int),
     body_to_joint: wp.array(dtype=int),
     body_to_articulation: wp.array(dtype=int),
     joint_ancestor: wp.array(dtype=int),
-    J_spatial: wp.array(dtype=float),
+    joint_qd_start: wp.array(dtype=int),
+    joint_S_s: wp.array(dtype=wp.spatial_vector),
     max_constraints: int,
     max_dofs: int,
     contact_beta: float,
     contact_cfm: float,
     enable_friction: int,
-    # outputs
+    # Outputs
     constraint_counts: wp.array(dtype=int),
     Jc_out: wp.array(dtype=float),
     phi_out: wp.array(dtype=float),
@@ -1437,12 +1385,8 @@ def build_contact_rows_normal(
     if mat_count > 0:
         mu /= float(mat_count)
 
-    # These are points in the *SHAPE* local frame
     point_a_local = contact_point0[tid]
     point_b_local = contact_point1[tid]
-
-    r_a = wp.vec3(0.0)
-    r_b = wp.vec3(0.0)
     point_a_world = wp.vec3(0.0)
     point_b_world = wp.vec3(0.0)
 
@@ -1452,9 +1396,6 @@ def build_contact_rows_normal(
         X_ws_a = wp.transform_multiply(X_wb_a, X_bs_a)  # World-from-Shape
 
         point_a_world = wp.transform_point(X_ws_a, point_a_local) - thickness_a * n
-        # origin_a_world = wp.transform_get_translation(X_wb_a)
-        # r_a = point_a_world - origin_a_world # wrong lever arm
-        r_a = point_a_world
     else:
         point_a_world = point_a_local - thickness_a * n
 
@@ -1464,18 +1405,10 @@ def build_contact_rows_normal(
         X_ws_b = wp.transform_multiply(X_wb_b, X_bs_b)  # World-from-Shape
 
         point_b_world = wp.transform_point(X_ws_b, point_b_local) + thickness_b * n
-        # origin_b_world = wp.transform_get_translation(X_wb_b)
-        # r_b = point_b_world - origin_b_world # wrong lever arm
-        r_b = point_b_world
     else:
         point_b_world = point_b_local + thickness_b * n
 
     phi = wp.dot(n, point_a_world - point_b_world)
-
-    weight = float(1.0)
-    if phi > 0.0:
-        return
-        # weight = 0.0
 
     slot = wp.atomic_add(constraint_counts, articulation, 1)
     if slot >= max_constraints:
@@ -1493,42 +1426,41 @@ def build_contact_rows_normal(
     for col in range(max_dofs):
         Jc_out[row_base + col] = 0.0
 
-    dof_count = articulation_H_rows[articulation]
-    J_offset = articulation_J_start[articulation]
-    joint_start = articulation_start[articulation]
+    art_dof_start = articulation_dof_start[articulation]
 
-    accumulate_contact_body(
+    accumulate_contact_jacobian_matrix_free(
         articulation,
         body_a,
-        weight,  # 1.0
-        r_a,
-        joint_start,
-        dof_count,
-        J_offset,
+        1.0,
+        point_a_world,
+        n,
         body_to_joint,
         body_to_articulation,
-        J_spatial,
+        joint_ancestor,
+        joint_qd_start,
+        joint_S_s,
+        art_dof_start,
         row_base,
-        n,
         Jc_out,
     )
 
-    accumulate_contact_body(
+    accumulate_contact_jacobian_matrix_free(
         articulation,
         body_b,
-        -weight,  # -1.0
-        r_b,
-        joint_start,
-        dof_count,
-        J_offset,
+        -1.0,
+        point_b_world,
+        n,
         body_to_joint,
         body_to_articulation,
-        J_spatial,
+        joint_ancestor,
+        joint_qd_start,
+        joint_S_s,
+        art_dof_start,
         row_base,
-        n,
         Jc_out,
     )
 
+    dof_count = articulation_H_rows[articulation]
     if enable_friction == 0 or mu <= 0.0 or dof_count == 0:
         return
 
@@ -1538,12 +1470,14 @@ def build_contact_rows_normal(
         tangent = t0
         if tangent_index == 1:
             tangent = t1
+
         tangent_slot = wp.atomic_add(constraint_counts, articulation, 1)
         if tangent_slot >= max_constraints:
             return
 
         row_index = articulation * max_constraints + tangent_slot
         tangent_base = row_index * max_dofs
+
         for col in range(max_dofs):
             Jc_out[tangent_base + col] = 0.0
 
@@ -1555,35 +1489,35 @@ def build_contact_rows_normal(
         row_parent[row_index] = phi_index
         row_mu[row_index] = mu
 
-        accumulate_contact_body(
+        accumulate_contact_jacobian_matrix_free(
             articulation,
             body_a,
-            weight,
-            r_a,
-            joint_start,
-            dof_count,
-            J_offset,
+            1.0,
+            point_a_world,
+            tangent,
             body_to_joint,
             body_to_articulation,
-            J_spatial,
+            joint_ancestor,
+            joint_qd_start,
+            joint_S_s,
+            art_dof_start,
             tangent_base,
-            tangent,
             Jc_out,
         )
 
-        accumulate_contact_body(
+        accumulate_contact_jacobian_matrix_free(
             articulation,
             body_b,
-            -weight,
-            r_b,
-            joint_start,
-            dof_count,
-            J_offset,
+            -1.0,
+            point_b_world,
+            tangent,
             body_to_joint,
             body_to_articulation,
-            J_spatial,
+            joint_ancestor,
+            joint_qd_start,
+            joint_S_s,
+            art_dof_start,
             tangent_base,
-            tangent,
             Jc_out,
         )
 
