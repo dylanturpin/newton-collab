@@ -2125,23 +2125,29 @@ def accumulate_contact_velocity(
     # outputs
     v_out: wp.array(dtype=float),
 ):
-    articulation = wp.tid()
-    n = articulation_H_rows[articulation]
-    if n == 0:
+    tid = wp.tid()
+
+    articulation = tid // max_dofs
+    local_dof = tid % max_dofs
+
+    num_dofs = articulation_H_rows[articulation]
+    if local_dof >= num_dofs:
         return
 
+    num_constraints = constraint_counts[articulation]
     dof_start = articulation_dof_start[articulation]
-    m = constraint_counts[articulation]
 
-    for k in range(n):
-        v = v_hat[dof_start + k]
+    delta_v = float(0.0)
 
-        for i in range(m):
-            row_base = (articulation * max_constraints + i) * max_dofs
-            impulse = impulses[articulation * max_constraints + i]
-            v += Y_rows[row_base + k] * impulse
+    for i in range(num_constraints):
+        row_start = (articulation * max_constraints + i) * max_dofs
+        y_val = Y_rows[row_start + local_dof]
 
-        v_out[dof_start + k] = v
+        impulse_val = impulses[articulation * max_constraints + i]
+
+        delta_v += y_val * impulse_val
+
+    v_out[dof_start + local_dof] = v_hat[dof_start + local_dof] + delta_v
 
 
 @wp.kernel

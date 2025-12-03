@@ -760,7 +760,7 @@ class SolverFeatherPGS(SolverBase):
         with self._timer("Contact apply (v, qdd)"):
             wp.launch(
                 accumulate_contact_velocity,
-                dim=model.articulation_count,
+                dim=model.articulation_count * self.articulation_max_dofs,
                 inputs=[
                     self.articulation_dof_start,
                     self.articulation_H_rows,
