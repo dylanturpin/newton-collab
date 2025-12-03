@@ -48,12 +48,13 @@ from .kernels import (
     clamp_contact_counts,
     clamp_joint_tau,
     compute_com_transforms,
+    compute_composite_inertia,
     compute_contact_bias,
     compute_spatial_inertia,
     compute_velocity_predictor,
     copy_int_array_masked,
     detect_limit_count_changes,
-    eval_crba,
+    eval_crba_fill_parallel,
     eval_dense_cholesky_batched,
     eval_dense_cholesky_batched_tiled,
     eval_dense_solve_batched,
@@ -347,6 +348,10 @@ class SolverFeatherPGS(SolverBase):
                 inputs=[model.body_com],
                 outputs=[self.body_X_com],
                 device=model.device,
+            )
+            # self.body_I_c = wp.zeros_like(self.body_I_s)
+            self.body_I_c = wp.empty(
+                (model.body_count,), dtype=wp.spatial_matrix, device=model.device, requires_grad=model.requires_grad
             )
 
         self.allocate_pgs_buffers(model)
@@ -1064,20 +1069,37 @@ class SolverFeatherPGS(SolverBase):
 
                         # form H using CRBA
                         wp.launch(
-                            eval_crba,
+                            compute_composite_inertia,
                             dim=model.articulation_count,
                             inputs=[
                                 model.articulation_start,
                                 self.mass_update_mask,
                                 model.joint_ancestor,
-                                model.joint_qd_start,
+                                state_aug.body_I_s,
+                            ],
+                            outputs=[self.body_I_c],
+                            device=model.device,
+                            block_dim=128,
+                        )
+                        wp.launch(
+                            eval_crba_fill_parallel,
+                            dim=model.articulation_count * self.articulation_max_dofs,
+                            inputs=[
+                                model.articulation_start,
+                                self.articulation_dof_start,
                                 self.articulation_H_start,
                                 self.articulation_H_rows,
+                                self.mass_update_mask,
+                                model.joint_ancestor,
+                                model.joint_qd_start,
+                                model.joint_dof_dim,
                                 state_aug.joint_S_s,
-                                state_aug.body_I_s,
+                                self.body_I_c,
+                                self.articulation_max_dofs,
                             ],
                             outputs=[self.H],
                             device=model.device,
+                            block_dim=128,
                         )
 
                         if self.pgs_use_augmented_targets:
