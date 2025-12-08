@@ -2116,6 +2116,18 @@ def pgs_solve_contacts(
     row_parent: wp.array(dtype=int),
     row_mu: wp.array(dtype=float),
 ):
+    """
+    Projected Gauss-Seidel solver for contact impulses.
+
+    - Normal rows (PGS_CONSTRAINT_TYPE_CONTACT):
+        lambda_n >= 0
+
+    - Friction rows (PGS_CONSTRAINT_TYPE_FRICTION):
+        Isotropic 2D Coulomb friction per contact:
+            ||lambda_t|| <= mu * lambda_n
+        where lambda_t is the 2D vector of the two tangent impulses that
+        share the same parent normal row.
+    """
     articulation = wp.tid()
     m = constraint_counts[articulation]
 
@@ -2130,6 +2142,7 @@ def pgs_solve_contacts(
             idx = base + i
             row_offset = mat_base + i * max_constraints
 
+            # compute residual w = rhs_i + sum_j A_ij * lambda_j
             w = rhs[idx]
             for j in range(m):
                 w += matrix[row_offset + j] * impulses[base + j]
@@ -2142,23 +2155,58 @@ def pgs_solve_contacts(
             new_impulse = impulses[idx] + omega * delta
             row_type = row_types[idx]
 
+            # --- Normal contact: lambda_n >= 0 ---
             if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
                 if new_impulse < 0.0:
                     new_impulse = 0.0
+                impulses[idx] = new_impulse
+
+            # --- Friction: isotropic Coulomb, shared disk per normal ---
             elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
                 parent_idx = row_parent[idx]
-                limit = 0.0
-                if parent_idx >= 0:
-                    limit = wp.max(row_mu[idx] * impulses[parent_idx], 0.0)
-                if limit <= 0.0:
-                    new_impulse = 0.0
-                else:
-                    if new_impulse > limit:
-                        new_impulse = limit
-                    elif new_impulse < -limit:
-                        new_impulse = -limit
 
-            impulses[idx] = new_impulse
+                lambda_n = impulses[parent_idx]
+                mu = row_mu[idx]
+                radius = wp.max(mu * lambda_n, 0.0)
+
+                if radius <= 0.0:
+                    impulses[idx] = 0.0
+                    continue
+
+                impulses[idx] = new_impulse
+
+                # Find sibling friction row with the same parent (order varies)
+                sib = int(-1)
+                for j in range(m):
+                    j_idx = base + j
+                    if (
+                        j_idx != idx
+                        and row_types[j_idx] == PGS_CONSTRAINT_TYPE_FRICTION
+                        and row_parent[j_idx] == parent_idx
+                    ):
+                        sib = j_idx
+                        break
+
+                # Build 2D tangential impulse vector (a, b)
+                a = impulses[idx]
+                b = float(0.0)
+                if sib >= 0:
+                    b = impulses[sib]
+
+                mag = wp.sqrt(a * a + b * b)
+
+                # Project (a, b) onto disk { ||t|| <= radius }
+                if mag > radius:
+                    scale = radius / mag
+                    a *= scale
+                    b *= scale
+                    impulses[idx] = a
+                    if sib >= 0:
+                        impulses[sib] = b
+
+            # --- Other constraint types ---
+            else:
+                impulses[idx] = new_impulse
 
 
 @wp.kernel
