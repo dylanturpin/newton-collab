@@ -108,11 +108,12 @@ def quat_rotate_inverse(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 def compute_obs(
     actions: torch.Tensor,
     state: State,
-    joint_pos_initial: torch.Tensor,
+    joint_pos_initial_full: torch.Tensor,
     device: str,
     indices: torch.Tensor,
     gravity_vec: torch.Tensor,
     command: torch.Tensor,
+    subset_idx: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute observation for robot policy.
 
@@ -141,16 +142,27 @@ def compute_obs(
     vel_b = quat_rotate_inverse(root_quat_w, root_lin_vel_w)
     a_vel_b = quat_rotate_inverse(root_quat_w, root_ang_vel_w)
     grav = quat_rotate_inverse(root_quat_w, gravity_vec)
-    joint_pos_rel = joint_pos_current - joint_pos_initial
+    joint_pos_rel = joint_pos_current - joint_pos_initial_full
     joint_vel_rel = joint_vel_current
     rearranged_joint_pos_rel = torch.index_select(joint_pos_rel, 1, indices)
     rearranged_joint_vel_rel = torch.index_select(joint_vel_rel, 1, indices)
+    if subset_idx is not None:
+        rearranged_joint_pos_rel = torch.index_select(rearranged_joint_pos_rel, 1, subset_idx)
+        rearranged_joint_vel_rel = torch.index_select(rearranged_joint_vel_rel, 1, subset_idx)
+        if actions.shape[1] != subset_idx.shape[0]:
+            actions = torch.index_select(actions, 1, subset_idx)
     obs = torch.cat([vel_b, a_vel_b, grav, command, rearranged_joint_pos_rel, rearranged_joint_vel_rel, actions], dim=1)
 
     return obs
 
 
-def load_policy_and_setup_tensors(example: Any, policy_path: str, num_dofs: int, joint_pos_slice: slice):
+def load_policy_and_setup_tensors(
+    example: Any,
+    policy_path: str,
+    policy_dofs: int,
+    joint_pos_slice: slice,
+    subset_idx_mjc: torch.Tensor | None,
+):
     """Load policy and setup initial tensors for robot control.
 
     Args:
@@ -165,9 +177,13 @@ def load_policy_and_setup_tensors(example: Any, policy_path: str, num_dofs: int,
 
     # Handle potential None state
     joint_q = example.state_0.joint_q if example.state_0.joint_q is not None else []
-    example.joint_pos_initial = torch.tensor(joint_q[joint_pos_slice], device=device, dtype=torch.float32).unsqueeze(0)
-    example.act = torch.zeros(1, num_dofs, device=device, dtype=torch.float32)
-    example.rearranged_act = torch.zeros(1, num_dofs, device=device, dtype=torch.float32)
+    full_joint_pos = torch.tensor(joint_q[joint_pos_slice], device=device, dtype=torch.float32).unsqueeze(0)
+    example.joint_pos_initial_full = full_joint_pos
+    example.joint_pos_initial = (
+        torch.index_select(full_joint_pos, 1, subset_idx_mjc) if subset_idx_mjc is not None else full_joint_pos
+    )
+    example.act = torch.zeros(1, policy_dofs, device=device, dtype=torch.float32)
+    example.rearranged_act = torch.zeros(1, policy_dofs, device=device, dtype=torch.float32)
 
 
 def find_physx_mjwarp_mapping(mjwarp_joint_names, physx_joint_names):
@@ -192,16 +208,18 @@ class Example:
     def __init__(
         self,
         viewer,
-        robot_config: RobotConfig,
-        config,
-        asset_directory: str,
-        mjc_to_physx: list[int],
-        physx_to_mjc: list[int],
-    ):
+    robot_config: RobotConfig,
+    config,
+    asset_directory: str,
+    mjc_to_physx: list[int],
+    physx_to_mjc: list[int],
+    subset_idx_mjc: list[int] | None,
+    policy_dofs: int,
+):
         # Setup simulation parameters first
-        fps = 50
+        fps = 200
         self.frame_dt = 1.0e0 / fps
-        self.decimation = 1
+        self.decimation = 4
         self.cycle_time = 1 / fps * self.decimation
 
         # Group related attributes by prefix
@@ -217,6 +235,9 @@ class Example:
         self.use_mujoco = False
         self.config = config
         self.robot_config = robot_config
+        self.total_dofs = config["num_dofs"]
+        self.policy_dofs = policy_dofs
+        self.policy_subset_idx_mjc = None
 
         # Device setup
         self.device = wp.get_device()
@@ -289,22 +310,34 @@ class Example:
         #     ls_iterations=50,
         # )
 
-        solver_kwargs = {
-            "update_mass_matrix_interval": 1,
-            "pgs_iterations": 4,
-            "pgs_beta": 0.1,
-            "pgs_cfm": 1e-6,
-            "pgs_omega": 1.4,
-            "pgs_max_constraints": 24,
-            "pgs_warmstart": True,
-            "pgs_use_joint_targets": True,
-            "pgs_joint_target_mode": "augmented",
-            # pgs_joint_beta=0.07,
-            # pgs_joint_cfm=0.1,
-            # pgs_joint_beta=0.01,
-            # pgs_joint_cfm=pgs_joint_cfm,
-        }
-        self.solver = newton.solvers.SolverFeatherPGS(self.model, **solver_kwargs)
+        # from il flat_env_cfg.py
+        self.solver = newton.solvers.SolverMuJoCo(
+            self.model,
+            njmax=210,
+            nconmax=35,
+            ls_iterations=10,
+            ls_parallel=True,
+            cone="pyramidal",
+            impratio=1,
+            integrator="implicit",
+        )
+
+        # solver_kwargs = {
+        #     "update_mass_matrix_interval": 1,
+        #     "pgs_iterations": 4,
+        #     "pgs_beta": 0.1,
+        #     "pgs_cfm": 1e-6,
+        #     "pgs_omega": 1.4,
+        #     "pgs_max_constraints": 32,
+        #     "pgs_warmstart": True,
+        #     "pgs_use_joint_targets": True,
+        #     "pgs_joint_target_mode": "augmented",
+        #     # pgs_joint_beta=0.07,
+        #     # pgs_joint_cfm=0.1,
+        #     # pgs_joint_beta=0.01,
+        #     # pgs_joint_cfm=pgs_joint_cfm,
+        # }
+        # self.solver = newton.solvers.SolverFeatherPGS(self.model, **solver_kwargs)
 
         # Initialize state objects
         self.state_temp = self.model.state()
@@ -330,11 +363,16 @@ class Example:
         self.gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=self.torch_device, dtype=torch.float32).unsqueeze(0)
         self.command = torch.zeros((1, 3), device=self.torch_device, dtype=torch.float32)
         self._reset_key_prev = False
+        if subset_idx_mjc:
+            self.policy_subset_idx_mjc = torch.tensor(
+                subset_idx_mjc, device=self.torch_device, dtype=torch.long, requires_grad=False
+            )
 
         # Initialize policy-related attributes
         # (will be set by load_policy_and_setup_tensors)
         self.policy = None
         self.joint_pos_initial = None
+        self.joint_pos_initial_full = None
         self.act = None
         self.rearranged_act = None
 
@@ -446,16 +484,24 @@ class Example:
         obs = compute_obs(
             self.act,
             self.state_0,
-            self.joint_pos_initial,
+            self.joint_pos_initial_full,
             self.torch_device,
             self.physx_to_mjc_indices,
             self.gravity_vec,
             self.command,
+            self.policy_subset_idx_mjc,
         )
         with torch.no_grad():
             self.act = self.policy(obs)
-            self.rearranged_act = torch.index_select(self.act, 1, self.mjc_to_physx_indices)
-            a = self.joint_pos_initial + self.config["action_scale"] * self.rearranged_act
+            if self.policy_subset_idx_mjc is not None:
+                full_act_mjc = torch.zeros(
+                    1, self.total_dofs, device=self.torch_device, dtype=torch.float32, requires_grad=False
+                )
+                full_act_mjc[0, self.policy_subset_idx_mjc] = self.act[0]
+            else:
+                full_act_mjc = self.act
+            self.rearranged_act = torch.index_select(full_act_mjc, 1, self.mjc_to_physx_indices)
+            a = self.joint_pos_initial_full + self.config["action_scale"] * self.rearranged_act
             a_with_zeros = torch.cat([torch.zeros(6, device=self.torch_device, dtype=torch.float32), a.squeeze(0)])
             a_wp = wp.from_torch(a_with_zeros, dtype=wp.float32, requires_grad=False)
             wp.copy(self.control.joint_target_pos, a_wp)
@@ -491,6 +537,11 @@ if __name__ == "__main__":
         "--robot", type=str, default="g1_29dof", choices=list(ROBOT_CONFIGS.keys()), help="Robot name to load"
     )
     parser.add_argument("--physx", action="store_true", help="Run physX policy instead of MJWarp.")
+    parser.add_argument(
+        "--lower-body-only",
+        action="store_true",
+        help="Use lower-body-only obs/action layout to match IL v1 (G1 only).",
+    )
 
     # Parse arguments and initialize viewer
     viewer, args = newton.examples.init(parser)
@@ -522,6 +573,39 @@ if __name__ == "__main__":
 
     print(f"[INFO] Loaded config with {config['num_dofs']} DOFs")
 
+    lower_body_order = [
+        "left_hip_pitch_joint",
+        "left_hip_roll_joint",
+        "left_hip_yaw_joint",
+        "left_knee_joint",
+        "left_ankle_pitch_joint",
+        "left_ankle_roll_joint",
+        "right_hip_pitch_joint",
+        "right_hip_roll_joint",
+        "right_hip_yaw_joint",
+        "right_knee_joint",
+        "right_ankle_pitch_joint",
+        "right_ankle_roll_joint",
+        "waist_yaw_joint",
+        "waist_roll_joint",
+        "waist_pitch_joint",
+    ]
+    subset_idx_mjc = None
+    policy_dofs = config["num_dofs"]
+
+    if args.lower_body_only:
+        if args.robot not in ("g1_29dof",):
+            raise ValueError("--lower-body-only is currently supported only for g1_29dof.")
+        if "mjw_joint_names" not in config:
+            raise ValueError("mjw_joint_names missing from config; cannot build lower-body mapping.")
+        name_to_idx = {name: idx for idx, name in enumerate(config["mjw_joint_names"])}
+        missing = [name for name in lower_body_order if name not in name_to_idx]
+        if missing:
+            raise ValueError(f"Lower-body joints not found in MJWarp joint list: {missing}")
+        subset_idx_mjc = [name_to_idx[name] for name in lower_body_order]
+        policy_dofs = len(subset_idx_mjc)
+        print(f"[INFO] Using lower-body-only mode: policy DOFs {policy_dofs} of {config['num_dofs']} total.")
+
     mjc_to_physx = list(range(config["num_dofs"]))
     physx_to_mjc = list(range(config["num_dofs"]))
 
@@ -536,10 +620,20 @@ if __name__ == "__main__":
     else:
         policy_path = f"{asset_directory}/{robot_config.policy_path['mjw']}"
 
-    example = Example(viewer, robot_config, config, asset_directory, mjc_to_physx, physx_to_mjc)
+    example = Example(
+        viewer,
+        robot_config,
+        config,
+        asset_directory,
+        mjc_to_physx,
+        physx_to_mjc,
+        subset_idx_mjc,
+        policy_dofs,
+    )
 
     # Use utility function to load policy and setup tensors
-    load_policy_and_setup_tensors(example, policy_path, config["num_dofs"], slice(7, None))
+    subset_idx_tensor = example.policy_subset_idx_mjc
+    load_policy_and_setup_tensors(example, policy_path, policy_dofs, slice(7, None), subset_idx_tensor)
 
     # Run using standard example loop
     newton.examples.run(example, args)
