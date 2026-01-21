@@ -81,7 +81,6 @@ from .kernels import (
     trisolve_flat_loop,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
-    zero_world_C_and_diag,
 )
 
 
@@ -1948,14 +1947,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_zero_world_C(self):
-        model = self.model
-        wp.launch(
-            zero_world_C_and_diag,
-            dim=self.world_count,
-            inputs=[self.world_count, self.pgs_max_constraints],
-            outputs=[self.C, self.diag],
-            device=model.device,
-        )
+        self.C.zero_()
+        self.diag.zero_()
 
     def _stage4_hinv_jt_batched_tiled(self, size: int):
         model = self.model
