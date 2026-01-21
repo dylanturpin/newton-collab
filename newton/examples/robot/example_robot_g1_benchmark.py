@@ -144,7 +144,7 @@ class Example:
                 "cholesky_kernel": "auto",
                 "trisolve_kernel": "auto",
                 "hinv_jt_kernel": "auto",
-                "pgs_kernel": "tiled",
+                "pgs_kernel": "tiled_contact",
                 "small_dof_threshold": 12,
                 "use_parallel_streams": True,
             }
