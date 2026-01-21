@@ -208,14 +208,14 @@ class Example:
     def __init__(
         self,
         viewer,
-    robot_config: RobotConfig,
-    config,
-    asset_directory: str,
-    mjc_to_physx: list[int],
-    physx_to_mjc: list[int],
-    subset_idx_mjc: list[int] | None,
-    policy_dofs: int,
-):
+        robot_config: RobotConfig,
+        config,
+        asset_directory: str,
+        mjc_to_physx: list[int],
+        physx_to_mjc: list[int],
+        subset_idx_mjc: list[int] | None,
+        policy_dofs: int,
+    ):
         # Setup simulation parameters first
         fps = 200
         self.frame_dt = 1.0e0 / fps

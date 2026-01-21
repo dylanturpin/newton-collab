@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
+from typing import ClassVar
 
+import numpy as np
 import warp as wp
 
 from ...core.types import override
@@ -21,9 +24,6 @@ from ...sim import Contacts, Control, Model, State, eval_fk
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
-)
-from ..semi_implicit.kernels_muscle import (
-    eval_muscle_forces,
 )
 from ..semi_implicit.kernels_particle import (
     eval_bending_forces,
@@ -36,39 +36,73 @@ from .kernels import (
     TILE_CONSTRAINTS,
     TILE_DOF,
     TILE_THREADS,
-    accumulate_contact_velocity,
+    allocate_world_contact_slots,
     apply_augmented_joint_tau,
     apply_augmented_mass_diagonal,
-    apply_hinv_Jt_multi_rhs,
-    apply_hinv_Jt_multi_rhs_tiled,
+    apply_augmented_mass_diagonal_grouped,
+    apply_impulses_flat_par_dof,
+    apply_impulses_world_par_dof,
     build_augmented_joint_rows,
     build_contact_rows_normal,
-    build_joint_target_rows,
     build_mass_update_mask,
+    cholesky_batched_loop,
+    cholesky_flat_loop,
     clamp_contact_counts,
     clamp_joint_tau,
     compute_com_transforms,
     compute_composite_inertia,
-    compute_contact_bias,
     compute_spatial_inertia,
     compute_velocity_predictor,
+    compute_world_contact_bias,
+    contact_bias_flat_par_row,
     copy_int_array_masked,
+    crba_fill_batched_par_dof,
+    crba_fill_flat_par_dof,
+    delassus_batched_par_row_col,
+    delassus_flat_par_row,
     detect_limit_count_changes,
-    eval_crba_fill_parallel,
-    eval_dense_cholesky_batched,
-    eval_dense_cholesky_batched_tiled,
-    eval_dense_solve_batched,
     eval_rigid_fk,
     eval_rigid_id,
     eval_rigid_mass,
     eval_rigid_tau,
-    form_contact_matrix,
+    finalize_world_constraint_counts,
+    finalize_world_diag_cfm,
+    gather_tau_to_groups,
+    hinv_jt_batched_par_row,
+    hinv_jt_flat_par_row,
     integrate_generalized_joints,
-    pgs_solve_contacts,
+    pgs_solve_loop,
+    populate_world_J_for_size,
     prepare_impulses,
+    prepare_world_impulses,
+    rhs_accum_world_par_art,
+    scatter_qdd_from_groups,
+    trisolve_batched_loop,
+    trisolve_flat_loop,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
+    zero_world_C_and_diag,
 )
+
+
+@wp.kernel
+def localize_parent_indices(
+    counts: wp.array(dtype=int),
+    max_constraints: int,
+    parent_flat: wp.array(dtype=int),
+    parent_local_flat: wp.array(dtype=int),
+):
+    art = wp.tid()
+    m = counts[art]
+    base = art * max_constraints
+
+    for i in range(m):
+        idx = base + i
+        p = parent_flat[idx]
+        if p >= 0:
+            parent_local_flat[idx] = p - base
+        else:
+            parent_local_flat[idx] = -1
 
 
 class SolverFeatherPGS(SolverBase):
@@ -127,13 +161,17 @@ class SolverFeatherPGS(SolverBase):
         pgs_omega: float = 1.0,
         pgs_max_constraints: int = 32,
         pgs_warmstart: bool = False,
-        pgs_use_joint_targets: bool = False,
-        pgs_joint_target_mode: str | None = None,
-        pgs_joint_beta: float | None = None,
-        pgs_joint_cfm: float | None = None,
-        enable_timers: bool = False,
-        use_tiled_contact_build: bool = True,
-        use_tiled_cholesky: bool = True,
+        # Storage path
+        storage: str = "batched",
+        # Kernel selection per operation
+        cholesky_kernel: str = "auto",
+        trisolve_kernel: str = "auto",
+        hinv_jt_kernel: str = "auto",
+        pgs_kernel: str = "tiled",
+        # Auto selection threshold (batched path)
+        small_dof_threshold: int = 12,
+        # Parallelism options
+        use_parallel_streams: bool = True,
     ):
         """
         Args:
@@ -148,12 +186,23 @@ class SolverFeatherPGS(SolverBase):
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             pgs_max_constraints (int, optional): Maximum number of contact constraints stored per articulation. Defaults to 32.
             pgs_warmstart (bool, optional): Re-use impulses from the previous frame when contacts persist. Defaults to False.
-            pgs_use_joint_targets (bool, optional): Whether to include joint drive targets as PGS equality constraints. Defaults to False.
-            pgs_joint_target_mode (str, optional): Override for how joint targets are enforced (\"off\", \"pgs\", or \"augmented\"). Defaults to deriving from ``pgs_use_joint_targets``.
-            pgs_joint_beta (float, optional): ERP override for joint-target constraints (defaults to auto-mapped from gains when None).
-            pgs_joint_cfm (float, optional): CFM override for joint-target constraints (defaults to auto-mapped from gains when None).
-            enable_timers (bool, optional): Enable NVTX profiling ranges for solver sub-sections. Defaults to False.
-            use_tiled_contact_build (bool, optional): Enable use of fast tiled kernels for building constraint matrix. Defaults to True.
+            storage (str, optional): Storage layout. "batched" groups by DOF size into 3D arrays, "flat" uses
+                offset-indexed 1D arrays. Defaults to "batched".
+            cholesky_kernel (str, optional): "tiled", "loop", or "auto" for Cholesky factorization. Defaults to "auto".
+            trisolve_kernel (str, optional): "tiled", "loop", or "auto" for triangular solve. Defaults to "auto".
+            hinv_jt_kernel (str, optional): "tiled", "par_row", or "auto" for H^{-1}J^T. Defaults to "auto".
+            pgs_kernel (str, optional): "tiled" or "loop" for PGS solve. Defaults to "tiled".
+            small_dof_threshold (int, optional): DOF threshold for "auto" selection in batched path. Defaults to 12.
+            use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams (batched path only).
+                Defaults to True.
+
+        Auto selection behavior:
+            - Batched + auto: size > threshold -> tiled (or par_row for hinv_jt), else loop/par_row.
+            - Flat + auto: if homogeneous and within tile limits -> tiled, else loop/par_row.
+            - Flat + tiled: only valid when homogeneous and within TILE_DOF / TILE_CONSTRAINTS limits.
+            - Delassus accumulation always uses par_row_col.
+            - Current limitation: storage="flat" requires one articulation per world.
+
         """
         super().__init__(model)
 
@@ -166,41 +215,81 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_cfm = pgs_cfm
         self.pgs_omega = pgs_omega
         self.pgs_max_constraints = pgs_max_constraints
-        if pgs_joint_target_mode is None:
-            pgs_joint_target_mode = "pgs" if pgs_use_joint_targets else "off"
-        if pgs_joint_target_mode not in ("off", "pgs", "augmented"):
-            raise ValueError(f"Invalid joint target mode '{pgs_joint_target_mode}'")
-
         self.pgs_warmstart = pgs_warmstart
-        self.pgs_joint_target_mode = pgs_joint_target_mode
-        self.pgs_use_joint_targets = pgs_joint_target_mode == "pgs"
-        self.pgs_use_augmented_targets = pgs_joint_target_mode == "augmented"
-        self.pgs_joint_beta = pgs_joint_beta
-        self.pgs_joint_cfm = pgs_joint_cfm
-        self.enable_timers = enable_timers
-        self.use_tiled_contact_build = use_tiled_contact_build
-        self.use_tiled_cholesky = use_tiled_cholesky
+
+        valid_storage = {"batched", "flat"}
+        if storage not in valid_storage:
+            raise ValueError(f"storage must be one of {sorted(valid_storage)}")
+
+        valid_cholesky = {"tiled", "loop", "auto"}
+        if cholesky_kernel not in valid_cholesky:
+            raise ValueError(f"cholesky_kernel must be one of {sorted(valid_cholesky)}")
+
+        valid_trisolve = {"tiled", "loop", "auto"}
+        if trisolve_kernel not in valid_trisolve:
+            raise ValueError(f"trisolve_kernel must be one of {sorted(valid_trisolve)}")
+
+        valid_hinv_jt = {"tiled", "par_row", "auto"}
+        if hinv_jt_kernel not in valid_hinv_jt:
+            raise ValueError(f"hinv_jt_kernel must be one of {sorted(valid_hinv_jt)}")
+
+        valid_pgs = {"tiled", "loop"}
+        if pgs_kernel not in valid_pgs:
+            raise ValueError(f"pgs_kernel must be one of {sorted(valid_pgs)}")
+
+        self.storage = storage
+        self.cholesky_kernel = cholesky_kernel
+        self.trisolve_kernel = trisolve_kernel
+        self.hinv_jt_kernel = hinv_jt_kernel
+        self.pgs_kernel = pgs_kernel
+        self.small_dof_threshold = small_dof_threshold
+        self.use_parallel_streams = use_parallel_streams
 
         self._step = 0
         self._force_mass_update = False
         self._last_step_dt = None
 
-        self.compute_articulation_indices(model)
-        # Validate tile-based path constraints (if enabled)
-        if self.use_tiled_contact_build and model.articulation_count:
-            if self.articulation_max_dofs > int(TILE_DOF):
+        self._compute_articulation_metadata(model)
+
+        if self.storage == "flat" and self._is_multi_articulation:
+            raise ValueError("storage='flat' is not supported for multiple articulations per world yet.")
+
+        if self.storage == "flat" and model.articulation_count:
+            if not self._is_homogeneous and (
+                self.cholesky_kernel == "tiled" or self.trisolve_kernel == "tiled" or self.hinv_jt_kernel == "tiled"
+            ):
+                raise ValueError("Flat tiled kernels require homogeneous articulation sizes.")
+            if self.cholesky_kernel == "tiled" and self.articulation_max_dofs > int(TILE_DOF):
                 raise ValueError(
                     f"articulation_max_dofs={self.articulation_max_dofs} exceeds TILE_DOF={int(TILE_DOF)} "
-                    "for tiled contact system build. Increase TILE_DOF or disable use_tiled_contact_build."
+                    "for flat tiled Cholesky. Increase TILE_DOF or choose cholesky_kernel='loop'."
                 )
-            if self.pgs_max_constraints > int(TILE_CONSTRAINTS):
+            if self.trisolve_kernel == "tiled" and self.articulation_max_dofs > int(TILE_DOF):
+                raise ValueError(
+                    f"articulation_max_dofs={self.articulation_max_dofs} exceeds TILE_DOF={int(TILE_DOF)} "
+                    "for flat tiled triangular solve. Increase TILE_DOF or choose trisolve_kernel='loop'."
+                )
+            if self.hinv_jt_kernel == "tiled" and (
+                self.articulation_max_dofs > int(TILE_DOF) or self.pgs_max_constraints > int(TILE_CONSTRAINTS)
+            ):
+                raise ValueError(
+                    "Flat tiled H^{-1}J^T requires articulation_max_dofs <= TILE_DOF and "
+                    "pgs_max_constraints <= TILE_CONSTRAINTS."
+                )
+            if self.pgs_kernel == "tiled" and self.pgs_max_constraints > int(TILE_CONSTRAINTS):
                 raise ValueError(
                     f"pgs_max_constraints={self.pgs_max_constraints} exceeds TILE_CONSTRAINTS={int(TILE_CONSTRAINTS)} "
-                    "for tiled contact system build. Increase TILE_CONSTRAINTS or reduce pgs_max_constraints."
+                    "for tiled PGS. Increase TILE_CONSTRAINTS or choose pgs_kernel='loop'."
                 )
+        self._allocate_common_buffers(model)
+        if self.storage == "flat":
+            self._allocate_flat_buffers(model)
+        else:
+            self._allocate_batched_buffers(model)
+            self._allocate_world_buffers(model)
+            self._scatter_armature_to_groups(model)
+            self._init_size_group_streams(model)
 
-        self.build_body_maps(model)
-        self.allocate_model_aux_vars(model)
         if model.shape_material_mu is not None:
             self.shape_material_mu = model.shape_material_mu
         else:
@@ -208,10 +297,15 @@ class SolverFeatherPGS(SolverBase):
                 (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
             )
 
-    def _timer(self, label: str):
-        return wp.ScopedTimer(label, active=self.enable_timers, use_nvtx=True, synchronize=True)
+    def _compute_articulation_metadata(self, model):
+        self._compute_articulation_indices(model)
+        self._setup_size_grouping(model)
+        self._setup_world_mapping(model)
+        self._is_one_art_per_world = self.world_count == model.articulation_count
+        self._is_homogeneous = (len(self.size_groups) == 1) if self.size_groups else True
+        self._build_body_maps(model)
 
-    def compute_articulation_indices(self, model):
+    def _compute_articulation_indices(self, model):
         # calculate total size and offsets of Jacobian and mass matrices for entire system
         if model.joint_count:
             self.J_size = 0
@@ -281,7 +375,105 @@ class SolverFeatherPGS(SolverBase):
             self.M_size = 0
             self.articulation_max_dofs = 0
 
-    def build_body_maps(self, model):
+    def _setup_size_grouping(self, model):
+        """Set up size-grouped storage and indirection arrays for multi-articulation support.
+
+        This enables efficient handling of articulations with different DOF counts by grouping
+        them by size, allowing optimized tiled kernel launches for each size group.
+        """
+        if not model.articulation_count or not model.joint_count:
+            self.size_groups = []
+            self.n_arts_by_size = {}
+            return
+
+        device = model.device
+
+        # Get DOF counts per articulation
+        articulation_start = model.articulation_start.numpy()
+        joint_qd_start = model.joint_qd_start.numpy()
+
+        articulation_dof_counts = np.zeros(model.articulation_count, dtype=np.int32)
+        for art_idx in range(model.articulation_count):
+            first_joint = articulation_start[art_idx]
+            last_joint = articulation_start[art_idx + 1]
+            first_dof = joint_qd_start[first_joint]
+            last_dof = joint_qd_start[last_joint]
+            articulation_dof_counts[art_idx] = last_dof - first_dof
+
+        # Determine unique sizes (sorted descending for largest first)
+        unique_sizes = sorted(set(articulation_dof_counts), reverse=True)
+        self.size_groups = unique_sizes
+        self.n_arts_by_size = {size: int(np.sum(articulation_dof_counts == size)) for size in unique_sizes}
+
+        # Build indirection arrays
+        art_size_np = articulation_dof_counts.copy()
+        art_group_idx_np = np.zeros(model.articulation_count, dtype=np.int32)
+        group_to_art_np = {size: np.zeros(self.n_arts_by_size[size], dtype=np.int32) for size in unique_sizes}
+
+        # Track current index within each size group
+        size_counters = dict.fromkeys(unique_sizes, 0)
+
+        for art_idx in range(model.articulation_count):
+            size = articulation_dof_counts[art_idx]
+            group_idx = size_counters[size]
+
+            art_group_idx_np[art_idx] = group_idx
+            group_to_art_np[size][group_idx] = art_idx
+
+            size_counters[size] += 1
+
+        # Copy to GPU
+        self.art_size = wp.array(art_size_np, dtype=wp.int32, device=device)
+        self.art_group_idx = wp.array(art_group_idx_np, dtype=wp.int32, device=device)
+        self.group_to_art = {
+            size: wp.array(group_to_art_np[size], dtype=wp.int32, device=device) for size in unique_sizes
+        }
+
+    def _setup_world_mapping(self, model):
+        """Set up world-level mapping for multi-articulation support.
+
+        Maps articulations to worlds and computes per-world articulation ranges.
+        """
+        if not model.articulation_count:
+            self.world_count = 0
+            self.art_to_world = None
+            self.world_art_start = None
+            self._is_multi_articulation = False
+            self._max_arts_per_world = 0
+            return
+
+        device = model.device
+
+        # Get articulation-to-world mapping from model
+        if model.articulation_world is not None:
+            art_to_world_np = model.articulation_world.numpy().astype(np.int32)
+            # Handle -1 (global) by mapping to world 0
+            art_to_world_np = np.where(art_to_world_np < 0, 0, art_to_world_np)
+            self.world_count = int(np.max(art_to_world_np)) + 1
+        else:
+            # Default: one articulation per world (current behavior)
+            art_to_world_np = np.arange(model.articulation_count, dtype=np.int32)
+            self.world_count = model.articulation_count
+
+        self.art_to_world = wp.array(art_to_world_np, dtype=wp.int32, device=device)
+
+        # Compute per-world articulation ranges
+        # Count articulations per world
+        world_art_counts = np.zeros(self.world_count, dtype=np.int32)
+        for world_idx in art_to_world_np:
+            world_art_counts[world_idx] += 1
+
+        # Compute start indices (exclusive prefix sum)
+        world_art_start_np = np.zeros(self.world_count + 1, dtype=np.int32)
+        world_art_start_np[1:] = np.cumsum(world_art_counts)
+
+        self.world_art_start = wp.array(world_art_start_np, dtype=wp.int32, device=device)
+
+        # Detect if we have multiple articulations per world
+        self._max_arts_per_world = int(np.max(world_art_counts)) if len(world_art_counts) > 0 else 0
+        self._is_multi_articulation = self._max_arts_per_world > 1
+
+    def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:
             self.body_to_joint = None
             self.body_to_articulation = None
@@ -309,24 +501,21 @@ class SolverFeatherPGS(SolverBase):
         self.body_to_joint = wp.array(body_to_joint, dtype=wp.int32, device=device)
         self.body_to_articulation = wp.array(body_to_articulation, dtype=wp.int32, device=device)
 
-    def allocate_model_aux_vars(self, model):
-        # allocate mass, Jacobian matrices, and other auxiliary variables pertaining to the model
+    def _allocate_common_buffers(self, model):
         if model.joint_count:
-            # system matrices
             self.M_blocks = wp.zeros(
                 (self.M_size,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
             )
-            self.J = wp.zeros((self.J_size,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad)
-            self.H = wp.empty((self.H_size,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad)
-
-            # zero since only upper triangle is set which can trigger NaN detection
-            self.L = wp.zeros_like(self.H)
             self.mass_update_mask = wp.zeros(
                 (model.articulation_count,), dtype=wp.int32, device=model.device, requires_grad=model.requires_grad
             )
-            self.limit_change_mask = wp.zeros(
-                (model.articulation_count,), dtype=wp.int32, device=model.device, requires_grad=model.requires_grad
-            )
+            self.v_hat = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+            self.v_out = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+        else:
+            self.M_blocks = None
+            self.mass_update_mask = None
+            self.v_hat = None
+            self.v_out = None
 
         if model.body_count:
             self.body_I_m = wp.empty(
@@ -349,58 +538,14 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[self.body_X_com],
                 device=model.device,
             )
-            # self.body_I_c = wp.zeros_like(self.body_I_s)
             self.body_I_c = wp.empty(
                 (model.body_count,), dtype=wp.spatial_matrix, device=model.device, requires_grad=model.requires_grad
             )
+        else:
+            self.body_I_m = None
+            self.body_X_com = None
+            self.body_I_c = None
 
-        self.allocate_pgs_buffers(model)
-        self.allocate_augmented_joint_buffers(model)
-
-    def allocate_pgs_buffers(self, model):
-        if not model.articulation_count or not model.joint_count:
-            return
-
-        max_dofs = self.articulation_max_dofs
-        if max_dofs == 0:
-            return
-
-        device = model.device
-        requires_grad = model.requires_grad
-        articulation_count = model.articulation_count
-        constraint_capacity = self.pgs_max_constraints
-
-        self.pgs_row_stride = constraint_capacity * max_dofs
-        self.pgs_matrix_stride = constraint_capacity * constraint_capacity
-
-        total_rows = articulation_count * self.pgs_row_stride
-        total_constraints = articulation_count * constraint_capacity
-        total_matrix = articulation_count * self.pgs_matrix_stride
-
-        self.pgs_counts = wp.zeros((articulation_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self.pgs_phi = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.pgs_diag = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.pgs_rhs = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.pgs_impulses = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.pgs_types = wp.zeros((total_constraints,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self.pgs_row_beta = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.pgs_row_cfm = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.pgs_target_velocity = wp.zeros(
-            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.pgs_parent = wp.full((total_constraints,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self.pgs_mu = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.pgs_contact_matrix = wp.zeros(
-            (total_matrix,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.pgs_Jc = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.pgs_Y = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.pgs_v_hat = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
-        self.pgs_v_out = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
-
-    def allocate_augmented_joint_buffers(self, model):
-        if not self.pgs_use_augmented_targets:
-            return
         if not model.articulation_count or not model.joint_count:
             return
 
@@ -425,18 +570,703 @@ class SolverFeatherPGS(SolverBase):
         self.aug_row_K = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.aug_row_u0 = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
 
-    def build_augmented_joint_targets(self, state_in: State, control: Control, dt: float):
-        if not self.pgs_use_augmented_targets:
+    def _allocate_flat_buffers(self, model):
+        if not model.articulation_count or not model.joint_count:
+            self.H_flat = None
+            self.L_flat = None
+            self.constraint_count_flat = None
+            self.phi_flat = None
+            self.diag_flat = None
+            self.rhs_flat = None
+            self.impulses_flat = None
+            self.row_type_flat = None
+            self.row_beta_flat = None
+            self.row_cfm_flat = None
+            self.target_velocity_flat = None
+            self.row_parent_flat = None
+            self.row_mu_flat = None
+            self.C_flat = None
+            self.J_flat = None
+            self.Y_flat = None
+            self.row_parent_local_flat = None
+            self.H_by_size = {}
+            self.L_by_size = {}
+            self.J_by_size = {}
+            self.Y_by_size = {}
+            self.R_by_size = {}
+            self.tau_by_size = {}
+            self.qdd_by_size = {}
             return
 
+        max_dofs = self.articulation_max_dofs
+        if max_dofs == 0:
+            return
+
+        device = model.device
+        requires_grad = model.requires_grad
+        articulation_count = model.articulation_count
+        constraint_capacity = self.pgs_max_constraints
+
+        self.H_flat = wp.empty((self.H_size,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.L_flat = wp.zeros_like(self.H_flat)
+
+        self.pgs_row_stride = constraint_capacity * max_dofs
+        self.pgs_matrix_stride = constraint_capacity * constraint_capacity
+
+        total_rows = articulation_count * self.pgs_row_stride
+        total_constraints = articulation_count * constraint_capacity
+        total_matrix = articulation_count * self.pgs_matrix_stride
+
+        self.constraint_count_flat = wp.zeros(
+            (articulation_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.phi_flat = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.diag_flat = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.rhs_flat = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.impulses_flat = wp.zeros(
+            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.row_type_flat = wp.zeros((total_constraints,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.row_beta_flat = wp.zeros(
+            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.row_cfm_flat = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.target_velocity_flat = wp.zeros(
+            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.row_parent_flat = wp.full(
+            (total_constraints,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.row_mu_flat = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.C_flat = wp.zeros((total_matrix,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.J_flat = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.Y_flat = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.row_parent_local_flat = wp.full(
+            (total_constraints,),
+            -1,
+            dtype=wp.int32,
+            device=device,
+            requires_grad=requires_grad,
+        )
+
+    def _allocate_batched_buffers(self, model):
+        if not self.size_groups:
+            self.H_by_size = {}
+            self.L_by_size = {}
+            self.J_by_size = {}
+            self.Y_by_size = {}
+            self.R_by_size = {}
+            self.tau_by_size = {}
+            self.qdd_by_size = {}
+            return
+
+        device = model.device
+        requires_grad = model.requires_grad
+        max_constraints = self.pgs_max_constraints
+
+        self.H_by_size = {}
+        self.L_by_size = {}
+        self.J_by_size = {}
+        self.Y_by_size = {}
+        self.R_by_size = {}
+        self.tau_by_size = {}
+        self.qdd_by_size = {}
+
+        for size in self.size_groups:
+            n_arts = self.n_arts_by_size[size]
+
+            h_dim = size
+            j_rows = max_constraints
+
+            # Mass matrix and Cholesky factor [n_arts, h_dim, h_dim]
+            self.H_by_size[size] = wp.zeros(
+                (n_arts, h_dim, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+            self.L_by_size[size] = wp.zeros(
+                (n_arts, h_dim, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+
+            # Contact Jacobian and Y = H^-1 * J^T [n_arts, j_rows, h_dim]
+            self.J_by_size[size] = wp.zeros(
+                (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+            self.Y_by_size[size] = wp.zeros(
+                (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+
+            # Armature (regularization) [n_arts, h_dim] - needs to match H dimension for tile_diag_add
+            self.R_by_size[size] = wp.zeros(
+                (n_arts, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+
+            # Tau and qdd grouped buffers for tiled triangular solve [n_arts, h_dim, 1]
+            self.tau_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
+            self.qdd_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
+
+        max_contacts = model.rigid_contact_max if model.rigid_contact_max > 0 else 1
+        self.contact_world = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.contact_slot = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+
+    def _allocate_world_buffers(self, model):
+        """Allocate world-level constraint system buffers for multi-articulation support."""
+        if self.world_count == 0:
+            return
+
+        device = model.device
+        requires_grad = model.requires_grad
+        max_constraints = self.pgs_max_constraints
+
+        # Per-world constraint matrices and vectors
+        self.C = wp.zeros(
+            (self.world_count, max_constraints, max_constraints),
+            dtype=wp.float32,
+            device=device,
+            requires_grad=requires_grad,
+        )
+        self.rhs = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.impulses = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.diag = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+
+        # Constraint metadata (per world x constraint)
+        self.row_type = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.row_parent = wp.full(
+            (self.world_count, max_constraints), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.row_mu = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.row_beta = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.row_cfm = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.phi = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.target_velocity = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+
+        # Per-world constraint counts
+        self.constraint_count = wp.zeros(
+            (self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+
+    def _scatter_armature_to_groups(self, model):
+        """Copy armature from model (DOF-ordered) to size-grouped storage."""
+        if not self.size_groups:
+            return
+
+        armature_np = model.joint_armature.numpy()
+        art_dof_start_np = self.articulation_dof_start.numpy()
+        art_H_rows_np = self.articulation_H_rows.numpy()
+
+        # R_by_size is sized to actual DOF count (matches H_by_size allocation)
+        for size in self.size_groups:
+            n_arts = self.n_arts_by_size[size]
+            R_np = np.zeros((n_arts, size), dtype=np.float32)
+
+            group_to_art_np = self.group_to_art[size].numpy()
+            for group_idx in range(n_arts):
+                art_idx = group_to_art_np[group_idx]
+                dof_start = art_dof_start_np[art_idx]
+                dof_count = art_H_rows_np[art_idx]
+                R_np[group_idx, :dof_count] = armature_np[dof_start : dof_start + dof_count]
+
+            self.R_by_size[size] = wp.array(R_np, dtype=wp.float32, device=model.device)
+
+    def _init_size_group_streams(self, model):
+        """Initialize CUDA streams for parallel kernel launches across size groups.
+
+        When multiple DOF sizes exist (heterogeneous articulations), we can launch
+        tiled kernels for different sizes in parallel using separate CUDA streams.
+        """
+        self._size_streams: dict[int, wp.Stream | None] = {}
+        self._size_events: dict[int, wp.Event | None] = {}
+
+        if self.use_parallel_streams and model.device.is_cuda and len(self.size_groups) > 1:
+            for size in self.size_groups:
+                self._size_streams[size] = wp.Stream(model.device)
+                self._size_events[size] = wp.Event(model.device)
+        else:
+            # No streams needed for CPU or single size group
+            for size in self.size_groups:
+                self._size_streams[size] = None
+                self._size_events[size] = None
+
+    @override
+    def step(
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control,
+        contacts: Contacts,
+        dt: float,
+    ):
+        if self._last_step_dt is None:
+            self._last_step_dt = dt
+        elif abs(self._last_step_dt - dt) > 1.0e-8:
+            self._force_mass_update = True
+            self._last_step_dt = dt
+        else:
+            self._last_step_dt = dt
+
+        model = self.model
+
+        if control is None:
+            control = model.control(clone_variables=False)
+        state_aug = self._prepare_augmented_state(state_in, state_out, control)
+
+        self._eval_particle_forces(state_in, control, contacts)
+
+        if not model.joint_count:
+            self.integrate_particles(model, state_in, state_out, dt)
+            self._step += 1
+            return state_out
+
+        if self.storage == "batched":
+            self._step_batched(state_in, state_out, state_aug, control, contacts, dt)
+        else:
+            self._step_flat(state_in, state_out, state_aug, control, contacts, dt)
+
+        self._step += 1
+        return state_out
+
+    def _prepare_augmented_state(
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control,
+    ) -> State:
+        requires_grad = state_in.requires_grad
+        state_aug = state_out if requires_grad else self
+        model = self.model
+
+        if not getattr(state_aug, "_featherstone_augmented", False):
+            self._allocate_state_aux_vars(model, state_aug, requires_grad)
+
+        return state_aug
+
+    def _allocate_state_aux_vars(self, model, target, requires_grad):
+        # allocate auxiliary variables that vary with state
+        if model.body_count:
+            # joints
+            target.joint_qdd = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
+            target.joint_tau = wp.empty_like(model.joint_qd, requires_grad=requires_grad)
+            if requires_grad:
+                # used in the custom grad implementation of trisolve_flat_loop
+                target.joint_solve_tmp = wp.zeros_like(model.joint_qd, requires_grad=True)
+            else:
+                target.joint_solve_tmp = None
+            target.joint_S_s = wp.empty(
+                (model.joint_dof_count,),
+                dtype=wp.spatial_vector,
+                device=model.device,
+                requires_grad=requires_grad,
+            )
+
+            # derived rigid body data (maximal coordinates)
+            target.body_q_com = wp.empty_like(model.body_q, requires_grad=requires_grad)
+            target.body_I_s = wp.empty(
+                (model.body_count,), dtype=wp.spatial_matrix, device=model.device, requires_grad=requires_grad
+            )
+            target.body_v_s = wp.empty(
+                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
+            )
+            target.body_a_s = wp.empty(
+                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
+            )
+            target.body_f_s = wp.zeros(
+                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
+            )
+            target.body_ft_s = wp.zeros(
+                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
+            )
+
+            target._featherstone_augmented = True
+
+    def _eval_particle_forces(self, state_in: State, control: Control, contacts: Contacts):
+        model = self.model
+
+        particle_f = state_in.particle_f if state_in.particle_count else None
+        body_f = state_in.body_f if state_in.body_count else None
+
+        # damped springs
+        eval_spring_forces(model, state_in, particle_f)
+
+        # triangle elastic and lift/drag forces
+        eval_triangle_forces(model, state_in, control, particle_f)
+
+        # triangle bending
+        eval_bending_forces(model, state_in, particle_f)
+
+        # tetrahedral FEM
+        eval_tetrahedra_forces(model, state_in, control, particle_f)
+
+        # particle-particle interactions
+        eval_particle_contact_forces(model, state_in, particle_f)
+
+        # particle shape contact
+        eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True)
+
+    def _step_flat(
+        self,
+        state_in: State,
+        state_out: State,
+        state_aug: State,
+        control: Control,
+        contacts: Contacts,
+        dt: float,
+    ):
+        model = self.model
+
+        flat_tiled_allowed = (
+            self._is_homogeneous
+            and self.articulation_max_dofs <= int(TILE_DOF)
+            and self.pgs_max_constraints <= int(TILE_CONSTRAINTS)
+        )
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 1: FK/ID + drives + CRBA
+        # ══════════════════════════════════════════════════════════════
+        self._stage1_fk_id(state_in, state_aug, state_out)
+
+        if model.articulation_count:
+            self._stage1_drives(state_in, state_aug, control, dt)
+
+        self._stage1_crba_flat(state_aug)
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 2: Cholesky
+        # ══════════════════════════════════════════════════════════════
+        use_tiled_cholesky = (self.cholesky_kernel != "loop") and flat_tiled_allowed
+        if use_tiled_cholesky:
+            self._stage2_cholesky_flat_tiled()
+        else:
+            self._stage2_cholesky_flat_loop()
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 3: Triangular solve + v_hat
+        # ══════════════════════════════════════════════════════════════
+        self._stage3_zero_qdd(state_aug)
+        use_tiled_trisolve = (self.trisolve_kernel != "loop") and flat_tiled_allowed
+        if use_tiled_trisolve:
+            self._stage3_trisolve_flat_tiled(state_aug)
+        else:
+            self._stage3_trisolve_flat_loop(state_aug)
+
+        self._stage3_compute_v_hat(state_in, state_aug, dt)
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 4: Build contact problem
+        # ══════════════════════════════════════════════════════════════
+        self._stage4_build_rows_flat(state_in, state_aug, contacts)
+
+        use_tiled_hinv_jt = (self.hinv_jt_kernel != "par_row") and flat_tiled_allowed
+        if use_tiled_hinv_jt:
+            self._stage4_hinv_jt_flat_tiled()
+        else:
+            self._stage4_hinv_jt_flat_par_row()
+            self._stage4_delassus_flat_par_row()
+        self._stage4_compute_rhs_flat(dt)
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 5: PGS solve
+        # ══════════════════════════════════════════════════════════════
+        self._stage5_prepare_impulses_flat()
+        if self.pgs_kernel == "tiled":
+            self._stage5_pgs_solve_flat_tiled()
+        else:
+            self._stage5_pgs_solve_flat_loop()
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 6: Apply impulses + integrate
+        # ══════════════════════════════════════════════════════════════
+        self._stage6_apply_impulses_flat()
+        self._stage6_update_qdd(state_in, state_aug, dt)
+
+        self._stage6_integrate(state_in, state_aug, state_out, dt)
+
+    @contextmanager
+    def _parallel_size_region(self, enabled: bool = True):
+        """Context for parallel dispatch across size groups."""
+        if not enabled or not self.use_parallel_streams or not self.model.device.is_cuda or len(self.size_groups) <= 1:
+            yield
+            return
+
+        main_stream = wp.get_stream(self.model.device)
+        self._main_stream = main_stream
+        self._init_event = main_stream.record_event()
+        try:
+            yield
+        finally:
+            for size in self.size_groups:
+                stream = self._size_streams.get(size)
+                if stream is not None:
+                    main_stream.wait_event(stream.record_event())
+            self._main_stream = None
+            self._init_event = None
+
+    @contextmanager
+    def _on_size_stream(self, size: int):
+        """Execute block on this size's CUDA stream."""
+        stream = self._size_streams.get(size)
+        init_event = getattr(self, "_init_event", None)
+        if stream is not None and init_event is not None:
+            stream.wait_event(init_event)
+            with wp.ScopedStream(stream):
+                yield
+        else:
+            yield
+
+    @contextmanager
+    def _size_dispatch(self, enabled: bool):
+        with self._parallel_size_region(enabled=enabled):
+            yield
+
+    @contextmanager
+    def _size_ctx(self, size: int):
+        with self._on_size_stream(size):
+            yield
+
+    def _for_sizes(self, enabled: bool):
+        # convenience generator; keeps step code tight
+        with self._size_dispatch(enabled):
+            for size in self.size_groups:
+                yield size, self._size_ctx(size)
+
+    def _step_batched(
+        self,
+        state_in: State,
+        state_out: State,
+        state_aug: State,
+        control: Control,
+        contacts: Contacts,
+        dt: float,
+    ):
+        model = self.model
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 1: FK/ID + drives + CRBA
+        # ══════════════════════════════════════════════════════════════
+        self._stage1_fk_id(state_in, state_aug, state_out)
+
+        if model.articulation_count:
+            self._stage1_drives(state_in, state_aug, control, dt)
+
+        self._stage1_crba_batched(state_aug)
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 2: Cholesky
+        # ══════════════════════════════════════════════════════════════
+        for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+            with ctx:
+                use_tiled = (self.cholesky_kernel == "tiled") or (
+                    self.cholesky_kernel == "auto" and size > self.small_dof_threshold
+                )
+                if use_tiled:
+                    self._stage2_cholesky_batched_tiled(size)
+                else:
+                    self._stage2_cholesky_batched_loop(size)
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 3: Triangular solve + v_hat
+        # ══════════════════════════════════════════════════════════════
+        self._stage3_zero_qdd(state_aug)
+        for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+            with ctx:
+                use_tiled = (self.trisolve_kernel == "tiled") or (
+                    self.trisolve_kernel == "auto" and size > self.small_dof_threshold
+                )
+                if use_tiled:
+                    self._stage3_trisolve_batched_tiled(size, state_aug)
+                else:
+                    self._stage3_trisolve_batched_loop(size, state_aug)
+
+        self._stage3_compute_v_hat(state_in, state_aug, dt)
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 4: Build contact problem
+        # ══════════════════════════════════════════════════════════════
+        self._stage4_build_rows_batched(state_in, state_aug, contacts)
+
+        fused_ok = (
+            self._is_one_art_per_world
+            and self.hinv_jt_kernel != "par_row"
+            and all(
+                (self.hinv_jt_kernel == "tiled") or (self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold)
+                for size in self.size_groups
+            )
+        )
+
+        if fused_ok:
+            for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+                with ctx:
+                    self._stage4_hinv_jt_batched_tiled_fused(size)
+        else:
+            self._stage4_zero_world_C()
+
+            for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+                with ctx:
+                    use_tiled = (self.hinv_jt_kernel == "tiled") or (
+                        self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold
+                    )
+                    if use_tiled:
+                        self._stage4_hinv_jt_batched_tiled(size)
+                    else:
+                        self._stage4_hinv_jt_batched_par_row(size)
+
+            for size in self.size_groups:
+                self._stage4_delassus_batched_par_row_col(size)
+
+            self._stage4_finalize_world_diag_cfm()
+
+        self._stage4_compute_rhs_world(dt)
+
+        for size in self.size_groups:
+            self._stage4_accumulate_rhs_world(size)
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 5: PGS solve
+        # ══════════════════════════════════════════════════════════════
+        self._stage5_prepare_impulses_world()
+        if self.pgs_kernel == "tiled":
+            self._stage5_pgs_solve_world_tiled()
+        else:
+            self._stage5_pgs_solve_world_loop()
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 6: Apply impulses + integrate
+        # ══════════════════════════════════════════════════════════════
+        self._stage6_prepare_world_velocity()
+        for size in self.size_groups:
+            self._stage6_apply_impulses_world(size)
+        self._stage6_update_qdd(state_in, state_aug, dt)
+
+        self._stage6_integrate(state_in, state_aug, state_out, dt)
+
+    def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State):
+        model = self.model
+
+        # evaluate body transforms
+        wp.launch(
+            eval_rigid_fk,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_in.joint_q,
+                model.joint_X_p,
+                model.joint_X_c,
+                self.body_X_com,
+                model.joint_axis,
+                model.joint_dof_dim,
+            ],
+            outputs=[state_in.body_q, state_aug.body_q_com],
+            device=model.device,
+        )
+
+        # evaluate joint inertias, motion vectors, and forces
+        state_aug.body_f_s.zero_()
+
+        wp.launch(
+            eval_rigid_id,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_qd_start,
+                state_in.joint_qd,
+                model.joint_axis,
+                model.joint_dof_dim,
+                self.body_I_m,
+                state_in.body_q,
+                state_aug.body_q_com,
+                model.joint_X_p,
+                model.gravity,
+            ],
+            outputs=[
+                state_aug.joint_S_s,
+                state_aug.body_I_s,
+                state_aug.body_v_s,
+                state_aug.body_f_s,
+                state_aug.body_a_s,
+            ],
+            device=model.device,
+        )
+
+        if model.body_count:
+            wp.launch(
+                update_body_qd_from_featherstone,
+                dim=model.body_count,
+                inputs=[state_aug.body_v_s, state_in.body_q, model.body_com],
+                outputs=[state_out.body_qd],
+                device=model.device,
+            )
+
+    def _stage1_drives(self, state_in: State, state_aug: State, control: Control, dt: float):
+        model = self.model
+
+        if model.articulation_count:
+            body_f = state_in.body_f if state_in.body_count else None
+            # evaluate joint torques
+            state_aug.body_ft_s.zero_()
+            wp.launch(
+                eval_rigid_tau,
+                dim=model.articulation_count,
+                inputs=[
+                    model.articulation_start,
+                    model.joint_type,
+                    model.joint_parent,
+                    model.joint_child,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    control.joint_f,
+                    state_aug.joint_S_s,
+                    state_aug.body_f_s,
+                    body_f,
+                    state_in.body_q,
+                    model.body_com,
+                ],
+                outputs=[
+                    state_aug.body_ft_s,
+                    state_aug.joint_tau,
+                ],
+                device=model.device,
+            )
+
+            self.build_augmented_joint_targets(state_in, control, dt)
+            self.apply_augmented_joint_tau(state_in, state_aug, dt)
+
+            wp.launch(
+                clamp_joint_tau,
+                dim=model.joint_dof_count,
+                inputs=[state_aug.joint_tau, model.joint_effort_limit],
+                device=model.device,
+            )
+
+    def build_augmented_joint_targets(self, state_in: State, control: Control, dt: float):
         model = self.model
         if model.articulation_count == 0 or self.articulation_max_dofs == 0:
             return
-        if dt <= 0.0:
-            self.aug_row_counts.zero_()
-            self.aug_limit_counts.zero_()
-            return
-
         device = model.device
 
         self.aug_row_counts.zero_()
@@ -486,11 +1316,6 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def apply_augmented_joint_tau(self, state_in: State, state_aug: State, dt: float):
-        if not self.pgs_use_augmented_targets:
-            return
-        if dt <= 0.0:
-            return
-
         model = self.model
         if model.articulation_count == 0 or self.articulation_max_dofs == 0:
             return
@@ -508,36 +1333,496 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def solve_contacts_pgs(self, state_in: State, state_aug, control: Control, contacts: Contacts, dt: float):
+    def _stage1_crba_flat(self, state_aug: State):
         model = self.model
-        if not model.joint_count or model.articulation_count == 0:
-            return
+        global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
 
-        device = model.device
+        wp.launch(
+            build_mass_update_mask,
+            dim=model.articulation_count,
+            inputs=[
+                global_flag,
+                self.limit_change_mask,
+            ],
+            outputs=[self.mass_update_mask],
+            device=model.device,
+        )
 
-        with self._timer("Contact assembly"):
+        wp.launch(
+            eval_rigid_mass,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self.articulation_M_start,
+                self.mass_update_mask,
+                state_aug.body_I_s,
+            ],
+            outputs=[self.M_blocks],
+            device=model.device,
+        )
+
+        wp.launch(
+            compute_composite_inertia,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self.mass_update_mask,
+                model.joint_ancestor,
+                state_aug.body_I_s,
+            ],
+            outputs=[self.body_I_c],
+            device=model.device,
+            block_dim=128,
+        )
+
+        wp.launch(
+            crba_fill_flat_par_dof,
+            dim=model.articulation_count * self.articulation_max_dofs,
+            inputs=[
+                model.articulation_start,
+                self.articulation_dof_start,
+                self.articulation_H_start,
+                self.articulation_H_rows,
+                self.mass_update_mask,
+                model.joint_ancestor,
+                model.joint_qd_start,
+                model.joint_dof_dim,
+                state_aug.joint_S_s,
+                self.body_I_c,
+                self.articulation_max_dofs,
+            ],
+            outputs=[self.H_flat],
+            device=model.device,
+            block_dim=128,
+        )
+
+        wp.launch(
+            apply_augmented_mass_diagonal,
+            dim=model.articulation_count,
+            inputs=[
+                self.articulation_H_start,
+                self.articulation_H_rows,
+                self.articulation_dof_start,
+                self.articulation_max_dofs,
+                self.mass_update_mask,
+                self.aug_row_counts,
+                self.aug_row_dof_index,
+                self.aug_row_K,
+                self.H_flat,
+            ],
+            device=model.device,
+        )
+
+        wp.launch(
+            copy_int_array_masked,
+            dim=model.articulation_count,
+            inputs=[self.aug_limit_counts, self.mass_update_mask],
+            outputs=[self.aug_prev_limit_counts],
+            device=model.device,
+        )
+
+        self._force_mass_update = False
+
+    def _stage1_crba_batched(self, state_aug: State):
+        model = self.model
+        global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
+
+        wp.launch(
+            build_mass_update_mask,
+            dim=model.articulation_count,
+            inputs=[
+                global_flag,
+                self.limit_change_mask,
+            ],
+            outputs=[self.mass_update_mask],
+            device=model.device,
+        )
+
+        wp.launch(
+            eval_rigid_mass,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self.articulation_M_start,
+                self.mass_update_mask,
+                state_aug.body_I_s,
+            ],
+            outputs=[self.M_blocks],
+            device=model.device,
+        )
+
+        wp.launch(
+            compute_composite_inertia,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self.mass_update_mask,
+                model.joint_ancestor,
+                state_aug.body_I_s,
+            ],
+            outputs=[self.body_I_c],
+            device=model.device,
+            block_dim=128,
+        )
+
+        for size in self.size_groups:
+            n_arts = self.n_arts_by_size[size]
+            self.H_by_size[size].zero_()
             wp.launch(
-                compute_velocity_predictor,
-                dim=model.joint_dof_count,
+                crba_fill_batched_par_dof,
+                dim=int(n_arts * size),
                 inputs=[
-                    state_in.joint_qd,
-                    state_aug.joint_qdd,
-                    dt,
+                    model.articulation_start,
+                    self.articulation_dof_start,
+                    self.mass_update_mask,
+                    model.joint_ancestor,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    state_aug.joint_S_s,
+                    self.body_I_c,
+                    self.group_to_art[size],
+                    size,
                 ],
-                outputs=[self.pgs_v_hat],
-                device=device,
+                outputs=[self.H_by_size[size]],
+                device=model.device,
+                block_dim=128,
             )
 
-            self.pgs_counts.zero_()
+        for size in self.size_groups:
+            n_arts = self.n_arts_by_size[size]
+            wp.launch(
+                apply_augmented_mass_diagonal_grouped,
+                dim=n_arts,
+                inputs=[
+                    self.group_to_art[size],
+                    self.articulation_dof_start,
+                    size,
+                    self.articulation_max_dofs,
+                    self.mass_update_mask,
+                    self.aug_row_counts,
+                    self.aug_row_dof_index,
+                    self.aug_row_K,
+                ],
+                outputs=[self.H_by_size[size]],
+                device=model.device,
+            )
 
-            if (
-                contacts is not None
-                and getattr(contacts, "rigid_contact_count", None) is not None
-                and contacts.rigid_contact_max > 0
-            ):
-                enable_friction_flag = 1 if self.enable_contact_friction else 0
+        wp.launch(
+            copy_int_array_masked,
+            dim=model.articulation_count,
+            inputs=[self.aug_limit_counts, self.mass_update_mask],
+            outputs=[self.aug_prev_limit_counts],
+            device=model.device,
+        )
+
+        self._force_mass_update = False
+
+    def _stage2_cholesky_flat_tiled(self):
+        model = self.model
+        n_dofs = self.articulation_max_dofs
+        H_tiled = self.H_flat.reshape((model.articulation_count, n_dofs, n_dofs))
+        R_tiled = model.joint_armature.reshape((model.articulation_count, n_dofs))
+        L_tiled = self.L_flat.reshape((model.articulation_count, n_dofs, n_dofs))
+
+        cholesky_kernel = TiledKernelFactory.get_cholesky_flat_kernel(n_dofs, model.device)
+        wp.launch_tiled(
+            cholesky_kernel,
+            dim=[model.articulation_count],
+            inputs=[H_tiled, R_tiled, self.mass_update_mask],
+            outputs=[L_tiled],
+            block_dim=TILE_THREADS,
+            device=model.device,
+        )
+
+    def _stage2_cholesky_flat_loop(self):
+        model = self.model
+        wp.launch(
+            cholesky_flat_loop,
+            dim=model.articulation_count,
+            inputs=[
+                self.articulation_H_start,
+                self.articulation_H_rows,
+                self.H_flat,
+                model.joint_armature,
+                self.mass_update_mask,
+            ],
+            outputs=[self.L_flat],
+            device=model.device,
+        )
+
+    def _stage2_cholesky_batched_tiled(self, size: int):
+        model = self.model
+        n_arts = self.n_arts_by_size[size]
+        cholesky_kernel = TiledKernelFactory.get_cholesky_kernel(size, model.device)
+        wp.launch_tiled(
+            cholesky_kernel,
+            dim=[n_arts],
+            inputs=[
+                self.H_by_size[size],
+                self.R_by_size[size],
+                self.group_to_art[size],
+                self.mass_update_mask,
+            ],
+            outputs=[self.L_by_size[size]],
+            block_dim=TILE_THREADS,
+            device=model.device,
+        )
+
+    def _stage2_cholesky_batched_loop(self, size: int):
+        model = self.model
+        n_arts = self.n_arts_by_size[size]
+        wp.launch(
+            cholesky_batched_loop,
+            dim=n_arts,
+            inputs=[
+                self.H_by_size[size],
+                self.R_by_size[size],
+                self.group_to_art[size],
+                self.mass_update_mask,
+                size,
+            ],
+            outputs=[self.L_by_size[size]],
+            device=model.device,
+        )
+
+    def _stage3_zero_qdd(self, state_aug: State):
+        state_aug.joint_qdd.zero_()
+
+    def _stage3_trisolve_flat_tiled(self, state_aug: State):
+        model = self.model
+        n_dofs = self.articulation_max_dofs
+        L_tiled = self.L_flat.reshape((model.articulation_count, n_dofs, n_dofs))
+        tau_tiled = state_aug.joint_tau.reshape((model.articulation_count, n_dofs, 1))
+        qdd_tiled = state_aug.joint_qdd.reshape((model.articulation_count, n_dofs, 1))
+
+        solve_kernel = TiledKernelFactory.get_triangular_solve_flat_kernel(n_dofs, model.device)
+        wp.launch_tiled(
+            solve_kernel,
+            dim=[model.articulation_count],
+            inputs=[
+                L_tiled,
+                tau_tiled,
+            ],
+            outputs=[qdd_tiled],
+            block_dim=TILE_THREADS,
+            device=model.device,
+        )
+
+    def _stage3_trisolve_flat_loop(self, state_aug: State):
+        model = self.model
+        wp.launch(
+            trisolve_flat_loop,
+            dim=model.articulation_count,
+            inputs=[
+                self.articulation_H_start,
+                self.articulation_H_rows,
+                self.articulation_dof_start,
+                self.H_flat,
+                self.L_flat,
+                state_aug.joint_tau,
+            ],
+            outputs=[
+                state_aug.joint_qdd,
+                state_aug.joint_solve_tmp,
+            ],
+            device=model.device,
+        )
+
+    def _stage3_trisolve_batched_tiled(self, size: int, state_aug: State):
+        model = self.model
+        n_arts = self.n_arts_by_size[size]
+
+        wp.launch(
+            gather_tau_to_groups,
+            dim=n_arts,
+            inputs=[
+                state_aug.joint_tau,
+                self.group_to_art[size],
+                self.articulation_dof_start,
+                size,
+            ],
+            outputs=[self.tau_by_size[size]],
+            device=model.device,
+        )
+
+        solve_kernel = TiledKernelFactory.get_triangular_solve_kernel(size, model.device)
+        wp.launch_tiled(
+            solve_kernel,
+            dim=[n_arts],
+            inputs=[
+                self.L_by_size[size],
+                self.tau_by_size[size],
+            ],
+            outputs=[self.qdd_by_size[size]],
+            block_dim=TILE_THREADS,
+            device=model.device,
+        )
+
+        wp.launch(
+            scatter_qdd_from_groups,
+            dim=n_arts,
+            inputs=[
+                self.qdd_by_size[size],
+                self.group_to_art[size],
+                self.articulation_dof_start,
+                size,
+            ],
+            outputs=[state_aug.joint_qdd],
+            device=model.device,
+        )
+
+    def _stage3_trisolve_batched_loop(self, size: int, state_aug: State):
+        model = self.model
+        n_arts = self.n_arts_by_size[size]
+        wp.launch(
+            trisolve_batched_loop,
+            dim=n_arts,
+            inputs=[
+                self.L_by_size[size],
+                self.group_to_art[size],
+                self.articulation_dof_start,
+                size,
+                state_aug.joint_tau,
+            ],
+            outputs=[state_aug.joint_qdd],
+            device=model.device,
+        )
+
+    def _stage3_compute_v_hat(self, state_in: State, state_aug: State, dt: float):
+        model = self.model
+        if not model.joint_count:
+            return
+        wp.launch(
+            compute_velocity_predictor,
+            dim=model.joint_dof_count,
+            inputs=[
+                state_in.joint_qd,
+                state_aug.joint_qdd,
+                dt,
+            ],
+            outputs=[self.v_hat],
+            device=model.device,
+        )
+
+    def _stage4_build_rows_flat(self, state_in: State, state_aug: State, contacts: Contacts):
+        model = self.model
+
+        self.constraint_count_flat.zero_()
+
+        if (
+            contacts is not None
+            and getattr(contacts, "rigid_contact_count", None) is not None
+            and contacts.rigid_contact_max > 0
+        ):
+            enable_friction_flag = 1 if self.enable_contact_friction else 0
+            wp.launch(
+                build_contact_rows_normal,
+                dim=contacts.rigid_contact_max,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_point0,
+                    contacts.rigid_contact_point1,
+                    contacts.rigid_contact_normal,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    contacts.rigid_contact_thickness0,
+                    contacts.rigid_contact_thickness1,
+                    model.shape_body,
+                    state_in.body_q,
+                    model.shape_transform,
+                    self.shape_material_mu,
+                    model.articulation_start,
+                    self.articulation_H_rows,
+                    self.articulation_dof_start,
+                    self.body_to_joint,
+                    self.body_to_articulation,
+                    model.joint_ancestor,
+                    model.joint_qd_start,
+                    state_aug.joint_S_s,
+                    self.pgs_max_constraints,
+                    self.articulation_max_dofs,
+                    self.pgs_beta,
+                    self.pgs_cfm,
+                    enable_friction_flag,
+                ],
+                outputs=[
+                    self.constraint_count_flat,
+                    self.J_flat,
+                    self.phi_flat,
+                    self.row_beta_flat,
+                    self.row_cfm_flat,
+                    self.row_type_flat,
+                    self.target_velocity_flat,
+                    self.row_parent_flat,
+                    self.row_mu_flat,
+                ],
+                device=model.device,
+            )
+
+        wp.launch(
+            clamp_contact_counts,
+            dim=model.articulation_count,
+            inputs=[self.constraint_count_flat, self.pgs_max_constraints],
+            device=model.device,
+        )
+        wp.launch(
+            localize_parent_indices,
+            dim=model.articulation_count,
+            inputs=[
+                self.constraint_count_flat,
+                self.pgs_max_constraints,
+                self.row_parent_flat,  # global/flat parent indices
+            ],
+            outputs=[
+                self.row_parent_local_flat,  # local parent indices
+            ],
+            device=model.device,
+        )
+
+    def _stage4_build_rows_batched(self, state_in: State, state_aug: State, contacts: Contacts):
+        model = self.model
+        max_constraints = self.pgs_max_constraints
+
+        # Zero world-level buffers
+        self.slot_counter.zero_()
+        self.constraint_count.zero_()
+
+        for size in self.size_groups:
+            self.J_by_size[size].zero_()
+
+        if (
+            contacts is not None
+            and getattr(contacts, "rigid_contact_count", None) is not None
+            and contacts.rigid_contact_max > 0
+        ):
+            enable_friction_flag = 1 if self.enable_contact_friction else 0
+
+            wp.launch(
+                allocate_world_contact_slots,
+                dim=contacts.rigid_contact_max,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    model.shape_body,
+                    self.body_to_articulation,
+                    self.art_to_world,
+                    max_constraints,
+                    enable_friction_flag,
+                ],
+                outputs=[
+                    self.contact_world,
+                    self.contact_slot,
+                    self.contact_art_a,
+                    self.contact_art_b,
+                    self.slot_counter,
+                ],
+                device=model.device,
+            )
+
+            for size in self.size_groups:
                 wp.launch(
-                    build_contact_rows_normal,
+                    populate_world_J_for_size,
                     dim=contacts.rigid_contact_max,
                     inputs=[
                         contacts.rigid_contact_count,
@@ -548,685 +1833,1072 @@ class SolverFeatherPGS(SolverBase):
                         contacts.rigid_contact_shape1,
                         contacts.rigid_contact_thickness0,
                         contacts.rigid_contact_thickness1,
+                        self.contact_world,
+                        self.contact_slot,
+                        self.contact_art_a,
+                        self.contact_art_b,
+                        size,  # target_size
+                        self.art_size,
+                        self.art_group_idx,
+                        self.articulation_dof_start,
+                        self.body_to_joint,
+                        model.joint_ancestor,
+                        model.joint_qd_start,
+                        state_aug.joint_S_s,
                         model.shape_body,
                         state_in.body_q,
                         model.shape_transform,
                         self.shape_material_mu,
-                        model.articulation_start,
-                        self.articulation_H_rows,
-                        self.articulation_dof_start,
-                        self.body_to_joint,
-                        self.body_to_articulation,
-                        model.joint_ancestor,
-                        model.joint_qd_start,
-                        state_aug.joint_S_s,
-                        self.pgs_max_constraints,
-                        self.articulation_max_dofs,
-                        self.pgs_beta,
-                        self.pgs_cfm,
                         enable_friction_flag,
-                    ],
-                    outputs=[
-                        self.pgs_counts,
-                        self.pgs_Jc,
-                        self.pgs_phi,
-                        self.pgs_row_beta,
-                        self.pgs_row_cfm,
-                        self.pgs_types,
-                        self.pgs_target_velocity,
-                        self.pgs_parent,
-                        self.pgs_mu,
-                    ],
-                    device=device,
-                )
-
-            if self.pgs_use_joint_targets and control is not None and self.articulation_max_dofs > 0:
-                beta_override = self.pgs_joint_beta if self.pgs_joint_beta is not None else -1.0
-                cfm_override = self.pgs_joint_cfm if self.pgs_joint_cfm is not None else -1.0
-                wp.launch(
-                    build_joint_target_rows,
-                    dim=model.articulation_count,
-                    inputs=[
-                        model.articulation_start,
-                        self.articulation_H_rows,
-                        self.articulation_dof_start,
-                        model.joint_type,
-                        model.joint_q_start,
-                        model.joint_qd_start,
-                        model.joint_dof_dim,
-                        model.joint_target_ke,
-                        model.joint_target_kd,
-                        state_in.joint_q,
-                        control.joint_target_pos,
-                        control.joint_target_vel,
-                        self.pgs_counts,
-                        self.pgs_max_constraints,
-                        self.articulation_max_dofs,
-                        self.pgs_row_beta,
-                        self.pgs_row_cfm,
-                        self.pgs_types,
-                        self.pgs_target_velocity,
-                        self.pgs_phi,
-                        self.pgs_Jc,
-                        self.pgs_parent,
-                        self.pgs_mu,
-                        dt,
                         self.pgs_beta,
                         self.pgs_cfm,
-                        beta_override,
-                        cfm_override,
-                    ],
-                    device=device,
-                )
-
-            wp.launch(
-                clamp_contact_counts,
-                dim=model.articulation_count,
-                inputs=[self.pgs_counts, self.pgs_max_constraints],
-                device=device,
-            )
-
-        with self._timer("Contact system build (HinvJt + K + bias)"):
-            if self.use_tiled_contact_build:
-                L_tiled = self.L.reshape((model.articulation_count, TILE_DOF, TILE_DOF))
-                J_tiled = self.pgs_Jc.reshape((model.articulation_count, TILE_CONSTRAINTS, TILE_DOF))
-                Y_tiled = self.pgs_Y.reshape((model.articulation_count, TILE_CONSTRAINTS, TILE_DOF))
-                C_tiled = self.pgs_contact_matrix.reshape(
-                    (model.articulation_count, TILE_CONSTRAINTS, TILE_CONSTRAINTS)
-                )
-
-                wp.launch_tiled(
-                    apply_hinv_Jt_multi_rhs_tiled,
-                    dim=[model.articulation_count],
-                    inputs=[
-                        self.articulation_H_start,
-                        self.articulation_H_rows,
-                        self.pgs_max_constraints,
-                        self.articulation_max_dofs,
-                        self.pgs_counts,
-                        L_tiled,
-                        J_tiled,
-                        self.pgs_row_cfm,
                     ],
                     outputs=[
-                        Y_tiled,
-                        C_tiled,
-                        self.pgs_diag,
+                        self.J_by_size[size],
+                        self.row_type,
+                        self.row_parent,
+                        self.row_mu,
+                        self.row_beta,
+                        self.row_cfm,
+                        self.phi,
+                        self.target_velocity,
                     ],
-                    block_dim=TILE_THREADS,
-                    device=device,
-                )
-
-                # wp.launch_tiled(
-                #     form_contact_matrix_tiled,
-                #     dim=[model.articulation_count],
-                #     inputs=[
-                #         self.articulation_H_rows,
-                #         self.pgs_max_constraints,
-                #         self.articulation_max_dofs,
-                #         self.pgs_counts,
-                #         self.pgs_Jc,
-                #         self.pgs_Y,
-                #         self.pgs_row_cfm,
-                #     ],
-                #     outputs=[
-                #         self.pgs_diag,
-                #         self.pgs_contact_matrix,
-                #     ],
-                #     block_dim=TILE_THREADS,
-                #     device=device,
-                # )
-            else:
-                wp.launch(
-                    apply_hinv_Jt_multi_rhs,
-                    dim=model.articulation_count * self.pgs_max_constraints,
-                    inputs=[
-                        self.articulation_H_start,
-                        self.articulation_H_rows,
-                        self.pgs_max_constraints,
-                        self.articulation_max_dofs,
-                        self.pgs_counts,
-                        self.L,
-                        self.pgs_Jc,
-                    ],
-                    outputs=[self.pgs_Y],
-                    device=device,
-                )
-
-                wp.launch(
-                    form_contact_matrix,
-                    # dim=model.articulation_count,
-                    dim=model.articulation_count * self.pgs_max_constraints,
-                    inputs=[
-                        self.articulation_H_rows,
-                        self.pgs_max_constraints,
-                        self.articulation_max_dofs,
-                        self.pgs_counts,
-                        self.pgs_Jc,
-                        self.pgs_Y,
-                        self.pgs_row_cfm,
-                    ],
-                    outputs=[
-                        self.pgs_diag,
-                        self.pgs_contact_matrix,
-                    ],
-                    device=device,
-                )
-
-            wp.launch(
-                compute_contact_bias,
-                dim=model.articulation_count,
-                inputs=[
-                    self.articulation_dof_start,
-                    self.articulation_H_rows,
-                    self.pgs_counts,
-                    self.pgs_max_constraints,
-                    self.articulation_max_dofs,
-                    self.pgs_Jc,
-                    self.pgs_v_hat,
-                    self.pgs_phi,
-                    self.pgs_row_beta,
-                    self.pgs_types,
-                    self.pgs_target_velocity,
-                    dt,
-                ],
-                outputs=[self.pgs_rhs],
-                device=device,
-            )
-
-        warmstart_flag = 1 if self.pgs_warmstart else 0
-        with self._timer("PGS iterations"):
-            wp.launch(
-                prepare_impulses,
-                dim=model.articulation_count,
-                inputs=[self.pgs_counts, self.pgs_max_constraints, warmstart_flag, self.pgs_impulses],
-                device=device,
-            )
-
-            wp.launch(
-                pgs_solve_contacts,
-                dim=model.articulation_count,
-                inputs=[
-                    self.pgs_counts,
-                    self.pgs_max_constraints,
-                    self.pgs_diag,
-                    self.pgs_contact_matrix,
-                    self.pgs_rhs,
-                    self.pgs_impulses,
-                    self.pgs_iterations,
-                    self.pgs_omega,
-                    self.pgs_types,
-                    self.pgs_parent,
-                    self.pgs_mu,
-                ],
-                device=device,
-            )
-
-        with self._timer("Contact apply (v, qdd)"):
-            wp.launch(
-                accumulate_contact_velocity,
-                dim=model.articulation_count * self.articulation_max_dofs,
-                inputs=[
-                    self.articulation_dof_start,
-                    self.articulation_H_rows,
-                    self.pgs_counts,
-                    self.pgs_max_constraints,
-                    self.articulation_max_dofs,
-                    self.pgs_Y,
-                    self.pgs_v_hat,
-                    self.pgs_impulses,
-                ],
-                outputs=[self.pgs_v_out],
-                device=device,
-            )
-
-            wp.launch(
-                update_qdd_from_velocity,
-                dim=model.joint_dof_count,
-                inputs=[state_in.joint_qd, self.pgs_v_out, 1.0 / dt],
-                outputs=[state_aug.joint_qdd],
-                device=device,
-            )
-
-    def allocate_state_aux_vars(self, model, target, requires_grad):
-        # allocate auxiliary variables that vary with state
-        if model.body_count:
-            # joints
-            target.joint_qdd = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
-            target.joint_tau = wp.empty_like(model.joint_qd, requires_grad=requires_grad)
-            if requires_grad:
-                # used in the custom grad implementation of eval_dense_solve_batched
-                target.joint_solve_tmp = wp.zeros_like(model.joint_qd, requires_grad=True)
-            else:
-                target.joint_solve_tmp = None
-            target.joint_S_s = wp.empty(
-                (model.joint_dof_count,),
-                dtype=wp.spatial_vector,
-                device=model.device,
-                requires_grad=requires_grad,
-            )
-
-            # derived rigid body data (maximal coordinates)
-            target.body_q_com = wp.empty_like(model.body_q, requires_grad=requires_grad)
-            target.body_I_s = wp.empty(
-                (model.body_count,), dtype=wp.spatial_matrix, device=model.device, requires_grad=requires_grad
-            )
-            target.body_v_s = wp.empty(
-                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
-            )
-            target.body_a_s = wp.empty(
-                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
-            )
-            target.body_f_s = wp.zeros(
-                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
-            )
-            target.body_ft_s = wp.zeros(
-                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
-            )
-
-            target._featherstone_augmented = True
-
-    @override
-    def step(
-        self,
-        state_in: State,
-        state_out: State,
-        control: Control,
-        contacts: Contacts,
-        dt: float,
-    ):
-        requires_grad = state_in.requires_grad
-
-        if self.pgs_use_augmented_targets:
-            if self._last_step_dt is None:
-                self._last_step_dt = dt
-            elif abs(self._last_step_dt - dt) > 1.0e-8:
-                self._force_mass_update = True
-                self._last_step_dt = dt
-            else:
-                self._last_step_dt = dt
-
-        # optionally create dynamical auxiliary variables
-        if requires_grad:
-            state_aug = state_out
-        else:
-            state_aug = self
-
-        model = self.model
-
-        if not getattr(state_aug, "_featherstone_augmented", False):
-            self.allocate_state_aux_vars(model, state_aug, requires_grad)
-        if control is None:
-            control = model.control(clone_variables=False)
-
-        with wp.ScopedTimer("simulate", False):
-            particle_f = None
-            body_f = None
-
-            if state_in.particle_count:
-                particle_f = state_in.particle_f
-
-            if state_in.body_count:
-                body_f = state_in.body_f
-
-            with self._timer("Unconstrained dynamics"):
-                # damped springs
-                eval_spring_forces(model, state_in, particle_f)
-
-                # triangle elastic and lift/drag forces
-                eval_triangle_forces(model, state_in, control, particle_f)
-
-                # triangle bending
-                eval_bending_forces(model, state_in, particle_f)
-
-                # tetrahedral FEM
-                eval_tetrahedra_forces(model, state_in, control, particle_f)
-
-                # particle-particle interactions
-                eval_particle_contact_forces(model, state_in, particle_f)
-
-                # particle shape contact
-                eval_particle_body_contact_forces(
-                    model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True
-                )
-
-                # muscles
-                if False:
-                    eval_muscle_forces(model, state_in, control, body_f)
-
-            # ----------------------------
-            # articulations
-
-            if model.joint_count:
-                with self._timer("Articulation dynamics (FK/ID/drives)"):
-                    with self._timer("FK + ID"):
-                        # evaluate body transforms
-                        wp.launch(
-                            eval_rigid_fk,
-                            dim=model.articulation_count,
-                            inputs=[
-                                model.articulation_start,
-                                model.joint_type,
-                                model.joint_parent,
-                                model.joint_child,
-                                model.joint_q_start,
-                                model.joint_qd_start,
-                                state_in.joint_q,
-                                model.joint_X_p,
-                                model.joint_X_c,
-                                self.body_X_com,
-                                model.joint_axis,
-                                model.joint_dof_dim,
-                            ],
-                            outputs=[state_in.body_q, state_aug.body_q_com],
-                            device=model.device,
-                        )
-
-                        # print("body_X_sc:")
-                        # print(state_in.body_q.numpy())
-
-                        # evaluate joint inertias, motion vectors, and forces
-                        state_aug.body_f_s.zero_()
-
-                        wp.launch(
-                            eval_rigid_id,
-                            dim=model.articulation_count,
-                            inputs=[
-                                model.articulation_start,
-                                model.joint_type,
-                                model.joint_parent,
-                                model.joint_child,
-                                model.joint_qd_start,
-                                state_in.joint_qd,
-                                model.joint_axis,
-                                model.joint_dof_dim,
-                                self.body_I_m,
-                                state_in.body_q,
-                                state_aug.body_q_com,
-                                model.joint_X_p,
-                                model.gravity,
-                            ],
-                            outputs=[
-                                state_aug.joint_S_s,
-                                state_aug.body_I_s,
-                                state_aug.body_v_s,
-                                state_aug.body_f_s,
-                                state_aug.body_a_s,
-                            ],
-                            device=model.device,
-                        )
-
-                        if model.body_count:
-                            wp.launch(
-                                update_body_qd_from_featherstone,
-                                dim=model.body_count,
-                                inputs=[state_aug.body_v_s, state_in.body_q, model.body_com],
-                                outputs=[state_out.body_qd],
-                                device=model.device,
-                            )
-
-                    if model.articulation_count:
-                        with self._timer("Drives + augmentation"):
-                            # evaluate joint torques
-                            state_aug.body_ft_s.zero_()
-                            use_joint_targets_flag = 0 if self.pgs_joint_target_mode in ("pgs", "augmented") else 1
-                            wp.launch(
-                                eval_rigid_tau,
-                                dim=model.articulation_count,
-                                inputs=[
-                                    model.articulation_start,
-                                    model.joint_type,
-                                    model.joint_parent,
-                                    model.joint_child,
-                                    model.joint_q_start,
-                                    model.joint_qd_start,
-                                    model.joint_dof_dim,
-                                    control.joint_target_pos,
-                                    control.joint_target_vel,
-                                    state_in.joint_q,
-                                    state_in.joint_qd,
-                                    control.joint_f,
-                                    model.joint_target_ke,
-                                    model.joint_target_kd,
-                                    model.joint_limit_lower,
-                                    model.joint_limit_upper,
-                                    model.joint_limit_ke,
-                                    model.joint_limit_kd,
-                                    state_aug.joint_S_s,
-                                    state_aug.body_f_s,
-                                    body_f,
-                                    state_in.body_q,
-                                    model.body_com,
-                                    use_joint_targets_flag,
-                                ],
-                                outputs=[
-                                    state_aug.body_ft_s,
-                                    state_aug.joint_tau,
-                                ],
-                                device=model.device,
-                            )
-
-                            # Clamp explicit PD torques to joint effort limits (MuJoCo-style forcerange)
-                            if self.pgs_joint_target_mode == "off":
-                                wp.launch(
-                                    clamp_joint_tau,
-                                    dim=model.joint_dof_count,
-                                    inputs=[state_aug.joint_tau, model.joint_effort_limit],
-                                    device=model.device,
-                                )
-
-                            if self.pgs_use_augmented_targets:
-                                self.build_augmented_joint_targets(state_in, control, dt)
-                                self.apply_augmented_joint_tau(state_in, state_aug, dt)
-
-                                wp.launch(
-                                    clamp_joint_tau,
-                                    dim=model.joint_dof_count,
-                                    inputs=[state_aug.joint_tau, model.joint_effort_limit],
-                                    device=model.device,
-                                )
-
-                            # print("joint_tau:")
-                            # print(state_aug.joint_tau.numpy())
-                            # print("body_q:")
-                            # print(state_in.body_q.numpy())
-                            # print("body_qd:")
-                            # print(state_in.body_qd.numpy())
-
-                global_flag = (
-                    1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
-                )
-                if self.pgs_use_augmented_targets:
-                    mass_update = True
-                else:
-                    mass_update = bool(global_flag)
-                if mass_update:
-                    with self._timer("Mass matrix build (CRBA + prep)"):
-                        wp.launch(
-                            build_mass_update_mask,
-                            dim=model.articulation_count,
-                            inputs=[
-                                global_flag,
-                                self.limit_change_mask,
-                            ],
-                            outputs=[self.mass_update_mask],
-                            device=model.device,
-                        )
-
-                        # build M
-                        wp.launch(
-                            eval_rigid_mass,
-                            dim=model.articulation_count,
-                            inputs=[
-                                model.articulation_start,
-                                self.articulation_M_start,
-                                self.mass_update_mask,
-                                state_aug.body_I_s,
-                            ],
-                            outputs=[self.M_blocks],
-                            device=model.device,
-                        )
-
-                        # form H using CRBA
-                        wp.launch(
-                            compute_composite_inertia,
-                            dim=model.articulation_count,
-                            inputs=[
-                                model.articulation_start,
-                                self.mass_update_mask,
-                                model.joint_ancestor,
-                                state_aug.body_I_s,
-                            ],
-                            outputs=[self.body_I_c],
-                            device=model.device,
-                            block_dim=128,
-                        )
-                        wp.launch(
-                            eval_crba_fill_parallel,
-                            dim=model.articulation_count * self.articulation_max_dofs,
-                            inputs=[
-                                model.articulation_start,
-                                self.articulation_dof_start,
-                                self.articulation_H_start,
-                                self.articulation_H_rows,
-                                self.mass_update_mask,
-                                model.joint_ancestor,
-                                model.joint_qd_start,
-                                model.joint_dof_dim,
-                                state_aug.joint_S_s,
-                                self.body_I_c,
-                                self.articulation_max_dofs,
-                            ],
-                            outputs=[self.H],
-                            device=model.device,
-                            block_dim=128,
-                        )
-
-                        if self.pgs_use_augmented_targets:
-                            wp.launch(
-                                apply_augmented_mass_diagonal,
-                                dim=model.articulation_count,
-                                inputs=[
-                                    self.articulation_H_start,
-                                    self.articulation_H_rows,
-                                    self.articulation_dof_start,
-                                    self.articulation_max_dofs,
-                                    self.mass_update_mask,
-                                    self.aug_row_counts,
-                                    self.aug_row_dof_index,
-                                    self.aug_row_K,
-                                    self.H,
-                                ],
-                                device=model.device,
-                            )
-
-                            wp.launch(
-                                copy_int_array_masked,
-                                dim=model.articulation_count,
-                                inputs=[self.aug_limit_counts, self.mass_update_mask],
-                                outputs=[self.aug_prev_limit_counts],
-                                device=model.device,
-                            )
-
-                        self._force_mass_update = False
-
-                        # print("joint_target:")
-                        # print(control.joint_target.numpy())
-                        # print("joint_tau:")
-                        # print(state_aug.joint_tau.numpy())
-                        # print("H:")
-                        # print(self.H.numpy())
-                        # print("L:")
-                        # print(self.L.numpy())
-
-                with self._timer("Mass solve (Cholesky + backsolve)"):
-                    if mass_update:
-                        if self.use_tiled_cholesky:
-                            H_tiled = self.H.reshape((model.articulation_count, TILE_DOF, TILE_DOF))
-                            R_tiled = model.joint_armature.reshape((model.articulation_count, TILE_DOF))
-                            L_tiled = self.L.reshape((model.articulation_count, TILE_DOF, TILE_DOF))
-
-                            wp.launch_tiled(
-                                eval_dense_cholesky_batched_tiled,
-                                dim=[model.articulation_count],
-                                inputs=[
-                                    self.articulation_H_start,
-                                    self.articulation_H_rows,
-                                    H_tiled,
-                                    R_tiled,
-                                    self.mass_update_mask,
-                                ],
-                                outputs=[L_tiled],
-                                block_dim=TILE_THREADS,
-                                device=model.device,
-                            )
-                        else:
-                            wp.launch(
-                                eval_dense_cholesky_batched,
-                                dim=model.articulation_count,
-                                inputs=[
-                                    self.articulation_H_start,
-                                    self.articulation_H_rows,
-                                    self.H,
-                                    model.joint_armature,
-                                    self.mass_update_mask,
-                                ],
-                                outputs=[self.L],
-                                device=model.device,
-                            )
-
-                    # solve for qdd
-                    state_aug.joint_qdd.zero_()
-                    wp.launch(
-                        eval_dense_solve_batched,
-                        dim=model.articulation_count,
-                        inputs=[
-                            self.articulation_H_start,
-                            self.articulation_H_rows,
-                            self.articulation_dof_start,
-                            self.H,
-                            self.L,
-                            state_aug.joint_tau,
-                        ],
-                        outputs=[
-                            state_aug.joint_qdd,
-                            state_aug.joint_solve_tmp,
-                        ],
-                        device=model.device,
-                    )
-
-                self.solve_contacts_pgs(state_in, state_aug, control, contacts, dt)
-                # print("joint_qdd:")
-                # print(state_aug.joint_qdd.numpy())
-                # print("\n\n")
-
-        # -------------------------------------
-        # integrate bodies
-
-        if model.joint_count:
-            with self._timer("Integration + FK_out"):
-                wp.launch(
-                    kernel=integrate_generalized_joints,
-                    dim=model.joint_count,
-                    inputs=[
-                        model.joint_type,
-                        model.joint_q_start,
-                        model.joint_qd_start,
-                        model.joint_dof_dim,
-                        state_in.joint_q,
-                        state_in.joint_qd,
-                        state_aug.joint_qdd,
-                        dt,
-                    ],
-                    outputs=[state_out.joint_q, state_out.joint_qd],
                     device=model.device,
                 )
 
-                # update maximal coordinates
-                eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+        wp.launch(
+            finalize_world_constraint_counts,
+            dim=self.world_count,
+            inputs=[self.slot_counter, max_constraints],
+            outputs=[self.constraint_count],
+            device=model.device,
+        )
+
+    def _stage4_hinv_jt_flat_tiled(self):
+        model = self.model
+        n_dofs = self.articulation_max_dofs
+        max_constraints = self.pgs_max_constraints
+        L_tiled = self.L_flat.reshape((model.articulation_count, n_dofs, n_dofs))
+        J_tiled = self.J_flat.reshape((model.articulation_count, max_constraints, n_dofs))
+        Y_tiled = self.Y_flat.reshape((model.articulation_count, max_constraints, n_dofs))
+        C_tiled = self.C_flat.reshape((model.articulation_count, max_constraints, max_constraints))
+
+        hinv_jt_kernel = TiledKernelFactory.get_hinv_jt_flat_kernel(n_dofs, max_constraints, model.device)
+        wp.launch_tiled(
+            hinv_jt_kernel,
+            dim=[model.articulation_count],
+            inputs=[
+                self.constraint_count_flat,
+                L_tiled,
+                J_tiled,
+                self.row_cfm_flat,
+            ],
+            outputs=[
+                Y_tiled,
+                C_tiled,
+                self.diag_flat,
+            ],
+            block_dim=TILE_THREADS,
+            device=model.device,
+        )
+
+    def _stage4_hinv_jt_flat_par_row(self):
+        model = self.model
+        wp.launch(
+            hinv_jt_flat_par_row,
+            dim=model.articulation_count * self.pgs_max_constraints,
+            inputs=[
+                self.articulation_H_start,
+                self.articulation_H_rows,
+                self.pgs_max_constraints,
+                self.articulation_max_dofs,
+                self.constraint_count_flat,
+                self.L_flat,
+                self.J_flat,
+            ],
+            outputs=[self.Y_flat],
+            device=model.device,
+        )
+
+    def _stage4_delassus_flat_par_row(self):
+        model = self.model
+        wp.launch(
+            delassus_flat_par_row,
+            dim=model.articulation_count * self.pgs_max_constraints,
+            inputs=[
+                self.articulation_H_rows,
+                self.pgs_max_constraints,
+                self.articulation_max_dofs,
+                self.constraint_count_flat,
+                self.J_flat,
+                self.Y_flat,
+                self.row_cfm_flat,
+            ],
+            outputs=[
+                self.diag_flat,
+                self.C_flat,
+            ],
+            device=model.device,
+        )
+
+    def _stage4_zero_world_C(self):
+        model = self.model
+        wp.launch(
+            zero_world_C_and_diag,
+            dim=self.world_count,
+            inputs=[self.world_count, self.pgs_max_constraints],
+            outputs=[self.C, self.diag],
+            device=model.device,
+        )
+
+    def _stage4_hinv_jt_batched_tiled(self, size: int):
+        model = self.model
+        n_arts = self.n_arts_by_size[size]
+        hinv_jt_kernel = TiledKernelFactory.get_hinv_jt_kernel(size, self.pgs_max_constraints, model.device)
+        wp.launch_tiled(
+            hinv_jt_kernel,
+            dim=[n_arts],
+            inputs=[
+                self.L_by_size[size],
+                self.J_by_size[size],
+                self.group_to_art[size],
+                self.art_to_world,
+                self.constraint_count,
+            ],
+            outputs=[self.Y_by_size[size]],
+            block_dim=TILE_THREADS,
+            device=model.device,
+        )
+
+    def _stage4_hinv_jt_batched_tiled_fused(self, size: int):
+        model = self.model
+        n_arts = self.n_arts_by_size[size]
+        hinv_jt_kernel = TiledKernelFactory.get_hinv_jt_fused_kernel(size, self.pgs_max_constraints, model.device)
+        wp.launch_tiled(
+            hinv_jt_kernel,
+            dim=[n_arts],
+            inputs=[
+                self.L_by_size[size],
+                self.J_by_size[size],
+                self.group_to_art[size],
+                self.art_to_world,
+                self.constraint_count,
+                self.row_cfm,
+            ],
+            outputs=[self.C, self.diag, self.Y_by_size[size]],
+            block_dim=TILE_THREADS,
+            device=model.device,
+        )
+
+    def _stage4_hinv_jt_batched_par_row(self, size: int):
+        model = self.model
+        n_arts = self.n_arts_by_size[size]
+        wp.launch(
+            hinv_jt_batched_par_row,
+            dim=n_arts * self.pgs_max_constraints,
+            inputs=[
+                self.L_by_size[size],
+                self.J_by_size[size],
+                self.group_to_art[size],
+                self.art_to_world,
+                self.constraint_count,
+                size,
+                self.pgs_max_constraints,
+                n_arts,
+            ],
+            outputs=[self.Y_by_size[size]],
+            device=model.device,
+        )
+
+    def _stage4_delassus_batched_par_row_col(self, size: int):
+        model = self.model
+        n_arts = self.n_arts_by_size[size]
+        wp.launch(
+            delassus_batched_par_row_col,
+            dim=n_arts * self.pgs_max_constraints * self.pgs_max_constraints,
+            inputs=[
+                self.J_by_size[size],
+                self.Y_by_size[size],
+                self.group_to_art[size],
+                self.art_to_world,
+                self.constraint_count,
+                size,
+                self.pgs_max_constraints,
+                n_arts,
+            ],
+            outputs=[self.C, self.diag],
+            device=model.device,
+        )
+
+    def _stage4_finalize_world_diag_cfm(self):
+        model = self.model
+        wp.launch(
+            finalize_world_diag_cfm,
+            dim=self.world_count,
+            inputs=[self.constraint_count, self.row_cfm],
+            outputs=[self.diag],
+            device=model.device,
+        )
+
+    def _stage4_compute_rhs_flat(self, dt: float):
+        model = self.model
+        wp.launch(
+            contact_bias_flat_par_row,
+            dim=model.articulation_count * self.pgs_max_constraints,
+            inputs=[
+                self.articulation_dof_start,
+                self.articulation_H_rows,
+                self.constraint_count_flat,
+                model.articulation_count,
+                self.pgs_max_constraints,
+                self.articulation_max_dofs,
+                self.J_flat,
+                self.v_hat,
+                self.phi_flat,
+                self.row_beta_flat,
+                self.row_type_flat,
+                self.target_velocity_flat,
+                dt,
+            ],
+            outputs=[self.rhs_flat],
+            device=model.device,
+        )
+
+    def _stage4_compute_rhs_world(self, dt: float):
+        model = self.model
+        wp.launch(
+            compute_world_contact_bias,
+            dim=self.world_count,
+            inputs=[
+                self.constraint_count,
+                self.pgs_max_constraints,
+                self.phi,
+                self.row_beta,
+                self.row_type,
+                self.target_velocity,
+                dt,
+            ],
+            outputs=[self.rhs],
+            device=model.device,
+        )
+
+    def _stage4_accumulate_rhs_world(self, size: int):
+        model = self.model
+        n_arts = self.n_arts_by_size[size]
+        wp.launch(
+            rhs_accum_world_par_art,
+            dim=n_arts,
+            inputs=[
+                self.constraint_count,
+                self.pgs_max_constraints,
+                self.art_to_world,
+                self.art_size,
+                self.art_group_idx,
+                self.articulation_dof_start,
+                self.v_hat,
+                self.group_to_art[size],
+                self.J_by_size[size],
+                size,
+            ],
+            outputs=[self.rhs],
+            device=model.device,
+        )
+
+    def _stage5_prepare_impulses_flat(self):
+        model = self.model
+        warmstart_flag = 1 if self.pgs_warmstart else 0
+        wp.launch(
+            prepare_impulses,
+            dim=model.articulation_count,
+            inputs=[
+                self.constraint_count_flat,
+                self.pgs_max_constraints,
+                warmstart_flag,
+                self.impulses_flat,
+            ],
+            device=model.device,
+        )
+
+    def _stage5_prepare_impulses_world(self):
+        warmstart_flag = 1 if self.pgs_warmstart else 0
+        wp.launch(
+            prepare_world_impulses,
+            dim=self.world_count,
+            inputs=[self.constraint_count, self.pgs_max_constraints, warmstart_flag],
+            outputs=[self.impulses],
+            device=self.model.device,
+        )
+
+    def _stage5_pgs_solve_flat_tiled(self):
+        model = self.model
+        M = self.pgs_max_constraints
+        A = model.articulation_count
+        diag2 = self.diag_flat.reshape((A, M))
+        rhs2 = self.rhs_flat.reshape((A, M))
+        lam2 = self.impulses_flat.reshape((A, M))
+        C3 = self.C_flat.reshape((A, M, M))
+        rtype2 = self.row_type_flat.reshape((A, M))
+        mu2 = self.row_mu_flat.reshape((A, M))
+        parent2_local = self.row_parent_local_flat.reshape((A, M))
+
+        pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_kernel(M, model.device)
+        wp.launch_tiled(
+            pgs_kernel,
+            dim=[A],
+            inputs=[
+                self.constraint_count_flat,
+                diag2,
+                C3,
+                rhs2,
+                lam2,
+                self.pgs_iterations,
+                self.pgs_omega,
+                rtype2,
+                parent2_local,
+                mu2,
+            ],
+            block_dim=32,
+            device=model.device,
+        )
+
+    def _stage5_pgs_solve_flat_loop(self):
+        model = self.model
+        M = self.pgs_max_constraints
+        A = model.articulation_count
+        diag2 = self.diag_flat.reshape((A, M))
+        rhs2 = self.rhs_flat.reshape((A, M))
+        lam2 = self.impulses_flat.reshape((A, M))
+        C3 = self.C_flat.reshape((A, M, M))
+        rtype2 = self.row_type_flat.reshape((A, M))
+        mu2 = self.row_mu_flat.reshape((A, M))
+        parent2_local = self.row_parent_local_flat.reshape((A, M))
+
+        wp.launch(
+            pgs_solve_loop,
+            dim=A,
+            inputs=[
+                self.constraint_count_flat,
+                M,
+                diag2,
+                C3,
+                rhs2,
+                lam2,
+                self.pgs_iterations,
+                self.pgs_omega,
+                rtype2,
+                parent2_local,
+                mu2,
+            ],
+            device=model.device,
+        )
+
+    def _stage5_pgs_solve_world_tiled(self):
+        pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_kernel(self.pgs_max_constraints, self.model.device)
+        wp.launch_tiled(
+            pgs_kernel,
+            dim=[self.world_count],
+            inputs=[
+                self.constraint_count,
+                self.diag,
+                self.C,
+                self.rhs,
+                self.impulses,
+                self.pgs_iterations,
+                self.pgs_omega,
+                self.row_type,
+                self.row_parent,
+                self.row_mu,
+            ],
+            block_dim=32,
+            device=self.model.device,
+        )
+
+    def _stage5_pgs_solve_world_loop(self):
+        wp.launch(
+            pgs_solve_loop,
+            dim=self.world_count,
+            inputs=[
+                self.constraint_count,
+                self.pgs_max_constraints,
+                self.diag,
+                self.C,
+                self.rhs,
+                self.impulses,
+                self.pgs_iterations,
+                self.pgs_omega,
+                self.row_type,
+                self.row_parent,
+                self.row_mu,
+            ],
+            device=self.model.device,
+        )
+
+    def _stage6_apply_impulses_flat(self):
+        model = self.model
+        wp.launch(
+            apply_impulses_flat_par_dof,
+            dim=model.articulation_count * self.articulation_max_dofs,
+            inputs=[
+                self.articulation_dof_start,
+                self.articulation_H_rows,
+                self.constraint_count_flat,
+                self.pgs_max_constraints,
+                self.articulation_max_dofs,
+                self.Y_flat,
+                self.v_hat,
+                self.impulses_flat,
+            ],
+            outputs=[self.v_out],
+            device=model.device,
+        )
+
+    def _stage6_prepare_world_velocity(self):
+        wp.copy(self.v_out, self.v_hat)
+
+    def _stage6_apply_impulses_world(self, size: int):
+        model = self.model
+        n_arts = self.n_arts_by_size[size]
+        wp.launch(
+            apply_impulses_world_par_dof,
+            dim=int(n_arts * size),
+            inputs=[
+                self.group_to_art[size],
+                self.art_to_world,
+                self.articulation_dof_start,
+                size,
+                n_arts,
+                self.constraint_count,
+                self.pgs_max_constraints,
+                self.Y_by_size[size],
+                self.impulses,
+                self.v_hat,
+            ],
+            outputs=[self.v_out],
+            device=model.device,
+        )
+
+    def _stage6_update_qdd(self, state_in: State, state_aug: State, dt: float):
+        model = self.model
+        wp.launch(
+            update_qdd_from_velocity,
+            dim=model.joint_dof_count,
+            inputs=[state_in.joint_qd, self.v_out, 1.0 / dt],
+            outputs=[state_aug.joint_qdd],
+            device=model.device,
+        )
+
+    def _stage6_integrate(self, state_in: State, state_aug: State, state_out: State, dt: float):
+        model = self.model
+
+        if model.joint_count:
+            wp.launch(
+                kernel=integrate_generalized_joints,
+                dim=model.joint_count,
+                inputs=[
+                    model.joint_type,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    state_in.joint_q,
+                    state_in.joint_qd,
+                    state_aug.joint_qdd,
+                    dt,
+                ],
+                outputs=[state_out.joint_q, state_out.joint_qd],
+                device=model.device,
+            )
+
+            # update maximal coordinates
+            eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
 
         self.integrate_particles(model, state_in, state_out, dt)
 
-        self._step += 1
 
-        return state_out
+class TiledKernelFactory:
+    """Factory for generating size-specialized tiled kernels for heterogeneous multi-articulation.
+
+    This factory generates and caches tiled kernels specialized for specific DOF counts,
+    enabling optimal tiled operations (Cholesky, triangular solves) for articulations
+    with different numbers of degrees of freedom.
+
+    The pattern follows ik_lbfgs_optimizer.py: kernels are generated on-demand with
+    wp.constant() captured via closure, then cached by (dimensions, device.arch).
+    """
+
+    # Class-level caches: key -> compiled kernel
+    _hinv_jt_flat_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
+    _cholesky_flat_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
+    _triangular_solve_flat_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
+    _hinv_jt_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
+    _hinv_jt_fused_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
+    _cholesky_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
+    _pgs_solve_tiled_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
+    _triangular_solve_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
+
+    @classmethod
+    def get_hinv_jt_flat_kernel(cls, n_dofs: int, max_constraints: int, device: "wp.Device") -> "wp.Kernel":
+        """Get or create a tiled flat H^-1*J^T kernel for the given dimensions."""
+        key = (n_dofs, max_constraints, device.arch)
+        if key not in cls._hinv_jt_flat_cache:
+            cls._hinv_jt_flat_cache[key] = cls._build_hinv_jt_flat_kernel(n_dofs, max_constraints)
+        return cls._hinv_jt_flat_cache[key]
+
+    @classmethod
+    def _build_hinv_jt_flat_kernel(cls, n_dofs: int, max_constraints: int) -> "wp.Kernel":
+        """Build specialized flat H^-1*J^T kernel for given dimensions."""
+        dofs = int(n_dofs)
+        max_c = int(max_constraints)
+        TILE_DOF_LOCAL = wp.constant(dofs)
+        TILE_CONSTRAINTS_LOCAL = wp.constant(max_c)
+
+        def hinv_jt_flat_tiled_template(
+            constraint_counts: wp.array(dtype=int),
+            L: wp.array3d(dtype=float),  # [arts, n_dofs, n_dofs]
+            J_rows: wp.array3d(dtype=float),  # [arts, max_c, n_dofs]
+            row_cfm: wp.array(dtype=float),
+            # outputs
+            Y: wp.array3d(dtype=float),  # [arts, max_c, n_dofs]
+            C: wp.array3d(dtype=float),  # [arts, max_c, max_c]
+            diag_out: wp.array(dtype=float),
+        ):
+            art, thread = wp.tid()
+            constraint_count = constraint_counts[art]
+
+            if constraint_count == 0:
+                return
+
+            L_tile = wp.tile_load(L[art], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
+            J_tile = wp.tile_load(J_rows[art], shape=(TILE_CONSTRAINTS_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
+
+            # Solve L * Z = J^T (forward substitution)
+            Z_tile = wp.tile_lower_solve(L_tile, wp.tile_transpose(J_tile))
+
+            # Solve L^T * X = Z (backward substitution)
+            U_tile = wp.tile_transpose(L_tile)
+            X_tile = wp.tile_upper_solve(U_tile, Z_tile)
+
+            C_tile = wp.tile_zeros(shape=(TILE_CONSTRAINTS_LOCAL, TILE_CONSTRAINTS_LOCAL), dtype=wp.float32)
+
+            # Store Y = H^-1 * J^T (transpose back to row layout)
+            wp.tile_store(Y[art], wp.tile_transpose(X_tile))
+
+            # Form C = J * H^-1 * J^T
+            wp.tile_matmul(J_tile, X_tile, C_tile)
+            wp.tile_store(C[art], C_tile)
+
+            if thread == 0:
+                diag_base = art * max_c
+                for i in range(constraint_count):
+                    diag_out[diag_base + i] = C_tile[i, i] + row_cfm[diag_base + i]
+
+        hinv_jt_flat_tiled_template.__name__ = f"hinv_jt_flat_tiled_{dofs}_{max_c}"
+        hinv_jt_flat_tiled_template.__qualname__ = f"hinv_jt_flat_tiled_{dofs}_{max_c}"
+        return wp.kernel(enable_backward=False, module="unique")(hinv_jt_flat_tiled_template)
+
+    @classmethod
+    def get_cholesky_flat_kernel(cls, n_dofs: int, device: "wp.Device") -> "wp.Kernel":
+        """Get or create a tiled flat Cholesky kernel for the given DOF count."""
+        key = (n_dofs, device.arch)
+        if key not in cls._cholesky_flat_cache:
+            cls._cholesky_flat_cache[key] = cls._build_cholesky_flat_kernel(n_dofs)
+        return cls._cholesky_flat_cache[key]
+
+    @classmethod
+    def _build_cholesky_flat_kernel(cls, n_dofs: int) -> "wp.Kernel":
+        """Build specialized flat Cholesky kernel for given DOF count."""
+        dofs = int(n_dofs)
+        TILE_DOF_LOCAL = wp.constant(dofs)
+
+        def cholesky_flat_tiled_template(
+            H: wp.array3d(dtype=float),  # [arts, n_dofs, n_dofs]
+            R: wp.array2d(dtype=float),  # [arts, n_dofs]
+            mass_update_mask: wp.array(dtype=int),
+            # output
+            L: wp.array3d(dtype=float),  # [arts, n_dofs, n_dofs]
+        ):
+            art = wp.tid()
+
+            if mass_update_mask[art] == 0:
+                return
+
+            H_tile = wp.tile_load(H[art], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
+            armature = wp.tile_load(R[art], shape=(TILE_DOF_LOCAL,), bounds_check=False)
+
+            H_tile = wp.tile_diag_add(H_tile, armature)
+            L_tile = wp.tile_cholesky(H_tile)
+
+            wp.tile_store(L[art], L_tile)
+
+        cholesky_flat_tiled_template.__name__ = f"cholesky_flat_tiled_{dofs}"
+        cholesky_flat_tiled_template.__qualname__ = f"cholesky_flat_tiled_{dofs}"
+        return wp.kernel(enable_backward=False, module="unique")(cholesky_flat_tiled_template)
+
+    @classmethod
+    def get_triangular_solve_flat_kernel(cls, n_dofs: int, device: "wp.Device") -> "wp.Kernel":
+        """Get or create a tiled flat triangular solve kernel for the given DOF count."""
+        key = (n_dofs, device.arch)
+        if key not in cls._triangular_solve_flat_cache:
+            cls._triangular_solve_flat_cache[key] = cls._build_triangular_solve_flat_kernel(n_dofs)
+        return cls._triangular_solve_flat_cache[key]
+
+    @classmethod
+    def _build_triangular_solve_flat_kernel(cls, n_dofs: int) -> "wp.Kernel":
+        """Build specialized flat triangular solve kernel for given DOF count."""
+        dofs = int(n_dofs)
+        TILE_DOF_LOCAL = wp.constant(dofs)
+
+        def trisolve_flat_tiled_template(
+            L: wp.array3d(dtype=float),  # [arts, n_dofs, n_dofs]
+            tau: wp.array3d(dtype=float),  # [arts, n_dofs, 1]
+            # output
+            qdd: wp.array3d(dtype=float),  # [arts, n_dofs, 1]
+        ):
+            art = wp.tid()
+
+            L_tile = wp.tile_load(L[art], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
+            tau_tile = wp.tile_load(tau[art], shape=(TILE_DOF_LOCAL, 1), bounds_check=False)
+
+            z_tile = wp.tile_lower_solve(L_tile, tau_tile)
+            Lt_tile = wp.tile_transpose(L_tile)
+            qdd_tile = wp.tile_upper_solve(Lt_tile, z_tile)
+
+            wp.tile_store(qdd[art], qdd_tile)
+
+        trisolve_flat_tiled_template.__name__ = f"trisolve_flat_tiled_{dofs}"
+        trisolve_flat_tiled_template.__qualname__ = f"trisolve_flat_tiled_{dofs}"
+        return wp.kernel(enable_backward=False, module="unique")(trisolve_flat_tiled_template)
+
+    @classmethod
+    def get_hinv_jt_kernel(cls, n_dofs: int, max_constraints: int, device: "wp.Device") -> "wp.Kernel":
+        """Get or create a tiled H^-1*J^T kernel for the given dimensions."""
+        key = (n_dofs, max_constraints, device.arch)
+        if key not in cls._hinv_jt_cache:
+            cls._hinv_jt_cache[key] = cls._build_hinv_jt_kernel(n_dofs, max_constraints)
+        return cls._hinv_jt_cache[key]
+
+    @classmethod
+    def get_hinv_jt_fused_kernel(cls, n_dofs: int, max_constraints: int, device: "wp.Device") -> "wp.Kernel":
+        """Get or create a tiled fused H^-1*J^T + Delassus kernel for the given dimensions."""
+        key = (n_dofs, max_constraints, device.arch)
+        if key not in cls._hinv_jt_fused_cache:
+            cls._hinv_jt_fused_cache[key] = cls._build_hinv_jt_fused_kernel(n_dofs, max_constraints)
+        return cls._hinv_jt_fused_cache[key]
+
+    @classmethod
+    def _build_hinv_jt_kernel(cls, n_dofs: int, max_constraints: int) -> "wp.Kernel":
+        """Build specialized H^-1*J^T kernel for given dimensions.
+
+        Solves Y = H^-1 * J^T using tiled Cholesky solve:
+          L * L^T * Y = J^T
+          => L * Z = J^T (forward solve)
+          => L^T * Y = Z (backward solve)
+        """
+        # Create compile-time constants via closure
+        # Convert to Python int to ensure wp.constant() accepts them
+        TILE_DOF_LOCAL = wp.constant(int(n_dofs))
+        TILE_CONSTRAINTS_LOCAL = wp.constant(int(max_constraints))
+
+        def hinv_jt_batched_tiled_template(
+            L_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
+            J_group: wp.array3d(dtype=float),  # [n_arts, max_c, n_dofs]
+            group_to_art: wp.array(dtype=int),
+            art_to_world: wp.array(dtype=int),
+            world_constraint_count: wp.array(dtype=int),
+            # output
+            Y_group: wp.array3d(dtype=float),  # [n_arts, max_c, n_dofs]
+        ):
+            idx = wp.tid()
+            art = group_to_art[idx]
+            world = art_to_world[art]
+            n_constraints = world_constraint_count[world]
+
+            if n_constraints == 0:
+                return
+
+            # Load L (Cholesky factor) and J (Jacobian rows)
+            L_tile = wp.tile_load(L_group[idx], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
+            J_tile = wp.tile_load(J_group[idx], shape=(TILE_CONSTRAINTS_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
+
+            # Solve L * Z = J^T (forward substitution)
+            # J_tile is (max_c x n_dofs), J^T is (n_dofs x max_c)
+            Jt_tile = wp.tile_transpose(J_tile)
+            Z_tile = wp.tile_lower_solve(L_tile, Jt_tile)
+
+            # Solve L^T * Y = Z (backward substitution)
+            Lt_tile = wp.tile_transpose(L_tile)
+            X_tile = wp.tile_upper_solve(Lt_tile, Z_tile)
+
+            # Store Y = H^-1 * J^T (transpose back to row layout)
+            Y_out_tile = wp.tile_transpose(X_tile)
+            wp.tile_store(Y_group[idx], Y_out_tile)
+
+        hinv_jt_batched_tiled_template.__name__ = f"hinv_jt_batched_tiled_{n_dofs}_{max_constraints}"
+        hinv_jt_batched_tiled_template.__qualname__ = f"hinv_jt_batched_tiled_{n_dofs}_{max_constraints}"
+        return wp.kernel(enable_backward=False, module="unique")(hinv_jt_batched_tiled_template)
+
+    @classmethod
+    def _build_hinv_jt_fused_kernel(cls, n_dofs: int, max_constraints: int) -> "wp.Kernel":
+        """Build specialized fused H^-1*J^T + Delassus kernel for given dimensions."""
+        TILE_DOF_LOCAL = wp.constant(int(n_dofs))
+        TILE_CONSTRAINTS_LOCAL = wp.constant(int(max_constraints))
+
+        def hinv_jt_batched_tiled_fused_template(
+            L_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
+            J_group: wp.array3d(dtype=float),  # [n_arts, max_c, n_dofs]
+            group_to_art: wp.array(dtype=int),
+            art_to_world: wp.array(dtype=int),
+            world_constraint_count: wp.array(dtype=int),
+            row_cfm: wp.array2d(dtype=float),
+            # outputs
+            world_C: wp.array3d(dtype=float),  # [world_count, max_c, max_c]
+            world_diag: wp.array2d(dtype=float),  # [world_count, max_c]
+            Y_group: wp.array3d(dtype=float),  # [n_arts, max_c, n_dofs]
+        ):
+            idx, thread = wp.tid()
+            art = group_to_art[idx]
+            world = art_to_world[art]
+            n_constraints = world_constraint_count[world]
+
+            if n_constraints == 0:
+                return
+
+            # Load L (Cholesky factor) and J (Jacobian rows)
+            L_tile = wp.tile_load(L_group[idx], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
+            J_tile = wp.tile_load(J_group[idx], shape=(TILE_CONSTRAINTS_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
+
+            # Solve L * Z = J^T (forward substitution)
+            Jt_tile = wp.tile_transpose(J_tile)
+            Z_tile = wp.tile_lower_solve(L_tile, Jt_tile)
+
+            # Solve L^T * Y = Z (backward substitution)
+            Lt_tile = wp.tile_transpose(L_tile)
+            X_tile = wp.tile_upper_solve(Lt_tile, Z_tile)
+
+            # Store Y = H^-1 * J^T (transpose back to row layout)
+            Y_out_tile = wp.tile_transpose(X_tile)
+            wp.tile_store(Y_group[idx], Y_out_tile)
+
+            # Form C = J * H^-1 * J^T
+            C_tile = wp.tile_zeros(shape=(TILE_CONSTRAINTS_LOCAL, TILE_CONSTRAINTS_LOCAL), dtype=wp.float32)
+            wp.tile_matmul(J_tile, X_tile, C_tile)
+            wp.tile_store(world_C[world], C_tile)
+
+            if thread == 0:
+                for i in range(n_constraints):
+                    world_diag[world, i] = C_tile[i, i] + row_cfm[world, i]
+
+        hinv_jt_batched_tiled_fused_template.__name__ = f"hinv_jt_batched_tiled_fused_{n_dofs}_{max_constraints}"
+        hinv_jt_batched_tiled_fused_template.__qualname__ = f"hinv_jt_batched_tiled_fused_{n_dofs}_{max_constraints}"
+        return wp.kernel(enable_backward=False, module="unique")(hinv_jt_batched_tiled_fused_template)
+
+    @classmethod
+    def get_cholesky_kernel(cls, n_dofs: int, device: "wp.Device") -> "wp.Kernel":
+        """Get or create a tiled Cholesky kernel for the given DOF count."""
+        key = (n_dofs, device.arch)
+        if key not in cls._cholesky_cache:
+            cls._cholesky_cache[key] = cls._build_cholesky_kernel(n_dofs)
+        return cls._cholesky_cache[key]
+
+    @classmethod
+    def _build_cholesky_kernel(cls, n_dofs: int) -> "wp.Kernel":
+        """Build specialized Cholesky kernel for given DOF count.
+
+        Computes L such that H + diag(armature) = L * L^T.
+        """
+        # Convert to Python int to ensure wp.constant() accepts them
+        TILE_DOF_LOCAL = wp.constant(int(n_dofs))
+
+        def cholesky_batched_tiled_template(
+            H_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
+            R_group: wp.array2d(dtype=float),  # [n_arts, n_dofs] armature
+            group_to_art: wp.array(dtype=int),
+            mass_update_mask: wp.array(dtype=int),
+            # output
+            L_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
+        ):
+            idx = wp.tid()
+            art = group_to_art[idx]
+
+            if mass_update_mask[art] == 0:
+                return
+
+            # Load H and armature
+            H_tile = wp.tile_load(H_group[idx], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
+            armature = wp.tile_load(R_group[idx], shape=(TILE_DOF_LOCAL,), bounds_check=False)
+
+            # Add armature to diagonal
+            H_tile = wp.tile_diag_add(H_tile, armature)
+
+            # Compute Cholesky factorization
+            L_tile = wp.tile_cholesky(H_tile)
+
+            # Store result
+            wp.tile_store(L_group[idx], L_tile)
+
+        cholesky_batched_tiled_template.__name__ = f"cholesky_batched_tiled_{n_dofs}"
+        cholesky_batched_tiled_template.__qualname__ = f"cholesky_batched_tiled_{n_dofs}"
+        return wp.kernel(enable_backward=False, module="unique")(cholesky_batched_tiled_template)
+
+    @classmethod
+    def get_triangular_solve_kernel(cls, n_dofs: int, device: "wp.Device") -> "wp.Kernel":
+        """Get or create a tiled triangular solve kernel for the given DOF count."""
+        key = (n_dofs, device.arch)
+        if key not in cls._triangular_solve_cache:
+            cls._triangular_solve_cache[key] = cls._build_triangular_solve_kernel(n_dofs)
+        return cls._triangular_solve_cache[key]
+
+    @classmethod
+    def _build_triangular_solve_kernel(cls, n_dofs: int) -> "wp.Kernel":
+        """Build specialized triangular solve kernel for given DOF count.
+
+        Solves L * L^T * x = b for x using tiled forward and backward substitution.
+        """
+        TILE_DOF_LOCAL = wp.constant(int(n_dofs))
+
+        def trisolve_batched_tiled_template(
+            L_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
+            tau_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, 1]
+            qdd_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, 1]
+        ):
+            idx = wp.tid()
+            L_tile = wp.tile_load(L_group[idx], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
+            tau_tile = wp.tile_load(tau_group[idx], shape=(TILE_DOF_LOCAL, 1), bounds_check=False)
+
+            # Forward substitution: L * z = tau
+            z_tile = wp.tile_lower_solve(L_tile, tau_tile)
+
+            # Backward substitution: L^T * qdd = z
+            Lt_tile = wp.tile_transpose(L_tile)
+            qdd_tile = wp.tile_upper_solve(Lt_tile, z_tile)
+
+            wp.tile_store(qdd_group[idx], qdd_tile)
+
+        trisolve_batched_tiled_template.__name__ = f"trisolve_batched_tiled_{n_dofs}"
+        trisolve_batched_tiled_template.__qualname__ = f"trisolve_batched_tiled_{n_dofs}"
+        return wp.kernel(enable_backward=False, module="unique")(trisolve_batched_tiled_template)
+
+    @classmethod
+    def get_pgs_solve_tiled_kernel(cls, max_constraints: int, device: "wp.Device") -> "wp.Kernel":
+        """Get or create a tiled PGS world solve kernel for the given constraint count."""
+        key = (max_constraints, device.arch)
+        if key not in cls._pgs_solve_tiled_cache:
+            cls._pgs_solve_tiled_cache[key] = cls._build_pgs_solve_tiled_kernel(max_constraints)
+        return cls._pgs_solve_tiled_cache[key]
+
+    @classmethod
+    def _build_pgs_solve_tiled_kernel(cls, max_constraints: int) -> "wp.Kernel":
+        """PGS world solve kernel that stages only the LOWER triangle of Delassus.
+
+        Shared memory footprint drops from M*M to M*(M+1)/2 floats.
+        Uses symmetry in dot: C(i,j) = L(i,j) if j<=i else L(j,i).
+        """
+        TILE_M = max_constraints
+        TILE_M_SQ = TILE_M * TILE_M
+        TILE_TRI = TILE_M * (TILE_M + 1) // 2
+
+        ELEMS_PER_THREAD_1D = (TILE_M + 31) // 32
+
+        def gen_load_1d(dst, src):
+            return "\n".join(
+                [
+                    f"    {dst}[lane + {k * 32}] = {src}.data[off1 + lane + {k * 32}];"
+                    for k in range(ELEMS_PER_THREAD_1D)
+                    if (k * 32) < TILE_M
+                ]
+            )
+
+        # Build a deterministic packed-lower-tri index order: row-major over (i, j<=i)
+        # idx = i*(i+1)/2 + j
+        tri_pairs = []
+        for i in range(TILE_M):
+            base = i * (i + 1) // 2
+            for j in range(i + 1):
+                tri_pairs.append((base + j, i, j))
+        assert len(tri_pairs) == TILE_TRI
+
+        load_code = "\n".join(
+            [
+                gen_load_1d("s_lam", "world_impulses"),
+                gen_load_1d("s_rhs", "world_rhs"),
+                gen_load_1d("s_diag", "world_diag"),
+                gen_load_1d("s_rtype", "world_row_type"),
+                gen_load_1d("s_parent", "world_row_parent"),
+                gen_load_1d("s_mu", "world_row_mu"),
+            ]
+        )
+
+        # Precompute lane's column indices (j_k) and their triangular bases (j_k*(j_k+1)/2)
+        # so inside the dot we avoid multiply.
+        precompute_j = []
+        for k in range(ELEMS_PER_THREAD_1D):
+            j = k * 32
+            if j < TILE_M:
+                precompute_j.append(
+                    f"    const int j{k} = lane + {j};\n    const int jb{k} = (j{k} * (j{k} + 1)) >> 1;"
+                )
+        precompute_j_code = "\n".join(precompute_j)
+
+        # Dot code: guarded on j_k < m
+        dot_terms = []
+        for k in range(ELEMS_PER_THREAD_1D):
+            joff = k * 32
+            if joff < TILE_M:
+                dot_terms.append(
+                    f"""    if (j{k} < m) {{
+            // Use symmetry to fetch C(i, j{k}) from packed-lower shared.
+            // base_i = i*(i+1)/2
+            float cij = (j{k} <= i) ? s_Ctri[base_i + j{k}] : s_Ctri[jb{k} + i];
+            my_sum += cij * s_lam[j{k}];
+        }}"""
+                )
+        dot_code = "\n".join(["float my_sum = 0.0f;", "int base_i = (i * (i + 1)) >> 1;", *dot_terms])
+
+        store_code = "\n".join(
+            [
+                f"    world_impulses.data[off1 + lane + {k * 32}] = s_lam[lane + {k * 32}];"
+                for k in range(ELEMS_PER_THREAD_1D)
+                if (k * 32) < TILE_M
+            ]
+        )
+
+        snippet = f"""
+    #if defined(__CUDA_ARCH__)
+        const int TILE_M = {TILE_M};
+        const int TILE_M_SQ = {TILE_M_SQ};
+        const int TILE_TRI = {TILE_TRI};
+        const unsigned MASK = 0xFFFFFFFF;
+
+        int lane = threadIdx.x;
+
+        int m = world_constraint_count.data[world];
+        if (m == 0) return;
+
+        // Packed LOWER triangle of C in row-major (i*(i+1)/2 + j), j<=i
+        __shared__ float s_Ctri[TILE_TRI];
+
+        __shared__ float s_lam[TILE_M];
+        __shared__ float s_rhs[TILE_M];
+        __shared__ float s_diag[TILE_M];
+        __shared__ int   s_rtype[TILE_M];
+        __shared__ int   s_parent[TILE_M];
+        __shared__ float s_mu[TILE_M];
+
+        int off1 = world * TILE_M;
+        int off2 = world * TILE_M_SQ;
+
+    {load_code}
+
+        // Load only lower triangle from global full matrix into packed shared.
+        // Work distribution: each lane walks rows; for each row i, lane loads j = lane, lane+32, lane+64...
+        for (int i = 0; i < TILE_M; ++i) {{
+            int base = (i * (i + 1)) >> 1; // packed base for row i
+            for (int j = lane; j <= i; j += 32) {{
+                s_Ctri[base + j] = world_C.data[off2 + i * TILE_M + j];
+            }}
+        }}
+        __syncwarp();
+
+    {precompute_j_code}
+
+        for (int iter = 0; iter < iterations; iter++) {{
+            for (int i = 0; i < m; i++) {{
+                // NOTE: single-warp kernel; __syncwarp here is typically unnecessary unless divergence occurs
+                // before the dot. If you want max perf, try removing it after verifying correctness.
+                // __syncwarp();
+
+                {dot_code}
+
+                // Warp reduce my_sum
+                my_sum += __shfl_down_sync(MASK, my_sum, 16);
+                my_sum += __shfl_down_sync(MASK, my_sum, 8);
+                my_sum += __shfl_down_sync(MASK, my_sum, 4);
+                my_sum += __shfl_down_sync(MASK, my_sum, 2);
+                my_sum += __shfl_down_sync(MASK, my_sum, 1);
+                float dot_sum = __shfl_sync(MASK, my_sum, 0);
+
+                float denom = s_diag[i];
+                if (denom <= 0.0f) continue;
+
+                float w_val = s_rhs[i] + dot_sum;
+                float delta = -w_val / denom;
+                float new_impulse = s_lam[i] + omega * delta;
+                int row_type = s_rtype[i];
+
+                if (row_type == 0) {{
+                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    s_lam[i] = new_impulse;
+                }} else if (row_type == 2) {{
+                    int parent_idx = s_parent[i];
+                    float lambda_n = s_lam[parent_idx];
+                    float mu = s_mu[i];
+                    float radius = fmaxf(mu * lambda_n, 0.0f);
+
+                    if (radius <= 0.0f) {{
+                        s_lam[i] = 0.0f;
+                    }} else {{
+                        s_lam[i] = new_impulse;
+                        int sib = (i == parent_idx + 1) ? (parent_idx + 2) : (parent_idx + 1);
+                        float a = s_lam[i];
+                        float b = s_lam[sib];
+                        float mag = sqrtf(a * a + b * b);
+                        if (mag > radius) {{
+                            float scale = radius / mag;
+                            s_lam[i] = a * scale;
+                            s_lam[sib] = b * scale;
+                        }}
+                    }}
+                }} else {{
+                    s_lam[i] = new_impulse;
+                }}
+            }}
+        }}
+
+    {store_code}
+    #endif
+    """
+
+        @wp.func_native(snippet)
+        def pgs_solve_native(
+            world: int,
+            world_constraint_count: wp.array(dtype=int),
+            world_diag: wp.array2d(dtype=float),
+            world_C: wp.array3d(dtype=float),
+            world_rhs: wp.array2d(dtype=float),
+            world_impulses: wp.array2d(dtype=float),
+            iterations: int,
+            omega: float,
+            world_row_type: wp.array2d(dtype=int),
+            world_row_parent: wp.array2d(dtype=int),
+            world_row_mu: wp.array2d(dtype=float),
+        ): ...
+
+        def pgs_solve_tiled_template(
+            world_constraint_count: wp.array(dtype=int),
+            world_diag: wp.array2d(dtype=float),
+            world_C: wp.array3d(dtype=float),
+            world_rhs: wp.array2d(dtype=float),
+            world_impulses: wp.array2d(dtype=float),
+            iterations: int,
+            omega: float,
+            world_row_type: wp.array2d(dtype=int),
+            world_row_parent: wp.array2d(dtype=int),
+            world_row_mu: wp.array2d(dtype=float),
+        ):
+            world, _lane = wp.tid()
+            pgs_solve_native(
+                world,
+                world_constraint_count,
+                world_diag,
+                world_C,
+                world_rhs,
+                world_impulses,
+                iterations,
+                omega,
+                world_row_type,
+                world_row_parent,
+                world_row_mu,
+            )
+
+        pgs_solve_tiled_template.__name__ = f"pgs_solve_tiled_tri_{max_constraints}"
+        pgs_solve_tiled_template.__qualname__ = f"pgs_solve_tiled_tri_{max_constraints}"
+        return wp.kernel(enable_backward=False, module="unique")(pgs_solve_tiled_template)
