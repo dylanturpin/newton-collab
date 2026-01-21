@@ -213,7 +213,7 @@ class Example:
         if solver_type == "feather_pgs":
             kernel_mode = "auto" if use_tiled else "loop"
             hinv_jt_mode = "auto" if use_tiled else "par_row"
-            pgs_mode = "tiled" if use_tiled else "loop"
+            pgs_mode = "tiled_contact" if use_tiled else "loop"
             solver_kwargs = {
                 "update_mass_matrix_interval": update_mass_matrix_interval,
                 "pgs_iterations": pgs_iterations,
