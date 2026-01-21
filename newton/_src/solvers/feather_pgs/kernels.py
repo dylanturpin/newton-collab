@@ -21,7 +21,6 @@ from ...sim.articulation import (
     compute_2d_rotational_dofs,
     compute_3d_rotational_dofs,
 )
-from ..semi_implicit.kernels_body import joint_force
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 PGS_CONSTRAINT_TYPE_JOINT_TARGET = 1
@@ -356,24 +355,12 @@ def jcalc_motion(
 @wp.func
 def jcalc_tau(
     type: int,
-    joint_target_ke: wp.array(dtype=float),
-    joint_target_kd: wp.array(dtype=float),
-    joint_limit_ke: wp.array(dtype=float),
-    joint_limit_kd: wp.array(dtype=float),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
-    joint_q: wp.array(dtype=float),
-    joint_qd: wp.array(dtype=float),
     joint_f: wp.array(dtype=float),
-    joint_target_pos: wp.array(dtype=float),
-    joint_target_vel: wp.array(dtype=float),
-    joint_limit_lower: wp.array(dtype=float),
-    joint_limit_upper: wp.array(dtype=float),
-    coord_start: int,
     dof_start: int,
     lin_axis_count: int,
     ang_axis_count: int,
     body_f_s: wp.spatial_vector,
-    use_joint_targets: int,
     # outputs
     tau: wp.array(dtype=float),
 ):
@@ -405,38 +392,8 @@ def jcalc_tau(
         for i in range(axis_count):
             j = dof_start + i
             S_s = joint_S_s[j]
-
-            q = joint_q[coord_start + i]
-            qd = joint_qd[j]
-
-            lower = joint_limit_lower[j]
-            upper = joint_limit_upper[j]
-            limit_ke = joint_limit_ke[j]
-            limit_kd = joint_limit_kd[j]
-            target_ke = joint_target_ke[j]
-            target_kd = joint_target_kd[j]
-            target_pos = joint_target_pos[j]
-            target_vel = joint_target_vel[j]
-
-            drive_f = 0.0
-            if use_joint_targets:
-                drive_f = joint_force(
-                    q,
-                    qd,
-                    target_pos,
-                    target_vel,
-                    target_ke,
-                    target_kd,
-                    lower,
-                    upper,
-                    limit_ke,
-                    limit_kd,
-                )
-
-            # total torque / force on the joint
-            t = -wp.dot(S_s, body_f_s) + drive_f + joint_f[j]
-
-            tau[j] = t
+            # total torque / force on the joint (drive forces handled via augmented mass)
+            tau[j] = -wp.dot(S_s, body_f_s) + joint_f[j]
 
         return
 
@@ -754,7 +711,7 @@ def compute_link_velocity(
 
     # body velocity, acceleration
     v_s = v_parent_s + v_j_s
-    a_s = a_parent_s + spatial_cross(v_s, v_j_s)  # + joint_S_s[i]*self.joint_qdd[i]
+    a_s = a_parent_s + spatial_cross(v_s, v_j_s)
 
     # compute body forces
     X_sm = body_q_com[child]
@@ -837,26 +794,14 @@ def eval_rigid_tau(
     joint_type: wp.array(dtype=int),
     joint_parent: wp.array(dtype=int),
     joint_child: wp.array(dtype=int),
-    joint_q_start: wp.array(dtype=int),
     joint_qd_start: wp.array(dtype=int),
     joint_dof_dim: wp.array(dtype=int, ndim=2),
-    joint_target_pos: wp.array(dtype=float),
-    joint_target_vel: wp.array(dtype=float),
-    joint_q: wp.array(dtype=float),
-    joint_qd: wp.array(dtype=float),
     joint_f: wp.array(dtype=float),
-    joint_target_ke: wp.array(dtype=float),
-    joint_target_kd: wp.array(dtype=float),
-    joint_limit_lower: wp.array(dtype=float),
-    joint_limit_upper: wp.array(dtype=float),
-    joint_limit_ke: wp.array(dtype=float),
-    joint_limit_kd: wp.array(dtype=float),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     body_fb_s: wp.array(dtype=wp.spatial_vector),
     body_f_ext: wp.array(dtype=wp.spatial_vector),
     body_q: wp.array(dtype=wp.transform),
     body_com: wp.array(dtype=wp.vec3),
-    use_joint_targets: int,
     # outputs
     body_ft_s: wp.array(dtype=wp.spatial_vector),
     tau: wp.array(dtype=float),
@@ -877,7 +822,6 @@ def eval_rigid_tau(
         parent = joint_parent[i]
         child = joint_child[i]
         dof_start = joint_qd_start[i]
-        coord_start = joint_q_start[i]
         lin_axis_count = joint_dof_dim[i, 0]
         ang_axis_count = joint_dof_dim[i, 1]
 
@@ -902,24 +846,12 @@ def eval_rigid_tau(
         # compute joint-space forces, writes out tau
         jcalc_tau(
             type,
-            joint_target_ke,
-            joint_target_kd,
-            joint_limit_ke,
-            joint_limit_kd,
             joint_S_s,
-            joint_q,
-            joint_qd,
             joint_f,
-            joint_target_pos,
-            joint_target_vel,
-            joint_limit_lower,
-            joint_limit_upper,
-            coord_start,
             dof_start,
             lin_axis_count,
             ang_axis_count,
             f_s,
-            use_joint_targets,
             tau,
         )
 
@@ -988,7 +920,7 @@ def compute_composite_inertia(
 
 
 @wp.kernel
-def eval_crba_fill_parallel(
+def crba_fill_flat_par_dof(
     articulation_start: wp.array(dtype=int),
     articulation_dof_start: wp.array(dtype=int),
     articulation_H_start: wp.array(dtype=int),
@@ -1022,7 +954,6 @@ def eval_crba_fill_parallel(
     joint_end = articulation_start[art_idx + 1]
 
     pivot_joint = int(-1)
-    int(-1)
 
     if pivot_joint == -1:
         for j in range(joint_start, joint_end):
@@ -1030,7 +961,6 @@ def eval_crba_fill_parallel(
             q_end = joint_qd_start[j + 1]
             if target_dof_global >= q_start and target_dof_global < q_end:
                 pivot_joint = j
-                target_dof_global - q_start
                 break
 
     if pivot_joint == -1:
@@ -1102,22 +1032,8 @@ def dense_cholesky(
             L[A_start + dense_index(n, i, j)] = s * invS
 
 
-@wp.func_grad(dense_cholesky)
-def adj_dense_cholesky(
-    n: int,
-    A: wp.array(dtype=float),
-    R: wp.array(dtype=float),
-    A_start: int,
-    R_start: int,
-    # outputs
-    L: wp.array(dtype=float),
-):
-    # nop, use dense_solve to differentiate through (A^-1)b = x
-    pass
-
-
 @wp.kernel
-def eval_dense_cholesky_batched(
+def cholesky_flat_loop(
     A_starts: wp.array(dtype=int),
     A_dim: wp.array(dtype=int),
     A: wp.array(dtype=float),
@@ -1125,6 +1041,7 @@ def eval_dense_cholesky_batched(
     mass_update_mask: wp.array(dtype=int),
     L: wp.array(dtype=float),
 ):
+    """Flat layout, loop-based Cholesky (one thread per articulation)."""
     batch = wp.tid()
 
     if mass_update_mask[batch] == 0:
@@ -1135,6 +1052,50 @@ def eval_dense_cholesky_batched(
     R_start = n * batch
 
     dense_cholesky(n, A, R, A_start, R_start, L)
+
+
+@wp.kernel
+def cholesky_batched_loop(
+    H_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
+    R_group: wp.array2d(dtype=float),  # [n_arts, n_dofs]
+    group_to_art: wp.array(dtype=int),
+    mass_update_mask: wp.array(dtype=int),
+    n_dofs: int,
+    # output
+    L_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
+):
+    """Non-tiled Cholesky for grouped articulation storage.
+
+    One thread per articulation, loop-based Cholesky decomposition.
+    Efficient for small articulations where tile overhead dominates.
+    """
+    group_idx = wp.tid()
+    art_idx = group_to_art[group_idx]
+
+    if mass_update_mask[art_idx] == 0:
+        return
+
+    # Cholesky decomposition with regularization: L L^T = H + diag(R)
+    for j in range(n_dofs):
+        # Compute diagonal element L[j,j]
+        s = H_group[group_idx, j, j] + R_group[group_idx, j]
+
+        for k in range(j):
+            r = L_group[group_idx, j, k]
+            s -= r * r
+
+        s = wp.sqrt(s)
+        inv_s = 1.0 / s
+        L_group[group_idx, j, j] = s
+
+        # Compute off-diagonal elements L[i,j] for i > j
+        for i in range(j + 1, n_dofs):
+            s = H_group[group_idx, i, j]
+
+            for k in range(j):
+                s -= L_group[group_idx, i, k] * L_group[group_idx, j, k]
+
+            L_group[group_idx, i, j] = s * inv_s
 
 
 @wp.func
@@ -1183,40 +1144,8 @@ def dense_solve(
     dense_subs(n, L_start, b_start, L, b, x)
 
 
-@wp.func_grad(dense_solve)
-def adj_dense_solve(
-    n: int,
-    L_start: int,
-    b_start: int,
-    A: wp.array(dtype=float),
-    L: wp.array(dtype=float),
-    b: wp.array(dtype=float),
-    # outputs
-    x: wp.array(dtype=float),
-    tmp: wp.array(dtype=float),
-):
-    if not tmp or not wp.adjoint[x] or not wp.adjoint[A] or not wp.adjoint[L]:
-        return
-    for i in range(n):
-        tmp[b_start + i] = 0.0
-
-    dense_subs(n, L_start, b_start, L, wp.adjoint[x], tmp)
-
-    for i in range(n):
-        wp.adjoint[b][b_start + i] += tmp[b_start + i]
-
-    # A* = -adj_b*x^T
-    for i in range(n):
-        for j in range(n):
-            wp.adjoint[L][L_start + dense_index(n, i, j)] += -tmp[b_start + i] * x[b_start + j]
-
-    for i in range(n):
-        for j in range(n):
-            wp.adjoint[A][L_start + dense_index(n, i, j)] += -tmp[b_start + i] * x[b_start + j]
-
-
 @wp.kernel
-def eval_dense_solve_batched(
+def trisolve_flat_loop(
     L_start: wp.array(dtype=int),
     L_dim: wp.array(dtype=int),
     b_start: wp.array(dtype=int),
@@ -1227,6 +1156,7 @@ def eval_dense_solve_batched(
     x: wp.array(dtype=float),
     tmp: wp.array(dtype=float),
 ):
+    """Flat layout, loop-based triangular solve (one thread per articulation)."""
     batch = wp.tid()
 
     dense_solve(L_dim[batch], L_start[batch], b_start[batch], A, L, b, x, tmp)
@@ -1459,11 +1389,23 @@ def build_contact_rows_normal(
 
     phi = wp.dot(n, point_a_world - point_b_world)
 
-    slot = wp.atomic_add(constraint_counts, articulation, 1)
-    if slot >= max_constraints:
+    # Determine upfront if we'll add friction rows (needed for atomic slot allocation)
+    dof_count = articulation_H_rows[articulation]
+    will_add_friction = enable_friction != 0 and mu > 0.0 and dof_count > 0
+
+    # Allocate all slots (normal + 2 friction) in a single atomic operation
+    # This guarantees contiguous layout: [normal, friction1, friction2]
+    slots_needed = 3 if will_add_friction else 1
+    base_slot = wp.atomic_add(constraint_counts, articulation, slots_needed)
+
+    # Check for overflow (all slots must fit)
+    if base_slot + slots_needed > max_constraints:
         return
 
-    phi_index = articulation * max_constraints + slot
+    art_dof_start = articulation_dof_start[articulation]
+
+    # --- Normal contact row at base_slot ---
+    phi_index = articulation * max_constraints + base_slot
     phi_out[phi_index] = phi
     row_beta[phi_index] = contact_beta
     row_cfm[phi_index] = contact_cfm
@@ -1471,11 +1413,10 @@ def build_contact_rows_normal(
     target_velocity[phi_index] = 0.0
     row_parent[phi_index] = -1
     row_mu[phi_index] = mu
-    row_base = (articulation * max_constraints + slot) * max_dofs
+
+    row_base = phi_index * max_dofs
     for col in range(max_dofs):
         Jc_out[row_base + col] = 0.0
-
-    art_dof_start = articulation_dof_start[articulation]
 
     accumulate_contact_jacobian_matrix_free(
         articulation,
@@ -1509,48 +1450,38 @@ def build_contact_rows_normal(
         Jc_out,
     )
 
-    dof_count = articulation_H_rows[articulation]
-    if enable_friction == 0 or mu <= 0.0 or dof_count == 0:
-        return
+    # --- Friction rows at base_slot + 1 and base_slot + 2 ---
+    if will_add_friction:
+        t0, t1 = contact_tangent_basis(n)
 
-    t0, t1 = contact_tangent_basis(n)
-
-    for tangent_index in range(2):
-        tangent = t0
-        if tangent_index == 1:
-            tangent = t1
-
-        tangent_slot = wp.atomic_add(constraint_counts, articulation, 1)
-        if tangent_slot >= max_constraints:
-            return
-
-        row_index = articulation * max_constraints + tangent_slot
-        tangent_base = row_index * max_dofs
+        # Friction row 1 at base_slot + 1
+        row_index_1 = articulation * max_constraints + base_slot + 1
+        tangent_base_1 = row_index_1 * max_dofs
 
         for col in range(max_dofs):
-            Jc_out[tangent_base + col] = 0.0
+            Jc_out[tangent_base_1 + col] = 0.0
 
-        row_beta[row_index] = 0.0
-        row_cfm[row_index] = contact_cfm
-        row_types[row_index] = PGS_CONSTRAINT_TYPE_FRICTION
-        target_velocity[row_index] = 0.0
-        phi_out[row_index] = 0.0
-        row_parent[row_index] = phi_index
-        row_mu[row_index] = mu
+        row_beta[row_index_1] = 0.0
+        row_cfm[row_index_1] = contact_cfm
+        row_types[row_index_1] = PGS_CONSTRAINT_TYPE_FRICTION
+        target_velocity[row_index_1] = 0.0
+        phi_out[row_index_1] = 0.0
+        row_parent[row_index_1] = phi_index
+        row_mu[row_index_1] = mu
 
         accumulate_contact_jacobian_matrix_free(
             articulation,
             body_a,
             1.0,
             point_a_world,
-            tangent,
+            t0,
             body_to_joint,
             body_to_articulation,
             joint_ancestor,
             joint_qd_start,
             joint_S_s,
             art_dof_start,
-            tangent_base,
+            tangent_base_1,
             Jc_out,
         )
 
@@ -1559,129 +1490,63 @@ def build_contact_rows_normal(
             body_b,
             -1.0,
             point_b_world,
-            tangent,
+            t0,
             body_to_joint,
             body_to_articulation,
             joint_ancestor,
             joint_qd_start,
             joint_S_s,
             art_dof_start,
-            tangent_base,
+            tangent_base_1,
             Jc_out,
         )
 
+        # Friction row 2 at base_slot + 2
+        row_index_2 = articulation * max_constraints + base_slot + 2
+        tangent_base_2 = row_index_2 * max_dofs
 
-@wp.kernel
-def build_joint_target_rows(
-    articulation_start: wp.array(dtype=int),
-    articulation_H_rows: wp.array(dtype=int),
-    articulation_dof_start: wp.array(dtype=int),
-    joint_type: wp.array(dtype=int),
-    joint_q_start: wp.array(dtype=int),
-    joint_qd_start: wp.array(dtype=int),
-    joint_dof_dim: wp.array(dtype=int, ndim=2),
-    joint_target_ke: wp.array(dtype=float),
-    joint_target_kd: wp.array(dtype=float),
-    joint_q: wp.array(dtype=float),
-    joint_target_pos: wp.array(dtype=float),
-    joint_target_vel: wp.array(dtype=float),
-    # in-out
-    constraint_counts: wp.array(dtype=int),
-    max_constraints: int,
-    max_dofs: int,
-    row_beta: wp.array(dtype=float),
-    row_cfm: wp.array(dtype=float),
-    row_types: wp.array(dtype=int),
-    target_velocity: wp.array(dtype=float),
-    phi_out: wp.array(dtype=float),
-    J_rows: wp.array(dtype=float),
-    row_parent: wp.array(dtype=int),
-    row_mu: wp.array(dtype=float),
-    dt: float,
-    default_beta: float,
-    default_cfm: float,
-    beta_override: float,
-    cfm_override: float,
-):
-    articulation = wp.tid()
-    dof_count = articulation_H_rows[articulation]
-    if dof_count == 0:
-        return
+        for col in range(max_dofs):
+            Jc_out[tangent_base_2 + col] = 0.0
 
-    joint_start = articulation_start[articulation]
-    joint_end = articulation_start[articulation + 1]
-    slot = constraint_counts[articulation]
-    dof_start = articulation_dof_start[articulation]
+        row_beta[row_index_2] = 0.0
+        row_cfm[row_index_2] = contact_cfm
+        row_types[row_index_2] = PGS_CONSTRAINT_TYPE_FRICTION
+        target_velocity[row_index_2] = 0.0
+        phi_out[row_index_2] = 0.0
+        row_parent[row_index_2] = phi_index
+        row_mu[row_index_2] = mu
 
-    for joint_index in range(joint_start, joint_end):
-        if slot >= max_dofs:
-            break
-        type = joint_type[joint_index]
-        if type != JointType.PRISMATIC and type != JointType.REVOLUTE and type != JointType.D6:
-            continue
+        accumulate_contact_jacobian_matrix_free(
+            articulation,
+            body_a,
+            1.0,
+            point_a_world,
+            t1,
+            body_to_joint,
+            body_to_articulation,
+            joint_ancestor,
+            joint_qd_start,
+            joint_S_s,
+            art_dof_start,
+            tangent_base_2,
+            Jc_out,
+        )
 
-        lin_axis_count = joint_dof_dim[joint_index, 0]
-        ang_axis_count = joint_dof_dim[joint_index, 1]
-        axis_count = lin_axis_count + ang_axis_count
-
-        qd_start = joint_qd_start[joint_index]
-        coord_start = joint_q_start[joint_index]
-
-        for axis in range(axis_count):
-            if slot >= max_constraints:
-                break
-
-            dof_index = qd_start + axis
-            coord_index = coord_start + axis
-
-            ke = joint_target_ke[dof_index]
-            kd = joint_target_kd[dof_index]
-
-            if ke <= 0.0 and kd <= 0.0:
-                continue
-
-            local_dof = dof_index - dof_start
-            if local_dof < 0 or local_dof >= max_dofs:
-                continue
-
-            row_index = articulation * max_constraints + slot
-            row_base = row_index * max_dofs
-
-            for col in range(max_dofs):
-                J_rows[row_base + col] = 0.0
-
-            J_rows[row_base + local_dof] = 1.0
-
-            phi = joint_q[coord_index] - joint_target_pos[dof_index]
-            phi_out[row_index] = phi
-            target_velocity[row_index] = joint_target_vel[dof_index]
-            row_types[row_index] = PGS_CONSTRAINT_TYPE_JOINT_TARGET
-            row_parent[row_index] = -1
-            row_mu[row_index] = 0.0
-
-            denom = kd + dt * ke
-            beta_drive = default_beta
-            cfm_drive = default_cfm
-
-            if beta_override >= 0.0:
-                beta_drive = beta_override
-            elif denom > 0.0:
-                beta_drive = dt * ke / denom
-
-            if cfm_override >= 0.0:
-                cfm_drive = cfm_override
-            elif denom > 0.0:
-                cfm_drive = 1.0 / denom
-
-            row_beta[row_index] = beta_drive
-            row_cfm[row_index] = cfm_drive
-
-            slot += 1
-
-            if slot >= max_constraints:
-                break
-
-    constraint_counts[articulation] = slot
+        accumulate_contact_jacobian_matrix_free(
+            articulation,
+            body_b,
+            -1.0,
+            point_b_world,
+            t1,
+            body_to_joint,
+            body_to_articulation,
+            joint_ancestor,
+            joint_qd_start,
+            joint_S_s,
+            art_dof_start,
+            tangent_base_2,
+            Jc_out,
+        )
 
 
 @wp.kernel
@@ -1709,7 +1574,7 @@ def build_augmented_joint_rows(
     limit_counts: wp.array(dtype=int),
 ):
     articulation = wp.tid()
-    if max_dofs == 0 or dt <= 0.0:
+    if max_dofs == 0:
         row_counts[articulation] = 0
         limit_counts[articulation] = 0
         return
@@ -1797,6 +1662,436 @@ def build_mass_update_mask(
     mass_update_mask[tid] = flag
 
 
+# =============================================================================
+# Multi-Articulation Contact Building Kernels
+# =============================================================================
+# These kernels enable contacts between multiple articulations within the same
+# world. The constraint system becomes world-level instead of per-articulation.
+
+
+@wp.kernel
+def allocate_world_contact_slots(
+    contact_count: wp.array(dtype=int),
+    contact_shape0: wp.array(dtype=int),
+    contact_shape1: wp.array(dtype=int),
+    shape_body: wp.array(dtype=int),
+    body_to_articulation: wp.array(dtype=int),
+    art_to_world: wp.array(dtype=int),
+    max_constraints: int,
+    enable_friction: int,
+    # outputs
+    contact_world: wp.array(dtype=int),
+    contact_slot: wp.array(dtype=int),
+    contact_art_a: wp.array(dtype=int),
+    contact_art_b: wp.array(dtype=int),
+    world_slot_counter: wp.array(dtype=int),
+):
+    """
+    Phase 1 of multi-articulation contact building.
+
+    Allocates world-level constraint slots for each contact and records
+    which articulations are involved.
+
+    Each contact reserves 3 slots (normal + 2 friction) in its world's constraint buffer.
+    """
+    c = wp.tid()
+    total_contacts = contact_count[0]
+    if c >= total_contacts:
+        contact_slot[c] = -1
+        return
+
+    shape_a = contact_shape0[c]
+    shape_b = contact_shape1[c]
+
+    # Get bodies and articulations
+    body_a = -1
+    body_b = -1
+    if shape_a >= 0:
+        body_a = shape_body[shape_a]
+    if shape_b >= 0:
+        body_b = shape_body[shape_b]
+
+    art_a = -1
+    art_b = -1
+    if body_a >= 0:
+        art_a = body_to_articulation[body_a]
+    if body_b >= 0:
+        art_b = body_to_articulation[body_b]
+
+    # Determine world (both bodies must be in same world, or one is ground)
+    world = -1
+    if art_a >= 0:
+        world = art_to_world[art_a]
+    if art_b >= 0:
+        world_b = art_to_world[art_b]
+        if world >= 0 and world_b != world:
+            # Cross-world contact - shouldn't happen, skip
+            contact_slot[c] = -1
+            return
+        world = world_b
+
+    if world < 0:
+        # No articulation involved (ground-ground?)
+        contact_slot[c] = -1
+        return
+
+    # Allocate slots (1 normal + 2 friction)
+    slots_needed = 1
+    if enable_friction != 0:
+        slots_needed = 3
+
+    slot = wp.atomic_add(world_slot_counter, world, slots_needed)
+
+    if slot + slots_needed > max_constraints:
+        # Overflow - skip this contact
+        contact_slot[c] = -1
+        return
+
+    contact_world[c] = world
+    contact_slot[c] = slot
+    contact_art_a[c] = art_a
+    contact_art_b[c] = art_b
+
+
+@wp.func
+def accumulate_jacobian_row_world(
+    body_index: int,
+    sign: float,
+    point_world: wp.vec3,
+    direction: wp.vec3,
+    body_to_joint: wp.array(dtype=int),
+    joint_ancestor: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_S_s: wp.array(dtype=wp.spatial_vector),
+    art_dof_start: int,
+    n_dofs: int,
+    group_idx: int,
+    row: int,
+    J_group: wp.array3d(dtype=float),
+):
+    """Accumulate Jacobian contributions by walking up the kinematic tree."""
+    if body_index < 0:
+        return
+
+    curr_joint = body_to_joint[body_index]
+
+    while curr_joint >= 0:
+        dof_start = joint_qd_start[curr_joint]
+        dof_end = joint_qd_start[curr_joint + 1]
+
+        for global_dof in range(dof_start, dof_end):
+            S = joint_S_s[global_dof]
+            lin = wp.vec3(S[0], S[1], S[2])
+            ang = wp.vec3(S[3], S[4], S[5])
+
+            # Velocity at contact point from this joint
+            v = lin + wp.cross(ang, point_world)
+            proj = wp.dot(direction, v)
+
+            local_dof = global_dof - art_dof_start
+            if local_dof >= 0 and local_dof < n_dofs:
+                J_group[group_idx, row, local_dof] += sign * proj
+
+        curr_joint = joint_ancestor[curr_joint]
+
+
+@wp.kernel
+def populate_world_J_for_size(
+    contact_count: wp.array(dtype=int),
+    contact_point0: wp.array(dtype=wp.vec3),
+    contact_point1: wp.array(dtype=wp.vec3),
+    contact_normal: wp.array(dtype=wp.vec3),
+    contact_shape0: wp.array(dtype=int),
+    contact_shape1: wp.array(dtype=int),
+    contact_thickness0: wp.array(dtype=float),
+    contact_thickness1: wp.array(dtype=float),
+    contact_world: wp.array(dtype=int),
+    contact_slot: wp.array(dtype=int),
+    contact_art_a: wp.array(dtype=int),
+    contact_art_b: wp.array(dtype=int),
+    target_size: int,
+    art_size: wp.array(dtype=int),
+    art_group_idx: wp.array(dtype=int),
+    art_dof_start: wp.array(dtype=int),
+    body_to_joint: wp.array(dtype=int),
+    joint_ancestor: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_S_s: wp.array(dtype=wp.spatial_vector),
+    shape_body: wp.array(dtype=int),
+    body_q: wp.array(dtype=wp.transform),
+    shape_transform: wp.array(dtype=wp.transform),
+    shape_material_mu: wp.array(dtype=float),
+    enable_friction: int,
+    pgs_beta: float,
+    pgs_cfm: float,
+    # outputs
+    J_group: wp.array3d(dtype=float),
+    world_row_type: wp.array2d(dtype=int),
+    world_row_parent: wp.array2d(dtype=int),
+    world_row_mu: wp.array2d(dtype=float),
+    world_row_beta: wp.array2d(dtype=float),
+    world_row_cfm: wp.array2d(dtype=float),
+    world_phi: wp.array2d(dtype=float),
+    world_target_velocity: wp.array2d(dtype=float),
+):
+    """
+    Phase 2 of multi-articulation contact building (per size group).
+
+    Populates the Jacobian matrix for articulations of a specific DOF size.
+    Each contact may contribute to multiple articulations' J matrices.
+    """
+    c = wp.tid()
+    total_contacts = contact_count[0]
+    if c >= total_contacts:
+        return
+
+    slot = contact_slot[c]
+    if slot < 0:
+        return
+
+    world = contact_world[c]
+    art_a = contact_art_a[c]
+    art_b = contact_art_b[c]
+
+    # Get contact geometry
+    normal = contact_normal[c]
+    shape_a = contact_shape0[c]
+    shape_b = contact_shape1[c]
+
+    body_a = -1
+    body_b = -1
+    if shape_a >= 0:
+        body_a = shape_body[shape_a]
+    if shape_b >= 0:
+        body_b = shape_body[shape_b]
+
+    thickness_a = contact_thickness0[c]
+    thickness_b = contact_thickness1[c]
+
+    # Compute contact points in world frame
+    point_a_local = contact_point0[c]
+    point_b_local = contact_point1[c]
+    point_a_world = wp.vec3(0.0)
+    point_b_world = wp.vec3(0.0)
+
+    if body_a >= 0:
+        X_wb_a = body_q[body_a]
+        X_bs_a = shape_transform[shape_a]
+        X_ws_a = wp.transform_multiply(X_wb_a, X_bs_a)
+        point_a_world = wp.transform_point(X_ws_a, point_a_local) - thickness_a * normal
+    else:
+        point_a_world = point_a_local - thickness_a * normal
+
+    if body_b >= 0:
+        X_wb_b = body_q[body_b]
+        X_bs_b = shape_transform[shape_b]
+        X_ws_b = wp.transform_multiply(X_wb_b, X_bs_b)
+        point_b_world = wp.transform_point(X_ws_b, point_b_local) + thickness_b * normal
+    else:
+        point_b_world = point_b_local + thickness_b * normal
+
+    # Compute penetration depth
+    phi = wp.dot(normal, point_a_world - point_b_world)
+
+    # Compute friction coefficient
+    mu = 0.0
+    mat_count = 0
+    if shape_a >= 0:
+        mu += shape_material_mu[shape_a]
+        mat_count += 1
+    if shape_b >= 0:
+        mu += shape_material_mu[shape_b]
+        mat_count += 1
+    if mat_count > 0:
+        mu /= float(mat_count)
+
+    # Compute tangent basis for friction
+    t0, t1 = contact_tangent_basis(normal)
+
+    # Handle articulation A if it matches target size
+    if art_a >= 0 and art_size[art_a] == target_size:
+        group_idx_a = art_group_idx[art_a]
+        dof_start_a = art_dof_start[art_a]
+
+        # Normal row (slot + 0)
+        accumulate_jacobian_row_world(
+            body_a,
+            1.0,
+            point_a_world,
+            normal,
+            body_to_joint,
+            joint_ancestor,
+            joint_qd_start,
+            joint_S_s,
+            dof_start_a,
+            target_size,
+            group_idx_a,
+            slot,
+            J_group,
+        )
+
+        if enable_friction != 0:
+            # Friction row 1 (slot + 1)
+            accumulate_jacobian_row_world(
+                body_a,
+                1.0,
+                point_a_world,
+                t0,
+                body_to_joint,
+                joint_ancestor,
+                joint_qd_start,
+                joint_S_s,
+                dof_start_a,
+                target_size,
+                group_idx_a,
+                slot + 1,
+                J_group,
+            )
+            # Friction row 2 (slot + 2)
+            accumulate_jacobian_row_world(
+                body_a,
+                1.0,
+                point_a_world,
+                t1,
+                body_to_joint,
+                joint_ancestor,
+                joint_qd_start,
+                joint_S_s,
+                dof_start_a,
+                target_size,
+                group_idx_a,
+                slot + 2,
+                J_group,
+            )
+
+    # Handle articulation B if it matches target size
+    if art_b >= 0 and art_size[art_b] == target_size:
+        group_idx_b = art_group_idx[art_b]
+        dof_start_b = art_dof_start[art_b]
+
+        # Opposite sign for body B
+        accumulate_jacobian_row_world(
+            body_b,
+            -1.0,
+            point_b_world,
+            normal,
+            body_to_joint,
+            joint_ancestor,
+            joint_qd_start,
+            joint_S_s,
+            dof_start_b,
+            target_size,
+            group_idx_b,
+            slot,
+            J_group,
+        )
+
+        if enable_friction != 0:
+            accumulate_jacobian_row_world(
+                body_b,
+                -1.0,
+                point_b_world,
+                t0,
+                body_to_joint,
+                joint_ancestor,
+                joint_qd_start,
+                joint_S_s,
+                dof_start_b,
+                target_size,
+                group_idx_b,
+                slot + 1,
+                J_group,
+            )
+            accumulate_jacobian_row_world(
+                body_b,
+                -1.0,
+                point_b_world,
+                t1,
+                body_to_joint,
+                joint_ancestor,
+                joint_qd_start,
+                joint_S_s,
+                dof_start_b,
+                target_size,
+                group_idx_b,
+                slot + 2,
+                J_group,
+            )
+
+    # Set row metadata (only once per contact, from whichever articulation runs first)
+    # Use art_a preferentially to avoid double-writes
+    if art_a >= 0 and art_size[art_a] == target_size:
+        # Normal contact row
+        world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
+        world_row_parent[world, slot] = -1
+        world_row_mu[world, slot] = mu
+        world_row_beta[world, slot] = pgs_beta
+        world_row_cfm[world, slot] = pgs_cfm
+        world_phi[world, slot] = phi
+        world_target_velocity[world, slot] = 0.0
+
+        if enable_friction != 0:
+            # Friction row 1
+            world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_FRICTION
+            world_row_parent[world, slot + 1] = slot
+            world_row_mu[world, slot + 1] = mu
+            world_row_beta[world, slot + 1] = 0.0
+            world_row_cfm[world, slot + 1] = pgs_cfm
+            world_phi[world, slot + 1] = 0.0
+            world_target_velocity[world, slot + 1] = 0.0
+
+            # Friction row 2
+            world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_FRICTION
+            world_row_parent[world, slot + 2] = slot
+            world_row_mu[world, slot + 2] = mu
+            world_row_beta[world, slot + 2] = 0.0
+            world_row_cfm[world, slot + 2] = pgs_cfm
+            world_phi[world, slot + 2] = 0.0
+            world_target_velocity[world, slot + 2] = 0.0
+
+    elif art_b >= 0 and art_size[art_b] == target_size:
+        # Only write metadata from art_b if art_a didn't match this size
+        world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
+        world_row_parent[world, slot] = -1
+        world_row_mu[world, slot] = mu
+        world_row_beta[world, slot] = pgs_beta
+        world_row_cfm[world, slot] = pgs_cfm
+        world_phi[world, slot] = phi
+        world_target_velocity[world, slot] = 0.0
+
+        if enable_friction != 0:
+            world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_FRICTION
+            world_row_parent[world, slot + 1] = slot
+            world_row_mu[world, slot + 1] = mu
+            world_row_beta[world, slot + 1] = 0.0
+            world_row_cfm[world, slot + 1] = pgs_cfm
+            world_phi[world, slot + 1] = 0.0
+            world_target_velocity[world, slot + 1] = 0.0
+
+            world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_FRICTION
+            world_row_parent[world, slot + 2] = slot
+            world_row_mu[world, slot + 2] = mu
+            world_row_beta[world, slot + 2] = 0.0
+            world_row_cfm[world, slot + 2] = pgs_cfm
+            world_phi[world, slot + 2] = 0.0
+            world_target_velocity[world, slot + 2] = 0.0
+
+
+@wp.kernel
+def finalize_world_constraint_counts(
+    world_slot_counter: wp.array(dtype=int),
+    max_constraints: int,
+    # outputs
+    world_constraint_count: wp.array(dtype=int),
+):
+    """Copy and clamp the slot counter to constraint counts."""
+    world = wp.tid()
+    count = world_slot_counter[world]
+    if count > max_constraints:
+        count = max_constraints
+    world_constraint_count[world] = count
+
+
 @wp.kernel
 def clamp_contact_counts(
     constraint_counts: wp.array(dtype=int),
@@ -1852,6 +2147,46 @@ def apply_augmented_mass_diagonal(
 
 
 @wp.kernel
+def apply_augmented_mass_diagonal_grouped(
+    group_to_art: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    n_dofs: int,
+    max_dofs: int,
+    mass_update_mask: wp.array(dtype=int),
+    row_counts: wp.array(dtype=int),
+    row_dof_index: wp.array(dtype=int),
+    row_K: wp.array(dtype=float),
+    # outputs
+    H_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
+):
+    """Apply augmented mass diagonal for grouped H storage."""
+    idx = wp.tid()
+    articulation = group_to_art[idx]
+
+    if mass_update_mask[articulation] == 0:
+        return
+
+    count = row_counts[articulation]
+    if count == 0:
+        return
+
+    dof_start = articulation_dof_start[articulation]
+
+    for i in range(count):
+        row_index = articulation * max_dofs + i
+        dof = row_dof_index[row_index]
+        local = dof - dof_start
+        if local < 0 or local >= n_dofs:
+            continue
+
+        K = row_K[row_index]
+        if K <= 0.0:
+            continue
+
+        H_group[idx, local, local] += K
+
+
+@wp.kernel
 def apply_augmented_joint_tau(
     max_dofs: int,
     row_counts: wp.array(dtype=int),
@@ -1879,7 +2214,7 @@ def apply_augmented_joint_tau(
 
 
 @wp.kernel
-def apply_hinv_Jt_multi_rhs(
+def hinv_jt_flat_par_row(
     articulation_H_start: wp.array(dtype=int),
     articulation_H_rows: wp.array(dtype=int),
     max_constraints: int,
@@ -1890,6 +2225,7 @@ def apply_hinv_Jt_multi_rhs(
     # outputs
     Y_rows: wp.array(dtype=float),
 ):
+    """Flat layout, par-row H^-1 J^T (one thread per (articulation, constraint))."""
     # One thread per (articulation, local_constraint)
     tid = wp.tid()
 
@@ -1946,7 +2282,7 @@ def apply_hinv_Jt_multi_rhs(
 
 
 @wp.kernel
-def form_contact_matrix(
+def delassus_flat_par_row(
     articulation_H_rows: wp.array(dtype=int),
     max_constraints: int,
     max_dofs: int,
@@ -1958,6 +2294,7 @@ def form_contact_matrix(
     diag_out: wp.array(dtype=float),
     matrix_out: wp.array(dtype=float),
 ):
+    """Flat layout, par-row Delassus accumulation (one thread per row)."""
     idx = wp.tid()
     articulation = idx // max_constraints
     i_row = idx % max_constraints
@@ -1988,53 +2325,12 @@ def form_contact_matrix(
         matrix_out[mat_base + i_row * max_constraints + j] = s
 
 
-# @wp.kernel
-# def form_contact_matrix(
-#     articulation_H_rows: wp.array(dtype=int),
-#     max_constraints: int,
-#     max_dofs: int,
-#     constraint_counts: wp.array(dtype=int),
-#     J_rows: wp.array(dtype=float),
-#     Y_rows: wp.array(dtype=float),
-#     row_cfm: wp.array(dtype=float),
-#     # outputs
-#     diag_out: wp.array(dtype=float),
-#     matrix_out: wp.array(dtype=float),
-# ):
-#     articulation = wp.tid()
-#     m = constraint_counts[articulation]
-#     n = articulation_H_rows[articulation]
-
-#     if m == 0 or n == 0:
-#         return
-
-#     diag_base = articulation * max_constraints
-#     mat_base = articulation * max_constraints * max_constraints
-
-#     for i in range(m):
-#         row_i = (articulation * max_constraints + i) * max_dofs
-
-#         diag_val = float(0.0)
-#         for k in range(n):
-#             diag_val += J_rows[row_i + k] * Y_rows[row_i + k]
-
-#         diag_out[diag_base + i] = diag_val + row_cfm[diag_base + i]
-
-#         for j in range(m):
-#             row_j = (articulation * max_constraints + j) * max_dofs
-
-#             s = float(0.0)
-#             for k in range(n):
-#                 s += J_rows[row_i + k] * Y_rows[row_j + k]
-
-#             matrix_out[mat_base + i * max_constraints + j] = s
-
-
 @wp.kernel
-def compute_contact_bias(
+def contact_bias_flat_par_row(
     articulation_dof_start: wp.array(dtype=int),
     articulation_H_rows: wp.array(dtype=int),
     constraint_counts: wp.array(dtype=int),
+    articulation_count: int,
     max_constraints: int,
     max_dofs: int,
     J_rows: wp.array(dtype=float),
@@ -2047,42 +2343,55 @@ def compute_contact_bias(
     # outputs
     rhs_out: wp.array(dtype=float),
 ):
-    articulation = wp.tid()
-    m = constraint_counts[articulation]
-    n = articulation_H_rows[articulation]
+    """Parallelized contact bias computation - one thread per constraint slot.
 
-    if m == 0 or n == 0 or dt <= 0.0:
+    Launched with dim = articulation_count * max_constraints.
+    Each thread computes J*v_hat for one constraint and the corresponding RHS.
+    """
+    tid = wp.tid()
+    articulation = tid // max_constraints
+    constraint_idx = tid % max_constraints
+
+    # Bounds check
+    if articulation >= articulation_count:
+        return
+
+    m = constraint_counts[articulation]
+    if constraint_idx >= m:
+        return
+
+    n = articulation_H_rows[articulation]
+    if n == 0:
         return
 
     dof_start = articulation_dof_start[articulation]
-    rhs_base = articulation * max_constraints
+    row_base = tid * max_dofs  # = (articulation * max_constraints + constraint_idx) * max_dofs
+    rhs_idx = articulation * max_constraints + constraint_idx
 
-    for i in range(m):
-        row_base = (articulation * max_constraints + i) * max_dofs
+    # Compute J * v_hat (dot product)
+    rel_vel = float(0.0)
+    for k in range(n):
+        rel_vel += J_rows[row_base + k] * v_hat[dof_start + k]
 
-        rel_vel = float(0.0)
-        for k in range(n):
-            rel_vel += J_rows[row_base + k] * v_hat[dof_start + k]
+    # Load constraint parameters
+    gap = phi[rhs_idx]
+    beta_val = row_beta[rhs_idx]
+    constraint_type = row_types[rhs_idx]
+    target_vel = target_velocity[rhs_idx]
 
-        gap = phi[rhs_base + i]
-        beta_val = row_beta[rhs_base + i]
-        constraint_type = row_types[rhs_base + i]
-        target_vel = target_velocity[rhs_base + i]
-
-        if constraint_type == PGS_CONSTRAINT_TYPE_CONTACT:
-            rhs = rel_vel - target_vel
-            if gap < 0.0 and dt > 0.0:
-                rhs += beta_val * gap / dt
-            rhs_out[rhs_base + i] = rhs
-        elif constraint_type == PGS_CONSTRAINT_TYPE_FRICTION:
-            rhs_out[rhs_base + i] = rel_vel - target_vel
-        elif constraint_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
-            correction = 0.0
-            if dt > 0.0:
-                correction = beta_val * gap / dt
-            rhs_out[rhs_base + i] = rel_vel - target_vel + correction
-        else:
-            rhs_out[rhs_base + i] = rel_vel
+    # Compute RHS based on constraint type
+    if constraint_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        rhs = rel_vel - target_vel
+        if gap < 0.0:
+            rhs += beta_val * gap / dt
+        rhs_out[rhs_idx] = rhs
+    elif constraint_type == PGS_CONSTRAINT_TYPE_FRICTION:
+        rhs_out[rhs_idx] = rel_vel - target_vel
+    elif constraint_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+        correction = beta_val * gap / dt
+        rhs_out[rhs_idx] = rel_vel - target_vel + correction
+    else:
+        rhs_out[rhs_idx] = rel_vel
 
 
 @wp.kernel
@@ -2103,114 +2412,7 @@ def prepare_impulses(
 
 
 @wp.kernel
-def pgs_solve_contacts(
-    constraint_counts: wp.array(dtype=int),
-    max_constraints: int,
-    diag: wp.array(dtype=float),
-    matrix: wp.array(dtype=float),
-    rhs: wp.array(dtype=float),
-    impulses: wp.array(dtype=float),
-    iterations: int,
-    omega: float,
-    row_types: wp.array(dtype=int),
-    row_parent: wp.array(dtype=int),
-    row_mu: wp.array(dtype=float),
-):
-    """
-    Projected Gauss-Seidel solver for contact impulses.
-
-    - Normal rows (PGS_CONSTRAINT_TYPE_CONTACT):
-        lambda_n >= 0
-
-    - Friction rows (PGS_CONSTRAINT_TYPE_FRICTION):
-        Isotropic 2D Coulomb friction per contact:
-            ||lambda_t|| <= mu * lambda_n
-        where lambda_t is the 2D vector of the two tangent impulses that
-        share the same parent normal row.
-    """
-    articulation = wp.tid()
-    m = constraint_counts[articulation]
-
-    if m == 0:
-        return
-
-    base = articulation * max_constraints
-    mat_base = articulation * max_constraints * max_constraints
-
-    for _ in range(iterations):
-        for i in range(m):
-            idx = base + i
-            row_offset = mat_base + i * max_constraints
-
-            # compute residual w = rhs_i + sum_j A_ij * lambda_j
-            w = rhs[idx]
-            for j in range(m):
-                w += matrix[row_offset + j] * impulses[base + j]
-
-            denom = diag[idx]
-            if denom <= 0.0:
-                continue
-
-            delta = -w / denom
-            new_impulse = impulses[idx] + omega * delta
-            row_type = row_types[idx]
-
-            # --- Normal contact: lambda_n >= 0 ---
-            if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-                if new_impulse < 0.0:
-                    new_impulse = 0.0
-                impulses[idx] = new_impulse
-
-            # --- Friction: isotropic Coulomb, shared disk per normal ---
-            elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-                parent_idx = row_parent[idx]
-
-                lambda_n = impulses[parent_idx]
-                mu = row_mu[idx]
-                radius = wp.max(mu * lambda_n, 0.0)
-
-                if radius <= 0.0:
-                    impulses[idx] = 0.0
-                    continue
-
-                impulses[idx] = new_impulse
-
-                # Find sibling friction row with the same parent (order varies)
-                sib = int(-1)
-                for j in range(m):
-                    j_idx = base + j
-                    if (
-                        j_idx != idx
-                        and row_types[j_idx] == PGS_CONSTRAINT_TYPE_FRICTION
-                        and row_parent[j_idx] == parent_idx
-                    ):
-                        sib = j_idx
-                        break
-
-                # Build 2D tangential impulse vector (a, b)
-                a = impulses[idx]
-                b = float(0.0)
-                if sib >= 0:
-                    b = impulses[sib]
-
-                mag = wp.sqrt(a * a + b * b)
-
-                # Project (a, b) onto disk { ||t|| <= radius }
-                if mag > radius:
-                    scale = radius / mag
-                    a *= scale
-                    b *= scale
-                    impulses[idx] = a
-                    if sib >= 0:
-                        impulses[sib] = b
-
-            # --- Other constraint types ---
-            else:
-                impulses[idx] = new_impulse
-
-
-@wp.kernel
-def accumulate_contact_velocity(
+def apply_impulses_flat_par_dof(
     articulation_dof_start: wp.array(dtype=int),
     articulation_H_rows: wp.array(dtype=int),
     constraint_counts: wp.array(dtype=int),
@@ -2254,7 +2456,7 @@ def clamp_joint_tau(
 ):
     tid = wp.tid()
 
-    # Per-DoF effort limit (same convention as you use for MuJoCo actuators)
+    # Per-DoF effort limit (same convention as MuJoCo actuators)
     limit = joint_effort_limit[tid]
 
     # If limit <= 0, treat as unlimited
@@ -2272,6 +2474,8 @@ def clamp_joint_tau(
 
 
 # --- Tile configuration for contact system build ---
+# Kernel naming: {op}_{layout}_{parallelism}
+# layout: flat | batched, parallelism: tiled | loop | par_row | par_row_col | par_dof
 
 # Max generalized dofs per articulation we support in the tiled path.
 # joint_dof_count per articulation must be <= TILE_DOF or we use fall back
@@ -2279,168 +2483,10 @@ TILE_DOF = wp.constant(49)
 
 # Max constraints per articulation we support in the tiled path.
 # pgs_max_constraints must be <= TILE_CONSTRAINTS or we use fall back
-TILE_CONSTRAINTS = wp.constant(32)
+TILE_CONSTRAINTS = wp.constant(128)
 
 # Threads per tile/block for tile kernels
 TILE_THREADS = 64
-
-
-@wp.kernel
-def apply_hinv_Jt_multi_rhs_tiled(
-    articulation_H_start: wp.array(dtype=int),
-    articulation_H_rows: wp.array(dtype=int),
-    max_constraints: int,
-    max_dofs: int,
-    constraint_counts: wp.array(dtype=int),
-    L: wp.array3d(dtype=float),
-    J_rows: wp.array3d(dtype=float),
-    row_cfm: wp.array(dtype=float),
-    # outputs
-    Y: wp.array3d(dtype=float),
-    C: wp.array3d(dtype=float),
-    diag_out: wp.array(dtype=float),
-):
-    """
-    Tiled version of H^{-1} J^T application.
-
-    For each articulation 'a', we:
-      - load the lower Cholesky factor L_a (n x n) into a tile (padded to TILE_DOF)
-      - load J_a rows (m x n) into a RHS tile as columns
-      - solve L_a L_a^T X = J^T for X using tile_lower_solve + tile_upper_solve
-      - write X back into Y_rows in the same layout as before
-
-    Assumes:
-      articulation_H_rows[a] <= TILE_DOF
-      constraint_counts[a]   <= TILE_CONSTRAINTS
-    """
-    articulation, thread = wp.tid()
-
-    # --- 1. Load L for this articulation into L_tile (padded) ---
-    L_tile = wp.tile_load(L[articulation], shape=(TILE_DOF, TILE_DOF), bounds_check=False)
-
-    # --- 2. Load J rows into RHS_tile as columns: RHS[:, ci] = J_row(ci)^T ---
-    J_tile = wp.tile_load(J_rows[articulation], shape=(TILE_CONSTRAINTS, TILE_DOF), bounds_check=False)
-
-    # --- 3. Solve L * Z = RHS (forward) ---
-    Z_tile = wp.tile_lower_solve(L_tile, wp.tile_transpose(J_tile))
-
-    # --- 4. Solve L^T * X = Z (backward) ---
-    U_tile = wp.tile_transpose(L_tile)  # U is upper-triangular
-    X_tile = wp.tile_upper_solve(U_tile, Z_tile)
-
-    C_tile = wp.tile_zeros(shape=(TILE_CONSTRAINTS, TILE_CONSTRAINTS), dtype=wp.float32)
-
-    # store Y = H^-1 * J^T (will be re-used during impulse application)
-    wp.tile_store(Y[articulation], wp.tile_transpose(X_tile))
-
-    # form C = J * H^-1 * J^T
-    wp.tile_matmul(J_tile, X_tile, C_tile)
-    wp.tile_store(C[articulation], C_tile)
-
-    if thread == 0:
-        constraint_count = constraint_counts[articulation]
-        diag_base = articulation * max_constraints
-
-        for i in range(constraint_count):
-            # write diagonal of constraint matrix
-            # todo: remove this since we should already
-            # have it during the PGS solve
-            diag_out[diag_base + i] = C_tile[i, i] + row_cfm[diag_base + i]
-
-
-@wp.kernel
-def form_contact_matrix_tiled(
-    articulation_H_rows: wp.array(dtype=int),
-    max_constraints: int,
-    max_dofs: int,
-    constraint_counts: wp.array(dtype=int),
-    J_rows: wp.array(dtype=float),
-    Y_rows: wp.array(dtype=float),
-    row_cfm: wp.array(dtype=float),
-    # outputs
-    diag_out: wp.array(dtype=float),
-    matrix_out: wp.array(dtype=float),
-):
-    """
-    Tiled version of Delassus matrix build:
-        W = J H^{-1} J^T  (plus CFM on diagonal)
-
-    We treat J and Y as (m x n) blocks per articulation, pad them into tiles of
-    size (TILE_CONSTRAINTS x TILE_DOF), and then compute:
-
-        W = J * Y^T
-
-    with tile_matmul.
-    """
-    articulation = wp.tid()
-
-    m = constraint_counts[articulation]
-    n = articulation_H_rows[articulation]
-
-    # constraints (rows) x dofs (cols)
-    J_tile = wp.tile_zeros(shape=(TILE_CONSTRAINTS, TILE_DOF), dtype=wp.float32)
-    Y_tile = wp.tile_zeros(shape=(TILE_CONSTRAINTS, TILE_DOF), dtype=wp.float32)
-
-    # --- 1. Load J and Y into tiles  ---
-    # (not using tile_load since stored flat to support varied sizes)
-
-    for i in range(m):
-        row_i = (articulation * max_constraints + i) * max_dofs
-        for k in range(n):
-            J_tile[i, k] = J_rows[row_i + k]
-            Y_tile[i, k] = Y_rows[row_i + k]
-
-    # --- 2. Compute W = J * Y^T ---
-
-    Y_T = wp.tile_transpose(Y_tile)  # (TILE_DOF x TILE_CONSTRAINTS)
-
-    W_tile = wp.tile_zeros(
-        shape=(TILE_CONSTRAINTS, TILE_CONSTRAINTS),
-        dtype=wp.float32,
-    )
-
-    wp.tile_matmul(J_tile, Y_T, W_tile)
-
-    # --- 3. Write back to diag_out and matrix_out (only m x m) ---
-
-    diag_base = articulation * max_constraints
-    mat_base = articulation * max_constraints * max_constraints
-
-    for i in range(m):
-        # diag
-        diag_val = W_tile[i, i] + row_cfm[diag_base + i]
-        diag_out[diag_base + i] = diag_val
-
-        # full row
-        for j in range(m):
-            matrix_out[mat_base + i * max_constraints + j] = W_tile[i, j]
-
-
-@wp.kernel
-def eval_dense_cholesky_batched_tiled(
-    H_starts: wp.array(dtype=int),
-    H_dim: wp.array(dtype=int),
-    H: wp.array3d(dtype=float),
-    R: wp.array2d(dtype=float),
-    mass_update_mask: wp.array(dtype=int),
-    L: wp.array3d(dtype=float),
-):
-    # articulation index
-    batch = wp.tid()
-
-    if mass_update_mask[batch] == 0:
-        return
-    # Load H
-    H_tile = wp.tile_load(H[batch], shape=(TILE_DOF, TILE_DOF), bounds_check=False)
-    armature = wp.tile_load(R[batch], shape=TILE_DOF, bounds_check=False)
-
-    # add armature to the diagonal of H
-    H_tile = wp.tile_diag_add(H_tile, armature)
-
-    # decomposition
-    L_tile = wp.tile_cholesky(H_tile)
-
-    wp.tile_store(L[batch], L_tile)
 
 
 @wp.kernel
@@ -2463,3 +2509,599 @@ def update_body_qd_from_featherstone(
     v_com = v0 + wp.cross(w, com_world)
 
     body_qd_out[tid] = wp.spatial_vector(v_com, w)
+
+
+# =============================================================================
+# World-Level PGS and Velocity Kernels for Multi-Articulation
+# =============================================================================
+
+
+@wp.kernel
+def compute_world_contact_bias(
+    world_constraint_count: wp.array(dtype=int),
+    max_constraints: int,
+    world_phi: wp.array2d(dtype=float),
+    world_row_beta: wp.array2d(dtype=float),
+    world_row_type: wp.array2d(dtype=int),
+    world_target_velocity: wp.array2d(dtype=float),
+    dt: float,
+    # outputs
+    world_rhs: wp.array2d(dtype=float),
+):
+    """Compute the RHS bias term for world-level PGS solve.
+
+    The RHS follows the convention: rhs = J*v + stabilization
+    For contacts with penetration (phi < 0): rhs = J*v + beta * phi / dt (negative)
+    This leads to positive impulses when resolved by PGS.
+    """
+    world = wp.tid()
+    m = world_constraint_count[world]
+
+    inv_dt = 1.0 / dt
+
+    for i in range(m):
+        phi = world_phi[world, i]
+        beta = world_row_beta[world, i]
+        row_type = world_row_type[world, i]
+        target_vel = world_target_velocity[world, i]
+
+        # Initialize with -target_velocity (will add J*v later)
+        rhs = -target_vel
+
+        # For contacts: add Baumgarte stabilization when penetrating
+        if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+            if phi < 0.0:
+                rhs += beta * phi * inv_dt  # Negative for penetration
+        elif row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+            rhs += beta * phi * inv_dt
+
+        world_rhs[world, i] = rhs
+
+
+@wp.kernel
+def rhs_accum_world_par_art(
+    world_constraint_count: wp.array(dtype=int),
+    max_constraints: int,
+    art_to_world: wp.array(dtype=int),
+    art_size: wp.array(dtype=int),
+    art_group_idx: wp.array(dtype=int),
+    art_dof_start: wp.array(dtype=int),
+    v_hat: wp.array(dtype=float),
+    group_to_art: wp.array(dtype=int),
+    J_group: wp.array3d(dtype=float),
+    n_dofs: int,
+    # outputs
+    world_rhs: wp.array2d(dtype=float),
+):
+    """
+    Accumulate J*v_hat into world RHS for a single size group.
+
+    RHS = J*v + stabilization (already includes stabilization from compute_world_contact_bias)
+    This kernel is launched once per size group to accumulate velocity contributions.
+    """
+    idx = wp.tid()
+    art = group_to_art[idx]
+    world = art_to_world[art]
+    n_constraints = world_constraint_count[world]
+
+    if n_constraints == 0:
+        return
+
+    dof_start = art_dof_start[art]
+
+    for c in range(n_constraints):
+        jv = float(0.0)
+        for d in range(n_dofs):
+            jv += J_group[idx, c, d] * v_hat[dof_start + d]
+        wp.atomic_add(world_rhs, world, c, jv)  # Add J*v (positive)
+
+
+@wp.kernel
+def prepare_world_impulses(
+    world_constraint_count: wp.array(dtype=int),
+    max_constraints: int,
+    warmstart: int,
+    # in/out
+    world_impulses: wp.array2d(dtype=float),
+):
+    """Initialize world impulses (zero or warmstart)."""
+    world = wp.tid()
+    m = world_constraint_count[world]
+
+    for i in range(max_constraints):
+        if warmstart == 0 or i >= m:
+            world_impulses[world, i] = 0.0
+
+
+@wp.kernel
+def pgs_solve_loop(
+    world_constraint_count: wp.array(dtype=int),
+    max_constraints: int,
+    world_diag: wp.array2d(dtype=float),
+    world_C: wp.array3d(dtype=float),
+    world_rhs: wp.array2d(dtype=float),
+    world_impulses: wp.array2d(dtype=float),
+    iterations: int,
+    omega: float,
+    world_row_type: wp.array2d(dtype=int),
+    world_row_parent: wp.array2d(dtype=int),
+    world_row_mu: wp.array2d(dtype=float),
+):
+    """
+    World-level Projected Gauss-Seidel solver.
+
+    Similar to pgs_solve_contacts but operates on 2D world-indexed arrays.
+    """
+    world = wp.tid()
+    m = world_constraint_count[world]
+
+    if m == 0:
+        return
+
+    for _ in range(iterations):
+        for i in range(m):
+            # Compute residual: w = rhs_i + sum_j C_ij * lambda_j
+            w = world_rhs[world, i]
+            for j in range(m):
+                w += world_C[world, i, j] * world_impulses[world, j]
+
+            denom = world_diag[world, i]
+            if denom <= 0.0:
+                continue
+
+            delta = -w / denom
+            new_impulse = world_impulses[world, i] + omega * delta
+            row_type = world_row_type[world, i]
+
+            # --- Normal contact: lambda_n >= 0 ---
+            if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+                if new_impulse < 0.0:
+                    new_impulse = 0.0
+                world_impulses[world, i] = new_impulse
+
+            # --- Friction: isotropic Coulomb ---
+            elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+                parent_idx = world_row_parent[world, i]
+                lambda_n = world_impulses[world, parent_idx]
+                mu = world_row_mu[world, i]
+                radius = wp.max(mu * lambda_n, 0.0)
+
+                if radius <= 0.0:
+                    world_impulses[world, i] = 0.0
+                    continue
+
+                world_impulses[world, i] = new_impulse
+
+                # Sibling friction row: constraints are laid out as [normal, friction1, friction2]
+                # so friction rows are at parent_idx+1 and parent_idx+2
+                if i == parent_idx + 1:
+                    sib = parent_idx + 2
+                else:
+                    sib = parent_idx + 1
+
+                # Project tangent impulses onto friction disk
+                a = world_impulses[world, i]
+                b = world_impulses[world, sib]
+
+                mag = wp.sqrt(a * a + b * b)
+                if mag > radius:
+                    scale = radius / mag
+                    world_impulses[world, i] = a * scale
+                    world_impulses[world, sib] = b * scale
+
+            else:
+                world_impulses[world, i] = new_impulse
+
+
+@wp.kernel
+def apply_impulses_world_par_dof(
+    group_to_art: wp.array(dtype=int),
+    art_to_world: wp.array(dtype=int),
+    art_dof_start: wp.array(dtype=int),
+    n_dofs: int,
+    n_arts: int,
+    world_constraint_count: wp.array(dtype=int),
+    max_constraints: int,
+    Y_group: wp.array3d(dtype=float),
+    world_impulses: wp.array2d(dtype=float),
+    v_hat: wp.array(dtype=float),
+    # outputs
+    v_out: wp.array(dtype=float),
+):
+    """
+    Accumulate velocity changes from world impulses for a single size group.
+    DOF-parallelized: each thread handles one (articulation, DOF) pair.
+
+    v_out = v_hat + Y * impulses
+    """
+    tid = wp.tid()
+
+    # Decode thread index
+    local_dof = tid % n_dofs
+    idx = tid // n_dofs  # group index
+
+    if idx >= n_arts:
+        return
+
+    art = group_to_art[idx]
+    world = art_to_world[art]
+    n_constraints = world_constraint_count[world]
+    dof_start = art_dof_start[art]
+
+    # Inner loop only over constraints
+    delta_v = float(0.0)
+    for c in range(n_constraints):
+        delta_v += Y_group[idx, c, local_dof] * world_impulses[world, c]
+
+    global_dof = dof_start + local_dof
+    v_out[global_dof] = v_hat[global_dof] + delta_v
+
+
+@wp.kernel
+def finalize_world_diag_cfm(
+    world_constraint_count: wp.array(dtype=int),
+    world_row_cfm: wp.array2d(dtype=float),
+    # in/out
+    world_diag: wp.array2d(dtype=float),
+):
+    """Add CFM to world diagonal after Delassus accumulation."""
+    world = wp.tid()
+    m = world_constraint_count[world]
+
+    for i in range(m):
+        world_diag[world, i] += world_row_cfm[world, i]
+
+
+@wp.kernel
+def zero_world_C_and_diag(
+    world_count: int,
+    max_constraints: int,
+    # outputs
+    world_C: wp.array3d(dtype=float),
+    world_diag: wp.array2d(dtype=float),
+):
+    """Zero world Delassus matrices before accumulation."""
+    world = wp.tid()
+    for i in range(max_constraints):
+        world_diag[world, i] = 0.0
+        for j in range(max_constraints):
+            world_C[world, i, j] = 0.0
+
+
+# =============================================================================
+# Parallelized Non-Tiled Kernels for Heterogeneous Multi-Articulation
+# =============================================================================
+# These kernels parallelize across constraints (and constraint pairs) to achieve
+# much better GPU utilization than the single-thread-per-articulation versions.
+
+
+@wp.kernel
+def hinv_jt_batched_par_row(
+    # Grouped Cholesky factor storage [n_arts, n_dofs, n_dofs]
+    L_group: wp.array3d(dtype=float),
+    # Size-grouped Jacobian [n_arts_of_size, max_constraints, n_dofs]
+    J_group: wp.array3d(dtype=float),
+    # Indirection arrays
+    group_to_art: wp.array(dtype=int),
+    art_to_world: wp.array(dtype=int),
+    world_constraint_count: wp.array(dtype=int),
+    # Size parameters
+    n_dofs: int,
+    max_constraints: int,
+    n_arts: int,
+    # Output: Y = H^-1 * J^T [n_arts_of_size, max_constraints, n_dofs]
+    Y_group: wp.array3d(dtype=float),
+):
+    """
+    Compute Y = H^-1 * J^T for one size group using forward/backward substitution.
+
+    GROUPED STORAGE VERSION: Uses L_group (3D array) instead of flat L.
+    Efficient for small articulations where tile overhead dominates.
+
+    Each thread handles one (articulation, constraint) pair.
+
+    For each articulation in the group, solves:
+        L * L^T * Y = J^T
+    Using:
+        1. Forward substitution: L * Z = J^T
+        2. Backward substitution: L^T * Y = Z
+
+    Thread dimension: n_arts_of_size * max_constraints
+    """
+    tid = wp.tid()
+
+    # Decode thread index
+    c = tid % max_constraints  # constraint index
+    idx = tid // max_constraints  # group index (articulation within size group)
+
+    # Bounds check for articulation
+    if idx >= n_arts:
+        return
+
+    art = group_to_art[idx]
+    world = art_to_world[art]
+    n_constraints = world_constraint_count[world]
+
+    # Early exit if this constraint is beyond the actual count
+    if c >= n_constraints:
+        return
+
+    # ----------------------------------------------------------------
+    # Forward substitution: L * z = j
+    # L is lower triangular, so solve from top to bottom
+    # ----------------------------------------------------------------
+    for i in range(n_dofs):
+        # z[i] = (j[i] - sum_{k<i} L[i,k] * z[k]) / L[i,i]
+        val = J_group[idx, c, i]
+
+        for k in range(i):
+            # z[k] is stored in Y_group temporarily
+            val -= L_group[idx, i, k] * Y_group[idx, c, k]
+
+        L_ii = L_group[idx, i, i]
+        if L_ii != 0.0:
+            Y_group[idx, c, i] = val / L_ii
+        else:
+            Y_group[idx, c, i] = 0.0
+
+    # ----------------------------------------------------------------
+    # Backward substitution: L^T * y = z
+    # L^T is upper triangular, so solve from bottom to top
+    # z is currently stored in Y_group, we overwrite with y
+    # ----------------------------------------------------------------
+    for i_rev in range(n_dofs):
+        i = n_dofs - 1 - i_rev
+
+        # y[i] = (z[i] - sum_{k>i} L[k,i] * y[k]) / L[i,i]
+        # Note: L^T[i,k] = L[k,i], so we read L[k,i] for k > i
+        val = Y_group[idx, c, i]  # This is z[i] from forward pass
+
+        for k in range(i + 1, n_dofs):
+            val -= L_group[idx, k, i] * Y_group[idx, c, k]
+
+        L_ii = L_group[idx, i, i]
+        if L_ii != 0.0:
+            Y_group[idx, c, i] = val / L_ii
+        else:
+            Y_group[idx, c, i] = 0.0
+
+
+@wp.kernel
+def delassus_batched_par_row_col(
+    # Size-grouped arrays
+    J_group: wp.array3d(dtype=float),  # [n_arts_of_size, max_constraints, n_dofs]
+    Y_group: wp.array3d(dtype=float),  # [n_arts_of_size, max_constraints, n_dofs]
+    # Indirection arrays
+    group_to_art: wp.array(dtype=int),
+    art_to_world: wp.array(dtype=int),
+    world_constraint_count: wp.array(dtype=int),
+    # Size parameters
+    n_dofs: int,
+    max_constraints: int,
+    n_arts: int,
+    # Output: Delassus matrix C and diagonal (accumulated via atomics)
+    world_C: wp.array3d(dtype=float),  # [world_count, max_constraints, max_constraints]
+    world_diag: wp.array2d(dtype=float),  # [world_count, max_constraints]
+):
+    """
+    Accumulate Delassus matrix contribution C += J * Y^T from one size group.
+
+    PARALLELIZED VERSION: Each thread handles one (articulation, i, j) triplet.
+
+    The Delassus matrix is: C = sum_art J_art * H_art^-1 * J_art^T = sum_art J_art * Y_art^T
+
+    Since Y is stored as [constraint, dof], we compute:
+        C[i,j] = sum_k J[i,k] * Y[j,k]
+
+    Thread dimension: n_arts_of_size * max_constraints * max_constraints
+    """
+    tid = wp.tid()
+
+    # Decode thread index
+    j = tid % max_constraints
+    i = (tid // max_constraints) % max_constraints
+    idx = tid // (max_constraints * max_constraints)
+
+    # Bounds check for articulation
+    if idx >= n_arts:
+        return
+
+    art = group_to_art[idx]
+    world = art_to_world[art]
+    n_constraints = world_constraint_count[world]
+
+    # Early exit if this (i, j) is beyond the actual constraint count
+    if i >= n_constraints or j >= n_constraints:
+        return
+
+    # Compute C[i,j] = sum_k J[i,k] * Y[j,k]
+    val = float(0.0)
+    for k in range(n_dofs):
+        val += J_group[idx, i, k] * Y_group[idx, j, k]
+
+    if val != 0.0:
+        wp.atomic_add(world_C, world, i, j, val)
+
+    # Also accumulate diagonal separately (only when i == j)
+    if i == j and val != 0.0:
+        wp.atomic_add(world_diag, world, i, val)
+
+
+# =============================================================================
+# Tiled kernels for homogenous multi-articulation support
+# =============================================================================
+
+
+@wp.kernel
+def crba_fill_batched_par_dof(
+    articulation_start: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    mass_update_mask: wp.array(dtype=int),
+    joint_ancestor: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_dof_dim: wp.array(dtype=int, ndim=2),
+    joint_S_s: wp.array(dtype=wp.spatial_vector),
+    body_I_c: wp.array(dtype=wp.spatial_matrix),
+    # Size-group parameters
+    group_to_art: wp.array(dtype=int),
+    n_dofs: int,  # = TILE_DOF for tiled path
+    # outputs
+    H_group: wp.array3d(dtype=float),  # [n_arts_of_size, n_dofs, n_dofs]
+):
+    """
+    CRBA fill kernel that writes directly to size-grouped H storage.
+
+    Thread dimension: n_arts_of_size * n_dofs (one thread per articulation-column pair)
+
+    This version is for homogenous multi-articulation where all articulations have
+    the same DOF count equal to TILE_DOF.
+    """
+    tid = wp.tid()
+
+    group_idx = tid // n_dofs
+    col_idx = tid % n_dofs
+
+    art_idx = group_to_art[group_idx]
+
+    if mass_update_mask[art_idx] == 0:
+        return
+
+    # All articulations in this group have exactly n_dofs DOFs
+    if col_idx >= n_dofs:
+        return
+
+    global_dof_start = articulation_dof_start[art_idx]
+    target_dof_global = global_dof_start + col_idx
+
+    joint_start = articulation_start[art_idx]
+    joint_end = articulation_start[art_idx + 1]
+
+    # Find the joint that owns this DOF
+    pivot_joint = int(-1)
+    for j in range(joint_start, joint_end):
+        q_start = joint_qd_start[j]
+        q_end = joint_qd_start[j + 1]
+        if target_dof_global >= q_start and target_dof_global < q_end:
+            pivot_joint = j
+            break
+
+    if pivot_joint == -1:
+        return
+
+    # Compute Force F = I_c[pivot] * S[column]
+    S_col = joint_S_s[target_dof_global]
+    I_comp = body_I_c[pivot_joint]
+    F = I_comp * S_col
+
+    # Walk up the tree and project F onto ancestors
+    # H[row, col] = S[row] * F
+    curr = pivot_joint
+
+    while curr != -1:
+        if curr < joint_start:
+            break
+
+        q_start = joint_qd_start[curr]
+        q_dim = joint_dof_dim[curr]
+        count = q_dim[0] + q_dim[1]
+
+        dof_offset_local = q_start - global_dof_start
+
+        for k in range(count):
+            row_idx = dof_offset_local + k
+
+            S_row = joint_S_s[q_start + k]
+            val = wp.dot(S_row, F)
+
+            # Write to grouped 3D array
+            H_group[group_idx, row_idx, col_idx] = val
+            H_group[group_idx, col_idx, row_idx] = val
+
+        curr = joint_ancestor[curr]
+
+
+@wp.kernel
+def trisolve_batched_loop(
+    L_group: wp.array3d(dtype=float),  # [n_arts_of_size, n_dofs, n_dofs]
+    group_to_art: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    n_dofs: int,
+    joint_tau: wp.array(dtype=float),  # [total_dofs]
+    # output
+    joint_qdd: wp.array(dtype=float),  # [total_dofs]
+):
+    """
+    Solve L * L^T * qdd = tau for grouped articulations using forward/backward substitution.
+
+    Thread dimension: n_arts_of_size (one thread per articulation in this size group)
+    """
+    idx = wp.tid()
+    art = group_to_art[idx]
+    dof_start = articulation_dof_start[art]
+
+    # Forward substitution: L * z = tau
+    # z is stored temporarily in joint_qdd
+    for i in range(n_dofs):
+        val = joint_tau[dof_start + i]
+        for k in range(i):
+            L_ik = L_group[idx, i, k]
+            val -= L_ik * joint_qdd[dof_start + k]
+
+        L_ii = L_group[idx, i, i]
+        if L_ii != 0.0:
+            joint_qdd[dof_start + i] = val / L_ii
+        else:
+            joint_qdd[dof_start + i] = 0.0
+
+    # Backward substitution: L^T * qdd = z
+    for i_rev in range(n_dofs):
+        i = n_dofs - 1 - i_rev
+
+        val = joint_qdd[dof_start + i]
+        for k in range(i + 1, n_dofs):
+            L_ki = L_group[idx, k, i]
+            val -= L_ki * joint_qdd[dof_start + k]
+
+        L_ii = L_group[idx, i, i]
+        if L_ii != 0.0:
+            joint_qdd[dof_start + i] = val / L_ii
+        else:
+            joint_qdd[dof_start + i] = 0.0
+
+
+@wp.kernel
+def gather_tau_to_groups(
+    joint_tau: wp.array(dtype=float),  # [total_dofs]
+    group_to_art: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    n_dofs: int,
+    tau_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, 1]
+):
+    """Gather joint_tau from flat array into grouped 3D buffer for tiled solve.
+
+    Thread dimension: n_arts_of_size (one thread per articulation in this size group)
+    """
+    idx = wp.tid()
+    art = group_to_art[idx]
+    dof_start = articulation_dof_start[art]
+    for i in range(n_dofs):
+        tau_group[idx, i, 0] = joint_tau[dof_start + i]
+
+
+@wp.kernel
+def scatter_qdd_from_groups(
+    qdd_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, 1]
+    group_to_art: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    n_dofs: int,
+    joint_qdd: wp.array(dtype=float),  # [total_dofs]
+):
+    """Scatter qdd from grouped 3D buffer back to flat array after tiled solve.
+
+    Thread dimension: n_arts_of_size (one thread per articulation in this size group)
+    """
+    idx = wp.tid()
+    art = group_to_art[idx]
+    dof_start = articulation_dof_start[art]
+    for i in range(n_dofs):
+        joint_qdd[dof_start + i] = qdd_group[idx, i, 0]

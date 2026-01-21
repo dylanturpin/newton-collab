@@ -68,10 +68,6 @@ class Example:
         pgs_cfm: float = 1.0e-6,
         pgs_omega: float = 1.0,
         pgs_warmstart: bool = False,
-        pgs_use_joint_targets: bool = False,
-        pgs_joint_target_mode: str | None = None,
-        pgs_joint_beta: float | None = None,
-        pgs_joint_cfm: float | None = None,
         enable_timers: bool = False,
         summary_timer: bool = False,
     ):
@@ -87,11 +83,6 @@ class Example:
         self.solver_type = solver_type
         self.enable_timers = enable_timers
         self.summary_timer = summary_timer
-
-        if pgs_joint_target_mode is None:
-            self.pgs_joint_target_mode = "pgs" if pgs_use_joint_targets else "off"
-        else:
-            self.pgs_joint_target_mode = pgs_joint_target_mode
 
         # ------------------------------------------------------------------
         # Build G1 model
@@ -134,6 +125,7 @@ class Example:
         builder.add_ground_plane()
 
         self.model = builder.finalize()
+        self.model.shape_contact_margin.fill_(0.01)
 
         # ------------------------------------------------------------------
         # Create solver
@@ -147,12 +139,14 @@ class Example:
                 "pgs_omega": pgs_omega,
                 "pgs_max_constraints": pgs_max_constraints,
                 "pgs_warmstart": pgs_warmstart,
-                "pgs_use_joint_targets": pgs_use_joint_targets,
-                "pgs_joint_target_mode": self.pgs_joint_target_mode,
-                "pgs_joint_beta": pgs_joint_beta,
-                "pgs_joint_cfm": pgs_joint_cfm,
                 "enable_contact_friction": True,
-                "enable_timers": enable_timers,
+                "storage": "flat",
+                "cholesky_kernel": "auto",
+                "trisolve_kernel": "auto",
+                "hinv_jt_kernel": "auto",
+                "pgs_kernel": "tiled",
+                "small_dof_threshold": 12,
+                "use_parallel_streams": True,
             }
             self.solver = newton.solvers.SolverFeatherPGS(self.model, **solver_kwargs)
             print(
@@ -169,8 +163,6 @@ class Example:
                 self.solver.pgs_max_constraints,
                 "pgs_warmstart",
                 self.solver.pgs_warmstart,
-                "joint_target_mode",
-                getattr(self.solver, "pgs_joint_target_mode", "off"),
             )
 
         elif solver_type == "mujoco":
@@ -226,7 +218,7 @@ class Example:
                 synchronize=True,
             ):
                 # Broad/narrow-phase collision for current state
-                self.contacts = self.model.collide(self.state_0, rigid_contact_margin=0.1)
+                self.contacts = self.model.collide(self.state_0)
 
             # Clear forces from previous step
             self.state_0.clear_forces()
@@ -374,7 +366,7 @@ def print_kernel_summary(results, indent: str = ""):
         return
 
     sorted_items = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
-    top = sorted_items[:10]
+    top = sorted_items
     other_time = total_time - sum(t for _, t in top)
 
     rows = []
@@ -444,30 +436,6 @@ if __name__ == "__main__":
         help="Re-use impulses from the previous frame when contacts persist.",
     )
     parser.add_argument(
-        "--pgs-use-joint-targets",
-        action="store_true",
-        help="Include joint drive targets as equality constraints in the PGS solve.",
-    )
-    parser.add_argument(
-        "--pgs-joint-target-mode",
-        type=str,
-        choices=["off", "pgs", "augmented"],
-        default=None,
-        help="Override how joint drive targets are enforced (default derives from --pgs-use-joint-targets).",
-    )
-    parser.add_argument(
-        "--pgs-joint-beta",
-        type=float,
-        default=None,
-        help="ERP override for joint-target PGS constraints (auto-derived from gains when omitted).",
-    )
-    parser.add_argument(
-        "--pgs-joint-cfm",
-        type=float,
-        default=None,
-        help="CFM override for joint-target PGS constraints (auto-derived from gains when omitted).",
-    )
-    parser.add_argument(
         "--update-mass-matrix-interval",
         type=int,
         default=1,
@@ -528,10 +496,6 @@ if __name__ == "__main__":
         pgs_cfm=args.pgs_cfm,
         pgs_omega=args.pgs_omega,
         pgs_warmstart=args.pgs_warmstart,
-        pgs_use_joint_targets=args.pgs_use_joint_targets,
-        pgs_joint_target_mode=args.pgs_joint_target_mode,
-        pgs_joint_beta=args.pgs_joint_beta,
-        pgs_joint_cfm=args.pgs_joint_cfm,
         enable_timers=args.enable_timers,
         summary_timer=args.summary_timer,
     )
