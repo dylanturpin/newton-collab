@@ -2752,22 +2752,6 @@ def finalize_world_diag_cfm(
         world_diag[world, i] += world_row_cfm[world, i]
 
 
-@wp.kernel
-def zero_world_C_and_diag(
-    world_count: int,
-    max_constraints: int,
-    # outputs
-    world_C: wp.array3d(dtype=float),
-    world_diag: wp.array2d(dtype=float),
-):
-    """Zero world Delassus matrices before accumulation."""
-    world = wp.tid()
-    for i in range(max_constraints):
-        world_diag[world, i] = 0.0
-        for j in range(max_constraints):
-            world_C[world, i, j] = 0.0
-
-
 # =============================================================================
 # Parallelized Non-Tiled Kernels for Heterogeneous Multi-Articulation
 # =============================================================================
