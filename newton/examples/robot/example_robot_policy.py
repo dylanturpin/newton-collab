@@ -220,6 +220,7 @@ class Example:
         physx_to_mjc: list[int],
         subset_idx_mjc: list[int] | None,
         policy_dofs: int,
+        solver_type: str = "feather_pgs",
     ):
         # Setup simulation parameters first
         fps = 200
@@ -232,6 +233,7 @@ class Example:
         self.sim_step = 0
         self.sim_substeps = 1
         self.sim_dt = self.frame_dt / self.sim_substeps
+        self.solver_type = solver_type
 
         # Save a reference to the viewer
         self.viewer = viewer
@@ -294,55 +296,33 @@ class Example:
         self.model = builder.finalize()
         self.model.set_gravity((0.0, 0.0, -9.81))
 
-        # self.solver = newton.solvers.SolverMuJoCo(
-        #     self.model,
-        #     use_mujoco_cpu=self.use_mujoco,
-        #     solver="newton",
-        #     nconmax=30,
-        #     njmax=100,
-        # )
+        # Create solver based on solver_type
+        if solver_type == "feather_pgs":
+            self.solver = newton.solvers.SolverFeatherPGS(
+                self.model,
+                update_mass_matrix_interval=1,
+                pgs_iterations=32,
+                pgs_max_constraints=64,
+                pgs_warmstart=False,
+                pgs_omega=1.0,
+                pgs_beta=0.1,
+                storage="batched"
+            )
+        elif solver_type == "mujoco":
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                njmax=210,
+                nconmax=35,
+                ls_iterations=10,
+                ls_parallel=True,
+                cone="pyramidal",
+                impratio=1,
+                integrator="implicit",
+            )
+        else:
+            raise ValueError(f"Unknown solver type: {solver_type}")
 
-        # from "original benchmark" script
-        # self.solver = newton.solvers.SolverMuJoCo(
-        #     self.model,
-        #     use_mujoco_cpu=False,
-        #     solver="newton",
-        #     integrator="implicit",
-        #     njmax=210,
-        #     nconmax=35,
-        #     ls_parallel=True,
-        #     iterations=100,
-        #     ls_iterations=50,
-        # )
-
-        # from il flat_env_cfg.py
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            njmax=210,
-            nconmax=35,
-            ls_iterations=10,
-            ls_parallel=True,
-            cone="pyramidal",
-            impratio=1,
-            integrator="implicit",
-        )
-
-        # solver_kwargs = {
-        #     "update_mass_matrix_interval": 1,
-        #     "pgs_iterations": 4,
-        #     "pgs_beta": 0.1,
-        #     "pgs_cfm": 1e-6,
-        #     "pgs_omega": 1.4,
-        #     "pgs_max_constraints": 32,
-        #     "pgs_warmstart": True,
-        #     "pgs_use_joint_targets": True,
-        #     "pgs_joint_target_mode": "augmented",
-        #     # pgs_joint_beta=0.07,
-        #     # pgs_joint_cfm=0.1,
-        #     # pgs_joint_beta=0.01,
-        #     # pgs_joint_cfm=pgs_joint_cfm,
-        # }
-        # self.solver = newton.solvers.SolverFeatherPGS(self.model, **solver_kwargs)
+        print(f"[INFO] Using solver: {solver_type}")
 
         # Initialize state objects
         self.state_temp = self.model.state()
@@ -543,6 +523,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--physx", action="store_true", help="Run physX policy instead of MJWarp.")
     parser.add_argument(
+        "--solver",
+        type=str,
+        choices=["mujoco", "feather_pgs"],
+        default="feather_pgs",
+        help="Which articulated solver to use.",
+    )
+    parser.add_argument(
         "--lower-body-only",
         action="store_true",
         help="Use lower-body-only obs/action layout to match IL v1 (G1 only).",
@@ -631,6 +618,7 @@ if __name__ == "__main__":
         physx_to_mjc,
         subset_idx_mjc,
         policy_dofs,
+        solver_type=args.solver,
     )
 
     # Use utility function to load policy and setup tensors
