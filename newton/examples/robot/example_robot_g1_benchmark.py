@@ -125,7 +125,6 @@ class Example:
         builder.add_ground_plane()
 
         self.model = builder.finalize()
-        self.model.shape_contact_margin.fill_(0.01)
 
         # ------------------------------------------------------------------
         # Create solver
