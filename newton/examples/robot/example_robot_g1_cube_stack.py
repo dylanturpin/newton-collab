@@ -199,7 +199,6 @@ class Example:
         builder.add_ground_plane()
 
         self.model = builder.finalize()
-        self.model.shape_contact_margin.fill_(0.01)
 
         # Report model structure
         arts_per_world = self.model.articulation_count // self.model.num_worlds
@@ -212,7 +211,7 @@ class Example:
         # ------------------------------------------------------------------
         if solver_type == "feather_pgs":
             kernel_mode = "auto" if use_tiled else "loop"
-            hinv_jt_mode = "auto" if use_tiled else "par_row"
+            hinv_jt_mode = "tiled" if use_tiled else "par_row"
             pgs_mode = "tiled_contact" if use_tiled else "loop"
             solver_kwargs = {
                 "update_mass_matrix_interval": update_mass_matrix_interval,

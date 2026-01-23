@@ -1389,6 +1389,9 @@ def build_contact_rows_normal(
 
     phi = wp.dot(n, point_a_world - point_b_world)
 
+    if phi > 0.001:
+        return
+
     # Determine upfront if we'll add friction rows (needed for atomic slot allocation)
     dof_count = articulation_H_rows[articulation]
     will_add_friction = enable_friction != 0 and mu > 0.0 and dof_count > 0
@@ -1674,6 +1677,13 @@ def allocate_world_contact_slots(
     contact_count: wp.array(dtype=int),
     contact_shape0: wp.array(dtype=int),
     contact_shape1: wp.array(dtype=int),
+    contact_point0: wp.array(dtype=wp.vec3),
+    contact_point1: wp.array(dtype=wp.vec3),
+    contact_normal: wp.array(dtype=wp.vec3),
+    contact_thickness0: wp.array(dtype=float),
+    contact_thickness1: wp.array(dtype=float),
+    body_q: wp.array(dtype=wp.transform),
+    shape_transform: wp.array(dtype=wp.transform),
     shape_body: wp.array(dtype=int),
     body_to_articulation: wp.array(dtype=int),
     art_to_world: wp.array(dtype=int),
@@ -1734,6 +1744,39 @@ def allocate_world_contact_slots(
         # No articulation involved (ground-ground?)
         contact_slot[c] = -1
         return
+
+    # Compute phi (same logic as populate_world_J_for_size)
+    normal = contact_normal[c]
+    point_a_local = contact_point0[c]
+    point_b_local = contact_point1[c]
+    thickness_a = contact_thickness0[c]
+    thickness_b = contact_thickness1[c]
+
+    point_a_world = wp.vec3(0.0)
+    point_b_world = wp.vec3(0.0)
+
+    if body_a >= 0:
+        X_wb_a = body_q[body_a]
+        X_bs_a = shape_transform[shape_a]
+        X_ws_a = wp.transform_multiply(X_wb_a, X_bs_a)
+        point_a_world = wp.transform_point(X_ws_a, point_a_local) - thickness_a * normal
+    else:
+        point_a_world = point_a_local - thickness_a * normal
+
+    if body_b >= 0:
+        X_wb_b = body_q[body_b]
+        X_bs_b = shape_transform[shape_b]
+        X_ws_b = wp.transform_multiply(X_wb_b, X_bs_b)
+        point_b_world = wp.transform_point(X_ws_b, point_b_local) + thickness_b * normal
+    else:
+        point_b_world = point_b_local + thickness_b * normal
+    phi = wp.dot(normal, point_a_world - point_b_world)
+
+    # Gate on margin
+    if phi >= 0.001:
+        contact_slot[c] = -1
+        return
+
 
     # Allocate slots (1 normal + 2 friction)
     slots_needed = 1
