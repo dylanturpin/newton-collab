@@ -1371,19 +1371,15 @@ def build_contact_rows_normal(
 
     if body_a >= 0:
         X_wb_a = body_q[body_a]  # World-from-Body transform
-        X_bs_a = shape_transform[shape_a]  # Body-from-Shape transform
-        X_ws_a = wp.transform_multiply(X_wb_a, X_bs_a)  # World-from-Shape
-
-        point_a_world = wp.transform_point(X_ws_a, point_a_local) - thickness_a * n
+        # Contact points are stored in body frame by collision detection
+        point_a_world = wp.transform_point(X_wb_a, point_a_local) - thickness_a * n
     else:
         point_a_world = point_a_local - thickness_a * n
 
     if body_b >= 0:
         X_wb_b = body_q[body_b]  # World-from-Body transform
-        X_bs_b = shape_transform[shape_b]  # Body-from-Shape transform
-        X_ws_b = wp.transform_multiply(X_wb_b, X_bs_b)  # World-from-Shape
-
-        point_b_world = wp.transform_point(X_ws_b, point_b_local) + thickness_b * n
+        # Contact points are stored in body frame by collision detection
+        point_b_world = wp.transform_point(X_wb_b, point_b_local) + thickness_b * n
     else:
         point_b_world = point_b_local + thickness_b * n
 
@@ -1757,17 +1753,15 @@ def allocate_world_contact_slots(
 
     if body_a >= 0:
         X_wb_a = body_q[body_a]
-        X_bs_a = shape_transform[shape_a]
-        X_ws_a = wp.transform_multiply(X_wb_a, X_bs_a)
-        point_a_world = wp.transform_point(X_ws_a, point_a_local) - thickness_a * normal
+        # Contact points are stored in body frame by collision detection
+        point_a_world = wp.transform_point(X_wb_a, point_a_local) - thickness_a * normal
     else:
         point_a_world = point_a_local - thickness_a * normal
 
     if body_b >= 0:
         X_wb_b = body_q[body_b]
-        X_bs_b = shape_transform[shape_b]
-        X_ws_b = wp.transform_multiply(X_wb_b, X_bs_b)
-        point_b_world = wp.transform_point(X_ws_b, point_b_local) + thickness_b * normal
+        # Contact points are stored in body frame by collision detection
+        point_b_world = wp.transform_point(X_wb_b, point_b_local) + thickness_b * normal
     else:
         point_b_world = point_b_local + thickness_b * normal
     phi = wp.dot(normal, point_a_world - point_b_world)
@@ -1912,6 +1906,7 @@ def populate_world_J_for_size(
     thickness_b = contact_thickness1[c]
 
     # Compute contact points in world frame
+    # Contact points are stored in body frame by collision detection
     point_a_local = contact_point0[c]
     point_b_local = contact_point1[c]
     point_a_world = wp.vec3(0.0)
@@ -1919,17 +1914,13 @@ def populate_world_J_for_size(
 
     if body_a >= 0:
         X_wb_a = body_q[body_a]
-        X_bs_a = shape_transform[shape_a]
-        X_ws_a = wp.transform_multiply(X_wb_a, X_bs_a)
-        point_a_world = wp.transform_point(X_ws_a, point_a_local) - thickness_a * normal
+        point_a_world = wp.transform_point(X_wb_a, point_a_local) - thickness_a * normal
     else:
         point_a_world = point_a_local - thickness_a * normal
 
     if body_b >= 0:
         X_wb_b = body_q[body_b]
-        X_bs_b = shape_transform[shape_b]
-        X_ws_b = wp.transform_multiply(X_wb_b, X_bs_b)
-        point_b_world = wp.transform_point(X_ws_b, point_b_local) + thickness_b * normal
+        point_b_world = wp.transform_point(X_wb_b, point_b_local) + thickness_b * normal
     else:
         point_b_world = point_b_local + thickness_b * normal
 
