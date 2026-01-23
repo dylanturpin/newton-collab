@@ -1132,7 +1132,13 @@ class SolverFeatherPGS(SolverBase):
                         self._stage4_hinv_jt_batched_par_row(size)
 
             for size in self.size_groups:
-                self._stage4_delassus_batched_par_row_col(size)
+                use_tiled = (self.hinv_jt_kernel == "tiled") or (
+                    self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold
+                )
+                if use_tiled:
+                    self._stage4_delassus_batched_tiled(size)
+                else:
+                    self._stage4_delassus_batched_par_row_col(size)
 
             self._stage4_finalize_world_diag_cfm()
 
@@ -2029,6 +2035,26 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
+    def _stage4_delassus_batched_tiled(self, size: int):
+        model = self.model
+        n_arts = self.n_arts_by_size[size]
+        delassus_kernel = TiledKernelFactory.get_delassus_kernel(size, self.pgs_max_constraints, model.device)
+        wp.launch_tiled(
+            delassus_kernel,
+            dim=[n_arts],
+            inputs=[
+                self.J_by_size[size],
+                self.Y_by_size[size],
+                self.group_to_art[size],
+                self.art_to_world,
+                self.constraint_count,
+                n_arts,
+            ],
+            outputs=[self.C, self.diag],
+            block_dim=128,
+            device=model.device,
+        )
+
     def _stage4_finalize_world_diag_cfm(self):
         model = self.model
         wp.launch(
@@ -2380,6 +2406,7 @@ class TiledKernelFactory:
     _pgs_solve_tiled_row_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_tiled_contact_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _triangular_solve_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
+    _delassus_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
 
     @classmethod
     def get_hinv_jt_flat_kernel(cls, n_dofs: int, max_constraints: int, device: "wp.Device") -> "wp.Kernel":
@@ -2636,6 +2663,102 @@ class TiledKernelFactory:
         hinv_jt_batched_tiled_fused_template.__name__ = f"hinv_jt_batched_tiled_fused_{n_dofs}_{max_constraints}"
         hinv_jt_batched_tiled_fused_template.__qualname__ = f"hinv_jt_batched_tiled_fused_{n_dofs}_{max_constraints}"
         return wp.kernel(enable_backward=False, module="unique")(hinv_jt_batched_tiled_fused_template)
+
+    @classmethod
+    def get_delassus_kernel(cls, n_dofs: int, max_constraints: int, device: "wp.Device") -> "wp.Kernel":
+        """Get or create a streaming Delassus kernel for the given dimensions."""
+        key = (n_dofs, max_constraints, device.arch)
+        if key not in cls._delassus_cache:
+            cls._delassus_cache[key] = cls._build_delassus_kernel(n_dofs, max_constraints)
+        return cls._delassus_cache[key]
+
+    @classmethod
+    def _build_delassus_kernel(cls, n_dofs: int, max_constraints: int) -> "wp.Kernel":
+        """Streaming Delassus: C += J * Y^T with shared memory."""
+        TILE_D = n_dofs
+        TILE_M = max_constraints
+        CHUNK = 64 if (2 * TILE_M * TILE_D * 4 > 45000) else TILE_M
+
+        snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int TILE_D = {TILE_D};
+    const int TILE_M = {TILE_M};
+    const int CHUNK = {CHUNK};
+
+    int lane = threadIdx.x;
+    int art = group_to_art.data[idx];
+    int world = art_to_world.data[art];
+    int m = world_constraint_count.data[world];
+    if (m == 0) return;
+
+    __shared__ float s_J[CHUNK * TILE_D];
+    __shared__ float s_Y[CHUNK * TILE_D];
+
+    int num_chunks = (m + CHUNK - 1) / CHUNK;
+
+    for (int ci = 0; ci < num_chunks; ci++) {{
+        int i0 = ci * CHUNK, i1 = min(i0 + CHUNK, m);
+
+        for (int t = lane; t < (i1 - i0) * TILE_D; t += blockDim.x)
+            s_J[t] = J_group.data[idx * TILE_M * TILE_D + i0 * TILE_D + t];
+        __syncthreads();
+
+        for (int cj = 0; cj < num_chunks; cj++) {{
+            int j0 = cj * CHUNK, j1 = min(j0 + CHUNK, m);
+
+            for (int t = lane; t < (j1 - j0) * TILE_D; t += blockDim.x)
+                s_Y[t] = Y_group.data[idx * TILE_M * TILE_D + j0 * TILE_D + t];
+            __syncthreads();
+
+            // Each thread computes multiple C elements
+            for (int e = lane; e < (i1 - i0) * (j1 - j0); e += blockDim.x) {{
+                int il = e / (j1 - j0), jl = e % (j1 - j0);
+                float sum = 0.0f;
+                for (int k = 0; k < TILE_D; k++)
+                    sum += s_J[il * TILE_D + k] * s_Y[jl * TILE_D + k];
+                if (sum != 0.0f) {{
+                    int ig = i0 + il, jg = j0 + jl;
+                    atomicAdd(&world_C.data[world * TILE_M * TILE_M + ig * TILE_M + jg], sum);
+                    if (ig == jg) atomicAdd(&world_diag.data[world * TILE_M + ig], sum);
+                }}
+            }}
+            __syncthreads();
+        }}
+    }}
+#endif
+"""
+
+        @wp.func_native(snippet)
+        def delassus_native(
+            idx: int,
+            J_group: wp.array3d(dtype=float),
+            Y_group: wp.array3d(dtype=float),
+            group_to_art: wp.array(dtype=int),
+            art_to_world: wp.array(dtype=int),
+            world_constraint_count: wp.array(dtype=int),
+            world_C: wp.array3d(dtype=float),
+            world_diag: wp.array2d(dtype=float),
+        ): ...
+
+        def delassus_template(
+            J_group: wp.array3d(dtype=float),
+            Y_group: wp.array3d(dtype=float),
+            group_to_art: wp.array(dtype=int),
+            art_to_world: wp.array(dtype=int),
+            world_constraint_count: wp.array(dtype=int),
+            n_arts: int,
+            world_C: wp.array3d(dtype=float),
+            world_diag: wp.array2d(dtype=float),
+        ):
+            idx, _lane = wp.tid()
+            if idx < n_arts:
+                delassus_native(
+                    idx, J_group, Y_group, group_to_art, art_to_world, world_constraint_count, world_C, world_diag
+                )
+
+        delassus_template.__name__ = f"delassus_streaming_{n_dofs}_{max_constraints}"
+        delassus_template.__qualname__ = f"delassus_streaming_{n_dofs}_{max_constraints}"
+        return wp.kernel(enable_backward=False, module="unique")(delassus_template)
 
     @classmethod
     def get_cholesky_kernel(cls, n_dofs: int, device: "wp.Device") -> "wp.Kernel":
