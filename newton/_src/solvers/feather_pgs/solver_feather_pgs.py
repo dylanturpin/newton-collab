@@ -166,6 +166,7 @@ class SolverFeatherPGS(SolverBase):
         cholesky_kernel: str = "auto",
         trisolve_kernel: str = "auto",
         hinv_jt_kernel: str = "auto",
+        delassus_kernel: str = "auto",
         pgs_kernel: str = "tiled_row",
         # Auto selection threshold (batched path)
         small_dof_threshold: int = 12,
@@ -190,6 +191,10 @@ class SolverFeatherPGS(SolverBase):
             cholesky_kernel (str, optional): "tiled", "loop", or "auto" for Cholesky factorization. Defaults to "auto".
             trisolve_kernel (str, optional): "tiled", "loop", or "auto" for triangular solve. Defaults to "auto".
             hinv_jt_kernel (str, optional): "tiled", "par_row", or "auto" for H^{-1}J^T. Defaults to "auto".
+            delassus_kernel (str, optional): "tiled", "par_row_col", or "auto" for Delassus accumulation
+                (C = J * H^{-1} * J^T). "tiled" uses a streaming CUDA kernel that chunks shared memory
+                and scales to any constraint count. "par_row_col" launches one thread per matrix element.
+                "auto" selects "tiled" in the batched path. Defaults to "auto".
             pgs_kernel (str, optional): "loop", "tiled_row", or "tiled_contact" for PGS solve. Defaults to "tiled_row".
             small_dof_threshold (int, optional): DOF threshold for "auto" selection in batched path. Defaults to 12.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams (batched path only).
@@ -199,7 +204,7 @@ class SolverFeatherPGS(SolverBase):
             - Batched + auto: size > threshold -> tiled (or par_row for hinv_jt), else loop/par_row.
             - Flat + auto: if homogeneous and within tile limits -> tiled, else loop/par_row.
             - Flat + tiled: only valid when homogeneous and within TILE_DOF / TILE_CONSTRAINTS limits.
-            - Delassus accumulation always uses par_row_col.
+            - Delassus batched + auto/tiled: streaming kernel (handles any constraint count via chunking).
             - Current limitation: storage="flat" requires one articulation per world.
 
         """
@@ -232,7 +237,11 @@ class SolverFeatherPGS(SolverBase):
         if hinv_jt_kernel not in valid_hinv_jt:
             raise ValueError(f"hinv_jt_kernel must be one of {sorted(valid_hinv_jt)}")
 
-        valid_pgs = {"loop", "tiled_row", "tiled_contact"}
+        valid_delassus = {"tiled", "par_row_col", "auto"}
+        if delassus_kernel not in valid_delassus:
+            raise ValueError(f"delassus_kernel must be one of {sorted(valid_delassus)}")
+
+        valid_pgs = {"loop", "tiled_row", "tiled_contact", "streaming"}
         if pgs_kernel not in valid_pgs:
             raise ValueError(f"pgs_kernel must be one of {sorted(valid_pgs)}")
 
@@ -240,6 +249,7 @@ class SolverFeatherPGS(SolverBase):
         self.cholesky_kernel = cholesky_kernel
         self.trisolve_kernel = trisolve_kernel
         self.hinv_jt_kernel = hinv_jt_kernel
+        self.delassus_kernel = delassus_kernel
         self.pgs_kernel = pgs_kernel
         self.small_dof_threshold = small_dof_threshold
         self.use_parallel_streams = use_parallel_streams
@@ -991,6 +1001,8 @@ class SolverFeatherPGS(SolverBase):
             self._stage5_pgs_solve_flat_tiled_row()
         elif self.pgs_kernel == "tiled_contact":
             self._stage5_pgs_solve_flat_tiled_contact()
+        elif self.pgs_kernel == "streaming":
+            self._stage5_pgs_solve_flat_streaming()
         else:
             self._stage5_pgs_solve_flat_loop()
 
@@ -1132,10 +1144,8 @@ class SolverFeatherPGS(SolverBase):
                         self._stage4_hinv_jt_batched_par_row(size)
 
             for size in self.size_groups:
-                use_tiled = (self.hinv_jt_kernel == "tiled") or (
-                    self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold
-                )
-                if use_tiled:
+                use_tiled_delassus = self.delassus_kernel != "par_row_col"
+                if use_tiled_delassus:
                     self._stage4_delassus_batched_tiled(size)
                 else:
                     self._stage4_delassus_batched_par_row_col(size)
@@ -1155,6 +1165,8 @@ class SolverFeatherPGS(SolverBase):
             self._stage5_pgs_solve_world_tiled_row()
         elif self.pgs_kernel == "tiled_contact":
             self._stage5_pgs_solve_world_tiled_contact()
+        elif self.pgs_kernel == "streaming":
+            self._stage5_pgs_solve_world_streaming()
         else:
             self._stage5_pgs_solve_world_loop()
 
@@ -2311,6 +2323,52 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
+    def _stage5_pgs_solve_flat_streaming(self):
+        model = self.model
+        M = self.pgs_max_constraints
+        A = model.articulation_count
+        rhs2 = self.rhs_flat.reshape((A, M))
+        lam2 = self.impulses_flat.reshape((A, M))
+        C3 = self.C_flat.reshape((A, M, M))
+        mu2 = self.row_mu_flat.reshape((A, M))
+
+        pgs_kernel = TiledKernelFactory.get_pgs_solve_streaming_kernel(M, model.device)
+        wp.launch_tiled(
+            pgs_kernel,
+            dim=[A],
+            inputs=[
+                self.constraint_count_flat,
+                C3,
+                rhs2,
+                lam2,
+                self.pgs_iterations,
+                self.pgs_omega,
+                mu2,
+            ],
+            block_dim=32,
+            device=model.device,
+        )
+
+    def _stage5_pgs_solve_world_streaming(self):
+        pgs_kernel = TiledKernelFactory.get_pgs_solve_streaming_kernel(
+            self.pgs_max_constraints, self.model.device
+        )
+        wp.launch_tiled(
+            pgs_kernel,
+            dim=[self.world_count],
+            inputs=[
+                self.constraint_count,
+                self.C,
+                self.rhs,
+                self.impulses,
+                self.pgs_iterations,
+                self.pgs_omega,
+                self.row_mu,
+            ],
+            block_dim=32,
+            device=self.model.device,
+        )
+
     def _stage6_apply_impulses_flat(self):
         model = self.model
         wp.launch(
@@ -2412,6 +2470,7 @@ class TiledKernelFactory:
     _cholesky_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_tiled_row_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_tiled_contact_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
+    _pgs_solve_streaming_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _triangular_solve_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _delassus_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
 
@@ -3334,3 +3393,270 @@ class TiledKernelFactory:
         pgs_solve_tiled_contact_template.__name__ = f"pgs_solve_tiled_contact_{max_constraints}"
         pgs_solve_tiled_contact_template.__qualname__ = f"pgs_solve_tiled_contact_{max_constraints}"
         return wp.kernel(enable_backward=False, module="unique")(pgs_solve_tiled_contact_template)
+
+    @classmethod
+    def get_pgs_solve_streaming_kernel(cls, max_constraints: int, device: "wp.Device") -> "wp.Kernel":
+        """Get or create a streaming contact-wise PGS world solve kernel."""
+        key = (max_constraints, device.arch)
+        if key not in cls._pgs_solve_streaming_cache:
+            cls._pgs_solve_streaming_cache[key] = cls._build_pgs_solve_streaming_kernel(max_constraints)
+        return cls._pgs_solve_streaming_cache[key]
+
+    @classmethod
+    def _build_pgs_solve_streaming_kernel(cls, max_constraints: int) -> "wp.Kernel":
+        """Streaming contact-wise PGS kernel that streams block-rows from global memory.
+
+        Unlike tiled_contact which loads the entire Delassus matrix into shared memory,
+        this kernel keeps only lambda and auxiliaries in shared memory (~15KB for 150 contacts)
+        and streams each block-row of C on demand. This enables handling much larger
+        constraint counts (hundreds of contacts) at the cost of increased global memory bandwidth.
+
+        Algorithm:
+        - Load lambda, rhs, mu, and compute diagonal block inverses once
+        - For each PGS iteration:
+            - For each contact c:
+                - Stream block-row c of C into shared memory (coalesced load)
+                - Compute block-row dot product with lambda (warp-parallel)
+                - Update lambda[c] with friction cone projection (lane 0)
+        - Store final lambda back to global memory
+        """
+        TILE_M = max_constraints
+        NUM_CONTACTS_MAX = TILE_M // 3
+        TILE_M_USABLE = NUM_CONTACTS_MAX * 3
+
+        snippet = f"""
+    #if defined(__CUDA_ARCH__)
+        const int TILE_M = {TILE_M};
+        const int TILE_M_USABLE = {TILE_M_USABLE};
+        const int NUM_CONTACTS_MAX = {NUM_CONTACTS_MAX};
+        const unsigned MASK = 0xFFFFFFFF;
+
+        int lane = threadIdx.x;
+
+        int m = world_constraint_count.data[world];
+        if (m == 0) return;
+
+        // Clamp m to usable range and ensure divisible by 3
+        if (m > TILE_M_USABLE) m = TILE_M_USABLE;
+        int num_contacts = m / 3;
+
+        // ═══════════════════════════════════════════════════════════════
+        // SHARED MEMORY: Only lambda, rhs, mu, diagonal inverses, and
+        // a single block-row buffer for streaming
+        // ═══════════════════════════════════════════════════════════════
+        __shared__ float s_lam[{TILE_M_USABLE}];
+        __shared__ float s_rhs[{TILE_M_USABLE}];
+        __shared__ float s_mu[{NUM_CONTACTS_MAX}];
+        __shared__ float s_Dinv[{NUM_CONTACTS_MAX} * 9];
+        __shared__ float s_block_row[{NUM_CONTACTS_MAX} * 9];  // Streamed per contact
+
+        int off1 = world * TILE_M;
+        int off2 = world * TILE_M * TILE_M;
+
+        // ═══════════════════════════════════════════════════════════════
+        // LOAD PHASE: Load persistent data into shared memory
+        // ═══════════════════════════════════════════════════════════════
+
+        // Load lambda and rhs (coalesced)
+        for (int i = lane; i < TILE_M_USABLE; i += 32) {{
+            if (i < m) {{
+                s_lam[i] = world_impulses.data[off1 + i];
+                s_rhs[i] = world_rhs.data[off1 + i];
+            }} else {{
+                s_lam[i] = 0.0f;
+                s_rhs[i] = 0.0f;
+            }}
+        }}
+
+        // Load mu (one per contact, stored on tangent1 row)
+        for (int c = lane; c < NUM_CONTACTS_MAX; c += 32) {{
+            if (c < num_contacts) {{
+                s_mu[c] = world_row_mu.data[off1 + c * 3 + 1];
+            }}
+        }}
+        __syncwarp();
+
+        // Compute diagonal block inverses (each thread handles one contact)
+        for (int c = lane; c < num_contacts; c += 32) {{
+            // Load diagonal block D[c,c] from global memory
+            int diag_row = c * 3;
+            float D[9];
+            for (int k = 0; k < 9; k++) {{
+                int lr = k / 3;
+                int lc = k % 3;
+                D[k] = world_C.data[off2 + (diag_row + lr) * TILE_M + (diag_row + lc)];
+            }}
+
+            // Compute 3x3 inverse
+            float det = D[0] * (D[4] * D[8] - D[5] * D[7])
+                      - D[1] * (D[3] * D[8] - D[5] * D[6])
+                      + D[2] * (D[3] * D[7] - D[4] * D[6]);
+
+            float inv_det = 1.0f / det;
+            float* Dinv = &s_Dinv[c * 9];
+
+            Dinv[0] = (D[4] * D[8] - D[5] * D[7]) * inv_det;
+            Dinv[1] = (D[2] * D[7] - D[1] * D[8]) * inv_det;
+            Dinv[2] = (D[1] * D[5] - D[2] * D[4]) * inv_det;
+            Dinv[3] = (D[5] * D[6] - D[3] * D[8]) * inv_det;
+            Dinv[4] = (D[0] * D[8] - D[2] * D[6]) * inv_det;
+            Dinv[5] = (D[2] * D[3] - D[0] * D[5]) * inv_det;
+            Dinv[6] = (D[3] * D[7] - D[4] * D[6]) * inv_det;
+            Dinv[7] = (D[1] * D[6] - D[0] * D[7]) * inv_det;
+            Dinv[8] = (D[0] * D[4] - D[1] * D[3]) * inv_det;
+        }}
+        __syncwarp();
+
+        // ═══════════════════════════════════════════════════════════════
+        // ITERATION PHASE: Stream block-rows and solve
+        // ═══════════════════════════════════════════════════════════════
+
+        for (int iter = 0; iter < iterations; iter++) {{
+            for (int c = 0; c < num_contacts; c++) {{
+
+                // ─────────────────────────────────────────────────────────
+                // STREAM: Load block-row c of Delassus matrix
+                // Each thread loads multiple 3x3 blocks (coalesced access)
+                // ─────────────────────────────────────────────────────────
+                int c_row = c * 3;
+                for (int j = lane; j < num_contacts; j += 32) {{
+                    int j_col = j * 3;
+                    float* dst = &s_block_row[j * 9];
+
+                    // Load 3x3 block C[c, j] - row-major
+                    for (int k = 0; k < 9; k++) {{
+                        int lr = k / 3;
+                        int lc = k % 3;
+                        dst[k] = world_C.data[off2 + (c_row + lr) * TILE_M + (j_col + lc)];
+                    }}
+                }}
+                __syncwarp();
+
+                // ─────────────────────────────────────────────────────────
+                // COMPUTE: Block-row dot product sum_j C[c,j] * lambda[j]
+                // ─────────────────────────────────────────────────────────
+                float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f;
+
+                for (int j = lane; j < num_contacts; j += 32) {{
+                    float l0 = s_lam[j * 3 + 0];
+                    float l1 = s_lam[j * 3 + 1];
+                    float l2 = s_lam[j * 3 + 2];
+
+                    const float* B = &s_block_row[j * 9];
+
+                    // C[c,j] * lambda[j] (row-major 3x3 block)
+                    sum0 += B[0] * l0 + B[1] * l1 + B[2] * l2;
+                    sum1 += B[3] * l0 + B[4] * l1 + B[5] * l2;
+                    sum2 += B[6] * l0 + B[7] * l1 + B[8] * l2;
+                }}
+
+                // Warp reduce
+                sum0 += __shfl_down_sync(MASK, sum0, 16);
+                sum1 += __shfl_down_sync(MASK, sum1, 16);
+                sum2 += __shfl_down_sync(MASK, sum2, 16);
+                sum0 += __shfl_down_sync(MASK, sum0, 8);
+                sum1 += __shfl_down_sync(MASK, sum1, 8);
+                sum2 += __shfl_down_sync(MASK, sum2, 8);
+                sum0 += __shfl_down_sync(MASK, sum0, 4);
+                sum1 += __shfl_down_sync(MASK, sum1, 4);
+                sum2 += __shfl_down_sync(MASK, sum2, 4);
+                sum0 += __shfl_down_sync(MASK, sum0, 2);
+                sum1 += __shfl_down_sync(MASK, sum1, 2);
+                sum2 += __shfl_down_sync(MASK, sum2, 2);
+                sum0 += __shfl_down_sync(MASK, sum0, 1);
+                sum1 += __shfl_down_sync(MASK, sum1, 1);
+                sum2 += __shfl_down_sync(MASK, sum2, 1);
+
+                // ─────────────────────────────────────────────────────────
+                // UPDATE: Solve and project (lane 0 only)
+                // ─────────────────────────────────────────────────────────
+                if (lane == 0) {{
+                    // Residual: r = -(rhs + C*lambda)
+                    float res0 = -(s_rhs[c * 3 + 0] + sum0);
+                    float res1 = -(s_rhs[c * 3 + 1] + sum1);
+                    float res2 = -(s_rhs[c * 3 + 2] + sum2);
+
+                    // Delta: d = D_cc^{{-1}} * r
+                    const float* Dinv = &s_Dinv[c * 9];
+                    float d0 = Dinv[0] * res0 + Dinv[1] * res1 + Dinv[2] * res2;
+                    float d1 = Dinv[3] * res0 + Dinv[4] * res1 + Dinv[5] * res2;
+                    float d2 = Dinv[6] * res0 + Dinv[7] * res1 + Dinv[8] * res2;
+
+                    // Update with relaxation
+                    float new_n  = s_lam[c * 3 + 0] + omega * d0;
+                    float new_t1 = s_lam[c * 3 + 1] + omega * d1;
+                    float new_t2 = s_lam[c * 3 + 2] + omega * d2;
+
+                    // Friction cone projection
+                    new_n = fmaxf(new_n, 0.0f);
+
+                    float mu = s_mu[c];
+                    float radius = mu * new_n;
+
+                    if (radius <= 0.0f) {{
+                        new_t1 = 0.0f;
+                        new_t2 = 0.0f;
+                    }} else {{
+                        float t_mag_sq = new_t1 * new_t1 + new_t2 * new_t2;
+                        if (t_mag_sq > radius * radius) {{
+                            float scale = radius * rsqrtf(t_mag_sq);
+                            new_t1 *= scale;
+                            new_t2 *= scale;
+                        }}
+                    }}
+
+                    s_lam[c * 3 + 0] = new_n;
+                    s_lam[c * 3 + 1] = new_t1;
+                    s_lam[c * 3 + 2] = new_t2;
+                }}
+                __syncwarp();
+            }}
+        }}
+
+        // ═══════════════════════════════════════════════════════════════
+        // STORE PHASE: Write final lambda back to global memory
+        // ═══════════════════════════════════════════════════════════════
+        for (int i = lane; i < TILE_M_USABLE; i += 32) {{
+            if (i < m) {{
+                world_impulses.data[off1 + i] = s_lam[i];
+            }}
+        }}
+    #endif
+    """
+
+        @wp.func_native(snippet)
+        def pgs_solve_streaming_native(
+            world: int,
+            world_constraint_count: wp.array(dtype=int),
+            world_C: wp.array3d(dtype=float),
+            world_rhs: wp.array2d(dtype=float),
+            world_impulses: wp.array2d(dtype=float),
+            iterations: int,
+            omega: float,
+            world_row_mu: wp.array2d(dtype=float),
+        ): ...
+
+        def pgs_solve_streaming_template(
+            world_constraint_count: wp.array(dtype=int),
+            world_C: wp.array3d(dtype=float),
+            world_rhs: wp.array2d(dtype=float),
+            world_impulses: wp.array2d(dtype=float),
+            iterations: int,
+            omega: float,
+            world_row_mu: wp.array2d(dtype=float),
+        ):
+            world, _lane = wp.tid()
+            pgs_solve_streaming_native(
+                world,
+                world_constraint_count,
+                world_C,
+                world_rhs,
+                world_impulses,
+                iterations,
+                omega,
+                world_row_mu,
+            )
+
+        pgs_solve_streaming_template.__name__ = f"pgs_solve_streaming_{max_constraints}"
+        pgs_solve_streaming_template.__qualname__ = f"pgs_solve_streaming_{max_constraints}"
+        return wp.kernel(enable_backward=False, module="unique")(pgs_solve_streaming_template)
