@@ -1,0 +1,15 @@
+{
+  "scenario": "g1_flat",
+  "scenario_description": "G1 humanoid on flat ground",
+  "timestamp": "2026-02-04T14:41:55.666959",
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "gpu_memory_total_gb": 23.536865234375,
+  "platform": "Linux",
+  "python_version": "3.13.11",
+  "newton_git_hash": "859d7ce",
+  "substeps": 2,
+  "pgs_iterations": 4,
+  "warmup_frames": 16,
+  "measure_frames": 64,
+  "num_worlds": 8192
+}

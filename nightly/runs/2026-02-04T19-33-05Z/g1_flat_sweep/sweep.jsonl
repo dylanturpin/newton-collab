@@ -1,0 +1,12 @@
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 1024, "env_fps": 69093.83, "gpu_used_gb": 14.896, "elapsed_s": 0.948507, "ok": true, "label": "fpgs_tiled @ 1024 worlds"}
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 2048, "env_fps": 119958.01, "gpu_used_gb": 14.989, "elapsed_s": 1.092649, "ok": true, "label": "fpgs_tiled @ 2048 worlds"}
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 4096, "env_fps": 182411.57, "gpu_used_gb": 15.207, "elapsed_s": 1.437102, "ok": true, "label": "fpgs_tiled @ 4096 worlds"}
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 8192, "env_fps": 220711.79, "gpu_used_gb": 15.695, "elapsed_s": 2.375442, "ok": true, "label": "fpgs_tiled @ 8192 worlds"}
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 16384, "env_fps": 204221.34, "gpu_used_gb": 16.569, "elapsed_s": 5.134507, "ok": true, "label": "fpgs_tiled @ 16384 worlds"}
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 32768, "env_fps": 251119.26, "gpu_used_gb": 18.35, "elapsed_s": 8.351219, "ok": true, "label": "fpgs_tiled @ 32768 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 1024, "env_fps": 161043.88, "gpu_used_gb": 1.987, "elapsed_s": 0.406945, "ok": true, "label": "mujoco @ 1024 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 2048, "env_fps": 205006.78, "gpu_used_gb": 2.175, "elapsed_s": 0.639354, "ok": true, "label": "mujoco @ 2048 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 4096, "env_fps": 220230.65, "gpu_used_gb": 2.576, "elapsed_s": 1.190316, "ok": true, "label": "mujoco @ 4096 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 8192, "env_fps": 228605.66, "gpu_used_gb": 3.357, "elapsed_s": 2.293417, "ok": true, "label": "mujoco @ 8192 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 16384, "env_fps": 230340.29, "gpu_used_gb": 4.924, "elapsed_s": 4.552291, "ok": true, "label": "mujoco @ 16384 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 32768, "env_fps": 227017.55, "gpu_used_gb": 7.981, "elapsed_s": 9.237841, "ok": true, "label": "mujoco @ 32768 worlds"}
