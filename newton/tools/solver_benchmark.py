@@ -4,7 +4,7 @@
 """
 Unified solver benchmark script for comparing FeatherPGS and MuJoCo solvers.
 
-Supports multiple scenarios, sweep/ablation modes, kernel timing, and plotting.
+Supports multiple scenarios, sweep/ablation modes, kernel timing, plotting, and JSONL outputs.
 
 Usage examples:
 
@@ -28,7 +28,6 @@ Usage examples:
 """
 
 import argparse
-import csv
 import datetime as dt
 import json
 import os
@@ -671,13 +670,10 @@ def run_sweep(args):
     out_dir = Path(args.out) if args.out else Path(f"results/{args.scenario}_{timestamp}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # CSV setup
-    csv_path = out_dir / "sweep.csv"
-    fieldnames = ["solver", "substeps", "num_worlds", "env_fps", "gpu_used_gb", "elapsed_s", "ok"]
-
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+    # JSONL setup
+    jsonl_path = out_dir / "sweep.jsonl"
+    if jsonl_path.exists():
+        jsonl_path.unlink()
 
     results = []
     multi_substeps = len(substeps_values) > 1
@@ -700,13 +696,13 @@ def run_sweep(args):
                     "gpu_used_gb": metrics.get("gpu_used_gb"),
                     "elapsed_s": metrics.get("elapsed_s"),
                     "ok": metrics.get("ok", False),
+                    "label": metrics.get("label"),
                 }
                 results.append(row)
 
-                # Append to CSV
-                with open(csv_path, "a", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writerow(row)
+                # Append to JSONL
+                with open(jsonl_path, "a") as f:
+                    f.write(json.dumps(row) + "\n")
 
     # Save metadata
     metadata = collect_metadata(args, scenario_cfg)
@@ -717,11 +713,11 @@ def run_sweep(args):
         json.dump(metadata, f, indent=2)
 
     print(f"\nResults saved to: {out_dir}")
-    print(f"  sweep.csv: {csv_path}")
+    print(f"  sweep.jsonl: {jsonl_path}")
 
     # Plot if requested
     if args.plot:
-        plot_sweep(csv_path, out_dir / "sweep.png", args.scenario, metadata.get("gpu", ""))
+        plot_sweep(jsonl_path, out_dir / "sweep.png", args.scenario, metadata.get("gpu", ""))
 
     return results
 
@@ -767,6 +763,7 @@ def run_ablation(args):
         cmd = build_run_command(args, step_config, args.num_worlds)
         metrics = run_subprocess(cmd, step_config["label"])
 
+        metrics["step_index"] = i
         metrics["config"] = step_config
         results.append(metrics)
 
@@ -810,17 +807,20 @@ def run_ablation(args):
     print("=" * 70)
 
     # Save results
-    ablation_csv = out_dir / "ablation.csv"
-    with open(ablation_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["label", "env_fps", "gpu_used_gb", "ok"])
-        writer.writeheader()
+    ablation_jsonl = out_dir / "ablation.jsonl"
+    if ablation_jsonl.exists():
+        ablation_jsonl.unlink()
+    with open(ablation_jsonl, "w") as f:
         for r in results:
-            writer.writerow({
+            f.write(json.dumps({
                 "label": r.get("label"),
                 "env_fps": r.get("env_fps"),
                 "gpu_used_gb": r.get("gpu_used_gb"),
                 "ok": r.get("ok"),
-            })
+                "solver": r.get("solver"),
+                "num_worlds": r.get("num_worlds"),
+                "step_index": r.get("step_index"),
+            }) + "\n")
 
     # Save metadata
     metadata = collect_metadata(args, scenario_cfg)
@@ -970,7 +970,22 @@ def run_compare(args):
 # Plotting
 # =============================================================================
 
-def plot_sweep(csv_path: Path, out_path: Path, scenario: str, gpu_name: str):
+def _load_jsonl(path: Path) -> list[dict]:
+    """Load JSONL file into list of dicts."""
+    rows = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def plot_sweep(jsonl_path: Path, out_path: Path, scenario: str, gpu_name: str):
     """Generate sweep plot with support for multiple substeps values."""
     try:
         import matplotlib.pyplot as plt
@@ -981,22 +996,21 @@ def plot_sweep(csv_path: Path, out_path: Path, scenario: str, gpu_name: str):
     # Load data keyed by (solver, substeps)
     series = {}
     all_substeps = set()
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            solver = row["solver"]
-            # Handle CSVs with or without substeps column
-            substeps = int(row.get("substeps", 0)) if row.get("substeps") else 0
-            all_substeps.add(substeps)
-            key = (solver, substeps)
-            if key not in series:
-                series[key] = {"num_worlds": [], "env_fps": [], "gpu_used_gb": []}
-            try:
-                series[key]["num_worlds"].append(int(row["num_worlds"]))
-                series[key]["env_fps"].append(float(row["env_fps"]))
-                series[key]["gpu_used_gb"].append(float(row["gpu_used_gb"]))
-            except (ValueError, TypeError):
-                continue
+    for row in _load_jsonl(jsonl_path):
+        solver = row.get("solver")
+        if not solver:
+            continue
+        substeps = int(row.get("substeps", 0)) if row.get("substeps") is not None else 0
+        all_substeps.add(substeps)
+        key = (solver, substeps)
+        if key not in series:
+            series[key] = {"num_worlds": [], "env_fps": [], "gpu_used_gb": []}
+        try:
+            series[key]["num_worlds"].append(int(row["num_worlds"]))
+            series[key]["env_fps"].append(float(row["env_fps"]) if row.get("env_fps") is not None else None)
+            series[key]["gpu_used_gb"].append(float(row["gpu_used_gb"]) if row.get("gpu_used_gb") is not None else None)
+        except (ValueError, TypeError):
+            continue
 
     if not series:
         print("No valid data to plot")
@@ -1635,25 +1649,20 @@ def run_replot(results_dir: Path):
     scenario = metadata.get("scenario", "unknown")
     gpu_name = metadata.get("gpu", "")
 
-    # Detect sweep vs ablation from CSV files
-    sweep_csv = results_dir / "sweep.csv"
-    ablation_csv = results_dir / "ablation.csv"
+    # Detect sweep vs ablation from JSONL files
+    sweep_jsonl = results_dir / "sweep.jsonl"
+    ablation_jsonl = results_dir / "ablation.jsonl"
 
-    if sweep_csv.exists():
+    if sweep_jsonl.exists():
         out_path = results_dir / "sweep.png"
-        plot_sweep(sweep_csv, out_path, scenario, gpu_name)
-    elif ablation_csv.exists():
-        results = []
-        with open(ablation_csv) as f:
-            for row in csv.DictReader(f):
-                row["env_fps"] = float(row["env_fps"]) if row.get("env_fps") else None
-                row["gpu_used_gb"] = float(row["gpu_used_gb"]) if row.get("gpu_used_gb") else None
-                results.append(row)
+        plot_sweep(sweep_jsonl, out_path, scenario, gpu_name)
+    elif ablation_jsonl.exists():
+        results = _load_jsonl(ablation_jsonl)
         num_worlds = metadata.get("num_worlds", 0)
         out_path = results_dir / "ablation.png"
         plot_ablation(results, out_path, scenario, num_worlds, gpu_name)
     else:
-        print(f"Error: no sweep.csv or ablation.csv found in {results_dir}")
+        print(f"Error: no sweep.jsonl or ablation.jsonl found in {results_dir}")
 
 
 # =============================================================================
