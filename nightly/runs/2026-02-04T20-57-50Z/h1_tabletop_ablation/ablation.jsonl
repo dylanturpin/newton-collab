@@ -1,0 +1,7 @@
+{"label": "baseline (all loop)", "env_fps": 297.38, "gpu_used_gb": 13.203, "ok": true, "solver": "feather_pgs", "num_worlds": 2048, "step_index": 0}
+{"label": "+ tiled cholesky", "env_fps": 299.45, "gpu_used_gb": 13.155, "ok": true, "solver": "feather_pgs", "num_worlds": 2048, "step_index": 1}
+{"label": "+ tiled trisolve", "env_fps": 298.02, "gpu_used_gb": 13.152, "ok": true, "solver": "feather_pgs", "num_worlds": 2048, "step_index": 2}
+{"label": "+ tiled delassus", "env_fps": 1140.76, "gpu_used_gb": 13.156, "ok": true, "solver": "feather_pgs", "num_worlds": 2048, "step_index": 3}
+{"label": "+ streaming PGS", "env_fps": 4688.03, "gpu_used_gb": 13.151, "ok": true, "solver": "feather_pgs", "num_worlds": 2048, "step_index": 4}
+{"label": "+ parallel streams", "env_fps": 4633.93, "gpu_used_gb": 13.151, "ok": true, "solver": "feather_pgs", "num_worlds": 2048, "step_index": 5}
+{"label": "MuJoCo baseline", "env_fps": 3510.69, "gpu_used_gb": 3.533, "ok": true, "solver": "mujoco", "num_worlds": 2048, "step_index": 6}

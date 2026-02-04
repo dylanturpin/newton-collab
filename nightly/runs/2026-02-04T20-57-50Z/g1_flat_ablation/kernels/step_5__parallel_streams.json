@@ -1,0 +1,31 @@
+{
+  "label": "+ parallel streams",
+  "config": {
+    "label": "+ parallel streams",
+    "cholesky_kernel": "tiled",
+    "trisolve_kernel": "tiled",
+    "hinv_jt_kernel": "tiled",
+    "delassus_kernel": "tiled",
+    "pgs_kernel": "tiled_contact",
+    "use_parallel_streams": true,
+    "type": "feather_pgs"
+  },
+  "env_fps": 478099.25,
+  "kernels": {
+    "eval_rigid_id": 128.0,
+    "build_contact_rows_normal": 123.0,
+    "crba_fill_flat_par_dof": 108.0,
+    "compute_composite_inertia": 108.0,
+    "hinv_jt_flat_tiled_49_32": 105.0,
+    "eval_articulation_fk": 70.0,
+    "eval_rigid_mass": 69.0,
+    "cholesky_flat_tiled_49": 68.0,
+    "eval_rigid_tau": 60.0,
+    "eval_rigid_fk": 56.0,
+    "trisolve_flat_tiled_49": 40.0,
+    "build_augmented_joint_rows": 31.0,
+    "pgs_solve_tiled_contact_32": 27.0,
+    "contact_bias_flat_par_row": 25.0,
+    "apply_augmented_mass_diagonal": 17.0
+  }
+}
