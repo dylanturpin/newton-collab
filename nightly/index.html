@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Newton Nightly Benchmarks</title>
+  <link rel="icon" href="data:," />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+  <style>
+    :root {
+      --bg: #0f1215;
+      --bg-card: #151b20;
+      --bg-card-2: #11161b;
+      --text: #e9eef2;
+      --text-dim: #9aa6b2;
+      --border: #24303a;
+      --accent: #35c1a2;
+      --accent-2: #f6b352;
+      --accent-3: #6aa7ff;
+      --danger: #f67373;
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f4f6f8;
+        --bg-card: #ffffff;
+        --bg-card-2: #f0f3f6;
+        --text: #1b1f23;
+        --text-dim: #55606c;
+        --border: #d6dde5;
+        --accent: #0f8c7a;
+        --accent-2: #c87b17;
+        --accent-3: #2563eb;
+        --danger: #b42318;
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Space Grotesk', sans-serif;
+      background: radial-gradient(circle at 10% 20%, rgba(53, 193, 162, 0.15), transparent 40%),
+        radial-gradient(circle at 80% 0%, rgba(246, 179, 82, 0.12), transparent 35%),
+        var(--bg);
+      color: var(--text);
+      padding: 2rem;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 2rem;
+      margin-bottom: 2rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    h1 {
+      font-size: 1.9rem;
+      letter-spacing: 0.01em;
+    }
+
+    .subtitle {
+      color: var(--text-dim);
+      font-size: 0.95rem;
+      margin-top: 0.35rem;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.3rem 0.75rem;
+      border-radius: 999px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      font-size: 0.8rem;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .control {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      min-width: 180px;
+    }
+
+    .control label {
+      font-size: 0.8rem;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    select {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 0.55rem 0.75rem;
+      font-size: 0.95rem;
+      outline: none;
+    }
+
+    select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(53, 193, 162, 0.2);
+    }
+
+    .section {
+      margin-top: 2rem;
+    }
+
+    .section-title {
+      font-size: 1.2rem;
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+
+    .section-title span {
+      color: var(--text-dim);
+      font-size: 0.85rem;
+      font-weight: 500;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 1.25rem;
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.25rem 1.25rem;
+      min-height: 320px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .card h3 {
+      font-size: 1rem;
+      font-weight: 600;
+    }
+
+    .chart-wrap {
+      flex: 1;
+      min-height: 240px;
+    }
+
+    .chart-wrap canvas {
+      width: 100% !important;
+      height: 100% !important;
+    }
+
+    .note {
+      color: var(--text-dim);
+      font-size: 0.85rem;
+      margin-top: 0.5rem;
+    }
+
+    .error {
+      background: rgba(246, 115, 115, 0.15);
+      border: 1px solid rgba(246, 115, 115, 0.4);
+      color: var(--danger);
+      padding: 1rem;
+      border-radius: 10px;
+      margin-bottom: 1.5rem;
+    }
+
+    footer {
+      margin-top: 3rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border);
+      color: var(--text-dim);
+      font-size: 0.85rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+
+    @media (max-width: 768px) {
+      body {
+        padding: 1rem;
+      }
+
+      header {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+
+      .controls {
+        flex-direction: column;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Newton Nightly Benchmarks</h1>
+      <div class="subtitle">Performance sweeps and ablations for FeatherPGS and MJWarp</div>
+    </div>
+    <div class="badge" id="run-badge">Loading runs…</div>
+  </header>
+
+  <div id="error" class="error" style="display:none;"></div>
+
+  <div class="controls">
+    <div class="control">
+      <label for="run-select">Run</label>
+      <select id="run-select"></select>
+    </div>
+    <div class="control">
+      <label for="mode-select">Time Series Mode</label>
+      <select id="mode-select">
+        <option value="sweep">Sweep</option>
+        <option value="ablation">Ablation</option>
+      </select>
+    </div>
+    <div class="control">
+      <label for="scenario-select">Scenario</label>
+      <select id="scenario-select"></select>
+    </div>
+    <div class="control">
+      <label for="solver-select">Solver / Variant</label>
+      <select id="solver-select"></select>
+    </div>
+    <div class="control">
+      <label for="env-select">Env Count</label>
+      <select id="env-select"></select>
+    </div>
+    <div class="control">
+      <label for="metric-select">Metric</label>
+      <select id="metric-select">
+        <option value="env_fps">Env-FPS</option>
+        <option value="gpu_used_gb">GPU Memory (GB)</option>
+        <option value="elapsed_s">Elapsed (s)</option>
+      </select>
+    </div>
+  </div>
+
+  <section class="section">
+    <div class="section-title">Run Snapshot <span id="run-title">–</span></div>
+    <div class="grid">
+      <div class="card">
+        <h3>G1 Flat Sweep • Env-FPS</h3>
+        <div class="chart-wrap"><canvas id="g1-flat-fps"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>G1 Flat Sweep • GPU Memory</h3>
+        <div class="chart-wrap"><canvas id="g1-flat-gpu"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>G1 Flat Ablation • Env-FPS</h3>
+        <div class="chart-wrap"><canvas id="g1-flat-ablation"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>H1 Tabletop Sweep • Env-FPS</h3>
+        <div class="chart-wrap"><canvas id="h1-tabletop-fps"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>H1 Tabletop Sweep • GPU Memory</h3>
+        <div class="chart-wrap"><canvas id="h1-tabletop-gpu"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>H1 Tabletop Ablation • Env-FPS</h3>
+        <div class="chart-wrap"><canvas id="h1-tabletop-ablation"></canvas></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-title">Time Series</div>
+    <div class="card">
+      <h3 id="timeseries-title">Env-FPS over time</h3>
+      <div class="chart-wrap"><canvas id="timeseries-chart"></canvas></div>
+      <div class="note">Select a scenario, solver, and env count to compare over time.</div>
+    </div>
+  </section>
+
+  <footer>
+    <div id="system-info">System info will appear here.</div>
+    <div>Powered by JSONL runs committed to the <code>gh-pages</code> branch.</div>
+  </footer>
+
+  <script>
+    const RUNS_URL = 'runs.jsonl';
+    const POINTS_URL = 'points.jsonl';
+
+    const SOLVER_COLORS = {
+      fpgs_tiled: '#35c1a2',
+      fpgs_tiled_contact: '#35c1a2',
+      fpgs_tiled_row: '#6aa7ff',
+      fpgs_loop: '#f6b352',
+      mujoco: '#9f7aea'
+    };
+
+    const LABEL_MAP = {
+      fpgs_tiled: 'FeatherPGS (tiled)',
+      fpgs_tiled_contact: 'FeatherPGS (tiled)',
+      fpgs_tiled_row: 'FeatherPGS (tiled_row)',
+      fpgs_loop: 'FeatherPGS (loop)',
+      mujoco: 'MJWarp'
+    };
+
+    let runs = [];
+    let points = [];
+    let charts = {};
+
+    const runSelect = document.getElementById('run-select');
+    const modeSelect = document.getElementById('mode-select');
+    const scenarioSelect = document.getElementById('scenario-select');
+    const solverSelect = document.getElementById('solver-select');
+    const envSelect = document.getElementById('env-select');
+    const metricSelect = document.getElementById('metric-select');
+    const errorEl = document.getElementById('error');
+    const runBadge = document.getElementById('run-badge');
+    const runTitle = document.getElementById('run-title');
+    const systemInfo = document.getElementById('system-info');
+
+    function parseJsonl(text) {
+      return text
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean)
+        .map(line => {
+          try { return JSON.parse(line); } catch (e) { return null; }
+        })
+        .filter(Boolean);
+    }
+
+    function formatRunLabel(run) {
+      const date = run.timestamp ? run.timestamp.replace('T', ' ').replace('Z', ' UTC') : 'unknown time';
+      const commit = run.commit_short || (run.commit ? run.commit.slice(0, 7) : 'unknown');
+      return `${date} • ${commit}`;
+    }
+
+    function unique(values) {
+      return Array.from(new Set(values)).sort();
+    }
+
+    function destroyChart(name) {
+      if (charts[name]) {
+        charts[name].destroy();
+        delete charts[name];
+      }
+    }
+
+    function buildLineChart(canvasId, datasets, xLabel, yLabel) {
+      destroyChart(canvasId);
+      charts[canvasId] = new Chart(document.getElementById(canvasId), {
+        type: 'line',
+        data: { datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'nearest', intersect: false },
+          scales: {
+            x: {
+              type: 'linear',
+              title: { display: true, text: xLabel },
+              ticks: { color: '#9aa6b2' },
+              grid: { color: 'rgba(255,255,255,0.05)' }
+            },
+            y: {
+              title: { display: true, text: yLabel },
+              ticks: { color: '#9aa6b2' },
+              grid: { color: 'rgba(255,255,255,0.05)' },
+              beginAtZero: true
+            }
+          },
+          plugins: {
+            legend: { labels: { color: '#9aa6b2' } },
+            tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y.toLocaleString()}` } }
+          }
+        }
+      });
+    }
+
+    function buildBarChart(canvasId, labels, data, colors) {
+      destroyChart(canvasId);
+      charts[canvasId] = new Chart(document.getElementById(canvasId), {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Env-FPS',
+            data,
+            backgroundColor: colors,
+            borderRadius: 6
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            x: {
+              ticks: { color: '#9aa6b2' },
+              grid: { display: false }
+            },
+            y: {
+              ticks: { color: '#9aa6b2' },
+              grid: { color: 'rgba(255,255,255,0.05)' },
+              beginAtZero: true
+            }
+          },
+          plugins: {
+            legend: { display: false },
+            tooltip: { callbacks: { label: ctx => `${ctx.parsed.y.toLocaleString()} env/s` } }
+          }
+        }
+      });
+    }
+
+    function buildTimeSeriesChart(datasets) {
+      destroyChart('timeseries-chart');
+      charts['timeseries-chart'] = new Chart(document.getElementById('timeseries-chart'), {
+        type: 'line',
+        data: { datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'nearest', intersect: false },
+          scales: {
+            x: {
+              type: 'time',
+              time: { unit: 'day' },
+              ticks: { color: '#9aa6b2' },
+              grid: { color: 'rgba(255,255,255,0.05)' }
+            },
+            y: {
+              ticks: { color: '#9aa6b2' },
+              grid: { color: 'rgba(255,255,255,0.05)' },
+              beginAtZero: true
+            }
+          },
+          plugins: {
+            legend: { labels: { color: '#9aa6b2' } }
+          }
+        }
+      });
+    }
+
+    function renderRunCharts(runId) {
+      const runPoints = points.filter(p => p.run_id === runId);
+      const run = runs.find(r => r.run_id === runId);
+      runTitle.textContent = run ? formatRunLabel(run) : '–';
+
+      const scenarios = ['g1_flat', 'h1_tabletop'];
+      scenarios.forEach(scenario => {
+        const sweep = runPoints.filter(p => p.mode === 'sweep' && p.scenario === scenario && p.ok !== false);
+        const ablation = runPoints.filter(p => p.mode === 'ablation' && p.scenario === scenario && p.ok !== false);
+
+        const sweepDatasetsFps = buildSweepDatasets(sweep, 'env_fps');
+        const sweepDatasetsGpu = buildSweepDatasets(sweep, 'gpu_used_gb');
+
+        buildLineChart(`${scenario.replace('_', '-')}-fps`, sweepDatasetsFps, 'num_envs', 'Env-FPS');
+        buildLineChart(`${scenario.replace('_', '-')}-gpu`, sweepDatasetsGpu, 'num_envs', 'GPU GB');
+
+        const ablationSorted = ablation.slice().sort((a, b) => (a.step_index ?? 0) - (b.step_index ?? 0));
+        const ablationLabels = ablationSorted.map(p => (p.label || p.solver || 'unknown').replace(/^\+\s*/, '').slice(0, 24));
+        const ablationValues = ablationSorted.map(p => p.env_fps || 0);
+        const ablationColors = ablationSorted.map(p => {
+          const label = (p.label || '').toLowerCase();
+          if (label.includes('mujoco')) return '#9f7aea';
+          return '#35c1a2';
+        });
+        buildBarChart(`${scenario.replace('_', '-')}-ablation`, ablationLabels, ablationValues, ablationColors);
+      });
+    }
+
+    function getSolverKey(point, mode) {
+      if (mode === 'ablation') {
+        return point.label || point.solver || 'unknown';
+      }
+      return point.solver || point.label || 'unknown';
+    }
+
+    function buildSweepDatasets(rows, key) {
+      const grouped = {};
+      rows.forEach(r => {
+        const solver = r.solver || 'unknown';
+        const substeps = r.substeps ?? '';
+        const label = substeps ? `${LABEL_MAP[solver] || solver} (${substeps} sub)` : (LABEL_MAP[solver] || solver);
+        const groupKey = `${solver}|${substeps}`;
+        if (!grouped[groupKey]) {
+          grouped[groupKey] = { label, solver, substeps, data: [] };
+        }
+        const value = r[key];
+        if (value === null || value === undefined) return;
+        grouped[groupKey].data.push({ x: r.num_worlds, y: value });
+      });
+
+      return Object.values(grouped).map(group => {
+        group.data.sort((a, b) => a.x - b.x);
+        return {
+          label: group.label,
+          data: group.data,
+          borderColor: SOLVER_COLORS[group.solver] || '#6aa7ff',
+          backgroundColor: SOLVER_COLORS[group.solver] || '#6aa7ff',
+          tension: 0.2,
+          pointRadius: 3
+        };
+      });
+    }
+
+    function updateTimeSeriesControls() {
+      const mode = modeSelect.value;
+      const available = points.filter(p => p.mode === mode);
+      const scenarios = unique(available.map(p => p.scenario));
+
+      scenarioSelect.innerHTML = scenarios.map(s => `<option value="${s}">${s}</option>`).join('');
+      scenarioSelect.value = scenarios[0] || '';
+
+      updateSolverEnvOptions();
+    }
+
+    function updateSolverEnvOptions() {
+      const mode = modeSelect.value;
+      const scenario = scenarioSelect.value;
+      const scoped = points.filter(p => p.mode === mode && p.scenario === scenario);
+
+      const solvers = unique(scoped.map(p => getSolverKey(p, mode)));
+      solverSelect.innerHTML = solvers.map(s => `<option value="${s}">${s}</option>`).join('');
+      solverSelect.value = solvers[0] || '';
+
+      const envs = unique(scoped.map(p => p.num_worlds).filter(Boolean));
+      envSelect.innerHTML = envs.map(n => `<option value="${n}">${n}</option>`).join('');
+      envSelect.value = envs[0] || '';
+
+      renderTimeSeries();
+    }
+
+    function renderTimeSeries() {
+      const mode = modeSelect.value;
+      const scenario = scenarioSelect.value;
+      const solver = solverSelect.value;
+      const env = Number(envSelect.value);
+      const metric = metricSelect.value;
+
+      const filtered = points.filter(p => {
+        if (p.mode !== mode) return false;
+        if (p.scenario !== scenario) return false;
+        const key = getSolverKey(p, mode);
+        if (key !== solver) return false;
+        if (env && p.num_worlds !== env) return false;
+        return p[metric] !== null && p[metric] !== undefined;
+      });
+
+      const dataset = filtered
+        .map(p => ({ x: new Date(p.run_timestamp || p.timestamp), y: p[metric] }))
+        .sort((a, b) => a.x - b.x);
+
+      const label = `${solver} • ${scenario} • ${env || 'n/a'} envs`;
+      buildTimeSeriesChart([{ label, data: dataset, borderColor: '#35c1a2', backgroundColor: '#35c1a2', pointRadius: 4, tension: 0.2 }]);
+      document.getElementById('timeseries-title').textContent = `${metric.replace('_', ' ')} over time`;
+    }
+
+    async function init() {
+      try {
+        const [runsText, pointsText] = await Promise.all([
+          fetch(RUNS_URL).then(r => r.text()),
+          fetch(POINTS_URL).then(r => r.text())
+        ]);
+
+        runs = parseJsonl(runsText).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+        points = parseJsonl(pointsText);
+
+        if (!runs.length) throw new Error('No runs found');
+
+        runSelect.innerHTML = runs.map(run => `<option value="${run.run_id}">${formatRunLabel(run)}</option>`).join('');
+        runSelect.value = runs[0].run_id;
+        runBadge.textContent = `Latest: ${formatRunLabel(runs[0])}`;
+
+        runSelect.addEventListener('change', () => renderRunCharts(runSelect.value));
+        modeSelect.addEventListener('change', () => {
+          updateTimeSeriesControls();
+        });
+        scenarioSelect.addEventListener('change', updateSolverEnvOptions);
+        solverSelect.addEventListener('change', updateSolverEnvOptions);
+        envSelect.addEventListener('change', renderTimeSeries);
+        metricSelect.addEventListener('change', renderTimeSeries);
+
+        updateTimeSeriesControls();
+        renderRunCharts(runSelect.value);
+
+        const latest = runs[0];
+        const system = [
+          latest.gpu ? `GPU: ${latest.gpu}` : null,
+          latest.gpu_memory_total_gb ? `VRAM: ${Number(latest.gpu_memory_total_gb).toFixed(1)} GB` : null,
+          latest.platform ? `OS: ${latest.platform}` : null,
+          latest.python_version ? `Python: ${latest.python_version}` : null
+        ].filter(Boolean).join(' • ');
+
+        systemInfo.textContent = system || 'System info unavailable.';
+      } catch (err) {
+        errorEl.textContent = `Failed to load benchmark data: ${err.message}`;
+        errorEl.style.display = 'block';
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
