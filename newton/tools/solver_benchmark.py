@@ -105,15 +105,17 @@ SCENARIOS = {
         "robot": "h1",
         "environment": "tabletop",
         "storage": "batched",
-        "default_substeps": 2,
+        "default_substeps": 8,
         "default_pgs_iterations": 8,
-        "default_pgs_max_constraints": 512,
+        "default_pgs_max_constraints": 1024,
         # High contact count (~150) exceeds tiled kernel shared memory limits.
-        # Use loop/par_row kernels until separate rigid body path is added.
-        "default_cholesky_kernel": "loop",
-        "default_trisolve_kernel": "loop",
+        # Use streaming kernel which streams block-rows from global memory.
+        "default_cholesky_kernel": "tiled",
+        "default_trisolve_kernel": "tiled",
         "default_hinv_jt_kernel": "par_row",
-        "default_pgs_kernel": "loop",
+        "default_delassus_kernel": "tiled",
+        "default_pgs_kernel": "streaming",
+        "ablation_sequence": "streaming",
         "mujoco_settings": {
             "njmax": 512,
             "nconmax": 128,
@@ -138,6 +140,7 @@ SOLVER_PRESETS = {
         "cholesky_kernel": "loop",
         "trisolve_kernel": "loop",
         "hinv_jt_kernel": "par_row",
+        "delassus_kernel": "par_row_col",
         "pgs_kernel": "loop",
         "use_parallel_streams": False,
     },
@@ -146,6 +149,7 @@ SOLVER_PRESETS = {
         "cholesky_kernel": "tiled",
         "trisolve_kernel": "tiled",
         "hinv_jt_kernel": "tiled",
+        "delassus_kernel": "tiled",
         "pgs_kernel": "tiled_contact",
         "use_parallel_streams": True,
     },
@@ -154,6 +158,7 @@ SOLVER_PRESETS = {
         "cholesky_kernel": "tiled",
         "trisolve_kernel": "tiled",
         "hinv_jt_kernel": "tiled",
+        "delassus_kernel": "tiled",
         "pgs_kernel": "tiled_row",
         "use_parallel_streams": True,
     },
@@ -162,8 +167,18 @@ SOLVER_PRESETS = {
         "cholesky_kernel": "tiled",
         "trisolve_kernel": "tiled",
         "hinv_jt_kernel": "tiled",
+        "delassus_kernel": "tiled",
         "pgs_kernel": "tiled_contact",
         "use_parallel_streams": True,
+    },
+    "fpgs_streaming": {
+        "type": "feather_pgs",
+        "cholesky_kernel": "tiled",
+        "trisolve_kernel": "tiled",
+        "hinv_jt_kernel": "par_row",
+        "delassus_kernel": "tiled",
+        "pgs_kernel": "streaming",
+        "use_parallel_streams": False,
     },
     "feather_pgs": {
         "type": "feather_pgs",
@@ -175,62 +190,137 @@ SOLVER_PRESETS = {
 # Ablation Sequence
 # =============================================================================
 
-ABLATION_SEQUENCE = [
-    {
-        "label": "baseline (all loop)",
-        "cholesky_kernel": "loop",
-        "trisolve_kernel": "loop",
-        "hinv_jt_kernel": "par_row",
-        "pgs_kernel": "loop",
-        "use_parallel_streams": False,
-    },
-    {
-        "label": "+ tiled cholesky",
-        "cholesky_kernel": "tiled",
-        "trisolve_kernel": "loop",
-        "hinv_jt_kernel": "par_row",
-        "pgs_kernel": "loop",
-        "use_parallel_streams": False,
-    },
-    {
-        "label": "+ tiled trisolve",
-        "cholesky_kernel": "tiled",
-        "trisolve_kernel": "tiled",
-        "hinv_jt_kernel": "par_row",
-        "pgs_kernel": "loop",
-        "use_parallel_streams": False,
-    },
-    {
-        "label": "+ tiled hinv_jt",
-        "cholesky_kernel": "tiled",
-        "trisolve_kernel": "tiled",
-        "hinv_jt_kernel": "tiled",
-        "pgs_kernel": "loop",
-        "use_parallel_streams": False,
-    },
-    {
-        "label": "+ tiled PGS",
-        "cholesky_kernel": "tiled",
-        "trisolve_kernel": "tiled",
-        "hinv_jt_kernel": "tiled",
-        "pgs_kernel": "tiled_contact",  # Will be overridden by --ablation-pgs if specified
-        "use_parallel_streams": False,
-    },
-    {
-        "label": "+ parallel streams",
-        "cholesky_kernel": "tiled",
-        "trisolve_kernel": "tiled",
-        "hinv_jt_kernel": "tiled",
-        "pgs_kernel": "tiled_contact",
-        "use_parallel_streams": True,
-    },
-]
+ABLATION_SEQUENCES = {
+    # Default: for low-constraint scenarios where tiled hinv_jt and tiled PGS fit in shared memory
+    # (e.g. g1_flat with 32 constraints, g1_cube_stack with 128 constraints)
+    "default": [
+        {
+            "label": "baseline (all loop)",
+            "cholesky_kernel": "loop",
+            "trisolve_kernel": "loop",
+            "hinv_jt_kernel": "par_row",
+            "delassus_kernel": "par_row_col",
+            "pgs_kernel": "loop",
+            "use_parallel_streams": False,
+        },
+        {
+            "label": "+ tiled cholesky",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "loop",
+            "hinv_jt_kernel": "par_row",
+            "delassus_kernel": "par_row_col",
+            "pgs_kernel": "loop",
+            "use_parallel_streams": False,
+        },
+        {
+            "label": "+ tiled trisolve",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "par_row",
+            "delassus_kernel": "par_row_col",
+            "pgs_kernel": "loop",
+            "use_parallel_streams": False,
+        },
+        {
+            "label": "+ tiled hinv_jt",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "tiled",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "loop",
+            "use_parallel_streams": False,
+        },
+        {
+            "label": "+ tiled PGS",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "tiled",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "tiled_contact",  # Will be overridden by --ablation-pgs if specified
+            "use_parallel_streams": False,
+        },
+        {
+            "label": "+ parallel streams",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "tiled",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "tiled_contact",
+            "use_parallel_streams": True,
+        },
+    ],
+    # Streaming: for high-constraint scenarios where tiled hinv_jt and tiled PGS exceed shared
+    # memory limits (e.g. h1_tabletop with 1024 constraints). Uses par_row hinv_jt, streaming
+    # Delassus (chunked shared memory), and streaming PGS throughout.
+    "streaming": [
+        {
+            "label": "baseline (all loop)",
+            "cholesky_kernel": "loop",
+            "trisolve_kernel": "loop",
+            "hinv_jt_kernel": "par_row",
+            "delassus_kernel": "par_row_col",
+            "pgs_kernel": "loop",
+            "use_parallel_streams": False,
+        },
+        {
+            "label": "+ tiled cholesky",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "loop",
+            "hinv_jt_kernel": "par_row",
+            "delassus_kernel": "par_row_col",
+            "pgs_kernel": "loop",
+            "use_parallel_streams": False,
+        },
+        {
+            "label": "+ tiled trisolve",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "par_row",
+            "delassus_kernel": "par_row_col",
+            "pgs_kernel": "loop",
+            "use_parallel_streams": False,
+        },
+        {
+            "label": "+ tiled delassus",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "par_row",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "loop",
+            "use_parallel_streams": False,
+        },
+        {
+            "label": "+ streaming PGS",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "par_row",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "streaming",  # Will be overridden by --ablation-pgs if specified
+            "use_parallel_streams": False,
+        },
+        {
+            "label": "+ parallel streams",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "par_row",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "streaming",
+            "use_parallel_streams": True,
+        },
+    ],
+}
 
 # =============================================================================
 # Kernel to Stage Mapping
 # =============================================================================
 
 STAGE_PATTERNS = {
+    "0_collision": [
+        # Shared - broadphase and contact pair generation
+        "broadphase_collision_pairs", "generate_handle_contact_pairs",
+        # MuJoCo - narrowphase
+        "_primitive_narrowphase", "_nxn_broadphase",
+    ],
     "1_fk_id": [
         # FeatherPGS
         "eval_rigid_fk", "eval_rigid_id", "eval_rigid_mass", "compute_com", "compute_spatial",
@@ -255,6 +345,8 @@ STAGE_PATTERNS = {
         "cholesky_",
         # MuJoCo - sparse Cholesky factorization accumulation
         "_qLD_acc",
+        # MuJoCo - sparse L*D*L^T accumulation sweeps (part of factorization)
+        "_solve_LD_sparse_x_acc",
     ],
     "3_trisolve": [
         # FeatherPGS
@@ -269,8 +361,9 @@ STAGE_PATTERNS = {
     "4_contact_build": [
         # FeatherPGS
         "build_contact_row", "build_augmented", "allocate_world_contact", "clamp_contact",
+        "populate_world_J",
         # MuJoCo - contact constraint generation with pyramidal friction
-        "_efc_contact",
+        "_efc_contact", "update_constraint_efc",
     ],
     "4_hinv_jt": [
         # FeatherPGS - compute H^-1 * J^T
@@ -278,7 +371,7 @@ STAGE_PATTERNS = {
     ],
     "4_delassus": [
         # FeatherPGS - Delassus matrix G = J * H^-1 * J^T (constraint space)
-        "delassus_",
+        "delassus_", "finalize_world_diag_cfm",
     ],
     "4_hessian": [
         # MuJoCo - build system Hessian: H + J^T * D * J (DOF space)
@@ -293,6 +386,7 @@ STAGE_PATTERNS = {
         "pgs_solve", "prepare_impulses", "prepare_world_impulses",
         # MuJoCo (Newton solver iterations with line search)
         "linesearch_jv", "linesearch_parallel", "update_gradient_cholesky",
+        "update_gradient_grad", "solve_init_jaref", "solve_search_update",
     ],
     "6_apply": [
         # FeatherPGS
@@ -470,6 +564,11 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
     else:
         cmd.extend(["--solver", "feather_pgs"])
 
+        # When kernel configs are explicitly specified (e.g. ablation steps),
+        # override scenario defaults so the CLI args take effect.
+        if any(k.endswith("_kernel") for k in solver_config):
+            cmd.append("--override-scenario-defaults")
+
         # Storage
         storage = solver_config.get("storage") or scenario_cfg.get("storage", "batched")
         cmd.extend(["--storage", storage])
@@ -481,6 +580,8 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
             cmd.extend(["--trisolve-kernel", solver_config["trisolve_kernel"]])
         if "hinv_jt_kernel" in solver_config:
             cmd.extend(["--hinv-jt-kernel", solver_config["hinv_jt_kernel"]])
+        if "delassus_kernel" in solver_config:
+            cmd.extend(["--delassus-kernel", solver_config["delassus_kernel"]])
         if "pgs_kernel" in solver_config:
             cmd.extend(["--pgs-kernel", solver_config["pgs_kernel"]])
 
@@ -639,14 +740,18 @@ def run_ablation(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "kernels").mkdir(exist_ok=True)
 
+    # Select ablation sequence based on scenario
+    seq_name = scenario_cfg.get("ablation_sequence", "default")
+    ablation_seq = ABLATION_SEQUENCES[seq_name]
+
     # Prepare ablation sequence
     ablation_steps = []
-    for step in ABLATION_SEQUENCE:
+    for step in ablation_seq:
         step_config = step.copy()
         step_config["type"] = "feather_pgs"
         # Override PGS kernel if specified
         if args.ablation_pgs != "auto":
-            if "tiled PGS" in step_config["label"] or "parallel streams" in step_config["label"]:
+            if "PGS" in step_config["label"] or "parallel streams" in step_config["label"]:
                 step_config["pgs_kernel"] = args.ablation_pgs
         ablation_steps.append(step_config)
 
@@ -770,11 +875,12 @@ def run_compare(args):
 
     # Header
     labels = [d.get("label", Path(d["file"]).stem)[:20] for d in data]
+    col_width_hdr = 22
     header = f"{'Kernel':<40}"
     for label in labels:
-        header += f" {label:>15}"
+        header += f" {label:>{col_width_hdr}}"
     print(header)
-    print("-" * 80)
+    print("-" * (40 + (col_width_hdr + 1) * len(labels)))
 
     stage_order = ["1_fk_id", "1_drives", "1_crba", "2_cholesky", "3_trisolve", "3_v_hat",
                    "4_contact_build", "4_hinv_jt", "4_delassus", "4_hessian", "4_rhs", "5_solver",
@@ -782,6 +888,17 @@ def run_compare(args):
 
     stage_totals = {label: defaultdict(float) for label in labels}
 
+    # Accumulate totals first
+    for stage in stage_order:
+        for kernel in stage_kernels.get(stage, []):
+            for i, d in enumerate(data):
+                time_ms = d.get("kernels", {}).get(kernel)
+                if time_ms is not None:
+                    stage_totals[labels[i]][stage] += time_ms
+
+    grand_totals_kernel = {label: sum(stage_totals[label].values()) for label in labels}
+
+    col_width = 22
     for stage in stage_order:
         kernels = sorted(stage_kernels.get(stage, []))
         if not kernels:
@@ -789,27 +906,32 @@ def run_compare(args):
 
         print(f"\n[{stage}]")
         for kernel in kernels:
-            row = f"  {kernel:<38}"
+            name = kernel if len(kernel) <= 38 else kernel[:35] + "..."
+            row = f"  {name:<38}"
             for i, d in enumerate(data):
                 time_ms = d.get("kernels", {}).get(kernel)
                 if time_ms is not None:
-                    row += f" {time_ms:>14.2f}ms"
-                    stage_totals[labels[i]][stage] += time_ms
+                    gt = grand_totals_kernel[labels[i]]
+                    pct = time_ms / gt * 100 if gt > 0 else 0
+                    row += f" {f'{time_ms:.1f}ms ({pct:.0f}%)':>{col_width}}"
                 else:
-                    row += f" {'-':>15}"
+                    row += f" {'-':>{col_width}}"
             print(row)
 
     # Stage totals
+    grand_totals = {label: sum(stage_totals[label].values()) for label in labels}
+
     print("\n" + "=" * 80)
     print("STAGE TOTALS")
     print("=" * 80)
+    col_width = 22
     print(f"{'Stage':<20}", end="")
     for label in labels:
-        print(f" {label:>15}", end="")
+        print(f" {label:>{col_width}}", end="")
     if len(labels) == 2:
         print(f" {'Speedup':>10}", end="")
     print()
-    print("-" * 80)
+    print("-" * (20 + (col_width + 1) * len(labels) + (11 if len(labels) == 2 else 0)))
 
     for stage in stage_order:
         has_data = any(stage_totals[label].get(stage, 0) > 0 for label in labels)
@@ -820,13 +942,28 @@ def run_compare(args):
         for label in labels:
             t = stage_totals[label].get(stage, 0)
             times.append(t)
-            print(f" {t:>14.2f}ms" if t > 0 else f" {'-':>15}", end="")
+            if t > 0 and grand_totals[label] > 0:
+                pct = t / grand_totals[label] * 100
+                print(f" {f'{t:.1f}ms ({pct:.0f}%)':>{col_width}}", end="")
+            else:
+                print(f" {'-':>{col_width}}", end="")
         if len(times) == 2 and times[1] > 0:
             speedup = times[1] / times[0] if times[0] > 0 else 0
             print(f" {speedup:>9.2f}x", end="")
         print()
 
-    print("=" * 80)
+    # Grand total row
+    print(f"{'TOTAL':<20}", end="")
+    for label in labels:
+        gt = grand_totals[label]
+        print(f" {f'{gt:.1f}ms':>{col_width}}", end="")
+    if len(labels) == 2:
+        gt0, gt1 = grand_totals[labels[0]], grand_totals[labels[1]]
+        if gt0 > 0:
+            print(f" {gt1 / gt0:>9.2f}x", end="")
+    print()
+
+    print("=" * (20 + (col_width + 1) * len(labels) + (11 if len(labels) == 2 else 0)))
 
 
 # =============================================================================
@@ -1219,17 +1356,20 @@ def create_solver(model, args, scenario_cfg: dict):
         )
     else:
         # Priority: preset > scenario default > CLI arg
+        # (--override-scenario-defaults skips scenario defaults, used by ablation subprocesses)
         def get_kernel(name, cli_val):
             if name in preset:
                 return preset[name]
-            scenario_key = f"default_{name}"
-            if scenario_key in scenario_cfg:
-                return scenario_cfg[scenario_key]
+            if not args.override_scenario_defaults:
+                scenario_key = f"default_{name}"
+                if scenario_key in scenario_cfg:
+                    return scenario_cfg[scenario_key]
             return cli_val
 
         cholesky = get_kernel("cholesky_kernel", args.cholesky_kernel)
         trisolve = get_kernel("trisolve_kernel", args.trisolve_kernel)
         hinv_jt = get_kernel("hinv_jt_kernel", args.hinv_jt_kernel)
+        delassus = get_kernel("delassus_kernel", args.delassus_kernel)
         pgs = get_kernel("pgs_kernel", args.pgs_kernel)
         parallel_streams = preset.get("use_parallel_streams", args.use_parallel_streams)
 
@@ -1246,6 +1386,7 @@ def create_solver(model, args, scenario_cfg: dict):
             "cholesky_kernel": cholesky,
             "trisolve_kernel": trisolve,
             "hinv_jt_kernel": hinv_jt,
+            "delassus_kernel": delassus,
             "pgs_kernel": pgs,
             "small_dof_threshold": 12,
             "use_parallel_streams": parallel_streams,
@@ -1478,6 +1619,44 @@ def run_interactive(args):
 
 
 # =============================================================================
+# Replot Mode
+# =============================================================================
+
+def run_replot(results_dir: Path):
+    """Regenerate plot from a previous results directory."""
+    metadata_path = results_dir / "metadata.json"
+    if not metadata_path.exists():
+        print(f"Error: no metadata.json found in {results_dir}")
+        return
+
+    with open(metadata_path) as f:
+        metadata = json.load(f)
+
+    scenario = metadata.get("scenario", "unknown")
+    gpu_name = metadata.get("gpu", "")
+
+    # Detect sweep vs ablation from CSV files
+    sweep_csv = results_dir / "sweep.csv"
+    ablation_csv = results_dir / "ablation.csv"
+
+    if sweep_csv.exists():
+        out_path = results_dir / "sweep.png"
+        plot_sweep(sweep_csv, out_path, scenario, gpu_name)
+    elif ablation_csv.exists():
+        results = []
+        with open(ablation_csv) as f:
+            for row in csv.DictReader(f):
+                row["env_fps"] = float(row["env_fps"]) if row.get("env_fps") else None
+                row["gpu_used_gb"] = float(row["gpu_used_gb"]) if row.get("gpu_used_gb") else None
+                results.append(row)
+        num_worlds = metadata.get("num_worlds", 0)
+        out_path = results_dir / "ablation.png"
+        plot_ablation(results, out_path, scenario, num_worlds, gpu_name)
+    else:
+        print(f"Error: no sweep.csv or ablation.csv found in {results_dir}")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1492,6 +1671,7 @@ def main():
     parser.add_argument("--sweep", action="store_true", help="Sweep over num_worlds")
     parser.add_argument("--ablation", action="store_true", help="Run ablation study")
     parser.add_argument("--compare", nargs="+", metavar="FILE", help="Compare kernel timing files")
+    parser.add_argument("--replot", type=str, metavar="DIR", help="Regenerate plot from a previous results directory")
 
     # Scenario
     parser.add_argument("--scenario", type=str, choices=list(SCENARIOS.keys()),
@@ -1520,8 +1700,10 @@ def main():
                         choices=["loop", "tiled", "auto"], help="Trisolve kernel")
     parser.add_argument("--hinv-jt-kernel", type=str, default="auto",
                         choices=["par_row", "tiled", "auto"], help="H^-1 J^T kernel")
+    parser.add_argument("--delassus-kernel", type=str, default="auto",
+                        choices=["par_row_col", "tiled", "auto"], help="Delassus kernel")
     parser.add_argument("--pgs-kernel", type=str, default="tiled_contact",
-                        choices=["loop", "tiled_row", "tiled_contact"], help="PGS kernel")
+                        choices=["loop", "tiled_row", "tiled_contact", "streaming"], help="PGS kernel")
     parser.add_argument("--pgs-iterations", type=int, default=8, help="PGS iterations")
     parser.add_argument("--pgs-max-constraints", type=int, default=64, help="Max constraints per world")
     parser.add_argument("--pgs-beta", type=float, default=0.1, help="PGS position correction factor (ERP)")
@@ -1531,6 +1713,8 @@ def main():
     parser.add_argument("--use-parallel-streams", action="store_true", dest="use_parallel_streams")
     parser.add_argument("--no-parallel-streams", action="store_false", dest="use_parallel_streams")
     parser.set_defaults(use_parallel_streams=True)
+    parser.add_argument("--override-scenario-defaults", action="store_true",
+                        help="CLI kernel args override scenario defaults (used by ablation)")
 
     # MuJoCo options
     parser.add_argument("--mj-solver", type=str, choices=["cg", "newton"])
@@ -1566,7 +1750,10 @@ def main():
             args.pgs_max_constraints = scenario_cfg.get("default_pgs_max_constraints", args.pgs_max_constraints)
 
     # Route to appropriate handler
-    if args.compare:
+    if args.replot:
+        run_replot(Path(args.replot))
+        return
+    elif args.compare:
         run_compare(args)
     elif args.sweep:
         run_sweep(args)
