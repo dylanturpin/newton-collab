@@ -363,6 +363,7 @@ STAGE_PATTERNS = {
         "compute_com",
         "compute_spatial",
         "compute_composite_inertia",
+        "eval_articulation_fk",
         # MuJoCo
         "_kinematics_level",
     ],
@@ -380,6 +381,7 @@ STAGE_PATTERNS = {
         "crba_",
         # MuJoCo - mass matrix setup
         "update_gradient_set_h_qM",
+        "_crb_accumulate",
     ],
     "2_cholesky": [
         # FeatherPGS
@@ -407,6 +409,9 @@ STAGE_PATTERNS = {
         "allocate_world_contact",
         "clamp_contact",
         "populate_world_J",
+        # FeatherPGS matrix-free
+        "build_mf_body_map",
+        "build_mf_contact_rows",
         # MuJoCo - contact constraint generation with pyramidal friction
         "_efc_contact",
         "update_constraint_efc",
@@ -419,6 +424,8 @@ STAGE_PATTERNS = {
         # FeatherPGS - Delassus matrix G = J * H^-1 * J^T (constraint space)
         "delassus_",
         "finalize_world_diag_cfm",
+        # FeatherPGS matrix-free - fused effective mass diagonal + RHS
+        "compute_mf_effective_mass",
     ],
     "4_hessian": [
         # MuJoCo - build system Hessian: H + J^T * D * J (DOF space)
