@@ -30,7 +30,6 @@ Usage examples:
 import argparse
 import datetime as dt
 import json
-import os
 import platform
 import re
 import subprocess
@@ -38,10 +37,8 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
 
 import numpy as np
-
 
 # =============================================================================
 # Scenario Definitions
@@ -259,6 +256,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
+            "enable_mf_pgs": False,
             "use_parallel_streams": False,
         },
         {
@@ -268,6 +266,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
+            "enable_mf_pgs": False,
             "use_parallel_streams": False,
         },
         {
@@ -277,6 +276,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
+            "enable_mf_pgs": False,
             "use_parallel_streams": False,
         },
         {
@@ -286,6 +286,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "tiled",
             "pgs_kernel": "loop",
+            "enable_mf_pgs": False,
             "use_parallel_streams": False,
         },
         {
@@ -295,6 +296,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "tiled",
             "pgs_kernel": "streaming",  # Will be overridden by --ablation-pgs if specified
+            "enable_mf_pgs": False,
             "use_parallel_streams": False,
         },
         {
@@ -304,6 +306,30 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "tiled",
             "pgs_kernel": "streaming",
+            "enable_mf_pgs": False,
+            "use_parallel_streams": True,
+        },
+        # --- MF comparison configs ---
+        {
+            "label": "no MF (streaming@396)",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "par_row",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "streaming",
+            "pgs_max_constraints": 396,
+            "enable_mf_pgs": False,
+            "use_parallel_streams": True,
+        },
+        {
+            "label": "MF + tiled@128",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "tiled",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "tiled_contact",
+            "pgs_max_constraints": 128,
+            "enable_mf_pgs": True,
             "use_parallel_streams": True,
         },
     ],
@@ -316,22 +342,31 @@ ABLATION_SEQUENCES = {
 STAGE_PATTERNS = {
     "0_collision": [
         # Shared - broadphase and contact pair generation
-        "broadphase_collision_pairs", "generate_handle_contact_pairs",
+        "broadphase_collision_pairs",
+        "generate_handle_contact_pairs",
         # MuJoCo - narrowphase
-        "_primitive_narrowphase", "_nxn_broadphase",
+        "_primitive_narrowphase",
+        "_nxn_broadphase",
     ],
     "1_fk_id": [
         # FeatherPGS
-        "eval_rigid_fk", "eval_rigid_id", "eval_rigid_mass", "compute_com", "compute_spatial",
+        "eval_rigid_fk",
+        "eval_rigid_id",
+        "eval_rigid_mass",
+        "compute_com",
+        "compute_spatial",
         "compute_composite_inertia",
         # MuJoCo
         "_kinematics_level",
     ],
     "1_drives": [
         # FeatherPGS
-        "eval_joint_drives", "eval_rigid_tau", "clamp_joint_tau",
+        "eval_joint_drives",
+        "eval_rigid_tau",
+        "clamp_joint_tau",
         # MuJoCo - actuator velocity from joint velocities
-        "_actuator_velocity", "_qderiv_actuator",
+        "_actuator_velocity",
+        "_qderiv_actuator",
     ],
     "1_crba": [
         # FeatherPGS
@@ -355,14 +390,19 @@ STAGE_PATTERNS = {
     ],
     "3_v_hat": [
         # FeatherPGS
-        "compute_velocity_predictor", "compute_v_hat",
+        "compute_velocity_predictor",
+        "compute_v_hat",
     ],
     "4_contact_build": [
         # FeatherPGS
-        "build_contact_row", "build_augmented", "allocate_world_contact", "clamp_contact",
+        "build_contact_row",
+        "build_augmented",
+        "allocate_world_contact",
+        "clamp_contact",
         "populate_world_J",
         # MuJoCo - contact constraint generation with pyramidal friction
-        "_efc_contact", "update_constraint_efc",
+        "_efc_contact",
+        "update_constraint_efc",
     ],
     "4_hinv_jt": [
         # FeatherPGS - compute H^-1 * J^T
@@ -370,32 +410,48 @@ STAGE_PATTERNS = {
     ],
     "4_delassus": [
         # FeatherPGS - Delassus matrix G = J * H^-1 * J^T (constraint space)
-        "delassus_", "finalize_world_diag_cfm",
+        "delassus_",
+        "finalize_world_diag_cfm",
     ],
     "4_hessian": [
         # MuJoCo - build system Hessian: H + J^T * D * J (DOF space)
-        "update_gradient_JTDAJ", "mul_m_sparse",
+        "update_gradient_JTDAJ",
+        "mul_m_sparse",
     ],
     "4_rhs": [
         # FeatherPGS
-        "compute_world_contact_bias", "contact_bias_", "compute_rhs", "rhs_accum",
+        "compute_world_contact_bias",
+        "contact_bias_",
+        "compute_rhs",
+        "rhs_accum",
     ],
     "5_solver": [
         # FeatherPGS (PGS iterations)
-        "pgs_solve", "prepare_impulses", "prepare_world_impulses",
+        "pgs_solve",
+        "prepare_impulses",
+        "prepare_world_impulses",
         # MuJoCo (Newton solver iterations with line search)
-        "linesearch_jv", "linesearch_parallel", "update_gradient_cholesky",
-        "update_gradient_grad", "solve_init_jaref", "solve_search_update",
+        "linesearch_jv",
+        "linesearch_parallel",
+        "update_gradient_cholesky",
+        "update_gradient_grad",
+        "solve_init_jaref",
+        "solve_search_update",
     ],
     "6_apply": [
         # FeatherPGS
-        "apply_impulse", "apply_augmented",
+        "apply_impulse",
+        "apply_augmented",
         # MuJoCo - map constraint forces to DOF space: qfrc += J^T * efc_force
         "update_constraint_init_qfrc",
     ],
     "6_integrate": [
         # FeatherPGS
-        "integrate_", "update_qdd", "update_body_qd", "scatter_qdd", "eval_fk",
+        "integrate_",
+        "update_qdd",
+        "update_body_qd",
+        "scatter_qdd",
+        "eval_fk",
     ],
 }
 
@@ -424,6 +480,7 @@ RE_SOLVER = re.compile(r"Solver:\s*([A-Za-z0-9_]+)")
 
 def parse_benchmark_output(text: str) -> dict:
     """Parse benchmark summary from stdout."""
+
     def get_float(regex, default=None):
         m = regex.search(text)
         if not m:
@@ -482,10 +539,12 @@ def parse_kernel_timing(text: str) -> dict:
 # Metadata Collection
 # =============================================================================
 
+
 def get_gpu_info() -> tuple[str, float]:
     """Get GPU name and total memory."""
     try:
         import torch
+
         if torch.cuda.is_available():
             name = torch.cuda.get_device_name(0)
             _, total = torch.cuda.mem_get_info()
@@ -498,10 +557,7 @@ def get_gpu_info() -> tuple[str, float]:
 def get_git_hash() -> str:
     """Get current git hash."""
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, check=True
-        )
+        result = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True)
         return result.stdout.strip()
     except Exception:
         return "unknown"
@@ -530,20 +586,29 @@ def collect_metadata(args, scenario_cfg: dict) -> dict:
 # Subprocess Runner
 # =============================================================================
 
+
 def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int | None = None) -> list[str]:
     """Build command line for a single benchmark run."""
     scenario_cfg = SCENARIOS[args.scenario]
     substeps = substeps if substeps is not None else args.substeps
 
     cmd = [
-        sys.executable, "-m", "newton.tools.solver_benchmark",
-        "--scenario", args.scenario,
-        "--num-worlds", str(num_worlds),
-        "--substeps", str(substeps),
-        "--warmup-frames", str(args.warmup_frames),
-        "--measure-frames", str(args.measure_frames),
+        sys.executable,
+        "-m",
+        "newton.tools.solver_benchmark",
+        "--scenario",
+        args.scenario,
+        "--num-worlds",
+        str(num_worlds),
+        "--substeps",
+        str(substeps),
+        "--warmup-frames",
+        str(args.warmup_frames),
+        "--measure-frames",
+        str(args.measure_frames),
         "--benchmark",
-        "--viewer", "null",
+        "--viewer",
+        "null",
     ]
 
     solver_type = solver_config.get("type", "feather_pgs")
@@ -592,12 +657,16 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
 
         # PGS params
         cmd.extend(["--pgs-iterations", str(args.pgs_iterations)])
-        cmd.extend(["--pgs-max-constraints", str(args.pgs_max_constraints)])
+        pgs_max_c = solver_config.get("pgs_max_constraints", args.pgs_max_constraints)
+        cmd.extend(["--pgs-max-constraints", str(pgs_max_c)])
         cmd.extend(["--pgs-beta", str(args.pgs_beta)])
         cmd.extend(["--pgs-cfm", str(args.pgs_cfm)])
         cmd.extend(["--pgs-omega", str(args.pgs_omega)])
         if args.pgs_warmstart:
             cmd.append("--pgs-warmstart")
+        enable_mf = solver_config.get("enable_mf_pgs", args.enable_mf_pgs)
+        if not enable_mf:
+            cmd.append("--no-mf-pgs")
 
         # Chunk sizes: solver_config overrides CLI
         delassus_chunk = solver_config.get("delassus_chunk_size", getattr(args, "delassus_chunk_size", None))
@@ -615,12 +684,12 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
 
 def run_subprocess(cmd: list[str], label: str) -> dict:
     """Run a benchmark subprocess and parse results."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Running: {label}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(" ".join(cmd[:10]) + " ...")
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
 
     if proc.stderr:
         # Print any warnings/errors
@@ -648,6 +717,7 @@ def run_subprocess(cmd: list[str], label: str) -> dict:
 # =============================================================================
 # Sweep Mode
 # =============================================================================
+
 
 def run_sweep(args):
     """Run sweep over num_worlds for multiple solvers (and optionally substeps)."""
@@ -734,6 +804,7 @@ def run_sweep(args):
 # Ablation Mode
 # =============================================================================
 
+
 def run_ablation(args):
     """Run ablation study."""
     scenario_cfg = SCENARIOS[args.scenario]
@@ -760,10 +831,12 @@ def run_ablation(args):
         ablation_steps.append(step_config)
 
     # Add MuJoCo baseline
-    ablation_steps.append({
-        "label": "MuJoCo baseline",
-        "type": "mujoco",
-    })
+    ablation_steps.append(
+        {
+            "label": "MuJoCo baseline",
+            "type": "mujoco",
+        }
+    )
 
     # Run ablation
     results = []
@@ -777,7 +850,9 @@ def run_ablation(args):
 
         # Save kernel timing
         if metrics.get("kernels"):
-            kernel_file = out_dir / "kernels" / f"step_{i}_{step_config['label'].replace(' ', '_').replace('+', '')[:30]}.json"
+            kernel_file = (
+                out_dir / "kernels" / f"step_{i}_{step_config['label'].replace(' ', '_').replace('+', '')[:30]}.json"
+            )
             kernel_data = {
                 "label": step_config["label"],
                 "config": step_config,
@@ -820,15 +895,20 @@ def run_ablation(args):
         ablation_jsonl.unlink()
     with open(ablation_jsonl, "w") as f:
         for r in results:
-            f.write(json.dumps({
-                "label": r.get("label"),
-                "env_fps": r.get("env_fps"),
-                "gpu_used_gb": r.get("gpu_used_gb"),
-                "ok": r.get("ok"),
-                "solver": r.get("solver"),
-                "num_worlds": r.get("num_worlds"),
-                "step_index": r.get("step_index"),
-            }) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        "label": r.get("label"),
+                        "env_fps": r.get("env_fps"),
+                        "gpu_used_gb": r.get("gpu_used_gb"),
+                        "ok": r.get("ok"),
+                        "solver": r.get("solver"),
+                        "num_worlds": r.get("num_worlds"),
+                        "step_index": r.get("step_index"),
+                    }
+                )
+                + "\n"
+            )
 
     # Save metadata
     metadata = collect_metadata(args, scenario_cfg)
@@ -848,6 +928,7 @@ def run_ablation(args):
 # =============================================================================
 # Compare Mode
 # =============================================================================
+
 
 def run_compare(args):
     """Compare kernel timing from multiple JSON files."""
@@ -890,9 +971,23 @@ def run_compare(args):
     print(header)
     print("-" * (40 + (col_width_hdr + 1) * len(labels)))
 
-    stage_order = ["1_fk_id", "1_drives", "1_crba", "2_cholesky", "3_trisolve", "3_v_hat",
-                   "4_contact_build", "4_hinv_jt", "4_delassus", "4_hessian", "4_rhs", "5_solver",
-                   "6_apply", "6_integrate", "other"]
+    stage_order = [
+        "1_fk_id",
+        "1_drives",
+        "1_crba",
+        "2_cholesky",
+        "3_trisolve",
+        "3_v_hat",
+        "4_contact_build",
+        "4_hinv_jt",
+        "4_delassus",
+        "4_hessian",
+        "4_rhs",
+        "5_solver",
+        "6_apply",
+        "6_integrate",
+        "other",
+    ]
 
     stage_totals = {label: defaultdict(float) for label in labels}
 
@@ -977,6 +1072,7 @@ def run_compare(args):
 # =============================================================================
 # Plotting
 # =============================================================================
+
 
 def _load_jsonl(path: Path) -> list[dict]:
     """Load JSONL file into list of dicts."""
@@ -1064,10 +1160,18 @@ def plot_sweep(jsonl_path: Path, out_path: Path, scenario: str, gpu_name: str):
             linestyle = "-"
             label = base_label
 
-        ax1.plot(data["num_worlds"], data["env_fps"], marker="o", linestyle=linestyle,
-                 color=color, label=label, markersize=6)
-        ax2.plot(data["num_worlds"], data["gpu_used_gb"], marker="o", linestyle=linestyle,
-                 color=color, label=label, markersize=6)
+        ax1.plot(
+            data["num_worlds"], data["env_fps"], marker="o", linestyle=linestyle, color=color, label=label, markersize=6
+        )
+        ax2.plot(
+            data["num_worlds"],
+            data["gpu_used_gb"],
+            marker="o",
+            linestyle=linestyle,
+            color=color,
+            label=label,
+            markersize=6,
+        )
 
     ax1.set_xlabel("num_envs")
     ax1.set_ylabel("Env-FPS")
@@ -1152,8 +1256,9 @@ def plot_ablation(results: list, out_path: Path, scenario: str, num_worlds: int,
 
     # Add value labels on bars
     for bar, val in zip(bars, fps_values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                f"{val:,.0f}", ha="center", va="bottom", fontsize=9)
+        ax.text(
+            bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{val:,.0f}", ha="center", va="bottom", fontsize=9
+        )
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white")
@@ -1164,6 +1269,7 @@ def plot_ablation(results: list, out_path: Path, scenario: str, num_worlds: int,
 # =============================================================================
 # Model and Solver Creation (shared between run modes)
 # =============================================================================
+
 
 def build_model(args, scenario_cfg: dict):
     """Build and finalize the simulation model for a scenario.
@@ -1270,8 +1376,8 @@ def build_model(args, scenario_cfg: dict):
             for obj in tabletop_objects:
                 pos = obj["pos"]
                 quat = obj.get("quat", (1, 0, 0, 0))
-                qlen = (quat[0]**2 + quat[1]**2 + quat[2]**2 + quat[3]**2) ** 0.5
-                quat = (quat[0]/qlen, quat[1]/qlen, quat[2]/qlen, quat[3]/qlen)
+                qlen = (quat[0] ** 2 + quat[1] ** 2 + quat[2] ** 2 + quat[3] ** 2) ** 0.5
+                quat = (quat[0] / qlen, quat[1] / qlen, quat[2] / qlen, quat[3] / qlen)
 
                 body_idx = builder.add_body(
                     xform=wp.transform(wp.vec3(pos[0], pos[1], pos[2]), wp.quat(quat[0], quat[1], quat[2], quat[3])),
@@ -1283,21 +1389,35 @@ def build_model(args, scenario_cfg: dict):
                     hs = obj["half_size"]
                     builder.add_shape_box(body_idx, hx=hs, hy=hs, hz=hs, cfg=obj_shape_cfg)
                 elif obj["type"] == "capsule":
-                    builder.add_shape_capsule(body_idx, radius=obj["radius"], half_height=obj["half_height"], cfg=obj_shape_cfg)
+                    builder.add_shape_capsule(
+                        body_idx, radius=obj["radius"], half_height=obj["half_height"], cfg=obj_shape_cfg
+                    )
                 elif obj["type"] == "ellipsoid":
                     builder.add_shape_ellipsoid(body_idx, a=obj["a"], b=obj["b"], c=obj["c"], cfg=obj_shape_cfg)
                 elif obj["type"] == "cylinder":
-                    builder.add_shape_cylinder(body_idx, radius=obj["radius"], half_height=obj["half_height"], cfg=obj_shape_cfg)
+                    builder.add_shape_cylinder(
+                        body_idx, radius=obj["radius"], half_height=obj["half_height"], cfg=obj_shape_cfg
+                    )
 
             builder.end_world()
 
         # Static table and container walls (body=-1 for static geometry)
         table_shape_cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
-        builder.add_shape_box(-1, xform=wp.transform((0.8, 0.0, 0.75), wp.quat_identity()), hx=0.5, hy=1.0, hz=0.01, cfg=table_shape_cfg)
-        builder.add_shape_box(-1, xform=wp.transform((0.9, 0.0, 0.86), wp.quat_identity()), hx=0.01, hy=0.21, hz=0.1, cfg=table_shape_cfg)
-        builder.add_shape_box(-1, xform=wp.transform((0.5, 0.0, 0.86), wp.quat_identity()), hx=0.01, hy=0.21, hz=0.1, cfg=table_shape_cfg)
-        builder.add_shape_box(-1, xform=wp.transform((0.7, -0.2, 0.86), wp.quat_identity()), hx=0.21, hy=0.01, hz=0.1, cfg=table_shape_cfg)
-        builder.add_shape_box(-1, xform=wp.transform((0.7, 0.2, 0.86), wp.quat_identity()), hx=0.21, hy=0.01, hz=0.1, cfg=table_shape_cfg)
+        builder.add_shape_box(
+            -1, xform=wp.transform((0.8, 0.0, 0.75), wp.quat_identity()), hx=0.5, hy=1.0, hz=0.01, cfg=table_shape_cfg
+        )
+        builder.add_shape_box(
+            -1, xform=wp.transform((0.9, 0.0, 0.86), wp.quat_identity()), hx=0.01, hy=0.21, hz=0.1, cfg=table_shape_cfg
+        )
+        builder.add_shape_box(
+            -1, xform=wp.transform((0.5, 0.0, 0.86), wp.quat_identity()), hx=0.01, hy=0.21, hz=0.1, cfg=table_shape_cfg
+        )
+        builder.add_shape_box(
+            -1, xform=wp.transform((0.7, -0.2, 0.86), wp.quat_identity()), hx=0.21, hy=0.01, hz=0.1, cfg=table_shape_cfg
+        )
+        builder.add_shape_box(
+            -1, xform=wp.transform((0.7, 0.2, 0.86), wp.quat_identity()), hx=0.21, hy=0.01, hz=0.1, cfg=table_shape_cfg
+        )
 
         builder.add_ground_plane()
         model = builder.finalize()
@@ -1345,7 +1465,7 @@ def build_model(args, scenario_cfg: dict):
         builder.replicate(articulation_builder, args.num_worlds)
         builder.add_ground_plane()
         model = builder.finalize()
-    
+
     model.shape_contact_margin.fill_(0.001)
 
     return model
@@ -1405,6 +1525,7 @@ def create_solver(model, args, scenario_cfg: dict):
             "pgs_omega": args.pgs_omega,
             "pgs_max_constraints": args.pgs_max_constraints,
             "pgs_warmstart": args.pgs_warmstart,
+            "enable_mf_pgs": args.enable_mf_pgs,
             "enable_contact_friction": True,
             "storage": args.storage or scenario_cfg.get("storage", "batched"),
             "cholesky_kernel": cholesky,
@@ -1424,9 +1545,11 @@ def create_solver(model, args, scenario_cfg: dict):
 # Direct Run Mode (called by subprocesses)
 # =============================================================================
 
+
 def run_direct(args):
     """Run a single benchmark directly (not as subprocess)."""
     import warp as wp
+
     wp.config.enable_backward = False
 
     scenario_cfg = SCENARIOS[args.scenario]
@@ -1454,6 +1577,7 @@ def run_direct(args):
     if not args.summary_timer:
         device = wp.get_device()
         if device.is_cuda:
+
             def simulate():
                 for i in range(args.substeps):
                     nonlocal contacts, state_0, state_1
@@ -1518,6 +1642,7 @@ def run_direct(args):
     gpu_total_gb = None
     try:
         import torch
+
         if torch.cuda.is_available():
             free, total = torch.cuda.mem_get_info()
             gpu_used_gb = (total - free) / 1024**3
@@ -1545,6 +1670,7 @@ def run_direct(args):
 def print_kernel_summary(results, indent: str = ""):
     """Print kernel timing summary."""
     import string
+
     kernel_results = [r for r in results if r.name.startswith(("forward kernel", "backward kernel"))]
     if not kernel_results:
         print(f"{indent}No kernel activity recorded.")
@@ -1582,7 +1708,7 @@ def print_kernel_summary(results, indent: str = ""):
     print(f"\n{indent}{'Kernel':<{name_width}}  {'Time (ms)':>10}  {'% total':>8}  {'Cumul.':>8}")
     print(f"{indent}{'-' * (name_width + 32)}")
     for name, t, pct, cum in rows:
-        label = name if len(name) <= name_width else name[:name_width - 3] + "..."
+        label = name if len(name) <= name_width else name[: name_width - 3] + "..."
         print(f"{indent}{label:<{name_width}}  {round(t):>10}  {pct:>7.1f}%  {cum:>7.1f}%")
 
 
@@ -1590,9 +1716,11 @@ def print_kernel_summary(results, indent: str = ""):
 # Interactive Mode
 # =============================================================================
 
+
 def run_interactive(args):
     """Run interactive mode with viewer."""
     import warp as wp
+
     wp.config.enable_backward = False
 
     import newton.viewer
@@ -1648,6 +1776,7 @@ def run_interactive(args):
 # Replot Mode
 # =============================================================================
 
+
 def run_replot(results_dir: Path):
     """Regenerate plot from a previous results directory."""
     metadata_path = results_dir / "metadata.json"
@@ -1681,6 +1810,7 @@ def run_replot(results_dir: Path):
 # Main
 # =============================================================================
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Unified solver benchmark for Newton",
@@ -1695,8 +1825,9 @@ def main():
     parser.add_argument("--replot", type=str, metavar="DIR", help="Regenerate plot from a previous results directory")
 
     # Scenario
-    parser.add_argument("--scenario", type=str, choices=list(SCENARIOS.keys()),
-                        default="g1_flat", help="Scenario to run")
+    parser.add_argument(
+        "--scenario", type=str, choices=list(SCENARIOS.keys()), default="g1_flat", help="Scenario to run"
+    )
 
     # Common options
     parser.add_argument("--num-worlds", type=int, default=4096, help="Number of parallel worlds")
@@ -1708,38 +1839,76 @@ def main():
     parser.add_argument("--plot", action="store_true", help="Generate plots")
 
     # Solver selection
-    parser.add_argument("--solver", type=str, default="feather_pgs",
-                        help="Solver: mujoco, feather_pgs, or preset (fpgs_tiled, fpgs_loop)")
-    parser.add_argument("--solvers", type=str, default="fpgs_tiled,fpgs_loop,mujoco",
-                        help="Comma-separated solvers for sweep mode")
+    parser.add_argument(
+        "--solver",
+        type=str,
+        default="feather_pgs",
+        help="Solver: mujoco, feather_pgs, or preset (fpgs_tiled, fpgs_loop)",
+    )
+    parser.add_argument(
+        "--solvers", type=str, default="fpgs_tiled,fpgs_loop,mujoco", help="Comma-separated solvers for sweep mode"
+    )
 
     # FeatherPGS options
     parser.add_argument("--storage", type=str, choices=["flat", "batched"], help="Storage mode")
-    parser.add_argument("--cholesky-kernel", type=str, default="auto",
-                        choices=["loop", "tiled", "auto"], help="Cholesky kernel")
-    parser.add_argument("--trisolve-kernel", type=str, default="auto",
-                        choices=["loop", "tiled", "auto"], help="Trisolve kernel")
-    parser.add_argument("--hinv-jt-kernel", type=str, default="auto",
-                        choices=["par_row", "tiled", "auto"], help="H^-1 J^T kernel")
-    parser.add_argument("--delassus-kernel", type=str, default="auto",
-                        choices=["par_row_col", "tiled", "auto"], help="Delassus kernel")
-    parser.add_argument("--pgs-kernel", type=str, default="tiled_contact",
-                        choices=["loop", "tiled_row", "tiled_contact", "streaming"], help="PGS kernel")
+    parser.add_argument(
+        "--cholesky-kernel", type=str, default="auto", choices=["loop", "tiled", "auto"], help="Cholesky kernel"
+    )
+    parser.add_argument(
+        "--trisolve-kernel", type=str, default="auto", choices=["loop", "tiled", "auto"], help="Trisolve kernel"
+    )
+    parser.add_argument(
+        "--hinv-jt-kernel", type=str, default="auto", choices=["par_row", "tiled", "auto"], help="H^-1 J^T kernel"
+    )
+    parser.add_argument(
+        "--delassus-kernel", type=str, default="auto", choices=["par_row_col", "tiled", "auto"], help="Delassus kernel"
+    )
+    parser.add_argument(
+        "--pgs-kernel",
+        type=str,
+        default="tiled_contact",
+        choices=["loop", "tiled_row", "tiled_contact", "streaming"],
+        help="PGS kernel",
+    )
     parser.add_argument("--pgs-iterations", type=int, default=8, help="PGS iterations")
     parser.add_argument("--pgs-max-constraints", type=int, default=64, help="Max constraints per world")
     parser.add_argument("--pgs-beta", type=float, default=0.1, help="PGS position correction factor (ERP)")
     parser.add_argument("--pgs-cfm", type=float, default=1.0e-6, help="PGS constraint force mixing (regularization)")
     parser.add_argument("--pgs-omega", type=float, default=1.0, help="PGS relaxation factor (SOR)")
     parser.add_argument("--pgs-warmstart", action="store_true", help="Enable warmstart")
-    parser.add_argument("--delassus-chunk-size", type=int, default=None,
-                        help="Chunk size (constraint rows) for streaming Delassus kernel (None=auto)")
-    parser.add_argument("--pgs-chunk-size", type=int, default=None,
-                        help="Chunk size (contacts) for streaming PGS kernel (None=1)")
+    parser.add_argument(
+        "--delassus-chunk-size",
+        type=int,
+        default=None,
+        help="Chunk size (constraint rows) for streaming Delassus kernel (None=auto)",
+    )
+    parser.add_argument(
+        "--pgs-chunk-size",
+        type=int,
+        default=None,
+        help="Chunk size (contacts) for streaming PGS kernel (None=1)",
+    )
+    parser.add_argument(
+        "--enable-mf-pgs",
+        action="store_true",
+        dest="enable_mf_pgs",
+        default=True,
+        help="Enable matrix-free PGS for free rigid body contacts (default)",
+    )
+    parser.add_argument(
+        "--no-mf-pgs",
+        action="store_false",
+        dest="enable_mf_pgs",
+        help="Disable matrix-free PGS for free rigid body contacts",
+    )
     parser.add_argument("--use-parallel-streams", action="store_true", dest="use_parallel_streams")
     parser.add_argument("--no-parallel-streams", action="store_false", dest="use_parallel_streams")
     parser.set_defaults(use_parallel_streams=True)
-    parser.add_argument("--override-scenario-defaults", action="store_true",
-                        help="CLI kernel args override scenario defaults (used by ablation)")
+    parser.add_argument(
+        "--override-scenario-defaults",
+        action="store_true",
+        help="CLI kernel args override scenario defaults (used by ablation)",
+    )
 
     # MuJoCo options
     parser.add_argument("--mj-solver", type=str, choices=["cg", "newton"])
@@ -1750,13 +1919,21 @@ def main():
     # Sweep options
     parser.add_argument("--min-log2-worlds", type=int, default=10, help="Min worlds = 2^N")
     parser.add_argument("--max-log2-worlds", type=int, default=14, help="Max worlds = 2^N")
-    parser.add_argument("--substeps-list", type=str, default=None,
-                        help="Comma-separated substeps to sweep (e.g., '2,4'). Overrides --substeps in sweep mode.")
+    parser.add_argument(
+        "--substeps-list",
+        type=str,
+        default=None,
+        help="Comma-separated substeps to sweep (e.g., '2,4'). Overrides --substeps in sweep mode.",
+    )
 
     # Ablation options
-    parser.add_argument("--ablation-pgs", type=str, default="auto",
-                        choices=["auto", "tiled_row", "tiled_contact"],
-                        help="PGS kernel for ablation final steps")
+    parser.add_argument(
+        "--ablation-pgs",
+        type=str,
+        default="auto",
+        choices=["auto", "tiled_row", "tiled_contact"],
+        help="PGS kernel for ablation final steps",
+    )
 
     # Timing
     parser.add_argument("--timing-out", type=str, help="Output kernel timing to JSON")

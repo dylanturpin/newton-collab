@@ -21,6 +21,7 @@ import warp as wp
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, State, eval_fk
+from ...sim.joints import JointType
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
@@ -45,12 +46,16 @@ from .kernels import (
     build_augmented_joint_rows,
     build_contact_rows_normal,
     build_mass_update_mask,
+    build_mf_body_map,
+    build_mf_contact_rows,
     cholesky_batched_loop,
     cholesky_flat_loop,
     clamp_contact_counts,
     clamp_joint_tau,
     compute_com_transforms,
     compute_composite_inertia,
+    compute_mf_body_Hinv,
+    compute_mf_effective_mass_and_rhs,
     compute_spatial_inertia,
     compute_velocity_predictor,
     compute_world_contact_bias,
@@ -65,6 +70,7 @@ from .kernels import (
     eval_rigid_id,
     eval_rigid_mass,
     eval_rigid_tau,
+    finalize_mf_constraint_counts,
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
     gather_tau_to_groups,
@@ -72,6 +78,7 @@ from .kernels import (
     hinv_jt_flat_par_row,
     integrate_generalized_joints,
     pgs_solve_loop,
+    pgs_solve_mf_loop,
     populate_world_J_for_size,
     prepare_impulses,
     prepare_world_impulses,
@@ -160,6 +167,9 @@ class SolverFeatherPGS(SolverBase):
         pgs_omega: float = 1.0,
         pgs_max_constraints: int = 32,
         pgs_warmstart: bool = False,
+        # Matrix-free PGS for free rigid bodies
+        enable_mf_pgs: bool = True,
+        mf_max_constraints: int = 512,
         # Storage path
         storage: str = "batched",
         # Kernel selection per operation
@@ -189,6 +199,8 @@ class SolverFeatherPGS(SolverBase):
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             pgs_max_constraints (int, optional): Maximum number of contact constraints stored per articulation. Defaults to 32.
             pgs_warmstart (bool, optional): Re-use impulses from the previous frame when contacts persist. Defaults to False.
+            enable_mf_pgs (bool, optional): Enable matrix-free PGS path for free rigid body contacts. Defaults to True.
+            mf_max_constraints (int, optional): Maximum number of matrix-free constraints per world. Defaults to 512.
             storage (str, optional): Storage layout. "batched" groups by DOF size into 3D arrays, "flat" uses
                 offset-indexed 1D arrays. Defaults to "batched".
             cholesky_kernel (str, optional): "tiled", "loop", or "auto" for Cholesky factorization. Defaults to "auto".
@@ -230,6 +242,8 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_omega = pgs_omega
         self.pgs_max_constraints = pgs_max_constraints
         self.pgs_warmstart = pgs_warmstart
+        self.enable_mf_pgs = enable_mf_pgs
+        self.mf_max_constraints = mf_max_constraints
 
         valid_storage = {"batched", "flat"}
         if storage not in valid_storage:
@@ -297,9 +311,7 @@ class SolverFeatherPGS(SolverBase):
                     "Flat tiled H^{-1}J^T requires articulation_max_dofs <= TILE_DOF and "
                     "pgs_max_constraints <= TILE_CONSTRAINTS."
                 )
-            if self.pgs_kernel in ("tiled_row", "tiled_contact") and self.pgs_max_constraints > int(
-                TILE_CONSTRAINTS
-            ):
+            if self.pgs_kernel in ("tiled_row", "tiled_contact") and self.pgs_max_constraints > int(TILE_CONSTRAINTS):
                 raise ValueError(
                     f"pgs_max_constraints={self.pgs_max_constraints} exceeds TILE_CONSTRAINTS={int(TILE_CONSTRAINTS)} "
                     "for tiled PGS. Increase TILE_CONSTRAINTS or choose pgs_kernel='loop'."
@@ -310,6 +322,7 @@ class SolverFeatherPGS(SolverBase):
         else:
             self._allocate_batched_buffers(model)
             self._allocate_world_buffers(model)
+            self._allocate_mf_buffers(model)
             self._scatter_armature_to_groups(model)
             self._init_size_group_streams(model)
 
@@ -327,6 +340,7 @@ class SolverFeatherPGS(SolverBase):
         self._is_one_art_per_world = self.world_count == model.articulation_count
         self._is_homogeneous = (len(self.size_groups) == 1) if self.size_groups else True
         self._build_body_maps(model)
+        self._classify_free_rigid_bodies(model)
 
     def _compute_articulation_indices(self, model):
         # calculate total size and offsets of Jacobian and mass matrices for entire system
@@ -523,6 +537,36 @@ class SolverFeatherPGS(SolverBase):
         device = model.device
         self.body_to_joint = wp.array(body_to_joint, dtype=wp.int32, device=device)
         self.body_to_articulation = wp.array(body_to_articulation, dtype=wp.int32, device=device)
+
+    def _classify_free_rigid_bodies(self, model):
+        """Identify articulations that are single free rigid bodies.
+
+        An articulation is "free rigid" if it has exactly 1 joint, that joint
+        is FREE type, and the joint parent is -1 (world). These can be solved
+        with a cheaper matrix-free PGS path. Gated on ``enable_mf_pgs``.
+        """
+        if not self.enable_mf_pgs or not model.articulation_count or not model.joint_count:
+            self._has_free_rigid_bodies = False
+            self._n_free_rigid = 0
+            self.is_free_rigid = None
+            return
+
+        joint_type_np = model.joint_type.numpy()
+        joint_parent_np = model.joint_parent.numpy()
+        articulation_start_np = model.articulation_start.numpy()
+
+        is_free_rigid_np = np.zeros(model.articulation_count, dtype=np.int32)
+        for art_idx in range(model.articulation_count):
+            first_joint = articulation_start_np[art_idx]
+            last_joint = articulation_start_np[art_idx + 1]
+            if last_joint - first_joint == 1:
+                if int(joint_type_np[first_joint]) == int(JointType.FREE) and int(joint_parent_np[first_joint]) == -1:
+                    is_free_rigid_np[art_idx] = 1
+
+        n_free = int(np.sum(is_free_rigid_np))
+        self._has_free_rigid_bodies = n_free > 0
+        self._n_free_rigid = n_free
+        self.is_free_rigid = wp.array(is_free_rigid_np, dtype=wp.int32, device=model.device)
 
     def _allocate_common_buffers(self, model):
         if model.joint_count:
@@ -732,6 +776,7 @@ class SolverFeatherPGS(SolverBase):
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.contact_path = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
 
     def _allocate_world_buffers(self, model):
         """Allocate world-level constraint system buffers for multi-articulation support."""
@@ -786,6 +831,54 @@ class SolverFeatherPGS(SolverBase):
         self.constraint_count = wp.zeros(
             (self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
+
+    def _allocate_mf_buffers(self, model):
+        """Allocate buffers for matrix-free PGS path for free rigid body contacts."""
+        if not self._has_free_rigid_bodies:
+            return
+
+        device = model.device
+        requires_grad = model.requires_grad
+        worlds = self.world_count
+        mf_max_c = self.mf_max_constraints
+        body_count = model.body_count
+
+        self.mf_constraint_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+
+        self.mf_body_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_body_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
+
+        self.mf_J_a = wp.zeros((worlds, mf_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_J_b = wp.zeros((worlds, mf_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
+
+        self.mf_MiJt_a = wp.zeros((worlds, mf_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_MiJt_b = wp.zeros((worlds, mf_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
+
+        self.mf_rhs = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_impulses = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_eff_mass_inv = wp.zeros(
+            (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+
+        self.mf_row_type = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_row_parent = wp.full((worlds, mf_max_c), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_row_mu = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_phi = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+
+        self.mf_body_Hinv = wp.zeros((body_count,), dtype=wp.spatial_matrix, device=device, requires_grad=requires_grad)
+
+        # Body map buffers for tiled MF PGS kernel
+        self.max_mf_bodies = 64
+        self.mf_body_list = wp.zeros(
+            (worlds, self.max_mf_bodies), dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.mf_body_dof_start = wp.zeros(
+            (worlds, self.max_mf_bodies), dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.mf_body_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_local_body_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_local_body_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
 
     def _scatter_armature_to_groups(self, model):
         """Copy armature from model (DOF-ordered) to size-grouped storage."""
@@ -1183,11 +1276,21 @@ class SolverFeatherPGS(SolverBase):
             self._stage5_pgs_solve_world_loop()
 
         # ══════════════════════════════════════════════════════════════
-        # STAGE 6: Apply impulses + integrate
+        # STAGE 6a: Apply dense impulses
         # ══════════════════════════════════════════════════════════════
         self._stage6_prepare_world_velocity()
         for size in self.size_groups:
             self._stage6_apply_impulses_world(size)
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 6b: Matrix-free PGS for free rigid body contacts
+        # ══════════════════════════════════════════════════════════════
+        if self._has_free_rigid_bodies:
+            self._stage6b_mf_pgs(state_aug, dt)
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 7: Update qdd + integrate
+        # ══════════════════════════════════════════════════════════════
         self._stage6_update_qdd(state_in, state_aug, dt)
 
         self._stage6_integrate(state_in, state_aug, state_out, dt)
@@ -1817,13 +1920,40 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_build_rows_batched(self, state_in: State, state_aug: State, contacts: Contacts):
         model = self.model
         max_constraints = self.pgs_max_constraints
+        mf_active = self._has_free_rigid_bodies
 
         # Zero world-level buffers
         self.slot_counter.zero_()
         self.constraint_count.zero_()
 
+        if mf_active:
+            self.mf_slot_counter.zero_()
+            self.mf_constraint_count.zero_()
+            self.mf_J_a.zero_()
+            self.mf_J_b.zero_()
+            self.mf_MiJt_a.zero_()
+            self.mf_MiJt_b.zero_()
+            self.mf_impulses.zero_()
+            self.mf_body_a.zero_()
+            self.mf_body_b.zero_()
+            self.mf_row_type.zero_()
+            self.mf_row_parent.fill_(-1)
+            self.mf_row_mu.zero_()
+            self.mf_phi.zero_()
+
         for size in self.size_groups:
             self.J_by_size[size].zero_()
+
+        has_free_rigid_flag = 1 if mf_active else 0
+        # Dummy arrays when MF is not active (kernel still needs valid pointers)
+        is_free_rigid = (
+            self.is_free_rigid
+            if self.is_free_rigid is not None
+            else wp.zeros((1,), dtype=wp.int32, device=model.device)
+        )
+        mf_slot_counter = (
+            self.mf_slot_counter if mf_active else wp.zeros((self.world_count,), dtype=wp.int32, device=model.device)
+        )
 
         if (
             contacts is not None
@@ -1849,7 +1979,10 @@ class SolverFeatherPGS(SolverBase):
                     model.shape_body,
                     self.body_to_articulation,
                     self.art_to_world,
+                    is_free_rigid,
+                    has_free_rigid_flag,
                     max_constraints,
+                    self.mf_max_constraints,
                     enable_friction_flag,
                 ],
                 outputs=[
@@ -1858,6 +1991,8 @@ class SolverFeatherPGS(SolverBase):
                     self.contact_art_a,
                     self.contact_art_b,
                     self.slot_counter,
+                    self.contact_path,
+                    mf_slot_counter,
                 ],
                 device=model.device,
             )
@@ -1879,6 +2014,7 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_slot,
                         self.contact_art_a,
                         self.contact_art_b,
+                        self.contact_path,
                         size,  # target_size
                         self.art_size,
                         self.art_group_idx,
@@ -1905,6 +2041,50 @@ class SolverFeatherPGS(SolverBase):
                         self.phi,
                         self.target_velocity,
                     ],
+                    device=model.device,
+                )
+
+            # Build MF contact rows
+            if mf_active:
+                wp.launch(
+                    build_mf_contact_rows,
+                    dim=contacts.rigid_contact_max,
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        contacts.rigid_contact_point0,
+                        contacts.rigid_contact_point1,
+                        contacts.rigid_contact_normal,
+                        contacts.rigid_contact_shape0,
+                        contacts.rigid_contact_shape1,
+                        contacts.rigid_contact_thickness0,
+                        contacts.rigid_contact_thickness1,
+                        self.contact_world,
+                        self.contact_slot,
+                        self.contact_path,
+                        model.shape_body,
+                        state_in.body_q,
+                        self.shape_material_mu,
+                        enable_friction_flag,
+                        self.pgs_beta,
+                    ],
+                    outputs=[
+                        self.mf_body_a,
+                        self.mf_body_b,
+                        self.mf_J_a,
+                        self.mf_J_b,
+                        self.mf_row_type,
+                        self.mf_row_parent,
+                        self.mf_row_mu,
+                        self.mf_phi,
+                    ],
+                    device=model.device,
+                )
+
+                wp.launch(
+                    finalize_mf_constraint_counts,
+                    dim=self.world_count,
+                    inputs=[self.mf_slot_counter, self.mf_max_constraints],
+                    outputs=[self.mf_constraint_count],
                     device=model.device,
                 )
 
@@ -2318,9 +2498,7 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage5_pgs_solve_world_tiled_contact(self):
-        pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_contact_kernel(
-            self.pgs_max_constraints, self.model.device
-        )
+        pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_contact_kernel(self.pgs_max_constraints, self.model.device)
         wp.launch_tiled(
             pgs_kernel,
             dim=[self.world_count],
@@ -2427,6 +2605,134 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
+    def _stage6b_mf_pgs(self, state_aug: State, dt: float):
+        """Run matrix-free PGS for free rigid body contacts."""
+        model = self.model
+
+        # Compute H^-1 = inverse(body_I_s) for free rigid bodies
+        wp.launch(
+            compute_mf_body_Hinv,
+            dim=model.body_count,
+            inputs=[
+                state_aug.body_I_s,
+                self.is_free_rigid,
+                self.body_to_articulation,
+            ],
+            outputs=[self.mf_body_Hinv],
+            device=model.device,
+        )
+
+        # Build compact body map for streaming kernel
+        wp.launch(
+            build_mf_body_map,
+            dim=self.world_count,
+            inputs=[
+                self.mf_constraint_count,
+                self.mf_body_a,
+                self.mf_body_b,
+                self.body_to_articulation,
+                self.articulation_dof_start,
+                self.max_mf_bodies,
+            ],
+            outputs=[
+                self.mf_body_list,
+                self.mf_body_dof_start,
+                self.mf_body_count,
+                self.mf_local_body_a,
+                self.mf_local_body_b,
+            ],
+            device=model.device,
+        )
+
+        # Compute effective mass and RHS
+        self.mf_rhs.zero_()
+        self.mf_eff_mass_inv.zero_()
+        wp.launch(
+            compute_mf_effective_mass_and_rhs,
+            dim=self.world_count,
+            inputs=[
+                self.mf_constraint_count,
+                self.mf_body_a,
+                self.mf_body_b,
+                self.mf_J_a,
+                self.mf_J_b,
+                self.mf_body_Hinv,
+                self.mf_phi,
+                self.mf_row_type,
+                self.pgs_cfm,
+                self.pgs_beta,
+                dt,
+            ],
+            outputs=[
+                self.mf_eff_mass_inv,
+                self.mf_MiJt_a,
+                self.mf_MiJt_b,
+                self.mf_rhs,
+            ],
+            device=model.device,
+        )
+
+        # MF PGS streaming solve (body velocities + impulses in shared memory)
+        if model.device.is_cuda:
+            mf_pgs_kernel = TiledKernelFactory.get_pgs_solve_mf_streaming_kernel(
+                self.mf_max_constraints, self.max_mf_bodies, model.device
+            )
+            wp.launch_tiled(
+                mf_pgs_kernel,
+                dim=[self.world_count],
+                inputs=[
+                    self.mf_constraint_count,
+                    self.mf_body_count,
+                    self.mf_body_dof_start,
+                    self.mf_local_body_a,
+                    self.mf_local_body_b,
+                    self.mf_J_a,
+                    self.mf_J_b,
+                    self.mf_MiJt_a,
+                    self.mf_MiJt_b,
+                    self.mf_eff_mass_inv,
+                    self.mf_rhs,
+                    self.mf_row_type,
+                    self.mf_row_parent,
+                    self.mf_row_mu,
+                    self.mf_impulses,
+                    self.v_out,
+                    self.pgs_iterations,
+                    self.pgs_omega,
+                ],
+                block_dim=32,
+                device=model.device,
+            )
+        else:
+            # CPU fallback: use the loop kernel
+            wp.launch(
+                pgs_solve_mf_loop,
+                dim=self.world_count,
+                inputs=[
+                    self.mf_constraint_count,
+                    self.mf_body_a,
+                    self.mf_body_b,
+                    self.mf_MiJt_a,
+                    self.mf_MiJt_b,
+                    self.mf_J_a,
+                    self.mf_J_b,
+                    self.mf_eff_mass_inv,
+                    self.mf_rhs,
+                    self.mf_row_type,
+                    self.mf_row_parent,
+                    self.mf_row_mu,
+                    self.body_to_articulation,
+                    self.articulation_dof_start,
+                    self.pgs_iterations,
+                    self.pgs_omega,
+                ],
+                outputs=[
+                    self.mf_impulses,
+                    self.v_out,
+                ],
+                device=model.device,
+            )
+
     def _stage6_update_qdd(self, state_in: State, state_aug: State, dt: float):
         model = self.model
         wp.launch(
@@ -2485,6 +2791,7 @@ class TiledKernelFactory:
     _pgs_solve_tiled_row_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_tiled_contact_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_streaming_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
+    _pgs_solve_mf_streaming_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
     _triangular_solve_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _delassus_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
 
@@ -3694,3 +4001,291 @@ class TiledKernelFactory:
         pgs_solve_streaming_template.__name__ = f"pgs_solve_streaming_{max_constraints}_chunk{pgs_chunk_size}"
         pgs_solve_streaming_template.__qualname__ = f"pgs_solve_streaming_{max_constraints}_chunk{pgs_chunk_size}"
         return wp.kernel(enable_backward=False, module="unique")(pgs_solve_streaming_template)
+
+    @classmethod
+    def get_pgs_solve_mf_streaming_kernel(
+        cls, mf_max_constraints: int, max_mf_bodies: int, device: "wp.Device"
+    ) -> "wp.Kernel":
+        """Get or create a streaming MF PGS kernel for free rigid body contacts."""
+        key = (mf_max_constraints, max_mf_bodies, device.arch)
+        if key not in cls._pgs_solve_mf_streaming_cache:
+            cls._pgs_solve_mf_streaming_cache[key] = cls._build_pgs_solve_mf_streaming_kernel(
+                mf_max_constraints, max_mf_bodies
+            )
+        return cls._pgs_solve_mf_streaming_cache[key]
+
+    @classmethod
+    def _build_pgs_solve_mf_streaming_kernel(cls, mf_max_constraints: int, max_mf_bodies: int) -> "wp.Kernel":
+        """Matrix-free PGS with body velocities and impulses in shared memory.
+
+        Uses one warp (32 threads) per world. Body velocities and impulses live
+        in shared memory for the duration of all PGS iterations, eliminating
+        global memory round-trips. J, MiJt, eff_mass_inv, and rhs are streamed
+        from global memory per constraint (read-only, cache-friendly sequential access).
+        """
+        MF_MAX_C = mf_max_constraints
+        MAX_BODIES = max_mf_bodies
+
+        snippet = f"""
+    #if defined(__CUDA_ARCH__)
+        const int MF_MAX_C = {MF_MAX_C};
+        const int MAX_BODIES = {MAX_BODIES};
+
+        int lane = threadIdx.x;
+
+        int m = mf_constraint_count.data[world];
+        if (m == 0) return;
+        if (m > MF_MAX_C) m = MF_MAX_C;
+
+        int n_bodies = mf_body_count.data[world];
+        if (n_bodies > MAX_BODIES) n_bodies = MAX_BODIES;
+
+        // ═══════════════════════════════════════════════════════════════
+        // SHARED MEMORY
+        // ═══════════════════════════════════════════════════════════════
+        __shared__ float s_vel[{MAX_BODIES * 6}];
+        __shared__ float s_impulse[{MF_MAX_C}];
+        __shared__ int s_dof_start[{MAX_BODIES}];
+
+        int body_off = world * MAX_BODIES;
+        int c_off = world * MF_MAX_C;
+
+        // ═══════════════════════════════════════════════════════════════
+        // LOAD PHASE
+        // ═══════════════════════════════════════════════════════════════
+
+        // Load body DOF starts and velocities
+        for (int b = lane; b < n_bodies; b += 32) {{
+            int dof = mf_body_dof_start.data[body_off + b];
+            s_dof_start[b] = dof;
+            for (int k = 0; k < 6; k++) {{
+                s_vel[b * 6 + k] = v_out.data[dof + k];
+            }}
+        }}
+
+        // Load impulses
+        for (int i = lane; i < m; i += 32) {{
+            s_impulse[i] = mf_impulses.data[c_off + i];
+        }}
+        __syncwarp();
+
+        // ═══════════════════════════════════════════════════════════════
+        // SOLVE PHASE (lane 0)
+        // ═══════════════════════════════════════════════════════════════
+
+        if (lane == 0) {{
+            for (int iter = 0; iter < iterations; iter++) {{
+                for (int i = 0; i < m; i++) {{
+                    float eff_inv = mf_eff_mass_inv.data[c_off + i];
+                    if (eff_inv <= 0.0f) continue;
+
+                    int lba = mf_local_body_a.data[c_off + i];
+                    int lbb = mf_local_body_b.data[c_off + i];
+
+                    // Load J from global memory
+                    int j_base = (c_off + i) * 6;
+                    float ja0 = mf_J_a.data[j_base + 0];
+                    float ja1 = mf_J_a.data[j_base + 1];
+                    float ja2 = mf_J_a.data[j_base + 2];
+                    float ja3 = mf_J_a.data[j_base + 3];
+                    float ja4 = mf_J_a.data[j_base + 4];
+                    float ja5 = mf_J_a.data[j_base + 5];
+
+                    float jb0 = mf_J_b.data[j_base + 0];
+                    float jb1 = mf_J_b.data[j_base + 1];
+                    float jb2 = mf_J_b.data[j_base + 2];
+                    float jb3 = mf_J_b.data[j_base + 3];
+                    float jb4 = mf_J_b.data[j_base + 4];
+                    float jb5 = mf_J_b.data[j_base + 5];
+
+                    // Compute J * v from shared memory
+                    float jv = 0.0f;
+                    if (lba >= 0) {{
+                        int va = lba * 6;
+                        jv += ja0 * s_vel[va] + ja1 * s_vel[va+1] + ja2 * s_vel[va+2]
+                            + ja3 * s_vel[va+3] + ja4 * s_vel[va+4] + ja5 * s_vel[va+5];
+                    }}
+                    if (lbb >= 0) {{
+                        int vb = lbb * 6;
+                        jv += jb0 * s_vel[vb] + jb1 * s_vel[vb+1] + jb2 * s_vel[vb+2]
+                            + jb3 * s_vel[vb+3] + jb4 * s_vel[vb+4] + jb5 * s_vel[vb+5];
+                    }}
+
+                    // PGS update
+                    float rhs_i = mf_rhs.data[c_off + i];
+                    float delta = -(jv + rhs_i) * eff_inv;
+                    float old_impulse = s_impulse[i];
+                    float new_impulse = old_impulse + omega * delta;
+
+                    int row_type = mf_row_type.data[c_off + i];
+
+                    // Project: contact
+                    if (row_type == 0) {{
+                        if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    }}
+                    // Project: friction
+                    else if (row_type == 2) {{
+                        int parent_idx = mf_row_parent.data[c_off + i];
+                        float lambda_n = s_impulse[parent_idx];
+                        float mu = mf_row_mu.data[c_off + i];
+                        float radius = fmaxf(mu * lambda_n, 0.0f);
+
+                        if (radius <= 0.0f) {{
+                            new_impulse = 0.0f;
+                        }} else {{
+                            int sib = (i == parent_idx + 1) ? parent_idx + 2 : parent_idx + 1;
+
+                            s_impulse[i] = new_impulse;
+                            float a_val = new_impulse;
+                            float b_val = s_impulse[sib];
+                            float mag = sqrtf(a_val * a_val + b_val * b_val);
+                            if (mag > radius) {{
+                                float scale = radius / mag;
+                                new_impulse = a_val * scale;
+                                float sib_new = b_val * scale;
+                                float sib_delta = sib_new - b_val;
+                                s_impulse[sib] = sib_new;
+
+                                // Apply sibling correction to body velocities
+                                int sib_lba = mf_local_body_a.data[c_off + sib];
+                                int sib_lbb = mf_local_body_b.data[c_off + sib];
+                                int sib_j_base = (c_off + sib) * 6;
+                                if (sib_lba >= 0) {{
+                                    int sva = sib_lba * 6;
+                                    s_vel[sva+0] += mf_MiJt_a.data[sib_j_base+0] * sib_delta;
+                                    s_vel[sva+1] += mf_MiJt_a.data[sib_j_base+1] * sib_delta;
+                                    s_vel[sva+2] += mf_MiJt_a.data[sib_j_base+2] * sib_delta;
+                                    s_vel[sva+3] += mf_MiJt_a.data[sib_j_base+3] * sib_delta;
+                                    s_vel[sva+4] += mf_MiJt_a.data[sib_j_base+4] * sib_delta;
+                                    s_vel[sva+5] += mf_MiJt_a.data[sib_j_base+5] * sib_delta;
+                                }}
+                                if (sib_lbb >= 0) {{
+                                    int svb = sib_lbb * 6;
+                                    s_vel[svb+0] += mf_MiJt_b.data[sib_j_base+0] * sib_delta;
+                                    s_vel[svb+1] += mf_MiJt_b.data[sib_j_base+1] * sib_delta;
+                                    s_vel[svb+2] += mf_MiJt_b.data[sib_j_base+2] * sib_delta;
+                                    s_vel[svb+3] += mf_MiJt_b.data[sib_j_base+3] * sib_delta;
+                                    s_vel[svb+4] += mf_MiJt_b.data[sib_j_base+4] * sib_delta;
+                                    s_vel[svb+5] += mf_MiJt_b.data[sib_j_base+5] * sib_delta;
+                                }}
+                            }}
+                        }}
+                    }}
+
+                    float delta_impulse = new_impulse - old_impulse;
+                    s_impulse[i] = new_impulse;
+
+                    // Apply velocity correction: v += MiJt * delta_impulse
+                    int mijt_base = (c_off + i) * 6;
+                    if (lba >= 0) {{
+                        int va = lba * 6;
+                        s_vel[va+0] += mf_MiJt_a.data[mijt_base+0] * delta_impulse;
+                        s_vel[va+1] += mf_MiJt_a.data[mijt_base+1] * delta_impulse;
+                        s_vel[va+2] += mf_MiJt_a.data[mijt_base+2] * delta_impulse;
+                        s_vel[va+3] += mf_MiJt_a.data[mijt_base+3] * delta_impulse;
+                        s_vel[va+4] += mf_MiJt_a.data[mijt_base+4] * delta_impulse;
+                        s_vel[va+5] += mf_MiJt_a.data[mijt_base+5] * delta_impulse;
+                    }}
+                    if (lbb >= 0) {{
+                        int vb = lbb * 6;
+                        s_vel[vb+0] += mf_MiJt_b.data[mijt_base+0] * delta_impulse;
+                        s_vel[vb+1] += mf_MiJt_b.data[mijt_base+1] * delta_impulse;
+                        s_vel[vb+2] += mf_MiJt_b.data[mijt_base+2] * delta_impulse;
+                        s_vel[vb+3] += mf_MiJt_b.data[mijt_base+3] * delta_impulse;
+                        s_vel[vb+4] += mf_MiJt_b.data[mijt_base+4] * delta_impulse;
+                        s_vel[vb+5] += mf_MiJt_b.data[mijt_base+5] * delta_impulse;
+                    }}
+                }}
+            }}
+        }}
+        __syncwarp();
+
+        // ═══════════════════════════════════════════════════════════════
+        // STORE PHASE
+        // ═══════════════════════════════════════════════════════════════
+
+        // Write body velocities back to v_out
+        for (int b = lane; b < n_bodies; b += 32) {{
+            int dof = s_dof_start[b];
+            for (int k = 0; k < 6; k++) {{
+                v_out.data[dof + k] = s_vel[b * 6 + k];
+            }}
+        }}
+
+        // Write impulses back
+        for (int i = lane; i < m; i += 32) {{
+            mf_impulses.data[c_off + i] = s_impulse[i];
+        }}
+    #endif
+    """
+
+        @wp.func_native(snippet)
+        def pgs_solve_mf_streaming_native(
+            world: int,
+            mf_constraint_count: wp.array(dtype=int),
+            mf_body_count: wp.array(dtype=int),
+            mf_body_dof_start: wp.array2d(dtype=int),
+            mf_local_body_a: wp.array2d(dtype=int),
+            mf_local_body_b: wp.array2d(dtype=int),
+            mf_J_a: wp.array3d(dtype=float),
+            mf_J_b: wp.array3d(dtype=float),
+            mf_MiJt_a: wp.array3d(dtype=float),
+            mf_MiJt_b: wp.array3d(dtype=float),
+            mf_eff_mass_inv: wp.array2d(dtype=float),
+            mf_rhs: wp.array2d(dtype=float),
+            mf_row_type: wp.array2d(dtype=int),
+            mf_row_parent: wp.array2d(dtype=int),
+            mf_row_mu: wp.array2d(dtype=float),
+            mf_impulses: wp.array2d(dtype=float),
+            v_out: wp.array(dtype=float),
+            iterations: int,
+            omega: float,
+        ): ...
+
+        def pgs_solve_mf_streaming_template(
+            mf_constraint_count: wp.array(dtype=int),
+            mf_body_count: wp.array(dtype=int),
+            mf_body_dof_start: wp.array2d(dtype=int),
+            mf_local_body_a: wp.array2d(dtype=int),
+            mf_local_body_b: wp.array2d(dtype=int),
+            mf_J_a: wp.array3d(dtype=float),
+            mf_J_b: wp.array3d(dtype=float),
+            mf_MiJt_a: wp.array3d(dtype=float),
+            mf_MiJt_b: wp.array3d(dtype=float),
+            mf_eff_mass_inv: wp.array2d(dtype=float),
+            mf_rhs: wp.array2d(dtype=float),
+            mf_row_type: wp.array2d(dtype=int),
+            mf_row_parent: wp.array2d(dtype=int),
+            mf_row_mu: wp.array2d(dtype=float),
+            mf_impulses: wp.array2d(dtype=float),
+            v_out: wp.array(dtype=float),
+            iterations: int,
+            omega: float,
+        ):
+            world, _lane = wp.tid()
+            pgs_solve_mf_streaming_native(
+                world,
+                mf_constraint_count,
+                mf_body_count,
+                mf_body_dof_start,
+                mf_local_body_a,
+                mf_local_body_b,
+                mf_J_a,
+                mf_J_b,
+                mf_MiJt_a,
+                mf_MiJt_b,
+                mf_eff_mass_inv,
+                mf_rhs,
+                mf_row_type,
+                mf_row_parent,
+                mf_row_mu,
+                mf_impulses,
+                v_out,
+                iterations,
+                omega,
+            )
+
+        name = f"pgs_solve_mf_streaming_{mf_max_constraints}_{max_mf_bodies}"
+        pgs_solve_mf_streaming_template.__name__ = name
+        pgs_solve_mf_streaming_template.__qualname__ = name
+        return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_streaming_template)
