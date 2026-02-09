@@ -18,7 +18,7 @@
 #   UPSTREAM_REF                    Upstream ref to rebase onto (default: upstream/main)
 #   RESULTS_BRANCH                  Results branch (default: gh-pages)
 #   SWEEP_SOLVERS_G1_FLAT           Solver list for g1_flat sweeps (default: fpgs_tiled,mujoco)
-#   SWEEP_SOLVERS_H1_TABLETOP       Solver list for h1_tabletop sweeps (default: fpgs_streaming,mujoco)
+#   SWEEP_SOLVERS_H1_TABLETOP       Solver list for h1_tabletop sweeps (default: fpgs_tiled,mujoco)
 #   SWEEP_MIN_LOG2_G1_FLAT          Min log2 worlds for g1_flat sweep (default: 10)
 #   SWEEP_MAX_LOG2_G1_FLAT          Max log2 worlds for g1_flat sweep (default: 15)
 #   SWEEP_MIN_LOG2_H1_TABLETOP      Min log2 worlds for h1_tabletop sweep (default: 10)
@@ -40,7 +40,7 @@ AUTO_BRANCH="${AUTO_BRANCH:-feather_pgs_auto_rebase}"
 UPSTREAM_REF="${UPSTREAM_REF:-upstream/main}"
 RESULTS_BRANCH="${RESULTS_BRANCH:-gh-pages}"
 SWEEP_SOLVERS_G1_FLAT="${SWEEP_SOLVERS_G1_FLAT:-fpgs_tiled,mujoco}"
-SWEEP_SOLVERS_H1_TABLETOP="${SWEEP_SOLVERS_H1_TABLETOP:-fpgs_streaming,mujoco}"
+SWEEP_SOLVERS_H1_TABLETOP="${SWEEP_SOLVERS_H1_TABLETOP:-fpgs_tiled,mujoco}"
 SWEEP_MIN_LOG2_G1_FLAT="${SWEEP_MIN_LOG2_G1_FLAT:-10}"
 SWEEP_MAX_LOG2_G1_FLAT="${SWEEP_MAX_LOG2_G1_FLAT:-17}"
 SWEEP_MIN_LOG2_H1_TABLETOP="${SWEEP_MIN_LOG2_H1_TABLETOP:-10}"
