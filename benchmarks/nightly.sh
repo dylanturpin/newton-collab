@@ -141,7 +141,7 @@ run_sweep() {
   fi
 
   log "Running sweep: $scenario"
-  UV_NO_CONFIG=1 "${cmd[@]}"
+  UV_NO_CONFIG=1 "${cmd[@]}" 2>&1 | log
 }
 
 run_ablation() {
@@ -160,7 +160,7 @@ run_ablation() {
   fi
 
   log "Running ablation: $scenario"
-  UV_NO_CONFIG=1 "${cmd[@]}"
+  UV_NO_CONFIG=1 "${cmd[@]}" 2>&1 | log
 }
 
 append_points() {
