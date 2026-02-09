@@ -1683,7 +1683,10 @@ def allocate_world_contact_slots(
     shape_body: wp.array(dtype=int),
     body_to_articulation: wp.array(dtype=int),
     art_to_world: wp.array(dtype=int),
+    is_free_rigid: wp.array(dtype=int),
+    has_free_rigid: int,
     max_constraints: int,
+    mf_max_constraints: int,
     enable_friction: int,
     # outputs
     contact_world: wp.array(dtype=int),
@@ -1691,12 +1694,15 @@ def allocate_world_contact_slots(
     contact_art_a: wp.array(dtype=int),
     contact_art_b: wp.array(dtype=int),
     world_slot_counter: wp.array(dtype=int),
+    contact_path: wp.array(dtype=int),
+    mf_slot_counter: wp.array(dtype=int),
 ):
     """
     Phase 1 of multi-articulation contact building.
 
     Allocates world-level constraint slots for each contact and records
-    which articulations are involved.
+    which articulations are involved. Contacts where both sides are free
+    rigid bodies (or ground) are routed to the matrix-free path.
 
     Each contact reserves 3 slots (normal + 2 friction) in its world's constraint buffer.
     """
@@ -1704,6 +1710,7 @@ def allocate_world_contact_slots(
     total_contacts = contact_count[0]
     if c >= total_contacts:
         contact_slot[c] = -1
+        contact_path[c] = -1
         return
 
     shape_a = contact_shape0[c]
@@ -1733,12 +1740,14 @@ def allocate_world_contact_slots(
         if world >= 0 and world_b != world:
             # Cross-world contact - shouldn't happen, skip
             contact_slot[c] = -1
+            contact_path[c] = -1
             return
         world = world_b
 
     if world < 0:
         # No articulation involved (ground-ground?)
         contact_slot[c] = -1
+        contact_path[c] = -1
         return
 
     # Compute phi (same logic as populate_world_J_for_size)
@@ -1769,25 +1778,46 @@ def allocate_world_contact_slots(
     # Gate on margin
     if phi >= 0.001:
         contact_slot[c] = -1
+        contact_path[c] = -1
         return
 
+    # Classify: MF path if both sides are free rigid or ground
+    is_mf = 0
+    if has_free_rigid != 0:
+        a_is_free_or_ground = (art_a < 0) or (is_free_rigid[art_a] != 0)
+        b_is_free_or_ground = (art_b < 0) or (is_free_rigid[art_b] != 0)
+        if a_is_free_or_ground and b_is_free_or_ground:
+            is_mf = 1
 
     # Allocate slots (1 normal + 2 friction)
     slots_needed = 1
     if enable_friction != 0:
         slots_needed = 3
 
-    slot = wp.atomic_add(world_slot_counter, world, slots_needed)
-
-    if slot + slots_needed > max_constraints:
-        # Overflow - skip this contact
-        contact_slot[c] = -1
-        return
-
-    contact_world[c] = world
-    contact_slot[c] = slot
-    contact_art_a[c] = art_a
-    contact_art_b[c] = art_b
+    if is_mf != 0:
+        # Matrix-free path
+        slot = wp.atomic_add(mf_slot_counter, world, slots_needed)
+        if slot + slots_needed > mf_max_constraints:
+            contact_slot[c] = -1
+            contact_path[c] = -1
+            return
+        contact_world[c] = world
+        contact_slot[c] = slot
+        contact_art_a[c] = art_a
+        contact_art_b[c] = art_b
+        contact_path[c] = 1
+    else:
+        # Dense path
+        slot = wp.atomic_add(world_slot_counter, world, slots_needed)
+        if slot + slots_needed > max_constraints:
+            contact_slot[c] = -1
+            contact_path[c] = -1
+            return
+        contact_world[c] = world
+        contact_slot[c] = slot
+        contact_art_a[c] = art_a
+        contact_art_b[c] = art_b
+        contact_path[c] = 0
 
 
 @wp.func
@@ -1846,6 +1876,7 @@ def populate_world_J_for_size(
     contact_slot: wp.array(dtype=int),
     contact_art_a: wp.array(dtype=int),
     contact_art_b: wp.array(dtype=int),
+    contact_path: wp.array(dtype=int),
     target_size: int,
     art_size: wp.array(dtype=int),
     art_group_idx: wp.array(dtype=int),
@@ -1876,10 +1907,15 @@ def populate_world_J_for_size(
 
     Populates the Jacobian matrix for articulations of a specific DOF size.
     Each contact may contribute to multiple articulations' J matrices.
+    Contacts routed to the matrix-free path (contact_path==1) are skipped.
     """
     c = wp.tid()
     total_contacts = contact_count[0]
     if c >= total_contacts:
+        return
+
+    # Skip contacts routed to MF path
+    if contact_path[c] != 0:
         return
 
     slot = contact_slot[c]
@@ -2645,6 +2681,593 @@ def prepare_world_impulses(
     for i in range(max_constraints):
         if warmstart == 0 or i >= m:
             world_impulses[world, i] = 0.0
+
+
+# =============================================================================
+# Matrix-Free PGS Kernels for Free Rigid Bodies
+# =============================================================================
+
+
+@wp.kernel
+def build_mf_contact_rows(
+    contact_count: wp.array(dtype=int),
+    contact_point0: wp.array(dtype=wp.vec3),
+    contact_point1: wp.array(dtype=wp.vec3),
+    contact_normal: wp.array(dtype=wp.vec3),
+    contact_shape0: wp.array(dtype=int),
+    contact_shape1: wp.array(dtype=int),
+    contact_thickness0: wp.array(dtype=float),
+    contact_thickness1: wp.array(dtype=float),
+    contact_world: wp.array(dtype=int),
+    contact_slot: wp.array(dtype=int),
+    contact_path: wp.array(dtype=int),
+    shape_body: wp.array(dtype=int),
+    body_q: wp.array(dtype=wp.transform),
+    shape_material_mu: wp.array(dtype=float),
+    enable_friction: int,
+    pgs_beta: float,
+    # outputs
+    mf_body_a: wp.array2d(dtype=int),
+    mf_body_b: wp.array2d(dtype=int),
+    mf_J_a: wp.array3d(dtype=float),
+    mf_J_b: wp.array3d(dtype=float),
+    mf_row_type: wp.array2d(dtype=int),
+    mf_row_parent: wp.array2d(dtype=int),
+    mf_row_mu: wp.array2d(dtype=float),
+    mf_phi: wp.array2d(dtype=float),
+):
+    """Build MF constraint rows for contacts between free rigid bodies / ground.
+
+    For root free joints, joint_qd stores the world-frame spatial twist at the
+    world origin: qd = [v_at_origin, omega].  S = identity (since X_wpj = I),
+    so the dense Jacobian row simplifies to:
+        J = [d, pw x d]   (pw = absolute world position of contact point)
+    """
+    c = wp.tid()
+    total_contacts = contact_count[0]
+    if c >= total_contacts:
+        return
+
+    if contact_path[c] != 1:
+        return
+
+    slot = contact_slot[c]
+    if slot < 0:
+        return
+
+    world = contact_world[c]
+    shape_a = contact_shape0[c]
+    shape_b = contact_shape1[c]
+    normal = contact_normal[c]
+
+    body_a = -1
+    body_b = -1
+    if shape_a >= 0:
+        body_a = shape_body[shape_a]
+    if shape_b >= 0:
+        body_b = shape_body[shape_b]
+
+    thickness_a = contact_thickness0[c]
+    thickness_b = contact_thickness1[c]
+
+    # Compute contact points in world frame
+    point_a_local = contact_point0[c]
+    point_b_local = contact_point1[c]
+    point_a_world = wp.vec3(0.0)
+    point_b_world = wp.vec3(0.0)
+
+    if body_a >= 0:
+        X_wb_a = body_q[body_a]
+        point_a_world = wp.transform_point(X_wb_a, point_a_local) - thickness_a * normal
+    else:
+        point_a_world = point_a_local - thickness_a * normal
+
+    if body_b >= 0:
+        X_wb_b = body_q[body_b]
+        point_b_world = wp.transform_point(X_wb_b, point_b_local) + thickness_b * normal
+    else:
+        point_b_world = point_b_local + thickness_b * normal
+
+    phi = wp.dot(normal, point_a_world - point_b_world)
+
+    # Friction coefficient
+    mu = 0.0
+    mat_count = 0
+    if shape_a >= 0:
+        mu += shape_material_mu[shape_a]
+        mat_count += 1
+    if shape_b >= 0:
+        mu += shape_material_mu[shape_b]
+        mat_count += 1
+    if mat_count > 0:
+        mu /= float(mat_count)
+
+    # Tangent basis
+    t0, t1 = contact_tangent_basis(normal)
+
+    # Write rows for normal + friction
+    for row_offset in range(3):
+        if row_offset > 0 and enable_friction == 0:
+            break
+
+        row_idx = slot + row_offset
+
+        if row_offset == 0:
+            d = normal
+        elif row_offset == 1:
+            d = t0
+        else:
+            d = t1
+
+        # Body A Jacobian in world frame: J = [d, pw_a × d]
+        # For root free joints, joint_qd stores world-frame spatial twist
+        # at the world origin (v_at_origin, omega). S = identity, so
+        # J[k] = dot(d, S_k_lin + cross(S_k_ang, pw)) reduces to
+        # J = [d, pw × d] with pw = absolute world position of contact point.
+        if body_a >= 0:
+            ang_a = wp.cross(point_a_world, d)
+            mf_J_a[world, row_idx, 0] = d[0]
+            mf_J_a[world, row_idx, 1] = d[1]
+            mf_J_a[world, row_idx, 2] = d[2]
+            mf_J_a[world, row_idx, 3] = ang_a[0]
+            mf_J_a[world, row_idx, 4] = ang_a[1]
+            mf_J_a[world, row_idx, 5] = ang_a[2]
+
+        # Body B Jacobian in world frame: negative sign (opposite contact direction)
+        if body_b >= 0:
+            ang_b = wp.cross(point_b_world, d)
+            mf_J_b[world, row_idx, 0] = -d[0]
+            mf_J_b[world, row_idx, 1] = -d[1]
+            mf_J_b[world, row_idx, 2] = -d[2]
+            mf_J_b[world, row_idx, 3] = -ang_b[0]
+            mf_J_b[world, row_idx, 4] = -ang_b[1]
+            mf_J_b[world, row_idx, 5] = -ang_b[2]
+
+        mf_body_a[world, row_idx] = body_a
+        mf_body_b[world, row_idx] = body_b
+
+        if row_offset == 0:
+            mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
+            mf_row_parent[world, row_idx] = -1
+            mf_phi[world, row_idx] = phi
+        else:
+            mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
+            mf_row_parent[world, row_idx] = slot
+            mf_phi[world, row_idx] = 0.0
+        mf_row_mu[world, row_idx] = mu
+
+
+@wp.func
+def spatial_matrix_block_inverse(M: wp.spatial_matrix):
+    """Invert a 6x6 spatial matrix using 3x3 block inversion.
+
+    Partition M = [A B; C D] into 3x3 blocks, then:
+        S = D - C * A^-1 * B   (Schur complement)
+        M^-1 = [A^-1 + A^-1*B*S^-1*C*A^-1,  -A^-1*B*S^-1]
+               [-S^-1*C*A^-1,                 S^-1]
+    """
+    A = wp.mat33(
+        M[0, 0],
+        M[0, 1],
+        M[0, 2],
+        M[1, 0],
+        M[1, 1],
+        M[1, 2],
+        M[2, 0],
+        M[2, 1],
+        M[2, 2],
+    )
+    B = wp.mat33(
+        M[0, 3],
+        M[0, 4],
+        M[0, 5],
+        M[1, 3],
+        M[1, 4],
+        M[1, 5],
+        M[2, 3],
+        M[2, 4],
+        M[2, 5],
+    )
+    C = wp.mat33(
+        M[3, 0],
+        M[3, 1],
+        M[3, 2],
+        M[4, 0],
+        M[4, 1],
+        M[4, 2],
+        M[5, 0],
+        M[5, 1],
+        M[5, 2],
+    )
+    D = wp.mat33(
+        M[3, 3],
+        M[3, 4],
+        M[3, 5],
+        M[4, 3],
+        M[4, 4],
+        M[4, 5],
+        M[5, 3],
+        M[5, 4],
+        M[5, 5],
+    )
+
+    Ainv = wp.inverse(A)
+    AinvB = Ainv * B
+    S = D - C * AinvB
+    Sinv = wp.inverse(S)
+    SinvCAinv = Sinv * C * Ainv
+
+    # Top-left: Ainv + AinvB * SinvCAinv
+    TL = Ainv + AinvB * SinvCAinv
+    # Top-right: -AinvB * Sinv
+    TR = -AinvB * Sinv
+    # Bottom-left: -SinvCAinv
+    BL = -SinvCAinv
+    # Bottom-right: Sinv
+    BR = Sinv
+
+    return wp.spatial_matrix(
+        TL[0, 0],
+        TL[0, 1],
+        TL[0, 2],
+        TR[0, 0],
+        TR[0, 1],
+        TR[0, 2],
+        TL[1, 0],
+        TL[1, 1],
+        TL[1, 2],
+        TR[1, 0],
+        TR[1, 1],
+        TR[1, 2],
+        TL[2, 0],
+        TL[2, 1],
+        TL[2, 2],
+        TR[2, 0],
+        TR[2, 1],
+        TR[2, 2],
+        BL[0, 0],
+        BL[0, 1],
+        BL[0, 2],
+        BR[0, 0],
+        BR[0, 1],
+        BR[0, 2],
+        BL[1, 0],
+        BL[1, 1],
+        BL[1, 2],
+        BR[1, 0],
+        BR[1, 1],
+        BR[1, 2],
+        BL[2, 0],
+        BL[2, 1],
+        BL[2, 2],
+        BR[2, 0],
+        BR[2, 1],
+        BR[2, 2],
+    )
+
+
+@wp.kernel
+def compute_mf_body_Hinv(
+    body_I_s: wp.array(dtype=wp.spatial_matrix),
+    is_free_rigid: wp.array(dtype=int),
+    body_to_articulation: wp.array(dtype=int),
+    # outputs
+    mf_body_Hinv: wp.array(dtype=wp.spatial_matrix),
+):
+    """Compute H^-1 = inverse(body_I_s) for free rigid bodies.
+
+    For root free joints, H = body_I_s (the spatial inertia at the world
+    origin). This is a full 6x6 matrix (not block-diagonal) because the
+    parallel axis theorem introduces off-diagonal coupling from the body's
+    position.
+    """
+    b = wp.tid()
+    art = body_to_articulation[b]
+    if art < 0:
+        return
+    if is_free_rigid[art] == 0:
+        return
+
+    mf_body_Hinv[b] = spatial_matrix_block_inverse(body_I_s[b])
+
+
+@wp.kernel
+def compute_mf_effective_mass_and_rhs(
+    mf_constraint_count: wp.array(dtype=int),
+    mf_body_a: wp.array2d(dtype=int),
+    mf_body_b: wp.array2d(dtype=int),
+    mf_J_a: wp.array3d(dtype=float),
+    mf_J_b: wp.array3d(dtype=float),
+    mf_body_Hinv: wp.array(dtype=wp.spatial_matrix),
+    mf_phi: wp.array2d(dtype=float),
+    mf_row_type: wp.array2d(dtype=int),
+    pgs_cfm: float,
+    pgs_beta: float,
+    dt: float,
+    # outputs
+    mf_eff_mass_inv: wp.array2d(dtype=float),
+    mf_MiJt_a: wp.array3d(dtype=float),
+    mf_MiJt_b: wp.array3d(dtype=float),
+    mf_rhs: wp.array2d(dtype=float),
+):
+    """Compute effective mass diagonal, H^-1*J^T, and RHS bias for MF constraints.
+
+    The effective mass for constraint i is:
+        d_ii = J_a^T * H_a_inv * J_a + J_b^T * H_b_inv * J_b + cfm
+
+    H_inv is the full 6x6 inverse of the spatial inertia at the world origin.
+    For root free joints, H = body_I_s (includes parallel axis terms).
+
+    RHS stores only the stabilization bias (not J*v), since the MF PGS
+    recomputes J*v each iteration from the live velocity array.
+    """
+    world = wp.tid()
+    m = mf_constraint_count[world]
+
+    for i in range(m):
+        ba = mf_body_a[world, i]
+        bb = mf_body_b[world, i]
+
+        # Load Jacobian as spatial_vector
+        Ja = wp.spatial_vector(
+            mf_J_a[world, i, 0],
+            mf_J_a[world, i, 1],
+            mf_J_a[world, i, 2],
+            mf_J_a[world, i, 3],
+            mf_J_a[world, i, 4],
+            mf_J_a[world, i, 5],
+        )
+        Jb = wp.spatial_vector(
+            mf_J_b[world, i, 0],
+            mf_J_b[world, i, 1],
+            mf_J_b[world, i, 2],
+            mf_J_b[world, i, 3],
+            mf_J_b[world, i, 4],
+            mf_J_b[world, i, 5],
+        )
+
+        d = pgs_cfm
+
+        # Side A: MiJt_a = H_a_inv * J_a, d += J_a^T * MiJt_a
+        if ba >= 0:
+            Hinv_a = mf_body_Hinv[ba]
+            MiJt_a = Hinv_a * Ja
+            d += wp.dot(Ja, MiJt_a)
+            mf_MiJt_a[world, i, 0] = MiJt_a[0]
+            mf_MiJt_a[world, i, 1] = MiJt_a[1]
+            mf_MiJt_a[world, i, 2] = MiJt_a[2]
+            mf_MiJt_a[world, i, 3] = MiJt_a[3]
+            mf_MiJt_a[world, i, 4] = MiJt_a[4]
+            mf_MiJt_a[world, i, 5] = MiJt_a[5]
+
+        # Side B
+        if bb >= 0:
+            Hinv_b = mf_body_Hinv[bb]
+            MiJt_b = Hinv_b * Jb
+            d += wp.dot(Jb, MiJt_b)
+            mf_MiJt_b[world, i, 0] = MiJt_b[0]
+            mf_MiJt_b[world, i, 1] = MiJt_b[1]
+            mf_MiJt_b[world, i, 2] = MiJt_b[2]
+            mf_MiJt_b[world, i, 3] = MiJt_b[3]
+            mf_MiJt_b[world, i, 4] = MiJt_b[4]
+            mf_MiJt_b[world, i, 5] = MiJt_b[5]
+
+        if d > 0.0:
+            mf_eff_mass_inv[world, i] = 1.0 / d
+        else:
+            mf_eff_mass_inv[world, i] = 0.0
+
+        # Baumgarte stabilization bias only (not J*v -- recomputed each PGS iter)
+        bias = float(0.0)
+        rtype = mf_row_type[world, i]
+        if rtype == PGS_CONSTRAINT_TYPE_CONTACT:
+            phi_val = mf_phi[world, i]
+            bias = pgs_beta / dt * wp.min(phi_val, 0.0)
+
+        mf_rhs[world, i] = bias
+
+
+@wp.kernel
+def pgs_solve_mf_loop(
+    mf_constraint_count: wp.array(dtype=int),
+    mf_body_a: wp.array2d(dtype=int),
+    mf_body_b: wp.array2d(dtype=int),
+    mf_MiJt_a: wp.array3d(dtype=float),
+    mf_MiJt_b: wp.array3d(dtype=float),
+    mf_J_a: wp.array3d(dtype=float),
+    mf_J_b: wp.array3d(dtype=float),
+    mf_eff_mass_inv: wp.array2d(dtype=float),
+    mf_rhs: wp.array2d(dtype=float),
+    mf_row_type: wp.array2d(dtype=int),
+    mf_row_parent: wp.array2d(dtype=int),
+    mf_row_mu: wp.array2d(dtype=float),
+    body_to_articulation: wp.array(dtype=int),
+    art_dof_start: wp.array(dtype=int),
+    iterations: int,
+    omega: float,
+    # in/out
+    mf_impulses: wp.array2d(dtype=float),
+    v_out: wp.array(dtype=float),
+):
+    """Matrix-free PGS solver for free rigid body contacts.
+
+    Operates directly on body velocities stored in v_out (generalized coordinates).
+    Each iteration recomputes J*v from v_out and applies velocity corrections
+    immediately (Gauss-Seidel style).
+    """
+    world = wp.tid()
+    m_count = mf_constraint_count[world]
+    if m_count == 0:
+        return
+
+    for _ in range(iterations):
+        for i in range(m_count):
+            eff_inv = mf_eff_mass_inv[world, i]
+            if eff_inv <= 0.0:
+                continue
+
+            ba = mf_body_a[world, i]
+            bb = mf_body_b[world, i]
+
+            # Compute current J * v
+            jv = float(0.0)
+            if ba >= 0:
+                art_a = body_to_articulation[ba]
+                ds_a = art_dof_start[art_a]
+                for k in range(6):
+                    jv += mf_J_a[world, i, k] * v_out[ds_a + k]
+            if bb >= 0:
+                art_b = body_to_articulation[bb]
+                ds_b = art_dof_start[art_b]
+                for k in range(6):
+                    jv += mf_J_b[world, i, k] * v_out[ds_b + k]
+
+            # PGS update: delta = -(J*v_current + bias) / d_ii
+            delta = -(jv + mf_rhs[world, i]) * eff_inv
+            new_impulse = mf_impulses[world, i] + omega * delta
+            old_impulse = mf_impulses[world, i]
+
+            row_type = mf_row_type[world, i]
+
+            # Project
+            if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+                if new_impulse < 0.0:
+                    new_impulse = 0.0
+            elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+                parent_idx = mf_row_parent[world, i]
+                lambda_n = mf_impulses[world, parent_idx]
+                mu_val = mf_row_mu[world, i]
+                radius = wp.max(mu_val * lambda_n, 0.0)
+
+                if radius <= 0.0:
+                    new_impulse = 0.0
+                else:
+                    # Sibling friction row
+                    if i == parent_idx + 1:
+                        sib = parent_idx + 2
+                    else:
+                        sib = parent_idx + 1
+
+                    mf_impulses[world, i] = new_impulse
+                    a = new_impulse
+                    b = mf_impulses[world, sib]
+                    mag = wp.sqrt(a * a + b * b)
+                    if mag > radius:
+                        scale = radius / mag
+                        new_impulse = a * scale
+                        mf_impulses[world, sib] = b * scale
+                        # Apply sibling correction to velocities
+                        sib_delta = b * scale - b
+                        sib_ba = mf_body_a[world, sib]
+                        sib_bb = mf_body_b[world, sib]
+                        if sib_ba >= 0:
+                            sib_art_a = body_to_articulation[sib_ba]
+                            sib_ds_a = art_dof_start[sib_art_a]
+                            for k in range(6):
+                                v_out[sib_ds_a + k] = v_out[sib_ds_a + k] + mf_MiJt_a[world, sib, k] * sib_delta
+                        if sib_bb >= 0:
+                            sib_art_b = body_to_articulation[sib_bb]
+                            sib_ds_b = art_dof_start[sib_art_b]
+                            for k in range(6):
+                                v_out[sib_ds_b + k] = v_out[sib_ds_b + k] + mf_MiJt_b[world, sib, k] * sib_delta
+
+            delta_impulse = new_impulse - old_impulse
+            mf_impulses[world, i] = new_impulse
+
+            # Apply velocity correction: v += M_inv * J^T * delta_impulse
+            if ba >= 0:
+                art_a2 = body_to_articulation[ba]
+                ds_a2 = art_dof_start[art_a2]
+                for k in range(6):
+                    v_out[ds_a2 + k] = v_out[ds_a2 + k] + mf_MiJt_a[world, i, k] * delta_impulse
+            if bb >= 0:
+                art_b2 = body_to_articulation[bb]
+                ds_b2 = art_dof_start[art_b2]
+                for k in range(6):
+                    v_out[ds_b2 + k] = v_out[ds_b2 + k] + mf_MiJt_b[world, i, k] * delta_impulse
+
+
+@wp.kernel
+def finalize_mf_constraint_counts(
+    mf_slot_counter: wp.array(dtype=int),
+    mf_max_constraints: int,
+    # outputs
+    mf_constraint_count: wp.array(dtype=int),
+):
+    """Clamp MF slot counter to max and store as constraint count."""
+    world = wp.tid()
+    count = mf_slot_counter[world]
+    if count > mf_max_constraints:
+        count = mf_max_constraints
+    mf_constraint_count[world] = count
+
+
+@wp.kernel
+def build_mf_body_map(
+    mf_constraint_count: wp.array(dtype=int),
+    mf_body_a: wp.array2d(dtype=int),
+    mf_body_b: wp.array2d(dtype=int),
+    body_to_articulation: wp.array(dtype=int),
+    art_dof_start: wp.array(dtype=int),
+    max_mf_bodies: int,
+    # outputs
+    mf_body_list: wp.array2d(dtype=int),
+    mf_body_dof_start: wp.array2d(dtype=int),
+    mf_body_count: wp.array(dtype=int),
+    mf_local_body_a: wp.array2d(dtype=int),
+    mf_local_body_b: wp.array2d(dtype=int),
+):
+    """Build per-world compact body table and local body index mapping.
+
+    Scans all MF constraint body indices, builds a unique body list per world,
+    and maps each constraint's body indices to local (compact) indices.
+    """
+    world = wp.tid()
+    m = mf_constraint_count[world]
+    if m == 0:
+        mf_body_count[world] = 0
+        return
+
+    n_bodies = int(0)
+
+    for i in range(m):
+        # Process body A
+        ba = mf_body_a[world, i]
+        if ba >= 0:
+            # Search for ba in body_list
+            found_a = int(-1)
+            for b in range(n_bodies):
+                if mf_body_list[world, b] == ba:
+                    found_a = b
+                    break
+            if found_a < 0 and n_bodies < max_mf_bodies:
+                found_a = n_bodies
+                mf_body_list[world, n_bodies] = ba
+                art_a = body_to_articulation[ba]
+                mf_body_dof_start[world, n_bodies] = art_dof_start[art_a]
+                n_bodies += 1
+            mf_local_body_a[world, i] = found_a
+        else:
+            mf_local_body_a[world, i] = -1
+
+        # Process body B
+        bb = mf_body_b[world, i]
+        if bb >= 0:
+            found_b = int(-1)
+            for b in range(n_bodies):
+                if mf_body_list[world, b] == bb:
+                    found_b = b
+                    break
+            if found_b < 0 and n_bodies < max_mf_bodies:
+                found_b = n_bodies
+                mf_body_list[world, n_bodies] = bb
+                mf_body_dof_start[world, n_bodies] = art_dof_start[body_to_articulation[bb]]
+                n_bodies += 1
+            mf_local_body_b[world, i] = found_b
+        else:
+            mf_local_body_b[world, i] = -1
+
+    mf_body_count[world] = n_bodies
 
 
 @wp.kernel
