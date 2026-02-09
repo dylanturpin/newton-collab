@@ -599,6 +599,14 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
         if args.pgs_warmstart:
             cmd.append("--pgs-warmstart")
 
+        # Chunk sizes: solver_config overrides CLI
+        delassus_chunk = solver_config.get("delassus_chunk_size", getattr(args, "delassus_chunk_size", None))
+        if delassus_chunk is not None:
+            cmd.extend(["--delassus-chunk-size", str(delassus_chunk)])
+        pgs_chunk = solver_config.get("pgs_chunk_size", getattr(args, "pgs_chunk_size", None))
+        if pgs_chunk is not None:
+            cmd.extend(["--pgs-chunk-size", str(pgs_chunk)])
+
     if args.timing_out or args.ablation:
         cmd.append("--summary-timer")
 
@@ -1385,6 +1393,8 @@ def create_solver(model, args, scenario_cfg: dict):
         hinv_jt = get_kernel("hinv_jt_kernel", args.hinv_jt_kernel)
         delassus = get_kernel("delassus_kernel", args.delassus_kernel)
         pgs = get_kernel("pgs_kernel", args.pgs_kernel)
+        delassus_chunk = get_kernel("delassus_chunk_size", args.delassus_chunk_size)
+        pgs_chunk = get_kernel("pgs_chunk_size", args.pgs_chunk_size)
         parallel_streams = preset.get("use_parallel_streams", args.use_parallel_streams)
 
         solver_kwargs = {
@@ -1402,6 +1412,8 @@ def create_solver(model, args, scenario_cfg: dict):
             "hinv_jt_kernel": hinv_jt,
             "delassus_kernel": delassus,
             "pgs_kernel": pgs,
+            "delassus_chunk_size": delassus_chunk,
+            "pgs_chunk_size": pgs_chunk,
             "small_dof_threshold": 12,
             "use_parallel_streams": parallel_streams,
         }
@@ -1719,6 +1731,10 @@ def main():
     parser.add_argument("--pgs-cfm", type=float, default=1.0e-6, help="PGS constraint force mixing (regularization)")
     parser.add_argument("--pgs-omega", type=float, default=1.0, help="PGS relaxation factor (SOR)")
     parser.add_argument("--pgs-warmstart", action="store_true", help="Enable warmstart")
+    parser.add_argument("--delassus-chunk-size", type=int, default=None,
+                        help="Chunk size (constraint rows) for streaming Delassus kernel (None=auto)")
+    parser.add_argument("--pgs-chunk-size", type=int, default=None,
+                        help="Chunk size (contacts) for streaming PGS kernel (None=1)")
     parser.add_argument("--use-parallel-streams", action="store_true", dest="use_parallel_streams")
     parser.add_argument("--no-parallel-streams", action="store_false", dest="use_parallel_streams")
     parser.set_defaults(use_parallel_streams=True)
