@@ -106,7 +106,7 @@ SCENARIOS = {
         "storage": "batched",
         "default_substeps": 8,
         "default_pgs_iterations": 8,
-        "default_pgs_max_constraints": 1024,
+        "default_pgs_max_constraints": 384,
         # High contact count (~150) exceeds tiled kernel shared memory limits.
         # Use streaming kernel which streams block-rows from global memory.
         "default_cholesky_kernel": "tiled",
