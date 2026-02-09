@@ -103,14 +103,15 @@ SCENARIOS = {
         "storage": "batched",
         "default_substeps": 8,
         "default_pgs_iterations": 8,
-        "default_pgs_max_constraints": 384,
-        # High contact count (~150) exceeds tiled kernel shared memory limits.
-        # Use streaming kernel which streams block-rows from global memory.
+        "default_pgs_max_constraints": 128,
+        # With MF enabled, rigid body contacts are routed to the matrix-free path,
+        # leaving only ~90 dense robot constraints. 128 max_constraints suffices and
+        # fits entirely in shared memory for tiled kernels.
         "default_cholesky_kernel": "tiled",
         "default_trisolve_kernel": "tiled",
-        "default_hinv_jt_kernel": "par_row",
+        "default_hinv_jt_kernel": "tiled",
         "default_delassus_kernel": "tiled",
-        "default_pgs_kernel": "streaming",
+        "default_pgs_kernel": "tiled_contact",
         "ablation_sequence": "streaming",
         "mujoco_settings": {
             "njmax": 512,
@@ -256,6 +257,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
+            "pgs_max_constraints": 396,
             "enable_mf_pgs": False,
             "use_parallel_streams": False,
         },
@@ -266,6 +268,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
+            "pgs_max_constraints": 396,
             "enable_mf_pgs": False,
             "use_parallel_streams": False,
         },
@@ -276,6 +279,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
+            "pgs_max_constraints": 396,
             "enable_mf_pgs": False,
             "use_parallel_streams": False,
         },
@@ -286,6 +290,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "tiled",
             "pgs_kernel": "loop",
+            "pgs_max_constraints": 396,
             "enable_mf_pgs": False,
             "use_parallel_streams": False,
         },
@@ -296,6 +301,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "tiled",
             "pgs_kernel": "streaming",  # Will be overridden by --ablation-pgs if specified
+            "pgs_max_constraints": 396,
             "enable_mf_pgs": False,
             "use_parallel_streams": False,
         },
@@ -306,6 +312,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "tiled",
             "pgs_kernel": "streaming",
+            "pgs_max_constraints": 396,
             "enable_mf_pgs": False,
             "use_parallel_streams": True,
         },
