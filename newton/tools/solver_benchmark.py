@@ -905,6 +905,7 @@ def run_ablation(args):
                         "solver": r.get("solver"),
                         "num_worlds": r.get("num_worlds"),
                         "step_index": r.get("step_index"),
+                        "kernels": r.get("kernels"),
                     }
                 )
                 + "\n"

@@ -199,6 +199,66 @@
       gap: 0.4rem;
     }
 
+    .kernel-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: 'Space Grotesk', monospace;
+      font-size: 0.8rem;
+      white-space: nowrap;
+    }
+
+    .kernel-table th,
+    .kernel-table td {
+      padding: 0.3rem 0.6rem;
+      text-align: right;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .kernel-table th:first-child,
+    .kernel-table td:first-child {
+      text-align: left;
+      position: sticky;
+      left: 0;
+      background: var(--bg-card);
+      z-index: 1;
+    }
+
+    .kernel-table thead th {
+      font-weight: 600;
+      color: var(--text);
+      border-bottom: 2px solid var(--border);
+    }
+
+    .kernel-table .stage-header td {
+      font-weight: 600;
+      color: var(--accent-3);
+      padding-top: 0.5rem;
+      border-bottom: none;
+    }
+
+    .kernel-table .kernel-row td {
+      color: var(--text-dim);
+      font-size: 0.75rem;
+    }
+
+    .kernel-table .stage-totals-sep td {
+      border-top: 2px solid var(--border);
+      font-weight: 600;
+      color: var(--text);
+      padding-top: 0.6rem;
+    }
+
+    .kernel-table .total-row td {
+      font-weight: 700;
+      color: var(--accent);
+      border-top: 2px solid var(--accent);
+    }
+
+    .kernel-table .absent {
+      color: var(--text-dim);
+      opacity: 0.4;
+    }
+
     @media (max-width: 768px) {
       body {
         padding: 1rem;
@@ -291,6 +351,32 @@
   </section>
 
   <section class="section">
+    <div class="section-title">Kernel Stage Breakdown</div>
+    <div class="grid">
+      <div class="card">
+        <h3>G1 Flat Ablation • Stage Breakdown</h3>
+        <div class="chart-wrap"><canvas id="g1-flat-kernel-stack"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>H1 Tabletop Ablation • Stage Breakdown</h3>
+        <div class="chart-wrap"><canvas id="h1-tabletop-kernel-stack"></canvas></div>
+      </div>
+    </div>
+    <div style="margin-top:1.25rem;">
+      <div class="card" style="min-height:auto;">
+        <h3>G1 Flat Ablation • Kernel Detail</h3>
+        <div id="g1-flat-kernel-table" style="overflow-x:auto;"></div>
+      </div>
+    </div>
+    <div style="margin-top:1.25rem;">
+      <div class="card" style="min-height:auto;">
+        <h3>H1 Tabletop Ablation • Kernel Detail</h3>
+        <div id="h1-tabletop-kernel-table" style="overflow-x:auto;"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
     <div class="section-title">Time Series</div>
     <div class="card">
       <h3 id="timeseries-title">Env-FPS over time</h3>
@@ -325,6 +411,31 @@
       fpgs_streaming: 'FeatherPGS (streaming)',
       mujoco: 'MJWarp'
     };
+
+    const STAGE_COLORS = {
+      '0_collision':     '#f97316',
+      '1_fk_id':         '#22d3ee',
+      '1_drives':        '#a78bfa',
+      '1_crba':          '#818cf8',
+      '2_cholesky':      '#f43f5e',
+      '3_trisolve':      '#fb923c',
+      '3_v_hat':         '#fbbf24',
+      '4_contact_build': '#34d399',
+      '4_hinv_jt':       '#60a5fa',
+      '4_delassus':      '#38bdf8',
+      '4_hessian':       '#c084fc',
+      '4_rhs':           '#4ade80',
+      '5_solver':        '#facc15',
+      '6_apply':         '#94a3b8',
+      '6_integrate':     '#cbd5e1',
+      'other':           '#64748b',
+    };
+
+    const STAGE_ORDER = [
+      '0_collision','1_fk_id','1_drives','1_crba','2_cholesky',
+      '3_trisolve','3_v_hat','4_contact_build','4_hinv_jt','4_delassus',
+      '4_hessian','4_rhs','5_solver','6_apply','6_integrate','other'
+    ];
 
     let runs = [];
     let points = [];
@@ -435,6 +546,181 @@
       });
     }
 
+    function buildStackedBarChart(canvasId, labels, stageData) {
+      destroyChart(canvasId);
+      const datasets = STAGE_ORDER
+        .filter(stage => stageData[stage])
+        .map(stage => ({
+          label: stage,
+          data: stageData[stage],
+          backgroundColor: STAGE_COLORS[stage] || '#64748b',
+          borderRadius: 2,
+        }));
+
+      charts[canvasId] = new Chart(document.getElementById(canvasId), {
+        type: 'bar',
+        data: { labels, datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            x: {
+              stacked: true,
+              ticks: { color: '#9aa6b2' },
+              grid: { display: false }
+            },
+            y: {
+              stacked: true,
+              title: { display: true, text: 'ms' },
+              ticks: { color: '#9aa6b2' },
+              grid: { color: 'rgba(255,255,255,0.05)' },
+              beginAtZero: true
+            }
+          },
+          plugins: {
+            legend: {
+              labels: { color: '#9aa6b2', boxWidth: 12, font: { size: 10 } },
+              position: 'bottom'
+            },
+            tooltip: {
+              callbacks: {
+                label: function(ctx) {
+                  const val = ctx.parsed.y;
+                  const dataIndex = ctx.dataIndex;
+                  let total = 0;
+                  ctx.chart.data.datasets.forEach(ds => { total += (ds.data[dataIndex] || 0); });
+                  const pct = total > 0 ? ((val / total) * 100).toFixed(1) : '0.0';
+                  return `${ctx.dataset.label}: ${val.toFixed(1)}ms (${pct}%)`;
+                }
+              }
+            }
+          }
+        }
+      });
+    }
+
+    function buildKernelTable(containerId, ablationPoints) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+      if (!ablationPoints.length || !ablationPoints.some(p => p.kernels)) {
+        container.innerHTML = '<div class="note">No kernel timing data available for this run.</div>';
+        return;
+      }
+
+      const labels = ablationPoints.map(p => (p.label || p.solver || '?').replace(/^\+\s*/, '').slice(0, 28));
+
+      // Compute stage totals client-side from raw kernels
+      const perPointStageTotals = ablationPoints.map(p => computeStageTotals(p.kernels));
+
+      // Collect all kernels across all steps, grouped by stage
+      const stageKernels = {};
+      STAGE_ORDER.forEach(s => { stageKernels[s] = new Set(); });
+
+      ablationPoints.forEach(p => {
+        const kernels = p.kernels || {};
+        Object.keys(kernels).forEach(k => {
+          const stage = classifyKernelJS(k);
+          if (!stageKernels[stage]) stageKernels[stage] = new Set();
+          stageKernels[stage].add(k);
+        });
+      });
+
+      // Compute step totals for percentage calculation
+      const stepTotals = perPointStageTotals.map(st =>
+        Object.values(st).reduce((a, b) => a + b, 0)
+      );
+
+      let html = '<table class="kernel-table"><thead><tr><th>Kernel</th>';
+      labels.forEach(l => { html += `<th>${l}</th>`; });
+      html += '</tr></thead><tbody>';
+
+      // Per-kernel rows grouped by stage
+      STAGE_ORDER.forEach(stage => {
+        const kernelNames = Array.from(stageKernels[stage] || []).sort();
+        if (!kernelNames.length) return;
+
+        html += `<tr class="stage-header"><td colspan="${labels.length + 1}">[${stage}]</td></tr>`;
+        kernelNames.forEach(k => {
+          html += '<tr class="kernel-row"><td>&nbsp;&nbsp;' + k + '</td>';
+          ablationPoints.forEach((p, i) => {
+            const val = (p.kernels || {})[k];
+            if (val !== undefined && val !== null) {
+              const pct = stepTotals[i] > 0 ? ((val / stepTotals[i]) * 100).toFixed(0) : '0';
+              html += `<td>${val.toFixed(1)}ms (${pct}%)</td>`;
+            } else {
+              html += '<td class="absent">\u2013</td>';
+            }
+          });
+          html += '</tr>';
+        });
+      });
+
+      // Stage totals section
+      html += `<tr class="stage-totals-sep"><td colspan="${labels.length + 1}">STAGE TOTALS</td></tr>`;
+      STAGE_ORDER.forEach(stage => {
+        const hasData = perPointStageTotals.some(st => st[stage]);
+        if (!hasData) return;
+
+        html += `<tr><td>${stage}</td>`;
+        perPointStageTotals.forEach((st, i) => {
+          const val = st[stage];
+          if (val !== undefined && val !== null) {
+            const pct = stepTotals[i] > 0 ? ((val / stepTotals[i]) * 100).toFixed(0) : '0';
+            html += `<td>${val.toFixed(1)}ms (${pct}%)</td>`;
+          } else {
+            html += '<td class="absent">\u2013</td>';
+          }
+        });
+        html += '</tr>';
+      });
+
+      // Total row
+      html += '<tr class="total-row"><td>TOTAL</td>';
+      stepTotals.forEach(t => { html += `<td>${t.toFixed(1)}ms</td>`; });
+      html += '</tr>';
+
+      html += '</tbody></table>';
+      container.innerHTML = html;
+    }
+
+    // JS-side kernel classifier mirroring classify_kernel() in Python
+    function classifyKernelJS(kernelName) {
+      const n = kernelName.toLowerCase();
+      const PATTERNS = {
+        '0_collision': ['broadphase_collision_pairs','generate_handle_contact_pairs','_primitive_narrowphase','_nxn_broadphase'],
+        '1_fk_id': ['eval_rigid_fk','eval_rigid_id','eval_rigid_mass','compute_com','compute_spatial','compute_composite_inertia','_kinematics_level'],
+        '1_drives': ['eval_joint_drives','eval_rigid_tau','clamp_joint_tau','_actuator_velocity','_qderiv_actuator'],
+        '1_crba': ['crba_','update_gradient_set_h_qm'],
+        '2_cholesky': ['cholesky_','_qld_acc','_solve_ld_sparse_x_acc'],
+        '3_trisolve': ['trisolve_','_solve_ld_sparse'],
+        '3_v_hat': ['compute_velocity_predictor','compute_v_hat'],
+        '4_contact_build': ['build_contact_row','build_augmented','allocate_world_contact','clamp_contact','populate_world_j','_efc_contact','update_constraint_efc'],
+        '4_hinv_jt': ['hinv_jt_'],
+        '4_delassus': ['delassus_','finalize_world_diag_cfm'],
+        '4_hessian': ['update_gradient_jtdaj','mul_m_sparse'],
+        '4_rhs': ['compute_world_contact_bias','contact_bias_','compute_rhs','rhs_accum'],
+        '5_solver': ['pgs_solve','prepare_impulses','prepare_world_impulses','linesearch_jv','linesearch_parallel','update_gradient_cholesky','update_gradient_grad','solve_init_jaref','solve_search_update'],
+        '6_apply': ['apply_impulse','apply_augmented','update_constraint_init_qfrc'],
+        '6_integrate': ['integrate_','update_qdd','update_body_qd','scatter_qdd','eval_fk'],
+      };
+      for (const [stage, pats] of Object.entries(PATTERNS)) {
+        for (const pat of pats) {
+          if (n.includes(pat)) return stage;
+        }
+      }
+      return 'other';
+    }
+
+    function computeStageTotals(kernels) {
+      if (!kernels) return {};
+      const totals = {};
+      for (const [name, ms] of Object.entries(kernels)) {
+        const stage = classifyKernelJS(name);
+        totals[stage] = (totals[stage] || 0) + ms;
+      }
+      return totals;
+    }
+
     function buildTimeSeriesChart(datasets) {
       destroyChart('timeseries-chart');
       charts['timeseries-chart'] = new Chart(document.getElementById('timeseries-chart'), {
@@ -489,6 +775,19 @@
           return '#35c1a2';
         });
         buildBarChart(`${scenario.replace('_', '-')}-ablation`, ablationLabels, ablationValues, ablationColors);
+
+        // Stacked stage breakdown chart (computed client-side from raw kernels)
+        const prefix = scenario.replace('_', '-');
+        const perPointTotals = ablationSorted.map(p => computeStageTotals(p.kernels));
+        const stageData = {};
+        STAGE_ORDER.forEach(stage => {
+          const vals = perPointTotals.map(st => st[stage] || 0);
+          if (vals.some(v => v > 0)) stageData[stage] = vals;
+        });
+        buildStackedBarChart(`${prefix}-kernel-stack`, ablationLabels, stageData);
+
+        // Kernel detail table
+        buildKernelTable(`${prefix}-kernel-table`, ablationSorted);
       });
     }
 
