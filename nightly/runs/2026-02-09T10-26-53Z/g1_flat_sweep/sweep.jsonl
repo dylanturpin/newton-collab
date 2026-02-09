@@ -1,0 +1,2 @@
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 1024, "env_fps": 178511.62, "gpu_used_gb": 3.906, "elapsed_s": 0.367125, "ok": true, "label": "fpgs_tiled @ 1024 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 1024, "env_fps": 260259.89, "gpu_used_gb": 4.008, "elapsed_s": 0.25181, "ok": true, "label": "mujoco @ 1024 worlds"}
