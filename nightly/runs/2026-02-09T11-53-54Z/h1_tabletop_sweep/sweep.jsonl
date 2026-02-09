@@ -1,0 +1,12 @@
+{"solver": "fpgs_streaming", "substeps": 8, "num_worlds": 1024, "env_fps": 13828.98, "gpu_used_gb": 4.283, "elapsed_s": 4.739034, "ok": true, "label": "fpgs_streaming @ 1024 worlds"}
+{"solver": "fpgs_streaming", "substeps": 8, "num_worlds": 2048, "env_fps": 17170.14, "gpu_used_gb": 5.94, "elapsed_s": 7.633718, "ok": true, "label": "fpgs_streaming @ 2048 worlds"}
+{"solver": "fpgs_streaming", "substeps": 8, "num_worlds": 4096, "env_fps": 19406.88, "gpu_used_gb": 9.283, "elapsed_s": 13.507789, "ok": true, "label": "fpgs_streaming @ 4096 worlds"}
+{"solver": "fpgs_streaming", "substeps": 8, "num_worlds": 8192, "env_fps": 20723.29, "gpu_used_gb": 15.971, "elapsed_s": 25.29946, "ok": true, "label": "fpgs_streaming @ 8192 worlds"}
+{"solver": "fpgs_streaming", "substeps": 8, "num_worlds": 16384, "env_fps": 66693.28, "gpu_used_gb": 29.315, "elapsed_s": 15.722364, "ok": true, "label": "fpgs_streaming @ 16384 worlds"}
+{"solver": "fpgs_streaming", "substeps": 8, "num_worlds": 32768, "env_fps": 68179.6, "gpu_used_gb": 56.033, "elapsed_s": 30.75923, "ok": true, "label": "fpgs_streaming @ 32768 worlds"}
+{"solver": "mujoco", "substeps": 8, "num_worlds": 1024, "env_fps": 13839.07, "gpu_used_gb": 4.205, "elapsed_s": 4.735579, "ok": true, "label": "mujoco @ 1024 worlds"}
+{"solver": "mujoco", "substeps": 8, "num_worlds": 2048, "env_fps": 16336.08, "gpu_used_gb": 5.799, "elapsed_s": 8.023468, "ok": true, "label": "mujoco @ 2048 worlds"}
+{"solver": "mujoco", "substeps": 8, "num_worlds": 4096, "env_fps": 17555.36, "gpu_used_gb": 8.986, "elapsed_s": 14.93242, "ok": true, "label": "mujoco @ 4096 worlds"}
+{"solver": "mujoco", "substeps": 8, "num_worlds": 8192, "env_fps": 18590.64, "gpu_used_gb": 15.268, "elapsed_s": 28.201718, "ok": true, "label": "mujoco @ 8192 worlds"}
+{"solver": "mujoco", "substeps": 8, "num_worlds": 16384, "env_fps": 19133.27, "gpu_used_gb": 27.955, "elapsed_s": 54.803807, "ok": true, "label": "mujoco @ 16384 worlds"}
+{"solver": "mujoco", "substeps": 8, "num_worlds": 32768, "env_fps": 19353.52, "gpu_used_gb": 53.205, "elapsed_s": 108.360214, "ok": true, "label": "mujoco @ 32768 worlds"}
