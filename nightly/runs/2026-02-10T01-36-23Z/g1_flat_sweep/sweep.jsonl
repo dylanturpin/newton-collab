@@ -1,0 +1,14 @@
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 1024, "env_fps": 172634.13, "gpu_used_gb": 3.906, "elapsed_s": 0.379624, "ok": true, "label": "fpgs_tiled @ 1024 worlds"}
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 2048, "env_fps": 325335.1, "gpu_used_gb": 5.063, "elapsed_s": 0.402883, "ok": true, "label": "fpgs_tiled @ 2048 worlds"}
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 4096, "env_fps": 606106.44, "gpu_used_gb": 7.438, "elapsed_s": 0.432505, "ok": true, "label": "fpgs_tiled @ 4096 worlds"}
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 8192, "env_fps": 949461.16, "gpu_used_gb": 12.156, "elapsed_s": 0.552195, "ok": true, "label": "fpgs_tiled @ 8192 worlds"}
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 16384, "env_fps": 1217806.29, "gpu_used_gb": 21.594, "elapsed_s": 0.861037, "ok": true, "label": "fpgs_tiled @ 16384 worlds"}
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 32768, "env_fps": 1176327.11, "gpu_used_gb": 40.469, "elapsed_s": 1.782797, "ok": true, "label": "fpgs_tiled @ 32768 worlds"}
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 65536, "env_fps": 1063075.38, "gpu_used_gb": 78.219, "elapsed_s": 3.945444, "ok": true, "label": "fpgs_tiled @ 65536 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 1024, "env_fps": 251973.05, "gpu_used_gb": 4.008, "elapsed_s": 0.260091, "ok": true, "label": "mujoco @ 1024 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 2048, "env_fps": 404443.06, "gpu_used_gb": 5.258, "elapsed_s": 0.32408, "ok": true, "label": "mujoco @ 2048 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 4096, "env_fps": 550434.78, "gpu_used_gb": 7.789, "elapsed_s": 0.476249, "ok": true, "label": "mujoco @ 4096 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 8192, "env_fps": 642493.11, "gpu_used_gb": 12.852, "elapsed_s": 0.816021, "ok": true, "label": "mujoco @ 8192 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 16384, "env_fps": 684026.55, "gpu_used_gb": 22.977, "elapsed_s": 1.532946, "ok": true, "label": "mujoco @ 16384 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 32768, "env_fps": 692045.74, "gpu_used_gb": 43.164, "elapsed_s": 3.030366, "ok": true, "label": "mujoco @ 32768 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 65536, "env_fps": 618642.55, "gpu_used_gb": 83.602, "elapsed_s": 6.77985, "ok": true, "label": "mujoco @ 65536 worlds"}
