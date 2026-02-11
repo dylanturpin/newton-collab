@@ -1,0 +1,33 @@
+{
+  "label": "+ parallel streams",
+  "config": {
+    "label": "+ parallel streams",
+    "cholesky_kernel": "tiled",
+    "trisolve_kernel": "tiled",
+    "hinv_jt_kernel": "par_row",
+    "delassus_kernel": "tiled",
+    "pgs_kernel": "streaming",
+    "pgs_max_constraints": 396,
+    "enable_mf_pgs": false,
+    "use_parallel_streams": true,
+    "type": "feather_pgs"
+  },
+  "env_fps": 153023.19,
+  "kernels": {
+    "populate_world_J_for_size": 240.0,
+    "allocate_world_contact_slots": 195.0,
+    "hinv_jt_batched_par_row": 126.0,
+    "trisolve_batched_tiled_25": 76.0,
+    "cholesky_batched_tiled_6": 71.0,
+    "trisolve_batched_tiled_6": 69.0,
+    "delassus_streaming_6_396_chunk396": 57.0,
+    "prepare_world_impulses": 47.0,
+    "cholesky_batched_tiled_25": 31.0,
+    "gather_tau_to_groups": 22.0,
+    "compute_shape_aabbs": 19.0,
+    "scatter_qdd_from_groups": 13.0,
+    "_nxn_broadphase_precomputed_pairs": 12.0,
+    "prepare_geom_data_kernel": 10.0,
+    "update_body_qd_from_featherstone": 10.0
+  }
+}

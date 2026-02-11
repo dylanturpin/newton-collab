@@ -1,0 +1,15 @@
+{
+  "scenario": "h1_tabletop",
+  "scenario_description": "H1 humanoid with tabletop objects",
+  "timestamp": "2026-02-11T04:45:44.157513",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "gpu_memory_total_gb": 94.9688720703125,
+  "platform": "Linux",
+  "python_version": "3.11.14",
+  "newton_git_hash": "b87d8e3",
+  "substeps": 8,
+  "pgs_iterations": 8,
+  "warmup_frames": 16,
+  "measure_frames": 64,
+  "num_worlds": 8192
+}
