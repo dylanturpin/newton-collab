@@ -2672,9 +2672,9 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-        # MF PGS streaming solve (body velocities + impulses in shared memory)
+        # MF PGS solve (body velocities + impulses in shared memory)
         if model.device.is_cuda:
-            mf_pgs_kernel = TiledKernelFactory.get_pgs_solve_mf_streaming_kernel(
+            mf_pgs_kernel = TiledKernelFactory.get_pgs_solve_mf_kernel(
                 self.mf_max_constraints, self.max_mf_bodies, model.device
             )
             wp.launch_tiled(
@@ -2791,7 +2791,7 @@ class TiledKernelFactory:
     _pgs_solve_tiled_row_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_tiled_contact_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_streaming_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
-    _pgs_solve_mf_streaming_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
+    _pgs_solve_mf_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
     _triangular_solve_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _delassus_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
 
@@ -4003,24 +4003,24 @@ class TiledKernelFactory:
         return wp.kernel(enable_backward=False, module="unique")(pgs_solve_streaming_template)
 
     @classmethod
-    def get_pgs_solve_mf_streaming_kernel(
+    def get_pgs_solve_mf_kernel(
         cls, mf_max_constraints: int, max_mf_bodies: int, device: "wp.Device"
     ) -> "wp.Kernel":
         """Get or create a streaming MF PGS kernel for free rigid body contacts."""
         key = (mf_max_constraints, max_mf_bodies, device.arch)
-        if key not in cls._pgs_solve_mf_streaming_cache:
-            cls._pgs_solve_mf_streaming_cache[key] = cls._build_pgs_solve_mf_streaming_kernel(
+        if key not in cls._pgs_solve_mf_cache:
+            cls._pgs_solve_mf_cache[key] = cls._build_pgs_solve_mf_kernel(
                 mf_max_constraints, max_mf_bodies
             )
-        return cls._pgs_solve_mf_streaming_cache[key]
+        return cls._pgs_solve_mf_cache[key]
 
     @classmethod
-    def _build_pgs_solve_mf_streaming_kernel(cls, mf_max_constraints: int, max_mf_bodies: int) -> "wp.Kernel":
+    def _build_pgs_solve_mf_kernel(cls, mf_max_constraints: int, max_mf_bodies: int) -> "wp.Kernel":
         """Matrix-free PGS with body velocities and impulses in shared memory.
 
         Uses one warp (32 threads) per world. Body velocities and impulses live
         in shared memory for the duration of all PGS iterations, eliminating
-        global memory round-trips. J, MiJt, eff_mass_inv, and rhs are streamed
+        global memory round-trips. J, MiJt, eff_mass_inv, and rhs are read
         from global memory per constraint (read-only, cache-friendly sequential access).
         """
         MF_MAX_C = mf_max_constraints
@@ -4220,7 +4220,7 @@ class TiledKernelFactory:
     """
 
         @wp.func_native(snippet)
-        def pgs_solve_mf_streaming_native(
+        def pgs_solve_mf_native(
             world: int,
             mf_constraint_count: wp.array(dtype=int),
             mf_body_count: wp.array(dtype=int),
@@ -4242,7 +4242,7 @@ class TiledKernelFactory:
             omega: float,
         ): ...
 
-        def pgs_solve_mf_streaming_template(
+        def pgs_solve_mf_template(
             mf_constraint_count: wp.array(dtype=int),
             mf_body_count: wp.array(dtype=int),
             mf_body_dof_start: wp.array2d(dtype=int),
@@ -4263,7 +4263,7 @@ class TiledKernelFactory:
             omega: float,
         ):
             world, _lane = wp.tid()
-            pgs_solve_mf_streaming_native(
+            pgs_solve_mf_native(
                 world,
                 mf_constraint_count,
                 mf_body_count,
@@ -4285,7 +4285,7 @@ class TiledKernelFactory:
                 omega,
             )
 
-        name = f"pgs_solve_mf_streaming_{mf_max_constraints}_{max_mf_bodies}"
-        pgs_solve_mf_streaming_template.__name__ = name
-        pgs_solve_mf_streaming_template.__qualname__ = name
-        return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_streaming_template)
+        name = f"pgs_solve_mf_{mf_max_constraints}_{max_mf_bodies}"
+        pgs_solve_mf_template.__name__ = name
+        pgs_solve_mf_template.__qualname__ = name
+        return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_template)
