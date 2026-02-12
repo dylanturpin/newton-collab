@@ -3746,3 +3746,23 @@ def scatter_qdd_from_groups(
     dof_start = articulation_dof_start[art]
     for i in range(n_dofs):
         joint_qdd[dof_start + i] = qdd_group[idx, i, 0]
+
+
+@wp.kernel
+def vector_add_inplace(a: wp.array(dtype=float), b: wp.array(dtype=float)):
+    """a[i] += b[i]"""
+    i = wp.tid()
+    a[i] = a[i] + b[i]
+
+
+@wp.kernel
+def compute_delta_and_accumulate(
+    v_out: wp.array(dtype=float),
+    v_snap: wp.array(dtype=float),
+    v_accum: wp.array(dtype=float),
+):
+    """delta = v_out - v_snap; v_accum += delta; v_snap = delta (reuse buffer for rhs_accum input)"""
+    i = wp.tid()
+    delta = v_out[i] - v_snap[i]
+    v_accum[i] = v_accum[i] + delta
+    v_snap[i] = delta

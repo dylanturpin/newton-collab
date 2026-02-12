@@ -54,6 +54,7 @@ from .kernels import (
     clamp_joint_tau,
     compute_com_transforms,
     compute_composite_inertia,
+    compute_delta_and_accumulate,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
     compute_spatial_inertia,
@@ -88,6 +89,7 @@ from .kernels import (
     trisolve_flat_loop,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
+    vector_add_inplace,
 )
 
 
@@ -566,6 +568,7 @@ class SolverFeatherPGS(SolverBase):
         n_free = int(np.sum(is_free_rigid_np))
         self._has_free_rigid_bodies = n_free > 0
         self._n_free_rigid = n_free
+        self._has_mixed_contacts = self._has_free_rigid_bodies and self._n_free_rigid < model.articulation_count
         self.is_free_rigid = wp.array(is_free_rigid_np, dtype=wp.int32, device=model.device)
 
     def _allocate_common_buffers(self, model):
@@ -578,11 +581,15 @@ class SolverFeatherPGS(SolverBase):
             )
             self.v_hat = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_out = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+            self.v_mf_accum = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+            self.v_out_snap = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
         else:
             self.M_blocks = None
             self.mass_update_mask = None
             self.v_hat = None
             self.v_out = None
+            self.v_mf_accum = None
+            self.v_out_snap = None
 
         if model.body_count:
             self.body_I_m = wp.empty(
@@ -1263,30 +1270,76 @@ class SolverFeatherPGS(SolverBase):
             self._stage4_accumulate_rhs_world(size)
 
         # ══════════════════════════════════════════════════════════════
-        # STAGE 5: PGS solve
+        # STAGE 5+6: PGS solve
         # ══════════════════════════════════════════════════════════════
         self._stage5_prepare_impulses_world()
-        if self.pgs_kernel == "tiled_row":
-            self._stage5_pgs_solve_world_tiled_row()
-        elif self.pgs_kernel == "tiled_contact":
-            self._stage5_pgs_solve_world_tiled_contact()
-        elif self.pgs_kernel == "streaming":
-            self._stage5_pgs_solve_world_streaming()
+
+        if self._has_mixed_contacts:
+            # Interleaved: dense and MF alternate, 1 iteration each
+            self._mf_pgs_setup(state_aug, dt)
+            self.v_mf_accum.zero_()
+
+            for _pgs_iter in range(self.pgs_iterations):
+                # Dense PGS (1 iteration, impulse space)
+                self._dispatch_dense_pgs_solve(iterations=1)
+
+                # Rebuild v_out = v_hat + Y*impulses + MF_corrections
+                self._stage6_prepare_world_velocity()
+                for size in self.size_groups:
+                    self._stage6_apply_impulses_world(size)
+                wp.launch(
+                    vector_add_inplace,
+                    dim=self.v_out.size,
+                    inputs=[self.v_out, self.v_mf_accum],
+                    device=self.model.device,
+                )
+
+                # Snapshot v_out, run MF, compute delta
+                wp.copy(self.v_out_snap, self.v_out)
+                self._mf_pgs_solve(iterations=1)
+
+                # v_mf_accum += (v_out - v_out_snap); v_out_snap = delta
+                wp.launch(
+                    compute_delta_and_accumulate,
+                    dim=self.v_out.size,
+                    inputs=[self.v_out, self.v_out_snap, self.v_mf_accum],
+                    device=self.model.device,
+                )
+
+                # Update dense rhs: world_rhs += J * delta_v_mf
+                for size in self.size_groups:
+                    n_arts = self.n_arts_by_size[size]
+                    wp.launch(
+                        rhs_accum_world_par_art,
+                        dim=n_arts,
+                        inputs=[
+                            self.constraint_count,
+                            self.pgs_max_constraints,
+                            self.art_to_world,
+                            self.art_size,
+                            self.art_group_idx,
+                            self.articulation_dof_start,
+                            self.v_out_snap,
+                            self.group_to_art[size],
+                            self.J_by_size[size],
+                            size,
+                        ],
+                        outputs=[self.rhs],
+                        device=self.model.device,
+                    )
+
+            # v_out is already final (includes both dense and MF corrections)
+
         else:
-            self._stage5_pgs_solve_world_loop()
+            # Non-mixed: run dense and MF sequentially
+            self._dispatch_dense_pgs_solve(iterations=self.pgs_iterations)
 
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 6a: Apply dense impulses
-        # ══════════════════════════════════════════════════════════════
-        self._stage6_prepare_world_velocity()
-        for size in self.size_groups:
-            self._stage6_apply_impulses_world(size)
+            self._stage6_prepare_world_velocity()
+            for size in self.size_groups:
+                self._stage6_apply_impulses_world(size)
 
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 6b: Matrix-free PGS for free rigid body contacts
-        # ══════════════════════════════════════════════════════════════
-        if self._has_free_rigid_bodies:
-            self._stage6b_mf_pgs(state_aug, dt)
+            if self._has_free_rigid_bodies:
+                self._stage6b_mf_pgs(state_aug, dt)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 7: Update qdd + integrate
@@ -2430,6 +2483,20 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
+    def _dispatch_dense_pgs_solve(self, iterations: int):
+        """Dispatch the dense PGS kernel with a given iteration count."""
+        saved = self.pgs_iterations
+        self.pgs_iterations = iterations
+        if self.pgs_kernel == "tiled_row":
+            self._stage5_pgs_solve_world_tiled_row()
+        elif self.pgs_kernel == "tiled_contact":
+            self._stage5_pgs_solve_world_tiled_contact()
+        elif self.pgs_kernel == "streaming":
+            self._stage5_pgs_solve_world_streaming()
+        else:
+            self._stage5_pgs_solve_world_loop()
+        self.pgs_iterations = saved
+
     def _stage5_pgs_solve_world_tiled_row(self):
         pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_row_kernel(self.pgs_max_constraints, self.model.device)
         wp.launch_tiled(
@@ -2607,6 +2674,11 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage6b_mf_pgs(self, state_aug: State, dt: float):
         """Run matrix-free PGS for free rigid body contacts."""
+        self._mf_pgs_setup(state_aug, dt)
+        self._mf_pgs_solve(self.pgs_iterations)
+
+    def _mf_pgs_setup(self, state_aug: State, dt: float):
+        """MF PGS setup: compute Hinv, build body map, compute effective mass and RHS."""
         model = self.model
 
         # Compute H^-1 = inverse(body_I_s) for free rigid bodies
@@ -2672,7 +2744,10 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-        # MF PGS solve (body velocities + impulses in shared memory)
+    def _mf_pgs_solve(self, iterations: int):
+        """MF PGS solve with given iteration count."""
+        model = self.model
+
         if model.device.is_cuda:
             mf_pgs_kernel = TiledKernelFactory.get_pgs_solve_mf_kernel(
                 self.mf_max_constraints, self.max_mf_bodies, model.device
@@ -2697,7 +2772,7 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_row_mu,
                     self.mf_impulses,
                     self.v_out,
-                    self.pgs_iterations,
+                    iterations,
                     self.pgs_omega,
                 ],
                 block_dim=32,
@@ -2723,7 +2798,7 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_row_mu,
                     self.body_to_articulation,
                     self.articulation_dof_start,
-                    self.pgs_iterations,
+                    iterations,
                     self.pgs_omega,
                 ],
                 outputs=[
