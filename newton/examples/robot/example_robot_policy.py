@@ -301,7 +301,7 @@ class Example:
                 pgs_warmstart=False,
                 pgs_omega=1.0,
                 pgs_beta=0.1,
-                storage="batched"
+                storage="batched",
             )
         elif solver_type == "mujoco":
             self.solver = newton.solvers.SolverMuJoCo(
