@@ -2799,11 +2799,11 @@ def build_mf_contact_rows(
         else:
             d = t1
 
-        # Body A Jacobian in world frame: J = [d, pw_a × d]
+        # Body A Jacobian in world frame: J = [d, pw_a x d]
         # For root free joints, joint_qd stores world-frame spatial twist
         # at the world origin (v_at_origin, omega). S = identity, so
         # J[k] = dot(d, S_k_lin + cross(S_k_ang, pw)) reduces to
-        # J = [d, pw × d] with pw = absolute world position of contact point.
+        # J = [d, pw x d] with pw = absolute world position of contact point.
         if body_a >= 0:
             ang_a = wp.cross(point_a_world, d)
             mf_J_a[world, row_idx, 0] = d[0]
