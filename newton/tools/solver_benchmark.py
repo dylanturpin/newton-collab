@@ -32,6 +32,7 @@ import datetime as dt
 import json
 import platform
 import re
+import string
 import subprocess
 import sys
 import time
@@ -1093,8 +1094,8 @@ def _load_jsonl(path: Path) -> list[dict]:
     """Load JSONL file into list of dicts."""
     rows = []
     with open(path) as f:
-        for line in f:
-            line = line.strip()
+        for raw_line in f:
+            line = raw_line.strip()
             if not line:
                 continue
             try:
@@ -1252,7 +1253,7 @@ def plot_ablation(results: list, out_path: Path, scenario: str, num_worlds: int,
         print("No valid data to plot")
         return
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    _fig, ax = plt.subplots(figsize=(12, 6))
 
     x = np.arange(len(labels))
     bars = ax.bar(x, fps_values, color=colors)
@@ -1270,7 +1271,7 @@ def plot_ablation(results: list, out_path: Path, scenario: str, num_worlds: int,
     ax.grid(True, alpha=0.3, axis="y")
 
     # Add value labels on bars
-    for bar, val in zip(bars, fps_values):
+    for bar, val in zip(bars, fps_values, strict=False):
         ax.text(
             bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{val:,.0f}", ha="center", va="bottom", fontsize=9
         )
@@ -1292,11 +1293,11 @@ def build_model(args, scenario_cfg: dict):
     Returns:
         The finalized newton.Model.
     """
-    import warp as wp
+    import warp as wp  # noqa: PLC0415
 
-    import newton
-    import newton.examples
-    import newton.utils
+    import newton  # noqa: PLC0415
+    import newton.examples  # noqa: PLC0415
+    import newton.utils  # noqa: PLC0415
 
     # Build articulation
     articulation_builder = newton.ModelBuilder()
@@ -1492,7 +1493,7 @@ def create_solver(model, args, scenario_cfg: dict):
     Returns:
         A solver instance (SolverMuJoCo or SolverFeatherPGS).
     """
-    import newton
+    import newton  # noqa: PLC0415
 
     # Resolve solver preset
     preset = SOLVER_PRESETS.get(args.solver, {})
@@ -1563,7 +1564,7 @@ def create_solver(model, args, scenario_cfg: dict):
 
 def run_direct(args):
     """Run a single benchmark directly (not as subprocess)."""
-    import warp as wp
+    import warp as wp  # noqa: PLC0415
 
     wp.config.enable_backward = False
 
@@ -1684,8 +1685,6 @@ def run_direct(args):
 
 def print_kernel_summary(results, indent: str = ""):
     """Print kernel timing summary."""
-    import string
-
     kernel_results = [r for r in results if r.name.startswith(("forward kernel", "backward kernel"))]
     if not kernel_results:
         print(f"{indent}No kernel activity recorded.")
@@ -1734,11 +1733,11 @@ def print_kernel_summary(results, indent: str = ""):
 
 def run_interactive(args):
     """Run interactive mode with viewer."""
-    import warp as wp
+    import warp as wp  # noqa: PLC0415
 
     wp.config.enable_backward = False
 
-    import newton.viewer
+    import newton.viewer  # noqa: PLC0415
 
     scenario_cfg = SCENARIOS[args.scenario]
     print(f"Interactive mode: {scenario_cfg['description']}")
