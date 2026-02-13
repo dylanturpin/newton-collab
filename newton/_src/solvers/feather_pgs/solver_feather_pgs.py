@@ -3144,9 +3144,7 @@ class TiledKernelFactory:
         return cls._delassus_cache[key]
 
     @classmethod
-    def _build_delassus_kernel(
-        cls, n_dofs: int, max_constraints: int, chunk_size: int | None = None
-    ) -> "wp.Kernel":
+    def _build_delassus_kernel(cls, n_dofs: int, max_constraints: int, chunk_size: int | None = None) -> "wp.Kernel":
         """Streaming Delassus: C += J * Y^T with shared memory."""
         TILE_D = n_dofs
         TILE_M = max_constraints
@@ -3811,9 +3809,7 @@ class TiledKernelFactory:
         """Get or create a streaming contact-wise PGS world solve kernel."""
         key = (max_constraints, device.arch, pgs_chunk_size)
         if key not in cls._pgs_solve_streaming_cache:
-            cls._pgs_solve_streaming_cache[key] = cls._build_pgs_solve_streaming_kernel(
-                max_constraints, pgs_chunk_size
-            )
+            cls._pgs_solve_streaming_cache[key] = cls._build_pgs_solve_streaming_kernel(max_constraints, pgs_chunk_size)
         return cls._pgs_solve_streaming_cache[key]
 
     @classmethod
@@ -4085,15 +4081,11 @@ class TiledKernelFactory:
         return wp.kernel(enable_backward=False, module="unique")(pgs_solve_streaming_template)
 
     @classmethod
-    def get_pgs_solve_mf_kernel(
-        cls, mf_max_constraints: int, max_mf_bodies: int, device: "wp.Device"
-    ) -> "wp.Kernel":
+    def get_pgs_solve_mf_kernel(cls, mf_max_constraints: int, max_mf_bodies: int, device: "wp.Device") -> "wp.Kernel":
         """Get or create a streaming MF PGS kernel for free rigid body contacts."""
         key = (mf_max_constraints, max_mf_bodies, device.arch)
         if key not in cls._pgs_solve_mf_cache:
-            cls._pgs_solve_mf_cache[key] = cls._build_pgs_solve_mf_kernel(
-                mf_max_constraints, max_mf_bodies
-            )
+            cls._pgs_solve_mf_cache[key] = cls._build_pgs_solve_mf_kernel(mf_max_constraints, max_mf_bodies)
         return cls._pgs_solve_mf_cache[key]
 
     @classmethod
