@@ -1,0 +1,25 @@
+{
+  "label": "MuJoCo baseline",
+  "config": {
+    "label": "MuJoCo baseline",
+    "type": "mujoco"
+  },
+  "env_fps": 11853.91,
+  "kernels": {
+    "update_gradient_JTDAJ_sparse_tiled__locals...": 10470.0,
+    "update_gradient_cholesky_blocked__locals__...": 4623.0,
+    "_efc_contact_pyramidal": 2297.0,
+    "update_constraint_init_qfrc_constraint": 1993.0,
+    "linesearch_jv_fused__locals__kernel": 1902.0,
+    "linesearch_parallel_fused": 595.0,
+    "update_gradient_set_h_qM_lower_sparse": 502.0,
+    "update_constraint_efc": 418.0,
+    "solve_init_jaref__locals__kernel": 373.0,
+    "_primitive_narrowphase__locals__primitive_...": 257.0,
+    "create_narrow_phase_kernel_gjk_mpr__locals...": 225.0,
+    "update_gradient_grad": 164.0,
+    "_qLD_acc": 161.0,
+    "mul_m_sparse_ij__locals___mul_m_sparse_ij": 153.0,
+    "solve_search_update": 129.0
+  }
+}
