@@ -777,7 +777,14 @@ class SolverFeatherPGS(SolverBase):
             self.tau_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
             self.qdd_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
 
-        max_contacts = model.rigid_contact_max if model.rigid_contact_max > 0 else 1
+        max_contacts = int(model.rigid_contact_max)
+        if max_contacts <= 0:
+            # Unified collision pipeline manages its own contact capacity and may
+            # leave model.rigid_contact_max unset. Use the same estimator as collide.py.
+            from ...sim.collide import _estimate_rigid_contact_max  # noqa: PLC0415
+
+            max_contacts = int(_estimate_rigid_contact_max(model))
+        max_contacts = max(max_contacts, 1)
         self.contact_world = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_slot = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
