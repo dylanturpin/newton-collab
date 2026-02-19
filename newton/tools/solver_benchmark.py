@@ -25,6 +25,10 @@ Usage examples:
 
     # Compare kernel timings
     uv run newton/tools/solver_benchmark.py --compare run1.json run2.json
+
+    # Render a 5-second video of a scenario (headless, outputs mp4 via ffmpeg)
+    uv run newton/tools/solver_benchmark.py --scenario h1_tabletop --solver fpgs_tiled \\
+        --render --render-frames 300 --out renders/
 """
 
 import argparse
@@ -1731,6 +1735,175 @@ def print_kernel_summary(results, indent: str = ""):
 
 
 # =============================================================================
+# Render Mode (headless video capture via ffmpeg)
+# =============================================================================
+
+# Camera presets per scenario: (pos, pitch, yaw)
+SOLVER_LABEL_MAP = {
+    "fpgs_tiled": "FeatherPGS (tiled)",
+    "fpgs_tiled_row": "FeatherPGS (tiled_row)",
+    "fpgs_loop": "FeatherPGS (loop)",
+    "fpgs_streaming": "FeatherPGS (streaming)",
+    "feather_pgs": "FeatherPGS",
+    "mujoco": "MJWarp",
+}
+
+CAMERA_PRESETS = {
+    "g1_flat": ((2.5, -1.0, 1.2), -15.0, 155.0),
+    "g1_cube_stack": ((3.0, -1.5, 2.5), -20.0, 155.0),
+    "h1_flat": ((2.5, -1.0, 1.2), -15.0, 155.0),
+    "h1_tabletop": ((2.77, -0.83, 2.40), -30.3, -198.6),
+}
+
+
+def run_render(args):
+    """Render a short video of the scenario running headlessly via ffmpeg."""
+    import shutil  # noqa: PLC0415
+
+    import warp as wp  # noqa: PLC0415
+
+    wp.config.enable_backward = False
+
+    import newton.viewer  # noqa: PLC0415
+
+    if not shutil.which("ffmpeg"):
+        print("Error: ffmpeg is required for --render but was not found on PATH")
+        sys.exit(1)
+
+    scenario_cfg = SCENARIOS[args.scenario]
+
+    # Force 1 world for rendering
+    saved_num_worlds = args.num_worlds
+    args.num_worlds = 1
+
+    model = build_model(args, scenario_cfg)
+    solver = create_solver(model, args, scenario_cfg)
+    args.num_worlds = saved_num_worlds
+
+    # Create headless viewer
+    width, height = args.render_width, args.render_height
+    viewer = newton.viewer.ViewerGL(width=width, height=height, headless=True)
+    viewer.set_model(model)
+
+    # Set camera (CLI overrides take priority over presets)
+    cam_pos, cam_pitch, cam_yaw = CAMERA_PRESETS.get(args.scenario, ((3.0, -1.0, 1.5), -15.0, 155.0))
+    if args.camera_pos is not None:
+        cam_pos = tuple(float(x) for x in args.camera_pos.split(","))
+    if args.camera_pitch is not None:
+        cam_pitch = args.camera_pitch
+    if args.camera_yaw is not None:
+        cam_yaw = args.camera_yaw
+    viewer.set_camera(wp.vec3(*cam_pos), cam_pitch, cam_yaw)
+
+    # Simulation setup
+    render_fps = 60.0
+    frame_dt = 1.0 / render_fps
+    sim_dt = frame_dt / float(args.substeps)
+    sim_time = 0.0
+
+    state_0 = model.state()
+    state_1 = model.state()
+    control = model.control()
+    contacts = model.collide(state_0)
+
+    num_frames = args.render_frames
+    out_dir = Path(args.out) if args.out else Path(".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    solver_name = args.solver if args.solver == "mujoco" else "feather_pgs"
+    video_path = out_dir / f"{args.scenario}.mp4"
+    print(f"Rendering {num_frames} frames of {args.scenario} with {solver_name}")
+    print(f"Resolution: {width}x{height}, substeps: {args.substeps}")
+    print(f"Output: {video_path}")
+
+    ffmpeg_proc = subprocess.Popen(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-s",
+            f"{width}x{height}",
+            "-pix_fmt",
+            "rgb24",
+            "-r",
+            str(int(render_fps)),
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            str(video_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Pre-allocate frame buffer on GPU
+    frame_buf = wp.empty(shape=(height, width, 3), dtype=wp.uint8, device=wp.get_device())
+
+    # Simulate and capture
+    for i in range(num_frames):
+        for _ in range(args.substeps):
+            contacts = model.collide(state_0)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, contacts, sim_dt)
+            state_0, state_1 = state_1, state_0
+        sim_time += frame_dt
+
+        # Render and capture frame
+        viewer.begin_frame(sim_time)
+        viewer.log_state(state_0)
+        viewer.log_contacts(contacts, state_0)
+        viewer.end_frame()
+
+        frame_buf = viewer.get_frame(target_image=frame_buf)
+        ffmpeg_proc.stdin.write(frame_buf.numpy().tobytes())
+
+        if (i + 1) % 60 == 0 or i == num_frames - 1:
+            print(f"  frame {i + 1}/{num_frames}")
+
+    # Finalize
+    ffmpeg_proc.stdin.close()
+    ffmpeg_proc.wait()
+
+    if ffmpeg_proc.returncode != 0:
+        print(f"Error: ffmpeg exited with code {ffmpeg_proc.returncode}")
+        sys.exit(1)
+
+    file_size_mb = video_path.stat().st_size / (1024 * 1024)
+    print(f"Video saved: {video_path} ({file_size_mb:.1f} MB)")
+
+    # Write render metadata
+    meta = {
+        "scenario": args.scenario,
+        "solver": args.solver,
+        "substeps": args.substeps,
+        "num_worlds": 1,
+        "fps": int(render_fps),
+        "frames": num_frames,
+        "width": width,
+        "height": height,
+        "video": f"{args.scenario}.mp4",
+        "label": f"{SOLVER_LABEL_MAP.get(args.solver, solver_name)}, {args.substeps} substeps",
+    }
+    meta_path = out_dir / "render_meta.json"
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"Metadata saved: {meta_path}")
+
+    viewer.close()
+
+
+# =============================================================================
 # Interactive Mode
 # =============================================================================
 
@@ -1841,6 +2014,17 @@ def main():
     parser.add_argument("--ablation", action="store_true", help="Run ablation study")
     parser.add_argument("--compare", nargs="+", metavar="FILE", help="Compare kernel timing files")
     parser.add_argument("--replot", type=str, metavar="DIR", help="Regenerate plot from a previous results directory")
+    parser.add_argument("--render", action="store_true", help="Render headless video/screenshot of scenario")
+
+    # Render options
+    parser.add_argument(
+        "--render-frames", type=int, default=300, help="Number of frames to render (default: 300 = 5s at 60fps)"
+    )
+    parser.add_argument("--render-width", type=int, default=1920, help="Render width in pixels")
+    parser.add_argument("--render-height", type=int, default=1080, help="Render height in pixels")
+    parser.add_argument("--camera-pos", type=str, default=None, help="Camera position as 'x,y,z' (overrides preset)")
+    parser.add_argument("--camera-pitch", type=float, default=None, help="Camera pitch in degrees (overrides preset)")
+    parser.add_argument("--camera-yaw", type=float, default=None, help="Camera yaw in degrees (overrides preset)")
 
     # Scenario
     parser.add_argument(
@@ -1986,6 +2170,8 @@ def main():
         run_sweep(args)
     elif args.ablation:
         run_ablation(args)
+    elif args.render:
+        run_render(args)
     elif args.benchmark:
         run_direct(args)
     else:
