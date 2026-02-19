@@ -1,0 +1,31 @@
+{
+  "label": "baseline (all loop)",
+  "config": {
+    "label": "baseline (all loop)",
+    "cholesky_kernel": "loop",
+    "trisolve_kernel": "loop",
+    "hinv_jt_kernel": "par_row",
+    "delassus_kernel": "par_row_col",
+    "pgs_kernel": "loop",
+    "use_parallel_streams": false,
+    "type": "feather_pgs"
+  },
+  "env_fps": 5481.39,
+  "kernels": {
+    "cholesky_flat_loop": 181.0,
+    "pgs_solve_loop": 27.0,
+    "compute_composite_inertia": 24.0,
+    "trisolve_flat_loop": 19.0,
+    "eval_rigid_id": 18.0,
+    "hinv_jt_flat_par_row": 15.0,
+    "eval_articulation_fk": 10.0,
+    "eval_rigid_fk": 9.0,
+    "eval_rigid_mass": 8.0,
+    "delassus_flat_par_row": 7.0,
+    "eval_rigid_tau": 7.0,
+    "build_augmented_joint_rows": 5.0,
+    "build_contact_rows_normal": 5.0,
+    "crba_fill_flat_par_dof": 3.0,
+    "apply_augmented_mass_diagonal": 3.0
+  }
+}

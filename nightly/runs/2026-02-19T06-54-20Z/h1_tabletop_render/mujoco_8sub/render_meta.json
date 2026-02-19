@@ -1,0 +1,12 @@
+{
+  "scenario": "h1_tabletop",
+  "solver": "mujoco",
+  "substeps": 8,
+  "num_worlds": 1,
+  "fps": 60,
+  "frames": 300,
+  "width": 1920,
+  "height": 1080,
+  "video": "h1_tabletop.mp4",
+  "label": "MJWarp, 8 substeps"
+}

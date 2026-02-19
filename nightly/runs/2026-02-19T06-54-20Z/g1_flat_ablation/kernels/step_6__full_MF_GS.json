@@ -1,0 +1,34 @@
+{
+  "label": "+ full MF GS",
+  "config": {
+    "label": "+ full MF GS",
+    "storage": "batched",
+    "cholesky_kernel": "tiled",
+    "trisolve_kernel": "tiled",
+    "hinv_jt_kernel": "tiled",
+    "delassus_kernel": "tiled",
+    "pgs_kernel": "tiled_contact",
+    "dense_max_constraints": 128,
+    "pgs_mode": "velocity",
+    "use_parallel_streams": true,
+    "type": "feather_pgs"
+  },
+  "env_fps": 11251.32,
+  "kernels": {
+    "compute_composite_inertia": 24.0,
+    "eval_rigid_id": 18.0,
+    "hinv_jt_batched_tiled_49_128": 12.0,
+    "eval_articulation_fk": 10.0,
+    "eval_rigid_fk": 8.0,
+    "eval_rigid_mass": 8.0,
+    "eval_rigid_tau": 7.0,
+    "pgs_solve_mf_gs_128_512_49": 7.0,
+    "build_augmented_joint_rows": 5.0,
+    "trisolve_batched_tiled_49": 3.0,
+    "apply_augmented_mass_diagonal_grouped": 3.0,
+    "apply_augmented_joint_tau": 3.0,
+    "crba_fill_batched_par_dof": 3.0,
+    "populate_world_J_for_size": 2.0,
+    "cholesky_batched_tiled_49": 2.0
+  }
+}

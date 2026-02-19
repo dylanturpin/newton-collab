@@ -1,0 +1,15 @@
+{
+  "run_id": "2026-02-19T06-54-20Z",
+  "timestamp": "2026-02-19T06:55:06Z",
+  "commit": "53510f3b0b1edeaf86bcc69fb25b7cfde470641f",
+  "commit_short": "53510f3b",
+  "branch": "feather_pgs_auto_rebase",
+  "scenarios": [
+    "g1_flat",
+    "h1_tabletop"
+  ],
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "gpu_memory_total_gb": 94.97076416015625,
+  "platform": "Linux",
+  "python_version": "3.11.14"
+}

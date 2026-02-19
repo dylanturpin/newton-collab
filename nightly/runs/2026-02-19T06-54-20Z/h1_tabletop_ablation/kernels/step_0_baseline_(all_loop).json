@@ -1,0 +1,33 @@
+{
+  "label": "baseline (all loop)",
+  "config": {
+    "label": "baseline (all loop)",
+    "cholesky_kernel": "loop",
+    "trisolve_kernel": "loop",
+    "hinv_jt_kernel": "par_row",
+    "delassus_kernel": "par_row_col",
+    "pgs_kernel": "loop",
+    "dense_max_constraints": 396,
+    "pgs_mode": "delassus",
+    "use_parallel_streams": false,
+    "type": "feather_pgs"
+  },
+  "env_fps": 261.64,
+  "kernels": {
+    "pgs_solve_loop": 6791.0,
+    "delassus_batched_par_row_col": 224.0,
+    "rhs_accum_world_par_art": 197.0,
+    "cholesky_batched_loop": 110.0,
+    "create_narrow_phase_kernel_gjk_mpr__locals...": 84.0,
+    "trisolve_batched_loop": 37.0,
+    "eval_rigid_id": 34.0,
+    "hinv_jt_batched_par_row": 32.0,
+    "compute_composite_inertia": 23.0,
+    "populate_world_J_for_size": 18.0,
+    "compute_shape_aabbs": 14.0,
+    "eval_articulation_fk": 14.0,
+    "compute_world_contact_bias": 14.0,
+    "eval_rigid_fk": 13.0,
+    "eval_rigid_mass": 13.0
+  }
+}
