@@ -1,0 +1,14 @@
+{
+  "run_id": "2026-02-04T20-29-35Z",
+  "timestamp": "2026-02-04T20:29:40Z",
+  "commit": "0cd7de0b054682512c78bfecffb0e0a09368e7b6",
+  "commit_short": "0cd7de0",
+  "branch": "feather_pgs_auto_rebase",
+  "scenarios": [
+    "g1_flat"
+  ],
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "gpu_memory_total_gb": 23.536865234375,
+  "platform": "Linux",
+  "python_version": "3.13.11"
+}

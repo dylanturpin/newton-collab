@@ -1,0 +1,25 @@
+{
+  "scenario": "h1_tabletop",
+  "scenario_description": "H1 humanoid with tabletop objects",
+  "timestamp": "2026-02-04T16:09:04.879748",
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "gpu_memory_total_gb": 23.536865234375,
+  "platform": "Linux",
+  "python_version": "3.13.11",
+  "newton_git_hash": "5d2859a",
+  "substeps": 8,
+  "pgs_iterations": 8,
+  "warmup_frames": 16,
+  "measure_frames": 64,
+  "solvers": [
+    "fpgs_streaming",
+    "mujoco"
+  ],
+  "substeps_values": [
+    8
+  ],
+  "world_counts": [
+    1024,
+    2048
+  ]
+}
