@@ -1,0 +1,4 @@
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 8, "env_fps": 5701.46, "gpu_used_gb": 0.902, "elapsed_s": 0.089802, "ok": true, "label": "fpgs_tiled @ 8 worlds"}
+{"solver": "fpgs_tiled", "substeps": 2, "num_worlds": 16, "env_fps": 9980.66, "gpu_used_gb": 0.902, "elapsed_s": 0.102598, "ok": true, "label": "fpgs_tiled @ 16 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 8, "env_fps": 3218.23, "gpu_used_gb": 0.904, "elapsed_s": 0.159094, "ok": true, "label": "mujoco @ 8 worlds"}
+{"solver": "mujoco", "substeps": 2, "num_worlds": 16, "env_fps": 6144.65, "gpu_used_gb": 0.904, "elapsed_s": 0.166649, "ok": true, "label": "mujoco @ 16 worlds"}
