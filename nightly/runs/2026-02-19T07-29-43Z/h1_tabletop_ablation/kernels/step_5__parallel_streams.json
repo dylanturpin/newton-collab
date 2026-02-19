@@ -1,0 +1,33 @@
+{
+  "label": "+ parallel streams",
+  "config": {
+    "label": "+ parallel streams",
+    "cholesky_kernel": "tiled",
+    "trisolve_kernel": "tiled",
+    "hinv_jt_kernel": "par_row",
+    "delassus_kernel": "tiled",
+    "pgs_kernel": "streaming",
+    "dense_max_constraints": 396,
+    "pgs_mode": "delassus",
+    "use_parallel_streams": true,
+    "type": "feather_pgs"
+  },
+  "env_fps": 37184.77,
+  "kernels": {
+    "hinv_jt_batched_par_row": 2595.0,
+    "delassus_streaming_6_396_chunk396": 2096.0,
+    "pgs_solve_streaming_396_chunk1": 1855.0,
+    "rhs_accum_world_par_art": 996.0,
+    "delassus_streaming_25_396_chunk64": 644.0,
+    "apply_impulses_world_par_dof": 399.0,
+    "populate_world_J_for_size": 378.0,
+    "create_narrow_phase_kernel_gjk_mpr__locals...": 216.0,
+    "allocate_world_contact_slots": 210.0,
+    "eval_rigid_id": 128.0,
+    "compute_composite_inertia": 94.0,
+    "create_narrow_phase_primitive_kernel__loca...": 78.0,
+    "compute_world_contact_bias": 69.0,
+    "cholesky_batched_tiled_6": 69.0,
+    "compute_shape_aabbs": 66.0
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "scenario": "g1_flat",
+  "scenario_description": "G1 humanoid on flat ground",
+  "timestamp": "2026-02-19T01:14:51.940720",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "gpu_memory_total_gb": 94.97076416015625,
+  "platform": "Linux",
+  "python_version": "3.11.14",
+  "newton_git_hash": "852dcac1",
+  "substeps": 2,
+  "pgs_iterations": 4,
+  "warmup_frames": 16,
+  "measure_frames": 64,
+  "num_worlds": 16384
+}

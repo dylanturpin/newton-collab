@@ -1,0 +1,31 @@
+{
+  "label": "+ tiled PGS",
+  "config": {
+    "label": "+ tiled PGS",
+    "cholesky_kernel": "tiled",
+    "trisolve_kernel": "tiled",
+    "hinv_jt_kernel": "tiled",
+    "delassus_kernel": "tiled",
+    "pgs_kernel": "tiled_contact",
+    "use_parallel_streams": false,
+    "type": "feather_pgs"
+  },
+  "env_fps": 1187686.35,
+  "kernels": {
+    "eval_rigid_id": 108.0,
+    "hinv_jt_flat_tiled_49_32": 108.0,
+    "compute_composite_inertia": 102.0,
+    "crba_fill_flat_par_dof": 87.0,
+    "cholesky_flat_tiled_49": 72.0,
+    "eval_rigid_mass": 55.0,
+    "trisolve_flat_tiled_49": 46.0,
+    "build_contact_rows_normal": 43.0,
+    "eval_articulation_fk": 40.0,
+    "eval_rigid_fk": 39.0,
+    "eval_rigid_tau": 30.0,
+    "pgs_solve_tiled_contact_32": 19.0,
+    "build_augmented_joint_rows": 16.0,
+    "contact_bias_flat_par_row": 15.0,
+    "apply_augmented_mass_diagonal": 13.0
+  }
+}
