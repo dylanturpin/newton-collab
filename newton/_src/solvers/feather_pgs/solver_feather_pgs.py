@@ -57,6 +57,7 @@ from .kernels import (
     compute_delta_and_accumulate,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
+    compute_mf_world_dof_offsets,
     compute_spatial_inertia,
     compute_velocity_predictor,
     compute_world_contact_bias,
@@ -67,6 +68,7 @@ from .kernels import (
     delassus_batched_par_row_col,
     delassus_flat_par_row,
     detect_limit_count_changes,
+    diag_from_JY_par_art,
     eval_rigid_fk,
     eval_rigid_id,
     eval_rigid_mass,
@@ -74,6 +76,7 @@ from .kernels import (
     finalize_mf_constraint_counts,
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
+    gather_JY_to_world,
     gather_tau_to_groups,
     hinv_jt_batched_par_row,
     hinv_jt_flat_par_row,
@@ -169,6 +172,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_omega: float = 1.0,
         pgs_max_constraints: int = 32,
         pgs_warmstart: bool = False,
+        pgs_mode: str = "delassus",
         # Matrix-free PGS for free rigid bodies
         enable_mf_pgs: bool = True,
         mf_max_constraints: int = 512,
@@ -201,6 +205,11 @@ class SolverFeatherPGS(SolverBase):
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             pgs_max_constraints (int, optional): Maximum number of contact constraints stored per articulation. Defaults to 32.
             pgs_warmstart (bool, optional): Re-use impulses from the previous frame when contacts persist. Defaults to False.
+            pgs_mode (str, optional): PGS mode. "delassus" builds the full Delassus matrix C = J*H^{-1}*J^T
+                and solves in impulse space (Gauss-Seidel). "mf" skips C entirely, recomputes J*v each
+                iteration, and uses only the diagonal for preconditioning (Jacobi-style). MF mode uses
+                O(max_constraints) memory instead of O(max_constraints^2). Requires storage="batched".
+                Defaults to "delassus".
             enable_mf_pgs (bool, optional): Enable matrix-free PGS path for free rigid body contacts. Defaults to True.
             mf_max_constraints (int, optional): Maximum number of matrix-free constraints per world. Defaults to 512.
             storage (str, optional): Storage layout. "batched" groups by DOF size into 3D arrays, "flat" uses
@@ -244,6 +253,9 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_omega = pgs_omega
         self.pgs_max_constraints = pgs_max_constraints
         self.pgs_warmstart = pgs_warmstart
+        if pgs_mode not in ("delassus", "mf"):
+            raise ValueError(f"pgs_mode must be 'delassus' or 'mf', got {pgs_mode!r}")
+        self.pgs_mode = pgs_mode
         self.enable_mf_pgs = enable_mf_pgs
         self.mf_max_constraints = mf_max_constraints
 
@@ -290,6 +302,9 @@ class SolverFeatherPGS(SolverBase):
 
         if self.storage == "flat" and self._is_multi_articulation:
             raise ValueError("storage='flat' is not supported for multiple articulations per world yet.")
+
+        if self.pgs_mode == "mf" and self.storage != "batched":
+            raise ValueError("pgs_mode='mf' requires storage='batched'.")
 
         if self.storage == "flat" and model.articulation_count:
             if not self._is_homogeneous and (
@@ -571,6 +586,29 @@ class SolverFeatherPGS(SolverBase):
         self._has_mixed_contacts = self._has_free_rigid_bodies and self._n_free_rigid < model.articulation_count
         self.is_free_rigid = wp.array(is_free_rigid_np, dtype=wp.int32, device=model.device)
 
+    def _compute_world_dof_mapping(self, model):
+        """Compute per-world DOF start and max DOF count for consolidated J/Y arrays."""
+        art_to_world_np = self.art_to_world.numpy()
+        art_dof_start_np = self.articulation_dof_start.numpy()
+        art_H_rows_np = self.articulation_H_rows.numpy()
+
+        world_dof_start_np = np.full(self.world_count, np.iinfo(np.int32).max, dtype=np.int32)
+        world_dof_end_np = np.zeros(self.world_count, dtype=np.int32)
+
+        for art_idx in range(model.articulation_count):
+            w = art_to_world_np[art_idx]
+            ds = art_dof_start_np[art_idx]
+            de = ds + art_H_rows_np[art_idx]
+            world_dof_start_np[w] = min(world_dof_start_np[w], ds)
+            world_dof_end_np[w] = max(world_dof_end_np[w], de)
+
+        # For worlds with no articulations, set start to 0
+        world_dof_start_np = np.where(world_dof_start_np == np.iinfo(np.int32).max, 0, world_dof_start_np)
+
+        world_dof_counts = world_dof_end_np - world_dof_start_np
+        self.max_world_dofs = int(np.max(world_dof_counts)) if len(world_dof_counts) > 0 else 0
+        self.world_dof_start = wp.array(world_dof_start_np, dtype=wp.int32, device=model.device)
+
     def _allocate_common_buffers(self, model):
         if model.joint_count:
             self.M_blocks = wp.zeros(
@@ -802,12 +840,34 @@ class SolverFeatherPGS(SolverBase):
         max_constraints = self.pgs_max_constraints
 
         # Per-world constraint matrices and vectors
-        self.C = wp.zeros(
-            (self.world_count, max_constraints, max_constraints),
-            dtype=wp.float32,
-            device=device,
-            requires_grad=requires_grad,
-        )
+        if self.pgs_mode != "mf":
+            self.C = wp.zeros(
+                (self.world_count, max_constraints, max_constraints),
+                dtype=wp.float32,
+                device=device,
+                requires_grad=requires_grad,
+            )
+        else:
+            self.C = None
+
+        if self.pgs_mode == "mf":
+            self._compute_world_dof_mapping(model)
+            self.J_world = wp.zeros(
+                (self.world_count, max_constraints, self.max_world_dofs),
+                dtype=wp.float32,
+                device=device,
+                requires_grad=requires_grad,
+            )
+            self.Y_world = wp.zeros(
+                (self.world_count, max_constraints, self.max_world_dofs),
+                dtype=wp.float32,
+                device=device,
+                requires_grad=requires_grad,
+            )
+        else:
+            self.J_world = None
+            self.Y_world = None
+
         self.rhs = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
@@ -848,7 +908,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _allocate_mf_buffers(self, model):
         """Allocate buffers for matrix-free PGS path for free rigid body contacts."""
-        if not self._has_free_rigid_bodies:
+        if not self._has_free_rigid_bodies and self.pgs_mode != "mf":
             return
 
         device = model.device
@@ -881,6 +941,10 @@ class SolverFeatherPGS(SolverBase):
         self.mf_phi = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
 
         self.mf_body_Hinv = wp.zeros((body_count,), dtype=wp.spatial_matrix, device=device, requires_grad=requires_grad)
+
+        # World-relative DOF offsets for two-phase GS kernel
+        self.mf_dof_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_dof_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
 
         # Body map buffers for tiled MF PGS kernel
         self.max_mf_bodies = 64
@@ -1236,22 +1300,8 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         self._stage4_build_rows_batched(state_in, state_aug, contacts)
 
-        fused_ok = (
-            self._is_one_art_per_world
-            and self.hinv_jt_kernel != "par_row"
-            and all(
-                (self.hinv_jt_kernel == "tiled") or (self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold)
-                for size in self.size_groups
-            )
-        )
-
-        if fused_ok:
-            for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
-                with ctx:
-                    self._stage4_hinv_jt_batched_tiled_fused(size)
-        else:
-            self._stage4_zero_world_C()
-
+        if self.pgs_mode == "mf":
+            # Compute Y = H^-1 * J^T only (no Delassus C)
             for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                 with ctx:
                     use_tiled = (self.hinv_jt_kernel == "tiled") or (
@@ -1262,26 +1312,159 @@ class SolverFeatherPGS(SolverBase):
                     else:
                         self._stage4_hinv_jt_batched_par_row(size)
 
+            # Diagonal from J*Y (no full Delassus)
+            self.diag.zero_()
             for size in self.size_groups:
-                use_tiled_delassus = self.delassus_kernel != "par_row_col"
-                if use_tiled_delassus:
-                    self._stage4_delassus_batched_tiled(size)
-                else:
-                    self._stage4_delassus_batched_par_row_col(size)
-
+                self._stage4_diag_from_JY(size)
             self._stage4_finalize_world_diag_cfm()
 
-        self._stage4_compute_rhs_world(dt)
+            # RHS = bias only (J*v recomputed per iteration)
+            self._stage4_compute_rhs_world(dt)
+            # NOTE: skip _stage4_accumulate_rhs_world — J*v_hat not baked into rhs
 
-        for size in self.size_groups:
-            self._stage4_accumulate_rhs_world(size)
+            # MF: compute mf_MiJt, mf_rhs, mf_eff_mass_inv, body maps
+            if self._has_free_rigid_bodies:
+                self._mf_pgs_setup(state_aug, dt)
+
+                # MF: compute world-relative DOF offsets for two-phase GS kernel
+                wp.launch(
+                    compute_mf_world_dof_offsets,
+                    dim=self.world_count * self.mf_max_constraints,
+                    inputs=[
+                        self.mf_constraint_count,
+                        self.mf_body_a,
+                        self.mf_body_b,
+                        self.body_to_articulation,
+                        self.articulation_dof_start,
+                        self.world_dof_start,
+                        self.mf_max_constraints,
+                    ],
+                    outputs=[self.mf_dof_a, self.mf_dof_b],
+                    device=self.model.device,
+                )
+
+        else:
+            # Existing Delassus path (unchanged)
+            fused_ok = (
+                self._is_one_art_per_world
+                and self.hinv_jt_kernel != "par_row"
+                and all(
+                    (self.hinv_jt_kernel == "tiled")
+                    or (self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold)
+                    for size in self.size_groups
+                )
+            )
+
+            if fused_ok:
+                for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+                    with ctx:
+                        self._stage4_hinv_jt_batched_tiled_fused(size)
+            else:
+                self._stage4_zero_world_C()
+
+                for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+                    with ctx:
+                        use_tiled = (self.hinv_jt_kernel == "tiled") or (
+                            self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold
+                        )
+                        if use_tiled:
+                            self._stage4_hinv_jt_batched_tiled(size)
+                        else:
+                            self._stage4_hinv_jt_batched_par_row(size)
+
+                for size in self.size_groups:
+                    use_tiled_delassus = self.delassus_kernel != "par_row_col"
+                    if use_tiled_delassus:
+                        self._stage4_delassus_batched_tiled(size)
+                    else:
+                        self._stage4_delassus_batched_par_row_col(size)
+
+                self._stage4_finalize_world_diag_cfm()
+
+            self._stage4_compute_rhs_world(dt)
+
+            for size in self.size_groups:
+                self._stage4_accumulate_rhs_world(size)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 5+6: PGS solve
         # ══════════════════════════════════════════════════════════════
         self._stage5_prepare_impulses_world()
 
-        if self._has_mixed_contacts:
+        if self.pgs_mode == "mf":
+            # Gather J/Y from per-size-group arrays into world-indexed arrays
+            self.J_world.zero_()
+            self.Y_world.zero_()
+            for size in self.size_groups:
+                n_arts = self.n_arts_by_size[size]
+                wp.launch(
+                    gather_JY_to_world,
+                    dim=int(n_arts * self.pgs_max_constraints * size),
+                    inputs=[
+                        self.group_to_art[size],
+                        self.art_to_world,
+                        self.articulation_dof_start,
+                        self.constraint_count,
+                        self.world_dof_start,
+                        self.J_by_size[size],
+                        self.Y_by_size[size],
+                        size,
+                        self.pgs_max_constraints,
+                        n_arts,
+                    ],
+                    outputs=[self.J_world, self.Y_world],
+                    device=self.model.device,
+                )
+
+            # Initialize v_out = v_hat before GS loop
+            self._stage6_prepare_world_velocity()
+
+            # Two-phase GS kernel: dense + MF in one pass
+            mf_gs_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_kernel(
+                self.pgs_max_constraints,
+                self.mf_max_constraints,
+                self.max_world_dofs,
+                self.model.device,
+            )
+            wp.launch_tiled(
+                mf_gs_kernel,
+                dim=[self.world_count],
+                inputs=[
+                    # Dense
+                    self.constraint_count,
+                    self.world_dof_start,
+                    self.rhs,
+                    self.diag,
+                    self.impulses,
+                    self.J_world,
+                    self.Y_world,
+                    self.row_type,
+                    self.row_parent,
+                    self.row_mu,
+                    # MF
+                    self.mf_constraint_count,
+                    self.mf_rhs,
+                    self.mf_eff_mass_inv,
+                    self.mf_impulses,
+                    self.mf_J_a,
+                    self.mf_J_b,
+                    self.mf_MiJt_a,
+                    self.mf_MiJt_b,
+                    self.mf_row_type,
+                    self.mf_row_parent,
+                    self.mf_row_mu,
+                    self.mf_dof_a,
+                    self.mf_dof_b,
+                    # Shared
+                    self.pgs_iterations,
+                    self.pgs_omega,
+                ],
+                outputs=[self.v_out],
+                block_dim=32,
+                device=self.model.device,
+            )
+
+        elif self._has_mixed_contacts:
             # Interleaved: dense and MF alternate, 1 iteration each
             self._mf_pgs_setup(state_aug, dt)
             self.v_mf_accum.zero_()
@@ -2338,6 +2521,25 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
+    def _stage4_diag_from_JY(self, size: int):
+        n_arts = self.n_arts_by_size[size]
+        wp.launch(
+            diag_from_JY_par_art,
+            dim=n_arts * self.pgs_max_constraints,
+            inputs=[
+                self.J_by_size[size],
+                self.Y_by_size[size],
+                self.group_to_art[size],
+                self.art_to_world,
+                self.constraint_count,
+                size,
+                self.pgs_max_constraints,
+                n_arts,
+            ],
+            outputs=[self.diag],
+            device=self.model.device,
+        )
+
     def _stage4_compute_rhs_flat(self, dt: float):
         model = self.model
         wp.launch(
@@ -2874,6 +3076,7 @@ class TiledKernelFactory:
     _pgs_solve_tiled_contact_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_streaming_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_mf_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
+    _pgs_solve_mf_gs_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
     _triangular_solve_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _delassus_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
 
@@ -4363,3 +4566,390 @@ class TiledKernelFactory:
         pgs_solve_mf_template.__name__ = name
         pgs_solve_mf_template.__qualname__ = name
         return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_template)
+
+    @classmethod
+    def get_pgs_solve_mf_gs_kernel(
+        cls, max_constraints: int, mf_max_constraints: int, max_world_dofs: int, device: "wp.Device"
+    ) -> "wp.Kernel":
+        """Get or create a two-phase GS kernel for matrix-free articulated PGS.
+
+        Phase 1 processes dense constraints (via J_world/Y_world at ``max_constraints``).
+        Phase 2 processes MF constraints (via mf_J/mf_MiJt at ``mf_max_constraints``).
+        Both phases share a single velocity vector in shared memory.
+        """
+        key = (max_constraints, mf_max_constraints, max_world_dofs, device.arch)
+        if key not in cls._pgs_solve_mf_gs_cache:
+            cls._pgs_solve_mf_gs_cache[key] = cls._build_pgs_solve_mf_gs_kernel(
+                max_constraints, mf_max_constraints, max_world_dofs
+            )
+        return cls._pgs_solve_mf_gs_cache[key]
+
+    @classmethod
+    def _build_pgs_solve_mf_gs_kernel(
+        cls, max_constraints: int, mf_max_constraints: int, max_world_dofs: int
+    ) -> "wp.Kernel":
+        """Two-phase GS PGS kernel: dense + matrix-free in one pass.
+
+        Uses one warp (32 threads) per world.
+
+        Phase 1 (dense): warp-parallel dot/update over D DOFs using J_world/Y_world.
+        Phase 2 (MF): lanes 0-5 handle body_a, lanes 6-11 handle body_b (6 DOFs each).
+
+        Shared memory layout:
+          s_v[D] — world velocity
+          s_lam_dense[M_D] + metadata — dense impulses and constraint info
+          s_lam_mf[M_MF] — MF impulses (metadata read from global per constraint)
+        """
+        M_D = max_constraints
+        M_MF = mf_max_constraints
+        D = max_world_dofs
+
+        # How many DOF elements each lane handles (ceil(D/32))
+        ELEMS_PER_LANE = (D + 31) // 32
+
+        # --- Code generation for dense phase (D-wide dot/update) ---
+
+        # Dense dot product: J_i · v
+        dense_dot_parts = []
+        for k in range(ELEMS_PER_LANE):
+            d_expr = f"lane + {k * 32}" if k > 0 else "lane"
+            dense_dot_parts.append(f"""
+                if ({d_expr} < {D}) {{
+                    my_sum += J_world.data[jy_row_base + {d_expr}] * s_v[{d_expr}];
+                }}""")
+        dense_dot_code = "\n".join(["float my_sum = 0.0f;", *dense_dot_parts])
+
+        # Dense v update: v += Y_i * delta
+        dense_v_update_parts = []
+        for k in range(ELEMS_PER_LANE):
+            d_expr = f"lane + {k * 32}" if k > 0 else "lane"
+            dense_v_update_parts.append(f"""
+                if ({d_expr} < {D}) {{
+                    s_v[{d_expr}] += Y_world.data[jy_row_base + {d_expr}] * delta_impulse;
+                }}""")
+        dense_v_update_code = "\n".join(dense_v_update_parts)
+
+        # Dense sibling v update for friction cone projection
+        dense_sib_v_parts = []
+        for k in range(ELEMS_PER_LANE):
+            d_expr = f"lane + {k * 32}" if k > 0 else "lane"
+            dense_sib_v_parts.append(f"""
+                    if ({d_expr} < {D}) {{
+                        s_v[{d_expr}] += Y_world.data[sib_row_base + {d_expr}] * sib_delta;
+                    }}""")
+        dense_sib_v_code = "\n".join(dense_sib_v_parts)
+
+        snippet = f"""
+    #if defined(__CUDA_ARCH__)
+        const unsigned MASK = 0xFFFFFFFF;
+        int lane = threadIdx.x;
+
+        int m_dense = world_constraint_count.data[world];
+        int m_mf = mf_constraint_count.data[world];
+        if (m_dense == 0 && m_mf == 0) return;
+        if (m_dense > {M_D}) m_dense = {M_D};
+        if (m_mf > {M_MF}) m_mf = {M_MF};
+
+        int w_dof_start = world_dof_start.data[world];
+        int off_dense = world * {M_D};
+        int off_mf = world * {M_MF};
+        int jy_world_base = world * {M_D} * {D};
+        int mf6_base = world * {M_MF} * 6;
+
+        // ═══════════════════════════════════════════════════════
+        // SHARED MEMORY
+        // ═══════════════════════════════════════════════════════
+        __shared__ float s_v[{D}];
+        __shared__ float s_lam_dense[{M_D}];
+        __shared__ float s_rhs_dense[{M_D}];
+        __shared__ float s_diag_dense[{M_D}];
+        __shared__ int   s_rtype_dense[{M_D}];
+        __shared__ int   s_parent_dense[{M_D}];
+        __shared__ float s_mu_dense[{M_D}];
+        __shared__ float s_lam_mf[{M_MF}];
+
+        // ═══════════════════════════════════════════════════════
+        // LOAD PHASE
+        // ═══════════════════════════════════════════════════════
+        for (int i = lane; i < m_dense; i += 32) {{
+            s_lam_dense[i] = world_impulses.data[off_dense + i];
+            s_rhs_dense[i] = rhs_bias.data[off_dense + i];
+            s_diag_dense[i] = world_diag.data[off_dense + i];
+            s_rtype_dense[i] = world_row_type.data[off_dense + i];
+            s_parent_dense[i] = world_row_parent.data[off_dense + i];
+            s_mu_dense[i] = world_row_mu.data[off_dense + i];
+        }}
+        for (int i = lane; i < m_mf; i += 32) {{
+            s_lam_mf[i] = mf_impulses.data[off_mf + i];
+        }}
+        for (int d = lane; d < {D}; d += 32) {{
+            s_v[d] = v_out.data[w_dof_start + d];
+        }}
+        __syncwarp();
+
+        // ═══════════════════════════════════════════════════════
+        // SOLVE PHASE
+        // ═══════════════════════════════════════════════════════
+        for (int iter = 0; iter < iterations; iter++) {{
+
+            // ── Phase 1: Dense constraints (D-DOF warp-parallel) ──
+            for (int i = 0; i < m_dense; i++) {{
+                float denom = s_diag_dense[i];
+                if (denom <= 0.0f) continue;
+
+                int jy_row_base = jy_world_base + i * {D};
+
+                // J_i · v
+                {dense_dot_code}
+
+                // Warp reduce
+                my_sum += __shfl_down_sync(MASK, my_sum, 16);
+                my_sum += __shfl_down_sync(MASK, my_sum, 8);
+                my_sum += __shfl_down_sync(MASK, my_sum, 4);
+                my_sum += __shfl_down_sync(MASK, my_sum, 2);
+                my_sum += __shfl_down_sync(MASK, my_sum, 1);
+                float jv = __shfl_sync(MASK, my_sum, 0);
+
+                float residual = jv + s_rhs_dense[i];
+                float delta = -residual / denom;
+                float old_impulse = s_lam_dense[i];
+                float new_impulse = old_impulse + omega * delta;
+                int row_type = s_rtype_dense[i];
+
+                if (row_type == 0) {{
+                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                }} else if (row_type == 2) {{
+                    int parent_idx = s_parent_dense[i];
+                    float lambda_n = s_lam_dense[parent_idx];
+                    float mu = s_mu_dense[i];
+                    float radius = fmaxf(mu * lambda_n, 0.0f);
+
+                    if (radius <= 0.0f) {{
+                        new_impulse = 0.0f;
+                    }} else {{
+                        int sib = (i == parent_idx + 1) ? parent_idx + 2 : parent_idx + 1;
+                        s_lam_dense[i] = new_impulse;
+                        float a_val = new_impulse;
+                        float b_val = s_lam_dense[sib];
+                        float mag = sqrtf(a_val * a_val + b_val * b_val);
+                        if (mag > radius) {{
+                            float scale = radius / mag;
+                            new_impulse = a_val * scale;
+                            float sib_new = b_val * scale;
+                            float sib_delta = sib_new - b_val;
+                            s_lam_dense[sib] = sib_new;
+
+                            int sib_row_base = jy_world_base + sib * {D};
+                            {dense_sib_v_code}
+                        }}
+                    }}
+                }}
+
+                float delta_impulse = new_impulse - old_impulse;
+                s_lam_dense[i] = new_impulse;
+
+                if (delta_impulse != 0.0f) {{
+                    {dense_v_update_code}
+                }}
+                __syncwarp();
+            }}
+
+            // ── Phase 2: MF constraints (6-DOF per body) ──
+            for (int i = 0; i < m_mf; i++) {{
+                int dof_a = mf_dof_a.data[off_mf + i];
+                int dof_b = mf_dof_b.data[off_mf + i];
+                int mf6_row = mf6_base + i * 6;
+
+                // J · v: lanes 0-5 body_a, lanes 6-11 body_b
+                float my_sum = 0.0f;
+                if (lane < 6 && dof_a >= 0) {{
+                    my_sum = mf_J_a.data[mf6_row + lane] * s_v[dof_a + lane];
+                }}
+                if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                    my_sum = mf_J_b.data[mf6_row + lane - 6] * s_v[dof_b + lane - 6];
+                }}
+                my_sum += __shfl_down_sync(MASK, my_sum, 16);
+                my_sum += __shfl_down_sync(MASK, my_sum, 8);
+                my_sum += __shfl_down_sync(MASK, my_sum, 4);
+                my_sum += __shfl_down_sync(MASK, my_sum, 2);
+                my_sum += __shfl_down_sync(MASK, my_sum, 1);
+                float jv = __shfl_sync(MASK, my_sum, 0);
+
+                float mf_diag = mf_eff_mass_inv.data[off_mf + i];
+                if (mf_diag <= 0.0f) continue;
+
+                float residual = jv + mf_rhs.data[off_mf + i];
+                float delta = -residual * mf_diag;
+                float old_impulse = s_lam_mf[i];
+                float new_impulse = old_impulse + omega * delta;
+                int mf_rt = mf_row_type.data[off_mf + i];
+
+                if (mf_rt == 0) {{
+                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                }} else if (mf_rt == 2) {{
+                    int mf_par = mf_row_parent.data[off_mf + i];
+                    float lambda_n = s_lam_mf[mf_par];
+                    float mu = mf_row_mu.data[off_mf + i];
+                    float radius = fmaxf(mu * lambda_n, 0.0f);
+
+                    if (radius <= 0.0f) {{
+                        new_impulse = 0.0f;
+                    }} else {{
+                        int sib = (i == mf_par + 1) ? mf_par + 2 : mf_par + 1;
+                        s_lam_mf[i] = new_impulse;
+                        float a_val = new_impulse;
+                        float b_val = s_lam_mf[sib];
+                        float mag = sqrtf(a_val * a_val + b_val * b_val);
+                        if (mag > radius) {{
+                            float scale = radius / mag;
+                            new_impulse = a_val * scale;
+                            float sib_new = b_val * scale;
+                            float sib_delta = sib_new - b_val;
+                            s_lam_mf[sib] = sib_new;
+
+                            // Sibling v update
+                            int sib_dof_a = mf_dof_a.data[off_mf + sib];
+                            int sib_dof_b = mf_dof_b.data[off_mf + sib];
+                            int sib_mf6 = mf6_base + sib * 6;
+                            if (lane < 6 && sib_dof_a >= 0) {{
+                                s_v[sib_dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
+                            }}
+                            if (lane >= 6 && lane < 12 && sib_dof_b >= 0) {{
+                                s_v[sib_dof_b + lane - 6] += mf_MiJt_b.data[sib_mf6 + lane - 6] * sib_delta;
+                            }}
+                        }}
+                    }}
+                }}
+
+                float delta_impulse = new_impulse - old_impulse;
+                s_lam_mf[i] = new_impulse;
+
+                if (delta_impulse != 0.0f) {{
+                    if (lane < 6 && dof_a >= 0) {{
+                        s_v[dof_a + lane] += mf_MiJt_a.data[mf6_row + lane] * delta_impulse;
+                    }}
+                    if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                        s_v[dof_b + lane - 6] += mf_MiJt_b.data[mf6_row + lane - 6] * delta_impulse;
+                    }}
+                }}
+                __syncwarp();
+            }}
+        }}
+
+        // ═══════════════════════════════════════════════════════
+        // STORE PHASE
+        // ═══════════════════════════════════════════════════════
+        for (int d = lane; d < {D}; d += 32) {{
+            v_out.data[w_dof_start + d] = s_v[d];
+        }}
+        for (int i = lane; i < m_dense; i += 32) {{
+            world_impulses.data[off_dense + i] = s_lam_dense[i];
+        }}
+        for (int i = lane; i < m_mf; i += 32) {{
+            mf_impulses.data[off_mf + i] = s_lam_mf[i];
+        }}
+    #endif
+    """
+
+        @wp.func_native(snippet)
+        def pgs_solve_mf_gs_native(
+            world: int,
+            # Dense
+            world_constraint_count: wp.array(dtype=int),
+            world_dof_start: wp.array(dtype=int),
+            rhs_bias: wp.array2d(dtype=float),
+            world_diag: wp.array2d(dtype=float),
+            world_impulses: wp.array2d(dtype=float),
+            J_world: wp.array3d(dtype=float),
+            Y_world: wp.array3d(dtype=float),
+            world_row_type: wp.array2d(dtype=int),
+            world_row_parent: wp.array2d(dtype=int),
+            world_row_mu: wp.array2d(dtype=float),
+            # MF
+            mf_constraint_count: wp.array(dtype=int),
+            mf_rhs: wp.array2d(dtype=float),
+            mf_eff_mass_inv: wp.array2d(dtype=float),
+            mf_impulses: wp.array2d(dtype=float),
+            mf_J_a: wp.array3d(dtype=float),
+            mf_J_b: wp.array3d(dtype=float),
+            mf_MiJt_a: wp.array3d(dtype=float),
+            mf_MiJt_b: wp.array3d(dtype=float),
+            mf_row_type: wp.array2d(dtype=int),
+            mf_row_parent: wp.array2d(dtype=int),
+            mf_row_mu: wp.array2d(dtype=float),
+            mf_dof_a: wp.array2d(dtype=int),
+            mf_dof_b: wp.array2d(dtype=int),
+            # Shared
+            iterations: int,
+            omega: float,
+            # Output
+            v_out: wp.array(dtype=float),
+        ): ...
+
+        def pgs_solve_mf_gs_template(
+            # Dense
+            world_constraint_count: wp.array(dtype=int),
+            world_dof_start: wp.array(dtype=int),
+            rhs_bias: wp.array2d(dtype=float),
+            world_diag: wp.array2d(dtype=float),
+            world_impulses: wp.array2d(dtype=float),
+            J_world: wp.array3d(dtype=float),
+            Y_world: wp.array3d(dtype=float),
+            world_row_type: wp.array2d(dtype=int),
+            world_row_parent: wp.array2d(dtype=int),
+            world_row_mu: wp.array2d(dtype=float),
+            # MF
+            mf_constraint_count: wp.array(dtype=int),
+            mf_rhs: wp.array2d(dtype=float),
+            mf_eff_mass_inv: wp.array2d(dtype=float),
+            mf_impulses: wp.array2d(dtype=float),
+            mf_J_a: wp.array3d(dtype=float),
+            mf_J_b: wp.array3d(dtype=float),
+            mf_MiJt_a: wp.array3d(dtype=float),
+            mf_MiJt_b: wp.array3d(dtype=float),
+            mf_row_type: wp.array2d(dtype=int),
+            mf_row_parent: wp.array2d(dtype=int),
+            mf_row_mu: wp.array2d(dtype=float),
+            mf_dof_a: wp.array2d(dtype=int),
+            mf_dof_b: wp.array2d(dtype=int),
+            # Shared
+            iterations: int,
+            omega: float,
+            # Output
+            v_out: wp.array(dtype=float),
+        ):
+            world, _lane = wp.tid()
+            pgs_solve_mf_gs_native(
+                world,
+                world_constraint_count,
+                world_dof_start,
+                rhs_bias,
+                world_diag,
+                world_impulses,
+                J_world,
+                Y_world,
+                world_row_type,
+                world_row_parent,
+                world_row_mu,
+                mf_constraint_count,
+                mf_rhs,
+                mf_eff_mass_inv,
+                mf_impulses,
+                mf_J_a,
+                mf_J_b,
+                mf_MiJt_a,
+                mf_MiJt_b,
+                mf_row_type,
+                mf_row_parent,
+                mf_row_mu,
+                mf_dof_a,
+                mf_dof_b,
+                iterations,
+                omega,
+                v_out,
+            )
+
+        name = f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}"
+        pgs_solve_mf_gs_template.__name__ = name
+        pgs_solve_mf_gs_template.__qualname__ = name
+        return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)

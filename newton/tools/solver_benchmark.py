@@ -679,6 +679,9 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
         cmd.extend(["--pgs-omega", str(args.pgs_omega)])
         if args.pgs_warmstart:
             cmd.append("--pgs-warmstart")
+        pgs_mode = solver_config.get("pgs_mode", args.pgs_mode)
+        if pgs_mode != "delassus":
+            cmd.extend(["--pgs-mode", pgs_mode])
         enable_mf = solver_config.get("enable_mf_pgs", args.enable_mf_pgs)
         if not enable_mf:
             cmd.append("--no-mf-pgs")
@@ -1541,6 +1544,7 @@ def create_solver(model, args, scenario_cfg: dict):
             "pgs_omega": args.pgs_omega,
             "pgs_max_constraints": args.pgs_max_constraints,
             "pgs_warmstart": args.pgs_warmstart,
+            "pgs_mode": args.pgs_mode,
             "enable_mf_pgs": args.enable_mf_pgs,
             "enable_contact_friction": True,
             "storage": args.storage or scenario_cfg.get("storage", "batched"),
@@ -1890,6 +1894,13 @@ def main():
     parser.add_argument("--pgs-cfm", type=float, default=1.0e-6, help="PGS constraint force mixing (regularization)")
     parser.add_argument("--pgs-omega", type=float, default=1.0, help="PGS relaxation factor (SOR)")
     parser.add_argument("--pgs-warmstart", action="store_true", help="Enable warmstart")
+    parser.add_argument(
+        "--pgs-mode",
+        type=str,
+        choices=["delassus", "mf"],
+        default="delassus",
+        help="PGS mode: delassus (default) or mf (velocity-space Jacobi)",
+    )
     parser.add_argument(
         "--delassus-chunk-size",
         type=int,
