@@ -57,7 +57,7 @@ SCENARIOS = {
         "storage": "flat",
         "default_substeps": 2,
         "default_pgs_iterations": 4,
-        "default_pgs_max_constraints": 32,
+        "default_dense_max_constraints": 32,
         "mujoco_settings": {
             "njmax": 210,
             "nconmax": 35,
@@ -74,7 +74,7 @@ SCENARIOS = {
         "storage": "batched",
         "default_substeps": 2,
         "default_pgs_iterations": 8,
-        "default_pgs_max_constraints": 128,
+        "default_dense_max_constraints": 128,
         "mujoco_settings": {
             "njmax": 256,
             "nconmax": 42,
@@ -91,7 +91,7 @@ SCENARIOS = {
         "storage": "flat",
         "default_substeps": 4,
         "default_pgs_iterations": 8,
-        "default_pgs_max_constraints": 32,
+        "default_dense_max_constraints": 32,
         "mujoco_settings": {
             "njmax": 65,
             "nconmax": 15,
@@ -108,7 +108,7 @@ SCENARIOS = {
         "storage": "batched",
         "default_substeps": 8,
         "default_pgs_iterations": 8,
-        "default_pgs_max_constraints": 128,
+        "default_dense_max_constraints": 128,
         # With MF enabled, rigid body contacts are routed to the matrix-free path,
         # leaving only ~90 dense robot constraints. 128 max_constraints suffices and
         # fits entirely in shared memory for tiled kernels.
@@ -184,13 +184,14 @@ SOLVER_PRESETS = {
     },
     "fpgs_mf": {
         "type": "feather_pgs",
+        "storage": "batched",
         "pgs_mode": "velocity",
         "cholesky_kernel": "tiled",
         "trisolve_kernel": "tiled",
         "hinv_jt_kernel": "tiled",
         "delassus_kernel": "tiled",
         "pgs_kernel": "tiled_contact",
-        "pgs_max_constraints": 128,
+        "dense_max_constraints": 128,
         "use_parallel_streams": True,
     },
     "feather_pgs": {
@@ -261,6 +262,18 @@ ABLATION_SEQUENCES = {
             "pgs_kernel": "tiled_contact",
             "use_parallel_streams": True,
         },
+        {
+            "label": "+ full MF GS",
+            "storage": "batched",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "tiled",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "tiled_contact",
+            "dense_max_constraints": 128,
+            "pgs_mode": "velocity",
+            "use_parallel_streams": True,
+        },
     ],
     # Streaming: for high-constraint scenarios where tiled hinv_jt and tiled PGS exceed shared
     # memory limits (e.g. h1_tabletop with 1024 constraints). Uses par_row hinv_jt, streaming
@@ -273,7 +286,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
-            "pgs_max_constraints": 396,
+            "dense_max_constraints": 396,
             "pgs_mode": "delassus",
             "use_parallel_streams": False,
         },
@@ -284,7 +297,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
-            "pgs_max_constraints": 396,
+            "dense_max_constraints": 396,
             "pgs_mode": "delassus",
             "use_parallel_streams": False,
         },
@@ -295,7 +308,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
-            "pgs_max_constraints": 396,
+            "dense_max_constraints": 396,
             "pgs_mode": "delassus",
             "use_parallel_streams": False,
         },
@@ -306,7 +319,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "tiled",
             "pgs_kernel": "loop",
-            "pgs_max_constraints": 396,
+            "dense_max_constraints": 396,
             "pgs_mode": "delassus",
             "use_parallel_streams": False,
         },
@@ -317,7 +330,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "tiled",
             "pgs_kernel": "streaming",  # Will be overridden by --ablation-pgs if specified
-            "pgs_max_constraints": 396,
+            "dense_max_constraints": 396,
             "pgs_mode": "delassus",
             "use_parallel_streams": False,
         },
@@ -328,7 +341,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "tiled",
             "pgs_kernel": "streaming",
-            "pgs_max_constraints": 396,
+            "dense_max_constraints": 396,
             "pgs_mode": "delassus",
             "use_parallel_streams": True,
         },
@@ -340,7 +353,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "tiled",
             "delassus_kernel": "tiled",
             "pgs_kernel": "tiled_contact",
-            "pgs_max_constraints": 128,
+            "dense_max_constraints": 128,
             "pgs_mode": "hybrid",
             "use_parallel_streams": True,
         },
@@ -351,7 +364,7 @@ ABLATION_SEQUENCES = {
             "hinv_jt_kernel": "tiled",
             "delassus_kernel": "tiled",
             "pgs_kernel": "tiled_contact",
-            "pgs_max_constraints": 128,
+            "dense_max_constraints": 128,
             "pgs_mode": "velocity",
             "use_parallel_streams": True,
         },
@@ -687,8 +700,8 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
 
         # PGS params
         cmd.extend(["--pgs-iterations", str(args.pgs_iterations)])
-        pgs_max_c = solver_config.get("pgs_max_constraints", args.pgs_max_constraints)
-        cmd.extend(["--pgs-max-constraints", str(pgs_max_c)])
+        pgs_max_c = solver_config.get("dense_max_constraints", args.dense_max_constraints)
+        cmd.extend(["--dense-max-constraints", str(pgs_max_c)])
         cmd.extend(["--pgs-beta", str(args.pgs_beta)])
         cmd.extend(["--pgs-cfm", str(args.pgs_cfm)])
         cmd.extend(["--pgs-omega", str(args.pgs_omega)])
@@ -1547,18 +1560,22 @@ def create_solver(model, args, scenario_cfg: dict):
         delassus_chunk = get_kernel("delassus_chunk_size", args.delassus_chunk_size)
         pgs_chunk = get_kernel("pgs_chunk_size", args.pgs_chunk_size)
         parallel_streams = preset.get("use_parallel_streams", args.use_parallel_streams)
+        storage = preset.get("storage", args.storage or scenario_cfg.get("storage", "batched"))
+        pgs_iterations = preset.get("pgs_iterations", args.pgs_iterations)
+        dense_max_constraints = preset.get("dense_max_constraints", args.dense_max_constraints)
+        pgs_mode = preset.get("pgs_mode", args.pgs_mode)
 
         solver_kwargs = {
             "update_mass_matrix_interval": 1,
-            "pgs_iterations": args.pgs_iterations,
+            "pgs_iterations": pgs_iterations,
             "pgs_beta": args.pgs_beta,
             "pgs_cfm": args.pgs_cfm,
             "pgs_omega": args.pgs_omega,
-            "pgs_max_constraints": args.pgs_max_constraints,
+            "dense_max_constraints": dense_max_constraints,
             "pgs_warmstart": args.pgs_warmstart,
-            "pgs_mode": args.pgs_mode,
+            "pgs_mode": pgs_mode,
             "enable_contact_friction": True,
-            "storage": args.storage or scenario_cfg.get("storage", "batched"),
+            "storage": storage,
             "cholesky_kernel": cholesky,
             "trisolve_kernel": trisolve,
             "hinv_jt_kernel": hinv_jt,
@@ -2080,7 +2097,9 @@ def main():
         help="PGS kernel",
     )
     parser.add_argument("--pgs-iterations", type=int, default=8, help="PGS iterations")
-    parser.add_argument("--pgs-max-constraints", type=int, default=64, help="Max constraints per world")
+    parser.add_argument(
+        "--dense-max-constraints", type=int, default=64, help="Max dense (articulation) constraint rows per world"
+    )
     parser.add_argument("--pgs-beta", type=float, default=0.1, help="PGS position correction factor (ERP)")
     parser.add_argument("--pgs-cfm", type=float, default=1.0e-6, help="PGS constraint force mixing (regularization)")
     parser.add_argument("--pgs-omega", type=float, default=1.0, help="PGS relaxation factor (SOR)")
@@ -2152,8 +2171,8 @@ def main():
             args.substeps = scenario_cfg.get("default_substeps", 4)
         if args.pgs_iterations == 8:  # default value, check if scenario has different
             args.pgs_iterations = scenario_cfg.get("default_pgs_iterations", args.pgs_iterations)
-        if args.pgs_max_constraints == 64:  # default value
-            args.pgs_max_constraints = scenario_cfg.get("default_pgs_max_constraints", args.pgs_max_constraints)
+        if args.dense_max_constraints == 64:  # default value
+            args.dense_max_constraints = scenario_cfg.get("default_dense_max_constraints", args.dense_max_constraints)
 
     # Route to appropriate handler
     if args.replot:
