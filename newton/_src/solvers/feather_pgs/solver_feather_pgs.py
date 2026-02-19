@@ -172,9 +172,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_omega: float = 1.0,
         pgs_max_constraints: int = 32,
         pgs_warmstart: bool = False,
-        pgs_mode: str = "delassus",
-        # Matrix-free PGS for free rigid bodies
-        enable_mf_pgs: bool = True,
+        pgs_mode: str = "hybrid",
         mf_max_constraints: int = 512,
         # Storage path
         storage: str = "batched",
@@ -206,11 +204,11 @@ class SolverFeatherPGS(SolverBase):
             pgs_max_constraints (int, optional): Maximum number of contact constraints stored per articulation. Defaults to 32.
             pgs_warmstart (bool, optional): Re-use impulses from the previous frame when contacts persist. Defaults to False.
             pgs_mode (str, optional): PGS mode. "delassus" builds the full Delassus matrix C = J*H^{-1}*J^T
-                and solves in impulse space (Gauss-Seidel). "mf" skips C entirely, recomputes J*v each
-                iteration, and uses only the diagonal for preconditioning (Jacobi-style). MF mode uses
-                O(max_constraints) memory instead of O(max_constraints^2). Requires storage="batched".
-                Defaults to "delassus".
-            enable_mf_pgs (bool, optional): Enable matrix-free PGS path for free rigid body contacts. Defaults to True.
+                and solves in impulse space (Gauss-Seidel) for all contacts. "hybrid" uses the Delassus
+                path for articulated bodies and a cheaper matrix-free PGS path for free rigid body
+                contacts. "velocity" skips C entirely, recomputes J*v each iteration, and uses only the
+                diagonal for preconditioning (Jacobi-style) — O(max_constraints) memory instead of
+                O(max_constraints^2). Requires storage="batched". Defaults to "hybrid".
             mf_max_constraints (int, optional): Maximum number of matrix-free constraints per world. Defaults to 512.
             storage (str, optional): Storage layout. "batched" groups by DOF size into 3D arrays, "flat" uses
                 offset-indexed 1D arrays. Defaults to "batched".
@@ -253,10 +251,9 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_omega = pgs_omega
         self.pgs_max_constraints = pgs_max_constraints
         self.pgs_warmstart = pgs_warmstart
-        if pgs_mode not in ("delassus", "mf"):
-            raise ValueError(f"pgs_mode must be 'delassus' or 'mf', got {pgs_mode!r}")
+        if pgs_mode not in ("delassus", "hybrid", "velocity"):
+            raise ValueError(f"pgs_mode must be 'delassus', 'hybrid', or 'velocity', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
-        self.enable_mf_pgs = enable_mf_pgs
         self.mf_max_constraints = mf_max_constraints
 
         valid_storage = {"batched", "flat"}
@@ -303,8 +300,8 @@ class SolverFeatherPGS(SolverBase):
         if self.storage == "flat" and self._is_multi_articulation:
             raise ValueError("storage='flat' is not supported for multiple articulations per world yet.")
 
-        if self.pgs_mode == "mf" and self.storage != "batched":
-            raise ValueError("pgs_mode='mf' requires storage='batched'.")
+        if self.pgs_mode == "velocity" and self.storage != "batched":
+            raise ValueError("pgs_mode='velocity' requires storage='batched'.")
 
         if self.storage == "flat" and model.articulation_count:
             if not self._is_homogeneous and (
@@ -560,9 +557,9 @@ class SolverFeatherPGS(SolverBase):
 
         An articulation is "free rigid" if it has exactly 1 joint, that joint
         is FREE type, and the joint parent is -1 (world). These can be solved
-        with a cheaper matrix-free PGS path. Gated on ``enable_mf_pgs``.
+        with a cheaper matrix-free PGS path. Gated on ``pgs_mode`` != "delassus".
         """
-        if not self.enable_mf_pgs or not model.articulation_count or not model.joint_count:
+        if self.pgs_mode == "delassus" or not model.articulation_count or not model.joint_count:
             self._has_free_rigid_bodies = False
             self._n_free_rigid = 0
             self.is_free_rigid = None
@@ -840,7 +837,7 @@ class SolverFeatherPGS(SolverBase):
         max_constraints = self.pgs_max_constraints
 
         # Per-world constraint matrices and vectors
-        if self.pgs_mode != "mf":
+        if self.pgs_mode != "velocity":
             self.C = wp.zeros(
                 (self.world_count, max_constraints, max_constraints),
                 dtype=wp.float32,
@@ -850,7 +847,7 @@ class SolverFeatherPGS(SolverBase):
         else:
             self.C = None
 
-        if self.pgs_mode == "mf":
+        if self.pgs_mode == "velocity":
             self._compute_world_dof_mapping(model)
             self.J_world = wp.zeros(
                 (self.world_count, max_constraints, self.max_world_dofs),
@@ -908,7 +905,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _allocate_mf_buffers(self, model):
         """Allocate buffers for matrix-free PGS path for free rigid body contacts."""
-        if not self._has_free_rigid_bodies and self.pgs_mode != "mf":
+        if not self._has_free_rigid_bodies and self.pgs_mode != "velocity":
             return
 
         device = model.device
@@ -1300,7 +1297,7 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         self._stage4_build_rows_batched(state_in, state_aug, contacts)
 
-        if self.pgs_mode == "mf":
+        if self.pgs_mode == "velocity":
             # Compute Y = H^-1 * J^T only (no Delassus C)
             for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                 with ctx:
@@ -1391,7 +1388,7 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         self._stage5_prepare_impulses_world()
 
-        if self.pgs_mode == "mf":
+        if self.pgs_mode == "velocity":
             # Gather J/Y from per-size-group arrays into world-indexed arrays
             self.J_world.zero_()
             self.Y_world.zero_()
