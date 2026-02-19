@@ -27,6 +27,8 @@
 #   ABLATION_WORLDS_H1_TABLETOP      Num worlds for h1_tabletop ablation (default: 2048)
 #   RUN_G1_FLAT                     Set to 0 to skip g1_flat sweeps/ablations (default: 1)
 #   RUN_H1_TABLETOP                 Set to 0 to skip h1_tabletop sweeps/ablations (default: 1)
+#   SUBSTEPS_G1_FLAT                Comma-separated substeps for g1_flat (default: "2,4")
+#   SUBSTEPS_H1_TABLETOP            Comma-separated substeps for h1_tabletop (default: "4,8")
 #   SKIP_ABLATIONS                  Set to 1 to skip ablations (default: 0)
 #   ENABLE_PLOTS                    Set to 0 to skip matplotlib plots (default: 1)
 #   CHERRY_PICK_BRANCHES            Comma-separated branches to cherry-pick after rebase (default: "")
@@ -48,6 +50,8 @@ SWEEP_MIN_LOG2_H1_TABLETOP="${SWEEP_MIN_LOG2_H1_TABLETOP:-10}"
 SWEEP_MAX_LOG2_H1_TABLETOP="${SWEEP_MAX_LOG2_H1_TABLETOP:-15}"
 ABLATION_WORLDS_G1_FLAT="${ABLATION_WORLDS_G1_FLAT:-16384}"
 ABLATION_WORLDS_H1_TABLETOP="${ABLATION_WORLDS_H1_TABLETOP:-8192}"
+SUBSTEPS_G1_FLAT="${SUBSTEPS_G1_FLAT:-2,4}"
+SUBSTEPS_H1_TABLETOP="${SUBSTEPS_H1_TABLETOP:-4,8}"
 ENABLE_PLOTS="${ENABLE_PLOTS:-1}"
 UV_EXTRAS="${UV_EXTRAS:---extra examples --extra torch-cu12}"
 RUN_G1_FLAT="${RUN_G1_FLAT:-1}"
@@ -77,7 +81,7 @@ log() {
 
 cleanup() {
   [[ -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR"
-  [[ -d "$RESULTS_DIR" ]] && rm -rf "$RESULTS_DIR"
+  # Keep RESULTS_DIR so partial runs can be salvaged
 }
 trap cleanup EXIT
 
@@ -138,12 +142,14 @@ run_sweep() {
   local min_log2="$2"
   local max_log2="$3"
   local solvers="$4"
+  local substeps_list="$5"
   local out_dir="$RUN_DIR/${scenario}_sweep"
 
   local cmd=(uv run $UV_EXTRAS -m newton.tools.solver_benchmark \
     --scenario "$scenario" \
     --sweep \
     --solvers "$solvers" \
+    --substeps-list "$substeps_list" \
     --min-log2-worlds "$min_log2" \
     --max-log2-worlds "$max_log2" \
     --out "$out_dir")
@@ -194,7 +200,7 @@ run_render() {
 
 build_renders_manifest() {
   # Collect all render_meta.json files into a single renders.json for this run
-  python - "$RUN_DIR" <<'PY'
+  uv run $UV_EXTRAS python - "$RUN_DIR" <<'PY'
 import json, sys
 from pathlib import Path
 
@@ -222,7 +228,7 @@ append_points() {
 
   RUN_ID="$RUN_ID" RUN_TIMESTAMP="$RUN_TIMESTAMP" RUN_COMMIT="$RUN_COMMIT" RUN_COMMIT_SHORT="$RUN_COMMIT_SHORT" \
   RUN_MODE="$mode" RUN_SCENARIO="$scenario" DATA_FILE="$data_file" META_FILE="$meta_file" \
-  python - <<'PY' >> "$RESULTS_DIR_PATH/points.jsonl"
+  uv run $UV_EXTRAS python - <<'PY' >> "$RESULTS_DIR_PATH/points.jsonl"
 import json
 import os
 
@@ -266,7 +272,7 @@ PY
 log "Benchmark run id: $RUN_ID"
 
 if [[ "$RUN_G1_FLAT" == "1" ]]; then
-  run_sweep "g1_flat" "$SWEEP_MIN_LOG2_G1_FLAT" "$SWEEP_MAX_LOG2_G1_FLAT" "$SWEEP_SOLVERS_G1_FLAT"
+  run_sweep "g1_flat" "$SWEEP_MIN_LOG2_G1_FLAT" "$SWEEP_MAX_LOG2_G1_FLAT" "$SWEEP_SOLVERS_G1_FLAT" "$SUBSTEPS_G1_FLAT"
   append_points "sweep" "g1_flat" "$RUN_DIR/g1_flat_sweep/sweep.jsonl" "$RUN_DIR/g1_flat_sweep/metadata.json"
 
   if [[ "$SKIP_ABLATIONS" != "1" ]]; then
@@ -275,14 +281,16 @@ if [[ "$RUN_G1_FLAT" == "1" ]]; then
   fi
 
   IFS=',' read -ra G1_SOLVERS <<< "$SWEEP_SOLVERS_G1_FLAT"
-  G1_SUBSTEPS="${SCENARIOS_SUBSTEPS_G1_FLAT:-2}"
+  IFS=',' read -ra G1_SUBSTEPS_ARR <<< "$SUBSTEPS_G1_FLAT"
   for solver in "${G1_SOLVERS[@]}"; do
-    run_render "g1_flat" "$solver" "$G1_SUBSTEPS"
+    for sub in "${G1_SUBSTEPS_ARR[@]}"; do
+      run_render "g1_flat" "$solver" "$sub"
+    done
   done
 fi
 
 if [[ "$RUN_H1_TABLETOP" == "1" ]]; then
-  run_sweep "h1_tabletop" "$SWEEP_MIN_LOG2_H1_TABLETOP" "$SWEEP_MAX_LOG2_H1_TABLETOP" "$SWEEP_SOLVERS_H1_TABLETOP"
+  run_sweep "h1_tabletop" "$SWEEP_MIN_LOG2_H1_TABLETOP" "$SWEEP_MAX_LOG2_H1_TABLETOP" "$SWEEP_SOLVERS_H1_TABLETOP" "$SUBSTEPS_H1_TABLETOP"
   append_points "sweep" "h1_tabletop" "$RUN_DIR/h1_tabletop_sweep/sweep.jsonl" "$RUN_DIR/h1_tabletop_sweep/metadata.json"
 
   if [[ "$SKIP_ABLATIONS" != "1" ]]; then
@@ -291,16 +299,18 @@ if [[ "$RUN_H1_TABLETOP" == "1" ]]; then
   fi
 
   IFS=',' read -ra H1_SOLVERS <<< "$SWEEP_SOLVERS_H1_TABLETOP"
-  H1_SUBSTEPS="${SCENARIOS_SUBSTEPS_H1_TABLETOP:-8}"
+  IFS=',' read -ra H1_SUBSTEPS_ARR <<< "$SUBSTEPS_H1_TABLETOP"
   for solver in "${H1_SOLVERS[@]}"; do
-    run_render "h1_tabletop" "$solver" "$H1_SUBSTEPS"
+    for sub in "${H1_SUBSTEPS_ARR[@]}"; do
+      run_render "h1_tabletop" "$solver" "$sub"
+    done
   done
 fi
 
 build_renders_manifest
 
 # Create run-level metadata
-RUN_META_JSON=$(RUN_DIR="$RUN_DIR" RUN_ID="$RUN_ID" RUN_TIMESTAMP="$RUN_TIMESTAMP" RUN_COMMIT="$RUN_COMMIT" RUN_COMMIT_SHORT="$RUN_COMMIT_SHORT" AUTO_BRANCH="$AUTO_BRANCH" python - <<'PY'
+RUN_META_JSON=$(RUN_DIR="$RUN_DIR" RUN_ID="$RUN_ID" RUN_TIMESTAMP="$RUN_TIMESTAMP" RUN_COMMIT="$RUN_COMMIT" RUN_COMMIT_SHORT="$RUN_COMMIT_SHORT" AUTO_BRANCH="$AUTO_BRANCH" uv run $UV_EXTRAS python - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -343,6 +353,7 @@ if git diff --staged --quiet; then
 else
   COMMIT_MSG="Update nightly benchmarks - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
   git commit -m "$COMMIT_MSG"
+  git pull --rebase origin "$RESULTS_BRANCH"
   git push origin "$RESULTS_BRANCH"
   log "Pushed nightly results"
 fi
