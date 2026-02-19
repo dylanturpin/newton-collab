@@ -29,6 +29,7 @@
 #   RUN_H1_TABLETOP                 Set to 0 to skip h1_tabletop sweeps/ablations (default: 1)
 #   SKIP_ABLATIONS                  Set to 1 to skip ablations (default: 0)
 #   ENABLE_PLOTS                    Set to 0 to skip matplotlib plots (default: 1)
+#   CHERRY_PICK_BRANCHES            Comma-separated branches to cherry-pick after rebase (default: "")
 #   UV_EXTRAS                       Extras for uv run (default: "--extra examples --extra torch-cu12")
 
 set -euo pipefail
@@ -52,6 +53,7 @@ UV_EXTRAS="${UV_EXTRAS:---extra examples --extra torch-cu12}"
 RUN_G1_FLAT="${RUN_G1_FLAT:-1}"
 RUN_H1_TABLETOP="${RUN_H1_TABLETOP:-1}"
 SKIP_ABLATIONS="${SKIP_ABLATIONS:-0}"
+CHERRY_PICK_BRANCHES="${CHERRY_PICK_BRANCHES:-}"
 
 export AUTO_BRANCH
 
@@ -97,6 +99,16 @@ fi
 log "Rebasing $SOURCE_BRANCH onto $UPSTREAM_REF"
 git checkout -B "$AUTO_BRANCH" "origin/$SOURCE_BRANCH"
 git rebase "$UPSTREAM_REF"
+
+if [[ -n "$CHERRY_PICK_BRANCHES" ]]; then
+  IFS=',' read -ra CP_BRANCHES <<< "$CHERRY_PICK_BRANCHES"
+  for branch in "${CP_BRANCHES[@]}"; do
+    branch="$(echo "$branch" | xargs)"  # trim whitespace
+    log "Cherry-picking origin/$branch"
+    git fetch origin "$branch"
+    git cherry-pick "origin/$branch"
+  done
+fi
 
 log "Pushing $AUTO_BRANCH"
 git push origin "$AUTO_BRANCH" --force-with-lease
