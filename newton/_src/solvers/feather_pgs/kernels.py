@@ -2684,6 +2684,86 @@ def prepare_world_impulses(
 
 
 # =============================================================================
+# Fully Matrix-Free PGS Kernels (velocity-space Jacobi)
+# =============================================================================
+
+
+@wp.kernel
+def diag_from_JY_par_art(
+    J_group: wp.array3d(dtype=float),  # [n_arts_of_size, max_constraints, n_dofs]
+    Y_group: wp.array3d(dtype=float),  # [n_arts_of_size, max_constraints, n_dofs]
+    group_to_art: wp.array(dtype=int),
+    art_to_world: wp.array(dtype=int),
+    world_constraint_count: wp.array(dtype=int),
+    n_dofs: int,
+    max_constraints: int,
+    n_arts: int,
+    # output
+    world_diag: wp.array2d(dtype=float),
+):
+    """Compute diagonal of Delassus from J and Y without assembling the full matrix.
+
+    diag[w,c] += sum_k J[idx,c,k] * Y[idx,c,k]. Thread dim: n_arts * max_constraints.
+    """
+    tid = wp.tid()
+    c = tid % max_constraints
+    idx = tid // max_constraints
+    if idx >= n_arts:
+        return
+    art = group_to_art[idx]
+    world = art_to_world[art]
+    if c >= world_constraint_count[world]:
+        return
+    val = float(0.0)
+    for k in range(n_dofs):
+        val += J_group[idx, c, k] * Y_group[idx, c, k]
+    if val != 0.0:
+        wp.atomic_add(world_diag, world, c, val)
+
+
+@wp.kernel
+def gather_JY_to_world(
+    group_to_art: wp.array(dtype=int),
+    art_to_world: wp.array(dtype=int),
+    art_dof_start: wp.array(dtype=int),
+    world_constraint_count: wp.array(dtype=int),
+    world_dof_start: wp.array(dtype=int),
+    J_group: wp.array3d(dtype=float),
+    Y_group: wp.array3d(dtype=float),
+    n_dofs: int,
+    max_constraints: int,
+    n_arts: int,
+    # outputs
+    J_world: wp.array3d(dtype=float),
+    Y_world: wp.array3d(dtype=float),
+):
+    """Gather per-size-group J/Y into world-indexed arrays.
+
+    Thread dim: n_arts * max_constraints * n_dofs.
+    """
+    tid = wp.tid()
+    d = tid % n_dofs
+    remainder = tid // n_dofs
+    c = remainder % max_constraints
+    idx = remainder // max_constraints
+    if idx >= n_arts:
+        return
+    art = group_to_art[idx]
+    world = art_to_world[art]
+    if c >= world_constraint_count[world]:
+        return
+    dof_start = art_dof_start[art]
+    w_dof_start = world_dof_start[world]
+    local_d = (dof_start - w_dof_start) + d
+    j_val = J_group[idx, c, d]
+    y_val = Y_group[idx, c, d]
+    if j_val != 0.0:
+        J_world[world, c, local_d] = j_val
+    if y_val != 0.0:
+        Y_world[world, c, local_d] = y_val
+
+
+# =============================================================================
 # Matrix-Free PGS Kernels for Free Rigid Bodies
 # =============================================================================
 
@@ -3268,6 +3348,43 @@ def build_mf_body_map(
             mf_local_body_b[world, i] = -1
 
     mf_body_count[world] = n_bodies
+
+
+@wp.kernel
+def compute_mf_world_dof_offsets(
+    mf_constraint_count: wp.array(dtype=int),
+    mf_body_a: wp.array2d(dtype=int),
+    mf_body_b: wp.array2d(dtype=int),
+    body_to_articulation: wp.array(dtype=int),
+    art_dof_start: wp.array(dtype=int),
+    world_dof_start: wp.array(dtype=int),
+    mf_max_constraints: int,
+    # outputs
+    mf_dof_a: wp.array2d(dtype=int),
+    mf_dof_b: wp.array2d(dtype=int),
+):
+    """Compute world-relative DOF offsets for each MF contact body.
+
+    For each MF constraint, stores the articulation DOF start minus the
+    world DOF start for body A and B.  The two-phase GS kernel uses
+    these offsets to index into the shared velocity vector.
+    """
+    tid = wp.tid()
+    world = tid // mf_max_constraints
+    c = tid % mf_max_constraints
+    if c >= mf_constraint_count[world]:
+        return
+    w_dof = world_dof_start[world]
+    ba = mf_body_a[world, c]
+    bb = mf_body_b[world, c]
+    if ba >= 0:
+        mf_dof_a[world, c] = art_dof_start[body_to_articulation[ba]] - w_dof
+    else:
+        mf_dof_a[world, c] = -1
+    if bb >= 0:
+        mf_dof_b[world, c] = art_dof_start[body_to_articulation[bb]] - w_dof
+    else:
+        mf_dof_b[world, c] = -1
 
 
 @wp.kernel
