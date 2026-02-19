@@ -170,7 +170,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_beta: float = 0.2,
         pgs_cfm: float = 1.0e-6,
         pgs_omega: float = 1.0,
-        pgs_max_constraints: int = 32,
+        dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
         pgs_mode: str = "hybrid",
         mf_max_constraints: int = 512,
@@ -201,7 +201,9 @@ class SolverFeatherPGS(SolverBase):
             pgs_beta (float, optional): ERP style position correction factor. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
-            pgs_max_constraints (int, optional): Maximum number of contact constraints stored per articulation. Defaults to 32.
+            dense_max_constraints (int, optional): Maximum number of dense (articulation) contact constraint
+                rows stored per world. Free rigid body contacts are stored separately, bounded by
+                mf_max_constraints. Defaults to 32.
             pgs_warmstart (bool, optional): Re-use impulses from the previous frame when contacts persist. Defaults to False.
             pgs_mode (str, optional): PGS mode. "delassus" builds the full Delassus matrix C = J*H^{-1}*J^T
                 and solves in impulse space (Gauss-Seidel) for all contacts. "hybrid" uses the Delassus
@@ -249,7 +251,7 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
         self.pgs_omega = pgs_omega
-        self.pgs_max_constraints = pgs_max_constraints
+        self.dense_max_constraints = dense_max_constraints
         self.pgs_warmstart = pgs_warmstart
         if pgs_mode not in ("delassus", "hybrid", "velocity"):
             raise ValueError(f"pgs_mode must be 'delassus', 'hybrid', or 'velocity', got {pgs_mode!r}")
@@ -319,15 +321,15 @@ class SolverFeatherPGS(SolverBase):
                     "for flat tiled triangular solve. Increase TILE_DOF or choose trisolve_kernel='loop'."
                 )
             if self.hinv_jt_kernel == "tiled" and (
-                self.articulation_max_dofs > int(TILE_DOF) or self.pgs_max_constraints > int(TILE_CONSTRAINTS)
+                self.articulation_max_dofs > int(TILE_DOF) or self.dense_max_constraints > int(TILE_CONSTRAINTS)
             ):
                 raise ValueError(
                     "Flat tiled H^{-1}J^T requires articulation_max_dofs <= TILE_DOF and "
-                    "pgs_max_constraints <= TILE_CONSTRAINTS."
+                    "dense_max_constraints <= TILE_CONSTRAINTS."
                 )
-            if self.pgs_kernel in ("tiled_row", "tiled_contact") and self.pgs_max_constraints > int(TILE_CONSTRAINTS):
+            if self.pgs_kernel in ("tiled_row", "tiled_contact") and self.dense_max_constraints > int(TILE_CONSTRAINTS):
                 raise ValueError(
-                    f"pgs_max_constraints={self.pgs_max_constraints} exceeds TILE_CONSTRAINTS={int(TILE_CONSTRAINTS)} "
+                    f"dense_max_constraints={self.dense_max_constraints} exceeds TILE_CONSTRAINTS={int(TILE_CONSTRAINTS)} "
                     "for tiled PGS. Increase TILE_CONSTRAINTS or choose pgs_kernel='loop'."
                 )
         self._allocate_common_buffers(model)
@@ -714,7 +716,7 @@ class SolverFeatherPGS(SolverBase):
         device = model.device
         requires_grad = model.requires_grad
         articulation_count = model.articulation_count
-        constraint_capacity = self.pgs_max_constraints
+        constraint_capacity = self.dense_max_constraints
 
         self.H_flat = wp.empty((self.H_size,), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.L_flat = wp.zeros_like(self.H_flat)
@@ -771,7 +773,7 @@ class SolverFeatherPGS(SolverBase):
 
         device = model.device
         requires_grad = model.requires_grad
-        max_constraints = self.pgs_max_constraints
+        max_constraints = self.dense_max_constraints
 
         self.H_by_size = {}
         self.L_by_size = {}
@@ -834,7 +836,7 @@ class SolverFeatherPGS(SolverBase):
 
         device = model.device
         requires_grad = model.requires_grad
-        max_constraints = self.pgs_max_constraints
+        max_constraints = self.dense_max_constraints
 
         # Per-world constraint matrices and vectors
         if self.pgs_mode != "velocity":
@@ -1126,7 +1128,7 @@ class SolverFeatherPGS(SolverBase):
         flat_tiled_allowed = (
             self._is_homogeneous
             and self.articulation_max_dofs <= int(TILE_DOF)
-            and self.pgs_max_constraints <= int(TILE_CONSTRAINTS)
+            and self.dense_max_constraints <= int(TILE_CONSTRAINTS)
         )
 
         # ══════════════════════════════════════════════════════════════
@@ -1396,7 +1398,7 @@ class SolverFeatherPGS(SolverBase):
                 n_arts = self.n_arts_by_size[size]
                 wp.launch(
                     gather_JY_to_world,
-                    dim=int(n_arts * self.pgs_max_constraints * size),
+                    dim=int(n_arts * self.dense_max_constraints * size),
                     inputs=[
                         self.group_to_art[size],
                         self.art_to_world,
@@ -1406,7 +1408,7 @@ class SolverFeatherPGS(SolverBase):
                         self.J_by_size[size],
                         self.Y_by_size[size],
                         size,
-                        self.pgs_max_constraints,
+                        self.dense_max_constraints,
                         n_arts,
                     ],
                     outputs=[self.J_world, self.Y_world],
@@ -1418,7 +1420,7 @@ class SolverFeatherPGS(SolverBase):
 
             # Two-phase GS kernel: dense + MF in one pass
             mf_gs_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_kernel(
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 self.mf_max_constraints,
                 self.max_world_dofs,
                 self.model.device,
@@ -1501,7 +1503,7 @@ class SolverFeatherPGS(SolverBase):
                         dim=n_arts,
                         inputs=[
                             self.constraint_count,
-                            self.pgs_max_constraints,
+                            self.dense_max_constraints,
                             self.art_to_world,
                             self.art_size,
                             self.art_group_idx,
@@ -2117,7 +2119,7 @@ class SolverFeatherPGS(SolverBase):
                     model.joint_ancestor,
                     model.joint_qd_start,
                     state_aug.joint_S_s,
-                    self.pgs_max_constraints,
+                    self.dense_max_constraints,
                     self.articulation_max_dofs,
                     self.pgs_beta,
                     self.pgs_cfm,
@@ -2140,7 +2142,7 @@ class SolverFeatherPGS(SolverBase):
         wp.launch(
             clamp_contact_counts,
             dim=model.articulation_count,
-            inputs=[self.constraint_count_flat, self.pgs_max_constraints],
+            inputs=[self.constraint_count_flat, self.dense_max_constraints],
             device=model.device,
         )
         wp.launch(
@@ -2148,7 +2150,7 @@ class SolverFeatherPGS(SolverBase):
             dim=model.articulation_count,
             inputs=[
                 self.constraint_count_flat,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 self.row_parent_flat,  # global/flat parent indices
             ],
             outputs=[
@@ -2159,7 +2161,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage4_build_rows_batched(self, state_in: State, state_aug: State, contacts: Contacts):
         model = self.model
-        max_constraints = self.pgs_max_constraints
+        max_constraints = self.dense_max_constraints
         mf_active = self._has_free_rigid_bodies
 
         # Zero world-level buffers
@@ -2339,7 +2341,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_hinv_jt_flat_tiled(self):
         model = self.model
         n_dofs = self.articulation_max_dofs
-        max_constraints = self.pgs_max_constraints
+        max_constraints = self.dense_max_constraints
         L_tiled = self.L_flat.reshape((model.articulation_count, n_dofs, n_dofs))
         J_tiled = self.J_flat.reshape((model.articulation_count, max_constraints, n_dofs))
         Y_tiled = self.Y_flat.reshape((model.articulation_count, max_constraints, n_dofs))
@@ -2368,11 +2370,11 @@ class SolverFeatherPGS(SolverBase):
         model = self.model
         wp.launch(
             hinv_jt_flat_par_row,
-            dim=model.articulation_count * self.pgs_max_constraints,
+            dim=model.articulation_count * self.dense_max_constraints,
             inputs=[
                 self.articulation_H_start,
                 self.articulation_H_rows,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 self.articulation_max_dofs,
                 self.constraint_count_flat,
                 self.L_flat,
@@ -2386,10 +2388,10 @@ class SolverFeatherPGS(SolverBase):
         model = self.model
         wp.launch(
             delassus_flat_par_row,
-            dim=model.articulation_count * self.pgs_max_constraints,
+            dim=model.articulation_count * self.dense_max_constraints,
             inputs=[
                 self.articulation_H_rows,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 self.articulation_max_dofs,
                 self.constraint_count_flat,
                 self.J_flat,
@@ -2410,7 +2412,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_hinv_jt_batched_tiled(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
-        hinv_jt_kernel = TiledKernelFactory.get_hinv_jt_kernel(size, self.pgs_max_constraints, model.device)
+        hinv_jt_kernel = TiledKernelFactory.get_hinv_jt_kernel(size, self.dense_max_constraints, model.device)
         wp.launch_tiled(
             hinv_jt_kernel,
             dim=[n_arts],
@@ -2429,7 +2431,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_hinv_jt_batched_tiled_fused(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
-        hinv_jt_kernel = TiledKernelFactory.get_hinv_jt_fused_kernel(size, self.pgs_max_constraints, model.device)
+        hinv_jt_kernel = TiledKernelFactory.get_hinv_jt_fused_kernel(size, self.dense_max_constraints, model.device)
         wp.launch_tiled(
             hinv_jt_kernel,
             dim=[n_arts],
@@ -2451,7 +2453,7 @@ class SolverFeatherPGS(SolverBase):
         n_arts = self.n_arts_by_size[size]
         wp.launch(
             hinv_jt_batched_par_row,
-            dim=n_arts * self.pgs_max_constraints,
+            dim=n_arts * self.dense_max_constraints,
             inputs=[
                 self.L_by_size[size],
                 self.J_by_size[size],
@@ -2459,7 +2461,7 @@ class SolverFeatherPGS(SolverBase):
                 self.art_to_world,
                 self.constraint_count,
                 size,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 n_arts,
             ],
             outputs=[self.Y_by_size[size]],
@@ -2471,7 +2473,7 @@ class SolverFeatherPGS(SolverBase):
         n_arts = self.n_arts_by_size[size]
         wp.launch(
             delassus_batched_par_row_col,
-            dim=n_arts * self.pgs_max_constraints * self.pgs_max_constraints,
+            dim=n_arts * self.dense_max_constraints * self.dense_max_constraints,
             inputs=[
                 self.J_by_size[size],
                 self.Y_by_size[size],
@@ -2479,7 +2481,7 @@ class SolverFeatherPGS(SolverBase):
                 self.art_to_world,
                 self.constraint_count,
                 size,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 n_arts,
             ],
             outputs=[self.C, self.diag],
@@ -2490,7 +2492,7 @@ class SolverFeatherPGS(SolverBase):
         model = self.model
         n_arts = self.n_arts_by_size[size]
         delassus_kernel = TiledKernelFactory.get_delassus_kernel(
-            size, self.pgs_max_constraints, model.device, chunk_size=self.delassus_chunk_size
+            size, self.dense_max_constraints, model.device, chunk_size=self.delassus_chunk_size
         )
         wp.launch_tiled(
             delassus_kernel,
@@ -2522,7 +2524,7 @@ class SolverFeatherPGS(SolverBase):
         n_arts = self.n_arts_by_size[size]
         wp.launch(
             diag_from_JY_par_art,
-            dim=n_arts * self.pgs_max_constraints,
+            dim=n_arts * self.dense_max_constraints,
             inputs=[
                 self.J_by_size[size],
                 self.Y_by_size[size],
@@ -2530,7 +2532,7 @@ class SolverFeatherPGS(SolverBase):
                 self.art_to_world,
                 self.constraint_count,
                 size,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 n_arts,
             ],
             outputs=[self.diag],
@@ -2541,13 +2543,13 @@ class SolverFeatherPGS(SolverBase):
         model = self.model
         wp.launch(
             contact_bias_flat_par_row,
-            dim=model.articulation_count * self.pgs_max_constraints,
+            dim=model.articulation_count * self.dense_max_constraints,
             inputs=[
                 self.articulation_dof_start,
                 self.articulation_H_rows,
                 self.constraint_count_flat,
                 model.articulation_count,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 self.articulation_max_dofs,
                 self.J_flat,
                 self.v_hat,
@@ -2568,7 +2570,7 @@ class SolverFeatherPGS(SolverBase):
             dim=self.world_count,
             inputs=[
                 self.constraint_count,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 self.phi,
                 self.row_beta,
                 self.row_type,
@@ -2587,7 +2589,7 @@ class SolverFeatherPGS(SolverBase):
             dim=n_arts,
             inputs=[
                 self.constraint_count,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 self.art_to_world,
                 self.art_size,
                 self.art_group_idx,
@@ -2609,7 +2611,7 @@ class SolverFeatherPGS(SolverBase):
             dim=model.articulation_count,
             inputs=[
                 self.constraint_count_flat,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 warmstart_flag,
                 self.impulses_flat,
             ],
@@ -2621,14 +2623,14 @@ class SolverFeatherPGS(SolverBase):
         wp.launch(
             prepare_world_impulses,
             dim=self.world_count,
-            inputs=[self.constraint_count, self.pgs_max_constraints, warmstart_flag],
+            inputs=[self.constraint_count, self.dense_max_constraints, warmstart_flag],
             outputs=[self.impulses],
             device=self.model.device,
         )
 
     def _stage5_pgs_solve_flat_tiled_row(self):
         model = self.model
-        M = self.pgs_max_constraints
+        M = self.dense_max_constraints
         A = model.articulation_count
         diag2 = self.diag_flat.reshape((A, M))
         rhs2 = self.rhs_flat.reshape((A, M))
@@ -2660,7 +2662,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage5_pgs_solve_flat_loop(self):
         model = self.model
-        M = self.pgs_max_constraints
+        M = self.dense_max_constraints
         A = model.articulation_count
         diag2 = self.diag_flat.reshape((A, M))
         rhs2 = self.rhs_flat.reshape((A, M))
@@ -2704,7 +2706,7 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_iterations = saved
 
     def _stage5_pgs_solve_world_tiled_row(self):
-        pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_row_kernel(self.pgs_max_constraints, self.model.device)
+        pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_row_kernel(self.dense_max_constraints, self.model.device)
         wp.launch_tiled(
             pgs_kernel,
             dim=[self.world_count],
@@ -2730,7 +2732,7 @@ class SolverFeatherPGS(SolverBase):
             dim=self.world_count,
             inputs=[
                 self.constraint_count,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 self.diag,
                 self.C,
                 self.rhs,
@@ -2746,7 +2748,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage5_pgs_solve_flat_tiled_contact(self):
         model = self.model
-        M = self.pgs_max_constraints
+        M = self.dense_max_constraints
         A = model.articulation_count
         rhs2 = self.rhs_flat.reshape((A, M))
         lam2 = self.impulses_flat.reshape((A, M))
@@ -2771,7 +2773,9 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage5_pgs_solve_world_tiled_contact(self):
-        pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_contact_kernel(self.pgs_max_constraints, self.model.device)
+        pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_contact_kernel(
+            self.dense_max_constraints, self.model.device
+        )
         wp.launch_tiled(
             pgs_kernel,
             dim=[self.world_count],
@@ -2790,7 +2794,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage5_pgs_solve_flat_streaming(self):
         model = self.model
-        M = self.pgs_max_constraints
+        M = self.dense_max_constraints
         A = model.articulation_count
         rhs2 = self.rhs_flat.reshape((A, M))
         lam2 = self.impulses_flat.reshape((A, M))
@@ -2816,7 +2820,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage5_pgs_solve_world_streaming(self):
         pgs_kernel = TiledKernelFactory.get_pgs_solve_streaming_kernel(
-            self.pgs_max_constraints, self.model.device, pgs_chunk_size=self.pgs_chunk_size
+            self.dense_max_constraints, self.model.device, pgs_chunk_size=self.pgs_chunk_size
         )
         wp.launch_tiled(
             pgs_kernel,
@@ -2843,7 +2847,7 @@ class SolverFeatherPGS(SolverBase):
                 self.articulation_dof_start,
                 self.articulation_H_rows,
                 self.constraint_count_flat,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 self.articulation_max_dofs,
                 self.Y_flat,
                 self.v_hat,
@@ -2869,7 +2873,7 @@ class SolverFeatherPGS(SolverBase):
                 size,
                 n_arts,
                 self.constraint_count,
-                self.pgs_max_constraints,
+                self.dense_max_constraints,
                 self.Y_by_size[size],
                 self.impulses,
                 self.v_hat,

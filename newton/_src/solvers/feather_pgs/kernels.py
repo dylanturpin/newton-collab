@@ -2552,7 +2552,7 @@ def clamp_joint_tau(
 TILE_DOF = wp.constant(49)
 
 # Max constraints per articulation we support in the tiled path.
-# pgs_max_constraints must be <= TILE_CONSTRAINTS or we use fall back
+# dense_max_constraints must be <= TILE_CONSTRAINTS or we use fall back
 TILE_CONSTRAINTS = wp.constant(128)
 
 # Threads per tile/block for tile kernels
