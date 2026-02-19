@@ -182,6 +182,17 @@ SOLVER_PRESETS = {
         "pgs_kernel": "streaming",
         "use_parallel_streams": False,
     },
+    "fpgs_mf": {
+        "type": "feather_pgs",
+        "pgs_mode": "velocity",
+        "cholesky_kernel": "tiled",
+        "trisolve_kernel": "tiled",
+        "hinv_jt_kernel": "tiled",
+        "delassus_kernel": "tiled",
+        "pgs_kernel": "tiled_contact",
+        "pgs_max_constraints": 128,
+        "use_parallel_streams": True,
+    },
     "feather_pgs": {
         "type": "feather_pgs",
         # Use defaults from CLI or scenario
@@ -263,7 +274,7 @@ ABLATION_SEQUENCES = {
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
             "pgs_max_constraints": 396,
-            "enable_mf_pgs": False,
+            "pgs_mode": "delassus",
             "use_parallel_streams": False,
         },
         {
@@ -274,7 +285,7 @@ ABLATION_SEQUENCES = {
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
             "pgs_max_constraints": 396,
-            "enable_mf_pgs": False,
+            "pgs_mode": "delassus",
             "use_parallel_streams": False,
         },
         {
@@ -285,7 +296,7 @@ ABLATION_SEQUENCES = {
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
             "pgs_max_constraints": 396,
-            "enable_mf_pgs": False,
+            "pgs_mode": "delassus",
             "use_parallel_streams": False,
         },
         {
@@ -296,7 +307,7 @@ ABLATION_SEQUENCES = {
             "delassus_kernel": "tiled",
             "pgs_kernel": "loop",
             "pgs_max_constraints": 396,
-            "enable_mf_pgs": False,
+            "pgs_mode": "delassus",
             "use_parallel_streams": False,
         },
         {
@@ -307,7 +318,7 @@ ABLATION_SEQUENCES = {
             "delassus_kernel": "tiled",
             "pgs_kernel": "streaming",  # Will be overridden by --ablation-pgs if specified
             "pgs_max_constraints": 396,
-            "enable_mf_pgs": False,
+            "pgs_mode": "delassus",
             "use_parallel_streams": False,
         },
         {
@@ -318,30 +329,30 @@ ABLATION_SEQUENCES = {
             "delassus_kernel": "tiled",
             "pgs_kernel": "streaming",
             "pgs_max_constraints": 396,
-            "enable_mf_pgs": False,
+            "pgs_mode": "delassus",
             "use_parallel_streams": True,
         },
         # --- MF comparison configs ---
         {
-            "label": "no MF (streaming@396)",
-            "cholesky_kernel": "tiled",
-            "trisolve_kernel": "tiled",
-            "hinv_jt_kernel": "par_row",
-            "delassus_kernel": "tiled",
-            "pgs_kernel": "streaming",
-            "pgs_max_constraints": 396,
-            "enable_mf_pgs": False,
-            "use_parallel_streams": True,
-        },
-        {
-            "label": "MF + tiled@128",
+            "label": "hybrid (dense + MF rigid)",
             "cholesky_kernel": "tiled",
             "trisolve_kernel": "tiled",
             "hinv_jt_kernel": "tiled",
             "delassus_kernel": "tiled",
             "pgs_kernel": "tiled_contact",
             "pgs_max_constraints": 128,
-            "enable_mf_pgs": True,
+            "pgs_mode": "hybrid",
+            "use_parallel_streams": True,
+        },
+        {
+            "label": "fully matrix-free GS",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "tiled",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "tiled_contact",
+            "pgs_max_constraints": 128,
+            "pgs_mode": "velocity",
             "use_parallel_streams": True,
         },
     ],
@@ -684,11 +695,8 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
         if args.pgs_warmstart:
             cmd.append("--pgs-warmstart")
         pgs_mode = solver_config.get("pgs_mode", args.pgs_mode)
-        if pgs_mode != "delassus":
+        if pgs_mode != "hybrid":
             cmd.extend(["--pgs-mode", pgs_mode])
-        enable_mf = solver_config.get("enable_mf_pgs", args.enable_mf_pgs)
-        if not enable_mf:
-            cmd.append("--no-mf-pgs")
 
         # Chunk sizes: solver_config overrides CLI
         delassus_chunk = solver_config.get("delassus_chunk_size", getattr(args, "delassus_chunk_size", None))
@@ -1549,7 +1557,6 @@ def create_solver(model, args, scenario_cfg: dict):
             "pgs_max_constraints": args.pgs_max_constraints,
             "pgs_warmstart": args.pgs_warmstart,
             "pgs_mode": args.pgs_mode,
-            "enable_mf_pgs": args.enable_mf_pgs,
             "enable_contact_friction": True,
             "storage": args.storage or scenario_cfg.get("storage", "batched"),
             "cholesky_kernel": cholesky,
@@ -2081,9 +2088,10 @@ def main():
     parser.add_argument(
         "--pgs-mode",
         type=str,
-        choices=["delassus", "mf"],
-        default="delassus",
-        help="PGS mode: delassus (default) or mf (velocity-space Jacobi)",
+        choices=["delassus", "hybrid", "velocity"],
+        default="hybrid",
+        help="PGS mode: delassus (pure Delassus), hybrid (Delassus + MF for free rigid bodies, default), "
+        "or velocity (fully matrix-free velocity-space GS)",
     )
     parser.add_argument(
         "--delassus-chunk-size",
@@ -2096,19 +2104,6 @@ def main():
         type=int,
         default=None,
         help="Chunk size (contacts) for streaming PGS kernel (None=1)",
-    )
-    parser.add_argument(
-        "--enable-mf-pgs",
-        action="store_true",
-        dest="enable_mf_pgs",
-        default=True,
-        help="Enable matrix-free PGS for free rigid body contacts (default)",
-    )
-    parser.add_argument(
-        "--no-mf-pgs",
-        action="store_false",
-        dest="enable_mf_pgs",
-        help="Disable matrix-free PGS for free rigid body contacts",
     )
     parser.add_argument("--use-parallel-streams", action="store_true", dest="use_parallel_streams")
     parser.add_argument("--no-parallel-streams", action="store_false", dest="use_parallel_streams")
