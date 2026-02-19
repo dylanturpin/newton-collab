@@ -563,6 +563,7 @@ class SolverFeatherPGS(SolverBase):
         """
         if self.pgs_mode == "delassus" or not model.articulation_count or not model.joint_count:
             self._has_free_rigid_bodies = False
+            self._has_mixed_contacts = False
             self._n_free_rigid = 0
             self.is_free_rigid = None
             return
