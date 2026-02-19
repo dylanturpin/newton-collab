@@ -1,0 +1,31 @@
+{
+  "label": "+ tiled cholesky",
+  "config": {
+    "label": "+ tiled cholesky",
+    "cholesky_kernel": "tiled",
+    "trisolve_kernel": "loop",
+    "hinv_jt_kernel": "par_row",
+    "delassus_kernel": "par_row_col",
+    "pgs_kernel": "loop",
+    "use_parallel_streams": false,
+    "type": "feather_pgs"
+  },
+  "env_fps": 132410.44,
+  "kernels": {
+    "hinv_jt_flat_par_row": 1934.0,
+    "delassus_flat_par_row": 739.0,
+    "trisolve_flat_loop": 186.0,
+    "build_contact_rows_normal": 130.0,
+    "eval_rigid_id": 129.0,
+    "crba_fill_flat_par_dof": 110.0,
+    "compute_composite_inertia": 109.0,
+    "pgs_solve_loop": 104.0,
+    "eval_rigid_mass": 72.0,
+    "eval_articulation_fk": 72.0,
+    "cholesky_flat_tiled_49": 69.0,
+    "eval_rigid_tau": 64.0,
+    "eval_rigid_fk": 59.0,
+    "build_augmented_joint_rows": 32.0,
+    "contact_bias_flat_par_row": 25.0
+  }
+}
