@@ -309,6 +309,10 @@
 
   <div class="controls">
     <div class="control">
+      <label for="gpu-select">GPU</label>
+      <select id="gpu-select"></select>
+    </div>
+    <div class="control">
       <label for="run-select">Run</label>
       <select id="run-select"></select>
     </div>
@@ -420,15 +424,17 @@
       fpgs_tiled: '#35c1a2',
       fpgs_tiled_contact: '#35c1a2',
       fpgs_tiled_row: '#6aa7ff',
-      fpgs_loop: '#f6b352',
+      fpgs_mf: '#f6b352',
+      fpgs_loop: '#94a3b8',
       fpgs_streaming: '#ef7a67',
       mujoco: '#9f7aea'
     };
 
     const LABEL_MAP = {
-      fpgs_tiled: 'FeatherPGS (tiled)',
-      fpgs_tiled_contact: 'FeatherPGS (tiled)',
+      fpgs_tiled: 'FeatherPGS (hybrid)',
+      fpgs_tiled_contact: 'FeatherPGS (hybrid)',
       fpgs_tiled_row: 'FeatherPGS (tiled_row)',
+      fpgs_mf: 'FeatherPGS (velocity MF)',
       fpgs_loop: 'FeatherPGS (loop)',
       fpgs_streaming: 'FeatherPGS (streaming)',
       mujoco: 'MJWarp'
@@ -469,6 +475,7 @@
     let charts = {};
     let renders = [];  // populated from renders.json per run
 
+    const gpuSelect = document.getElementById('gpu-select');
     const runSelect = document.getElementById('run-select');
     const sceneSelect = document.getElementById('scene-select');
     const videoSelect = document.getElementById('video-select');
@@ -480,6 +487,27 @@
     const runBadge = document.getElementById('run-badge');
     const runTitle = document.getElementById('run-title');
     const systemInfo = document.getElementById('system-info');
+
+    function getFilteredRuns() {
+      return runs.filter(r => r.gpu === gpuSelect.value);
+    }
+
+    function getFilteredPoints() {
+      return points.filter(p => p.gpu === gpuSelect.value);
+    }
+
+    function refreshRunSelect() {
+      const filtered = getFilteredRuns();
+      const prevRun = runSelect.value;
+      runSelect.innerHTML = filtered.map(run => `<option value="${run.run_id}">${formatRunLabel(run)}</option>`).join('');
+      if (filtered.some(r => r.run_id === prevRun)) {
+        runSelect.value = prevRun;
+      } else if (filtered.length) {
+        runSelect.value = filtered[0].run_id;
+      }
+      const latest = filtered[0];
+      runBadge.textContent = latest ? `Latest: ${formatRunLabel(latest)}` : 'No runs';
+    }
 
     function parseJsonl(text) {
       return text
@@ -495,7 +523,8 @@
     function formatRunLabel(run) {
       const date = run.timestamp ? run.timestamp.replace('T', ' ').replace('Z', ' UTC') : 'unknown time';
       const commit = run.commit_short || (run.commit ? run.commit.slice(0, 7) : 'unknown');
-      return `${date} • ${commit}`;
+      const gpu = run.gpu ? ` • ${run.gpu}` : '';
+      return `${date} • ${commit}${gpu}`;
     }
 
     function unique(values) {
@@ -944,7 +973,7 @@
     function updateTimeSeriesControls() {
       const mode = modeSelect.value;
       const scene = getSelectedScene();
-      const available = points.filter(p => p.mode === mode && p.scenario === scene);
+      const available = getFilteredPoints().filter(p => p.mode === mode && p.scenario === scene);
 
       const solvers = unique(available.map(p => getSolverKey(p, mode)));
       solverSelect.innerHTML = solvers.map(s => `<option value="${s}">${s}</option>`).join('');
@@ -964,7 +993,7 @@
       const env = Number(envSelect.value);
       const metric = metricSelect.value;
 
-      const filtered = points.filter(p => {
+      const filtered = getFilteredPoints().filter(p => {
         if (p.mode !== mode) return false;
         if (p.scenario !== scene) return false;
         const key = getSolverKey(p, mode);
@@ -982,6 +1011,18 @@
       document.getElementById('timeseries-title').textContent = `${metric.replace('_', ' ')} over time`;
     }
 
+    function updateSystemInfo() {
+      const latest = getFilteredRuns()[0];
+      if (!latest) { systemInfo.textContent = 'No runs for this GPU.'; return; }
+      const system = [
+        latest.gpu ? `GPU: ${latest.gpu}` : null,
+        latest.gpu_memory_total_gb ? `VRAM: ${Number(latest.gpu_memory_total_gb).toFixed(1)} GB` : null,
+        latest.platform ? `OS: ${latest.platform}` : null,
+        latest.python_version ? `Python: ${latest.python_version}` : null
+      ].filter(Boolean).join(' \u2022 ');
+      systemInfo.textContent = system || 'System info unavailable.';
+    }
+
     // ---- Init ----
 
     async function init() {
@@ -996,11 +1037,19 @@
 
         if (!runs.length) throw new Error('No runs found');
 
-        runSelect.innerHTML = runs.map(run => `<option value="${run.run_id}">${formatRunLabel(run)}</option>`).join('');
-        runSelect.value = runs[0].run_id;
-        runBadge.textContent = `Latest: ${formatRunLabel(runs[0])}`;
+        // Populate GPU filter
+        const gpus = unique(runs.map(r => r.gpu).filter(Boolean));
+        gpuSelect.innerHTML = gpus.map(g => `<option value="${g}">${g}</option>`).join('');
+
+        refreshRunSelect();
 
         // Event listeners
+        gpuSelect.addEventListener('change', () => {
+          refreshRunSelect();
+          renderSceneCharts();
+          updateTimeSeriesControls();
+          updateSystemInfo();
+        });
         runSelect.addEventListener('change', () => renderSceneCharts());
         sceneSelect.addEventListener('change', () => {
           updateVideoSelector();
@@ -1016,16 +1065,7 @@
         // Initial render
         renderSceneCharts();
         updateTimeSeriesControls();
-
-        const latest = runs[0];
-        const system = [
-          latest.gpu ? `GPU: ${latest.gpu}` : null,
-          latest.gpu_memory_total_gb ? `VRAM: ${Number(latest.gpu_memory_total_gb).toFixed(1)} GB` : null,
-          latest.platform ? `OS: ${latest.platform}` : null,
-          latest.python_version ? `Python: ${latest.python_version}` : null
-        ].filter(Boolean).join(' • ');
-
-        systemInfo.textContent = system || 'System info unavailable.';
+        updateSystemInfo();
       } catch (err) {
         errorEl.textContent = `Failed to load benchmark data: ${err.message}`;
         errorEl.style.display = 'block';
