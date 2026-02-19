@@ -20,6 +20,7 @@ from __future__ import annotations
 import copy
 import ctypes
 import math
+import os
 import warnings
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
@@ -1735,11 +1736,341 @@ class ModelBuilder:
                 For example, (5.0, 5.0, 0.0) arranges copies in a 2D grid in the XY plane.
                 Defaults to (0.0, 0.0, 0.0).
         """
+        # Fast path: when replicating into an empty builder, bulk-copy source arrays with
+        # vectorized offsets instead of calling add_world()/add_builder() N times.
+        if self._can_use_bulk_replicate(builder):
+            self._replicate_bulk(builder, world_count, spacing)
+            return
+
         offsets = compute_world_offsets(world_count, spacing, self.up_axis)
         xform = wp.transform_identity()
         for i in range(world_count):
             xform[:3] = offsets[i]
             self.add_world(builder, xform=xform)
+
+    def _can_use_bulk_replicate(self, builder: ModelBuilder) -> bool:
+        """Check whether the fast bulk replicate path can be used."""
+        if os.environ.get("NEWTON_DISABLE_BULK_REPLICATE") == "1":
+            return False
+
+        # Bulk path requires destination builder to be empty.
+        if self.body_count or self.shape_count or self.joint_count or self.particle_count:
+            return False
+        if self.num_worlds > 0:
+            return False
+
+        # Restrict v1 fast path to rigid-only scenes.
+        if builder.particle_count or builder.spring_count or builder.edge_count:
+            return False
+        if builder.tri_count or builder.tet_count:
+            return False
+        if builder.muscle_count:
+            return False
+
+        # Skip constraints that require extra remapping logic for fast path.
+        if len(builder.equality_constraint_type) or len(builder.constraint_mimic_joint0):
+            return False
+
+        return True
+
+    def _replicate_bulk(
+        self,
+        builder: ModelBuilder,
+        num_worlds: int,
+        spacing: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ):
+        """Vectorized rigid-only replication using numpy tiling.
+
+        This avoids Python per-world add_builder() overhead and list growth churn.
+        """
+        if builder.up_axis != self.up_axis:
+            raise ValueError("Cannot add a builder with a different up axis.")
+
+        N = num_worlds
+        nb = builder.body_count
+        ns = builder.shape_count
+        nj = builder.joint_count
+        na = builder.articulation_count
+        n_jdof = builder.joint_dof_count
+        n_jcoord = builder.joint_coord_count
+        n_jcts = builder.joint_constraint_count
+
+        offsets = compute_world_offsets(N, spacing, self.up_axis)
+
+        # Copy requested state/contact attrs.
+        self._requested_contact_attributes.update(builder._requested_contact_attributes)
+        self._requested_state_attributes.update(builder._requested_state_attributes)
+
+        # World metadata
+        self.num_worlds = N
+        default_gravity = tuple(g * builder.gravity for g in builder.up_vector)
+        self.world_gravity = [default_gravity] * N
+
+        def tile_list(src):
+            return src * N
+
+        def tile_int_with_offset(src, per_copy_offset):
+            """Tile int list and add per-copy offsets, preserving -1 sentinels."""
+            if not src:
+                return []
+            arr = np.array(src, dtype=np.int64)
+            tiled = np.tile(arr, N)
+            n = len(src)
+            copy_offsets = np.repeat(np.arange(N, dtype=np.int64) * per_copy_offset, n)
+            mask = tiled >= 0
+            tiled[mask] += copy_offsets[mask]
+            return tiled.tolist()
+
+        def make_world_ids(count_per_copy):
+            if count_per_copy == 0:
+                return []
+            return np.repeat(np.arange(N, dtype=np.int32), count_per_copy).tolist()
+
+        # Bodies
+        self.body_mass = tile_list(builder.body_mass)
+        self.body_inv_mass = tile_list(builder.body_inv_mass)
+        self.body_inertia = tile_list(builder.body_inertia)
+        self.body_inv_inertia = tile_list(builder.body_inv_inertia)
+        self.body_com = tile_list(builder.body_com)
+        self.body_lock_inertia = tile_list(builder.body_lock_inertia)
+        self.body_qd = tile_list(builder.body_qd)
+        self.body_world = make_world_ids(nb)
+
+        if nb > 0:
+            bq = np.array([list(q) for q in builder.body_q], dtype=np.float32)
+            tiled_bq = np.tile(bq, (N, 1))
+            for i in range(N):
+                tiled_bq[i * nb : (i + 1) * nb, :3] += offsets[i]
+            self.body_q = [wp.transform(*row) for row in tiled_bq]
+        else:
+            self.body_q = []
+
+        # Make per-world keys unique.
+        if builder.body_key:
+            self.body_key = []
+            for i in range(N):
+                self.body_key.extend([f"{k}_w{i}" for k in builder.body_key])
+        else:
+            self.body_key = []
+
+        # body_shapes map: body index -> shape indices
+        self.body_shapes = {-1: []}
+        for i in range(N):
+            body_off = i * nb
+            shape_off = i * ns
+            for b, shapes in builder.body_shapes.items():
+                if b == -1:
+                    self.body_shapes[-1].extend([s + shape_off for s in shapes])
+                else:
+                    self.body_shapes[b + body_off] = [s + shape_off for s in shapes]
+
+        # Shapes
+        self.shape_body = tile_int_with_offset(builder.shape_body, nb)
+        self.shape_transform = tile_list(builder.shape_transform)
+        self.shape_world = make_world_ids(ns)
+
+        shape_tile_attrs = [
+            "shape_key",
+            "shape_flags",
+            "shape_type",
+            "shape_scale",
+            "shape_source",
+            "shape_is_solid",
+            "shape_thickness",
+            "shape_material_ke",
+            "shape_material_kd",
+            "shape_material_kf",
+            "shape_material_ka",
+            "shape_material_mu",
+            "shape_material_restitution",
+            "shape_material_torsional_friction",
+            "shape_material_rolling_friction",
+            "shape_material_k_hydro",
+            "shape_collision_radius",
+            "shape_contact_margin",
+            "shape_collision_group",
+            "shape_sdf_narrow_band_range",
+            "shape_sdf_max_resolution",
+            "shape_sdf_target_voxel_size",
+        ]
+        for attr in shape_tile_attrs:
+            setattr(self, attr, tile_list(getattr(builder, attr)))
+
+        # shape_collision_filter_pairs with per-copy shape offsets
+        # Use the same list-comprehension pattern as add_builder(); this avoids
+        # expensive ndarray-to-tuple materialization for large pair counts.
+        if builder.shape_collision_filter_pairs:
+            self.shape_collision_filter_pairs = []
+            for i in range(N):
+                shape_off = i * ns
+                self.shape_collision_filter_pairs.extend(
+                    [(s1 + shape_off, s2 + shape_off) for s1, s2 in builder.shape_collision_filter_pairs]
+                )
+        else:
+            self.shape_collision_filter_pairs = []
+
+        # Joints
+        self.joint_parent = tile_int_with_offset(builder.joint_parent, nb)
+        self.joint_child = tile_int_with_offset(builder.joint_child, nb)
+        self.joint_articulation = tile_int_with_offset(builder.joint_articulation, na)
+        self.joint_q_start = tile_int_with_offset(builder.joint_q_start, n_jcoord)
+        self.joint_qd_start = tile_int_with_offset(builder.joint_qd_start, n_jdof)
+        self.joint_cts_start = tile_int_with_offset(builder.joint_cts_start, n_jcts)
+        self.joint_world = make_world_ids(nj)
+
+        # joint_q with world-space offsets for FREE joints
+        self.joint_q = tile_list(builder.joint_q)
+        if nb > 0 and nj > 0:
+            for i in range(N):
+                for j in range(nj):
+                    if builder.joint_type[j] == JointType.FREE:
+                        qi = builder.joint_q_start[j]
+                        gi = i * n_jcoord + qi
+                        for d in range(3):
+                            self.joint_q[gi + d] += offsets[i][d]
+
+        self.joint_X_p = tile_list(builder.joint_X_p)
+
+        joint_tile_attrs = [
+            "joint_type",
+            "joint_enabled",
+            "joint_X_c",
+            "joint_armature",
+            "joint_axis",
+            "joint_dof_dim",
+            "joint_qd",
+            "joint_cts",
+            "joint_f",
+            "joint_target_pos",
+            "joint_target_vel",
+            "joint_limit_lower",
+            "joint_limit_upper",
+            "joint_limit_ke",
+            "joint_limit_kd",
+            "joint_target_ke",
+            "joint_target_kd",
+            "joint_act_mode",
+            "joint_effort_limit",
+            "joint_velocity_limit",
+            "joint_friction",
+        ]
+        for attr in joint_tile_attrs:
+            setattr(self, attr, tile_list(getattr(builder, attr)))
+
+        if builder.joint_key:
+            self.joint_key = []
+            for i in range(N):
+                self.joint_key.extend([f"{k}_w{i}" for k in builder.joint_key])
+        else:
+            self.joint_key = []
+
+        # Rebuild parent/child adjacency maps
+        self.joint_parents = {}
+        self.joint_children = {}
+        for i in range(N):
+            body_off = i * nb
+            for child, parents in builder.joint_parents.items():
+                new_child = child + body_off if child >= 0 else child
+                new_parents = [p + body_off if p >= 0 else p for p in parents]
+                self.joint_parents[new_child] = new_parents
+            for parent, children in builder.joint_children.items():
+                new_parent = parent + body_off if parent >= 0 else parent
+                new_children = [c + body_off for c in children]
+                if new_parent in self.joint_children:
+                    self.joint_children[new_parent].extend(new_children)
+                else:
+                    self.joint_children[new_parent] = new_children
+
+        self.joint_dof_count = n_jdof * N
+        self.joint_coord_count = n_jcoord * N
+        self.joint_constraint_count = n_jcts * N
+
+        # Articulations
+        self.articulation_start = tile_int_with_offset(builder.articulation_start, nj)
+        self.articulation_world = make_world_ids(na)
+        if builder.articulation_key:
+            self.articulation_key = []
+            for i in range(N):
+                self.articulation_key.extend([f"{k}_w{i}" for k in builder.articulation_key])
+        else:
+            self.articulation_key = []
+
+        # Custom attributes
+        entity_counts = {
+            "body": nb,
+            "shape": ns,
+            "joint": nj,
+            "joint_dof": n_jdof,
+            "joint_coord": n_jcoord,
+            "joint_constraint": n_jcts,
+            "articulation": na,
+        }
+        for full_key, attr in builder.custom_attributes.items():
+            freq_key = attr.frequency_key
+            if isinstance(freq_key, str):
+                if attr.values:
+                    tiled_values = []
+                    per_copy_count = len(attr.values)
+                    for i in range(N):
+                        if attr.references and attr.references in entity_counts:
+                            ref_off = i * entity_counts[attr.references]
+                            tiled_values.extend(
+                                [v + ref_off if isinstance(v, int) and v >= 0 else v for v in attr.values]
+                            )
+                        elif attr.references == "world":
+                            tiled_values.extend([i] * per_copy_count)
+                        else:
+                            tiled_values.extend(attr.values)
+                    self.custom_attributes[full_key] = replace(attr, values=tiled_values)
+                else:
+                    self.custom_attributes[full_key] = replace(attr, values=[])
+            elif attr.frequency == Model.AttributeFrequency.WORLD:
+                if attr.values:
+                    new_values = {}
+                    for i in range(N):
+                        for _idx, value in attr.values.items():
+                            if attr.references == "world":
+                                new_values[i] = i
+                            elif attr.references and attr.references in entity_counts:
+                                ref_off = i * entity_counts[attr.references]
+                                new_values[i] = value + ref_off if isinstance(value, int) and value >= 0 else value
+                            else:
+                                new_values[i] = value
+                    self.custom_attributes[full_key] = replace(attr, values=new_values)
+                else:
+                    self.custom_attributes[full_key] = replace(attr, values={})
+            elif attr.frequency == Model.AttributeFrequency.ONCE:
+                if isinstance(attr.values, dict):
+                    copied = dict(attr.values)
+                else:
+                    copied = list(attr.values)
+                self.custom_attributes[full_key] = replace(attr, values=copied)
+            else:
+                freq_name = attr.frequency.name.lower()
+                per_copy_count = entity_counts.get(freq_name, 0)
+                if attr.values and per_copy_count > 0:
+                    new_values = {}
+                    for i in range(N):
+                        idx_off = i * per_copy_count
+                        ref_off = 0
+                        if attr.references and attr.references in entity_counts:
+                            ref_off = i * entity_counts[attr.references]
+                        for idx, value in attr.values.items():
+                            if attr.references == "world":
+                                new_values[idx_off + idx] = i
+                            elif ref_off and isinstance(value, int) and value >= 0:
+                                new_values[idx_off + idx] = value + ref_off
+                            else:
+                                new_values[idx_off + idx] = value
+                    self.custom_attributes[full_key] = replace(attr, values=new_values)
+                else:
+                    self.custom_attributes[full_key] = replace(
+                        attr,
+                        values={} if isinstance(attr.values, dict) else [],
+                    )
+
+        for freq_key, count in builder._custom_frequency_counts.items():
+            self._custom_frequency_counts[freq_key] = count * N
 
     def add_articulation(
         self, joints: list[int], label: str | None = None, custom_attributes: dict[str, Any] | None = None
