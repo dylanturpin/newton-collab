@@ -302,7 +302,7 @@ class Example:
                 self.model,
                 update_mass_matrix_interval=1,
                 pgs_iterations=32,
-                pgs_max_constraints=64,
+                dense_max_constraints=64,
                 pgs_warmstart=False,
                 pgs_omega=1.0,
                 pgs_beta=0.1,

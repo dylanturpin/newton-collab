@@ -63,7 +63,7 @@ class Example:
         solver_type: str = "feather_pgs",
         update_mass_matrix_interval: int = 1,
         pgs_iterations: int = 12,
-        pgs_max_constraints: int = 32,
+        dense_max_constraints: int = 32,
         pgs_beta: float = 0.01,
         pgs_cfm: float = 1.0e-6,
         pgs_omega: float = 1.0,
@@ -136,7 +136,7 @@ class Example:
                 "pgs_beta": pgs_beta,
                 "pgs_cfm": pgs_cfm,
                 "pgs_omega": pgs_omega,
-                "pgs_max_constraints": pgs_max_constraints,
+                "dense_max_constraints": dense_max_constraints,
                 "pgs_warmstart": pgs_warmstart,
                 "enable_contact_friction": True,
                 "storage": "flat",
@@ -159,7 +159,7 @@ class Example:
                 "omega",
                 self.solver.pgs_omega,
                 "max_constraints",
-                self.solver.pgs_max_constraints,
+                self.solver.dense_max_constraints,
                 "pgs_warmstart",
                 self.solver.pgs_warmstart,
             )
@@ -406,7 +406,7 @@ if __name__ == "__main__":
     # FeatherPGS-specific parameters
     parser.add_argument("--pgs-iterations", type=int, default=12, help="Number of PGS iterations per frame.")
     parser.add_argument(
-        "--pgs-max-constraints",
+        "--dense-max-constraints",
         type=int,
         default=32,
         help="Maximum number of stored contact constraints per articulation for PGS.",
@@ -490,7 +490,7 @@ if __name__ == "__main__":
         solver_type=args.solver,
         update_mass_matrix_interval=args.update_mass_matrix_interval,
         pgs_iterations=args.pgs_iterations,
-        pgs_max_constraints=args.pgs_max_constraints,
+        dense_max_constraints=args.dense_max_constraints,
         pgs_beta=args.pgs_beta,
         pgs_cfm=args.pgs_cfm,
         pgs_omega=args.pgs_omega,
