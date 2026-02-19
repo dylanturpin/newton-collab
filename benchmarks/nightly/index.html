@@ -259,6 +259,27 @@
       opacity: 0.4;
     }
 
+    .video-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.25rem 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .video-card video {
+      width: 100%;
+      max-width: 640px;
+      border-radius: 8px;
+      background: #000;
+    }
+
+    .video-card .note {
+      margin-top: 0;
+    }
+
     @media (max-width: 768px) {
       body {
         padding: 1rem;
@@ -292,96 +313,97 @@
       <select id="run-select"></select>
     </div>
     <div class="control">
-      <label for="mode-select">Time Series Mode</label>
-      <select id="mode-select">
-        <option value="sweep">Sweep</option>
-        <option value="ablation">Ablation</option>
+      <label for="scene-select">Scene</label>
+      <select id="scene-select">
+        <option value="h1_tabletop">H1 Tabletop</option>
+        <option value="g1_flat">G1 Flat</option>
       </select>
     </div>
-    <div class="control">
-      <label for="scenario-select">Scenario</label>
-      <select id="scenario-select"></select>
-    </div>
-    <div class="control">
-      <label for="solver-select">Solver / Variant</label>
-      <select id="solver-select"></select>
-    </div>
-    <div class="control">
-      <label for="env-select">Env Count</label>
-      <select id="env-select"></select>
-    </div>
-    <div class="control">
-      <label for="metric-select">Metric</label>
-      <select id="metric-select">
-        <option value="env_fps">Env-FPS</option>
-        <option value="gpu_used_gb">GPU Memory (GB)</option>
-        <option value="elapsed_s">Elapsed (s)</option>
-      </select>
+    <div class="control" id="video-select-control">
+      <label for="video-select">Preview</label>
+      <select id="video-select"></select>
     </div>
   </div>
 
+  <!-- Scene preview video -->
+  <section class="section" id="video-section">
+    <div class="section-title">Scene Preview <span id="video-title">–</span></div>
+    <div class="video-card">
+      <video id="scene-video" autoplay loop muted playsinline>
+        <source id="scene-video-src" src="" type="video/mp4" />
+      </video>
+      <div class="note" id="video-note"></div>
+    </div>
+  </section>
+
+  <!-- Run snapshot charts (for selected scene) -->
   <section class="section">
     <div class="section-title">Run Snapshot <span id="run-title">–</span></div>
     <div class="grid">
       <div class="card">
-        <h3>G1 Flat Sweep • Env-FPS</h3>
-        <div class="chart-wrap"><canvas id="g1-flat-fps"></canvas></div>
+        <h3 id="sweep-fps-title">Sweep • Env-FPS</h3>
+        <div class="chart-wrap"><canvas id="sweep-fps"></canvas></div>
       </div>
       <div class="card">
-        <h3>G1 Flat Sweep • GPU Memory</h3>
-        <div class="chart-wrap"><canvas id="g1-flat-gpu"></canvas></div>
+        <h3 id="sweep-gpu-title">Sweep • GPU Memory</h3>
+        <div class="chart-wrap"><canvas id="sweep-gpu"></canvas></div>
       </div>
       <div class="card">
-        <h3>G1 Flat Ablation • Env-FPS</h3>
-        <div class="chart-wrap"><canvas id="g1-flat-ablation"></canvas></div>
-      </div>
-      <div class="card">
-        <h3>H1 Tabletop Sweep • Env-FPS</h3>
-        <div class="chart-wrap"><canvas id="h1-tabletop-fps"></canvas></div>
-      </div>
-      <div class="card">
-        <h3>H1 Tabletop Sweep • GPU Memory</h3>
-        <div class="chart-wrap"><canvas id="h1-tabletop-gpu"></canvas></div>
-      </div>
-      <div class="card">
-        <h3>H1 Tabletop Ablation • Env-FPS</h3>
-        <div class="chart-wrap"><canvas id="h1-tabletop-ablation"></canvas></div>
+        <h3 id="ablation-title">Ablation • Env-FPS</h3>
+        <div class="chart-wrap"><canvas id="ablation-fps"></canvas></div>
       </div>
     </div>
   </section>
 
+  <!-- Kernel stage breakdown (for selected scene) -->
   <section class="section">
     <div class="section-title">Kernel Stage Breakdown</div>
     <div class="grid">
       <div class="card">
-        <h3>G1 Flat Ablation • Stage Breakdown</h3>
-        <div class="chart-wrap"><canvas id="g1-flat-kernel-stack"></canvas></div>
-      </div>
-      <div class="card">
-        <h3>H1 Tabletop Ablation • Stage Breakdown</h3>
-        <div class="chart-wrap"><canvas id="h1-tabletop-kernel-stack"></canvas></div>
+        <h3 id="kernel-stack-title">Ablation • Stage Breakdown</h3>
+        <div class="chart-wrap"><canvas id="kernel-stack"></canvas></div>
       </div>
     </div>
     <div style="margin-top:1.25rem;">
       <div class="card" style="min-height:auto;">
-        <h3>G1 Flat Ablation • Kernel Detail</h3>
-        <div id="g1-flat-kernel-table" style="overflow-x:auto;"></div>
-      </div>
-    </div>
-    <div style="margin-top:1.25rem;">
-      <div class="card" style="min-height:auto;">
-        <h3>H1 Tabletop Ablation • Kernel Detail</h3>
-        <div id="h1-tabletop-kernel-table" style="overflow-x:auto;"></div>
+        <h3 id="kernel-detail-title">Ablation • Kernel Detail</h3>
+        <div id="kernel-table" style="overflow-x:auto;"></div>
       </div>
     </div>
   </section>
 
+  <!-- Time series -->
   <section class="section">
     <div class="section-title">Time Series</div>
+    <div class="controls">
+      <div class="control">
+        <label for="mode-select">Mode</label>
+        <select id="mode-select">
+          <option value="sweep">Sweep</option>
+          <option value="ablation">Ablation</option>
+        </select>
+      </div>
+      <div class="control">
+        <label for="solver-select">Solver / Variant</label>
+        <select id="solver-select"></select>
+      </div>
+      <div class="control">
+        <label for="env-select">Env Count</label>
+        <select id="env-select"></select>
+      </div>
+      <div class="control">
+        <label for="metric-select">Metric</label>
+        <select id="metric-select">
+          <option value="env_fps">Env-FPS</option>
+          <option value="gpu_used_gb">GPU Memory (GB)</option>
+          <option value="elapsed_s">Elapsed (s)</option>
+        </select>
+      </div>
+    </div>
     <div class="card">
       <h3 id="timeseries-title">Env-FPS over time</h3>
       <div class="chart-wrap"><canvas id="timeseries-chart"></canvas></div>
-      <div class="note">Select a scenario, solver, and env count to compare over time.</div>
+      <div class="note">Tracks the selected metric across nightly runs.</div>
     </div>
   </section>
 
@@ -412,6 +434,11 @@
       mujoco: 'MJWarp'
     };
 
+    const SCENE_LABELS = {
+      g1_flat: 'G1 Flat',
+      h1_tabletop: 'H1 Tabletop'
+    };
+
     const STAGE_COLORS = {
       '0_collision':     '#f97316',
       '1_fk_id':         '#22d3ee',
@@ -440,10 +467,12 @@
     let runs = [];
     let points = [];
     let charts = {};
+    let renders = [];  // populated from renders.json per run
 
     const runSelect = document.getElementById('run-select');
+    const sceneSelect = document.getElementById('scene-select');
+    const videoSelect = document.getElementById('video-select');
     const modeSelect = document.getElementById('mode-select');
-    const scenarioSelect = document.getElementById('scenario-select');
     const solverSelect = document.getElementById('solver-select');
     const envSelect = document.getElementById('env-select');
     const metricSelect = document.getElementById('metric-select');
@@ -479,6 +508,8 @@
         delete charts[name];
       }
     }
+
+    // ---- Chart builders ----
 
     function buildLineChart(canvasId, datasets, xLabel, yLabel) {
       destroyChart(canvasId);
@@ -599,91 +630,37 @@
       });
     }
 
-    function buildKernelTable(containerId, ablationPoints) {
-      const container = document.getElementById(containerId);
-      if (!container) return;
-      if (!ablationPoints.length || !ablationPoints.some(p => p.kernels)) {
-        container.innerHTML = '<div class="note">No kernel timing data available for this run.</div>';
-        return;
-      }
-
-      const labels = ablationPoints.map(p => (p.label || p.solver || '?').replace(/^\+\s*/, '').slice(0, 28));
-
-      // Compute stage totals client-side from raw kernels
-      const perPointStageTotals = ablationPoints.map(p => computeStageTotals(p.kernels));
-
-      // Collect all kernels across all steps, grouped by stage
-      const stageKernels = {};
-      STAGE_ORDER.forEach(s => { stageKernels[s] = new Set(); });
-
-      ablationPoints.forEach(p => {
-        const kernels = p.kernels || {};
-        Object.keys(kernels).forEach(k => {
-          const stage = classifyKernelJS(k);
-          if (!stageKernels[stage]) stageKernels[stage] = new Set();
-          stageKernels[stage].add(k);
-        });
-      });
-
-      // Compute step totals for percentage calculation
-      const stepTotals = perPointStageTotals.map(st =>
-        Object.values(st).reduce((a, b) => a + b, 0)
-      );
-
-      let html = '<table class="kernel-table"><thead><tr><th>Kernel</th>';
-      labels.forEach(l => { html += `<th>${l}</th>`; });
-      html += '</tr></thead><tbody>';
-
-      // Per-kernel rows grouped by stage
-      STAGE_ORDER.forEach(stage => {
-        const kernelNames = Array.from(stageKernels[stage] || []).sort();
-        if (!kernelNames.length) return;
-
-        html += `<tr class="stage-header"><td colspan="${labels.length + 1}">[${stage}]</td></tr>`;
-        kernelNames.forEach(k => {
-          html += '<tr class="kernel-row"><td>&nbsp;&nbsp;' + k + '</td>';
-          ablationPoints.forEach((p, i) => {
-            const val = (p.kernels || {})[k];
-            if (val !== undefined && val !== null) {
-              const pct = stepTotals[i] > 0 ? ((val / stepTotals[i]) * 100).toFixed(0) : '0';
-              html += `<td>${val.toFixed(1)}ms (${pct}%)</td>`;
-            } else {
-              html += '<td class="absent">\u2013</td>';
+    function buildTimeSeriesChart(datasets) {
+      destroyChart('timeseries-chart');
+      charts['timeseries-chart'] = new Chart(document.getElementById('timeseries-chart'), {
+        type: 'line',
+        data: { datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'nearest', intersect: false },
+          scales: {
+            x: {
+              type: 'time',
+              time: { unit: 'day' },
+              ticks: { color: '#9aa6b2' },
+              grid: { color: 'rgba(255,255,255,0.05)' }
+            },
+            y: {
+              ticks: { color: '#9aa6b2' },
+              grid: { color: 'rgba(255,255,255,0.05)' },
+              beginAtZero: true
             }
-          });
-          html += '</tr>';
-        });
-      });
-
-      // Stage totals section
-      html += `<tr class="stage-totals-sep"><td colspan="${labels.length + 1}">STAGE TOTALS</td></tr>`;
-      STAGE_ORDER.forEach(stage => {
-        const hasData = perPointStageTotals.some(st => st[stage]);
-        if (!hasData) return;
-
-        html += `<tr><td>${stage}</td>`;
-        perPointStageTotals.forEach((st, i) => {
-          const val = st[stage];
-          if (val !== undefined && val !== null) {
-            const pct = stepTotals[i] > 0 ? ((val / stepTotals[i]) * 100).toFixed(0) : '0';
-            html += `<td>${val.toFixed(1)}ms (${pct}%)</td>`;
-          } else {
-            html += '<td class="absent">\u2013</td>';
+          },
+          plugins: {
+            legend: { labels: { color: '#9aa6b2' } }
           }
-        });
-        html += '</tr>';
+        }
       });
-
-      // Total row
-      html += '<tr class="total-row"><td>TOTAL</td>';
-      stepTotals.forEach(t => { html += `<td>${t.toFixed(1)}ms</td>`; });
-      html += '</tr>';
-
-      html += '</tbody></table>';
-      container.innerHTML = html;
     }
 
-    // JS-side kernel classifier mirroring classify_kernel() in Python
+    // ---- Kernel classification ----
+
     function classifyKernelJS(kernelName) {
       const n = kernelName.toLowerCase();
       const PATTERNS = {
@@ -721,82 +698,86 @@
       return totals;
     }
 
-    function buildTimeSeriesChart(datasets) {
-      destroyChart('timeseries-chart');
-      charts['timeseries-chart'] = new Chart(document.getElementById('timeseries-chart'), {
-        type: 'line',
-        data: { datasets },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          interaction: { mode: 'nearest', intersect: false },
-          scales: {
-            x: {
-              type: 'time',
-              time: { unit: 'day' },
-              ticks: { color: '#9aa6b2' },
-              grid: { color: 'rgba(255,255,255,0.05)' }
-            },
-            y: {
-              ticks: { color: '#9aa6b2' },
-              grid: { color: 'rgba(255,255,255,0.05)' },
-              beginAtZero: true
-            }
-          },
-          plugins: {
-            legend: { labels: { color: '#9aa6b2' } }
-          }
-        }
-      });
-    }
+    // ---- Kernel detail table ----
 
-    function renderRunCharts(runId) {
-      const runPoints = points.filter(p => p.run_id === runId);
-      const run = runs.find(r => r.run_id === runId);
-      runTitle.textContent = run ? formatRunLabel(run) : '–';
-
-      const scenarios = ['g1_flat', 'h1_tabletop'];
-      scenarios.forEach(scenario => {
-        const sweep = runPoints.filter(p => p.mode === 'sweep' && p.scenario === scenario && p.ok !== false);
-        const ablation = runPoints.filter(p => p.mode === 'ablation' && p.scenario === scenario && p.ok !== false);
-
-        const sweepDatasetsFps = buildSweepDatasets(sweep, 'env_fps');
-        const sweepDatasetsGpu = buildSweepDatasets(sweep, 'gpu_used_gb');
-
-        buildLineChart(`${scenario.replace('_', '-')}-fps`, sweepDatasetsFps, 'num_envs', 'Env-FPS');
-        buildLineChart(`${scenario.replace('_', '-')}-gpu`, sweepDatasetsGpu, 'num_envs', 'GPU GB');
-
-        const ablationSorted = ablation.slice().sort((a, b) => (a.step_index ?? 0) - (b.step_index ?? 0));
-        const ablationLabels = ablationSorted.map(p => (p.label || p.solver || 'unknown').replace(/^\+\s*/, '').slice(0, 24));
-        const ablationValues = ablationSorted.map(p => p.env_fps || 0);
-        const ablationColors = ablationSorted.map(p => {
-          const label = (p.label || '').toLowerCase();
-          if (label.includes('mujoco')) return '#9f7aea';
-          return '#35c1a2';
-        });
-        buildBarChart(`${scenario.replace('_', '-')}-ablation`, ablationLabels, ablationValues, ablationColors);
-
-        // Stacked stage breakdown chart (computed client-side from raw kernels)
-        const prefix = scenario.replace('_', '-');
-        const perPointTotals = ablationSorted.map(p => computeStageTotals(p.kernels));
-        const stageData = {};
-        STAGE_ORDER.forEach(stage => {
-          const vals = perPointTotals.map(st => st[stage] || 0);
-          if (vals.some(v => v > 0)) stageData[stage] = vals;
-        });
-        buildStackedBarChart(`${prefix}-kernel-stack`, ablationLabels, stageData);
-
-        // Kernel detail table
-        buildKernelTable(`${prefix}-kernel-table`, ablationSorted);
-      });
-    }
-
-    function getSolverKey(point, mode) {
-      if (mode === 'ablation') {
-        return point.label || point.solver || 'unknown';
+    function buildKernelTable(containerId, ablationPoints) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+      if (!ablationPoints.length || !ablationPoints.some(p => p.kernels)) {
+        container.innerHTML = '<div class="note">No kernel timing data available for this run.</div>';
+        return;
       }
-      return point.solver || point.label || 'unknown';
+
+      const labels = ablationPoints.map(p => (p.label || p.solver || '?').replace(/^\+\s*/, '').slice(0, 28));
+      const perPointStageTotals = ablationPoints.map(p => computeStageTotals(p.kernels));
+
+      const stageKernels = {};
+      STAGE_ORDER.forEach(s => { stageKernels[s] = new Set(); });
+
+      ablationPoints.forEach(p => {
+        const kernels = p.kernels || {};
+        Object.keys(kernels).forEach(k => {
+          const stage = classifyKernelJS(k);
+          if (!stageKernels[stage]) stageKernels[stage] = new Set();
+          stageKernels[stage].add(k);
+        });
+      });
+
+      const stepTotals = perPointStageTotals.map(st =>
+        Object.values(st).reduce((a, b) => a + b, 0)
+      );
+
+      let html = '<table class="kernel-table"><thead><tr><th>Kernel</th>';
+      labels.forEach(l => { html += `<th>${l}</th>`; });
+      html += '</tr></thead><tbody>';
+
+      STAGE_ORDER.forEach(stage => {
+        const kernelNames = Array.from(stageKernels[stage] || []).sort();
+        if (!kernelNames.length) return;
+
+        html += `<tr class="stage-header"><td colspan="${labels.length + 1}">[${stage}]</td></tr>`;
+        kernelNames.forEach(k => {
+          html += '<tr class="kernel-row"><td>&nbsp;&nbsp;' + k + '</td>';
+          ablationPoints.forEach((p, i) => {
+            const val = (p.kernels || {})[k];
+            if (val !== undefined && val !== null) {
+              const pct = stepTotals[i] > 0 ? ((val / stepTotals[i]) * 100).toFixed(0) : '0';
+              html += `<td>${val.toFixed(1)}ms (${pct}%)</td>`;
+            } else {
+              html += '<td class="absent">\u2013</td>';
+            }
+          });
+          html += '</tr>';
+        });
+      });
+
+      html += `<tr class="stage-totals-sep"><td colspan="${labels.length + 1}">STAGE TOTALS</td></tr>`;
+      STAGE_ORDER.forEach(stage => {
+        const hasData = perPointStageTotals.some(st => st[stage]);
+        if (!hasData) return;
+
+        html += `<tr><td>${stage}</td>`;
+        perPointStageTotals.forEach((st, i) => {
+          const val = st[stage];
+          if (val !== undefined && val !== null) {
+            const pct = stepTotals[i] > 0 ? ((val / stepTotals[i]) * 100).toFixed(0) : '0';
+            html += `<td>${val.toFixed(1)}ms (${pct}%)</td>`;
+          } else {
+            html += '<td class="absent">\u2013</td>';
+          }
+        });
+        html += '</tr>';
+      });
+
+      html += '<tr class="total-row"><td>TOTAL</td>';
+      stepTotals.forEach(t => { html += `<td>${t.toFixed(1)}ms</td>`; });
+      html += '</tr>';
+
+      html += '</tbody></table>';
+      container.innerHTML = html;
     }
+
+    // ---- Sweep dataset builder ----
 
     function buildSweepDatasets(rows, key) {
       const grouped = {};
@@ -826,27 +807,150 @@
       });
     }
 
-    function updateTimeSeriesControls() {
-      const mode = modeSelect.value;
-      const available = points.filter(p => p.mode === mode);
-      const scenarios = unique(available.map(p => p.scenario));
+    // ---- Main rendering ----
 
-      scenarioSelect.innerHTML = scenarios.map(s => `<option value="${s}">${s}</option>`).join('');
-      scenarioSelect.value = scenarios[0] || '';
-
-      updateSolverEnvOptions();
+    function getSelectedScene() {
+      return sceneSelect.value;
     }
 
-    function updateSolverEnvOptions() {
-      const mode = modeSelect.value;
-      const scenario = scenarioSelect.value;
-      const scoped = points.filter(p => p.mode === mode && p.scenario === scenario);
+    function getSceneLabel(scene) {
+      return SCENE_LABELS[scene] || scene;
+    }
 
-      const solvers = unique(scoped.map(p => getSolverKey(p, mode)));
+    async function loadRenders(runId) {
+      const run = runs.find(r => r.run_id === runId);
+      const runDir = run && run.run_dir ? run.run_dir : `runs/${runId}`;
+      try {
+        const resp = await fetch(`${runDir}/renders.json`);
+        if (!resp.ok) { renders = []; return; }
+        renders = await resp.json();
+      } catch (e) {
+        renders = [];
+      }
+    }
+
+    function updateVideoSelector() {
+      const scene = getSelectedScene();
+      const available = renders.filter(r => r.scenario === scene);
+      const control = document.getElementById('video-select-control');
+
+      if (!available.length) {
+        control.style.display = 'none';
+        document.getElementById('video-section').style.display = 'none';
+        return;
+      }
+
+      control.style.display = '';
+      videoSelect.innerHTML = available.map((r, i) =>
+        `<option value="${i}">${r.label}</option>`
+      ).join('');
+      videoSelect.value = '0';
+      playSelectedVideo();
+    }
+
+    function playSelectedVideo() {
+      const scene = getSelectedScene();
+      const available = renders.filter(r => r.scenario === scene);
+      const idx = parseInt(videoSelect.value, 10);
+      const meta = available[idx];
+
+      const videoEl = document.getElementById('scene-video');
+      const srcEl = document.getElementById('scene-video-src');
+      const noteEl = document.getElementById('video-note');
+      const titleEl = document.getElementById('video-title');
+
+      if (!meta) {
+        document.getElementById('video-section').style.display = 'none';
+        return;
+      }
+
+      const runId = runSelect.value;
+      const run = runs.find(r => r.run_id === runId);
+      const runDir = run && run.run_dir ? run.run_dir : `runs/${runId}`;
+
+      titleEl.textContent = getSceneLabel(scene);
+      srcEl.src = `${runDir}/${meta.path}`;
+      videoEl.load();
+
+      videoEl.onerror = () => {
+        document.getElementById('video-section').style.display = 'none';
+      };
+      videoEl.onloadeddata = () => {
+        document.getElementById('video-section').style.display = '';
+      };
+
+      noteEl.textContent = `${meta.label}, 1 env @ ${meta.fps || 60} fps`;
+    }
+
+    async function renderSceneCharts() {
+      const runId = runSelect.value;
+      const scene = getSelectedScene();
+      const sceneLabel = getSceneLabel(scene);
+      const run = runs.find(r => r.run_id === runId);
+      const runPoints = points.filter(p => p.run_id === runId && p.scenario === scene);
+
+      runTitle.textContent = run ? formatRunLabel(run) : '–';
+
+      // Update chart titles
+      document.getElementById('sweep-fps-title').textContent = `${sceneLabel} Sweep • Env-FPS`;
+      document.getElementById('sweep-gpu-title').textContent = `${sceneLabel} Sweep • GPU Memory`;
+      document.getElementById('ablation-title').textContent = `${sceneLabel} Ablation • Env-FPS`;
+      document.getElementById('kernel-stack-title').textContent = `${sceneLabel} Ablation • Stage Breakdown`;
+      document.getElementById('kernel-detail-title').textContent = `${sceneLabel} Ablation • Kernel Detail`;
+
+      // Sweep charts
+      const sweep = runPoints.filter(p => p.mode === 'sweep' && p.ok !== false);
+      buildLineChart('sweep-fps', buildSweepDatasets(sweep, 'env_fps'), 'num_envs', 'Env-FPS');
+      buildLineChart('sweep-gpu', buildSweepDatasets(sweep, 'gpu_used_gb'), 'num_envs', 'GPU GB');
+
+      // Ablation chart
+      const ablation = runPoints.filter(p => p.mode === 'ablation' && p.ok !== false);
+      const ablationSorted = ablation.slice().sort((a, b) => (a.step_index ?? 0) - (b.step_index ?? 0));
+      const ablationLabels = ablationSorted.map(p => (p.label || p.solver || 'unknown').replace(/^\+\s*/, '').slice(0, 24));
+      const ablationValues = ablationSorted.map(p => p.env_fps || 0);
+      const ablationColors = ablationSorted.map(p => {
+        const label = (p.label || '').toLowerCase();
+        if (label.includes('mujoco')) return '#9f7aea';
+        return '#35c1a2';
+      });
+      buildBarChart('ablation-fps', ablationLabels, ablationValues, ablationColors);
+
+      // Stacked stage breakdown
+      const perPointTotals = ablationSorted.map(p => computeStageTotals(p.kernels));
+      const stageData = {};
+      STAGE_ORDER.forEach(stage => {
+        const vals = perPointTotals.map(st => st[stage] || 0);
+        if (vals.some(v => v > 0)) stageData[stage] = vals;
+      });
+      buildStackedBarChart('kernel-stack', ablationLabels, stageData);
+
+      // Kernel detail table
+      buildKernelTable('kernel-table', ablationSorted);
+
+      // Video
+      await loadRenders(runId);
+      updateVideoSelector();
+    }
+
+    // ---- Time series ----
+
+    function getSolverKey(point, mode) {
+      if (mode === 'ablation') {
+        return point.label || point.solver || 'unknown';
+      }
+      return point.solver || point.label || 'unknown';
+    }
+
+    function updateTimeSeriesControls() {
+      const mode = modeSelect.value;
+      const scene = getSelectedScene();
+      const available = points.filter(p => p.mode === mode && p.scenario === scene);
+
+      const solvers = unique(available.map(p => getSolverKey(p, mode)));
       solverSelect.innerHTML = solvers.map(s => `<option value="${s}">${s}</option>`).join('');
       solverSelect.value = solvers[0] || '';
 
-      const envs = unique(scoped.map(p => p.num_worlds).filter(Boolean));
+      const envs = unique(available.map(p => p.num_worlds).filter(Boolean));
       envSelect.innerHTML = envs.map(n => `<option value="${n}">${n}</option>`).join('');
       envSelect.value = envs[0] || '';
 
@@ -855,14 +959,14 @@
 
     function renderTimeSeries() {
       const mode = modeSelect.value;
-      const scenario = scenarioSelect.value;
+      const scene = getSelectedScene();
       const solver = solverSelect.value;
       const env = Number(envSelect.value);
       const metric = metricSelect.value;
 
       const filtered = points.filter(p => {
         if (p.mode !== mode) return false;
-        if (p.scenario !== scenario) return false;
+        if (p.scenario !== scene) return false;
         const key = getSolverKey(p, mode);
         if (key !== solver) return false;
         if (env && p.num_worlds !== env) return false;
@@ -873,10 +977,12 @@
         .map(p => ({ x: new Date(p.run_timestamp || p.timestamp), y: p[metric] }))
         .sort((a, b) => a.x - b.x);
 
-      const label = `${solver} • ${scenario} • ${env || 'n/a'} envs`;
+      const label = `${solver} • ${scene} • ${env || 'n/a'} envs`;
       buildTimeSeriesChart([{ label, data: dataset, borderColor: '#35c1a2', backgroundColor: '#35c1a2', pointRadius: 4, tension: 0.2 }]);
       document.getElementById('timeseries-title').textContent = `${metric.replace('_', ' ')} over time`;
     }
+
+    // ---- Init ----
 
     async function init() {
       try {
@@ -894,17 +1000,22 @@
         runSelect.value = runs[0].run_id;
         runBadge.textContent = `Latest: ${formatRunLabel(runs[0])}`;
 
-        runSelect.addEventListener('change', () => renderRunCharts(runSelect.value));
-        modeSelect.addEventListener('change', () => {
+        // Event listeners
+        runSelect.addEventListener('change', () => renderSceneCharts());
+        sceneSelect.addEventListener('change', () => {
+          updateVideoSelector();
+          renderSceneCharts();
           updateTimeSeriesControls();
         });
-        scenarioSelect.addEventListener('change', updateSolverEnvOptions);
-        solverSelect.addEventListener('change', updateSolverEnvOptions);
+        videoSelect.addEventListener('change', playSelectedVideo);
+        modeSelect.addEventListener('change', updateTimeSeriesControls);
+        solverSelect.addEventListener('change', renderTimeSeries);
         envSelect.addEventListener('change', renderTimeSeries);
         metricSelect.addEventListener('change', renderTimeSeries);
 
+        // Initial render
+        renderSceneCharts();
         updateTimeSeriesControls();
-        renderRunCharts(runSelect.value);
 
         const latest = runs[0];
         const system = [

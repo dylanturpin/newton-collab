@@ -163,6 +163,45 @@ run_ablation() {
   UV_NO_CONFIG=1 PYTHONUNBUFFERED=1 "${cmd[@]}" 2>&1 | log
 }
 
+run_render() {
+  local scenario="$1"
+  local solver="$2"
+  local substeps="$3"
+  local tag="${solver}_${substeps}sub"
+  local out_dir="$RUN_DIR/${scenario}_render/$tag"
+
+  log "Rendering video: $scenario with $solver ($substeps substeps)"
+  UV_NO_CONFIG=1 PYTHONUNBUFFERED=1 uv run $UV_EXTRAS -m newton.tools.solver_benchmark \
+    --scenario "$scenario" \
+    --solver "$solver" \
+    --substeps "$substeps" \
+    --render \
+    --render-frames 300 \
+    --out "$out_dir" 2>&1 | log
+}
+
+build_renders_manifest() {
+  # Collect all render_meta.json files into a single renders.json for this run
+  python - "$RUN_DIR" <<'PY'
+import json, sys
+from pathlib import Path
+
+run_dir = Path(sys.argv[1])
+renders = []
+for meta_file in sorted(run_dir.rglob("render_meta.json")):
+    meta = json.loads(meta_file.read_text())
+    # Store path relative to run dir
+    video_rel = str(meta_file.parent / meta["video"])
+    video_rel = str(Path(video_rel).relative_to(run_dir))
+    meta["path"] = video_rel
+    renders.append(meta)
+
+manifest = run_dir / "renders.json"
+manifest.write_text(json.dumps(renders, indent=2))
+print(f"Wrote {len(renders)} render entries to {manifest}")
+PY
+}
+
 append_points() {
   local mode="$1"
   local scenario="$2"
@@ -222,6 +261,12 @@ if [[ "$RUN_G1_FLAT" == "1" ]]; then
     run_ablation "g1_flat" "$ABLATION_WORLDS_G1_FLAT"
     append_points "ablation" "g1_flat" "$RUN_DIR/g1_flat_ablation/ablation.jsonl" "$RUN_DIR/g1_flat_ablation/metadata.json"
   fi
+
+  IFS=',' read -ra G1_SOLVERS <<< "$SWEEP_SOLVERS_G1_FLAT"
+  G1_SUBSTEPS="${SCENARIOS_SUBSTEPS_G1_FLAT:-2}"
+  for solver in "${G1_SOLVERS[@]}"; do
+    run_render "g1_flat" "$solver" "$G1_SUBSTEPS"
+  done
 fi
 
 if [[ "$RUN_H1_TABLETOP" == "1" ]]; then
@@ -232,7 +277,15 @@ if [[ "$RUN_H1_TABLETOP" == "1" ]]; then
     run_ablation "h1_tabletop" "$ABLATION_WORLDS_H1_TABLETOP"
     append_points "ablation" "h1_tabletop" "$RUN_DIR/h1_tabletop_ablation/ablation.jsonl" "$RUN_DIR/h1_tabletop_ablation/metadata.json"
   fi
+
+  IFS=',' read -ra H1_SOLVERS <<< "$SWEEP_SOLVERS_H1_TABLETOP"
+  H1_SUBSTEPS="${SCENARIOS_SUBSTEPS_H1_TABLETOP:-8}"
+  for solver in "${H1_SOLVERS[@]}"; do
+    run_render "h1_tabletop" "$solver" "$H1_SUBSTEPS"
+  done
 fi
+
+build_renders_manifest
 
 # Create run-level metadata
 RUN_META_JSON=$(RUN_DIR="$RUN_DIR" RUN_ID="$RUN_ID" RUN_TIMESTAMP="$RUN_TIMESTAMP" RUN_COMMIT="$RUN_COMMIT" RUN_COMMIT_SHORT="$RUN_COMMIT_SHORT" AUTO_BRANCH="$AUTO_BRANCH" python - <<'PY'
