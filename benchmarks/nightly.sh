@@ -30,6 +30,7 @@
 #   SKIP_ABLATIONS                  Set to 1 to skip ablations (default: 0)
 #   ENABLE_PLOTS                    Set to 0 to skip matplotlib plots (default: 1)
 #   CHERRY_PICK_BRANCHES            Comma-separated branches to cherry-pick after rebase (default: "")
+#   PROFILE_SETUP                   Set to 0 to disable setup timing breakdowns (default: 1)
 #   UV_EXTRAS                       Extras for uv run (default: "--extra examples --extra torch-cu12")
 
 set -euo pipefail
@@ -49,6 +50,7 @@ SWEEP_MAX_LOG2_H1_TABLETOP="${SWEEP_MAX_LOG2_H1_TABLETOP:-15}"
 ABLATION_WORLDS_G1_FLAT="${ABLATION_WORLDS_G1_FLAT:-16384}"
 ABLATION_WORLDS_H1_TABLETOP="${ABLATION_WORLDS_H1_TABLETOP:-8192}"
 ENABLE_PLOTS="${ENABLE_PLOTS:-1}"
+PROFILE_SETUP="${PROFILE_SETUP:-1}"
 UV_EXTRAS="${UV_EXTRAS:---extra examples --extra torch-cu12}"
 RUN_G1_FLAT="${RUN_G1_FLAT:-1}"
 RUN_H1_TABLETOP="${RUN_H1_TABLETOP:-1}"
@@ -151,6 +153,9 @@ run_sweep() {
   if [[ "$ENABLE_PLOTS" == "1" ]]; then
     cmd+=(--plot)
   fi
+  if [[ "$PROFILE_SETUP" == "1" ]]; then
+    cmd+=(--profile-setup)
+  fi
 
   log "Running sweep: $scenario"
   UV_NO_CONFIG=1 PYTHONUNBUFFERED=1 "${cmd[@]}" 2>&1 | log
@@ -169,6 +174,9 @@ run_ablation() {
 
   if [[ "$ENABLE_PLOTS" == "1" ]]; then
     cmd+=(--plot)
+  fi
+  if [[ "$PROFILE_SETUP" == "1" ]]; then
+    cmd+=(--profile-setup)
   fi
 
   log "Running ablation: $scenario"

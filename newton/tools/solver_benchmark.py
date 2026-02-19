@@ -491,6 +491,13 @@ def classify_kernel(kernel_name: str) -> str:
 
 RE_ELAPSED = re.compile(r"Elapsed time \(s\):\s*([0-9.]+)")
 RE_ENVFPS = re.compile(r"Env-FPS \(env/s\):\s*([0-9,\.]+)")
+RE_SETUP_TOTAL = re.compile(r"Setup total \(s\):\s*([0-9.]+)")
+RE_BUILD_MODEL = re.compile(r"build_model \(s\):\s*([0-9.]+)")
+RE_CREATE_SOLVER = re.compile(r"create_solver \(s\):\s*([0-9.]+)")
+RE_STATE_INIT = re.compile(r"state_init \(s\):\s*([0-9.]+)")
+RE_CUDA_GRAPH_CAP = re.compile(r"cuda_graph_cap \(s\):\s*([0-9.]+)")
+RE_WARMUP = re.compile(r"warmup \(s\):\s*([0-9.]+)")
+RE_RUN_TOTAL = re.compile(r"run_total \(s\):\s*([0-9.]+)")
 RE_GPU_USED = re.compile(r"GPU memory used \(GB\):\s*([0-9.]+)")
 RE_GPU_TOTAL = re.compile(r"GPU memory total \(GB\):\s*([0-9.]+)")
 RE_WORLDS = re.compile(r"Worlds:\s*([0-9]+)")
@@ -517,6 +524,13 @@ def parse_benchmark_output(text: str) -> dict:
         "num_worlds": get_int(RE_WORLDS),
         "elapsed_s": get_float(RE_ELAPSED),
         "env_fps": get_float(RE_ENVFPS),
+        "setup_total_s": get_float(RE_SETUP_TOTAL),
+        "build_model_s": get_float(RE_BUILD_MODEL),
+        "create_solver_s": get_float(RE_CREATE_SOLVER),
+        "state_init_s": get_float(RE_STATE_INIT),
+        "cuda_graph_cap_s": get_float(RE_CUDA_GRAPH_CAP),
+        "warmup_s": get_float(RE_WARMUP),
+        "run_total_s": get_float(RE_RUN_TOTAL),
         "gpu_used_gb": get_float(RE_GPU_USED),
         "gpu_total_gb": get_float(RE_GPU_TOTAL),
     }
@@ -700,6 +714,8 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
 
     if args.timing_out or args.ablation:
         cmd.append("--summary-timer")
+    if args.profile_setup:
+        cmd.append("--profile-setup")
 
     return cmd
 
@@ -795,6 +811,13 @@ def run_sweep(args):
                     "env_fps": metrics.get("env_fps"),
                     "gpu_used_gb": metrics.get("gpu_used_gb"),
                     "elapsed_s": metrics.get("elapsed_s"),
+                    "setup_total_s": metrics.get("setup_total_s"),
+                    "build_model_s": metrics.get("build_model_s"),
+                    "create_solver_s": metrics.get("create_solver_s"),
+                    "state_init_s": metrics.get("state_init_s"),
+                    "cuda_graph_cap_s": metrics.get("cuda_graph_cap_s"),
+                    "warmup_s": metrics.get("warmup_s"),
+                    "run_total_s": metrics.get("run_total_s"),
                     "ok": metrics.get("ok", False),
                     "label": metrics.get("label"),
                 }
@@ -923,6 +946,14 @@ def run_ablation(args):
                         "label": r.get("label"),
                         "env_fps": r.get("env_fps"),
                         "gpu_used_gb": r.get("gpu_used_gb"),
+                        "elapsed_s": r.get("elapsed_s"),
+                        "setup_total_s": r.get("setup_total_s"),
+                        "build_model_s": r.get("build_model_s"),
+                        "create_solver_s": r.get("create_solver_s"),
+                        "state_init_s": r.get("state_init_s"),
+                        "cuda_graph_cap_s": r.get("cuda_graph_cap_s"),
+                        "warmup_s": r.get("warmup_s"),
+                        "run_total_s": r.get("run_total_s"),
                         "ok": r.get("ok"),
                         "solver": r.get("solver"),
                         "num_worlds": r.get("num_worlds"),
@@ -1588,18 +1619,28 @@ def run_direct(args):
 
     scenario_cfg = SCENARIOS[args.scenario]
 
+    run_start = time.perf_counter()
+    setup_timings = {}
+
+    t0 = time.perf_counter()
     model = build_model(args, scenario_cfg)
+    setup_timings["build_model_s"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
     solver = create_solver(model, args, scenario_cfg)
+    setup_timings["create_solver_s"] = time.perf_counter() - t0
 
     # States
     fps = 60.0
     frame_dt = 1.0 / fps
     sim_dt = frame_dt / float(args.substeps)
 
+    t0 = time.perf_counter()
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
     contacts = model.collide(state_0)
+    setup_timings["state_init_s"] = time.perf_counter() - t0
 
     # CUDA graph capture (if not timing)
     # Handle odd substeps: with CUDA graphs, we need state_0 to end up in the
@@ -1608,6 +1649,7 @@ def run_direct(args):
     graph = None
     need_odd_substep_fix = args.substeps % 2 == 1
 
+    t0 = time.perf_counter()
     if not args.summary_timer:
         device = wp.get_device()
         if device.is_cuda:
@@ -1627,6 +1669,7 @@ def run_direct(args):
             with wp.ScopedCapture() as capture:
                 simulate()
             graph = capture.graph
+    setup_timings["cuda_graph_capture_s"] = time.perf_counter() - t0
 
     def step():
         nonlocal contacts, state_0, state_1
@@ -1644,9 +1687,11 @@ def run_direct(args):
                     state_0, state_1 = state_1, state_0
 
     # Warmup
+    t0 = time.perf_counter()
     for _ in range(args.warmup_frames):
         step()
     wp.synchronize_device()
+    setup_timings["warmup_s"] = time.perf_counter() - t0
 
     # Benchmark
     total_env_frames = args.num_worlds * args.measure_frames
@@ -1668,6 +1713,9 @@ def run_direct(args):
             elapsed = run_benchmark()
     else:
         elapsed = run_benchmark()
+
+    setup_timings["benchmark_loop_s"] = elapsed
+    setup_timings["run_total_s"] = time.perf_counter() - run_start
 
     fps_env = total_env_frames / elapsed if elapsed > 0 else 0
 
@@ -1695,6 +1743,15 @@ def run_direct(args):
     print(f"Total env-frames:    {total_env_frames}")
     print(f"Elapsed time (s):    {elapsed:.6f}")
     print(f"Env-FPS (env/s):     {fps_env:,.2f}")
+    if args.profile_setup:
+        setup_only = setup_timings["run_total_s"] - setup_timings["benchmark_loop_s"]
+        print(f"Setup total (s):     {setup_only:.6f}")
+        print(f"build_model (s):     {setup_timings['build_model_s']:.6f}")
+        print(f"create_solver (s):   {setup_timings['create_solver_s']:.6f}")
+        print(f"state_init (s):      {setup_timings['state_init_s']:.6f}")
+        print(f"cuda_graph_cap (s):  {setup_timings['cuda_graph_capture_s']:.6f}")
+        print(f"warmup (s):          {setup_timings['warmup_s']:.6f}")
+        print(f"run_total (s):       {setup_timings['run_total_s']:.6f}")
     if gpu_used_gb is not None:
         print(f"GPU memory used (GB):   {gpu_used_gb:.3f}")
         print(f"GPU memory total (GB):  {gpu_total_gb:.3f}")
@@ -2157,6 +2214,11 @@ def main():
     # Timing
     parser.add_argument("--timing-out", type=str, help="Output kernel timing to JSON")
     parser.add_argument("--summary-timer", action="store_true", help="Print kernel summary")
+    parser.add_argument(
+        "--profile-setup",
+        action="store_true",
+        help="Print setup timing breakdown in benchmark mode",
+    )
 
     args = parser.parse_args()
 
