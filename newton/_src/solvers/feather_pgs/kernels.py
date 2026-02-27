@@ -1820,6 +1820,35 @@ def allocate_world_contact_slots(
         contact_path[c] = 0
 
 
+@wp.kernel
+def zero_active_J_rows(
+    group_to_art: wp.array(dtype=int),
+    art_to_world: wp.array(dtype=int),
+    world_constraint_count: wp.array(dtype=int),
+    n_dofs: int,
+    max_constraints: int,
+    n_arts: int,
+    # output
+    J_group: wp.array3d(dtype=float),
+):
+    """Zero only the active rows of J_group (up to constraint_count per world).
+
+    Thread dim: n_arts * max_constraints * n_dofs.
+    """
+    tid = wp.tid()
+    d = tid % n_dofs
+    remainder = tid // n_dofs
+    c = remainder % max_constraints
+    idx = remainder // max_constraints
+    if idx >= n_arts:
+        return
+    art = group_to_art[idx]
+    world = art_to_world[art]
+    if c >= world_constraint_count[world]:
+        return
+    J_group[idx, c, d] = 0.0
+
+
 @wp.func
 def accumulate_jacobian_row_world(
     body_index: int,
@@ -2755,12 +2784,9 @@ def gather_JY_to_world(
     dof_start = art_dof_start[art]
     w_dof_start = world_dof_start[world]
     local_d = (dof_start - w_dof_start) + d
-    j_val = J_group[idx, c, d]
-    y_val = Y_group[idx, c, d]
-    if j_val != 0.0:
-        J_world[world, c, local_d] = j_val
-    if y_val != 0.0:
-        Y_world[world, c, local_d] = y_val
+    # Write unconditionally (including zeros) so J_world/Y_world don't need pre-zeroing
+    J_world[world, c, local_d] = J_group[idx, c, d]
+    Y_world[world, c, local_d] = Y_group[idx, c, d]
 
 
 # =============================================================================

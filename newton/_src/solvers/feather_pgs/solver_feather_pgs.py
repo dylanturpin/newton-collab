@@ -232,7 +232,6 @@ class SolverFeatherPGS(SolverBase):
             small_dof_threshold (int, optional): DOF threshold for "auto" selection in batched path. Defaults to 12.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams (batched path only).
                 Defaults to True.
-
         Auto selection behavior:
             - Batched + auto: size > threshold -> tiled (or par_row for hinv_jt), else loop/par_row.
             - Flat + auto: if homogeneous and within tile limits -> tiled, else loop/par_row.
@@ -946,6 +945,13 @@ class SolverFeatherPGS(SolverBase):
         self.mf_dof_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_dof_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
 
+        # Packed MF metadata for two-phase GS kernel (int4 per constraint):
+        #   .x = (dof_a << 16) | (dof_b & 0xFFFF)
+        #   .y = __float_as_int(eff_mass_inv)
+        #   .z = __float_as_int(rhs)
+        #   .w = row_type | (row_parent << 16)
+        self.mf_meta_packed = wp.zeros((worlds, mf_max_c * 4), dtype=wp.int32, device=device)
+
         # Body map buffers for tiled MF PGS kernel
         self.max_mf_bodies = 64
         self.mf_body_list = wp.zeros(
@@ -1393,8 +1399,7 @@ class SolverFeatherPGS(SolverBase):
 
         if self.pgs_mode == "velocity":
             # Gather J/Y from per-size-group arrays into world-indexed arrays
-            self.J_world.zero_()
-            self.Y_world.zero_()
+            # No J_world/Y_world zeroing needed: gather writes all DOFs unconditionally
             for size in self.size_groups:
                 n_arts = self.n_arts_by_size[size]
                 wp.launch(
@@ -1418,6 +1423,27 @@ class SolverFeatherPGS(SolverBase):
 
             # Initialize v_out = v_hat before GS loop
             self._stage6_prepare_world_velocity()
+
+            # Pack MF metadata into int4 structs for coalesced 128-bit loads
+            pack_kernel = TiledKernelFactory.get_pack_mf_meta_kernel(
+                self.mf_max_constraints, self.model.device
+            )
+            wp.launch_tiled(
+                pack_kernel,
+                dim=[self.world_count],
+                inputs=[
+                    self.mf_constraint_count,
+                    self.mf_dof_a,
+                    self.mf_dof_b,
+                    self.mf_eff_mass_inv,
+                    self.mf_rhs,
+                    self.mf_row_type,
+                    self.mf_row_parent,
+                ],
+                outputs=[self.mf_meta_packed],
+                block_dim=32,
+                device=self.model.device,
+            )
 
             # Two-phase GS kernel: dense + MF in one pass
             mf_gs_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_kernel(
@@ -1443,18 +1469,13 @@ class SolverFeatherPGS(SolverBase):
                     self.row_mu,
                     # MF
                     self.mf_constraint_count,
-                    self.mf_rhs,
-                    self.mf_eff_mass_inv,
+                    self.mf_meta_packed,
                     self.mf_impulses,
                     self.mf_J_a,
                     self.mf_J_b,
                     self.mf_MiJt_a,
                     self.mf_MiJt_b,
-                    self.mf_row_type,
-                    self.mf_row_parent,
                     self.mf_row_mu,
-                    self.mf_dof_a,
-                    self.mf_dof_b,
                     # Shared
                     self.pgs_iterations,
                     self.pgs_omega,
@@ -2165,27 +2186,16 @@ class SolverFeatherPGS(SolverBase):
         max_constraints = self.dense_max_constraints
         mf_active = self._has_free_rigid_bodies
 
-        # Zero world-level buffers
-        self.slot_counter.zero_()
-        self.constraint_count.zero_()
+        # Zero world-level buffers (only arrays that require it)
+        self.slot_counter.zero_()  # atomic-add counter
 
         if mf_active:
-            self.mf_slot_counter.zero_()
-            self.mf_constraint_count.zero_()
-            self.mf_J_a.zero_()
-            self.mf_J_b.zero_()
-            self.mf_MiJt_a.zero_()
-            self.mf_MiJt_b.zero_()
-            self.mf_impulses.zero_()
-            self.mf_body_a.zero_()
-            self.mf_body_b.zero_()
-            self.mf_row_type.zero_()
-            self.mf_row_parent.fill_(-1)
-            self.mf_row_mu.zero_()
-            self.mf_phi.zero_()
-
-        for size in self.size_groups:
-            self.J_by_size[size].zero_()
+            self.mf_slot_counter.zero_()  # atomic-add counter
+            self.mf_constraint_count.zero_()  # finalize only runs when contacts exist
+            self.mf_impulses.zero_()  # PGS reads before first write
+            # mf_J_a/b, mf_MiJt_a/b: writers cover all used slots, readers gated by body >= 0
+            # mf_body_a/b, mf_row_type, mf_row_parent, mf_row_mu, mf_phi: unconditionally overwritten
+            # constraint_count: fully overwritten by finalize_world_constraint_counts
 
         has_free_rigid_flag = 1 if mf_active else 0
         # Dummy arrays when MF is not active (kernel still needs valid pointers)
@@ -2239,6 +2249,9 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 device=model.device,
             )
+
+            for size in self.size_groups:
+                self.J_by_size[size].zero_()
 
             for size in self.size_groups:
                 wp.launch(
@@ -3079,6 +3092,7 @@ class TiledKernelFactory:
     _pgs_solve_streaming_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_mf_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
     _pgs_solve_mf_gs_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
+    _pack_mf_meta_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _triangular_solve_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _delassus_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
 
@@ -4570,6 +4584,89 @@ class TiledKernelFactory:
         return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_template)
 
     @classmethod
+    def get_pack_mf_meta_kernel(cls, mf_max_constraints: int, device: "wp.Device") -> "wp.Kernel":
+        """Get or create a kernel to pack MF metadata into int4 format."""
+        key = (mf_max_constraints, device.arch)
+        if key not in cls._pack_mf_meta_cache:
+            cls._pack_mf_meta_cache[key] = cls._build_pack_mf_meta_kernel(mf_max_constraints)
+        return cls._pack_mf_meta_cache[key]
+
+    @classmethod
+    def _build_pack_mf_meta_kernel(cls, mf_max_constraints: int) -> "wp.Kernel":
+        """Build a kernel to pack MF constraint metadata into int4 structs.
+
+        Packs dof_a, dof_b, eff_mass_inv, rhs, row_type, row_parent into
+        4 contiguous int32s per constraint for 128-bit coalesced loads.
+        """
+        M_MF = mf_max_constraints
+
+        snippet = f"""
+    #if defined(__CUDA_ARCH__)
+        int lane = threadIdx.x;
+        int m_mf = mf_constraint_count.data[world];
+        int off_mf = world * {M_MF};
+        int off_meta = off_mf * 4;
+
+        for (int i = lane; i < m_mf; i += 32) {{
+            int da = mf_dof_a.data[off_mf + i];
+            int db = mf_dof_b.data[off_mf + i];
+            float diag = mf_eff_mass_inv.data[off_mf + i];
+            float rhs_val = mf_rhs.data[off_mf + i];
+            int rt = mf_row_type.data[off_mf + i];
+            int par = mf_row_parent.data[off_mf + i];
+
+            int4 packed;
+            packed.x = (da << 16) | (db & 0xFFFF);
+            packed.y = __float_as_int(diag);
+            packed.z = __float_as_int(rhs_val);
+            packed.w = rt | (par << 16);
+            *reinterpret_cast<int4*>(&mf_meta.data[off_meta + i * 4]) = packed;
+        }}
+    #endif
+    """
+
+        @wp.func_native(snippet)
+        def pack_mf_meta_native(
+            world: int,
+            mf_constraint_count: wp.array(dtype=int),
+            mf_dof_a: wp.array2d(dtype=int),
+            mf_dof_b: wp.array2d(dtype=int),
+            mf_eff_mass_inv: wp.array2d(dtype=float),
+            mf_rhs: wp.array2d(dtype=float),
+            mf_row_type: wp.array2d(dtype=int),
+            mf_row_parent: wp.array2d(dtype=int),
+            mf_meta: wp.array2d(dtype=int),
+        ): ...
+
+        def pack_mf_meta_template(
+            mf_constraint_count: wp.array(dtype=int),
+            mf_dof_a: wp.array2d(dtype=int),
+            mf_dof_b: wp.array2d(dtype=int),
+            mf_eff_mass_inv: wp.array2d(dtype=float),
+            mf_rhs: wp.array2d(dtype=float),
+            mf_row_type: wp.array2d(dtype=int),
+            mf_row_parent: wp.array2d(dtype=int),
+            mf_meta: wp.array2d(dtype=int),
+        ):
+            world, _lane = wp.tid()
+            pack_mf_meta_native(
+                world,
+                mf_constraint_count,
+                mf_dof_a,
+                mf_dof_b,
+                mf_eff_mass_inv,
+                mf_rhs,
+                mf_row_type,
+                mf_row_parent,
+                mf_meta,
+            )
+
+        name = f"pack_mf_meta_{mf_max_constraints}"
+        pack_mf_meta_template.__name__ = name
+        pack_mf_meta_template.__qualname__ = name
+        return wp.kernel(enable_backward=False, module="unique")(pack_mf_meta_template)
+
+    @classmethod
     def get_pgs_solve_mf_gs_kernel(
         cls, max_constraints: int, mf_max_constraints: int, max_world_dofs: int, device: "wp.Device"
     ) -> "wp.Kernel":
@@ -4609,29 +4706,62 @@ class TiledKernelFactory:
         # How many DOF elements each lane handles (ceil(D/32))
         ELEMS_PER_LANE = (D + 31) // 32
 
-        # --- Code generation for dense phase (D-wide dot/update) ---
+        # --- Code generation for dense phase (D-wide dot/update, software-pipelined) ---
 
-        # Dense dot product: J_i · v
+        # Pipeline register declarations
+        dense_pipe_decl = "\n".join(
+            [f"        float pre_dJ_{k} = 0.0f, pre_dY_{k} = 0.0f;" for k in range(ELEMS_PER_LANE)]
+        )
+
+        # Initial prefetch (constraint 0)
+        dense_prefetch_init_parts = []
+        for k in range(ELEMS_PER_LANE):
+            d_expr = f"lane + {k * 32}" if k > 0 else "lane"
+            dense_prefetch_init_parts.append(f"""
+                if ({d_expr} < {D}) {{
+                    pre_dJ_{k} = J_world.data[jy_world_base + {d_expr}];
+                    pre_dY_{k} = Y_world.data[jy_world_base + {d_expr}];
+                }}""")
+        dense_prefetch_init_code = "\n".join(dense_prefetch_init_parts)
+
+        # Consume prefetched values into cur_ variables
+        dense_consume_code = "\n".join(
+            [f"                float cur_dJ_{k} = pre_dJ_{k}, cur_dY_{k} = pre_dY_{k};"
+             for k in range(ELEMS_PER_LANE)]
+        )
+
+        # Prefetch next constraint (i+1)
+        dense_prefetch_next_parts = []
+        for k in range(ELEMS_PER_LANE):
+            d_expr = f"lane + {k * 32}" if k > 0 else "lane"
+            dense_prefetch_next_parts.append(f"""
+                    if ({d_expr} < {D}) {{
+                        pre_dJ_{k} = J_world.data[next_jy_base + {d_expr}];
+                        pre_dY_{k} = Y_world.data[next_jy_base + {d_expr}];
+                    }}""")
+        dense_prefetch_next_code = "\n".join(dense_prefetch_next_parts)
+
+        # Dense dot product using prefetched J: cur_dJ_k * s_v[d]
         dense_dot_parts = []
         for k in range(ELEMS_PER_LANE):
             d_expr = f"lane + {k * 32}" if k > 0 else "lane"
             dense_dot_parts.append(f"""
                 if ({d_expr} < {D}) {{
-                    my_sum += J_world.data[jy_row_base + {d_expr}] * s_v[{d_expr}];
+                    my_sum += cur_dJ_{k} * s_v[{d_expr}];
                 }}""")
         dense_dot_code = "\n".join(["float my_sum = 0.0f;", *dense_dot_parts])
 
-        # Dense v update: v += Y_i * delta
+        # Dense v update using prefetched Y: s_v[d] += cur_dY_k * delta
         dense_v_update_parts = []
         for k in range(ELEMS_PER_LANE):
             d_expr = f"lane + {k * 32}" if k > 0 else "lane"
             dense_v_update_parts.append(f"""
                 if ({d_expr} < {D}) {{
-                    s_v[{d_expr}] += Y_world.data[jy_row_base + {d_expr}] * delta_impulse;
+                    s_v[{d_expr}] += cur_dY_{k} * delta_impulse;
                 }}""")
         dense_v_update_code = "\n".join(dense_v_update_parts)
 
-        # Dense sibling v update for friction cone projection
+        # Dense sibling v update — NOT pipelined (random sib index)
         dense_sib_v_parts = []
         for k in range(ELEMS_PER_LANE):
             d_expr = f"lane + {k * 32}" if k > 0 else "lane"
@@ -4655,6 +4785,7 @@ class TiledKernelFactory:
         int w_dof_start = world_dof_start.data[world];
         int off_dense = world * {M_D};
         int off_mf = world * {M_MF};
+        int off_meta = off_mf * 4;
         int jy_world_base = world * {M_D} * {D};
         int mf6_base = world * {M_MF} * 6;
 
@@ -4692,16 +4823,32 @@ class TiledKernelFactory:
         // ═══════════════════════════════════════════════════════
         // SOLVE PHASE
         // ═══════════════════════════════════════════════════════
+        // Dense pipeline registers
+{dense_pipe_decl}
+
         for (int iter = 0; iter < iterations; iter++) {{
 
-            // ── Phase 1: Dense constraints (D-DOF warp-parallel) ──
+            // ── Phase 1: Dense constraints (D-DOF warp-parallel, software-pipelined) ──
+
+            // Prefetch constraint 0
+            if (m_dense > 0) {{
+                {dense_prefetch_init_code}
+            }}
+
             for (int i = 0; i < m_dense; i++) {{
+                // Consume prefetched J/Y for constraint i
+                {dense_consume_code}
+
+                // Prefetch constraint i+1
+                if (i + 1 < m_dense) {{
+                    int next_jy_base = jy_world_base + (i + 1) * {D};
+                    {dense_prefetch_next_code}
+                }}
+
                 float denom = s_diag_dense[i];
                 if (denom <= 0.0f) continue;
 
-                int jy_row_base = jy_world_base + i * {D};
-
-                // J_i · v
+                // J_i · v (using prefetched J)
                 {dense_dot_code}
 
                 // Warp reduce
@@ -4750,25 +4897,70 @@ class TiledKernelFactory:
                 float delta_impulse = new_impulse - old_impulse;
                 s_lam_dense[i] = new_impulse;
 
+                // V update using prefetched Y
                 if (delta_impulse != 0.0f) {{
                     {dense_v_update_code}
                 }}
                 __syncwarp();
             }}
 
-            // ── Phase 2: MF constraints (6-DOF per body) ──
-            for (int i = 0; i < m_mf; i++) {{
-                int dof_a = mf_dof_a.data[off_mf + i];
-                int dof_b = mf_dof_b.data[off_mf + i];
-                int mf6_row = mf6_base + i * 6;
+            // ── Phase 2: MF constraints (6-DOF per body, software-pipelined) ──
 
-                // J · v: lanes 0-5 body_a, lanes 6-11 body_b
+            // Pipeline registers: prefetch next constraint's global data
+            int4 pre_meta;
+            float pre_Ja = 0.0f, pre_Jb = 0.0f;
+            float pre_MiJta = 0.0f, pre_MiJtb = 0.0f;
+
+            // Prefetch constraint 0
+            if (m_mf > 0) {{
+                pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta]);
+                if (lane < 6) {{
+                    pre_Ja = mf_J_a.data[mf6_base + lane];
+                    pre_MiJta = mf_MiJt_a.data[mf6_base + lane];
+                }}
+                if (lane >= 6 && lane < 12) {{
+                    pre_Jb = mf_J_b.data[mf6_base + lane - 6];
+                    pre_MiJtb = mf_MiJt_b.data[mf6_base + lane - 6];
+                }}
+            }}
+
+            for (int i = 0; i < m_mf; i++) {{
+                // Consume prefetched data for constraint i
+                int4 meta = pre_meta;
+                float cur_Ja = pre_Ja;
+                float cur_Jb = pre_Jb;
+                float cur_MiJta = pre_MiJta;
+                float cur_MiJtb = pre_MiJtb;
+
+                // Prefetch constraint i+1 (loads issued now, complete during compute)
+                if (i + 1 < m_mf) {{
+                    int next_mf6 = mf6_base + (i + 1) * 6;
+                    pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i + 1) * 4]);
+                    if (lane < 6) {{
+                        pre_Ja = mf_J_a.data[next_mf6 + lane];
+                        pre_MiJta = mf_MiJt_a.data[next_mf6 + lane];
+                    }}
+                    if (lane >= 6 && lane < 12) {{
+                        pre_Jb = mf_J_b.data[next_mf6 + lane - 6];
+                        pre_MiJtb = mf_MiJt_b.data[next_mf6 + lane - 6];
+                    }}
+                }}
+
+                // Process constraint i
+                int packed_dofs = meta.x;
+                int dof_a = packed_dofs >> 16;
+                int dof_b = (packed_dofs << 16) >> 16;
+                float mf_diag = __int_as_float(meta.y);
+
+                if (mf_diag <= 0.0f) continue;
+
+                // J · v using prefetched J values
                 float my_sum = 0.0f;
                 if (lane < 6 && dof_a >= 0) {{
-                    my_sum = mf_J_a.data[mf6_row + lane] * s_v[dof_a + lane];
+                    my_sum = cur_Ja * s_v[dof_a + lane];
                 }}
                 if (lane >= 6 && lane < 12 && dof_b >= 0) {{
-                    my_sum = mf_J_b.data[mf6_row + lane - 6] * s_v[dof_b + lane - 6];
+                    my_sum = cur_Jb * s_v[dof_b + lane - 6];
                 }}
                 my_sum += __shfl_down_sync(MASK, my_sum, 16);
                 my_sum += __shfl_down_sync(MASK, my_sum, 8);
@@ -4777,19 +4969,17 @@ class TiledKernelFactory:
                 my_sum += __shfl_down_sync(MASK, my_sum, 1);
                 float jv = __shfl_sync(MASK, my_sum, 0);
 
-                float mf_diag = mf_eff_mass_inv.data[off_mf + i];
-                if (mf_diag <= 0.0f) continue;
-
-                float residual = jv + mf_rhs.data[off_mf + i];
+                float residual = jv + __int_as_float(meta.z);
                 float delta = -residual * mf_diag;
                 float old_impulse = s_lam_mf[i];
                 float new_impulse = old_impulse + omega * delta;
-                int mf_rt = mf_row_type.data[off_mf + i];
+                int packed_tp = meta.w;
+                int mf_rt = packed_tp & 0xFFFF;
 
                 if (mf_rt == 0) {{
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                 }} else if (mf_rt == 2) {{
-                    int mf_par = mf_row_parent.data[off_mf + i];
+                    int mf_par = packed_tp >> 16;
                     float lambda_n = s_lam_mf[mf_par];
                     float mu = mf_row_mu.data[off_mf + i];
                     float radius = fmaxf(mu * lambda_n, 0.0f);
@@ -4809,9 +4999,10 @@ class TiledKernelFactory:
                             float sib_delta = sib_new - b_val;
                             s_lam_mf[sib] = sib_new;
 
-                            // Sibling v update
-                            int sib_dof_a = mf_dof_a.data[off_mf + sib];
-                            int sib_dof_b = mf_dof_b.data[off_mf + sib];
+                            // Sibling v update (can't prefetch — random sib index)
+                            int sib_packed_dofs = mf_meta.data[off_meta + sib * 4];
+                            int sib_dof_a = sib_packed_dofs >> 16;
+                            int sib_dof_b = (sib_packed_dofs << 16) >> 16;
                             int sib_mf6 = mf6_base + sib * 6;
                             if (lane < 6 && sib_dof_a >= 0) {{
                                 s_v[sib_dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
@@ -4826,12 +5017,13 @@ class TiledKernelFactory:
                 float delta_impulse = new_impulse - old_impulse;
                 s_lam_mf[i] = new_impulse;
 
+                // V update using prefetched MiJt values
                 if (delta_impulse != 0.0f) {{
                     if (lane < 6 && dof_a >= 0) {{
-                        s_v[dof_a + lane] += mf_MiJt_a.data[mf6_row + lane] * delta_impulse;
+                        s_v[dof_a + lane] += cur_MiJta * delta_impulse;
                     }}
                     if (lane >= 6 && lane < 12 && dof_b >= 0) {{
-                        s_v[dof_b + lane - 6] += mf_MiJt_b.data[mf6_row + lane - 6] * delta_impulse;
+                        s_v[dof_b + lane - 6] += cur_MiJtb * delta_impulse;
                     }}
                 }}
                 __syncwarp();
@@ -4869,18 +5061,13 @@ class TiledKernelFactory:
             world_row_mu: wp.array2d(dtype=float),
             # MF
             mf_constraint_count: wp.array(dtype=int),
-            mf_rhs: wp.array2d(dtype=float),
-            mf_eff_mass_inv: wp.array2d(dtype=float),
+            mf_meta: wp.array2d(dtype=int),
             mf_impulses: wp.array2d(dtype=float),
             mf_J_a: wp.array3d(dtype=float),
             mf_J_b: wp.array3d(dtype=float),
             mf_MiJt_a: wp.array3d(dtype=float),
             mf_MiJt_b: wp.array3d(dtype=float),
-            mf_row_type: wp.array2d(dtype=int),
-            mf_row_parent: wp.array2d(dtype=int),
             mf_row_mu: wp.array2d(dtype=float),
-            mf_dof_a: wp.array2d(dtype=int),
-            mf_dof_b: wp.array2d(dtype=int),
             # Shared
             iterations: int,
             omega: float,
@@ -4902,18 +5089,13 @@ class TiledKernelFactory:
             world_row_mu: wp.array2d(dtype=float),
             # MF
             mf_constraint_count: wp.array(dtype=int),
-            mf_rhs: wp.array2d(dtype=float),
-            mf_eff_mass_inv: wp.array2d(dtype=float),
+            mf_meta: wp.array2d(dtype=int),
             mf_impulses: wp.array2d(dtype=float),
             mf_J_a: wp.array3d(dtype=float),
             mf_J_b: wp.array3d(dtype=float),
             mf_MiJt_a: wp.array3d(dtype=float),
             mf_MiJt_b: wp.array3d(dtype=float),
-            mf_row_type: wp.array2d(dtype=int),
-            mf_row_parent: wp.array2d(dtype=int),
             mf_row_mu: wp.array2d(dtype=float),
-            mf_dof_a: wp.array2d(dtype=int),
-            mf_dof_b: wp.array2d(dtype=int),
             # Shared
             iterations: int,
             omega: float,
@@ -4934,18 +5116,13 @@ class TiledKernelFactory:
                 world_row_parent,
                 world_row_mu,
                 mf_constraint_count,
-                mf_rhs,
-                mf_eff_mass_inv,
+                mf_meta,
                 mf_impulses,
                 mf_J_a,
                 mf_J_b,
                 mf_MiJt_a,
                 mf_MiJt_b,
-                mf_row_type,
-                mf_row_parent,
                 mf_row_mu,
-                mf_dof_a,
-                mf_dof_b,
                 iterations,
                 omega,
                 v_out,
