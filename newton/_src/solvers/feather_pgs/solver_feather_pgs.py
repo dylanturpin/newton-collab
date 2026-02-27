@@ -189,6 +189,8 @@ class SolverFeatherPGS(SolverBase):
         small_dof_threshold: int = 12,
         # Parallelism options
         use_parallel_streams: bool = True,
+        double_buffer: bool = True,
+        nvtx: bool = False,
     ):
         """
         Args:
@@ -256,6 +258,8 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(f"pgs_mode must be 'delassus', 'hybrid', or 'velocity', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
         self.mf_max_constraints = mf_max_constraints
+        self._double_buffer = double_buffer
+        self._nvtx = nvtx
 
         valid_storage = {"batched", "flat"}
         if storage not in valid_storage:
@@ -334,6 +338,8 @@ class SolverFeatherPGS(SolverBase):
         self._allocate_common_buffers(model)
         if self.storage == "flat":
             self._allocate_flat_buffers(model)
+            self._H_bufs = None
+            self._J_bufs = None
         else:
             self._allocate_batched_buffers(model)
             self._allocate_world_buffers(model)
@@ -347,6 +353,8 @@ class SolverFeatherPGS(SolverBase):
             self.shape_material_mu = wp.zeros(
                 (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
             )
+
+        self._init_double_buffer_stream()
 
     def _compute_articulation_metadata(self, model):
         self._compute_articulation_indices(model)
@@ -769,19 +777,26 @@ class SolverFeatherPGS(SolverBase):
             self.R_by_size = {}
             self.tau_by_size = {}
             self.qdd_by_size = {}
+            self._H_bufs = None
+            self._J_bufs = None
             return
 
         device = model.device
         requires_grad = model.requires_grad
         max_constraints = self.dense_max_constraints
 
-        self.H_by_size = {}
         self.L_by_size = {}
-        self.J_by_size = {}
         self.Y_by_size = {}
         self.R_by_size = {}
         self.tau_by_size = {}
         self.qdd_by_size = {}
+
+        if self._double_buffer and device.is_cuda:
+            self._H_bufs = [{}, {}]
+            self._J_bufs = [{}, {}]
+        else:
+            self._H_bufs = None
+            self._J_bufs = None
 
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
@@ -789,18 +804,21 @@ class SolverFeatherPGS(SolverBase):
             h_dim = size
             j_rows = max_constraints
 
-            # Mass matrix and Cholesky factor [n_arts, h_dim, h_dim]
-            self.H_by_size[size] = wp.zeros(
-                (n_arts, h_dim, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
-            )
+            if self._H_bufs is not None:
+                for buf_idx in range(2):
+                    self._H_bufs[buf_idx][size] = wp.zeros(
+                        (n_arts, h_dim, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
+                    )
+                    self._J_bufs[buf_idx][size] = wp.zeros(
+                        (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
+                    )
+            else:
+                pass  # allocated below after the if/else
+
             self.L_by_size[size] = wp.zeros(
                 (n_arts, h_dim, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
             )
 
-            # Contact Jacobian and Y = H^-1 * J^T [n_arts, j_rows, h_dim]
-            self.J_by_size[size] = wp.zeros(
-                (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
-            )
             self.Y_by_size[size] = wp.zeros(
                 (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
             )
@@ -813,6 +831,24 @@ class SolverFeatherPGS(SolverBase):
             # Tau and qdd grouped buffers for tiled triangular solve [n_arts, h_dim, 1]
             self.tau_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
             self.qdd_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
+
+        if self._H_bufs is not None:
+            self.H_by_size = self._H_bufs[0]
+            self.J_by_size = self._J_bufs[0]
+            self._buf_idx = 0
+        else:
+            self.H_by_size = {}
+            self.J_by_size = {}
+            for size in self.size_groups:
+                n_arts = self.n_arts_by_size[size]
+                h_dim = size
+                j_rows = max_constraints
+                self.H_by_size[size] = wp.zeros(
+                    (n_arts, h_dim, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
+                )
+                self.J_by_size[size] = wp.zeros(
+                    (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
+                )
 
         max_contacts = int(model.rigid_contact_max)
         if max_contacts <= 0:
@@ -1006,6 +1042,30 @@ class SolverFeatherPGS(SolverBase):
                 self._size_streams[size] = None
                 self._size_events[size] = None
 
+    def _init_double_buffer_stream(self):
+        """Create a dedicated CUDA stream for async memset of H/J buffers."""
+        if self._H_bufs is None or not self.model.device.is_cuda:
+            self._memset_stream = None
+            return
+        self._memset_stream = wp.Stream(self.model.device)
+        # Track the last memset-done event per buffer slot so the main stream
+        # can wait only for the specific buffer it needs.
+        self._memset_done_event: list[wp.Event | None] = [None, None]
+
+    def seed_double_buffer_events(self):
+        """Record initial memset_done events on the main stream.
+
+        Must be called inside CUDA graph capture, before the first ``step()`` call.
+        Since buffers are allocated with ``wp.zeros()``, they are already zeroed;
+        recording here provides trivially-satisfied wait targets for the first two
+        substeps.
+        """
+        if self._memset_stream is None:
+            return
+        main_stream = wp.get_stream(self.model.device)
+        self._memset_done_event[0] = main_stream.record_event()
+        self._memset_done_event[1] = main_stream.record_event()
+
     @override
     def step(
         self,
@@ -1014,6 +1074,7 @@ class SolverFeatherPGS(SolverBase):
         control: Control,
         contacts: Contacts,
         dt: float,
+        collide_done_event=None,
     ):
         if self._last_step_dt is None:
             self._last_step_dt = dt
@@ -1029,6 +1090,10 @@ class SolverFeatherPGS(SolverBase):
             control = model.control(clone_variables=False)
         state_aug = self._prepare_augmented_state(state_in, state_out, control)
 
+        if collide_done_event is not None and state_in.particle_count > 0:
+            wp.get_stream(self.model.device).wait_event(collide_done_event)
+            collide_done_event = None  # consumed
+
         self._eval_particle_forces(state_in, control, contacts)
 
         if not model.joint_count:
@@ -1037,9 +1102,9 @@ class SolverFeatherPGS(SolverBase):
             return state_out
 
         if self.storage == "batched":
-            self._step_batched(state_in, state_out, state_aug, control, contacts, dt)
+            self._step_batched(state_in, state_out, state_aug, control, contacts, dt, collide_done_event)
         else:
-            self._step_flat(state_in, state_out, state_aug, control, contacts, dt)
+            self._step_flat(state_in, state_out, state_aug, control, contacts, dt, collide_done_event)
 
         self._step += 1
         return state_out
@@ -1129,6 +1194,7 @@ class SolverFeatherPGS(SolverBase):
         control: Control,
         contacts: Contacts,
         dt: float,
+        collide_done_event=None,
     ):
         model = self.model
 
@@ -1168,6 +1234,10 @@ class SolverFeatherPGS(SolverBase):
             self._stage3_trisolve_flat_loop(state_aug)
 
         self._stage3_compute_v_hat(state_in, state_aug, dt)
+
+        # Wait for pipelined collide (if running on separate stream)
+        if collide_done_event is not None:
+            wp.get_stream(model.device).wait_event(collide_done_event)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 4: Build contact problem
@@ -1259,95 +1329,114 @@ class SolverFeatherPGS(SolverBase):
         control: Control,
         contacts: Contacts,
         dt: float,
+        collide_done_event=None,
     ):
         model = self.model
+
+        # Double-buffer: select buffer set and wait for its memset to finish
+        if self._memset_stream is not None:
+            self.H_by_size = self._H_bufs[self._buf_idx]
+            self.J_by_size = self._J_bufs[self._buf_idx]
+            evt = self._memset_done_event[self._buf_idx]
+            if evt is not None:
+                wp.get_stream(model.device).wait_event(evt)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 1: FK/ID + drives + CRBA
         # ══════════════════════════════════════════════════════════════
-        self._stage1_fk_id(state_in, state_aug, state_out)
+        with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+            self._stage1_fk_id(state_in, state_aug, state_out)
 
-        if model.articulation_count:
-            self._stage1_drives(state_in, state_aug, control, dt)
+            if model.articulation_count:
+                self._stage1_drives(state_in, state_aug, control, dt)
 
-        self._stage1_crba_batched(state_aug)
+            self._stage1_crba_batched(state_aug)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 2: Cholesky
         # ══════════════════════════════════════════════════════════════
-        for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
-            with ctx:
-                use_tiled = (self.cholesky_kernel == "tiled") or (
-                    self.cholesky_kernel == "auto" and size > self.small_dof_threshold
-                )
-                if use_tiled:
-                    self._stage2_cholesky_batched_tiled(size)
-                else:
-                    self._stage2_cholesky_batched_loop(size)
+        with wp.ScopedTimer("S2_Cholesky", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+            for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+                with ctx:
+                    use_tiled = (self.cholesky_kernel == "tiled") or (
+                        self.cholesky_kernel == "auto" and size > self.small_dof_threshold
+                    )
+                    if use_tiled:
+                        self._stage2_cholesky_batched_tiled(size)
+                    else:
+                        self._stage2_cholesky_batched_loop(size)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 3: Triangular solve + v_hat
         # ══════════════════════════════════════════════════════════════
-        self._stage3_zero_qdd(state_aug)
-        for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
-            with ctx:
-                use_tiled = (self.trisolve_kernel == "tiled") or (
-                    self.trisolve_kernel == "auto" and size > self.small_dof_threshold
-                )
-                if use_tiled:
-                    self._stage3_trisolve_batched_tiled(size, state_aug)
-                else:
-                    self._stage3_trisolve_batched_loop(size, state_aug)
+        with wp.ScopedTimer("S3_Trisolve_Vhat", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+            self._stage3_zero_qdd(state_aug)
+            for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+                with ctx:
+                    use_tiled = (self.trisolve_kernel == "tiled") or (
+                        self.trisolve_kernel == "auto" and size > self.small_dof_threshold
+                    )
+                    if use_tiled:
+                        self._stage3_trisolve_batched_tiled(size, state_aug)
+                    else:
+                        self._stage3_trisolve_batched_loop(size, state_aug)
 
-        self._stage3_compute_v_hat(state_in, state_aug, dt)
+            self._stage3_compute_v_hat(state_in, state_aug, dt)
+
+        # Wait for pipelined collide (if running on separate stream)
+        if collide_done_event is not None:
+            wp.get_stream(model.device).wait_event(collide_done_event)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 4: Build contact problem
         # ══════════════════════════════════════════════════════════════
-        self._stage4_build_rows_batched(state_in, state_aug, contacts)
+        with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+            self._stage4_build_rows_batched(state_in, state_aug, contacts)
 
         if self.pgs_mode == "velocity":
             # Compute Y = H^-1 * J^T only (no Delassus C)
-            for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
-                with ctx:
-                    use_tiled = (self.hinv_jt_kernel == "tiled") or (
-                        self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold
-                    )
-                    if use_tiled:
-                        self._stage4_hinv_jt_batched_tiled(size)
-                    else:
-                        self._stage4_hinv_jt_batched_par_row(size)
+            with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+                for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+                    with ctx:
+                        use_tiled = (self.hinv_jt_kernel == "tiled") or (
+                            self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold
+                        )
+                        if use_tiled:
+                            self._stage4_hinv_jt_batched_tiled(size)
+                        else:
+                            self._stage4_hinv_jt_batched_par_row(size)
 
-            # Diagonal from J*Y (no full Delassus)
-            self.diag.zero_()
-            for size in self.size_groups:
-                self._stage4_diag_from_JY(size)
-            self._stage4_finalize_world_diag_cfm()
+                # Diagonal from J*Y (no full Delassus)
+                self.diag.zero_()
+                for size in self.size_groups:
+                    self._stage4_diag_from_JY(size)
+                self._stage4_finalize_world_diag_cfm()
 
-            # RHS = bias only (J*v recomputed per iteration)
-            self._stage4_compute_rhs_world(dt)
-            # NOTE: skip _stage4_accumulate_rhs_world — J*v_hat not baked into rhs
+                # RHS = bias only (J*v recomputed per iteration)
+                self._stage4_compute_rhs_world(dt)
+                # NOTE: skip _stage4_accumulate_rhs_world — J*v_hat not baked into rhs
 
             # MF: compute mf_MiJt, mf_rhs, mf_eff_mass_inv, body maps
             if self._has_free_rigid_bodies:
-                self._mf_pgs_setup(state_aug, dt)
+                with wp.ScopedTimer("S4_MF_Setup", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+                    self._mf_pgs_setup(state_aug, dt)
 
-                # MF: compute world-relative DOF offsets for two-phase GS kernel
-                wp.launch(
-                    compute_mf_world_dof_offsets,
-                    dim=self.world_count * self.mf_max_constraints,
-                    inputs=[
-                        self.mf_constraint_count,
-                        self.mf_body_a,
-                        self.mf_body_b,
-                        self.body_to_articulation,
-                        self.articulation_dof_start,
-                        self.world_dof_start,
-                        self.mf_max_constraints,
-                    ],
-                    outputs=[self.mf_dof_a, self.mf_dof_b],
-                    device=self.model.device,
-                )
+                    # MF: compute world-relative DOF offsets for two-phase GS kernel
+                    wp.launch(
+                        compute_mf_world_dof_offsets,
+                        dim=self.world_count * self.mf_max_constraints,
+                        inputs=[
+                            self.mf_constraint_count,
+                            self.mf_body_a,
+                            self.mf_body_b,
+                            self.body_to_articulation,
+                            self.articulation_dof_start,
+                            self.world_dof_start,
+                            self.mf_max_constraints,
+                        ],
+                        outputs=[self.mf_dof_a, self.mf_dof_b],
+                        device=self.model.device,
+                    )
 
         else:
             # Existing Delassus path (unchanged)
@@ -1395,95 +1484,98 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         # STAGE 5+6: PGS solve
         # ══════════════════════════════════════════════════════════════
-        self._stage5_prepare_impulses_world()
+        with wp.ScopedTimer("S5_PGS_Prep", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+            self._stage5_prepare_impulses_world()
 
         if self.pgs_mode == "velocity":
-            # Gather J/Y from per-size-group arrays into world-indexed arrays
-            # No J_world/Y_world zeroing needed: gather writes all DOFs unconditionally
-            for size in self.size_groups:
-                n_arts = self.n_arts_by_size[size]
-                wp.launch(
-                    gather_JY_to_world,
-                    dim=int(n_arts * self.dense_max_constraints * size),
+            with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+                # Gather J/Y from per-size-group arrays into world-indexed arrays
+                # No J_world/Y_world zeroing needed: gather writes all DOFs unconditionally
+                for size in self.size_groups:
+                    n_arts = self.n_arts_by_size[size]
+                    wp.launch(
+                        gather_JY_to_world,
+                        dim=int(n_arts * self.dense_max_constraints * size),
+                        inputs=[
+                            self.group_to_art[size],
+                            self.art_to_world,
+                            self.articulation_dof_start,
+                            self.constraint_count,
+                            self.world_dof_start,
+                            self.J_by_size[size],
+                            self.Y_by_size[size],
+                            size,
+                            self.dense_max_constraints,
+                            n_arts,
+                        ],
+                        outputs=[self.J_world, self.Y_world],
+                        device=self.model.device,
+                    )
+
+                # Initialize v_out = v_hat before GS loop
+                self._stage6_prepare_world_velocity()
+
+                # Pack MF metadata into int4 structs for coalesced 128-bit loads
+                pack_kernel = TiledKernelFactory.get_pack_mf_meta_kernel(
+                    self.mf_max_constraints, self.model.device
+                )
+                wp.launch_tiled(
+                    pack_kernel,
+                    dim=[self.world_count],
                     inputs=[
-                        self.group_to_art[size],
-                        self.art_to_world,
-                        self.articulation_dof_start,
-                        self.constraint_count,
-                        self.world_dof_start,
-                        self.J_by_size[size],
-                        self.Y_by_size[size],
-                        size,
-                        self.dense_max_constraints,
-                        n_arts,
+                        self.mf_constraint_count,
+                        self.mf_dof_a,
+                        self.mf_dof_b,
+                        self.mf_eff_mass_inv,
+                        self.mf_rhs,
+                        self.mf_row_type,
+                        self.mf_row_parent,
                     ],
-                    outputs=[self.J_world, self.Y_world],
+                    outputs=[self.mf_meta_packed],
+                    block_dim=32,
                     device=self.model.device,
                 )
 
-            # Initialize v_out = v_hat before GS loop
-            self._stage6_prepare_world_velocity()
-
-            # Pack MF metadata into int4 structs for coalesced 128-bit loads
-            pack_kernel = TiledKernelFactory.get_pack_mf_meta_kernel(
-                self.mf_max_constraints, self.model.device
-            )
-            wp.launch_tiled(
-                pack_kernel,
-                dim=[self.world_count],
-                inputs=[
-                    self.mf_constraint_count,
-                    self.mf_dof_a,
-                    self.mf_dof_b,
-                    self.mf_eff_mass_inv,
-                    self.mf_rhs,
-                    self.mf_row_type,
-                    self.mf_row_parent,
-                ],
-                outputs=[self.mf_meta_packed],
-                block_dim=32,
-                device=self.model.device,
-            )
-
             # Two-phase GS kernel: dense + MF in one pass
-            mf_gs_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_kernel(
-                self.dense_max_constraints,
-                self.mf_max_constraints,
-                self.max_world_dofs,
-                self.model.device,
-            )
-            wp.launch_tiled(
-                mf_gs_kernel,
-                dim=[self.world_count],
-                inputs=[
-                    # Dense
-                    self.constraint_count,
-                    self.world_dof_start,
-                    self.rhs,
-                    self.diag,
-                    self.impulses,
-                    self.J_world,
-                    self.Y_world,
-                    self.row_type,
-                    self.row_parent,
-                    self.row_mu,
-                    # MF
-                    self.mf_constraint_count,
-                    self.mf_meta_packed,
-                    self.mf_impulses,
-                    self.mf_J_a,
-                    self.mf_J_b,
-                    self.mf_MiJt_a,
-                    self.mf_MiJt_b,
-                    self.mf_row_mu,
-                    # Shared
-                    self.pgs_iterations,
-                    self.pgs_omega,
-                ],
-                outputs=[self.v_out],
-                block_dim=32,
-                device=self.model.device,
-            )
+            with wp.ScopedTimer("S6_PGS_Solve", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+                mf_gs_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_kernel(
+                    self.dense_max_constraints,
+                    self.mf_max_constraints,
+                    self.max_world_dofs,
+                    self.model.device,
+                )
+                wp.launch_tiled(
+                    mf_gs_kernel,
+                    dim=[self.world_count],
+                    inputs=[
+                        # Dense
+                        self.constraint_count,
+                        self.world_dof_start,
+                        self.rhs,
+                        self.diag,
+                        self.impulses,
+                        self.J_world,
+                        self.Y_world,
+                        self.row_type,
+                        self.row_parent,
+                        self.row_mu,
+                        # MF
+                        self.mf_constraint_count,
+                        self.mf_meta_packed,
+                        self.mf_impulses,
+                        self.mf_J_a,
+                        self.mf_J_b,
+                        self.mf_MiJt_a,
+                        self.mf_MiJt_b,
+                        self.mf_row_mu,
+                        # Shared
+                        self.pgs_iterations,
+                        self.pgs_omega,
+                    ],
+                    outputs=[self.v_out],
+                    block_dim=32,
+                    device=self.model.device,
+                )
 
         elif self._has_mixed_contacts:
             # Interleaved: dense and MF alternate, 1 iteration each
@@ -1555,9 +1647,22 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         # STAGE 7: Update qdd + integrate
         # ══════════════════════════════════════════════════════════════
-        self._stage6_update_qdd(state_in, state_aug, dt)
+        with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+            self._stage6_update_qdd(state_in, state_aug, dt)
 
-        self._stage6_integrate(state_in, state_aug, state_out, dt)
+            self._stage6_integrate(state_in, state_aug, state_out, dt)
+
+        # Double-buffer: fork memset stream to zero current buffer for reuse.
+        # ScopedStream(sync_enter=True) records an event on the main stream and
+        # makes the memset stream wait — this is what forks it into graph capture.
+        if self._memset_stream is not None:
+            with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+                with wp.ScopedStream(self._memset_stream):
+                    for size in self.size_groups:
+                        self._H_bufs[self._buf_idx][size].zero_()
+                        self._J_bufs[self._buf_idx][size].zero_()
+                self._memset_done_event[self._buf_idx] = self._memset_stream.record_event()
+                self._buf_idx = 1 - self._buf_idx
 
     def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State):
         model = self.model
@@ -1869,7 +1974,8 @@ class SolverFeatherPGS(SolverBase):
 
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
-            self.H_by_size[size].zero_()
+            if self._H_bufs is None:  # not double-buffered
+                self.H_by_size[size].zero_()
             wp.launch(
                 crba_fill_batched_par_dof,
                 dim=int(n_arts * size),
@@ -2250,8 +2356,9 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-            for size in self.size_groups:
-                self.J_by_size[size].zero_()
+            if self._H_bufs is None:  # not double-buffered
+                for size in self.size_groups:
+                    self.J_by_size[size].zero_()
 
             for size in self.size_groups:
                 wp.launch(
