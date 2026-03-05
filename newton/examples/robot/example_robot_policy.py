@@ -300,7 +300,7 @@ class Example:
 
         # Create solver based on solver_type
         if solver_type == "feather_pgs":
-            from newton._src.solvers import SolverFeatherPGS
+            from newton._src.solvers import SolverFeatherPGS  # noqa: PLC0415
 
             self.solver = SolverFeatherPGS(
                 self.model,

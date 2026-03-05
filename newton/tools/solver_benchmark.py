@@ -1647,7 +1647,6 @@ def run_direct(args):
     if not args.summary_timer and not args.no_graph:
         device = wp.get_device()
         if device.is_cuda:
-
             if _pipeline_collide:
 
                 def simulate():
@@ -1659,8 +1658,14 @@ def run_direct(args):
                             next_buf = 0
                         with wp.ScopedTimer("ClearForces", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
                             state_0.clear_forces()
-                        solver.step(state_0, state_1, control, contacts_bufs[buf], sim_dt,
-                                    collide_done_event=collide_done_events[buf])
+                        solver.step(
+                            state_0,
+                            state_1,
+                            control,
+                            contacts_bufs[buf],
+                            sim_dt,
+                            collide_done_event=collide_done_events[buf],
+                        )
                         wp.copy(collide_state.body_q, state_1.body_q)
                         integrate_done = wp.get_stream(device).record_event()
                         with wp.ScopedStream(collide_stream):
@@ -1713,8 +1718,9 @@ def run_direct(args):
                     next_buf = 0
                 with wp.ScopedTimer("ClearForces", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
                     state_0.clear_forces()
-                solver.step(state_0, state_1, control, contacts_bufs[buf], sim_dt,
-                            collide_done_event=collide_done_events[buf])
+                solver.step(
+                    state_0, state_1, control, contacts_bufs[buf], sim_dt, collide_done_event=collide_done_events[buf]
+                )
                 wp.copy(collide_state.body_q, state_1.body_q)
                 integrate_done = wp.get_stream(_dev).record_event()
                 with wp.ScopedStream(collide_stream):
