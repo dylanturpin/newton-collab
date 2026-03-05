@@ -1510,7 +1510,7 @@ def build_model(args, scenario_cfg: dict):
         builder.add_ground_plane()
         model = builder.finalize()
 
-    model.shape_contact_margin.fill_(0.001)
+    model.shape_margin.fill_(0.001)
 
     return model
 

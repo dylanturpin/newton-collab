@@ -15,7 +15,7 @@
 
 import warp as wp
 
-from ...core import transform_twist
+from ...math.spatial import transform_twist
 from ...sim import JointType
 from ...sim.articulation import (
     compute_2d_rotational_dofs,
