@@ -297,7 +297,9 @@ class Example:
 
         # Create solver based on solver_type
         if solver_type == "feather_pgs":
-            self.solver = newton.solvers.SolverFeatherPGS(
+            from newton._src.solvers import SolverFeatherPGS
+
+            self.solver = SolverFeatherPGS(
                 self.model,
                 update_mass_matrix_interval=1,
                 pgs_iterations=32,
