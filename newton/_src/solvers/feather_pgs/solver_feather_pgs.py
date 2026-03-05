@@ -53,9 +53,6 @@ from .kernels import (
     clamp_contact_counts,
     clamp_joint_tau,
     compute_com_transforms,
-    convert_root_free_qd_local_to_world,
-    convert_root_free_qd_world_to_local,
-    update_articulation_origins,
     compute_composite_inertia,
     compute_delta_and_accumulate,
     compute_mf_body_Hinv,
@@ -65,6 +62,8 @@ from .kernels import (
     compute_velocity_predictor,
     compute_world_contact_bias,
     contact_bias_flat_par_row,
+    convert_root_free_qd_local_to_world,
+    convert_root_free_qd_world_to_local,
     copy_int_array_masked,
     crba_fill_batched_par_dof,
     crba_fill_flat_par_dof,
@@ -93,6 +92,7 @@ from .kernels import (
     scatter_qdd_from_groups,
     trisolve_batched_loop,
     trisolve_flat_loop,
+    update_articulation_origins,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
     vector_add_inplace,
@@ -1554,9 +1554,7 @@ class SolverFeatherPGS(SolverBase):
                 self._stage6_prepare_world_velocity()
 
                 # Pack MF metadata into int4 structs for coalesced 128-bit loads
-                pack_kernel = TiledKernelFactory.get_pack_mf_meta_kernel(
-                    self.mf_max_constraints, self.model.device
-                )
+                pack_kernel = TiledKernelFactory.get_pack_mf_meta_kernel(self.mf_max_constraints, self.model.device)
                 wp.launch_tiled(
                     pack_kernel,
                     dim=[self.world_count],
@@ -4923,8 +4921,7 @@ class TiledKernelFactory:
 
         # Consume prefetched values into cur_ variables
         dense_consume_code = "\n".join(
-            [f"                float cur_dJ_{k} = pre_dJ_{k}, cur_dY_{k} = pre_dY_{k};"
-             for k in range(ELEMS_PER_LANE)]
+            [f"                float cur_dJ_{k} = pre_dJ_{k}, cur_dY_{k} = pre_dY_{k};" for k in range(ELEMS_PER_LANE)]
         )
 
         # Prefetch next constraint (i+1)
