@@ -53,6 +53,9 @@ from .kernels import (
     clamp_contact_counts,
     clamp_joint_tau,
     compute_com_transforms,
+    convert_root_free_qd_local_to_world,
+    convert_root_free_qd_world_to_local,
+    update_articulation_origins,
     compute_composite_inertia,
     compute_delta_and_accumulate,
     compute_mf_body_Hinv,
@@ -352,6 +355,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _compute_articulation_metadata(self, model):
         self._compute_articulation_indices(model)
+        self._compute_root_free_metadata(model)
         self._setup_size_grouping(model)
         self._setup_world_mapping(model)
         self._is_one_art_per_world = self.world_count == model.articulation_count
@@ -428,6 +432,33 @@ class SolverFeatherPGS(SolverBase):
         else:
             self.M_size = 0
             self.articulation_max_dofs = 0
+
+    def _compute_root_free_metadata(self, model):
+        if not model.articulation_count or not model.joint_count:
+            self.articulation_root_is_free = None
+            self.articulation_root_dof_start = None
+            self._has_root_free = False
+            return
+
+        articulation_start = model.articulation_start.numpy()
+        joint_type = model.joint_type.numpy()
+        joint_parent = model.joint_parent.numpy()
+        joint_qd_start = model.joint_qd_start.numpy()
+
+        root_is_free = np.zeros(model.articulation_count, dtype=np.int32)
+        root_dof_start = np.zeros(model.articulation_count, dtype=np.int32)
+
+        for art in range(model.articulation_count):
+            root_joint = articulation_start[art]
+            root_dof_start[art] = int(joint_qd_start[root_joint])
+            jt = int(joint_type[root_joint])
+            jp = int(joint_parent[root_joint])
+            if jp == -1 and (jt == int(JointType.FREE) or jt == int(JointType.DISTANCE)):
+                root_is_free[art] = 1
+
+        self.articulation_root_is_free = wp.array(root_is_free, dtype=wp.int32, device=model.device)
+        self.articulation_root_dof_start = wp.array(root_dof_start, dtype=wp.int32, device=model.device)
+        self._has_root_free = bool(np.any(root_is_free != 0))
 
     def _setup_size_grouping(self, model):
         """Set up size-grouped storage and indirection arrays for multi-articulation support.
@@ -619,6 +650,7 @@ class SolverFeatherPGS(SolverBase):
             )
             self.v_hat = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_out = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+            self.qd_work = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_mf_accum = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_out_snap = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
         else:
@@ -626,6 +658,7 @@ class SolverFeatherPGS(SolverBase):
             self.mass_update_mask = None
             self.v_hat = None
             self.v_out = None
+            self.qd_work = None
             self.v_mf_accum = None
             self.v_out_snap = None
 
@@ -659,7 +692,12 @@ class SolverFeatherPGS(SolverBase):
             self.body_I_c = None
 
         if not model.articulation_count or not model.joint_count:
+            self.articulation_origin = None
             return
+
+        self.articulation_origin = wp.zeros(
+            (model.articulation_count,), dtype=wp.vec3, device=model.device, requires_grad=model.requires_grad
+        )
 
         max_dofs = self.articulation_max_dofs
         if max_dofs == 0:
@@ -1563,8 +1601,33 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
+        wp.launch(
+            update_articulation_origins,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                model.joint_child,
+                state_in.body_q,
+            ],
+            outputs=[self.articulation_origin],
+            device=model.device,
+        )
+
         # evaluate joint inertias, motion vectors, and forces
         state_aug.body_f_s.zero_()
+        wp.copy(self.qd_work, state_in.joint_qd)
+        if self._has_root_free:
+            wp.launch(
+                convert_root_free_qd_world_to_local,
+                dim=model.articulation_count,
+                inputs=[
+                    self.articulation_root_is_free,
+                    self.articulation_root_dof_start,
+                    self.articulation_origin,
+                ],
+                outputs=[self.qd_work],
+                device=model.device,
+            )
 
         wp.launch(
             eval_rigid_id,
@@ -1574,14 +1637,16 @@ class SolverFeatherPGS(SolverBase):
                 model.joint_type,
                 model.joint_parent,
                 model.joint_child,
+                model.joint_articulation,
                 model.joint_qd_start,
-                state_in.joint_qd,
+                self.qd_work,
                 model.joint_axis,
                 model.joint_dof_dim,
                 self.body_I_m,
                 state_in.body_q,
                 state_aug.body_q_com,
                 model.joint_X_p,
+                self.articulation_origin,
                 model.gravity,
             ],
             outputs=[
@@ -1598,7 +1663,13 @@ class SolverFeatherPGS(SolverBase):
             wp.launch(
                 update_body_qd_from_featherstone,
                 dim=model.body_count,
-                inputs=[state_aug.body_v_s, state_in.body_q, model.body_com],
+                inputs=[
+                    state_aug.body_v_s,
+                    state_in.body_q,
+                    model.body_com,
+                    self.body_to_articulation,
+                    self.articulation_origin,
+                ],
                 outputs=[state_out.body_qd],
                 device=model.device,
             )
@@ -1618,6 +1689,7 @@ class SolverFeatherPGS(SolverBase):
                     model.joint_type,
                     model.joint_parent,
                     model.joint_child,
+                    model.joint_articulation,
                     model.joint_qd_start,
                     model.joint_dof_dim,
                     control.joint_f,
@@ -1626,6 +1698,7 @@ class SolverFeatherPGS(SolverBase):
                     body_f,
                     state_in.body_q,
                     model.body_com,
+                    self.articulation_origin,
                 ],
                 outputs=[
                     state_aug.body_ft_s,
@@ -2077,7 +2150,7 @@ class SolverFeatherPGS(SolverBase):
             compute_velocity_predictor,
             dim=model.joint_dof_count,
             inputs=[
-                state_in.joint_qd,
+                self.qd_work,
                 state_aug.joint_qdd,
                 dt,
             ],
@@ -2120,6 +2193,7 @@ class SolverFeatherPGS(SolverBase):
                     model.joint_ancestor,
                     model.joint_qd_start,
                     state_aug.joint_S_s,
+                    self.articulation_origin,
                     self.pgs_max_constraints,
                     self.articulation_max_dofs,
                     self.pgs_beta,
@@ -2262,6 +2336,7 @@ class SolverFeatherPGS(SolverBase):
                         self.art_size,
                         self.art_group_idx,
                         self.articulation_dof_start,
+                        self.articulation_origin,
                         self.body_to_joint,
                         model.joint_ancestor,
                         model.joint_qd_start,
@@ -2304,6 +2379,9 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_world,
                         self.contact_slot,
                         self.contact_path,
+                        self.contact_art_a,
+                        self.contact_art_b,
+                        self.articulation_origin,
                         model.shape_body,
                         state_in.body_q,
                         self.shape_material_mu,
@@ -3019,6 +3097,18 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage6_update_qdd(self, state_in: State, state_aug: State, dt: float):
         model = self.model
+        if self._has_root_free:
+            wp.launch(
+                convert_root_free_qd_local_to_world,
+                dim=model.articulation_count,
+                inputs=[
+                    self.articulation_root_is_free,
+                    self.articulation_root_dof_start,
+                    self.articulation_origin,
+                ],
+                outputs=[self.v_out],
+                device=model.device,
+            )
         wp.launch(
             update_qdd_from_velocity,
             dim=model.joint_dof_count,

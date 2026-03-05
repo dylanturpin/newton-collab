@@ -72,6 +72,80 @@ def compute_com_transforms(
     body_X_com[tid] = wp.transform(com, wp.quat_identity())
 
 
+@wp.kernel
+def update_articulation_origins(
+    articulation_start: wp.array(dtype=int),
+    joint_child: wp.array(dtype=int),
+    body_q: wp.array(dtype=wp.transform),
+    # outputs
+    articulation_origin: wp.array(dtype=wp.vec3),
+):
+    art = wp.tid()
+
+    start = articulation_start[art]
+    end = articulation_start[art + 1]
+
+    if start >= end:
+        articulation_origin[art] = wp.vec3()
+        return
+
+    root_body = joint_child[start]
+    if root_body >= 0:
+        articulation_origin[art] = wp.transform_get_translation(body_q[root_body])
+    else:
+        articulation_origin[art] = wp.vec3()
+
+
+@wp.kernel
+def convert_root_free_qd_world_to_local(
+    articulation_root_is_free: wp.array(dtype=int),
+    articulation_root_dof_start: wp.array(dtype=int),
+    articulation_origin: wp.array(dtype=wp.vec3),
+    # in/out
+    qd: wp.array(dtype=float),
+):
+    art = wp.tid()
+    if articulation_root_is_free[art] == 0:
+        return
+
+    ds = articulation_root_dof_start[art]
+    v_world = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
+    w = wp.vec3(qd[ds + 3], qd[ds + 4], qd[ds + 5])
+    origin = articulation_origin[art]
+
+    # Shift linear velocity from world-origin reference to articulation-origin reference.
+    v_local = v_world + wp.cross(w, origin)
+
+    qd[ds + 0] = v_local[0]
+    qd[ds + 1] = v_local[1]
+    qd[ds + 2] = v_local[2]
+
+
+@wp.kernel
+def convert_root_free_qd_local_to_world(
+    articulation_root_is_free: wp.array(dtype=int),
+    articulation_root_dof_start: wp.array(dtype=int),
+    articulation_origin: wp.array(dtype=wp.vec3),
+    # in/out
+    qd: wp.array(dtype=float),
+):
+    art = wp.tid()
+    if articulation_root_is_free[art] == 0:
+        return
+
+    ds = articulation_root_dof_start[art]
+    v_local = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
+    w = wp.vec3(qd[ds + 3], qd[ds + 4], qd[ds + 5])
+    origin = articulation_origin[art]
+
+    # Convert linear velocity back to world-origin reference.
+    v_world = v_local - wp.cross(w, origin)
+
+    qd[ds + 0] = v_world[0]
+    qd[ds + 1] = v_world[1]
+    qd[ds + 2] = v_world[2]
+
+
 @wp.func
 def transform_spatial_inertia(t: wp.transform, I: wp.spatial_matrix):
     """
@@ -324,24 +398,24 @@ def jcalc_motion(
         return wp.spatial_vector()
 
     if type == JointType.FREE or type == JointType.DISTANCE:
-        v_j_s = transform_twist(
-            X_sc,
-            wp.spatial_vector(
-                joint_qd[qd_start + 0],
-                joint_qd[qd_start + 1],
-                joint_qd[qd_start + 2],
-                joint_qd[qd_start + 3],
-                joint_qd[qd_start + 4],
-                joint_qd[qd_start + 5],
-            ),
-        )
+        # For FREE/DISTANCE joints we treat linear/angular velocity components as
+        # referenced at the articulation origin to avoid world-origin conditioning.
+        q_sc = wp.transform_get_rotation(X_sc)
 
-        joint_S_s[qd_start + 0] = transform_twist(X_sc, wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.0))
-        joint_S_s[qd_start + 1] = transform_twist(X_sc, wp.spatial_vector(0.0, 1.0, 0.0, 0.0, 0.0, 0.0))
-        joint_S_s[qd_start + 2] = transform_twist(X_sc, wp.spatial_vector(0.0, 0.0, 1.0, 0.0, 0.0, 0.0))
-        joint_S_s[qd_start + 3] = transform_twist(X_sc, wp.spatial_vector(0.0, 0.0, 0.0, 1.0, 0.0, 0.0))
-        joint_S_s[qd_start + 4] = transform_twist(X_sc, wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 1.0, 0.0))
-        joint_S_s[qd_start + 5] = transform_twist(X_sc, wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 1.0))
+        v_local = wp.vec3(joint_qd[qd_start + 0], joint_qd[qd_start + 1], joint_qd[qd_start + 2])
+        w_local = wp.vec3(joint_qd[qd_start + 3], joint_qd[qd_start + 4], joint_qd[qd_start + 5])
+        v_j_s = wp.spatial_vector(wp.quat_rotate(q_sc, v_local), wp.quat_rotate(q_sc, w_local))
+
+        ex = wp.quat_rotate(q_sc, wp.vec3(1.0, 0.0, 0.0))
+        ey = wp.quat_rotate(q_sc, wp.vec3(0.0, 1.0, 0.0))
+        ez = wp.quat_rotate(q_sc, wp.vec3(0.0, 0.0, 1.0))
+
+        joint_S_s[qd_start + 0] = wp.spatial_vector(ex, wp.vec3())
+        joint_S_s[qd_start + 1] = wp.spatial_vector(ey, wp.vec3())
+        joint_S_s[qd_start + 2] = wp.spatial_vector(ez, wp.vec3())
+        joint_S_s[qd_start + 3] = wp.spatial_vector(wp.vec3(), ex)
+        joint_S_s[qd_start + 4] = wp.spatial_vector(wp.vec3(), ey)
+        joint_S_s[qd_start + 5] = wp.spatial_vector(wp.vec3(), ez)
 
         return v_j_s
 
@@ -657,6 +731,7 @@ def compute_link_velocity(
     joint_type: wp.array(dtype=int),
     joint_parent: wp.array(dtype=int),
     joint_child: wp.array(dtype=int),
+    joint_articulation: wp.array(dtype=int),
     joint_qd_start: wp.array(dtype=int),
     joint_qd: wp.array(dtype=float),
     joint_axis: wp.array(dtype=wp.vec3),
@@ -665,6 +740,7 @@ def compute_link_velocity(
     body_q: wp.array(dtype=wp.transform),
     body_q_com: wp.array(dtype=wp.transform),
     joint_X_p: wp.array(dtype=wp.transform),
+    articulation_origin: wp.array(dtype=wp.vec3),
     gravity: wp.array(dtype=wp.vec3),
     # outputs
     joint_S_s: wp.array(dtype=wp.spatial_vector),
@@ -676,7 +752,11 @@ def compute_link_velocity(
     type = joint_type[i]
     child = joint_child[i]
     parent = joint_parent[i]
+    articulation = joint_articulation[i]
     qd_start = joint_qd_start[i]
+    origin = wp.vec3()
+    if articulation >= 0:
+        origin = articulation_origin[articulation]
 
     X_pj = joint_X_p[i]
     # X_cj = joint_X_c[i]
@@ -686,6 +766,10 @@ def compute_link_velocity(
     if parent >= 0:
         X_wp = body_q[parent]
         X_wpj = X_wp * X_wpj
+    X_wpj_local = wp.transform(
+        wp.transform_get_translation(X_wpj) - origin,
+        wp.transform_get_rotation(X_wpj),
+    )
 
     # compute motion subspace and velocity across the joint (also stores S_s to global memory)
     lin_axis_count = joint_dof_dim[i, 0]
@@ -695,7 +779,7 @@ def compute_link_velocity(
         joint_axis,
         lin_axis_count,
         ang_axis_count,
-        X_wpj,
+        X_wpj_local,
         joint_qd,
         qd_start,
         joint_S_s,
@@ -715,17 +799,21 @@ def compute_link_velocity(
 
     # compute body forces
     X_sm = body_q_com[child]
+    X_sm_local = wp.transform(
+        wp.transform_get_translation(X_sm) - origin,
+        wp.transform_get_rotation(X_sm),
+    )
     I_m = body_I_m[child]
 
     # gravity and external forces (expressed in frame aligned with s but centered at body mass)
     m = I_m[0, 0]
 
     f_g = m * gravity[0]
-    r_com = wp.transform_get_translation(X_sm)
+    r_com = wp.transform_get_translation(X_sm_local)
     f_g_s = wp.spatial_vector(f_g, wp.cross(r_com, f_g))
 
     # body forces
-    I_s = transform_spatial_inertia(X_sm, I_m)
+    I_s = transform_spatial_inertia(X_sm_local, I_m)
 
     f_b_s = I_s * a_s + spatial_cross_dual(v_s, I_s * v_s)
 
@@ -742,6 +830,7 @@ def eval_rigid_id(
     joint_type: wp.array(dtype=int),
     joint_parent: wp.array(dtype=int),
     joint_child: wp.array(dtype=int),
+    joint_articulation: wp.array(dtype=int),
     joint_qd_start: wp.array(dtype=int),
     joint_qd: wp.array(dtype=float),
     joint_axis: wp.array(dtype=wp.vec3),
@@ -750,6 +839,7 @@ def eval_rigid_id(
     body_q: wp.array(dtype=wp.transform),
     body_q_com: wp.array(dtype=wp.transform),
     joint_X_p: wp.array(dtype=wp.transform),
+    articulation_origin: wp.array(dtype=wp.vec3),
     gravity: wp.array(dtype=wp.vec3),
     # outputs
     joint_S_s: wp.array(dtype=wp.spatial_vector),
@@ -771,6 +861,7 @@ def eval_rigid_id(
             joint_type,
             joint_parent,
             joint_child,
+            joint_articulation,
             joint_qd_start,
             joint_qd,
             joint_axis,
@@ -779,6 +870,7 @@ def eval_rigid_id(
             body_q,
             body_q_com,
             joint_X_p,
+            articulation_origin,
             gravity,
             joint_S_s,
             body_I_s,
@@ -794,6 +886,7 @@ def eval_rigid_tau(
     joint_type: wp.array(dtype=int),
     joint_parent: wp.array(dtype=int),
     joint_child: wp.array(dtype=int),
+    joint_articulation: wp.array(dtype=int),
     joint_qd_start: wp.array(dtype=int),
     joint_dof_dim: wp.array(dtype=int, ndim=2),
     joint_f: wp.array(dtype=float),
@@ -802,6 +895,7 @@ def eval_rigid_tau(
     body_f_ext: wp.array(dtype=wp.spatial_vector),
     body_q: wp.array(dtype=wp.transform),
     body_com: wp.array(dtype=wp.vec3),
+    articulation_origin: wp.array(dtype=wp.vec3),
     # outputs
     body_ft_s: wp.array(dtype=wp.spatial_vector),
     tau: wp.array(dtype=float),
@@ -821,9 +915,13 @@ def eval_rigid_tau(
         type = joint_type[i]
         parent = joint_parent[i]
         child = joint_child[i]
+        articulation = joint_articulation[i]
         dof_start = joint_qd_start[i]
         lin_axis_count = joint_dof_dim[i, 0]
         ang_axis_count = joint_dof_dim[i, 1]
+        origin = wp.vec3()
+        if articulation >= 0:
+            origin = articulation_origin[articulation]
 
         # body forces in Featherstone frame (origin)
         f_b_s = body_fb_s[child]
@@ -837,7 +935,8 @@ def eval_rigid_tau(
         X_wb = body_q[child]
         com_local = body_com[child]
         com_world = wp.transform_point(X_wb, com_local)
-        tau_origin = f_ext_f + wp.cross(com_world, f_ext_t)
+        com_rel = com_world - origin
+        tau_origin = f_ext_f + wp.cross(com_rel, f_ext_t)
         f_ext_origin = wp.spatial_vector(f_ext_t, tau_origin)
 
         # subtract external wrench to get net wrench on body
@@ -1249,6 +1348,7 @@ def accumulate_contact_jacobian_matrix_free(
     joint_ancestor: wp.array(dtype=int),
     joint_qd_start: wp.array(dtype=int),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
+    articulation_origin: wp.array(dtype=wp.vec3),
     articulation_dof_start: int,
     # Outputs
     row_base_index: int,
@@ -1256,6 +1356,9 @@ def accumulate_contact_jacobian_matrix_free(
 ):
     if body_index < 0:
         return
+
+    origin = articulation_origin[articulation]
+    point_rel = point_world - origin
 
     curr_joint = body_to_joint[body_index]
 
@@ -1272,7 +1375,7 @@ def accumulate_contact_jacobian_matrix_free(
             linear = wp.vec3(S[0], S[1], S[2])
             angular = wp.vec3(S[3], S[4], S[5])
 
-            lin_vel_at_point = linear + wp.cross(angular, point_world)
+            lin_vel_at_point = linear + wp.cross(angular, point_rel)
             proj = wp.dot(n_vec, lin_vel_at_point)
 
             local_dof = global_dof - articulation_dof_start
@@ -1304,6 +1407,7 @@ def build_contact_rows_normal(
     joint_ancestor: wp.array(dtype=int),
     joint_qd_start: wp.array(dtype=int),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
+    articulation_origin: wp.array(dtype=wp.vec3),
     max_constraints: int,
     max_dofs: int,
     contact_beta: float,
@@ -1428,6 +1532,7 @@ def build_contact_rows_normal(
         joint_ancestor,
         joint_qd_start,
         joint_S_s,
+        articulation_origin,
         art_dof_start,
         row_base,
         Jc_out,
@@ -1444,6 +1549,7 @@ def build_contact_rows_normal(
         joint_ancestor,
         joint_qd_start,
         joint_S_s,
+        articulation_origin,
         art_dof_start,
         row_base,
         Jc_out,
@@ -1479,6 +1585,7 @@ def build_contact_rows_normal(
             joint_ancestor,
             joint_qd_start,
             joint_S_s,
+            articulation_origin,
             art_dof_start,
             tangent_base_1,
             Jc_out,
@@ -1495,6 +1602,7 @@ def build_contact_rows_normal(
             joint_ancestor,
             joint_qd_start,
             joint_S_s,
+            articulation_origin,
             art_dof_start,
             tangent_base_1,
             Jc_out,
@@ -1526,6 +1634,7 @@ def build_contact_rows_normal(
             joint_ancestor,
             joint_qd_start,
             joint_S_s,
+            articulation_origin,
             art_dof_start,
             tangent_base_2,
             Jc_out,
@@ -1542,6 +1651,7 @@ def build_contact_rows_normal(
             joint_ancestor,
             joint_qd_start,
             joint_S_s,
+            articulation_origin,
             art_dof_start,
             tangent_base_2,
             Jc_out,
@@ -1825,6 +1935,7 @@ def accumulate_jacobian_row_world(
     body_index: int,
     sign: float,
     point_world: wp.vec3,
+    origin: wp.vec3,
     direction: wp.vec3,
     body_to_joint: wp.array(dtype=int),
     joint_ancestor: wp.array(dtype=int),
@@ -1840,6 +1951,7 @@ def accumulate_jacobian_row_world(
     if body_index < 0:
         return
 
+    point_rel = point_world - origin
     curr_joint = body_to_joint[body_index]
 
     while curr_joint >= 0:
@@ -1852,7 +1964,7 @@ def accumulate_jacobian_row_world(
             ang = wp.vec3(S[3], S[4], S[5])
 
             # Velocity at contact point from this joint
-            v = lin + wp.cross(ang, point_world)
+            v = lin + wp.cross(ang, point_rel)
             proj = wp.dot(direction, v)
 
             local_dof = global_dof - art_dof_start
@@ -1881,6 +1993,7 @@ def populate_world_J_for_size(
     art_size: wp.array(dtype=int),
     art_group_idx: wp.array(dtype=int),
     art_dof_start: wp.array(dtype=int),
+    articulation_origin: wp.array(dtype=wp.vec3),
     body_to_joint: wp.array(dtype=int),
     joint_ancestor: wp.array(dtype=int),
     joint_qd_start: wp.array(dtype=int),
@@ -1982,12 +2095,14 @@ def populate_world_J_for_size(
     if art_a >= 0 and art_size[art_a] == target_size:
         group_idx_a = art_group_idx[art_a]
         dof_start_a = art_dof_start[art_a]
+        origin_a = articulation_origin[art_a]
 
         # Normal row (slot + 0)
         accumulate_jacobian_row_world(
             body_a,
             1.0,
             point_a_world,
+            origin_a,
             normal,
             body_to_joint,
             joint_ancestor,
@@ -2006,6 +2121,7 @@ def populate_world_J_for_size(
                 body_a,
                 1.0,
                 point_a_world,
+                origin_a,
                 t0,
                 body_to_joint,
                 joint_ancestor,
@@ -2022,6 +2138,7 @@ def populate_world_J_for_size(
                 body_a,
                 1.0,
                 point_a_world,
+                origin_a,
                 t1,
                 body_to_joint,
                 joint_ancestor,
@@ -2038,12 +2155,14 @@ def populate_world_J_for_size(
     if art_b >= 0 and art_size[art_b] == target_size:
         group_idx_b = art_group_idx[art_b]
         dof_start_b = art_dof_start[art_b]
+        origin_b = articulation_origin[art_b]
 
         # Opposite sign for body B
         accumulate_jacobian_row_world(
             body_b,
             -1.0,
             point_b_world,
+            origin_b,
             normal,
             body_to_joint,
             joint_ancestor,
@@ -2061,6 +2180,7 @@ def populate_world_J_for_size(
                 body_b,
                 -1.0,
                 point_b_world,
+                origin_b,
                 t0,
                 body_to_joint,
                 joint_ancestor,
@@ -2076,6 +2196,7 @@ def populate_world_J_for_size(
                 body_b,
                 -1.0,
                 point_b_world,
+                origin_b,
                 t1,
                 body_to_joint,
                 joint_ancestor,
@@ -2564,6 +2685,8 @@ def update_body_qd_from_featherstone(
     body_v_s: wp.array(dtype=wp.spatial_vector),
     body_q: wp.array(dtype=wp.transform),
     body_com: wp.array(dtype=wp.vec3),
+    body_to_articulation: wp.array(dtype=int),
+    articulation_origin: wp.array(dtype=wp.vec3),
     body_qd_out: wp.array(dtype=wp.spatial_vector),
 ):
     tid = wp.tid()
@@ -2575,8 +2698,13 @@ def update_body_qd_from_featherstone(
     X_wb = body_q[tid]
     com_local = body_com[tid]
     com_world = wp.transform_point(X_wb, com_local)
+    art = body_to_articulation[tid]
+    origin = wp.vec3()
+    if art >= 0:
+        origin = articulation_origin[art]
+    com_rel = com_world - origin
 
-    v_com = v0 + wp.cross(w, com_world)
+    v_com = v0 + wp.cross(w, com_rel)
 
     body_qd_out[tid] = wp.spatial_vector(v_com, w)
 
@@ -2781,6 +2909,9 @@ def build_mf_contact_rows(
     contact_world: wp.array(dtype=int),
     contact_slot: wp.array(dtype=int),
     contact_path: wp.array(dtype=int),
+    contact_art_a: wp.array(dtype=int),
+    contact_art_b: wp.array(dtype=int),
+    articulation_origin: wp.array(dtype=wp.vec3),
     shape_body: wp.array(dtype=int),
     body_q: wp.array(dtype=wp.transform),
     shape_material_mu: wp.array(dtype=float),
@@ -2798,10 +2929,10 @@ def build_mf_contact_rows(
 ):
     """Build MF constraint rows for contacts between free rigid bodies / ground.
 
-    For root free joints, joint_qd stores the world-frame spatial twist at the
-    world origin: qd = [v_at_origin, omega].  S = identity (since X_wpj = I),
-    so the dense Jacobian row simplifies to:
-        J = [d, pw x d]   (pw = absolute world position of contact point)
+    For root free joints, `joint_qd` stores spatial twist in an articulation-local
+    frame whose origin is the body origin, i.e. `qd = [v_origin, omega]`.
+    The MF contact Jacobian uses contact position relative to that origin:
+        J = [d, r x d]   (r = p_contact - p_origin)
     """
     c = wp.tid()
     total_contacts = contact_count[0]
@@ -2879,13 +3010,13 @@ def build_mf_contact_rows(
         else:
             d = t1
 
-        # Body A Jacobian in world frame: J = [d, pw_a x d]
-        # For root free joints, joint_qd stores world-frame spatial twist
-        # at the world origin (v_at_origin, omega). S = identity, so
-        # J[k] = dot(d, S_k_lin + cross(S_k_ang, pw)) reduces to
-        # J = [d, pw x d] with pw = absolute world position of contact point.
+        # Body A Jacobian in articulation-local frame: J = [d, r_a x d], where
+        # r_a is the contact point relative to articulation A's fixed origin.
         if body_a >= 0:
-            ang_a = wp.cross(point_a_world, d)
+            art_a = contact_art_a[c]
+            origin_a = articulation_origin[art_a]
+            r_a = point_a_world - origin_a
+            ang_a = wp.cross(r_a, d)
             mf_J_a[world, row_idx, 0] = d[0]
             mf_J_a[world, row_idx, 1] = d[1]
             mf_J_a[world, row_idx, 2] = d[2]
@@ -2893,9 +3024,12 @@ def build_mf_contact_rows(
             mf_J_a[world, row_idx, 4] = ang_a[1]
             mf_J_a[world, row_idx, 5] = ang_a[2]
 
-        # Body B Jacobian in world frame: negative sign (opposite contact direction)
+        # Body B Jacobian in articulation-local frame (opposite sign).
         if body_b >= 0:
-            ang_b = wp.cross(point_b_world, d)
+            art_b = contact_art_b[c]
+            origin_b = articulation_origin[art_b]
+            r_b = point_b_world - origin_b
+            ang_b = wp.cross(r_b, d)
             mf_J_b[world, row_idx, 0] = -d[0]
             mf_J_b[world, row_idx, 1] = -d[1]
             mf_J_b[world, row_idx, 2] = -d[2]
@@ -3036,10 +3170,8 @@ def compute_mf_body_Hinv(
 ):
     """Compute H^-1 = inverse(body_I_s) for free rigid bodies.
 
-    For root free joints, H = body_I_s (the spatial inertia at the world
-    origin). This is a full 6x6 matrix (not block-diagonal) because the
-    parallel axis theorem introduces off-diagonal coupling from the body's
-    position.
+    For root free joints, H = body_I_s in articulation-local coordinates.
+    This remains a full 6x6 matrix for bodies with non-zero CoM offsets.
     """
     b = wp.tid()
     art = body_to_articulation[b]
@@ -3075,8 +3207,8 @@ def compute_mf_effective_mass_and_rhs(
     The effective mass for constraint i is:
         d_ii = J_a^T * H_a_inv * J_a + J_b^T * H_b_inv * J_b + cfm
 
-    H_inv is the full 6x6 inverse of the spatial inertia at the world origin.
-    For root free joints, H = body_I_s (includes parallel axis terms).
+    H_inv is the full 6x6 inverse of the spatial inertia in articulation-local
+    coordinates for each free rigid articulation.
 
     RHS stores only the stabilization bias (not J*v), since the MF PGS
     recomputes J*v each iteration from the live velocity array.

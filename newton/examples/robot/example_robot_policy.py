@@ -138,9 +138,13 @@ def compute_obs(
     joint_q = state.joint_q if state.joint_q is not None else []
     joint_qd = state.joint_qd if state.joint_qd is not None else []
 
+    root_pos_w = torch.tensor(joint_q[0:3], device=device, dtype=torch.float32).unsqueeze(0)
     root_quat_w = torch.tensor(joint_q[3:7], device=device, dtype=torch.float32).unsqueeze(0)
-    root_lin_vel_w = torch.tensor(joint_qd[:3], device=device, dtype=torch.float32).unsqueeze(0)
+    root_lin_vel_origin_w = torch.tensor(joint_qd[:3], device=device, dtype=torch.float32).unsqueeze(0)
     root_ang_vel_w = torch.tensor(joint_qd[3:6], device=device, dtype=torch.float32).unsqueeze(0)
+    # For free roots, qd[:3] stores linear velocity at world origin. Convert to
+    # root-frame linear velocity at the root position to remove origin dependence.
+    root_lin_vel_w = root_lin_vel_origin_w + torch.cross(root_ang_vel_w, root_pos_w, dim=1)
     joint_pos_current = torch.tensor(joint_q[7:], device=device, dtype=torch.float32).unsqueeze(0)
     joint_vel_current = torch.tensor(joint_qd[6:], device=device, dtype=torch.float32).unsqueeze(0)
 
