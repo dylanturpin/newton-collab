@@ -230,7 +230,9 @@ class Example:
                 "small_dof_threshold": 12,
                 "use_parallel_streams": use_tiled,
             }
-            self.solver = newton.solvers.SolverFeatherPGS(self.model, **solver_kwargs)
+            from newton._src.solvers import SolverFeatherPGS  # noqa: PLC0415
+
+            self.solver = SolverFeatherPGS(self.model, **solver_kwargs)
             print(
                 "PGS params:",
                 "iter",

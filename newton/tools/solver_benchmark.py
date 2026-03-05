@@ -1588,7 +1588,9 @@ def create_solver(model, args, scenario_cfg: dict):
             "double_buffer": args.double_buffer,
             "nvtx": args.nvtx,
         }
-        return newton.solvers.SolverFeatherPGS(model, **solver_kwargs)
+        from newton._src.solvers import SolverFeatherPGS  # noqa: PLC0415
+
+        return SolverFeatherPGS(model, **solver_kwargs)
 
 
 # =============================================================================

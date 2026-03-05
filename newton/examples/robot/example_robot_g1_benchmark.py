@@ -19,7 +19,7 @@ Unitree G1 benchmark / example:
 - Builds a replicated G1 scene from USD.
 - Can use either:
     * newton.solvers.SolverMuJoCo  (implicit, hardcoded parameters)
-    * newton.solvers.SolverFeatherPGS (CRBA + PGS contacts)
+    * SolverFeatherPGS (CRBA + PGS contacts)
 
 Usage examples:
 
@@ -147,7 +147,9 @@ class Example:
                 "small_dof_threshold": 12,
                 "use_parallel_streams": True,
             }
-            self.solver = newton.solvers.SolverFeatherPGS(self.model, **solver_kwargs)
+            from newton._src.solvers import SolverFeatherPGS  # noqa: PLC0415
+
+            self.solver = SolverFeatherPGS(self.model, **solver_kwargs)
             print(
                 "PGS params:",
                 "iter",
