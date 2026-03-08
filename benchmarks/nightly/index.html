@@ -318,10 +318,7 @@
     </div>
     <div class="control">
       <label for="scene-select">Scene</label>
-      <select id="scene-select">
-        <option value="h1_tabletop">H1 Tabletop</option>
-        <option value="g1_flat">G1 Flat</option>
-      </select>
+      <select id="scene-select"></select>
     </div>
     <div class="control" id="video-select-control">
       <label for="video-select">Preview</label>
@@ -512,6 +509,11 @@
       return points.filter(p => p.gpu === gpuSelect.value);
     }
 
+    function getAvailableScenes() {
+      const scenes = unique(getFilteredPoints().map(p => p.scenario).filter(Boolean));
+      return scenes;
+    }
+
     function refreshRunSelect() {
       const filtered = getFilteredRuns();
       const prevRun = runSelect.value;
@@ -523,6 +525,19 @@
       }
       const latest = filtered[0];
       runBadge.textContent = latest ? `Latest: ${formatRunLabel(latest)} • ${formatRunHealth(latest)}` : 'No runs';
+    }
+
+    function refreshSceneSelect() {
+      const availableScenes = getAvailableScenes();
+      const previous = sceneSelect.value;
+      sceneSelect.innerHTML = availableScenes
+        .map(scene => `<option value="${scene}">${getSceneLabel(scene)}</option>`)
+        .join('');
+      if (availableScenes.includes(previous)) {
+        sceneSelect.value = previous;
+      } else if (availableScenes.length) {
+        sceneSelect.value = availableScenes[0];
+      }
     }
 
     function parseJsonl(text) {
@@ -1136,6 +1151,7 @@
         // Event listeners
         gpuSelect.addEventListener('change', () => {
           refreshRunSelect();
+          refreshSceneSelect();
           renderSceneCharts();
           updateTimeSeriesControls();
           updateSystemInfo();
@@ -1153,6 +1169,7 @@
         metricSelect.addEventListener('change', renderTimeSeries);
 
         // Initial render
+        refreshSceneSelect();
         renderSceneCharts();
         updateTimeSeriesControls();
         updateSystemInfo();
