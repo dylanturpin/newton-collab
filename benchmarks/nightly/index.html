@@ -343,6 +343,7 @@
   <!-- Run snapshot charts (for selected scene) -->
   <section class="section">
     <div class="section-title">Run Snapshot <span id="run-title">–</span></div>
+    <div class="note" id="run-health">Run health will appear here.</div>
     <div class="grid">
       <div class="card">
         <h3 id="sweep-fps-title">Sweep • Env-FPS</h3>
@@ -445,6 +446,19 @@
       h1_tabletop: 'H1 Tabletop'
     };
 
+    const DISPLAY_SERIES = {
+      g1_flat: {
+        sweep: 'g1_flat_env_fps',
+        ablation: 'g1_flat_ablation',
+        render: 'g1_flat_render'
+      },
+      h1_tabletop: {
+        sweep: 'h1_tabletop_env_fps',
+        ablation: 'h1_tabletop_ablation',
+        render: 'h1_tabletop_render'
+      }
+    };
+
     const STAGE_COLORS = {
       '0_collision':     '#f97316',
       '1_fk_id':         '#22d3ee',
@@ -474,6 +488,7 @@
     let points = [];
     let charts = {};
     let renders = [];  // populated from renders.json per run
+    const runSummaries = new Map();
 
     const gpuSelect = document.getElementById('gpu-select');
     const runSelect = document.getElementById('run-select');
@@ -486,6 +501,7 @@
     const errorEl = document.getElementById('error');
     const runBadge = document.getElementById('run-badge');
     const runTitle = document.getElementById('run-title');
+    const runHealth = document.getElementById('run-health');
     const systemInfo = document.getElementById('system-info');
 
     function getFilteredRuns() {
@@ -506,7 +522,7 @@
         runSelect.value = filtered[0].run_id;
       }
       const latest = filtered[0];
-      runBadge.textContent = latest ? `Latest: ${formatRunLabel(latest)}` : 'No runs';
+      runBadge.textContent = latest ? `Latest: ${formatRunLabel(latest)} • ${formatRunHealth(latest)}` : 'No runs';
     }
 
     function parseJsonl(text) {
@@ -846,6 +862,75 @@
       return SCENE_LABELS[scene] || scene;
     }
 
+    function getDisplaySeries(scene, mode) {
+      return DISPLAY_SERIES[scene] && DISPLAY_SERIES[scene][mode] ? DISPLAY_SERIES[scene][mode] : null;
+    }
+
+    function pointMatchesDisplay(point, scene, mode) {
+      if (point.scenario !== scene || point.mode !== mode) return false;
+      const displaySeries = getDisplaySeries(scene, mode);
+      if (!displaySeries) return true;
+      return point.series === displaySeries;
+    }
+
+    function renderMatchesScene(render, scene) {
+      if (render.scenario !== scene) return false;
+      const displaySeries = getDisplaySeries(scene, 'render');
+      if (!displaySeries) return true;
+      return render.series === displaySeries;
+    }
+
+    function formatRunHealth(summary) {
+      if (!summary) return 'status unknown';
+      const failedTasks = Number(summary.failed_tasks || 0);
+      const failedJobs = Number(summary.failed_jobs || 0);
+      if (summary.status === 'failed') {
+        const parts = [];
+        if (failedTasks) parts.push(`${failedTasks} failed task${failedTasks === 1 ? '' : 's'}`);
+        if (failedJobs) parts.push(`${failedJobs} failed job${failedJobs === 1 ? '' : 's'}`);
+        return parts.length ? parts.join(', ') : 'failed';
+      }
+      return 'healthy';
+    }
+
+    async function loadRunSummary(runId) {
+      if (runSummaries.has(runId)) return runSummaries.get(runId);
+      const run = runs.find(r => r.run_id === runId);
+      const runDir = run && run.run_dir ? run.run_dir : `runs/${runId}`;
+      try {
+        const resp = await fetch(`${runDir}/summary.json`);
+        if (!resp.ok) {
+          runSummaries.set(runId, null);
+          return null;
+        }
+        const summary = await resp.json();
+        runSummaries.set(runId, summary);
+        return summary;
+      } catch (e) {
+        runSummaries.set(runId, null);
+        return null;
+      }
+    }
+
+    async function updateRunHealth() {
+      const runId = runSelect.value;
+      if (!runId) {
+        runHealth.textContent = 'Run health unavailable.';
+        return;
+      }
+      const run = runs.find(r => r.run_id === runId);
+      const summary = await loadRunSummary(runId);
+      const source = summary || run;
+      if (!source) {
+        runHealth.textContent = 'Run health unavailable.';
+        return;
+      }
+      const parts = [`Status: ${formatRunHealth(source)}`];
+      if (source.point_count !== undefined) parts.push(`${source.point_count} published point${source.point_count === 1 ? '' : 's'}`);
+      if (source.render_count !== undefined) parts.push(`${source.render_count} render${source.render_count === 1 ? '' : 's'}`);
+      runHealth.textContent = parts.join(' • ');
+    }
+
     async function loadRenders(runId) {
       const run = runs.find(r => r.run_id === runId);
       const runDir = run && run.run_dir ? run.run_dir : `runs/${runId}`;
@@ -860,7 +945,7 @@
 
     function updateVideoSelector() {
       const scene = getSelectedScene();
-      const available = renders.filter(r => r.scenario === scene);
+      const available = renders.filter(r => renderMatchesScene(r, scene));
       const control = document.getElementById('video-select-control');
 
       if (!available.length) {
@@ -879,7 +964,7 @@
 
     function playSelectedVideo() {
       const scene = getSelectedScene();
-      const available = renders.filter(r => r.scenario === scene);
+      const available = renders.filter(r => renderMatchesScene(r, scene));
       const idx = parseInt(videoSelect.value, 10);
       const meta = available[idx];
 
@@ -928,12 +1013,12 @@
       document.getElementById('kernel-detail-title').textContent = `${sceneLabel} Ablation • Kernel Detail`;
 
       // Sweep charts
-      const sweep = runPoints.filter(p => p.mode === 'sweep' && p.ok !== false);
+      const sweep = runPoints.filter(p => pointMatchesDisplay(p, scene, 'sweep') && p.ok !== false);
       buildLineChart('sweep-fps', buildSweepDatasets(sweep, 'env_fps'), 'num_envs', 'Env-FPS');
       buildLineChart('sweep-gpu', buildSweepDatasets(sweep, 'gpu_used_gb'), 'num_envs', 'GPU GB');
 
       // Ablation chart
-      const ablation = runPoints.filter(p => p.mode === 'ablation' && p.ok !== false);
+      const ablation = runPoints.filter(p => pointMatchesDisplay(p, scene, 'ablation') && p.ok !== false);
       const ablationSorted = ablation.slice().sort((a, b) => (a.step_index ?? 0) - (b.step_index ?? 0));
       const ablationLabels = ablationSorted.map(p => (p.label || p.solver || 'unknown').replace(/^\+\s*/, '').slice(0, 24));
       const ablationValues = ablationSorted.map(p => p.env_fps || 0);
@@ -959,6 +1044,7 @@
       // Video
       await loadRenders(runId);
       updateVideoSelector();
+      await updateRunHealth();
     }
 
     // ---- Time series ----
@@ -973,7 +1059,7 @@
     function updateTimeSeriesControls() {
       const mode = modeSelect.value;
       const scene = getSelectedScene();
-      const available = getFilteredPoints().filter(p => p.mode === mode && p.scenario === scene);
+      const available = getFilteredPoints().filter(p => pointMatchesDisplay(p, scene, mode));
 
       const solvers = unique(available.map(p => getSolverKey(p, mode)));
       solverSelect.innerHTML = solvers.map(s => `<option value="${s}">${s}</option>`).join('');
@@ -994,8 +1080,7 @@
       const metric = metricSelect.value;
 
       const filtered = getFilteredPoints().filter(p => {
-        if (p.mode !== mode) return false;
-        if (p.scenario !== scene) return false;
+        if (!pointMatchesDisplay(p, scene, mode)) return false;
         const key = getSolverKey(p, mode);
         if (key !== solver) return false;
         if (env && p.num_worlds !== env) return false;
@@ -1012,13 +1097,13 @@
     }
 
     function updateSystemInfo() {
-      const latest = getFilteredRuns()[0];
-      if (!latest) { systemInfo.textContent = 'No runs for this GPU.'; return; }
+      const selected = runs.find(r => r.run_id === runSelect.value) || getFilteredRuns()[0];
+      if (!selected) { systemInfo.textContent = 'No runs for this GPU.'; return; }
       const system = [
-        latest.gpu ? `GPU: ${latest.gpu}` : null,
-        latest.gpu_memory_total_gb ? `VRAM: ${Number(latest.gpu_memory_total_gb).toFixed(1)} GB` : null,
-        latest.platform ? `OS: ${latest.platform}` : null,
-        latest.python_version ? `Python: ${latest.python_version}` : null
+        selected.gpu ? `GPU: ${selected.gpu}` : null,
+        selected.gpu_memory_total_gb ? `VRAM: ${Number(selected.gpu_memory_total_gb).toFixed(1)} GB` : null,
+        selected.platform ? `OS: ${selected.platform}` : null,
+        selected.python_version ? `Python: ${selected.python_version}` : null
       ].filter(Boolean).join(' \u2022 ');
       systemInfo.textContent = system || 'System info unavailable.';
     }

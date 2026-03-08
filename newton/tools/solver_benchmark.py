@@ -1,41 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Unified solver benchmark script for comparing FeatherPGS and MuJoCo solvers.
-
-Supports multiple scenarios, sweep/ablation modes, kernel timing, plotting, and JSONL outputs.
+"""Concrete benchmark and render worker used by nightly orchestration.
 
 Usage examples:
 
     # Interactive run
     uv run newton/tools/solver_benchmark.py --scenario g1_flat --num-worlds 1
 
-    # Single benchmark run
+    # Single benchmark run with job-owned artifacts
     uv run newton/tools/solver_benchmark.py --scenario h1_tabletop --solver fpgs_tiled \\
-        --num-worlds 4096 --benchmark
+        --num-worlds 4096 --benchmark --summary-timer --out results/job_0001
 
-    # Sweep over num_worlds with plotting
-    uv run newton/tools/solver_benchmark.py --scenario h1_tabletop --sweep \\
-        --solvers fpgs_tiled,fpgs_loop,mujoco --plot
-
-    # Ablation study
-    uv run newton/tools/solver_benchmark.py --scenario g1_cube_stack --ablation \\
-        --num-worlds 4096 --plot
-
-    # Compare kernel timings
-    uv run newton/tools/solver_benchmark.py --compare run1.json run2.json
-
-    # Render a 5-second video of a scenario (headless, outputs mp4 via ffmpeg)
+    # Render a short video of a scenario (headless, outputs mp4 via ffmpeg)
     uv run newton/tools/solver_benchmark.py --scenario h1_tabletop --solver fpgs_tiled \\
-        --render --render-frames 300 --out renders/
+        --render --render-frames 300 --out renders/job_0002
 """
 
 import argparse
 import datetime as dt
 import json
 import platform
-import re
 import string
 import subprocess
 import sys
@@ -250,7 +235,7 @@ ABLATION_SEQUENCES = {
             "trisolve_kernel": "tiled",
             "hinv_jt_kernel": "tiled",
             "delassus_kernel": "tiled",
-            "pgs_kernel": "tiled_contact",  # Will be overridden by --ablation-pgs if specified
+            "pgs_kernel": "tiled_contact",
             "use_parallel_streams": False,
         },
         {
@@ -329,7 +314,7 @@ ABLATION_SEQUENCES = {
             "trisolve_kernel": "tiled",
             "hinv_jt_kernel": "par_row",
             "delassus_kernel": "tiled",
-            "pgs_kernel": "streaming",  # Will be overridden by --ablation-pgs if specified
+            "pgs_kernel": "streaming",
             "dense_max_constraints": 396,
             "pgs_mode": "delassus",
             "use_parallel_streams": False,
@@ -372,213 +357,6 @@ ABLATION_SEQUENCES = {
 }
 
 # =============================================================================
-# Kernel to Stage Mapping
-# =============================================================================
-
-STAGE_PATTERNS = {
-    "0_collision": [
-        # Shared - broadphase and contact pair generation
-        "broadphase_collision_pairs",
-        "generate_handle_contact_pairs",
-        # MuJoCo - narrowphase
-        "_primitive_narrowphase",
-        "_nxn_broadphase",
-    ],
-    "1_fk_id": [
-        # FeatherPGS
-        "eval_rigid_fk",
-        "eval_rigid_id",
-        "eval_rigid_mass",
-        "compute_com",
-        "compute_spatial",
-        "compute_composite_inertia",
-        "eval_articulation_fk",
-        # MuJoCo
-        "_kinematics_level",
-    ],
-    "1_drives": [
-        # FeatherPGS
-        "eval_joint_drives",
-        "eval_rigid_tau",
-        "clamp_joint_tau",
-        # MuJoCo - actuator velocity from joint velocities
-        "_actuator_velocity",
-        "_qderiv_actuator",
-    ],
-    "1_crba": [
-        # FeatherPGS
-        "crba_",
-        # MuJoCo - mass matrix setup
-        "update_gradient_set_h_qM",
-        "_crb_accumulate",
-    ],
-    "2_cholesky": [
-        # FeatherPGS
-        "cholesky_",
-        # MuJoCo - sparse Cholesky factorization accumulation
-        "_qLD_acc",
-        # MuJoCo - sparse L*D*L^T accumulation sweeps (part of factorization)
-        "_solve_LD_sparse_x_acc",
-    ],
-    "3_trisolve": [
-        # FeatherPGS
-        "trisolve_",
-        # MuJoCo - forward/back substitution for L*x=y and L^T*x=y
-        "_solve_LD_sparse",
-    ],
-    "3_v_hat": [
-        # FeatherPGS
-        "compute_velocity_predictor",
-        "compute_v_hat",
-    ],
-    "4_contact_build": [
-        # FeatherPGS
-        "build_contact_row",
-        "build_augmented",
-        "allocate_world_contact",
-        "clamp_contact",
-        "populate_world_J",
-        # FeatherPGS matrix-free
-        "build_mf_body_map",
-        "build_mf_contact_rows",
-        # MuJoCo - contact constraint generation with pyramidal friction
-        "_efc_contact",
-        "update_constraint_efc",
-    ],
-    "4_hinv_jt": [
-        # FeatherPGS - compute H^-1 * J^T
-        "hinv_jt_",
-    ],
-    "4_delassus": [
-        # FeatherPGS - Delassus matrix G = J * H^-1 * J^T (constraint space)
-        "delassus_",
-        "finalize_world_diag_cfm",
-        # FeatherPGS matrix-free - fused effective mass diagonal + RHS
-        "compute_mf_effective_mass",
-    ],
-    "4_hessian": [
-        # MuJoCo - build system Hessian: H + J^T * D * J (DOF space)
-        "update_gradient_JTDAJ",
-        "mul_m_sparse",
-    ],
-    "4_rhs": [
-        # FeatherPGS
-        "compute_world_contact_bias",
-        "contact_bias_",
-        "compute_rhs",
-        "rhs_accum",
-    ],
-    "5_solver": [
-        # FeatherPGS (PGS iterations)
-        "pgs_solve",
-        "prepare_impulses",
-        "prepare_world_impulses",
-        # MuJoCo (Newton solver iterations with line search)
-        "linesearch_jv",
-        "linesearch_parallel",
-        "update_gradient_cholesky",
-        "update_gradient_grad",
-        "solve_init_jaref",
-        "solve_search_update",
-    ],
-    "6_apply": [
-        # FeatherPGS
-        "apply_impulse",
-        "apply_augmented",
-        # MuJoCo - map constraint forces to DOF space: qfrc += J^T * efc_force
-        "update_constraint_init_qfrc",
-    ],
-    "6_integrate": [
-        # FeatherPGS
-        "integrate_",
-        "update_qdd",
-        "update_body_qd",
-        "scatter_qdd",
-        "eval_fk",
-    ],
-}
-
-
-def classify_kernel(kernel_name: str) -> str:
-    """Classify a kernel name into a stage."""
-    name_lower = kernel_name.lower()
-    for stage, patterns in STAGE_PATTERNS.items():
-        for pattern in patterns:
-            if pattern.lower() in name_lower:
-                return stage
-    return "other"
-
-
-# =============================================================================
-# Output Parsing
-# =============================================================================
-
-RE_ELAPSED = re.compile(r"Elapsed time \(s\):\s*([0-9.]+)")
-RE_ENVFPS = re.compile(r"Env-FPS \(env/s\):\s*([0-9,\.]+)")
-RE_GPU_USED = re.compile(r"GPU memory used \(GB\):\s*([0-9.]+)")
-RE_GPU_TOTAL = re.compile(r"GPU memory total \(GB\):\s*([0-9.]+)")
-RE_WORLDS = re.compile(r"Worlds:\s*([0-9]+)")
-RE_SOLVER = re.compile(r"Solver:\s*([A-Za-z0-9_]+)")
-
-
-def parse_benchmark_output(text: str) -> dict:
-    """Parse benchmark summary from stdout."""
-
-    def get_float(regex, default=None):
-        m = regex.search(text)
-        if not m:
-            return default
-        return float(m.group(1).replace(",", ""))
-
-    def get_int(regex, default=None):
-        m = regex.search(text)
-        if not m:
-            return default
-        return int(m.group(1))
-
-    return {
-        "solver": RE_SOLVER.search(text).group(1) if RE_SOLVER.search(text) else None,
-        "num_worlds": get_int(RE_WORLDS),
-        "elapsed_s": get_float(RE_ELAPSED),
-        "env_fps": get_float(RE_ENVFPS),
-        "gpu_used_gb": get_float(RE_GPU_USED),
-        "gpu_total_gb": get_float(RE_GPU_TOTAL),
-    }
-
-
-def parse_kernel_timing(text: str) -> dict:
-    """Parse kernel timing from --summary-timer output."""
-    # Look for kernel timing lines in the format:
-    # kernel_name    TIME    PERCENT    CUMULATIVE
-    kernels = {}
-    lines = text.split("\n")
-    in_timing_section = False
-
-    for line in lines:
-        # Detect timing table
-        if "Kernel" in line and "Time" in line and "%" in line:
-            in_timing_section = True
-            continue
-        if in_timing_section:
-            if line.strip().startswith("-"):
-                continue
-            if not line.strip():
-                in_timing_section = False
-                continue
-            # Parse kernel line
-            parts = line.split()
-            if len(parts) >= 2:
-                try:
-                    kernel_name = parts[0]
-                    time_ms = float(parts[1])
-                    kernels[kernel_name] = time_ms
-                except (ValueError, IndexError):
-                    pass
-
-    return kernels
-
-
-# =============================================================================
 # Metadata Collection
 # =============================================================================
 
@@ -612,6 +390,8 @@ def collect_metadata(args, scenario_cfg: dict) -> dict:
     return {
         "scenario": args.scenario,
         "scenario_description": scenario_cfg["description"],
+        "solver": args.solver,
+        "num_worlds": args.num_worlds,
         "timestamp": dt.datetime.now().isoformat(),
         "gpu": gpu_name,
         "gpu_memory_total_gb": gpu_total,
@@ -622,7 +402,66 @@ def collect_metadata(args, scenario_cfg: dict) -> dict:
         "pgs_iterations": args.pgs_iterations,
         "warmup_frames": args.warmup_frames,
         "measure_frames": args.measure_frames,
+        "viewer": args.viewer,
     }
+
+
+def build_measurement_row(
+    *,
+    args,
+    elapsed_s: float,
+    env_fps: float,
+    gpu_used_gb: float | None,
+    gpu_total_gb: float | None,
+    kernels: dict[str, float] | None = None,
+) -> dict[str, object]:
+    """Build the structured measurement row for one benchmark job."""
+    return {
+        "solver": args.solver,
+        "substeps": args.substeps,
+        "num_worlds": args.num_worlds,
+        "env_fps": env_fps,
+        "gpu_used_gb": gpu_used_gb,
+        "gpu_total_gb": gpu_total_gb,
+        "elapsed_s": elapsed_s,
+        "ok": True,
+        "kernels": kernels or {},
+    }
+
+
+def write_benchmark_artifacts(out_dir: Path, measurement: dict[str, object], metadata: dict[str, object]) -> None:
+    """Write job-owned benchmark artifacts to ``out_dir``."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "measurements.jsonl").write_text(json.dumps(measurement) + "\n", encoding="utf-8")
+    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+
+def build_render_metadata(args, *, render_fps: float, width: int, height: int, video_name: str) -> dict[str, object]:
+    """Build the structured render metadata for one render job."""
+    solver_name = args.solver if args.solver == "mujoco" else "feather_pgs"
+    return {
+        "scenario": args.scenario,
+        "solver": args.solver,
+        "substeps": args.substeps,
+        "num_worlds": 1,
+        "fps": int(render_fps),
+        "frames": args.render_frames,
+        "width": width,
+        "height": height,
+        "video": video_name,
+        "label": f"{SOLVER_LABEL_MAP.get(args.solver, solver_name)}, {args.substeps} substeps",
+    }
+
+
+def write_render_artifacts(
+    out_dir: Path,
+    metadata: dict[str, object],
+    render_metadata: dict[str, object],
+) -> None:
+    """Write job-owned render artifacts to ``out_dir``."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    (out_dir / "render_meta.json").write_text(json.dumps(render_metadata, indent=2) + "\n", encoding="utf-8")
 
 
 # =============================================================================
@@ -719,595 +558,10 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
         if pgs_chunk is not None:
             cmd.extend(["--pgs-chunk-size", str(pgs_chunk)])
 
-    if args.timing_out or args.ablation:
+    if getattr(args, "summary_timer", False):
         cmd.append("--summary-timer")
 
     return cmd
-
-
-def run_subprocess(cmd: list[str], label: str) -> dict:
-    """Run a benchmark subprocess and parse results."""
-    print(f"\n{'=' * 60}")
-    print(f"Running: {label}")
-    print(f"{'=' * 60}")
-    print(" ".join(cmd[:10]) + " ...")
-
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-
-    if proc.stderr:
-        # Print any warnings/errors
-        for line in proc.stderr.split("\n"):
-            if "error" in line.lower() or "warning" in line.lower():
-                print(f"  {line}")
-
-    if proc.returncode != 0:
-        print(f"  FAILED (return code {proc.returncode})")
-        return {"ok": False, "label": label}
-
-    metrics = parse_benchmark_output(proc.stdout)
-    metrics["ok"] = True
-    metrics["label"] = label
-    metrics["kernels"] = parse_kernel_timing(proc.stdout)
-    metrics["stdout"] = proc.stdout
-
-    if metrics["env_fps"]:
-        print(f"  env_fps: {metrics['env_fps']:,.0f}")
-        print(f"  gpu_used: {metrics.get('gpu_used_gb', 'N/A')} GB")
-
-    return metrics
-
-
-# =============================================================================
-# Sweep Mode
-# =============================================================================
-
-
-def run_sweep(args):
-    """Run sweep over num_worlds for multiple solvers (and optionally substeps)."""
-    scenario_cfg = SCENARIOS[args.scenario]
-
-    # Parse solvers
-    solver_names = [s.strip() for s in args.solvers.split(",")]
-    solver_configs = []
-    for name in solver_names:
-        if name in SOLVER_PRESETS:
-            config = SOLVER_PRESETS[name].copy()
-            config["name"] = name
-            solver_configs.append(config)
-        else:
-            print(f"Warning: Unknown solver preset '{name}', skipping")
-
-    # Parse substeps list
-    if args.substeps_list:
-        substeps_values = [int(s.strip()) for s in args.substeps_list.split(",")]
-    else:
-        substeps_values = [args.substeps]
-
-    # World counts
-    world_counts = [2**k for k in range(args.min_log2_worlds, args.max_log2_worlds + 1)]
-
-    # Output directory
-    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(args.out) if args.out else Path(f"results/{args.scenario}_{timestamp}")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # JSONL setup
-    jsonl_path = out_dir / "sweep.jsonl"
-    if jsonl_path.exists():
-        jsonl_path.unlink()
-
-    results = []
-    multi_substeps = len(substeps_values) > 1
-
-    for solver_config in solver_configs:
-        for substeps in substeps_values:
-            for num_worlds in world_counts:
-                cmd = build_run_command(args, solver_config, num_worlds, substeps=substeps)
-                if multi_substeps:
-                    label = f"{solver_config['name']} ({substeps} sub) @ {num_worlds} worlds"
-                else:
-                    label = f"{solver_config['name']} @ {num_worlds} worlds"
-                metrics = run_subprocess(cmd, label)
-
-                row = {
-                    "solver": solver_config["name"],
-                    "substeps": substeps,
-                    "num_worlds": num_worlds,
-                    "env_fps": metrics.get("env_fps"),
-                    "gpu_used_gb": metrics.get("gpu_used_gb"),
-                    "elapsed_s": metrics.get("elapsed_s"),
-                    "ok": metrics.get("ok", False),
-                    "label": metrics.get("label"),
-                }
-                results.append(row)
-
-                # Append to JSONL
-                with open(jsonl_path, "a") as f:
-                    f.write(json.dumps(row) + "\n")
-
-    # Save metadata
-    metadata = collect_metadata(args, scenario_cfg)
-    metadata["solvers"] = solver_names
-    metadata["substeps_values"] = substeps_values
-    metadata["world_counts"] = world_counts
-    with open(out_dir / "metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    print(f"\nResults saved to: {out_dir}")
-    print(f"  sweep.jsonl: {jsonl_path}")
-
-    # Plot if requested
-    if args.plot:
-        plot_sweep(jsonl_path, out_dir / "sweep.png", args.scenario, metadata.get("gpu", ""))
-
-    return results
-
-
-# =============================================================================
-# Ablation Mode
-# =============================================================================
-
-
-def run_ablation(args):
-    """Run ablation study."""
-    scenario_cfg = SCENARIOS[args.scenario]
-
-    # Output directory
-    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(args.out) if args.out else Path(f"results/{args.scenario}_ablation_{timestamp}")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "kernels").mkdir(exist_ok=True)
-
-    # Select ablation sequence based on scenario
-    seq_name = scenario_cfg.get("ablation_sequence", "default")
-    ablation_seq = ABLATION_SEQUENCES[seq_name]
-
-    # Prepare ablation sequence
-    ablation_steps = []
-    for step in ablation_seq:
-        step_config = step.copy()
-        step_config["type"] = "feather_pgs"
-        # Override PGS kernel if specified
-        if args.ablation_pgs != "auto":
-            if "PGS" in step_config["label"] or "parallel streams" in step_config["label"]:
-                step_config["pgs_kernel"] = args.ablation_pgs
-        ablation_steps.append(step_config)
-
-    # Add MuJoCo baseline
-    ablation_steps.append(
-        {
-            "label": "MuJoCo baseline",
-            "type": "mujoco",
-        }
-    )
-
-    # Run ablation
-    results = []
-    for i, step_config in enumerate(ablation_steps):
-        cmd = build_run_command(args, step_config, args.num_worlds)
-        metrics = run_subprocess(cmd, step_config["label"])
-
-        metrics["step_index"] = i
-        metrics["config"] = step_config
-        results.append(metrics)
-
-        # Save kernel timing
-        if metrics.get("kernels"):
-            kernel_file = (
-                out_dir / "kernels" / f"step_{i}_{step_config['label'].replace(' ', '_').replace('+', '')[:30]}.json"
-            )
-            kernel_data = {
-                "label": step_config["label"],
-                "config": step_config,
-                "env_fps": metrics.get("env_fps"),
-                "kernels": metrics.get("kernels", {}),
-            }
-            with open(kernel_file, "w") as f:
-                json.dump(kernel_data, f, indent=2)
-
-    # Print ablation table
-    print("\n" + "=" * 70)
-    print(f"ABLATION RESULTS: {args.scenario} @ {args.num_worlds} worlds")
-    print("=" * 70)
-    print(f"{'Configuration':<45} {'Env-FPS':>12} {'vs baseline':>12}")
-    print("-" * 70)
-
-    baseline_fps = None
-    for r in results:
-        fps = r.get("env_fps")
-        label = r.get("label", "?")
-
-        if fps is None:
-            print(f"{label:<45} {'FAILED':>12}")
-            continue
-
-        if baseline_fps is None:
-            baseline_fps = fps
-            delta_str = "-"
-        else:
-            delta_pct = (fps - baseline_fps) / baseline_fps * 100
-            delta_str = f"+{delta_pct:.1f}%" if delta_pct >= 0 else f"{delta_pct:.1f}%"
-
-        print(f"{label:<45} {fps:>12,.0f} {delta_str:>12}")
-
-    print("=" * 70)
-
-    # Save results
-    ablation_jsonl = out_dir / "ablation.jsonl"
-    if ablation_jsonl.exists():
-        ablation_jsonl.unlink()
-    with open(ablation_jsonl, "w") as f:
-        for r in results:
-            f.write(
-                json.dumps(
-                    {
-                        "label": r.get("label"),
-                        "env_fps": r.get("env_fps"),
-                        "gpu_used_gb": r.get("gpu_used_gb"),
-                        "ok": r.get("ok"),
-                        "solver": r.get("solver"),
-                        "num_worlds": r.get("num_worlds"),
-                        "step_index": r.get("step_index"),
-                        "kernels": r.get("kernels"),
-                    }
-                )
-                + "\n"
-            )
-
-    # Save metadata
-    metadata = collect_metadata(args, scenario_cfg)
-    metadata["num_worlds"] = args.num_worlds
-    with open(out_dir / "metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    print(f"\nResults saved to: {out_dir}")
-
-    # Plot if requested
-    if args.plot:
-        plot_ablation(results, out_dir / "ablation.png", args.scenario, args.num_worlds, metadata.get("gpu", ""))
-
-    return results
-
-
-# =============================================================================
-# Compare Mode
-# =============================================================================
-
-
-def run_compare(args):
-    """Compare kernel timing from multiple JSON files."""
-    files = args.compare
-
-    if len(files) < 2:
-        print("Need at least 2 files to compare")
-        return
-
-    # Load data
-    data = []
-    for f in files:
-        with open(f) as fp:
-            d = json.load(fp)
-            d["file"] = f
-            data.append(d)
-
-    # Collect all stages
-    all_kernels = set()
-    for d in data:
-        all_kernels.update(d.get("kernels", {}).keys())
-
-    # Group by stage
-    stage_kernels = defaultdict(set)
-    for k in all_kernels:
-        stage = classify_kernel(k)
-        stage_kernels[stage].add(k)
-
-    # Print comparison
-    print("\n" + "=" * 80)
-    print("KERNEL COMPARISON BY STAGE")
-    print("=" * 80)
-
-    # Header
-    labels = [d.get("label", Path(d["file"]).stem)[:20] for d in data]
-    col_width_hdr = 22
-    header = f"{'Kernel':<40}"
-    for label in labels:
-        header += f" {label:>{col_width_hdr}}"
-    print(header)
-    print("-" * (40 + (col_width_hdr + 1) * len(labels)))
-
-    stage_order = [
-        "1_fk_id",
-        "1_drives",
-        "1_crba",
-        "2_cholesky",
-        "3_trisolve",
-        "3_v_hat",
-        "4_contact_build",
-        "4_hinv_jt",
-        "4_delassus",
-        "4_hessian",
-        "4_rhs",
-        "5_solver",
-        "6_apply",
-        "6_integrate",
-        "other",
-    ]
-
-    stage_totals = {label: defaultdict(float) for label in labels}
-
-    # Accumulate totals first
-    for stage in stage_order:
-        for kernel in stage_kernels.get(stage, []):
-            for i, d in enumerate(data):
-                time_ms = d.get("kernels", {}).get(kernel)
-                if time_ms is not None:
-                    stage_totals[labels[i]][stage] += time_ms
-
-    grand_totals_kernel = {label: sum(stage_totals[label].values()) for label in labels}
-
-    col_width = 22
-    for stage in stage_order:
-        kernels = sorted(stage_kernels.get(stage, []))
-        if not kernels:
-            continue
-
-        print(f"\n[{stage}]")
-        for kernel in kernels:
-            name = kernel if len(kernel) <= 38 else kernel[:35] + "..."
-            row = f"  {name:<38}"
-            for i, d in enumerate(data):
-                time_ms = d.get("kernels", {}).get(kernel)
-                if time_ms is not None:
-                    gt = grand_totals_kernel[labels[i]]
-                    pct = time_ms / gt * 100 if gt > 0 else 0
-                    row += f" {f'{time_ms:.1f}ms ({pct:.0f}%)':>{col_width}}"
-                else:
-                    row += f" {'-':>{col_width}}"
-            print(row)
-
-    # Stage totals
-    grand_totals = {label: sum(stage_totals[label].values()) for label in labels}
-
-    print("\n" + "=" * 80)
-    print("STAGE TOTALS")
-    print("=" * 80)
-    col_width = 22
-    print(f"{'Stage':<20}", end="")
-    for label in labels:
-        print(f" {label:>{col_width}}", end="")
-    if len(labels) == 2:
-        print(f" {'Speedup':>10}", end="")
-    print()
-    print("-" * (20 + (col_width + 1) * len(labels) + (11 if len(labels) == 2 else 0)))
-
-    for stage in stage_order:
-        has_data = any(stage_totals[label].get(stage, 0) > 0 for label in labels)
-        if not has_data:
-            continue
-        print(f"{stage:<20}", end="")
-        times = []
-        for label in labels:
-            t = stage_totals[label].get(stage, 0)
-            times.append(t)
-            if t > 0 and grand_totals[label] > 0:
-                pct = t / grand_totals[label] * 100
-                print(f" {f'{t:.1f}ms ({pct:.0f}%)':>{col_width}}", end="")
-            else:
-                print(f" {'-':>{col_width}}", end="")
-        if len(times) == 2 and times[1] > 0:
-            speedup = times[1] / times[0] if times[0] > 0 else 0
-            print(f" {speedup:>9.2f}x", end="")
-        print()
-
-    # Grand total row
-    print(f"{'TOTAL':<20}", end="")
-    for label in labels:
-        gt = grand_totals[label]
-        print(f" {f'{gt:.1f}ms':>{col_width}}", end="")
-    if len(labels) == 2:
-        gt0, gt1 = grand_totals[labels[0]], grand_totals[labels[1]]
-        if gt0 > 0:
-            print(f" {gt1 / gt0:>9.2f}x", end="")
-    print()
-
-    print("=" * (20 + (col_width + 1) * len(labels) + (11 if len(labels) == 2 else 0)))
-
-
-# =============================================================================
-# Plotting
-# =============================================================================
-
-
-def _load_jsonl(path: Path) -> list[dict]:
-    """Load JSONL file into list of dicts."""
-    rows = []
-    with open(path) as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return rows
-
-
-def plot_sweep(jsonl_path: Path, out_path: Path, scenario: str, gpu_name: str):
-    """Generate sweep plot with support for multiple substeps values."""
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib not available, skipping plot")
-        return
-
-    # Load data keyed by (solver, substeps)
-    series = {}
-    all_substeps = set()
-    for row in _load_jsonl(jsonl_path):
-        solver = row.get("solver")
-        if not solver:
-            continue
-        substeps = int(row.get("substeps", 0)) if row.get("substeps") is not None else 0
-        all_substeps.add(substeps)
-        key = (solver, substeps)
-        if key not in series:
-            series[key] = {"num_worlds": [], "env_fps": [], "gpu_used_gb": []}
-        try:
-            series[key]["num_worlds"].append(int(row["num_worlds"]))
-            series[key]["env_fps"].append(float(row["env_fps"]) if row.get("env_fps") is not None else None)
-            series[key]["gpu_used_gb"].append(float(row["gpu_used_gb"]) if row.get("gpu_used_gb") is not None else None)
-        except (ValueError, TypeError):
-            continue
-
-    if not series:
-        print("No valid data to plot")
-        return
-
-    # Determine if we have multiple substeps values
-    all_substeps.discard(0)  # Remove placeholder
-    multi_substeps = len(all_substeps) > 1
-    sorted_substeps = sorted(all_substeps) if all_substeps else [0]
-
-    # Colors by solver
-    COLORS = {
-        "fpgs_tiled": "#1f77b4",
-        "fpgs_tiled_contact": "#1f77b4",
-        "fpgs_tiled_row": "#2ca02c",
-        "fpgs_loop": "#ff7f0e",
-        "mujoco": "#9467bd",
-    }
-
-    SOLVER_LABELS = {
-        "fpgs_tiled": "FeatherPGS",
-        "fpgs_tiled_contact": "FeatherPGS",
-        "fpgs_tiled_row": "FeatherPGS (tiled_row)",
-        "fpgs_loop": "FeatherPGS (loop)",
-        "mujoco": "MJWarp",
-    }
-
-    # Line styles by substeps index (solid for first, dashed for second, etc.)
-    LINE_STYLES = ["-", "--", ":", "-."]
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-    for (solver, substeps), data in sorted(series.items()):
-        color = COLORS.get(solver, "#333333")
-        base_label = SOLVER_LABELS.get(solver, solver)
-
-        # Determine line style based on substeps index
-        if multi_substeps and substeps in sorted_substeps:
-            substeps_idx = sorted_substeps.index(substeps)
-            linestyle = LINE_STYLES[substeps_idx % len(LINE_STYLES)]
-            label = f"{base_label} ({substeps} substeps)"
-        else:
-            linestyle = "-"
-            label = base_label
-
-        ax1.plot(
-            data["num_worlds"], data["env_fps"], marker="o", linestyle=linestyle, color=color, label=label, markersize=6
-        )
-        ax2.plot(
-            data["num_worlds"],
-            data["gpu_used_gb"],
-            marker="o",
-            linestyle=linestyle,
-            color=color,
-            label=label,
-            markersize=6,
-        )
-
-    ax1.set_xlabel("num_envs")
-    ax1.set_ylabel("Env-FPS")
-    ax1.set_title("FPS vs Num Envs")
-    ax1.set_ylim(bottom=0)
-    ax1.ticklabel_format(style="plain", axis="both")
-    ax1.grid(True, alpha=0.3)
-
-    ax2.set_xlabel("num_envs")
-    ax2.set_ylabel("GPU Memory (GB)")
-    ax2.set_title("GPU Memory Usage vs Num Envs")
-    ax2.set_ylim(bottom=0)
-    ax2.ticklabel_format(style="plain", axis="x")
-    ax2.grid(True, alpha=0.3)
-
-    # Build title
-    title = f"FeatherPGS vs. MJWarp ({SCENARIOS[scenario]['description']}"
-    if gpu_name:
-        title += f", {gpu_name}"
-    title += ")"
-    fig.suptitle(title, fontsize=14, fontweight="bold")
-
-    handles, labels_list = ax1.get_legend_handles_labels()
-    ncol = min(len(handles), 4)
-    fig.legend(handles, labels_list, loc="lower center", ncol=ncol, bbox_to_anchor=(0.5, -0.02))
-
-    plt.tight_layout()
-    plt.subplots_adjust(top=0.88, bottom=0.18)
-
-    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white")
-    print(f"Plot saved: {out_path}")
-    plt.close()
-
-
-def plot_ablation(results: list, out_path: Path, scenario: str, num_worlds: int, gpu_name: str = ""):
-    """Generate ablation bar chart."""
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib not available, skipping plot")
-        return
-
-    labels = []
-    fps_values = []
-    colors = []
-
-    for r in results:
-        if r.get("env_fps") is None:
-            continue
-        label = r.get("label", "?")
-        # Shorten label
-        if label.startswith("+ "):
-            label = label[2:]
-        labels.append(label[:25])
-        fps_values.append(r["env_fps"])
-        # Color: blue for feather_pgs steps, purple for mujoco
-        if "mujoco" in label.lower():
-            colors.append("#9467bd")
-        else:
-            colors.append("#1f77b4")
-
-    if not labels:
-        print("No valid data to plot")
-        return
-
-    _fig, ax = plt.subplots(figsize=(12, 6))
-
-    x = np.arange(len(labels))
-    bars = ax.bar(x, fps_values, color=colors)
-
-    ax.set_xlabel("Configuration")
-    ax.set_ylabel("Env-FPS")
-    title = f"Ablation: {SCENARIOS[scenario]['description']} @ {num_worlds} worlds"
-    if gpu_name:
-        title += f" ({gpu_name})"
-    ax.set_title(title)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=45, ha="right")
-    ax.set_ylim(bottom=0)
-    ax.ticklabel_format(style="plain", axis="y")
-    ax.grid(True, alpha=0.3, axis="y")
-
-    # Add value labels on bars
-    for bar, val in zip(bars, fps_values, strict=False):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{val:,.0f}", ha="center", va="bottom", fontsize=9
-        )
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white")
-    print(f"Plot saved: {out_path}")
-    plt.close()
 
 
 # =============================================================================
@@ -1759,12 +1013,18 @@ def run_direct(args):
         wp.synchronize_device()
         return time.time() - t_start
 
+    kernel_timings = {}
     if args.summary_timer:
+
+        def report_kernel_summary(results):
+            nonlocal kernel_timings
+            kernel_timings = print_kernel_summary(results)
+
         with wp.ScopedTimer(
             "benchmark",
             cuda_filter=wp.TIMING_ALL,
             synchronize=True,
-            report_func=print_kernel_summary,
+            report_func=report_kernel_summary,
         ):
             elapsed = run_benchmark()
     else:
@@ -1801,13 +1061,27 @@ def run_direct(args):
         print(f"GPU memory total (GB):  {gpu_total_gb:.3f}")
     print("=========================\n")
 
+    measurement = build_measurement_row(
+        args=args,
+        elapsed_s=elapsed,
+        env_fps=fps_env,
+        gpu_used_gb=gpu_used_gb,
+        gpu_total_gb=gpu_total_gb,
+        kernels=kernel_timings,
+    )
+    if args.out:
+        metadata = collect_metadata(args, scenario_cfg)
+        write_benchmark_artifacts(Path(args.out), measurement, metadata)
 
-def print_kernel_summary(results, indent: str = ""):
-    """Print kernel timing summary."""
+    return measurement
+
+
+def print_kernel_summary(results, indent: str = "") -> dict[str, float]:
+    """Print kernel timing summary and return per-kernel totals in milliseconds."""
     kernel_results = [r for r in results if r.name.startswith(("forward kernel", "backward kernel"))]
     if not kernel_results:
         print(f"{indent}No kernel activity recorded.")
-        return
+        return {}
 
     def normalize_kernel_name(name: str) -> str:
         if " kernel " in name:
@@ -1826,7 +1100,7 @@ def print_kernel_summary(results, indent: str = ""):
     total_time = sum(totals.values())
     if total_time <= 0:
         print(f"{indent}No kernel time recorded.")
-        return
+        return {}
 
     sorted_items = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
 
@@ -1843,6 +1117,8 @@ def print_kernel_summary(results, indent: str = ""):
     for name, t, pct, cum in rows:
         label = name if len(name) <= name_width else name[: name_width - 3] + "..."
         print(f"{indent}{label:<{name_width}}  {round(t):>10}  {pct:>7.1f}%  {cum:>7.1f}%")
+
+    return {name: round(time_ms, 6) for name, time_ms in totals.items()}
 
 
 # =============================================================================
@@ -1921,8 +1197,8 @@ def run_render(args):
     out_dir = Path(args.out) if args.out else Path(".")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    solver_name = args.solver if args.solver == "mujoco" else "feather_pgs"
     video_path = out_dir / f"{args.scenario}.mp4"
+    solver_name = args.solver if args.solver == "mujoco" else "feather_pgs"
     print(f"Rendering {num_frames} frames of {args.scenario} with {solver_name}")
     print(f"Resolution: {width}x{height}, substeps: {args.substeps}")
     print(f"Output: {video_path}")
@@ -1994,24 +1270,24 @@ def run_render(args):
     print(f"Video saved: {video_path} ({file_size_mb:.1f} MB)")
 
     # Write render metadata
-    meta = {
-        "scenario": args.scenario,
-        "solver": args.solver,
-        "substeps": args.substeps,
-        "num_worlds": 1,
-        "fps": int(render_fps),
-        "frames": num_frames,
-        "width": width,
-        "height": height,
-        "video": f"{args.scenario}.mp4",
-        "label": f"{SOLVER_LABEL_MAP.get(args.solver, solver_name)}, {args.substeps} substeps",
-    }
-    meta_path = out_dir / "render_meta.json"
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
-    print(f"Metadata saved: {meta_path}")
+    metadata = collect_metadata(args, scenario_cfg)
+    metadata["num_worlds"] = 1
+    metadata["render_frames"] = args.render_frames
+    metadata["render_width"] = width
+    metadata["render_height"] = height
+
+    render_metadata = build_render_metadata(
+        args,
+        render_fps=render_fps,
+        width=width,
+        height=height,
+        video_name=f"{args.scenario}.mp4",
+    )
+    write_render_artifacts(out_dir, metadata, render_metadata)
+    print(f"Metadata saved: {out_dir / 'render_meta.json'}")
 
     viewer.close()
+    return render_metadata
 
 
 # =============================================================================
@@ -2075,59 +1351,20 @@ def run_interactive(args):
 
 
 # =============================================================================
-# Replot Mode
-# =============================================================================
-
-
-def run_replot(results_dir: Path):
-    """Regenerate plot from a previous results directory."""
-    metadata_path = results_dir / "metadata.json"
-    if not metadata_path.exists():
-        print(f"Error: no metadata.json found in {results_dir}")
-        return
-
-    with open(metadata_path) as f:
-        metadata = json.load(f)
-
-    scenario = metadata.get("scenario", "unknown")
-    gpu_name = metadata.get("gpu", "")
-
-    # Detect sweep vs ablation from JSONL files
-    sweep_jsonl = results_dir / "sweep.jsonl"
-    ablation_jsonl = results_dir / "ablation.jsonl"
-
-    if sweep_jsonl.exists():
-        out_path = results_dir / "sweep.png"
-        plot_sweep(sweep_jsonl, out_path, scenario, gpu_name)
-    elif ablation_jsonl.exists():
-        results = _load_jsonl(ablation_jsonl)
-        num_worlds = metadata.get("num_worlds", 0)
-        out_path = results_dir / "ablation.png"
-        plot_ablation(results, out_path, scenario, num_worlds, gpu_name)
-    else:
-        print(f"Error: no sweep.jsonl or ablation.jsonl found in {results_dir}")
-
-
-# =============================================================================
 # Main
 # =============================================================================
 
 
-def main():
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Unified solver benchmark for Newton",
+        description="Concrete benchmark and render worker for Newton nightly jobs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # Mode selection
-    parser.add_argument("--benchmark", action="store_true", help="Run single headless benchmark")
-    parser.add_argument("--sweep", action="store_true", help="Sweep over num_worlds")
-    parser.add_argument("--ablation", action="store_true", help="Run ablation study")
-    parser.add_argument("--compare", nargs="+", metavar="FILE", help="Compare kernel timing files")
-    parser.add_argument("--replot", type=str, metavar="DIR", help="Regenerate plot from a previous results directory")
-    parser.add_argument("--render", action="store_true", help="Render headless video/screenshot of scenario")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--benchmark", action="store_true", help="Run one headless benchmark job")
+    mode_group.add_argument("--render", action="store_true", help="Render one headless video job")
 
-    # Render options
     parser.add_argument(
         "--render-frames", type=int, default=300, help="Number of frames to render (default: 300 = 5s at 60fps)"
     )
@@ -2137,32 +1374,23 @@ def main():
     parser.add_argument("--camera-pitch", type=float, default=None, help="Camera pitch in degrees (overrides preset)")
     parser.add_argument("--camera-yaw", type=float, default=None, help="Camera yaw in degrees (overrides preset)")
 
-    # Scenario
     parser.add_argument(
         "--scenario", type=str, choices=list(SCENARIOS.keys()), default="g1_flat", help="Scenario to run"
     )
-
-    # Common options
     parser.add_argument("--num-worlds", type=int, default=4096, help="Number of parallel worlds")
     parser.add_argument("--substeps", type=int, default=None, help="Sim substeps per frame (default: from scenario)")
     parser.add_argument("--warmup-frames", type=int, default=16, help="Warmup frames")
     parser.add_argument("--measure-frames", type=int, default=64, help="Measurement frames")
     parser.add_argument("--viewer", type=str, default="gl", choices=["gl", "null"], help="Viewer type")
-    parser.add_argument("--out", type=str, help="Output directory")
-    parser.add_argument("--plot", action="store_true", help="Generate plots")
+    parser.add_argument("--out", type=str, help="Output directory for job-owned artifacts")
 
-    # Solver selection
     parser.add_argument(
         "--solver",
         type=str,
         default="feather_pgs",
-        help="Solver: mujoco, feather_pgs, or preset (fpgs_tiled, fpgs_loop)",
-    )
-    parser.add_argument(
-        "--solvers", type=str, default="fpgs_tiled,fpgs_loop,mujoco", help="Comma-separated solvers for sweep mode"
+        help="Solver: mujoco, feather_pgs, or preset (fpgs_tiled, fpgs_loop, fpgs_mf, ...)",
     )
 
-    # FeatherPGS options
     parser.add_argument("--storage", type=str, choices=["flat", "batched"], help="Storage mode")
     parser.add_argument(
         "--cholesky-kernel", type=str, default="auto", choices=["loop", "tiled", "auto"], help="Cholesky kernel"
@@ -2196,8 +1424,7 @@ def main():
         type=str,
         choices=["delassus", "hybrid", "velocity"],
         default="hybrid",
-        help="PGS mode: delassus (pure Delassus), hybrid (Delassus + MF for free rigid bodies, default), "
-        "or velocity (fully matrix-free velocity-space GS)",
+        help="PGS mode: delassus, hybrid, or velocity",
     )
     parser.add_argument(
         "--delassus-chunk-size",
@@ -2225,66 +1452,36 @@ def main():
     parser.add_argument(
         "--override-scenario-defaults",
         action="store_true",
-        help="CLI kernel args override scenario defaults (used by ablation)",
+        help="CLI kernel args override scenario defaults",
     )
 
-    # MuJoCo options
     parser.add_argument("--mj-solver", type=str, choices=["cg", "newton"])
     parser.add_argument("--mj-integrator", type=str, choices=["euler", "rk4", "implicit", "implicitfast"])
     parser.add_argument("--mj-njmax", type=int)
     parser.add_argument("--mj-nconmax", type=int)
 
-    # Sweep options
-    parser.add_argument("--min-log2-worlds", type=int, default=10, help="Min worlds = 2^N")
-    parser.add_argument("--max-log2-worlds", type=int, default=14, help="Max worlds = 2^N")
-    parser.add_argument(
-        "--substeps-list",
-        type=str,
-        default=None,
-        help="Comma-separated substeps to sweep (e.g., '2,4'). Overrides --substeps in sweep mode.",
-    )
+    parser.add_argument("--summary-timer", action="store_true", help="Print kernel summary and store kernel timings")
+    return parser
 
-    # Ablation options
-    parser.add_argument(
-        "--ablation-pgs",
-        type=str,
-        default="auto",
-        choices=["auto", "tiled_row", "tiled_contact"],
-        help="PGS kernel for ablation final steps",
-    )
 
-    # Timing
-    parser.add_argument("--timing-out", type=str, help="Output kernel timing to JSON")
-    parser.add_argument("--summary-timer", action="store_true", help="Print kernel summary")
-
+def main():
+    parser = _build_arg_parser()
     args = parser.parse_args()
 
-    # Apply scenario defaults for unspecified options
     if args.scenario in SCENARIOS:
         scenario_cfg = SCENARIOS[args.scenario]
         if args.substeps is None:
             args.substeps = scenario_cfg.get("default_substeps", 4)
-        if args.pgs_iterations == 8:  # default value, check if scenario has different
+        if args.pgs_iterations == 8:
             args.pgs_iterations = scenario_cfg.get("default_pgs_iterations", args.pgs_iterations)
-        if args.dense_max_constraints == 64:  # default value
+        if args.dense_max_constraints == 64:
             args.dense_max_constraints = scenario_cfg.get("default_dense_max_constraints", args.dense_max_constraints)
 
-    # Route to appropriate handler
-    if args.replot:
-        run_replot(Path(args.replot))
-        return
-    elif args.compare:
-        run_compare(args)
-    elif args.sweep:
-        run_sweep(args)
-    elif args.ablation:
-        run_ablation(args)
-    elif args.render:
+    if args.render:
         run_render(args)
     elif args.benchmark:
         run_direct(args)
     else:
-        # Interactive mode with viewer
         run_interactive(args)
 
 

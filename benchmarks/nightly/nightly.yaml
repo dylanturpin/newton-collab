@@ -1,0 +1,125 @@
+version: 1
+
+defaults:
+  results_branch: gh-pages
+  shared_state_dir: ~/.nightly-state
+  work_base_dir: /tmp/$USER/newton-nightly
+  cache_env:
+    TMPDIR: /tmp
+    UV_CACHE_DIR: /tmp/$USER/uv-cache
+    UV_PROJECT_ENVIRONMENT: /tmp/$USER/newton-venv
+    WARP_CACHE_PATH: /tmp/$USER/warp-cache
+  benchmark:
+    viewer: "null"
+    warmup_frames: 16
+    measure_frames: 64
+    pgs_iterations: 8
+    dense_max_constraints: 64
+    pgs_beta: 0.1
+    pgs_cfm: 1.0e-6
+    pgs_omega: 1.0
+    pgs_warmstart: false
+    pgs_mode: hybrid
+    use_parallel_streams: true
+    double_buffer: true
+    pipeline_collide: false
+  render:
+    render_frames: 300
+    render_width: 1920
+    render_height: 1080
+
+hardware_profiles:
+  rtx_5090:
+    label: rtx-5090
+    slurm:
+      account: all-users
+      partition: rtx-5090@ts2/b650d4u/1gpu-16cpu-128gb
+      gres: gpu:1
+      time_limit: 01:00:00
+      exclude:
+        - 2u1g-b650-0839
+
+tasks:
+  - id: g1_flat_sweep
+    run_modes: [full]
+    kind: benchmark
+    profile: rtx_5090
+    series: g1_flat_env_fps
+    scenario: g1_flat
+    solver: [fpgs_tiled, mujoco]
+    substeps: [2, 4]
+    num_worlds: [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+
+  - id: g1_flat_ablation
+    run_modes: [full]
+    kind: benchmark
+    profile: rtx_5090
+    series: g1_flat_ablation
+    scenario: g1_flat
+    num_worlds: 16384
+    ablation_sequence: default
+
+  - id: g1_flat_renders
+    run_modes: [full]
+    kind: render
+    profile: rtx_5090
+    series: g1_flat_render
+    scenario: g1_flat
+    solver: [fpgs_tiled, mujoco]
+    substeps: [2, 4]
+
+  - id: h1_tabletop_sweep
+    run_modes: [full]
+    kind: benchmark
+    profile: rtx_5090
+    series: h1_tabletop_env_fps
+    scenario: h1_tabletop
+    solver: [fpgs_mf, mujoco]
+    substeps: [4, 8]
+    num_worlds: [1024, 2048, 4096, 8192, 16384, 32768]
+
+  - id: h1_tabletop_ablation
+    run_modes: [full]
+    kind: benchmark
+    profile: rtx_5090
+    series: h1_tabletop_ablation
+    scenario: h1_tabletop
+    num_worlds: 8192
+    ablation_sequence: streaming
+
+  - id: h1_tabletop_renders
+    run_modes: [full]
+    kind: render
+    profile: rtx_5090
+    series: h1_tabletop_render
+    scenario: h1_tabletop
+    solver: [fpgs_mf, mujoco]
+    substeps: [4, 8]
+
+  - id: validation_g1_flat_sweep
+    run_modes: [validation]
+    kind: benchmark
+    profile: rtx_5090
+    series: g1_flat_env_fps
+    scenario: g1_flat
+    solver: [fpgs_tiled, mujoco]
+    substeps: [2]
+    num_worlds: [256, 512]
+    warmup_frames: 4
+    measure_frames: 8
+
+  - id: validation_g1_flat_render
+    run_modes: [validation]
+    kind: render
+    profile: rtx_5090
+    series: g1_flat_render
+    scenario: g1_flat
+    solver: [fpgs_tiled]
+    substeps: [2]
+    render_frames: 32
+
+validation:
+  task_ids:
+    - validation_g1_flat_sweep
+    - validation_g1_flat_render
+  skip_publish: true
