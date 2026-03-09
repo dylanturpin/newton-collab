@@ -37,6 +37,7 @@
 - Disable process reuse in the test runner on multi-GPU systems to prevent CUDA errors from cascading across test suites, keeping process reuse enabled on single-GPU systems for faster throughput
 - Default `python -m newton.examples` with no argument to launch `basic_pendulum`; use `--list` to print available examples
 - Default nightly benchmark workers to CUDA-graph execution with pipeline collision enabled, extend FeatherPGS ablations with double-buffer and pipeline-collide stages, and default the nightly shell wrappers to cherry-pick `fast-bulk-replicate`.
+- Default nightly benchmark workers to CUDA-graph execution with pipeline collision enabled, extend H1 FeatherPGS ablations with double-buffer and pipeline-collide stages, add a G1 pipeline-collide ablation step after parallel streams, and default the nightly shell wrappers to cherry-pick `fast-bulk-replicate`.
 
 ### Deprecated
 

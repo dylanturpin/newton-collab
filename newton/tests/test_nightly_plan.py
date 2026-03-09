@@ -112,8 +112,12 @@ class TestNightlyPlan(unittest.TestCase):
         expanded = plan.expand_plan(loaded, run_mode="full")
         ablation_task = next(task for task in expanded["tasks"] if task["id"] == "g1_flat_ablation")
 
+        self.assertEqual(ablation_task["jobs"][-3]["ablation_label"], "+ parallel streams")
+        self.assertTrue(ablation_task["jobs"][-3]["use_parallel_streams"])
+        self.assertFalse(ablation_task["jobs"][-3]["double_buffer"])
+        self.assertFalse(ablation_task["jobs"][-3]["pipeline_collide"])
         self.assertEqual(ablation_task["jobs"][-2]["ablation_label"], "+ pipeline collide")
-        self.assertTrue(ablation_task["jobs"][-2]["double_buffer"])
+        self.assertFalse(ablation_task["jobs"][-2]["double_buffer"])
         self.assertTrue(ablation_task["jobs"][-2]["pipeline_collide"])
         self.assertEqual(ablation_task["jobs"][-1]["ablation_label"], "MuJoCo baseline")
 
