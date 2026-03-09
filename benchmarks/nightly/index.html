@@ -351,6 +351,43 @@
       grid-column: span 1;
     }
 
+    @media (max-width: 1100px) {
+      .profile-panel-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .profile-panel-card {
+        grid-column: auto;
+      }
+
+      .profile-table thead {
+        display: none;
+      }
+
+      .profile-table,
+      .profile-table tbody,
+      .profile-table tr,
+      .profile-table td {
+        display: block;
+        width: 100%;
+      }
+
+      .profile-table tr {
+        padding: 0.4rem 0;
+      }
+
+      .profile-table td {
+        border-top: none;
+        padding: 0.18rem 0;
+      }
+
+      .profile-metric,
+      .profile-artifacts {
+        text-align: left;
+        justify-content: flex-start;
+      }
+    }
+
     .video-card {
       background: var(--bg-card);
       border: 1px solid var(--border);
@@ -386,40 +423,6 @@
         flex-direction: column;
       }
 
-      .profile-panel-grid {
-        grid-template-columns: 1fr;
-      }
-
-      .profile-panel-card {
-        grid-column: auto;
-      }
-
-      .profile-table thead {
-        display: none;
-      }
-
-      .profile-table,
-      .profile-table tbody,
-      .profile-table tr,
-      .profile-table td {
-        display: block;
-        width: 100%;
-      }
-
-      .profile-table tr {
-        padding: 0.4rem 0;
-      }
-
-      .profile-table td {
-        border-top: none;
-        padding: 0.18rem 0;
-      }
-
-      .profile-metric,
-      .profile-artifacts {
-        text-align: left;
-        justify-content: flex-start;
-      }
     }
   </style>
 </head>
