@@ -895,10 +895,22 @@
 
     function renderMatchesScene(render, scene) {
       if (render.scenario !== scene) return false;
-      if (render.gpu && render.gpu !== gpuSelect.value) return false;
       const displaySeries = getDisplaySeries(scene, 'render');
       if (!displaySeries) return true;
       return render.series === displaySeries;
+    }
+
+    function getRenderSourceLabel(render) {
+      return render.gpu || render.gpu_tag || 'another GPU';
+    }
+
+    function getActiveSceneRenders(scene) {
+      const sceneRenders = renders.filter(r => renderMatchesScene(r, scene));
+      const preferredRenders = sceneRenders.filter(r => !r.gpu || r.gpu === gpuSelect.value);
+      return {
+        fallback: preferredRenders.length === 0 && sceneRenders.length > 0,
+        renders: preferredRenders.length ? preferredRenders : sceneRenders,
+      };
     }
 
     function formatRunHealth(summary) {
@@ -971,7 +983,8 @@
 
     function updateVideoSelector() {
       const scene = getSelectedScene();
-      const available = renders.filter(r => renderMatchesScene(r, scene));
+      const activeRenders = getActiveSceneRenders(scene);
+      const available = activeRenders.renders;
       const control = document.getElementById('video-select-control');
 
       if (!available.length) {
@@ -982,7 +995,7 @@
 
       control.style.display = '';
       videoSelect.innerHTML = available.map((r, i) =>
-        `<option value="${i}">${r.label}</option>`
+        `<option value="${i}">${r.label}${r.gpu && r.gpu !== gpuSelect.value ? ` (${getRenderSourceLabel(r)})` : ''}</option>`
       ).join('');
       videoSelect.value = '0';
       playSelectedVideo();
@@ -990,7 +1003,8 @@
 
     function playSelectedVideo() {
       const scene = getSelectedScene();
-      const available = renders.filter(r => renderMatchesScene(r, scene));
+      const activeRenders = getActiveSceneRenders(scene);
+      const available = activeRenders.renders;
       const idx = parseInt(videoSelect.value, 10);
       const meta = available[idx];
 
@@ -1019,7 +1033,11 @@
         document.getElementById('video-section').style.display = '';
       };
 
-      noteEl.textContent = `${meta.label}, 1 env @ ${meta.fps || 60} fps`;
+      const renderNote = [`${meta.label}, 1 env @ ${meta.fps || 60} fps`];
+      if (activeRenders.fallback) {
+        renderNote.push(`showing ${getRenderSourceLabel(meta)} render because ${gpuSelect.value} has no render for this run`);
+      }
+      noteEl.textContent = renderNote.join(' • ');
     }
 
     async function renderSceneCharts() {

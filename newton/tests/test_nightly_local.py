@@ -96,6 +96,7 @@ class TestNightlyLocal(unittest.TestCase):
             self.assertEqual(run_manifest["plan_run_mode"], "validation")
             self.assertFalse(run_manifest["publish_requested"])
             self.assertEqual(run_manifest["publish_status"], "skipped")
+            self.assertEqual(run_manifest["selected_profiles"], ["rtx_5090", "rtx_pro_6000_server"])
 
     def test_run_local_nightly_can_select_one_task(self):
         with TemporaryDirectory() as tmp_dir:

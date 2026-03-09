@@ -23,3 +23,7 @@ nightly Slurm path without waiting for review between tasks.
   single `run_id`, shared run directory, and shared `summary.json`. This keeps
   one launch/finalize path across GPUs without collapsing the dashboard onto a
   fake single-GPU summary.
+- Route render tasks to the RTX PRO 6000 Blackwell Server Edition profile for
+  now. The 5090 nodes benchmark correctly but do not have a reliable GL/EGL
+  stack for headless rendering, so the dashboard falls back to any same-run
+  render and labels the source GPU explicitly.
