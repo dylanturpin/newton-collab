@@ -1756,7 +1756,7 @@ class ModelBuilder:
         # Bulk path requires destination builder to be empty.
         if self.body_count or self.shape_count or self.joint_count or self.particle_count:
             return False
-        if self.num_worlds > 0:
+        if self.world_count > 0:
             return False
 
         # Restrict v1 fast path to rigid-only scenes.
@@ -1802,7 +1802,7 @@ class ModelBuilder:
         self._requested_state_attributes.update(builder._requested_state_attributes)
 
         # World metadata
-        self.num_worlds = N
+        self.world_count = N
         default_gravity = tuple(g * builder.gravity for g in builder.up_vector)
         self.world_gravity = [default_gravity] * N
 
@@ -1846,12 +1846,12 @@ class ModelBuilder:
             self.body_q = []
 
         # Make per-world keys unique.
-        if builder.body_key:
-            self.body_key = []
+        if builder.body_label:
+            self.body_label = []
             for i in range(N):
-                self.body_key.extend([f"{k}_w{i}" for k in builder.body_key])
+                self.body_label.extend([f"{k}_w{i}" for k in builder.body_label])
         else:
-            self.body_key = []
+            self.body_label = []
 
         # body_shapes map: body index -> shape indices
         self.body_shapes = {-1: []}
@@ -1870,24 +1870,24 @@ class ModelBuilder:
         self.shape_world = make_world_ids(ns)
 
         shape_tile_attrs = [
-            "shape_key",
+            "shape_label",
             "shape_flags",
             "shape_type",
             "shape_scale",
             "shape_source",
             "shape_is_solid",
-            "shape_thickness",
+            "shape_margin",
             "shape_material_ke",
             "shape_material_kd",
             "shape_material_kf",
             "shape_material_ka",
             "shape_material_mu",
             "shape_material_restitution",
-            "shape_material_torsional_friction",
-            "shape_material_rolling_friction",
-            "shape_material_k_hydro",
+            "shape_material_mu_torsional",
+            "shape_material_mu_rolling",
+            "shape_material_kh",
             "shape_collision_radius",
-            "shape_contact_margin",
+            "shape_gap",
             "shape_collision_group",
             "shape_sdf_narrow_band_range",
             "shape_sdf_max_resolution",
@@ -1941,6 +1941,7 @@ class ModelBuilder:
             "joint_qd",
             "joint_cts",
             "joint_f",
+            "joint_act",
             "joint_target_pos",
             "joint_target_vel",
             "joint_limit_lower",
@@ -1949,7 +1950,7 @@ class ModelBuilder:
             "joint_limit_kd",
             "joint_target_ke",
             "joint_target_kd",
-            "joint_act_mode",
+            "joint_target_mode",
             "joint_effort_limit",
             "joint_velocity_limit",
             "joint_friction",
@@ -1957,12 +1958,12 @@ class ModelBuilder:
         for attr in joint_tile_attrs:
             setattr(self, attr, tile_list(getattr(builder, attr)))
 
-        if builder.joint_key:
-            self.joint_key = []
+        if builder.joint_label:
+            self.joint_label = []
             for i in range(N):
-                self.joint_key.extend([f"{k}_w{i}" for k in builder.joint_key])
+                self.joint_label.extend([f"{k}_w{i}" for k in builder.joint_label])
         else:
-            self.joint_key = []
+            self.joint_label = []
 
         # Rebuild parent/child adjacency maps
         self.joint_parents = {}
@@ -1988,12 +1989,12 @@ class ModelBuilder:
         # Articulations
         self.articulation_start = tile_int_with_offset(builder.articulation_start, nj)
         self.articulation_world = make_world_ids(na)
-        if builder.articulation_key:
-            self.articulation_key = []
+        if builder.articulation_label:
+            self.articulation_label = []
             for i in range(N):
-                self.articulation_key.extend([f"{k}_w{i}" for k in builder.articulation_key])
+                self.articulation_label.extend([f"{k}_w{i}" for k in builder.articulation_label])
         else:
-            self.articulation_key = []
+            self.articulation_label = []
 
         # Custom attributes
         entity_counts = {
@@ -2006,7 +2007,7 @@ class ModelBuilder:
             "articulation": na,
         }
         for full_key, attr in builder.custom_attributes.items():
-            freq_key = attr.frequency_key
+            freq_key = attr.frequency
             if isinstance(freq_key, str):
                 if attr.values:
                     tiled_values = []
