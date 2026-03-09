@@ -31,7 +31,8 @@ def _make_args(**overrides):
         "pgs_mode": "hybrid",
         "delassus_chunk_size": None,
         "pgs_chunk_size": None,
-        "summary_timer": True,
+        "double_buffer": True,
+        "pipeline_collide": True,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -52,6 +53,7 @@ class TestSolverBenchmarkWorker(unittest.TestCase):
             ["--substeps-list", "2,4"],
             ["--ablation-pgs", "streaming"],
             ["--timing-out", "timings.jsonl"],
+            ["--summary-timer"],
         ]
 
         for argv in legacy_argv_cases:
@@ -69,7 +71,8 @@ class TestSolverBenchmarkWorker(unittest.TestCase):
         self.assertIn("--benchmark", command)
         self.assertIn("--num-worlds", command)
         self.assertIn("2048", command)
-        self.assertIn("--summary-timer", command)
+        self.assertIn("--double-buffer", command)
+        self.assertIn("--pipeline-collide", command)
         self.assertNotIn("--sweep", command)
         self.assertNotIn("--ablation", command)
         self.assertNotIn("--plot", command)

@@ -36,6 +36,11 @@
 - Migrate all raycast logic to `geometry.raycast`, all raycast functions now return distance and normal information
 - Disable process reuse in the test runner on multi-GPU systems to prevent CUDA errors from cascading across test suites, keeping process reuse enabled on single-GPU systems for faster throughput
 - Default `python -m newton.examples` with no argument to launch `basic_pendulum`; use `--list` to print available examples
+- Default nightly benchmark workers to CUDA-graph execution with pipeline collision enabled, extend FeatherPGS ablations with double-buffer and pipeline-collide stages, and default the nightly shell wrappers to cherry-pick `fast-bulk-replicate`.
+
+### Deprecated
+
+### Removed
 
 ### Fixed
 

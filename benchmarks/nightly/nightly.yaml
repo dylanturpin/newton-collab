@@ -24,7 +24,7 @@ defaults:
     pgs_mode: hybrid
     use_parallel_streams: true
     double_buffer: true
-    pipeline_collide: false
+    pipeline_collide: true
   render:
     render_frames: 300
     render_width: 1920

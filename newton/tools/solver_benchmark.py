@@ -10,7 +10,7 @@ Usage examples:
 
     # Single benchmark run with job-owned artifacts
     uv run newton/tools/solver_benchmark.py --scenario h1_tabletop --solver fpgs_tiled \\
-        --num-worlds 4096 --benchmark --summary-timer --out results/job_0001
+        --num-worlds 4096 --benchmark --out results/job_0001
 
     # Render a short video of a scenario (headless, outputs mp4 via ffmpeg)
     uv run newton/tools/solver_benchmark.py --scenario h1_tabletop --solver fpgs_tiled \\
@@ -21,11 +21,9 @@ import argparse
 import datetime as dt
 import json
 import platform
-import string
 import subprocess
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -270,6 +268,33 @@ ABLATION_SEQUENCES = {
             "pgs_mode": "velocity",
             "use_parallel_streams": True,
         },
+        {
+            "label": "+ double buffer",
+            "storage": "batched",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "tiled",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "tiled_contact",
+            "dense_max_constraints": 128,
+            "pgs_mode": "velocity",
+            "use_parallel_streams": True,
+            "double_buffer": True,
+        },
+        {
+            "label": "+ pipeline collide",
+            "storage": "batched",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "tiled",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "tiled_contact",
+            "dense_max_constraints": 128,
+            "pgs_mode": "velocity",
+            "use_parallel_streams": True,
+            "double_buffer": True,
+            "pipeline_collide": True,
+        },
     ],
     # Streaming: for high-constraint scenarios where tiled hinv_jt and tiled PGS exceed shared
     # memory limits (e.g. h1_tabletop with 1024 constraints). Uses par_row hinv_jt, streaming
@@ -364,8 +389,38 @@ ABLATION_SEQUENCES = {
             "pgs_mode": "velocity",
             "use_parallel_streams": True,
         },
+        {
+            "label": "+ double buffer",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "tiled",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "tiled_contact",
+            "dense_max_constraints": 128,
+            "pgs_mode": "velocity",
+            "use_parallel_streams": True,
+            "double_buffer": True,
+        },
+        {
+            "label": "+ pipeline collide",
+            "cholesky_kernel": "tiled",
+            "trisolve_kernel": "tiled",
+            "hinv_jt_kernel": "tiled",
+            "delassus_kernel": "tiled",
+            "pgs_kernel": "tiled_contact",
+            "dense_max_constraints": 128,
+            "pgs_mode": "velocity",
+            "use_parallel_streams": True,
+            "double_buffer": True,
+            "pipeline_collide": True,
+        },
     ],
 }
+
+for sequence in ABLATION_SEQUENCES.values():
+    for step in sequence:
+        step.setdefault("double_buffer", False)
+        step.setdefault("pipeline_collide", False)
 
 # =============================================================================
 # Metadata Collection
@@ -569,8 +624,15 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
         if pgs_chunk is not None:
             cmd.extend(["--pgs-chunk-size", str(pgs_chunk)])
 
-    if getattr(args, "summary_timer", False):
-        cmd.append("--summary-timer")
+    if getattr(args, "double_buffer", True):
+        cmd.append("--double-buffer")
+    else:
+        cmd.append("--no-double-buffer")
+
+    if getattr(args, "pipeline_collide", False):
+        cmd.append("--pipeline-collide")
+    else:
+        cmd.append("--no-pipeline-collide")
 
     return cmd
 
@@ -909,7 +971,7 @@ def run_direct(args):
 
     _nvtx = args.nvtx
 
-    if not args.summary_timer and not args.no_graph:
+    if not args.no_graph:
         device = wp.get_device()
         if device.is_cuda:
             if _pipeline_collide:
@@ -1025,21 +1087,7 @@ def run_direct(args):
         return time.time() - t_start
 
     kernel_timings = {}
-    if args.summary_timer:
-
-        def report_kernel_summary(results):
-            nonlocal kernel_timings
-            kernel_timings = print_kernel_summary(results)
-
-        with wp.ScopedTimer(
-            "benchmark",
-            cuda_filter=wp.TIMING_ALL,
-            synchronize=True,
-            report_func=report_kernel_summary,
-        ):
-            elapsed = run_benchmark()
-    else:
-        elapsed = run_benchmark()
+    elapsed = run_benchmark()
 
     fps_env = total_env_frames / elapsed if elapsed > 0 else 0
 
@@ -1085,51 +1133,6 @@ def run_direct(args):
         write_benchmark_artifacts(Path(args.out), measurement, metadata)
 
     return measurement
-
-
-def print_kernel_summary(results, indent: str = "") -> dict[str, float]:
-    """Print kernel timing summary and return per-kernel totals in milliseconds."""
-    kernel_results = [r for r in results if r.name.startswith(("forward kernel", "backward kernel"))]
-    if not kernel_results:
-        print(f"{indent}No kernel activity recorded.")
-        return {}
-
-    def normalize_kernel_name(name: str) -> str:
-        if " kernel " in name:
-            _, rest = name.split(" kernel ", 1)
-        else:
-            rest = name
-        parts = rest.split("_")
-        if len(parts) > 1 and len(parts[-1]) == 8 and all(c in string.hexdigits for c in parts[-1]):
-            parts = parts[:-1]
-        return "_".join(parts)
-
-    totals = defaultdict(float)
-    for r in kernel_results:
-        totals[normalize_kernel_name(r.name)] += r.elapsed
-
-    total_time = sum(totals.values())
-    if total_time <= 0:
-        print(f"{indent}No kernel time recorded.")
-        return {}
-
-    sorted_items = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
-
-    rows = []
-    cumulative = 0.0
-    for name, t in sorted_items[:15]:
-        pct = (t / total_time) * 100
-        cumulative += pct
-        rows.append((name, t, pct, cumulative))
-
-    name_width = min(max(len(name) for name, *_ in rows), 45)
-    print(f"\n{indent}{'Kernel':<{name_width}}  {'Time (ms)':>10}  {'% total':>8}  {'Cumul.':>8}")
-    print(f"{indent}{'-' * (name_width + 32)}")
-    for name, t, pct, cum in rows:
-        label = name if len(name) <= name_width else name[: name_width - 3] + "..."
-        print(f"{indent}{label:<{name_width}}  {round(t):>10}  {pct:>7.1f}%  {cum:>7.1f}%")
-
-    return {name: round(time_ms, 6) for name, time_ms in totals.items()}
 
 
 # =============================================================================
@@ -1457,7 +1460,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.set_defaults(double_buffer=True)
     parser.add_argument("--pipeline-collide", action="store_true", dest="pipeline_collide")
     parser.add_argument("--no-pipeline-collide", action="store_false", dest="pipeline_collide")
-    parser.set_defaults(pipeline_collide=False)
+    parser.set_defaults(pipeline_collide=True)
     parser.add_argument("--nvtx", action="store_true", help="Enable NVTX markers in solver stages")
     parser.add_argument("--no-graph", action="store_true", help="Disable CUDA graph capture (for NVTX profiling)")
     parser.add_argument(
@@ -1471,7 +1474,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mj-njmax", type=int)
     parser.add_argument("--mj-nconmax", type=int)
 
-    parser.add_argument("--summary-timer", action="store_true", help="Print kernel summary and store kernel timings")
     return parser
 
 
