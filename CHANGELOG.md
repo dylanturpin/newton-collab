@@ -9,6 +9,7 @@
 ### Changed
 
 - Default nightly benchmark workers to CUDA-graph execution with pipeline collision enabled, extend H1 FeatherPGS ablations with double-buffer and pipeline-collide stages, add a G1 pipeline-collide ablation step after parallel streams, and default the nightly shell wrappers to cherry-pick `fast-bulk-replicate`.
+- Present nightly profiling artifacts as a compact ablation table with Env-FPS and direct artifact links so profiled runs are easier to scan in the dashboard.
 
 ### Deprecated
 
