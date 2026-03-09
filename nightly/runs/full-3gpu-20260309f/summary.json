@@ -1,7 +1,7 @@
 {
   "commit": "87928f83",
   "commit_short": "87928f8",
-  "completed_jobs": 162,
+  "completed_jobs": 158,
   "completed_tasks": 14,
   "execution_mode": "slurm",
   "failed_jobs": 0,
@@ -11,8 +11,8 @@
   "gpu_memory_total_gb": 94.97296142578125,
   "plan_run_mode": "full",
   "platform": "Linux",
-  "point_count": 154,
-  "profile_count": 42,
+  "point_count": 150,
+  "profile_count": 38,
   "python_version": "3.12.3",
   "render_count": 8,
   "run_dir": "runs/full-3gpu-20260309f",
@@ -52,7 +52,7 @@
     "h1_tabletop_render"
   ],
   "status": "completed",
-  "successful_point_count": 154,
+  "successful_point_count": 150,
   "tasks": [
     {
       "completed_jobs": 32,
@@ -196,7 +196,7 @@
       "task_id": "g1_flat_sweep_5090"
     },
     {
-      "completed_jobs": 10,
+      "completed_jobs": 8,
       "dependency_ids": [],
       "failed_jobs": 0,
       "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
@@ -209,19 +209,17 @@
         "g1_flat_ablation_6000__0005",
         "g1_flat_ablation_6000__0006",
         "g1_flat_ablation_6000__0007",
-        "g1_flat_ablation_6000__0008",
-        "g1_flat_ablation_6000__0009",
-        "g1_flat_ablation_6000__0010"
+        "g1_flat_ablation_6000__0008"
       ],
       "kind": "benchmark",
       "scenario": "g1_flat",
       "series": "g1_flat_ablation",
       "status": "completed",
-      "submission_id": "1456506",
+      "submission_id": "1457258",
       "task_id": "g1_flat_ablation_6000"
     },
     {
-      "completed_jobs": 10,
+      "completed_jobs": 8,
       "dependency_ids": [],
       "failed_jobs": 0,
       "gpu": "NVIDIA B200",
@@ -234,15 +232,13 @@
         "g1_flat_ablation_b200__0005",
         "g1_flat_ablation_b200__0006",
         "g1_flat_ablation_b200__0007",
-        "g1_flat_ablation_b200__0008",
-        "g1_flat_ablation_b200__0009",
-        "g1_flat_ablation_b200__0010"
+        "g1_flat_ablation_b200__0008"
       ],
       "kind": "benchmark",
       "scenario": "g1_flat",
       "series": "g1_flat_ablation",
       "status": "completed",
-      "submission_id": "1456507",
+      "submission_id": "1457259",
       "task_id": "g1_flat_ablation_b200"
     },
     {
@@ -595,6 +591,6 @@
     }
   ],
   "timestamp": "2026-03-09T13:45:34.206544Z",
-  "total_jobs": 162,
+  "total_jobs": 158,
   "total_tasks": 20
 }
