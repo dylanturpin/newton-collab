@@ -5,6 +5,7 @@
 ### Added
 
 - Add optional Nsight profiling artifacts to nightly benchmark publication, including `.nsys-rep` and Perfetto JSON links in the nightly dashboard.
+- Add a post-run nightly Nsight kernel-summary pass that derives per-kernel timing JSON from published `.nsys-rep` artifacts for dashboard enrichment.
 
 ### Changed
 
