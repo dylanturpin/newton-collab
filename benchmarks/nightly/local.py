@@ -15,8 +15,8 @@ from typing import Any
 
 from benchmarks.nightly.common import (
     RunManifest,
-    RunPaths,
     make_run_id,
+    prepare_execution_repo,
     resolve_run_paths,
     utc_now_iso,
     validate_run_environment,
@@ -38,8 +38,11 @@ def run_local_nightly(
     work_base_dir: str | None = None,
     publish_root: Path | str | None = None,
     cache_env_overrides: Mapping[str, str] | None = None,
+    cherry_pick_refs: Sequence[str] | None = None,
     publish: bool = False,
     working_dir: Path | str | None = None,
+    source_repo_root: Path | str = REPO_ROOT,
+    repo_preparer=prepare_execution_repo,
     runner=None,
 ) -> dict[str, Any]:
     """Run the local nightly flow and return a JSON-serializable summary."""
@@ -62,11 +65,16 @@ def run_local_nightly(
     )
     validate_run_environment(run_paths)
     _prepare_run_directories(run_paths)
+    prepared_repo = repo_preparer(
+        source_repo_root=source_repo_root,
+        run_dir=run_paths.run_dir,
+        cherry_pick_refs=cherry_pick_refs,
+    )
 
     run_manifest = RunManifest(
         run_id=effective_run_id,
         mode="local",
-        revision=_git_revision(),
+        revision=prepared_repo.revision,
         created_at=utc_now_iso(),
         plan_path=str(Path(plan_path)),
         plan_run_mode=run_mode,
@@ -78,17 +86,24 @@ def run_local_nightly(
         publish_root=str(publish_root) if publish_root is not None else None,
         publish_requested=publish,
         publish_status="pending" if publish else "skipped",
+        base_revision=prepared_repo.base_revision,
+        execution_repo_root=str(prepared_repo.repo_root),
+        cherry_pick_refs=list(prepared_repo.cherry_pick_refs),
+        resolved_cherry_pick_refs=list(prepared_repo.resolved_cherry_pick_refs),
     )
     write_json(run_paths.run_manifest_path(), run_manifest.to_record())
     write_plan_lock(expanded_plan, run_paths.plan_lock_path())
 
     task_results = []
+    execution_working_dir = (
+        prepared_repo.repo_root if cherry_pick_refs else Path(working_dir) if working_dir is not None else REPO_ROOT
+    )
     for task in expanded_plan["tasks"]:
         task_results.append(
             run_task(
                 run_paths,
                 task,
-                working_dir=working_dir or REPO_ROOT,
+                working_dir=execution_working_dir,
                 runner=runner,
             )
         )
@@ -291,6 +306,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Override defaults.cache_env.UV_PROJECT_ENVIRONMENT",
     )
     parser.add_argument("--warp-cache-path", type=str, default=None, help="Override defaults.cache_env.WARP_CACHE_PATH")
+    parser.add_argument(
+        "--cherry-pick-ref",
+        action="append",
+        default=None,
+        help="Prepare a run-specific checkout and cherry-pick the given ref before executing jobs",
+    )
     parser.add_argument("--publish", action="store_true", help="Run gather-and-publish after local execution")
     parser.add_argument("--skip-publish", action="store_true", help="Explicitly skip gather-and-publish")
     return parser
@@ -319,6 +340,7 @@ def main() -> None:
             "UV_PROJECT_ENVIRONMENT": args.uv_project_environment,
             "WARP_CACHE_PATH": args.warp_cache_path,
         },
+        cherry_pick_refs=args.cherry_pick_ref,
         publish=publish,
     )
 

@@ -20,13 +20,15 @@ import datetime as dt
 import json
 import os
 import string
+import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
 CACHE_ENV_KEYS = ("TMPDIR", "UV_CACHE_DIR", "UV_PROJECT_ENVIRONMENT", "WARP_CACHE_PATH")
 StatusState = Literal["pending", "running", "completed", "failed"]
+GitRunner = Callable[[list[str], Path], str]
 
 
 def expand_env_string(value: str, env: Mapping[str, str] | None = None) -> str:
@@ -170,6 +172,10 @@ class RunManifest:
     publish_root: str | None = None
     submission_mode: str | None = None
     publish_submission_id: str | None = None
+    base_revision: str | None = None
+    execution_repo_root: str | None = None
+    cherry_pick_refs: list[str] = dataclasses.field(default_factory=list)
+    resolved_cherry_pick_refs: list[str] = dataclasses.field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:
         """Convert the manifest into JSON-serializable data."""
@@ -232,6 +238,22 @@ class StatusRecord:
         return _jsonable(dataclasses.asdict(self))
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class PreparedRepo:
+    """Prepared repository checkout used for one local or Slurm nightly run."""
+
+    source_repo_root: Path
+    repo_root: Path
+    base_revision: str
+    revision: str
+    cherry_pick_refs: list[str]
+    resolved_cherry_pick_refs: list[str]
+
+    def to_record(self) -> dict[str, Any]:
+        """Convert the prepared repo metadata into JSON-serializable data."""
+        return _jsonable(dataclasses.asdict(self))
+
+
 def resolve_run_paths(
     *,
     run_id: str,
@@ -262,6 +284,69 @@ def validate_run_environment(run_paths: RunPaths) -> None:
     _ensure_writable_directory(run_paths.work_base_dir, create=True, label="work_base_dir")
     for key, path in run_paths.cache_env.items():
         _ensure_writable_directory(path, create=True, label=key)
+
+
+def prepare_execution_repo(
+    *,
+    source_repo_root: Path | str,
+    run_dir: Path | str,
+    cherry_pick_refs: Sequence[str] | None = None,
+    git_runner: GitRunner | None = None,
+) -> PreparedRepo:
+    """Prepare a run-specific checkout that cherry-picks requested refs.
+
+    When no refs are requested, this returns the source checkout unchanged.
+    When refs are requested, it creates a detached git worktree under the run
+    directory, cherry-picks the resolved refs there, and records metadata for
+    reuse by reruns of the same run id.
+    """
+    source_root = Path(source_repo_root)
+    resolved_run_dir = Path(run_dir)
+    requested_refs = [str(ref) for ref in cherry_pick_refs or [] if str(ref).strip()]
+    base_revision = _git_stdout(["git", "rev-parse", "--short", "HEAD"], source_root, git_runner).strip() or "unknown"
+    if not requested_refs:
+        return PreparedRepo(
+            source_repo_root=source_root,
+            repo_root=source_root,
+            base_revision=base_revision,
+            revision=base_revision,
+            cherry_pick_refs=[],
+            resolved_cherry_pick_refs=[],
+        )
+
+    metadata_path = resolved_run_dir / "prepared-repo.json"
+    if metadata_path.exists():
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        return PreparedRepo(
+            source_repo_root=Path(payload["source_repo_root"]),
+            repo_root=Path(payload["repo_root"]),
+            base_revision=str(payload["base_revision"]),
+            revision=str(payload["revision"]),
+            cherry_pick_refs=[str(item) for item in payload.get("cherry_pick_refs", [])],
+            resolved_cherry_pick_refs=[str(item) for item in payload.get("resolved_cherry_pick_refs", [])],
+        )
+
+    checkout_dir = resolved_run_dir / "repo"
+    checkout_dir.parent.mkdir(parents=True, exist_ok=True)
+    _git_stdout(["git", "worktree", "add", "--detach", str(checkout_dir), "HEAD"], source_root, git_runner)
+
+    resolved_refs: list[str] = []
+    for ref in requested_refs:
+        resolved_ref = _resolve_git_ref(source_root, ref, git_runner)
+        _git_stdout(["git", "-C", str(checkout_dir), "cherry-pick", resolved_ref], source_root, git_runner)
+        resolved_refs.append(resolved_ref)
+
+    revision = _git_stdout(["git", "-C", str(checkout_dir), "rev-parse", "--short", "HEAD"], source_root, git_runner)
+    prepared = PreparedRepo(
+        source_repo_root=source_root,
+        repo_root=checkout_dir,
+        base_revision=base_revision,
+        revision=revision.strip() or base_revision,
+        cherry_pick_refs=requested_refs,
+        resolved_cherry_pick_refs=resolved_refs,
+    )
+    write_json(metadata_path, prepared.to_record())
+    return prepared
 
 
 def write_json(path: str | Path, payload: Mapping[str, Any]) -> Path:
@@ -308,6 +393,37 @@ def _ensure_writable_directory(path: Path, *, create: bool, label: str) -> None:
             pass
     except OSError as exc:  # pragma: no cover - exercised indirectly in environments with path issues
         raise ValueError(f"{label} is not writable: {path}") from exc
+
+
+def _git_stdout(command: list[str], cwd: Path, git_runner: GitRunner | None) -> str:
+    if git_runner is not None:
+        return git_runner(command, cwd)
+
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip() or "git command failed"
+        raise RuntimeError(stderr)
+    return completed.stdout.strip()
+
+
+def _resolve_git_ref(source_root: Path, ref: str, git_runner: GitRunner | None) -> str:
+    candidates = [ref]
+    if "/" not in ref and not ref.startswith("refs/"):
+        candidates.extend([f"origin/{ref}", f"refs/remotes/origin/{ref}"])
+
+    for candidate in candidates:
+        try:
+            _git_stdout(["git", "rev-parse", "--verify", candidate], source_root, git_runner)
+        except RuntimeError:
+            continue
+        return candidate
+    raise RuntimeError(f"Unable to resolve git ref for cherry-pick: {ref}")
 
 
 def _jsonable(value: Any) -> Any:

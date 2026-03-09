@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from benchmarks.nightly.common import resolve_run_paths, validate_run_environment
+from benchmarks.nightly.common import PreparedRepo, resolve_run_paths, validate_run_environment
 from benchmarks.nightly.plan import DEFAULT_PLAN_PATH, expand_plan, load_plan
 from benchmarks.nightly.slurm import build_task_sbatch_command, submit_slurm_nightly
 
@@ -166,6 +166,50 @@ class TestNightlySlurm(unittest.TestCase):
                 )
             )
             self.assertEqual(failed_status["failure_phase"], "submission")
+
+    def test_submit_slurm_nightly_uses_prepared_repo_checkout(self):
+        runner = FakeSbatchRunner(["9101", "9102"])
+
+        with TemporaryDirectory() as tmp_dir:
+            prepared_repo_root = Path(tmp_dir) / "prepared-repo"
+            prepared_repo_root.mkdir(parents=True)
+
+            def fake_repo_preparer(*, source_repo_root, run_dir, cherry_pick_refs):
+                return PreparedRepo(
+                    source_repo_root=Path(source_repo_root),
+                    repo_root=prepared_repo_root,
+                    base_revision="base123",
+                    revision="exec456",
+                    cherry_pick_refs=list(cherry_pick_refs or []),
+                    resolved_cherry_pick_refs=["origin/fast-bulk-replicate"],
+                )
+
+            summary = submit_slurm_nightly(
+                plan_path=DEFAULT_PLAN_PATH,
+                run_mode="validation",
+                run_id="prepared-submit",
+                shared_state_dir=str(Path(tmp_dir) / "shared"),
+                work_base_dir=str(Path(tmp_dir) / "work"),
+                cache_env_overrides={
+                    "TMPDIR": str(Path(tmp_dir) / "tmp"),
+                    "UV_CACHE_DIR": str(Path(tmp_dir) / "uv-cache"),
+                    "UV_PROJECT_ENVIRONMENT": str(Path(tmp_dir) / "uv-env"),
+                    "WARP_CACHE_PATH": str(Path(tmp_dir) / "warp-cache"),
+                },
+                cherry_pick_refs=["fast-bulk-replicate"],
+                publish=False,
+                submission_mode="parallel",
+                sbatch_runner=runner,
+                repo_preparer=fake_repo_preparer,
+            )
+
+            self.assertEqual(summary["submitted_tasks"], 2)
+            self.assertTrue(all(f"--chdir {prepared_repo_root}" in " ".join(command) for command in runner.commands))
+            run_manifest = json.loads((Path(summary["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(run_manifest["revision"], "exec456")
+            self.assertEqual(run_manifest["base_revision"], "base123")
+            self.assertEqual(run_manifest["execution_repo_root"], str(prepared_repo_root))
+            self.assertEqual(run_manifest["cherry_pick_refs"], ["fast-bulk-replicate"])
 
 
 if __name__ == "__main__":
