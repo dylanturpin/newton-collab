@@ -312,6 +312,53 @@ class TestNightlyPublish(unittest.TestCase):
                 ).is_file()
             )
 
+    def test_publish_run_loads_kernel_summary_from_profile_summary(self):
+        with TemporaryDirectory() as tmp_dir:
+            run_dir = self._run_validation(tmp_dir, run_id="publish-kernel-summary")
+            results_dir = (
+                run_dir / "tasks" / "validation_g1_flat_sweep" / "jobs" / "validation_g1_flat_sweep__0001" / "results"
+            )
+            measurement_path = results_dir / "measurements.jsonl"
+            measurement = _jsonl_rows(measurement_path)[0]
+            measurement.pop("kernels", None)
+            measurement_path.write_text(json.dumps(measurement) + "\n", encoding="utf-8")
+            (results_dir / "profile_summary.json").write_text(
+                json.dumps(
+                    {
+                        "kernel_count": 2,
+                        "kernel_event_count": 3,
+                        "kernels": {
+                            "pgs_solve_kernel": 8.7,
+                            "build_contact_row_kernel": 1.2,
+                        },
+                        "measure_frames": 8,
+                        "total_kernel_ms": 9.9,
+                        "window_end_ns": 20,
+                        "window_ms": 10.0,
+                        "window_start_ns": 10,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            site_root = Path(tmp_dir) / "site" / "nightly"
+            publish_run(run_dir, publish_root=site_root)
+
+            run_points = [
+                row for row in _jsonl_rows(site_root / "points.jsonl") if row["run_id"] == "publish-kernel-summary"
+            ]
+            profiled_row = next(row for row in run_points if row["job_id"] == "validation_g1_flat_sweep__0001")
+            self.assertEqual(
+                profiled_row["kernels"],
+                {
+                    "build_contact_row_kernel": 1.2,
+                    "pgs_solve_kernel": 8.7,
+                },
+            )
+
     def test_publish_run_marks_ablation_rows_as_ablation_mode(self):
         with TemporaryDirectory() as tmp_dir:
             summary = run_local_nightly(

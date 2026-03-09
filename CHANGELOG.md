@@ -22,6 +22,7 @@
 - Add `ViewerViser.log_scalar()` for live scalar time-series plots via uPlot
 - Honor `UsdGeomImageable` visibility (including inherited `invisible`) on USD prims imported via `ModelBuilder.add_usd()`; visual shapes, gaussian splats, and collider shapes are imported with `ShapeFlags.VISIBLE` cleared when the prim is effectively invisible, while collision behavior is preserved
 - Add optional Nsight profiling artifacts to nightly benchmark publication, including `.nsys-rep` and Perfetto JSON links in the nightly dashboard.
+- Add a post-run nightly Nsight kernel-summary pass that derives per-kernel timing JSON from published `.nsys-rep` artifacts for dashboard enrichment.
 
 ### Changed
 

@@ -460,6 +460,11 @@ def _base_point_row(
             row["nsys_report_path"] = str(_public_profile_path(job, report_name))
         if isinstance(trace_name, str) and trace_name:
             row["nsys_trace_path"] = str(_public_profile_path(job, trace_name))
+    profile_summary = job.get("profile_summary")
+    if isinstance(profile_summary, Mapping):
+        kernels = profile_summary.get("kernels")
+        if isinstance(kernels, Mapping):
+            row["kernels"] = {str(name): float(value) for name, value in kernels.items()}
     if metadata.get("pgs_iterations") is not None:
         row["pgs_iterations"] = metadata["pgs_iterations"]
     if metadata.get("measure_frames") is not None:
@@ -713,6 +718,7 @@ def _load_context(run_dir: Path | str) -> dict[str, Any]:
                     "measurements": _read_jsonl_if_exists(results_dir / "measurements.jsonl"),
                     "render_meta": _read_json_if_exists(results_dir / "render_meta.json"),
                     "profile_meta": _read_json_if_exists(results_dir / "profile_meta.json"),
+                    "profile_summary": _read_json_if_exists(results_dir / "profile_summary.json"),
                 }
             )
         tasks.append(
