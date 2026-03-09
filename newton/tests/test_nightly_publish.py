@@ -155,6 +155,25 @@ class TestNightlyPublish(unittest.TestCase):
             self.assertEqual(summary["failed_jobs"], 1)
             self.assertEqual(summary["render_count"], 1)
 
+    def test_failed_render_without_metadata_stays_in_one_gpu_group(self):
+        with TemporaryDirectory() as tmp_dir:
+            run_dir = self._run_validation(
+                tmp_dir,
+                run_id="publish-render-failure",
+                failed_job_ids={"validation_g1_flat_render__0001"},
+            )
+            site_root = Path(tmp_dir) / "site" / "nightly"
+
+            publish_run(run_dir, publish_root=site_root)
+
+            run_rows = [
+                row for row in _jsonl_rows(site_root / "runs.jsonl") if row["run_id"] == "publish-render-failure"
+            ]
+            self.assertEqual(len(run_rows), 1)
+            self.assertEqual(run_rows[0]["gpu"], "Synthetic GPU")
+            self.assertEqual(run_rows[0]["failed_jobs"], 1)
+            self.assertEqual(run_rows[0]["point_count"], 4)
+
     def test_publish_run_emits_one_run_row_per_gpu_for_mixed_profile_run(self):
         with TemporaryDirectory() as tmp_dir:
             run_dir = self._run_validation(tmp_dir, run_id="publish-multi-gpu")

@@ -898,11 +898,14 @@ class RendererGL:
         self.sky_upper = self.background_color
         self.sky_lower = (40.0 / 255.0, 44.0 / 255.0, 55.0 / 255.0)
 
+        has_display = bool(os.environ.get("DISPLAY")) or bool(os.environ.get("WAYLAND_DISPLAY"))
+        use_true_headless = bool(headless) and not has_display
+
         # On Wayland, PyOpenGL defaults to EGL which cannot see the GLX context
         # that pyglet creates via XWayland. Force GLX so both libraries agree.
-        # Must be set before PyOpenGL is first imported (platform is selected
-        # once at import time).
-        if "PYOPENGL_PLATFORM" not in os.environ:
+        # Skip this override for true headless rendering, where pyglet's
+        # headless backend can use EGL without any X display.
+        if "PYOPENGL_PLATFORM" not in os.environ and not use_true_headless:
             # WAYLAND_DISPLAY is the primary indicator; XDG_SESSION_TYPE is
             # checked as a fallback for sessions where the socket is not yet set.
             is_wayland = bool(os.environ.get("WAYLAND_DISPLAY")) or os.environ.get("XDG_SESSION_TYPE") == "wayland"
@@ -914,6 +917,9 @@ class RendererGL:
 
             # disable error checking for performance
             pyglet.options["debug_gl"] = False
+            if use_true_headless:
+                pyglet.options["headless"] = True
+                pyglet.options["shadow_window"] = False
 
             # try imports
             from pyglet.graphics.shader import Shader, ShaderProgram  # noqa: F401

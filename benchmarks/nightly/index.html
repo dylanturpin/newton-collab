@@ -1027,7 +1027,7 @@
       const scene = getSelectedScene();
       const sceneLabel = getSceneLabel(scene);
       const run = getSelectedRun(runId);
-      const runPoints = points.filter(p => p.run_id === runId && p.scenario === scene);
+      const runPoints = getFilteredPoints().filter(p => p.run_id === runId && p.scenario === scene);
 
       runTitle.textContent = run ? formatRunLabel(run) : '–';
 
