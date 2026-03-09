@@ -26,7 +26,14 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
-CACHE_ENV_KEYS = ("TMPDIR", "UV_CACHE_DIR", "UV_PROJECT_ENVIRONMENT", "WARP_CACHE_PATH")
+CACHE_ENV_KEYS = (
+    "TMPDIR",
+    "UV_CACHE_DIR",
+    "UV_PROJECT_ENVIRONMENT",
+    "WARP_CACHE_PATH",
+    "NEWTON_CACHE_PATH",
+    "CUDA_CACHE_PATH",
+)
 StatusState = Literal["pending", "running", "completed", "failed"]
 GitRunner = Callable[[list[str], Path], str]
 

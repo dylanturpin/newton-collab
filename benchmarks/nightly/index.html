@@ -179,6 +179,15 @@
       margin-top: 0.5rem;
     }
 
+    a {
+      color: var(--accent-3);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
     .error {
       background: rgba(246, 115, 115, 0.15);
       border: 1px solid rgba(246, 115, 115, 0.4);
@@ -257,6 +266,34 @@
     .kernel-table .absent {
       color: var(--text-dim);
       opacity: 0.4;
+    }
+
+    .profile-links {
+      display: flex;
+      flex-direction: column;
+      gap: 0.9rem;
+    }
+
+    .profile-link-row {
+      padding-top: 0.9rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .profile-link-row:first-child {
+      border-top: none;
+      padding-top: 0;
+    }
+
+    .profile-link-label {
+      font-weight: 600;
+      margin-bottom: 0.35rem;
+    }
+
+    .profile-link-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem 1rem;
+      font-size: 0.88rem;
     }
 
     .video-card {
@@ -370,6 +407,12 @@
       <div class="card" style="min-height:auto;">
         <h3 id="kernel-detail-title">Ablation • Kernel Detail</h3>
         <div id="kernel-table" style="overflow-x:auto;"></div>
+      </div>
+    </div>
+    <div style="margin-top:1.25rem;">
+      <div class="card" style="min-height:auto;">
+        <h3 id="profile-links-title">Ablation • Profiling Artifacts</h3>
+        <div id="profile-links"></div>
       </div>
     </div>
   </section>
@@ -565,6 +608,15 @@
 
     function unique(values) {
       return Array.from(new Set(values)).sort();
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
     }
 
     function destroyChart(name) {
@@ -842,6 +894,44 @@
       container.innerHTML = html;
     }
 
+    function buildProfileLinks(containerId, runDir, ablationPoints) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+
+      const profiledPoints = ablationPoints.filter(p => p.nsys_report_path || p.nsys_trace_path);
+      if (!profiledPoints.length) {
+        container.innerHTML = '<div class="note">No Nsight profiling artifacts were published for this run.</div>';
+        return;
+      }
+
+      const rows = profiledPoints.map(point => {
+        const label = escapeHtml((point.label || point.solver || 'unknown').replace(/^\+\s*/, ''));
+        const actions = [];
+        if (point.nsys_report_path) {
+          actions.push(
+            `<a href="${escapeHtml(`${runDir}/${point.nsys_report_path}`)}" target="_blank" rel="noopener">nsys-rep</a>`
+          );
+        }
+        if (point.nsys_trace_path) {
+          const traceHref = `${runDir}/${point.nsys_trace_path}`;
+          const traceUrl = new URL(traceHref, window.location.href).href;
+          actions.push(
+            `<a href="${escapeHtml(traceHref)}" target="_blank" rel="noopener">trace.json</a>`
+          );
+          actions.push(
+            `<a href="${escapeHtml(`https://ui.perfetto.dev/#!/?url=${encodeURIComponent(traceUrl)}`)}" target="_blank" rel="noopener">Open in Perfetto</a>`
+          );
+        }
+        return `
+          <div class="profile-link-row">
+            <div class="profile-link-label">${label}</div>
+            <div class="profile-link-actions">${actions.join('')}</div>
+          </div>
+        `;
+      });
+      container.innerHTML = `<div class="profile-links">${rows.join('')}</div>`;
+    }
+
     // ---- Sweep dataset builder ----
 
     function buildSweepDatasets(rows, key) {
@@ -1045,6 +1135,7 @@
       const scene = getSelectedScene();
       const sceneLabel = getSceneLabel(scene);
       const run = getSelectedRun(runId);
+      const runDir = run && run.run_dir ? run.run_dir : `runs/${runId}`;
       const runPoints = getFilteredPoints().filter(p => p.run_id === runId && p.scenario === scene);
 
       runTitle.textContent = run ? formatRunLabel(run) : '–';
@@ -1055,6 +1146,7 @@
       document.getElementById('ablation-title').textContent = `${sceneLabel} Ablation • Env-FPS`;
       document.getElementById('kernel-stack-title').textContent = `${sceneLabel} Ablation • Stage Breakdown`;
       document.getElementById('kernel-detail-title').textContent = `${sceneLabel} Ablation • Kernel Detail`;
+      document.getElementById('profile-links-title').textContent = `${sceneLabel} Ablation • Profiling Artifacts`;
 
       // Sweep charts
       const sweep = runPoints.filter(p => pointMatchesDisplay(p, scene, 'sweep') && p.ok !== false);
@@ -1084,6 +1176,7 @@
 
       // Kernel detail table
       buildKernelTable('kernel-table', ablationSorted);
+      buildProfileLinks('profile-links', runDir, ablationSorted);
 
       // Video
       await loadRenders(runId);

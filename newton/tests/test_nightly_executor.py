@@ -4,6 +4,7 @@
 import json
 import subprocess
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -24,7 +25,7 @@ class FakeWorkerRunner:
         self.commands.append(command)
         self.envs.append(dict(env))
 
-        out_dir = Path(command[command.index("--out") + 1])
+        command, out_dir, profiled = _unwrap_test_command(command)
         out_dir.mkdir(parents=True, exist_ok=True)
         job_id = out_dir.parent.name
 
@@ -46,6 +47,8 @@ class FakeWorkerRunner:
             metadata = {"scenario": command[command.index("--scenario") + 1], "mode": "benchmark"}
             (out_dir / "measurements.jsonl").write_text(json.dumps(measurement) + "\n", encoding="utf-8")
             (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+            if profiled:
+                _write_profile_artifacts(out_dir)
             return subprocess.CompletedProcess(command, 0, stdout=f"{job_id} completed\n", stderr="")
 
         if "--render" in command:
@@ -60,6 +63,34 @@ class FakeWorkerRunner:
         raise AssertionError(f"Unexpected command: {command}")
 
 
+def _unwrap_test_command(command: list[str]) -> tuple[list[str], Path, bool]:
+    if "benchmarks.nightly.profiled_worker" not in command:
+        return command, Path(command[command.index("--out") + 1]), False
+    results_dir = Path(command[command.index("--results-dir") + 1])
+    inner_command = command[command.index("--") + 1 :]
+    return inner_command, results_dir, True
+
+
+def _write_profile_artifacts(out_dir: Path) -> None:
+    (out_dir / "profile.nsys-rep").write_text("synthetic nsys report\n", encoding="utf-8")
+    (out_dir / "profile.trace.json").write_text('{"traceEvents":[]}\n', encoding="utf-8")
+    (out_dir / "profile_meta.json").write_text(
+        json.dumps(
+            {
+                "tool": "nsys",
+                "cuda_graph_trace": "node",
+                "measure_frames": 8,
+                "report_name": "profile.nsys-rep",
+                "trace_name": "profile.trace.json",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 class TestNightlyExecutor(unittest.TestCase):
     def _make_run_paths(self, tmp_dir: str):
         return resolve_run_paths(
@@ -71,6 +102,8 @@ class TestNightlyExecutor(unittest.TestCase):
                 "UV_CACHE_DIR": str(Path(tmp_dir) / "uv-cache"),
                 "UV_PROJECT_ENVIRONMENT": str(Path(tmp_dir) / "uv-env"),
                 "WARP_CACHE_PATH": str(Path(tmp_dir) / "warp-cache"),
+                "NEWTON_CACHE_PATH": str(Path(tmp_dir) / "newton-cache"),
+                "CUDA_CACHE_PATH": str(Path(tmp_dir) / "cuda-cache"),
             },
         )
 
@@ -149,6 +182,26 @@ class TestNightlyExecutor(unittest.TestCase):
             self.assertTrue((output_dir / "metadata.json").is_file())
             self.assertTrue((output_dir / "render_meta.json").is_file())
             self.assertTrue((output_dir / "g1_flat.mp4").is_file())
+
+    def test_run_task_writes_profile_artifacts_for_profiled_benchmark_job(self):
+        benchmark_task, _ = self._load_validation_tasks()
+        profiled_task = deepcopy(benchmark_task)
+        profiled_task["jobs"][0]["nsys_profile"] = True
+        profiled_task["jobs"][0]["nsys_cuda_graph_trace"] = "node"
+
+        with TemporaryDirectory() as tmp_dir:
+            run_paths = self._make_run_paths(tmp_dir)
+            validate_run_environment(run_paths)
+            runner = FakeWorkerRunner()
+
+            result = run_task(run_paths, profiled_task, runner=runner, working_dir=Path(tmp_dir))
+
+            self.assertEqual(result.status.state, "completed")
+            profiled_output_dir = Path(result.job_results[0].job_manifest.output_dir)
+            self.assertTrue((profiled_output_dir / "profile.nsys-rep").is_file())
+            self.assertTrue((profiled_output_dir / "profile.trace.json").is_file())
+            self.assertTrue((profiled_output_dir / "profile_meta.json").is_file())
+            self.assertIn("benchmarks.nightly.profiled_worker", runner.commands[0])
 
 
 if __name__ == "__main__":

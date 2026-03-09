@@ -29,6 +29,8 @@ class TestNightlyPlan(unittest.TestCase):
         self.assertEqual(cache_env["UV_CACHE_DIR"], "/tmp/plan-test-user/uv-cache")
         self.assertEqual(cache_env["UV_PROJECT_ENVIRONMENT"], "/tmp/plan-test-user/newton-venv")
         self.assertEqual(cache_env["WARP_CACHE_PATH"], "/tmp/plan-test-user/warp-cache")
+        self.assertEqual(cache_env["NEWTON_CACHE_PATH"], "/tmp/plan-test-user/newton-cache")
+        self.assertEqual(cache_env["CUDA_CACHE_PATH"], "/tmp/plan-test-user/cuda-compute-cache")
 
     def test_expand_plan_full_mode_is_deterministic(self):
         loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})
@@ -104,6 +106,8 @@ class TestNightlyPlan(unittest.TestCase):
                 UV_CACHE_DIR: /tmp/cache
                 UV_PROJECT_ENVIRONMENT: /tmp/env
                 WARP_CACHE_PATH: /tmp/warp
+                NEWTON_CACHE_PATH: /tmp/newton
+                CUDA_CACHE_PATH: /tmp/cuda
             hardware_profiles:
               test_gpu:
                 label: test-gpu

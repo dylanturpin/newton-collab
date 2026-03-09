@@ -190,6 +190,17 @@ SOLVER_PRESETS = {
 # =============================================================================
 
 ABLATION_SEQUENCES = {
+    "smoke": [
+        {
+            "label": "FeatherPGS baseline",
+            "cholesky_kernel": "loop",
+            "trisolve_kernel": "loop",
+            "hinv_jt_kernel": "par_row",
+            "delassus_kernel": "par_row_col",
+            "pgs_kernel": "loop",
+            "use_parallel_streams": False,
+        },
+    ],
     # Default: for low-constraint scenarios where tiled hinv_jt and tiled PGS fit in shared memory
     # (e.g. g1_flat with 32 constraints, g1_cube_stack with 128 constraints)
     "default": [

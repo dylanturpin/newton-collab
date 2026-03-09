@@ -16,6 +16,8 @@ export TMPDIR="${TMPDIR:-/tmp}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/$USER_NAME/uv-cache}"
 export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-/tmp/$USER_NAME/newton-venv}"
 export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/$USER_NAME/warp-cache}"
+export NEWTON_CACHE_PATH="${NEWTON_CACHE_PATH:-/tmp/$USER_NAME/newton-cache}"
+export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-/tmp/$USER_NAME/cuda-compute-cache}"
 
 cd "$REPO_ROOT"
 
