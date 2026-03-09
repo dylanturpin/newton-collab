@@ -134,7 +134,7 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
     for task in context["tasks"]:
         task_status = task["status"]
         task_definition = task["definition"]
-        task_mode = _task_mode(task["manifest"], task_definition)
+        task_mode = _task_mode(task["manifest"], task_definition, task["jobs"])
         task_summary = {
             "task_id": task["task_id"],
             "kind": task["manifest"]["kind"],
@@ -506,11 +506,19 @@ def _public_profile_path(job_id: str, file_name: str | None) -> Path:
     return Path("profiles") / str(job_id) / file_name
 
 
-def _task_mode(task_manifest: Mapping[str, Any], task_definition: Mapping[str, Any]) -> str:
+def _task_mode(
+    task_manifest: Mapping[str, Any],
+    task_definition: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+) -> str:
     if task_manifest["kind"] != "benchmark":
         return "render"
     if task_definition.get("ablation_sequence"):
         return "ablation"
+    for job in jobs:
+        params = job.get("manifest", {}).get("params", {})
+        if params.get("ablation_step_index") is not None or params.get("ablation_label"):
+            return "ablation"
     return "sweep"
 
 
