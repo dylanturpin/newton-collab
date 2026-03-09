@@ -61,7 +61,9 @@ class TestNightlyPlan(unittest.TestCase):
         self.assertEqual(g1_sweep["jobs"][-1]["solver"], "mujoco")
         self.assertEqual(g1_sweep["jobs"][-1]["substeps"], 4)
         self.assertEqual(g1_sweep["jobs"][-1]["num_worlds"], 131072)
-        self.assertEqual(expanded["tasks"][2]["profile"], "rtx_pro_6000_server")
+        self.assertEqual(expanded["tasks"][2]["profile"], "rtx_pro_6000_render")
+        self.assertTrue(expanded["tasks"][1]["jobs"][0]["nsys_profile"])
+        self.assertTrue(expanded["tasks"][6]["jobs"][0]["nsys_profile"])
         h1_early = expanded["tasks"][3]
         h1_late = expanded["tasks"][4]
         h1_extreme = expanded["tasks"][5]
@@ -72,7 +74,7 @@ class TestNightlyPlan(unittest.TestCase):
         self.assertEqual(h1_late["jobs"][0]["num_worlds"], 16384)
         self.assertEqual(h1_extreme["job_count"], 4)
         self.assertEqual(h1_extreme["jobs"][0]["num_worlds"], 32768)
-        self.assertEqual(expanded["tasks"][-1]["profile"], "rtx_pro_6000_server")
+        self.assertEqual(expanded["tasks"][-1]["profile"], "rtx_pro_6000_render")
 
     def test_expand_plan_validation_mode_uses_validation_tasks(self):
         loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})
@@ -83,7 +85,7 @@ class TestNightlyPlan(unittest.TestCase):
         self.assertEqual(expanded["tasks"][0]["job_count"], 4)
         self.assertEqual(expanded["tasks"][1]["job_count"], 1)
         self.assertEqual(expanded["tasks"][0]["profile"], "rtx_5090")
-        self.assertEqual(expanded["tasks"][1]["profile"], "rtx_pro_6000_server")
+        self.assertEqual(expanded["tasks"][1]["profile"], "rtx_pro_6000_render")
 
     def test_ablation_expansion_adds_mujoco_baseline(self):
         loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})

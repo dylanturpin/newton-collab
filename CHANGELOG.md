@@ -215,5 +215,7 @@
 - Fix WELD constraint data corruption when a model contains both FIXED and revolute/ball loop joints, caused by CONNECT anchor kernels overwriting WELD `eq_data`
 
 ## [1.0.0] - 2026-03-10
+- Keep nightly MuJoCo benchmark jobs off the FeatherPGS-only pipeline-collision path, and route nightly renders through the known-good RTX PRO 6000 render lane so nightly runs produce stable videos and benchmark results.
+## [1.0.0] - YYYY-MM-DD
 
 Initial public release.
