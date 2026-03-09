@@ -188,12 +188,12 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
         point_rows.extend(task_rows)
         render_entries.extend(task_renders)
         task_summaries.append(task_summary)
-        gpu_key = task_summary["gpu"] or task_summary["hardware_label"] or "unknown"
+        gpu_key = task_summary["hardware_label"] or task_summary["gpu"] or "unknown"
         gpu_group = gpu_groups.setdefault(
             gpu_key,
             {
-                "gpu": gpu_key,
                 "hardware_label": task_summary["hardware_label"],
+                "display_gpu": task_summary["gpu"],
                 "sample_metadata": None,
                 "scenarios": set(),
                 "series": set(),
@@ -208,6 +208,7 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
                 metadata = job.get("metadata")
                 if metadata and metadata.get("gpu"):
                     gpu_group["sample_metadata"] = metadata
+                    gpu_group["display_gpu"] = metadata.get("gpu")
                     break
         gpu_group["scenarios"].add(task_summary["scenario"])
         gpu_group["series"].add(task_summary["series"])
@@ -251,9 +252,13 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
 
     run_rows = []
     for gpu_key, gpu_group in sorted(gpu_groups.items()):
-        successful_points = [row for row in point_rows if row.get("gpu") == gpu_key and row.get("ok") is not False]
-        failed_point_rows = [row for row in point_rows if row.get("gpu") == gpu_key and row.get("ok") is False]
-        gpu_renders = [row for row in render_entries if row.get("gpu") == gpu_key]
+        successful_points = [
+            row for row in point_rows if row.get("hardware_label") == gpu_key and row.get("ok") is not False
+        ]
+        failed_point_rows = [
+            row for row in point_rows if row.get("hardware_label") == gpu_key and row.get("ok") is False
+        ]
+        gpu_renders = [row for row in render_entries if row.get("gpu_tag") == gpu_key]
         run_row = {
             "run_id": context["run_id"],
             "timestamp": context["run_timestamp"],
@@ -269,7 +274,7 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
             "failed_point_count": len(failed_point_rows),
             "render_count": len(gpu_renders),
             "scenarios": sorted(gpu_group["scenarios"]),
-            "gpu": gpu_key,
+            "gpu": gpu_group["display_gpu"] or gpu_key,
             "gpu_tag": gpu_group["hardware_label"],
         }
         sample = gpu_group["sample_metadata"]
