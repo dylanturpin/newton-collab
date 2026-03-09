@@ -90,6 +90,7 @@ class TestNightlyPlan(unittest.TestCase):
         expanded = plan.expand_plan(loaded, run_mode="full")
         ablation_task = next(task for task in expanded["tasks"] if task["id"] == "h1_tabletop_ablation")
 
+        self.assertEqual(ablation_task["ablation_sequence"], "streaming")
         self.assertEqual(len(ablation_task["jobs"]), len(plan.ABLATION_SEQUENCES["streaming"]) + 1)
         self.assertEqual(ablation_task["jobs"][-1]["solver"], "mujoco")
         self.assertEqual(ablation_task["jobs"][-1]["ablation_label"], "MuJoCo baseline")

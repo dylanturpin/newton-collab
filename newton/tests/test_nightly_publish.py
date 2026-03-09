@@ -307,6 +307,36 @@ class TestNightlyPublish(unittest.TestCase):
                 ).is_file()
             )
 
+    def test_publish_run_marks_ablation_rows_as_ablation_mode(self):
+        with TemporaryDirectory() as tmp_dir:
+            summary = run_local_nightly(
+                plan_path=DEFAULT_PLAN_PATH,
+                run_mode="full",
+                task_ids=["g1_flat_ablation"],
+                run_id="publish-ablation",
+                shared_state_dir=str(Path(tmp_dir) / "shared"),
+                work_base_dir=str(Path(tmp_dir) / "work"),
+                cache_env_overrides={
+                    "TMPDIR": str(Path(tmp_dir) / "tmp"),
+                    "UV_CACHE_DIR": str(Path(tmp_dir) / "uv-cache"),
+                    "UV_PROJECT_ENVIRONMENT": str(Path(tmp_dir) / "uv-env"),
+                    "WARP_CACHE_PATH": str(Path(tmp_dir) / "warp-cache"),
+                    "NEWTON_CACHE_PATH": str(Path(tmp_dir) / "newton-cache"),
+                    "CUDA_CACHE_PATH": str(Path(tmp_dir) / "cuda-cache"),
+                },
+                publish=False,
+                working_dir=Path(tmp_dir),
+                runner=FakeWorkerRunner(),
+            )
+            run_dir = Path(summary["run_dir"])
+            site_root = Path(tmp_dir) / "site" / "nightly"
+
+            publish_run(run_dir, publish_root=site_root)
+
+            run_points = [row for row in _jsonl_rows(site_root / "points.jsonl") if row["run_id"] == "publish-ablation"]
+            self.assertTrue(run_points)
+            self.assertTrue(all(row["mode"] == "ablation" for row in run_points))
+
 
 def _jsonl_rows(path: Path) -> list[dict]:
     rows = []

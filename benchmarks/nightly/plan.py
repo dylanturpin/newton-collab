@@ -344,6 +344,7 @@ def _expand_task(
         "series": task["series"],
         "scenario": task["scenario"],
         "run_modes": _normalized_run_modes(task),
+        "ablation_sequence": task.get("ablation_sequence"),
         "job_count": len(jobs),
         "jobs": jobs,
     }
