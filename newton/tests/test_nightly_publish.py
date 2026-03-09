@@ -281,10 +281,14 @@ class TestNightlyPublish(unittest.TestCase):
             run_points = [row for row in _jsonl_rows(site_root / "points.jsonl") if row["run_id"] == "publish-profiled"]
             profiled_row = next(row for row in run_points if row["job_id"] == "validation_g1_flat_sweep__0001")
             self.assertEqual(
-                profiled_row["nsys_report_path"], "profiles/validation_g1_flat_sweep__0001/profile.nsys-rep"
+                profiled_row["nsys_report_path"],
+                "profiles/validation_g1_flat_sweep__0001/"
+                "validation_g1_flat_sweep__0001--g1-flat--fpgs-tiled--s2--n256.nsys-rep",
             )
             self.assertEqual(
-                profiled_row["nsys_trace_path"], "profiles/validation_g1_flat_sweep__0001/profile.trace.json"
+                profiled_row["nsys_trace_path"],
+                "profiles/validation_g1_flat_sweep__0001/"
+                "validation_g1_flat_sweep__0001--g1-flat--fpgs-tiled--s2--n256.trace.json",
             )
             self.assertTrue(
                 (
@@ -293,7 +297,7 @@ class TestNightlyPublish(unittest.TestCase):
                     / "publish-profiled"
                     / "profiles"
                     / "validation_g1_flat_sweep__0001"
-                    / "profile.nsys-rep"
+                    / "validation_g1_flat_sweep__0001--g1-flat--fpgs-tiled--s2--n256.nsys-rep"
                 ).is_file()
             )
             self.assertTrue(
@@ -303,7 +307,7 @@ class TestNightlyPublish(unittest.TestCase):
                     / "publish-profiled"
                     / "profiles"
                     / "validation_g1_flat_sweep__0001"
-                    / "profile.trace.json"
+                    / "validation_g1_flat_sweep__0001--g1-flat--fpgs-tiled--s2--n256.trace.json"
                 ).is_file()
             )
 

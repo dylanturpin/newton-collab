@@ -454,9 +454,9 @@ def _base_point_row(
         report_name = profile_meta.get("report_name")
         trace_name = profile_meta.get("trace_name")
         if isinstance(report_name, str) and report_name:
-            row["nsys_report_path"] = str(_public_profile_path(job["job_id"], report_name))
+            row["nsys_report_path"] = str(_public_profile_path(job, report_name))
         if isinstance(trace_name, str) and trace_name:
-            row["nsys_trace_path"] = str(_public_profile_path(job["job_id"], trace_name))
+            row["nsys_trace_path"] = str(_public_profile_path(job, trace_name))
     if metadata.get("pgs_iterations") is not None:
         row["pgs_iterations"] = metadata["pgs_iterations"]
     if metadata.get("measure_frames") is not None:
@@ -493,17 +493,58 @@ def _build_profile_artifacts(job: Mapping[str, Any]) -> list[dict[str, Any]]:
         artifacts.append(
             {
                 "job_id": job["job_id"],
-                "path": str(_public_profile_path(job["job_id"], file_name)),
+                "path": str(_public_profile_path(job, file_name)),
                 "_source_path": str(source_path),
             }
         )
     return artifacts
 
 
-def _public_profile_path(job_id: str, file_name: str | None) -> Path:
+def _public_profile_path(job: Mapping[str, Any], file_name: str | None) -> Path:
     if not isinstance(file_name, str) or not file_name:
         raise ValueError("Profile artifact file name must be a non-empty string.")
-    return Path("profiles") / str(job_id) / file_name
+    params = job["manifest"]["params"]
+    label = params.get("ablation_label") or params.get("solver") or "profile"
+    scenario = job["manifest"].get("scenario") or "scenario"
+    num_worlds = params.get("num_worlds")
+    substeps = params.get("substeps")
+    extension = _profile_extension(file_name)
+    public_name = (
+        "--".join(
+            [
+                str(job["job_id"]),
+                _slug_fragment(str(scenario)),
+                _slug_fragment(str(label)),
+                f"s{substeps}",
+                f"n{num_worlds}",
+            ]
+        )
+        + extension
+    )
+    return Path("profiles") / str(job["job_id"]) / public_name
+
+
+def _profile_extension(file_name: str) -> str:
+    if file_name.endswith(".trace.json"):
+        return ".trace.json"
+    if file_name.endswith(".nsys-rep"):
+        return ".nsys-rep"
+    return Path(file_name).suffix or ""
+
+
+def _slug_fragment(value: str) -> str:
+    cleaned = []
+    previous_dash = False
+    for char in value.lower():
+        if char.isalnum():
+            cleaned.append(char)
+            previous_dash = False
+            continue
+        if not previous_dash:
+            cleaned.append("-")
+            previous_dash = True
+    slug = "".join(cleaned).strip("-")
+    return slug or "item"
 
 
 def _task_mode(

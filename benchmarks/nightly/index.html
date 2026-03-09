@@ -392,6 +392,12 @@
         <div class="chart-wrap"><canvas id="ablation-fps"></canvas></div>
       </div>
     </div>
+    <div style="margin-top:1.25rem;">
+      <div class="card" style="min-height:auto;">
+        <h3 id="profile-links-title">Ablation • Profiling Artifacts</h3>
+        <div id="profile-links"></div>
+      </div>
+    </div>
   </section>
 
   <!-- Kernel stage breakdown (for selected scene) -->
@@ -407,12 +413,6 @@
       <div class="card" style="min-height:auto;">
         <h3 id="kernel-detail-title">Ablation • Kernel Detail</h3>
         <div id="kernel-table" style="overflow-x:auto;"></div>
-      </div>
-    </div>
-    <div style="margin-top:1.25rem;">
-      <div class="card" style="min-height:auto;">
-        <h3 id="profile-links-title">Ablation • Profiling Artifacts</h3>
-        <div id="profile-links"></div>
       </div>
     </div>
   </section>
@@ -908,15 +908,17 @@
         const label = escapeHtml((point.label || point.solver || 'unknown').replace(/^\+\s*/, ''));
         const actions = [];
         if (point.nsys_report_path) {
+          const downloadName = point.nsys_report_path.split('/').pop();
           actions.push(
-            `<a href="${escapeHtml(`${runDir}/${point.nsys_report_path}`)}" target="_blank" rel="noopener">nsys-rep</a>`
+            `<a href="${escapeHtml(`${runDir}/${point.nsys_report_path}`)}" download="${escapeHtml(downloadName)}">Download nsys-rep</a>`
           );
         }
         if (point.nsys_trace_path) {
           const traceHref = `${runDir}/${point.nsys_trace_path}`;
           const traceUrl = new URL(traceHref, window.location.href).href;
+          const downloadName = point.nsys_trace_path.split('/').pop();
           actions.push(
-            `<a href="${escapeHtml(traceHref)}" target="_blank" rel="noopener">trace.json</a>`
+            `<a href="${escapeHtml(traceHref)}" download="${escapeHtml(downloadName)}">Download trace.json</a>`
           );
           actions.push(
             `<a href="${escapeHtml(`https://ui.perfetto.dev/#!/?url=${encodeURIComponent(traceUrl)}`)}" target="_blank" rel="noopener">Open in Perfetto</a>`
