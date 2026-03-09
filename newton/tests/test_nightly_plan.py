@@ -57,6 +57,8 @@ class TestNightlyPlan(unittest.TestCase):
         self.assertEqual(g1_sweep["jobs"][-1]["solver"], "mujoco")
         self.assertEqual(g1_sweep["jobs"][-1]["substeps"], 4)
         self.assertEqual(g1_sweep["jobs"][-1]["num_worlds"], 131072)
+        self.assertEqual(expanded["tasks"][2]["profile"], "rtx_pro_6000_server")
+        self.assertEqual(expanded["tasks"][5]["profile"], "rtx_pro_6000_server")
 
     def test_expand_plan_validation_mode_uses_validation_tasks(self):
         loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})
@@ -66,6 +68,8 @@ class TestNightlyPlan(unittest.TestCase):
         self.assertEqual(task_ids, ["validation_g1_flat_sweep", "validation_g1_flat_render"])
         self.assertEqual(expanded["tasks"][0]["job_count"], 4)
         self.assertEqual(expanded["tasks"][1]["job_count"], 1)
+        self.assertEqual(expanded["tasks"][0]["profile"], "rtx_5090")
+        self.assertEqual(expanded["tasks"][1]["profile"], "rtx_pro_6000_server")
 
     def test_ablation_expansion_adds_mujoco_baseline(self):
         loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})

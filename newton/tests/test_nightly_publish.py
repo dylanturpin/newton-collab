@@ -22,6 +22,7 @@ class FakeWorkerRunner:
         out_dir = Path(command[command.index("--out") + 1])
         out_dir.mkdir(parents=True, exist_ok=True)
         job_id = out_dir.parent.name
+        gpu_name = "RTX PRO 6000 Blackwell Server Edition" if "--render" in command else "Synthetic GPU"
 
         if job_id in self.failed_job_ids:
             return subprocess.CompletedProcess(command, 9, stdout="", stderr="synthetic failure\n")
@@ -30,7 +31,7 @@ class FakeWorkerRunner:
         metadata = {
             "scenario": scenario,
             "timestamp": "2026-03-08T12:00:00Z",
-            "gpu": "Synthetic GPU",
+            "gpu": gpu_name,
             "gpu_memory_total_gb": 48.0,
             "platform": "Linux",
             "python_version": "3.12.0",
@@ -98,9 +99,14 @@ class TestNightlyPublish(unittest.TestCase):
             site_root = Path(tmp_dir) / "site" / "nightly"
 
             publish_run(run_dir, publish_root=site_root)
-            run_row = _jsonl_rows(site_root / "runs.jsonl")[0]
-            self.assertEqual(run_row["run_id"], "publish-test")
-            self.assertEqual(run_row["point_count"], 4)
+            run_rows = [row for row in _jsonl_rows(site_root / "runs.jsonl") if row["run_id"] == "publish-test"]
+            self.assertEqual(len(run_rows), 2)
+            benchmark_row = next(row for row in run_rows if row["gpu"] == "Synthetic GPU")
+            render_row = next(row for row in run_rows if row["gpu"] == "RTX PRO 6000 Blackwell Server Edition")
+            self.assertEqual(benchmark_row["point_count"], 4)
+            self.assertEqual(benchmark_row["render_count"], 0)
+            self.assertEqual(render_row["point_count"], 0)
+            self.assertEqual(render_row["render_count"], 1)
 
             initial_points = [row for row in _jsonl_rows(site_root / "points.jsonl") if row["run_id"] == "publish-test"]
             self.assertEqual(len(initial_points), 4)
@@ -126,7 +132,7 @@ class TestNightlyPublish(unittest.TestCase):
             updated_first = next(row for row in updated_points if row["job_id"] == "validation_g1_flat_sweep__0001")
             self.assertEqual(updated_first["env_fps"], 2048.0)
             self.assertEqual(
-                len([row for row in _jsonl_rows(site_root / "runs.jsonl") if row["run_id"] == "publish-test"]), 1
+                len([row for row in _jsonl_rows(site_root / "runs.jsonl") if row["run_id"] == "publish-test"]), 2
             )
 
     def test_publish_run_keeps_partial_success_and_failed_placeholder_rows(self):
@@ -169,10 +175,13 @@ class TestNightlyPublish(unittest.TestCase):
             run_rows = [
                 row for row in _jsonl_rows(site_root / "runs.jsonl") if row["run_id"] == "publish-render-failure"
             ]
-            self.assertEqual(len(run_rows), 1)
-            self.assertEqual(run_rows[0]["gpu"], "Synthetic GPU")
-            self.assertEqual(run_rows[0]["failed_jobs"], 1)
-            self.assertEqual(run_rows[0]["point_count"], 4)
+            self.assertEqual(len(run_rows), 2)
+            benchmark_row = next(row for row in run_rows if row["gpu"] == "Synthetic GPU")
+            failed_render_row = next(row for row in run_rows if row["gpu"] == "rtx-pro-6000-blackwell-server-edition")
+            self.assertEqual(benchmark_row["failed_jobs"], 0)
+            self.assertEqual(benchmark_row["point_count"], 4)
+            self.assertEqual(failed_render_row["failed_jobs"], 1)
+            self.assertEqual(failed_render_row["point_count"], 0)
 
     def test_publish_run_emits_one_run_row_per_gpu_for_mixed_profile_run(self):
         with TemporaryDirectory() as tmp_dir:
