@@ -75,7 +75,7 @@ tasks:
     solver: [fpgs_tiled, mujoco]
     substeps: [2, 4]
 
-  - id: h1_tabletop_sweep
+  - id: h1_tabletop_sweep_early
     run_modes: [full]
     kind: benchmark
     profile: rtx_5090
@@ -83,7 +83,27 @@ tasks:
     scenario: h1_tabletop
     solver: [fpgs_mf, mujoco]
     substeps: [4, 8]
-    num_worlds: [1024, 2048, 4096, 8192, 16384, 32768]
+    num_worlds: [1024, 2048, 4096, 8192]
+
+  - id: h1_tabletop_sweep_late
+    run_modes: [full]
+    kind: benchmark
+    profile: rtx_5090
+    series: h1_tabletop_env_fps
+    scenario: h1_tabletop
+    solver: [fpgs_mf, mujoco]
+    substeps: [4, 8]
+    num_worlds: [16384]
+
+  - id: h1_tabletop_sweep_extreme
+    run_modes: [full]
+    kind: benchmark
+    profile: rtx_5090
+    series: h1_tabletop_env_fps
+    scenario: h1_tabletop
+    solver: [fpgs_mf, mujoco]
+    substeps: [4, 8]
+    num_worlds: [32768]
 
   - id: h1_tabletop_ablation
     run_modes: [full]
