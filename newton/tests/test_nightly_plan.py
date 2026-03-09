@@ -92,7 +92,27 @@ class TestNightlyPlan(unittest.TestCase):
 
         self.assertEqual(ablation_task["ablation_sequence"], "streaming")
         self.assertEqual(len(ablation_task["jobs"]), len(plan.ABLATION_SEQUENCES["streaming"]) + 1)
+        self.assertEqual(ablation_task["jobs"][-4]["ablation_label"], "fully matrix-free GS")
+        self.assertEqual(ablation_task["jobs"][-4]["solver"], "feather_pgs")
+        self.assertFalse(ablation_task["jobs"][-4]["double_buffer"])
+        self.assertFalse(ablation_task["jobs"][-4]["pipeline_collide"])
+        self.assertEqual(ablation_task["jobs"][-3]["ablation_label"], "+ double buffer")
+        self.assertTrue(ablation_task["jobs"][-3]["double_buffer"])
+        self.assertFalse(ablation_task["jobs"][-3]["pipeline_collide"])
+        self.assertEqual(ablation_task["jobs"][-2]["ablation_label"], "+ pipeline collide")
+        self.assertTrue(ablation_task["jobs"][-2]["double_buffer"])
+        self.assertTrue(ablation_task["jobs"][-2]["pipeline_collide"])
         self.assertEqual(ablation_task["jobs"][-1]["solver"], "mujoco")
+        self.assertEqual(ablation_task["jobs"][-1]["ablation_label"], "MuJoCo baseline")
+
+    def test_g1_ablation_sequence_ends_with_pipeline_collide_before_mujoco(self):
+        loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})
+        expanded = plan.expand_plan(loaded, run_mode="full")
+        ablation_task = next(task for task in expanded["tasks"] if task["id"] == "g1_flat_ablation")
+
+        self.assertEqual(ablation_task["jobs"][-2]["ablation_label"], "+ pipeline collide")
+        self.assertTrue(ablation_task["jobs"][-2]["double_buffer"])
+        self.assertTrue(ablation_task["jobs"][-2]["pipeline_collide"])
         self.assertEqual(ablation_task["jobs"][-1]["ablation_label"], "MuJoCo baseline")
 
     def test_invalid_list_field_is_rejected(self):

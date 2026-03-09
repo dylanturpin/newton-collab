@@ -18,7 +18,14 @@ export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-/tmp/$USER_NAME/newton-
 export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/$USER_NAME/warp-cache}"
 export NEWTON_CACHE_PATH="${NEWTON_CACHE_PATH:-/tmp/$USER_NAME/newton-cache}"
 export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-/tmp/$USER_NAME/cuda-compute-cache}"
+DEFAULT_CHERRY_PICK_REF="${NIGHTLY_CHERRY_PICK_REF-fast-bulk-replicate}"
 
 cd "$REPO_ROOT"
 
-exec uv run --extra examples --extra torch-cu12 -m benchmarks.nightly.slurm submit "$@"
+CMD=(uv run --extra examples --extra torch-cu12 -m benchmarks.nightly.slurm submit)
+if [[ -n "$DEFAULT_CHERRY_PICK_REF" ]]; then
+  CMD+=(--cherry-pick-ref "$DEFAULT_CHERRY_PICK_REF")
+fi
+CMD+=("$@")
+
+exec "${CMD[@]}"

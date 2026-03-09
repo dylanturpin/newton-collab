@@ -8,6 +8,8 @@
 
 ### Changed
 
+- Default nightly benchmark workers to CUDA-graph execution with pipeline collision enabled, extend FeatherPGS ablations with double-buffer and pipeline-collide stages, and default the nightly shell wrappers to cherry-pick `fast-bulk-replicate`.
+
 ### Deprecated
 
 ### Removed

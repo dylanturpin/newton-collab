@@ -384,7 +384,12 @@ def _expand_ablation_jobs(
     for step in ablation_sequence:
         step_config = copy.deepcopy(step)
         step_config["type"] = "feather_pgs"
-        if ablation_pgs != "auto" and ("PGS" in step_config["label"] or "parallel streams" in step_config["label"]):
+        if ablation_pgs != "auto" and (
+            "PGS" in step_config["label"]
+            or "parallel streams" in step_config["label"]
+            or "double buffer" in step_config["label"]
+            or "pipeline collide" in step_config["label"]
+        ):
             step_config["pgs_kernel"] = ablation_pgs
         ablation_steps.append(step_config)
     ablation_steps.append({"label": "MuJoCo baseline", "type": "mujoco"})
@@ -396,6 +401,10 @@ def _expand_ablation_jobs(
         job["solver_config"] = copy.deepcopy(step_config)
         job["ablation_label"] = step_config["label"]
         job["ablation_step_index"] = step_index - 1
+        if "double_buffer" in step_config:
+            job["double_buffer"] = step_config["double_buffer"]
+        if "pipeline_collide" in step_config:
+            job["pipeline_collide"] = step_config["pipeline_collide"]
         job["id"] = _format_job_id(task["id"], step_index)
         jobs.append(job)
     return jobs
