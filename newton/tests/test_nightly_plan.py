@@ -41,7 +41,9 @@ class TestNightlyPlan(unittest.TestCase):
                 "g1_flat_sweep",
                 "g1_flat_ablation",
                 "g1_flat_renders",
-                "h1_tabletop_sweep",
+                "h1_tabletop_sweep_early",
+                "h1_tabletop_sweep_late",
+                "h1_tabletop_sweep_extreme",
                 "h1_tabletop_ablation",
                 "h1_tabletop_renders",
             ],
@@ -58,7 +60,17 @@ class TestNightlyPlan(unittest.TestCase):
         self.assertEqual(g1_sweep["jobs"][-1]["substeps"], 4)
         self.assertEqual(g1_sweep["jobs"][-1]["num_worlds"], 131072)
         self.assertEqual(expanded["tasks"][2]["profile"], "rtx_pro_6000_server")
-        self.assertEqual(expanded["tasks"][5]["profile"], "rtx_pro_6000_server")
+        h1_early = expanded["tasks"][3]
+        h1_late = expanded["tasks"][4]
+        h1_extreme = expanded["tasks"][5]
+        self.assertEqual(h1_early["job_count"], 16)
+        self.assertEqual(h1_early["jobs"][0]["id"], "h1_tabletop_sweep_early__0001")
+        self.assertEqual(h1_early["jobs"][-1]["id"], "h1_tabletop_sweep_early__0016")
+        self.assertEqual(h1_late["job_count"], 4)
+        self.assertEqual(h1_late["jobs"][0]["num_worlds"], 16384)
+        self.assertEqual(h1_extreme["job_count"], 4)
+        self.assertEqual(h1_extreme["jobs"][0]["num_worlds"], 32768)
+        self.assertEqual(expanded["tasks"][-1]["profile"], "rtx_pro_6000_server")
 
     def test_expand_plan_validation_mode_uses_validation_tasks(self):
         loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})
