@@ -11,7 +11,6 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -665,7 +664,9 @@ def _summarize_run_from_disk(
             if run_paths.job_stdout_path(task_id, job_id).exists():
                 job_expected.append(run_paths.job_stdout_path(task_id, job_id))
             if job_state == "completed":
-                job_expected.extend(required_artifact_paths(jobs_by_id[job_id], run_paths.job_results_dir(task_id, job_id)))
+                job_expected.extend(
+                    required_artifact_paths(jobs_by_id[job_id], run_paths.job_results_dir(task_id, job_id))
+                )
             missing_artifacts.extend(str(path) for path in job_expected if not path.exists())
 
         task_summaries.append(
@@ -709,7 +710,9 @@ def _build_parser() -> argparse.ArgumentParser:
     submit_parser = subparsers.add_parser("submit", help="Submit the nightly plan to Slurm from the head node")
     submit_parser.add_argument("--plan", type=Path, default=DEFAULT_PLAN_PATH, help="Path to nightly.yaml")
     submit_parser.add_argument("--run-mode", choices=RUN_MODES, default="full", help="Expanded task set to submit")
-    submit_parser.add_argument("--task-id", action="append", default=None, help="Restrict submission to specific task ids")
+    submit_parser.add_argument(
+        "--task-id", action="append", default=None, help="Restrict submission to specific task ids"
+    )
     submit_parser.add_argument("--run-id", type=str, default=None, help="Override the generated run identifier")
     submit_parser.add_argument("--shared-state-dir", type=str, default=None, help="Override defaults.shared_state_dir")
     submit_parser.add_argument("--work-base-dir", type=str, default=None, help="Override defaults.work_base_dir")
@@ -720,15 +723,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional local nightly site root; skips git branch publication when set",
     )
     submit_parser.add_argument("--tmpdir", type=str, default=None, help="Override defaults.cache_env.TMPDIR")
-    submit_parser.add_argument("--uv-cache-dir", type=str, default=None, help="Override defaults.cache_env.UV_CACHE_DIR")
+    submit_parser.add_argument(
+        "--uv-cache-dir", type=str, default=None, help="Override defaults.cache_env.UV_CACHE_DIR"
+    )
     submit_parser.add_argument(
         "--uv-project-environment",
         type=str,
         default=None,
         help="Override defaults.cache_env.UV_PROJECT_ENVIRONMENT",
     )
-    submit_parser.add_argument("--warp-cache-path", type=str, default=None, help="Override defaults.cache_env.WARP_CACHE_PATH")
-    submit_parser.add_argument("--publish", action="store_true", help="Submit the final publish job after task submissions")
+    submit_parser.add_argument(
+        "--warp-cache-path", type=str, default=None, help="Override defaults.cache_env.WARP_CACHE_PATH"
+    )
+    submit_parser.add_argument(
+        "--publish", action="store_true", help="Submit the final publish job after task submissions"
+    )
     submit_parser.add_argument("--skip-publish", action="store_true", help="Explicitly skip the final publish job")
     submit_parser.add_argument(
         "--submission-mode",
@@ -737,7 +746,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Submit tasks independently or chain them per hardware profile with afterany dependencies",
     )
 
-    execute_parser = subparsers.add_parser("execute-task", help="Internal compute-node entrypoint for one submitted task")
+    execute_parser = subparsers.add_parser(
+        "execute-task", help="Internal compute-node entrypoint for one submitted task"
+    )
     execute_parser.add_argument("--run-dir", type=Path, required=True, help="Path to the shared run directory")
     execute_parser.add_argument("--task-id", type=str, required=True, help="Task id from plan.lock.yaml")
 

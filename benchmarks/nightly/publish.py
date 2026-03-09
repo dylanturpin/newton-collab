@@ -86,7 +86,7 @@ def publish_run(
             "publish_materialized",
             run_id=context["run_id"],
             publish_root=str(site_root),
-            run_row=publication["run_row"],
+            run_rows=publication["run_rows"],
             point_count=len(publication["point_rows"]),
             render_count=len(publication["render_entries"]),
         ),
@@ -96,6 +96,7 @@ def publish_run(
         "publish_root": str(site_root),
         "site_checkout": str(checkout_dir) if checkout_dir is not None else None,
         "results_branch": context["results_branch"],
+        "run_rows": publication["run_rows"],
         "run_row": publication["run_row"],
         "point_count": len(publication["point_rows"]),
         "render_count": len(publication["render_entries"]),
@@ -120,6 +121,7 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
     task_summaries: list[dict[str, Any]] = []
     sample_metadata: dict[str, Any] | None = None
     fallback_hardware_label = None
+    gpu_groups: dict[str, dict[str, Any]] = {}
 
     completed_tasks = 0
     failed_tasks = 0
@@ -141,6 +143,8 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
             "failed_jobs": 0,
             "submission_id": task["manifest"].get("submission_id"),
             "dependency_ids": task["manifest"].get("dependency_ids", []),
+            "gpu": None,
+            "hardware_label": task["manifest"].get("hardware_label"),
         }
         if fallback_hardware_label is None:
             fallback_hardware_label = task["manifest"].get("hardware_label")
@@ -156,6 +160,7 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
             scenarios.add(str(job["manifest"]["scenario"]))
             series_names.add(str(job["manifest"]["series"]))
             metadata = job.get("metadata")
+            task_summary["gpu"] = task_summary["gpu"] or _resolved_job_gpu(job)
             if sample_metadata is None and metadata and metadata.get("gpu"):
                 sample_metadata = metadata
 
@@ -183,6 +188,35 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
         point_rows.extend(task_rows)
         render_entries.extend(task_renders)
         task_summaries.append(task_summary)
+        gpu_key = task_summary["gpu"] or task_summary["hardware_label"] or "unknown"
+        gpu_group = gpu_groups.setdefault(
+            gpu_key,
+            {
+                "gpu": gpu_key,
+                "hardware_label": task_summary["hardware_label"],
+                "sample_metadata": None,
+                "scenarios": set(),
+                "series": set(),
+                "completed_tasks": 0,
+                "failed_tasks": 0,
+                "completed_jobs": 0,
+                "failed_jobs": 0,
+            },
+        )
+        if gpu_group["sample_metadata"] is None:
+            for job in task["jobs"]:
+                metadata = job.get("metadata")
+                if metadata and metadata.get("gpu"):
+                    gpu_group["sample_metadata"] = metadata
+                    break
+        gpu_group["scenarios"].add(task_summary["scenario"])
+        gpu_group["series"].add(task_summary["series"])
+        gpu_group["completed_jobs"] += task_summary["completed_jobs"]
+        gpu_group["failed_jobs"] += task_summary["failed_jobs"]
+        if task_summary["status"] == "completed":
+            gpu_group["completed_tasks"] += 1
+        elif task_summary["status"] == "failed":
+            gpu_group["failed_tasks"] += 1
 
     run_summary = {
         "run_id": context["run_id"],
@@ -215,28 +249,57 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
     elif fallback_hardware_label:
         run_summary["gpu"] = fallback_hardware_label
 
-    run_row = {
-        "run_id": context["run_id"],
-        "timestamp": context["run_timestamp"],
-        "commit": context["commit"],
-        "commit_short": context["commit_short"],
-        "run_dir": f"runs/{context['run_id']}",
-        "execution_mode": context["run_manifest"].get("mode"),
-        "plan_run_mode": context["run_manifest"].get("plan_run_mode"),
-        "status": run_summary["status"],
-        "failed_tasks": failed_tasks,
-        "failed_jobs": failed_jobs,
-        "point_count": run_summary["successful_point_count"],
-        "failed_point_count": run_summary["failed_point_count"],
-        "render_count": len(render_entries),
-        "scenarios": run_summary["scenarios"],
-    }
-    if sample_metadata is not None:
-        for key in ("gpu", "gpu_memory_total_gb", "platform", "python_version"):
-            if sample_metadata.get(key) is not None:
-                run_row[key] = sample_metadata[key]
-    elif fallback_hardware_label:
-        run_row["gpu"] = fallback_hardware_label
+    run_rows = []
+    for gpu_key, gpu_group in sorted(gpu_groups.items()):
+        successful_points = [row for row in point_rows if row.get("gpu") == gpu_key and row.get("ok") is not False]
+        failed_point_rows = [row for row in point_rows if row.get("gpu") == gpu_key and row.get("ok") is False]
+        gpu_renders = [row for row in render_entries if row.get("gpu") == gpu_key]
+        run_row = {
+            "run_id": context["run_id"],
+            "timestamp": context["run_timestamp"],
+            "commit": context["commit"],
+            "commit_short": context["commit_short"],
+            "run_dir": f"runs/{context['run_id']}",
+            "execution_mode": context["run_manifest"].get("mode"),
+            "plan_run_mode": context["run_manifest"].get("plan_run_mode"),
+            "status": "failed" if gpu_group["failed_tasks"] or gpu_group["failed_jobs"] else "completed",
+            "failed_tasks": gpu_group["failed_tasks"],
+            "failed_jobs": gpu_group["failed_jobs"],
+            "point_count": len(successful_points),
+            "failed_point_count": len(failed_point_rows),
+            "render_count": len(gpu_renders),
+            "scenarios": sorted(gpu_group["scenarios"]),
+            "gpu": gpu_key,
+            "gpu_tag": gpu_group["hardware_label"],
+        }
+        sample = gpu_group["sample_metadata"]
+        if sample is not None:
+            for key in ("gpu_memory_total_gb", "platform", "python_version"):
+                if sample.get(key) is not None:
+                    run_row[key] = sample[key]
+        run_rows.append(run_row)
+
+    if not run_rows:
+        run_rows.append(
+            {
+                "run_id": context["run_id"],
+                "timestamp": context["run_timestamp"],
+                "commit": context["commit"],
+                "commit_short": context["commit_short"],
+                "run_dir": f"runs/{context['run_id']}",
+                "execution_mode": context["run_manifest"].get("mode"),
+                "plan_run_mode": context["run_manifest"].get("plan_run_mode"),
+                "status": run_summary["status"],
+                "failed_tasks": failed_tasks,
+                "failed_jobs": failed_jobs,
+                "point_count": run_summary["successful_point_count"],
+                "failed_point_count": run_summary["failed_point_count"],
+                "render_count": len(render_entries),
+                "scenarios": run_summary["scenarios"],
+                "gpu": sample_metadata.get("gpu") if sample_metadata else fallback_hardware_label,
+            }
+        )
+    run_row = run_rows[0]
 
     point_rows.sort(
         key=lambda row: (
@@ -264,6 +327,7 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
     )
 
     return {
+        "run_rows": run_rows,
         "run_row": run_row,
         "run_summary": run_summary,
         "point_rows": point_rows,
@@ -329,6 +393,8 @@ def _build_render_entry(
         "width": render_meta.get("width"),
         "height": render_meta.get("height"),
         "path": str(public_path),
+        "gpu": _resolved_job_gpu(job),
+        "gpu_tag": job["manifest"].get("hardware_label"),
     }
     entry["_source_path"] = str(job["results_dir"] / video_name)
     return entry
@@ -386,6 +452,11 @@ def _base_point_row(
     return row
 
 
+def _resolved_job_gpu(job: Mapping[str, Any]) -> str:
+    metadata = job.get("metadata") or {}
+    return str(metadata.get("gpu") or job["manifest"].get("hardware_label") or "unknown")
+
+
 def _task_mode(task_manifest: Mapping[str, Any], task_definition: Mapping[str, Any]) -> str:
     if task_manifest["kind"] != "benchmark":
         return "render"
@@ -401,14 +472,16 @@ def _write_site(site_root: Path, publication: Mapping[str, Any], *, repo_root: P
 
     existing_runs = _read_jsonl(site_root / "runs.jsonl")
     updated_runs = [row for row in existing_runs if row.get("run_id") != publication["run_row"]["run_id"]]
-    updated_runs.append(dict(publication["run_row"]))
+    updated_runs.extend(dict(row) for row in publication["run_rows"])
     updated_runs.sort(key=lambda row: str(row.get("timestamp", "")), reverse=True)
     _write_jsonl(site_root / "runs.jsonl", updated_runs)
 
     existing_points = _read_jsonl(site_root / "points.jsonl")
     updated_points = [row for row in existing_points if row.get("run_id") != publication["run_row"]["run_id"]]
     updated_points.extend(dict(row) for row in publication["point_rows"])
-    updated_points.sort(key=lambda row: (str(row.get("run_timestamp", "")), str(row.get("task_id", "")), str(row.get("job_id", ""))))
+    updated_points.sort(
+        key=lambda row: (str(row.get("run_timestamp", "")), str(row.get("task_id", "")), str(row.get("job_id", "")))
+    )
     _write_jsonl(site_root / "points.jsonl", updated_points)
 
     public_run_dir = runs_dir / str(publication["run_row"]["run_id"])

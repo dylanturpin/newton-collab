@@ -19,3 +19,7 @@ nightly Slurm path without waiting for review between tasks.
   convenience fields even though the display routing is owned by stable
   `series`. This keeps the page logic simple while removing execution packing
   from the planner-to-dashboard contract.
+- For mixed-profile runs, emit one `runs.jsonl` row per GPU while preserving a
+  single `run_id`, shared run directory, and shared `summary.json`. This keeps
+  one launch/finalize path across GPUs without collapsing the dashboard onto a
+  fake single-GPU summary.
