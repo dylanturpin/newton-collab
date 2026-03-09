@@ -257,6 +257,10 @@
       padding-top: 0.6rem;
     }
 
+    .kernel-table .stage-total-row td {
+      border-bottom: none;
+    }
+
     .kernel-table .total-row td {
       font-weight: 700;
       color: var(--accent);
@@ -266,6 +270,12 @@
     .kernel-table .absent {
       color: var(--text-dim);
       opacity: 0.4;
+    }
+
+    .kernel-detail-note {
+      margin-bottom: 0.6rem;
+      color: var(--text-dim);
+      font-size: 0.82rem;
     }
 
     .profile-table {
@@ -565,6 +575,8 @@
       g1_flat: 'G1 Flat',
       h1_tabletop: 'H1 Tabletop'
     };
+    const DEFAULT_SCENE = 'h1_tabletop';
+    const KERNEL_DETAIL_MIN_PCT = 0.03;
 
     const DISPLAY_SERIES = {
       g1_flat: {
@@ -663,6 +675,8 @@
         .join('');
       if (availableScenes.includes(previous)) {
         sceneSelect.value = previous;
+      } else if (availableScenes.includes(DEFAULT_SCENE)) {
+        sceneSelect.value = DEFAULT_SCENE;
       } else if (availableScenes.length) {
         sceneSelect.value = availableScenes[0];
       }
@@ -907,24 +921,31 @@
 
       const labels = ablationPoints.map(p => (p.label || p.solver || '?').replace(/^\+\s*/, '').slice(0, 28));
       const perPointStageTotals = ablationPoints.map(p => computeStageTotals(p.kernels));
+      const stepTotals = perPointStageTotals.map(st =>
+        Object.values(st).reduce((a, b) => a + b, 0)
+      );
 
       const stageKernels = {};
       STAGE_ORDER.forEach(s => { stageKernels[s] = new Set(); });
 
-      ablationPoints.forEach(p => {
+      ablationPoints.forEach((p, i) => {
         const kernels = p.kernels || {};
-        Object.keys(kernels).forEach(k => {
+        Object.entries(kernels).forEach(([k, val]) => {
+          if (!(stepTotals[i] > 0) || (val / stepTotals[i]) < KERNEL_DETAIL_MIN_PCT) return;
           const stage = classifyKernelJS(k);
           if (!stageKernels[stage]) stageKernels[stage] = new Set();
           stageKernels[stage].add(k);
         });
       });
 
-      const stepTotals = perPointStageTotals.map(st =>
-        Object.values(st).reduce((a, b) => a + b, 0)
-      );
+      const filteredKernelCount = Object.values(stageKernels).reduce((count, names) => count + names.size, 0);
+      if (!filteredKernelCount) {
+        container.innerHTML = `<div class="note">No kernels reached ${(KERNEL_DETAIL_MIN_PCT * 100).toFixed(0)}% of total kernel time in the selected ablations.</div>`;
+        return;
+      }
 
-      let html = '<table class="kernel-table"><thead><tr><th>Kernel</th>';
+      let html = `<div class="kernel-detail-note">Showing only the final Newton ablation and MuJoCo baseline. Kernel rows appear only if they reach ${(KERNEL_DETAIL_MIN_PCT * 100).toFixed(0)}% of total kernel time in at least one column.</div>`;
+      html += '<table class="kernel-table"><thead><tr><th>Kernel</th>';
       labels.forEach(l => { html += `<th>${l}</th>`; });
       html += '</tr></thead><tbody>';
 
@@ -953,7 +974,7 @@
         const hasData = perPointStageTotals.some(st => st[stage]);
         if (!hasData) return;
 
-        html += `<tr><td>${stage}</td>`;
+        html += `<tr class="stage-total-row"><td>${stage}</td>`;
         perPointStageTotals.forEach((st, i) => {
           const val = st[stage];
           if (val !== undefined && val !== null) {
@@ -972,6 +993,14 @@
 
       html += '</tbody></table>';
       container.innerHTML = html;
+    }
+
+    function getKernelDetailPoints(ablationPoints) {
+      if (!ablationPoints.length) return [];
+      const reversed = ablationPoints.slice().reverse();
+      const mujoco = reversed.find(p => ((p.label || '').toLowerCase().includes('mujoco'))) || null;
+      const finalNewton = reversed.find(p => !((p.label || '').toLowerCase().includes('mujoco'))) || null;
+      return [finalNewton, mujoco].filter(Boolean);
     }
 
     function buildProfileLinks(containerId, runDir, ablationPoints) {
@@ -1270,7 +1299,7 @@
       buildStackedBarChart('kernel-stack', ablationLabels, stageData);
 
       // Kernel detail table
-      buildKernelTable('kernel-table', ablationSorted);
+      buildKernelTable('kernel-table', getKernelDetailPoints(ablationSorted));
       buildProfileLinks('profile-links', runDir, ablationSorted);
 
       // Video
