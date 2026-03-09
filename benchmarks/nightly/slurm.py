@@ -660,17 +660,23 @@ def _summarize_run_from_disk(
         failed_task_jobs = 0
         for job in task["jobs"]:
             job_id = str(job["id"])
-            job_status_payload = json.loads(run_paths.job_status_path(task_id, job_id).read_text(encoding="utf-8"))
-            job_state = str(job_status_payload["state"])
+            job_status_path = run_paths.job_status_path(task_id, job_id)
+            if job_status_path.exists():
+                job_status_payload = json.loads(job_status_path.read_text(encoding="utf-8"))
+                job_state = str(job_status_payload["state"])
+            else:
+                job_state = "pending"
             if job_state == "completed":
                 completed_jobs += 1
             elif job_state == "failed":
                 failed_jobs += 1
                 failed_task_jobs += 1
+            else:
+                continue
 
             job_expected = [
                 run_paths.job_manifest_path(task_id, job_id),
-                run_paths.job_status_path(task_id, job_id),
+                job_status_path,
                 run_paths.job_stderr_path(task_id, job_id),
             ]
             if run_paths.job_stdout_path(task_id, job_id).exists():

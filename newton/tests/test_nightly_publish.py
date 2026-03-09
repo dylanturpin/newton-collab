@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -340,6 +341,28 @@ class TestNightlyPublish(unittest.TestCase):
             run_points = [row for row in _jsonl_rows(site_root / "points.jsonl") if row["run_id"] == "publish-ablation"]
             self.assertTrue(run_points)
             self.assertTrue(all(row["mode"] == "ablation" for row in run_points))
+
+    def test_publish_run_skips_pending_task_jobs_without_crashing(self):
+        with TemporaryDirectory() as tmp_dir:
+            run_dir = self._run_validation(tmp_dir, run_id="publish-pending")
+            render_task_dir = run_dir / "tasks" / "validation_g1_flat_render"
+            render_status = json.loads((render_task_dir / "status.json").read_text(encoding="utf-8"))
+            render_status["state"] = "pending"
+            render_status["finished_at"] = None
+            render_status["duration_s"] = None
+            render_status["exit_code"] = None
+            (render_task_dir / "status.json").write_text(
+                json.dumps(render_status, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            shutil.rmtree(render_task_dir / "jobs")
+
+            site_root = Path(tmp_dir) / "site" / "nightly"
+            publish_run(run_dir, publish_root=site_root)
+
+            run_points = [row for row in _jsonl_rows(site_root / "points.jsonl") if row["run_id"] == "publish-pending"]
+            self.assertEqual(len(run_points), 4)
+            self.assertTrue(all(row["job_status"] == "completed" for row in run_points))
 
 
 def _jsonl_rows(path: Path) -> list[dict]:
