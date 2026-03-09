@@ -24,13 +24,14 @@ from benchmarks.nightly.common import (
     TaskManifest,
     make_log_record,
     make_run_id,
+    prepare_execution_repo,
     resolve_run_paths,
     utc_now_iso,
     validate_run_environment,
     write_json,
 )
 from benchmarks.nightly.executor import required_artifact_paths, run_task
-from benchmarks.nightly.local import _apply_plan_overrides, _git_revision, _prepare_run_directories
+from benchmarks.nightly.local import _apply_plan_overrides, _prepare_run_directories
 from benchmarks.nightly.plan import DEFAULT_PLAN_PATH, RUN_MODES, expand_plan, load_plan, write_plan_lock
 
 DEFAULT_UV_EXTRAS = ("--extra", "examples", "--extra", "torch-cu12")
@@ -49,10 +50,12 @@ def submit_slurm_nightly(
     work_base_dir: str | None = None,
     publish_root: Path | str | None = None,
     cache_env_overrides: Mapping[str, str] | None = None,
+    cherry_pick_refs: Sequence[str] | None = None,
     publish: bool = False,
     submission_mode: str = "parallel",
     sbatch_runner: SBATCHRunner | None = None,
     repo_root: Path | str = REPO_ROOT,
+    repo_preparer=prepare_execution_repo,
 ) -> dict[str, Any]:
     """Submit the expanded nightly plan to Slurm from the head node."""
     if submission_mode not in {"parallel", "serial"}:
@@ -76,11 +79,16 @@ def submit_slurm_nightly(
     )
     validate_run_environment(run_paths)
     _prepare_run_directories(run_paths)
+    prepared_repo = repo_preparer(
+        source_repo_root=repo_root,
+        run_dir=run_paths.run_dir,
+        cherry_pick_refs=cherry_pick_refs,
+    )
 
     run_manifest = RunManifest(
         run_id=effective_run_id,
         mode="slurm",
-        revision=_git_revision(),
+        revision=prepared_repo.revision,
         created_at=utc_now_iso(),
         plan_path=str(Path(plan_path)),
         plan_run_mode=run_mode,
@@ -93,6 +101,10 @@ def submit_slurm_nightly(
         publish_requested=publish,
         publish_status="pending" if publish else "skipped",
         submission_mode=submission_mode,
+        base_revision=prepared_repo.base_revision,
+        execution_repo_root=str(prepared_repo.repo_root),
+        cherry_pick_refs=list(prepared_repo.cherry_pick_refs),
+        resolved_cherry_pick_refs=list(prepared_repo.resolved_cherry_pick_refs),
     )
     write_json(run_paths.run_manifest_path(), run_manifest.to_record())
     write_plan_lock(expanded_plan, run_paths.plan_lock_path())
@@ -116,7 +128,7 @@ def submit_slurm_nightly(
             task=task,
             slurm_settings=expanded_plan["hardware_profiles"][profile_name]["slurm"],
             dependency_ids=dependency_ids,
-            repo_root=repo_root,
+            repo_root=prepared_repo.repo_root,
         )
         try:
             submission_id = sbatch(task_command)
@@ -161,7 +173,7 @@ def submit_slurm_nightly(
             run_paths=run_paths,
             dependency_ids=successful_submission_ids,
             slurm_settings=_publish_slurm_settings(expanded_plan),
-            repo_root=repo_root,
+            repo_root=prepared_repo.repo_root,
         )
         try:
             publish_submission_id = sbatch(publish_command)
@@ -745,6 +757,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default="parallel",
         help="Submit tasks independently or chain them per hardware profile with afterany dependencies",
     )
+    submit_parser.add_argument(
+        "--cherry-pick-ref",
+        action="append",
+        default=None,
+        help="Prepare a run-specific checkout and cherry-pick the given ref before task submission",
+    )
 
     execute_parser = subparsers.add_parser(
         "execute-task", help="Internal compute-node entrypoint for one submitted task"
@@ -781,6 +799,7 @@ def main() -> None:
             },
             publish=args.publish and not args.skip_publish,
             submission_mode=args.submission_mode,
+            cherry_pick_refs=args.cherry_pick_ref,
         )
         print(json.dumps(summary, indent=2, sort_keys=True))
         if summary["failed_task_submissions"] or summary["publish"]["status"] == "failed":

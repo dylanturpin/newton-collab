@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from benchmarks.nightly.common import PreparedRepo
 from benchmarks.nightly.local import run_local_nightly
 from benchmarks.nightly.plan import DEFAULT_PLAN_PATH
 
@@ -62,6 +63,17 @@ class FakeWorkerRunner:
         (out_dir / "render_meta.json").write_text(json.dumps(render_meta, indent=2) + "\n", encoding="utf-8")
         (out_dir / f"{scenario}.mp4").write_bytes(b"fake mp4")
         return subprocess.CompletedProcess(command, 0, stdout="render ok\n", stderr="")
+
+
+class RecordingWorkerRunner(FakeWorkerRunner):
+    """Capture worker cwd values while reusing the fake artifact behavior."""
+
+    def __init__(self):
+        self.cwds: list[Path] = []
+
+    def __call__(self, command: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        self.cwds.append(cwd)
+        return super().__call__(command, cwd, env)
 
 
 class TestNightlyLocal(unittest.TestCase):
@@ -147,6 +159,49 @@ class TestNightlyLocal(unittest.TestCase):
             self.assertTrue((site_root / "runs.jsonl").is_file())
             self.assertTrue((site_root / "points.jsonl").is_file())
             self.assertTrue((site_root / "runs" / "publish-local" / "renders.json").is_file())
+
+    def test_run_local_nightly_can_prepare_a_cherry_picked_checkout(self):
+        with TemporaryDirectory() as tmp_dir:
+            prepared_repo_root = Path(tmp_dir) / "prepared-repo"
+            prepared_repo_root.mkdir(parents=True)
+            worker_runner = RecordingWorkerRunner()
+
+            def fake_repo_preparer(*, source_repo_root, run_dir, cherry_pick_refs):
+                return PreparedRepo(
+                    source_repo_root=Path(source_repo_root),
+                    repo_root=prepared_repo_root,
+                    base_revision="base123",
+                    revision="exec456",
+                    cherry_pick_refs=list(cherry_pick_refs or []),
+                    resolved_cherry_pick_refs=["origin/fast-bulk-replicate"],
+                )
+
+            summary = run_local_nightly(
+                plan_path=DEFAULT_PLAN_PATH,
+                run_mode="validation",
+                run_id="prepared-repo-run",
+                shared_state_dir=str(Path(tmp_dir) / "shared"),
+                work_base_dir=str(Path(tmp_dir) / "work"),
+                cache_env_overrides={
+                    "TMPDIR": str(Path(tmp_dir) / "tmp"),
+                    "UV_CACHE_DIR": str(Path(tmp_dir) / "uv-cache"),
+                    "UV_PROJECT_ENVIRONMENT": str(Path(tmp_dir) / "uv-env"),
+                    "WARP_CACHE_PATH": str(Path(tmp_dir) / "warp-cache"),
+                },
+                cherry_pick_refs=["fast-bulk-replicate"],
+                working_dir=Path(tmp_dir) / "ignored-working-dir",
+                repo_preparer=fake_repo_preparer,
+                runner=worker_runner,
+            )
+
+            self.assertTrue(worker_runner.cwds)
+            self.assertTrue(all(cwd == prepared_repo_root for cwd in worker_runner.cwds))
+            run_manifest = json.loads((Path(summary["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(run_manifest["revision"], "exec456")
+            self.assertEqual(run_manifest["base_revision"], "base123")
+            self.assertEqual(run_manifest["execution_repo_root"], str(prepared_repo_root))
+            self.assertEqual(run_manifest["cherry_pick_refs"], ["fast-bulk-replicate"])
+            self.assertEqual(run_manifest["resolved_cherry_pick_refs"], ["origin/fast-bulk-replicate"])
 
 
 if __name__ == "__main__":
