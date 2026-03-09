@@ -120,7 +120,9 @@ class TestNightlyExecutor(unittest.TestCase):
             result = run_task(run_paths, benchmark_task, runner=runner, working_dir=Path(tmp_dir))
 
             self.assertEqual(result.status.state, "failed")
-            failed_result = next(job_result for job_result in result.job_results if job_result.job_manifest.job_id == failed_job_id)
+            failed_result = next(
+                job_result for job_result in result.job_results if job_result.job_manifest.job_id == failed_job_id
+            )
             self.assertEqual(failed_result.status.state, "failed")
             self.assertEqual(failed_result.status.failure_phase, "execution")
 

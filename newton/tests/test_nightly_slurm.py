@@ -97,9 +97,7 @@ class TestNightlySlurm(unittest.TestCase):
             self.assertEqual(len(runner.commands), 2)
             self.assertTrue(all("--dependency" not in command for command in runner.commands))
 
-            run_manifest = json.loads(
-                (Path(summary["run_dir"]) / "run.json").read_text(encoding="utf-8")
-            )
+            run_manifest = json.loads((Path(summary["run_dir"]) / "run.json").read_text(encoding="utf-8"))
             self.assertEqual(run_manifest["mode"], "slurm")
             self.assertEqual(run_manifest["submission_mode"], "parallel")
 
@@ -164,7 +162,9 @@ class TestNightlySlurm(unittest.TestCase):
 
             failed_task = next(task for task in summary["tasks"] if task["status"] == "failed")
             failed_status = json.loads(
-                (Path(summary["run_dir"]) / "tasks" / failed_task["task_id"] / "status.json").read_text(encoding="utf-8")
+                (Path(summary["run_dir"]) / "tasks" / failed_task["task_id"] / "status.json").read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(failed_status["failure_phase"], "submission")
 

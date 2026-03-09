@@ -182,7 +182,11 @@ def run_task(
             error_summary=f"{failed_jobs}/{len(job_results)} jobs failed",
             failure_phase="execution",
             artifact_paths=_existing_paths(
-                [run_paths.task_manifest_path(task_id), task_log_path, *(result.job_manifest.output_dir for result in job_results)]
+                [
+                    run_paths.task_manifest_path(task_id),
+                    task_log_path,
+                    *(result.job_manifest.output_dir for result in job_results),
+                ]
             ),
         )
         event_name = "task_failed"
@@ -194,7 +198,11 @@ def run_task(
             duration_s=duration_s,
             exit_code=0,
             artifact_paths=_existing_paths(
-                [run_paths.task_manifest_path(task_id), task_log_path, *(result.job_manifest.output_dir for result in job_results)]
+                [
+                    run_paths.task_manifest_path(task_id),
+                    task_log_path,
+                    *(result.job_manifest.output_dir for result in job_results),
+                ]
             ),
         )
         event_name = "task_completed"

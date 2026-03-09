@@ -209,7 +209,9 @@ def expand_plan(
         expanded_ids = {task["id"] for task in expanded_tasks}
         missing = sorted(selected_set - expanded_ids)
         if missing:
-            raise PlanValidationError(f"Selected task ids were not available in mode '{run_mode}': {', '.join(missing)}")
+            raise PlanValidationError(
+                f"Selected task ids were not available in mode '{run_mode}': {', '.join(missing)}"
+            )
 
     if not expanded_tasks:
         raise PlanValidationError(f"No tasks selected for run mode '{run_mode}'.")
@@ -320,7 +322,11 @@ def _expand_task(
 ) -> dict[str, Any]:
     profile = copy.deepcopy(hardware_profiles[task["profile"]])
     sequence_name = task.get("ablation_sequence")
-    jobs = _expand_ablation_jobs(task, defaults, profile) if sequence_name else _expand_matrix_jobs(task, defaults, profile)
+    jobs = (
+        _expand_ablation_jobs(task, defaults, profile)
+        if sequence_name
+        else _expand_matrix_jobs(task, defaults, profile)
+    )
     return {
         "id": task["id"],
         "kind": task["kind"],

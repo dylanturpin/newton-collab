@@ -509,6 +509,11 @@
       return points.filter(p => p.gpu === gpuSelect.value);
     }
 
+    function getSelectedRun(runId = runSelect.value) {
+      if (!runId) return null;
+      return getFilteredRuns().find(r => r.run_id === runId) || runs.find(r => r.run_id === runId) || null;
+    }
+
     function getAvailableScenes() {
       const scenes = unique(getFilteredPoints().map(p => p.scenario).filter(Boolean));
       return scenes;
@@ -890,6 +895,7 @@
 
     function renderMatchesScene(render, scene) {
       if (render.scenario !== scene) return false;
+      if (render.gpu && render.gpu !== gpuSelect.value) return false;
       const displaySeries = getDisplaySeries(scene, 'render');
       if (!displaySeries) return true;
       return render.series === displaySeries;
@@ -910,7 +916,7 @@
 
     async function loadRunSummary(runId) {
       if (runSummaries.has(runId)) return runSummaries.get(runId);
-      const run = runs.find(r => r.run_id === runId);
+      const run = getSelectedRun(runId);
       const runDir = run && run.run_dir ? run.run_dir : `runs/${runId}`;
       try {
         const resp = await fetch(`${runDir}/summary.json`);
@@ -933,21 +939,26 @@
         runHealth.textContent = 'Run health unavailable.';
         return;
       }
-      const run = runs.find(r => r.run_id === runId);
+      const run = getSelectedRun(runId);
       const summary = await loadRunSummary(runId);
-      const source = summary || run;
-      if (!source) {
+      if (!run && !summary) {
         runHealth.textContent = 'Run health unavailable.';
         return;
       }
-      const parts = [`Status: ${formatRunHealth(source)}`];
-      if (source.point_count !== undefined) parts.push(`${source.point_count} published point${source.point_count === 1 ? '' : 's'}`);
-      if (source.render_count !== undefined) parts.push(`${source.render_count} render${source.render_count === 1 ? '' : 's'}`);
+      const healthSource = run || summary;
+      const countSource = run || summary;
+      const parts = [`Status: ${formatRunHealth(healthSource)}`];
+      if (countSource && countSource.point_count !== undefined) {
+        parts.push(`${countSource.point_count} published point${countSource.point_count === 1 ? '' : 's'}`);
+      }
+      if (countSource && countSource.render_count !== undefined) {
+        parts.push(`${countSource.render_count} render${countSource.render_count === 1 ? '' : 's'}`);
+      }
       runHealth.textContent = parts.join(' • ');
     }
 
     async function loadRenders(runId) {
-      const run = runs.find(r => r.run_id === runId);
+      const run = getSelectedRun(runId);
       const runDir = run && run.run_dir ? run.run_dir : `runs/${runId}`;
       try {
         const resp = await fetch(`${runDir}/renders.json`);
@@ -994,7 +1005,7 @@
       }
 
       const runId = runSelect.value;
-      const run = runs.find(r => r.run_id === runId);
+      const run = getSelectedRun(runId);
       const runDir = run && run.run_dir ? run.run_dir : `runs/${runId}`;
 
       titleEl.textContent = getSceneLabel(scene);
@@ -1015,7 +1026,7 @@
       const runId = runSelect.value;
       const scene = getSelectedScene();
       const sceneLabel = getSceneLabel(scene);
-      const run = runs.find(r => r.run_id === runId);
+      const run = getSelectedRun(runId);
       const runPoints = points.filter(p => p.run_id === runId && p.scenario === scene);
 
       runTitle.textContent = run ? formatRunLabel(run) : '–';
@@ -1112,7 +1123,7 @@
     }
 
     function updateSystemInfo() {
-      const selected = runs.find(r => r.run_id === runSelect.value) || getFilteredRuns()[0];
+      const selected = getSelectedRun() || getFilteredRuns()[0];
       if (!selected) { systemInfo.textContent = 'No runs for this GPU.'; return; }
       const system = [
         selected.gpu ? `GPU: ${selected.gpu}` : null,

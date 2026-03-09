@@ -125,7 +125,9 @@ class TestNightlyPublish(unittest.TestCase):
             self.assertEqual(len(updated_points), 4)
             updated_first = next(row for row in updated_points if row["job_id"] == "validation_g1_flat_sweep__0001")
             self.assertEqual(updated_first["env_fps"], 2048.0)
-            self.assertEqual(len([row for row in _jsonl_rows(site_root / "runs.jsonl") if row["run_id"] == "publish-test"]), 1)
+            self.assertEqual(
+                len([row for row in _jsonl_rows(site_root / "runs.jsonl") if row["run_id"] == "publish-test"]), 1
+            )
 
     def test_publish_run_keeps_partial_success_and_failed_placeholder_rows(self):
         with TemporaryDirectory() as tmp_dir:
@@ -152,6 +154,42 @@ class TestNightlyPublish(unittest.TestCase):
             summary = json.loads((site_root / "runs" / "publish-failure" / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["failed_jobs"], 1)
             self.assertEqual(summary["render_count"], 1)
+
+    def test_publish_run_emits_one_run_row_per_gpu_for_mixed_profile_run(self):
+        with TemporaryDirectory() as tmp_dir:
+            run_dir = self._run_validation(tmp_dir, run_id="publish-multi-gpu")
+            render_task_dir = run_dir / "tasks" / "validation_g1_flat_render"
+            render_job_dir = render_task_dir / "jobs" / "validation_g1_flat_render__0001"
+
+            task_manifest = json.loads((render_task_dir / "task.json").read_text(encoding="utf-8"))
+            task_manifest["hardware_label"] = "rtx-pro-6000-blackwell-server-edition"
+            (render_task_dir / "task.json").write_text(
+                json.dumps(task_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+            job_manifest = json.loads((render_job_dir / "job.json").read_text(encoding="utf-8"))
+            job_manifest["hardware_label"] = "rtx-pro-6000-blackwell-server-edition"
+            (render_job_dir / "job.json").write_text(
+                json.dumps(job_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+            metadata = json.loads((render_job_dir / "results" / "metadata.json").read_text(encoding="utf-8"))
+            metadata["gpu"] = "RTX PRO 6000 Blackwell Server Edition"
+            (render_job_dir / "results" / "metadata.json").write_text(
+                json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            site_root = Path(tmp_dir) / "site" / "nightly"
+            publish_run(run_dir, publish_root=site_root)
+
+            run_rows = [row for row in _jsonl_rows(site_root / "runs.jsonl") if row["run_id"] == "publish-multi-gpu"]
+            self.assertEqual(len(run_rows), 2)
+            rows_by_gpu = {row["gpu"]: row for row in run_rows}
+            self.assertEqual(rows_by_gpu["Synthetic GPU"]["point_count"], 4)
+            self.assertEqual(rows_by_gpu["Synthetic GPU"]["render_count"], 0)
+            self.assertEqual(rows_by_gpu["RTX PRO 6000 Blackwell Server Edition"]["point_count"], 0)
+            self.assertEqual(rows_by_gpu["RTX PRO 6000 Blackwell Server Edition"]["render_count"], 1)
 
 
 def _jsonl_rows(path: Path) -> list[dict]:

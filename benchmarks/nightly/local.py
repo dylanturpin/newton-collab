@@ -9,7 +9,6 @@ import argparse
 import importlib
 import json
 import subprocess
-import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -155,7 +154,9 @@ def _resolve_publish_callable(publish_requested: bool):
     try:
         publish_module = importlib.import_module("benchmarks.nightly.publish")
     except ModuleNotFoundError as exc:
-        raise RuntimeError("Local publish was requested, but benchmarks.nightly.publish is not implemented yet.") from exc
+        raise RuntimeError(
+            "Local publish was requested, but benchmarks.nightly.publish is not implemented yet."
+        ) from exc
 
     publish_func = getattr(publish_module, "publish_run", None)
     if publish_func is None:
@@ -206,7 +207,9 @@ def _build_run_summary(
 
             if job_result.status.state == "completed":
                 completed_jobs += 1
-                job_expected.extend(required_artifact_paths(jobs_by_id[job_id], Path(job_result.job_manifest.output_dir)))
+                job_expected.extend(
+                    required_artifact_paths(jobs_by_id[job_id], Path(job_result.job_manifest.output_dir))
+                )
             else:
                 failed_jobs += 1
 
