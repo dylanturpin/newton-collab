@@ -9,6 +9,8 @@ defaults:
     UV_CACHE_DIR: /tmp/$USER/uv-cache
     UV_PROJECT_ENVIRONMENT: /tmp/$USER/newton-venv
     WARP_CACHE_PATH: /tmp/$USER/warp-cache
+    NEWTON_CACHE_PATH: /tmp/$USER/newton-cache
+    CUDA_CACHE_PATH: /tmp/$USER/cuda-compute-cache
   benchmark:
     viewer: "null"
     warmup_frames: 16

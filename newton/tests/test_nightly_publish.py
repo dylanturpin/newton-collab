@@ -19,7 +19,7 @@ class FakeWorkerRunner:
         self.failed_job_ids = set(failed_job_ids or set())
 
     def __call__(self, command: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-        out_dir = Path(command[command.index("--out") + 1])
+        command, out_dir, profiled = _unwrap_test_command(command)
         out_dir.mkdir(parents=True, exist_ok=True)
         job_id = out_dir.parent.name
         gpu_name = "RTX PRO 6000 Blackwell Server Edition" if "--render" in command else "Synthetic GPU"
@@ -54,6 +54,8 @@ class FakeWorkerRunner:
             }
             (out_dir / "measurements.jsonl").write_text(json.dumps(measurement) + "\n", encoding="utf-8")
             (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+            if profiled:
+                _write_profile_artifacts(out_dir)
             return subprocess.CompletedProcess(command, 0, stdout="benchmark ok\n", stderr="")
 
         render_meta = {
@@ -73,6 +75,34 @@ class FakeWorkerRunner:
         return subprocess.CompletedProcess(command, 0, stdout="render ok\n", stderr="")
 
 
+def _unwrap_test_command(command: list[str]) -> tuple[list[str], Path, bool]:
+    if "benchmarks.nightly.profiled_worker" not in command:
+        return command, Path(command[command.index("--out") + 1]), False
+    results_dir = Path(command[command.index("--results-dir") + 1])
+    inner_command = command[command.index("--") + 1 :]
+    return inner_command, results_dir, True
+
+
+def _write_profile_artifacts(out_dir: Path) -> None:
+    (out_dir / "profile.nsys-rep").write_text("synthetic nsys report\n", encoding="utf-8")
+    (out_dir / "profile.trace.json").write_text('{"traceEvents":[]}\n', encoding="utf-8")
+    (out_dir / "profile_meta.json").write_text(
+        json.dumps(
+            {
+                "tool": "nsys",
+                "cuda_graph_trace": "node",
+                "measure_frames": 8,
+                "report_name": "profile.nsys-rep",
+                "trace_name": "profile.trace.json",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 class TestNightlyPublish(unittest.TestCase):
     def _run_validation(self, tmp_dir: str, *, run_id: str, failed_job_ids: set[str] | None = None) -> Path:
         summary = run_local_nightly(
@@ -86,6 +116,8 @@ class TestNightlyPublish(unittest.TestCase):
                 "UV_CACHE_DIR": str(Path(tmp_dir) / "uv-cache"),
                 "UV_PROJECT_ENVIRONMENT": str(Path(tmp_dir) / "uv-env"),
                 "WARP_CACHE_PATH": str(Path(tmp_dir) / "warp-cache"),
+                "NEWTON_CACHE_PATH": str(Path(tmp_dir) / "newton-cache"),
+                "CUDA_CACHE_PATH": str(Path(tmp_dir) / "cuda-cache"),
             },
             publish=False,
             working_dir=Path(tmp_dir),
@@ -218,6 +250,62 @@ class TestNightlyPublish(unittest.TestCase):
             self.assertEqual(rows_by_gpu["Synthetic GPU"]["render_count"], 0)
             self.assertEqual(rows_by_gpu["RTX PRO 6000 Blackwell Server Edition"]["point_count"], 0)
             self.assertEqual(rows_by_gpu["RTX PRO 6000 Blackwell Server Edition"]["render_count"], 1)
+
+    def test_publish_run_copies_profile_artifacts_and_links_them_from_points(self):
+        with TemporaryDirectory() as tmp_dir:
+            run_dir = self._run_validation(tmp_dir, run_id="publish-profiled")
+            profile_results_dir = (
+                run_dir / "tasks" / "validation_g1_flat_sweep" / "jobs" / "validation_g1_flat_sweep__0001" / "results"
+            )
+            (profile_results_dir / "profile.nsys-rep").write_text("synthetic nsys report\n", encoding="utf-8")
+            (profile_results_dir / "profile.trace.json").write_text('{"traceEvents":[]}\n', encoding="utf-8")
+            (profile_results_dir / "profile_meta.json").write_text(
+                json.dumps(
+                    {
+                        "tool": "nsys",
+                        "cuda_graph_trace": "node",
+                        "measure_frames": 8,
+                        "report_name": "profile.nsys-rep",
+                        "trace_name": "profile.trace.json",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            site_root = Path(tmp_dir) / "site" / "nightly"
+            publish_run(run_dir, publish_root=site_root)
+
+            run_points = [row for row in _jsonl_rows(site_root / "points.jsonl") if row["run_id"] == "publish-profiled"]
+            profiled_row = next(row for row in run_points if row["job_id"] == "validation_g1_flat_sweep__0001")
+            self.assertEqual(
+                profiled_row["nsys_report_path"], "profiles/validation_g1_flat_sweep__0001/profile.nsys-rep"
+            )
+            self.assertEqual(
+                profiled_row["nsys_trace_path"], "profiles/validation_g1_flat_sweep__0001/profile.trace.json"
+            )
+            self.assertTrue(
+                (
+                    site_root
+                    / "runs"
+                    / "publish-profiled"
+                    / "profiles"
+                    / "validation_g1_flat_sweep__0001"
+                    / "profile.nsys-rep"
+                ).is_file()
+            )
+            self.assertTrue(
+                (
+                    site_root
+                    / "runs"
+                    / "publish-profiled"
+                    / "profiles"
+                    / "validation_g1_flat_sweep__0001"
+                    / "profile.trace.json"
+                ).is_file()
+            )
 
 
 def _jsonl_rows(path: Path) -> list[dict]:

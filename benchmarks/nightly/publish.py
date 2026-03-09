@@ -89,6 +89,7 @@ def publish_run(
             run_rows=publication["run_rows"],
             point_count=len(publication["point_rows"]),
             render_count=len(publication["render_entries"]),
+            profile_count=publication["profile_count"],
         ),
     )
     return {
@@ -100,6 +101,7 @@ def publish_run(
         "run_row": publication["run_row"],
         "point_count": len(publication["point_rows"]),
         "render_count": len(publication["render_entries"]),
+        "profile_count": publication["profile_count"],
     }
 
 
@@ -116,6 +118,7 @@ def write_run_summary(run_dir: Path | str) -> dict[str, Any]:
 def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
     point_rows: list[dict[str, Any]] = []
     render_entries: list[dict[str, Any]] = []
+    profile_artifacts: list[dict[str, Any]] = []
     scenarios: set[str] = set()
     series_names: set[str] = set()
     task_summaries: list[dict[str, Any]] = []
@@ -180,6 +183,7 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
                         task_mode=task_mode,
                     )
                 )
+                profile_artifacts.extend(_build_profile_artifacts(job))
             elif job["manifest"]["kind"] == "render":
                 render_entry = _build_render_entry(context=context, task=task, job=job)
                 if render_entry is not None:
@@ -241,6 +245,7 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
         "successful_point_count": sum(1 for row in point_rows if row.get("ok") is not False),
         "failed_point_count": sum(1 for row in point_rows if row.get("ok") is False),
         "render_count": len(render_entries),
+        "profile_count": len({artifact["job_id"] for artifact in profile_artifacts}),
         "tasks": task_summaries,
     }
     if sample_metadata is not None:
@@ -337,6 +342,8 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
         "run_summary": run_summary,
         "point_rows": point_rows,
         "render_entries": render_entries,
+        "profile_artifacts": profile_artifacts,
+        "profile_count": len({artifact["job_id"] for artifact in profile_artifacts}),
     }
 
 
@@ -442,6 +449,14 @@ def _base_point_row(
         "job_status": job["status"].get("state"),
         "ok": ok,
     }
+    profile_meta = job.get("profile_meta")
+    if profile_meta is not None:
+        report_name = profile_meta.get("report_name")
+        trace_name = profile_meta.get("trace_name")
+        if isinstance(report_name, str) and report_name:
+            row["nsys_report_path"] = str(_public_profile_path(job["job_id"], report_name))
+        if isinstance(trace_name, str) and trace_name:
+            row["nsys_trace_path"] = str(_public_profile_path(job["job_id"], trace_name))
     if metadata.get("pgs_iterations") is not None:
         row["pgs_iterations"] = metadata["pgs_iterations"]
     if metadata.get("measure_frames") is not None:
@@ -460,6 +475,35 @@ def _base_point_row(
 def _resolved_job_gpu(job: Mapping[str, Any]) -> str:
     metadata = job.get("metadata") or {}
     return str(metadata.get("gpu") or job["manifest"].get("hardware_label") or "unknown")
+
+
+def _build_profile_artifacts(job: Mapping[str, Any]) -> list[dict[str, Any]]:
+    profile_meta = job.get("profile_meta")
+    if profile_meta is None:
+        return []
+
+    artifacts = []
+    for key in ("report_name", "trace_name"):
+        file_name = profile_meta.get(key)
+        if not isinstance(file_name, str) or not file_name:
+            continue
+        source_path = job["results_dir"] / file_name
+        if not source_path.is_file():
+            continue
+        artifacts.append(
+            {
+                "job_id": job["job_id"],
+                "path": str(_public_profile_path(job["job_id"], file_name)),
+                "_source_path": str(source_path),
+            }
+        )
+    return artifacts
+
+
+def _public_profile_path(job_id: str, file_name: str | None) -> Path:
+    if not isinstance(file_name, str) or not file_name:
+        raise ValueError("Profile artifact file name must be a non-empty string.")
+    return Path("profiles") / str(job_id) / file_name
 
 
 def _task_mode(task_manifest: Mapping[str, Any], task_definition: Mapping[str, Any]) -> str:
@@ -503,6 +547,12 @@ def _write_site(site_root: Path, publication: Mapping[str, Any], *, repo_root: P
         target_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, target_path)
     _write_json_value(public_run_dir / "renders.json", render_entries)
+
+    for artifact in publication["profile_artifacts"]:
+        source_path = Path(artifact["_source_path"])
+        target_path = public_run_dir / artifact["path"]
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target_path)
 
     dashboard_source = repo_root / "benchmarks" / "nightly" / "index.html"
     if dashboard_source.is_file():
@@ -608,6 +658,7 @@ def _load_context(run_dir: Path | str) -> dict[str, Any]:
                     "metadata": _read_json_if_exists(results_dir / "metadata.json"),
                     "measurements": _read_jsonl_if_exists(results_dir / "measurements.jsonl"),
                     "render_meta": _read_json_if_exists(results_dir / "render_meta.json"),
+                    "profile_meta": _read_json_if_exists(results_dir / "profile_meta.json"),
                 }
             )
         tasks.append(

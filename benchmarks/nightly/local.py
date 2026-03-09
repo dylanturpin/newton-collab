@@ -307,6 +307,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--warp-cache-path", type=str, default=None, help="Override defaults.cache_env.WARP_CACHE_PATH")
     parser.add_argument(
+        "--newton-cache-path", type=str, default=None, help="Override defaults.cache_env.NEWTON_CACHE_PATH"
+    )
+    parser.add_argument("--cuda-cache-path", type=str, default=None, help="Override defaults.cache_env.CUDA_CACHE_PATH")
+    parser.add_argument(
         "--cherry-pick-ref",
         action="append",
         default=None,
@@ -339,6 +343,8 @@ def main() -> None:
             "UV_CACHE_DIR": args.uv_cache_dir,
             "UV_PROJECT_ENVIRONMENT": args.uv_project_environment,
             "WARP_CACHE_PATH": args.warp_cache_path,
+            "NEWTON_CACHE_PATH": args.newton_cache_path,
+            "CUDA_CACHE_PATH": args.cuda_cache_path,
         },
         cherry_pick_refs=args.cherry_pick_ref,
         publish=publish,

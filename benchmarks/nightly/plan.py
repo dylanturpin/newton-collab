@@ -23,7 +23,14 @@ DEFAULT_PLAN_PATH = Path(__file__).with_name("nightly.yaml")
 
 RUN_MODES = ("full", "validation")
 TASK_KINDS = ("benchmark", "render")
-CACHE_ENV_KEYS = ("TMPDIR", "UV_CACHE_DIR", "UV_PROJECT_ENVIRONMENT", "WARP_CACHE_PATH")
+CACHE_ENV_KEYS = (
+    "TMPDIR",
+    "UV_CACHE_DIR",
+    "UV_PROJECT_ENVIRONMENT",
+    "WARP_CACHE_PATH",
+    "NEWTON_CACHE_PATH",
+    "CUDA_CACHE_PATH",
+)
 EXPANSION_FIELD_ORDER = (
     "solver",
     "substeps",
@@ -86,6 +93,8 @@ BENCHMARK_OPTION_FIELDS = {
     "mj_njmax",
     "mj_nconmax",
     "override_scenario_defaults",
+    "nsys_profile",
+    "nsys_cuda_graph_trace",
 }
 RENDER_OPTION_FIELDS = {
     "solver",

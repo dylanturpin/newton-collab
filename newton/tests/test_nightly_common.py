@@ -34,10 +34,14 @@ class TestNightlyCommon(unittest.TestCase):
                 "UV_CACHE_DIR": "/tmp/$USER/cache",
                 "UV_PROJECT_ENVIRONMENT": "/tmp/$USER/env",
                 "WARP_CACHE_PATH": "/tmp/$USER/warp",
+                "NEWTON_CACHE_PATH": "/tmp/$USER/newton",
+                "CUDA_CACHE_PATH": "/tmp/$USER/cuda",
             },
             env={"USER": "nightly"},
         )
         self.assertEqual(resolved["UV_CACHE_DIR"], "/tmp/nightly/cache")
+        self.assertEqual(resolved["NEWTON_CACHE_PATH"], "/tmp/nightly/newton")
+        self.assertEqual(resolved["CUDA_CACHE_PATH"], "/tmp/nightly/cuda")
         self.assertEqual(tuple(resolved), CACHE_ENV_KEYS)
 
     def test_resolve_run_paths_and_validate_environment(self):
@@ -53,6 +57,8 @@ class TestNightlyCommon(unittest.TestCase):
                     "UV_CACHE_DIR": str(Path(tmp_dir) / "uv-cache"),
                     "UV_PROJECT_ENVIRONMENT": str(Path(tmp_dir) / "uv-env"),
                     "WARP_CACHE_PATH": str(Path(tmp_dir) / "warp-cache"),
+                    "NEWTON_CACHE_PATH": str(Path(tmp_dir) / "newton-cache"),
+                    "CUDA_CACHE_PATH": str(Path(tmp_dir) / "cuda-cache"),
                 },
             )
 
@@ -137,6 +143,8 @@ class TestNightlyCommon(unittest.TestCase):
                     "UV_CACHE_DIR": str(Path(tmp_dir) / "uv-cache"),
                     "UV_PROJECT_ENVIRONMENT": str(Path(tmp_dir) / "uv-env"),
                     "WARP_CACHE_PATH": str(Path(tmp_dir) / "warp-cache"),
+                    "NEWTON_CACHE_PATH": str(Path(tmp_dir) / "newton-cache"),
+                    "CUDA_CACHE_PATH": str(Path(tmp_dir) / "cuda-cache"),
                 },
             )
 

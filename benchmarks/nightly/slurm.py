@@ -748,6 +748,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--warp-cache-path", type=str, default=None, help="Override defaults.cache_env.WARP_CACHE_PATH"
     )
     submit_parser.add_argument(
+        "--newton-cache-path", type=str, default=None, help="Override defaults.cache_env.NEWTON_CACHE_PATH"
+    )
+    submit_parser.add_argument(
+        "--cuda-cache-path", type=str, default=None, help="Override defaults.cache_env.CUDA_CACHE_PATH"
+    )
+    submit_parser.add_argument(
         "--publish", action="store_true", help="Submit the final publish job after task submissions"
     )
     submit_parser.add_argument("--skip-publish", action="store_true", help="Explicitly skip the final publish job")
@@ -796,6 +802,8 @@ def main() -> None:
                 "UV_CACHE_DIR": args.uv_cache_dir,
                 "UV_PROJECT_ENVIRONMENT": args.uv_project_environment,
                 "WARP_CACHE_PATH": args.warp_cache_path,
+                "NEWTON_CACHE_PATH": args.newton_cache_path,
+                "CUDA_CACHE_PATH": args.cuda_cache_path,
             },
             publish=args.publish and not args.skip_publish,
             submission_mode=args.submission_mode,

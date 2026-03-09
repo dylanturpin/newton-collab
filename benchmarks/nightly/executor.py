@@ -33,6 +33,7 @@ CompletedProcessRunner = Callable[[list[str], Path, Mapping[str, str]], subproce
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 BENCHMARK_REQUIRED_ARTIFACTS = ("measurements.jsonl", "metadata.json")
+PROFILE_REQUIRED_ARTIFACTS = ("profile.nsys-rep", "profile.trace.json", "profile_meta.json")
 RENDER_REQUIRED_ARTIFACTS = ("metadata.json", "render_meta.json")
 
 JOB_METADATA_KEYS = {
@@ -286,7 +287,7 @@ def run_job(
 
     start_monotonic = time.monotonic()
     try:
-        command = build_worker_command(job, results_dir)
+        command = build_job_command(job, results_dir)
     except Exception as exc:
         _write_text(run_paths.job_stderr_path(task_id, job_id), f"{type(exc).__name__}: {exc}\n")
         status = StatusRecord(
@@ -458,10 +459,33 @@ def build_worker_command(job: Mapping[str, Any], results_dir: Path) -> list[str]
     raise ValueError(f"Unsupported job kind: {job['kind']}")
 
 
+def build_job_command(job: Mapping[str, Any], results_dir: Path) -> list[str]:
+    """Build the concrete job command, optionally wrapped with Nsight Systems."""
+    worker_command = build_worker_command(job, results_dir)
+    if not _job_uses_nsys(job):
+        return worker_command
+    return [
+        sys.executable,
+        "-m",
+        "benchmarks.nightly.profiled_worker",
+        "--results-dir",
+        str(results_dir),
+        "--measure-frames",
+        str(job["measure_frames"]),
+        "--cuda-graph-trace",
+        str(job.get("nsys_cuda_graph_trace", "node")),
+        "--",
+        *worker_command,
+    ]
+
+
 def required_artifact_paths(job: Mapping[str, Any], results_dir: Path) -> list[Path]:
     """Return the artifact paths expected for a successful job."""
     if job["kind"] == "benchmark":
-        return [results_dir / name for name in BENCHMARK_REQUIRED_ARTIFACTS]
+        artifact_names = list(BENCHMARK_REQUIRED_ARTIFACTS)
+        if _job_uses_nsys(job):
+            artifact_names.extend(PROFILE_REQUIRED_ARTIFACTS)
+        return [results_dir / name for name in artifact_names]
     if job["kind"] == "render":
         return [results_dir / name for name in RENDER_REQUIRED_ARTIFACTS] + [results_dir / f"{job['scenario']}.mp4"]
     raise ValueError(f"Unsupported job kind: {job['kind']}")
@@ -588,6 +612,10 @@ def _camera_pos_value(value: Any) -> str:
 
 def _missing_required_artifacts(job: Mapping[str, Any], results_dir: Path) -> list[str]:
     return [str(path.name) for path in required_artifact_paths(job, results_dir) if not path.exists()]
+
+
+def _job_uses_nsys(job: Mapping[str, Any]) -> bool:
+    return job["kind"] == "benchmark" and bool(job.get("nsys_profile"))
 
 
 def _existing_paths(paths: Sequence[str | Path]) -> list[str]:

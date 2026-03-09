@@ -15,7 +15,7 @@ class FakeWorkerRunner:
     """Small fake subprocess runner for end-to-end workflow tests."""
 
     def __call__(self, command: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-        out_dir = Path(command[command.index("--out") + 1])
+        command, out_dir, profiled = _unwrap_test_command(command)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         if "--benchmark" in command:
@@ -40,6 +40,8 @@ class FakeWorkerRunner:
             }
             (out_dir / "measurements.jsonl").write_text(json.dumps(measurement) + "\n", encoding="utf-8")
             (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+            if profiled:
+                _write_profile_artifacts(out_dir)
             return subprocess.CompletedProcess(command, 0, stdout="benchmark ok\n", stderr="")
 
         scenario = command[command.index("--scenario") + 1]
@@ -64,6 +66,34 @@ class FakeWorkerRunner:
         return subprocess.CompletedProcess(command, 0, stdout="render ok\n", stderr="")
 
 
+def _unwrap_test_command(command: list[str]) -> tuple[list[str], Path, bool]:
+    if "benchmarks.nightly.profiled_worker" not in command:
+        return command, Path(command[command.index("--out") + 1]), False
+    results_dir = Path(command[command.index("--results-dir") + 1])
+    inner_command = command[command.index("--") + 1 :]
+    return inner_command, results_dir, True
+
+
+def _write_profile_artifacts(out_dir: Path) -> None:
+    (out_dir / "profile.nsys-rep").write_text("synthetic nsys report\n", encoding="utf-8")
+    (out_dir / "profile.trace.json").write_text('{"traceEvents":[]}\n', encoding="utf-8")
+    (out_dir / "profile_meta.json").write_text(
+        json.dumps(
+            {
+                "tool": "nsys",
+                "cuda_graph_trace": "node",
+                "measure_frames": 8,
+                "report_name": "profile.nsys-rep",
+                "trace_name": "profile.trace.json",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 class TestNightlyWorkflow(unittest.TestCase):
     def test_validation_run_creates_expected_artifact_tree_without_publish(self):
         with TemporaryDirectory() as tmp_dir:
@@ -78,6 +108,8 @@ class TestNightlyWorkflow(unittest.TestCase):
                     "UV_CACHE_DIR": str(Path(tmp_dir) / "uv-cache"),
                     "UV_PROJECT_ENVIRONMENT": str(Path(tmp_dir) / "uv-env"),
                     "WARP_CACHE_PATH": str(Path(tmp_dir) / "warp-cache"),
+                    "NEWTON_CACHE_PATH": str(Path(tmp_dir) / "newton-cache"),
+                    "CUDA_CACHE_PATH": str(Path(tmp_dir) / "cuda-cache"),
                 },
                 publish=False,
                 working_dir=Path(tmp_dir),
