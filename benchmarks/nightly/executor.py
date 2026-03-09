@@ -322,7 +322,7 @@ def run_job(
         )
         return JobExecutionResult(job_manifest=job_manifest, status=status)
 
-    env = _worker_env(run_paths, extra_env)
+    env = _worker_env(run_paths, task_id, extra_env)
     cwd = Path(working_dir) if working_dir is not None else REPO_ROOT
     job_runner = runner or _default_runner
 
@@ -589,9 +589,18 @@ def _write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def _worker_env(run_paths: RunPaths, extra_env: Mapping[str, str] | None) -> dict[str, str]:
+def _task_cache_env(run_paths: RunPaths, task_id: str) -> dict[str, str]:
+    cache_env: dict[str, str] = {}
+    for key, base_path in run_paths.cache_env.items():
+        task_path = base_path / task_id
+        task_path.mkdir(parents=True, exist_ok=True)
+        cache_env[key] = str(task_path)
+    return cache_env
+
+
+def _worker_env(run_paths: RunPaths, task_id: str, extra_env: Mapping[str, str] | None) -> dict[str, str]:
     env = dict(os.environ)
-    env.update({key: str(value) for key, value in run_paths.cache_env.items()})
+    env.update(_task_cache_env(run_paths, task_id))
     env["PYTHONUNBUFFERED"] = "1"
     if extra_env is not None:
         env.update(dict(extra_env))

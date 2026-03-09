@@ -126,7 +126,8 @@ class TestNightlyExecutor(unittest.TestCase):
 
             self.assertEqual(result.status.state, "completed")
             self.assertEqual(len(result.job_results), benchmark_task["job_count"])
-            self.assertTrue(runner.envs[0]["UV_CACHE_DIR"].endswith("uv-cache"))
+            self.assertEqual(Path(runner.envs[0]["UV_CACHE_DIR"]).name, benchmark_task["id"])
+            self.assertEqual(Path(runner.envs[0]["UV_CACHE_DIR"]).parent.name, "uv-cache")
 
             task_log_records = [
                 json.loads(line)
@@ -202,6 +203,34 @@ class TestNightlyExecutor(unittest.TestCase):
             self.assertTrue((profiled_output_dir / "profile.trace.json").is_file())
             self.assertTrue((profiled_output_dir / "profile_meta.json").is_file())
             self.assertIn("benchmarks.nightly.profiled_worker", runner.commands[0])
+
+    def test_run_task_scopes_worker_cache_paths_by_task_id(self):
+        benchmark_task, render_task = self._load_validation_tasks()
+
+        with TemporaryDirectory() as tmp_dir:
+            run_paths = self._make_run_paths(tmp_dir)
+            validate_run_environment(run_paths)
+            runner = FakeWorkerRunner()
+
+            run_task(run_paths, benchmark_task, runner=runner, working_dir=Path(tmp_dir))
+            run_task(run_paths, render_task, runner=runner, working_dir=Path(tmp_dir))
+
+            benchmark_env = runner.envs[0]
+            render_env = runner.envs[-1]
+
+            for key in (
+                "TMPDIR",
+                "UV_CACHE_DIR",
+                "UV_PROJECT_ENVIRONMENT",
+                "WARP_CACHE_PATH",
+                "NEWTON_CACHE_PATH",
+                "CUDA_CACHE_PATH",
+            ):
+                self.assertTrue(benchmark_env[key].endswith(benchmark_task["id"]))
+                self.assertTrue(render_env[key].endswith(render_task["id"]))
+                self.assertNotEqual(benchmark_env[key], render_env[key])
+                self.assertTrue(Path(benchmark_env[key]).is_dir())
+                self.assertTrue(Path(render_env[key]).is_dir())
 
 
 if __name__ == "__main__":
