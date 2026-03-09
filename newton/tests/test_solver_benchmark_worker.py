@@ -77,6 +77,18 @@ class TestSolverBenchmarkWorker(unittest.TestCase):
         self.assertNotIn("--ablation", command)
         self.assertNotIn("--plot", command)
 
+    def test_supports_pipeline_collide_checks_solver_signature(self):
+        class PipelineSolver:
+            def step(self, state_in, state_out, control, contacts, dt, collide_done_event=None):
+                return None
+
+        class PlainSolver:
+            def step(self, state_in, state_out, control, contacts, dt):
+                return None
+
+        self.assertTrue(solver_benchmark.supports_pipeline_collide(PipelineSolver()))
+        self.assertFalse(solver_benchmark.supports_pipeline_collide(PlainSolver()))
+
     def test_write_benchmark_artifacts_writes_measurement_and_metadata(self):
         args = _make_args()
         measurement = solver_benchmark.build_measurement_row(

@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Keep nightly MuJoCo benchmark jobs off the FeatherPGS-only pipeline-collision path, and route nightly renders through the known-good RTX PRO 6000 render lane so nightly runs produce stable videos and benchmark results.
 ## [1.0.0] - YYYY-MM-DD
 
 Initial public release.

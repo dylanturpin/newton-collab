@@ -19,6 +19,7 @@ Usage examples:
 
 import argparse
 import datetime as dt
+import inspect
 import json
 import platform
 import subprocess
@@ -530,6 +531,11 @@ def write_render_artifacts(
     (out_dir / "render_meta.json").write_text(json.dumps(render_metadata, indent=2) + "\n", encoding="utf-8")
 
 
+def supports_pipeline_collide(solver) -> bool:
+    """Return whether ``solver.step()`` accepts ``collide_done_event``."""
+    return "collide_done_event" in inspect.signature(solver.step).parameters
+
+
 # =============================================================================
 # Subprocess Runner
 # =============================================================================
@@ -946,8 +952,12 @@ def run_direct(args):
     control = model.control()
     contacts = model.collide(state_0)
 
-    # Pipeline collide: overlap collision detection with solver stages S1-S3
+    # Pipeline collide: overlap collision detection with solver stages S1-S3.
+    # This is currently only supported by solvers that accept the optional
+    # ``collide_done_event`` hook.
     _pipeline_collide = getattr(args, "pipeline_collide", False)
+    if _pipeline_collide and not supports_pipeline_collide(solver):
+        _pipeline_collide = False
     collide_stream = None
     contacts_bufs = None
     collide_done_events = None

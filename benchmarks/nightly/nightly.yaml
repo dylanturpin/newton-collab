@@ -47,6 +47,18 @@ hardware_profiles:
       partition: rtx-pro-6000-blackwell-server-edition@ts1/spc741d16qm3/1gpu-32cpu-256gb
       gres: gpu:1
       time_limit: 01:00:00
+      exclude:
+        - 2u2g-spr-0095
+  rtx_pro_6000_render:
+    label: rtx-pro-6000-blackwell-server-edition
+    slurm:
+      account: all-users
+      partition: rtx-pro-6000-blackwell-server-edition@ts1/spc741d16qm3/1gpu-32cpu-256gb
+      gres: gpu:1
+      time_limit: 01:00:00
+      exclude:
+        - 2u2g-spr-0093
+        - 2u2g-spr-0095
   b200:
     label: b200
     slurm:
@@ -74,11 +86,12 @@ tasks:
     scenario: g1_flat
     num_worlds: 16384
     ablation_sequence: default
+    nsys_profile: true
 
   - id: g1_flat_renders
     run_modes: [full]
     kind: render
-    profile: rtx_pro_6000_server
+    profile: rtx_pro_6000_render
     series: g1_flat_render
     scenario: g1_flat
     solver: [fpgs_tiled, mujoco]
@@ -122,11 +135,12 @@ tasks:
     scenario: h1_tabletop
     num_worlds: 8192
     ablation_sequence: streaming
+    nsys_profile: true
 
   - id: h1_tabletop_renders
     run_modes: [full]
     kind: render
-    profile: rtx_pro_6000_server
+    profile: rtx_pro_6000_render
     series: h1_tabletop_render
     scenario: h1_tabletop
     solver: [fpgs_mf, mujoco]
@@ -147,7 +161,7 @@ tasks:
   - id: validation_g1_flat_render
     run_modes: [validation]
     kind: render
-    profile: rtx_pro_6000_server
+    profile: rtx_pro_6000_render
     series: g1_flat_render
     scenario: g1_flat
     solver: [fpgs_tiled]
