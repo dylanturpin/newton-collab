@@ -10,6 +10,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+USER_NAME="${USER:-$(id -un)}"
+
+export TMPDIR="${TMPDIR:-/tmp}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/$USER_NAME/uv-cache}"
+export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-/tmp/$USER_NAME/newton-venv}"
+export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/$USER_NAME/warp-cache}"
 
 cd "$REPO_ROOT"
 
