@@ -375,6 +375,11 @@ def _build_job_point_rows(
     for measurement in rows:
         row = _base_point_row(context=context, task=task, job=job, task_mode=task_mode, ok=measurement.get("ok", True))
         row.update(measurement)
+        profile_summary = job.get("profile_summary")
+        if isinstance(profile_summary, Mapping) and not row.get("kernels"):
+            kernels = profile_summary.get("kernels")
+            if isinstance(kernels, Mapping):
+                row["kernels"] = {str(name): float(value) for name, value in kernels.items()}
         point_rows.append(row)
     return point_rows
 

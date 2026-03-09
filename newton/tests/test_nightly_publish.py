@@ -320,7 +320,7 @@ class TestNightlyPublish(unittest.TestCase):
             )
             measurement_path = results_dir / "measurements.jsonl"
             measurement = _jsonl_rows(measurement_path)[0]
-            measurement.pop("kernels", None)
+            measurement["kernels"] = {}
             measurement_path.write_text(json.dumps(measurement) + "\n", encoding="utf-8")
             (results_dir / "profile_summary.json").write_text(
                 json.dumps(
