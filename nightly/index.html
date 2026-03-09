@@ -179,6 +179,15 @@
       margin-top: 0.5rem;
     }
 
+    a {
+      color: var(--accent-3);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
     .error {
       background: rgba(246, 115, 115, 0.15);
       border: 1px solid rgba(246, 115, 115, 0.4);
@@ -259,6 +268,34 @@
       opacity: 0.4;
     }
 
+    .profile-links {
+      display: flex;
+      flex-direction: column;
+      gap: 0.9rem;
+    }
+
+    .profile-link-row {
+      padding-top: 0.9rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .profile-link-row:first-child {
+      border-top: none;
+      padding-top: 0;
+    }
+
+    .profile-link-label {
+      font-weight: 600;
+      margin-bottom: 0.35rem;
+    }
+
+    .profile-link-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem 1rem;
+      font-size: 0.88rem;
+    }
+
     .video-card {
       background: var(--bg-card);
       border: 1px solid var(--border);
@@ -318,10 +355,7 @@
     </div>
     <div class="control">
       <label for="scene-select">Scene</label>
-      <select id="scene-select">
-        <option value="h1_tabletop">H1 Tabletop</option>
-        <option value="g1_flat">G1 Flat</option>
-      </select>
+      <select id="scene-select"></select>
     </div>
     <div class="control" id="video-select-control">
       <label for="video-select">Preview</label>
@@ -343,6 +377,7 @@
   <!-- Run snapshot charts (for selected scene) -->
   <section class="section">
     <div class="section-title">Run Snapshot <span id="run-title">–</span></div>
+    <div class="note" id="run-health">Run health will appear here.</div>
     <div class="grid">
       <div class="card">
         <h3 id="sweep-fps-title">Sweep • Env-FPS</h3>
@@ -355,6 +390,12 @@
       <div class="card">
         <h3 id="ablation-title">Ablation • Env-FPS</h3>
         <div class="chart-wrap"><canvas id="ablation-fps"></canvas></div>
+      </div>
+    </div>
+    <div style="margin-top:1.25rem;">
+      <div class="card" style="min-height:auto;">
+        <h3 id="profile-links-title">Ablation • Profiling Artifacts</h3>
+        <div id="profile-links"></div>
       </div>
     </div>
   </section>
@@ -445,6 +486,19 @@
       h1_tabletop: 'H1 Tabletop'
     };
 
+    const DISPLAY_SERIES = {
+      g1_flat: {
+        sweep: 'g1_flat_env_fps',
+        ablation: 'g1_flat_ablation',
+        render: 'g1_flat_render'
+      },
+      h1_tabletop: {
+        sweep: 'h1_tabletop_env_fps',
+        ablation: 'h1_tabletop_ablation',
+        render: 'h1_tabletop_render'
+      }
+    };
+
     const STAGE_COLORS = {
       '0_collision':     '#f97316',
       '1_fk_id':         '#22d3ee',
@@ -474,6 +528,7 @@
     let points = [];
     let charts = {};
     let renders = [];  // populated from renders.json per run
+    const runSummaries = new Map();
 
     const gpuSelect = document.getElementById('gpu-select');
     const runSelect = document.getElementById('run-select');
@@ -486,6 +541,7 @@
     const errorEl = document.getElementById('error');
     const runBadge = document.getElementById('run-badge');
     const runTitle = document.getElementById('run-title');
+    const runHealth = document.getElementById('run-health');
     const systemInfo = document.getElementById('system-info');
 
     function getFilteredRuns() {
@@ -494,6 +550,16 @@
 
     function getFilteredPoints() {
       return points.filter(p => p.gpu === gpuSelect.value);
+    }
+
+    function getSelectedRun(runId = runSelect.value) {
+      if (!runId) return null;
+      return getFilteredRuns().find(r => r.run_id === runId) || runs.find(r => r.run_id === runId) || null;
+    }
+
+    function getAvailableScenes() {
+      const scenes = unique(getFilteredPoints().map(p => p.scenario).filter(Boolean));
+      return scenes;
     }
 
     function refreshRunSelect() {
@@ -506,7 +572,20 @@
         runSelect.value = filtered[0].run_id;
       }
       const latest = filtered[0];
-      runBadge.textContent = latest ? `Latest: ${formatRunLabel(latest)}` : 'No runs';
+      runBadge.textContent = latest ? `Latest: ${formatRunLabel(latest)} • ${formatRunHealth(latest)}` : 'No runs';
+    }
+
+    function refreshSceneSelect() {
+      const availableScenes = getAvailableScenes();
+      const previous = sceneSelect.value;
+      sceneSelect.innerHTML = availableScenes
+        .map(scene => `<option value="${scene}">${getSceneLabel(scene)}</option>`)
+        .join('');
+      if (availableScenes.includes(previous)) {
+        sceneSelect.value = previous;
+      } else if (availableScenes.length) {
+        sceneSelect.value = availableScenes[0];
+      }
     }
 
     function parseJsonl(text) {
@@ -529,6 +608,15 @@
 
     function unique(values) {
       return Array.from(new Set(values)).sort();
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
     }
 
     function destroyChart(name) {
@@ -806,6 +894,46 @@
       container.innerHTML = html;
     }
 
+    function buildProfileLinks(containerId, runDir, ablationPoints) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+
+      const profiledPoints = ablationPoints.filter(p => p.nsys_report_path || p.nsys_trace_path);
+      if (!profiledPoints.length) {
+        container.innerHTML = '<div class="note">No Nsight profiling artifacts were published for this run.</div>';
+        return;
+      }
+
+      const rows = profiledPoints.map(point => {
+        const label = escapeHtml((point.label || point.solver || 'unknown').replace(/^\+\s*/, ''));
+        const actions = [];
+        if (point.nsys_report_path) {
+          const downloadName = point.nsys_report_path.split('/').pop();
+          actions.push(
+            `<a href="${escapeHtml(`${runDir}/${point.nsys_report_path}`)}" download="${escapeHtml(downloadName)}">Download nsys-rep</a>`
+          );
+        }
+        if (point.nsys_trace_path) {
+          const traceHref = `${runDir}/${point.nsys_trace_path}`;
+          const traceUrl = new URL(traceHref, window.location.href).href;
+          const downloadName = point.nsys_trace_path.split('/').pop();
+          actions.push(
+            `<a href="${escapeHtml(traceHref)}" download="${escapeHtml(downloadName)}">Download trace.json</a>`
+          );
+          actions.push(
+            `<a href="${escapeHtml(`https://ui.perfetto.dev/#!/?url=${encodeURIComponent(traceUrl)}`)}" target="_blank" rel="noopener">Open in Perfetto</a>`
+          );
+        }
+        return `
+          <div class="profile-link-row">
+            <div class="profile-link-label">${label}</div>
+            <div class="profile-link-actions">${actions.join('')}</div>
+          </div>
+        `;
+      });
+      container.innerHTML = `<div class="profile-links">${rows.join('')}</div>`;
+    }
+
     // ---- Sweep dataset builder ----
 
     function buildSweepDatasets(rows, key) {
@@ -846,8 +974,95 @@
       return SCENE_LABELS[scene] || scene;
     }
 
+    function getDisplaySeries(scene, mode) {
+      return DISPLAY_SERIES[scene] && DISPLAY_SERIES[scene][mode] ? DISPLAY_SERIES[scene][mode] : null;
+    }
+
+    function pointMatchesDisplay(point, scene, mode) {
+      if (point.scenario !== scene || point.mode !== mode) return false;
+      const displaySeries = getDisplaySeries(scene, mode);
+      if (!displaySeries) return true;
+      return point.series === displaySeries;
+    }
+
+    function renderMatchesScene(render, scene) {
+      if (render.scenario !== scene) return false;
+      const displaySeries = getDisplaySeries(scene, 'render');
+      if (!displaySeries) return true;
+      return render.series === displaySeries;
+    }
+
+    function getRenderSourceLabel(render) {
+      return render.gpu || render.gpu_tag || 'another GPU';
+    }
+
+    function getActiveSceneRenders(scene) {
+      const sceneRenders = renders.filter(r => renderMatchesScene(r, scene));
+      const preferredRenders = sceneRenders.filter(r => !r.gpu || r.gpu === gpuSelect.value);
+      return {
+        fallback: preferredRenders.length === 0 && sceneRenders.length > 0,
+        renders: preferredRenders.length ? preferredRenders : sceneRenders,
+      };
+    }
+
+    function formatRunHealth(summary) {
+      if (!summary) return 'status unknown';
+      const failedTasks = Number(summary.failed_tasks || 0);
+      const failedJobs = Number(summary.failed_jobs || 0);
+      if (summary.status === 'failed') {
+        const parts = [];
+        if (failedTasks) parts.push(`${failedTasks} failed task${failedTasks === 1 ? '' : 's'}`);
+        if (failedJobs) parts.push(`${failedJobs} failed job${failedJobs === 1 ? '' : 's'}`);
+        return parts.length ? parts.join(', ') : 'failed';
+      }
+      return 'healthy';
+    }
+
+    async function loadRunSummary(runId) {
+      if (runSummaries.has(runId)) return runSummaries.get(runId);
+      const run = getSelectedRun(runId);
+      const runDir = run && run.run_dir ? run.run_dir : `runs/${runId}`;
+      try {
+        const resp = await fetch(`${runDir}/summary.json`);
+        if (!resp.ok) {
+          runSummaries.set(runId, null);
+          return null;
+        }
+        const summary = await resp.json();
+        runSummaries.set(runId, summary);
+        return summary;
+      } catch (e) {
+        runSummaries.set(runId, null);
+        return null;
+      }
+    }
+
+    async function updateRunHealth() {
+      const runId = runSelect.value;
+      if (!runId) {
+        runHealth.textContent = 'Run health unavailable.';
+        return;
+      }
+      const run = getSelectedRun(runId);
+      const summary = await loadRunSummary(runId);
+      if (!run && !summary) {
+        runHealth.textContent = 'Run health unavailable.';
+        return;
+      }
+      const healthSource = run || summary;
+      const countSource = run || summary;
+      const parts = [`Status: ${formatRunHealth(healthSource)}`];
+      if (countSource && countSource.point_count !== undefined) {
+        parts.push(`${countSource.point_count} published point${countSource.point_count === 1 ? '' : 's'}`);
+      }
+      if (countSource && countSource.render_count !== undefined) {
+        parts.push(`${countSource.render_count} render${countSource.render_count === 1 ? '' : 's'}`);
+      }
+      runHealth.textContent = parts.join(' • ');
+    }
+
     async function loadRenders(runId) {
-      const run = runs.find(r => r.run_id === runId);
+      const run = getSelectedRun(runId);
       const runDir = run && run.run_dir ? run.run_dir : `runs/${runId}`;
       try {
         const resp = await fetch(`${runDir}/renders.json`);
@@ -860,7 +1075,8 @@
 
     function updateVideoSelector() {
       const scene = getSelectedScene();
-      const available = renders.filter(r => r.scenario === scene);
+      const activeRenders = getActiveSceneRenders(scene);
+      const available = activeRenders.renders;
       const control = document.getElementById('video-select-control');
 
       if (!available.length) {
@@ -871,7 +1087,7 @@
 
       control.style.display = '';
       videoSelect.innerHTML = available.map((r, i) =>
-        `<option value="${i}">${r.label}</option>`
+        `<option value="${i}">${r.label}${r.gpu && r.gpu !== gpuSelect.value ? ` (${getRenderSourceLabel(r)})` : ''}</option>`
       ).join('');
       videoSelect.value = '0';
       playSelectedVideo();
@@ -879,7 +1095,8 @@
 
     function playSelectedVideo() {
       const scene = getSelectedScene();
-      const available = renders.filter(r => r.scenario === scene);
+      const activeRenders = getActiveSceneRenders(scene);
+      const available = activeRenders.renders;
       const idx = parseInt(videoSelect.value, 10);
       const meta = available[idx];
 
@@ -894,7 +1111,7 @@
       }
 
       const runId = runSelect.value;
-      const run = runs.find(r => r.run_id === runId);
+      const run = getSelectedRun(runId);
       const runDir = run && run.run_dir ? run.run_dir : `runs/${runId}`;
 
       titleEl.textContent = getSceneLabel(scene);
@@ -908,15 +1125,20 @@
         document.getElementById('video-section').style.display = '';
       };
 
-      noteEl.textContent = `${meta.label}, 1 env @ ${meta.fps || 60} fps`;
+      const renderNote = [`${meta.label}, 1 env @ ${meta.fps || 60} fps`];
+      if (activeRenders.fallback) {
+        renderNote.push(`showing ${getRenderSourceLabel(meta)} render because ${gpuSelect.value} has no render for this run`);
+      }
+      noteEl.textContent = renderNote.join(' • ');
     }
 
     async function renderSceneCharts() {
       const runId = runSelect.value;
       const scene = getSelectedScene();
       const sceneLabel = getSceneLabel(scene);
-      const run = runs.find(r => r.run_id === runId);
-      const runPoints = points.filter(p => p.run_id === runId && p.scenario === scene);
+      const run = getSelectedRun(runId);
+      const runDir = run && run.run_dir ? run.run_dir : `runs/${runId}`;
+      const runPoints = getFilteredPoints().filter(p => p.run_id === runId && p.scenario === scene);
 
       runTitle.textContent = run ? formatRunLabel(run) : '–';
 
@@ -926,14 +1148,15 @@
       document.getElementById('ablation-title').textContent = `${sceneLabel} Ablation • Env-FPS`;
       document.getElementById('kernel-stack-title').textContent = `${sceneLabel} Ablation • Stage Breakdown`;
       document.getElementById('kernel-detail-title').textContent = `${sceneLabel} Ablation • Kernel Detail`;
+      document.getElementById('profile-links-title').textContent = `${sceneLabel} Ablation • Profiling Artifacts`;
 
       // Sweep charts
-      const sweep = runPoints.filter(p => p.mode === 'sweep' && p.ok !== false);
+      const sweep = runPoints.filter(p => pointMatchesDisplay(p, scene, 'sweep') && p.ok !== false);
       buildLineChart('sweep-fps', buildSweepDatasets(sweep, 'env_fps'), 'num_envs', 'Env-FPS');
       buildLineChart('sweep-gpu', buildSweepDatasets(sweep, 'gpu_used_gb'), 'num_envs', 'GPU GB');
 
       // Ablation chart
-      const ablation = runPoints.filter(p => p.mode === 'ablation' && p.ok !== false);
+      const ablation = runPoints.filter(p => pointMatchesDisplay(p, scene, 'ablation') && p.ok !== false);
       const ablationSorted = ablation.slice().sort((a, b) => (a.step_index ?? 0) - (b.step_index ?? 0));
       const ablationLabels = ablationSorted.map(p => (p.label || p.solver || 'unknown').replace(/^\+\s*/, '').slice(0, 24));
       const ablationValues = ablationSorted.map(p => p.env_fps || 0);
@@ -955,10 +1178,12 @@
 
       // Kernel detail table
       buildKernelTable('kernel-table', ablationSorted);
+      buildProfileLinks('profile-links', runDir, ablationSorted);
 
       // Video
       await loadRenders(runId);
       updateVideoSelector();
+      await updateRunHealth();
     }
 
     // ---- Time series ----
@@ -973,7 +1198,7 @@
     function updateTimeSeriesControls() {
       const mode = modeSelect.value;
       const scene = getSelectedScene();
-      const available = getFilteredPoints().filter(p => p.mode === mode && p.scenario === scene);
+      const available = getFilteredPoints().filter(p => pointMatchesDisplay(p, scene, mode));
 
       const solvers = unique(available.map(p => getSolverKey(p, mode)));
       solverSelect.innerHTML = solvers.map(s => `<option value="${s}">${s}</option>`).join('');
@@ -994,8 +1219,7 @@
       const metric = metricSelect.value;
 
       const filtered = getFilteredPoints().filter(p => {
-        if (p.mode !== mode) return false;
-        if (p.scenario !== scene) return false;
+        if (!pointMatchesDisplay(p, scene, mode)) return false;
         const key = getSolverKey(p, mode);
         if (key !== solver) return false;
         if (env && p.num_worlds !== env) return false;
@@ -1012,13 +1236,13 @@
     }
 
     function updateSystemInfo() {
-      const latest = getFilteredRuns()[0];
-      if (!latest) { systemInfo.textContent = 'No runs for this GPU.'; return; }
+      const selected = getSelectedRun() || getFilteredRuns()[0];
+      if (!selected) { systemInfo.textContent = 'No runs for this GPU.'; return; }
       const system = [
-        latest.gpu ? `GPU: ${latest.gpu}` : null,
-        latest.gpu_memory_total_gb ? `VRAM: ${Number(latest.gpu_memory_total_gb).toFixed(1)} GB` : null,
-        latest.platform ? `OS: ${latest.platform}` : null,
-        latest.python_version ? `Python: ${latest.python_version}` : null
+        selected.gpu ? `GPU: ${selected.gpu}` : null,
+        selected.gpu_memory_total_gb ? `VRAM: ${Number(selected.gpu_memory_total_gb).toFixed(1)} GB` : null,
+        selected.platform ? `OS: ${selected.platform}` : null,
+        selected.python_version ? `Python: ${selected.python_version}` : null
       ].filter(Boolean).join(' \u2022 ');
       systemInfo.textContent = system || 'System info unavailable.';
     }
@@ -1051,6 +1275,7 @@
         // Event listeners
         gpuSelect.addEventListener('change', () => {
           refreshRunSelect();
+          refreshSceneSelect();
           renderSceneCharts();
           updateTimeSeriesControls();
           updateSystemInfo();
@@ -1068,6 +1293,7 @@
         metricSelect.addEventListener('change', renderTimeSeries);
 
         // Initial render
+        refreshSceneSelect();
         renderSceneCharts();
         updateTimeSeriesControls();
         updateSystemInfo();
