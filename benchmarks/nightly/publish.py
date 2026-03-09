@@ -167,12 +167,15 @@ def _build_publication(context: dict[str, Any]) -> dict[str, Any]:
             if sample_metadata is None and metadata and metadata.get("gpu"):
                 sample_metadata = metadata
 
-            if job["status"].get("state") == "completed":
+            job_state = job["status"].get("state")
+            if job_state == "completed":
                 completed_jobs += 1
                 task_summary["completed_jobs"] += 1
-            else:
+            elif job_state == "failed":
                 failed_jobs += 1
                 task_summary["failed_jobs"] += 1
+            else:
+                continue
 
             if job["manifest"]["kind"] == "benchmark":
                 task_rows.extend(
@@ -691,12 +694,14 @@ def _load_context(run_dir: Path | str) -> dict[str, Any]:
     for task in plan_lock.get("tasks", []):
         task_id = str(task["id"])
         task_manifest = _read_json(run_paths.task_manifest_path(task_id))
-        task_status = _read_json(run_paths.task_status_path(task_id))
+        task_status = _read_json_if_exists(run_paths.task_status_path(task_id)) or {"state": "pending"}
         jobs = []
         for job in task.get("jobs", []):
             job_id = str(job["id"])
-            job_manifest = _read_json(run_paths.job_manifest_path(task_id, job_id))
-            job_status = _read_json(run_paths.job_status_path(task_id, job_id))
+            job_manifest = _read_json_if_exists(run_paths.job_manifest_path(task_id, job_id)) or _planned_job_manifest(
+                task, job
+            )
+            job_status = _read_json_if_exists(run_paths.job_status_path(task_id, job_id)) or {"state": "pending"}
             results_dir = run_paths.job_results_dir(task_id, job_id)
             jobs.append(
                 {
@@ -732,6 +737,25 @@ def _load_context(run_dir: Path | str) -> dict[str, Any]:
         "run_paths": run_paths,
         "publish_dir": run_paths.publish_dir,
         "tasks": tasks,
+    }
+
+
+def _planned_job_manifest(task: Mapping[str, Any], job: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": str(job["id"]),
+        "task_id": str(task["id"]),
+        "kind": str(job["kind"]),
+        "scenario": str(job["scenario"]),
+        "series": str(job["series"]),
+        "profile": str(job["profile"]),
+        "hardware_label": str(job["hardware_label"]),
+        "params": {
+            key: value
+            for key, value in dict(job).items()
+            if key not in {"id", "task_id", "kind", "profile", "hardware_label", "series", "scenario"}
+        },
+        "output_dir": "",
+        "scheduler": None,
     }
 
 
