@@ -739,38 +739,48 @@ def build_model(args, scenario_cfg: dict):
 
         obj_shape_cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
 
-        builder = newton.ModelBuilder()
-        for _ in range(args.num_worlds):
-            builder.begin_world()
-            builder.add_builder(articulation_builder)
+        # Build a single world once, then replicate it. This avoids N times Python-level
+        # body/shape construction when sweeping large world counts.
+        world_builder = newton.ModelBuilder()
+        world_builder.begin_world()
+        world_builder.add_builder(articulation_builder)
 
-            for obj in tabletop_objects:
-                pos = obj["pos"]
-                quat = obj.get("quat", (1, 0, 0, 0))
-                qlen = (quat[0] ** 2 + quat[1] ** 2 + quat[2] ** 2 + quat[3] ** 2) ** 0.5
-                quat = (quat[0] / qlen, quat[1] / qlen, quat[2] / qlen, quat[3] / qlen)
+        for obj in tabletop_objects:
+            pos = obj["pos"]
+            quat = obj.get("quat", (1, 0, 0, 0))
+            qlen = (quat[0] ** 2 + quat[1] ** 2 + quat[2] ** 2 + quat[3] ** 2) ** 0.5
+            quat = (quat[0] / qlen, quat[1] / qlen, quat[2] / qlen, quat[3] / qlen)
 
-                body_idx = builder.add_body(
-                    xform=wp.transform(wp.vec3(pos[0], pos[1], pos[2]), wp.quat(quat[0], quat[1], quat[2], quat[3])),
+            body_idx = world_builder.add_body(
+                xform=wp.transform(wp.vec3(pos[0], pos[1], pos[2]), wp.quat(quat[0], quat[1], quat[2], quat[3])),
+            )
+
+            if obj["type"] == "sphere":
+                world_builder.add_shape_sphere(body_idx, radius=obj["radius"], cfg=obj_shape_cfg)
+            elif obj["type"] == "box":
+                hs = obj["half_size"]
+                world_builder.add_shape_box(body_idx, hx=hs, hy=hs, hz=hs, cfg=obj_shape_cfg)
+            elif obj["type"] == "capsule":
+                world_builder.add_shape_capsule(
+                    body_idx,
+                    radius=obj["radius"],
+                    half_height=obj["half_height"],
+                    cfg=obj_shape_cfg,
+                )
+            elif obj["type"] == "ellipsoid":
+                world_builder.add_shape_ellipsoid(body_idx, a=obj["a"], b=obj["b"], c=obj["c"], cfg=obj_shape_cfg)
+            elif obj["type"] == "cylinder":
+                world_builder.add_shape_cylinder(
+                    body_idx,
+                    radius=obj["radius"],
+                    half_height=obj["half_height"],
+                    cfg=obj_shape_cfg,
                 )
 
-                if obj["type"] == "sphere":
-                    builder.add_shape_sphere(body_idx, radius=obj["radius"], cfg=obj_shape_cfg)
-                elif obj["type"] == "box":
-                    hs = obj["half_size"]
-                    builder.add_shape_box(body_idx, hx=hs, hy=hs, hz=hs, cfg=obj_shape_cfg)
-                elif obj["type"] == "capsule":
-                    builder.add_shape_capsule(
-                        body_idx, radius=obj["radius"], half_height=obj["half_height"], cfg=obj_shape_cfg
-                    )
-                elif obj["type"] == "ellipsoid":
-                    builder.add_shape_ellipsoid(body_idx, a=obj["a"], b=obj["b"], c=obj["c"], cfg=obj_shape_cfg)
-                elif obj["type"] == "cylinder":
-                    builder.add_shape_cylinder(
-                        body_idx, radius=obj["radius"], half_height=obj["half_height"], cfg=obj_shape_cfg
-                    )
+        world_builder.end_world()
 
-            builder.end_world()
+        builder = newton.ModelBuilder()
+        builder.replicate(world_builder, args.num_worlds)
 
         # Static table and container walls (body=-1 for static geometry)
         table_shape_cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
