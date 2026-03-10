@@ -32,7 +32,7 @@ class TestNightlyPlan(unittest.TestCase):
         self.assertEqual(cache_env["NEWTON_CACHE_PATH"], "/tmp/plan-test-user/newton-cache")
         self.assertEqual(cache_env["CUDA_CACHE_PATH"], "/tmp/plan-test-user/cuda-compute-cache")
 
-    def test_expand_plan_full_mode_is_deterministic(self):
+    def test_expand_plan_full_mode_expands_targets_deterministically(self):
         loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})
         expanded = plan.expand_plan(loaded, run_mode="full")
 
@@ -40,41 +40,48 @@ class TestNightlyPlan(unittest.TestCase):
         self.assertEqual(
             task_ids,
             [
-                "g1_flat_sweep",
-                "g1_flat_ablation",
+                "g1_flat_sweep_rtx_5090",
+                "g1_flat_sweep_rtx_pro_6000_server",
+                "g1_flat_sweep_b200",
+                "g1_flat_ablation_rtx_5090",
+                "g1_flat_ablation_rtx_pro_6000_server",
+                "g1_flat_ablation_b200",
                 "g1_flat_renders",
-                "h1_tabletop_sweep_early",
-                "h1_tabletop_sweep_late",
-                "h1_tabletop_sweep_extreme",
-                "h1_tabletop_ablation",
+                "h1_tabletop_sweep_early_rtx_5090",
+                "h1_tabletop_sweep_early_rtx_pro_6000_server",
+                "h1_tabletop_sweep_early_b200",
+                "h1_tabletop_sweep_late_rtx_pro_6000_server",
+                "h1_tabletop_sweep_late_b200",
+                "h1_tabletop_sweep_extreme_rtx_pro_6000_server",
+                "h1_tabletop_sweep_extreme_b200",
+                "h1_tabletop_ablation_rtx_5090",
+                "h1_tabletop_ablation_rtx_pro_6000_server",
+                "h1_tabletop_ablation_b200",
                 "h1_tabletop_renders",
             ],
         )
 
-        g1_sweep = expanded["tasks"][0]
-        self.assertEqual(g1_sweep["job_count"], 32)
-        self.assertEqual(g1_sweep["jobs"][0]["id"], "g1_flat_sweep__0001")
-        self.assertEqual(g1_sweep["jobs"][0]["solver"], "fpgs_tiled")
-        self.assertEqual(g1_sweep["jobs"][0]["substeps"], 2)
-        self.assertEqual(g1_sweep["jobs"][0]["num_worlds"], 1024)
-        self.assertEqual(g1_sweep["jobs"][-1]["id"], "g1_flat_sweep__0032")
-        self.assertEqual(g1_sweep["jobs"][-1]["solver"], "mujoco")
-        self.assertEqual(g1_sweep["jobs"][-1]["substeps"], 4)
-        self.assertEqual(g1_sweep["jobs"][-1]["num_worlds"], 131072)
-        self.assertEqual(expanded["tasks"][2]["profile"], "rtx_pro_6000_render")
-        self.assertTrue(expanded["tasks"][1]["jobs"][0]["nsys_profile"])
-        self.assertTrue(expanded["tasks"][6]["jobs"][0]["nsys_profile"])
-        h1_early = expanded["tasks"][3]
-        h1_late = expanded["tasks"][4]
-        h1_extreme = expanded["tasks"][5]
-        self.assertEqual(h1_early["job_count"], 16)
-        self.assertEqual(h1_early["jobs"][0]["id"], "h1_tabletop_sweep_early__0001")
-        self.assertEqual(h1_early["jobs"][-1]["id"], "h1_tabletop_sweep_early__0016")
+        g1_sweep_5090 = expanded["tasks"][0]
+        self.assertEqual(g1_sweep_5090["job_count"], 28)
+        self.assertEqual(g1_sweep_5090["jobs"][0]["id"], "g1_flat_sweep_rtx_5090__0001")
+        self.assertEqual(g1_sweep_5090["jobs"][-1]["id"], "g1_flat_sweep_rtx_5090__0028")
+        self.assertEqual(g1_sweep_5090["jobs"][-1]["num_worlds"], 65536)
+
+        g1_sweep_6000 = expanded["tasks"][1]
+        self.assertEqual(g1_sweep_6000["job_count"], 32)
+        self.assertEqual(g1_sweep_6000["jobs"][-1]["num_worlds"], 131072)
+
+        h1_late = expanded["tasks"][10]
         self.assertEqual(h1_late["job_count"], 4)
         self.assertEqual(h1_late["jobs"][0]["num_worlds"], 16384)
+
+        h1_extreme = expanded["tasks"][12]
         self.assertEqual(h1_extreme["job_count"], 4)
         self.assertEqual(h1_extreme["jobs"][0]["num_worlds"], 32768)
-        self.assertEqual(expanded["tasks"][-1]["profile"], "rtx_pro_6000_render")
+
+        g1_render = expanded["tasks"][6]
+        self.assertEqual(g1_render["profile"], "rtx_pro_6000_render")
+        self.assertEqual(g1_render["job_count"], 4)
 
     def test_expand_plan_validation_mode_uses_validation_tasks(self):
         loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})
@@ -87,39 +94,39 @@ class TestNightlyPlan(unittest.TestCase):
         self.assertEqual(expanded["tasks"][0]["profile"], "rtx_5090")
         self.assertEqual(expanded["tasks"][1]["profile"], "rtx_pro_6000_render")
 
-    def test_ablation_expansion_adds_mujoco_baseline(self):
+    def test_explicit_jobs_live_in_plan_and_carry_generic_metadata(self):
         loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})
         expanded = plan.expand_plan(loaded, run_mode="full")
-        ablation_task = next(task for task in expanded["tasks"] if task["id"] == "h1_tabletop_ablation")
+        ablation_task = next(
+            task for task in expanded["tasks"] if task["id"] == "h1_tabletop_ablation_rtx_pro_6000_server"
+        )
 
-        self.assertEqual(ablation_task["ablation_sequence"], "streaming")
-        self.assertEqual(len(ablation_task["jobs"]), len(plan.ABLATION_SEQUENCES["streaming"]) + 1)
-        self.assertEqual(ablation_task["jobs"][-4]["ablation_label"], "fully matrix-free GS")
-        self.assertEqual(ablation_task["jobs"][-4]["solver"], "feather_pgs")
-        self.assertFalse(ablation_task["jobs"][-4]["double_buffer"])
-        self.assertFalse(ablation_task["jobs"][-4]["pipeline_collide"])
-        self.assertEqual(ablation_task["jobs"][-3]["ablation_label"], "+ double buffer")
-        self.assertTrue(ablation_task["jobs"][-3]["double_buffer"])
-        self.assertFalse(ablation_task["jobs"][-3]["pipeline_collide"])
-        self.assertEqual(ablation_task["jobs"][-2]["ablation_label"], "+ pipeline collide")
-        self.assertTrue(ablation_task["jobs"][-2]["double_buffer"])
-        self.assertTrue(ablation_task["jobs"][-2]["pipeline_collide"])
-        self.assertEqual(ablation_task["jobs"][-1]["solver"], "mujoco")
-        self.assertEqual(ablation_task["jobs"][-1]["ablation_label"], "MuJoCo baseline")
+        self.assertEqual(ablation_task["job_style"], "explicit")
+        self.assertEqual(ablation_task["job_count"], 11)
+        self.assertEqual(ablation_task["tags"], ["h1_tabletop_ablation"])
+        self.assertEqual(ablation_task["jobs"][7]["label"], "fully matrix-free GS")
+        self.assertEqual(ablation_task["jobs"][7]["variant_id"], "matrix_free")
+        self.assertEqual(ablation_task["jobs"][7]["step_index"], 7)
+        self.assertFalse(ablation_task["jobs"][7]["double_buffer"])
+        self.assertFalse(ablation_task["jobs"][7]["pipeline_collide"])
+        self.assertTrue(ablation_task["jobs"][9]["double_buffer"])
+        self.assertTrue(ablation_task["jobs"][10]["solver"] == "mujoco")
+        self.assertEqual(ablation_task["jobs"][10]["label"], "MuJoCo baseline")
 
-    def test_g1_ablation_sequence_ends_with_pipeline_collide_before_mujoco(self):
+    def test_target_overrides_apply_to_explicit_jobs(self):
         loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})
         expanded = plan.expand_plan(loaded, run_mode="full")
-        ablation_task = next(task for task in expanded["tasks"] if task["id"] == "g1_flat_ablation")
+        ablation_task = next(task for task in expanded["tasks"] if task["id"] == "h1_tabletop_ablation_rtx_5090")
 
-        self.assertEqual(ablation_task["jobs"][-3]["ablation_label"], "+ parallel streams")
-        self.assertTrue(ablation_task["jobs"][-3]["use_parallel_streams"])
-        self.assertFalse(ablation_task["jobs"][-3]["double_buffer"])
-        self.assertFalse(ablation_task["jobs"][-3]["pipeline_collide"])
-        self.assertEqual(ablation_task["jobs"][-2]["ablation_label"], "+ pipeline collide")
-        self.assertFalse(ablation_task["jobs"][-2]["double_buffer"])
-        self.assertTrue(ablation_task["jobs"][-2]["pipeline_collide"])
-        self.assertEqual(ablation_task["jobs"][-1]["ablation_label"], "MuJoCo baseline")
+        self.assertTrue(all(job["num_worlds"] == 4096 for job in ablation_task["jobs"]))
+        self.assertEqual(ablation_task["jobs"][0]["id"], "h1_tabletop_ablation_rtx_5090__baseline_loop")
+
+    def test_can_select_expanded_concrete_task_id(self):
+        loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})
+        expanded = plan.expand_plan(loaded, run_mode="full", selected_task_ids=["g1_flat_ablation_b200"])
+
+        self.assertEqual([task["id"] for task in expanded["tasks"]], ["g1_flat_ablation_b200"])
+        self.assertEqual(expanded["tasks"][0]["job_count"], 8)
 
     def test_invalid_list_field_is_rejected(self):
         invalid_plan_text = textwrap.dedent(

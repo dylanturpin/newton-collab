@@ -17,7 +17,7 @@ from typing import Any
 
 import yaml
 
-from newton.tools.solver_benchmark import ABLATION_SEQUENCES, SCENARIOS, SOLVER_PRESETS
+from newton.tools.solver_benchmark import SCENARIOS, SOLVER_PRESETS
 
 DEFAULT_PLAN_PATH = Path(__file__).with_name("nightly.yaml")
 
@@ -50,6 +50,8 @@ SOLVER_OVERRIDE_FIELDS = (
     "pgs_mode",
     "dense_max_constraints",
     "use_parallel_streams",
+    "double_buffer",
+    "pipeline_collide",
     "delassus_chunk_size",
     "pgs_chunk_size",
 )
@@ -57,11 +59,17 @@ TASK_METADATA_FIELDS = {
     "id",
     "kind",
     "profile",
+    "targets",
     "series",
+    "tags",
     "scenario",
     "run_modes",
-    "ablation_sequence",
-    "ablation_pgs",
+    "jobs",
+}
+JOB_METADATA_FIELDS = {
+    "id",
+    "label",
+    "tags",
 }
 BENCHMARK_OPTION_FIELDS = {
     "solver",
@@ -205,18 +213,29 @@ def expand_plan(
         effective_task_ids = list(validation.get("task_ids", []))
 
     selected_set = set(effective_task_ids)
+    matched_selected: set[str] = set()
     expanded_tasks = []
+    seen_expanded_ids: set[str] = set()
     for task in plan["tasks"]:
         run_modes = _normalized_run_modes(task)
         if run_mode not in run_modes:
             continue
-        if selected_set and task["id"] not in selected_set:
-            continue
-        expanded_tasks.append(_expand_task(task, plan["defaults"], plan["hardware_profiles"]))
+        concrete_tasks = _expand_task(task, plan["defaults"], plan["hardware_profiles"])
+        for concrete_task in concrete_tasks:
+            include = not selected_set or task["id"] in selected_set or concrete_task["id"] in selected_set
+            if not include:
+                continue
+            if concrete_task["id"] in seen_expanded_ids:
+                raise PlanValidationError(f"Expanded task id collision: {concrete_task['id']}")
+            seen_expanded_ids.add(concrete_task["id"])
+            expanded_tasks.append(concrete_task)
+            if task["id"] in selected_set:
+                matched_selected.add(task["id"])
+            if concrete_task["id"] in selected_set:
+                matched_selected.add(concrete_task["id"])
 
     if selected_set:
-        expanded_ids = {task["id"] for task in expanded_tasks}
-        missing = sorted(selected_set - expanded_ids)
+        missing = sorted(selected_set - matched_selected)
         if missing:
             raise PlanValidationError(
                 f"Selected task ids were not available in mode '{run_mode}': {', '.join(missing)}"
@@ -272,23 +291,31 @@ def _validate_task(task: Any, hardware_profiles: Mapping[str, Any], seen_task_id
     if kind not in TASK_KINDS:
         raise PlanValidationError(f"Task '{task_id}' must have kind in {TASK_KINDS}.")
 
-    if task.get("profile") not in hardware_profiles:
-        raise PlanValidationError(f"Task '{task_id}' references unknown hardware profile '{task.get('profile')}'.")
     if task.get("scenario") not in SCENARIOS:
         raise PlanValidationError(f"Task '{task_id}' references unknown scenario '{task.get('scenario')}'.")
     if not isinstance(task.get("series"), str) or not task["series"]:
         raise PlanValidationError(f"Task '{task_id}' must define a non-empty series.")
+    _validate_tags(task.get("tags"), task_id, "task")
+    _normalized_targets(task, hardware_profiles)
 
     run_modes = _normalized_run_modes(task)
     if not run_modes:
         raise PlanValidationError(f"Task '{task_id}' must include at least one run mode.")
 
-    allowed_fields = TASK_METADATA_FIELDS | (RENDER_OPTION_FIELDS if kind == "render" else BENCHMARK_OPTION_FIELDS)
+    option_fields = RENDER_OPTION_FIELDS if kind == "render" else BENCHMARK_OPTION_FIELDS
+    allowed_fields = TASK_METADATA_FIELDS | option_fields
     unknown_fields = sorted(set(task) - allowed_fields)
     if unknown_fields:
         raise PlanValidationError(f"Task '{task_id}' contains unknown fields: {', '.join(unknown_fields)}")
 
-    list_fields = [key for key, value in task.items() if isinstance(value, list) and key not in {"run_modes"}]
+    jobs = task.get("jobs")
+    if jobs is not None:
+        _validate_explicit_job_task(task, option_fields)
+        return
+
+    list_fields = [
+        key for key, value in task.items() if isinstance(value, list) and key not in {"run_modes", "targets", "tags"}
+    ]
     invalid_list_fields = sorted(field for field in list_fields if field not in EXPANSION_FIELD_ORDER)
     if invalid_list_fields:
         raise PlanValidationError(
@@ -301,53 +328,161 @@ def _validate_task(task: Any, hardware_profiles: Mapping[str, Any], seen_task_id
         if solver_name not in SOLVER_PRESETS:
             raise PlanValidationError(f"Task '{task_id}' references unknown solver preset '{solver_name}'.")
 
-    if task.get("ablation_sequence"):
-        _validate_ablation_task(task)
-    elif kind == "benchmark" and "num_worlds" not in task:
+    if kind == "benchmark" and "num_worlds" not in task:
         raise PlanValidationError(f"Benchmark task '{task_id}' must define num_worlds.")
 
+    _validate_target_overrides(task, option_fields)
 
-def _validate_ablation_task(task: Mapping[str, Any]) -> None:
+
+def _validate_explicit_job_task(task: Mapping[str, Any], option_fields: set[str]) -> None:
     task_id = task["id"]
-    sequence_name = task.get("ablation_sequence") or SCENARIOS[task["scenario"]].get("ablation_sequence", "default")
-    if sequence_name not in ABLATION_SEQUENCES:
-        raise PlanValidationError(f"Task '{task_id}' references unknown ablation sequence '{sequence_name}'.")
-    solver_name = task.get("solver", "feather_pgs")
-    if isinstance(solver_name, list):
-        raise PlanValidationError(f"Ablation task '{task_id}' must not use a solver list.")
-    if solver_name != "feather_pgs":
+    jobs = task.get("jobs")
+    if not isinstance(jobs, list) or not jobs:
+        raise PlanValidationError(f"Task '{task_id}' jobs must be a non-empty list.")
+
+    task_list_fields = [
+        key
+        for key, value in task.items()
+        if isinstance(value, list) and key not in {"run_modes", "targets", "tags", "jobs"}
+    ]
+    if task_list_fields:
         raise PlanValidationError(
-            f"Ablation task '{task_id}' must use the concrete FeatherPGS worker path, not '{solver_name}'."
+            f"Explicit-job task '{task_id}' must not use list-valued runtime fields: {', '.join(sorted(task_list_fields))}"
         )
-    num_worlds = task.get("num_worlds")
-    if not isinstance(num_worlds, int):
-        raise PlanValidationError(f"Ablation task '{task_id}' must define an integer num_worlds.")
+
+    seen_job_ids: set[str] = set()
+    for job in jobs:
+        if not isinstance(job, Mapping):
+            raise PlanValidationError(f"Explicit job entries for task '{task_id}' must be mappings.")
+        job_id = job.get("id")
+        if not isinstance(job_id, str) or not job_id:
+            raise PlanValidationError(f"Explicit jobs for task '{task_id}' must define a non-empty id.")
+        if not _is_valid_job_fragment(job_id):
+            raise PlanValidationError(
+                f"Explicit job id '{job_id}' in task '{task_id}' must use only letters, numbers, '-' or '_'."
+            )
+        if job_id in seen_job_ids:
+            raise PlanValidationError(f"Duplicate explicit job id '{job_id}' in task '{task_id}'.")
+        seen_job_ids.add(job_id)
+
+        label = job.get("label")
+        if label is not None and (not isinstance(label, str) or not label):
+            raise PlanValidationError(f"Explicit job '{job_id}' in task '{task_id}' must use a non-empty label.")
+        _validate_tags(job.get("tags"), task_id, f"job '{job_id}'")
+
+        allowed_job_fields = JOB_METADATA_FIELDS | option_fields
+        unknown_job_fields = sorted(set(job) - allowed_job_fields)
+        if unknown_job_fields:
+            raise PlanValidationError(
+                f"Explicit job '{job_id}' in task '{task_id}' contains unknown fields: {', '.join(unknown_job_fields)}"
+            )
+
+        job_list_fields = [key for key, value in job.items() if isinstance(value, list) and key != "tags"]
+        if job_list_fields:
+            raise PlanValidationError(
+                f"Explicit job '{job_id}' in task '{task_id}' must not use list-valued runtime fields: "
+                f"{', '.join(sorted(job_list_fields))}"
+            )
+
+        solver_name = job.get("solver", task.get("solver", "feather_pgs"))
+        if solver_name not in SOLVER_PRESETS:
+            raise PlanValidationError(
+                f"Explicit job '{job_id}' in task '{task_id}' references unknown solver preset '{solver_name}'."
+            )
+
+        num_worlds = job.get("num_worlds", task.get("num_worlds"))
+        if task["kind"] == "benchmark" and not isinstance(num_worlds, int):
+            raise PlanValidationError(
+                f"Explicit benchmark job '{job_id}' in task '{task_id}' must resolve to an integer num_worlds."
+            )
+
+    _validate_target_overrides(task, option_fields, explicit_jobs=True)
+
+
+def _validate_target_overrides(
+    task: Mapping[str, Any],
+    option_fields: set[str],
+    *,
+    explicit_jobs: bool = False,
+) -> None:
+    targets = task.get("targets")
+    if not isinstance(targets, Mapping):
+        return
+
+    for profile_name, overrides in targets.items():
+        if overrides in (None, {}):
+            continue
+        if not isinstance(overrides, Mapping):
+            raise PlanValidationError(f"Target '{profile_name}' overrides for task '{task['id']}' must be a mapping.")
+        unknown_fields = sorted(set(overrides) - option_fields)
+        if unknown_fields:
+            raise PlanValidationError(
+                f"Target '{profile_name}' overrides for task '{task['id']}' contain unknown fields: "
+                f"{', '.join(unknown_fields)}"
+            )
+        if explicit_jobs:
+            list_fields = [key for key, value in overrides.items() if isinstance(value, list)]
+            if list_fields:
+                raise PlanValidationError(
+                    f"Explicit-job task '{task['id']}' target '{profile_name}' must not use list-valued overrides: "
+                    f"{', '.join(sorted(list_fields))}"
+                )
+        else:
+            list_fields = [key for key, value in overrides.items() if isinstance(value, list)]
+            invalid_list_fields = sorted(field for field in list_fields if field not in EXPANSION_FIELD_ORDER)
+            if invalid_list_fields:
+                raise PlanValidationError(
+                    f"Task '{task['id']}' target '{profile_name}' uses list-valued overrides that are not "
+                    f"supported for deterministic expansion: {', '.join(invalid_list_fields)}"
+                )
+        solver_name = overrides.get("solver")
+        if solver_name is not None and solver_name not in SOLVER_PRESETS:
+            raise PlanValidationError(
+                f"Target '{profile_name}' overrides for task '{task['id']}' reference unknown solver '{solver_name}'."
+            )
 
 
 def _expand_task(
     task: Mapping[str, Any],
     defaults: Mapping[str, Any],
     hardware_profiles: Mapping[str, Any],
-) -> dict[str, Any]:
-    profile = copy.deepcopy(hardware_profiles[task["profile"]])
-    sequence_name = task.get("ablation_sequence")
-    jobs = (
-        _expand_ablation_jobs(task, defaults, profile)
-        if sequence_name
-        else _expand_matrix_jobs(task, defaults, profile)
-    )
-    return {
-        "id": task["id"],
-        "kind": task["kind"],
-        "profile": task["profile"],
-        "hardware_label": profile["label"],
-        "series": task["series"],
-        "scenario": task["scenario"],
-        "run_modes": _normalized_run_modes(task),
-        "ablation_sequence": task.get("ablation_sequence"),
-        "job_count": len(jobs),
-        "jobs": jobs,
-    }
+) -> list[dict[str, Any]]:
+    targets = _normalized_targets(task, hardware_profiles)
+    multi_target = len(targets) > 1
+    expanded_tasks: list[dict[str, Any]] = []
+    for profile_name, target_overrides in targets:
+        profile = copy.deepcopy(hardware_profiles[profile_name])
+        concrete_task = copy.deepcopy(task)
+        concrete_task["source_task_id"] = task["id"]
+        concrete_task["id"] = _expanded_task_id(task["id"], profile_name, multi_target)
+        concrete_task["profile"] = profile_name
+        concrete_task.pop("targets", None)
+
+        if task.get("jobs") is not None:
+            jobs = _expand_explicit_jobs(concrete_task, defaults, profile, target_overrides)
+            job_style = "explicit"
+        else:
+            matrix_task = _apply_overrides(concrete_task, target_overrides)
+            jobs = _expand_matrix_jobs(matrix_task, defaults, profile)
+            job_style = "matrix"
+
+        expanded_tasks.append(
+            {
+                "id": concrete_task["id"],
+                "source_task_id": task["id"],
+                "kind": concrete_task["kind"],
+                "profile": profile_name,
+                "hardware_label": profile["label"],
+                "series": concrete_task["series"],
+                "tags": list(concrete_task.get("tags", [])),
+                "scenario": concrete_task["scenario"],
+                "run_modes": _normalized_run_modes(concrete_task),
+                "job_style": job_style,
+                "job_count": len(jobs),
+                "jobs": jobs,
+            }
+        )
+    return expanded_tasks
 
 
 def _expand_matrix_jobs(
@@ -365,47 +500,32 @@ def _expand_matrix_jobs(
         for field_name, field_value in zip(matrix_fields, combination, strict=False):
             job[field_name] = field_value
         job["solver_config"] = _resolve_solver_config(job)
-        job["id"] = _format_job_id(task["id"], job_index)
+        job["id"] = _format_matrix_job_id(task["id"], job_index)
         jobs.append(job)
     return jobs
 
 
-def _expand_ablation_jobs(
+def _expand_explicit_jobs(
     task: Mapping[str, Any],
     defaults: Mapping[str, Any],
     profile: Mapping[str, Any],
+    target_overrides: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    scenario_cfg = SCENARIOS[task["scenario"]]
-    sequence_name = task.get("ablation_sequence") or scenario_cfg.get("ablation_sequence", "default")
-    ablation_sequence = copy.deepcopy(ABLATION_SEQUENCES[sequence_name])
-    ablation_pgs = task.get("ablation_pgs", "auto")
-
-    ablation_steps = []
-    for step in ablation_sequence:
-        step_config = copy.deepcopy(step)
-        step_config["type"] = "feather_pgs"
-        if ablation_pgs != "auto" and (
-            "PGS" in step_config["label"]
-            or "parallel streams" in step_config["label"]
-            or "double buffer" in step_config["label"]
-            or "pipeline collide" in step_config["label"]
-        ):
-            step_config["pgs_kernel"] = ablation_pgs
-        ablation_steps.append(step_config)
-    ablation_steps.append({"label": "MuJoCo baseline", "type": "mujoco"})
-
     jobs = []
-    for step_index, step_config in enumerate(ablation_steps, start=1):
+    task_tags = task.get("tags", [])
+    for step_index, job_spec in enumerate(task["jobs"], start=0):
         job = _base_job(task, defaults, profile)
-        job["solver"] = "mujoco" if step_config["type"] == "mujoco" else "feather_pgs"
-        job["solver_config"] = copy.deepcopy(step_config)
-        job["ablation_label"] = step_config["label"]
-        job["ablation_step_index"] = step_index - 1
-        if "double_buffer" in step_config:
-            job["double_buffer"] = step_config["double_buffer"]
-        if "pipeline_collide" in step_config:
-            job["pipeline_collide"] = step_config["pipeline_collide"]
-        job["id"] = _format_job_id(task["id"], step_index)
+        for field, value in job_spec.items():
+            if field in JOB_METADATA_FIELDS:
+                continue
+            job[field] = copy.deepcopy(value)
+        job = _apply_overrides(job, target_overrides)
+        job["solver_config"] = _resolve_solver_config(job)
+        job["variant_id"] = job_spec["id"]
+        job["label"] = job_spec.get("label", job_spec["id"])
+        job["step_index"] = step_index
+        job["tags"] = _combine_tags(task_tags, job_spec.get("tags", []))
+        job["id"] = _format_explicit_job_id(task["id"], job_spec["id"])
         jobs.append(job)
     return jobs
 
@@ -422,6 +542,7 @@ def _base_job(task: Mapping[str, Any], defaults: Mapping[str, Any], profile: Map
         "profile": task["profile"],
         "hardware_label": profile["label"],
         "series": task["series"],
+        "tags": list(task.get("tags", [])),
         "scenario": task["scenario"],
         "solver": task.get("solver", "feather_pgs"),
         "substeps": task.get("substeps", scenario_cfg.get("default_substeps")),
@@ -466,6 +587,60 @@ def _normalized_run_modes(task: Mapping[str, Any]) -> list[str]:
     return list(run_modes)
 
 
+def _normalized_targets(
+    task: Mapping[str, Any],
+    hardware_profiles: Mapping[str, Any],
+) -> list[tuple[str, Mapping[str, Any]]]:
+    profile = task.get("profile")
+    targets = task.get("targets")
+    task_id = task.get("id", "<unknown>")
+
+    if profile is not None and targets is not None:
+        raise PlanValidationError(f"Task '{task_id}' must use either profile or targets, not both.")
+    if profile is None and targets is None:
+        raise PlanValidationError(f"Task '{task_id}' must define profile or targets.")
+
+    if profile is not None:
+        if profile not in hardware_profiles:
+            raise PlanValidationError(f"Task '{task_id}' references unknown hardware profile '{profile}'.")
+        return [(profile, {})]
+
+    if isinstance(targets, list):
+        normalized = []
+        seen_profiles: set[str] = set()
+        for target in targets:
+            if not isinstance(target, str) or not target:
+                raise PlanValidationError(f"Task '{task_id}' targets must be non-empty profile names.")
+            if target not in hardware_profiles:
+                raise PlanValidationError(f"Task '{task_id}' references unknown hardware profile '{target}'.")
+            if target in seen_profiles:
+                raise PlanValidationError(f"Task '{task_id}' targets include duplicate profile '{target}'.")
+            seen_profiles.add(target)
+            normalized.append((target, {}))
+        if not normalized:
+            raise PlanValidationError(f"Task '{task_id}' targets must not be empty.")
+        return normalized
+
+    if isinstance(targets, Mapping):
+        normalized = []
+        for target, overrides in targets.items():
+            if not isinstance(target, str) or not target:
+                raise PlanValidationError(f"Task '{task_id}' targets must use non-empty profile names.")
+            if target not in hardware_profiles:
+                raise PlanValidationError(f"Task '{task_id}' references unknown hardware profile '{target}'.")
+            if overrides is None:
+                normalized.append((target, {}))
+            elif isinstance(overrides, Mapping):
+                normalized.append((target, dict(overrides)))
+            else:
+                raise PlanValidationError(f"Task '{task_id}' target '{target}' overrides must be a mapping or null.")
+        if not normalized:
+            raise PlanValidationError(f"Task '{task_id}' targets must not be empty.")
+        return normalized
+
+    raise PlanValidationError(f"Task '{task_id}' targets must be a list or mapping.")
+
+
 def _expand_env_values(value: Any, env: Mapping[str, str]) -> Any:
     if isinstance(value, str):
         return os.path.expanduser(string.Template(value).safe_substitute(env))
@@ -487,8 +662,45 @@ def _as_list(value: Any) -> list[Any]:
     return list(value) if isinstance(value, list) else [value]
 
 
-def _format_job_id(task_id: str, job_index: int) -> str:
+def _combine_tags(task_tags: Sequence[str], job_tags: Sequence[str]) -> list[str]:
+    combined: list[str] = []
+    for tag in itertools.chain(task_tags, job_tags):
+        if tag not in combined:
+            combined.append(tag)
+    return combined
+
+
+def _validate_tags(tags: Any, task_id: str, owner: str) -> None:
+    if tags is None:
+        return
+    if not isinstance(tags, list) or not tags:
+        raise PlanValidationError(f"{owner.capitalize()} for task '{task_id}' must use a non-empty tags list.")
+    for tag in tags:
+        if not isinstance(tag, str) or not tag:
+            raise PlanValidationError(f"{owner.capitalize()} for task '{task_id}' uses an invalid tag value.")
+
+
+def _apply_overrides(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(dict(base))
+    for key, value in overrides.items():
+        merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _expanded_task_id(task_id: str, profile_name: str, multi_target: bool) -> str:
+    return f"{task_id}_{profile_name}" if multi_target else task_id
+
+
+def _format_matrix_job_id(task_id: str, job_index: int) -> str:
     return f"{task_id}__{job_index:04d}"
+
+
+def _format_explicit_job_id(task_id: str, job_id: str) -> str:
+    return f"{task_id}__{job_id}"
+
+
+def _is_valid_job_fragment(value: str) -> bool:
+    return bool(value) and all(char.isalnum() or char in {"-", "_"} for char in value)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

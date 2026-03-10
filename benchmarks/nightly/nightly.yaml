@@ -71,8 +71,13 @@ tasks:
   - id: g1_flat_sweep
     run_modes: [full]
     kind: benchmark
-    profile: rtx_5090
+    targets:
+      rtx_5090:
+        num_worlds: [1024, 2048, 4096, 8192, 16384, 32768, 65536]
+      rtx_pro_6000_server: {}
+      b200: {}
     series: g1_flat_env_fps
+    tags: [g1_flat_env_fps]
     scenario: g1_flat
     solver: [fpgs_tiled, mujoco]
     substeps: [2, 4]
@@ -81,18 +86,118 @@ tasks:
   - id: g1_flat_ablation
     run_modes: [full]
     kind: benchmark
-    profile: rtx_5090
+    targets:
+      rtx_5090: {}
+      rtx_pro_6000_server: {}
+      b200: {}
     series: g1_flat_ablation
+    tags: [g1_flat_ablation]
     scenario: g1_flat
-    num_worlds: 16384
-    ablation_sequence: default
     nsys_profile: true
+    jobs:
+      - id: baseline_loop
+        label: FeatherPGS baseline
+        solver: feather_pgs
+        substeps: 2
+        num_worlds: 16384
+        cholesky_kernel: loop
+        trisolve_kernel: loop
+        hinv_jt_kernel: par_row
+        delassus_kernel: par_row_col
+        pgs_kernel: loop
+        use_parallel_streams: false
+        double_buffer: false
+        pipeline_collide: false
+      - id: tiled_cholesky
+        label: tiled cholesky
+        solver: feather_pgs
+        substeps: 2
+        num_worlds: 16384
+        cholesky_kernel: tiled
+        trisolve_kernel: loop
+        hinv_jt_kernel: par_row
+        delassus_kernel: par_row_col
+        pgs_kernel: loop
+        use_parallel_streams: false
+        double_buffer: false
+        pipeline_collide: false
+      - id: tiled_trisolve
+        label: tiled trisolve
+        solver: feather_pgs
+        substeps: 2
+        num_worlds: 16384
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: par_row
+        delassus_kernel: par_row_col
+        pgs_kernel: loop
+        use_parallel_streams: false
+        double_buffer: false
+        pipeline_collide: false
+      - id: tiled_hinv_jt
+        label: tiled hinv_jt
+        solver: feather_pgs
+        substeps: 2
+        num_worlds: 16384
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: tiled
+        delassus_kernel: tiled
+        pgs_kernel: loop
+        use_parallel_streams: false
+        double_buffer: false
+        pipeline_collide: false
+      - id: tiled_pgs
+        label: tiled PGS
+        solver: feather_pgs
+        substeps: 2
+        num_worlds: 16384
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: tiled
+        delassus_kernel: tiled
+        pgs_kernel: tiled_contact
+        use_parallel_streams: false
+        double_buffer: false
+        pipeline_collide: false
+      - id: parallel_streams
+        label: parallel streams
+        solver: feather_pgs
+        substeps: 2
+        num_worlds: 16384
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: tiled
+        delassus_kernel: tiled
+        pgs_kernel: tiled_contact
+        use_parallel_streams: true
+        double_buffer: false
+        pipeline_collide: false
+      - id: pipeline_collide
+        label: pipeline collide
+        solver: feather_pgs
+        substeps: 2
+        num_worlds: 16384
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: tiled
+        delassus_kernel: tiled
+        pgs_kernel: tiled_contact
+        use_parallel_streams: true
+        double_buffer: false
+        pipeline_collide: true
+      - id: mujoco_baseline
+        label: MuJoCo baseline
+        solver: mujoco
+        substeps: 2
+        num_worlds: 16384
 
   - id: g1_flat_renders
     run_modes: [full]
     kind: render
     profile: rtx_pro_6000_render
     series: g1_flat_render
+    tags: [g1_flat_render]
     scenario: g1_flat
     solver: [fpgs_tiled, mujoco]
     substeps: [2, 4]
@@ -100,8 +205,12 @@ tasks:
   - id: h1_tabletop_sweep_early
     run_modes: [full]
     kind: benchmark
-    profile: rtx_5090
+    targets:
+      rtx_5090: {}
+      rtx_pro_6000_server: {}
+      b200: {}
     series: h1_tabletop_env_fps
+    tags: [h1_tabletop_env_fps]
     scenario: h1_tabletop
     solver: [fpgs_mf, mujoco]
     substeps: [4, 8]
@@ -110,8 +219,11 @@ tasks:
   - id: h1_tabletop_sweep_late
     run_modes: [full]
     kind: benchmark
-    profile: rtx_5090
+    targets:
+      rtx_pro_6000_server: {}
+      b200: {}
     series: h1_tabletop_env_fps
+    tags: [h1_tabletop_env_fps]
     scenario: h1_tabletop
     solver: [fpgs_mf, mujoco]
     substeps: [4, 8]
@@ -120,8 +232,11 @@ tasks:
   - id: h1_tabletop_sweep_extreme
     run_modes: [full]
     kind: benchmark
-    profile: rtx_5090
+    targets:
+      rtx_pro_6000_server: {}
+      b200: {}
     series: h1_tabletop_env_fps
+    tags: [h1_tabletop_env_fps]
     scenario: h1_tabletop
     solver: [fpgs_mf, mujoco]
     substeps: [4, 8]
@@ -130,18 +245,178 @@ tasks:
   - id: h1_tabletop_ablation
     run_modes: [full]
     kind: benchmark
-    profile: rtx_5090
+    targets:
+      rtx_5090:
+        num_worlds: 4096
+      rtx_pro_6000_server: {}
+      b200: {}
     series: h1_tabletop_ablation
+    tags: [h1_tabletop_ablation]
     scenario: h1_tabletop
-    num_worlds: 8192
-    ablation_sequence: streaming
     nsys_profile: true
+    jobs:
+      - id: baseline_loop
+        label: baseline (all loop)
+        solver: feather_pgs
+        substeps: 8
+        num_worlds: 8192
+        cholesky_kernel: loop
+        trisolve_kernel: loop
+        hinv_jt_kernel: par_row
+        delassus_kernel: par_row_col
+        pgs_kernel: loop
+        dense_max_constraints: 396
+        pgs_mode: delassus
+        use_parallel_streams: false
+        double_buffer: false
+        pipeline_collide: false
+      - id: tiled_cholesky
+        label: tiled cholesky
+        solver: feather_pgs
+        substeps: 8
+        num_worlds: 8192
+        cholesky_kernel: tiled
+        trisolve_kernel: loop
+        hinv_jt_kernel: par_row
+        delassus_kernel: par_row_col
+        pgs_kernel: loop
+        dense_max_constraints: 396
+        pgs_mode: delassus
+        use_parallel_streams: false
+        double_buffer: false
+        pipeline_collide: false
+      - id: tiled_trisolve
+        label: tiled trisolve
+        solver: feather_pgs
+        substeps: 8
+        num_worlds: 8192
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: par_row
+        delassus_kernel: par_row_col
+        pgs_kernel: loop
+        dense_max_constraints: 396
+        pgs_mode: delassus
+        use_parallel_streams: false
+        double_buffer: false
+        pipeline_collide: false
+      - id: tiled_delassus
+        label: tiled delassus
+        solver: feather_pgs
+        substeps: 8
+        num_worlds: 8192
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: par_row
+        delassus_kernel: tiled
+        pgs_kernel: loop
+        dense_max_constraints: 396
+        pgs_mode: delassus
+        use_parallel_streams: false
+        double_buffer: false
+        pipeline_collide: false
+      - id: streaming_pgs
+        label: streaming PGS
+        solver: feather_pgs
+        substeps: 8
+        num_worlds: 8192
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: par_row
+        delassus_kernel: tiled
+        pgs_kernel: streaming
+        dense_max_constraints: 396
+        pgs_mode: delassus
+        use_parallel_streams: false
+        double_buffer: false
+        pipeline_collide: false
+      - id: parallel_streams
+        label: parallel streams
+        solver: feather_pgs
+        substeps: 8
+        num_worlds: 8192
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: par_row
+        delassus_kernel: tiled
+        pgs_kernel: streaming
+        dense_max_constraints: 396
+        pgs_mode: delassus
+        use_parallel_streams: true
+        double_buffer: false
+        pipeline_collide: false
+      - id: hybrid
+        label: hybrid (dense + MF rigid)
+        solver: feather_pgs
+        substeps: 8
+        num_worlds: 8192
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: tiled
+        delassus_kernel: tiled
+        pgs_kernel: tiled_contact
+        dense_max_constraints: 128
+        pgs_mode: hybrid
+        use_parallel_streams: true
+        double_buffer: false
+        pipeline_collide: false
+      - id: matrix_free
+        label: fully matrix-free GS
+        solver: feather_pgs
+        substeps: 8
+        num_worlds: 8192
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: tiled
+        delassus_kernel: tiled
+        pgs_kernel: tiled_contact
+        dense_max_constraints: 128
+        pgs_mode: velocity
+        use_parallel_streams: true
+        double_buffer: false
+        pipeline_collide: false
+      - id: double_buffer
+        label: double buffer
+        solver: feather_pgs
+        substeps: 8
+        num_worlds: 8192
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: tiled
+        delassus_kernel: tiled
+        pgs_kernel: tiled_contact
+        dense_max_constraints: 128
+        pgs_mode: velocity
+        use_parallel_streams: true
+        double_buffer: true
+        pipeline_collide: false
+      - id: pipeline_collide
+        label: pipeline collide
+        solver: feather_pgs
+        substeps: 8
+        num_worlds: 8192
+        cholesky_kernel: tiled
+        trisolve_kernel: tiled
+        hinv_jt_kernel: tiled
+        delassus_kernel: tiled
+        pgs_kernel: tiled_contact
+        dense_max_constraints: 128
+        pgs_mode: velocity
+        use_parallel_streams: true
+        double_buffer: true
+        pipeline_collide: true
+      - id: mujoco_baseline
+        label: MuJoCo baseline
+        solver: mujoco
+        substeps: 8
+        num_worlds: 8192
 
   - id: h1_tabletop_renders
     run_modes: [full]
     kind: render
     profile: rtx_pro_6000_render
     series: h1_tabletop_render
+    tags: [h1_tabletop_render]
     scenario: h1_tabletop
     solver: [fpgs_mf, mujoco]
     substeps: [4, 8]
@@ -151,6 +426,7 @@ tasks:
     kind: benchmark
     profile: rtx_5090
     series: g1_flat_env_fps
+    tags: [g1_flat_env_fps]
     scenario: g1_flat
     solver: [fpgs_tiled, mujoco]
     substeps: [2]
@@ -163,6 +439,7 @@ tasks:
     kind: render
     profile: rtx_pro_6000_render
     series: g1_flat_render
+    tags: [g1_flat_render]
     scenario: g1_flat
     solver: [fpgs_tiled]
     substeps: [2]

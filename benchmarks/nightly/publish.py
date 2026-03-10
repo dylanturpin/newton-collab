@@ -404,6 +404,7 @@ def _build_render_entry(
         "task_id": task["task_id"],
         "job_id": job["job_id"],
         "series": task["manifest"].get("series"),
+        "tags": job["manifest"]["params"].get("tags"),
         "scenario": job["manifest"]["scenario"],
         "solver": job["manifest"]["params"].get("solver"),
         "substeps": job["manifest"]["params"].get("substeps"),
@@ -446,8 +447,10 @@ def _base_point_row(
         "solver": params.get("solver"),
         "substeps": params.get("substeps"),
         "num_worlds": params.get("num_worlds"),
-        "label": params.get("ablation_label"),
-        "step_index": params.get("ablation_step_index"),
+        "label": params.get("label"),
+        "step_index": params.get("step_index"),
+        "variant_id": params.get("variant_id"),
+        "tags": params.get("tags"),
         "gpu": metadata.get("gpu"),
         "gpu_tag": job["manifest"].get("hardware_label"),
         "gpu_memory_total_gb": metadata.get("gpu_memory_total_gb"),
@@ -517,7 +520,7 @@ def _public_profile_path(job: Mapping[str, Any], file_name: str | None) -> Path:
     if not isinstance(file_name, str) or not file_name:
         raise ValueError("Profile artifact file name must be a non-empty string.")
     params = job["manifest"]["params"]
-    label = params.get("ablation_label") or params.get("solver") or "profile"
+    label = params.get("label") or params.get("variant_id") or params.get("solver") or "profile"
     scenario = job["manifest"].get("scenario") or "scenario"
     num_worlds = params.get("num_worlds")
     substeps = params.get("substeps")
@@ -567,11 +570,11 @@ def _task_mode(
 ) -> str:
     if task_manifest["kind"] != "benchmark":
         return "render"
-    if task_definition.get("ablation_sequence"):
+    if task_definition.get("job_style") == "explicit":
         return "ablation"
     for job in jobs:
         params = job.get("manifest", {}).get("params", {})
-        if params.get("ablation_step_index") is not None or params.get("ablation_label"):
+        if params.get("step_index") is not None or params.get("label"):
             return "ablation"
     return "sweep"
 
