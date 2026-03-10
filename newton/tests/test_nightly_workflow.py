@@ -125,7 +125,7 @@ class TestNightlyWorkflow(unittest.TestCase):
             self.assertTrue((run_dir / "plan.lock.yaml").is_file())
             self.assertTrue((run_dir / "publish" / "summary.json").is_file())
             run_manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-            self.assertEqual(run_manifest["selected_profiles"], ["rtx_5090", "rtx_pro_6000_server"])
+            self.assertEqual(run_manifest["selected_profiles"], ["rtx_5090", "rtx_pro_6000_render"])
 
             benchmark_task_dir = run_dir / "tasks" / "validation_g1_flat_sweep"
             render_task_dir = run_dir / "tasks" / "validation_g1_flat_render"
