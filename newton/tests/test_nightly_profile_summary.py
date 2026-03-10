@@ -15,12 +15,8 @@ class TestNightlyProfileSummary(unittest.TestCase):
             sqlite_path = Path(tmp_dir) / "profile.sqlite"
             with sqlite3.connect(sqlite_path) as conn:
                 conn.execute("CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT)")
-                conn.execute(
-                    "CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (start INTEGER, end INTEGER, nameId INTEGER)"
-                )
-                conn.execute(
-                    "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start INTEGER, end INTEGER, shortName INTEGER)"
-                )
+                conn.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (start INTEGER, end INTEGER, nameId INTEGER)")
+                conn.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start INTEGER, end INTEGER, shortName INTEGER)")
                 conn.executemany(
                     "INSERT INTO StringIds (id, value) VALUES (?, ?)",
                     [
