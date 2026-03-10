@@ -10,7 +10,7 @@
   "gpu_tag": "b200",
   "plan_run_mode": "full",
   "platform": "Linux",
-  "point_count": 75,
+  "point_count": 79,
   "python_version": "3.11.14",
   "render_count": 0,
   "run_dir": "runs/full-3gpu-20260309f",

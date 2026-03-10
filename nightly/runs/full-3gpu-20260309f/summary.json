@@ -1,18 +1,18 @@
 {
   "commit": "87928f83",
   "commit_short": "87928f8",
-  "completed_jobs": 158,
-  "completed_tasks": 14,
+  "completed_jobs": 230,
+  "completed_tasks": 18,
   "execution_mode": "slurm",
-  "failed_jobs": 0,
-  "failed_point_count": 0,
-  "failed_tasks": 0,
+  "failed_jobs": 11,
+  "failed_point_count": 11,
+  "failed_tasks": 4,
   "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
   "gpu_memory_total_gb": 94.97296142578125,
   "plan_run_mode": "full",
   "platform": "Linux",
-  "point_count": 150,
-  "profile_count": 38,
+  "point_count": 233,
+  "profile_count": 56,
   "python_version": "3.12.3",
   "render_count": 8,
   "run_dir": "runs/full-3gpu-20260309f",
@@ -41,7 +41,9 @@
     "h1_tabletop_ablation_b200",
     "h1_tabletop_ablation_5090",
     "g1_flat_renders",
-    "h1_tabletop_renders"
+    "h1_tabletop_renders",
+    "g1_flat_sweep_plus_256k_6000",
+    "g1_flat_sweep_plus_256k_b200"
   ],
   "series": [
     "g1_flat_ablation",
@@ -51,8 +53,8 @@
     "h1_tabletop_env_fps",
     "h1_tabletop_render"
   ],
-  "status": "completed",
-  "successful_point_count": 150,
+  "status": "failed",
+  "successful_point_count": 222,
   "tasks": [
     {
       "completed_jobs": 32,
@@ -149,10 +151,10 @@
       "task_id": "g1_flat_sweep_b200"
     },
     {
-      "completed_jobs": 0,
+      "completed_jobs": 30,
       "dependency_ids": [],
-      "failed_jobs": 0,
-      "gpu": "rtx-5090",
+      "failed_jobs": 2,
+      "gpu": "NVIDIA GeForce RTX 5090",
       "hardware_label": "rtx-5090",
       "job_ids": [
         "g1_flat_sweep_5090__0001",
@@ -191,7 +193,7 @@
       "kind": "benchmark",
       "scenario": "g1_flat",
       "series": "g1_flat_env_fps",
-      "status": "pending",
+      "status": "failed",
       "submission_id": "1456505",
       "task_id": "g1_flat_sweep_5090"
     },
@@ -242,10 +244,10 @@
       "task_id": "g1_flat_ablation_b200"
     },
     {
-      "completed_jobs": 0,
+      "completed_jobs": 8,
       "dependency_ids": [],
       "failed_jobs": 0,
-      "gpu": "rtx-5090",
+      "gpu": "NVIDIA GeForce RTX 5090",
       "hardware_label": "rtx-5090",
       "job_ids": [
         "g1_flat_ablation_5090__0001",
@@ -255,15 +257,13 @@
         "g1_flat_ablation_5090__0005",
         "g1_flat_ablation_5090__0006",
         "g1_flat_ablation_5090__0007",
-        "g1_flat_ablation_5090__0008",
-        "g1_flat_ablation_5090__0009",
-        "g1_flat_ablation_5090__0010"
+        "g1_flat_ablation_5090__0008"
       ],
       "kind": "benchmark",
       "scenario": "g1_flat",
       "series": "g1_flat_ablation",
-      "status": "pending",
-      "submission_id": "1456509",
+      "status": "completed",
+      "submission_id": "1457261",
       "task_id": "g1_flat_ablation_5090"
     },
     {
@@ -329,10 +329,10 @@
       "task_id": "h1_tabletop_sweep_early_b200"
     },
     {
-      "completed_jobs": 0,
+      "completed_jobs": 16,
       "dependency_ids": [],
       "failed_jobs": 0,
-      "gpu": "rtx-5090",
+      "gpu": "NVIDIA GeForce RTX 5090",
       "hardware_label": "rtx-5090",
       "job_ids": [
         "h1_tabletop_sweep_early_5090__0001",
@@ -355,7 +355,7 @@
       "kind": "benchmark",
       "scenario": "h1_tabletop",
       "series": "h1_tabletop_env_fps",
-      "status": "pending",
+      "status": "completed",
       "submission_id": "1456512",
       "task_id": "h1_tabletop_sweep_early_5090"
     },
@@ -400,7 +400,7 @@
     {
       "completed_jobs": 0,
       "dependency_ids": [],
-      "failed_jobs": 0,
+      "failed_jobs": 4,
       "gpu": "rtx-5090",
       "hardware_label": "rtx-5090",
       "job_ids": [
@@ -412,7 +412,7 @@
       "kind": "benchmark",
       "scenario": "h1_tabletop",
       "series": "h1_tabletop_env_fps",
-      "status": "pending",
+      "status": "failed",
       "submission_id": "1456516",
       "task_id": "h1_tabletop_sweep_late_5090"
     },
@@ -457,7 +457,7 @@
     {
       "completed_jobs": 0,
       "dependency_ids": [],
-      "failed_jobs": 0,
+      "failed_jobs": 4,
       "gpu": "rtx-5090",
       "hardware_label": "rtx-5090",
       "job_ids": [
@@ -469,7 +469,7 @@
       "kind": "benchmark",
       "scenario": "h1_tabletop",
       "series": "h1_tabletop_env_fps",
-      "status": "pending",
+      "status": "failed",
       "submission_id": "1456519",
       "task_id": "h1_tabletop_sweep_extreme_5090"
     },
@@ -526,10 +526,10 @@
       "task_id": "h1_tabletop_ablation_b200"
     },
     {
-      "completed_jobs": 0,
+      "completed_jobs": 10,
       "dependency_ids": [],
-      "failed_jobs": 0,
-      "gpu": "rtx-5090",
+      "failed_jobs": 1,
+      "gpu": "NVIDIA GeForce RTX 5090",
       "hardware_label": "rtx-5090",
       "job_ids": [
         "h1_tabletop_ablation_5090__0001",
@@ -547,7 +547,7 @@
       "kind": "benchmark",
       "scenario": "h1_tabletop",
       "series": "h1_tabletop_ablation",
-      "status": "pending",
+      "status": "failed",
       "submission_id": "1456525",
       "task_id": "h1_tabletop_ablation_5090"
     },
@@ -588,9 +588,47 @@
       "status": "completed",
       "submission_id": "1456527",
       "task_id": "h1_tabletop_renders"
+    },
+    {
+      "completed_jobs": 4,
+      "dependency_ids": [],
+      "failed_jobs": 0,
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "hardware_label": "rtx-pro-6000-blackwell-server-edition",
+      "job_ids": [
+        "g1_flat_sweep_plus_256k_6000__0001",
+        "g1_flat_sweep_plus_256k_6000__0002",
+        "g1_flat_sweep_plus_256k_6000__0003",
+        "g1_flat_sweep_plus_256k_6000__0004"
+      ],
+      "kind": "benchmark",
+      "scenario": "g1_flat",
+      "series": "g1_flat_env_fps",
+      "status": "completed",
+      "submission_id": "1457818",
+      "task_id": "g1_flat_sweep_plus_256k_6000"
+    },
+    {
+      "completed_jobs": 4,
+      "dependency_ids": [],
+      "failed_jobs": 0,
+      "gpu": "NVIDIA B200",
+      "hardware_label": "b200",
+      "job_ids": [
+        "g1_flat_sweep_plus_256k_b200__0001",
+        "g1_flat_sweep_plus_256k_b200__0002",
+        "g1_flat_sweep_plus_256k_b200__0003",
+        "g1_flat_sweep_plus_256k_b200__0004"
+      ],
+      "kind": "benchmark",
+      "scenario": "g1_flat",
+      "series": "g1_flat_env_fps",
+      "status": "completed",
+      "submission_id": "1457819",
+      "task_id": "g1_flat_sweep_plus_256k_b200"
     }
   ],
   "timestamp": "2026-03-09T13:45:34.206544Z",
-  "total_jobs": 158,
-  "total_tasks": 20
+  "total_jobs": 241,
+  "total_tasks": 22
 }
