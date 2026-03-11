@@ -1633,9 +1633,9 @@ def run_direct(args):
 
             def simulate():
                 nonlocal state_0, state_1
+                with wp.ScopedTimer("Collide", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
+                    model.collide(state_0, contacts)
                 for i in range(args.substeps):
-                    with wp.ScopedTimer("Collide", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
-                        model.collide(state_0, contacts)
                     with wp.ScopedTimer("ClearForces", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
                         state_0.clear_forces()
                     solver.step(state_0, state_1, control, contacts, sim_dt)
@@ -1653,9 +1653,9 @@ def run_direct(args):
         if graph is not None:
             wp.capture_launch(graph)
         else:
+            with wp.ScopedTimer("Collide", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
+                model.collide(state_0, contacts)
             for i in range(args.substeps):
-                with wp.ScopedTimer("Collide", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
-                    model.collide(state_0, contacts)
                 with wp.ScopedTimer("ClearForces", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
                     state_0.clear_forces()
                 solver.step(state_0, state_1, control, contacts, sim_dt)
@@ -1883,8 +1883,8 @@ def run_render(args):
 
     # Simulate and capture
     for i in range(num_frames):
+        model.collide(state_0, contacts)
         for _ in range(args.substeps):
-            model.collide(state_0, contacts)
             state_0.clear_forces()
             solver.step(state_0, state_1, control, contacts, sim_dt)
             state_0, state_1 = state_1, state_0
@@ -1977,8 +1977,8 @@ def run_interactive(args):
     # Main loop
     while viewer.is_running():
         if not viewer.is_paused():
+            model.collide(state_0, contacts)
             for _ in range(args.substeps):
-                model.collide(state_0, contacts)
                 state_0.clear_forces()
                 viewer.apply_forces(state_0)
                 solver.step(state_0, state_1, control, contacts, sim_dt)
