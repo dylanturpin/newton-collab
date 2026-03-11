@@ -1585,7 +1585,6 @@ def create_solver(model, args, scenario_cfg: dict):
             "pgs_chunk_size": pgs_chunk,
             "small_dof_threshold": 12,
             "use_parallel_streams": parallel_streams,
-            "double_buffer": args.double_buffer,
             "nvtx": args.nvtx,
         }
         from newton._src.solvers import SolverFeatherPGS  # noqa: PLC0415
@@ -1619,22 +1618,6 @@ def run_direct(args):
     control = model.control()
     contacts = model.collide(state_0)
 
-    # Pipeline collide: overlap collision detection with solver stages S1-S3
-    _pipeline_collide = getattr(args, "pipeline_collide", False)
-    collide_stream = None
-    contacts_bufs = None
-    collide_done_events = None
-    collide_state = None
-    if _pipeline_collide:
-        _pc_dev = wp.get_device()
-        if _pc_dev.is_cuda:
-            collide_stream = wp.Stream(_pc_dev)
-            contacts_bufs = [contacts, model.contacts()]
-            collide_done_events = [None, None]
-            collide_state = model.state()
-        else:
-            _pipeline_collide = False
-
     # CUDA graph capture (if not timing)
     # Handle odd substeps: with CUDA graphs, we need state_0 to end up in the
     # same buffer it started in. With odd substeps, normal swapping leaves it
@@ -1647,95 +1630,32 @@ def run_direct(args):
     if not args.summary_timer and not args.no_graph:
         device = wp.get_device()
         if device.is_cuda:
-            if _pipeline_collide:
 
-                def simulate():
-                    nonlocal state_0, state_1
-                    for i in range(args.substeps):
-                        buf = i % 2
-                        next_buf = 1 - buf
-                        if need_odd_substep_fix and i == args.substeps - 1:
-                            next_buf = 0
-                        with wp.ScopedTimer("ClearForces", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
-                            state_0.clear_forces()
-                        solver.step(
-                            state_0,
-                            state_1,
-                            control,
-                            contacts_bufs[buf],
-                            sim_dt,
-                            collide_done_event=collide_done_events[buf],
-                        )
-                        wp.copy(collide_state.body_q, state_1.body_q)
-                        integrate_done = wp.get_stream(device).record_event()
-                        with wp.ScopedStream(collide_stream):
-                            collide_stream.wait_event(integrate_done)
-                            with wp.ScopedTimer("Collide", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
-                                model.collide(collide_state, contacts_bufs[next_buf])
-                            collide_done_events[next_buf] = collide_stream.record_event()
-                        if need_odd_substep_fix and i == args.substeps - 1:
-                            state_0.assign(state_1)
-                        else:
-                            state_0, state_1 = state_1, state_0
-
-            else:
-
-                def simulate():
-                    for i in range(args.substeps):
-                        nonlocal contacts, state_0, state_1
-                        with wp.ScopedTimer("Collide", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
-                            contacts = model.collide(state_0)
-                        with wp.ScopedTimer("ClearForces", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
-                            state_0.clear_forces()
-                        solver.step(state_0, state_1, control, contacts, sim_dt)
-                        if need_odd_substep_fix and i == args.substeps - 1:
-                            state_0.assign(state_1)
-                        else:
-                            state_0, state_1 = state_1, state_0
+            def simulate():
+                nonlocal state_0, state_1
+                for i in range(args.substeps):
+                    with wp.ScopedTimer("Collide", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
+                        model.collide(state_0, contacts)
+                    with wp.ScopedTimer("ClearForces", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
+                        state_0.clear_forces()
+                    solver.step(state_0, state_1, control, contacts, sim_dt)
+                    if need_odd_substep_fix and i == args.substeps - 1:
+                        state_0.assign(state_1)
+                    else:
+                        state_0, state_1 = state_1, state_0
 
             with wp.ScopedCapture() as capture:
-                if hasattr(solver, "seed_double_buffer_events"):
-                    solver.seed_double_buffer_events()
-                if _pipeline_collide:
-                    collide_done_events[0] = wp.get_stream(device).record_event()
                 simulate()
             graph = capture.graph
 
-    # Seed pipeline collide events for non-graph path
-    if _pipeline_collide and graph is None:
-        collide_done_events[0] = wp.get_stream(wp.get_device()).record_event()
-
     def step():
-        nonlocal contacts, state_0, state_1
+        nonlocal state_0, state_1
         if graph is not None:
             wp.capture_launch(graph)
-        elif _pipeline_collide:
-            _dev = wp.get_device()
-            for i in range(args.substeps):
-                buf = i % 2
-                next_buf = 1 - buf
-                if need_odd_substep_fix and i == args.substeps - 1:
-                    next_buf = 0
-                with wp.ScopedTimer("ClearForces", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
-                    state_0.clear_forces()
-                solver.step(
-                    state_0, state_1, control, contacts_bufs[buf], sim_dt, collide_done_event=collide_done_events[buf]
-                )
-                wp.copy(collide_state.body_q, state_1.body_q)
-                integrate_done = wp.get_stream(_dev).record_event()
-                with wp.ScopedStream(collide_stream):
-                    collide_stream.wait_event(integrate_done)
-                    with wp.ScopedTimer("Collide", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
-                        model.collide(collide_state, contacts_bufs[next_buf])
-                    collide_done_events[next_buf] = collide_stream.record_event()
-                if need_odd_substep_fix and i == args.substeps - 1:
-                    state_0.assign(state_1)
-                else:
-                    state_0, state_1 = state_1, state_0
         else:
             for i in range(args.substeps):
                 with wp.ScopedTimer("Collide", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
-                    contacts = model.collide(state_0)
+                    model.collide(state_0, contacts)
                 with wp.ScopedTimer("ClearForces", print=False, use_nvtx=_nvtx, synchronize=_nvtx):
                     state_0.clear_forces()
                 solver.step(state_0, state_1, control, contacts, sim_dt)
@@ -1964,7 +1884,7 @@ def run_render(args):
     # Simulate and capture
     for i in range(num_frames):
         for _ in range(args.substeps):
-            contacts = model.collide(state_0)
+            model.collide(state_0, contacts)
             state_0.clear_forces()
             solver.step(state_0, state_1, control, contacts, sim_dt)
             state_0, state_1 = state_1, state_0
@@ -2058,7 +1978,7 @@ def run_interactive(args):
     while viewer.is_running():
         if not viewer.is_paused():
             for _ in range(args.substeps):
-                contacts = model.collide(state_0)
+                model.collide(state_0, contacts)
                 state_0.clear_forces()
                 viewer.apply_forces(state_0)
                 solver.step(state_0, state_1, control, contacts, sim_dt)
@@ -2214,12 +2134,6 @@ def main():
     parser.add_argument("--use-parallel-streams", action="store_true", dest="use_parallel_streams")
     parser.add_argument("--no-parallel-streams", action="store_false", dest="use_parallel_streams")
     parser.set_defaults(use_parallel_streams=True)
-    parser.add_argument("--double-buffer", action="store_true", dest="double_buffer")
-    parser.add_argument("--no-double-buffer", action="store_false", dest="double_buffer")
-    parser.set_defaults(double_buffer=True)
-    parser.add_argument("--pipeline-collide", action="store_true", dest="pipeline_collide")
-    parser.add_argument("--no-pipeline-collide", action="store_false", dest="pipeline_collide")
-    parser.set_defaults(pipeline_collide=False)
     parser.add_argument("--nvtx", action="store_true", help="Enable NVTX markers in solver stages")
     parser.add_argument("--no-graph", action="store_true", help="Disable CUDA graph capture (for NVTX profiling)")
     parser.add_argument(

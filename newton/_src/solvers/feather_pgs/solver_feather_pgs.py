@@ -192,7 +192,6 @@ class SolverFeatherPGS(SolverBase):
         small_dof_threshold: int = 12,
         # Parallelism options
         use_parallel_streams: bool = True,
-        double_buffer: bool = True,
         nvtx: bool = False,
     ):
         """
@@ -261,7 +260,6 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(f"pgs_mode must be 'delassus', 'hybrid', or 'velocity', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
         self.mf_max_constraints = mf_max_constraints
-        self._double_buffer = double_buffer
         self._nvtx = nvtx
 
         valid_storage = {"batched", "flat"}
@@ -341,8 +339,6 @@ class SolverFeatherPGS(SolverBase):
         self._allocate_common_buffers(model)
         if self.storage == "flat":
             self._allocate_flat_buffers(model)
-            self._H_bufs = None
-            self._J_bufs = None
         else:
             self._allocate_batched_buffers(model)
             self._allocate_world_buffers(model)
@@ -356,8 +352,6 @@ class SolverFeatherPGS(SolverBase):
             self.shape_material_mu = wp.zeros(
                 (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
             )
-
-        self._init_double_buffer_stream()
 
     def _compute_articulation_metadata(self, model):
         self._compute_articulation_indices(model)
@@ -815,26 +809,19 @@ class SolverFeatherPGS(SolverBase):
             self.R_by_size = {}
             self.tau_by_size = {}
             self.qdd_by_size = {}
-            self._H_bufs = None
-            self._J_bufs = None
             return
 
         device = model.device
         requires_grad = model.requires_grad
         max_constraints = self.dense_max_constraints
 
+        self.H_by_size = {}
+        self.J_by_size = {}
         self.L_by_size = {}
         self.Y_by_size = {}
         self.R_by_size = {}
         self.tau_by_size = {}
         self.qdd_by_size = {}
-
-        if self._double_buffer and device.is_cuda:
-            self._H_bufs = [{}, {}]
-            self._J_bufs = [{}, {}]
-        else:
-            self._H_bufs = None
-            self._J_bufs = None
 
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
@@ -842,17 +829,12 @@ class SolverFeatherPGS(SolverBase):
             h_dim = size
             j_rows = max_constraints
 
-            if self._H_bufs is not None:
-                for buf_idx in range(2):
-                    self._H_bufs[buf_idx][size] = wp.zeros(
-                        (n_arts, h_dim, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
-                    )
-                    self._J_bufs[buf_idx][size] = wp.zeros(
-                        (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
-                    )
-            else:
-                pass  # allocated below after the if/else
-
+            self.H_by_size[size] = wp.zeros(
+                (n_arts, h_dim, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+            self.J_by_size[size] = wp.zeros(
+                (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
             self.L_by_size[size] = wp.zeros(
                 (n_arts, h_dim, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
             )
@@ -869,24 +851,6 @@ class SolverFeatherPGS(SolverBase):
             # Tau and qdd grouped buffers for tiled triangular solve [n_arts, h_dim, 1]
             self.tau_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
             self.qdd_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
-
-        if self._H_bufs is not None:
-            self.H_by_size = self._H_bufs[0]
-            self.J_by_size = self._J_bufs[0]
-            self._buf_idx = 0
-        else:
-            self.H_by_size = {}
-            self.J_by_size = {}
-            for size in self.size_groups:
-                n_arts = self.n_arts_by_size[size]
-                h_dim = size
-                j_rows = max_constraints
-                self.H_by_size[size] = wp.zeros(
-                    (n_arts, h_dim, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
-                )
-                self.J_by_size[size] = wp.zeros(
-                    (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
-                )
 
         max_contacts = int(model.rigid_contact_max)
         if max_contacts <= 0:
@@ -1080,30 +1044,6 @@ class SolverFeatherPGS(SolverBase):
                 self._size_streams[size] = None
                 self._size_events[size] = None
 
-    def _init_double_buffer_stream(self):
-        """Create a dedicated CUDA stream for async memset of H/J buffers."""
-        if self._H_bufs is None or not self.model.device.is_cuda:
-            self._memset_stream = None
-            return
-        self._memset_stream = wp.Stream(self.model.device)
-        # Track the last memset-done event per buffer slot so the main stream
-        # can wait only for the specific buffer it needs.
-        self._memset_done_event: list[wp.Event | None] = [None, None]
-
-    def seed_double_buffer_events(self):
-        """Record initial memset_done events on the main stream.
-
-        Must be called inside CUDA graph capture, before the first ``step()`` call.
-        Since buffers are allocated with ``wp.zeros()``, they are already zeroed;
-        recording here provides trivially-satisfied wait targets for the first two
-        substeps.
-        """
-        if self._memset_stream is None:
-            return
-        main_stream = wp.get_stream(self.model.device)
-        self._memset_done_event[0] = main_stream.record_event()
-        self._memset_done_event[1] = main_stream.record_event()
-
     @override
     def step(
         self,
@@ -1112,7 +1052,6 @@ class SolverFeatherPGS(SolverBase):
         control: Control,
         contacts: Contacts,
         dt: float,
-        collide_done_event=None,
     ):
         if self._last_step_dt is None:
             self._last_step_dt = dt
@@ -1128,10 +1067,6 @@ class SolverFeatherPGS(SolverBase):
             control = model.control(clone_variables=False)
         state_aug = self._prepare_augmented_state(state_in, state_out, control)
 
-        if collide_done_event is not None and state_in.particle_count > 0:
-            wp.get_stream(self.model.device).wait_event(collide_done_event)
-            collide_done_event = None  # consumed
-
         self._eval_particle_forces(state_in, control, contacts)
 
         if not model.joint_count:
@@ -1140,9 +1075,9 @@ class SolverFeatherPGS(SolverBase):
             return state_out
 
         if self.storage == "batched":
-            self._step_batched(state_in, state_out, state_aug, control, contacts, dt, collide_done_event)
+            self._step_batched(state_in, state_out, state_aug, control, contacts, dt)
         else:
-            self._step_flat(state_in, state_out, state_aug, control, contacts, dt, collide_done_event)
+            self._step_flat(state_in, state_out, state_aug, control, contacts, dt)
 
         self._step += 1
         return state_out
@@ -1232,7 +1167,6 @@ class SolverFeatherPGS(SolverBase):
         control: Control,
         contacts: Contacts,
         dt: float,
-        collide_done_event=None,
     ):
         model = self.model
 
@@ -1272,10 +1206,6 @@ class SolverFeatherPGS(SolverBase):
             self._stage3_trisolve_flat_loop(state_aug)
 
         self._stage3_compute_v_hat(state_in, state_aug, dt)
-
-        # Wait for pipelined collide (if running on separate stream)
-        if collide_done_event is not None:
-            wp.get_stream(model.device).wait_event(collide_done_event)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 4: Build contact problem
@@ -1367,17 +1297,8 @@ class SolverFeatherPGS(SolverBase):
         control: Control,
         contacts: Contacts,
         dt: float,
-        collide_done_event=None,
     ):
         model = self.model
-
-        # Double-buffer: select buffer set and wait for its memset to finish
-        if self._memset_stream is not None:
-            self.H_by_size = self._H_bufs[self._buf_idx]
-            self.J_by_size = self._J_bufs[self._buf_idx]
-            evt = self._memset_done_event[self._buf_idx]
-            if evt is not None:
-                wp.get_stream(model.device).wait_event(evt)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 1: FK/ID + drives + CRBA
@@ -1420,10 +1341,6 @@ class SolverFeatherPGS(SolverBase):
                         self._stage3_trisolve_batched_loop(size, state_aug)
 
             self._stage3_compute_v_hat(state_in, state_aug, dt)
-
-        # Wait for pipelined collide (if running on separate stream)
-        if collide_done_event is not None:
-            wp.get_stream(model.device).wait_event(collide_done_event)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 4: Build contact problem
@@ -1687,18 +1604,6 @@ class SolverFeatherPGS(SolverBase):
             self._stage6_update_qdd(state_in, state_aug, dt)
 
             self._stage6_integrate(state_in, state_aug, state_out, dt)
-
-        # Double-buffer: fork memset stream to zero current buffer for reuse.
-        # ScopedStream(sync_enter=True) records an event on the main stream and
-        # makes the memset stream wait — this is what forks it into graph capture.
-        if self._memset_stream is not None:
-            with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
-                with wp.ScopedStream(self._memset_stream):
-                    for size in self.size_groups:
-                        self._H_bufs[self._buf_idx][size].zero_()
-                        self._J_bufs[self._buf_idx][size].zero_()
-                self._memset_done_event[self._buf_idx] = self._memset_stream.record_event()
-                self._buf_idx = 1 - self._buf_idx
 
     def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State):
         model = self.model
@@ -2045,8 +1950,7 @@ class SolverFeatherPGS(SolverBase):
 
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
-            if self._H_bufs is None:  # not double-buffered
-                self.H_by_size[size].zero_()
+            self.H_by_size[size].zero_()
             wp.launch(
                 crba_fill_batched_par_dof,
                 dim=int(n_arts * size),
@@ -2428,9 +2332,8 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-            if self._H_bufs is None:  # not double-buffered
-                for size in self.size_groups:
-                    self.J_by_size[size].zero_()
+            for size in self.size_groups:
+                self.J_by_size[size].zero_()
 
             for size in self.size_groups:
                 wp.launch(
