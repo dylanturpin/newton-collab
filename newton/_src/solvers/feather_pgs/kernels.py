@@ -1787,6 +1787,8 @@ def allocate_world_contact_slots(
         # Matrix-free path
         slot = wp.atomic_add(mf_slot_counter, world, slots_needed)
         if slot + slots_needed > mf_max_constraints:
+            # Roll back the counter so finalize sees only filled slots
+            wp.atomic_add(mf_slot_counter, world, -slots_needed)
             contact_slot[c] = -1
             contact_path[c] = -1
             return
@@ -1799,6 +1801,8 @@ def allocate_world_contact_slots(
         # Dense path
         slot = wp.atomic_add(world_slot_counter, world, slots_needed)
         if slot + slots_needed > max_constraints:
+            # Roll back the counter so finalize sees only filled slots
+            wp.atomic_add(world_slot_counter, world, -slots_needed)
             contact_slot[c] = -1
             contact_path[c] = -1
             return
