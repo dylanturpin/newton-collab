@@ -3197,6 +3197,7 @@ def compute_mf_effective_mass_and_rhs(
     pgs_cfm: float,
     pgs_beta: float,
     dt: float,
+    mf_max_constraints: int,
     # outputs
     mf_eff_mass_inv: wp.array2d(dtype=float),
     mf_MiJt_a: wp.array3d(dtype=float),
@@ -3214,70 +3215,72 @@ def compute_mf_effective_mass_and_rhs(
     RHS stores only the stabilization bias (not J*v), since the MF PGS
     recomputes J*v each iteration from the live velocity array.
     """
-    world = wp.tid()
-    m = mf_constraint_count[world]
+    tid = wp.tid()
+    world = tid // mf_max_constraints
+    i = tid % mf_max_constraints
+    if i >= mf_constraint_count[world]:
+        return
 
-    for i in range(m):
-        ba = mf_body_a[world, i]
-        bb = mf_body_b[world, i]
+    ba = mf_body_a[world, i]
+    bb = mf_body_b[world, i]
 
-        # Load Jacobian as spatial_vector
-        Ja = wp.spatial_vector(
-            mf_J_a[world, i, 0],
-            mf_J_a[world, i, 1],
-            mf_J_a[world, i, 2],
-            mf_J_a[world, i, 3],
-            mf_J_a[world, i, 4],
-            mf_J_a[world, i, 5],
-        )
-        Jb = wp.spatial_vector(
-            mf_J_b[world, i, 0],
-            mf_J_b[world, i, 1],
-            mf_J_b[world, i, 2],
-            mf_J_b[world, i, 3],
-            mf_J_b[world, i, 4],
-            mf_J_b[world, i, 5],
-        )
+    # Load Jacobian as spatial_vector
+    Ja = wp.spatial_vector(
+        mf_J_a[world, i, 0],
+        mf_J_a[world, i, 1],
+        mf_J_a[world, i, 2],
+        mf_J_a[world, i, 3],
+        mf_J_a[world, i, 4],
+        mf_J_a[world, i, 5],
+    )
+    Jb = wp.spatial_vector(
+        mf_J_b[world, i, 0],
+        mf_J_b[world, i, 1],
+        mf_J_b[world, i, 2],
+        mf_J_b[world, i, 3],
+        mf_J_b[world, i, 4],
+        mf_J_b[world, i, 5],
+    )
 
-        d = pgs_cfm
+    d = pgs_cfm
 
-        # Side A: MiJt_a = H_a_inv * J_a, d += J_a^T * MiJt_a
-        if ba >= 0:
-            Hinv_a = mf_body_Hinv[ba]
-            MiJt_a = Hinv_a * Ja
-            d += wp.dot(Ja, MiJt_a)
-            mf_MiJt_a[world, i, 0] = MiJt_a[0]
-            mf_MiJt_a[world, i, 1] = MiJt_a[1]
-            mf_MiJt_a[world, i, 2] = MiJt_a[2]
-            mf_MiJt_a[world, i, 3] = MiJt_a[3]
-            mf_MiJt_a[world, i, 4] = MiJt_a[4]
-            mf_MiJt_a[world, i, 5] = MiJt_a[5]
+    # Side A: MiJt_a = H_a_inv * J_a, d += J_a^T * MiJt_a
+    if ba >= 0:
+        Hinv_a = mf_body_Hinv[ba]
+        MiJt_a = Hinv_a * Ja
+        d += wp.dot(Ja, MiJt_a)
+        mf_MiJt_a[world, i, 0] = MiJt_a[0]
+        mf_MiJt_a[world, i, 1] = MiJt_a[1]
+        mf_MiJt_a[world, i, 2] = MiJt_a[2]
+        mf_MiJt_a[world, i, 3] = MiJt_a[3]
+        mf_MiJt_a[world, i, 4] = MiJt_a[4]
+        mf_MiJt_a[world, i, 5] = MiJt_a[5]
 
-        # Side B
-        if bb >= 0:
-            Hinv_b = mf_body_Hinv[bb]
-            MiJt_b = Hinv_b * Jb
-            d += wp.dot(Jb, MiJt_b)
-            mf_MiJt_b[world, i, 0] = MiJt_b[0]
-            mf_MiJt_b[world, i, 1] = MiJt_b[1]
-            mf_MiJt_b[world, i, 2] = MiJt_b[2]
-            mf_MiJt_b[world, i, 3] = MiJt_b[3]
-            mf_MiJt_b[world, i, 4] = MiJt_b[4]
-            mf_MiJt_b[world, i, 5] = MiJt_b[5]
+    # Side B
+    if bb >= 0:
+        Hinv_b = mf_body_Hinv[bb]
+        MiJt_b = Hinv_b * Jb
+        d += wp.dot(Jb, MiJt_b)
+        mf_MiJt_b[world, i, 0] = MiJt_b[0]
+        mf_MiJt_b[world, i, 1] = MiJt_b[1]
+        mf_MiJt_b[world, i, 2] = MiJt_b[2]
+        mf_MiJt_b[world, i, 3] = MiJt_b[3]
+        mf_MiJt_b[world, i, 4] = MiJt_b[4]
+        mf_MiJt_b[world, i, 5] = MiJt_b[5]
 
-        if d > 0.0:
-            mf_eff_mass_inv[world, i] = 1.0 / d
-        else:
-            mf_eff_mass_inv[world, i] = 0.0
+    if d > 0.0:
+        mf_eff_mass_inv[world, i] = 1.0 / d
+    else:
+        mf_eff_mass_inv[world, i] = 0.0
 
-        # Baumgarte stabilization bias only (not J*v -- recomputed each PGS iter)
-        bias = float(0.0)
-        rtype = mf_row_type[world, i]
-        if rtype == PGS_CONSTRAINT_TYPE_CONTACT:
-            phi_val = mf_phi[world, i]
-            bias = pgs_beta / dt * wp.min(phi_val, 0.0)
+    # Baumgarte stabilization bias only (not J*v -- recomputed each PGS iter)
+    bias = float(0.0)
+    rtype = mf_row_type[world, i]
+    if rtype == PGS_CONSTRAINT_TYPE_CONTACT:
+        phi_val = mf_phi[world, i]
+        bias = pgs_beta / dt * wp.min(phi_val, 0.0)
 
-        mf_rhs[world, i] = bias
+    mf_rhs[world, i] = bias
 
 
 @wp.kernel

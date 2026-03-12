@@ -3031,7 +3031,7 @@ class SolverFeatherPGS(SolverBase):
         self.mf_eff_mass_inv.zero_()
         wp.launch(
             compute_mf_effective_mass_and_rhs,
-            dim=self.world_count,
+            dim=self.world_count * self.mf_max_constraints,
             inputs=[
                 self.mf_constraint_count,
                 self.mf_body_a,
@@ -3044,6 +3044,7 @@ class SolverFeatherPGS(SolverBase):
                 self.pgs_cfm,
                 self.pgs_beta,
                 dt,
+                self.mf_max_constraints,
             ],
             outputs=[
                 self.mf_eff_mass_inv,
