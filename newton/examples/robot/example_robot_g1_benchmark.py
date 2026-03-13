@@ -139,7 +139,6 @@ class Example:
                 "dense_max_constraints": dense_max_constraints,
                 "pgs_warmstart": pgs_warmstart,
                 "enable_contact_friction": True,
-                "storage": "flat",
                 "cholesky_kernel": "auto",
                 "trisolve_kernel": "auto",
                 "hinv_jt_kernel": "auto",

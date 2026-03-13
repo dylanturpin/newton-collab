@@ -1018,87 +1018,6 @@ def compute_composite_inertia(
             body_I_c[parent_idx] += body_I_c[child_idx]
 
 
-@wp.kernel
-def crba_fill_flat_par_dof(
-    articulation_start: wp.array(dtype=int),
-    articulation_dof_start: wp.array(dtype=int),
-    articulation_H_start: wp.array(dtype=int),
-    articulation_H_rows: wp.array(dtype=int),
-    mass_update_mask: wp.array(dtype=int),
-    joint_ancestor: wp.array(dtype=int),
-    joint_qd_start: wp.array(dtype=int),
-    joint_dof_dim: wp.array(dtype=int, ndim=2),
-    joint_S_s: wp.array(dtype=wp.spatial_vector),
-    body_I_c: wp.array(dtype=wp.spatial_matrix),
-    max_dofs: int,
-    # outputs
-    H: wp.array(dtype=float),
-):
-    tid = wp.tid()
-
-    art_idx = tid // max_dofs
-    col_idx = tid % max_dofs
-
-    if mass_update_mask[art_idx] == 0:
-        return
-
-    num_dofs = articulation_H_rows[art_idx]
-    if col_idx >= num_dofs:
-        return
-
-    global_dof_start = articulation_dof_start[art_idx]
-    target_dof_global = global_dof_start + col_idx
-
-    joint_start = articulation_start[art_idx]
-    joint_end = articulation_start[art_idx + 1]
-
-    pivot_joint = int(-1)
-
-    if pivot_joint == -1:
-        for j in range(joint_start, joint_end):
-            q_start = joint_qd_start[j]
-            q_end = joint_qd_start[j + 1]
-            if target_dof_global >= q_start and target_dof_global < q_end:
-                pivot_joint = j
-                break
-
-    if pivot_joint == -1:
-        return
-
-    # Compute Force F = I_c[pivot] * S[column]
-    S_col = joint_S_s[target_dof_global]
-    I_comp = body_I_c[pivot_joint]
-    F = I_comp * S_col
-
-    # Walk up the tree and project F onto ancestors
-    # H[row, col] = S[row] * F
-
-    curr = pivot_joint
-    H_base = articulation_H_start[art_idx]
-    stride = num_dofs
-
-    while curr != -1:
-        if curr < joint_start:
-            break
-
-        q_start = joint_qd_start[curr]
-        q_dim = joint_dof_dim[curr]
-        count = q_dim[0] + q_dim[1]
-
-        dof_offset_local = q_start - global_dof_start
-
-        for k in range(count):
-            row_idx = dof_offset_local + k
-
-            S_row = joint_S_s[q_start + k]
-            val = wp.dot(S_row, F)
-
-            H[H_base + row_idx * stride + col_idx] = val
-            H[H_base + col_idx * stride + row_idx] = val
-
-        curr = joint_ancestor[curr]
-
-
 @wp.func
 def dense_cholesky(
     n: int,
@@ -1132,29 +1051,7 @@ def dense_cholesky(
 
 
 @wp.kernel
-def cholesky_flat_loop(
-    A_starts: wp.array(dtype=int),
-    A_dim: wp.array(dtype=int),
-    A: wp.array(dtype=float),
-    R: wp.array(dtype=float),
-    mass_update_mask: wp.array(dtype=int),
-    L: wp.array(dtype=float),
-):
-    """Flat layout, loop-based Cholesky (one thread per articulation)."""
-    batch = wp.tid()
-
-    if mass_update_mask[batch] == 0:
-        return
-
-    n = A_dim[batch]
-    A_start = A_starts[batch]
-    R_start = n * batch
-
-    dense_cholesky(n, A, R, A_start, R_start, L)
-
-
-@wp.kernel
-def cholesky_batched_loop(
+def cholesky_loop(
     H_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
     R_group: wp.array2d(dtype=float),  # [n_arts, n_dofs]
     group_to_art: wp.array(dtype=int),
@@ -1241,24 +1138,6 @@ def dense_solve(
 ):
     # helper function to include tmp argument for backward pass
     dense_subs(n, L_start, b_start, L, b, x)
-
-
-@wp.kernel
-def trisolve_flat_loop(
-    L_start: wp.array(dtype=int),
-    L_dim: wp.array(dtype=int),
-    b_start: wp.array(dtype=int),
-    A: wp.array(dtype=float),
-    L: wp.array(dtype=float),
-    b: wp.array(dtype=float),
-    # outputs
-    x: wp.array(dtype=float),
-    tmp: wp.array(dtype=float),
-):
-    """Flat layout, loop-based triangular solve (one thread per articulation)."""
-    batch = wp.tid()
-
-    dense_solve(L_dim[batch], L_start[batch], b_start[batch], A, L, b, x, tmp)
 
 
 @wp.kernel
@@ -2405,187 +2284,6 @@ def apply_augmented_joint_tau(
 
 
 @wp.kernel
-def hinv_jt_flat_par_row(
-    articulation_H_start: wp.array(dtype=int),
-    articulation_H_rows: wp.array(dtype=int),
-    max_constraints: int,
-    max_dofs: int,
-    constraint_counts: wp.array(dtype=int),
-    L: wp.array(dtype=float),
-    J_rows: wp.array(dtype=float),
-    # outputs
-    Y_rows: wp.array(dtype=float),
-):
-    """Flat layout, par-row H^-1 J^T (one thread per (articulation, constraint))."""
-    # One thread per (articulation, local_constraint)
-    tid = wp.tid()
-
-    articulation = tid // max_constraints
-    local_constraint = tid - articulation * max_constraints  # tid % max_constraints
-
-    m = constraint_counts[articulation]
-    n = articulation_H_rows[articulation]
-
-    # Nothing to do if no dofs or this constraint index is unused
-    if n == 0 or local_constraint >= m:
-        return
-
-    L_start = articulation_H_start[articulation]
-    stride = n
-
-    # Base index into the flattened [articulation, constraint, dof] buffer
-    row_base = (articulation * max_constraints + local_constraint) * max_dofs
-
-    # ----------------------------------------------------------------------
-    # Forward substitution: solve L * y = J_row
-    # ----------------------------------------------------------------------
-    for row in range(n):
-        s = J_rows[row_base + row]
-
-        # subtract contributions from previously solved entries
-        for k in range(row):
-            s -= L[L_start + dense_index(stride, row, k)] * Y_rows[row_base + k]
-
-        diag = L[L_start + dense_index(stride, row, row)]
-        if diag != 0.0:
-            Y_rows[row_base + row] = s / diag
-        else:
-            Y_rows[row_base + row] = 0.0
-
-    # ----------------------------------------------------------------------
-    # Backward substitution: solve L^T * x = y
-    # ----------------------------------------------------------------------
-    for row in range(n - 1, -1, -1):
-        s = Y_rows[row_base + row]
-
-        for k in range(row + 1, n):
-            s -= L[L_start + dense_index(stride, k, row)] * Y_rows[row_base + k]
-
-        diag = L[L_start + dense_index(stride, row, row)]
-        if diag != 0.0:
-            Y_rows[row_base + row] = s / diag
-        else:
-            Y_rows[row_base + row] = 0.0
-
-    # Zero-pad up to max_dofs for safety / consistency
-    for row in range(n, max_dofs):
-        Y_rows[row_base + row] = 0.0
-
-
-@wp.kernel
-def delassus_flat_par_row(
-    articulation_H_rows: wp.array(dtype=int),
-    max_constraints: int,
-    max_dofs: int,
-    constraint_counts: wp.array(dtype=int),
-    J_rows: wp.array(dtype=float),
-    Y_rows: wp.array(dtype=float),
-    row_cfm: wp.array(dtype=float),
-    # outputs
-    diag_out: wp.array(dtype=float),
-    matrix_out: wp.array(dtype=float),
-):
-    """Flat layout, par-row Delassus accumulation (one thread per row)."""
-    idx = wp.tid()
-    articulation = idx // max_constraints
-    i_row = idx % max_constraints
-
-    m = constraint_counts[articulation]
-    n = articulation_H_rows[articulation]
-    if i_row >= m or n == 0:
-        return
-
-    diag_base = articulation * max_constraints
-    mat_base = articulation * max_constraints * max_constraints
-
-    row_i = (articulation * max_constraints + i_row) * max_dofs
-
-    # diag
-    diag_val = float(0.0)
-    for k in range(n):
-        diag_val += J_rows[row_i + k] * Y_rows[row_i + k]
-    cfm = row_cfm[diag_base + i_row]
-    diag_out[diag_base + i_row] = diag_val + cfm
-
-    # off-diagonals
-    for j in range(m):
-        row_j = (articulation * max_constraints + j) * max_dofs
-        s = float(0.0)
-        for k in range(n):
-            s += J_rows[row_i + k] * Y_rows[row_j + k]
-        matrix_out[mat_base + i_row * max_constraints + j] = s
-
-
-@wp.kernel
-def contact_bias_flat_par_row(
-    articulation_dof_start: wp.array(dtype=int),
-    articulation_H_rows: wp.array(dtype=int),
-    constraint_counts: wp.array(dtype=int),
-    articulation_count: int,
-    max_constraints: int,
-    max_dofs: int,
-    J_rows: wp.array(dtype=float),
-    v_hat: wp.array(dtype=float),
-    phi: wp.array(dtype=float),
-    row_beta: wp.array(dtype=float),
-    row_types: wp.array(dtype=int),
-    target_velocity: wp.array(dtype=float),
-    dt: float,
-    # outputs
-    rhs_out: wp.array(dtype=float),
-):
-    """Parallelized contact bias computation - one thread per constraint slot.
-
-    Launched with dim = articulation_count * max_constraints.
-    Each thread computes J*v_hat for one constraint and the corresponding RHS.
-    """
-    tid = wp.tid()
-    articulation = tid // max_constraints
-    constraint_idx = tid % max_constraints
-
-    # Bounds check
-    if articulation >= articulation_count:
-        return
-
-    m = constraint_counts[articulation]
-    if constraint_idx >= m:
-        return
-
-    n = articulation_H_rows[articulation]
-    if n == 0:
-        return
-
-    dof_start = articulation_dof_start[articulation]
-    row_base = tid * max_dofs  # = (articulation * max_constraints + constraint_idx) * max_dofs
-    rhs_idx = articulation * max_constraints + constraint_idx
-
-    # Compute J * v_hat (dot product)
-    rel_vel = float(0.0)
-    for k in range(n):
-        rel_vel += J_rows[row_base + k] * v_hat[dof_start + k]
-
-    # Load constraint parameters
-    gap = phi[rhs_idx]
-    beta_val = row_beta[rhs_idx]
-    constraint_type = row_types[rhs_idx]
-    target_vel = target_velocity[rhs_idx]
-
-    # Compute RHS based on constraint type
-    if constraint_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        rhs = rel_vel - target_vel
-        if gap < 0.0:
-            rhs += beta_val * gap / dt
-        rhs_out[rhs_idx] = rhs
-    elif constraint_type == PGS_CONSTRAINT_TYPE_FRICTION:
-        rhs_out[rhs_idx] = rel_vel - target_vel
-    elif constraint_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
-        correction = beta_val * gap / dt
-        rhs_out[rhs_idx] = rel_vel - target_vel + correction
-    else:
-        rhs_out[rhs_idx] = rel_vel
-
-
-@wp.kernel
 def prepare_impulses(
     constraint_counts: wp.array(dtype=int),
     max_constraints: int,
@@ -2600,44 +2298,6 @@ def prepare_impulses(
     for i in range(max_constraints):
         if warmstart == 0 or i >= m:
             impulses[base + i] = 0.0
-
-
-@wp.kernel
-def apply_impulses_flat_par_dof(
-    articulation_dof_start: wp.array(dtype=int),
-    articulation_H_rows: wp.array(dtype=int),
-    constraint_counts: wp.array(dtype=int),
-    max_constraints: int,
-    max_dofs: int,
-    Y_rows: wp.array(dtype=float),
-    v_hat: wp.array(dtype=float),
-    impulses: wp.array(dtype=float),
-    # outputs
-    v_out: wp.array(dtype=float),
-):
-    tid = wp.tid()
-
-    articulation = tid // max_dofs
-    local_dof = tid % max_dofs
-
-    num_dofs = articulation_H_rows[articulation]
-    if local_dof >= num_dofs:
-        return
-
-    num_constraints = constraint_counts[articulation]
-    dof_start = articulation_dof_start[articulation]
-
-    delta_v = float(0.0)
-
-    for i in range(num_constraints):
-        row_start = (articulation * max_constraints + i) * max_dofs
-        y_val = Y_rows[row_start + local_dof]
-
-        impulse_val = impulses[articulation * max_constraints + i]
-
-        delta_v += y_val * impulse_val
-
-    v_out[dof_start + local_dof] = v_hat[dof_start + local_dof] + delta_v
 
 
 @wp.kernel
@@ -2665,8 +2325,8 @@ def clamp_joint_tau(
 
 
 # --- Tile configuration for contact system build ---
-# Kernel naming: {op}_{layout}_{parallelism}
-# layout: flat | batched, parallelism: tiled | loop | par_row | par_row_col | par_dof
+# Kernel naming: {op}_{parallelism}
+# parallelism: tiled | loop | par_row | par_row_col | par_dof
 
 # Max generalized dofs per articulation we support in the tiled path.
 # joint_dof_count per articulation must be <= TILE_DOF or we use fall back
@@ -3663,7 +3323,7 @@ def finalize_world_diag_cfm(
 
 
 @wp.kernel
-def hinv_jt_batched_par_row(
+def hinv_jt_par_row(
     # Grouped Cholesky factor storage [n_arts, n_dofs, n_dofs]
     L_group: wp.array3d(dtype=float),
     # Size-grouped Jacobian [n_arts_of_size, max_constraints, n_dofs]
@@ -3682,7 +3342,7 @@ def hinv_jt_batched_par_row(
     """
     Compute Y = H^-1 * J^T for one size group using forward/backward substitution.
 
-    GROUPED STORAGE VERSION: Uses L_group (3D array) instead of flat L.
+    Uses L_group (3D array) grouped by DOF size.
     Efficient for small articulations where tile overhead dominates.
 
     Each thread handles one (articulation, constraint) pair.
@@ -3754,7 +3414,7 @@ def hinv_jt_batched_par_row(
 
 
 @wp.kernel
-def delassus_batched_par_row_col(
+def delassus_par_row_col(
     # Size-grouped arrays
     J_group: wp.array3d(dtype=float),  # [n_arts_of_size, max_constraints, n_dofs]
     Y_group: wp.array3d(dtype=float),  # [n_arts_of_size, max_constraints, n_dofs]
@@ -3820,7 +3480,7 @@ def delassus_batched_par_row_col(
 
 
 @wp.kernel
-def crba_fill_batched_par_dof(
+def crba_fill_par_dof(
     articulation_start: wp.array(dtype=int),
     articulation_dof_start: wp.array(dtype=int),
     mass_update_mask: wp.array(dtype=int),
@@ -3908,7 +3568,7 @@ def crba_fill_batched_par_dof(
 
 
 @wp.kernel
-def trisolve_batched_loop(
+def trisolve_loop(
     L_group: wp.array3d(dtype=float),  # [n_arts_of_size, n_dofs, n_dofs]
     group_to_art: wp.array(dtype=int),
     articulation_dof_start: wp.array(dtype=int),
@@ -3964,7 +3624,7 @@ def gather_tau_to_groups(
     n_dofs: int,
     tau_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, 1]
 ):
-    """Gather joint_tau from flat array into grouped 3D buffer for tiled solve.
+    """Gather joint_tau from 1D array into grouped 3D buffer for tiled solve.
 
     Thread dimension: n_arts_of_size (one thread per articulation in this size group)
     """
@@ -3983,7 +3643,7 @@ def scatter_qdd_from_groups(
     n_dofs: int,
     joint_qdd: wp.array(dtype=float),  # [total_dofs]
 ):
-    """Scatter qdd from grouped 3D buffer back to flat array after tiled solve.
+    """Scatter qdd from grouped 3D buffer back to 1D array after tiled solve.
 
     Thread dimension: n_arts_of_size (one thread per articulation in this size group)
     """

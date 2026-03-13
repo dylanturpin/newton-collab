@@ -41,7 +41,6 @@ EXPANSION_FIELD_ORDER = (
     "camera_yaw",
 )
 SOLVER_OVERRIDE_FIELDS = (
-    "storage",
     "cholesky_kernel",
     "trisolve_kernel",
     "hinv_jt_kernel",
@@ -78,7 +77,6 @@ BENCHMARK_OPTION_FIELDS = {
     "warmup_frames",
     "measure_frames",
     "viewer",
-    "storage",
     "cholesky_kernel",
     "trisolve_kernel",
     "hinv_jt_kernel",
@@ -114,7 +112,6 @@ RENDER_OPTION_FIELDS = {
     "camera_pos",
     "camera_pitch",
     "camera_yaw",
-    "storage",
     "cholesky_kernel",
     "trisolve_kernel",
     "hinv_jt_kernel",
