@@ -540,9 +540,9 @@ class SolverFeatherPGS(SolverBase):
 
         An articulation is "free rigid" if it has exactly 1 joint, that joint
         is FREE type, and the joint parent is -1 (world). These can be solved
-        with a cheaper matrix-free PGS path. Gated on ``pgs_mode`` != "delassus".
+        with a cheaper matrix-free PGS path.
         """
-        if self.pgs_mode == "delassus" or not model.articulation_count or not model.joint_count:
+        if not model.articulation_count or not model.joint_count:
             self._has_free_rigid_bodies = False
             self._has_mixed_contacts = False
             self._n_free_rigid = 0
@@ -845,7 +845,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _allocate_mf_buffers(self, model):
         """Allocate buffers for matrix-free PGS path for free rigid body contacts."""
-        if not self._has_free_rigid_bodies and self.pgs_mode != "velocity":
+        if self.pgs_mode == "delassus" or (not self._has_free_rigid_bodies and self.pgs_mode != "velocity"):
             return
 
         device = model.device
@@ -1245,8 +1245,8 @@ class SolverFeatherPGS(SolverBase):
                     device=self.model.device,
                 )
 
-        elif self._has_mixed_contacts:
-            # Interleaved: dense and MF alternate, 1 iteration each
+        elif self.pgs_mode == "hybrid" and self._has_mixed_contacts:
+            # Hybrid with mixed contacts: interleaved dense and MF, 1 iteration each
             self._mf_pgs_setup(state_aug, dt)
             self.v_mf_accum.zero_()
 
@@ -1302,14 +1302,14 @@ class SolverFeatherPGS(SolverBase):
             # v_out is already final (includes both dense and MF corrections)
 
         else:
-            # Non-mixed: run dense and MF sequentially
+            # Delassus or hybrid without mixed contacts: dense PGS, then optional MF
             self._dispatch_dense_pgs_solve(iterations=self.pgs_iterations)
 
             self._stage6_prepare_world_velocity()
             for size in self.size_groups:
                 self._stage6_apply_impulses_world(size)
 
-            if self._has_free_rigid_bodies:
+            if self.pgs_mode == "hybrid" and self._has_free_rigid_bodies:
                 self._stage6b_mf_pgs(state_aug, dt)
 
         # ══════════════════════════════════════════════════════════════
@@ -1884,7 +1884,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_build_rows(self, state_in: State, state_aug: State, contacts: Contacts):
         model = self.model
         max_constraints = self.dense_max_constraints
-        mf_active = self._has_free_rigid_bodies
+        mf_active = self._has_free_rigid_bodies and self.pgs_mode != "delassus"
 
         # Zero world-level buffers (only arrays that require it)
         self.slot_counter.zero_()  # atomic-add counter
@@ -2367,7 +2367,7 @@ class SolverFeatherPGS(SolverBase):
         self._mf_pgs_solve(self.pgs_iterations)
 
     def _mf_pgs_setup(self, state_aug: State, dt: float):
-        """MF PGS setup: compute Hinv, build body map, compute effective mass and RHS."""
+        """MF PGS setup: compute Hinv, compute effective mass and RHS."""
         model = self.model
 
         # Compute H^-1 = inverse(body_I_s) for free rigid bodies
@@ -2380,28 +2380,6 @@ class SolverFeatherPGS(SolverBase):
                 self.body_to_articulation,
             ],
             outputs=[self.mf_body_Hinv],
-            device=model.device,
-        )
-
-        # Build compact body map for streaming kernel
-        wp.launch(
-            build_mf_body_map,
-            dim=self.world_count,
-            inputs=[
-                self.mf_constraint_count,
-                self.mf_body_a,
-                self.mf_body_b,
-                self.body_to_articulation,
-                self.articulation_dof_start,
-                self.max_mf_bodies,
-            ],
-            outputs=[
-                self.mf_body_list,
-                self.mf_body_dof_start,
-                self.mf_body_count,
-                self.mf_local_body_a,
-                self.mf_local_body_b,
-            ],
             device=model.device,
         )
 
@@ -2436,6 +2414,28 @@ class SolverFeatherPGS(SolverBase):
     def _mf_pgs_solve(self, iterations: int):
         """MF PGS solve with given iteration count."""
         model = self.model
+
+        # Build compact body map for standalone MF kernel
+        wp.launch(
+            build_mf_body_map,
+            dim=self.world_count,
+            inputs=[
+                self.mf_constraint_count,
+                self.mf_body_a,
+                self.mf_body_b,
+                self.body_to_articulation,
+                self.articulation_dof_start,
+                self.max_mf_bodies,
+            ],
+            outputs=[
+                self.mf_body_list,
+                self.mf_body_dof_start,
+                self.mf_body_count,
+                self.mf_local_body_a,
+                self.mf_local_body_b,
+            ],
+            device=model.device,
+        )
 
         if model.device.is_cuda:
             mf_pgs_kernel = TiledKernelFactory.get_pgs_solve_mf_kernel(
