@@ -72,6 +72,7 @@ from .kernels import (
     gather_tau_to_groups,
     hinv_jt_par_row,
     integrate_generalized_joints,
+    pgs_convergence_diagnostic_velocity,
     pgs_solve_loop,
     pgs_solve_mf_loop,
     populate_world_J_for_size,
@@ -179,6 +180,7 @@ class SolverFeatherPGS(SolverBase):
         use_parallel_streams: bool = True,
         double_buffer: bool = True,
         nvtx: bool = False,
+        pgs_debug: bool = False,
     ):
         """
         Args:
@@ -243,6 +245,8 @@ class SolverFeatherPGS(SolverBase):
         self.mf_max_constraints = mf_max_constraints
         self._double_buffer = double_buffer
         self._nvtx = nvtx
+        self.pgs_debug = pgs_debug
+        self._pgs_convergence_log: list[np.ndarray] = []
 
         valid_cholesky = {"tiled", "loop", "auto"}
         if cholesky_kernel not in valid_cholesky:
@@ -284,6 +288,7 @@ class SolverFeatherPGS(SolverBase):
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
         self._allocate_mf_buffers(model)
+        self._allocate_debug_buffers(model)
         self._scatter_armature_to_groups(model)
         self._init_size_group_streams(model)
 
@@ -896,6 +901,22 @@ class SolverFeatherPGS(SolverBase):
         self.mf_local_body_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_local_body_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
 
+    def _allocate_debug_buffers(self, model):
+        """Allocate buffers for PGS convergence diagnostics."""
+        if not self.pgs_debug:
+            return
+        device = model.device
+        worlds = self.world_count
+        max_c = self.dense_max_constraints
+        mf_max_c = self.mf_max_constraints
+
+        self._diag_metrics = wp.zeros((worlds, 4), dtype=wp.float32, device=device)
+        self._diag_prev_impulses = wp.zeros((worlds, max_c), dtype=wp.float32, device=device)
+        if hasattr(self, "mf_impulses"):
+            self._diag_prev_mf_impulses = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device)
+        else:
+            self._diag_prev_mf_impulses = None
+
     def _scatter_armature_to_groups(self, model):
         """Copy armature from model (DOF-ordered) to size-grouped storage."""
         if not self.size_groups:
@@ -1206,38 +1227,125 @@ class SolverFeatherPGS(SolverBase):
                     self.max_world_dofs,
                     self.model.device,
                 )
-                wp.launch_tiled(
-                    mf_gs_kernel,
-                    dim=[self.world_count],
-                    inputs=[
-                        # Dense
-                        self.constraint_count,
-                        self.world_dof_start,
-                        self.rhs,
-                        self.diag,
-                        self.impulses,
-                        self.J_world,
-                        self.Y_world,
-                        self.row_type,
-                        self.row_parent,
-                        self.row_mu,
-                        # MF
-                        self.mf_constraint_count,
-                        self.mf_meta_packed,
-                        self.mf_impulses,
-                        self.mf_J_a,
-                        self.mf_J_b,
-                        self.mf_MiJt_a,
-                        self.mf_MiJt_b,
-                        self.mf_row_mu,
-                        # Shared
-                        self.pgs_iterations,
-                        self.pgs_omega,
-                    ],
-                    outputs=[self.v_out],
-                    block_dim=32,
-                    device=self.model.device,
-                )
+
+                if self.pgs_debug:
+                    self._pgs_convergence_log.append([])
+                    for _pgs_dbg_iter in range(self.pgs_iterations):
+                        # Snapshot impulses before this iteration
+                        wp.copy(self._diag_prev_impulses, self.impulses)
+                        if self._diag_prev_mf_impulses is not None:
+                            wp.copy(self._diag_prev_mf_impulses, self.mf_impulses)
+
+                        # Run 1 iteration
+                        wp.launch_tiled(
+                            mf_gs_kernel,
+                            dim=[self.world_count],
+                            inputs=[
+                                self.constraint_count,
+                                self.world_dof_start,
+                                self.rhs,
+                                self.diag,
+                                self.impulses,
+                                self.J_world,
+                                self.Y_world,
+                                self.row_type,
+                                self.row_parent,
+                                self.row_mu,
+                                self.mf_constraint_count,
+                                self.mf_meta_packed,
+                                self.mf_impulses,
+                                self.mf_J_a,
+                                self.mf_J_b,
+                                self.mf_MiJt_a,
+                                self.mf_MiJt_b,
+                                self.mf_row_mu,
+                                1,  # iterations=1
+                                self.pgs_omega,
+                            ],
+                            outputs=[self.v_out],
+                            block_dim=32,
+                            device=self.model.device,
+                        )
+
+                        # Diagnostic kernel
+                        wp.launch(
+                            pgs_convergence_diagnostic_velocity,
+                            dim=self.world_count,
+                            inputs=[
+                                self.constraint_count,
+                                self.world_dof_start,
+                                self.rhs,
+                                self.impulses,
+                                self._diag_prev_impulses,
+                                self.row_type,
+                                self.row_parent,
+                                self.row_mu,
+                                self.J_world,
+                                self.dense_max_constraints,
+                                self.max_world_dofs,
+                                self.mf_constraint_count,
+                                self.mf_rhs,
+                                self.mf_impulses,
+                                self._diag_prev_mf_impulses,
+                                self.mf_row_type,
+                                self.mf_row_parent,
+                                self.mf_row_mu,
+                                self.mf_J_a,
+                                self.mf_J_b,
+                                self.mf_dof_a,
+                                self.mf_dof_b,
+                                self.mf_max_constraints,
+                                self.v_out,
+                            ],
+                            outputs=[self._diag_metrics],
+                            device=self.model.device,
+                        )
+
+                        # Sync and reduce across worlds
+                        metrics_np = self._diag_metrics.numpy()
+                        row = np.array([
+                            np.max(metrics_np[:, 0]),   # max|delta_lambda|
+                            np.sum(metrics_np[:, 1]),   # complementarity gap
+                            np.sum(metrics_np[:, 2]),   # tangent residual
+                            np.sum(metrics_np[:, 3]),   # FB merit
+                        ])
+                        self._pgs_convergence_log[-1].append(row)
+
+                    self._pgs_convergence_log[-1] = np.array(self._pgs_convergence_log[-1])
+
+                else:
+                    wp.launch_tiled(
+                        mf_gs_kernel,
+                        dim=[self.world_count],
+                        inputs=[
+                            # Dense
+                            self.constraint_count,
+                            self.world_dof_start,
+                            self.rhs,
+                            self.diag,
+                            self.impulses,
+                            self.J_world,
+                            self.Y_world,
+                            self.row_type,
+                            self.row_parent,
+                            self.row_mu,
+                            # MF
+                            self.mf_constraint_count,
+                            self.mf_meta_packed,
+                            self.mf_impulses,
+                            self.mf_J_a,
+                            self.mf_J_b,
+                            self.mf_MiJt_a,
+                            self.mf_MiJt_b,
+                            self.mf_row_mu,
+                            # Shared
+                            self.pgs_iterations,
+                            self.pgs_omega,
+                        ],
+                        outputs=[self.v_out],
+                        block_dim=32,
+                        device=self.model.device,
+                    )
 
         elif self.pgs_mode == "hybrid" and self._has_mixed_contacts:
             # Hybrid with mixed contacts: interleaved dense and MF, 1 iteration each
@@ -1297,7 +1405,17 @@ class SolverFeatherPGS(SolverBase):
 
         else:
             # Delassus or hybrid without mixed contacts: dense PGS, then optional MF
-            self._dispatch_dense_pgs_solve(iterations=self.pgs_iterations)
+            if self.pgs_debug:
+                self._pgs_convergence_log.append([])
+                for _pgs_dbg_iter in range(self.pgs_iterations):
+                    prev_np = self.impulses.numpy().copy()
+                    self._dispatch_dense_pgs_solve(iterations=1)
+                    cur_np = self.impulses.numpy()
+                    max_delta = float(np.max(np.abs(cur_np - prev_np)))
+                    self._pgs_convergence_log[-1].append(np.array([max_delta, 0.0, 0.0, 0.0]))
+                self._pgs_convergence_log[-1] = np.array(self._pgs_convergence_log[-1])
+            else:
+                self._dispatch_dense_pgs_solve(iterations=self.pgs_iterations)
 
             self._stage6_prepare_world_velocity()
             for size in self.size_groups:

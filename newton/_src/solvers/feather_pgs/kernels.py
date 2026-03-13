@@ -3694,3 +3694,145 @@ def compute_delta_and_accumulate(
     delta = v_out[i] - v_snap[i]
     v_accum[i] = v_accum[i] + delta
     v_snap[i] = delta
+
+
+# =============================================================================
+# PGS Convergence Diagnostic Kernel (velocity-space mode)
+# =============================================================================
+
+
+@wp.kernel
+def pgs_convergence_diagnostic_velocity(
+    # Dense constraints
+    constraint_count: wp.array(dtype=int),
+    world_dof_start: wp.array(dtype=int),
+    rhs: wp.array2d(dtype=float),
+    impulses: wp.array2d(dtype=float),
+    prev_impulses: wp.array2d(dtype=float),
+    row_type: wp.array2d(dtype=int),
+    row_parent: wp.array2d(dtype=int),
+    row_mu: wp.array2d(dtype=float),
+    J_world: wp.array3d(dtype=float),
+    max_constraints: int,
+    max_world_dofs: int,
+    # MF constraints
+    mf_constraint_count: wp.array(dtype=int),
+    mf_rhs: wp.array2d(dtype=float),
+    mf_impulses: wp.array2d(dtype=float),
+    prev_mf_impulses: wp.array2d(dtype=float),
+    mf_row_type: wp.array2d(dtype=int),
+    mf_row_parent: wp.array2d(dtype=int),
+    mf_row_mu: wp.array2d(dtype=float),
+    mf_J_a: wp.array3d(dtype=float),
+    mf_J_b: wp.array3d(dtype=float),
+    mf_dof_a: wp.array2d(dtype=int),
+    mf_dof_b: wp.array2d(dtype=int),
+    mf_max_constraints: int,
+    # Velocity
+    v_out: wp.array(dtype=float),
+    # Output: [worlds, 4]
+    metrics: wp.array2d(dtype=float),
+):
+    """Compute per-world PGS convergence metrics for velocity-space mode.
+
+    Metrics:
+        [0] max|delta_lambda| across all constraint rows
+        [1] sum(lambda_n * residual_n) for normal contacts (complementarity gap)
+        [2] sum(residual_t^2) for sticking friction contacts (tangent residual energy)
+        [3] sum(FB(lambda_n, residual_n)^2) for normal contacts (Fischer-Burmeister)
+    """
+    world = wp.tid()
+
+    m_dense = constraint_count[world]
+    m_mf = mf_constraint_count[world]
+    w_dof_start = world_dof_start[world]
+
+    max_dl = float(0.0)
+    comp_gap = float(0.0)
+    tang_res = float(0.0)
+    fb_merit = float(0.0)
+
+    # --- Dense constraints ---
+    for i in range(m_dense):
+        lam = impulses[world, i]
+        prev_lam = prev_impulses[world, i]
+        dl = wp.abs(lam - prev_lam)
+        if dl > max_dl:
+            max_dl = dl
+
+        # Compute residual: r_i = J_i * v + bias_i
+        jv = float(0.0)
+        for d in range(max_world_dofs):
+            jv += J_world[world, i, d] * v_out[w_dof_start + d]
+        residual = jv + rhs[world, i]
+
+        rt = row_type[world, i]
+        if rt == PGS_CONSTRAINT_TYPE_CONTACT:
+            # Normal: complementarity gap and FB
+            comp_gap += lam * residual
+            fb_val = wp.sqrt(lam * lam + residual * residual) - lam - residual
+            fb_merit += fb_val * fb_val
+        elif rt == PGS_CONSTRAINT_TYPE_FRICTION:
+            # Friction: tangent residual for sticking contacts
+            parent_idx = row_parent[world, i]
+            lambda_n = impulses[world, parent_idx]
+            mu = row_mu[world, i]
+            radius = mu * lambda_n
+            if radius > 0.0:
+                # Check if sticking: |lambda_t| < mu * lambda_n
+                # Get sibling
+                if i == parent_idx + 1:
+                    sib = parent_idx + 2
+                else:
+                    sib = parent_idx + 1
+                lam_t1 = impulses[world, i]
+                lam_t2 = impulses[world, sib]
+                t_mag = wp.sqrt(lam_t1 * lam_t1 + lam_t2 * lam_t2)
+                if t_mag < radius * 0.999:  # sticking (with small tolerance)
+                    tang_res += residual * residual
+
+    # --- MF constraints ---
+    for i in range(m_mf):
+        lam = mf_impulses[world, i]
+        prev_lam = prev_mf_impulses[world, i]
+        dl = wp.abs(lam - prev_lam)
+        if dl > max_dl:
+            max_dl = dl
+
+        # Compute residual: r = J_a * v_a + J_b * v_b + bias
+        dof_a = mf_dof_a[world, i]
+        dof_b = mf_dof_b[world, i]
+        jv = float(0.0)
+        if dof_a >= 0:
+            for k in range(6):
+                jv += mf_J_a[world, i, k] * v_out[dof_a + k]
+        if dof_b >= 0:
+            for k in range(6):
+                jv += mf_J_b[world, i, k] * v_out[dof_b + k]
+        residual = jv + mf_rhs[world, i]
+
+        rt = mf_row_type[world, i]
+        if rt == PGS_CONSTRAINT_TYPE_CONTACT:
+            comp_gap += lam * residual
+            fb_val = wp.sqrt(lam * lam + residual * residual) - lam - residual
+            fb_merit += fb_val * fb_val
+        elif rt == PGS_CONSTRAINT_TYPE_FRICTION:
+            parent_idx = mf_row_parent[world, i]
+            lambda_n = mf_impulses[world, parent_idx]
+            mu = mf_row_mu[world, i]
+            radius = mu * lambda_n
+            if radius > 0.0:
+                if i == parent_idx + 1:
+                    sib = parent_idx + 2
+                else:
+                    sib = parent_idx + 1
+                lam_t1 = mf_impulses[world, i]
+                lam_t2 = mf_impulses[world, sib]
+                t_mag = wp.sqrt(lam_t1 * lam_t1 + lam_t2 * lam_t2)
+                if t_mag < radius * 0.999:
+                    tang_res += residual * residual
+
+    metrics[world, 0] = max_dl
+    metrics[world, 1] = comp_gap
+    metrics[world, 2] = tang_res
+    metrics[world, 3] = fb_merit
