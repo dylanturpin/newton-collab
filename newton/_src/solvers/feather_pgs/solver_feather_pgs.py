@@ -34,21 +34,16 @@ from ..semi_implicit.kernels_particle import (
 )
 from ..solver import SolverBase
 from .kernels import (
-    TILE_CONSTRAINTS,
-    TILE_DOF,
     TILE_THREADS,
     allocate_world_contact_slots,
     apply_augmented_joint_tau,
-    apply_augmented_mass_diagonal,
     apply_augmented_mass_diagonal_grouped,
     apply_impulses_world_par_dof,
     build_augmented_joint_rows,
-    build_contact_rows_normal,
     build_mass_update_mask,
     build_mf_body_map,
     build_mf_contact_rows,
     cholesky_loop,
-    clamp_contact_counts,
     clamp_joint_tau,
     compute_com_transforms,
     compute_composite_inertia,
@@ -80,7 +75,6 @@ from .kernels import (
     pgs_solve_loop,
     pgs_solve_mf_loop,
     populate_world_J_for_size,
-    prepare_impulses,
     prepare_world_impulses,
     rhs_accum_world_par_art,
     scatter_qdd_from_groups,
@@ -1332,7 +1326,6 @@ class SolverFeatherPGS(SolverBase):
                 self._memset_done_event[self._buf_idx] = self._memset_stream.record_event()
                 self._buf_idx = 1 - self._buf_idx
 
-
         self._step += 1
         return state_out
 
@@ -2041,18 +2034,20 @@ class SolverFeatherPGS(SolverBase):
                     device=model.device,
                 )
 
+                slots_per_contact = 3 if self.enable_contact_friction else 1
                 wp.launch(
                     finalize_mf_constraint_counts,
                     dim=self.world_count,
-                    inputs=[self.mf_slot_counter, self.mf_max_constraints],
+                    inputs=[self.mf_slot_counter, self.mf_max_constraints, slots_per_contact],
                     outputs=[self.mf_constraint_count],
                     device=model.device,
                 )
 
+        slots_per_contact_dense = 3 if self.enable_contact_friction else 1
         wp.launch(
             finalize_world_constraint_counts,
             dim=self.world_count,
-            inputs=[self.slot_counter, max_constraints],
+            inputs=[self.slot_counter, max_constraints, slots_per_contact_dense],
             outputs=[self.constraint_count],
             device=model.device,
         )
