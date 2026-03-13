@@ -658,6 +658,7 @@ def create_solver(model, args, scenario_cfg: dict):
             "use_parallel_streams": parallel_streams,
             "double_buffer": args.double_buffer,
             "nvtx": args.nvtx,
+            "pgs_debug": getattr(args, "pgs_debug", False),
         }
         from newton._src.solvers import SolverFeatherPGS  # noqa: PLC0415
 
@@ -789,6 +790,15 @@ def run_direct(args):
         print(f"GPU memory used (GB):   {gpu_used_gb:.3f}")
         print(f"GPU memory total (GB):  {gpu_total_gb:.3f}")
     print("=========================\n")
+
+    # Save convergence data if debug was enabled
+    if getattr(args, "pgs_debug", False) and hasattr(solver, "_pgs_convergence_log") and solver._pgs_convergence_log:
+        import numpy as np  # noqa: PLC0415
+
+        convergence_data = np.stack(solver._pgs_convergence_log)
+        save_path = "pgs_convergence.npy"
+        np.save(save_path, convergence_data)
+        print(f"Saved convergence data: {convergence_data.shape} to {save_path}")
 
     measurement = build_measurement_row(
         args=args,
@@ -1033,6 +1043,15 @@ def run_interactive(args):
 
     viewer.close()
 
+    # Save convergence data if debug was enabled
+    if getattr(args, "pgs_debug", False) and hasattr(solver, "_pgs_convergence_log") and solver._pgs_convergence_log:
+        import numpy as np  # noqa: PLC0415
+
+        convergence_data = np.stack(solver._pgs_convergence_log)
+        save_path = "pgs_convergence.npy"
+        np.save(save_path, convergence_data)
+        print(f"Saved convergence data: {convergence_data.shape} to {save_path}")
+
 
 # =============================================================================
 # Main
@@ -1129,6 +1148,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.set_defaults(double_buffer=True)
     parser.add_argument("--nvtx", action="store_true", help="Enable NVTX markers in solver stages")
     parser.add_argument("--no-graph", action="store_true", help="Disable CUDA graph capture (for NVTX profiling)")
+    parser.add_argument("--pgs-debug", action="store_true", help="Record per-iteration PGS convergence metrics")
     parser.add_argument(
         "--override-scenario-defaults",
         action="store_true",
