@@ -41,15 +41,13 @@ from .kernels import (
     apply_augmented_joint_tau,
     apply_augmented_mass_diagonal,
     apply_augmented_mass_diagonal_grouped,
-    apply_impulses_flat_par_dof,
     apply_impulses_world_par_dof,
     build_augmented_joint_rows,
     build_contact_rows_normal,
     build_mass_update_mask,
     build_mf_body_map,
     build_mf_contact_rows,
-    cholesky_batched_loop,
-    cholesky_flat_loop,
+    cholesky_loop,
     clamp_contact_counts,
     clamp_joint_tau,
     compute_com_transforms,
@@ -61,14 +59,11 @@ from .kernels import (
     compute_spatial_inertia,
     compute_velocity_predictor,
     compute_world_contact_bias,
-    contact_bias_flat_par_row,
     convert_root_free_qd_local_to_world,
     convert_root_free_qd_world_to_local,
     copy_int_array_masked,
-    crba_fill_batched_par_dof,
-    crba_fill_flat_par_dof,
-    delassus_batched_par_row_col,
-    delassus_flat_par_row,
+    crba_fill_par_dof,
+    delassus_par_row_col,
     detect_limit_count_changes,
     diag_from_JY_par_art,
     eval_rigid_fk,
@@ -80,8 +75,7 @@ from .kernels import (
     finalize_world_diag_cfm,
     gather_JY_to_world,
     gather_tau_to_groups,
-    hinv_jt_batched_par_row,
-    hinv_jt_flat_par_row,
+    hinv_jt_par_row,
     integrate_generalized_joints,
     pgs_solve_loop,
     pgs_solve_mf_loop,
@@ -90,8 +84,7 @@ from .kernels import (
     prepare_world_impulses,
     rhs_accum_world_par_art,
     scatter_qdd_from_groups,
-    trisolve_batched_loop,
-    trisolve_flat_loop,
+    trisolve_loop,
     update_articulation_origins,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
@@ -103,8 +96,8 @@ from .kernels import (
 def localize_parent_indices(
     counts: wp.array(dtype=int),
     max_constraints: int,
-    parent_flat: wp.array(dtype=int),
-    parent_local_flat: wp.array(dtype=int),
+    parent_arr: wp.array(dtype=int),
+    parent_local_arr: wp.array(dtype=int),
 ):
     art = wp.tid()
     m = counts[art]
@@ -112,11 +105,11 @@ def localize_parent_indices(
 
     for i in range(m):
         idx = base + i
-        p = parent_flat[idx]
+        p = parent_arr[idx]
         if p >= 0:
-            parent_local_flat[idx] = p - base
+            parent_local_arr[idx] = p - base
         else:
-            parent_local_flat[idx] = -1
+            parent_local_arr[idx] = -1
 
 
 class SolverFeatherPGS(SolverBase):
@@ -177,8 +170,6 @@ class SolverFeatherPGS(SolverBase):
         pgs_warmstart: bool = False,
         pgs_mode: str = "hybrid",
         mf_max_constraints: int = 512,
-        # Storage path
-        storage: str = "batched",
         # Kernel selection per operation
         cholesky_kernel: str = "auto",
         trisolve_kernel: str = "auto",
@@ -188,7 +179,7 @@ class SolverFeatherPGS(SolverBase):
         # Streaming kernel chunk sizes (None = auto-select)
         delassus_chunk_size: int | None = None,
         pgs_chunk_size: int | None = None,
-        # Auto selection threshold (batched path)
+        # Auto selection threshold
         small_dof_threshold: int = 12,
         # Parallelism options
         use_parallel_streams: bool = True,
@@ -215,17 +206,15 @@ class SolverFeatherPGS(SolverBase):
                 path for articulated bodies and a cheaper matrix-free PGS path for free rigid body
                 contacts. "velocity" skips C entirely, recomputes J*v each iteration, and uses only the
                 diagonal for preconditioning (Jacobi-style) — O(max_constraints) memory instead of
-                O(max_constraints^2). Requires storage="batched". Defaults to "hybrid".
+                O(max_constraints^2). Defaults to "hybrid".
             mf_max_constraints (int, optional): Maximum number of matrix-free constraints per world. Defaults to 512.
-            storage (str, optional): Storage layout. "batched" groups by DOF size into 3D arrays, "flat" uses
-                offset-indexed 1D arrays. Defaults to "batched".
             cholesky_kernel (str, optional): "tiled", "loop", or "auto" for Cholesky factorization. Defaults to "auto".
             trisolve_kernel (str, optional): "tiled", "loop", or "auto" for triangular solve. Defaults to "auto".
             hinv_jt_kernel (str, optional): "tiled", "par_row", or "auto" for H^{-1}J^T. Defaults to "auto".
             delassus_kernel (str, optional): "tiled", "par_row_col", or "auto" for Delassus accumulation
                 (C = J * H^{-1} * J^T). "tiled" uses a streaming CUDA kernel that chunks shared memory
                 and scales to any constraint count. "par_row_col" launches one thread per matrix element.
-                "auto" selects "tiled" in the batched path. Defaults to "auto".
+                "auto" selects "tiled" when DOFs exceed the threshold. Defaults to "auto".
             pgs_kernel (str, optional): "loop", "tiled_row", or "tiled_contact" for PGS solve. Defaults to "tiled_row".
             delassus_chunk_size (int, optional): Chunk size (in constraint rows) for the streaming Delassus
                 kernel. Controls how many rows of J and Y are loaded into shared memory at once.
@@ -234,15 +223,12 @@ class SolverFeatherPGS(SolverBase):
                 for the streaming PGS kernel. Controls how many block-rows of the Delassus matrix are
                 preloaded into shared memory at once. 1 = current streaming behavior (one block-row
                 at a time). None defaults to 1. Defaults to None.
-            small_dof_threshold (int, optional): DOF threshold for "auto" selection in batched path. Defaults to 12.
-            use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams (batched path only).
+            small_dof_threshold (int, optional): DOF threshold for "auto" kernel selection. Defaults to 12.
+            use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
         Auto selection behavior:
-            - Batched + auto: size > threshold -> tiled (or par_row for hinv_jt), else loop/par_row.
-            - Flat + auto: if homogeneous and within tile limits -> tiled, else loop/par_row.
-            - Flat + tiled: only valid when homogeneous and within TILE_DOF / TILE_CONSTRAINTS limits.
-            - Delassus batched + auto/tiled: streaming kernel (handles any constraint count via chunking).
-            - Current limitation: storage="flat" requires one articulation per world.
+            - auto: size > threshold -> tiled, else loop/par_row.
+            - Delassus auto/tiled: streaming kernel (handles any constraint count via chunking).
 
         """
         super().__init__(model)
@@ -264,10 +250,6 @@ class SolverFeatherPGS(SolverBase):
         self._double_buffer = double_buffer
         self._nvtx = nvtx
 
-        valid_storage = {"batched", "flat"}
-        if storage not in valid_storage:
-            raise ValueError(f"storage must be one of {sorted(valid_storage)}")
-
         valid_cholesky = {"tiled", "loop", "auto"}
         if cholesky_kernel not in valid_cholesky:
             raise ValueError(f"cholesky_kernel must be one of {sorted(valid_cholesky)}")
@@ -288,7 +270,6 @@ class SolverFeatherPGS(SolverBase):
         if pgs_kernel not in valid_pgs:
             raise ValueError(f"pgs_kernel must be one of {sorted(valid_pgs)}")
 
-        self.storage = storage
         self.cholesky_kernel = cholesky_kernel
         self.trisolve_kernel = trisolve_kernel
         self.hinv_jt_kernel = hinv_jt_kernel
@@ -305,50 +286,12 @@ class SolverFeatherPGS(SolverBase):
 
         self._compute_articulation_metadata(model)
 
-        if self.storage == "flat" and self._is_multi_articulation:
-            raise ValueError("storage='flat' is not supported for multiple articulations per world yet.")
-
-        if self.pgs_mode == "velocity" and self.storage != "batched":
-            raise ValueError("pgs_mode='velocity' requires storage='batched'.")
-
-        if self.storage == "flat" and model.articulation_count:
-            if not self._is_homogeneous and (
-                self.cholesky_kernel == "tiled" or self.trisolve_kernel == "tiled" or self.hinv_jt_kernel == "tiled"
-            ):
-                raise ValueError("Flat tiled kernels require homogeneous articulation sizes.")
-            if self.cholesky_kernel == "tiled" and self.articulation_max_dofs > int(TILE_DOF):
-                raise ValueError(
-                    f"articulation_max_dofs={self.articulation_max_dofs} exceeds TILE_DOF={int(TILE_DOF)} "
-                    "for flat tiled Cholesky. Increase TILE_DOF or choose cholesky_kernel='loop'."
-                )
-            if self.trisolve_kernel == "tiled" and self.articulation_max_dofs > int(TILE_DOF):
-                raise ValueError(
-                    f"articulation_max_dofs={self.articulation_max_dofs} exceeds TILE_DOF={int(TILE_DOF)} "
-                    "for flat tiled triangular solve. Increase TILE_DOF or choose trisolve_kernel='loop'."
-                )
-            if self.hinv_jt_kernel == "tiled" and (
-                self.articulation_max_dofs > int(TILE_DOF) or self.dense_max_constraints > int(TILE_CONSTRAINTS)
-            ):
-                raise ValueError(
-                    "Flat tiled H^{-1}J^T requires articulation_max_dofs <= TILE_DOF and "
-                    "dense_max_constraints <= TILE_CONSTRAINTS."
-                )
-            if self.pgs_kernel in ("tiled_row", "tiled_contact") and self.dense_max_constraints > int(TILE_CONSTRAINTS):
-                raise ValueError(
-                    f"dense_max_constraints={self.dense_max_constraints} exceeds TILE_CONSTRAINTS={int(TILE_CONSTRAINTS)} "
-                    "for tiled PGS. Increase TILE_CONSTRAINTS or choose pgs_kernel='loop'."
-                )
         self._allocate_common_buffers(model)
-        if self.storage == "flat":
-            self._allocate_flat_buffers(model)
-            self._H_bufs = None
-            self._J_bufs = None
-        else:
-            self._allocate_batched_buffers(model)
-            self._allocate_world_buffers(model)
-            self._allocate_mf_buffers(model)
-            self._scatter_armature_to_groups(model)
-            self._init_size_group_streams(model)
+        self._allocate_buffers(model)
+        self._allocate_world_buffers(model)
+        self._allocate_mf_buffers(model)
+        self._scatter_armature_to_groups(model)
+        self._init_size_group_streams(model)
 
         if model.shape_material_mu is not None:
             self.shape_material_mu = model.shape_material_mu
@@ -420,7 +363,7 @@ class SolverFeatherPGS(SolverBase):
                 self.M_size = wp.int64(self.M_size + wp.int64(joint_count * 36))
                 self.H_size += dof_count * dof_count
 
-            # matrix offsets for batched gemm
+            # matrix offsets for grouped gemm
             self.articulation_J_start = wp.array(articulation_J_start, dtype=wp.int32, device=model.device)
             self.articulation_M_start = wp.array(articulation_M_start, dtype=wp.int32, device=model.device)
             self.articulation_H_start = wp.array(articulation_H_start, dtype=wp.int32, device=model.device)
@@ -727,86 +670,7 @@ class SolverFeatherPGS(SolverBase):
         self.aug_row_K = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.aug_row_u0 = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
 
-    def _allocate_flat_buffers(self, model):
-        if not model.articulation_count or not model.joint_count:
-            self.H_flat = None
-            self.L_flat = None
-            self.constraint_count_flat = None
-            self.phi_flat = None
-            self.diag_flat = None
-            self.rhs_flat = None
-            self.impulses_flat = None
-            self.row_type_flat = None
-            self.row_beta_flat = None
-            self.row_cfm_flat = None
-            self.target_velocity_flat = None
-            self.row_parent_flat = None
-            self.row_mu_flat = None
-            self.C_flat = None
-            self.J_flat = None
-            self.Y_flat = None
-            self.row_parent_local_flat = None
-            self.H_by_size = {}
-            self.L_by_size = {}
-            self.J_by_size = {}
-            self.Y_by_size = {}
-            self.R_by_size = {}
-            self.tau_by_size = {}
-            self.qdd_by_size = {}
-            return
-
-        max_dofs = self.articulation_max_dofs
-        if max_dofs == 0:
-            return
-
-        device = model.device
-        requires_grad = model.requires_grad
-        articulation_count = model.articulation_count
-        constraint_capacity = self.dense_max_constraints
-
-        self.H_flat = wp.empty((self.H_size,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.L_flat = wp.zeros_like(self.H_flat)
-
-        self.pgs_row_stride = constraint_capacity * max_dofs
-        self.pgs_matrix_stride = constraint_capacity * constraint_capacity
-
-        total_rows = articulation_count * self.pgs_row_stride
-        total_constraints = articulation_count * constraint_capacity
-        total_matrix = articulation_count * self.pgs_matrix_stride
-
-        self.constraint_count_flat = wp.zeros(
-            (articulation_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self.phi_flat = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.diag_flat = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.rhs_flat = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.impulses_flat = wp.zeros(
-            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.row_type_flat = wp.zeros((total_constraints,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self.row_beta_flat = wp.zeros(
-            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.row_cfm_flat = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.target_velocity_flat = wp.zeros(
-            (total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.row_parent_flat = wp.full(
-            (total_constraints,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self.row_mu_flat = wp.zeros((total_constraints,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.C_flat = wp.zeros((total_matrix,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.J_flat = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.Y_flat = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.row_parent_local_flat = wp.full(
-            (total_constraints,),
-            -1,
-            dtype=wp.int32,
-            device=device,
-            requires_grad=requires_grad,
-        )
-
-    def _allocate_batched_buffers(self, model):
+    def _allocate_buffers(self, model):
         if not self.size_groups:
             self.H_by_size = {}
             self.L_by_size = {}
@@ -1139,238 +1003,6 @@ class SolverFeatherPGS(SolverBase):
             self._step += 1
             return state_out
 
-        if self.storage == "batched":
-            self._step_batched(state_in, state_out, state_aug, control, contacts, dt, collide_done_event)
-        else:
-            self._step_flat(state_in, state_out, state_aug, control, contacts, dt, collide_done_event)
-
-        self._step += 1
-        return state_out
-
-    def _prepare_augmented_state(
-        self,
-        state_in: State,
-        state_out: State,
-        control: Control,
-    ) -> State:
-        requires_grad = state_in.requires_grad
-        state_aug = state_out if requires_grad else self
-        model = self.model
-
-        if not getattr(state_aug, "_featherstone_augmented", False):
-            self._allocate_state_aux_vars(model, state_aug, requires_grad)
-
-        return state_aug
-
-    def _allocate_state_aux_vars(self, model, target, requires_grad):
-        # allocate auxiliary variables that vary with state
-        if model.body_count:
-            # joints
-            target.joint_qdd = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
-            target.joint_tau = wp.empty_like(model.joint_qd, requires_grad=requires_grad)
-            if requires_grad:
-                # used in the custom grad implementation of trisolve_flat_loop
-                target.joint_solve_tmp = wp.zeros_like(model.joint_qd, requires_grad=True)
-            else:
-                target.joint_solve_tmp = None
-            target.joint_S_s = wp.empty(
-                (model.joint_dof_count,),
-                dtype=wp.spatial_vector,
-                device=model.device,
-                requires_grad=requires_grad,
-            )
-
-            # derived rigid body data (maximal coordinates)
-            target.body_q_com = wp.empty_like(model.body_q, requires_grad=requires_grad)
-            target.body_I_s = wp.empty(
-                (model.body_count,), dtype=wp.spatial_matrix, device=model.device, requires_grad=requires_grad
-            )
-            target.body_v_s = wp.empty(
-                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
-            )
-            target.body_a_s = wp.empty(
-                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
-            )
-            target.body_f_s = wp.zeros(
-                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
-            )
-            target.body_ft_s = wp.zeros(
-                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
-            )
-
-            target._featherstone_augmented = True
-
-    def _eval_particle_forces(self, state_in: State, control: Control, contacts: Contacts):
-        model = self.model
-
-        particle_f = state_in.particle_f if state_in.particle_count else None
-        body_f = state_in.body_f if state_in.body_count else None
-
-        # damped springs
-        eval_spring_forces(model, state_in, particle_f)
-
-        # triangle elastic and lift/drag forces
-        eval_triangle_forces(model, state_in, control, particle_f)
-
-        # triangle bending
-        eval_bending_forces(model, state_in, particle_f)
-
-        # tetrahedral FEM
-        eval_tetrahedra_forces(model, state_in, control, particle_f)
-
-        # particle-particle interactions
-        eval_particle_contact_forces(model, state_in, particle_f)
-
-        # particle shape contact
-        eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True)
-
-    def _step_flat(
-        self,
-        state_in: State,
-        state_out: State,
-        state_aug: State,
-        control: Control,
-        contacts: Contacts,
-        dt: float,
-        collide_done_event=None,
-    ):
-        model = self.model
-
-        flat_tiled_allowed = (
-            self._is_homogeneous
-            and self.articulation_max_dofs <= int(TILE_DOF)
-            and self.dense_max_constraints <= int(TILE_CONSTRAINTS)
-        )
-
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 1: FK/ID + drives + CRBA
-        # ══════════════════════════════════════════════════════════════
-        self._stage1_fk_id(state_in, state_aug, state_out)
-
-        if model.articulation_count:
-            self._stage1_drives(state_in, state_aug, control, dt)
-
-        self._stage1_crba_flat(state_aug)
-
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 2: Cholesky
-        # ══════════════════════════════════════════════════════════════
-        use_tiled_cholesky = (self.cholesky_kernel != "loop") and flat_tiled_allowed
-        if use_tiled_cholesky:
-            self._stage2_cholesky_flat_tiled()
-        else:
-            self._stage2_cholesky_flat_loop()
-
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 3: Triangular solve + v_hat
-        # ══════════════════════════════════════════════════════════════
-        self._stage3_zero_qdd(state_aug)
-        use_tiled_trisolve = (self.trisolve_kernel != "loop") and flat_tiled_allowed
-        if use_tiled_trisolve:
-            self._stage3_trisolve_flat_tiled(state_aug)
-        else:
-            self._stage3_trisolve_flat_loop(state_aug)
-
-        self._stage3_compute_v_hat(state_in, state_aug, dt)
-
-        # Wait for pipelined collide (if running on separate stream)
-        if collide_done_event is not None:
-            wp.get_stream(model.device).wait_event(collide_done_event)
-
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 4: Build contact problem
-        # ══════════════════════════════════════════════════════════════
-        self._stage4_build_rows_flat(state_in, state_aug, contacts)
-
-        use_tiled_hinv_jt = (self.hinv_jt_kernel != "par_row") and flat_tiled_allowed
-        if use_tiled_hinv_jt:
-            self._stage4_hinv_jt_flat_tiled()
-        else:
-            self._stage4_hinv_jt_flat_par_row()
-            self._stage4_delassus_flat_par_row()
-        self._stage4_compute_rhs_flat(dt)
-
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 5: PGS solve
-        # ══════════════════════════════════════════════════════════════
-        self._stage5_prepare_impulses_flat()
-        if self.pgs_kernel == "tiled_row":
-            self._stage5_pgs_solve_flat_tiled_row()
-        elif self.pgs_kernel == "tiled_contact":
-            self._stage5_pgs_solve_flat_tiled_contact()
-        elif self.pgs_kernel == "streaming":
-            self._stage5_pgs_solve_flat_streaming()
-        else:
-            self._stage5_pgs_solve_flat_loop()
-
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 6: Apply impulses + integrate
-        # ══════════════════════════════════════════════════════════════
-        self._stage6_apply_impulses_flat()
-        self._stage6_update_qdd(state_in, state_aug, dt)
-
-        self._stage6_integrate(state_in, state_aug, state_out, dt)
-
-    @contextmanager
-    def _parallel_size_region(self, enabled: bool = True):
-        """Context for parallel dispatch across size groups."""
-        if not enabled or not self.use_parallel_streams or not self.model.device.is_cuda or len(self.size_groups) <= 1:
-            yield
-            return
-
-        main_stream = wp.get_stream(self.model.device)
-        self._main_stream = main_stream
-        self._init_event = main_stream.record_event()
-        try:
-            yield
-        finally:
-            for size in self.size_groups:
-                stream = self._size_streams.get(size)
-                if stream is not None:
-                    main_stream.wait_event(stream.record_event())
-            self._main_stream = None
-            self._init_event = None
-
-    @contextmanager
-    def _on_size_stream(self, size: int):
-        """Execute block on this size's CUDA stream."""
-        stream = self._size_streams.get(size)
-        init_event = getattr(self, "_init_event", None)
-        if stream is not None and init_event is not None:
-            stream.wait_event(init_event)
-            with wp.ScopedStream(stream):
-                yield
-        else:
-            yield
-
-    @contextmanager
-    def _size_dispatch(self, enabled: bool):
-        with self._parallel_size_region(enabled=enabled):
-            yield
-
-    @contextmanager
-    def _size_ctx(self, size: int):
-        with self._on_size_stream(size):
-            yield
-
-    def _for_sizes(self, enabled: bool):
-        # convenience generator; keeps step code tight
-        with self._size_dispatch(enabled):
-            for size in self.size_groups:
-                yield size, self._size_ctx(size)
-
-    def _step_batched(
-        self,
-        state_in: State,
-        state_out: State,
-        state_aug: State,
-        control: Control,
-        contacts: Contacts,
-        dt: float,
-        collide_done_event=None,
-    ):
-        model = self.model
-
         # Double-buffer: select buffer set and wait for its memset to finish
         if self._memset_stream is not None:
             self.H_by_size = self._H_bufs[self._buf_idx]
@@ -1388,7 +1020,7 @@ class SolverFeatherPGS(SolverBase):
             if model.articulation_count:
                 self._stage1_drives(state_in, state_aug, control, dt)
 
-            self._stage1_crba_batched(state_aug)
+            self._stage1_crba(state_aug)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 2: Cholesky
@@ -1400,9 +1032,9 @@ class SolverFeatherPGS(SolverBase):
                         self.cholesky_kernel == "auto" and size > self.small_dof_threshold
                     )
                     if use_tiled:
-                        self._stage2_cholesky_batched_tiled(size)
+                        self._stage2_cholesky_tiled(size)
                     else:
-                        self._stage2_cholesky_batched_loop(size)
+                        self._stage2_cholesky_loop(size)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 3: Triangular solve + v_hat
@@ -1415,9 +1047,9 @@ class SolverFeatherPGS(SolverBase):
                         self.trisolve_kernel == "auto" and size > self.small_dof_threshold
                     )
                     if use_tiled:
-                        self._stage3_trisolve_batched_tiled(size, state_aug)
+                        self._stage3_trisolve_tiled(size, state_aug)
                     else:
-                        self._stage3_trisolve_batched_loop(size, state_aug)
+                        self._stage3_trisolve_loop(size, state_aug)
 
             self._stage3_compute_v_hat(state_in, state_aug, dt)
 
@@ -1429,7 +1061,7 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 4: Build contact problem
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
-            self._stage4_build_rows_batched(state_in, state_aug, contacts)
+            self._stage4_build_rows(state_in, state_aug, contacts)
 
         if self.pgs_mode == "velocity":
             # Compute Y = H^-1 * J^T only (no Delassus C)
@@ -1440,9 +1072,9 @@ class SolverFeatherPGS(SolverBase):
                             self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold
                         )
                         if use_tiled:
-                            self._stage4_hinv_jt_batched_tiled(size)
+                            self._stage4_hinv_jt_tiled(size)
                         else:
-                            self._stage4_hinv_jt_batched_par_row(size)
+                            self._stage4_hinv_jt_par_row(size)
 
                 # Diagonal from J*Y (no full Delassus)
                 self.diag.zero_()
@@ -1491,7 +1123,7 @@ class SolverFeatherPGS(SolverBase):
             if fused_ok:
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                     with ctx:
-                        self._stage4_hinv_jt_batched_tiled_fused(size)
+                        self._stage4_hinv_jt_tiled_fused(size)
             else:
                 self._stage4_zero_world_C()
 
@@ -1501,16 +1133,16 @@ class SolverFeatherPGS(SolverBase):
                             self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold
                         )
                         if use_tiled:
-                            self._stage4_hinv_jt_batched_tiled(size)
+                            self._stage4_hinv_jt_tiled(size)
                         else:
-                            self._stage4_hinv_jt_batched_par_row(size)
+                            self._stage4_hinv_jt_par_row(size)
 
                 for size in self.size_groups:
                     use_tiled_delassus = self.delassus_kernel != "par_row_col"
                     if use_tiled_delassus:
-                        self._stage4_delassus_batched_tiled(size)
+                        self._stage4_delassus_tiled(size)
                     else:
-                        self._stage4_delassus_batched_par_row_col(size)
+                        self._stage4_delassus_par_row_col(size)
 
                 self._stage4_finalize_world_diag_cfm()
 
@@ -1699,6 +1331,135 @@ class SolverFeatherPGS(SolverBase):
                         self._J_bufs[self._buf_idx][size].zero_()
                 self._memset_done_event[self._buf_idx] = self._memset_stream.record_event()
                 self._buf_idx = 1 - self._buf_idx
+
+
+        self._step += 1
+        return state_out
+
+    def _prepare_augmented_state(
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control,
+    ) -> State:
+        requires_grad = state_in.requires_grad
+        state_aug = state_out if requires_grad else self
+        model = self.model
+
+        if not getattr(state_aug, "_featherstone_augmented", False):
+            self._allocate_state_aux_vars(model, state_aug, requires_grad)
+
+        return state_aug
+
+    def _allocate_state_aux_vars(self, model, target, requires_grad):
+        # allocate auxiliary variables that vary with state
+        if model.body_count:
+            # joints
+            target.joint_qdd = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
+            target.joint_tau = wp.empty_like(model.joint_qd, requires_grad=requires_grad)
+            if requires_grad:
+                # used in the custom grad implementation of trisolve_loop
+                target.joint_solve_tmp = wp.zeros_like(model.joint_qd, requires_grad=True)
+            else:
+                target.joint_solve_tmp = None
+            target.joint_S_s = wp.empty(
+                (model.joint_dof_count,),
+                dtype=wp.spatial_vector,
+                device=model.device,
+                requires_grad=requires_grad,
+            )
+
+            # derived rigid body data (maximal coordinates)
+            target.body_q_com = wp.empty_like(model.body_q, requires_grad=requires_grad)
+            target.body_I_s = wp.empty(
+                (model.body_count,), dtype=wp.spatial_matrix, device=model.device, requires_grad=requires_grad
+            )
+            target.body_v_s = wp.empty(
+                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
+            )
+            target.body_a_s = wp.empty(
+                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
+            )
+            target.body_f_s = wp.zeros(
+                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
+            )
+            target.body_ft_s = wp.zeros(
+                (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
+            )
+
+            target._featherstone_augmented = True
+
+    def _eval_particle_forces(self, state_in: State, control: Control, contacts: Contacts):
+        model = self.model
+
+        particle_f = state_in.particle_f if state_in.particle_count else None
+        body_f = state_in.body_f if state_in.body_count else None
+
+        # damped springs
+        eval_spring_forces(model, state_in, particle_f)
+
+        # triangle elastic and lift/drag forces
+        eval_triangle_forces(model, state_in, control, particle_f)
+
+        # triangle bending
+        eval_bending_forces(model, state_in, particle_f)
+
+        # tetrahedral FEM
+        eval_tetrahedra_forces(model, state_in, control, particle_f)
+
+        # particle-particle interactions
+        eval_particle_contact_forces(model, state_in, particle_f)
+
+        # particle shape contact
+        eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True)
+
+    @contextmanager
+    def _parallel_size_region(self, enabled: bool = True):
+        """Context for parallel dispatch across size groups."""
+        if not enabled or not self.use_parallel_streams or not self.model.device.is_cuda or len(self.size_groups) <= 1:
+            yield
+            return
+
+        main_stream = wp.get_stream(self.model.device)
+        self._main_stream = main_stream
+        self._init_event = main_stream.record_event()
+        try:
+            yield
+        finally:
+            for size in self.size_groups:
+                stream = self._size_streams.get(size)
+                if stream is not None:
+                    main_stream.wait_event(stream.record_event())
+            self._main_stream = None
+            self._init_event = None
+
+    @contextmanager
+    def _on_size_stream(self, size: int):
+        """Execute block on this size's CUDA stream."""
+        stream = self._size_streams.get(size)
+        init_event = getattr(self, "_init_event", None)
+        if stream is not None and init_event is not None:
+            stream.wait_event(init_event)
+            with wp.ScopedStream(stream):
+                yield
+        else:
+            yield
+
+    @contextmanager
+    def _size_dispatch(self, enabled: bool):
+        with self._parallel_size_region(enabled=enabled):
+            yield
+
+    @contextmanager
+    def _size_ctx(self, size: int):
+        with self._on_size_stream(size):
+            yield
+
+    def _for_sizes(self, enabled: bool):
+        # convenience generator; keeps step code tight
+        with self._size_dispatch(enabled):
+            for size in self.size_groups:
+                yield size, self._size_ctx(size)
 
     def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State):
         model = self.model
@@ -1911,97 +1672,7 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage1_crba_flat(self, state_aug: State):
-        model = self.model
-        global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
-
-        wp.launch(
-            build_mass_update_mask,
-            dim=model.articulation_count,
-            inputs=[
-                global_flag,
-                self.limit_change_mask,
-            ],
-            outputs=[self.mass_update_mask],
-            device=model.device,
-        )
-
-        wp.launch(
-            eval_rigid_mass,
-            dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                self.articulation_M_start,
-                self.mass_update_mask,
-                state_aug.body_I_s,
-            ],
-            outputs=[self.M_blocks],
-            device=model.device,
-        )
-
-        wp.launch(
-            compute_composite_inertia,
-            dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                self.mass_update_mask,
-                model.joint_ancestor,
-                state_aug.body_I_s,
-            ],
-            outputs=[self.body_I_c],
-            device=model.device,
-            block_dim=128,
-        )
-
-        wp.launch(
-            crba_fill_flat_par_dof,
-            dim=model.articulation_count * self.articulation_max_dofs,
-            inputs=[
-                model.articulation_start,
-                self.articulation_dof_start,
-                self.articulation_H_start,
-                self.articulation_H_rows,
-                self.mass_update_mask,
-                model.joint_ancestor,
-                model.joint_qd_start,
-                model.joint_dof_dim,
-                state_aug.joint_S_s,
-                self.body_I_c,
-                self.articulation_max_dofs,
-            ],
-            outputs=[self.H_flat],
-            device=model.device,
-            block_dim=128,
-        )
-
-        wp.launch(
-            apply_augmented_mass_diagonal,
-            dim=model.articulation_count,
-            inputs=[
-                self.articulation_H_start,
-                self.articulation_H_rows,
-                self.articulation_dof_start,
-                self.articulation_max_dofs,
-                self.mass_update_mask,
-                self.aug_row_counts,
-                self.aug_row_dof_index,
-                self.aug_row_K,
-                self.H_flat,
-            ],
-            device=model.device,
-        )
-
-        wp.launch(
-            copy_int_array_masked,
-            dim=model.articulation_count,
-            inputs=[self.aug_limit_counts, self.mass_update_mask],
-            outputs=[self.aug_prev_limit_counts],
-            device=model.device,
-        )
-
-        self._force_mass_update = False
-
-    def _stage1_crba_batched(self, state_aug: State):
+    def _stage1_crba(self, state_aug: State):
         model = self.model
         global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
 
@@ -2048,7 +1719,7 @@ class SolverFeatherPGS(SolverBase):
             if self._H_bufs is None:  # not double-buffered
                 self.H_by_size[size].zero_()
             wp.launch(
-                crba_fill_batched_par_dof,
+                crba_fill_par_dof,
                 dim=int(n_arts * size),
                 inputs=[
                     model.articulation_start,
@@ -2096,40 +1767,7 @@ class SolverFeatherPGS(SolverBase):
 
         self._force_mass_update = False
 
-    def _stage2_cholesky_flat_tiled(self):
-        model = self.model
-        n_dofs = self.articulation_max_dofs
-        H_tiled = self.H_flat.reshape((model.articulation_count, n_dofs, n_dofs))
-        R_tiled = model.joint_armature.reshape((model.articulation_count, n_dofs))
-        L_tiled = self.L_flat.reshape((model.articulation_count, n_dofs, n_dofs))
-
-        cholesky_kernel = TiledKernelFactory.get_cholesky_flat_kernel(n_dofs, model.device)
-        wp.launch_tiled(
-            cholesky_kernel,
-            dim=[model.articulation_count],
-            inputs=[H_tiled, R_tiled, self.mass_update_mask],
-            outputs=[L_tiled],
-            block_dim=TILE_THREADS,
-            device=model.device,
-        )
-
-    def _stage2_cholesky_flat_loop(self):
-        model = self.model
-        wp.launch(
-            cholesky_flat_loop,
-            dim=model.articulation_count,
-            inputs=[
-                self.articulation_H_start,
-                self.articulation_H_rows,
-                self.H_flat,
-                model.joint_armature,
-                self.mass_update_mask,
-            ],
-            outputs=[self.L_flat],
-            device=model.device,
-        )
-
-    def _stage2_cholesky_batched_tiled(self, size: int):
+    def _stage2_cholesky_tiled(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
         cholesky_kernel = TiledKernelFactory.get_cholesky_kernel(size, model.device)
@@ -2147,11 +1785,11 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage2_cholesky_batched_loop(self, size: int):
+    def _stage2_cholesky_loop(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
         wp.launch(
-            cholesky_batched_loop,
+            cholesky_loop,
             dim=n_arts,
             inputs=[
                 self.H_by_size[size],
@@ -2167,47 +1805,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage3_zero_qdd(self, state_aug: State):
         state_aug.joint_qdd.zero_()
 
-    def _stage3_trisolve_flat_tiled(self, state_aug: State):
-        model = self.model
-        n_dofs = self.articulation_max_dofs
-        L_tiled = self.L_flat.reshape((model.articulation_count, n_dofs, n_dofs))
-        tau_tiled = state_aug.joint_tau.reshape((model.articulation_count, n_dofs, 1))
-        qdd_tiled = state_aug.joint_qdd.reshape((model.articulation_count, n_dofs, 1))
-
-        solve_kernel = TiledKernelFactory.get_triangular_solve_flat_kernel(n_dofs, model.device)
-        wp.launch_tiled(
-            solve_kernel,
-            dim=[model.articulation_count],
-            inputs=[
-                L_tiled,
-                tau_tiled,
-            ],
-            outputs=[qdd_tiled],
-            block_dim=TILE_THREADS,
-            device=model.device,
-        )
-
-    def _stage3_trisolve_flat_loop(self, state_aug: State):
-        model = self.model
-        wp.launch(
-            trisolve_flat_loop,
-            dim=model.articulation_count,
-            inputs=[
-                self.articulation_H_start,
-                self.articulation_H_rows,
-                self.articulation_dof_start,
-                self.H_flat,
-                self.L_flat,
-                state_aug.joint_tau,
-            ],
-            outputs=[
-                state_aug.joint_qdd,
-                state_aug.joint_solve_tmp,
-            ],
-            device=model.device,
-        )
-
-    def _stage3_trisolve_batched_tiled(self, size: int, state_aug: State):
+    def _stage3_trisolve_tiled(self, size: int, state_aug: State):
         model = self.model
         n_arts = self.n_arts_by_size[size]
 
@@ -2250,11 +1848,11 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage3_trisolve_batched_loop(self, size: int, state_aug: State):
+    def _stage3_trisolve_loop(self, size: int, state_aug: State):
         model = self.model
         n_arts = self.n_arts_by_size[size]
         wp.launch(
-            trisolve_batched_loop,
+            trisolve_loop,
             dim=n_arts,
             inputs=[
                 self.L_by_size[size],
@@ -2283,83 +1881,7 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage4_build_rows_flat(self, state_in: State, state_aug: State, contacts: Contacts):
-        model = self.model
-
-        self.constraint_count_flat.zero_()
-
-        if (
-            contacts is not None
-            and getattr(contacts, "rigid_contact_count", None) is not None
-            and contacts.rigid_contact_max > 0
-        ):
-            enable_friction_flag = 1 if self.enable_contact_friction else 0
-            wp.launch(
-                build_contact_rows_normal,
-                dim=contacts.rigid_contact_max,
-                inputs=[
-                    contacts.rigid_contact_count,
-                    contacts.rigid_contact_point0,
-                    contacts.rigid_contact_point1,
-                    contacts.rigid_contact_normal,
-                    contacts.rigid_contact_shape0,
-                    contacts.rigid_contact_shape1,
-                    contacts.rigid_contact_margin0,
-                    contacts.rigid_contact_margin1,
-                    model.shape_body,
-                    state_in.body_q,
-                    model.shape_transform,
-                    self.shape_material_mu,
-                    model.articulation_start,
-                    self.articulation_H_rows,
-                    self.articulation_dof_start,
-                    self.body_to_joint,
-                    self.body_to_articulation,
-                    model.joint_ancestor,
-                    model.joint_qd_start,
-                    state_aug.joint_S_s,
-                    self.articulation_origin,
-                    self.dense_max_constraints,
-                    self.articulation_max_dofs,
-                    self.pgs_beta,
-                    self.pgs_cfm,
-                    enable_friction_flag,
-                ],
-                outputs=[
-                    self.constraint_count_flat,
-                    self.J_flat,
-                    self.phi_flat,
-                    self.row_beta_flat,
-                    self.row_cfm_flat,
-                    self.row_type_flat,
-                    self.target_velocity_flat,
-                    self.row_parent_flat,
-                    self.row_mu_flat,
-                ],
-                device=model.device,
-            )
-
-        wp.launch(
-            clamp_contact_counts,
-            dim=model.articulation_count,
-            inputs=[self.constraint_count_flat, self.dense_max_constraints],
-            device=model.device,
-        )
-        wp.launch(
-            localize_parent_indices,
-            dim=model.articulation_count,
-            inputs=[
-                self.constraint_count_flat,
-                self.dense_max_constraints,
-                self.row_parent_flat,  # global/flat parent indices
-            ],
-            outputs=[
-                self.row_parent_local_flat,  # local parent indices
-            ],
-            device=model.device,
-        )
-
-    def _stage4_build_rows_batched(self, state_in: State, state_aug: State, contacts: Contacts):
+    def _stage4_build_rows(self, state_in: State, state_aug: State, contacts: Contacts):
         model = self.model
         max_constraints = self.dense_max_constraints
         mf_active = self._has_free_rigid_bodies
@@ -2535,78 +2057,11 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage4_hinv_jt_flat_tiled(self):
-        model = self.model
-        n_dofs = self.articulation_max_dofs
-        max_constraints = self.dense_max_constraints
-        L_tiled = self.L_flat.reshape((model.articulation_count, n_dofs, n_dofs))
-        J_tiled = self.J_flat.reshape((model.articulation_count, max_constraints, n_dofs))
-        Y_tiled = self.Y_flat.reshape((model.articulation_count, max_constraints, n_dofs))
-        C_tiled = self.C_flat.reshape((model.articulation_count, max_constraints, max_constraints))
-
-        hinv_jt_kernel = TiledKernelFactory.get_hinv_jt_flat_kernel(n_dofs, max_constraints, model.device)
-        wp.launch_tiled(
-            hinv_jt_kernel,
-            dim=[model.articulation_count],
-            inputs=[
-                self.constraint_count_flat,
-                L_tiled,
-                J_tiled,
-                self.row_cfm_flat,
-            ],
-            outputs=[
-                Y_tiled,
-                C_tiled,
-                self.diag_flat,
-            ],
-            block_dim=TILE_THREADS,
-            device=model.device,
-        )
-
-    def _stage4_hinv_jt_flat_par_row(self):
-        model = self.model
-        wp.launch(
-            hinv_jt_flat_par_row,
-            dim=model.articulation_count * self.dense_max_constraints,
-            inputs=[
-                self.articulation_H_start,
-                self.articulation_H_rows,
-                self.dense_max_constraints,
-                self.articulation_max_dofs,
-                self.constraint_count_flat,
-                self.L_flat,
-                self.J_flat,
-            ],
-            outputs=[self.Y_flat],
-            device=model.device,
-        )
-
-    def _stage4_delassus_flat_par_row(self):
-        model = self.model
-        wp.launch(
-            delassus_flat_par_row,
-            dim=model.articulation_count * self.dense_max_constraints,
-            inputs=[
-                self.articulation_H_rows,
-                self.dense_max_constraints,
-                self.articulation_max_dofs,
-                self.constraint_count_flat,
-                self.J_flat,
-                self.Y_flat,
-                self.row_cfm_flat,
-            ],
-            outputs=[
-                self.diag_flat,
-                self.C_flat,
-            ],
-            device=model.device,
-        )
-
     def _stage4_zero_world_C(self):
         self.C.zero_()
         self.diag.zero_()
 
-    def _stage4_hinv_jt_batched_tiled(self, size: int):
+    def _stage4_hinv_jt_tiled(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
         hinv_jt_kernel = TiledKernelFactory.get_hinv_jt_kernel(size, self.dense_max_constraints, model.device)
@@ -2625,7 +2080,7 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage4_hinv_jt_batched_tiled_fused(self, size: int):
+    def _stage4_hinv_jt_tiled_fused(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
         hinv_jt_kernel = TiledKernelFactory.get_hinv_jt_fused_kernel(size, self.dense_max_constraints, model.device)
@@ -2645,11 +2100,11 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage4_hinv_jt_batched_par_row(self, size: int):
+    def _stage4_hinv_jt_par_row(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
         wp.launch(
-            hinv_jt_batched_par_row,
+            hinv_jt_par_row,
             dim=n_arts * self.dense_max_constraints,
             inputs=[
                 self.L_by_size[size],
@@ -2665,11 +2120,11 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage4_delassus_batched_par_row_col(self, size: int):
+    def _stage4_delassus_par_row_col(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
         wp.launch(
-            delassus_batched_par_row_col,
+            delassus_par_row_col,
             dim=n_arts * self.dense_max_constraints * self.dense_max_constraints,
             inputs=[
                 self.J_by_size[size],
@@ -2685,7 +2140,7 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage4_delassus_batched_tiled(self, size: int):
+    def _stage4_delassus_tiled(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
         delassus_kernel = TiledKernelFactory.get_delassus_kernel(
@@ -2736,30 +2191,6 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _stage4_compute_rhs_flat(self, dt: float):
-        model = self.model
-        wp.launch(
-            contact_bias_flat_par_row,
-            dim=model.articulation_count * self.dense_max_constraints,
-            inputs=[
-                self.articulation_dof_start,
-                self.articulation_H_rows,
-                self.constraint_count_flat,
-                model.articulation_count,
-                self.dense_max_constraints,
-                self.articulation_max_dofs,
-                self.J_flat,
-                self.v_hat,
-                self.phi_flat,
-                self.row_beta_flat,
-                self.row_type_flat,
-                self.target_velocity_flat,
-                dt,
-            ],
-            outputs=[self.rhs_flat],
-            device=model.device,
-        )
-
     def _stage4_compute_rhs_world(self, dt: float):
         model = self.model
         wp.launch(
@@ -2800,21 +2231,6 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage5_prepare_impulses_flat(self):
-        model = self.model
-        warmstart_flag = 1 if self.pgs_warmstart else 0
-        wp.launch(
-            prepare_impulses,
-            dim=model.articulation_count,
-            inputs=[
-                self.constraint_count_flat,
-                self.dense_max_constraints,
-                warmstart_flag,
-                self.impulses_flat,
-            ],
-            device=model.device,
-        )
-
     def _stage5_prepare_impulses_world(self):
         warmstart_flag = 1 if self.pgs_warmstart else 0
         wp.launch(
@@ -2823,69 +2239,6 @@ class SolverFeatherPGS(SolverBase):
             inputs=[self.constraint_count, self.dense_max_constraints, warmstart_flag],
             outputs=[self.impulses],
             device=self.model.device,
-        )
-
-    def _stage5_pgs_solve_flat_tiled_row(self):
-        model = self.model
-        M = self.dense_max_constraints
-        A = model.articulation_count
-        diag2 = self.diag_flat.reshape((A, M))
-        rhs2 = self.rhs_flat.reshape((A, M))
-        lam2 = self.impulses_flat.reshape((A, M))
-        C3 = self.C_flat.reshape((A, M, M))
-        rtype2 = self.row_type_flat.reshape((A, M))
-        mu2 = self.row_mu_flat.reshape((A, M))
-        parent2_local = self.row_parent_local_flat.reshape((A, M))
-
-        pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_row_kernel(M, model.device)
-        wp.launch_tiled(
-            pgs_kernel,
-            dim=[A],
-            inputs=[
-                self.constraint_count_flat,
-                diag2,
-                C3,
-                rhs2,
-                lam2,
-                self.pgs_iterations,
-                self.pgs_omega,
-                rtype2,
-                parent2_local,
-                mu2,
-            ],
-            block_dim=32,
-            device=model.device,
-        )
-
-    def _stage5_pgs_solve_flat_loop(self):
-        model = self.model
-        M = self.dense_max_constraints
-        A = model.articulation_count
-        diag2 = self.diag_flat.reshape((A, M))
-        rhs2 = self.rhs_flat.reshape((A, M))
-        lam2 = self.impulses_flat.reshape((A, M))
-        C3 = self.C_flat.reshape((A, M, M))
-        rtype2 = self.row_type_flat.reshape((A, M))
-        mu2 = self.row_mu_flat.reshape((A, M))
-        parent2_local = self.row_parent_local_flat.reshape((A, M))
-
-        wp.launch(
-            pgs_solve_loop,
-            dim=A,
-            inputs=[
-                self.constraint_count_flat,
-                M,
-                diag2,
-                C3,
-                rhs2,
-                lam2,
-                self.pgs_iterations,
-                self.pgs_omega,
-                rtype2,
-                parent2_local,
-                mu2,
-            ],
-            device=model.device,
         )
 
     def _dispatch_dense_pgs_solve(self, iterations: int):
@@ -2943,32 +2296,6 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _stage5_pgs_solve_flat_tiled_contact(self):
-        model = self.model
-        M = self.dense_max_constraints
-        A = model.articulation_count
-        rhs2 = self.rhs_flat.reshape((A, M))
-        lam2 = self.impulses_flat.reshape((A, M))
-        C3 = self.C_flat.reshape((A, M, M))
-        mu2 = self.row_mu_flat.reshape((A, M))
-
-        pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_contact_kernel(M, model.device)
-        wp.launch_tiled(
-            pgs_kernel,
-            dim=[A],
-            inputs=[
-                self.constraint_count_flat,
-                C3,
-                rhs2,
-                lam2,
-                self.pgs_iterations,
-                self.pgs_omega,
-                mu2,
-            ],
-            block_dim=32,
-            device=model.device,
-        )
-
     def _stage5_pgs_solve_world_tiled_contact(self):
         pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_contact_kernel(
             self.dense_max_constraints, self.model.device
@@ -2989,32 +2316,6 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _stage5_pgs_solve_flat_streaming(self):
-        model = self.model
-        M = self.dense_max_constraints
-        A = model.articulation_count
-        rhs2 = self.rhs_flat.reshape((A, M))
-        lam2 = self.impulses_flat.reshape((A, M))
-        C3 = self.C_flat.reshape((A, M, M))
-        mu2 = self.row_mu_flat.reshape((A, M))
-
-        pgs_kernel = TiledKernelFactory.get_pgs_solve_streaming_kernel(M, model.device)
-        wp.launch_tiled(
-            pgs_kernel,
-            dim=[A],
-            inputs=[
-                self.constraint_count_flat,
-                C3,
-                rhs2,
-                lam2,
-                self.pgs_iterations,
-                self.pgs_omega,
-                mu2,
-            ],
-            block_dim=32,
-            device=model.device,
-        )
-
     def _stage5_pgs_solve_world_streaming(self):
         pgs_kernel = TiledKernelFactory.get_pgs_solve_streaming_kernel(
             self.dense_max_constraints, self.model.device, pgs_chunk_size=self.pgs_chunk_size
@@ -3033,25 +2334,6 @@ class SolverFeatherPGS(SolverBase):
             ],
             block_dim=32,
             device=self.model.device,
-        )
-
-    def _stage6_apply_impulses_flat(self):
-        model = self.model
-        wp.launch(
-            apply_impulses_flat_par_dof,
-            dim=model.articulation_count * self.articulation_max_dofs,
-            inputs=[
-                self.articulation_dof_start,
-                self.articulation_H_rows,
-                self.constraint_count_flat,
-                self.dense_max_constraints,
-                self.articulation_max_dofs,
-                self.Y_flat,
-                self.v_hat,
-                self.impulses_flat,
-            ],
-            outputs=[self.v_out],
-            device=model.device,
         )
 
     def _stage6_prepare_world_velocity(self):
@@ -3276,9 +2558,6 @@ class TiledKernelFactory:
     """
 
     # Class-level caches: key -> compiled kernel
-    _hinv_jt_flat_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
-    _cholesky_flat_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
-    _triangular_solve_flat_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _hinv_jt_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
     _hinv_jt_fused_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
     _cholesky_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
@@ -3290,139 +2569,6 @@ class TiledKernelFactory:
     _pack_mf_meta_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _triangular_solve_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _delassus_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
-
-    @classmethod
-    def get_hinv_jt_flat_kernel(cls, n_dofs: int, max_constraints: int, device: "wp.Device") -> "wp.Kernel":
-        """Get or create a tiled flat H^-1*J^T kernel for the given dimensions."""
-        key = (n_dofs, max_constraints, device.arch)
-        if key not in cls._hinv_jt_flat_cache:
-            cls._hinv_jt_flat_cache[key] = cls._build_hinv_jt_flat_kernel(n_dofs, max_constraints)
-        return cls._hinv_jt_flat_cache[key]
-
-    @classmethod
-    def _build_hinv_jt_flat_kernel(cls, n_dofs: int, max_constraints: int) -> "wp.Kernel":
-        """Build specialized flat H^-1*J^T kernel for given dimensions."""
-        dofs = int(n_dofs)
-        max_c = int(max_constraints)
-        TILE_DOF_LOCAL = wp.constant(dofs)
-        TILE_CONSTRAINTS_LOCAL = wp.constant(max_c)
-
-        def hinv_jt_flat_tiled_template(
-            constraint_counts: wp.array(dtype=int),
-            L: wp.array3d(dtype=float),  # [arts, n_dofs, n_dofs]
-            J_rows: wp.array3d(dtype=float),  # [arts, max_c, n_dofs]
-            row_cfm: wp.array(dtype=float),
-            # outputs
-            Y: wp.array3d(dtype=float),  # [arts, max_c, n_dofs]
-            C: wp.array3d(dtype=float),  # [arts, max_c, max_c]
-            diag_out: wp.array(dtype=float),
-        ):
-            art, thread = wp.tid()
-            constraint_count = constraint_counts[art]
-
-            if constraint_count == 0:
-                return
-
-            L_tile = wp.tile_load(L[art], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
-            J_tile = wp.tile_load(J_rows[art], shape=(TILE_CONSTRAINTS_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
-
-            # Solve L * Z = J^T (forward substitution)
-            Z_tile = wp.tile_lower_solve(L_tile, wp.tile_transpose(J_tile))
-
-            # Solve L^T * X = Z (backward substitution)
-            U_tile = wp.tile_transpose(L_tile)
-            X_tile = wp.tile_upper_solve(U_tile, Z_tile)
-
-            C_tile = wp.tile_zeros(shape=(TILE_CONSTRAINTS_LOCAL, TILE_CONSTRAINTS_LOCAL), dtype=wp.float32)
-
-            # Store Y = H^-1 * J^T (transpose back to row layout)
-            wp.tile_store(Y[art], wp.tile_transpose(X_tile))
-
-            # Form C = J * H^-1 * J^T
-            wp.tile_matmul(J_tile, X_tile, C_tile)
-            wp.tile_store(C[art], C_tile)
-
-            if thread == 0:
-                diag_base = art * max_c
-                for i in range(constraint_count):
-                    diag_out[diag_base + i] = C_tile[i, i] + row_cfm[diag_base + i]
-
-        hinv_jt_flat_tiled_template.__name__ = f"hinv_jt_flat_tiled_{dofs}_{max_c}"
-        hinv_jt_flat_tiled_template.__qualname__ = f"hinv_jt_flat_tiled_{dofs}_{max_c}"
-        return wp.kernel(enable_backward=False, module="unique")(hinv_jt_flat_tiled_template)
-
-    @classmethod
-    def get_cholesky_flat_kernel(cls, n_dofs: int, device: "wp.Device") -> "wp.Kernel":
-        """Get or create a tiled flat Cholesky kernel for the given DOF count."""
-        key = (n_dofs, device.arch)
-        if key not in cls._cholesky_flat_cache:
-            cls._cholesky_flat_cache[key] = cls._build_cholesky_flat_kernel(n_dofs)
-        return cls._cholesky_flat_cache[key]
-
-    @classmethod
-    def _build_cholesky_flat_kernel(cls, n_dofs: int) -> "wp.Kernel":
-        """Build specialized flat Cholesky kernel for given DOF count."""
-        dofs = int(n_dofs)
-        TILE_DOF_LOCAL = wp.constant(dofs)
-
-        def cholesky_flat_tiled_template(
-            H: wp.array3d(dtype=float),  # [arts, n_dofs, n_dofs]
-            R: wp.array2d(dtype=float),  # [arts, n_dofs]
-            mass_update_mask: wp.array(dtype=int),
-            # output
-            L: wp.array3d(dtype=float),  # [arts, n_dofs, n_dofs]
-        ):
-            art = wp.tid()
-
-            if mass_update_mask[art] == 0:
-                return
-
-            H_tile = wp.tile_load(H[art], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
-            armature = wp.tile_load(R[art], shape=(TILE_DOF_LOCAL,), bounds_check=False)
-
-            H_tile = wp.tile_diag_add(H_tile, armature)
-            L_tile = wp.tile_cholesky(H_tile)
-
-            wp.tile_store(L[art], L_tile)
-
-        cholesky_flat_tiled_template.__name__ = f"cholesky_flat_tiled_{dofs}"
-        cholesky_flat_tiled_template.__qualname__ = f"cholesky_flat_tiled_{dofs}"
-        return wp.kernel(enable_backward=False, module="unique")(cholesky_flat_tiled_template)
-
-    @classmethod
-    def get_triangular_solve_flat_kernel(cls, n_dofs: int, device: "wp.Device") -> "wp.Kernel":
-        """Get or create a tiled flat triangular solve kernel for the given DOF count."""
-        key = (n_dofs, device.arch)
-        if key not in cls._triangular_solve_flat_cache:
-            cls._triangular_solve_flat_cache[key] = cls._build_triangular_solve_flat_kernel(n_dofs)
-        return cls._triangular_solve_flat_cache[key]
-
-    @classmethod
-    def _build_triangular_solve_flat_kernel(cls, n_dofs: int) -> "wp.Kernel":
-        """Build specialized flat triangular solve kernel for given DOF count."""
-        dofs = int(n_dofs)
-        TILE_DOF_LOCAL = wp.constant(dofs)
-
-        def trisolve_flat_tiled_template(
-            L: wp.array3d(dtype=float),  # [arts, n_dofs, n_dofs]
-            tau: wp.array3d(dtype=float),  # [arts, n_dofs, 1]
-            # output
-            qdd: wp.array3d(dtype=float),  # [arts, n_dofs, 1]
-        ):
-            art = wp.tid()
-
-            L_tile = wp.tile_load(L[art], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
-            tau_tile = wp.tile_load(tau[art], shape=(TILE_DOF_LOCAL, 1), bounds_check=False)
-
-            z_tile = wp.tile_lower_solve(L_tile, tau_tile)
-            Lt_tile = wp.tile_transpose(L_tile)
-            qdd_tile = wp.tile_upper_solve(Lt_tile, z_tile)
-
-            wp.tile_store(qdd[art], qdd_tile)
-
-        trisolve_flat_tiled_template.__name__ = f"trisolve_flat_tiled_{dofs}"
-        trisolve_flat_tiled_template.__qualname__ = f"trisolve_flat_tiled_{dofs}"
-        return wp.kernel(enable_backward=False, module="unique")(trisolve_flat_tiled_template)
 
     @classmethod
     def get_hinv_jt_kernel(cls, n_dofs: int, max_constraints: int, device: "wp.Device") -> "wp.Kernel":
@@ -3454,7 +2600,7 @@ class TiledKernelFactory:
         TILE_DOF_LOCAL = wp.constant(int(n_dofs))
         TILE_CONSTRAINTS_LOCAL = wp.constant(int(max_constraints))
 
-        def hinv_jt_batched_tiled_template(
+        def hinv_jt_tiled_template(
             L_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
             J_group: wp.array3d(dtype=float),  # [n_arts, max_c, n_dofs]
             group_to_art: wp.array(dtype=int),
@@ -3488,9 +2634,9 @@ class TiledKernelFactory:
             Y_out_tile = wp.tile_transpose(X_tile)
             wp.tile_store(Y_group[idx], Y_out_tile)
 
-        hinv_jt_batched_tiled_template.__name__ = f"hinv_jt_batched_tiled_{n_dofs}_{max_constraints}"
-        hinv_jt_batched_tiled_template.__qualname__ = f"hinv_jt_batched_tiled_{n_dofs}_{max_constraints}"
-        return wp.kernel(enable_backward=False, module="unique")(hinv_jt_batched_tiled_template)
+        hinv_jt_tiled_template.__name__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}"
+        hinv_jt_tiled_template.__qualname__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}"
+        return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_template)
 
     @classmethod
     def _build_hinv_jt_fused_kernel(cls, n_dofs: int, max_constraints: int) -> "wp.Kernel":
@@ -3498,7 +2644,7 @@ class TiledKernelFactory:
         TILE_DOF_LOCAL = wp.constant(int(n_dofs))
         TILE_CONSTRAINTS_LOCAL = wp.constant(int(max_constraints))
 
-        def hinv_jt_batched_tiled_fused_template(
+        def hinv_jt_tiled_fused_template(
             L_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
             J_group: wp.array3d(dtype=float),  # [n_arts, max_c, n_dofs]
             group_to_art: wp.array(dtype=int),
@@ -3543,9 +2689,9 @@ class TiledKernelFactory:
                 for i in range(n_constraints):
                     world_diag[world, i] = C_tile[i, i] + row_cfm[world, i]
 
-        hinv_jt_batched_tiled_fused_template.__name__ = f"hinv_jt_batched_tiled_fused_{n_dofs}_{max_constraints}"
-        hinv_jt_batched_tiled_fused_template.__qualname__ = f"hinv_jt_batched_tiled_fused_{n_dofs}_{max_constraints}"
-        return wp.kernel(enable_backward=False, module="unique")(hinv_jt_batched_tiled_fused_template)
+        hinv_jt_tiled_fused_template.__name__ = f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}"
+        hinv_jt_tiled_fused_template.__qualname__ = f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}"
+        return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_fused_template)
 
     @classmethod
     def get_delassus_kernel(
@@ -3665,7 +2811,7 @@ class TiledKernelFactory:
         # Convert to Python int to ensure wp.constant() accepts them
         TILE_DOF_LOCAL = wp.constant(int(n_dofs))
 
-        def cholesky_batched_tiled_template(
+        def cholesky_tiled_template(
             H_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
             R_group: wp.array2d(dtype=float),  # [n_arts, n_dofs] armature
             group_to_art: wp.array(dtype=int),
@@ -3692,9 +2838,9 @@ class TiledKernelFactory:
             # Store result
             wp.tile_store(L_group[idx], L_tile)
 
-        cholesky_batched_tiled_template.__name__ = f"cholesky_batched_tiled_{n_dofs}"
-        cholesky_batched_tiled_template.__qualname__ = f"cholesky_batched_tiled_{n_dofs}"
-        return wp.kernel(enable_backward=False, module="unique")(cholesky_batched_tiled_template)
+        cholesky_tiled_template.__name__ = f"cholesky_tiled_{n_dofs}"
+        cholesky_tiled_template.__qualname__ = f"cholesky_tiled_{n_dofs}"
+        return wp.kernel(enable_backward=False, module="unique")(cholesky_tiled_template)
 
     @classmethod
     def get_triangular_solve_kernel(cls, n_dofs: int, device: "wp.Device") -> "wp.Kernel":
@@ -3712,7 +2858,7 @@ class TiledKernelFactory:
         """
         TILE_DOF_LOCAL = wp.constant(int(n_dofs))
 
-        def trisolve_batched_tiled_template(
+        def trisolve_tiled_template(
             L_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
             tau_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, 1]
             qdd_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, 1]
@@ -3730,9 +2876,9 @@ class TiledKernelFactory:
 
             wp.tile_store(qdd_group[idx], qdd_tile)
 
-        trisolve_batched_tiled_template.__name__ = f"trisolve_batched_tiled_{n_dofs}"
-        trisolve_batched_tiled_template.__qualname__ = f"trisolve_batched_tiled_{n_dofs}"
-        return wp.kernel(enable_backward=False, module="unique")(trisolve_batched_tiled_template)
+        trisolve_tiled_template.__name__ = f"trisolve_tiled_{n_dofs}"
+        trisolve_tiled_template.__qualname__ = f"trisolve_tiled_{n_dofs}"
+        return wp.kernel(enable_backward=False, module="unique")(trisolve_tiled_template)
 
     @classmethod
     def get_pgs_solve_tiled_row_kernel(cls, max_constraints: int, device: "wp.Device") -> "wp.Kernel":

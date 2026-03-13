@@ -528,7 +528,6 @@ def _build_render_command(job: Mapping[str, Any], results_dir: Path) -> list[str
 
 def _append_solver_override_flags(command: list[str], job: Mapping[str, Any]) -> None:
     single_value_flags = (
-        ("storage", "--storage"),
         ("cholesky_kernel", "--cholesky-kernel"),
         ("trisolve_kernel", "--trisolve-kernel"),
         ("hinv_jt_kernel", "--hinv-jt-kernel"),

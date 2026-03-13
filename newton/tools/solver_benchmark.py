@@ -38,7 +38,6 @@ SCENARIOS = {
         "description": "G1 humanoid on flat ground",
         "robot": "g1",
         "environment": None,
-        "storage": "flat",
         "default_substeps": 2,
         "default_pgs_iterations": 4,
         "default_dense_max_constraints": 32,
@@ -55,7 +54,6 @@ SCENARIOS = {
         "description": "G1 on stack of cubes (multi-articulation)",
         "robot": "g1",
         "environment": "cube_stack",
-        "storage": "batched",
         "default_substeps": 2,
         "default_pgs_iterations": 8,
         "default_dense_max_constraints": 128,
@@ -72,7 +70,6 @@ SCENARIOS = {
         "description": "H1 humanoid on flat ground",
         "robot": "h1",
         "environment": None,
-        "storage": "flat",
         "default_substeps": 4,
         "default_pgs_iterations": 8,
         "default_dense_max_constraints": 32,
@@ -89,7 +86,6 @@ SCENARIOS = {
         "description": "H1 humanoid with tabletop objects",
         "robot": "h1",
         "environment": "tabletop",
-        "storage": "batched",
         "default_substeps": 8,
         "default_pgs_iterations": 8,
         "default_dense_max_constraints": 128,
@@ -167,7 +163,6 @@ SOLVER_PRESETS = {
     },
     "fpgs_mf": {
         "type": "feather_pgs",
-        "storage": "batched",
         "pgs_mode": "velocity",
         "cholesky_kernel": "tiled",
         "trisolve_kernel": "tiled",
@@ -346,10 +341,6 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
         # override scenario defaults so the CLI args take effect.
         if any(k.endswith("_kernel") for k in solver_config):
             cmd.append("--override-scenario-defaults")
-
-        # Storage
-        storage = solver_config.get("storage") or scenario_cfg.get("storage", "batched")
-        cmd.extend(["--storage", storage])
 
         # Kernel options
         if "cholesky_kernel" in solver_config:
@@ -653,7 +644,6 @@ def create_solver(model, args, scenario_cfg: dict):
         delassus_chunk = get_kernel("delassus_chunk_size", args.delassus_chunk_size)
         pgs_chunk = get_kernel("pgs_chunk_size", args.pgs_chunk_size)
         parallel_streams = preset.get("use_parallel_streams", args.use_parallel_streams)
-        storage = preset.get("storage", args.storage or scenario_cfg.get("storage", "batched"))
         pgs_iterations = preset.get("pgs_iterations", args.pgs_iterations)
         dense_max_constraints = preset.get("dense_max_constraints", args.dense_max_constraints)
         pgs_mode = preset.get("pgs_mode", args.pgs_mode)
@@ -668,7 +658,6 @@ def create_solver(model, args, scenario_cfg: dict):
             "pgs_warmstart": args.pgs_warmstart,
             "pgs_mode": pgs_mode,
             "enable_contact_friction": True,
-            "storage": storage,
             "cholesky_kernel": cholesky,
             "trisolve_kernel": trisolve,
             "hinv_jt_kernel": hinv_jt,
@@ -1175,7 +1164,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Solver: mujoco, feather_pgs, or preset (fpgs_tiled, fpgs_loop, fpgs_mf, ...)",
     )
 
-    parser.add_argument("--storage", type=str, choices=["flat", "batched"], help="Storage mode")
     parser.add_argument(
         "--cholesky-kernel", type=str, default="auto", choices=["loop", "tiled", "auto"], help="Cholesky kernel"
     )
