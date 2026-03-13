@@ -2151,14 +2151,23 @@ def populate_world_J_for_size(
 def finalize_world_constraint_counts(
     world_slot_counter: wp.array(dtype=int),
     max_constraints: int,
+    slots_per_contact: int,
     # outputs
     world_constraint_count: wp.array(dtype=int),
 ):
-    """Copy and clamp the slot counter to constraint counts."""
+    """Copy and clamp the slot counter to constraint counts.
+
+    When the atomic slot counter exceeds ``max_constraints``, clamping can
+    leave "gap" slots that were reserved by a rejected contact but never
+    written.  Rounding down to the nearest ``slots_per_contact`` boundary
+    (3 with friction, 1 without) eliminates those gaps.
+    """
     world = wp.tid()
     count = world_slot_counter[world]
     if count > max_constraints:
         count = max_constraints
+    # Round down to avoid gap slots from atomic-add overflow
+    count = (count // slots_per_contact) * slots_per_contact
     world_constraint_count[world] = count
 
 
@@ -3060,14 +3069,20 @@ def pgs_solve_mf_loop(
 def finalize_mf_constraint_counts(
     mf_slot_counter: wp.array(dtype=int),
     mf_max_constraints: int,
+    slots_per_contact: int,
     # outputs
     mf_constraint_count: wp.array(dtype=int),
 ):
-    """Clamp MF slot counter to max and store as constraint count."""
+    """Clamp MF slot counter to max and store as constraint count.
+
+    See :func:`finalize_world_constraint_counts` for the gap-avoidance
+    rationale behind the ``slots_per_contact`` rounding.
+    """
     world = wp.tid()
     count = mf_slot_counter[world]
     if count > mf_max_constraints:
         count = mf_max_constraints
+    count = (count // slots_per_contact) * slots_per_contact
     mf_constraint_count[world] = count
 
 
