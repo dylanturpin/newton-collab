@@ -16,10 +16,14 @@ defaults:
     warmup_frames: 16
     measure_frames: 64
     pgs_iterations: 8
+    dense_max_constraints: 64
     pgs_beta: 0.1
     pgs_cfm: 1.0e-6
     pgs_omega: 1.0
     pgs_warmstart: false
+    pgs_mode: hybrid
+    use_parallel_streams: true
+    double_buffer: true
   render:
     render_frames: 300
     render_width: 1920
