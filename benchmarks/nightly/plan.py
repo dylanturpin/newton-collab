@@ -490,10 +490,12 @@ def _expand_matrix_jobs(
 
     jobs = []
     for job_index, combination in enumerate(combinations, start=1):
-        job = _base_job(task, defaults, profile)
+        job, explicit = _base_job(task, defaults, profile)
         for field_name, field_value in zip(matrix_fields, combination, strict=False):
             job[field_name] = field_value
-        job["solver_config"] = _resolve_solver_config(job)
+            if field_name in set(SOLVER_OVERRIDE_FIELDS):
+                explicit.add(field_name)
+        job["solver_config"] = _resolve_solver_config(job, explicit)
         job["id"] = _format_matrix_job_id(task["id"], job_index)
         jobs.append(job)
     return jobs
@@ -507,14 +509,17 @@ def _expand_explicit_jobs(
 ) -> list[dict[str, Any]]:
     jobs = []
     task_tags = task.get("tags", [])
+    solver_override_set = set(SOLVER_OVERRIDE_FIELDS)
     for step_index, job_spec in enumerate(task["jobs"], start=0):
-        job = _base_job(task, defaults, profile)
+        job, explicit = _base_job(task, defaults, profile)
         for field, value in job_spec.items():
             if field in JOB_METADATA_FIELDS:
                 continue
             job[field] = copy.deepcopy(value)
+            if field in solver_override_set:
+                explicit.add(field)
         job = _apply_overrides(job, target_overrides)
-        job["solver_config"] = _resolve_solver_config(job)
+        job["solver_config"] = _resolve_solver_config(job, explicit)
         job["variant_id"] = job_spec["id"]
         job["label"] = job_spec.get("label", job_spec["id"])
         job["step_index"] = step_index
@@ -543,35 +548,44 @@ def _base_job(task: Mapping[str, Any], defaults: Mapping[str, Any], profile: Map
         "num_worlds": task.get("num_worlds", 1),
     }
 
-    # Solver-override fields (kernel selections, pgs_mode, etc.) must NOT be
-    # populated from defaults — the solver preset provides them.  Only values
-    # explicitly authored on the task or job should override the preset.
-    # Non-solver fields (viewer, warmup_frames, …) are fine to inherit from
-    # defaults.
+    # Track which solver-override fields were explicitly authored on the
+    # task (vs inherited from defaults).  Only explicit values should
+    # override the solver preset in _resolve_solver_config.
+    explicit_solver_fields: set[str] = set()
     solver_override_set = set(SOLVER_OVERRIDE_FIELDS)
 
     if kind == "benchmark":
         for field in BENCHMARK_OPTION_FIELDS - {"solver", "substeps", "num_worlds"}:
             if field in task:
                 job[field] = task[field]
-            elif field not in solver_override_set and field in benchmark_defaults:
+                if field in solver_override_set:
+                    explicit_solver_fields.add(field)
+            elif field in benchmark_defaults:
                 job[field] = benchmark_defaults[field]
     else:
         for field in RENDER_OPTION_FIELDS - {"solver", "substeps", "num_worlds"}:
             if field in task:
                 job[field] = task[field]
-            elif field not in solver_override_set and field in render_defaults:
+                if field in solver_override_set:
+                    explicit_solver_fields.add(field)
+            elif field in render_defaults:
                 job[field] = render_defaults[field]
         job["num_worlds"] = task.get("num_worlds", 1)
 
-    return job
+    return job, explicit_solver_fields
 
 
-def _resolve_solver_config(job: Mapping[str, Any]) -> dict[str, Any]:
+def _resolve_solver_config(job: Mapping[str, Any], explicit_fields: set[str] | None = None) -> dict[str, Any]:
+    """Build solver_config from the preset, overridden only by explicitly authored fields.
+
+    Fields that were inherited from YAML defaults (not authored on the task or
+    job) must not override the solver preset — the preset is more specific.
+    """
     solver_name = job["solver"]
     solver_config = copy.deepcopy(SOLVER_PRESETS[solver_name])
+    override_fields = explicit_fields if explicit_fields is not None else set(SOLVER_OVERRIDE_FIELDS)
     for field in SOLVER_OVERRIDE_FIELDS:
-        if field in job and job[field] is not None:
+        if field in override_fields and field in job and job[field] is not None:
             solver_config[field] = job[field]
     return solver_config
 
