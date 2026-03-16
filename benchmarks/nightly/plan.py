@@ -543,17 +543,24 @@ def _base_job(task: Mapping[str, Any], defaults: Mapping[str, Any], profile: Map
         "num_worlds": task.get("num_worlds", 1),
     }
 
+    # Solver-override fields (kernel selections, pgs_mode, etc.) must NOT be
+    # populated from defaults — the solver preset provides them.  Only values
+    # explicitly authored on the task or job should override the preset.
+    # Non-solver fields (viewer, warmup_frames, …) are fine to inherit from
+    # defaults.
+    solver_override_set = set(SOLVER_OVERRIDE_FIELDS)
+
     if kind == "benchmark":
         for field in BENCHMARK_OPTION_FIELDS - {"solver", "substeps", "num_worlds"}:
             if field in task:
                 job[field] = task[field]
-            elif field in benchmark_defaults:
+            elif field not in solver_override_set and field in benchmark_defaults:
                 job[field] = benchmark_defaults[field]
     else:
         for field in RENDER_OPTION_FIELDS - {"solver", "substeps", "num_worlds"}:
             if field in task:
                 job[field] = task[field]
-            elif field in render_defaults:
+            elif field not in solver_override_set and field in render_defaults:
                 job[field] = render_defaults[field]
         job["num_worlds"] = task.get("num_worlds", 1)
 
