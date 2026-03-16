@@ -1110,7 +1110,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--pgs-kernel",
         type=str,
         default="tiled_contact",
-        choices=["loop", "tiled_row", "tiled_contact", "streaming"],
+        choices=["loop", "tiled_row", "tiled_row_desaxce", "tiled_contact", "streaming", "block_gs", "block_gs_desaxce"],
         help="PGS kernel",
     )
     parser.add_argument("--pgs-iterations", type=int, default=8, help="PGS iterations")

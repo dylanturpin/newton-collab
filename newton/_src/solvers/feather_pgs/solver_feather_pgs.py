@@ -264,7 +264,7 @@ class SolverFeatherPGS(SolverBase):
         if delassus_kernel not in valid_delassus:
             raise ValueError(f"delassus_kernel must be one of {sorted(valid_delassus)}")
 
-        valid_pgs = {"loop", "tiled_row", "tiled_contact", "streaming"}
+        valid_pgs = {"loop", "tiled_row", "tiled_row_desaxce", "tiled_contact", "streaming", "block_gs", "block_gs_desaxce"}
         if pgs_kernel not in valid_pgs:
             raise ValueError(f"pgs_kernel must be one of {sorted(valid_pgs)}")
 
@@ -1221,12 +1221,63 @@ class SolverFeatherPGS(SolverBase):
 
             # Two-phase GS kernel: dense + MF in one pass
             with wp.ScopedTimer("S6_PGS_Solve", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
-                mf_gs_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_kernel(
-                    self.dense_max_constraints,
-                    self.mf_max_constraints,
-                    self.max_world_dofs,
-                    self.model.device,
-                )
+                use_block_gs = self.pgs_kernel in ("block_gs", "block_gs_desaxce")
+                use_desaxce = self.pgs_kernel in ("tiled_row_desaxce", "block_gs_desaxce")
+
+                if use_block_gs:
+                    solve_kernel = TiledKernelFactory.get_pgs_solve_block_gs_kernel(
+                        self.dense_max_constraints,
+                        self.mf_max_constraints,
+                        self.max_world_dofs,
+                        self.model.device,
+                        desaxce=use_desaxce,
+                    )
+                    solve_inputs = [
+                        self.constraint_count,
+                        self.world_dof_start,
+                        self.rhs,
+                        self.diag,
+                        self.impulses,
+                        self.J_world,
+                        self.Y_world,
+                        self.row_mu,
+                        self.mf_constraint_count,
+                        self.mf_meta_packed,
+                        self.mf_impulses,
+                        self.mf_J_a,
+                        self.mf_J_b,
+                        self.mf_MiJt_a,
+                        self.mf_MiJt_b,
+                        self.mf_row_mu,
+                    ]
+                else:
+                    solve_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_kernel(
+                        self.dense_max_constraints,
+                        self.mf_max_constraints,
+                        self.max_world_dofs,
+                        self.model.device,
+                        desaxce=use_desaxce,
+                    )
+                    solve_inputs = [
+                        self.constraint_count,
+                        self.world_dof_start,
+                        self.rhs,
+                        self.diag,
+                        self.impulses,
+                        self.J_world,
+                        self.Y_world,
+                        self.row_type,
+                        self.row_parent,
+                        self.row_mu,
+                        self.mf_constraint_count,
+                        self.mf_meta_packed,
+                        self.mf_impulses,
+                        self.mf_J_a,
+                        self.mf_J_b,
+                        self.mf_MiJt_a,
+                        self.mf_MiJt_b,
+                        self.mf_row_mu,
+                    ]
 
                 if self.pgs_debug:
                     self._pgs_convergence_log.append([])
@@ -1238,30 +1289,9 @@ class SolverFeatherPGS(SolverBase):
 
                         # Run 1 iteration
                         wp.launch_tiled(
-                            mf_gs_kernel,
+                            solve_kernel,
                             dim=[self.world_count],
-                            inputs=[
-                                self.constraint_count,
-                                self.world_dof_start,
-                                self.rhs,
-                                self.diag,
-                                self.impulses,
-                                self.J_world,
-                                self.Y_world,
-                                self.row_type,
-                                self.row_parent,
-                                self.row_mu,
-                                self.mf_constraint_count,
-                                self.mf_meta_packed,
-                                self.mf_impulses,
-                                self.mf_J_a,
-                                self.mf_J_b,
-                                self.mf_MiJt_a,
-                                self.mf_MiJt_b,
-                                self.mf_row_mu,
-                                1,  # iterations=1
-                                self.pgs_omega,
-                            ],
+                            inputs=[*solve_inputs, 1, self.pgs_omega],
                             outputs=[self.v_out],
                             block_dim=32,
                             device=self.model.device,
@@ -1315,33 +1345,9 @@ class SolverFeatherPGS(SolverBase):
 
                 else:
                     wp.launch_tiled(
-                        mf_gs_kernel,
+                        solve_kernel,
                         dim=[self.world_count],
-                        inputs=[
-                            # Dense
-                            self.constraint_count,
-                            self.world_dof_start,
-                            self.rhs,
-                            self.diag,
-                            self.impulses,
-                            self.J_world,
-                            self.Y_world,
-                            self.row_type,
-                            self.row_parent,
-                            self.row_mu,
-                            # MF
-                            self.mf_constraint_count,
-                            self.mf_meta_packed,
-                            self.mf_impulses,
-                            self.mf_J_a,
-                            self.mf_J_b,
-                            self.mf_MiJt_a,
-                            self.mf_MiJt_b,
-                            self.mf_row_mu,
-                            # Shared
-                            self.pgs_iterations,
-                            self.pgs_omega,
-                        ],
+                        inputs=[*solve_inputs, self.pgs_iterations, self.pgs_omega],
                         outputs=[self.v_out],
                         block_dim=32,
                         device=self.model.device,
@@ -2358,7 +2364,7 @@ class SolverFeatherPGS(SolverBase):
         """Dispatch the dense PGS kernel with a given iteration count."""
         saved = self.pgs_iterations
         self.pgs_iterations = iterations
-        if self.pgs_kernel == "tiled_row":
+        if self.pgs_kernel in ("tiled_row", "tiled_row_desaxce"):
             self._stage5_pgs_solve_world_tiled_row()
         elif self.pgs_kernel == "tiled_contact":
             self._stage5_pgs_solve_world_tiled_contact()
@@ -2680,6 +2686,7 @@ class TiledKernelFactory:
     _pgs_solve_streaming_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_mf_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
     _pgs_solve_mf_gs_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
+    _pgs_solve_block_gs_cache: ClassVar[dict[tuple[int, int, int, str], "wp.Kernel"]] = {}
     _pack_mf_meta_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _triangular_solve_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _delassus_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
@@ -4123,24 +4130,29 @@ class TiledKernelFactory:
 
     @classmethod
     def get_pgs_solve_mf_gs_kernel(
-        cls, max_constraints: int, mf_max_constraints: int, max_world_dofs: int, device: "wp.Device"
+        cls, max_constraints: int, mf_max_constraints: int, max_world_dofs: int, device: "wp.Device",
+        *, desaxce: bool = False,
     ) -> "wp.Kernel":
         """Get or create a two-phase GS kernel for matrix-free articulated PGS.
 
         Phase 1 processes dense constraints (via J_world/Y_world at ``max_constraints``).
         Phase 2 processes MF constraints (via mf_J/mf_MiJt at ``mf_max_constraints``).
         Both phases share a single velocity vector in shared memory.
+
+        When *desaxce* is True, the MF phase uses De Saxcé's modified NCP
+        formulation with SOC friction cone projection.
         """
-        key = (max_constraints, mf_max_constraints, max_world_dofs, device.arch)
+        key = (max_constraints, mf_max_constraints, max_world_dofs, device.arch, desaxce)
         if key not in cls._pgs_solve_mf_gs_cache:
             cls._pgs_solve_mf_gs_cache[key] = cls._build_pgs_solve_mf_gs_kernel(
-                max_constraints, mf_max_constraints, max_world_dofs
+                max_constraints, mf_max_constraints, max_world_dofs, desaxce=desaxce,
             )
         return cls._pgs_solve_mf_gs_cache[key]
 
     @classmethod
     def _build_pgs_solve_mf_gs_kernel(
-        cls, max_constraints: int, mf_max_constraints: int, max_world_dofs: int
+        cls, max_constraints: int, mf_max_constraints: int, max_world_dofs: int,
+        *, desaxce: bool = False,
     ) -> "wp.Kernel":
         """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -4224,6 +4236,242 @@ class TiledKernelFactory:
                         s_v[{d_expr}] += Y_world.data[sib_row_base + {d_expr}] * sib_delta;
                     }}""")
         dense_sib_v_code = "\n".join(dense_sib_v_parts)
+
+        # --- Code generation for MF phase (original vs De Saxcé) ---
+        if desaxce:
+            mf_phase_code = """
+            // ── Phase 2: MF constraints (De Saxcé, 3-row contact blocks) ──
+            {{
+                int num_mf_contacts = m_mf / 3;
+                for (int b = 0; b < num_mf_contacts; b++) {{
+                    int i0 = b * 3;
+                    int mf6_0 = mf6_base + i0 * 6;
+
+                    int4 mt0 = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i0 * 4]);
+                    int4 mt1 = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i0 + 1) * 4]);
+                    int4 mt2 = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i0 + 2) * 4]);
+
+                    int packed_dofs = mt0.x;
+                    int dof_a = packed_dofs >> 16;
+                    int dof_b = (packed_dofs << 16) >> 16;
+
+                    float diag0 = __int_as_float(mt0.y);
+                    float diag1 = __int_as_float(mt1.y);
+                    float diag2 = __int_as_float(mt2.y);
+
+                    if (diag0 <= 0.0f) continue;
+
+                    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f;
+                    if (lane < 6 && dof_a >= 0) {{
+                        float va = s_v[dof_a + lane];
+                        s0 = mf_J_a.data[mf6_0 + lane] * va;
+                        s1 = mf_J_a.data[mf6_0 + 6 + lane] * va;
+                        s2 = mf_J_a.data[mf6_0 + 12 + lane] * va;
+                    }}
+                    if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                        int l = lane - 6;
+                        float vb = s_v[dof_b + l];
+                        s0 += mf_J_b.data[mf6_0 + l] * vb;
+                        s1 += mf_J_b.data[mf6_0 + 6 + l] * vb;
+                        s2 += mf_J_b.data[mf6_0 + 12 + l] * vb;
+                    }}
+                    s0 += __shfl_down_sync(MASK, s0, 16);
+                    s1 += __shfl_down_sync(MASK, s1, 16);
+                    s2 += __shfl_down_sync(MASK, s2, 16);
+                    s0 += __shfl_down_sync(MASK, s0, 8);
+                    s1 += __shfl_down_sync(MASK, s1, 8);
+                    s2 += __shfl_down_sync(MASK, s2, 8);
+                    s0 += __shfl_down_sync(MASK, s0, 4);
+                    s1 += __shfl_down_sync(MASK, s1, 4);
+                    s2 += __shfl_down_sync(MASK, s2, 4);
+                    s0 += __shfl_down_sync(MASK, s0, 2);
+                    s1 += __shfl_down_sync(MASK, s1, 2);
+                    s2 += __shfl_down_sync(MASK, s2, 2);
+                    s0 += __shfl_down_sync(MASK, s0, 1);
+                    s1 += __shfl_down_sync(MASK, s1, 1);
+                    s2 += __shfl_down_sync(MASK, s2, 1);
+
+                    float jv0 = __shfl_sync(MASK, s0, 0);
+                    float jv1 = __shfl_sync(MASK, s1, 0);
+                    float jv2 = __shfl_sync(MASK, s2, 0);
+
+                    float dl0 = 0.0f, dl1 = 0.0f, dl2 = 0.0f;
+                    if (lane == 0) {{
+                        float mu = mf_row_mu.data[off_mf + i0 + 1];
+
+                        float vt_mag = sqrtf(jv1 * jv1 + jv2 * jv2);
+                        float res0 = -(jv0 + mu * vt_mag + __int_as_float(mt0.z));
+                        float res1 = -(jv1 + __int_as_float(mt1.z));
+                        float res2 = -(jv2 + __int_as_float(mt2.z));
+
+                        float d0 = diag0 * res0;
+                        float d1 = diag1 * res1;
+                        float d2 = diag2 * res2;
+
+                        float new_n  = s_lam_mf[i0]     + omega * d0;
+                        float new_t1 = s_lam_mf[i0 + 1] + omega * d1;
+                        float new_t2 = s_lam_mf[i0 + 2] + omega * d2;
+
+                        float t_mag = sqrtf(new_t1 * new_t1 + new_t2 * new_t2);
+                        if (t_mag <= mu * new_n) {{
+                        }} else if (new_n + mu * t_mag <= 0.0f) {{
+                            new_n = 0.0f; new_t1 = 0.0f; new_t2 = 0.0f;
+                        }} else {{
+                            float sc = (new_n + mu * t_mag) / (1.0f + mu * mu);
+                            new_n = sc;
+                            float t_scale = mu * sc / t_mag;
+                            new_t1 *= t_scale;
+                            new_t2 *= t_scale;
+                        }}
+
+                        dl0 = new_n  - s_lam_mf[i0];
+                        dl1 = new_t1 - s_lam_mf[i0 + 1];
+                        dl2 = new_t2 - s_lam_mf[i0 + 2];
+                        s_lam_mf[i0]     = new_n;
+                        s_lam_mf[i0 + 1] = new_t1;
+                        s_lam_mf[i0 + 2] = new_t2;
+                    }}
+
+                    dl0 = __shfl_sync(MASK, dl0, 0);
+                    dl1 = __shfl_sync(MASK, dl1, 0);
+                    dl2 = __shfl_sync(MASK, dl2, 0);
+
+                    if (dl0 != 0.0f || dl1 != 0.0f || dl2 != 0.0f) {{
+                        if (lane < 6 && dof_a >= 0) {{
+                            s_v[dof_a + lane] += mf_MiJt_a.data[mf6_0 + lane] * dl0
+                                               + mf_MiJt_a.data[mf6_0 + 6 + lane] * dl1
+                                               + mf_MiJt_a.data[mf6_0 + 12 + lane] * dl2;
+                        }}
+                        if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                            int l = lane - 6;
+                            s_v[dof_b + l] += mf_MiJt_b.data[mf6_0 + l] * dl0
+                                            + mf_MiJt_b.data[mf6_0 + 6 + l] * dl1
+                                            + mf_MiJt_b.data[mf6_0 + 12 + l] * dl2;
+                        }}
+                    }}
+                    __syncwarp();
+                }}
+            }}"""
+        else:
+            mf_phase_code = """
+            // ── Phase 2: MF constraints (6-DOF per body, software-pipelined) ──
+
+            // Pipeline registers: prefetch next constraint's global data
+            int4 pre_meta;
+            float pre_Ja = 0.0f, pre_Jb = 0.0f;
+            float pre_MiJta = 0.0f, pre_MiJtb = 0.0f;
+
+            // Prefetch constraint 0
+            if (m_mf > 0) {{
+                pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta]);
+                if (lane < 6) {{
+                    pre_Ja = mf_J_a.data[mf6_base + lane];
+                    pre_MiJta = mf_MiJt_a.data[mf6_base + lane];
+                }}
+                if (lane >= 6 && lane < 12) {{
+                    pre_Jb = mf_J_b.data[mf6_base + lane - 6];
+                    pre_MiJtb = mf_MiJt_b.data[mf6_base + lane - 6];
+                }}
+            }}
+
+            for (int i = 0; i < m_mf; i++) {{
+                int4 meta = pre_meta;
+                float cur_Ja = pre_Ja;
+                float cur_Jb = pre_Jb;
+                float cur_MiJta = pre_MiJta;
+                float cur_MiJtb = pre_MiJtb;
+
+                if (i + 1 < m_mf) {{
+                    int next_mf6 = mf6_base + (i + 1) * 6;
+                    pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i + 1) * 4]);
+                    if (lane < 6) {{
+                        pre_Ja = mf_J_a.data[next_mf6 + lane];
+                        pre_MiJta = mf_MiJt_a.data[next_mf6 + lane];
+                    }}
+                    if (lane >= 6 && lane < 12) {{
+                        pre_Jb = mf_J_b.data[next_mf6 + lane - 6];
+                        pre_MiJtb = mf_MiJt_b.data[next_mf6 + lane - 6];
+                    }}
+                }}
+
+                int packed_dofs = meta.x;
+                int dof_a = packed_dofs >> 16;
+                int dof_b = (packed_dofs << 16) >> 16;
+                float mf_diag = __int_as_float(meta.y);
+
+                if (mf_diag <= 0.0f) continue;
+
+                float my_sum = 0.0f;
+                if (lane < 6 && dof_a >= 0) {{
+                    my_sum = cur_Ja * s_v[dof_a + lane];
+                }}
+                if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                    my_sum = cur_Jb * s_v[dof_b + lane - 6];
+                }}
+                my_sum += __shfl_down_sync(MASK, my_sum, 16);
+                my_sum += __shfl_down_sync(MASK, my_sum, 8);
+                my_sum += __shfl_down_sync(MASK, my_sum, 4);
+                my_sum += __shfl_down_sync(MASK, my_sum, 2);
+                my_sum += __shfl_down_sync(MASK, my_sum, 1);
+                float jv = __shfl_sync(MASK, my_sum, 0);
+
+                float residual = jv + __int_as_float(meta.z);
+                float delta = -residual * mf_diag;
+                float old_impulse = s_lam_mf[i];
+                float new_impulse = old_impulse + omega * delta;
+                int packed_tp = meta.w;
+                int mf_rt = packed_tp & 0xFFFF;
+
+                if (mf_rt == 0) {{
+                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                }} else if (mf_rt == 2) {{
+                    int mf_par = packed_tp >> 16;
+                    float lambda_n = s_lam_mf[mf_par];
+                    float mu = mf_row_mu.data[off_mf + i];
+                    float radius = fmaxf(mu * lambda_n, 0.0f);
+
+                    if (radius <= 0.0f) {{
+                        new_impulse = 0.0f;
+                    }} else {{
+                        int sib = (i == mf_par + 1) ? mf_par + 2 : mf_par + 1;
+                        s_lam_mf[i] = new_impulse;
+                        float a_val = new_impulse;
+                        float b_val = s_lam_mf[sib];
+                        float mag = sqrtf(a_val * a_val + b_val * b_val);
+                        if (mag > radius) {{
+                            float scale = radius / mag;
+                            new_impulse = a_val * scale;
+                            float sib_new = b_val * scale;
+                            float sib_delta = sib_new - b_val;
+                            s_lam_mf[sib] = sib_new;
+
+                            int sib_packed_dofs = mf_meta.data[off_meta + sib * 4];
+                            int sib_dof_a = sib_packed_dofs >> 16;
+                            int sib_dof_b = (sib_packed_dofs << 16) >> 16;
+                            int sib_mf6 = mf6_base + sib * 6;
+                            if (lane < 6 && sib_dof_a >= 0) {{
+                                s_v[sib_dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
+                            }}
+                            if (lane >= 6 && lane < 12 && sib_dof_b >= 0) {{
+                                s_v[sib_dof_b + lane - 6] += mf_MiJt_b.data[sib_mf6 + lane - 6] * sib_delta;
+                            }}
+                        }}
+                    }}
+                }}
+
+                float delta_impulse = new_impulse - old_impulse;
+                s_lam_mf[i] = new_impulse;
+
+                if (delta_impulse != 0.0f) {{
+                    if (lane < 6 && dof_a >= 0) {{
+                        s_v[dof_a + lane] += cur_MiJta * delta_impulse;
+                    }}
+                    if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                        s_v[dof_b + lane - 6] += cur_MiJtb * delta_impulse;
+                    }}
+                }}
+                __syncwarp();
+            }}"""
 
         snippet = f"""
     #if defined(__CUDA_ARCH__)
@@ -4358,130 +4606,7 @@ class TiledKernelFactory:
                 __syncwarp();
             }}
 
-            // ── Phase 2: MF constraints (6-DOF per body, software-pipelined) ──
-
-            // Pipeline registers: prefetch next constraint's global data
-            int4 pre_meta;
-            float pre_Ja = 0.0f, pre_Jb = 0.0f;
-            float pre_MiJta = 0.0f, pre_MiJtb = 0.0f;
-
-            // Prefetch constraint 0
-            if (m_mf > 0) {{
-                pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta]);
-                if (lane < 6) {{
-                    pre_Ja = mf_J_a.data[mf6_base + lane];
-                    pre_MiJta = mf_MiJt_a.data[mf6_base + lane];
-                }}
-                if (lane >= 6 && lane < 12) {{
-                    pre_Jb = mf_J_b.data[mf6_base + lane - 6];
-                    pre_MiJtb = mf_MiJt_b.data[mf6_base + lane - 6];
-                }}
-            }}
-
-            for (int i = 0; i < m_mf; i++) {{
-                // Consume prefetched data for constraint i
-                int4 meta = pre_meta;
-                float cur_Ja = pre_Ja;
-                float cur_Jb = pre_Jb;
-                float cur_MiJta = pre_MiJta;
-                float cur_MiJtb = pre_MiJtb;
-
-                // Prefetch constraint i+1 (loads issued now, complete during compute)
-                if (i + 1 < m_mf) {{
-                    int next_mf6 = mf6_base + (i + 1) * 6;
-                    pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i + 1) * 4]);
-                    if (lane < 6) {{
-                        pre_Ja = mf_J_a.data[next_mf6 + lane];
-                        pre_MiJta = mf_MiJt_a.data[next_mf6 + lane];
-                    }}
-                    if (lane >= 6 && lane < 12) {{
-                        pre_Jb = mf_J_b.data[next_mf6 + lane - 6];
-                        pre_MiJtb = mf_MiJt_b.data[next_mf6 + lane - 6];
-                    }}
-                }}
-
-                // Process constraint i
-                int packed_dofs = meta.x;
-                int dof_a = packed_dofs >> 16;
-                int dof_b = (packed_dofs << 16) >> 16;
-                float mf_diag = __int_as_float(meta.y);
-
-                if (mf_diag <= 0.0f) continue;
-
-                // J · v using prefetched J values
-                float my_sum = 0.0f;
-                if (lane < 6 && dof_a >= 0) {{
-                    my_sum = cur_Ja * s_v[dof_a + lane];
-                }}
-                if (lane >= 6 && lane < 12 && dof_b >= 0) {{
-                    my_sum = cur_Jb * s_v[dof_b + lane - 6];
-                }}
-                my_sum += __shfl_down_sync(MASK, my_sum, 16);
-                my_sum += __shfl_down_sync(MASK, my_sum, 8);
-                my_sum += __shfl_down_sync(MASK, my_sum, 4);
-                my_sum += __shfl_down_sync(MASK, my_sum, 2);
-                my_sum += __shfl_down_sync(MASK, my_sum, 1);
-                float jv = __shfl_sync(MASK, my_sum, 0);
-
-                float residual = jv + __int_as_float(meta.z);
-                float delta = -residual * mf_diag;
-                float old_impulse = s_lam_mf[i];
-                float new_impulse = old_impulse + omega * delta;
-                int packed_tp = meta.w;
-                int mf_rt = packed_tp & 0xFFFF;
-
-                if (mf_rt == 0) {{
-                    if (new_impulse < 0.0f) new_impulse = 0.0f;
-                }} else if (mf_rt == 2) {{
-                    int mf_par = packed_tp >> 16;
-                    float lambda_n = s_lam_mf[mf_par];
-                    float mu = mf_row_mu.data[off_mf + i];
-                    float radius = fmaxf(mu * lambda_n, 0.0f);
-
-                    if (radius <= 0.0f) {{
-                        new_impulse = 0.0f;
-                    }} else {{
-                        int sib = (i == mf_par + 1) ? mf_par + 2 : mf_par + 1;
-                        s_lam_mf[i] = new_impulse;
-                        float a_val = new_impulse;
-                        float b_val = s_lam_mf[sib];
-                        float mag = sqrtf(a_val * a_val + b_val * b_val);
-                        if (mag > radius) {{
-                            float scale = radius / mag;
-                            new_impulse = a_val * scale;
-                            float sib_new = b_val * scale;
-                            float sib_delta = sib_new - b_val;
-                            s_lam_mf[sib] = sib_new;
-
-                            // Sibling v update (can't prefetch — random sib index)
-                            int sib_packed_dofs = mf_meta.data[off_meta + sib * 4];
-                            int sib_dof_a = sib_packed_dofs >> 16;
-                            int sib_dof_b = (sib_packed_dofs << 16) >> 16;
-                            int sib_mf6 = mf6_base + sib * 6;
-                            if (lane < 6 && sib_dof_a >= 0) {{
-                                s_v[sib_dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
-                            }}
-                            if (lane >= 6 && lane < 12 && sib_dof_b >= 0) {{
-                                s_v[sib_dof_b + lane - 6] += mf_MiJt_b.data[sib_mf6 + lane - 6] * sib_delta;
-                            }}
-                        }}
-                    }}
-                }}
-
-                float delta_impulse = new_impulse - old_impulse;
-                s_lam_mf[i] = new_impulse;
-
-                // V update using prefetched MiJt values
-                if (delta_impulse != 0.0f) {{
-                    if (lane < 6 && dof_a >= 0) {{
-                        s_v[dof_a + lane] += cur_MiJta * delta_impulse;
-                    }}
-                    if (lane >= 6 && lane < 12 && dof_b >= 0) {{
-                        s_v[dof_b + lane - 6] += cur_MiJtb * delta_impulse;
-                    }}
-                }}
-                __syncwarp();
-            }}
+            {mf_phase_code}
         }}
 
         // ═══════════════════════════════════════════════════════
@@ -4586,3 +4711,640 @@ class TiledKernelFactory:
         pgs_solve_mf_gs_template.__name__ = name
         pgs_solve_mf_gs_template.__qualname__ = name
         return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+
+    # ─────────────────────────────────────────────────────────────────
+    # velocity block_gs kernel: 3×3 Dinv dense + MF rigid
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    def get_pgs_solve_block_gs_kernel(
+        cls,
+        max_constraints: int,
+        mf_max_constraints: int,
+        max_world_dofs: int,
+        device: "wp.Device",
+        *,
+        desaxce: bool = False,
+    ) -> "wp.Kernel":
+        """Get or create a block GS velocity kernel.
+
+        Dense phase: 3-row contact blocks with pre-computed 3x3 diagonal
+        block inverse (from J*Y), operating in velocity space.
+        MF phase: matrix-free 6-DOF rigid body solve with 3x3 block Dinv.
+        Both phases share a velocity vector in shared memory.
+
+        When *desaxce* is True, both phases use De Saxcé's modified NCP
+        formulation with SOC friction cone projection.
+        """
+        key = (max_constraints, mf_max_constraints, max_world_dofs, device.arch, desaxce)
+        if key not in cls._pgs_solve_block_gs_cache:
+            cls._pgs_solve_block_gs_cache[key] = cls._build_pgs_solve_block_gs_kernel(
+                max_constraints, mf_max_constraints, max_world_dofs, desaxce=desaxce,
+            )
+        return cls._pgs_solve_block_gs_cache[key]
+
+    @classmethod
+    def _build_pgs_solve_block_gs_kernel(
+        cls, max_constraints: int, mf_max_constraints: int, max_world_dofs: int,
+        *, desaxce: bool = False,
+    ) -> "wp.Kernel":
+        """Block GS velocity kernel: 3x3 block Dinv for both dense and MF phases.
+
+        Dense phase: 3-row contact blocks with pre-computed 3x3 diagonal
+        block inverse (from J*Y), operating in velocity space.
+        MF phase: 3-row contact blocks with pre-computed 3x3 diagonal
+        block inverse (from J*MiJt), 6-DOF per body.
+        Both phases share a velocity vector in shared memory.
+        """
+        M_D = max_constraints
+        M_MF = mf_max_constraints
+        D = max_world_dofs
+        NUM_CONTACTS_MAX = M_D // 3
+        NUM_MF_CONTACTS_MAX = M_MF // 3
+
+        # --- Conditional residual + projection for dense and MF phases ---
+        if desaxce:
+            bgs_dense_solve_code = """\
+                float dl0 = 0.0f, dl1 = 0.0f, dl2 = 0.0f;
+                if (lane == 0) {{
+                    float mu = s_mu[b];
+                    float vt_mag = sqrtf(jv1 * jv1 + jv2 * jv2);
+                    float res0 = -(jv0 + mu * vt_mag + s_rhs[i0]);
+                    float res1 = -(jv1 + s_rhs[i0 + 1]);
+                    float res2 = -(jv2 + s_rhs[i0 + 2]);
+
+                    const float* Dinv = &s_Dinv[b * 9];
+                    float d0 = Dinv[0] * res0 + Dinv[1] * res1 + Dinv[2] * res2;
+                    float d1 = Dinv[3] * res0 + Dinv[4] * res1 + Dinv[5] * res2;
+                    float d2 = Dinv[6] * res0 + Dinv[7] * res1 + Dinv[8] * res2;
+
+                    float new_n  = s_lam[i0]     + omega * d0;
+                    float new_t1 = s_lam[i0 + 1] + omega * d1;
+                    float new_t2 = s_lam[i0 + 2] + omega * d2;
+
+                    float t_mag = sqrtf(new_t1 * new_t1 + new_t2 * new_t2);
+                    if (t_mag <= mu * new_n) {{
+                    }} else if (new_n + mu * t_mag <= 0.0f) {{
+                        new_n = 0.0f; new_t1 = 0.0f; new_t2 = 0.0f;
+                    }} else {{
+                        float s = (new_n + mu * t_mag) / (1.0f + mu * mu);
+                        new_n = s;
+                        float t_scale = mu * s / t_mag;
+                        new_t1 *= t_scale;
+                        new_t2 *= t_scale;
+                    }}
+
+                    dl0 = new_n  - s_lam[i0];
+                    dl1 = new_t1 - s_lam[i0 + 1];
+                    dl2 = new_t2 - s_lam[i0 + 2];
+                    s_lam[i0]     = new_n;
+                    s_lam[i0 + 1] = new_t1;
+                    s_lam[i0 + 2] = new_t2;
+                }}"""
+            bgs_mf_solve_code = """\
+                float dl0 = 0.0f, dl1 = 0.0f, dl2 = 0.0f;
+                if (lane == 0) {{
+                    float mu = s_mf_mu[b];
+                    float vt_mag = sqrtf(jv1 * jv1 + jv2 * jv2);
+                    float res0 = -(jv0 + mu * vt_mag + s_mf_rhs[i0]);
+                    float res1 = -(jv1 + s_mf_rhs[i0 + 1]);
+                    float res2 = -(jv2 + s_mf_rhs[i0 + 2]);
+
+                    const float* Dinv = &s_mf_Dinv[b * 9];
+                    float d0 = Dinv[0] * res0 + Dinv[1] * res1 + Dinv[2] * res2;
+                    float d1 = Dinv[3] * res0 + Dinv[4] * res1 + Dinv[5] * res2;
+                    float d2 = Dinv[6] * res0 + Dinv[7] * res1 + Dinv[8] * res2;
+
+                    float new_n  = s_lam_mf[i0]     + omega * d0;
+                    float new_t1 = s_lam_mf[i0 + 1] + omega * d1;
+                    float new_t2 = s_lam_mf[i0 + 2] + omega * d2;
+
+                    float t_mag = sqrtf(new_t1 * new_t1 + new_t2 * new_t2);
+                    if (t_mag <= mu * new_n) {{
+                    }} else if (new_n + mu * t_mag <= 0.0f) {{
+                        new_n = 0.0f; new_t1 = 0.0f; new_t2 = 0.0f;
+                    }} else {{
+                        float s = (new_n + mu * t_mag) / (1.0f + mu * mu);
+                        new_n = s;
+                        float t_scale = mu * s / t_mag;
+                        new_t1 *= t_scale;
+                        new_t2 *= t_scale;
+                    }}
+
+                    dl0 = new_n  - s_lam_mf[i0];
+                    dl1 = new_t1 - s_lam_mf[i0 + 1];
+                    dl2 = new_t2 - s_lam_mf[i0 + 2];
+                    s_lam_mf[i0]     = new_n;
+                    s_lam_mf[i0 + 1] = new_t1;
+                    s_lam_mf[i0 + 2] = new_t2;
+                }}"""
+        else:
+            bgs_dense_solve_code = """\
+                float dl0 = 0.0f, dl1 = 0.0f, dl2 = 0.0f;
+                if (lane == 0) {{
+                    float res0 = -(jv0 + s_rhs[i0]);
+                    float res1 = -(jv1 + s_rhs[i0 + 1]);
+                    float res2 = -(jv2 + s_rhs[i0 + 2]);
+
+                    const float* Dinv = &s_Dinv[b * 9];
+                    float d0 = Dinv[0] * res0 + Dinv[1] * res1 + Dinv[2] * res2;
+                    float d1 = Dinv[3] * res0 + Dinv[4] * res1 + Dinv[5] * res2;
+                    float d2 = Dinv[6] * res0 + Dinv[7] * res1 + Dinv[8] * res2;
+
+                    float new_n  = s_lam[i0]     + omega * d0;
+                    float new_t1 = s_lam[i0 + 1] + omega * d1;
+                    float new_t2 = s_lam[i0 + 2] + omega * d2;
+
+                    new_n = fmaxf(new_n, 0.0f);
+                    float mu = s_mu[b];
+                    float radius = mu * new_n;
+                    if (radius <= 0.0f) {{
+                        new_t1 = 0.0f;
+                        new_t2 = 0.0f;
+                    }} else {{
+                        float t_mag_sq = new_t1 * new_t1 + new_t2 * new_t2;
+                        if (t_mag_sq > radius * radius) {{
+                            float scale = radius * rsqrtf(t_mag_sq);
+                            new_t1 *= scale;
+                            new_t2 *= scale;
+                        }}
+                    }}
+
+                    dl0 = new_n  - s_lam[i0];
+                    dl1 = new_t1 - s_lam[i0 + 1];
+                    dl2 = new_t2 - s_lam[i0 + 2];
+                    s_lam[i0]     = new_n;
+                    s_lam[i0 + 1] = new_t1;
+                    s_lam[i0 + 2] = new_t2;
+                }}"""
+            bgs_mf_solve_code = """\
+                float dl0 = 0.0f, dl1 = 0.0f, dl2 = 0.0f;
+                if (lane == 0) {{
+                    float res0 = -(jv0 + s_mf_rhs[i0]);
+                    float res1 = -(jv1 + s_mf_rhs[i0 + 1]);
+                    float res2 = -(jv2 + s_mf_rhs[i0 + 2]);
+
+                    const float* Dinv = &s_mf_Dinv[b * 9];
+                    float d0 = Dinv[0] * res0 + Dinv[1] * res1 + Dinv[2] * res2;
+                    float d1 = Dinv[3] * res0 + Dinv[4] * res1 + Dinv[5] * res2;
+                    float d2 = Dinv[6] * res0 + Dinv[7] * res1 + Dinv[8] * res2;
+
+                    float new_n  = s_lam_mf[i0]     + omega * d0;
+                    float new_t1 = s_lam_mf[i0 + 1] + omega * d1;
+                    float new_t2 = s_lam_mf[i0 + 2] + omega * d2;
+
+                    new_n = fmaxf(new_n, 0.0f);
+                    float mu = s_mf_mu[b];
+                    float radius = mu * new_n;
+                    if (radius <= 0.0f) {{
+                        new_t1 = 0.0f;
+                        new_t2 = 0.0f;
+                    }} else {{
+                        float t_mag_sq = new_t1 * new_t1 + new_t2 * new_t2;
+                        if (t_mag_sq > radius * radius) {{
+                            float scale = radius * rsqrtf(t_mag_sq);
+                            new_t1 *= scale;
+                            new_t2 *= scale;
+                        }}
+                    }}
+
+                    dl0 = new_n  - s_lam_mf[i0];
+                    dl1 = new_t1 - s_lam_mf[i0 + 1];
+                    dl2 = new_t2 - s_lam_mf[i0 + 2];
+                    s_lam_mf[i0]     = new_n;
+                    s_lam_mf[i0 + 1] = new_t1;
+                    s_lam_mf[i0 + 2] = new_t2;
+                }}"""
+
+        snippet = f"""
+    #if defined(__CUDA_ARCH__)
+        const unsigned MASK = 0xFFFFFFFF;
+        int lane = threadIdx.x;
+
+        int m_dense = world_constraint_count.data[world];
+        int m_mf = mf_constraint_count.data[world];
+        if (m_dense == 0 && m_mf == 0) return;
+        if (m_dense > {M_D}) m_dense = {M_D};
+        if (m_mf > {M_MF}) m_mf = {M_MF};
+
+        int num_contacts = m_dense / 3;
+        m_dense = num_contacts * 3;
+        int num_mf_contacts = m_mf / 3;
+        m_mf = num_mf_contacts * 3;
+
+        int w_dof_start = world_dof_start.data[world];
+        int off_dense = world * {M_D};
+        int off_mf = world * {M_MF};
+        int off_meta = off_mf * 4;
+        int jy_world_base = world * {M_D} * {D};
+        int mf6_base = world * {M_MF} * 6;
+
+        // ═══════════════════════════════════════════════════════
+        // SHARED MEMORY
+        // ═══════════════════════════════════════════════════════
+        __shared__ float s_v[{D}];
+        // Dense
+        __shared__ float s_lam[{M_D}];
+        __shared__ float s_rhs[{M_D}];
+        __shared__ float s_diag[{M_D}];
+        __shared__ float s_mu[{NUM_CONTACTS_MAX}];
+        __shared__ float s_Dinv[{NUM_CONTACTS_MAX * 9}];
+        // MF
+        __shared__ float s_lam_mf[{M_MF}];
+        __shared__ float s_mf_rhs[{M_MF}];
+        __shared__ float s_mf_mu[{NUM_MF_CONTACTS_MAX}];
+        __shared__ float s_mf_Dinv[{NUM_MF_CONTACTS_MAX * 9}];
+        __shared__ int   s_mf_dofs[{NUM_MF_CONTACTS_MAX}];  // packed dof_a|dof_b
+
+        // ═══════════════════════════════════════════════════════
+        // LOAD PHASE
+        // ═══════════════════════════════════════════════════════
+        for (int i = lane; i < m_dense; i += 32) {{
+            s_lam[i] = world_impulses.data[off_dense + i];
+            s_rhs[i] = rhs_bias.data[off_dense + i];
+            s_diag[i] = world_diag.data[off_dense + i];
+        }}
+        for (int c = lane; c < num_contacts; c += 32) {{
+            s_mu[c] = world_row_mu.data[off_dense + c * 3 + 1];
+        }}
+        for (int i = lane; i < m_mf; i += 32) {{
+            s_lam_mf[i] = mf_impulses.data[off_mf + i];
+            // Unpack rhs from metadata
+            int4 mt = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);
+            s_mf_rhs[i] = __int_as_float(mt.z);
+        }}
+        for (int c = lane; c < num_mf_contacts; c += 32) {{
+            s_mf_mu[c] = mf_row_mu.data[off_mf + c * 3 + 1];
+            // Pack dof_a|dof_b from normal row metadata
+            int4 mt = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + c * 3 * 4]);
+            s_mf_dofs[c] = mt.x;
+        }}
+        for (int d = lane; d < {D}; d += 32) {{
+            s_v[d] = v_out.data[w_dof_start + d];
+        }}
+        __syncwarp();
+
+        // ═══════════════════════════════════════════════════════
+        // COMPUTE DENSE BLOCK DIAGONAL INVERSES from J*Y
+        // ═══════════════════════════════════════════════════════
+        for (int b = 0; b < num_contacts; b++) {{
+            int row_base = jy_world_base + b * 3 * {D};
+            float c01_acc = 0.0f, c02_acc = 0.0f, c12_acc = 0.0f;
+            for (int d = lane; d < {D}; d += 32) {{
+                float j0 = J_world.data[row_base + d];
+                float j1 = J_world.data[row_base + {D} + d];
+                float y1 = Y_world.data[row_base + {D} + d];
+                float y2 = Y_world.data[row_base + 2 * {D} + d];
+                c01_acc += j0 * y1;
+                c02_acc += j0 * y2;
+                c12_acc += j1 * y2;
+            }}
+            c01_acc += __shfl_down_sync(MASK, c01_acc, 16);
+            c02_acc += __shfl_down_sync(MASK, c02_acc, 16);
+            c12_acc += __shfl_down_sync(MASK, c12_acc, 16);
+            c01_acc += __shfl_down_sync(MASK, c01_acc, 8);
+            c02_acc += __shfl_down_sync(MASK, c02_acc, 8);
+            c12_acc += __shfl_down_sync(MASK, c12_acc, 8);
+            c01_acc += __shfl_down_sync(MASK, c01_acc, 4);
+            c02_acc += __shfl_down_sync(MASK, c02_acc, 4);
+            c12_acc += __shfl_down_sync(MASK, c12_acc, 4);
+            c01_acc += __shfl_down_sync(MASK, c01_acc, 2);
+            c02_acc += __shfl_down_sync(MASK, c02_acc, 2);
+            c12_acc += __shfl_down_sync(MASK, c12_acc, 2);
+            c01_acc += __shfl_down_sync(MASK, c01_acc, 1);
+            c02_acc += __shfl_down_sync(MASK, c02_acc, 1);
+            c12_acc += __shfl_down_sync(MASK, c12_acc, 1);
+
+            if (lane == 0) {{
+                int i0 = b * 3;
+                float c00 = s_diag[i0];
+                float c11 = s_diag[i0 + 1];
+                float c22 = s_diag[i0 + 2];
+                float c01 = c01_acc, c02 = c02_acc, c12 = c12_acc;
+
+                float det = c00 * (c11 * c22 - c12 * c12)
+                          - c01 * (c01 * c22 - c12 * c02)
+                          + c02 * (c01 * c12 - c11 * c02);
+
+                float* Dinv = &s_Dinv[b * 9];
+                if (fabsf(det) > 1e-30f) {{
+                    float inv_det = 1.0f / det;
+                    Dinv[0] = (c11 * c22 - c12 * c12) * inv_det;
+                    Dinv[1] = (c02 * c12 - c01 * c22) * inv_det;
+                    Dinv[2] = (c01 * c12 - c02 * c11) * inv_det;
+                    Dinv[3] = Dinv[1];
+                    Dinv[4] = (c00 * c22 - c02 * c02) * inv_det;
+                    Dinv[5] = (c02 * c01 - c00 * c12) * inv_det;
+                    Dinv[6] = Dinv[2];
+                    Dinv[7] = Dinv[5];
+                    Dinv[8] = (c00 * c11 - c01 * c01) * inv_det;
+                }} else {{
+                    for (int k = 0; k < 9; k++) Dinv[k] = 0.0f;
+                }}
+            }}
+            __syncwarp();
+        }}
+
+        // ═══════════════════════════════════════════════════════
+        // COMPUTE MF BLOCK DIAGONAL INVERSES from J*MiJt
+        // ═══════════════════════════════════════════════════════
+        for (int b = 0; b < num_mf_contacts; b++) {{
+            int i0 = b * 3;
+            int mf6_0 = mf6_base + i0 * 6;
+
+            // Off-diagonals: c01 = dot(J_a[0], MiJt_a[1]) + dot(J_b[0], MiJt_b[1])
+            float c01_acc = 0.0f, c02_acc = 0.0f, c12_acc = 0.0f;
+            if (lane < 6) {{
+                float ja0 = mf_J_a.data[mf6_0 + lane];
+                float ja1 = mf_J_a.data[mf6_0 + 6 + lane];
+                float mt1a = mf_MiJt_a.data[mf6_0 + 6 + lane];
+                float mt2a = mf_MiJt_a.data[mf6_0 + 12 + lane];
+                c01_acc = ja0 * mt1a;
+                c02_acc = ja0 * mt2a;
+                c12_acc = ja1 * mt2a;
+            }}
+            {{
+                int packed_dofs_b = s_mf_dofs[b];
+                int dof_b_check = (packed_dofs_b << 16) >> 16;
+                if (lane >= 6 && lane < 12 && dof_b_check >= 0) {{
+                    int l = lane - 6;
+                    float jb0 = mf_J_b.data[mf6_0 + l];
+                    float jb1 = mf_J_b.data[mf6_0 + 6 + l];
+                    float mt1b = mf_MiJt_b.data[mf6_0 + 6 + l];
+                    float mt2b = mf_MiJt_b.data[mf6_0 + 12 + l];
+                    c01_acc += jb0 * mt1b;
+                    c02_acc += jb0 * mt2b;
+                    c12_acc += jb1 * mt2b;
+                }}
+            }}
+            // Warp reduce (only lanes 0-11 contributed)
+            c01_acc += __shfl_down_sync(MASK, c01_acc, 16);
+            c02_acc += __shfl_down_sync(MASK, c02_acc, 16);
+            c12_acc += __shfl_down_sync(MASK, c12_acc, 16);
+            c01_acc += __shfl_down_sync(MASK, c01_acc, 8);
+            c02_acc += __shfl_down_sync(MASK, c02_acc, 8);
+            c12_acc += __shfl_down_sync(MASK, c12_acc, 8);
+            c01_acc += __shfl_down_sync(MASK, c01_acc, 4);
+            c02_acc += __shfl_down_sync(MASK, c02_acc, 4);
+            c12_acc += __shfl_down_sync(MASK, c12_acc, 4);
+            c01_acc += __shfl_down_sync(MASK, c01_acc, 2);
+            c02_acc += __shfl_down_sync(MASK, c02_acc, 2);
+            c12_acc += __shfl_down_sync(MASK, c12_acc, 2);
+            c01_acc += __shfl_down_sync(MASK, c01_acc, 1);
+            c02_acc += __shfl_down_sync(MASK, c02_acc, 1);
+            c12_acc += __shfl_down_sync(MASK, c12_acc, 1);
+
+            if (lane == 0) {{
+                // Diagonal from mf_eff_mass_inv (stored as 1/d in meta.y)
+                int4 mt0 = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i0 * 4]);
+                int4 mt1 = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i0+1) * 4]);
+                int4 mt2 = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i0+2) * 4]);
+                float d0_inv = __int_as_float(mt0.y);
+                float d1_inv = __int_as_float(mt1.y);
+                float d2_inv = __int_as_float(mt2.y);
+                float c00 = (d0_inv > 0.0f) ? 1.0f / d0_inv : 0.0f;
+                float c11 = (d1_inv > 0.0f) ? 1.0f / d1_inv : 0.0f;
+                float c22 = (d2_inv > 0.0f) ? 1.0f / d2_inv : 0.0f;
+                float c01 = c01_acc, c02 = c02_acc, c12 = c12_acc;
+
+                float det = c00 * (c11 * c22 - c12 * c12)
+                          - c01 * (c01 * c22 - c12 * c02)
+                          + c02 * (c01 * c12 - c11 * c02);
+
+                float* Dinv = &s_mf_Dinv[b * 9];
+                if (fabsf(det) > 1e-30f) {{
+                    float inv_det = 1.0f / det;
+                    Dinv[0] = (c11 * c22 - c12 * c12) * inv_det;
+                    Dinv[1] = (c02 * c12 - c01 * c22) * inv_det;
+                    Dinv[2] = (c01 * c12 - c02 * c11) * inv_det;
+                    Dinv[3] = Dinv[1];
+                    Dinv[4] = (c00 * c22 - c02 * c02) * inv_det;
+                    Dinv[5] = (c02 * c01 - c00 * c12) * inv_det;
+                    Dinv[6] = Dinv[2];
+                    Dinv[7] = Dinv[5];
+                    Dinv[8] = (c00 * c11 - c01 * c01) * inv_det;
+                }} else {{
+                    for (int k = 0; k < 9; k++) Dinv[k] = 0.0f;
+                }}
+            }}
+            __syncwarp();
+        }}
+
+        // ═══════════════════════════════════════════════════════
+        // SOLVE PHASE
+        // ═══════════════════════════════════════════════════════
+        for (int iter = 0; iter < iterations; iter++) {{
+
+            // ── Phase 1: Dense contacts (3-row block GS in velocity space) ──
+            for (int b = 0; b < num_contacts; b++) {{
+                int i0 = b * 3;
+                int j_base = jy_world_base + i0 * {D};
+
+                float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f;
+                for (int d = lane; d < {D}; d += 32) {{
+                    float v_d = s_v[d];
+                    sum0 += J_world.data[j_base + d] * v_d;
+                    sum1 += J_world.data[j_base + {D} + d] * v_d;
+                    sum2 += J_world.data[j_base + 2 * {D} + d] * v_d;
+                }}
+                sum0 += __shfl_down_sync(MASK, sum0, 16);
+                sum1 += __shfl_down_sync(MASK, sum1, 16);
+                sum2 += __shfl_down_sync(MASK, sum2, 16);
+                sum0 += __shfl_down_sync(MASK, sum0, 8);
+                sum1 += __shfl_down_sync(MASK, sum1, 8);
+                sum2 += __shfl_down_sync(MASK, sum2, 8);
+                sum0 += __shfl_down_sync(MASK, sum0, 4);
+                sum1 += __shfl_down_sync(MASK, sum1, 4);
+                sum2 += __shfl_down_sync(MASK, sum2, 4);
+                sum0 += __shfl_down_sync(MASK, sum0, 2);
+                sum1 += __shfl_down_sync(MASK, sum1, 2);
+                sum2 += __shfl_down_sync(MASK, sum2, 2);
+                sum0 += __shfl_down_sync(MASK, sum0, 1);
+                sum1 += __shfl_down_sync(MASK, sum1, 1);
+                sum2 += __shfl_down_sync(MASK, sum2, 1);
+
+                float jv0 = __shfl_sync(MASK, sum0, 0);
+                float jv1 = __shfl_sync(MASK, sum1, 0);
+                float jv2 = __shfl_sync(MASK, sum2, 0);
+
+                {bgs_dense_solve_code}
+
+                dl0 = __shfl_sync(MASK, dl0, 0);
+                dl1 = __shfl_sync(MASK, dl1, 0);
+                dl2 = __shfl_sync(MASK, dl2, 0);
+
+                if (dl0 != 0.0f || dl1 != 0.0f || dl2 != 0.0f) {{
+                    int y_base = jy_world_base + i0 * {D};
+                    for (int d = lane; d < {D}; d += 32) {{
+                        s_v[d] += Y_world.data[y_base + d] * dl0
+                                + Y_world.data[y_base + {D} + d] * dl1
+                                + Y_world.data[y_base + 2 * {D} + d] * dl2;
+                    }}
+                }}
+                __syncwarp();
+            }}
+
+            // ── Phase 2: MF contacts (3-row block GS, 6-DOF per body) ──
+            for (int b = 0; b < num_mf_contacts; b++) {{
+                int i0 = b * 3;
+                int mf6_0 = mf6_base + i0 * 6;
+
+                int packed_dofs = s_mf_dofs[b];
+                int dof_a = packed_dofs >> 16;
+                int dof_b = (packed_dofs << 16) >> 16;
+
+                // 3 J·v products (lanes 0-5 = body_a, 6-11 = body_b)
+                float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f;
+                if (lane < 6 && dof_a >= 0) {{
+                    float va = s_v[dof_a + lane];
+                    s0 = mf_J_a.data[mf6_0 + lane] * va;
+                    s1 = mf_J_a.data[mf6_0 + 6 + lane] * va;
+                    s2 = mf_J_a.data[mf6_0 + 12 + lane] * va;
+                }}
+                if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                    int l = lane - 6;
+                    float vb = s_v[dof_b + l];
+                    s0 += mf_J_b.data[mf6_0 + l] * vb;
+                    s1 += mf_J_b.data[mf6_0 + 6 + l] * vb;
+                    s2 += mf_J_b.data[mf6_0 + 12 + l] * vb;
+                }}
+                s0 += __shfl_down_sync(MASK, s0, 16);
+                s1 += __shfl_down_sync(MASK, s1, 16);
+                s2 += __shfl_down_sync(MASK, s2, 16);
+                s0 += __shfl_down_sync(MASK, s0, 8);
+                s1 += __shfl_down_sync(MASK, s1, 8);
+                s2 += __shfl_down_sync(MASK, s2, 8);
+                s0 += __shfl_down_sync(MASK, s0, 4);
+                s1 += __shfl_down_sync(MASK, s1, 4);
+                s2 += __shfl_down_sync(MASK, s2, 4);
+                s0 += __shfl_down_sync(MASK, s0, 2);
+                s1 += __shfl_down_sync(MASK, s1, 2);
+                s2 += __shfl_down_sync(MASK, s2, 2);
+                s0 += __shfl_down_sync(MASK, s0, 1);
+                s1 += __shfl_down_sync(MASK, s1, 1);
+                s2 += __shfl_down_sync(MASK, s2, 1);
+
+                float jv0 = __shfl_sync(MASK, s0, 0);
+                float jv1 = __shfl_sync(MASK, s1, 0);
+                float jv2 = __shfl_sync(MASK, s2, 0);
+
+                {bgs_mf_solve_code}
+
+                dl0 = __shfl_sync(MASK, dl0, 0);
+                dl1 = __shfl_sync(MASK, dl1, 0);
+                dl2 = __shfl_sync(MASK, dl2, 0);
+
+                // Rank-3 velocity update
+                if (dl0 != 0.0f || dl1 != 0.0f || dl2 != 0.0f) {{
+                    if (lane < 6 && dof_a >= 0) {{
+                        s_v[dof_a + lane] += mf_MiJt_a.data[mf6_0 + lane] * dl0
+                                           + mf_MiJt_a.data[mf6_0 + 6 + lane] * dl1
+                                           + mf_MiJt_a.data[mf6_0 + 12 + lane] * dl2;
+                    }}
+                    if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                        int l = lane - 6;
+                        s_v[dof_b + l] += mf_MiJt_b.data[mf6_0 + l] * dl0
+                                        + mf_MiJt_b.data[mf6_0 + 6 + l] * dl1
+                                        + mf_MiJt_b.data[mf6_0 + 12 + l] * dl2;
+                    }}
+                }}
+                __syncwarp();
+            }}
+        }}
+
+        // ═══════════════════════════════════════════════════════
+        // STORE PHASE
+        // ═══════════════════════════════════════════════════════
+        for (int d = lane; d < {D}; d += 32) {{
+            v_out.data[w_dof_start + d] = s_v[d];
+        }}
+        for (int i = lane; i < m_dense; i += 32) {{
+            world_impulses.data[off_dense + i] = s_lam[i];
+        }}
+        for (int i = lane; i < m_mf; i += 32) {{
+            mf_impulses.data[off_mf + i] = s_lam_mf[i];
+        }}
+    #endif
+    """
+
+        @wp.func_native(snippet)
+        def pgs_solve_block_gs_native(
+            world: int,
+            # Dense
+            world_constraint_count: wp.array(dtype=int),
+            world_dof_start: wp.array(dtype=int),
+            rhs_bias: wp.array2d(dtype=float),
+            world_diag: wp.array2d(dtype=float),
+            world_impulses: wp.array2d(dtype=float),
+            J_world: wp.array3d(dtype=float),
+            Y_world: wp.array3d(dtype=float),
+            world_row_mu: wp.array2d(dtype=float),
+            # MF
+            mf_constraint_count: wp.array(dtype=int),
+            mf_meta: wp.array2d(dtype=int),
+            mf_impulses: wp.array2d(dtype=float),
+            mf_J_a: wp.array3d(dtype=float),
+            mf_J_b: wp.array3d(dtype=float),
+            mf_MiJt_a: wp.array3d(dtype=float),
+            mf_MiJt_b: wp.array3d(dtype=float),
+            mf_row_mu: wp.array2d(dtype=float),
+            # Shared
+            iterations: int,
+            omega: float,
+            # Output
+            v_out: wp.array(dtype=float),
+        ): ...
+
+        def pgs_solve_block_gs_template(
+            # Dense
+            world_constraint_count: wp.array(dtype=int),
+            world_dof_start: wp.array(dtype=int),
+            rhs_bias: wp.array2d(dtype=float),
+            world_diag: wp.array2d(dtype=float),
+            world_impulses: wp.array2d(dtype=float),
+            J_world: wp.array3d(dtype=float),
+            Y_world: wp.array3d(dtype=float),
+            world_row_mu: wp.array2d(dtype=float),
+            # MF
+            mf_constraint_count: wp.array(dtype=int),
+            mf_meta: wp.array2d(dtype=int),
+            mf_impulses: wp.array2d(dtype=float),
+            mf_J_a: wp.array3d(dtype=float),
+            mf_J_b: wp.array3d(dtype=float),
+            mf_MiJt_a: wp.array3d(dtype=float),
+            mf_MiJt_b: wp.array3d(dtype=float),
+            mf_row_mu: wp.array2d(dtype=float),
+            # Shared
+            iterations: int,
+            omega: float,
+            # Output
+            v_out: wp.array(dtype=float),
+        ):
+            world, _lane = wp.tid()
+            pgs_solve_block_gs_native(
+                world,
+                world_constraint_count,
+                world_dof_start,
+                rhs_bias,
+                world_diag,
+                world_impulses,
+                J_world,
+                Y_world,
+                world_row_mu,
+                mf_constraint_count,
+                mf_meta,
+                mf_impulses,
+                mf_J_a,
+                mf_J_b,
+                mf_MiJt_a,
+                mf_MiJt_b,
+                mf_row_mu,
+                iterations,
+                omega,
+                v_out,
+            )
+
+        name = f"pgs_solve_block_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}"
+        pgs_solve_block_gs_template.__name__ = name
+        pgs_solve_block_gs_template.__qualname__ = name
+        return wp.kernel(enable_backward=False, module="unique")(pgs_solve_block_gs_template)
