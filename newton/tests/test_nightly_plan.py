@@ -102,16 +102,15 @@ class TestNightlyPlan(unittest.TestCase):
         )
 
         self.assertEqual(ablation_task["job_style"], "explicit")
-        self.assertEqual(ablation_task["job_count"], 11)
+        self.assertEqual(ablation_task["job_count"], 10)
         self.assertEqual(ablation_task["tags"], ["h1_tabletop_ablation"])
         self.assertEqual(ablation_task["jobs"][7]["label"], "fully matrix-free GS")
         self.assertEqual(ablation_task["jobs"][7]["variant_id"], "matrix_free")
         self.assertEqual(ablation_task["jobs"][7]["step_index"], 7)
         self.assertFalse(ablation_task["jobs"][7]["double_buffer"])
-        self.assertFalse(ablation_task["jobs"][7]["pipeline_collide"])
-        self.assertTrue(ablation_task["jobs"][9]["double_buffer"])
-        self.assertTrue(ablation_task["jobs"][10]["solver"] == "mujoco")
-        self.assertEqual(ablation_task["jobs"][10]["label"], "MuJoCo baseline")
+        self.assertTrue(ablation_task["jobs"][8]["double_buffer"])
+        self.assertTrue(ablation_task["jobs"][9]["solver"] == "mujoco")
+        self.assertEqual(ablation_task["jobs"][9]["label"], "MuJoCo baseline")
 
     def test_target_overrides_apply_to_explicit_jobs(self):
         loaded = plan.load_plan(plan.DEFAULT_PLAN_PATH, env={"USER": "plan-test-user"})

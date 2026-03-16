@@ -564,11 +564,6 @@ def _append_solver_override_flags(command: list[str], job: Mapping[str, Any]) ->
     elif job.get("double_buffer") is False:
         command.append("--no-double-buffer")
 
-    if job.get("pipeline_collide") is True:
-        command.append("--pipeline-collide")
-    elif job.get("pipeline_collide") is False:
-        command.append("--no-pipeline-collide")
-
     if job.get("override_scenario_defaults"):
         command.append("--override-scenario-defaults")
 
