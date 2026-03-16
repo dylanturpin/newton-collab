@@ -1308,7 +1308,8 @@ def build_contact_rows_normal(
     if tid >= total_contacts:
         return
 
-    n = contact_normal[tid]
+    # contact normal stored as A-to-B; negate to get B-to-A used internally
+    n = -contact_normal[tid]
     shape_a = contact_shape0[tid]
     shape_b = contact_shape1[tid]
 
@@ -1740,7 +1741,8 @@ def allocate_world_contact_slots(
         return
 
     # Compute phi (same logic as populate_world_J_for_size)
-    normal = contact_normal[c]
+    # contact normal stored as A-to-B; negate to get B-to-A used internally
+    normal = -contact_normal[c]
     point_a_local = contact_point0[c]
     point_b_local = contact_point1[c]
     thickness_a = contact_thickness0[c]
@@ -1923,7 +1925,8 @@ def populate_world_J_for_size(
     art_b = contact_art_b[c]
 
     # Get contact geometry
-    normal = contact_normal[c]
+    # contact normal stored as A-to-B; negate to get B-to-A used internally
+    normal = -contact_normal[c]
     shape_a = contact_shape0[c]
     shape_b = contact_shape1[c]
 
@@ -2619,7 +2622,8 @@ def build_mf_contact_rows(
     world = contact_world[c]
     shape_a = contact_shape0[c]
     shape_b = contact_shape1[c]
-    normal = contact_normal[c]
+    # contact normal stored as A-to-B; negate to get B-to-A used internally
+    normal = -contact_normal[c]
 
     body_a = -1
     body_b = -1
