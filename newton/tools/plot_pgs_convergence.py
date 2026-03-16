@@ -33,7 +33,7 @@ def main():
     iters = np.arange(1, curve.shape[0] + 1)
 
     try:
-        import matplotlib.pyplot as plt  # noqa: PLC0415
+        import matplotlib.pyplot as plt
     except ImportError:
         print("matplotlib is required: pip install matplotlib")
         sys.exit(1)
@@ -48,7 +48,7 @@ def main():
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     fig.suptitle(f"PGS Convergence — step {idx}", fontsize=14)
 
-    for ax, col, name in zip(axes.flat, range(4), metric_names):
+    for ax, col, name in zip(axes.flat, range(4), metric_names, strict=False):
         vals = curve[:, col]
         # Replace zeros/negatives with small value for log scale
         vals_plot = np.where(vals > 0, vals, np.finfo(np.float32).tiny)

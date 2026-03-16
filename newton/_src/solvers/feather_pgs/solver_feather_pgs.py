@@ -21,7 +21,7 @@ import warp as wp
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, State, eval_fk
-from ...sim.joints import JointType
+from ...sim.enums import JointType
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
@@ -1303,12 +1303,14 @@ class SolverFeatherPGS(SolverBase):
 
                         # Sync and reduce across worlds
                         metrics_np = self._diag_metrics.numpy()
-                        row = np.array([
-                            np.max(metrics_np[:, 0]),   # max|delta_lambda|
-                            np.sum(metrics_np[:, 1]),   # complementarity gap
-                            np.sum(metrics_np[:, 2]),   # tangent residual
-                            np.sum(metrics_np[:, 3]),   # FB merit
-                        ])
+                        row = np.array(
+                            [
+                                np.max(metrics_np[:, 0]),  # max|delta_lambda|
+                                np.sum(metrics_np[:, 1]),  # complementarity gap
+                                np.sum(metrics_np[:, 2]),  # tangent residual
+                                np.sum(metrics_np[:, 3]),  # FB merit
+                            ]
+                        )
                         self._pgs_convergence_log[-1].append(row)
 
                     self._pgs_convergence_log[-1] = np.array(self._pgs_convergence_log[-1])
