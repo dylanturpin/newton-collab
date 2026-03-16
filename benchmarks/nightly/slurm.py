@@ -575,6 +575,8 @@ def _slurm_resource_args(slurm_settings: Mapping[str, Any]) -> list[str]:
     for field_name, flag in mapping:
         value = slurm_settings.get(field_name)
         if value:
+            if isinstance(value, list):
+                value = ",".join(str(item) for item in value)
             command.extend([flag, str(value)])
     exclude = slurm_settings.get("exclude")
     if exclude:
