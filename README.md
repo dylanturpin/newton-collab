@@ -14,6 +14,14 @@ Newton is a [Linux Foundation](https://www.linuxfoundation.org/) project that is
 
 Newton was initiated by [Disney Research](https://www.disneyresearch.com/), [Google DeepMind](https://deepmind.google/), and [NVIDIA](https://www.nvidia.com/).
 
+## Requirements
+
+- **Python** 3.10+
+- **OS:** Linux (x86-64, aarch64), Windows (x86-64), or macOS (CPU only)
+- **GPU:** NVIDIA GPU (Maxwell or newer), driver 545 or newer (CUDA 12). No local CUDA Toolkit installation required. macOS runs on CPU.
+
+For detailed system requirements and tested configurations, see the [installation guide](https://newton-physics.github.io/newton/latest/guide/installation.html).
+
 ## Quickstart
 
 ```bash
@@ -77,8 +85,8 @@ If you installed from source with uv, substitute `uv run` for `python` in the co
       </a>
     </td>
     <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_heightfield.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_heightfield.jpg" alt="Heightfield">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_conveyor.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_conveyor.jpg" alt="Conveyor">
       </a>
     </td>
   </tr>
@@ -90,10 +98,15 @@ If you installed from source with uv, substitute `uv run` for `python` in the co
       <code>python -m newton.examples basic_joints</code>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples basic_heightfield</code>
+      <code>python -m newton.examples basic_conveyor</code>
     </td>
   </tr>
   <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_heightfield.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_heightfield.jpg" alt="Heightfield">
+      </a>
+    </td>
     <td align="center" width="33%">
       <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_recording.py">
         <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_recording.jpg" alt="Recording">
@@ -104,17 +117,16 @@ If you installed from source with uv, substitute `uv run` for `python` in the co
         <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_replay_viewer.jpg" alt="Replay Viewer">
       </a>
     </td>
-    <td align="center" width="33%">
-    </td>
   </tr>
   <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples basic_heightfield</code>
+    </td>
     <td align="center" width="33%">
       <code>python -m newton.examples recording</code>
     </td>
     <td align="center" width="33%">
       <code>python -m newton.examples replay_viewer</code>
-    </td>
-    <td align="center" width="33%">
     </td>
   </tr>
   <tr>
@@ -700,12 +712,9 @@ If you installed from source with uv, substitute `uv run` for `python` in the co
     </td>
   </tr>
   <tr>
-    <td colspan="3"><h3>Softbody Examples</h3></td>
-  </tr>
-  <tr>
     <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/softbody/example_softbody_hanging.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_softbody_hanging.jpg" alt="Softbody Hanging">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/contacts/example_pyramid.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_pyramid.jpg" alt="Pyramid">
       </a>
     </td>
     <td align="center" width="33%">
@@ -715,9 +724,36 @@ If you installed from source with uv, substitute `uv run` for `python` in the co
   </tr>
   <tr>
     <td align="center" width="33%">
+      <code>python -m newton.examples pyramid</code>
+    </td>
+    <td align="center" width="33%">
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
+    <td colspan="3"><h3>Softbody Examples</h3></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/softbody/example_softbody_hanging.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_softbody_hanging.jpg" alt="Softbody Hanging">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/softbody/example_softbody_franka.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_softbody_franka.jpg" alt="Softbody Franka">
+      </a>
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
       <code>python -m newton.examples softbody_hanging</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples softbody_franka</code>
     </td>
     <td align="center" width="33%">
     </td>

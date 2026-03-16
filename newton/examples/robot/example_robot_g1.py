@@ -32,30 +32,30 @@ from newton import JointTargetMode
 
 
 class Example:
-    def __init__(self, viewer, world_count=4, args=None):
+    def __init__(self, viewer, args):
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
         self.sim_substeps = 6
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        self.world_count = world_count
+        self.world_count = args.world_count
 
         self.viewer = viewer
 
         g1 = newton.ModelBuilder()
         newton.solvers.SolverMuJoCo.register_custom_attributes(g1)
         g1.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=1.0e3, limit_kd=1.0e1, friction=1e-5)
-        g1.default_shape_cfg.ke = 2.0e3
-        g1.default_shape_cfg.kd = 1.0e2
+        g1.default_shape_cfg.ke = 1.0e3
+        g1.default_shape_cfg.kd = 2.0e2
         g1.default_shape_cfg.kf = 1.0e3
         g1.default_shape_cfg.mu = 0.75
 
         asset_path = newton.utils.download_asset("unitree_g1")
 
         g1.add_usd(
-            str(asset_path / "usd" / "g1_isaac.usd"),
-            xform=wp.transform(wp.vec3(0, 0, 0.8)),
+            str(asset_path / "usd_structured" / "g1_29dof_with_hand_rev_1_0.usda"),
+            xform=wp.transform(wp.vec3(0, 0, 0.2)),
             collapse_fixed_joints=True,
             enable_self_collisions=False,
             hide_collision_shapes=True,
@@ -63,8 +63,8 @@ class Example:
         )
 
         for i in range(6, g1.joint_dof_count):
-            g1.joint_target_ke[i] = 1000.0
-            g1.joint_target_kd[i] = 5.0
+            g1.joint_target_ke[i] = 500.0
+            g1.joint_target_kd[i] = 10.0
             g1.joint_target_mode[i] = int(JointTargetMode.POSITION)
 
         # approximate meshes for faster collision detection
@@ -74,7 +74,7 @@ class Example:
         builder.replicate(g1, self.world_count)
 
         builder.default_shape_cfg.ke = 1.0e3
-        builder.default_shape_cfg.kd = 1.0e2
+        builder.default_shape_cfg.kd = 2.0e2
         builder.add_ground_plane()
 
         self.model = builder.finalize()
@@ -163,13 +163,19 @@ class Example:
             < 0.015,  # Relaxed from 0.005 - G1 has higher residual velocities with collision pipeline
         )
 
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        newton.examples.add_world_count_arg(parser)
+        newton.examples.add_mujoco_contacts_arg(parser)
+        parser.set_defaults(world_count=4)
+        return parser
+
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
-    parser.add_argument("--world-count", type=int, default=4, help="Total number of simulated worlds.")
-
+    parser = Example.create_parser()
     viewer, args = newton.examples.init(parser)
 
-    example = Example(viewer, args.world_count, args)
+    example = Example(viewer, args)
 
     newton.examples.run(example, args)

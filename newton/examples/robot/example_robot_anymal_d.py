@@ -22,24 +22,24 @@
 #
 ###########################################################################
 
-import mujoco
 import warp as wp
 
 import newton
 import newton.examples
 import newton.utils
 from newton import JointTargetMode
+from newton.solvers import SolverMuJoCo
 
 
 class Example:
-    def __init__(self, viewer, world_count=8, args=None):
+    def __init__(self, viewer, args):
         self.fps = 50
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
         self.sim_substeps = 4
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        self.world_count = world_count
+        self.world_count = args.world_count
 
         self.viewer = viewer
 
@@ -83,9 +83,9 @@ class Example:
 
         self.model = builder.finalize()
         use_mujoco_contacts = args.use_mujoco_contacts if args else False
-        self.solver = newton.solvers.SolverMuJoCo(
+        self.solver = SolverMuJoCo(
             self.model,
-            cone=mujoco.mjtCone.mjCONE_ELLIPTIC,
+            cone="elliptic",
             impratio=100,
             iterations=100,
             ls_iterations=50,
@@ -168,13 +168,19 @@ class Example:
                 < 0.25,  # Relaxed from 0.1 - collision pipeline has residual velocities up to ~0.2
             )
 
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        newton.examples.add_world_count_arg(parser)
+        newton.examples.add_mujoco_contacts_arg(parser)
+        parser.set_defaults(world_count=8)
+        return parser
+
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
-    parser.add_argument("--world-count", type=int, default=8, help="Total number of simulated worlds.")
-
+    parser = Example.create_parser()
     viewer, args = newton.examples.init(parser)
 
-    example = Example(viewer, args.world_count, args)
+    example = Example(viewer, args)
 
     newton.examples.run(example, args)
