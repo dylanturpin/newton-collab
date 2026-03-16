@@ -16,14 +16,10 @@ defaults:
     warmup_frames: 16
     measure_frames: 64
     pgs_iterations: 8
-    dense_max_constraints: 64
     pgs_beta: 0.1
     pgs_cfm: 1.0e-6
     pgs_omega: 1.0
     pgs_warmstart: false
-    pgs_mode: hybrid
-    use_parallel_streams: true
-    double_buffer: true
   render:
     render_frames: 300
     render_width: 1920
@@ -58,6 +54,13 @@ hardware_profiles:
       exclude:
         - 2u2g-spr-0093
         - 2u2g-spr-0095
+  rtx_a5000:
+    label: rtx-a5000
+    slurm:
+      account: all-users
+      partition: rtx-a5000@cr+mp/x11spitf/1gpu-16cpu-64gb
+      gres: gpu:rtx-a5000:1
+      time_limit: 03:00:00
   b200:
     label: b200
     slurm:
@@ -71,6 +74,8 @@ tasks:
     run_modes: [full]
     kind: benchmark
     targets:
+      rtx_a5000:
+        num_worlds: [1024, 2048, 4096, 8192, 16384, 32768]
       rtx_5090:
         num_worlds: [1024, 2048, 4096, 8192, 16384, 32768, 65536]
       rtx_pro_6000_server: {}
@@ -86,6 +91,7 @@ tasks:
     run_modes: [full]
     kind: benchmark
     targets:
+      rtx_a5000: {}
       rtx_5090: {}
       rtx_pro_6000_server: {}
       b200: {}
@@ -198,6 +204,7 @@ tasks:
     run_modes: [full]
     kind: benchmark
     targets:
+      rtx_a5000: {}
       rtx_5090: {}
       rtx_pro_6000_server: {}
       b200: {}
@@ -238,6 +245,8 @@ tasks:
     run_modes: [full]
     kind: benchmark
     targets:
+      rtx_a5000:
+        num_worlds: 4096
       rtx_5090:
         num_worlds: 4096
       rtx_pro_6000_server: {}
