@@ -32,7 +32,6 @@ def _make_args(**overrides):
         "delassus_chunk_size": None,
         "pgs_chunk_size": None,
         "double_buffer": True,
-        "pipeline_collide": True,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -72,22 +71,9 @@ class TestSolverBenchmarkWorker(unittest.TestCase):
         self.assertIn("--num-worlds", command)
         self.assertIn("2048", command)
         self.assertIn("--double-buffer", command)
-        self.assertIn("--pipeline-collide", command)
         self.assertNotIn("--sweep", command)
         self.assertNotIn("--ablation", command)
         self.assertNotIn("--plot", command)
-
-    def test_supports_pipeline_collide_checks_solver_signature(self):
-        class PipelineSolver:
-            def step(self, state_in, state_out, control, contacts, dt, collide_done_event=None):
-                return None
-
-        class PlainSolver:
-            def step(self, state_in, state_out, control, contacts, dt):
-                return None
-
-        self.assertTrue(solver_benchmark.supports_pipeline_collide(PipelineSolver()))
-        self.assertFalse(solver_benchmark.supports_pipeline_collide(PlainSolver()))
 
     def test_write_benchmark_artifacts_writes_measurement_and_metadata(self):
         args = _make_args()

@@ -50,7 +50,6 @@ SOLVER_OVERRIDE_FIELDS = (
     "dense_max_constraints",
     "use_parallel_streams",
     "double_buffer",
-    "pipeline_collide",
     "delassus_chunk_size",
     "pgs_chunk_size",
 )
@@ -91,7 +90,6 @@ BENCHMARK_OPTION_FIELDS = {
     "pgs_mode",
     "use_parallel_streams",
     "double_buffer",
-    "pipeline_collide",
     "delassus_chunk_size",
     "pgs_chunk_size",
     "mj_solver",
@@ -126,7 +124,6 @@ RENDER_OPTION_FIELDS = {
     "pgs_mode",
     "use_parallel_streams",
     "double_buffer",
-    "pipeline_collide",
     "delassus_chunk_size",
     "pgs_chunk_size",
     "mj_solver",

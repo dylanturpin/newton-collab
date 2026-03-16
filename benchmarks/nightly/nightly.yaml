@@ -24,7 +24,6 @@ defaults:
     pgs_mode: hybrid
     use_parallel_streams: true
     double_buffer: true
-    pipeline_collide: true
   render:
     render_frames: 300
     render_width: 1920
@@ -107,7 +106,6 @@ tasks:
         pgs_kernel: loop
         use_parallel_streams: false
         double_buffer: false
-        pipeline_collide: false
       - id: tiled_cholesky
         label: tiled cholesky
         solver: feather_pgs
@@ -120,7 +118,6 @@ tasks:
         pgs_kernel: loop
         use_parallel_streams: false
         double_buffer: false
-        pipeline_collide: false
       - id: tiled_trisolve
         label: tiled trisolve
         solver: feather_pgs
@@ -133,7 +130,6 @@ tasks:
         pgs_kernel: loop
         use_parallel_streams: false
         double_buffer: false
-        pipeline_collide: false
       - id: tiled_hinv_jt
         label: tiled hinv_jt
         solver: feather_pgs
@@ -146,7 +142,6 @@ tasks:
         pgs_kernel: loop
         use_parallel_streams: false
         double_buffer: false
-        pipeline_collide: false
       - id: tiled_pgs
         label: tiled PGS
         solver: feather_pgs
@@ -159,7 +154,6 @@ tasks:
         pgs_kernel: tiled_contact
         use_parallel_streams: false
         double_buffer: false
-        pipeline_collide: false
       - id: parallel_streams
         label: parallel streams
         solver: feather_pgs
@@ -172,9 +166,8 @@ tasks:
         pgs_kernel: tiled_contact
         use_parallel_streams: true
         double_buffer: false
-        pipeline_collide: false
-      - id: pipeline_collide
-        label: pipeline collide
+      - id: double_buffer
+        label: double buffer
         solver: feather_pgs
         substeps: 2
         num_worlds: 16384
@@ -184,8 +177,7 @@ tasks:
         delassus_kernel: tiled
         pgs_kernel: tiled_contact
         use_parallel_streams: true
-        double_buffer: false
-        pipeline_collide: true
+        double_buffer: true
       - id: mujoco_baseline
         label: MuJoCo baseline
         solver: mujoco
@@ -269,7 +261,6 @@ tasks:
         pgs_mode: delassus
         use_parallel_streams: false
         double_buffer: false
-        pipeline_collide: false
       - id: tiled_cholesky
         label: tiled cholesky
         solver: feather_pgs
@@ -284,7 +275,6 @@ tasks:
         pgs_mode: delassus
         use_parallel_streams: false
         double_buffer: false
-        pipeline_collide: false
       - id: tiled_trisolve
         label: tiled trisolve
         solver: feather_pgs
@@ -299,7 +289,6 @@ tasks:
         pgs_mode: delassus
         use_parallel_streams: false
         double_buffer: false
-        pipeline_collide: false
       - id: tiled_delassus
         label: tiled delassus
         solver: feather_pgs
@@ -314,7 +303,6 @@ tasks:
         pgs_mode: delassus
         use_parallel_streams: false
         double_buffer: false
-        pipeline_collide: false
       - id: streaming_pgs
         label: streaming PGS
         solver: feather_pgs
@@ -329,7 +317,6 @@ tasks:
         pgs_mode: delassus
         use_parallel_streams: false
         double_buffer: false
-        pipeline_collide: false
       - id: parallel_streams
         label: parallel streams
         solver: feather_pgs
@@ -344,7 +331,6 @@ tasks:
         pgs_mode: delassus
         use_parallel_streams: true
         double_buffer: false
-        pipeline_collide: false
       - id: hybrid
         label: hybrid (dense + MF rigid)
         solver: feather_pgs
@@ -359,7 +345,6 @@ tasks:
         pgs_mode: hybrid
         use_parallel_streams: true
         double_buffer: false
-        pipeline_collide: false
       - id: matrix_free
         label: fully matrix-free GS
         solver: feather_pgs
@@ -374,7 +359,6 @@ tasks:
         pgs_mode: velocity
         use_parallel_streams: true
         double_buffer: false
-        pipeline_collide: false
       - id: double_buffer
         label: double buffer
         solver: feather_pgs
@@ -389,22 +373,6 @@ tasks:
         pgs_mode: velocity
         use_parallel_streams: true
         double_buffer: true
-        pipeline_collide: false
-      - id: pipeline_collide
-        label: pipeline collide
-        solver: feather_pgs
-        substeps: 8
-        num_worlds: 8192
-        cholesky_kernel: tiled
-        trisolve_kernel: tiled
-        hinv_jt_kernel: tiled
-        delassus_kernel: tiled
-        pgs_kernel: tiled_contact
-        dense_max_constraints: 128
-        pgs_mode: velocity
-        use_parallel_streams: true
-        double_buffer: true
-        pipeline_collide: true
       - id: mujoco_baseline
         label: MuJoCo baseline
         solver: mujoco
