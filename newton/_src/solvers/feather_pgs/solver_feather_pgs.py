@@ -47,6 +47,7 @@ from .kernels import (
     clamp_joint_tau,
     compute_com_transforms,
     compute_composite_inertia,
+    compute_contact_linear_force_from_impulses,
     compute_delta_and_accumulate,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
@@ -72,6 +73,7 @@ from .kernels import (
     gather_tau_to_groups,
     hinv_jt_par_row,
     integrate_generalized_joints,
+    pack_contact_linear_force_as_spatial,
     pgs_convergence_diagnostic_velocity,
     pgs_solve_loop,
     pgs_solve_mf_loop,
@@ -291,6 +293,7 @@ class SolverFeatherPGS(SolverBase):
         self._allocate_debug_buffers(model)
         self._scatter_armature_to_groups(model)
         self._init_size_group_streams(model)
+        self._dummy_contact_impulses = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
 
         if model.shape_material_mu is not None:
             self.shape_material_mu = model.shape_material_mu
@@ -1448,6 +1451,49 @@ class SolverFeatherPGS(SolverBase):
 
         self._step += 1
         return state_out
+
+    @override
+    def update_contacts(self, contacts: Contacts) -> None:
+        """Populate Newton contact-force buffers from the last FeatherPGS solve."""
+        if contacts is None or contacts.rigid_contact_count is None:
+            return
+
+        dt = self._last_step_dt
+        inv_dt = 0.0 if dt is None or dt <= 0.0 else 1.0 / dt
+        enable_friction_flag = 1 if self.enable_contact_friction else 0
+        mf_impulses = getattr(self, "mf_impulses", None)
+        if mf_impulses is None:
+            mf_impulses = self._dummy_contact_impulses
+
+        wp.launch(
+            compute_contact_linear_force_from_impulses,
+            dim=contacts.rigid_contact_max,
+            inputs=[
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_normal,
+                self.contact_world,
+                self.contact_slot,
+                self.contact_path,
+                self.impulses,
+                mf_impulses,
+                enable_friction_flag,
+                inv_dt,
+            ],
+            outputs=[contacts.rigid_contact_force],
+            device=self.model.device,
+        )
+
+        if contacts.force is not None:
+            wp.launch(
+                pack_contact_linear_force_as_spatial,
+                dim=contacts.rigid_contact_max,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_force,
+                ],
+                outputs=[contacts.force],
+                device=self.model.device,
+            )
 
     def _prepare_augmented_state(
         self,
