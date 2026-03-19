@@ -83,6 +83,7 @@ from .kernels import (
     scatter_qdd_from_groups,
     trisolve_loop,
     update_articulation_origins,
+    update_articulation_root_com_offsets,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
     vector_add_inplace,
@@ -645,9 +646,13 @@ class SolverFeatherPGS(SolverBase):
 
         if not model.articulation_count or not model.joint_count:
             self.articulation_origin = None
+            self.articulation_root_com_offset = None
             return
 
         self.articulation_origin = wp.zeros(
+            (model.articulation_count,), dtype=wp.vec3, device=model.device, requires_grad=model.requires_grad
+        )
+        self.articulation_root_com_offset = wp.zeros(
             (model.articulation_count,), dtype=wp.vec3, device=model.device, requires_grad=model.requires_grad
         )
 
@@ -1656,6 +1661,18 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.articulation_origin],
             device=model.device,
         )
+        wp.launch(
+            update_articulation_root_com_offsets,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                model.joint_child,
+                state_in.body_q,
+                model.body_com,
+            ],
+            outputs=[self.articulation_root_com_offset],
+            device=model.device,
+        )
 
         # evaluate joint inertias, motion vectors, and forces
         state_aug.body_f_s.zero_()
@@ -1667,7 +1684,7 @@ class SolverFeatherPGS(SolverBase):
                 inputs=[
                     self.articulation_root_is_free,
                     self.articulation_root_dof_start,
-                    self.articulation_origin,
+                    self.articulation_root_com_offset,
                 ],
                 outputs=[self.qd_work],
                 device=model.device,
@@ -2668,7 +2685,7 @@ class SolverFeatherPGS(SolverBase):
                 inputs=[
                     self.articulation_root_is_free,
                     self.articulation_root_dof_start,
-                    self.articulation_origin,
+                    self.articulation_root_com_offset,
                 ],
                 outputs=[self.v_out],
                 device=model.device,
