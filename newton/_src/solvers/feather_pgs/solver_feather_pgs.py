@@ -20,8 +20,9 @@ import numpy as np
 import warp as wp
 
 from ...core.types import override
-from ...sim import Contacts, Control, Model, State, eval_fk
+from ...sim import Contacts, Control, Model, State
 from ...sim.enums import JointType
+from ..featherstone.kernels import eval_fk_with_velocity_conversion
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
@@ -37,6 +38,7 @@ from .kernels import (
     TILE_THREADS,
     allocate_joint_limit_slots,
     allocate_world_contact_slots,
+    add_dense_contact_compliance_to_diag,
     apply_augmented_joint_tau,
     apply_augmented_mass_diagonal_grouped,
     apply_impulses_world_par_dof,
@@ -165,6 +167,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_iterations: int = 12,
         pgs_beta: float = 0.2,
         pgs_cfm: float = 1.0e-6,
+        dense_contact_compliance: float = 0.0,
         pgs_omega: float = 1.0,
         dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
@@ -201,6 +204,9 @@ class SolverFeatherPGS(SolverBase):
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_beta (float, optional): ERP style position correction factor. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
+            dense_contact_compliance (float, optional): Normal contact compliance [m/N] applied
+                only to dense articulated contact rows. Converted to an impulse-space diagonal
+                term using ``compliance / dt^2``. Defaults to 0.0.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             dense_max_constraints (int, optional): Maximum number of dense (articulation) contact constraint
                 rows stored per world. Free rigid body contacts are stored separately, bounded by
@@ -246,6 +252,7 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_iterations = pgs_iterations
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
+        self.dense_contact_compliance = dense_contact_compliance
         self.pgs_omega = pgs_omega
         self.dense_max_constraints = dense_max_constraints
         self.pgs_warmstart = pgs_warmstart
@@ -1120,6 +1127,7 @@ class SolverFeatherPGS(SolverBase):
                 for size in self.size_groups:
                     self._stage4_diag_from_JY(size)
                 self._stage4_finalize_world_diag_cfm()
+                self._stage4_add_dense_contact_compliance(dt)
 
                 # RHS = bias only (J*v recomputed per iteration)
                 self._stage4_compute_rhs_world(dt)
@@ -1185,6 +1193,7 @@ class SolverFeatherPGS(SolverBase):
 
                 self._stage4_finalize_world_diag_cfm()
 
+            self._stage4_add_dense_contact_compliance(dt)
             self._stage4_compute_rhs_world(dt)
 
             for size in self.size_groups:
@@ -2490,6 +2499,19 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
+    def _stage4_add_dense_contact_compliance(self, dt: float):
+        if self.dense_contact_compliance <= 0.0:
+            return
+
+        contact_alpha = float(self.dense_contact_compliance / (dt * dt))
+        wp.launch(
+            add_dense_contact_compliance_to_diag,
+            dim=self.world_count,
+            inputs=[self.constraint_count, self.row_type, contact_alpha],
+            outputs=[self.diag],
+            device=self.model.device,
+        )
+
     def _stage4_diag_from_JY(self, size: int):
         n_arts = self.n_arts_by_size[size]
         wp.launch(
@@ -2859,8 +2881,8 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-            # update maximal coordinates
-            eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+            # Match Featherstone FK writeback so FREE/DISTANCE body_qd stores COM velocity.
+            eval_fk_with_velocity_conversion(model, state_out.joint_q, state_out.joint_qd, state_out)
 
         self.integrate_particles(model, state_in, state_out, dt)
 
