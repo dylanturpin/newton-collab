@@ -1213,6 +1213,76 @@ def contact_tangent_basis(n: wp.vec3):
     return tangent0, tangent1
 
 
+@wp.kernel
+def compute_contact_linear_force_from_impulses(
+    contact_count: wp.array(dtype=wp.int32),
+    contact_normal: wp.array(dtype=wp.vec3),
+    contact_world: wp.array(dtype=wp.int32),
+    contact_slot: wp.array(dtype=wp.int32),
+    contact_path: wp.array(dtype=wp.int32),
+    world_impulses: wp.array2d(dtype=wp.float32),
+    mf_impulses: wp.array2d(dtype=wp.float32),
+    enable_friction: int,
+    inv_dt: float,
+    # outputs
+    rigid_contact_force: wp.array(dtype=wp.vec3),
+):
+    """Convert solved FeatherPGS contact impulses into world-frame forces."""
+    c = wp.tid()
+    total_contacts = contact_count[0]
+    if c >= total_contacts:
+        return
+
+    force = wp.vec3(0.0)
+    slot = contact_slot[c]
+    path = contact_path[c]
+
+    if slot >= 0 and path >= 0 and inv_dt > 0.0:
+        world = contact_world[c]
+        # Contacts store normals from shape 0 toward shape 1 (A-to-B). FeatherPGS
+        # solves along the opposite direction internally, which corresponds to the
+        # force on shape/body 0 from shape/body 1.
+        normal = -contact_normal[c]
+
+        lam_n = 0.0
+        lam_t0 = 0.0
+        lam_t1 = 0.0
+        if path == 0:
+            lam_n = world_impulses[world, slot]
+            if enable_friction != 0:
+                lam_t0 = world_impulses[world, slot + 1]
+                lam_t1 = world_impulses[world, slot + 2]
+        elif path == 1:
+            lam_n = mf_impulses[world, slot]
+            if enable_friction != 0:
+                lam_t0 = mf_impulses[world, slot + 1]
+                lam_t1 = mf_impulses[world, slot + 2]
+
+        force = lam_n * normal
+        if enable_friction != 0:
+            tangent0, tangent1 = contact_tangent_basis(normal)
+            force += lam_t0 * tangent0 + lam_t1 * tangent1
+        force *= inv_dt
+
+    rigid_contact_force[c] = force
+
+
+@wp.kernel
+def pack_contact_linear_force_as_spatial(
+    contact_count: wp.array(dtype=wp.int32),
+    rigid_contact_force: wp.array(dtype=wp.vec3),
+    # outputs
+    contact_force: wp.array(dtype=wp.spatial_vector),
+):
+    """Pack linear contact forces into Newton's spatial-force contact buffer."""
+    c = wp.tid()
+    total_contacts = contact_count[0]
+    if c >= total_contacts:
+        return
+
+    contact_force[c] = wp.spatial_vector(rigid_contact_force[c], wp.vec3(0.0))
+
+
 # Computes J*v contribution on the fly by walking the tree
 # This keeps the S vectors in L2 cache and avoids reading the large J matrix.
 @wp.func
