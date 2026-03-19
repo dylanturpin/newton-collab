@@ -35,6 +35,7 @@ from ..semi_implicit.kernels_particle import (
 from ..solver import SolverBase
 from .kernels import (
     TILE_THREADS,
+    allocate_joint_limit_slots,
     allocate_world_contact_slots,
     apply_augmented_joint_tau,
     apply_augmented_mass_diagonal_grouped,
@@ -77,6 +78,7 @@ from .kernels import (
     pgs_convergence_diagnostic_velocity,
     pgs_solve_loop,
     pgs_solve_mf_loop,
+    populate_joint_limit_J_for_size,
     populate_world_J_for_size,
     prepare_world_impulses,
     rhs_accum_world_par_art,
@@ -160,6 +162,7 @@ class SolverFeatherPGS(SolverBase):
         update_mass_matrix_interval: int = 1,
         friction_smoothing: float = 1.0,
         enable_contact_friction: bool = True,
+        enable_joint_limits: bool = False,
         pgs_iterations: int = 12,
         pgs_beta: float = 0.2,
         pgs_cfm: float = 1.0e-6,
@@ -192,6 +195,10 @@ class SolverFeatherPGS(SolverBase):
             update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the :meth:`step` function gets called). Defaults to 1.
             friction_smoothing (float, optional): The delta value for the Huber norm (see :func:`warp.math.norm_huber`) used for the friction velocity normalization. Defaults to 1.0.
             enable_contact_friction (bool, optional): Enables Coulomb friction contacts inside the PGS solve. Defaults to True.
+            enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
+                constraints.  Each violated limit adds one constraint row.  Supported with
+                ``pgs_kernel="loop"`` and ``pgs_kernel="tiled_row"``; the ``"tiled_contact"``
+                and ``"streaming"`` PGS kernels are *not* compatible.  Defaults to False.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_beta (float, optional): ERP style position correction factor. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
@@ -236,6 +243,7 @@ class SolverFeatherPGS(SolverBase):
         self.update_mass_matrix_interval = update_mass_matrix_interval
         self.friction_smoothing = friction_smoothing
         self.enable_contact_friction = enable_contact_friction
+        self.enable_joint_limits = enable_joint_limits
         self.pgs_iterations = pgs_iterations
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
@@ -773,6 +781,19 @@ class SolverFeatherPGS(SolverBase):
         self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_path = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+
+        # Joint limit buffers (per-DOF tracking)
+        if self.enable_joint_limits and model.joint_dof_count > 0:
+            dof_count = model.joint_dof_count
+            self.limit_slot = wp.full(
+                (dof_count,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+            )
+            self.limit_sign = wp.zeros(
+                (dof_count,), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+        else:
+            self.limit_slot = None
+            self.limit_sign = None
 
     def _allocate_world_buffers(self, model):
         """Allocate world-level constraint system buffers for multi-articulation support."""
@@ -2126,6 +2147,33 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
+            # Allocate joint limit constraint slots (same counter as contacts)
+            if self.enable_joint_limits and self.limit_slot is not None:
+                wp.launch(
+                    allocate_joint_limit_slots,
+                    dim=model.articulation_count,
+                    inputs=[
+                        model.articulation_start,
+                        self.articulation_dof_start,
+                        self.articulation_H_rows,
+                        model.joint_type,
+                        model.joint_q_start,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_limit_lower,
+                        model.joint_limit_upper,
+                        state_in.joint_q,
+                        self.art_to_world,
+                        max_constraints,
+                    ],
+                    outputs=[
+                        self.limit_slot,
+                        self.limit_sign,
+                        self.slot_counter,
+                    ],
+                    device=model.device,
+                )
+
             if self._H_bufs is None:  # not double-buffered
                 for size in self.size_groups:
                     self.J_by_size[size].zero_()
@@ -2178,6 +2226,43 @@ class SolverFeatherPGS(SolverBase):
                     device=model.device,
                 )
 
+            # Populate joint limit Jacobian rows (per size group)
+            if self.enable_joint_limits and self.limit_slot is not None:
+                for size in self.size_groups:
+                    n_arts = self.n_arts_by_size[size]
+                    wp.launch(
+                        populate_joint_limit_J_for_size,
+                        dim=n_arts,
+                        inputs=[
+                            model.articulation_start,
+                            self.articulation_dof_start,
+                            model.joint_type,
+                            model.joint_q_start,
+                            model.joint_qd_start,
+                            model.joint_dof_dim,
+                            model.joint_limit_lower,
+                            model.joint_limit_upper,
+                            state_in.joint_q,
+                            self.art_to_world,
+                            self.limit_slot,
+                            self.limit_sign,
+                            self.group_to_art[size],
+                            self.pgs_beta,
+                            self.pgs_cfm,
+                        ],
+                        outputs=[
+                            self.J_by_size[size],
+                            self.row_type,
+                            self.row_parent,
+                            self.row_mu,
+                            self.row_beta,
+                            self.row_cfm,
+                            self.phi,
+                            self.target_velocity,
+                        ],
+                        device=model.device,
+                    )
+
             # Build MF contact rows
             if mf_active:
                 wp.launch(
@@ -2225,6 +2310,77 @@ class SolverFeatherPGS(SolverBase):
                     outputs=[self.mf_constraint_count],
                     device=model.device,
                 )
+
+        # Joint limit constraints (outside contact block — limits work with or without contacts)
+        if self.enable_joint_limits and self.limit_slot is not None:
+            has_contacts = (
+                contacts is not None
+                and getattr(contacts, "rigid_contact_count", None) is not None
+                and contacts.rigid_contact_max > 0
+            )
+            if not has_contacts:
+                # Contacts block was skipped — allocate limits and J from scratch
+                wp.launch(
+                    allocate_joint_limit_slots,
+                    dim=model.articulation_count,
+                    inputs=[
+                        model.articulation_start,
+                        self.articulation_dof_start,
+                        self.articulation_H_rows,
+                        model.joint_type,
+                        model.joint_q_start,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_limit_lower,
+                        model.joint_limit_upper,
+                        state_in.joint_q,
+                        self.art_to_world,
+                        max_constraints,
+                    ],
+                    outputs=[
+                        self.limit_slot,
+                        self.limit_sign,
+                        self.slot_counter,
+                    ],
+                    device=model.device,
+                )
+                if self._H_bufs is None:
+                    for size in self.size_groups:
+                        self.J_by_size[size].zero_()
+                for size in self.size_groups:
+                    n_arts = self.n_arts_by_size[size]
+                    wp.launch(
+                        populate_joint_limit_J_for_size,
+                        dim=n_arts,
+                        inputs=[
+                            model.articulation_start,
+                            self.articulation_dof_start,
+                            model.joint_type,
+                            model.joint_q_start,
+                            model.joint_qd_start,
+                            model.joint_dof_dim,
+                            model.joint_limit_lower,
+                            model.joint_limit_upper,
+                            state_in.joint_q,
+                            self.art_to_world,
+                            self.limit_slot,
+                            self.limit_sign,
+                            self.group_to_art[size],
+                            self.pgs_beta,
+                            self.pgs_cfm,
+                        ],
+                        outputs=[
+                            self.J_by_size[size],
+                            self.row_type,
+                            self.row_parent,
+                            self.row_mu,
+                            self.row_beta,
+                            self.row_cfm,
+                            self.phi,
+                            self.target_velocity,
+                        ],
+                        device=model.device,
+                    )
 
         slots_per_contact_dense = 3 if self.enable_contact_friction else 1
         wp.launch(
@@ -3206,7 +3362,7 @@ class TiledKernelFactory:
                 float new_impulse = s_lam[i] + omega * delta;
                 int row_type = s_rtype[i];
 
-                if (row_type == 0) {{
+                if (row_type == 0 || row_type == 3) {{
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                     s_lam[i] = new_impulse;
                 }} else if (row_type == 2) {{
@@ -3932,8 +4088,8 @@ class TiledKernelFactory:
 
                     int row_type = mf_row_type.data[c_off + i];
 
-                    // Project: contact
-                    if (row_type == 0) {{
+                    // Project: contact or joint limit
+                    if (row_type == 0 || row_type == 3) {{
                         if (new_impulse < 0.0f) new_impulse = 0.0f;
                     }}
                     // Project: friction
@@ -4384,7 +4540,7 @@ class TiledKernelFactory:
                 float new_impulse = old_impulse + omega * delta;
                 int row_type = s_rtype_dense[i];
 
-                if (row_type == 0) {{
+                if (row_type == 0 || row_type == 3) {{
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                 }} else if (row_type == 2) {{
                     int parent_idx = s_parent_dense[i];

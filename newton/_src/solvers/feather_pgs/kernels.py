@@ -25,6 +25,7 @@ from ...sim.articulation import (
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 PGS_CONSTRAINT_TYPE_JOINT_TARGET = 1
 PGS_CONSTRAINT_TYPE_FRICTION = 2
+PGS_CONSTRAINT_TYPE_JOINT_LIMIT = 3
 
 
 @wp.kernel
@@ -1748,6 +1749,172 @@ def build_mass_update_mask(
 
 
 # =============================================================================
+# Joint Limit Constraint Kernels
+# =============================================================================
+
+
+@wp.kernel
+def allocate_joint_limit_slots(
+    articulation_start: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    articulation_H_rows: wp.array(dtype=int),
+    joint_type: wp.array(dtype=int),
+    joint_q_start: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_dof_dim: wp.array(dtype=int, ndim=2),
+    joint_limit_lower: wp.array(dtype=float),
+    joint_limit_upper: wp.array(dtype=float),
+    joint_q: wp.array(dtype=float),
+    art_to_world: wp.array(dtype=int),
+    max_constraints: int,
+    # outputs
+    limit_slot: wp.array(dtype=int),
+    limit_sign: wp.array(dtype=float),
+    world_slot_counter: wp.array(dtype=int),
+):
+    """Allocate constraint slots for violated joint limits.
+
+    For each articulation, checks all DOFs of PRISMATIC, REVOLUTE, and D6
+    joints against their limits.  When a DOF violates its lower or upper
+    limit, a single constraint slot is atomically reserved in the world's
+    slot counter (the same counter used by contacts).
+
+    Outputs per-DOF arrays ``limit_slot`` (world-constraint row, or -1) and
+    ``limit_sign`` (+1 for lower-limit violation, -1 for upper).
+    """
+    art = wp.tid()
+    world = art_to_world[art]
+
+    # Initialize all DOFs of this articulation to "no limit active"
+    dof_base = articulation_dof_start[art]
+    dof_count = articulation_H_rows[art]
+    for d in range(dof_count):
+        limit_slot[dof_base + d] = -1
+        limit_sign[dof_base + d] = 0.0
+
+    joint_start = articulation_start[art]
+    joint_end = articulation_start[art + 1]
+
+    for j in range(joint_start, joint_end):
+        jtype = joint_type[j]
+        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+            continue
+
+        lin_count = joint_dof_dim[j, 0]
+        ang_count = joint_dof_dim[j, 1]
+        axis_count = lin_count + ang_count
+        qd_start = joint_qd_start[j]
+        q_start = joint_q_start[j]
+
+        for axis in range(axis_count):
+            dof = qd_start + axis
+            q_val = joint_q[q_start + axis]
+            lower = joint_limit_lower[dof]
+            upper = joint_limit_upper[dof]
+
+            # Lower limit violation (q < lower)
+            if q_val < lower:
+                slot = wp.atomic_add(world_slot_counter, world, 1)
+                if slot < max_constraints:
+                    limit_slot[dof] = slot
+                    limit_sign[dof] = 1.0
+            # Upper limit violation (q > upper)
+            elif q_val > upper:
+                slot = wp.atomic_add(world_slot_counter, world, 1)
+                if slot < max_constraints:
+                    limit_slot[dof] = slot
+                    limit_sign[dof] = -1.0
+
+
+@wp.kernel
+def populate_joint_limit_J_for_size(
+    articulation_start: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    joint_type: wp.array(dtype=int),
+    joint_q_start: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_dof_dim: wp.array(dtype=int, ndim=2),
+    joint_limit_lower: wp.array(dtype=float),
+    joint_limit_upper: wp.array(dtype=float),
+    joint_q: wp.array(dtype=float),
+    art_to_world: wp.array(dtype=int),
+    limit_slot: wp.array(dtype=int),
+    limit_sign: wp.array(dtype=float),
+    group_to_art: wp.array(dtype=int),
+    pgs_beta: float,
+    pgs_cfm: float,
+    # outputs
+    J_group: wp.array3d(dtype=float),
+    world_row_type: wp.array2d(dtype=int),
+    world_row_parent: wp.array2d(dtype=int),
+    world_row_mu: wp.array2d(dtype=float),
+    world_row_beta: wp.array2d(dtype=float),
+    world_row_cfm: wp.array2d(dtype=float),
+    world_phi: wp.array2d(dtype=float),
+    world_target_velocity: wp.array2d(dtype=float),
+):
+    """Populate Jacobian and metadata for joint limit constraints.
+
+    Launched once per size group with ``dim = n_arts_of_size``.  Each thread
+    walks the joints of one articulation and, for every DOF whose
+    ``limit_slot`` is non-negative (i.e. the limit was activated by
+    :func:`allocate_joint_limit_slots`), writes:
+
+    * A single ±1 entry in the Jacobian at the DOF's local column.
+    * Constraint metadata (type, phi, beta, cfm, etc.).
+    """
+    group_idx = wp.tid()
+    art = group_to_art[group_idx]
+    world = art_to_world[art]
+    dof_start = articulation_dof_start[art]
+
+    joint_start = articulation_start[art]
+    joint_end = articulation_start[art + 1]
+
+    for j in range(joint_start, joint_end):
+        jtype = joint_type[j]
+        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+            continue
+
+        lin_count = joint_dof_dim[j, 0]
+        ang_count = joint_dof_dim[j, 1]
+        axis_count = lin_count + ang_count
+        qd_start = joint_qd_start[j]
+        q_start = joint_q_start[j]
+
+        for axis in range(axis_count):
+            dof = qd_start + axis
+            slot = limit_slot[dof]
+            if slot < 0:
+                continue
+
+            sign = limit_sign[dof]
+            q_val = joint_q[q_start + axis]
+            lower = joint_limit_lower[dof]
+            upper = joint_limit_upper[dof]
+
+            # phi is negative when violating
+            phi = 0.0
+            if sign > 0.0:
+                phi = q_val - lower
+            else:
+                phi = upper - q_val
+
+            # Jacobian: single ±1 entry at the local DOF column
+            local_dof = dof - dof_start
+            J_group[group_idx, slot, local_dof] = sign
+
+            # Constraint metadata
+            world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+            world_row_parent[world, slot] = -1
+            world_row_mu[world, slot] = 0.0
+            world_row_beta[world, slot] = pgs_beta
+            world_row_cfm[world, slot] = pgs_cfm
+            world_phi[world, slot] = phi
+            world_target_velocity[world, slot] = 0.0
+
+
+# =============================================================================
 # Multi-Articulation Contact Building Kernels
 # =============================================================================
 # These kernels enable contacts between multiple articulations within the same
@@ -2262,15 +2429,18 @@ def finalize_world_constraint_counts(
 
     When the atomic slot counter exceeds ``max_constraints``, clamping can
     leave "gap" slots that were reserved by a rejected contact but never
-    written.  Rounding down to the nearest ``slots_per_contact`` boundary
-    (3 with friction, 1 without) eliminates those gaps.
+    written.  Those gap slots have zero Jacobians and will be harmlessly
+    skipped by PGS (zero diagonal → ``continue``).
+
+    The ``slots_per_contact`` argument is accepted for backwards
+    compatibility but is no longer used for rounding, because the
+    constraint buffer may now contain a mix of 3-row contact groups and
+    single-row joint-limit constraints.
     """
     world = wp.tid()
     count = world_slot_counter[world]
     if count > max_constraints:
         count = max_constraints
-    # Round down to avoid gap slots from atomic-add overflow
-    count = (count // slots_per_contact) * slots_per_contact
     world_constraint_count[world] = count
 
 
@@ -2518,10 +2688,10 @@ def compute_world_contact_bias(
         # Initialize with -target_velocity (will add J*v later)
         rhs = -target_vel
 
-        # For contacts: add Baumgarte stabilization when penetrating
-        if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        # For contacts and joint limits: add Baumgarte stabilization when violating
+        if row_type == PGS_CONSTRAINT_TYPE_CONTACT or row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
             if phi < 0.0:
-                rhs += beta * phi * inv_dt  # Negative for penetration
+                rhs += beta * phi * inv_dt  # Negative for penetration / violation
         elif row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
             rhs += beta * phi * inv_dt
 
@@ -3338,8 +3508,8 @@ def pgs_solve_loop(
             new_impulse = world_impulses[world, i] + omega * delta
             row_type = world_row_type[world, i]
 
-            # --- Normal contact: lambda_n >= 0 ---
-            if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+            # --- Normal contact or joint limit: lambda_n >= 0 ---
+            if row_type == PGS_CONSTRAINT_TYPE_CONTACT or row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
                 if new_impulse < 0.0:
                     new_impulse = 0.0
                 world_impulses[world, i] = new_impulse
