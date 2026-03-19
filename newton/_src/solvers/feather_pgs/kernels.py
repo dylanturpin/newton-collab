@@ -78,6 +78,7 @@ def update_articulation_origins(
     articulation_start: wp.array(dtype=int),
     joint_child: wp.array(dtype=int),
     body_q: wp.array(dtype=wp.transform),
+    body_com: wp.array(dtype=wp.vec3),
     # outputs
     articulation_origin: wp.array(dtype=wp.vec3),
 ):
@@ -92,7 +93,7 @@ def update_articulation_origins(
 
     root_body = joint_child[start]
     if root_body >= 0:
-        articulation_origin[art] = wp.transform_get_translation(body_q[root_body])
+        articulation_origin[art] = wp.transform_point(body_q[root_body], body_com[root_body])
     else:
         articulation_origin[art] = wp.vec3()
 
@@ -127,7 +128,7 @@ def update_articulation_root_com_offsets(
 def convert_root_free_qd_world_to_local(
     articulation_root_is_free: wp.array(dtype=int),
     articulation_root_dof_start: wp.array(dtype=int),
-    articulation_root_com_offset: wp.array(dtype=wp.vec3),
+    articulation_origin: wp.array(dtype=wp.vec3),
     # in/out
     qd: wp.array(dtype=float),
 ):
@@ -138,10 +139,10 @@ def convert_root_free_qd_world_to_local(
     ds = articulation_root_dof_start[art]
     v_com = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
     w = wp.vec3(qd[ds + 3], qd[ds + 4], qd[ds + 5])
-    com_offset = articulation_root_com_offset[art]
+    origin = articulation_origin[art]
 
-    # Shift linear velocity from the public CoM convention to the internal articulation-origin convention.
-    v_local = v_com - wp.cross(w, com_offset)
+    # Shift linear velocity from public CoM convention to internal articulation-origin convention.
+    v_local = v_com + wp.cross(w, origin)
 
     qd[ds + 0] = v_local[0]
     qd[ds + 1] = v_local[1]
@@ -152,7 +153,7 @@ def convert_root_free_qd_world_to_local(
 def convert_root_free_qd_local_to_world(
     articulation_root_is_free: wp.array(dtype=int),
     articulation_root_dof_start: wp.array(dtype=int),
-    articulation_root_com_offset: wp.array(dtype=wp.vec3),
+    articulation_origin: wp.array(dtype=wp.vec3),
     # in/out
     qd: wp.array(dtype=float),
 ):
@@ -163,10 +164,10 @@ def convert_root_free_qd_local_to_world(
     ds = articulation_root_dof_start[art]
     v_local = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
     w = wp.vec3(qd[ds + 3], qd[ds + 4], qd[ds + 5])
-    com_offset = articulation_root_com_offset[art]
+    origin = articulation_origin[art]
 
-    # Convert the internal articulation-origin velocity back to the public CoM convention.
-    v_world = v_local + wp.cross(w, com_offset)
+    # Convert internal articulation-origin velocity back to public CoM convention.
+    v_world = v_local - wp.cross(w, origin)
 
     qd[ds + 0] = v_world[0]
     qd[ds + 1] = v_world[1]
