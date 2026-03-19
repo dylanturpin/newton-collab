@@ -93,6 +93,7 @@ def update_articulation_origins(
 
     root_body = joint_child[start]
     if root_body >= 0:
+        # Store the absolute world-space COM position of the articulation root body.
         articulation_origin[art] = wp.transform_point(body_q[root_body], body_com[root_body])
     else:
         articulation_origin[art] = wp.vec3()
@@ -107,6 +108,9 @@ def update_articulation_root_com_offsets(
     # outputs
     articulation_root_com_offset: wp.array(dtype=wp.vec3),
 ):
+    # NOTE: This helper keeps the rotated root COM offset in world orientation.
+    # FeatherPGS currently uses update_articulation_origins() instead, which
+    # stores the absolute root COM world position for its free-root convention.
     art = wp.tid()
 
     start = articulation_start[art]
@@ -137,12 +141,13 @@ def convert_root_free_qd_world_to_local(
         return
 
     ds = articulation_root_dof_start[art]
-    v_com = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
+    v_public = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
     w = wp.vec3(qd[ds + 3], qd[ds + 4], qd[ds + 5])
-    origin = articulation_origin[art]
+    root_com_world = articulation_origin[art]
 
-    # Shift linear velocity from public CoM convention to internal articulation-origin convention.
-    v_local = v_com + wp.cross(w, origin)
+    # Public FREE-joint qd stores the spatial linear term referenced at the world origin.
+    # Convert it to the internal COM-point linear term used by FeatherPGS.
+    v_local = v_public + wp.cross(w, root_com_world)
 
     qd[ds + 0] = v_local[0]
     qd[ds + 1] = v_local[1]
@@ -164,14 +169,15 @@ def convert_root_free_qd_local_to_world(
     ds = articulation_root_dof_start[art]
     v_local = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
     w = wp.vec3(qd[ds + 3], qd[ds + 4], qd[ds + 5])
-    origin = articulation_origin[art]
+    root_com_world = articulation_origin[art]
 
-    # Convert internal articulation-origin velocity back to public CoM convention.
-    v_world = v_local - wp.cross(w, origin)
+    # Convert the internal COM-point linear term back to the public world-origin
+    # spatial linear term stored in FREE-joint qd.
+    v_public = v_local - wp.cross(w, root_com_world)
 
-    qd[ds + 0] = v_world[0]
-    qd[ds + 1] = v_world[1]
-    qd[ds + 2] = v_world[2]
+    qd[ds + 0] = v_public[0]
+    qd[ds + 1] = v_public[1]
+    qd[ds + 2] = v_public[2]
 
 
 @wp.func
@@ -427,7 +433,7 @@ def jcalc_motion(
 
     if type == JointType.FREE or type == JointType.DISTANCE:
         # For FREE/DISTANCE joints we treat linear/angular velocity components as
-        # referenced at the articulation origin to avoid world-origin conditioning.
+        # referenced at the root COM world point to avoid world-origin conditioning.
         q_sc = wp.transform_get_rotation(X_sc)
 
         v_local = wp.vec3(joint_qd[qd_start + 0], joint_qd[qd_start + 1], joint_qd[qd_start + 2])
@@ -2869,10 +2875,11 @@ def build_mf_contact_rows(
 ):
     """Build MF constraint rows for contacts between free rigid bodies / ground.
 
-    For root free joints, `joint_qd` stores spatial twist in an articulation-local
-    frame whose origin is the body origin, i.e. `qd = [v_origin, omega]`.
-    The MF contact Jacobian uses contact position relative to that origin:
-        J = [d, r x d]   (r = p_contact - p_origin)
+    For root free joints, the internal qd used here stores the COM-point linear
+    term and angular velocity, i.e. `qd = [v_com_point, omega]`, where the COM
+    point is the root body's world-space COM position. The MF contact Jacobian
+    uses contact position relative to that point:
+        J = [d, r x d]   (r = p_contact - p_com_world)
     """
     c = wp.tid()
     total_contacts = contact_count[0]
@@ -3606,6 +3613,29 @@ def finalize_world_diag_cfm(
 
     for i in range(m):
         world_diag[world, i] += world_row_cfm[world, i]
+
+
+@wp.kernel
+def add_dense_contact_compliance_to_diag(
+    world_constraint_count: wp.array(dtype=int),
+    world_row_type: wp.array2d(dtype=int),
+    contact_alpha: float,
+    # in/out
+    world_diag: wp.array2d(dtype=float),
+):
+    """Add normal-contact compliance to the dense PGS diagonal.
+
+    The dense articulated contact path uses a Delassus diagonal in impulse
+    space. A compliance ``alpha = compliance / dt^2`` contributes an additional
+    diagonal term for normal contact rows only, yielding a softer normal
+    response without changing friction or joint-limit rows.
+    """
+    world = wp.tid()
+    m = world_constraint_count[world]
+
+    for i in range(m):
+        if world_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
+            world_diag[world, i] += contact_alpha
 
 
 # =============================================================================
