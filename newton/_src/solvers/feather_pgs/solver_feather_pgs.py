@@ -171,7 +171,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_omega: float = 1.0,
         dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
-        pgs_mode: str = "hybrid",
+        pgs_mode: str = "split",
         mf_max_constraints: int = 512,
         # Kernel selection per operation
         cholesky_kernel: str = "auto",
@@ -212,12 +212,12 @@ class SolverFeatherPGS(SolverBase):
                 rows stored per world. Free rigid body contacts are stored separately, bounded by
                 mf_max_constraints. Defaults to 32.
             pgs_warmstart (bool, optional): Re-use impulses from the previous frame when contacts persist. Defaults to False.
-            pgs_mode (str, optional): PGS mode. "delassus" builds the full Delassus matrix C = J*H^{-1}*J^T
-                and solves in impulse space (Gauss-Seidel) for all contacts. "hybrid" uses the Delassus
+            pgs_mode (str, optional): PGS mode. "dense" builds the full Delassus matrix C = J*H^{-1}*J^T
+                and solves in impulse space (Gauss-Seidel) for all contacts. "split" uses the dense
                 path for articulated bodies and a cheaper matrix-free PGS path for free rigid body
-                contacts. "velocity" skips C entirely, recomputes J*v each iteration, and uses only the
-                diagonal for preconditioning (Jacobi-style) — O(max_constraints) memory instead of
-                O(max_constraints^2). Defaults to "hybrid".
+                contacts. "matrix_free" skips C entirely, recomputes J*v each iteration, and uses only
+                the diagonal for preconditioning — O(max_constraints) memory instead of
+                O(max_constraints^2). Defaults to "split".
             mf_max_constraints (int, optional): Maximum number of matrix-free constraints per world. Defaults to 512.
             cholesky_kernel (str, optional): "tiled", "loop", or "auto" for Cholesky factorization. Defaults to "auto".
             trisolve_kernel (str, optional): "tiled", "loop", or "auto" for triangular solve. Defaults to "auto".
@@ -256,8 +256,8 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_omega = pgs_omega
         self.dense_max_constraints = dense_max_constraints
         self.pgs_warmstart = pgs_warmstart
-        if pgs_mode not in ("delassus", "hybrid", "velocity"):
-            raise ValueError(f"pgs_mode must be 'delassus', 'hybrid', or 'velocity', got {pgs_mode!r}")
+        if pgs_mode not in ("dense", "split", "matrix_free"):
+            raise ValueError(f"pgs_mode must be 'dense', 'split', or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
         self.mf_max_constraints = mf_max_constraints
         self._double_buffer = double_buffer
@@ -807,7 +807,7 @@ class SolverFeatherPGS(SolverBase):
         max_constraints = self.dense_max_constraints
 
         # Per-world constraint matrices and vectors
-        if self.pgs_mode != "velocity":
+        if self.pgs_mode != "matrix_free":
             self.C = wp.zeros(
                 (self.world_count, max_constraints, max_constraints),
                 dtype=wp.float32,
@@ -817,7 +817,7 @@ class SolverFeatherPGS(SolverBase):
         else:
             self.C = None
 
-        if self.pgs_mode == "velocity":
+        if self.pgs_mode == "matrix_free":
             self._compute_world_dof_mapping(model)
             self.J_world = wp.zeros(
                 (self.world_count, max_constraints, self.max_world_dofs),
@@ -875,7 +875,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _allocate_mf_buffers(self, model):
         """Allocate buffers for matrix-free PGS path for free rigid body contacts."""
-        if self.pgs_mode == "delassus" or (not self._has_free_rigid_bodies and self.pgs_mode != "velocity"):
+        if self.pgs_mode == "dense" or (not self._has_free_rigid_bodies and self.pgs_mode != "matrix_free"):
             return
 
         device = model.device
@@ -1109,7 +1109,7 @@ class SolverFeatherPGS(SolverBase):
         with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
             self._stage4_build_rows(state_in, state_aug, contacts)
 
-        if self.pgs_mode == "velocity":
+        if self.pgs_mode == "matrix_free":
             # Compute Y = H^-1 * J^T only (no Delassus C)
             with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
@@ -1205,7 +1205,7 @@ class SolverFeatherPGS(SolverBase):
         with wp.ScopedTimer("S5_PGS_Prep", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
             self._stage5_prepare_impulses_world()
 
-        if self.pgs_mode == "velocity":
+        if self.pgs_mode == "matrix_free":
             with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
                 # Gather J/Y from per-size-group arrays into world-indexed arrays
                 # No J_world/Y_world zeroing needed: gather writes all DOFs unconditionally
@@ -1252,7 +1252,7 @@ class SolverFeatherPGS(SolverBase):
                     device=self.model.device,
                 )
 
-            # Two-phase GS kernel: dense + MF in one pass
+            # Two-phase GS kernel: split-style dense + MF in one pass
             with wp.ScopedTimer("S6_PGS_Solve", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
                 mf_gs_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_kernel(
                     self.dense_max_constraints,
@@ -1382,8 +1382,8 @@ class SolverFeatherPGS(SolverBase):
                         device=self.model.device,
                     )
 
-        elif self.pgs_mode == "hybrid" and self._has_mixed_contacts:
-            # Hybrid with mixed contacts: interleaved dense and MF, 1 iteration each
+        elif self.pgs_mode == "split" and self._has_mixed_contacts:
+            # Split mode with mixed contacts: interleaved dense and MF, 1 iteration each
             self._mf_pgs_setup(state_aug, dt)
             self.v_mf_accum.zero_()
 
@@ -1439,7 +1439,7 @@ class SolverFeatherPGS(SolverBase):
             # v_out is already final (includes both dense and MF corrections)
 
         else:
-            # Delassus or hybrid without mixed contacts: dense PGS, then optional MF
+            # Dense or split without mixed contacts: dense PGS, then optional MF
             if self.pgs_debug:
                 self._pgs_convergence_log.append([])
                 for _pgs_dbg_iter in range(self.pgs_iterations):
@@ -1456,7 +1456,7 @@ class SolverFeatherPGS(SolverBase):
             for size in self.size_groups:
                 self._stage6_apply_impulses_world(size)
 
-            if self.pgs_mode == "hybrid" and self._has_free_rigid_bodies:
+            if self.pgs_mode == "split" and self._has_free_rigid_bodies:
                 self._stage6b_mf_pgs(state_aug, dt)
 
         # ══════════════════════════════════════════════════════════════
@@ -2074,7 +2074,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_build_rows(self, state_in: State, state_aug: State, contacts: Contacts):
         model = self.model
         max_constraints = self.dense_max_constraints
-        mf_active = self._has_free_rigid_bodies and self.pgs_mode != "delassus"
+        mf_active = self._has_free_rigid_bodies and self.pgs_mode != "dense"
 
         # Zero world-level buffers (only arrays that require it)
         self.slot_counter.zero_()  # atomic-add counter

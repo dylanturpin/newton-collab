@@ -115,7 +115,7 @@ class TestNightlyCommon(unittest.TestCase):
             series="g1_flat_env_fps",
             profile="rtx_5090",
             hardware_label="rtx-5090",
-            params={"solver": "fpgs_tiled", "num_worlds": 1024},
+            params={"solver": "fpgs_split", "num_worlds": 1024},
             output_dir="/tmp/state/runs/run-001/tasks/g1_flat_sweep/jobs/g1_flat_sweep__0001",
         )
         status_record = StatusRecord(state="completed", exit_code=0, artifact_paths=["measurements.jsonl"])
