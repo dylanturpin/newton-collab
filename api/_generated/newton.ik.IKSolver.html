@@ -41,7 +41,7 @@
   <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
 <link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
 
-    <script src="../../_static/documentation_options.js?v=938c9ccc"></script>
+    <script src="../../_static/documentation_options.js?v=1c471e8e"></script>
     <script src="../../_static/doctools.js?v=9bcbadda"></script>
     <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -49,9 +49,16 @@
     <script src="../../_static/design-tabs.js?v=f930bc37"></script>
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'api/_generated/newton.ik.IKSolver';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="newton.selection" href="../newton_selection.html" />
+    <link rel="next" title="newton.math" href="../newton_math.html" />
     <link rel="prev" title="newton.ik.IKSampler" href="newton.ik.IKSampler.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -125,7 +132,7 @@
     <img src="../../_static/newton-logo-dark.png" class="logo__image only-dark pst-js-only" alt="Newton Physics Logo"/>
   
   
-    <p class="title logo__title">Newton Physics <span style='font-size: 0.8em; color: #888;'>(0.2.0)</span></p>
+    <p class="title logo__title">Newton Physics <span style='font-size: 0.8em; color: #888;'>(1.1.0.dev0)</span></p>
   
 </a></div>
     
@@ -161,15 +168,15 @@
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../../guide/key-concepts.html">
-    Key Concepts
+  <a class="nav-link nav-internal" href="../../guide/tutorials.html">
+    Tutorials
   </a>
 </li>
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../../guide/tutorials.html">
-    Tutorials
+  <a class="nav-link nav-internal" href="../../guide/development.html">
+    Development
   </a>
 </li>
 
@@ -182,8 +189,8 @@
                 <ul id="pst-nav-more-links" class="dropdown-menu">
                     
 <li class=" ">
-  <a class="nav-link dropdown-item nav-internal" href="../../guide/development.html">
-    Development
+  <a class="nav-link dropdown-item nav-internal" href="../../concepts/worlds.html">
+    Worlds
   </a>
 </li>
 
@@ -191,6 +198,13 @@
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../../concepts/articulations.html">
     Articulations
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../../concepts/mass_inertia.html">
+    Mass and Inertia
   </a>
 </li>
 
@@ -245,6 +259,13 @@
 
 
 <li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../../concepts/feather_pgs.html">
+    FeatherPGS
+  </a>
+</li>
+
+
+<li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../newton.html">
     newton
   </a>
@@ -261,6 +282,13 @@
 <li class=" current active">
   <a class="nav-link dropdown-item nav-internal" href="../newton_ik.html">
     newton.ik
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../newton_math.html">
+    newton.math
   </a>
 </li>
 
@@ -364,6 +392,26 @@
   <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
 </button></div>
       
+        <div class="navbar-item">
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
     </div>
     
   </div>
@@ -432,13 +480,6 @@
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../../guide/key-concepts.html">
-    Key Concepts
-  </a>
-</li>
-
-
-<li class="nav-item ">
   <a class="nav-link nav-internal" href="../../guide/tutorials.html">
     Tutorials
   </a>
@@ -453,8 +494,22 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../concepts/worlds.html">
+    Worlds
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../../concepts/articulations.html">
     Articulations
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../concepts/mass_inertia.html">
+    Mass and Inertia
   </a>
 </li>
 
@@ -509,6 +564,13 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../concepts/feather_pgs.html">
+    FeatherPGS
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../newton.html">
     newton
   </a>
@@ -525,6 +587,13 @@
 <li class="nav-item current active">
   <a class="nav-link nav-internal" href="../newton_ik.html">
     newton.ik
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../newton_math.html">
+    newton.math
   </a>
 </li>
 
@@ -616,6 +685,26 @@
   <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
 </button></div>
         
+          <div class="navbar-item">
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+        
       </div>
     
   </div>
@@ -630,13 +719,14 @@
 <li class="toctree-l1"><a class="reference internal" href="../../guide/overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../guide/installation.html">Installation</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../guide/visualization.html">Visualization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../guide/key-concepts.html">Key Concepts</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../guide/tutorials.html">Tutorials</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../guide/development.html">Development</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/worlds.html">Worlds</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/articulations.html">Articulations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/mass_inertia.html">Mass and Inertia</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/sites.html">Sites</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/sensors.html">Sensors</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/conventions.html">Conventions</a></li>
@@ -645,12 +735,14 @@
 
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/extended_attributes.html">Extended Attributes</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/collisions.html">Collisions and Contacts</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/feather_pgs.html">FeatherPGS</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1 current active"><a class="reference internal" href="../newton.html">newton</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_geometry.html">newton.geometry</a></li>
 <li class="toctree-l1 current active"><a class="reference internal" href="../newton_ik.html">newton.ik</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../newton_math.html">newton.math</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_selection.html">newton.selection</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_sensors.html">newton.sensors</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_solvers.html">newton.solvers</a></li>
@@ -774,7 +866,7 @@
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.ik.IKSolver"><code class="docutils literal notranslate"><span class="pre">IKSolver</span></code></a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.ik.IKSolver.__init__"><code class="docutils literal notranslate"><span class="pre">IKSolver.__init__()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.ik.IKSolver.__init__"><code class="docutils literal notranslate"><span class="pre">__init__()</span></code></a></li>
 </ul>
 </li>
 </ul>
@@ -805,17 +897,9 @@
 
   <p class="copyright">
     
-      © Copyright 2026, The Newton Developers.
+      © Copyright 2026, The Newton Developers. Documentation licensed under CC-BY-4.0.
       <br/>
     
-  </p>
-</div>
-      
-        <div class="footer-item">
-
-  <p class="sphinx-version">
-    Created using <a href="https://www.sphinx-doc.org/">Sphinx</a> 8.2.3.
-    <br/>
   </p>
 </div>
       

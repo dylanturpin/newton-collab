@@ -1,6 +1,0 @@
-﻿newton.infer\_actuator\_mode
-============================
-
-.. currentmodule:: newton
-
-.. autofunction:: infer_actuator_mode

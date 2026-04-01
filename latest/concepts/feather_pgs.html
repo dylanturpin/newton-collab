@@ -1,0 +1,1219 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>FeatherPGS &#8212; Newton Physics</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/sphinx-design.min.css?v=95c83b7e" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=b2b65678" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=1c471e8e"></script>
+    <script src="../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=f281be69"></script>
+    <script src="../_static/design-tabs.js?v=f930bc37"></script>
+    <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'concepts/feather_pgs';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="newton" href="../api/newton.html" />
+    <link rel="prev" title="Collisions" href="collisions.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/newton-logo-light.png" class="logo__image only-light" alt="Newton Physics Logo"/>
+    <img src="../_static/newton-logo-dark.png" class="logo__image only-dark pst-js-only" alt="Newton Physics Logo"/>
+  
+  
+    <p class="title logo__title">Newton Physics <span style='font-size: 0.8em; color: #888;'>(1.1.0.dev0)</span></p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+<nav>
+  <ul class="bd-navbar-elements navbar-nav">
+    
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/overview.html">
+    Overview
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/installation.html">
+    Installation
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/visualization.html">
+    Visualization
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/tutorials.html">
+    Tutorials
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/development.html">
+    Development
+  </a>
+</li>
+
+            <li class="nav-item dropdown">
+                <button class="btn dropdown-toggle nav-item" type="button"
+                data-bs-toggle="dropdown" aria-expanded="false"
+                aria-controls="pst-nav-more-links">
+                    More
+                </button>
+                <ul id="pst-nav-more-links" class="dropdown-menu">
+                    
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="worlds.html">
+    Worlds
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="articulations.html">
+    Articulations
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="mass_inertia.html">
+    Mass and Inertia
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="sites.html">
+    Sites
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="sensors.html">
+    Sensors
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="conventions.html">
+    Conventions
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="usd_parsing.html">
+    USD Parsing
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="custom_attributes.html">
+    Custom Attributes
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="extended_attributes.html">
+    Extended Attributes
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="collisions.html">
+    Collisions and Contacts
+  </a>
+</li>
+
+
+<li class=" current active">
+  <a class="nav-link dropdown-item nav-internal" href="#">
+    FeatherPGS
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton.html">
+    newton
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_geometry.html">
+    newton.geometry
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_ik.html">
+    newton.ik
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_math.html">
+    newton.math
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_selection.html">
+    newton.selection
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_sensors.html">
+    newton.sensors
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_solvers.html">
+    newton.solvers
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_usd.html">
+    newton.usd
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_utils.html">
+    newton.utils
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_viewer.html">
+    newton.viewer
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../faq.html">
+    FAQ
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../migration.html">
+    Migration Guide
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../integrations/index.html">
+    Integrations
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-external" href="https://github.com/newton-physics/newton">
+     GitHub
+  </a>
+</li>
+
+                </ul>
+            </li>
+            
+  </ul>
+</nav></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+        <div class="navbar-item">
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+<nav>
+  <ul class="bd-navbar-elements navbar-nav">
+    
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/overview.html">
+    Overview
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/installation.html">
+    Installation
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/visualization.html">
+    Visualization
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/tutorials.html">
+    Tutorials
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/development.html">
+    Development
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="worlds.html">
+    Worlds
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="articulations.html">
+    Articulations
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="mass_inertia.html">
+    Mass and Inertia
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="sites.html">
+    Sites
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="sensors.html">
+    Sensors
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="conventions.html">
+    Conventions
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="usd_parsing.html">
+    USD Parsing
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="custom_attributes.html">
+    Custom Attributes
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="extended_attributes.html">
+    Extended Attributes
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="collisions.html">
+    Collisions and Contacts
+  </a>
+</li>
+
+
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="#">
+    FeatherPGS
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton.html">
+    newton
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_geometry.html">
+    newton.geometry
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_ik.html">
+    newton.ik
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_math.html">
+    newton.math
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_selection.html">
+    newton.selection
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_sensors.html">
+    newton.sensors
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_solvers.html">
+    newton.solvers
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_usd.html">
+    newton.usd
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_utils.html">
+    newton.utils
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_viewer.html">
+    newton.viewer
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../faq.html">
+    FAQ
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../migration.html">
+    Migration Guide
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../integrations/index.html">
+    Integrations
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-external" href="https://github.com/newton-physics/newton">
+     GitHub
+  </a>
+</li>
+
+  </ul>
+</nav></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+          <div class="navbar-item">
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../guide/overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/visualization.html">Visualization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/tutorials.html">Tutorials</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/development.html">Development</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="worlds.html">Worlds</a></li>
+<li class="toctree-l1"><a class="reference internal" href="articulations.html">Articulations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="mass_inertia.html">Mass and Inertia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sites.html">Sites</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sensors.html">Sensors</a></li>
+<li class="toctree-l1"><a class="reference internal" href="conventions.html">Conventions</a></li>
+<li class="toctree-l1"><a class="reference internal" href="usd_parsing.html">USD Parsing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="custom_attributes.html">Custom Attributes</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="extended_attributes.html">Extended Attributes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="collisions.html">Collisions and Contacts</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">FeatherPGS</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../api/newton.html">newton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_geometry.html">newton.geometry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_ik.html">newton.ik</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_math.html">newton.math</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_selection.html">newton.selection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_sensors.html">newton.sensors</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_solvers.html">newton.solvers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_usd.html">newton.usd</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_utils.html">newton.utils</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_viewer.html">newton.viewer</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Further Reading</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../faq.html">FAQ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../migration.html">Migration Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../integrations/index.html">Integrations</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Project Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/newton-physics/newton"> GitHub</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">FeatherPGS</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <!-- SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+<section id="featherpgs">
+<h1>FeatherPGS<a class="headerlink" href="#featherpgs" title="Link to this heading">#</a></h1>
+<p>This note records the current FeatherPGS formulation as implemented in Newton. It is intentionally close in scope and tone to the earlier two-page writeup in <code class="docutils literal notranslate"><span class="pre">featherpgs.pdf</span></code>, but it reflects the solver as it exists today rather than the original dense-only framing.</p>
+<p>The short version is:</p>
+<ul class="simple">
+<li><p>the original derivation is still the right starting point for the articulated part of the solver;</p></li>
+<li><p>the code no longer treats explicit Delassus assembly as the only useful endpoint;</p></li>
+<li><p>the main performance shift has been from “assemble $C = J \tilde{H}^{-1} J^T$ and iterate in impulse space for everything” toward “keep the reduced-coordinate articulation machinery, but avoid materializing the dense contact operator when that cost dominates.”</p></li>
+</ul>
+<p>The implementation lives primarily in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py"><code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/solver_feather_pgs.py</span></code></a> and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/kernels.py</span></code></a>. Benchmark-facing mode names are defined in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/tools/solver_benchmark.py"><code class="docutils literal notranslate"><span class="pre">newton/tools/solver_benchmark.py</span></code></a> and exercised in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/benchmarks/nightly/nightly.yaml"><code class="docutils literal notranslate"><span class="pre">benchmarks/nightly/nightly.yaml</span></code></a>.</p>
+<section id="motivation-and-background">
+<h2>Motivation and Background<a class="headerlink" href="#motivation-and-background" title="Link to this heading">#</a></h2>
+<p>FeatherPGS is Newton’s reduced-coordinate rigid-body contact solver built around Featherstone-style articulated dynamics, a semi-implicit step, and a projected Gauss-Seidel (PGS) contact solve. The original writeup emphasized a practical Schur-complement method:</p>
+<p>$$
+\tilde{H} = H + \Delta t K_d + \Delta t^2 K_p,
+\qquad
+C = J \tilde{H}^{-1} J^T,
+$$</p>
+<p>followed by a PGS solve in impulse space. That remains an accurate description of one important operating mode, and it remains the cleanest way to explain the articulation-side math.</p>
+<p>What changed in the implementation is not the reduced-coordinate foundation. The change is that explicit assembly of the full Delassus operator is no longer treated as mandatory. On current workloads, especially scenes that mix a large articulated system with many contacts involving free rigid bodies, storing and sweeping a dense per-world contact matrix is often the wrong bottleneck. The newer solver paths keep the same stage-1 through stage-3 articulation pipeline, then branch into denser or more matrix-free contact handling depending on the structure of the contact set.</p>
+</section>
+<section id="problem-setup-and-notation">
+<h2>Problem Setup and Notation<a class="headerlink" href="#problem-setup-and-notation" title="Link to this heading">#</a></h2>
+<p>Let $q \in \mathbb{R}^n$ be generalized coordinates, $\dot{q}$ generalized velocities, and $\ddot{q}$ generalized accelerations for one articulation. FeatherPGS works in reduced coordinates internally, but it still maintains maximal-coordinate body state because collision detection and downstream consumers use body poses and spatial velocities.</p>
+<p>At a high level the solver step is:</p>
+<ol class="arabic simple">
+<li><p>evaluate forward kinematics and inverse dynamics terms;</p></li>
+<li><p>build the articulated mass operator and fold implicit PD terms into it;</p></li>
+<li><p>compute an unconstrained velocity predictor $\hat{v}$;</p></li>
+<li><p>build contact and optional joint-limit rows;</p></li>
+<li><p>solve a unilateral/frictional contact problem with PGS;</p></li>
+<li><p>recover accelerations, integrate, and update maximal state.</p></li>
+</ol>
+<p>The current code uses <code class="docutils literal notranslate"><span class="pre">v_hat</span></code> and <code class="docutils literal notranslate"><span class="pre">v_out</span></code> for the unconstrained and corrected generalized velocities respectively; see <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py"><code class="docutils literal notranslate"><span class="pre">solver_feather_pgs.py</span></code></a>. The earlier note wrote this in the more compact form</p>
+<p>$$
+\hat{\dot{q}} = \tilde{H}^{-1} b,
+\qquad
+\dot{q}_{t+1} = \hat{\dot{q}} + \tilde{H}^{-1} J^T p.
+$$</p>
+<p>That interpretation still matches the dense path. In the newer paths, the same objects are present, but the solver may avoid ever forming the full dense matrix $C$.</p>
+</section>
+<section id="original-dense-delassus-view">
+<h2>Original Dense-Delassus View<a class="headerlink" href="#original-dense-delassus-view" title="Link to this heading">#</a></h2>
+<p>The historical writeup presented FeatherPGS as a straightforward Schur-complement solver:</p>
+<p>$$
+0 \le p \perp (Cp + r) \ge 0,
+\qquad
+C = J \tilde{H}^{-1} J^T.
+$$</p>
+<p>In implementation terms, this corresponds to the dense path:</p>
+<ul class="simple">
+<li><p>Stage 1 computes articulated kinematics and dynamics terms.</p></li>
+<li><p>Stage 2 factorizes $\tilde{H}$ with Cholesky.</p></li>
+<li><p>Stage 3 solves for the predictor velocity $\hat{v}$.</p></li>
+<li><p>Stage 4 builds contact Jacobian rows, computes $Y = \tilde{H}^{-1} J^T$, and then assembles the Delassus operator.</p></li>
+<li><p>Stage 5/6 runs PGS on the explicit dense contact system.</p></li>
+</ul>
+<p>This structure is still visible in the solver. The dense branch in <code class="docutils literal notranslate"><span class="pre">step()</span></code> does exactly that:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">_stage4_build_rows(...)</span></code> builds the world-level constraint rows;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">_stage4_hinv_jt_*</span></code> computes $Y = \tilde{H}^{-1} J^T$;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">_stage4_delassus_*</span></code> assembles $C = JY$;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">_stage4_compute_rhs_world(...)</span></code> and <code class="docutils literal notranslate"><span class="pre">_stage4_accumulate_rhs_world(...)</span></code> form the right-hand side;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">_dispatch_dense_pgs_solve(...)</span></code> runs the chosen dense PGS kernel;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">_stage6_apply_impulses_world(...)</span></code> applies the resulting correction back to generalized velocity.</p></li>
+</ul>
+<p>This is still the simplest formulation to reason about mathematically, and it remains useful when the per-world contact count is modest enough that explicit dense storage and sweep kernels are not the dominant cost.</p>
+</section>
+<section id="current-solver-architecture">
+<h2>Current Solver Architecture<a class="headerlink" href="#current-solver-architecture" title="Link to this heading">#</a></h2>
+<p>The current implementation is best understood as a shared articulation pipeline followed by one of several contact-system realizations.</p>
+<section id="shared-articulation-pipeline">
+<h3>Shared articulation pipeline<a class="headerlink" href="#shared-articulation-pipeline" title="Link to this heading">#</a></h3>
+<p>The front half of the solver is common across modes:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">eval_rigid_fk</span></code>, <code class="docutils literal notranslate"><span class="pre">eval_rigid_id</span></code>, and CRBA-style mass construction produce the reduced-coordinate dynamics terms.</p></li>
+<li><p>The effective operator includes implicit drive terms, so joint PD stays in the operator rather than appearing as extra constraint rows.</p></li>
+<li><p>Cholesky and triangular solves are selected per articulation size group, with loop and tiled kernels available.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">compute_velocity_predictor</span></code> produces <code class="docutils literal notranslate"><span class="pre">v_hat</span></code>, the unconstrained generalized velocity used as the base point for contact resolution.</p></li>
+</ul>
+<p>This part is still very much the solver described in the PDF. The main architectural change happens after row construction.</p>
+</section>
+<section id="contact-row-construction-and-path-split">
+<h3>Contact-row construction and path split<a class="headerlink" href="#contact-row-construction-and-path-split" title="Link to this heading">#</a></h3>
+<p>The row builder now classifies contacts before they enter the solve. The key classifier is <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">allocate_world_contact_slots</span></code></a>, which assigns each contact either:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">contact_path</span> <span class="pre">==</span> <span class="pre">0</span></code>: dense articulated/world path;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">contact_path</span> <span class="pre">==</span> <span class="pre">1</span></code>: matrix-free free-rigid path;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">contact_path</span> <span class="pre">==</span> <span class="pre">-1</span></code>: skipped or overflowed.</p></li>
+</ul>
+<p>The current heuristic is structural rather than adaptive: if both sides of a contact are free rigid bodies or ground, the contact can be routed to the cheaper matrix-free path. Contacts involving nontrivial articulations stay on the dense articulated path. This is why the code talks about “free rigid bodies” separately from general articulations: a single free root body admits a much cheaper $6 \times 6$ effective-mass treatment than an arbitrary articulated subtree.</p>
+<p>Joint limits are also handled as unilateral rows when enabled, but they are still built into the dense articulated row set rather than the free-rigid matrix-free path.</p>
+</section>
+</section>
+<section id="why-the-velocity-path-direction-is-faster">
+<h2>Why the Velocity-Path Direction Is Faster<a class="headerlink" href="#why-the-velocity-path-direction-is-faster" title="Link to this heading">#</a></h2>
+<p>The performance issue with the original dense view is not the reduced-coordinate dynamics. The expensive part is the requirement to materialize and iterate over a dense per-world contact operator whose size scales like the square of the number of active rows.</p>
+<p>The current <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> direction removes that requirement for the articulated rows, and it uses an even cheaper specialized path for free rigid contacts.</p>
+<section id="what-matrix-free-actually-means-here">
+<h3>What <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> actually means here<a class="headerlink" href="#what-matrix-free-actually-means-here" title="Link to this heading">#</a></h3>
+<p>In the current code, <code class="docutils literal notranslate"><span class="pre">pgs_mode=&quot;matrix_free&quot;</span></code> does <strong>not</strong> mean “no Jacobians are stored” and it does <strong>not</strong> mean “the solver works only in body-space without articulation information.” Instead it means:</p>
+<ul class="simple">
+<li><p>compute $Y = \tilde{H}^{-1} J^T$ as before;</p></li>
+<li><p>compute only the diagonal of $JY$ with <code class="docutils literal notranslate"><span class="pre">diag_from_JY_par_art</span></code>;</p></li>
+<li><p>gather <code class="docutils literal notranslate"><span class="pre">J</span></code> and <code class="docutils literal notranslate"><span class="pre">Y</span></code> into world-indexed buffers (<code class="docutils literal notranslate"><span class="pre">J_world</span></code>, <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>);</p></li>
+<li><p>keep <code class="docutils literal notranslate"><span class="pre">rhs</span></code> as a bias term rather than baking in $J \hat{v}$ once;</p></li>
+<li><p>during PGS, recompute the current $Jv$ from the live velocity vector each iteration instead of consulting a preassembled dense matrix.</p></li>
+</ul>
+<p>So the shift is from an explicit Delassus matrix to an explicit velocity path:</p>
+<p>$$
+\text{dense: } w_i = r_i + \sum_j C_{ij} p_j,
+\qquad
+\text{current matrix-free direction: } w_i = \text{bias}_i + J_i v.
+$$</p>
+<p>The second form avoids storing and streaming the full $C$ tensor. It still uses the same articulated dynamics factorization and the same reduced-coordinate Jacobians, but the per-iteration working set is smaller and better aligned with the actual dependency structure of the solve.</p>
+</section>
+<section id="specialized-matrix-free-handling-for-free-rigid-bodies">
+<h3>Specialized matrix-free handling for free rigid bodies<a class="headerlink" href="#specialized-matrix-free-handling-for-free-rigid-bodies" title="Link to this heading">#</a></h3>
+<p>For contacts whose two sides are free rigid bodies or ground, FeatherPGS goes further. It builds spatial Jacobian rows directly against the free body state using <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">build_mf_contact_rows</span></code></a>, computes per-body $H^{-1}$ from the spatial inertia blocks with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_body_Hinv</span></code></a>, and forms only per-row effective masses and bias terms with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_effective_mass_and_rhs</span></code></a>.</p>
+<p>This avoids both:</p>
+<ul class="simple">
+<li><p>dense world-level Delassus assembly, and</p></li>
+<li><p>articulated gather/scatter through a larger joint-space contact operator</p></li>
+</ul>
+<p>for the subset of contacts that do not need it.</p>
+<p>The resulting free-rigid solve uses live velocity updates inside the PGS sweep (<code class="docutils literal notranslate"><span class="pre">pgs_solve_mf_loop</span></code> in the simple path, or the fused two-phase tiled kernel in the main <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> path).</p>
+</section>
+<section id="mixed-worlds-and-the-current-compromise">
+<h3>Mixed worlds and the current compromise<a class="headerlink" href="#mixed-worlds-and-the-current-compromise" title="Link to this heading">#</a></h3>
+<p>The code also supports mixed worlds, where some rows belong to articulated contacts and others belong to free-rigid contacts. In <code class="docutils literal notranslate"><span class="pre">split</span></code> mode with mixed contacts, the solver interleaves one dense iteration with one matrix-free iteration and updates the dense right-hand side with the incremental free-rigid velocity correction. This is not the cleanest mathematical presentation, but it is faithful to the current implementation and it avoids forcing all contacts into the more expensive dense representation.</p>
+</section>
+</section>
+<section id="mode-taxonomy">
+<h2>Mode Taxonomy<a class="headerlink" href="#mode-taxonomy" title="Link to this heading">#</a></h2>
+<p>There are two levels of naming in the current codebase.</p>
+<section id="internal-solve-modes">
+<h3>Internal solve modes<a class="headerlink" href="#internal-solve-modes" title="Link to this heading">#</a></h3>
+<p>The core solver exposes three <code class="docutils literal notranslate"><span class="pre">pgs_mode</span></code> values:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">dense</span></code>: build the full Delassus operator and solve the entire contact system in the dense articulated path.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">split</span></code>: use the dense path for articulated contacts and the specialized matrix-free path for contacts involving only free rigid bodies or ground.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">matrix_free</span></code>: do not assemble the full Delassus operator for articulated rows; solve articulated rows from <code class="docutils literal notranslate"><span class="pre">J</span></code>, <code class="docutils literal notranslate"><span class="pre">Y</span></code>, and the diagonal while also using the free-rigid matrix-free path where available.</p></li>
+</ul>
+<p>These are defined on <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py"><code class="docutils literal notranslate"><span class="pre">SolverFeatherPGS</span></code></a>.</p>
+</section>
+<section id="benchmark-and-nightly-preset-names">
+<h3>Benchmark and nightly preset names<a class="headerlink" href="#benchmark-and-nightly-preset-names" title="Link to this heading">#</a></h3>
+<p>The nightly dashboards and benchmark scripts expose a more user-facing taxonomy:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">fpgs_dense_loop</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fpgs_dense_row</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fpgs_dense_streaming</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fpgs_split</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fpgs_matrix_free</span></code></p></li>
+</ul>
+<p>These presets are not separate algorithms so much as combinations of:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">pgs_mode</span></code></p></li>
+<li><p>kernel families for Cholesky, triangular solve, <code class="docutils literal notranslate"><span class="pre">H^{-1}J^T</span></code>, and Delassus assembly</p></li>
+<li><p>dense PGS kernel choice (<code class="docutils literal notranslate"><span class="pre">loop</span></code>, <code class="docutils literal notranslate"><span class="pre">tiled_row</span></code>, <code class="docutils literal notranslate"><span class="pre">tiled_contact</span></code>, <code class="docutils literal notranslate"><span class="pre">streaming</span></code>)</p></li>
+<li><p>stream parallelism and double buffering</p></li>
+</ul>
+<p>The canonical preset definitions are in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/tools/solver_benchmark.py"><code class="docutils literal notranslate"><span class="pre">newton/tools/solver_benchmark.py</span></code></a>, and the currently tracked nightly ablations are in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/benchmarks/nightly/nightly.yaml"><code class="docutils literal notranslate"><span class="pre">benchmarks/nightly/nightly.yaml</span></code></a>.</p>
+<p>Two distinctions are worth making explicit because the labels can otherwise sound more different than they are:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">dense</span> <span class="pre">row</span></code> and <code class="docutils literal notranslate"><span class="pre">dense</span> <span class="pre">streaming</span></code> are both dense Delassus methods. They differ mainly in kernel strategy, not in the underlying mathematical formulation.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">split</span></code> is not just a renamed dense method. It is the hybrid path that keeps articulated contacts on the dense side while routing free-rigid contacts through the cheaper matrix-free side.</p></li>
+</ul>
+</section>
+</section>
+<section id="mapping-from-math-to-code">
+<h2>Mapping From Math to Code<a class="headerlink" href="#mapping-from-math-to-code" title="Link to this heading">#</a></h2>
+<p>The easiest way to relate the note’s symbols to the code is by stage.</p>
+<section id="articulated-operator-and-predictor">
+<h3>Articulated operator and predictor<a class="headerlink" href="#articulated-operator-and-predictor" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>$\tilde{H}$: grouped per-articulation matrices in <code class="docutils literal notranslate"><span class="pre">H_by_size</span></code>, factorized into <code class="docutils literal notranslate"><span class="pre">L_by_size</span></code>.</p></li>
+<li><p>$\hat{v}$ / $\hat{\dot{q}}$: <code class="docutils literal notranslate"><span class="pre">v_hat</span></code>, produced after <code class="docutils literal notranslate"><span class="pre">_stage3_trisolve_*</span></code> and <code class="docutils literal notranslate"><span class="pre">compute_velocity_predictor</span></code>.</p></li>
+<li><p>corrected velocity $v_{t+1}$: <code class="docutils literal notranslate"><span class="pre">v_out</span></code>.</p></li>
+</ul>
+<p>Relevant code paths:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py"><code class="docutils literal notranslate"><span class="pre">solver_feather_pgs.py</span></code></a></p></li>
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">kernels.py</span></code></a></p></li>
+</ul>
+</section>
+<section id="contact-jacobians-and-metadata">
+<h3>Contact Jacobians and metadata<a class="headerlink" href="#contact-jacobians-and-metadata" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>$J$: grouped dense articulated rows in <code class="docutils literal notranslate"><span class="pre">J_by_size</span></code>; gathered world form in <code class="docutils literal notranslate"><span class="pre">J_world</span></code> for the newer matrix-free articulated path.</p></li>
+<li><p>row metadata: <code class="docutils literal notranslate"><span class="pre">row_type</span></code>, <code class="docutils literal notranslate"><span class="pre">row_parent</span></code>, <code class="docutils literal notranslate"><span class="pre">row_mu</span></code>, <code class="docutils literal notranslate"><span class="pre">row_beta</span></code>, <code class="docutils literal notranslate"><span class="pre">row_cfm</span></code>, <code class="docutils literal notranslate"><span class="pre">phi</span></code>, <code class="docutils literal notranslate"><span class="pre">target_velocity</span></code>.</p></li>
+<li><p>free-rigid contact Jacobians: <code class="docutils literal notranslate"><span class="pre">mf_J_a</span></code>, <code class="docutils literal notranslate"><span class="pre">mf_J_b</span></code>.</p></li>
+</ul>
+<p>Relevant row builders:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">allocate_world_contact_slots</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">populate_world_J_for_size</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">populate_joint_limit_J_for_size</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">build_mf_contact_rows</span></code></p></li>
+</ul>
+</section>
+<section id="y-tilde-h-1-j-t-delassus-and-diagonal-terms">
+<h3>$Y = \tilde{H}^{-1} J^T$, Delassus, and diagonal terms<a class="headerlink" href="#y-tilde-h-1-j-t-delassus-and-diagonal-terms" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>$Y$: <code class="docutils literal notranslate"><span class="pre">Y_by_size</span></code>, or world-gathered <code class="docutils literal notranslate"><span class="pre">Y_world</span></code> in the articulated matrix-free path.</p></li>
+<li><p>dense $C = JY$: <code class="docutils literal notranslate"><span class="pre">C</span></code>.</p></li>
+<li><p>diagonal-only articulated approximation for the matrix-free path: <code class="docutils literal notranslate"><span class="pre">diag</span></code>, built by <code class="docutils literal notranslate"><span class="pre">diag_from_JY_par_art</span></code> plus regularization/compliance.</p></li>
+<li><p>free-rigid effective mass inverse: <code class="docutils literal notranslate"><span class="pre">mf_eff_mass_inv</span></code>.</p></li>
+</ul>
+<p>Relevant kernels:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">_stage4_hinv_jt_tiled</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">_stage4_hinv_jt_par_row</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">_stage4_delassus_tiled</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">_stage4_delassus_par_row_col</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">diag_from_JY_par_art</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">compute_mf_effective_mass_and_rhs</span></code></p></li>
+</ul>
+</section>
+<section id="right-hand-side-and-pgs-state">
+<h3>Right-hand side and PGS state<a class="headerlink" href="#right-hand-side-and-pgs-state" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>dense right-hand side $r$: <code class="docutils literal notranslate"><span class="pre">rhs</span></code>, built from bias terms and optionally accumulated $J \hat{v}$.</p></li>
+<li><p>dense impulses $p$: <code class="docutils literal notranslate"><span class="pre">impulses</span></code>.</p></li>
+<li><p>free-rigid impulses: <code class="docutils literal notranslate"><span class="pre">mf_impulses</span></code>.</p></li>
+</ul>
+<p>One detail that matters for interpreting the current code: in dense mode the solver builds <code class="docutils literal notranslate"><span class="pre">rhs</span> <span class="pre">=</span> <span class="pre">bias</span> <span class="pre">+</span> <span class="pre">J</span> <span class="pre">v_hat</span></code>, while in the articulated <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> path it keeps only the bias in <code class="docutils literal notranslate"><span class="pre">rhs</span></code> and recomputes $Jv$ against the live <code class="docutils literal notranslate"><span class="pre">v_out</span></code> inside the PGS loop.</p>
+</section>
+</section>
+<section id="practical-features-and-current-experiments">
+<h2>Practical Features and Current Experiments<a class="headerlink" href="#practical-features-and-current-experiments" title="Link to this heading">#</a></h2>
+<p>Several practical details from the original note remain present, although they now sit in a broader implementation space.</p>
+<section id="implicit-drives-instead-of-explicit-motor-constraints">
+<h3>Implicit drives instead of explicit motor constraints<a class="headerlink" href="#implicit-drives-instead-of-explicit-motor-constraints" title="Link to this heading">#</a></h3>
+<p>The original note argued for keeping joint PD in the operator rather than inflating the constraint system. That is still the right description of the implementation. FeatherPGS augments the reduced-coordinate operator rather than adding solver rows for ordinary drives.</p>
+</section>
+<section id="joint-limits-as-on-demand-unilateral-rows">
+<h3>Joint limits as on-demand unilateral rows<a class="headerlink" href="#joint-limits-as-on-demand-unilateral-rows" title="Link to this heading">#</a></h3>
+<p>Joint limits remain optional and row-based. When <code class="docutils literal notranslate"><span class="pre">enable_joint_limits=True</span></code>, violated limits allocate unilateral rows and enter the dense articulated solve with their own Jacobian and bias terms. They are not part of the free-rigid matrix-free specialization.</p>
+</section>
+<section id="compliance-regularization-and-warm-starting">
+<h3>Compliance, regularization, and warm starting<a class="headerlink" href="#compliance-regularization-and-warm-starting" title="Link to this heading">#</a></h3>
+<p>The current solver still uses several standard stabilizers:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">pgs_cfm</span></code> adds diagonal regularization;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dense_contact_compliance</span></code> adds a normal-contact compliance term to the dense articulated diagonal, scaled as <code class="docutils literal notranslate"><span class="pre">compliance</span> <span class="pre">/</span> <span class="pre">dt^2</span></code>;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">pgs_warmstart</span></code> optionally reuses impulses across frames;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">pgs_omega</span></code> controls over-relaxation.</p></li>
+</ul>
+<p>These are not new ideas, but they matter more now because the code compares several solve realizations and kernel schedules under the same benchmark harness.</p>
+</section>
+<section id="kernel-level-experiments">
+<h3>Kernel-level experiments<a class="headerlink" href="#kernel-level-experiments" title="Link to this heading">#</a></h3>
+<p>The current benchmark taxonomy also reflects implementation experiments that the original PDF did not discuss:</p>
+<ul class="simple">
+<li><p>loop versus tiled Cholesky and triangular solves;</p></li>
+<li><p>row-wise, contact-wise, and streaming dense PGS kernels;</p></li>
+<li><p>parallel stream launches across articulation size groups;</p></li>
+<li><p>double-buffering of <code class="docutils literal notranslate"><span class="pre">H</span></code> and <code class="docutils literal notranslate"><span class="pre">J</span></code> buffers to overlap clearing with later work.</p></li>
+</ul>
+<p>Those are engineering choices rather than changes in the mathematical problem statement, but they are part of the current FeatherPGS story because they strongly affect observed throughput on nightly benchmarks.</p>
+</section>
+</section>
+<section id="limitations-and-open-questions">
+<h2>Limitations and Open Questions<a class="headerlink" href="#limitations-and-open-questions" title="Link to this heading">#</a></h2>
+<p>The current solver is better described as a family of closely related paths than as a single fixed algorithm. That is useful for performance work, but it leaves a few conceptual edges that should eventually be cleaned up.</p>
+<p>First, the name <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> is only partially literal. For articulated rows the solver still stores <code class="docutils literal notranslate"><span class="pre">J</span></code> and <code class="docutils literal notranslate"><span class="pre">Y</span></code>; what it avoids is explicit assembly of the full dense Delassus operator. The name is still reasonable, but any future external writeup should say this plainly.</p>
+<p>Second, <code class="docutils literal notranslate"><span class="pre">split</span></code> and <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> are currently motivated by contact structure, especially the distinction between general articulations and single free rigid bodies. That distinction is performant, but it is implementation-driven. A future writeup may want a cleaner statement of the invariants that justify the two path families.</p>
+<p>Third, the mixed-contact path is faithful to the code but not especially elegant in presentation. The interleaved dense/MF iteration is a pragmatic compromise, not the final conceptual form.</p>
+<p>Fourth, the benchmark-facing names combine algorithmic and kernel-scheduling differences. That is fine for performance tracking, but not ideal for exposition. A later revision should likely separate:</p>
+<ul class="simple">
+<li><p>mathematical mode (<code class="docutils literal notranslate"><span class="pre">dense</span></code>, <code class="docutils literal notranslate"><span class="pre">split</span></code>, <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code>), and</p></li>
+<li><p>kernel realization (<code class="docutils literal notranslate"><span class="pre">loop</span></code>, <code class="docutils literal notranslate"><span class="pre">tiled_row</span></code>, <code class="docutils literal notranslate"><span class="pre">streaming</span></code>, parallel streams, double buffer).</p></li>
+</ul>
+</section>
+<section id="pointers-for-future-revision">
+<h2>Pointers for Future Revision<a class="headerlink" href="#pointers-for-future-revision" title="Link to this heading">#</a></h2>
+<p>The draft is intentionally prose-first, but the page is structured so that a later revision can link directly to code and performance artifacts. The most obvious additions are:</p>
+<ul class="simple">
+<li><p>permalinks or Sphinx-managed source links for the stage methods in <code class="docutils literal notranslate"><span class="pre">solver_feather_pgs.py</span></code>;</p></li>
+<li><p>a compact figure showing the stage-4 / stage-5 branch between dense, split, and matrix-free paths;</p></li>
+<li><p>one or two benchmark plots from <code class="docutils literal notranslate"><span class="pre">benchmarks/nightly/</span></code> showing where <code class="docutils literal notranslate"><span class="pre">split</span></code> and <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> overtake the dense variants;</p></li>
+<li><p>a short appendix on the free-rigid $6 \times 6$ effective-mass path.</p></li>
+</ul>
+<p>If this page becomes part of longer public-facing documentation, it should remain a technical note. The older PDF was useful precisely because it stayed close to the implementation and did not try to oversell the method. The current solver is more complicated, but the same style still fits it best.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#motivation-and-background">Motivation and Background</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#problem-setup-and-notation">Problem Setup and Notation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#original-dense-delassus-view">Original Dense-Delassus View</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#current-solver-architecture">Current Solver Architecture</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#shared-articulation-pipeline">Shared articulation pipeline</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#contact-row-construction-and-path-split">Contact-row construction and path split</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#why-the-velocity-path-direction-is-faster">Why the Velocity-Path Direction Is Faster</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-matrix-free-actually-means-here">What <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> actually means here</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#specialized-matrix-free-handling-for-free-rigid-bodies">Specialized matrix-free handling for free rigid bodies</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mixed-worlds-and-the-current-compromise">Mixed worlds and the current compromise</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mode-taxonomy">Mode Taxonomy</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#internal-solve-modes">Internal solve modes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmark-and-nightly-preset-names">Benchmark and nightly preset names</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mapping-from-math-to-code">Mapping From Math to Code</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#articulated-operator-and-predictor">Articulated operator and predictor</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#contact-jacobians-and-metadata">Contact Jacobians and metadata</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#y-tilde-h-1-j-t-delassus-and-diagonal-terms">$Y = \tilde{H}^{-1} J^T$, Delassus, and diagonal terms</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#right-hand-side-and-pgs-state">Right-hand side and PGS state</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#practical-features-and-current-experiments">Practical Features and Current Experiments</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#implicit-drives-instead-of-explicit-motor-constraints">Implicit drives instead of explicit motor constraints</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#joint-limits-as-on-demand-unilateral-rows">Joint limits as on-demand unilateral rows</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#compliance-regularization-and-warm-starting">Compliance, regularization, and warm starting</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kernel-level-experiments">Kernel-level experiments</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations-and-open-questions">Limitations and Open Questions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pointers-for-future-revision">Pointers for Future Revision</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+
+  <p class="copyright">
+    
+      © Copyright 2026, The Newton Developers. Documentation licensed under CC-BY-4.0.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+    <div class="footer-items__end">
+      
+        <div class="footer-item">
+<p class="theme-version">
+  <!-- # L10n: Setting the PST URL as an argument as this does not need to be localized -->
+  Built with the <a href="https://pydata-sphinx-theme.readthedocs.io/en/stable/index.html">PyData Sphinx Theme</a> 0.16.1.
+</p></div>
+      
+    </div>
+  
+</div>
+
+  </footer>
+  </body>
+</html>

@@ -1,8 +1,0 @@
-﻿newton.utils.MeshEdge
-=====================
-
-.. autoclass:: newton.utils.MeshEdge
-   :members:
-   :undoc-members:
-   :show-inheritance:
-   :member-order: groupwise

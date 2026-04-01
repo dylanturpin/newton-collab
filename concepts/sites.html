@@ -41,7 +41,7 @@
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
 
-    <script src="../_static/documentation_options.js?v=938c9ccc"></script>
+    <script src="../_static/documentation_options.js?v=1c471e8e"></script>
     <script src="../_static/doctools.js?v=9bcbadda"></script>
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -49,10 +49,17 @@
     <script src="../_static/design-tabs.js?v=f930bc37"></script>
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'concepts/sites';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="Sensors" href="sensors.html" />
-    <link rel="prev" title="Articulations" href="articulations.html" />
+    <link rel="prev" title="Mass and Inertia" href="mass_inertia.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="" />
@@ -125,7 +132,7 @@
     <img src="../_static/newton-logo-dark.png" class="logo__image only-dark pst-js-only" alt="Newton Physics Logo"/>
   
   
-    <p class="title logo__title">Newton Physics <span style='font-size: 0.8em; color: #888;'>(0.2.0)</span></p>
+    <p class="title logo__title">Newton Physics <span style='font-size: 0.8em; color: #888;'>(1.1.0.dev0)</span></p>
   
 </a></div>
     
@@ -161,15 +168,15 @@
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../guide/key-concepts.html">
-    Key Concepts
+  <a class="nav-link nav-internal" href="../guide/tutorials.html">
+    Tutorials
   </a>
 </li>
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../guide/tutorials.html">
-    Tutorials
+  <a class="nav-link nav-internal" href="../guide/development.html">
+    Development
   </a>
 </li>
 
@@ -182,8 +189,8 @@
                 <ul id="pst-nav-more-links" class="dropdown-menu">
                     
 <li class=" ">
-  <a class="nav-link dropdown-item nav-internal" href="../guide/development.html">
-    Development
+  <a class="nav-link dropdown-item nav-internal" href="worlds.html">
+    Worlds
   </a>
 </li>
 
@@ -191,6 +198,13 @@
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="articulations.html">
     Articulations
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="mass_inertia.html">
+    Mass and Inertia
   </a>
 </li>
 
@@ -245,6 +259,13 @@
 
 
 <li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="feather_pgs.html">
+    FeatherPGS
+  </a>
+</li>
+
+
+<li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../api/newton.html">
     newton
   </a>
@@ -261,6 +282,13 @@
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../api/newton_ik.html">
     newton.ik
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_math.html">
+    newton.math
   </a>
 </li>
 
@@ -364,6 +392,26 @@
   <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
 </button></div>
       
+        <div class="navbar-item">
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
     </div>
     
   </div>
@@ -432,13 +480,6 @@
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../guide/key-concepts.html">
-    Key Concepts
-  </a>
-</li>
-
-
-<li class="nav-item ">
   <a class="nav-link nav-internal" href="../guide/tutorials.html">
     Tutorials
   </a>
@@ -453,8 +494,22 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="worlds.html">
+    Worlds
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="articulations.html">
     Articulations
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="mass_inertia.html">
+    Mass and Inertia
   </a>
 </li>
 
@@ -509,6 +564,13 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="feather_pgs.html">
+    FeatherPGS
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../api/newton.html">
     newton
   </a>
@@ -525,6 +587,13 @@
 <li class="nav-item ">
   <a class="nav-link nav-internal" href="../api/newton_ik.html">
     newton.ik
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_math.html">
+    newton.math
   </a>
 </li>
 
@@ -616,6 +685,26 @@
   <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
 </button></div>
         
+          <div class="navbar-item">
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+        
       </div>
     
   </div>
@@ -630,13 +719,14 @@
 <li class="toctree-l1"><a class="reference internal" href="../guide/overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../guide/installation.html">Installation</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../guide/visualization.html">Visualization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../guide/key-concepts.html">Key Concepts</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../guide/tutorials.html">Tutorials</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../guide/development.html">Development</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="worlds.html">Worlds</a></li>
 <li class="toctree-l1"><a class="reference internal" href="articulations.html">Articulations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="mass_inertia.html">Mass and Inertia</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Sites</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sensors.html">Sensors</a></li>
 <li class="toctree-l1"><a class="reference internal" href="conventions.html">Conventions</a></li>
@@ -645,12 +735,14 @@
 
 <li class="toctree-l1"><a class="reference internal" href="extended_attributes.html">Extended Attributes</a></li>
 <li class="toctree-l1"><a class="reference internal" href="collisions.html">Collisions and Contacts</a></li>
+<li class="toctree-l1"><a class="reference internal" href="feather_pgs.html">FeatherPGS</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../api/newton.html">newton</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../api/newton_geometry.html">newton.geometry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../api/newton_ik.html">newton.ik</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_math.html">newton.math</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../api/newton_selection.html">newton.selection</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../api/newton_sensors.html">newton.sensors</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../api/newton_solvers.html">newton.solvers</a></li>
@@ -755,7 +847,7 @@
 <span class="c1"># Add a site at body origin</span>
 <span class="n">imu_site</span> <span class="o">=</span> <span class="n">builder</span><span class="o">.</span><span class="n">add_site</span><span class="p">(</span>
     <span class="n">body</span><span class="o">=</span><span class="n">body</span><span class="p">,</span>
-    <span class="n">key</span><span class="o">=</span><span class="s2">&quot;imu&quot;</span>
+    <span class="n">label</span><span class="o">=</span><span class="s2">&quot;imu&quot;</span>
 <span class="p">)</span>
 
 <span class="c1"># Add a site with offset and rotation</span>
@@ -768,7 +860,7 @@
     <span class="nb">type</span><span class="o">=</span><span class="n">newton</span><span class="o">.</span><span class="n">GeoType</span><span class="o">.</span><span class="n">BOX</span><span class="p">,</span>
     <span class="n">scale</span><span class="o">=</span><span class="p">(</span><span class="mf">0.05</span><span class="p">,</span> <span class="mf">0.05</span><span class="p">,</span> <span class="mf">0.02</span><span class="p">),</span>
     <span class="n">visible</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-    <span class="n">key</span><span class="o">=</span><span class="s2">&quot;camera&quot;</span>
+    <span class="n">label</span><span class="o">=</span><span class="s2">&quot;camera&quot;</span>
 <span class="p">)</span>
 </pre></div>
 </div>
@@ -779,13 +871,13 @@
 <span class="n">world_origin</span> <span class="o">=</span> <span class="n">builder</span><span class="o">.</span><span class="n">add_site</span><span class="p">(</span>
     <span class="n">body</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span>
     <span class="n">xform</span><span class="o">=</span><span class="n">wp</span><span class="o">.</span><span class="n">transform</span><span class="p">(</span><span class="n">wp</span><span class="o">.</span><span class="n">vec3</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">wp</span><span class="o">.</span><span class="n">quat_identity</span><span class="p">()),</span>
-    <span class="n">key</span><span class="o">=</span><span class="s2">&quot;world_origin&quot;</span>
+    <span class="n">label</span><span class="o">=</span><span class="s2">&quot;world_origin&quot;</span>
 <span class="p">)</span>
 </pre></div>
 </div>
 <section id="alternative-using-shape-methods-with-as-site-true">
 <h3>Alternative: Using Shape Methods with <code class="docutils literal notranslate"><span class="pre">as_site=True</span></code><a class="headerlink" href="#alternative-using-shape-methods-with-as-site-true" title="Link to this heading">#</a></h3>
-<p>Sites can also be created using shape creation methods (<code class="docutils literal notranslate"><span class="pre">add_shape_sphere</span></code>, <code class="docutils literal notranslate"><span class="pre">add_shape_box</span></code>, <code class="docutils literal notranslate"><span class="pre">add_shape_capsule</span></code>, <code class="docutils literal notranslate"><span class="pre">add_shape_cylinder</span></code>) by passing <code class="docutils literal notranslate"><span class="pre">as_site=True</span></code>. This is particularly useful when programmatically generating shapes or conditionally creating sites:</p>
+<p>Sites can also be created using shape creation methods (<code class="docutils literal notranslate"><span class="pre">add_shape_sphere</span></code>, <code class="docutils literal notranslate"><span class="pre">add_shape_box</span></code>, <code class="docutils literal notranslate"><span class="pre">add_shape_capsule</span></code>, <code class="docutils literal notranslate"><span class="pre">add_shape_cylinder</span></code>, <code class="docutils literal notranslate"><span class="pre">add_shape_ellipsoid</span></code>, <code class="docutils literal notranslate"><span class="pre">add_shape_cone</span></code>) by passing <code class="docutils literal notranslate"><span class="pre">as_site=True</span></code>. This is particularly useful when programmatically generating shapes or conditionally creating sites:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">builder</span> <span class="o">=</span> <span class="n">newton</span><span class="o">.</span><span class="n">ModelBuilder</span><span class="p">()</span>
 <span class="n">body</span> <span class="o">=</span> <span class="n">builder</span><span class="o">.</span><span class="n">add_body</span><span class="p">(</span><span class="n">mass</span><span class="o">=</span><span class="mf">1.0</span><span class="p">)</span>
 
@@ -794,14 +886,14 @@
     <span class="n">body</span><span class="o">=</span><span class="n">body</span><span class="p">,</span>
     <span class="n">radius</span><span class="o">=</span><span class="mf">0.05</span><span class="p">,</span>
     <span class="n">as_site</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-    <span class="n">key</span><span class="o">=</span><span class="s2">&quot;sphere_marker&quot;</span>
+    <span class="n">label</span><span class="o">=</span><span class="s2">&quot;sphere_marker&quot;</span>
 <span class="p">)</span>
 
 <span class="n">box_site</span> <span class="o">=</span> <span class="n">builder</span><span class="o">.</span><span class="n">add_shape_box</span><span class="p">(</span>
     <span class="n">body</span><span class="o">=</span><span class="n">body</span><span class="p">,</span>
     <span class="n">hx</span><span class="o">=</span><span class="mf">0.1</span><span class="p">,</span> <span class="n">hy</span><span class="o">=</span><span class="mf">0.1</span><span class="p">,</span> <span class="n">hz</span><span class="o">=</span><span class="mf">0.1</span><span class="p">,</span>
     <span class="n">as_site</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-    <span class="n">key</span><span class="o">=</span><span class="s2">&quot;box_marker&quot;</span>
+    <span class="n">label</span><span class="o">=</span><span class="s2">&quot;box_marker&quot;</span>
 <span class="p">)</span>
 
 <span class="c1"># Useful for conditional creation</span>
@@ -810,11 +902,11 @@
     <span class="n">body</span><span class="o">=</span><span class="n">body</span><span class="p">,</span>
     <span class="n">radius</span><span class="o">=</span><span class="mf">0.05</span><span class="p">,</span>
     <span class="n">as_site</span><span class="o">=</span><span class="n">is_sensor_point</span><span class="p">,</span>  <span class="c1"># Conditionally a site</span>
-    <span class="n">key</span><span class="o">=</span><span class="s2">&quot;measurement_point&quot;</span>
+    <span class="n">label</span><span class="o">=</span><span class="s2">&quot;measurement_point&quot;</span>
 <span class="p">)</span>
 </pre></div>
 </div>
-<p>When <code class="docutils literal notranslate"><span class="pre">as_site=True</span></code>, the shape is automatically configured with all site invariants (no collision, zero density, collision_group=0), regardless of any custom configuration passed</p>
+<p>When <code class="docutils literal notranslate"><span class="pre">as_site=True</span></code>, the shape is automatically configured with all site invariants (no collision, zero density, collision_group=0), regardless of any custom configuration passed.</p>
 </section>
 </section>
 <section id="importing-sites">
@@ -877,7 +969,7 @@
 </section>
 <section id="using-sites-with-sensors">
 <h2>Using Sites with Sensors<a class="headerlink" href="#using-sites-with-sensors" title="Link to this heading">#</a></h2>
-<p>Sites are commonly used as reference frames for sensors, particularly the <code class="docutils literal notranslate"><span class="pre">SensorFrameTransform</span></code> which computes relative poses between objects and reference frames.</p>
+<p>Sites are commonly used as reference frames for sensors, particularly <a class="reference internal" href="../api/_generated/newton.sensors.SensorFrameTransform.html#newton.sensors.SensorFrameTransform" title="newton.sensors.SensorFrameTransform"><code class="xref py py-class docutils literal notranslate"><span class="pre">SensorFrameTransform</span></code></a> which computes relative poses between objects and reference frames.</p>
 <p>For detailed information on using sites with sensors, see <a class="reference internal" href="sensors.html"><span class="doc">Sensors</span></a>.</p>
 </section>
 <section id="mujoco-interoperability">
@@ -887,23 +979,23 @@
 
 <span class="c1"># Create a simple model with a site</span>
 <span class="n">builder</span> <span class="o">=</span> <span class="n">newton</span><span class="o">.</span><span class="n">ModelBuilder</span><span class="p">()</span>
-<span class="n">body</span> <span class="o">=</span> <span class="n">builder</span><span class="o">.</span><span class="n">add_body</span><span class="p">(</span><span class="n">mass</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">I_m</span><span class="o">=</span><span class="n">wp</span><span class="o">.</span><span class="n">mat33</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">eye</span><span class="p">(</span><span class="mi">3</span><span class="p">)))</span>
-<span class="n">site</span> <span class="o">=</span> <span class="n">builder</span><span class="o">.</span><span class="n">add_site</span><span class="p">(</span><span class="n">body</span><span class="o">=</span><span class="n">body</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="s2">&quot;sensor&quot;</span><span class="p">)</span>
+<span class="n">body</span> <span class="o">=</span> <span class="n">builder</span><span class="o">.</span><span class="n">add_body</span><span class="p">(</span><span class="n">mass</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">inertia</span><span class="o">=</span><span class="n">wp</span><span class="o">.</span><span class="n">mat33</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">eye</span><span class="p">(</span><span class="mi">3</span><span class="p">)))</span>
+<span class="n">site</span> <span class="o">=</span> <span class="n">builder</span><span class="o">.</span><span class="n">add_site</span><span class="p">(</span><span class="n">body</span><span class="o">=</span><span class="n">body</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s2">&quot;sensor&quot;</span><span class="p">)</span>
 <span class="n">model</span> <span class="o">=</span> <span class="n">builder</span><span class="o">.</span><span class="n">finalize</span><span class="p">()</span>
 
 <span class="c1"># Create MuJoCo solver (sites are exported by default)</span>
 <span class="n">solver</span> <span class="o">=</span> <span class="n">SolverMuJoCo</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>Sites are exported with their visual properties (color, size) and can be used with MuJoCo’s native sensors and actuators. To disable site export, pass <code class="docutils literal notranslate"><span class="pre">include_sites=False</span></code> to the <code class="docutils literal notranslate"><span class="pre">convert_to_mjc()</span></code> method if calling it manually.</p>
+<p>Sites are exported with their visual properties (color, size) and can be used with MuJoCo’s native sensors and actuators. To disable site export, pass <code class="docutils literal notranslate"><span class="pre">include_sites=False</span></code> to <a class="reference internal" href="../api/_generated/newton.solvers.SolverMuJoCo.html#newton.solvers.SolverMuJoCo" title="newton.solvers.SolverMuJoCo"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverMuJoCo</span></code></a>.</p>
 </section>
 <section id="implementation-details">
 <h2>Implementation Details<a class="headerlink" href="#implementation-details" title="Link to this heading">#</a></h2>
-<p>Sites are internally represented as shapes with the <code class="docutils literal notranslate"><span class="pre">ShapeFlags.SITE</span></code> flag set. This allows them to leverage Newton’s existing shape infrastructure while maintaining distinct behavior:</p>
+<p>Sites are internally represented as shapes with the <a class="reference internal" href="../api/_generated/newton.ShapeFlags.html#newton.ShapeFlags.SITE" title="newton.ShapeFlags.SITE"><code class="xref py py-attr docutils literal notranslate"><span class="pre">SITE</span></code></a> flag set. This allows them to leverage Newton’s existing shape infrastructure while maintaining distinct behavior:</p>
 <ul class="simple">
 <li><p>Sites are filtered out from collision detection pipelines</p></li>
 <li><p>Site density is automatically set to zero during creation</p></li>
-<li><p>Sites can be queried and filtered using the Selection API with shape-frequency operations</p></li>
+<li><p>Sites can be identified at runtime by checking the <a class="reference internal" href="../api/_generated/newton.ShapeFlags.html#newton.ShapeFlags.SITE" title="newton.ShapeFlags.SITE"><code class="xref py py-attr docutils literal notranslate"><span class="pre">SITE</span></code></a> flag on <code class="docutils literal notranslate"><span class="pre">model.shape_flags</span></code></p></li>
 </ul>
 <p>This implementation approach provides maximum flexibility while keeping the codebase maintainable and avoiding duplication.</p>
 </section>
@@ -983,17 +1075,9 @@
 
   <p class="copyright">
     
-      © Copyright 2026, The Newton Developers.
+      © Copyright 2026, The Newton Developers. Documentation licensed under CC-BY-4.0.
       <br/>
     
-  </p>
-</div>
-      
-        <div class="footer-item">
-
-  <p class="sphinx-version">
-    Created using <a href="https://www.sphinx-doc.org/">Sphinx</a> 8.2.3.
-    <br/>
   </p>
 </div>
       

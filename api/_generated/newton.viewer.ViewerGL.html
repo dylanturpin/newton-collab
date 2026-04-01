@@ -41,7 +41,7 @@
   <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
 <link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
 
-    <script src="../../_static/documentation_options.js?v=938c9ccc"></script>
+    <script src="../../_static/documentation_options.js?v=1c471e8e"></script>
     <script src="../../_static/doctools.js?v=9bcbadda"></script>
     <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -49,6 +49,13 @@
     <script src="../../_static/design-tabs.js?v=f930bc37"></script>
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'api/_generated/newton.viewer.ViewerGL';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
     <link rel="next" title="newton.viewer.ViewerNull" href="newton.viewer.ViewerNull.html" />
@@ -125,7 +132,7 @@
     <img src="../../_static/newton-logo-dark.png" class="logo__image only-dark pst-js-only" alt="Newton Physics Logo"/>
   
   
-    <p class="title logo__title">Newton Physics <span style='font-size: 0.8em; color: #888;'>(0.2.0)</span></p>
+    <p class="title logo__title">Newton Physics <span style='font-size: 0.8em; color: #888;'>(1.1.0.dev0)</span></p>
   
 </a></div>
     
@@ -161,15 +168,15 @@
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../../guide/key-concepts.html">
-    Key Concepts
+  <a class="nav-link nav-internal" href="../../guide/tutorials.html">
+    Tutorials
   </a>
 </li>
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../../guide/tutorials.html">
-    Tutorials
+  <a class="nav-link nav-internal" href="../../guide/development.html">
+    Development
   </a>
 </li>
 
@@ -182,8 +189,8 @@
                 <ul id="pst-nav-more-links" class="dropdown-menu">
                     
 <li class=" ">
-  <a class="nav-link dropdown-item nav-internal" href="../../guide/development.html">
-    Development
+  <a class="nav-link dropdown-item nav-internal" href="../../concepts/worlds.html">
+    Worlds
   </a>
 </li>
 
@@ -191,6 +198,13 @@
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../../concepts/articulations.html">
     Articulations
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../../concepts/mass_inertia.html">
+    Mass and Inertia
   </a>
 </li>
 
@@ -245,6 +259,13 @@
 
 
 <li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../../concepts/feather_pgs.html">
+    FeatherPGS
+  </a>
+</li>
+
+
+<li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../newton.html">
     newton
   </a>
@@ -261,6 +282,13 @@
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../newton_ik.html">
     newton.ik
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../newton_math.html">
+    newton.math
   </a>
 </li>
 
@@ -364,6 +392,26 @@
   <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
 </button></div>
       
+        <div class="navbar-item">
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
     </div>
     
   </div>
@@ -432,13 +480,6 @@
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../../guide/key-concepts.html">
-    Key Concepts
-  </a>
-</li>
-
-
-<li class="nav-item ">
   <a class="nav-link nav-internal" href="../../guide/tutorials.html">
     Tutorials
   </a>
@@ -453,8 +494,22 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../concepts/worlds.html">
+    Worlds
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../../concepts/articulations.html">
     Articulations
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../concepts/mass_inertia.html">
+    Mass and Inertia
   </a>
 </li>
 
@@ -509,6 +564,13 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../concepts/feather_pgs.html">
+    FeatherPGS
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../newton.html">
     newton
   </a>
@@ -525,6 +587,13 @@
 <li class="nav-item ">
   <a class="nav-link nav-internal" href="../newton_ik.html">
     newton.ik
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../newton_math.html">
+    newton.math
   </a>
 </li>
 
@@ -616,6 +685,26 @@
   <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
 </button></div>
         
+          <div class="navbar-item">
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+        
       </div>
     
   </div>
@@ -630,13 +719,14 @@
 <li class="toctree-l1"><a class="reference internal" href="../../guide/overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../guide/installation.html">Installation</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../guide/visualization.html">Visualization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../guide/key-concepts.html">Key Concepts</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../guide/tutorials.html">Tutorials</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../guide/development.html">Development</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/worlds.html">Worlds</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/articulations.html">Articulations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/mass_inertia.html">Mass and Inertia</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/sites.html">Sites</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/sensors.html">Sensors</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/conventions.html">Conventions</a></li>
@@ -645,12 +735,14 @@
 
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/extended_attributes.html">Extended Attributes</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/collisions.html">Collisions and Contacts</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/feather_pgs.html">FeatherPGS</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1 current active"><a class="reference internal" href="../newton.html">newton</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_geometry.html">newton.geometry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_ik.html">newton.ik</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../newton_math.html">newton.math</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_selection.html">newton.selection</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_sensors.html">newton.sensors</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_solvers.html">newton.solvers</a></li>
@@ -734,7 +826,7 @@
 <h1>newton.viewer.ViewerGL<a class="headerlink" href="#newton-viewer-viewergl" title="Link to this heading">#</a></h1>
 <dl class="py class">
 <dt class="sig sig-object py" id="newton.viewer.ViewerGL">
-<em class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">newton.viewer.</span></span><span class="sig-name descname"><span class="pre">ViewerGL</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">width</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1920</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">height</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1080</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vsync</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">headless</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/viewer/viewer_gl.py#L94"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.viewer.ViewerGL" title="Link to this definition">#</a></dt>
+<em class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">newton.viewer.</span></span><span class="sig-name descname"><span class="pre">ViewerGL</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">width</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1920</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">height</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1080</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vsync</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">headless</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/viewer/viewer_gl.py#L181"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.viewer.ViewerGL" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">ViewerBase</span></code></p>
 <p>OpenGL-based interactive viewer for Newton physics models.</p>
 <p>This class provides a graphical interface for visualizing and interacting with
@@ -753,6 +845,8 @@ model introspection and visualization options.</p>
 <li><p>Extensible logging of meshes, lines, points, and arrays for custom visualization.</p></li>
 </ul>
 </dd>
+</dl>
+<dl class="field-list simple">
 </dl>
 <dl class="py method">
 <dt class="sig sig-object py" id="newton.viewer.ViewerGL.__init__">
@@ -776,7 +870,7 @@ model introspection and visualization options.</p>
 <dd><p>Apply viewer-driven forces (picking, wind) to the model.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>state</strong> – The current simulation state.</p>
+<dd class="field-odd"><p><strong>state</strong> (<a class="reference internal" href="newton.State.html#newton.State" title="newton._src.sim.state.State"><em>State</em></a>) – The current simulation state.</p>
 </dd>
 </dl>
 </dd></dl>
@@ -787,9 +881,17 @@ model introspection and visualization options.</p>
 <dd><p>Begin a new frame (calls parent implementation).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>time</strong> – Current simulation time.</p>
+<dd class="field-odd"><p><strong>time</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Current simulation time.</p>
 </dd>
 </dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="newton.viewer.ViewerGL.clear_model">
+<span class="sig-name descname"><span class="pre">clear_model</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#newton.viewer.ViewerGL.clear_model" title="Link to this definition">#</a></dt>
+<dd><p>Reset GL-specific model-dependent state to defaults.</p>
+<p>Called from <code class="docutils literal notranslate"><span class="pre">__init__</span></code> (via <code class="docutils literal notranslate"><span class="pre">super().__init__</span></code> → <code class="docutils literal notranslate"><span class="pre">clear_model</span></code>)
+and whenever the current model is discarded.</p>
 </dd></dl>
 
 <dl class="py method">
@@ -819,7 +921,7 @@ to transfer pixel data entirely on the GPU, avoiding expensive CPU-GPU transfers
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>target_image</strong> (<em>wp.array</em><em>, </em><em>optional</em>) – Optional pre-allocated Warp array with shape <cite>(height, width, 3)</cite>
+<li><p><strong>target_image</strong> (<a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.array.html#warp.array" title="(in Warp v1.12.0)"><em>array</em></a><em> | </em><em>None</em>) – Optional pre-allocated Warp array with shape <cite>(height, width, 3)</cite>
 and dtype <cite>wp.uint8</cite>. If <cite>None</cite>, a new array will be created.</p></li>
 <li><p><strong>render_ui</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – Whether to render the UI.</p></li>
 </ul>
@@ -843,7 +945,7 @@ and dtype <cite>wp.uint8</cite>. If <cite>None</cite>, a new array will be creat
 <dd><p>Check if a key is currently pressed.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>key</strong> – <p>Either a string representing a character/key name, or an int
+<dd class="field-odd"><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – <p>Either a string representing a character/key name, or an int
 representing a pyglet key constant.</p>
 <p>String examples: ‘w’, ‘a’, ‘s’, ‘d’, ‘space’, ‘escape’, ‘enter’
 Int examples: pyglet.window.key.W, pyglet.window.key.SPACE</p>
@@ -890,6 +992,14 @@ Int examples: pyglet.window.key.W, pyglet.window.key.SPACE</p>
 <dt class="sig sig-object py" id="newton.viewer.ViewerGL.log_array">
 <span class="sig-name descname"><span class="pre">log_array</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">array</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.viewer.ViewerGL.log_array" title="Link to this definition">#</a></dt>
 <dd><p>Log a generic array for visualization (not implemented).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a>) – Unique path/name for the array signal.</p></li>
+<li><p><strong>array</strong> (<em>wp.array</em><em>(</em><em>dtype=Any</em><em>) </em><em>| </em><em>nparray</em>) – Array data to visualize.</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py method">
@@ -902,12 +1012,28 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a>) – Unique name for the capsule instancer group.</p></li>
-<li><p><strong>mesh</strong> – Capsule prototype mesh path from ViewerBase (unused in this backend).</p></li>
-<li><p><strong>xforms</strong> – Capsule instance transforms (wp.transform), length N.</p></li>
-<li><p><strong>scales</strong> – Capsule body instance scales, expected (radius, radius, half_height), length N.</p></li>
-<li><p><strong>colors</strong> – Capsule instance colors (wp.vec3), length N or None (no update).</p></li>
-<li><p><strong>materials</strong> – Capsule instance materials (wp.vec4), length N or None (no update).</p></li>
+<li><p><strong>mesh</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a>) – Capsule prototype mesh path from ViewerBase (unused in this backend).</p></li>
+<li><p><strong>xforms</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.transform</em><em>) </em><em>| </em><em>None</em>) – Capsule instance transforms (wp.transform), length N.</p></li>
+<li><p><strong>scales</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec3</em><em>) </em><em>| </em><em>None</em>) – Capsule body instance scales, expected (radius, radius, half_height), length N.</p></li>
+<li><p><strong>colors</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec3</em><em>) </em><em>| </em><em>None</em>) – Capsule instance colors (wp.vec3), length N or None (no update).</p></li>
+<li><p><strong>materials</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec4</em><em>) </em><em>| </em><em>None</em>) – Capsule instance materials (wp.vec4), length N or None (no update).</p></li>
 <li><p><strong>hidden</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – Whether the instances are hidden.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="newton.viewer.ViewerGL.log_gaussian">
+<span class="sig-name descname"><span class="pre">log_gaussian</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gaussian</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">xform</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.viewer.ViewerGL.log_gaussian" title="Link to this definition">#</a></dt>
+<dd><p>Log a <a class="reference internal" href="newton.Gaussian.html#newton.Gaussian" title="newton.Gaussian"><code class="xref py py-class docutils literal notranslate"><span class="pre">newton.Gaussian</span></code></a> as a point cloud of spheres.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a>) – Unique path/name for the Gaussian point cloud.</p></li>
+<li><p><strong>gaussian</strong> (<a class="reference internal" href="newton.Gaussian.html#newton.Gaussian" title="newton._src.geometry.types.Gaussian"><em>Gaussian</em></a>) – The <a class="reference internal" href="newton.Gaussian.html#newton.Gaussian" title="newton.Gaussian"><code class="xref py py-class docutils literal notranslate"><span class="pre">newton.Gaussian</span></code></a> asset to visualize.</p></li>
+<li><p><strong>xform</strong> (<a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.transformf.html#warp.transformf" title="(in Warp v1.12.0)"><em>transformf</em></a><em> | </em><em>None</em>) – Optional world-space transform applied to all splat centers.</p></li>
+<li><p><strong>hidden</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – Whether the point cloud should be hidden.</p></li>
 </ul>
 </dd>
 </dl>
@@ -916,7 +1042,16 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dl class="py method">
 <dt class="sig sig-object py" id="newton.viewer.ViewerGL.log_gizmo">
 <span class="sig-name descname"><span class="pre">log_gizmo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">transform</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.viewer.ViewerGL.log_gizmo" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
+<dd><p>Log or update a transform gizmo for the current frame.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a>) – Unique gizmo path/name.</p></li>
+<li><p><strong>transform</strong> (<a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.transformf.html#warp.transformf" title="(in Warp v1.12.0)"><em>transformf</em></a>) – Gizmo world transform.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="newton.viewer.ViewerGL.log_instances">
@@ -927,11 +1062,11 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a>) – Unique name for the instancer.</p></li>
 <li><p><strong>mesh</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a>) – Name of the base mesh.</p></li>
-<li><p><strong>xforms</strong> – Array of transforms.</p></li>
-<li><p><strong>scales</strong> – Array of scales.</p></li>
-<li><p><strong>colors</strong> – Array of colors.</p></li>
-<li><p><strong>materials</strong> – Array of materials.</p></li>
-<li><p><strong>hidden</strong> – Whether the instances are hidden.</p></li>
+<li><p><strong>xforms</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.transform</em><em>) </em><em>| </em><em>None</em>) – Array of transforms.</p></li>
+<li><p><strong>scales</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec3</em><em>) </em><em>| </em><em>None</em>) – Array of scales.</p></li>
+<li><p><strong>colors</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec3</em><em>) </em><em>| </em><em>None</em>) – Array of colors.</p></li>
+<li><p><strong>materials</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec4</em><em>) </em><em>| </em><em>None</em>) – Array of materials.</p></li>
+<li><p><strong>hidden</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – Whether the instances are hidden.</p></li>
 </ul>
 </dd>
 </dl>
@@ -945,10 +1080,10 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a>) – Unique identifier for the line batch.</p></li>
-<li><p><strong>starts</strong> (<em>wp.array</em>) – Array of line start positions (shape: [N, 3]) or None for empty.</p></li>
-<li><p><strong>ends</strong> (<em>wp.array</em>) – Array of line end positions (shape: [N, 3]) or None for empty.</p></li>
-<li><p><strong>colors</strong> – Array of line colors (shape: [N, 3]) or tuple/list of RGB or None for empty.</p></li>
-<li><p><strong>width</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – The width of the lines (float)</p></li>
+<li><p><strong>starts</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec3</em><em>) </em><em>| </em><em>None</em>) – Array of line start positions (shape: [N, 3]) or None for empty.</p></li>
+<li><p><strong>ends</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec3</em><em>) </em><em>| </em><em>None</em>) – Array of line end positions (shape: [N, 3]) or None for empty.</p></li>
+<li><p><strong>colors</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec3</em><em>) </em><em>| </em><em>wp.array</em><em>(</em><em>dtype=wp.float32</em><em>) </em><em>| </em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#tuple" title="(in Python v3.14)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.14)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>] </em><em>| </em><em>None</em>) – Array of line colors (shape: [N, 3]) or tuple/list of RGB or None for empty.</p></li>
+<li><p><strong>width</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – The width of the lines.</p></li>
 <li><p><strong>hidden</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – Whether the lines are initially hidden.</p></li>
 </ul>
 </dd>
@@ -957,16 +1092,17 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 
 <dl class="py method">
 <dt class="sig sig-object py" id="newton.viewer.ViewerGL.log_mesh">
-<span class="sig-name descname"><span class="pre">log_mesh</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">points</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">normals</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">uvs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backface_culling</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.viewer.ViewerGL.log_mesh" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">log_mesh</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">points</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">normals</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">uvs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">texture</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backface_culling</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.viewer.ViewerGL.log_mesh" title="Link to this definition">#</a></dt>
 <dd><p>Log a mesh for rendering.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a>) – Unique name for the mesh.</p></li>
-<li><p><strong>points</strong> (<em>wp.array</em>) – Vertex positions.</p></li>
-<li><p><strong>indices</strong> (<em>wp.array</em>) – Triangle indices.</p></li>
-<li><p><strong>normals</strong> (<em>wp.array</em><em>, </em><em>optional</em>) – Vertex normals.</p></li>
-<li><p><strong>uvs</strong> (<em>wp.array</em><em>, </em><em>optional</em>) – Vertex UVs.</p></li>
+<li><p><strong>points</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec3</em><em>)</em>) – Vertex positions.</p></li>
+<li><p><strong>indices</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.int32</em><em>) </em><em>| </em><em>wp.array</em><em>(</em><em>dtype=wp.uint32</em><em>)</em>) – Triangle indices.</p></li>
+<li><p><strong>normals</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec3</em><em>) </em><em>| </em><em>None</em>) – Vertex normals.</p></li>
+<li><p><strong>uvs</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec2</em><em>) </em><em>| </em><em>None</em>) – Vertex UVs.</p></li>
+<li><p><strong>texture</strong> (<em>np.ndarray</em><em> | </em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a><em> | </em><em>None</em>) – Texture path/URL or image array (H, W, C).</p></li>
 <li><p><strong>hidden</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – Whether the mesh is hidden.</p></li>
 <li><p><strong>backface_culling</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – Enable backface culling.</p></li>
 </ul>
@@ -976,15 +1112,15 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 
 <dl class="py method">
 <dt class="sig sig-object py" id="newton.viewer.ViewerGL.log_points">
-<span class="sig-name descname"><span class="pre">log_points</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">points</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">radii</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">colors</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.viewer.ViewerGL.log_points" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">log_points</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">points</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">radii</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">colors</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.viewer.ViewerGL.log_points" title="Link to this definition">#</a></dt>
 <dd><p>Log a batch of points for rendering as spheres.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a>) – Unique name for the point batch.</p></li>
-<li><p><strong>points</strong> – Array of point positions.</p></li>
-<li><p><strong>radii</strong> – Array of point radius values.</p></li>
-<li><p><strong>colors</strong> – Array of point colors.</p></li>
+<li><p><strong>points</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec3</em><em>) </em><em>| </em><em>None</em>) – Array of point positions.</p></li>
+<li><p><strong>radii</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.float32</em><em>) </em><em>| </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em> | </em><em>None</em>) – Array of point radius values.</p></li>
+<li><p><strong>colors</strong> (<em>wp.array</em><em>(</em><em>dtype=wp.vec3</em><em>) </em><em>| </em><em>wp.array</em><em>(</em><em>dtype=wp.float32</em><em>) </em><em>| </em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#tuple" title="(in Python v3.14)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.14)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>] </em><em>| </em><em>None</em>) – Array of point colors.</p></li>
 <li><p><strong>hidden</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – Whether the points are hidden.</p></li>
 </ul>
 </dd>
@@ -995,15 +1131,26 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dt class="sig sig-object py" id="newton.viewer.ViewerGL.log_scalar">
 <span class="sig-name descname"><span class="pre">log_scalar</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.viewer.ViewerGL.log_scalar" title="Link to this definition">#</a></dt>
 <dd><p>Log a scalar value for visualization (not implemented).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><em>str</em></a>) – Unique path/name for the scalar signal.</p></li>
+<li><p><strong>value</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a><em> | </em><a class="reference external" href="https://numpy.org/doc/stable/reference/arrays.scalars.html#numpy.number" title="(in NumPy v2.4)"><em>number</em></a>) – Scalar value to visualize.</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="newton.viewer.ViewerGL.log_state">
 <span class="sig-name descname"><span class="pre">log_state</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">state</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.viewer.ViewerGL.log_state" title="Link to this definition">#</a></dt>
-<dd><p>Cache the simulation state for UI panels and call parent log_state.</p>
+<dd><p>Log the current simulation state for rendering.</p>
+<p>For shape instances on CUDA, uses a batched path: 2 kernel launches +
+1 D2H copy to a shared pinned buffer, then uploads slices per instancer.
+Everything else (capsules, SDF, particles, joints, …) uses the standard path.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>state</strong> – The current simulation state.</p>
+<dd class="field-odd"><p><strong>state</strong> (<a class="reference internal" href="newton.State.html#newton.State" title="newton._src.sim.state.State"><em>State</em></a>) – Current simulation state for all rendered bodies/shapes.</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1015,8 +1162,8 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>symbol</strong> – Key symbol.</p></li>
-<li><p><strong>modifiers</strong> – Modifier keys.</p></li>
+<li><p><strong>symbol</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – Key symbol.</p></li>
+<li><p><strong>modifiers</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – Modifier keys.</p></li>
 </ul>
 </dd>
 </dl>
@@ -1026,6 +1173,14 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dt class="sig sig-object py" id="newton.viewer.ViewerGL.on_key_release">
 <span class="sig-name descname"><span class="pre">on_key_release</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">symbol</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">modifiers</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.viewer.ViewerGL.on_key_release" title="Link to this definition">#</a></dt>
 <dd><p>Handle key release events (not used).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>symbol</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – Released key code.</p></li>
+<li><p><strong>modifiers</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – Active modifier bitmask for this event.</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py method">
@@ -1035,12 +1190,12 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>x</strong> – Mouse position.</p></li>
-<li><p><strong>y</strong> – Mouse position.</p></li>
-<li><p><strong>dx</strong> – Mouse movement deltas.</p></li>
-<li><p><strong>dy</strong> – Mouse movement deltas.</p></li>
-<li><p><strong>buttons</strong> – Mouse buttons pressed.</p></li>
-<li><p><strong>modifiers</strong> – Modifier keys.</p></li>
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse X position in window coordinates.</p></li>
+<li><p><strong>y</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse Y position in window coordinates.</p></li>
+<li><p><strong>dx</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse delta along X since previous event.</p></li>
+<li><p><strong>dy</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse delta along Y since previous event.</p></li>
+<li><p><strong>buttons</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – Mouse buttons pressed.</p></li>
+<li><p><strong>modifiers</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – Modifier keys.</p></li>
 </ul>
 </dd>
 </dl>
@@ -1050,6 +1205,16 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dt class="sig sig-object py" id="newton.viewer.ViewerGL.on_mouse_motion">
 <span class="sig-name descname"><span class="pre">on_mouse_motion</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">y</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dy</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.viewer.ViewerGL.on_mouse_motion" title="Link to this definition">#</a></dt>
 <dd><p>Handle mouse motion events (not used).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse X position in window coordinates.</p></li>
+<li><p><strong>y</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse Y position in window coordinates.</p></li>
+<li><p><strong>dx</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse delta along X since previous event.</p></li>
+<li><p><strong>dy</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse delta along Y since previous event.</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py method">
@@ -1059,10 +1224,10 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>x</strong> – Mouse position.</p></li>
-<li><p><strong>y</strong> – Mouse position.</p></li>
-<li><p><strong>button</strong> – Mouse button pressed.</p></li>
-<li><p><strong>modifiers</strong> – Modifier keys.</p></li>
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse X position in window coordinates.</p></li>
+<li><p><strong>y</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse Y position in window coordinates.</p></li>
+<li><p><strong>button</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – Mouse button pressed.</p></li>
+<li><p><strong>modifiers</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – Modifier keys.</p></li>
 </ul>
 </dd>
 </dl>
@@ -1075,10 +1240,10 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>x</strong> – Mouse position.</p></li>
-<li><p><strong>y</strong> – Mouse position.</p></li>
-<li><p><strong>button</strong> – Mouse button released.</p></li>
-<li><p><strong>modifiers</strong> – Modifier keys.</p></li>
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse X position in window coordinates.</p></li>
+<li><p><strong>y</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse Y position in window coordinates.</p></li>
+<li><p><strong>button</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – Mouse button released.</p></li>
+<li><p><strong>modifiers</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a>) – Modifier keys.</p></li>
 </ul>
 </dd>
 </dl>
@@ -1091,10 +1256,10 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>x</strong> – Mouse position.</p></li>
-<li><p><strong>y</strong> – Mouse position.</p></li>
-<li><p><strong>scroll_x</strong> – Scroll deltas.</p></li>
-<li><p><strong>scroll_y</strong> – Scroll deltas.</p></li>
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse X position in window coordinates.</p></li>
+<li><p><strong>y</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mouse Y position in window coordinates.</p></li>
+<li><p><strong>scroll_x</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Horizontal scroll delta.</p></li>
+<li><p><strong>scroll_y</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Vertical scroll delta.</p></li>
 </ul>
 </dd>
 </dl>
@@ -1121,11 +1286,12 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>callback</strong> – Function to be called during UI rendering</p></li>
-<li><p><strong>position</strong> – Position where the UI should be rendered. One of:
+<li><p><strong>callback</strong> (<a class="reference external" href="https://docs.python.org/3/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.14)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><em>Any</em></a><em>]</em><em>, </em><em>None</em><em>]</em>) – Function to be called during UI rendering</p></li>
+<li><p><strong>position</strong> (<a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Literal" title="(in Python v3.14)"><em>Literal</em></a><em>[</em><em>'side'</em><em>, </em><em>'stats'</em><em>, </em><em>'free'</em><em>, </em><em>'panel'</em><em>]</em>) – Position where the UI should be rendered. One of:
 “side” - Side callback (default)
 “stats” - Stats/metrics area
-“free” - Free-floating UI elements</p></li>
+“free” - Free-floating UI elements
+“panel” - Top-level collapsing headers in left panel</p></li>
 </ul>
 </dd>
 </dl>
@@ -1138,7 +1304,7 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>pos</strong> (<a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.vec3f.html#warp.vec3f" title="(in Warp v1.11.1)"><em>vec3f</em></a>) – The camera position.</p></li>
+<li><p><strong>pos</strong> (<a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.vec3f.html#warp.vec3f" title="(in Warp v1.12.0)"><em>vec3f</em></a>) – The camera position.</p></li>
 <li><p><strong>pitch</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – The camera pitch.</p></li>
 <li><p><strong>yaw</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – The camera yaw.</p></li>
 </ul>
@@ -1153,7 +1319,7 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>model</strong> – The Newton model instance.</p></li>
+<li><p><strong>model</strong> (<a class="reference internal" href="newton.Model.html#newton.Model" title="newton._src.sim.model.Model"><em>Model</em></a><em> | </em><em>None</em>) – The Newton model instance.</p></li>
 <li><p><strong>max_worlds</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><em>int</em></a><em> | </em><em>None</em>) – Maximum number of worlds to render (None = all).</p></li>
 </ul>
 </dd>
@@ -1166,7 +1332,7 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dd><p>Set world offsets and update the picking system.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>spacing</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#tuple" title="(in Python v3.14)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.14)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.vec3f.html#warp.vec3f" title="(in Warp v1.11.1)"><em>vec3f</em></a>) – Spacing between worlds along each axis.</p>
+<dd class="field-odd"><p><strong>spacing</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#tuple" title="(in Python v3.14)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.14)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.vec3f.html#warp.vec3f" title="(in Warp v1.12.0)"><em>vec3f</em></a>) – Spacing between worlds along each axis.</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1213,37 +1379,39 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL"><code class="docutils literal notranslate"><span class="pre">ViewerGL</span></code></a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.__init__"><code class="docutils literal notranslate"><span class="pre">ViewerGL.__init__()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.apply_forces"><code class="docutils literal notranslate"><span class="pre">ViewerGL.apply_forces()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.begin_frame"><code class="docutils literal notranslate"><span class="pre">ViewerGL.begin_frame()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.close"><code class="docutils literal notranslate"><span class="pre">ViewerGL.close()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.end_frame"><code class="docutils literal notranslate"><span class="pre">ViewerGL.end_frame()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.get_frame"><code class="docutils literal notranslate"><span class="pre">ViewerGL.get_frame()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.is_key_down"><code class="docutils literal notranslate"><span class="pre">ViewerGL.is_key_down()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.is_paused"><code class="docutils literal notranslate"><span class="pre">ViewerGL.is_paused()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.is_running"><code class="docutils literal notranslate"><span class="pre">ViewerGL.is_running()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_array"><code class="docutils literal notranslate"><span class="pre">ViewerGL.log_array()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_capsules"><code class="docutils literal notranslate"><span class="pre">ViewerGL.log_capsules()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_gizmo"><code class="docutils literal notranslate"><span class="pre">ViewerGL.log_gizmo()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_instances"><code class="docutils literal notranslate"><span class="pre">ViewerGL.log_instances()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_lines"><code class="docutils literal notranslate"><span class="pre">ViewerGL.log_lines()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_mesh"><code class="docutils literal notranslate"><span class="pre">ViewerGL.log_mesh()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_points"><code class="docutils literal notranslate"><span class="pre">ViewerGL.log_points()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_scalar"><code class="docutils literal notranslate"><span class="pre">ViewerGL.log_scalar()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_state"><code class="docutils literal notranslate"><span class="pre">ViewerGL.log_state()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_key_press"><code class="docutils literal notranslate"><span class="pre">ViewerGL.on_key_press()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_key_release"><code class="docutils literal notranslate"><span class="pre">ViewerGL.on_key_release()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_mouse_drag"><code class="docutils literal notranslate"><span class="pre">ViewerGL.on_mouse_drag()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_mouse_motion"><code class="docutils literal notranslate"><span class="pre">ViewerGL.on_mouse_motion()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_mouse_press"><code class="docutils literal notranslate"><span class="pre">ViewerGL.on_mouse_press()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_mouse_release"><code class="docutils literal notranslate"><span class="pre">ViewerGL.on_mouse_release()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_mouse_scroll"><code class="docutils literal notranslate"><span class="pre">ViewerGL.on_mouse_scroll()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_resize"><code class="docutils literal notranslate"><span class="pre">ViewerGL.on_resize()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.register_ui_callback"><code class="docutils literal notranslate"><span class="pre">ViewerGL.register_ui_callback()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.set_camera"><code class="docutils literal notranslate"><span class="pre">ViewerGL.set_camera()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.set_model"><code class="docutils literal notranslate"><span class="pre">ViewerGL.set_model()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.set_world_offsets"><code class="docutils literal notranslate"><span class="pre">ViewerGL.set_world_offsets()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.vsync"><code class="docutils literal notranslate"><span class="pre">ViewerGL.vsync</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.__init__"><code class="docutils literal notranslate"><span class="pre">__init__()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.apply_forces"><code class="docutils literal notranslate"><span class="pre">apply_forces()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.begin_frame"><code class="docutils literal notranslate"><span class="pre">begin_frame()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.clear_model"><code class="docutils literal notranslate"><span class="pre">clear_model()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.close"><code class="docutils literal notranslate"><span class="pre">close()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.end_frame"><code class="docutils literal notranslate"><span class="pre">end_frame()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.get_frame"><code class="docutils literal notranslate"><span class="pre">get_frame()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.is_key_down"><code class="docutils literal notranslate"><span class="pre">is_key_down()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.is_paused"><code class="docutils literal notranslate"><span class="pre">is_paused()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.is_running"><code class="docutils literal notranslate"><span class="pre">is_running()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_array"><code class="docutils literal notranslate"><span class="pre">log_array()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_capsules"><code class="docutils literal notranslate"><span class="pre">log_capsules()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_gaussian"><code class="docutils literal notranslate"><span class="pre">log_gaussian()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_gizmo"><code class="docutils literal notranslate"><span class="pre">log_gizmo()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_instances"><code class="docutils literal notranslate"><span class="pre">log_instances()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_lines"><code class="docutils literal notranslate"><span class="pre">log_lines()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_mesh"><code class="docutils literal notranslate"><span class="pre">log_mesh()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_points"><code class="docutils literal notranslate"><span class="pre">log_points()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_scalar"><code class="docutils literal notranslate"><span class="pre">log_scalar()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.log_state"><code class="docutils literal notranslate"><span class="pre">log_state()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_key_press"><code class="docutils literal notranslate"><span class="pre">on_key_press()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_key_release"><code class="docutils literal notranslate"><span class="pre">on_key_release()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_mouse_drag"><code class="docutils literal notranslate"><span class="pre">on_mouse_drag()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_mouse_motion"><code class="docutils literal notranslate"><span class="pre">on_mouse_motion()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_mouse_press"><code class="docutils literal notranslate"><span class="pre">on_mouse_press()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_mouse_release"><code class="docutils literal notranslate"><span class="pre">on_mouse_release()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_mouse_scroll"><code class="docutils literal notranslate"><span class="pre">on_mouse_scroll()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.on_resize"><code class="docutils literal notranslate"><span class="pre">on_resize()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.register_ui_callback"><code class="docutils literal notranslate"><span class="pre">register_ui_callback()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.set_camera"><code class="docutils literal notranslate"><span class="pre">set_camera()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.set_model"><code class="docutils literal notranslate"><span class="pre">set_model()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.set_world_offsets"><code class="docutils literal notranslate"><span class="pre">set_world_offsets()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.viewer.ViewerGL.vsync"><code class="docutils literal notranslate"><span class="pre">vsync</span></code></a></li>
 </ul>
 </li>
 </ul>
@@ -1274,17 +1442,9 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 
   <p class="copyright">
     
-      © Copyright 2026, The Newton Developers.
+      © Copyright 2026, The Newton Developers. Documentation licensed under CC-BY-4.0.
       <br/>
     
-  </p>
-</div>
-      
-        <div class="footer-item">
-
-  <p class="sphinx-version">
-    Created using <a href="https://www.sphinx-doc.org/">Sphinx</a> 8.2.3.
-    <br/>
   </p>
 </div>
       

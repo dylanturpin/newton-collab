@@ -1,6 +1,0 @@
-﻿newton.geometry.generate\_terrain\_grid
-=======================================
-
-.. currentmodule:: newton.geometry
-
-.. autofunction:: generate_terrain_grid

@@ -41,7 +41,7 @@
   <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
 <link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
 
-    <script src="../../_static/documentation_options.js?v=938c9ccc"></script>
+    <script src="../../_static/documentation_options.js?v=1c471e8e"></script>
     <script src="../../_static/doctools.js?v=9bcbadda"></script>
     <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -51,10 +51,17 @@
     <script>window.MathJax = {"tex": {"inlineMath": [["$", "$"], ["\\(", "\\)"]], "processEscapes": true, "packages": {"[+]": ["amsmath", "amssymb", "amsfonts"]}, "displayMath": [["$$", "$$"], ["\\[", "\\]"]], "processEnvironments": true, "tags": "ams", "macros": {"RR": "{\\mathbb{R}}", "bold": ["{\\mathbf{#1}}", 1], "vec": ["{\\mathbf{#1}}", 1]}}, "options": {"ignoreHtmlClass": "annotation", "processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
     <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'api/_generated/newton.geometry.transform_inertia';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
     <link rel="next" title="newton.ik" href="../newton_ik.html" />
-    <link rel="prev" title="newton.geometry.remesh_mesh" href="newton.geometry.remesh_mesh.html" />
+    <link rel="prev" title="newton.geometry.sdf_sphere" href="newton.geometry.sdf_sphere.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="" />
@@ -127,7 +134,7 @@
     <img src="../../_static/newton-logo-dark.png" class="logo__image only-dark pst-js-only" alt="Newton Physics Logo"/>
   
   
-    <p class="title logo__title">Newton Physics <span style='font-size: 0.8em; color: #888;'>(0.2.0)</span></p>
+    <p class="title logo__title">Newton Physics <span style='font-size: 0.8em; color: #888;'>(1.1.0.dev0)</span></p>
   
 </a></div>
     
@@ -163,15 +170,15 @@
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../../guide/key-concepts.html">
-    Key Concepts
+  <a class="nav-link nav-internal" href="../../guide/tutorials.html">
+    Tutorials
   </a>
 </li>
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../../guide/tutorials.html">
-    Tutorials
+  <a class="nav-link nav-internal" href="../../guide/development.html">
+    Development
   </a>
 </li>
 
@@ -184,8 +191,8 @@
                 <ul id="pst-nav-more-links" class="dropdown-menu">
                     
 <li class=" ">
-  <a class="nav-link dropdown-item nav-internal" href="../../guide/development.html">
-    Development
+  <a class="nav-link dropdown-item nav-internal" href="../../concepts/worlds.html">
+    Worlds
   </a>
 </li>
 
@@ -193,6 +200,13 @@
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../../concepts/articulations.html">
     Articulations
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../../concepts/mass_inertia.html">
+    Mass and Inertia
   </a>
 </li>
 
@@ -247,6 +261,13 @@
 
 
 <li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../../concepts/feather_pgs.html">
+    FeatherPGS
+  </a>
+</li>
+
+
+<li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../newton.html">
     newton
   </a>
@@ -263,6 +284,13 @@
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../newton_ik.html">
     newton.ik
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../newton_math.html">
+    newton.math
   </a>
 </li>
 
@@ -366,6 +394,26 @@
   <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
 </button></div>
       
+        <div class="navbar-item">
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
     </div>
     
   </div>
@@ -434,13 +482,6 @@
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../../guide/key-concepts.html">
-    Key Concepts
-  </a>
-</li>
-
-
-<li class="nav-item ">
   <a class="nav-link nav-internal" href="../../guide/tutorials.html">
     Tutorials
   </a>
@@ -455,8 +496,22 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../concepts/worlds.html">
+    Worlds
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../../concepts/articulations.html">
     Articulations
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../concepts/mass_inertia.html">
+    Mass and Inertia
   </a>
 </li>
 
@@ -511,6 +566,13 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../concepts/feather_pgs.html">
+    FeatherPGS
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../newton.html">
     newton
   </a>
@@ -527,6 +589,13 @@
 <li class="nav-item ">
   <a class="nav-link nav-internal" href="../newton_ik.html">
     newton.ik
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../newton_math.html">
+    newton.math
   </a>
 </li>
 
@@ -618,6 +687,26 @@
   <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
 </button></div>
         
+          <div class="navbar-item">
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+        
       </div>
     
   </div>
@@ -632,13 +721,14 @@
 <li class="toctree-l1"><a class="reference internal" href="../../guide/overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../guide/installation.html">Installation</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../guide/visualization.html">Visualization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../guide/key-concepts.html">Key Concepts</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../guide/tutorials.html">Tutorials</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../guide/development.html">Development</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/worlds.html">Worlds</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/articulations.html">Articulations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/mass_inertia.html">Mass and Inertia</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/sites.html">Sites</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/sensors.html">Sensors</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/conventions.html">Conventions</a></li>
@@ -647,12 +737,14 @@
 
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/extended_attributes.html">Extended Attributes</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../concepts/collisions.html">Collisions and Contacts</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/feather_pgs.html">FeatherPGS</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1 current active"><a class="reference internal" href="../newton.html">newton</a></li>
 <li class="toctree-l1 current active"><a class="reference internal" href="../newton_geometry.html">newton.geometry</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_ik.html">newton.ik</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../newton_math.html">newton.math</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_selection.html">newton.selection</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_sensors.html">newton.sensors</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../newton_solvers.html">newton.solvers</a></li>
@@ -736,11 +828,11 @@
 <h1>newton.geometry.transform_inertia<a class="headerlink" href="#newton-geometry-transform-inertia" title="Link to this heading">#</a></h1>
 <dl class="py function">
 <dt class="sig sig-object py" id="newton.geometry.transform_inertia">
-<span class="sig-prename descclassname"><span class="pre">newton.geometry.</span></span><span class="sig-name descname"><span class="pre">transform_inertia</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">m</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">I</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">p</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">q</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/geometry/inertia.py#L419"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.geometry.transform_inertia" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">newton.geometry.</span></span><span class="sig-name descname"><span class="pre">transform_inertia</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mass</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inertia</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">offset</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">quat</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/geometry/inertia.py#L427"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.geometry.transform_inertia" title="Link to this definition">#</a></dt>
 <dd><p>Compute a rigid body’s inertia tensor expressed in a new coordinate frame.</p>
-<p>The transformation applies (1) a rotation by quaternion <code class="docutils literal notranslate"><span class="pre">q</span></code> and
-(2) a parallel-axis shift by vector <code class="docutils literal notranslate"><span class="pre">p</span></code> (Steiner’s theorem).
-Let <code class="docutils literal notranslate"><span class="pre">R</span></code> be the rotation matrix corresponding to <code class="docutils literal notranslate"><span class="pre">q</span></code>. The returned
+<p>The transformation applies (1) a rotation by quaternion <code class="docutils literal notranslate"><span class="pre">quat</span></code> and
+(2) a parallel-axis shift by vector <code class="docutils literal notranslate"><span class="pre">offset</span></code> (Steiner’s theorem).
+Let <code class="docutils literal notranslate"><span class="pre">R</span></code> be the rotation matrix corresponding to <code class="docutils literal notranslate"><span class="pre">quat</span></code>. The returned
 inertia tensor <span class="math notranslate nohighlight">\(\mathbf{I}'\)</span> is</p>
 <div class="math notranslate nohighlight">
 \[\mathbf{I}' \,=\, \mathbf{R}\,\mathbf{I}\,\mathbf{R}^\top
@@ -750,12 +842,12 @@ inertia tensor <span class="math notranslate nohighlight">\(\mathbf{I}'\)</span>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>m</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mass of the rigid body.</p></li>
-<li><p><strong>I</strong> (<em>wp.mat33</em>) – Inertia tensor expressed in the body’s local frame, relative
+<li><p><strong>mass</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><em>float</em></a>) – Mass of the rigid body.</p></li>
+<li><p><strong>inertia</strong> (<a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.mat33f.html#warp.mat33f" title="(in Warp v1.12.0)"><em>mat33f</em></a>) – Inertia tensor expressed in the body’s local frame, relative
 to its center of mass.</p></li>
-<li><p><strong>p</strong> (<em>wp.vec3</em>) – Position vector from the new frame’s origin to the body’s
+<li><p><strong>offset</strong> (<a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.vec3f.html#warp.vec3f" title="(in Warp v1.12.0)"><em>vec3f</em></a>) – Position vector from the new frame’s origin to the body’s
 center of mass.</p></li>
-<li><p><strong>q</strong> (<em>wp.quat</em>) – Orientation of the body relative to the new frame, expressed
+<li><p><strong>quat</strong> (<a class="reference external" href="https://nvidia.github.io/warp/api_reference/_generated/warp.quatf.html#warp.quatf" title="(in Warp v1.12.0)"><em>quatf</em></a>) – Orientation of the body relative to the new frame, expressed
 as a quaternion.</p></li>
 </ul>
 </dd>
@@ -822,17 +914,9 @@ as a quaternion.</p></li>
 
   <p class="copyright">
     
-      © Copyright 2026, The Newton Developers.
+      © Copyright 2026, The Newton Developers. Documentation licensed under CC-BY-4.0.
       <br/>
     
-  </p>
-</div>
-      
-        <div class="footer-item">
-
-  <p class="sphinx-version">
-    Created using <a href="https://www.sphinx-doc.org/">Sphinx</a> 8.2.3.
-    <br/>
   </p>
 </div>
       
