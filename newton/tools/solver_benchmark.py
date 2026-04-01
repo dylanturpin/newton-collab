@@ -9,11 +9,11 @@ Usage examples:
     uv run newton/tools/solver_benchmark.py --scenario g1_flat --num-worlds 1
 
     # Single benchmark run with job-owned artifacts
-    uv run newton/tools/solver_benchmark.py --scenario h1_tabletop --solver fpgs_tiled \\
+    uv run newton/tools/solver_benchmark.py --scenario h1_tabletop --solver fpgs_split \\
         --num-worlds 4096 --benchmark --out results/job_0001
 
     # Render a short video of a scenario (headless, outputs mp4 via ffmpeg)
-    uv run newton/tools/solver_benchmark.py --scenario h1_tabletop --solver fpgs_tiled \\
+    uv run newton/tools/solver_benchmark.py --scenario h1_tabletop --solver fpgs_split \\
         --render --render-frames 300 --out renders/job_0002
 """
 
@@ -115,54 +115,49 @@ SOLVER_PRESETS = {
     "mujoco": {
         "type": "mujoco",
     },
-    "fpgs_loop": {
+    "fpgs_dense_loop": {
         "type": "feather_pgs",
         "cholesky_kernel": "loop",
         "trisolve_kernel": "loop",
         "hinv_jt_kernel": "par_row",
         "delassus_kernel": "par_row_col",
         "pgs_kernel": "loop",
+        "pgs_mode": "dense",
         "use_parallel_streams": False,
     },
-    "fpgs_tiled": {
-        "type": "feather_pgs",
-        "cholesky_kernel": "tiled",
-        "trisolve_kernel": "tiled",
-        "hinv_jt_kernel": "tiled",
-        "delassus_kernel": "tiled",
-        "pgs_kernel": "tiled_contact",
-        "use_parallel_streams": True,
-    },
-    "fpgs_tiled_row": {
+    "fpgs_dense_row": {
         "type": "feather_pgs",
         "cholesky_kernel": "tiled",
         "trisolve_kernel": "tiled",
         "hinv_jt_kernel": "tiled",
         "delassus_kernel": "tiled",
         "pgs_kernel": "tiled_row",
+        "pgs_mode": "dense",
         "use_parallel_streams": True,
     },
-    "fpgs_tiled_contact": {
+    "fpgs_split": {
         "type": "feather_pgs",
         "cholesky_kernel": "tiled",
         "trisolve_kernel": "tiled",
         "hinv_jt_kernel": "tiled",
         "delassus_kernel": "tiled",
         "pgs_kernel": "tiled_contact",
+        "pgs_mode": "split",
         "use_parallel_streams": True,
     },
-    "fpgs_streaming": {
+    "fpgs_dense_streaming": {
         "type": "feather_pgs",
         "cholesky_kernel": "tiled",
         "trisolve_kernel": "tiled",
         "hinv_jt_kernel": "par_row",
         "delassus_kernel": "tiled",
         "pgs_kernel": "streaming",
+        "pgs_mode": "dense",
         "use_parallel_streams": False,
     },
-    "fpgs_mf": {
+    "fpgs_matrix_free": {
         "type": "feather_pgs",
-        "pgs_mode": "velocity",
+        "pgs_mode": "matrix_free",
         "cholesky_kernel": "tiled",
         "trisolve_kernel": "tiled",
         "hinv_jt_kernel": "tiled",
@@ -364,7 +359,7 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
         if args.pgs_warmstart:
             cmd.append("--pgs-warmstart")
         pgs_mode = solver_config.get("pgs_mode", args.pgs_mode)
-        if pgs_mode != "hybrid":
+        if pgs_mode != "split":
             cmd.extend(["--pgs-mode", pgs_mode])
 
         # Chunk sizes: solver_config overrides CLI
@@ -821,10 +816,11 @@ def run_direct(args):
 
 # Camera presets per scenario: (pos, pitch, yaw)
 SOLVER_LABEL_MAP = {
-    "fpgs_tiled": "FeatherPGS (tiled)",
-    "fpgs_tiled_row": "FeatherPGS (tiled_row)",
-    "fpgs_loop": "FeatherPGS (loop)",
-    "fpgs_streaming": "FeatherPGS (streaming)",
+    "fpgs_dense_row": "FeatherPGS (dense row)",
+    "fpgs_dense_loop": "FeatherPGS (dense loop)",
+    "fpgs_dense_streaming": "FeatherPGS (dense streaming)",
+    "fpgs_split": "FeatherPGS (split)",
+    "fpgs_matrix_free": "FeatherPGS (matrix-free)",
     "feather_pgs": "FeatherPGS",
     "mujoco": "MJWarp",
 }
@@ -1091,7 +1087,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--solver",
         type=str,
         default="feather_pgs",
-        help="Solver: mujoco, feather_pgs, or preset (fpgs_tiled, fpgs_loop, fpgs_mf, ...)",
+        help="Solver: mujoco, feather_pgs, or preset (fpgs_split, fpgs_dense_loop, fpgs_matrix_free, ...)",
     )
 
     parser.add_argument(
@@ -1124,9 +1120,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pgs-mode",
         type=str,
-        choices=["delassus", "hybrid", "velocity"],
-        default="hybrid",
-        help="PGS mode: delassus, hybrid, or velocity",
+        choices=["dense", "split", "matrix_free"],
+        default="split",
+        help="PGS mode: dense, split, or matrix_free",
     )
     parser.add_argument(
         "--delassus-chunk-size",

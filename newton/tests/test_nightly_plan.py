@@ -40,13 +40,16 @@ class TestNightlyPlan(unittest.TestCase):
         self.assertEqual(
             task_ids,
             [
+                "g1_flat_sweep_rtx_a5000",
                 "g1_flat_sweep_rtx_5090",
                 "g1_flat_sweep_rtx_pro_6000_server",
                 "g1_flat_sweep_b200",
+                "g1_flat_ablation_rtx_a5000",
                 "g1_flat_ablation_rtx_5090",
                 "g1_flat_ablation_rtx_pro_6000_server",
                 "g1_flat_ablation_b200",
                 "g1_flat_renders",
+                "h1_tabletop_sweep_early_rtx_a5000",
                 "h1_tabletop_sweep_early_rtx_5090",
                 "h1_tabletop_sweep_early_rtx_pro_6000_server",
                 "h1_tabletop_sweep_early_b200",
@@ -54,6 +57,7 @@ class TestNightlyPlan(unittest.TestCase):
                 "h1_tabletop_sweep_late_b200",
                 "h1_tabletop_sweep_extreme_rtx_pro_6000_server",
                 "h1_tabletop_sweep_extreme_b200",
+                "h1_tabletop_ablation_rtx_a5000",
                 "h1_tabletop_ablation_rtx_5090",
                 "h1_tabletop_ablation_rtx_pro_6000_server",
                 "h1_tabletop_ablation_b200",
@@ -61,25 +65,25 @@ class TestNightlyPlan(unittest.TestCase):
             ],
         )
 
-        g1_sweep_5090 = expanded["tasks"][0]
+        g1_sweep_5090 = expanded["tasks"][1]
         self.assertEqual(g1_sweep_5090["job_count"], 28)
         self.assertEqual(g1_sweep_5090["jobs"][0]["id"], "g1_flat_sweep_rtx_5090__0001")
         self.assertEqual(g1_sweep_5090["jobs"][-1]["id"], "g1_flat_sweep_rtx_5090__0028")
         self.assertEqual(g1_sweep_5090["jobs"][-1]["num_worlds"], 65536)
 
-        g1_sweep_6000 = expanded["tasks"][1]
+        g1_sweep_6000 = expanded["tasks"][2]
         self.assertEqual(g1_sweep_6000["job_count"], 32)
         self.assertEqual(g1_sweep_6000["jobs"][-1]["num_worlds"], 131072)
 
-        h1_late = expanded["tasks"][10]
+        h1_late = expanded["tasks"][13]
         self.assertEqual(h1_late["job_count"], 4)
         self.assertEqual(h1_late["jobs"][0]["num_worlds"], 16384)
 
-        h1_extreme = expanded["tasks"][12]
+        h1_extreme = expanded["tasks"][15]
         self.assertEqual(h1_extreme["job_count"], 4)
         self.assertEqual(h1_extreme["jobs"][0]["num_worlds"], 32768)
 
-        g1_render = expanded["tasks"][6]
+        g1_render = expanded["tasks"][8]
         self.assertEqual(g1_render["profile"], "rtx_pro_6000_render")
         self.assertEqual(g1_render["job_count"], 4)
 
@@ -104,7 +108,7 @@ class TestNightlyPlan(unittest.TestCase):
         self.assertEqual(ablation_task["job_style"], "explicit")
         self.assertEqual(ablation_task["job_count"], 10)
         self.assertEqual(ablation_task["tags"], ["h1_tabletop_ablation"])
-        self.assertEqual(ablation_task["jobs"][7]["label"], "fully matrix-free GS")
+        self.assertEqual(ablation_task["jobs"][7]["label"], "matrix-free")
         self.assertEqual(ablation_task["jobs"][7]["variant_id"], "matrix_free")
         self.assertEqual(ablation_task["jobs"][7]["step_index"], 7)
         self.assertFalse(ablation_task["jobs"][7]["double_buffer"])
@@ -150,7 +154,7 @@ class TestNightlyPlan(unittest.TestCase):
                 profile: test_gpu
                 series: invalid
                 scenario: g1_flat
-                solver: fpgs_tiled
+                solver: fpgs_split
                 num_worlds: 256
                 measure_frames: [8, 16]
             """

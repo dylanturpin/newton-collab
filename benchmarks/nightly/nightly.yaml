@@ -21,7 +21,7 @@ defaults:
     pgs_cfm: 1.0e-6
     pgs_omega: 1.0
     pgs_warmstart: false
-    pgs_mode: hybrid
+    pgs_mode: split
     use_parallel_streams: true
     double_buffer: true
   render:
@@ -91,7 +91,7 @@ tasks:
     series: g1_flat_env_fps
     tags: [g1_flat_env_fps]
     scenario: g1_flat
-    solver: [fpgs_tiled, mujoco]
+    solver: [fpgs_split, mujoco]
     substeps: [2, 4]
     num_worlds: [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
 
@@ -205,7 +205,7 @@ tasks:
     series: g1_flat_render
     tags: [g1_flat_render]
     scenario: g1_flat
-    solver: [fpgs_tiled, mujoco]
+    solver: [fpgs_split, mujoco]
     substeps: [2, 4]
 
   - id: h1_tabletop_sweep_early
@@ -219,7 +219,7 @@ tasks:
     series: h1_tabletop_env_fps
     tags: [h1_tabletop_env_fps]
     scenario: h1_tabletop
-    solver: [fpgs_mf, mujoco]
+    solver: [fpgs_matrix_free, mujoco]
     substeps: [4, 8]
     num_worlds: [1024, 2048, 4096, 8192]
 
@@ -232,7 +232,7 @@ tasks:
     series: h1_tabletop_env_fps
     tags: [h1_tabletop_env_fps]
     scenario: h1_tabletop
-    solver: [fpgs_mf, mujoco]
+    solver: [fpgs_matrix_free, mujoco]
     substeps: [4, 8]
     num_worlds: [16384]
 
@@ -245,7 +245,7 @@ tasks:
     series: h1_tabletop_env_fps
     tags: [h1_tabletop_env_fps]
     scenario: h1_tabletop
-    solver: [fpgs_mf, mujoco]
+    solver: [fpgs_matrix_free, mujoco]
     substeps: [4, 8]
     num_worlds: [32768]
 
@@ -275,7 +275,7 @@ tasks:
         delassus_kernel: par_row_col
         pgs_kernel: loop
         dense_max_constraints: 396
-        pgs_mode: delassus
+        pgs_mode: dense
         use_parallel_streams: false
         double_buffer: false
       - id: tiled_cholesky
@@ -289,7 +289,7 @@ tasks:
         delassus_kernel: par_row_col
         pgs_kernel: loop
         dense_max_constraints: 396
-        pgs_mode: delassus
+        pgs_mode: dense
         use_parallel_streams: false
         double_buffer: false
       - id: tiled_trisolve
@@ -303,11 +303,11 @@ tasks:
         delassus_kernel: par_row_col
         pgs_kernel: loop
         dense_max_constraints: 396
-        pgs_mode: delassus
+        pgs_mode: dense
         use_parallel_streams: false
         double_buffer: false
-      - id: tiled_delassus
-        label: tiled delassus
+      - id: tiled_dense
+        label: tiled dense
         solver: feather_pgs
         substeps: 8
         num_worlds: 8192
@@ -317,7 +317,7 @@ tasks:
         delassus_kernel: tiled
         pgs_kernel: loop
         dense_max_constraints: 396
-        pgs_mode: delassus
+        pgs_mode: dense
         use_parallel_streams: false
         double_buffer: false
       - id: streaming_pgs
@@ -331,7 +331,7 @@ tasks:
         delassus_kernel: tiled
         pgs_kernel: streaming
         dense_max_constraints: 396
-        pgs_mode: delassus
+        pgs_mode: dense
         use_parallel_streams: false
         double_buffer: false
       - id: parallel_streams
@@ -345,11 +345,11 @@ tasks:
         delassus_kernel: tiled
         pgs_kernel: streaming
         dense_max_constraints: 396
-        pgs_mode: delassus
+        pgs_mode: dense
         use_parallel_streams: true
         double_buffer: false
-      - id: hybrid
-        label: hybrid (dense + MF rigid)
+      - id: split
+        label: split
         solver: feather_pgs
         substeps: 8
         num_worlds: 8192
@@ -359,11 +359,11 @@ tasks:
         delassus_kernel: tiled
         pgs_kernel: tiled_contact
         dense_max_constraints: 128
-        pgs_mode: hybrid
+        pgs_mode: split
         use_parallel_streams: true
         double_buffer: false
       - id: matrix_free
-        label: fully matrix-free GS
+        label: matrix-free
         solver: feather_pgs
         substeps: 8
         num_worlds: 8192
@@ -373,7 +373,7 @@ tasks:
         delassus_kernel: tiled
         pgs_kernel: tiled_contact
         dense_max_constraints: 128
-        pgs_mode: velocity
+        pgs_mode: matrix_free
         use_parallel_streams: true
         double_buffer: false
       - id: double_buffer
@@ -387,7 +387,7 @@ tasks:
         delassus_kernel: tiled
         pgs_kernel: tiled_contact
         dense_max_constraints: 128
-        pgs_mode: velocity
+        pgs_mode: matrix_free
         use_parallel_streams: true
         double_buffer: true
       - id: mujoco_baseline
@@ -403,7 +403,7 @@ tasks:
     series: h1_tabletop_render
     tags: [h1_tabletop_render]
     scenario: h1_tabletop
-    solver: [fpgs_mf, mujoco]
+    solver: [fpgs_matrix_free, mujoco]
     substeps: [4, 8]
 
   - id: validation_g1_flat_sweep
@@ -413,7 +413,7 @@ tasks:
     series: g1_flat_env_fps
     tags: [g1_flat_env_fps]
     scenario: g1_flat
-    solver: [fpgs_tiled, mujoco]
+    solver: [fpgs_split, mujoco]
     substeps: [2]
     num_worlds: [256, 512]
     warmup_frames: 4
@@ -426,7 +426,7 @@ tasks:
     series: g1_flat_render
     tags: [g1_flat_render]
     scenario: g1_flat
-    solver: [fpgs_tiled]
+    solver: [fpgs_split]
     substeps: [2]
     render_frames: 32
 

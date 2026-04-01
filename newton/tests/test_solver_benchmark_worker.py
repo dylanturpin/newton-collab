@@ -15,7 +15,7 @@ from newton.tools import solver_benchmark
 def _make_args(**overrides):
     values = {
         "scenario": "g1_flat",
-        "solver": "fpgs_tiled",
+        "solver": "fpgs_split",
         "num_worlds": 1024,
         "substeps": 2,
         "warmup_frames": 4,
@@ -28,7 +28,7 @@ def _make_args(**overrides):
         "pgs_cfm": 1.0e-6,
         "pgs_omega": 1.0,
         "pgs_warmstart": False,
-        "pgs_mode": "hybrid",
+        "pgs_mode": "split",
         "delassus_chunk_size": None,
         "pgs_chunk_size": None,
         "double_buffer": True,
@@ -64,7 +64,7 @@ class TestSolverBenchmarkWorker(unittest.TestCase):
     def test_build_run_command_emits_concrete_worker_invocation(self):
         args = _make_args()
 
-        command = solver_benchmark.build_run_command(args, solver_benchmark.SOLVER_PRESETS["fpgs_tiled"], 2048)
+        command = solver_benchmark.build_run_command(args, solver_benchmark.SOLVER_PRESETS["fpgs_split"], 2048)
 
         self.assertEqual(command[1:3], ["-m", "newton.tools.solver_benchmark"])
         self.assertIn("--benchmark", command)
