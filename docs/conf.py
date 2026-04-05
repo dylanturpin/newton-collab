@@ -133,8 +133,14 @@ source_suffix = {
     ".md": "markdown",
 }
 
+# Enable MyST math syntax used in in-repo Markdown pages.
+myst_enable_extensions = [
+    "amsmath",
+    "dollarmath",
+]
+
 extlinks = {
-    "github": (f"https://github.com/newton-physics/newton/blob/{github_version}/%s", "%s"),
+    "github": (f"https://github.com/dylanturpin/newton-collab/blob/{github_version}/%s", "%s"),
 }
 
 doctest_global_setup = """
@@ -235,7 +241,7 @@ _is_release = os.environ.get("GITHUB_REF", "").startswith("refs/tags/v")
 
 # Configure version switcher
 html_theme_options["switcher"] = {
-    "json_url": "https://newton-physics.github.io/newton/switcher.json",
+    "json_url": "https://dylanturpin.github.io/newton-collab/switcher.json",
     "version_match": release if _is_release else "dev",
 }
 
@@ -354,7 +360,7 @@ def linkcode_resolve(domain: str, info: dict[str, str]) -> str | None:
         line_fragment = f"#L{line_number}" if line_number else ""
 
         # Construct GitHub URL
-        github_base = "https://github.com/newton-physics/newton"
+        github_base = "https://github.com/dylanturpin/newton-collab"
         return f"{github_base}/blob/{github_version}/{rel_path}{line_fragment}"
 
     except (ImportError, AttributeError, TypeError):

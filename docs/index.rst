@@ -35,6 +35,7 @@ Newton Physics
    Custom Attributes <concepts/custom_attributes>
    Extended Attributes <concepts/extended_attributes>
    Collisions and Contacts <concepts/collisions>
+   FeatherPGS <concepts/feather_pgs>
    
 .. toctree::
    :maxdepth: 1
