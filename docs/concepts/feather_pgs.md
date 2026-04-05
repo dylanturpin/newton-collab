@@ -20,12 +20,15 @@ The implementation lives primarily in [`newton/_src/solvers/feather_pgs/solver_f
 Quick code anchors for this page:
 
 - [`step()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L1018) is the top-level solver step and mode dispatch.
-- [`_stage4_build_rows()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2074) builds the contact and joint-limit row sets.
-- [`_stage4_hinv_jt_tiled()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2391) and [`_stage4_delassus_tiled()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2470) are the dense Delassus path.
-- [`_dispatch_dense_pgs_solve()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2584), [`_mf_pgs_setup()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2709), and [`_mf_pgs_solve()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2755) are the main dense and matrix-free solve entry points.
-- [`allocate_world_contact_slots()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L1932), [`diag_from_JY_par_art()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L2769), and [`build_mf_contact_rows()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L2846) are the key row-routing and matrix-free kernels.
+- [`_stage4_build_rows()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2077) builds the contact and joint-limit row sets.
+- [`_stage4_hinv_jt_tiled()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2394) and [`_stage4_delassus_tiled()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2473) are the dense Delassus path.
+- [`_dispatch_dense_pgs_solve()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2587), [`_mf_pgs_setup()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2712), and [`_mf_pgs_solve()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2758) are the main dense and matrix-free solve entry points.
+- [`allocate_world_contact_slots()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L1932), [`diag_from_JY_par_art()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L2769), and [`build_mf_contact_rows()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L2853) are the key row-routing and matrix-free kernels.
 - [`compute_mf_body_Hinv()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L3112), [`compute_mf_effective_mass_and_rhs()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L3135), and [`pgs_solve_mf_loop()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L3234) are the specialized free-rigid path.
+- [`convert_root_free_qd_world_to_local()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L132), [`convert_root_free_qd_local_to_world()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L158), and [`jcalc_integrate()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L509) are the free-root boundary conversion and integration kernels.
+- [`update_articulation_origins()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L77), [`update_articulation_root_com_offsets()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L103), and [`update_body_qd_from_featherstone()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L2640) cover the current root-frame bookkeeping and public-velocity writeback.
 - [`newton/tools/solver_benchmark.py`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/tools/solver_benchmark.py#L118) and [`benchmarks/nightly/nightly.yaml`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/benchmarks/nightly/nightly.yaml#L269) expose the current benchmark-facing mode names and nightly ablations.
+- [`newton/tests/test_feather_pgs_free_root_velocity.py`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/tests/test_feather_pgs_free_root_velocity.py) is the regression test for the free-root velocity convention and integration fix.
 
 ## Motivation and Background
 
@@ -63,6 +66,37 @@ $$
 $$
 
 That interpretation still matches the dense path. In the newer paths, the same objects are present, but the solver may avoid ever forming the full dense matrix $C$.
+
+## Frame Conventions in FeatherPGS
+
+FeatherPGS currently uses a mixed velocity convention, and it is worth stating that explicitly because it is easy to misread the code otherwise.
+
+- At the public API boundary, free-root `joint_qd` follows the CoM convention: the linear term is the root body's center-of-mass velocity.
+- Inside the articulated solve, stages 1 through 6 use the root-body-origin linear term instead. On entry, FeatherPGS converts
+
+$$
+v_{\mathrm{local}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com}},
+$$
+
+where $r_{\mathrm{com}}$ is the root-body COM offset in world orientation. In the current code this is the `convert_root_free_qd_world_to_local()` / `convert_root_free_qd_local_to_world()` pair, using `articulation_root_com_offset` rather than `articulation_origin`.
+- The internal Featherstone algebra is otherwise unchanged: inverse dynamics, CRBA, Cholesky, triangular solve, and the articulated PGS paths all run on that internal root-origin linear term.
+- At stage 7, integration uses the public CoM-based `joint_qd` and `joint_qdd`, but FREE and DISTANCE joints reconstruct origin translation velocity before integrating position. In other words, position update uses
+
+$$
+v_{\mathrm{origin}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com,world}},
+$$
+
+while the stored velocity after integration remains CoM-based.
+- FK writeback then restores the public maximal-coordinate contract: `body_qd` stores CoM velocity again.
+
+There is one additional convention detail for contacts. `articulation_origin` is currently the root-body CoM world position, not the articulation frame origin. Dense articulated contact rows are still assembled against the articulated generalized coordinates in the usual way, but the free-rigid matrix-free rows use contact offsets relative to that root CoM world point. This is why the current code can keep the internal articulated math unchanged while still building free-rigid Jacobian rows in the expected CoM-centered form.
+
+This matches the direction of upstream PR 2206, which keeps Featherstone internal math unchanged and makes the CoM convention explicit at the public boundary.
+
+The bug fixed on this branch was exactly at that boundary. The integration step was previously treating CoM-referenced linear velocity as though it were origin velocity when updating root translation. Under aggressive actions that error could accumulate into NaN divergence. The current fix has two parts:
+
+- the boundary conversion kernels use `articulation_root_com_offset` rather than `articulation_origin`;
+- FREE and DISTANCE integration reconstruct origin translation velocity before advancing position.
 
 ## Original Dense-Delassus View
 
@@ -163,7 +197,7 @@ The second form avoids storing and streaming the full $C$ tensor. It still uses 
 
 ### Specialized matrix-free handling for free rigid bodies
 
-For contacts whose two sides are free rigid bodies or ground, FeatherPGS goes further. It builds spatial Jacobian rows directly against the free body state using [`build_mf_contact_rows`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py), computes per-body $H^{-1}$ from the spatial inertia blocks with [`compute_mf_body_Hinv`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py), and forms only per-row effective masses and bias terms with [`compute_mf_effective_mass_and_rhs`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py).
+For contacts whose two sides are free rigid bodies or ground, FeatherPGS goes further. It builds spatial Jacobian rows directly against the free body state using [`build_mf_contact_rows`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py), computes per-body $H^{-1}$ from the spatial inertia blocks with [`compute_mf_body_Hinv`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py), and forms only per-row effective masses and bias terms with [`compute_mf_effective_mass_and_rhs`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py). In that free-rigid branch the row offsets are taken relative to the root-body CoM world point stored in `articulation_origin`, not a separate articulation-frame origin.
 
 This avoids both:
 
