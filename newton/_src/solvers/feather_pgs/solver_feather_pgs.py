@@ -36,9 +36,9 @@ from ..semi_implicit.kernels_particle import (
 from ..solver import SolverBase
 from .kernels import (
     TILE_THREADS,
+    add_dense_contact_compliance_to_diag,
     allocate_joint_limit_slots,
     allocate_world_contact_slots,
-    add_dense_contact_compliance_to_diag,
     apply_augmented_joint_tau,
     apply_augmented_mass_diagonal_grouped,
     apply_impulses_world_par_dof,
@@ -87,6 +87,7 @@ from .kernels import (
     scatter_qdd_from_groups,
     trisolve_loop,
     update_articulation_origins,
+    update_articulation_root_com_offsets,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
     vector_add_inplace,
@@ -264,7 +265,6 @@ class SolverFeatherPGS(SolverBase):
         self._nvtx = nvtx
         self.pgs_debug = pgs_debug
         self._pgs_convergence_log: list[np.ndarray] = []
-
         valid_cholesky = {"tiled", "loop", "auto"}
         if cholesky_kernel not in valid_cholesky:
             raise ValueError(f"cholesky_kernel must be one of {sorted(valid_cholesky)}")
@@ -660,9 +660,13 @@ class SolverFeatherPGS(SolverBase):
 
         if not model.articulation_count or not model.joint_count:
             self.articulation_origin = None
+            self.articulation_root_com_offset = None
             return
 
         self.articulation_origin = wp.zeros(
+            (model.articulation_count,), dtype=wp.vec3, device=model.device, requires_grad=model.requires_grad
+        )
+        self.articulation_root_com_offset = wp.zeros(
             (model.articulation_count,), dtype=wp.vec3, device=model.device, requires_grad=model.requires_grad
         )
 
@@ -787,12 +791,8 @@ class SolverFeatherPGS(SolverBase):
         # Joint limit buffers (per-DOF tracking)
         if self.enable_joint_limits and model.joint_dof_count > 0:
             dof_count = model.joint_dof_count
-            self.limit_slot = wp.full(
-                (dof_count,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
-            )
-            self.limit_sign = wp.zeros(
-                (dof_count,), dtype=wp.float32, device=device, requires_grad=requires_grad
-            )
+            self.limit_slot = wp.full((dof_count,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
+            self.limit_sign = wp.zeros((dof_count,), dtype=wp.float32, device=device, requires_grad=requires_grad)
         else:
             self.limit_slot = None
             self.limit_sign = None
@@ -1067,7 +1067,6 @@ class SolverFeatherPGS(SolverBase):
                 self._stage1_drives(state_in, state_aug, control, dt)
 
             self._stage1_crba(state_aug)
-
         # ══════════════════════════════════════════════════════════════
         # STAGE 2: Cholesky
         # ══════════════════════════════════════════════════════════════
@@ -1081,7 +1080,6 @@ class SolverFeatherPGS(SolverBase):
                         self._stage2_cholesky_tiled(size)
                     else:
                         self._stage2_cholesky_loop(size)
-
         # ══════════════════════════════════════════════════════════════
         # STAGE 3: Triangular solve + v_hat
         # ══════════════════════════════════════════════════════════════
@@ -1096,7 +1094,6 @@ class SolverFeatherPGS(SolverBase):
                         self._stage3_trisolve_tiled(size, state_aug)
                     else:
                         self._stage3_trisolve_loop(size, state_aug)
-
             self._stage3_compute_v_hat(state_in, state_aug, dt)
 
         # Wait for pipelined collide (if running on separate stream)
@@ -1381,7 +1378,6 @@ class SolverFeatherPGS(SolverBase):
                         block_dim=32,
                         device=self.model.device,
                     )
-
         elif self.pgs_mode == "split" and self._has_mixed_contacts:
             # Split mode with mixed contacts: interleaved dense and MF, 1 iteration each
             self._mf_pgs_setup(state_aug, dt)
@@ -1464,7 +1460,6 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
             self._stage6_update_qdd(state_in, state_aug, dt)
-
             self._stage6_integrate(state_in, state_aug, state_out, dt)
 
         # Double-buffer: fork memset stream to zero current buffer for reuse.
@@ -1687,7 +1682,18 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.articulation_origin],
             device=model.device,
         )
-
+        wp.launch(
+            update_articulation_root_com_offsets,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                model.joint_child,
+                state_in.body_q,
+                model.body_com,
+            ],
+            outputs=[self.articulation_root_com_offset],
+            device=model.device,
+        )
         # evaluate joint inertias, motion vectors, and forces
         state_aug.body_f_s.zero_()
         wp.copy(self.qd_work, state_in.joint_qd)
@@ -1698,7 +1704,7 @@ class SolverFeatherPGS(SolverBase):
                 inputs=[
                     self.articulation_root_is_free,
                     self.articulation_root_dof_start,
-                    self.articulation_origin,
+                    self.articulation_root_com_offset,
                 ],
                 outputs=[self.qd_work],
                 device=model.device,
@@ -1733,7 +1739,6 @@ class SolverFeatherPGS(SolverBase):
             ],
             device=model.device,
         )
-
         if model.body_count:
             wp.launch(
                 update_body_qd_from_featherstone,
@@ -2011,7 +2016,6 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.tau_by_size[size]],
             device=model.device,
         )
-
         solve_kernel = TiledKernelFactory.get_triangular_solve_kernel(size, model.device)
         wp.launch_tiled(
             solve_kernel,
@@ -2024,7 +2028,6 @@ class SolverFeatherPGS(SolverBase):
             block_dim=TILE_THREADS,
             device=model.device,
         )
-
         wp.launch(
             scatter_qdd_from_groups,
             dim=n_arts,
@@ -2847,7 +2850,7 @@ class SolverFeatherPGS(SolverBase):
                 inputs=[
                     self.articulation_root_is_free,
                     self.articulation_root_dof_start,
-                    self.articulation_origin,
+                    self.articulation_root_com_offset,
                 ],
                 outputs=[self.v_out],
                 device=model.device,
@@ -2869,9 +2872,11 @@ class SolverFeatherPGS(SolverBase):
                 dim=model.joint_count,
                 inputs=[
                     model.joint_type,
+                    model.joint_child,
                     model.joint_q_start,
                     model.joint_qd_start,
                     model.joint_dof_dim,
+                    model.body_com,
                     state_in.joint_q,
                     state_in.joint_qd,
                     state_aug.joint_qdd,

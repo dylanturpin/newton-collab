@@ -132,7 +132,7 @@ def update_articulation_root_com_offsets(
 def convert_root_free_qd_world_to_local(
     articulation_root_is_free: wp.array(dtype=int),
     articulation_root_dof_start: wp.array(dtype=int),
-    articulation_origin: wp.array(dtype=wp.vec3),
+    articulation_root_com_offset: wp.array(dtype=wp.vec3),
     # in/out
     qd: wp.array(dtype=float),
 ):
@@ -141,13 +141,13 @@ def convert_root_free_qd_world_to_local(
         return
 
     ds = articulation_root_dof_start[art]
-    v_public = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
+    v_com = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
     w = wp.vec3(qd[ds + 3], qd[ds + 4], qd[ds + 5])
-    root_com_world = articulation_origin[art]
+    com_offset = articulation_root_com_offset[art]
 
-    # Public FREE-joint qd stores the spatial linear term referenced at the world origin.
-    # Convert it to the internal COM-point linear term used by FeatherPGS.
-    v_local = v_public + wp.cross(w, root_com_world)
+    # Shift linear velocity from the public CoM convention to the internal
+    # root-body-origin linear term used by FeatherPGS integration/ID state.
+    v_local = v_com - wp.cross(w, com_offset)
 
     qd[ds + 0] = v_local[0]
     qd[ds + 1] = v_local[1]
@@ -158,7 +158,7 @@ def convert_root_free_qd_world_to_local(
 def convert_root_free_qd_local_to_world(
     articulation_root_is_free: wp.array(dtype=int),
     articulation_root_dof_start: wp.array(dtype=int),
-    articulation_origin: wp.array(dtype=wp.vec3),
+    articulation_root_com_offset: wp.array(dtype=wp.vec3),
     # in/out
     qd: wp.array(dtype=float),
 ):
@@ -169,15 +169,14 @@ def convert_root_free_qd_local_to_world(
     ds = articulation_root_dof_start[art]
     v_local = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
     w = wp.vec3(qd[ds + 3], qd[ds + 4], qd[ds + 5])
-    root_com_world = articulation_origin[art]
+    com_offset = articulation_root_com_offset[art]
 
-    # Convert the internal COM-point linear term back to the public world-origin
-    # spatial linear term stored in FREE-joint qd.
-    v_public = v_local - wp.cross(w, root_com_world)
+    # Convert the internal root-body-origin linear term back to the public CoM convention.
+    v_com = v_local + wp.cross(w, com_offset)
 
-    qd[ds + 0] = v_public[0]
-    qd[ds + 1] = v_public[1]
-    qd[ds + 2] = v_public[2]
+    qd[ds + 0] = v_com[0]
+    qd[ds + 1] = v_com[1]
+    qd[ds + 2] = v_com[2]
 
 
 @wp.func
@@ -509,6 +508,8 @@ def jcalc_tau(
 @wp.func
 def jcalc_integrate(
     type: int,
+    child: int,
+    body_com: wp.array(dtype=wp.vec3),
     joint_q: wp.array(dtype=float),
     joint_qd: wp.array(dtype=float),
     joint_qdd: wp.array(dtype=float),
@@ -572,19 +573,20 @@ def jcalc_integrate(
         a_s = wp.vec3(joint_qdd[dof_start + 0], joint_qdd[dof_start + 1], joint_qdd[dof_start + 2])
         m_s = wp.vec3(joint_qdd[dof_start + 3], joint_qdd[dof_start + 4], joint_qdd[dof_start + 5])
 
-        v_s = wp.vec3(joint_qd[dof_start + 0], joint_qd[dof_start + 1], joint_qd[dof_start + 2])
+        v_com = wp.vec3(joint_qd[dof_start + 0], joint_qd[dof_start + 1], joint_qd[dof_start + 2])
         w_s = wp.vec3(joint_qd[dof_start + 3], joint_qd[dof_start + 4], joint_qd[dof_start + 5])
 
         # symplectic Euler
         w_s = w_s + m_s * dt
-        v_s = v_s + a_s * dt
+        v_com = v_com + a_s * dt
 
         p_s = wp.vec3(joint_q[coord_start + 0], joint_q[coord_start + 1], joint_q[coord_start + 2])
 
-        dpdt_s = v_s + wp.cross(w_s, p_s)
         r_s = wp.quat(
             joint_q[coord_start + 3], joint_q[coord_start + 4], joint_q[coord_start + 5], joint_q[coord_start + 6]
         )
+        com_offset_world = wp.quat_rotate(r_s, body_com[child])
+        dpdt_s = v_com - wp.cross(w_s, com_offset_world)
 
         drdt_s = wp.quat(w_s, 0.0) * r_s * 0.5
 
@@ -602,9 +604,9 @@ def jcalc_integrate(
         joint_q_new[coord_start + 5] = r_s_new[2]
         joint_q_new[coord_start + 6] = r_s_new[3]
 
-        joint_qd_new[dof_start + 0] = v_s[0]
-        joint_qd_new[dof_start + 1] = v_s[1]
-        joint_qd_new[dof_start + 2] = v_s[2]
+        joint_qd_new[dof_start + 0] = v_com[0]
+        joint_qd_new[dof_start + 1] = v_com[1]
+        joint_qd_new[dof_start + 2] = v_com[2]
         joint_qd_new[dof_start + 3] = w_s[0]
         joint_qd_new[dof_start + 4] = w_s[1]
         joint_qd_new[dof_start + 5] = w_s[2]
@@ -988,8 +990,8 @@ def eval_rigid_tau(
             tau,
         )
 
-        # update parent forces, todo: check that this is valid for the backwards pass
         if parent >= 0:
+            # update parent forces, todo: check that this is valid for the backwards pass
             wp.atomic_add(body_ft_s, parent, f_s)
 
 
@@ -1177,9 +1179,11 @@ def dense_solve(
 @wp.kernel
 def integrate_generalized_joints(
     joint_type: wp.array(dtype=int),
+    joint_child: wp.array(dtype=int),
     joint_q_start: wp.array(dtype=int),
     joint_qd_start: wp.array(dtype=int),
     joint_dof_dim: wp.array(dtype=int, ndim=2),
+    body_com: wp.array(dtype=wp.vec3),
     joint_q: wp.array(dtype=float),
     joint_qd: wp.array(dtype=float),
     joint_qdd: wp.array(dtype=float),
@@ -1192,6 +1196,7 @@ def integrate_generalized_joints(
     index = wp.tid()
 
     type = joint_type[index]
+    child = joint_child[index]
     coord_start = joint_q_start[index]
     dof_start = joint_qd_start[index]
     lin_axis_count = joint_dof_dim[index, 0]
@@ -1199,6 +1204,8 @@ def integrate_generalized_joints(
 
     jcalc_integrate(
         type,
+        child,
+        body_com,
         joint_q,
         joint_qd,
         joint_qdd,
