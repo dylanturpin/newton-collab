@@ -50,6 +50,14 @@
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>window.MathJax = {"tex": {"inlineMath": [["$", "$"], ["\\(", "\\)"]], "processEscapes": true, "packages": {"[+]": ["amsmath", "amssymb", "amsfonts"]}, "displayMath": [["$$", "$$"], ["\\[", "\\]"]], "processEnvironments": true, "tags": "ams", "macros": {"RR": "{\\mathbb{R}}", "bold": ["{\\mathbf{#1}}", 1], "vec": ["{\\mathbf{#1}}", 1]}}, "options": {"ignoreHtmlClass": "annotation", "processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
     <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script type="module" src="https://cdn.jsdelivr.net/npm/mermaid@11.2.0/dist/mermaid.esm.min.mjs"></script>
+    <script type="module" src="https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0.1.4/dist/mermaid-layout-elk.esm.min.mjs"></script>
+    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.2.0/dist/mermaid.esm.min.mjs";import elkLayouts from "https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0.1.4/dist/mermaid-layout-elk.esm.min.mjs";mermaid.registerLayoutLoaders(elkLayouts);mermaid.initialize({startOnLoad:false});</script>
+    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+    <script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.2.0/dist/mermaid.esm.min.mjs";
+window.addEventListener("load", () => mermaid.run());
+</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'concepts/feather_pgs';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
@@ -823,6 +831,10 @@
 <section class="tex2jax_ignore mathjax_ignore" id="featherpgs">
 <h1>FeatherPGS<a class="headerlink" href="#featherpgs" title="Link to this heading">#</a></h1>
 <p>This note records the current FeatherPGS formulation as implemented in Newton. It is intentionally close in scope and tone to the earlier two-page writeup in <code class="docutils literal notranslate"><span class="pre">featherpgs.pdf</span></code>, but it reflects the solver as it exists today rather than the original dense-only framing.</p>
+<div class="admonition important">
+<p class="admonition-title">Important</p>
+<p>For skimming: FeatherPGS used to admit a clean “this is a Delassus solve” description. That is no longer quite true. We now have three closely related paths: <code class="docutils literal notranslate"><span class="pre">dense</span></code>, <code class="docutils literal notranslate"><span class="pre">split</span></code>, and <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code>. <code class="docutils literal notranslate"><span class="pre">dense</span></code> is still the old explicit Delassus story. <code class="docutils literal notranslate"><span class="pre">split</span></code> is “Delassus for articulated rows, matrix-free for free rigid contacts.” <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> is not a different articulation model; it is still the same reduced-coordinate machinery, but with the solve written more directly as repeated velocity-space updates rather than as sweeps over a fully assembled dense <code class="docutils literal notranslate"><span class="pre">J</span> <span class="pre">\tilde{H}^{-1}</span> <span class="pre">J^T</span></code>. The implementation is faster this way, but the conceptual packaging is less tidy than it used to be. The clean long-term direction is probably to present this as one Featherstone solver with pluggable constraint handling, rather than as a collection of solver names that sound more different than they really are.</p>
+</div>
 <p>The short version is:</p>
 <ul class="simple">
 <li><p>the original derivation is still the right starting point for the articulated part of the solver;</p></li>
@@ -830,6 +842,16 @@
 <li><p>the main performance shift has been from “assemble <span class="math notranslate nohighlight">\(C = J \tilde{H}^{-1} J^T\)</span> and iterate in impulse space for everything” toward “keep the reduced-coordinate articulation machinery, but avoid materializing the dense contact operator when that cost dominates.”</p></li>
 </ul>
 <p>The implementation lives primarily in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py"><code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/solver_feather_pgs.py</span></code></a> and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/kernels.py</span></code></a>. Benchmark-facing mode names are defined in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/tools/solver_benchmark.py"><code class="docutils literal notranslate"><span class="pre">newton/tools/solver_benchmark.py</span></code></a> and exercised in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/benchmarks/nightly/nightly.yaml"><code class="docutils literal notranslate"><span class="pre">benchmarks/nightly/nightly.yaml</span></code></a>.</p>
+<p>Quick code anchors for this page:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L1018"><code class="docutils literal notranslate"><span class="pre">step()</span></code></a> is the top-level solver step and mode dispatch.</p></li>
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2074"><code class="docutils literal notranslate"><span class="pre">_stage4_build_rows()</span></code></a> builds the contact and joint-limit row sets.</p></li>
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2391"><code class="docutils literal notranslate"><span class="pre">_stage4_hinv_jt_tiled()</span></code></a> and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2470"><code class="docutils literal notranslate"><span class="pre">_stage4_delassus_tiled()</span></code></a> are the dense Delassus path.</p></li>
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2584"><code class="docutils literal notranslate"><span class="pre">_dispatch_dense_pgs_solve()</span></code></a>, <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2709"><code class="docutils literal notranslate"><span class="pre">_mf_pgs_setup()</span></code></a>, and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2755"><code class="docutils literal notranslate"><span class="pre">_mf_pgs_solve()</span></code></a> are the main dense and matrix-free solve entry points.</p></li>
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L1932"><code class="docutils literal notranslate"><span class="pre">allocate_world_contact_slots()</span></code></a>, <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L2769"><code class="docutils literal notranslate"><span class="pre">diag_from_JY_par_art()</span></code></a>, and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L2846"><code class="docutils literal notranslate"><span class="pre">build_mf_contact_rows()</span></code></a> are the key row-routing and matrix-free kernels.</p></li>
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L3112"><code class="docutils literal notranslate"><span class="pre">compute_mf_body_Hinv()</span></code></a>, <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L3135"><code class="docutils literal notranslate"><span class="pre">compute_mf_effective_mass_and_rhs()</span></code></a>, and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L3234"><code class="docutils literal notranslate"><span class="pre">pgs_solve_mf_loop()</span></code></a> are the specialized free-rigid path.</p></li>
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/tools/solver_benchmark.py#L118"><code class="docutils literal notranslate"><span class="pre">newton/tools/solver_benchmark.py</span></code></a> and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/benchmarks/nightly/nightly.yaml#L269"><code class="docutils literal notranslate"><span class="pre">benchmarks/nightly/nightly.yaml</span></code></a> expose the current benchmark-facing mode names and nightly ablations.</p></li>
+</ul>
 <section id="motivation-and-background">
 <h2>Motivation and Background<a class="headerlink" href="#motivation-and-background" title="Link to this heading">#</a></h2>
 <p>FeatherPGS is Newton’s reduced-coordinate rigid-body contact solver built around Featherstone-style articulated dynamics, a semi-implicit step, and a projected Gauss-Seidel (PGS) contact solve. The original writeup emphasized a practical Schur-complement method:</p>
@@ -894,7 +916,20 @@ C = J \tilde{H}^{-1} J^T.
 <section id="current-solver-architecture">
 <h2>Current Solver Architecture<a class="headerlink" href="#current-solver-architecture" title="Link to this heading">#</a></h2>
 <p>The current implementation is best understood as a shared articulation pipeline followed by one of several contact-system realizations.</p>
-<section id="shared-articulation-pipeline">
+<pre  class="mermaid">
+        flowchart TD
+    A[Shared stages 1-3&lt;br/&gt;articulation dynamics, factorization, v_hat] --&gt; B[Stage 4 row build]
+    B --&gt; C{Contact structure and pgs_mode}
+    C --&gt; D[dense&lt;br/&gt;assemble J H^-1 J^T for all rows]
+    C --&gt; E[split&lt;br/&gt;articulated rows dense&lt;br/&gt;free rigid rows matrix-free]
+    C --&gt; F[matrix_free&lt;br/&gt;articulated rows from J/Y/diag&lt;br/&gt;free rigid rows matrix-free]
+    D --&gt; G[Dense PGS sweep]
+    E --&gt; H[Interleaved dense plus free-rigid MF sweep]
+    F --&gt; I[Velocity-path articulated PGS plus free-rigid MF sweep]
+    G --&gt; J[Apply impulses and integrate]
+    H --&gt; J
+    I --&gt; J
+    </pre><section id="shared-articulation-pipeline">
 <h3>Shared articulation pipeline<a class="headerlink" href="#shared-articulation-pipeline" title="Link to this heading">#</a></h3>
 <p>The front half of the solver is common across modes:</p>
 <ul class="simple">
@@ -1099,17 +1134,6 @@ C = J \tilde{H}^{-1} J^T.
 <li><p>kernel realization (<code class="docutils literal notranslate"><span class="pre">loop</span></code>, <code class="docutils literal notranslate"><span class="pre">tiled_row</span></code>, <code class="docutils literal notranslate"><span class="pre">streaming</span></code>, parallel streams, double buffer).</p></li>
 </ul>
 </section>
-<section id="pointers-for-future-revision">
-<h2>Pointers for Future Revision<a class="headerlink" href="#pointers-for-future-revision" title="Link to this heading">#</a></h2>
-<p>The draft is intentionally prose-first, but the page is structured so that a later revision can link directly to code and performance artifacts. The most obvious additions are:</p>
-<ul class="simple">
-<li><p>permalinks or Sphinx-managed source links for the stage methods in <code class="docutils literal notranslate"><span class="pre">solver_feather_pgs.py</span></code>;</p></li>
-<li><p>a compact figure showing the stage-4 / stage-5 branch between dense, split, and matrix-free paths;</p></li>
-<li><p>one or two benchmark plots from <code class="docutils literal notranslate"><span class="pre">benchmarks/nightly/</span></code> showing where <code class="docutils literal notranslate"><span class="pre">split</span></code> and <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> overtake the dense variants;</p></li>
-<li><p>a short appendix on the free-rigid <span class="math notranslate nohighlight">\(6 \times 6\)</span> effective-mass path.</p></li>
-</ul>
-<p>If this page becomes part of longer public-facing documentation, it should remain a technical note. The older PDF was useful precisely because it stayed close to the implementation and did not try to oversell the method. The current solver is more complicated, but the same style still fits it best.</p>
-</section>
 </section>
 
 
@@ -1169,7 +1193,6 @@ C = J \tilde{H}^{-1} J^T.
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations-and-open-questions">Limitations and Open Questions</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pointers-for-future-revision">Pointers for Future Revision</a></li>
 </ul>
   </nav></div>
 

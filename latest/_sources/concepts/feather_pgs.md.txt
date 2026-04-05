@@ -5,6 +5,10 @@
 
 This note records the current FeatherPGS formulation as implemented in Newton. It is intentionally close in scope and tone to the earlier two-page writeup in `featherpgs.pdf`, but it reflects the solver as it exists today rather than the original dense-only framing.
 
+```{important}
+For skimming: FeatherPGS used to admit a clean "this is a Delassus solve" description. That is no longer quite true. We now have three closely related paths: `dense`, `split`, and `matrix_free`. `dense` is still the old explicit Delassus story. `split` is "Delassus for articulated rows, matrix-free for free rigid contacts." `matrix_free` is not a different articulation model; it is still the same reduced-coordinate machinery, but with the solve written more directly as repeated velocity-space updates rather than as sweeps over a fully assembled dense `J \tilde{H}^{-1} J^T`. The implementation is faster this way, but the conceptual packaging is less tidy than it used to be. The clean long-term direction is probably to present this as one Featherstone solver with pluggable constraint handling, rather than as a collection of solver names that sound more different than they really are.
+```
+
 The short version is:
 
 - the original derivation is still the right starting point for the articulated part of the solver;
@@ -12,6 +16,16 @@ The short version is:
 - the main performance shift has been from "assemble $C = J \tilde{H}^{-1} J^T$ and iterate in impulse space for everything" toward "keep the reduced-coordinate articulation machinery, but avoid materializing the dense contact operator when that cost dominates."
 
 The implementation lives primarily in [`newton/_src/solvers/feather_pgs/solver_feather_pgs.py`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py) and [`newton/_src/solvers/feather_pgs/kernels.py`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py). Benchmark-facing mode names are defined in [`newton/tools/solver_benchmark.py`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/tools/solver_benchmark.py) and exercised in [`benchmarks/nightly/nightly.yaml`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/benchmarks/nightly/nightly.yaml).
+
+Quick code anchors for this page:
+
+- [`step()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L1018) is the top-level solver step and mode dispatch.
+- [`_stage4_build_rows()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2074) builds the contact and joint-limit row sets.
+- [`_stage4_hinv_jt_tiled()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2391) and [`_stage4_delassus_tiled()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2470) are the dense Delassus path.
+- [`_dispatch_dense_pgs_solve()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2584), [`_mf_pgs_setup()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2709), and [`_mf_pgs_solve()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2755) are the main dense and matrix-free solve entry points.
+- [`allocate_world_contact_slots()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L1932), [`diag_from_JY_par_art()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L2769), and [`build_mf_contact_rows()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L2846) are the key row-routing and matrix-free kernels.
+- [`compute_mf_body_Hinv()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L3112), [`compute_mf_effective_mass_and_rhs()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L3135), and [`pgs_solve_mf_loop()`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L3234) are the specialized free-rigid path.
+- [`newton/tools/solver_benchmark.py`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/tools/solver_benchmark.py#L118) and [`benchmarks/nightly/nightly.yaml`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/benchmarks/nightly/nightly.yaml#L269) expose the current benchmark-facing mode names and nightly ablations.
 
 ## Motivation and Background
 
@@ -82,6 +96,21 @@ This is still the simplest formulation to reason about mathematically, and it re
 ## Current Solver Architecture
 
 The current implementation is best understood as a shared articulation pipeline followed by one of several contact-system realizations.
+
+```{mermaid}
+flowchart TD
+    A[Shared stages 1-3<br/>articulation dynamics, factorization, v_hat] --> B[Stage 4 row build]
+    B --> C{Contact structure and pgs_mode}
+    C --> D[dense<br/>assemble J H^-1 J^T for all rows]
+    C --> E[split<br/>articulated rows dense<br/>free rigid rows matrix-free]
+    C --> F[matrix_free<br/>articulated rows from J/Y/diag<br/>free rigid rows matrix-free]
+    D --> G[Dense PGS sweep]
+    E --> H[Interleaved dense plus free-rigid MF sweep]
+    F --> I[Velocity-path articulated PGS plus free-rigid MF sweep]
+    G --> J[Apply impulses and integrate]
+    H --> J
+    I --> J
+```
 
 ### Shared articulation pipeline
 
@@ -287,14 +316,3 @@ Fourth, the benchmark-facing names combine algorithmic and kernel-scheduling dif
 
 - mathematical mode (`dense`, `split`, `matrix_free`), and
 - kernel realization (`loop`, `tiled_row`, `streaming`, parallel streams, double buffer).
-
-## Pointers for Future Revision
-
-The draft is intentionally prose-first, but the page is structured so that a later revision can link directly to code and performance artifacts. The most obvious additions are:
-
-- permalinks or Sphinx-managed source links for the stage methods in `solver_feather_pgs.py`;
-- a compact figure showing the stage-4 / stage-5 branch between dense, split, and matrix-free paths;
-- one or two benchmark plots from `benchmarks/nightly/` showing where `split` and `matrix_free` overtake the dense variants;
-- a short appendix on the free-rigid $6 \times 6$ effective-mass path.
-
-If this page becomes part of longer public-facing documentation, it should remain a technical note. The older PDF was useful precisely because it stayed close to the implementation and did not try to oversell the method. The current solver is more complicated, but the same style still fits it best.
