@@ -1321,20 +1321,6 @@ C = J \tilde{H}^{-1} J^T.
 <li><p><code class="docutils literal notranslate"><span class="pre">_dispatch_dense_pgs_solve(...)</span></code> runs the chosen dense PGS kernel;</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">_stage6_apply_impulses_world(...)</span></code> applies the resulting correction back to generalized velocity.</p></li>
 </ul>
-<section id="why-the-dense-and-matrix-free-paths-compute-the-same-thing">
-<h3>Why the dense and matrix-free paths compute the same thing<a class="headerlink" href="#why-the-dense-and-matrix-free-paths-compute-the-same-thing" title="Link to this heading">#</a></h3>
-<p>In dense PGS, row <span class="math notranslate nohighlight">\(i\)</span> reads its constraint velocity from the preassembled Delassus matrix:</p>
-<div class="math notranslate nohighlight">
-\[
-w_i = r_i + \sum_j C_{ij}\, p_j.
-\]</div>
-<p>In the matrix-free path, row <span class="math notranslate nohighlight">\(i\)</span> evaluates <span class="math notranslate nohighlight">\(J_i\, v\)</span> against the live velocity vector instead. But the velocity at any point in the sweep is <span class="math notranslate nohighlight">\(v = \hat{v} + \sum_j Y_j\, p_j\)</span>, so</p>
-<div class="math notranslate nohighlight">
-\[
-J_i\, v \;=\; J_i\, \hat{v} \;+\; \sum_j \underbrace{J_i\, Y_j}_{C_{ij}}\, p_j,
-\]</div>
-<p>which is the same sum. Every off-diagonal coupling term <span class="math notranslate nohighlight">\(C_{ij}\)</span> — contact <span class="math notranslate nohighlight">\(j\)</span>’s impulse rippling through the articulation to affect contact <span class="math notranslate nohighlight">\(i\)</span> — is still there. The matrix-free path just reconstructs it on the fly through <span class="math notranslate nohighlight">\(J \times v\)</span> rather than reading it from a stored matrix. The only thing computed explicitly is the diagonal <span class="math notranslate nohighlight">\(C_{ii}\)</span> (the per-row effective mass), needed for the Gauss-Seidel projection step.</p>
-</section>
 </section>
 <section id="the-matrix-free-path">
 <h2>The Matrix-Free Path<a class="headerlink" href="#the-matrix-free-path" title="Link to this heading">#</a></h2>
@@ -1354,6 +1340,20 @@ J_i\, v \;=\; J_i\, \hat{v} \;+\; \sum_j \underbrace{J_i\, Y_j}_{C_{ij}}\, p_j,
 \text{current matrix-free direction: } w_i = \text{bias}_i + J_i v.
 \]</div>
 <p>The second form avoids storing and streaming the full <span class="math notranslate nohighlight">\(C\)</span> tensor. It still uses the same articulated dynamics factorization and the same reduced-coordinate Jacobians.</p>
+<section id="equivalence-with-the-dense-path">
+<h3>Equivalence with the dense path<a class="headerlink" href="#equivalence-with-the-dense-path" title="Link to this heading">#</a></h3>
+<p>In dense PGS, row <span class="math notranslate nohighlight">\(i\)</span> reads its constraint velocity from the preassembled Delassus matrix:</p>
+<div class="math notranslate nohighlight">
+\[
+w_i = r_i + \sum_j C_{ij}\, p_j.
+\]</div>
+<p>In the matrix-free path, row <span class="math notranslate nohighlight">\(i\)</span> evaluates <span class="math notranslate nohighlight">\(J_i\, v\)</span> against the live velocity vector instead. But the velocity at any point in the sweep is <span class="math notranslate nohighlight">\(v = \hat{v} + \sum_j Y_j\, p_j\)</span>, so</p>
+<div class="math notranslate nohighlight">
+\[
+J_i\, v \;=\; J_i\, \hat{v} \;+\; \sum_j \underbrace{J_i\, Y_j}_{C_{ij}}\, p_j,
+\]</div>
+<p>which is the same sum. Every off-diagonal coupling term <span class="math notranslate nohighlight">\(C_{ij}\)</span> is still there. The matrix-free path just reconstructs it on the fly through <span class="math notranslate nohighlight">\(J \times v\)</span> rather than reading it from a stored matrix. The only thing computed explicitly is the diagonal <span class="math notranslate nohighlight">\(C_{ii}\)</span> (the per-row effective mass), needed for the Gauss-Seidel projection step.</p>
+</section>
 <section id="specialized-matrix-free-handling-for-free-rigid-bodies">
 <h3>Specialized matrix-free handling for free rigid bodies<a class="headerlink" href="#specialized-matrix-free-handling-for-free-rigid-bodies" title="Link to this heading">#</a></h3>
 <p>For contacts whose two sides are free rigid bodies or ground, the solver builds spatial Jacobian rows directly against the free body state using <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">build_mf_contact_rows</span></code></a>, computes per-body <span class="math notranslate nohighlight">\(H^{-1}\)</span> from the spatial inertia blocks with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_body_Hinv</span></code></a>, and forms only per-row effective masses and bias terms with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_effective_mass_and_rhs</span></code></a>. In that free-rigid branch the row offsets are taken relative to the root-body CoM world point stored in <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code>, not a separate articulation-frame origin.</p>
@@ -1542,11 +1542,9 @@ v_{\mathrm{origin}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com,world}},
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#motivation-and-background">Motivation and Background</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#problem-setup-and-notation">Problem Setup and Notation</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-delassus-view">Dense-Delassus View</a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#why-the-dense-and-matrix-free-paths-compute-the-same-thing">Why the dense and matrix-free paths compute the same thing</a></li>
-</ul>
-</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-delassus-view">Dense-Delassus View</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-matrix-free-path">The Matrix-Free Path</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#equivalence-with-the-dense-path">Equivalence with the dense path</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#specialized-matrix-free-handling-for-free-rigid-bodies">Specialized matrix-free handling for free rigid bodies</a></li>
 </ul>
 </li>
