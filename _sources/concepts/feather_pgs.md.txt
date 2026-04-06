@@ -68,11 +68,6 @@ There is one additional convention detail for contacts. `articulation_origin` is
 
 This matches the direction of upstream PR 2206, which keeps Featherstone internal math unchanged and makes the CoM convention explicit at the public boundary.
 
-The bug fixed on this branch was exactly at that boundary. The integration step was previously treating CoM-referenced linear velocity as though it were origin velocity when updating root translation. Under aggressive actions that error could accumulate into NaN divergence. The current fix has two parts:
-
-- the boundary conversion kernels use `articulation_root_com_offset` rather than `articulation_origin`;
-- FREE and DISTANCE integration reconstruct origin translation velocity before advancing position.
-
 ## Dense-Delassus View
 
 The dense path is a straightforward Schur-complement solver:
@@ -100,7 +95,38 @@ The dense branch in `step()` follows this structure:
 - `_dispatch_dense_pgs_solve(...)` runs the chosen dense PGS kernel;
 - `_stage6_apply_impulses_world(...)` applies the resulting correction back to generalized velocity.
 
-This is the simplest formulation to reason about mathematically, and it is most useful when the per-world contact count is modest enough that explicit dense storage and sweep kernels are not the dominant cost.
+## The Matrix-Free Path
+
+In the current code, `pgs_mode="matrix_free"` does **not** mean "no Jacobians are stored" and it does **not** mean "the solver works only in body-space without articulation information." Instead it means:
+
+- compute $Y = \tilde{H}^{-1} J^T$ as before;
+- compute only the diagonal of $JY$ with `diag_from_JY_par_art`;
+- gather `J` and `Y` into world-indexed buffers (`J_world`, `Y_world`);
+- keep `rhs` as a bias term rather than baking in $J \hat{v}$ once;
+- during PGS, recompute the current $Jv$ from the live velocity vector each iteration instead of consulting a preassembled dense matrix.
+
+So the shift is from an explicit Delassus matrix to an explicit velocity path:
+
+$$
+\text{dense: } w_i = r_i + \sum_j C_{ij} p_j,
+\qquad
+\text{current matrix-free direction: } w_i = \text{bias}_i + J_i v.
+$$
+
+The second form avoids storing and streaming the full $C$ tensor. It still uses the same articulated dynamics factorization and the same reduced-coordinate Jacobians, but the per-iteration working set is smaller and better aligned with the actual dependency structure of the solve.
+
+### Specialized matrix-free handling for free rigid bodies
+
+For contacts whose two sides are free rigid bodies or ground, the solver builds spatial Jacobian rows directly against the free body state using [`build_mf_contact_rows`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py), computes per-body $H^{-1}$ from the spatial inertia blocks with [`compute_mf_body_Hinv`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py), and forms only per-row effective masses and bias terms with [`compute_mf_effective_mass_and_rhs`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py). In that free-rigid branch the row offsets are taken relative to the root-body CoM world point stored in `articulation_origin`, not a separate articulation-frame origin.
+
+This avoids both:
+
+- dense world-level Delassus assembly, and
+- articulated gather/scatter through a larger joint-space contact operator
+
+for the subset of contacts that do not need it.
+
+The resulting free-rigid solve uses live velocity updates inside the PGS sweep (`pgs_solve_mf_loop` in the simple path, or the fused two-phase tiled kernel in the main `matrix_free` path).
 
 ## Current Solver Architecture
 
@@ -143,39 +169,6 @@ The row builder classifies contacts before they enter the solve. The key classif
 The current heuristic is structural rather than adaptive: if both sides of a contact are free rigid bodies or ground, the contact can be routed to the cheaper matrix-free path. Contacts involving nontrivial articulations stay on the dense articulated path. This is why the code talks about "free rigid bodies" separately from general articulations: a single free root body admits a much cheaper $6 \times 6$ effective-mass treatment than an arbitrary articulated subtree.
 
 Joint limits are also handled as unilateral rows when enabled, but they are still built into the dense articulated row set rather than the free-rigid matrix-free path.
-
-## The Matrix-Free Path
-
-In the current code, `pgs_mode="matrix_free"` does **not** mean "no Jacobians are stored" and it does **not** mean "the solver works only in body-space without articulation information." Instead it means:
-
-- compute $Y = \tilde{H}^{-1} J^T$ as before;
-- compute only the diagonal of $JY$ with `diag_from_JY_par_art`;
-- gather `J` and `Y` into world-indexed buffers (`J_world`, `Y_world`);
-- keep `rhs` as a bias term rather than baking in $J \hat{v}$ once;
-- during PGS, recompute the current $Jv$ from the live velocity vector each iteration instead of consulting a preassembled dense matrix.
-
-So the shift is from an explicit Delassus matrix to an explicit velocity path:
-
-$$
-\text{dense: } w_i = r_i + \sum_j C_{ij} p_j,
-\qquad
-\text{current matrix-free direction: } w_i = \text{bias}_i + J_i v.
-$$
-
-The second form avoids storing and streaming the full $C$ tensor. It still uses the same articulated dynamics factorization and the same reduced-coordinate Jacobians, but the per-iteration working set is smaller and better aligned with the actual dependency structure of the solve.
-
-### Specialized matrix-free handling for free rigid bodies
-
-For contacts whose two sides are free rigid bodies or ground, the solver builds spatial Jacobian rows directly against the free body state using [`build_mf_contact_rows`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py), computes per-body $H^{-1}$ from the spatial inertia blocks with [`compute_mf_body_Hinv`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py), and forms only per-row effective masses and bias terms with [`compute_mf_effective_mass_and_rhs`](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py). In that free-rigid branch the row offsets are taken relative to the root-body CoM world point stored in `articulation_origin`, not a separate articulation-frame origin.
-
-This avoids both:
-
-- dense world-level Delassus assembly, and
-- articulated gather/scatter through a larger joint-space contact operator
-
-for the subset of contacts that do not need it.
-
-The resulting free-rigid solve uses live velocity updates inside the PGS sweep (`pgs_solve_mf_loop` in the simple path, or the fused two-phase tiled kernel in the main `matrix_free` path).
 
 ### Mixed worlds and the current compromise
 

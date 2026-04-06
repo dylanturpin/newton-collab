@@ -1325,11 +1325,6 @@ v_{\mathrm{origin}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com,world}},
 </ul>
 <p>There is one additional convention detail for contacts. <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code> is currently the root-body CoM world position, not the articulation frame origin. Dense articulated contact rows are still assembled against the articulated generalized coordinates in the usual way, but the free-rigid matrix-free rows use contact offsets relative to that root CoM world point. This is why the current code can keep the internal articulated math unchanged while still building free-rigid Jacobian rows in the expected CoM-centered form.</p>
 <p>This matches the direction of upstream PR 2206, which keeps Featherstone internal math unchanged and makes the CoM convention explicit at the public boundary.</p>
-<p>The bug fixed on this branch was exactly at that boundary. The integration step was previously treating CoM-referenced linear velocity as though it were origin velocity when updating root translation. Under aggressive actions that error could accumulate into NaN divergence. The current fix has two parts:</p>
-<ul class="simple">
-<li><p>the boundary conversion kernels use <code class="docutils literal notranslate"><span class="pre">articulation_root_com_offset</span></code> rather than <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code>;</p></li>
-<li><p>FREE and DISTANCE integration reconstruct origin translation velocity before advancing position.</p></li>
-</ul>
 </section>
 <section id="dense-delassus-view">
 <h2>Dense-Delassus View<a class="headerlink" href="#dense-delassus-view" title="Link to this heading">#</a></h2>
@@ -1357,7 +1352,36 @@ C = J \tilde{H}^{-1} J^T.
 <li><p><code class="docutils literal notranslate"><span class="pre">_dispatch_dense_pgs_solve(...)</span></code> runs the chosen dense PGS kernel;</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">_stage6_apply_impulses_world(...)</span></code> applies the resulting correction back to generalized velocity.</p></li>
 </ul>
-<p>This is the simplest formulation to reason about mathematically, and it is most useful when the per-world contact count is modest enough that explicit dense storage and sweep kernels are not the dominant cost.</p>
+</section>
+<section id="the-matrix-free-path">
+<h2>The Matrix-Free Path<a class="headerlink" href="#the-matrix-free-path" title="Link to this heading">#</a></h2>
+<p>In the current code, <code class="docutils literal notranslate"><span class="pre">pgs_mode=&quot;matrix_free&quot;</span></code> does <strong>not</strong> mean “no Jacobians are stored” and it does <strong>not</strong> mean “the solver works only in body-space without articulation information.” Instead it means:</p>
+<ul class="simple">
+<li><p>compute <span class="math notranslate nohighlight">\(Y = \tilde{H}^{-1} J^T\)</span> as before;</p></li>
+<li><p>compute only the diagonal of <span class="math notranslate nohighlight">\(JY\)</span> with <code class="docutils literal notranslate"><span class="pre">diag_from_JY_par_art</span></code>;</p></li>
+<li><p>gather <code class="docutils literal notranslate"><span class="pre">J</span></code> and <code class="docutils literal notranslate"><span class="pre">Y</span></code> into world-indexed buffers (<code class="docutils literal notranslate"><span class="pre">J_world</span></code>, <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>);</p></li>
+<li><p>keep <code class="docutils literal notranslate"><span class="pre">rhs</span></code> as a bias term rather than baking in <span class="math notranslate nohighlight">\(J \hat{v}\)</span> once;</p></li>
+<li><p>during PGS, recompute the current <span class="math notranslate nohighlight">\(Jv\)</span> from the live velocity vector each iteration instead of consulting a preassembled dense matrix.</p></li>
+</ul>
+<p>So the shift is from an explicit Delassus matrix to an explicit velocity path:</p>
+<div class="math notranslate nohighlight">
+\[
+\text{dense: } w_i = r_i + \sum_j C_{ij} p_j,
+\qquad
+\text{current matrix-free direction: } w_i = \text{bias}_i + J_i v.
+\]</div>
+<p>The second form avoids storing and streaming the full <span class="math notranslate nohighlight">\(C\)</span> tensor. It still uses the same articulated dynamics factorization and the same reduced-coordinate Jacobians, but the per-iteration working set is smaller and better aligned with the actual dependency structure of the solve.</p>
+<section id="specialized-matrix-free-handling-for-free-rigid-bodies">
+<h3>Specialized matrix-free handling for free rigid bodies<a class="headerlink" href="#specialized-matrix-free-handling-for-free-rigid-bodies" title="Link to this heading">#</a></h3>
+<p>For contacts whose two sides are free rigid bodies or ground, the solver builds spatial Jacobian rows directly against the free body state using <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">build_mf_contact_rows</span></code></a>, computes per-body <span class="math notranslate nohighlight">\(H^{-1}\)</span> from the spatial inertia blocks with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_body_Hinv</span></code></a>, and forms only per-row effective masses and bias terms with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_effective_mass_and_rhs</span></code></a>. In that free-rigid branch the row offsets are taken relative to the root-body CoM world point stored in <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code>, not a separate articulation-frame origin.</p>
+<p>This avoids both:</p>
+<ul class="simple">
+<li><p>dense world-level Delassus assembly, and</p></li>
+<li><p>articulated gather/scatter through a larger joint-space contact operator</p></li>
+</ul>
+<p>for the subset of contacts that do not need it.</p>
+<p>The resulting free-rigid solve uses live velocity updates inside the PGS sweep (<code class="docutils literal notranslate"><span class="pre">pgs_solve_mf_loop</span></code> in the simple path, or the fused two-phase tiled kernel in the main <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> path).</p>
+</section>
 </section>
 <section id="current-solver-architecture">
 <h2>Current Solver Architecture<a class="headerlink" href="#current-solver-architecture" title="Link to this heading">#</a></h2>
@@ -1396,36 +1420,6 @@ C = J \tilde{H}^{-1} J^T.
 </ul>
 <p>The current heuristic is structural rather than adaptive: if both sides of a contact are free rigid bodies or ground, the contact can be routed to the cheaper matrix-free path. Contacts involving nontrivial articulations stay on the dense articulated path. This is why the code talks about “free rigid bodies” separately from general articulations: a single free root body admits a much cheaper <span class="math notranslate nohighlight">\(6 \times 6\)</span> effective-mass treatment than an arbitrary articulated subtree.</p>
 <p>Joint limits are also handled as unilateral rows when enabled, but they are still built into the dense articulated row set rather than the free-rigid matrix-free path.</p>
-</section>
-</section>
-<section id="the-matrix-free-path">
-<h2>The Matrix-Free Path<a class="headerlink" href="#the-matrix-free-path" title="Link to this heading">#</a></h2>
-<p>In the current code, <code class="docutils literal notranslate"><span class="pre">pgs_mode=&quot;matrix_free&quot;</span></code> does <strong>not</strong> mean “no Jacobians are stored” and it does <strong>not</strong> mean “the solver works only in body-space without articulation information.” Instead it means:</p>
-<ul class="simple">
-<li><p>compute <span class="math notranslate nohighlight">\(Y = \tilde{H}^{-1} J^T\)</span> as before;</p></li>
-<li><p>compute only the diagonal of <span class="math notranslate nohighlight">\(JY\)</span> with <code class="docutils literal notranslate"><span class="pre">diag_from_JY_par_art</span></code>;</p></li>
-<li><p>gather <code class="docutils literal notranslate"><span class="pre">J</span></code> and <code class="docutils literal notranslate"><span class="pre">Y</span></code> into world-indexed buffers (<code class="docutils literal notranslate"><span class="pre">J_world</span></code>, <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>);</p></li>
-<li><p>keep <code class="docutils literal notranslate"><span class="pre">rhs</span></code> as a bias term rather than baking in <span class="math notranslate nohighlight">\(J \hat{v}\)</span> once;</p></li>
-<li><p>during PGS, recompute the current <span class="math notranslate nohighlight">\(Jv\)</span> from the live velocity vector each iteration instead of consulting a preassembled dense matrix.</p></li>
-</ul>
-<p>So the shift is from an explicit Delassus matrix to an explicit velocity path:</p>
-<div class="math notranslate nohighlight">
-\[
-\text{dense: } w_i = r_i + \sum_j C_{ij} p_j,
-\qquad
-\text{current matrix-free direction: } w_i = \text{bias}_i + J_i v.
-\]</div>
-<p>The second form avoids storing and streaming the full <span class="math notranslate nohighlight">\(C\)</span> tensor. It still uses the same articulated dynamics factorization and the same reduced-coordinate Jacobians, but the per-iteration working set is smaller and better aligned with the actual dependency structure of the solve.</p>
-<section id="specialized-matrix-free-handling-for-free-rigid-bodies">
-<h3>Specialized matrix-free handling for free rigid bodies<a class="headerlink" href="#specialized-matrix-free-handling-for-free-rigid-bodies" title="Link to this heading">#</a></h3>
-<p>For contacts whose two sides are free rigid bodies or ground, the solver builds spatial Jacobian rows directly against the free body state using <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">build_mf_contact_rows</span></code></a>, computes per-body <span class="math notranslate nohighlight">\(H^{-1}\)</span> from the spatial inertia blocks with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_body_Hinv</span></code></a>, and forms only per-row effective masses and bias terms with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_effective_mass_and_rhs</span></code></a>. In that free-rigid branch the row offsets are taken relative to the root-body CoM world point stored in <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code>, not a separate articulation-frame origin.</p>
-<p>This avoids both:</p>
-<ul class="simple">
-<li><p>dense world-level Delassus assembly, and</p></li>
-<li><p>articulated gather/scatter through a larger joint-space contact operator</p></li>
-</ul>
-<p>for the subset of contacts that do not need it.</p>
-<p>The resulting free-rigid solve uses live velocity updates inside the PGS sweep (<code class="docutils literal notranslate"><span class="pre">pgs_solve_mf_loop</span></code> in the simple path, or the fused two-phase tiled kernel in the main <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> path).</p>
 </section>
 <section id="mixed-worlds-and-the-current-compromise">
 <h3>Mixed worlds and the current compromise<a class="headerlink" href="#mixed-worlds-and-the-current-compromise" title="Link to this heading">#</a></h3>
@@ -1540,13 +1534,13 @@ C = J \tilde{H}^{-1} J^T.
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#problem-setup-and-notation">Problem Setup and Notation</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#frame-conventions-in-featherpgs">Frame Conventions in FeatherPGS</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-delassus-view">Dense-Delassus View</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-matrix-free-path">The Matrix-Free Path</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#specialized-matrix-free-handling-for-free-rigid-bodies">Specialized matrix-free handling for free rigid bodies</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#current-solver-architecture">Current Solver Architecture</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#shared-articulation-pipeline">Shared articulation pipeline</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#contact-row-construction-and-path-split">Contact-row construction and path split</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-matrix-free-path">The Matrix-Free Path</a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#specialized-matrix-free-handling-for-free-rigid-bodies">Specialized matrix-free handling for free rigid bodies</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mixed-worlds-and-the-current-compromise">Mixed worlds and the current compromise</a></li>
 </ul>
 </li>
