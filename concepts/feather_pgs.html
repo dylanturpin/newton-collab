@@ -1263,10 +1263,6 @@ window.runMermaid = runMermaid;</script>
 <!-- SPDX-License-Identifier: CC-BY-4.0 -->
 <section class="tex2jax_ignore mathjax_ignore" id="featherpgs">
 <h1>FeatherPGS<a class="headerlink" href="#featherpgs" title="Link to this heading">#</a></h1>
-<div class="admonition important">
-<p class="admonition-title">Important</p>
-<p>For skimming: FeatherPGS used to admit a clean “this is a Delassus solve” description. That is no longer quite true. We now have three closely related paths: <code class="docutils literal notranslate"><span class="pre">dense</span></code>, <code class="docutils literal notranslate"><span class="pre">split</span></code>, and <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code>. <code class="docutils literal notranslate"><span class="pre">dense</span></code> is still the old explicit Delassus story. <code class="docutils literal notranslate"><span class="pre">split</span></code> is “Delassus for articulated rows, matrix-free for free rigid contacts.” <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> is not a different articulation model; it is still the same reduced-coordinate machinery, but with the solve written more directly as repeated velocity-space updates rather than as sweeps over a fully assembled dense <code class="docutils literal notranslate"><span class="pre">J</span> <span class="pre">\tilde{H}^{-1}</span> <span class="pre">J^T</span></code>. The implementation is faster this way, but the conceptual packaging is less tidy than it used to be. The clean long-term direction is probably to present this as one Featherstone solver with pluggable constraint handling, rather than as a collection of solver names that sound more different than they really are.</p>
-</div>
 <section id="motivation-and-background">
 <h2>Motivation and Background<a class="headerlink" href="#motivation-and-background" title="Link to this heading">#</a></h2>
 <p>FeatherPGS is Newton’s reduced-coordinate rigid-body contact solver built around Featherstone-style articulated dynamics, a semi-implicit step, and a projected Gauss-Seidel (PGS) contact solve. The core formulation uses a Schur-complement approach:</p>
@@ -1299,33 +1295,6 @@ C = J \tilde{H}^{-1} J^T,
 \]</div>
 <p>This matches the dense path. In the <code class="docutils literal notranslate"><span class="pre">split</span></code> and <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> paths, the same objects are present, but the solver avoids forming the full dense matrix <span class="math notranslate nohighlight">\(C\)</span>.</p>
 </section>
-<section id="frame-conventions-in-featherpgs">
-<h2>Frame Conventions in FeatherPGS<a class="headerlink" href="#frame-conventions-in-featherpgs" title="Link to this heading">#</a></h2>
-<p>FeatherPGS currently uses a mixed velocity convention, and it is worth stating that explicitly because it is easy to misread the code otherwise.</p>
-<ul class="simple">
-<li><p>At the public API boundary, free-root <code class="docutils literal notranslate"><span class="pre">joint_qd</span></code> follows the CoM convention: the linear term is the root body’s center-of-mass velocity.</p></li>
-<li><p>Inside the articulated solve, stages 1 through 6 use the root-body-origin linear term instead. On entry, FeatherPGS converts</p></li>
-</ul>
-<div class="math notranslate nohighlight">
-\[
-v_{\mathrm{local}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com}},
-\]</div>
-<p>where <span class="math notranslate nohighlight">\(r_{\mathrm{com}}\)</span> is the root-body COM offset in world orientation. In the current code this is the <code class="docutils literal notranslate"><span class="pre">convert_root_free_qd_world_to_local()</span></code> / <code class="docutils literal notranslate"><span class="pre">convert_root_free_qd_local_to_world()</span></code> pair, using <code class="docutils literal notranslate"><span class="pre">articulation_root_com_offset</span></code> rather than <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code>.</p>
-<ul class="simple">
-<li><p>The internal Featherstone algebra is otherwise unchanged: inverse dynamics, CRBA, Cholesky, triangular solve, and the articulated PGS paths all run on that internal root-origin linear term.</p></li>
-<li><p>At stage 7, integration uses the public CoM-based <code class="docutils literal notranslate"><span class="pre">joint_qd</span></code> and <code class="docutils literal notranslate"><span class="pre">joint_qdd</span></code>, but FREE and DISTANCE joints reconstruct origin translation velocity before integrating position. In other words, position update uses</p></li>
-</ul>
-<div class="math notranslate nohighlight">
-\[
-v_{\mathrm{origin}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com,world}},
-\]</div>
-<p>while the stored velocity after integration remains CoM-based.</p>
-<ul class="simple">
-<li><p>FK writeback then restores the public maximal-coordinate contract: <code class="docutils literal notranslate"><span class="pre">body_qd</span></code> stores CoM velocity again.</p></li>
-</ul>
-<p>There is one additional convention detail for contacts. <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code> is currently the root-body CoM world position, not the articulation frame origin. Dense articulated contact rows are still assembled against the articulated generalized coordinates in the usual way, but the free-rigid matrix-free rows use contact offsets relative to that root CoM world point. This is why the current code can keep the internal articulated math unchanged while still building free-rigid Jacobian rows in the expected CoM-centered form.</p>
-<p>This matches the direction of upstream PR 2206, which keeps Featherstone internal math unchanged and makes the CoM convention explicit at the public boundary.</p>
-</section>
 <section id="dense-delassus-view">
 <h2>Dense-Delassus View<a class="headerlink" href="#dense-delassus-view" title="Link to this heading">#</a></h2>
 <p>The dense path is a straightforward Schur-complement solver:</p>
@@ -1352,6 +1321,20 @@ C = J \tilde{H}^{-1} J^T.
 <li><p><code class="docutils literal notranslate"><span class="pre">_dispatch_dense_pgs_solve(...)</span></code> runs the chosen dense PGS kernel;</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">_stage6_apply_impulses_world(...)</span></code> applies the resulting correction back to generalized velocity.</p></li>
 </ul>
+<section id="why-the-dense-and-matrix-free-paths-compute-the-same-thing">
+<h3>Why the dense and matrix-free paths compute the same thing<a class="headerlink" href="#why-the-dense-and-matrix-free-paths-compute-the-same-thing" title="Link to this heading">#</a></h3>
+<p>In dense PGS, row <span class="math notranslate nohighlight">\(i\)</span> reads its constraint velocity from the preassembled Delassus matrix:</p>
+<div class="math notranslate nohighlight">
+\[
+w_i = r_i + \sum_j C_{ij}\, p_j.
+\]</div>
+<p>In the matrix-free path, row <span class="math notranslate nohighlight">\(i\)</span> evaluates <span class="math notranslate nohighlight">\(J_i\, v\)</span> against the live velocity vector instead. But the velocity at any point in the sweep is <span class="math notranslate nohighlight">\(v = \hat{v} + \sum_j Y_j\, p_j\)</span>, so</p>
+<div class="math notranslate nohighlight">
+\[
+J_i\, v \;=\; J_i\, \hat{v} \;+\; \sum_j \underbrace{J_i\, Y_j}_{C_{ij}}\, p_j,
+\]</div>
+<p>which is the same sum. Every off-diagonal coupling term <span class="math notranslate nohighlight">\(C_{ij}\)</span> — contact <span class="math notranslate nohighlight">\(j\)</span>’s impulse rippling through the articulation to affect contact <span class="math notranslate nohighlight">\(i\)</span> — is still there. The matrix-free path just reconstructs it on the fly through <span class="math notranslate nohighlight">\(J \times v\)</span> rather than reading it from a stored matrix. The only thing computed explicitly is the diagonal <span class="math notranslate nohighlight">\(C_{ii}\)</span> (the per-row effective mass), needed for the Gauss-Seidel projection step.</p>
+</section>
 </section>
 <section id="the-matrix-free-path">
 <h2>The Matrix-Free Path<a class="headerlink" href="#the-matrix-free-path" title="Link to this heading">#</a></h2>
@@ -1370,7 +1353,7 @@ C = J \tilde{H}^{-1} J^T.
 \qquad
 \text{current matrix-free direction: } w_i = \text{bias}_i + J_i v.
 \]</div>
-<p>The second form avoids storing and streaming the full <span class="math notranslate nohighlight">\(C\)</span> tensor. It still uses the same articulated dynamics factorization and the same reduced-coordinate Jacobians, but the per-iteration working set is smaller and better aligned with the actual dependency structure of the solve.</p>
+<p>The second form avoids storing and streaming the full <span class="math notranslate nohighlight">\(C\)</span> tensor. It still uses the same articulated dynamics factorization and the same reduced-coordinate Jacobians.</p>
 <section id="specialized-matrix-free-handling-for-free-rigid-bodies">
 <h3>Specialized matrix-free handling for free rigid bodies<a class="headerlink" href="#specialized-matrix-free-handling-for-free-rigid-bodies" title="Link to this heading">#</a></h3>
 <p>For contacts whose two sides are free rigid bodies or ground, the solver builds spatial Jacobian rows directly against the free body state using <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">build_mf_contact_rows</span></code></a>, computes per-body <span class="math notranslate nohighlight">\(H^{-1}\)</span> from the spatial inertia blocks with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_body_Hinv</span></code></a>, and forms only per-row effective masses and bias terms with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_effective_mass_and_rhs</span></code></a>. In that free-rigid branch the row offsets are taken relative to the root-body CoM world point stored in <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code>, not a separate articulation-frame origin.</p>
@@ -1505,6 +1488,33 @@ C = J \tilde{H}^{-1} J^T.
 <p>Joint limits remain optional and row-based. When <code class="docutils literal notranslate"><span class="pre">enable_joint_limits=True</span></code>, violated limits allocate unilateral rows and enter the dense articulated solve with their own Jacobian and bias terms. They are not part of the free-rigid matrix-free specialization.</p>
 </section>
 </section>
+<section id="frame-conventions-in-featherpgs">
+<h2>Frame Conventions in FeatherPGS<a class="headerlink" href="#frame-conventions-in-featherpgs" title="Link to this heading">#</a></h2>
+<p>FeatherPGS currently uses a mixed velocity convention, and it is worth stating that explicitly because it is easy to misread the code otherwise.</p>
+<ul class="simple">
+<li><p>At the public API boundary, free-root <code class="docutils literal notranslate"><span class="pre">joint_qd</span></code> follows the CoM convention: the linear term is the root body’s center-of-mass velocity.</p></li>
+<li><p>Inside the articulated solve, stages 1 through 6 use the root-body-origin linear term instead. On entry, FeatherPGS converts</p></li>
+</ul>
+<div class="math notranslate nohighlight">
+\[
+v_{\mathrm{local}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com}},
+\]</div>
+<p>where <span class="math notranslate nohighlight">\(r_{\mathrm{com}}\)</span> is the root-body COM offset in world orientation. In the current code this is the <code class="docutils literal notranslate"><span class="pre">convert_root_free_qd_world_to_local()</span></code> / <code class="docutils literal notranslate"><span class="pre">convert_root_free_qd_local_to_world()</span></code> pair, using <code class="docutils literal notranslate"><span class="pre">articulation_root_com_offset</span></code> rather than <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code>.</p>
+<ul class="simple">
+<li><p>The internal Featherstone algebra is otherwise unchanged: inverse dynamics, CRBA, Cholesky, triangular solve, and the articulated PGS paths all run on that internal root-origin linear term.</p></li>
+<li><p>At stage 7, integration uses the public CoM-based <code class="docutils literal notranslate"><span class="pre">joint_qd</span></code> and <code class="docutils literal notranslate"><span class="pre">joint_qdd</span></code>, but FREE and DISTANCE joints reconstruct origin translation velocity before integrating position. In other words, position update uses</p></li>
+</ul>
+<div class="math notranslate nohighlight">
+\[
+v_{\mathrm{origin}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com,world}},
+\]</div>
+<p>while the stored velocity after integration remains CoM-based.</p>
+<ul class="simple">
+<li><p>FK writeback then restores the public maximal-coordinate contract: <code class="docutils literal notranslate"><span class="pre">body_qd</span></code> stores CoM velocity again.</p></li>
+</ul>
+<p>There is one additional convention detail for contacts. <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code> is currently the root-body CoM world position, not the articulation frame origin. Dense articulated contact rows are still assembled against the articulated generalized coordinates in the usual way, but the free-rigid matrix-free rows use contact offsets relative to that root CoM world point. This is why the current code can keep the internal articulated math unchanged while still building free-rigid Jacobian rows in the expected CoM-centered form.</p>
+<p>This matches the direction of upstream PR 2206, which keeps Featherstone internal math unchanged and makes the CoM convention explicit at the public boundary.</p>
+</section>
 </section>
 
 
@@ -1532,8 +1542,10 @@ C = J \tilde{H}^{-1} J^T.
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#motivation-and-background">Motivation and Background</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#problem-setup-and-notation">Problem Setup and Notation</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#frame-conventions-in-featherpgs">Frame Conventions in FeatherPGS</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-delassus-view">Dense-Delassus View</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-delassus-view">Dense-Delassus View</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#why-the-dense-and-matrix-free-paths-compute-the-same-thing">Why the dense and matrix-free paths compute the same thing</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-matrix-free-path">The Matrix-Free Path</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#specialized-matrix-free-handling-for-free-rigid-bodies">Specialized matrix-free handling for free rigid bodies</a></li>
 </ul>
@@ -1557,6 +1569,7 @@ C = J \tilde{H}^{-1} J^T.
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#joint-limits-as-on-demand-unilateral-rows">Joint limits as on-demand unilateral rows</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#frame-conventions-in-featherpgs">Frame Conventions in FeatherPGS</a></li>
 </ul>
   </nav></div>
 
