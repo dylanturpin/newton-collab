@@ -3,10 +3,6 @@
 
 # FeatherPGS
 
-```{important}
-For skimming: FeatherPGS used to admit a clean "this is a Delassus solve" description. That is no longer quite true. We now have three closely related paths: `dense`, `split`, and `matrix_free`. `dense` is still the old explicit Delassus story. `split` is "Delassus for articulated rows, matrix-free for free rigid contacts." `matrix_free` is not a different articulation model; it is still the same reduced-coordinate machinery, but with the solve written more directly as repeated velocity-space updates rather than as sweeps over a fully assembled dense `J \tilde{H}^{-1} J^T`. The implementation is faster this way, but the conceptual packaging is less tidy than it used to be. The clean long-term direction is probably to present this as one Featherstone solver with pluggable constraint handling, rather than as a collection of solver names that sound more different than they really are.
-```
-
 ## Motivation and Background
 
 FeatherPGS is Newton's reduced-coordinate rigid-body contact solver built around Featherstone-style articulated dynamics, a semi-implicit step, and a projected Gauss-Seidel (PGS) contact solve. The core formulation uses a Schur-complement approach:
@@ -42,32 +38,6 @@ $$
 
 This matches the dense path. In the `split` and `matrix_free` paths, the same objects are present, but the solver avoids forming the full dense matrix $C$.
 
-## Frame Conventions in FeatherPGS
-
-FeatherPGS currently uses a mixed velocity convention, and it is worth stating that explicitly because it is easy to misread the code otherwise.
-
-- At the public API boundary, free-root `joint_qd` follows the CoM convention: the linear term is the root body's center-of-mass velocity.
-- Inside the articulated solve, stages 1 through 6 use the root-body-origin linear term instead. On entry, FeatherPGS converts
-
-$$
-v_{\mathrm{local}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com}},
-$$
-
-where $r_{\mathrm{com}}$ is the root-body COM offset in world orientation. In the current code this is the `convert_root_free_qd_world_to_local()` / `convert_root_free_qd_local_to_world()` pair, using `articulation_root_com_offset` rather than `articulation_origin`.
-- The internal Featherstone algebra is otherwise unchanged: inverse dynamics, CRBA, Cholesky, triangular solve, and the articulated PGS paths all run on that internal root-origin linear term.
-- At stage 7, integration uses the public CoM-based `joint_qd` and `joint_qdd`, but FREE and DISTANCE joints reconstruct origin translation velocity before integrating position. In other words, position update uses
-
-$$
-v_{\mathrm{origin}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com,world}},
-$$
-
-while the stored velocity after integration remains CoM-based.
-- FK writeback then restores the public maximal-coordinate contract: `body_qd` stores CoM velocity again.
-
-There is one additional convention detail for contacts. `articulation_origin` is currently the root-body CoM world position, not the articulation frame origin. Dense articulated contact rows are still assembled against the articulated generalized coordinates in the usual way, but the free-rigid matrix-free rows use contact offsets relative to that root CoM world point. This is why the current code can keep the internal articulated math unchanged while still building free-rigid Jacobian rows in the expected CoM-centered form.
-
-This matches the direction of upstream PR 2206, which keeps Featherstone internal math unchanged and makes the CoM convention explicit at the public boundary.
-
 ## Dense-Delassus View
 
 The dense path is a straightforward Schur-complement solver:
@@ -95,6 +65,22 @@ The dense branch in `step()` follows this structure:
 - `_dispatch_dense_pgs_solve(...)` runs the chosen dense PGS kernel;
 - `_stage6_apply_impulses_world(...)` applies the resulting correction back to generalized velocity.
 
+### Why the dense and matrix-free paths compute the same thing
+
+In dense PGS, row $i$ reads its constraint velocity from the preassembled Delassus matrix:
+
+$$
+w_i = r_i + \sum_j C_{ij}\, p_j.
+$$
+
+In the matrix-free path, row $i$ evaluates $J_i\, v$ against the live velocity vector instead. But the velocity at any point in the sweep is $v = \hat{v} + \sum_j Y_j\, p_j$, so
+
+$$
+J_i\, v \;=\; J_i\, \hat{v} \;+\; \sum_j \underbrace{J_i\, Y_j}_{C_{ij}}\, p_j,
+$$
+
+which is the same sum. Every off-diagonal coupling term $C_{ij}$ — contact $j$'s impulse rippling through the articulation to affect contact $i$ — is still there. The matrix-free path just reconstructs it on the fly through $J \times v$ rather than reading it from a stored matrix. The only thing computed explicitly is the diagonal $C_{ii}$ (the per-row effective mass), needed for the Gauss-Seidel projection step.
+
 ## The Matrix-Free Path
 
 In the current code, `pgs_mode="matrix_free"` does **not** mean "no Jacobians are stored" and it does **not** mean "the solver works only in body-space without articulation information." Instead it means:
@@ -113,7 +99,7 @@ $$
 \text{current matrix-free direction: } w_i = \text{bias}_i + J_i v.
 $$
 
-The second form avoids storing and streaming the full $C$ tensor. It still uses the same articulated dynamics factorization and the same reduced-coordinate Jacobians, but the per-iteration working set is smaller and better aligned with the actual dependency structure of the solve.
+The second form avoids storing and streaming the full $C$ tensor. It still uses the same articulated dynamics factorization and the same reduced-coordinate Jacobians.
 
 ### Specialized matrix-free handling for free rigid bodies
 
@@ -243,3 +229,29 @@ FeatherPGS keeps joint PD in the reduced-coordinate operator rather than inflati
 ### Joint limits as on-demand unilateral rows
 
 Joint limits remain optional and row-based. When `enable_joint_limits=True`, violated limits allocate unilateral rows and enter the dense articulated solve with their own Jacobian and bias terms. They are not part of the free-rigid matrix-free specialization.
+
+## Frame Conventions in FeatherPGS
+
+FeatherPGS currently uses a mixed velocity convention, and it is worth stating that explicitly because it is easy to misread the code otherwise.
+
+- At the public API boundary, free-root `joint_qd` follows the CoM convention: the linear term is the root body's center-of-mass velocity.
+- Inside the articulated solve, stages 1 through 6 use the root-body-origin linear term instead. On entry, FeatherPGS converts
+
+$$
+v_{\mathrm{local}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com}},
+$$
+
+where $r_{\mathrm{com}}$ is the root-body COM offset in world orientation. In the current code this is the `convert_root_free_qd_world_to_local()` / `convert_root_free_qd_local_to_world()` pair, using `articulation_root_com_offset` rather than `articulation_origin`.
+- The internal Featherstone algebra is otherwise unchanged: inverse dynamics, CRBA, Cholesky, triangular solve, and the articulated PGS paths all run on that internal root-origin linear term.
+- At stage 7, integration uses the public CoM-based `joint_qd` and `joint_qdd`, but FREE and DISTANCE joints reconstruct origin translation velocity before integrating position. In other words, position update uses
+
+$$
+v_{\mathrm{origin}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com,world}},
+$$
+
+while the stored velocity after integration remains CoM-based.
+- FK writeback then restores the public maximal-coordinate contract: `body_qd` stores CoM velocity again.
+
+There is one additional convention detail for contacts. `articulation_origin` is currently the root-body CoM world position, not the articulation frame origin. Dense articulated contact rows are still assembled against the articulated generalized coordinates in the usual way, but the free-rigid matrix-free rows use contact offsets relative to that root CoM world point. This is why the current code can keep the internal articulated math unchanged while still building free-rigid Jacobian rows in the expected CoM-centered form.
+
+This matches the direction of upstream PR 2206, which keeps Featherstone internal math unchanged and makes the CoM convention explicit at the public boundary.
