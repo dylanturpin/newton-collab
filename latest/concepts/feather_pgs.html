@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
@@ -36,10 +36,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=b2b65678" />
   
   <!-- So that users can add custom icons -->
-  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=7f76b32a3354e82990f2"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2" />
 
     <script src="../_static/documentation_options.js?v=1c471e8e"></script>
     <script src="../_static/doctools.js?v=9bcbadda"></script>
@@ -50,22 +50,451 @@
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>window.MathJax = {"tex": {"inlineMath": [["$", "$"], ["\\(", "\\)"]], "processEscapes": true, "packages": {"[+]": ["amsmath", "amssymb", "amsfonts"]}, "displayMath": [["$$", "$$"], ["\\[", "\\]"]], "processEnvironments": true, "tags": "ams", "macros": {"RR": "{\\mathbb{R}}", "bold": ["{\\mathbf{#1}}", 1], "vec": ["{\\mathbf{#1}}", 1]}}, "options": {"ignoreHtmlClass": "annotation", "processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
     <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
-    <script type="module" src="https://cdn.jsdelivr.net/npm/mermaid@11.2.0/dist/mermaid.esm.min.mjs"></script>
-    <script type="module" src="https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0.1.4/dist/mermaid-layout-elk.esm.min.mjs"></script>
-    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.2.0/dist/mermaid.esm.min.mjs";import elkLayouts from "https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0.1.4/dist/mermaid-layout-elk.esm.min.mjs";mermaid.registerLayoutLoaders(elkLayouts);mermaid.initialize({startOnLoad:false});</script>
     <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
-    <script type="module">
-import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.2.0/dist/mermaid.esm.min.mjs";
-window.addEventListener("load", () => mermaid.run());
-</script>
+    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.esm.min.mjs";
+
+
+
+
+
+const initStyles = () => {
+    const defaultStyle = document.createElement('style');
+    defaultStyle.textContent = `pre.mermaid {
+    /* Same as .mermaid-container > pre */
+    display: block;
+    width: 100%;
+}
+
+pre.mermaid > svg {
+    /* Same as .mermaid-container > pre > svg */
+    height: 500px;
+    width: 100%;
+    max-width: 100% !important;
+}`;
+    document.head.appendChild(defaultStyle);
+
+    const fullscreenStyle = document.createElement('style');
+    fullscreenStyle.textContent = `.mermaid-container {
+    display: flex;
+    flex-direction: row;
+    width: 100%;
+}
+
+.mermaid-container > pre {
+    display: block;
+    width: 100%;
+}
+
+.mermaid-container > pre > svg {
+    height: 500px;
+    width: 100%;
+    max-width: 100% !important;
+}
+
+.mermaid-fullscreen-btn {
+    width: 28px;
+    height: 28px;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(0, 0, 0, 0.3);
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+    font-size: 14px;
+    line-height: 1;
+    padding: 0;
+    color: #333;
+}
+
+.mermaid-fullscreen-btn:hover {
+    opacity: 100% !important;
+    background: rgba(255, 255, 255, 1);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+    transform: scale(1.1);
+}
+
+.mermaid-fullscreen-btn.dark-theme {
+    background: rgba(50, 50, 50, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    color: #e0e0e0;
+}
+
+.mermaid-fullscreen-btn.dark-theme:hover {
+    background: rgba(60, 60, 60, 1);
+    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);
+}
+
+.mermaid-fullscreen-modal {
+    display: none;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 95vw;
+    height: 100vh;
+    background: rgba(255, 255, 255, 0.98);
+    z-index: 9999;
+    padding: 20px;
+    overflow: auto;
+}
+
+.mermaid-fullscreen-modal.dark-theme {
+    background: rgba(0, 0, 0, 0.98);
+}
+
+.mermaid-fullscreen-modal.active {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen {
+    position: relative;
+    width: 95vw;
+    height: 90vh;
+    max-width: 95vw;
+    max-height: 90vh;
+    background: white;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+    overflow: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen.dark-theme {
+    background: #1a1a1a;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+}
+
+.mermaid-container-fullscreen pre.mermaid {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen .mermaid svg {
+    height: 100% !important;
+    width: 100% !important;
+    cursor: grab;
+}
+
+.mermaid-fullscreen-close {
+    position: fixed !important;
+    top: 20px !important;
+    right: 20px !important;
+    width: 40px;
+    height: 40px;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(0, 0, 0, 0.2);
+    border-radius: 50%;
+    cursor: pointer;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    transition: all 0.2s;
+    font-size: 24px;
+    line-height: 1;
+    color: #333;
+}
+
+.mermaid-fullscreen-close:hover {
+    background: white;
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+    transform: scale(1.1);
+}
+
+.mermaid-fullscreen-close.dark-theme {
+    background: rgba(50, 50, 50, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #e0e0e0;
+}
+
+.mermaid-fullscreen-close.dark-theme:hover {
+    background: rgba(60, 60, 60, 1);
+    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);
+}
+
+.mermaid-fullscreen-modal .mermaid-fullscreen-btn {
+    display: none !important;
+}`;
+    document.head.appendChild(fullscreenStyle);
+}
+
+// Detect if page has dark background
+const isDarkTheme = () => {
+    // We use a set of heuristics:
+    // 1. Check for common dark mode classes or attributes
+    // 2. Check computed background color brightness
+    if (document.documentElement.classList.contains('dark') ||
+        document.documentElement.getAttribute('data-theme') === 'dark' ||
+        document.body.classList.contains('dark') ||
+        document.body.getAttribute('data-theme') === 'dark') {
+        // console.log("Dark theme detected via class/attribute");
+        return true;
+    }
+    if (document.documentElement.classList.contains('light') ||
+        document.documentElement.getAttribute('data-theme') === 'light' ||
+        document.body.classList.contains('light') ||
+        document.body.getAttribute('data-theme') === 'light') {
+        // console.log("Light theme detected via class/attribute");
+        return false;
+    }
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        // console.log("Dark theme detected via prefers-color-scheme");
+        return true;
+    }
+    const bgColor = window.getComputedStyle(document.body).backgroundColor;
+    const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
+    if (match) {
+        const r = parseInt(match[1]);
+        const g = parseInt(match[2]);
+        const b = parseInt(match[3]);
+        const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+        // console.log("Background color brightness:", brightness);
+        return brightness < 128;
+    }
+    // console.log("No dark or light theme detected, defaulting to light theme");
+    return false;
+};
+
+let darkTheme = isDarkTheme();
+let modal = null;
+let modalContent = null;
+let previousScrollOffset = [window.scrollX, window.scrollY];
+
+const runMermaid = async (rerun) => {
+    console.log("Running mermaid diagrams, rerun =", rerun);
+    // clear all existing mermaid charts
+    let all_mermaids = document.querySelectorAll(".mermaid");
+
+    if (rerun) {
+        all_mermaids.forEach((el) => {
+            if(!el.hasAttribute("data-original-code")) {
+                // store original code
+                // console.log(`Storing original code for first run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+            if(el.getAttribute("data-processed") === "true") {
+                // remove and restore original
+                el.removeAttribute("data-processed");
+                // console.log(`Restoring original code for re-run: `, el.getAttribute('data-original-code'));
+                el.innerHTML = el.getAttribute('data-original-code');
+            } else {
+                // store original code
+                // console.log(`Storing original code for re-run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+        });
+        await mermaid.run();
+    }
+
+    all_mermaids = document.querySelectorAll(".mermaid");
+    const mermaids_processed = document.querySelectorAll(".mermaid[data-processed='true']");
+
+    if ("False" === "True") {
+        const mermaids_to_add_zoom = -1 === -1 ? all_mermaids.length : -1;
+        if(mermaids_to_add_zoom > 0) {
+            var svgs = d3.selectAll("");
+            if(all_mermaids.length !== mermaids_processed.length) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            } else if(svgs.size() !== mermaids_to_add_zoom) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            } else {
+                svgs.each(function() {
+                    var svg = d3.select(this);
+                    svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+                    var inner = svg.select("g");
+                    var zoom = d3.zoom().on("zoom", function(event) {
+                        inner.attr("transform", event.transform);
+                    });
+                    svg.call(zoom);
+                });
+            }
+        }
+    } else if(all_mermaids.length !== mermaids_processed.length) {
+        // Wait for mermaid to process all diagrams
+        setTimeout(() => runMermaid(false), 200);
+        return;
+    }
+
+    // Stop here if not adding fullscreen capability
+    if ("True" !== "True") return;
+
+    if (modal !== null ) {
+        // Destroy existing modal
+        modal.remove();
+        modal = null;
+        modalContent = null;
+    }
+
+    modal = document.createElement('div');
+    modal.className = 'mermaid-fullscreen-modal' + (darkTheme ? ' dark-theme' : '');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', 'Fullscreen diagram viewer');
+    modal.innerHTML = `
+        <button class="mermaid-fullscreen-close${darkTheme ? ' dark-theme' : ''}" aria-label="Close fullscreen">✕</button>
+        <div class="mermaid-container-fullscreen${darkTheme ? ' dark-theme' : ''}"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modalContent = modal.querySelector('.mermaid-container-fullscreen');
+    const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
+
+    const closeModal = () => {
+        modal.classList.remove('active');
+        modalContent.innerHTML = '';
+        document.body.style.overflow = ''
+        window.scrollTo({left: previousScrollOffset[0], top: previousScrollOffset[1], behavior: 'instant'});
+    };
+
+    closeBtn.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && modal.classList.contains('active')) {
+            closeModal();
+        }
+    });
+
+    document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
+        if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
+            mermaidDiv.closest('.mermaid-fullscreen-modal')) {
+            // Already processed, adjust button class if needed
+            const existingBtn = mermaidDiv.parentNode.querySelector('.mermaid-fullscreen-btn');
+            if (existingBtn) {
+                existingBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+            }
+            return;
+        }
+
+        const container = document.createElement('div');
+        container.className = 'mermaid-container';
+        mermaidDiv.parentNode.insertBefore(container, mermaidDiv);
+        container.appendChild(mermaidDiv);
+
+        const fullscreenBtn = document.createElement('button');
+        fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+        fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
+        fullscreenBtn.textContent = '⛶';
+        fullscreenBtn.style.opacity = '50%';
+
+        // Calculate dynamic position based on diagram's margin and padding
+        const diagramStyle = window.getComputedStyle(mermaidDiv);
+        const marginTop = parseFloat(diagramStyle.marginTop) || 0;
+        const marginRight = parseFloat(diagramStyle.marginRight) || 0;
+        const paddingTop = parseFloat(diagramStyle.paddingTop) || 0;
+        const paddingRight = parseFloat(diagramStyle.paddingRight) || 0;
+        fullscreenBtn.style.top = `${marginTop + paddingTop + 4}px`;
+        fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
+
+        fullscreenBtn.addEventListener('click', () => {
+            previousScrollOffset = [window.scroll, window.scrollY];
+            const clone = mermaidDiv.cloneNode(true);
+            modalContent.innerHTML = '';
+            modalContent.appendChild(clone);
+
+            const svg = clone.querySelector('svg');
+            if (svg) {
+                svg.removeAttribute('width');
+                svg.removeAttribute('height');
+                svg.style.width = '100%';
+                svg.style.height = 'auto';
+                svg.style.maxWidth = '100%';
+                svg.style.sdisplay = 'block';
+
+                if ("False" === "True") {
+                    setTimeout(() => {
+                        const g = svg.querySelector('g');
+                        if (g) {
+                            var svgD3 = d3.select(svg);
+                            svgD3.html("<g class='wrapper'>" + svgD3.html() + "</g>");
+                            var inner = svgD3.select("g");
+                            var zoom = d3.zoom().on("zoom", function(event) {
+                                inner.attr("transform", event.transform);
+                            });
+                            svgD3.call(zoom);
+                        }
+                    }, 100);
+                }
+            }
+
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        });
+        container.appendChild(fullscreenBtn);
+    });
+};
+
+const load = async () => {
+    initStyles();
+
+    await runMermaid(true);
+
+    const reRunIfThemeChanges = async () => {
+        const newDarkTheme = isDarkTheme();
+        if (newDarkTheme !== darkTheme) {
+            darkTheme = newDarkTheme;
+            console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
+            await mermaid.initialize(
+                {...JSON.parse(
+                    `{"startOnLoad": false}`
+                ),
+                ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+                }
+            );
+            await runMermaid(true);
+        }
+    };
+
+    // Update theme classes when theme changes
+    const themeObserver = new MutationObserver(reRunIfThemeChanges);
+    themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+    themeObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+};
+
+
+
+
+
+console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
+mermaid.initialize(
+    {...JSON.parse(
+        `{"startOnLoad": false}`
+    ),
+    ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+    }
+);
+
+window.addEventListener("load", load);
+window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'concepts/feather_pgs';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_version = '0.17.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://dylanturpin.github.io/newton-collab/switcher.json';
         DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="newton" href="../api/newton.html" />
@@ -73,14 +502,18 @@ window.addEventListener("load", () => mermaid.run());
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
   </head>
-  
-  
-  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
-
+  <body data-default-mode="">
   
   
   <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
   
   <div id="pst-scroll-pixel-helper"></div>
   
@@ -112,7 +545,7 @@ window.addEventListener("load", () => mermaid.run());
 </div>
 
   
-    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
   <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
     <span class="fa-solid fa-bars"></span>
@@ -830,39 +1263,20 @@ window.addEventListener("load", () => mermaid.run());
 <!-- SPDX-License-Identifier: CC-BY-4.0 -->
 <section class="tex2jax_ignore mathjax_ignore" id="featherpgs">
 <h1>FeatherPGS<a class="headerlink" href="#featherpgs" title="Link to this heading">#</a></h1>
-<p>This note records the current FeatherPGS formulation as implemented in Newton. It is intentionally close in scope and tone to the earlier two-page writeup in <code class="docutils literal notranslate"><span class="pre">featherpgs.pdf</span></code>, but it reflects the solver as it exists today rather than the original dense-only framing.</p>
 <div class="admonition important">
 <p class="admonition-title">Important</p>
 <p>For skimming: FeatherPGS used to admit a clean “this is a Delassus solve” description. That is no longer quite true. We now have three closely related paths: <code class="docutils literal notranslate"><span class="pre">dense</span></code>, <code class="docutils literal notranslate"><span class="pre">split</span></code>, and <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code>. <code class="docutils literal notranslate"><span class="pre">dense</span></code> is still the old explicit Delassus story. <code class="docutils literal notranslate"><span class="pre">split</span></code> is “Delassus for articulated rows, matrix-free for free rigid contacts.” <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> is not a different articulation model; it is still the same reduced-coordinate machinery, but with the solve written more directly as repeated velocity-space updates rather than as sweeps over a fully assembled dense <code class="docutils literal notranslate"><span class="pre">J</span> <span class="pre">\tilde{H}^{-1}</span> <span class="pre">J^T</span></code>. The implementation is faster this way, but the conceptual packaging is less tidy than it used to be. The clean long-term direction is probably to present this as one Featherstone solver with pluggable constraint handling, rather than as a collection of solver names that sound more different than they really are.</p>
 </div>
-<p>The short version is:</p>
-<ul class="simple">
-<li><p>the original derivation is still the right starting point for the articulated part of the solver;</p></li>
-<li><p>the code no longer treats explicit Delassus assembly as the only useful endpoint;</p></li>
-<li><p>the main performance shift has been from “assemble <span class="math notranslate nohighlight">\(C = J \tilde{H}^{-1} J^T\)</span> and iterate in impulse space for everything” toward “keep the reduced-coordinate articulation machinery, but avoid materializing the dense contact operator when that cost dominates.”</p></li>
-</ul>
-<p>The implementation lives primarily in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py"><code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/solver_feather_pgs.py</span></code></a> and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/kernels.py</span></code></a>. Benchmark-facing mode names are defined in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/tools/solver_benchmark.py"><code class="docutils literal notranslate"><span class="pre">newton/tools/solver_benchmark.py</span></code></a> and exercised in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/benchmarks/nightly/nightly.yaml"><code class="docutils literal notranslate"><span class="pre">benchmarks/nightly/nightly.yaml</span></code></a>.</p>
-<p>Quick code anchors for this page:</p>
-<ul class="simple">
-<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L1018"><code class="docutils literal notranslate"><span class="pre">step()</span></code></a> is the top-level solver step and mode dispatch.</p></li>
-<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2074"><code class="docutils literal notranslate"><span class="pre">_stage4_build_rows()</span></code></a> builds the contact and joint-limit row sets.</p></li>
-<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2391"><code class="docutils literal notranslate"><span class="pre">_stage4_hinv_jt_tiled()</span></code></a> and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2470"><code class="docutils literal notranslate"><span class="pre">_stage4_delassus_tiled()</span></code></a> are the dense Delassus path.</p></li>
-<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2584"><code class="docutils literal notranslate"><span class="pre">_dispatch_dense_pgs_solve()</span></code></a>, <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2709"><code class="docutils literal notranslate"><span class="pre">_mf_pgs_setup()</span></code></a>, and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py#L2755"><code class="docutils literal notranslate"><span class="pre">_mf_pgs_solve()</span></code></a> are the main dense and matrix-free solve entry points.</p></li>
-<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L1932"><code class="docutils literal notranslate"><span class="pre">allocate_world_contact_slots()</span></code></a>, <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L2769"><code class="docutils literal notranslate"><span class="pre">diag_from_JY_par_art()</span></code></a>, and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L2846"><code class="docutils literal notranslate"><span class="pre">build_mf_contact_rows()</span></code></a> are the key row-routing and matrix-free kernels.</p></li>
-<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L3112"><code class="docutils literal notranslate"><span class="pre">compute_mf_body_Hinv()</span></code></a>, <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L3135"><code class="docutils literal notranslate"><span class="pre">compute_mf_effective_mass_and_rhs()</span></code></a>, and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py#L3234"><code class="docutils literal notranslate"><span class="pre">pgs_solve_mf_loop()</span></code></a> are the specialized free-rigid path.</p></li>
-<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/tools/solver_benchmark.py#L118"><code class="docutils literal notranslate"><span class="pre">newton/tools/solver_benchmark.py</span></code></a> and <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/benchmarks/nightly/nightly.yaml#L269"><code class="docutils literal notranslate"><span class="pre">benchmarks/nightly/nightly.yaml</span></code></a> expose the current benchmark-facing mode names and nightly ablations.</p></li>
-</ul>
 <section id="motivation-and-background">
 <h2>Motivation and Background<a class="headerlink" href="#motivation-and-background" title="Link to this heading">#</a></h2>
-<p>FeatherPGS is Newton’s reduced-coordinate rigid-body contact solver built around Featherstone-style articulated dynamics, a semi-implicit step, and a projected Gauss-Seidel (PGS) contact solve. The original writeup emphasized a practical Schur-complement method:</p>
+<p>FeatherPGS is Newton’s reduced-coordinate rigid-body contact solver built around Featherstone-style articulated dynamics, a semi-implicit step, and a projected Gauss-Seidel (PGS) contact solve. The core formulation uses a Schur-complement approach:</p>
 <div class="math notranslate nohighlight">
 \[
 \tilde{H} = H + \Delta t K_d + \Delta t^2 K_p,
 \qquad
 C = J \tilde{H}^{-1} J^T,
 \]</div>
-<p>followed by a PGS solve in impulse space. That remains an accurate description of one important operating mode, and it remains the cleanest way to explain the articulation-side math.</p>
-<p>What changed in the implementation is not the reduced-coordinate foundation. The change is that explicit assembly of the full Delassus operator is no longer treated as mandatory. On current workloads, especially scenes that mix a large articulated system with many contacts involving free rigid bodies, storing and sweeping a dense per-world contact matrix is often the wrong bottleneck. The newer solver paths keep the same stage-1 through stage-3 articulation pipeline, then branch into denser or more matrix-free contact handling depending on the structure of the contact set.</p>
+<p>followed by a PGS solve in impulse space. This describes the <code class="docutils literal notranslate"><span class="pre">dense</span></code> operating mode and is the most direct way to explain the articulation-side math. The other modes (<code class="docutils literal notranslate"><span class="pre">split</span></code>, <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code>) keep the same reduced-coordinate foundation but avoid materializing the full dense Delassus operator when that cost dominates — especially in scenes mixing large articulated systems with many free-rigid-body contacts.</p>
 </section>
 <section id="problem-setup-and-notation">
 <h2>Problem Setup and Notation<a class="headerlink" href="#problem-setup-and-notation" title="Link to this heading">#</a></h2>
@@ -876,18 +1290,50 @@ C = J \tilde{H}^{-1} J^T,
 <li><p>solve a unilateral/frictional contact problem with PGS;</p></li>
 <li><p>recover accelerations, integrate, and update maximal state.</p></li>
 </ol>
-<p>The current code uses <code class="docutils literal notranslate"><span class="pre">v_hat</span></code> and <code class="docutils literal notranslate"><span class="pre">v_out</span></code> for the unconstrained and corrected generalized velocities respectively; see <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py"><code class="docutils literal notranslate"><span class="pre">solver_feather_pgs.py</span></code></a>. The earlier note wrote this in the more compact form</p>
+<p>The current code uses <code class="docutils literal notranslate"><span class="pre">v_hat</span></code> and <code class="docutils literal notranslate"><span class="pre">v_out</span></code> for the unconstrained and corrected generalized velocities respectively; see <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py"><code class="docutils literal notranslate"><span class="pre">solver_feather_pgs.py</span></code></a>. In compact form:</p>
 <div class="math notranslate nohighlight">
 \[
 \hat{\dot{q}} = \tilde{H}^{-1} b,
 \qquad
 \dot{q}_{t+1} = \hat{\dot{q}} + \tilde{H}^{-1} J^T p.
 \]</div>
-<p>That interpretation still matches the dense path. In the newer paths, the same objects are present, but the solver may avoid ever forming the full dense matrix <span class="math notranslate nohighlight">\(C\)</span>.</p>
+<p>This matches the dense path. In the <code class="docutils literal notranslate"><span class="pre">split</span></code> and <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> paths, the same objects are present, but the solver avoids forming the full dense matrix <span class="math notranslate nohighlight">\(C\)</span>.</p>
 </section>
-<section id="original-dense-delassus-view">
-<h2>Original Dense-Delassus View<a class="headerlink" href="#original-dense-delassus-view" title="Link to this heading">#</a></h2>
-<p>The historical writeup presented FeatherPGS as a straightforward Schur-complement solver:</p>
+<section id="frame-conventions-in-featherpgs">
+<h2>Frame Conventions in FeatherPGS<a class="headerlink" href="#frame-conventions-in-featherpgs" title="Link to this heading">#</a></h2>
+<p>FeatherPGS currently uses a mixed velocity convention, and it is worth stating that explicitly because it is easy to misread the code otherwise.</p>
+<ul class="simple">
+<li><p>At the public API boundary, free-root <code class="docutils literal notranslate"><span class="pre">joint_qd</span></code> follows the CoM convention: the linear term is the root body’s center-of-mass velocity.</p></li>
+<li><p>Inside the articulated solve, stages 1 through 6 use the root-body-origin linear term instead. On entry, FeatherPGS converts</p></li>
+</ul>
+<div class="math notranslate nohighlight">
+\[
+v_{\mathrm{local}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com}},
+\]</div>
+<p>where <span class="math notranslate nohighlight">\(r_{\mathrm{com}}\)</span> is the root-body COM offset in world orientation. In the current code this is the <code class="docutils literal notranslate"><span class="pre">convert_root_free_qd_world_to_local()</span></code> / <code class="docutils literal notranslate"><span class="pre">convert_root_free_qd_local_to_world()</span></code> pair, using <code class="docutils literal notranslate"><span class="pre">articulation_root_com_offset</span></code> rather than <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code>.</p>
+<ul class="simple">
+<li><p>The internal Featherstone algebra is otherwise unchanged: inverse dynamics, CRBA, Cholesky, triangular solve, and the articulated PGS paths all run on that internal root-origin linear term.</p></li>
+<li><p>At stage 7, integration uses the public CoM-based <code class="docutils literal notranslate"><span class="pre">joint_qd</span></code> and <code class="docutils literal notranslate"><span class="pre">joint_qdd</span></code>, but FREE and DISTANCE joints reconstruct origin translation velocity before integrating position. In other words, position update uses</p></li>
+</ul>
+<div class="math notranslate nohighlight">
+\[
+v_{\mathrm{origin}} = v_{\mathrm{com}} - \omega \times r_{\mathrm{com,world}},
+\]</div>
+<p>while the stored velocity after integration remains CoM-based.</p>
+<ul class="simple">
+<li><p>FK writeback then restores the public maximal-coordinate contract: <code class="docutils literal notranslate"><span class="pre">body_qd</span></code> stores CoM velocity again.</p></li>
+</ul>
+<p>There is one additional convention detail for contacts. <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code> is currently the root-body CoM world position, not the articulation frame origin. Dense articulated contact rows are still assembled against the articulated generalized coordinates in the usual way, but the free-rigid matrix-free rows use contact offsets relative to that root CoM world point. This is why the current code can keep the internal articulated math unchanged while still building free-rigid Jacobian rows in the expected CoM-centered form.</p>
+<p>This matches the direction of upstream PR 2206, which keeps Featherstone internal math unchanged and makes the CoM convention explicit at the public boundary.</p>
+<p>The bug fixed on this branch was exactly at that boundary. The integration step was previously treating CoM-referenced linear velocity as though it were origin velocity when updating root translation. Under aggressive actions that error could accumulate into NaN divergence. The current fix has two parts:</p>
+<ul class="simple">
+<li><p>the boundary conversion kernels use <code class="docutils literal notranslate"><span class="pre">articulation_root_com_offset</span></code> rather than <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code>;</p></li>
+<li><p>FREE and DISTANCE integration reconstruct origin translation velocity before advancing position.</p></li>
+</ul>
+</section>
+<section id="dense-delassus-view">
+<h2>Dense-Delassus View<a class="headerlink" href="#dense-delassus-view" title="Link to this heading">#</a></h2>
+<p>The dense path is a straightforward Schur-complement solver:</p>
 <div class="math notranslate nohighlight">
 \[
 0 \le p \perp (Cp + r) \ge 0,
@@ -902,7 +1348,7 @@ C = J \tilde{H}^{-1} J^T.
 <li><p>Stage 4 builds contact Jacobian rows, computes <span class="math notranslate nohighlight">\(Y = \tilde{H}^{-1} J^T\)</span>, and then assembles the Delassus operator.</p></li>
 <li><p>Stage 5/6 runs PGS on the explicit dense contact system.</p></li>
 </ul>
-<p>This structure is still visible in the solver. The dense branch in <code class="docutils literal notranslate"><span class="pre">step()</span></code> does exactly that:</p>
+<p>The dense branch in <code class="docutils literal notranslate"><span class="pre">step()</span></code> follows this structure:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">_stage4_build_rows(...)</span></code> builds the world-level constraint rows;</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">_stage4_hinv_jt_*</span></code> computes <span class="math notranslate nohighlight">\(Y = \tilde{H}^{-1} J^T\)</span>;</p></li>
@@ -911,7 +1357,7 @@ C = J \tilde{H}^{-1} J^T.
 <li><p><code class="docutils literal notranslate"><span class="pre">_dispatch_dense_pgs_solve(...)</span></code> runs the chosen dense PGS kernel;</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">_stage6_apply_impulses_world(...)</span></code> applies the resulting correction back to generalized velocity.</p></li>
 </ul>
-<p>This is still the simplest formulation to reason about mathematically, and it remains useful when the per-world contact count is modest enough that explicit dense storage and sweep kernels are not the dominant cost.</p>
+<p>This is the simplest formulation to reason about mathematically, and it is most useful when the per-world contact count is modest enough that explicit dense storage and sweep kernels are not the dominant cost.</p>
 </section>
 <section id="current-solver-architecture">
 <h2>Current Solver Architecture<a class="headerlink" href="#current-solver-architecture" title="Link to this heading">#</a></h2>
@@ -938,11 +1384,11 @@ C = J \tilde{H}^{-1} J^T.
 <li><p>Cholesky and triangular solves are selected per articulation size group, with loop and tiled kernels available.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">compute_velocity_predictor</span></code> produces <code class="docutils literal notranslate"><span class="pre">v_hat</span></code>, the unconstrained generalized velocity used as the base point for contact resolution.</p></li>
 </ul>
-<p>This part is still very much the solver described in the PDF. The main architectural change happens after row construction.</p>
+<p>The main divergence between modes happens after row construction.</p>
 </section>
 <section id="contact-row-construction-and-path-split">
 <h3>Contact-row construction and path split<a class="headerlink" href="#contact-row-construction-and-path-split" title="Link to this heading">#</a></h3>
-<p>The row builder now classifies contacts before they enter the solve. The key classifier is <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">allocate_world_contact_slots</span></code></a>, which assigns each contact either:</p>
+<p>The row builder classifies contacts before they enter the solve. The key classifier is <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">allocate_world_contact_slots</span></code></a>, which assigns each contact either:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">contact_path</span> <span class="pre">==</span> <span class="pre">0</span></code>: dense articulated/world path;</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">contact_path</span> <span class="pre">==</span> <span class="pre">1</span></code>: matrix-free free-rigid path;</p></li>
@@ -952,12 +1398,8 @@ C = J \tilde{H}^{-1} J^T.
 <p>Joint limits are also handled as unilateral rows when enabled, but they are still built into the dense articulated row set rather than the free-rigid matrix-free path.</p>
 </section>
 </section>
-<section id="why-the-velocity-path-direction-is-faster">
-<h2>Why the Velocity-Path Direction Is Faster<a class="headerlink" href="#why-the-velocity-path-direction-is-faster" title="Link to this heading">#</a></h2>
-<p>The performance issue with the original dense view is not the reduced-coordinate dynamics. The expensive part is the requirement to materialize and iterate over a dense per-world contact operator whose size scales like the square of the number of active rows.</p>
-<p>The current <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> direction removes that requirement for the articulated rows, and it uses an even cheaper specialized path for free rigid contacts.</p>
-<section id="what-matrix-free-actually-means-here">
-<h3>What <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> actually means here<a class="headerlink" href="#what-matrix-free-actually-means-here" title="Link to this heading">#</a></h3>
+<section id="the-matrix-free-path">
+<h2>The Matrix-Free Path<a class="headerlink" href="#the-matrix-free-path" title="Link to this heading">#</a></h2>
 <p>In the current code, <code class="docutils literal notranslate"><span class="pre">pgs_mode=&quot;matrix_free&quot;</span></code> does <strong>not</strong> mean “no Jacobians are stored” and it does <strong>not</strong> mean “the solver works only in body-space without articulation information.” Instead it means:</p>
 <ul class="simple">
 <li><p>compute <span class="math notranslate nohighlight">\(Y = \tilde{H}^{-1} J^T\)</span> as before;</p></li>
@@ -974,10 +1416,9 @@ C = J \tilde{H}^{-1} J^T.
 \text{current matrix-free direction: } w_i = \text{bias}_i + J_i v.
 \]</div>
 <p>The second form avoids storing and streaming the full <span class="math notranslate nohighlight">\(C\)</span> tensor. It still uses the same articulated dynamics factorization and the same reduced-coordinate Jacobians, but the per-iteration working set is smaller and better aligned with the actual dependency structure of the solve.</p>
-</section>
 <section id="specialized-matrix-free-handling-for-free-rigid-bodies">
 <h3>Specialized matrix-free handling for free rigid bodies<a class="headerlink" href="#specialized-matrix-free-handling-for-free-rigid-bodies" title="Link to this heading">#</a></h3>
-<p>For contacts whose two sides are free rigid bodies or ground, FeatherPGS goes further. It builds spatial Jacobian rows directly against the free body state using <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">build_mf_contact_rows</span></code></a>, computes per-body <span class="math notranslate nohighlight">\(H^{-1}\)</span> from the spatial inertia blocks with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_body_Hinv</span></code></a>, and forms only per-row effective masses and bias terms with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_effective_mass_and_rhs</span></code></a>.</p>
+<p>For contacts whose two sides are free rigid bodies or ground, the solver builds spatial Jacobian rows directly against the free body state using <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">build_mf_contact_rows</span></code></a>, computes per-body <span class="math notranslate nohighlight">\(H^{-1}\)</span> from the spatial inertia blocks with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_body_Hinv</span></code></a>, and forms only per-row effective masses and bias terms with <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/kernels.py"><code class="docutils literal notranslate"><span class="pre">compute_mf_effective_mass_and_rhs</span></code></a>. In that free-rigid branch the row offsets are taken relative to the root-body CoM world point stored in <code class="docutils literal notranslate"><span class="pre">articulation_origin</span></code>, not a separate articulation-frame origin.</p>
 <p>This avoids both:</p>
 <ul class="simple">
 <li><p>dense world-level Delassus assembly, and</p></li>
@@ -993,9 +1434,6 @@ C = J \tilde{H}^{-1} J^T.
 </section>
 <section id="mode-taxonomy">
 <h2>Mode Taxonomy<a class="headerlink" href="#mode-taxonomy" title="Link to this heading">#</a></h2>
-<p>There are two levels of naming in the current codebase.</p>
-<section id="internal-solve-modes">
-<h3>Internal solve modes<a class="headerlink" href="#internal-solve-modes" title="Link to this heading">#</a></h3>
 <p>The core solver exposes three <code class="docutils literal notranslate"><span class="pre">pgs_mode</span></code> values:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">dense</span></code>: build the full Delassus operator and solve the entire contact system in the dense articulated path.</p></li>
@@ -1004,34 +1442,8 @@ C = J \tilde{H}^{-1} J^T.
 </ul>
 <p>These are defined on <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/_src/solvers/feather_pgs/solver_feather_pgs.py"><code class="docutils literal notranslate"><span class="pre">SolverFeatherPGS</span></code></a>.</p>
 </section>
-<section id="benchmark-and-nightly-preset-names">
-<h3>Benchmark and nightly preset names<a class="headerlink" href="#benchmark-and-nightly-preset-names" title="Link to this heading">#</a></h3>
-<p>The nightly dashboards and benchmark scripts expose a more user-facing taxonomy:</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">fpgs_dense_loop</span></code></p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">fpgs_dense_row</span></code></p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">fpgs_dense_streaming</span></code></p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">fpgs_split</span></code></p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">fpgs_matrix_free</span></code></p></li>
-</ul>
-<p>These presets are not separate algorithms so much as combinations of:</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">pgs_mode</span></code></p></li>
-<li><p>kernel families for Cholesky, triangular solve, <code class="docutils literal notranslate"><span class="pre">H^{-1}J^T</span></code>, and Delassus assembly</p></li>
-<li><p>dense PGS kernel choice (<code class="docutils literal notranslate"><span class="pre">loop</span></code>, <code class="docutils literal notranslate"><span class="pre">tiled_row</span></code>, <code class="docutils literal notranslate"><span class="pre">tiled_contact</span></code>, <code class="docutils literal notranslate"><span class="pre">streaming</span></code>)</p></li>
-<li><p>stream parallelism and double buffering</p></li>
-</ul>
-<p>The canonical preset definitions are in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/newton/tools/solver_benchmark.py"><code class="docutils literal notranslate"><span class="pre">newton/tools/solver_benchmark.py</span></code></a>, and the currently tracked nightly ablations are in <a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/benchmarks/nightly/nightly.yaml"><code class="docutils literal notranslate"><span class="pre">benchmarks/nightly/nightly.yaml</span></code></a>.</p>
-<p>Two distinctions are worth making explicit because the labels can otherwise sound more different than they are:</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">dense</span> <span class="pre">row</span></code> and <code class="docutils literal notranslate"><span class="pre">dense</span> <span class="pre">streaming</span></code> are both dense Delassus methods. They differ mainly in kernel strategy, not in the underlying mathematical formulation.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">split</span></code> is not just a renamed dense method. It is the hybrid path that keeps articulated contacts on the dense side while routing free-rigid contacts through the cheaper matrix-free side.</p></li>
-</ul>
-</section>
-</section>
 <section id="mapping-from-math-to-code">
 <h2>Mapping From Math to Code<a class="headerlink" href="#mapping-from-math-to-code" title="Link to this heading">#</a></h2>
-<p>The easiest way to relate the note’s symbols to the code is by stage.</p>
 <section id="articulated-operator-and-predictor">
 <h3>Articulated operator and predictor<a class="headerlink" href="#articulated-operator-and-predictor" title="Link to this heading">#</a></h3>
 <ul class="simple">
@@ -1048,7 +1460,7 @@ C = J \tilde{H}^{-1} J^T.
 <section id="contact-jacobians-and-metadata">
 <h3>Contact Jacobians and metadata<a class="headerlink" href="#contact-jacobians-and-metadata" title="Link to this heading">#</a></h3>
 <ul class="simple">
-<li><p><span class="math notranslate nohighlight">\(J\)</span>: grouped dense articulated rows in <code class="docutils literal notranslate"><span class="pre">J_by_size</span></code>; gathered world form in <code class="docutils literal notranslate"><span class="pre">J_world</span></code> for the newer matrix-free articulated path.</p></li>
+<li><p><span class="math notranslate nohighlight">\(J\)</span>: grouped dense articulated rows in <code class="docutils literal notranslate"><span class="pre">J_by_size</span></code>; gathered world form in <code class="docutils literal notranslate"><span class="pre">J_world</span></code> for the matrix-free articulated path.</p></li>
 <li><p>row metadata: <code class="docutils literal notranslate"><span class="pre">row_type</span></code>, <code class="docutils literal notranslate"><span class="pre">row_parent</span></code>, <code class="docutils literal notranslate"><span class="pre">row_mu</span></code>, <code class="docutils literal notranslate"><span class="pre">row_beta</span></code>, <code class="docutils literal notranslate"><span class="pre">row_cfm</span></code>, <code class="docutils literal notranslate"><span class="pre">phi</span></code>, <code class="docutils literal notranslate"><span class="pre">target_velocity</span></code>.</p></li>
 <li><p>free-rigid contact Jacobians: <code class="docutils literal notranslate"><span class="pre">mf_J_a</span></code>, <code class="docutils literal notranslate"><span class="pre">mf_J_b</span></code>.</p></li>
 </ul>
@@ -1088,51 +1500,16 @@ C = J \tilde{H}^{-1} J^T.
 <p>One detail that matters for interpreting the current code: in dense mode the solver builds <code class="docutils literal notranslate"><span class="pre">rhs</span> <span class="pre">=</span> <span class="pre">bias</span> <span class="pre">+</span> <span class="pre">J</span> <span class="pre">v_hat</span></code>, while in the articulated <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> path it keeps only the bias in <code class="docutils literal notranslate"><span class="pre">rhs</span></code> and recomputes <span class="math notranslate nohighlight">\(Jv\)</span> against the live <code class="docutils literal notranslate"><span class="pre">v_out</span></code> inside the PGS loop.</p>
 </section>
 </section>
-<section id="practical-features-and-current-experiments">
-<h2>Practical Features and Current Experiments<a class="headerlink" href="#practical-features-and-current-experiments" title="Link to this heading">#</a></h2>
-<p>Several practical details from the original note remain present, although they now sit in a broader implementation space.</p>
+<section id="practical-features">
+<h2>Practical Features<a class="headerlink" href="#practical-features" title="Link to this heading">#</a></h2>
 <section id="implicit-drives-instead-of-explicit-motor-constraints">
 <h3>Implicit drives instead of explicit motor constraints<a class="headerlink" href="#implicit-drives-instead-of-explicit-motor-constraints" title="Link to this heading">#</a></h3>
-<p>The original note argued for keeping joint PD in the operator rather than inflating the constraint system. That is still the right description of the implementation. FeatherPGS augments the reduced-coordinate operator rather than adding solver rows for ordinary drives.</p>
+<p>FeatherPGS keeps joint PD in the reduced-coordinate operator rather than inflating the constraint system with additional solver rows for ordinary drives.</p>
 </section>
 <section id="joint-limits-as-on-demand-unilateral-rows">
 <h3>Joint limits as on-demand unilateral rows<a class="headerlink" href="#joint-limits-as-on-demand-unilateral-rows" title="Link to this heading">#</a></h3>
 <p>Joint limits remain optional and row-based. When <code class="docutils literal notranslate"><span class="pre">enable_joint_limits=True</span></code>, violated limits allocate unilateral rows and enter the dense articulated solve with their own Jacobian and bias terms. They are not part of the free-rigid matrix-free specialization.</p>
 </section>
-<section id="compliance-regularization-and-warm-starting">
-<h3>Compliance, regularization, and warm starting<a class="headerlink" href="#compliance-regularization-and-warm-starting" title="Link to this heading">#</a></h3>
-<p>The current solver still uses several standard stabilizers:</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">pgs_cfm</span></code> adds diagonal regularization;</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">dense_contact_compliance</span></code> adds a normal-contact compliance term to the dense articulated diagonal, scaled as <code class="docutils literal notranslate"><span class="pre">compliance</span> <span class="pre">/</span> <span class="pre">dt^2</span></code>;</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">pgs_warmstart</span></code> optionally reuses impulses across frames;</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">pgs_omega</span></code> controls over-relaxation.</p></li>
-</ul>
-<p>These are not new ideas, but they matter more now because the code compares several solve realizations and kernel schedules under the same benchmark harness.</p>
-</section>
-<section id="kernel-level-experiments">
-<h3>Kernel-level experiments<a class="headerlink" href="#kernel-level-experiments" title="Link to this heading">#</a></h3>
-<p>The current benchmark taxonomy also reflects implementation experiments that the original PDF did not discuss:</p>
-<ul class="simple">
-<li><p>loop versus tiled Cholesky and triangular solves;</p></li>
-<li><p>row-wise, contact-wise, and streaming dense PGS kernels;</p></li>
-<li><p>parallel stream launches across articulation size groups;</p></li>
-<li><p>double-buffering of <code class="docutils literal notranslate"><span class="pre">H</span></code> and <code class="docutils literal notranslate"><span class="pre">J</span></code> buffers to overlap clearing with later work.</p></li>
-</ul>
-<p>Those are engineering choices rather than changes in the mathematical problem statement, but they are part of the current FeatherPGS story because they strongly affect observed throughput on nightly benchmarks.</p>
-</section>
-</section>
-<section id="limitations-and-open-questions">
-<h2>Limitations and Open Questions<a class="headerlink" href="#limitations-and-open-questions" title="Link to this heading">#</a></h2>
-<p>The current solver is better described as a family of closely related paths than as a single fixed algorithm. That is useful for performance work, but it leaves a few conceptual edges that should eventually be cleaned up.</p>
-<p>First, the name <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> is only partially literal. For articulated rows the solver still stores <code class="docutils literal notranslate"><span class="pre">J</span></code> and <code class="docutils literal notranslate"><span class="pre">Y</span></code>; what it avoids is explicit assembly of the full dense Delassus operator. The name is still reasonable, but any future external writeup should say this plainly.</p>
-<p>Second, <code class="docutils literal notranslate"><span class="pre">split</span></code> and <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> are currently motivated by contact structure, especially the distinction between general articulations and single free rigid bodies. That distinction is performant, but it is implementation-driven. A future writeup may want a cleaner statement of the invariants that justify the two path families.</p>
-<p>Third, the mixed-contact path is faithful to the code but not especially elegant in presentation. The interleaved dense/MF iteration is a pragmatic compromise, not the final conceptual form.</p>
-<p>Fourth, the benchmark-facing names combine algorithmic and kernel-scheduling differences. That is fine for performance tracking, but not ideal for exposition. A later revision should likely separate:</p>
-<ul class="simple">
-<li><p>mathematical mode (<code class="docutils literal notranslate"><span class="pre">dense</span></code>, <code class="docutils literal notranslate"><span class="pre">split</span></code>, <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code>), and</p></li>
-<li><p>kernel realization (<code class="docutils literal notranslate"><span class="pre">loop</span></code>, <code class="docutils literal notranslate"><span class="pre">tiled_row</span></code>, <code class="docutils literal notranslate"><span class="pre">streaming</span></code>, parallel streams, double buffer).</p></li>
-</ul>
 </section>
 </section>
 
@@ -1157,42 +1534,35 @@ C = J \tilde{H}^{-1} J^T.
     class="page-toc tocsection onthispage">
     <i class="fa-solid fa-list"></i> On this page
   </div>
-  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
-    <ul class="visible nav section-nav flex-column">
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#motivation-and-background">Motivation and Background</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#problem-setup-and-notation">Problem Setup and Notation</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#original-dense-delassus-view">Original Dense-Delassus View</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#current-solver-architecture">Current Solver Architecture</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#frame-conventions-in-featherpgs">Frame Conventions in FeatherPGS</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-delassus-view">Dense-Delassus View</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#current-solver-architecture">Current Solver Architecture</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#shared-articulation-pipeline">Shared articulation pipeline</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#contact-row-construction-and-path-split">Contact-row construction and path split</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#why-the-velocity-path-direction-is-faster">Why the Velocity-Path Direction Is Faster</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-matrix-free-actually-means-here">What <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> actually means here</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-matrix-free-path">The Matrix-Free Path</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#specialized-matrix-free-handling-for-free-rigid-bodies">Specialized matrix-free handling for free rigid bodies</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mixed-worlds-and-the-current-compromise">Mixed worlds and the current compromise</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mode-taxonomy">Mode Taxonomy</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#internal-solve-modes">Internal solve modes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmark-and-nightly-preset-names">Benchmark and nightly preset names</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mapping-from-math-to-code">Mapping From Math to Code</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mode-taxonomy">Mode Taxonomy</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mapping-from-math-to-code">Mapping From Math to Code</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#articulated-operator-and-predictor">Articulated operator and predictor</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#contact-jacobians-and-metadata">Contact Jacobians and metadata</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#y-tilde-h-1-j-t-delassus-and-diagonal-terms"><span class="math notranslate nohighlight">\(Y = \tilde{H}^{-1} J^T\)</span>, Delassus, and diagonal terms</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#right-hand-side-and-pgs-state">Right-hand side and PGS state</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#practical-features-and-current-experiments">Practical Features and Current Experiments</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#practical-features">Practical Features</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#implicit-drives-instead-of-explicit-motor-constraints">Implicit drives instead of explicit motor constraints</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#joint-limits-as-on-demand-unilateral-rows">Joint limits as on-demand unilateral rows</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#compliance-regularization-and-warm-starting">Compliance, regularization, and warm starting</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kernel-level-experiments">Kernel-level experiments</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations-and-open-questions">Limitations and Open Questions</a></li>
 </ul>
   </nav></div>
 
@@ -1209,8 +1579,8 @@ C = J \tilde{H}^{-1} J^T.
   </div>
   
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2"></script>
 
   <footer class="bd-footer">
 <div class="bd-footer__inner bd-page-width">
@@ -1236,7 +1606,7 @@ C = J \tilde{H}^{-1} J^T.
         <div class="footer-item">
 <p class="theme-version">
   <!-- # L10n: Setting the PST URL as an argument as this does not need to be localized -->
-  Built with the <a href="https://pydata-sphinx-theme.readthedocs.io/en/stable/index.html">PyData Sphinx Theme</a> 0.16.1.
+  Built with the <a href="https://pydata-sphinx-theme.readthedocs.io/en/stable/index.html">PyData Sphinx Theme</a> 0.17.0.
 </p></div>
       
     </div>
