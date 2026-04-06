@@ -65,22 +65,6 @@ The dense branch in `step()` follows this structure:
 - `_dispatch_dense_pgs_solve(...)` runs the chosen dense PGS kernel;
 - `_stage6_apply_impulses_world(...)` applies the resulting correction back to generalized velocity.
 
-### Why the dense and matrix-free paths compute the same thing
-
-In dense PGS, row $i$ reads its constraint velocity from the preassembled Delassus matrix:
-
-$$
-w_i = r_i + \sum_j C_{ij}\, p_j.
-$$
-
-In the matrix-free path, row $i$ evaluates $J_i\, v$ against the live velocity vector instead. But the velocity at any point in the sweep is $v = \hat{v} + \sum_j Y_j\, p_j$, so
-
-$$
-J_i\, v \;=\; J_i\, \hat{v} \;+\; \sum_j \underbrace{J_i\, Y_j}_{C_{ij}}\, p_j,
-$$
-
-which is the same sum. Every off-diagonal coupling term $C_{ij}$ — contact $j$'s impulse rippling through the articulation to affect contact $i$ — is still there. The matrix-free path just reconstructs it on the fly through $J \times v$ rather than reading it from a stored matrix. The only thing computed explicitly is the diagonal $C_{ii}$ (the per-row effective mass), needed for the Gauss-Seidel projection step.
-
 ## The Matrix-Free Path
 
 In the current code, `pgs_mode="matrix_free"` does **not** mean "no Jacobians are stored" and it does **not** mean "the solver works only in body-space without articulation information." Instead it means:
@@ -100,6 +84,22 @@ $$
 $$
 
 The second form avoids storing and streaming the full $C$ tensor. It still uses the same articulated dynamics factorization and the same reduced-coordinate Jacobians.
+
+### Equivalence with the dense path
+
+In dense PGS, row $i$ reads its constraint velocity from the preassembled Delassus matrix:
+
+$$
+w_i = r_i + \sum_j C_{ij}\, p_j.
+$$
+
+In the matrix-free path, row $i$ evaluates $J_i\, v$ against the live velocity vector instead. But the velocity at any point in the sweep is $v = \hat{v} + \sum_j Y_j\, p_j$, so
+
+$$
+J_i\, v \;=\; J_i\, \hat{v} \;+\; \sum_j \underbrace{J_i\, Y_j}_{C_{ij}}\, p_j,
+$$
+
+which is the same sum. Every off-diagonal coupling term $C_{ij}$ is still there. The matrix-free path just reconstructs it on the fly through $J \times v$ rather than reading it from a stored matrix. The only thing computed explicitly is the diagonal $C_{ii}$ (the per-row effective mass), needed for the Gauss-Seidel projection step.
 
 ### Specialized matrix-free handling for free rigid bodies
 
