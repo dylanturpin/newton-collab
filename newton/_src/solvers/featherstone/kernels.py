@@ -1610,6 +1610,13 @@ def eval_single_articulation_fk_with_velocity_conversion(
         linear_vel = wp.transform_vector(X_wpj, wp.spatial_top(v_j))
         angular_vel = wp.transform_vector(X_wpj, wp.spatial_bottom(v_j))
 
+        if type == JointType.FREE or type == JointType.DISTANCE:
+            # Public FREE/DISTANCE joint_qd stores the linear term at the child COM.
+            # Convert back to the child-body origin convention before composing the
+            # world-space twist, then convert back to COM on body_qd writeback below.
+            r_com = wp.quat_rotate(wp.transform_get_rotation(X_wc), body_com[child])
+            linear_vel = linear_vel - wp.cross(angular_vel, r_com)
+
         v_wc = v_wpj + wp.spatial_vector(linear_vel, angular_vel)
 
         body_q[child] = X_wc
@@ -1703,11 +1710,11 @@ def eval_fk_with_velocity_conversion(
     indices: wp.array(dtype=int) | None = None,
 ):
     """
-    Evaluates the model's forward kinematics with velocity conversion for Featherstone solver.
+    Evaluates the model's forward kinematics with velocity conversion for Featherstone-based state writeback.
 
-    This is a local copy that converts FREE/DISTANCE joint velocities from origin frame to COM frame,
-    as required by the Featherstone solver. Updates the state's body information (:attr:`State.body_q`
-    and :attr:`State.body_qd`).
+    FREE/DISTANCE joint_qd is interpreted in the public CoM convention and converted to
+    origin-referenced twists for FK propagation. The resulting body_qd writeback is then
+    converted back to CoM velocity so state.body_qd matches IsaacLab's expected convention.
 
     Args:
         model (Model): The model to evaluate.
