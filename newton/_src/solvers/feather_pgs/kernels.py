@@ -4144,3 +4144,44 @@ def pgs_convergence_diagnostic_velocity(
     metrics[world, 1] = comp_gap
     metrics[world, 2] = tang_res
     metrics[world, 3] = fb_merit
+
+
+@wp.kernel
+def pack_contact_triplets_vec3(
+    src: wp.array2d(dtype=float),
+    dst: wp.array2d(dtype=wp.vec3),
+):
+    """Pack flat scalar rows into vec3 contact triplets: dst[w,c] = vec3(src[w,c*3], src[w,c*3+1], src[w,c*3+2])."""
+    world, c = wp.tid()
+    row0 = c * 3
+    dst[world, c] = wp.vec3(src[world, row0], src[world, row0 + 1], src[world, row0 + 2])
+
+
+@wp.kernel
+def pack_mf_meta(
+    mf_dof_a: wp.array2d(dtype=int),
+    mf_dof_b: wp.array2d(dtype=int),
+    mf_eff_mass_inv: wp.array2d(dtype=float),
+    mf_rhs: wp.array2d(dtype=float),
+    mf_row_type: wp.array2d(dtype=int),
+    mf_row_parent: wp.array2d(dtype=int),
+    mf_meta: wp.array2d(dtype=wp.vec4i),
+):
+    """Pack 6 MF metadata arrays into a single vec4i for 16-byte vectorized loads."""
+    world, i = wp.tid()
+    dof_a = mf_dof_a[world, i]
+    dof_b = mf_dof_b[world, i]
+    eff_mass = mf_eff_mass_inv[world, i]
+    rhs = mf_rhs[world, i]
+    row_type = mf_row_type[world, i]
+    row_parent = mf_row_parent[world, i]
+
+    packed_dofs = (dof_a << 16) | (dof_b & 0xFFFF)
+    packed_tp = (row_parent << 16) | (row_type & 0xFFFF)
+
+    mf_meta[world, i] = wp.vec4i(
+        packed_dofs,
+        wp.cast(eff_mass, wp.int32),
+        wp.cast(rhs, wp.int32),
+        packed_tp,
+    )
