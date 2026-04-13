@@ -1243,6 +1243,31 @@ def update_qdd_from_velocity(
     joint_qdd[tid] = (v_new[tid] - joint_qd[tid]) * inv_dt
 
 
+@wp.kernel
+def clamp_velocity_per_dof(
+    velocity_limits: wp.array(dtype=float),
+    clamp_factor: float,
+    # in/out
+    v_out: wp.array(dtype=float),
+):
+    """Clamp v_out per-DOF to ``[-clamp_factor * limit, +clamp_factor * limit]``.
+
+    DOFs whose velocity limit is zero or negative are left untouched (no clamp).
+    This kernel is intended to run between the impulse-apply stage and the qdd
+    update / integration stage so that the clamped velocity propagates consistently
+    through the rest of the pipeline.
+    """
+    tid = wp.tid()
+    limit = velocity_limits[tid]
+    if limit > 0.0:
+        bound = limit * clamp_factor
+        v = v_out[tid]
+        if v > bound:
+            v_out[tid] = bound
+        elif v < -bound:
+            v_out[tid] = -bound
+
+
 @wp.func
 def contact_tangent_basis(n: wp.vec3):
     # pick an arbitrary perpendicular vector and orthonormalize

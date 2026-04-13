@@ -49,6 +49,7 @@ from .kernels import (
     build_mf_contact_rows,
     cholesky_loop,
     clamp_joint_tau,
+    clamp_velocity_per_dof,
     compute_com_transforms,
     compute_composite_inertia,
     compute_contact_linear_force_from_impulses,
@@ -191,6 +192,8 @@ class SolverFeatherPGS(SolverBase):
         double_buffer: bool = True,
         nvtx: bool = False,
         pgs_debug: bool = False,
+        enable_velocity_clamp: bool = False,
+        velocity_clamp_factor: float = 1.25,
     ):
         """
         Args:
@@ -239,6 +242,17 @@ class SolverFeatherPGS(SolverBase):
             small_dof_threshold (int, optional): DOF threshold for "auto" kernel selection. Defaults to 12.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
+            enable_velocity_clamp (bool, optional): When True, clamp ``v_out`` per-DOF to
+                ``velocity_clamp_factor * model.joint_velocity_limit`` after the constraint
+                solve and before integration.  This is a safety-net that prevents
+                unconstrained dynamics from producing velocities far above the URDF-declared
+                soft limits.  Dormant by default.  Requires that
+                ``model.joint_velocity_limit`` is populated.  Defaults to False.
+            velocity_clamp_factor (float, optional): Multiplier on
+                ``model.joint_velocity_limit`` for the per-DOF clamp.  A value of 1.25
+                matches the typical termination threshold used in Isaac Lab tasks, meaning
+                the clamp only fires for velocities that would trigger episode termination.
+                Defaults to 1.25.
         Auto selection behavior:
             - auto: size > threshold -> tiled, else loop/par_row.
             - Delassus auto/tiled: streaming kernel (handles any constraint count via chunking).
@@ -265,6 +279,8 @@ class SolverFeatherPGS(SolverBase):
         self._double_buffer = double_buffer
         self._nvtx = nvtx
         self.pgs_debug = pgs_debug
+        self.enable_velocity_clamp = enable_velocity_clamp
+        self.velocity_clamp_factor = velocity_clamp_factor
         self._pgs_convergence_log: list[np.ndarray] = []
         valid_cholesky = {"tiled", "loop", "auto"}
         if cholesky_kernel not in valid_cholesky:
@@ -319,6 +335,16 @@ class SolverFeatherPGS(SolverBase):
             )
 
         self._init_double_buffer_stream()
+
+        # Post-solve velocity clamp (opt-in, see enable_velocity_clamp)
+        if self.enable_velocity_clamp:
+            if model.joint_velocity_limit is None:
+                raise ValueError(
+                    "enable_velocity_clamp=True requires model.joint_velocity_limit to be populated. "
+                    "Ensure the URDF/USD asset declares per-DOF velocity limits."
+                )
+            if self.velocity_clamp_factor <= 0.0:
+                raise ValueError(f"velocity_clamp_factor must be positive, got {self.velocity_clamp_factor}")
 
         # Velocity spike capture (dormant by default, see spike_capture.py)
         self.spike_capture = SpikeCapture(SpikeCaptureConfig())
@@ -1461,6 +1487,19 @@ class SolverFeatherPGS(SolverBase):
 
             if self.pgs_mode == "split" and self._has_free_rigid_bodies:
                 self._stage6b_mf_pgs(state_aug, dt)
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE 6c: Optional post-solve velocity clamp
+        # ══════════════════════════════════════════════════════════════
+        if self.enable_velocity_clamp:
+            with wp.ScopedTimer("S6c_VelocityClamp", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+                wp.launch(
+                    clamp_velocity_per_dof,
+                    dim=model.joint_dof_count,
+                    inputs=[model.joint_velocity_limit, self.velocity_clamp_factor],
+                    outputs=[self.v_out],
+                    device=model.device,
+                )
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 7: Update qdd + integrate

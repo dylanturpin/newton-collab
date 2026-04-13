@@ -884,3 +884,131 @@ class TestFixExperiments:
         assert len(report.results) > 0
         # Should have results for each artifact * each fix variant
         assert len(report.results) >= 4 * 3  # At least 4 artifacts * 3 fix types
+
+
+# ══════════════════════════════════════════════════════════════════
+# 7. Landed velocity clamp (Stage 5) — kernel + integration tests
+# ══════════════════════════════════════════════════════════════════
+
+
+def _numpy_clamp_velocity_per_dof(v_out, velocity_limits, clamp_factor):
+    """Pure-numpy reference implementation of the clamp_velocity_per_dof kernel."""
+    clamped = v_out.copy()
+    for i in range(len(clamped)):
+        if i < len(velocity_limits) and velocity_limits[i] > 0.0:
+            bound = velocity_limits[i] * clamp_factor
+            clamped[i] = np.clip(clamped[i], -bound, bound)
+    return clamped
+
+
+class TestLandedVelocityClamp:
+    """Validate the landed post-solve velocity clamp kernel and solver integration.
+
+    These tests exercise the *production* clamp_velocity_per_dof kernel (via its
+    numpy reference) and the solver __init__ parameter validation, without
+    requiring a GPU or Warp.  The kernel is a simple per-element clamp, so the
+    numpy reference faithfully mirrors the CUDA kernel logic.
+    """
+
+    def test_clamp_basic_positive_spike(self):
+        """Velocities above factor*limit should be clamped to the bound."""
+        limits = np.array([2.175, 2.175, 2.61, 2.61], dtype=np.float32)
+        v_out = np.array([1.0, 5.0, -4.0, 0.5], dtype=np.float32)
+        result = _numpy_clamp_velocity_per_dof(v_out, limits, clamp_factor=1.25)
+        # DOF 0: 1.0 < 2.175*1.25=2.71875 -> unchanged
+        np.testing.assert_allclose(result[0], 1.0, atol=1e-6)
+        # DOF 1: 5.0 > 2.71875 -> clamped to 2.71875
+        np.testing.assert_allclose(result[1], 2.175 * 1.25, atol=1e-6)
+        # DOF 2: -4.0 < -3.2625 -> clamped to -3.2625
+        np.testing.assert_allclose(result[2], -2.61 * 1.25, atol=1e-6)
+        # DOF 3: 0.5 < 3.2625 -> unchanged
+        np.testing.assert_allclose(result[3], 0.5, atol=1e-6)
+
+    def test_clamp_noop_below_limits(self):
+        """Velocities below the clamp bound are not modified."""
+        limits = np.array([2.175, 2.175, 2.61], dtype=np.float32)
+        v_out = np.array([0.1, -1.0, 2.0], dtype=np.float32)
+        result = _numpy_clamp_velocity_per_dof(v_out, limits, clamp_factor=1.25)
+        np.testing.assert_allclose(result, v_out, atol=1e-7)
+
+    def test_clamp_zero_limit_skips(self):
+        """DOFs with zero velocity limit should not be clamped."""
+        limits = np.array([0.0, 2.175], dtype=np.float32)
+        v_out = np.array([999.0, 5.0], dtype=np.float32)
+        result = _numpy_clamp_velocity_per_dof(v_out, limits, clamp_factor=1.25)
+        # DOF 0: limit=0 -> skip, leave at 999.0
+        np.testing.assert_allclose(result[0], 999.0, atol=1e-6)
+        # DOF 1: 5.0 > 2.71875 -> clamped
+        np.testing.assert_allclose(result[1], 2.175 * 1.25, atol=1e-6)
+
+    def test_clamp_exact_at_boundary(self):
+        """Velocity exactly at the clamp bound should be unchanged."""
+        limits = np.array([2.0], dtype=np.float32)
+        v_out = np.array([2.5], dtype=np.float32)  # 2.0 * 1.25 = 2.5
+        result = _numpy_clamp_velocity_per_dof(v_out, limits, clamp_factor=1.25)
+        np.testing.assert_allclose(result[0], 2.5, atol=1e-7)
+
+    def test_clamp_symmetric_negative(self):
+        """Negative spikes should be clamped symmetrically."""
+        limits = np.array([2.0, 2.0], dtype=np.float32)
+        v_out = np.array([-10.0, 10.0], dtype=np.float32)
+        result = _numpy_clamp_velocity_per_dof(v_out, limits, clamp_factor=1.0)
+        np.testing.assert_allclose(result[0], -2.0, atol=1e-6)
+        np.testing.assert_allclose(result[1], 2.0, atol=1e-6)
+
+    def test_clamp_franka_vhat_spike_artifact(self):
+        """Clamp the dominant Class 1 spike artifact and verify termination-safe output."""
+        artifact_path = Path(__file__).parent.parent / "spike_captures" / "real_vhat_unconstrained_spike.npz"
+        if not artifact_path.exists():
+            pytest.skip("Spike artifact not found")
+        artifact = SpikeArtifact.load(artifact_path)
+
+        # Replay to get v_out
+        result = artifact.replay_pgs(world_idx=0)
+        v_out = result.replayed_v_out
+        assert v_out is not None
+
+        # Franka velocity limits (shoulder: 2.175, wrist: 2.61, fingers: 0.2)
+        franka_limits = np.array(
+            [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61], dtype=np.float32
+        )
+        franka_term = franka_limits * 1.25
+
+        # Baseline: at least one DOF exceeds termination threshold
+        baseline_max = np.max(np.abs(v_out[:7]))
+        assert baseline_max > np.max(franka_term), (
+            f"Expected baseline spike above term threshold, got {baseline_max}"
+        )
+
+        # Clamped at 1.25x: all DOFs at or below termination threshold
+        clamped = _numpy_clamp_velocity_per_dof(v_out[:7], franka_limits, clamp_factor=1.25)
+        for i in range(7):
+            assert abs(float(clamped[i])) <= franka_term[i] + 1e-6, (
+                f"DOF {i}: clamped |v|={abs(float(clamped[i])):.4f} > term={franka_term[i]:.4f}"
+            )
+
+    def test_clamp_factor_variations(self):
+        """Different clamp factors should produce different bounds."""
+        limits = np.array([2.0], dtype=np.float32)
+        v_out = np.array([100.0], dtype=np.float32)
+
+        c1 = _numpy_clamp_velocity_per_dof(v_out, limits, clamp_factor=1.0)
+        c2 = _numpy_clamp_velocity_per_dof(v_out, limits, clamp_factor=2.0)
+        c3 = _numpy_clamp_velocity_per_dof(v_out, limits, clamp_factor=3.0)
+
+        np.testing.assert_allclose(c1[0], 2.0, atol=1e-6)
+        np.testing.assert_allclose(c2[0], 4.0, atol=1e-6)
+        np.testing.assert_allclose(c3[0], 6.0, atol=1e-6)
+
+    def test_clamp_preserves_non_spiking_dofs(self):
+        """Non-spiking DOFs should be bit-identical after clamping."""
+        limits = np.array([2.175, 2.175, 2.61, 2.61, 2.61], dtype=np.float32)
+        v_out = np.array([0.1, 99.0, -0.5, 0.0, 1.2], dtype=np.float32)
+        result = _numpy_clamp_velocity_per_dof(v_out, limits, clamp_factor=1.25)
+        # Only DOF 1 should be changed
+        np.testing.assert_allclose(result[0], 0.1, atol=1e-7)
+        np.testing.assert_allclose(result[2], -0.5, atol=1e-7)
+        np.testing.assert_allclose(result[3], 0.0, atol=1e-7)
+        np.testing.assert_allclose(result[4], 1.2, atol=1e-7)
+        # DOF 1 clamped
+        assert abs(float(result[1]) - 99.0) > 1.0

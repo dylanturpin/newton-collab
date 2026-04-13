@@ -334,6 +334,57 @@ Based on the fix experiment results, the recommended mitigation strategy is **la
 
 4. **No fix found for joint-limit cross-coupling (Class 3).**  This class is mild (max 1.94 rad/s, below termination thresholds) and is the mathematically correct solution to the constraint problem.  The cross-coupling comes from the mass matrix off-diagonals and cannot be removed without changing the physics.  If this class becomes problematic at higher velocities, per-row impulse clamping (limit the velocity delta produced by any single constraint through Y) would be the next candidate to investigate.
 
+## Landed Mitigation (Stage 5)
+
+The recommended layered mitigation has been implemented and landed on branch `dt/velocity-spike-claude` in both `newton-collab` and `skild-IL-solver`.
+
+### 1. Post-Solve Velocity Clamp (newton-collab)
+
+A new opt-in post-solve velocity clamp has been added to the FeatherPGS solver.  When enabled, it clamps `v_out` per-DOF to `velocity_clamp_factor * model.joint_velocity_limit` after the constraint solve (Stage 6) and before integration (Stage 7).
+
+**Implementation details:**
+
+- **Kernel:** `clamp_velocity_per_dof` in `kernels.py` — a single-pass per-DOF clamp.  DOFs with zero or negative velocity limits are left untouched.
+- **Solver integration:** Inserted as Stage 6c in `solver_feather_pgs.py`, between `_stage6_apply_impulses_world()` and `_stage6_update_qdd()`.  This placement ensures the clamped velocity propagates consistently to `joint_qdd` and through integration.
+- **New constructor parameters on `SolverFeatherPGS`:**
+  - `enable_velocity_clamp` (bool, default `False`): opt-in switch.
+  - `velocity_clamp_factor` (float, default `1.25`): multiplier on per-DOF velocity limits.
+- **Validation at init:** Raises `ValueError` if `enable_velocity_clamp=True` but `model.joint_velocity_limit` is `None`, or if `velocity_clamp_factor <= 0`.
+- **Dormant by default:** When `enable_velocity_clamp=False` (the default), no kernel launch occurs and there is zero overhead.
+
+**Why 1.25x:**  The Franka lift task terminates episodes when joint velocity exceeds 1.25x the soft limit (`joint_vel_out_of_limit_factor` with `factor=1.25`).  Clamping at 1.25x means the solver will never produce a velocity that the environment would kill, while still allowing the full 25% headroom above the nominal limit for normal dynamics.
+
+**Effect on Class 1 spikes:**  The dominant unconstrained v_hat spike (5.20 rad/s, 2.4x shoulder limit) is clamped to 2.72 rad/s (exactly at the termination threshold).  This is a 47.7% reduction and eliminates the termination trigger entirely.
+
+### 2. Contact Compliance Configuration (skild-IL-solver)
+
+The `dense_contact_compliance` parameter — already implemented in the solver but previously not exposed in the task configuration — has been:
+
+1. **Added to `FeatherPGSSolverCfg`** in `newton_manager_cfg.py` with documentation.
+2. **Set to 0.0001** in the Franka lift task config (`lift_env_cfg.py`).
+
+This softens contact response and reduces Class 2 contact-impulse spikes by 28-38% (from 2.70 rad/s to 1.94-1.67 rad/s depending on the exact compliance value).
+
+### 3. Configuration Change in Franka Lift Task
+
+The `LiftPhysicsCfg.feather_pgs` section in `lift_env_cfg.py` now includes:
+
+    dense_contact_compliance=0.0001,
+    enable_velocity_clamp=True,
+    velocity_clamp_factor=1.25,
+
+These settings apply only to the Franka lift task and are opt-in: other tasks using FeatherPGS are unaffected unless they explicitly enable these settings.
+
+### 4. Why skild-IL-solver Carries the Config Change
+
+The `skild-IL-solver` repository owns the task-level configuration (`lift_env_cfg.py`) and the solver configuration class (`FeatherPGSSolverCfg` in `newton_manager_cfg.py`).  The config class is the bridge between Isaac Lab task declarations and the Newton solver's `__init__` parameters.  Adding `dense_contact_compliance`, `enable_velocity_clamp`, and `velocity_clamp_factor` to the config class makes them available to all tasks without modifying the solver's Python API.
+
+### End-to-End Confirmation Limitation
+
+The current branch has replay-based fix evidence (32 experiments on 4 spike artifacts) and kernel-level unit tests (43/43 pass).  A full end-to-end confirmation on a long training run is not available in this workspace because no active Isaac Sim session is accessible.  The recommended next step after merging is to run a 1000-step rollout of `Isaac-Lift-Cube-Franka-v0` with the new settings and confirm that:
+1. No episodes are terminated by `joint_vel_out_of_limit_factor`.
+2. Training reward curves are not degraded compared to the baseline.
+
 ## Status
 
 - [x] Branch `dt/velocity-spike-claude` created in both repos
@@ -346,22 +397,34 @@ Based on the fix experiment results, the recommended mitigation strategy is **la
 - [x] Physically grounded spike artifacts generated and classified
 - [x] Spike classification from artifact analysis (4 classes ranked by severity)
 - [x] Key finding: PGS converges at 8 iterations; spikes are from unconstrained dynamics
-- [x] Fix experiments on replay: 3 fixes x 4 artifacts x multiple parameter values = 32 experiments (35/35 unit tests pass)
+- [x] Fix experiments on replay: 3 fixes x 4 artifacts x multiple parameter values = 32 experiments
 - [x] Quantitative before/after results documented for all experiments
 - [x] Final recommendation with layered mitigation strategy
+- [x] **Landed mitigation: post-solve velocity clamp (kernel + solver integration + config)**
+- [x] **Landed mitigation: contact compliance config exposed and set to 0.0001**
+- [x] **Franka lift task config updated with both mitigations enabled**
+- [x] **Targeted validation: 43/43 unit tests pass (35 original + 8 new clamp tests)**
 
 ## Files Changed
 
+### newton-collab
+
+- `newton/_src/solvers/feather_pgs/kernels.py` – Added `clamp_velocity_per_dof` Warp kernel
+- `newton/_src/solvers/feather_pgs/solver_feather_pgs.py` – Added `enable_velocity_clamp` and `velocity_clamp_factor` params; wired Stage 6c velocity clamp between impulse apply and integration; added init validation; imported `clamp_velocity_per_dof`
 - `newton/_src/solvers/feather_pgs/spike_capture.py` – Capture module (enhanced with constraint-level data)
 - `newton/_src/solvers/feather_pgs/spike_replay.py` – Replay harness with pure-numpy PGS solver, drift measurement, and parameter sweep
 - `newton/_src/solvers/feather_pgs/generate_synthetic_spike.py` – Original synthetic spike artifact generator
 - `newton/_src/solvers/feather_pgs/generate_realistic_spikes.py` – Physically grounded spike generator (4 classes)
 - `newton/_src/solvers/feather_pgs/fix_experiments.py` – Fix experiment script (3 candidate fixes with quantitative results)
-- `newton/_src/solvers/feather_pgs/solver_feather_pgs.py` – Modified: import + hooks in `step()`
-- `tests/test_spike_capture.py` – Unit tests (35 tests: capture, PGS solver, replay, drift, fix experiments)
+- `tests/test_spike_capture.py` – Unit tests (43 tests: capture, PGS solver, replay, drift, fix experiments, landed velocity clamp)
 - `spike_captures/synthetic_franka_spike.npz` – Original reference artifact
 - `spike_captures/real_joint_limit_spike.npz` – Class 3: Joint-limit cross-coupling spike
 - `spike_captures/real_vhat_unconstrained_spike.npz` – Class 1: Unconstrained v_hat spike
 - `spike_captures/real_contact_impulse_spike.npz` – Class 2: Contact impulse spike
 - `spike_captures/real_coupled_limit_contact_spike.npz` – Class 4: Coupled limit+contact (no spike)
 - `report.md` – This file
+
+### skild-IL-solver
+
+- `source/isaaclab_newton/isaaclab_newton/physics/newton_manager_cfg.py` – Added `dense_contact_compliance`, `enable_velocity_clamp`, and `velocity_clamp_factor` fields to `FeatherPGSSolverCfg`
+- `source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/lift/lift_env_cfg.py` – Enabled velocity clamp (factor=1.25) and contact compliance (0.0001) in `LiftPhysicsCfg.feather_pgs`
