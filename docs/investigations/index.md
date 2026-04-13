@@ -17,12 +17,6 @@ Branch: `dt/velocity-spike-claude`
 
 The current spike study says the dominant spike class is unconstrained `v_hat`, not a PGS convergence failure. On the reproduced traces, PGS converges in 8 iterations; the recommended mitigation is post-solve velocity clamping plus compliance-oriented follow-up work rather than a dense-vs-matrix-free path change.
 
-### TGS feasibility study
-
-Branch: `dt/tgs-feather-pgs-study`
-
-The current TGS study reports equivalent physics at roughly 2x cost for the tested setup, with the velocity guard remaining the dominant training blocker. That keeps TGS in the "useful reference, not current winner" category while the results are still being finalized.
-
 ### Private API matrix-free cleanup
 
 Branch: `dturpin/fpgs-private-api-matrix-free`
@@ -32,3 +26,9 @@ The private API cleanup collapsed the public FeatherPGS surface to matrix-free-o
 ### Warp kernel migration (Zach Corse)
 
 Zach converted the FeatherPGS kernels from raw CUDA strings to Warp, which is significantly easier to maintain, understand, and debug. The initial conversion showed a ~40% throughput reduction on `h1_tabletop`, but after targeted Warp-side optimizations that gap has narrowed to ~9% — likely an acceptable tradeoff for the maintainability and debuggability gains. Release timing for this depends on landing the required Warp PRs upstream, and needs to be coordinated with the private FeatherPGS API changes in Newton.
+
+### [In-flight] TGS feasibility study
+
+Branch: `dt/tgs-feather-pgs-study`
+
+Just kicked off. The TGS-style smaller-step path (doubled FeatherPGS solves per action at `sim.dt=0.0025`, `decimation=8`) shows equivalent physics at roughly 2× wall-clock cost. Early training comparisons suggest the velocity guard is the dominant training blocker — removing it allows learning to start — but the absolute reward numbers are low and need validation against a proper baseline. Assumptions and setup still need human verification before drawing conclusions.
