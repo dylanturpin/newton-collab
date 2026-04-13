@@ -1,0 +1,312 @@
+# ExecPlan: FeatherPGS Dense vs Matrix-Free Explainer
+
+## Objective
+
+Produce a deep technical documentation deliverable for the FeatherPGS line that compares the dense and matrix-free formulations with concrete, scenario-backed data. The final deliverable may be either:
+
+- a substantial new section in `docs/concepts/feather_pgs.md`, or
+- a separate page linked from the FeatherPGS docs,
+
+whichever yields the cleaner final documentation structure.
+
+This lane is for documentation, data capture, and safe publication mechanics. It is not a general solver refactor lane unless limited code changes are needed to extract, validate, or present the required data.
+
+## Workspace Facts
+
+- Repo: `newton-collab` fork at `/home/dturpin/repos/newton-collab-fpgs-explainer`
+- Working branch: `dturpin/fpgs-matrix-free-dense-explainer`
+- Base line of work: `feather_pgs`
+- Fork remote: `origin = git@github.com:dylanturpin/newton-collab.git`
+- Upstream remote: `upstream = https://github.com/newton-physics/newton.git`
+- Existing FeatherPGS doc page: `docs/concepts/feather_pgs.md`
+- Nightly benchmark plan: `benchmarks/nightly/nightly.yaml`
+- Nightly benchmark site/artifacts source branch: `origin/gh-pages`
+- Optional representative Isaac Lab repo: `~/repos/il-newton-dev`
+
+## Non-Negotiable Guardrails
+
+- Do not create a GitHub issue.
+- Do not open a PR.
+- Never push to `upstream`.
+- Do not publish to `gh-pages` until the docs work is actually complete.
+- Preserve nightly benchmark data on `gh-pages`; any eventual docs update must be docs-only and must not clobber JSONL history, plots, or benchmark assets.
+- Treat raw data as a first-class deliverable, not just prose support.
+- Main comparison is dense vs matrix-free. Hybrid may be mentioned briefly with caveats.
+- Keep the plan and workflow self-contained so a new contributor can continue from the workspace.
+
+## Push Policy
+
+There is an explicit constraint conflict:
+
+- requested workflow behavior: commit and push at milestones
+- repository safety rule from the user: only the final worker, when the work is actually complete, may push to fork branches `feather_pgs` and `gh-pages`
+
+This ExecPlan resolves that conflict conservatively:
+
+- milestone work may be committed locally on `dturpin/fpgs-matrix-free-dense-explainer`
+- remote pushes are forbidden until the relevant final milestone is complete
+- the only allowed remote pushes are:
+  - source/docs changes to `origin/feather_pgs`
+  - docs site changes to `origin/gh-pages`
+- no other remote branches may be pushed from this workflow unless the user changes policy explicitly
+
+## Required Deliverables
+
+1. A living technical explainer in the docs comparing dense and matrix-free FeatherPGS.
+2. Raw data artifacts under version control for representative scenarios, including logical array shapes and realistic sizing.
+3. Clear discussion of the actual work performed by each path:
+   - matrix/vector objects
+   - multiplies and accumulations
+   - what is materialized vs recomputed
+4. Memory-layout discussion for the main PGS solve kernels:
+   - registers
+   - shared memory
+   - global memory
+   - streamed vs preloaded data
+5. Real scenario sizing for at least:
+   - `g1_flat`
+   - `h1_tabletop`
+   - ideally one or more Isaac Lab tasks from `~/repos/il-newton-dev` if useful
+6. The motivating observations:
+   - matrix-free performs surprisingly well without shared memory
+   - dense path has issues
+   - streaming dense kernel does not fully resolve them
+7. A small open-questions section if unexplained observations remain.
+8. Local docs build validation with the real toolchain.
+9. A safe, manual `gh-pages` update procedure or helper script that preserves nightly data.
+
+## Evidence and Artifact Locations
+
+- Living plan: `.agent/execplans/fpgs-matrix-free-dense-explainer.md`
+- Workflow definition: `.agent/workflows/fpgs-matrix-free-dense-explainer.yaml`
+- Handoff notes / human summary draft: `.agent/review/fpgs-matrix-free-dense-explainer-handoff.md`
+- Raw data and derived tables: `.agent/data/fpgs-matrix-free-dense-explainer/`
+- Optional helper scripts for extraction / sizing / gh-pages safety:
+  - `scripts/analysis/`
+  - `scripts/docs/`
+
+If a different path is materially cleaner, update this section before moving files.
+
+## Milestones
+
+### M0. Orchestration Setup
+
+Status: complete
+
+Definition of done:
+
+- create this living ExecPlan
+- create a milestone-driven workflow definition in the workspace
+- start a workflow run attached to this workspace
+- record any setup caveats for the next worker
+
+### M1. Source Inventory and Page Placement Decision
+
+Status: complete
+
+Definition of done:
+
+- inventory the exact solver kernels, docs sections, nightly configs, and `gh-pages` artifacts needed
+- decide whether the deliverable belongs inside `docs/concepts/feather_pgs.md` or in a separate page
+- document the decision and rationale here
+- identify which existing branch edits in `docs/concepts/feather_pgs.md` should be retained, revised, or moved
+
+Expected outputs:
+
+- updated page-placement note in this ExecPlan
+- initial artifact inventory under `.agent/data/...` or `.agent/review/...`
+
+### M2. Data Extraction Tooling and Schema
+
+Status: pending
+
+Definition of done:
+
+- add any helper scripts needed to extract logical shapes, storage sizes, and scenario-backed counts
+- define the raw artifact schema plainly enough that later passes stay consistent
+- prefer checked-in machine-readable artifacts such as JSON or CSV plus lightweight markdown summaries
+
+Expected outputs:
+
+- helper scripts if needed
+- initial raw artifact schema and output location
+
+### M3. Scenario-Backed Dense vs Matrix-Free Data Capture
+
+Status: pending
+
+Definition of done:
+
+- gather concrete sizing and storage data for `g1_flat` and `h1_tabletop`
+- include array/tensor names, shapes, storage class, and size implications
+- include at least one Isaac Lab task if it materially improves the comparison
+- verify the captured data is tied to real scenarios, not just theoretical formulas
+
+Expected outputs:
+
+- versioned raw data artifacts
+- concise notes explaining provenance and scenario assumptions
+
+### M4. Kernel Work / Memory Layout Analysis
+
+Status: pending
+
+Definition of done:
+
+- document the main dense and matrix-free PGS solve kernels used by the current FeatherPGS line
+- explain which multiply / accumulation each path performs
+- explain what resides in registers, shared memory, and global memory as implemented today
+- call out what is streamed, what is preloaded, and what is recomputed
+- explicitly address the surprising observations motivating the explainer
+
+Expected outputs:
+
+- artifact notes and/or tables that can be pulled into docs directly
+
+### M5. Draft the Explainer Content
+
+Status: pending
+
+Definition of done:
+
+- land a coherent docs draft in the chosen page location
+- make the dense vs matrix-free comparison the center of the page
+- include raw-data-backed tables / figures / summaries as first-class content
+- mention hybrid briefly with caveats only if it helps
+- include open questions only where genuinely unresolved
+
+Expected outputs:
+
+- docs content in repo
+- updated handoff summary draft
+
+### M6. Validate Docs Build and Tighten Presentation
+
+Status: pending
+
+Definition of done:
+
+- build docs locally with the real docs toolchain:
+  - `uv run --extra docs --extra sim sphinx-build -j auto -b html docs docs/_build/html`
+- fix doc build issues caused by the explainer work
+- run `uvx pre-commit run -a`
+- update this ExecPlan and handoff notes with exact validation evidence
+
+Expected outputs:
+
+- passing local docs build
+- lint / formatting evidence
+
+### M7. Final Source-Branch Publication
+
+Status: pending
+
+Definition of done:
+
+- docs work is actually complete
+- source changes are committed and ready to publish from the working branch
+- push only to `origin/feather_pgs`
+- record exact push command/result in the handoff summary
+
+This milestone must not start early.
+
+### M8. Safe `gh-pages` Update
+
+Status: pending
+
+Definition of done:
+
+- docs work is already complete and source branch publication is done
+- update `origin/gh-pages` manually and safely without damaging nightly benchmark content
+- preserve benchmark JSONL rows, plots, and unrelated site assets
+- record exactly what was updated and what was intentionally left untouched
+
+This milestone must not start early.
+
+## Current Placement Hypothesis
+
+Decision after M1: keep `docs/concepts/feather_pgs.md` as the theory / architecture page and draft the dense-vs-matrix-free explainer as a dedicated sibling page under `docs/concepts/`.
+
+Rationale:
+
+- the current `docs/concepts/feather_pgs.md` already covers formulation, mode taxonomy, and code mapping at substantial length
+- the requested deliverable needs scenario-backed tables, kernel-memory-layout discussion, and raw-data-driven comparisons that would make the existing page too long and harder to scan
+- a sibling page keeps the current page stable as the conceptual entry point while allowing the new explainer to be explicitly data-heavy and benchmark-oriented
+- the sibling-page path is additive and minimizes churn in already-useful narrative material on the current branch
+
+Planned page structure:
+
+- retain `docs/concepts/feather_pgs.md` as the main overview page
+- add a new sibling page for the deep dense-vs-matrix-free comparison and link it from `docs/index.rst` and/or from the FeatherPGS overview page
+- reuse short background snippets from `docs/concepts/feather_pgs.md` only where they improve local readability; do not duplicate the full theory section
+
+Existing branch edits in `docs/concepts/feather_pgs.md`:
+
+- retain: motivation/background, dense-vs-matrix-free math equivalence, mode taxonomy, mapping-from-math-to-code, and frame-convention notes
+- revise later only as needed to add a short pointer to the new explainer page and tighten any wording that becomes redundant
+- move: none verbatim for now; prefer leaving the existing narrative in place and building the empirical comparison as a new document
+
+## M1 Source Inventory
+
+Documentation entry points:
+
+- current FeatherPGS overview page: `docs/concepts/feather_pgs.md`
+- concepts navigation: `docs/index.rst`
+
+Primary solver implementation locations:
+
+- solver orchestration and mode split: `newton/_src/solvers/feather_pgs/solver_feather_pgs.py`
+- row builders / supporting kernels: `newton/_src/solvers/feather_pgs/kernels.py`
+- benchmark entry point and scenario presets: `newton/tools/solver_benchmark.py`
+
+Dense articulated path locations to analyze in later milestones:
+
+- stage-4 articulated operator build: `_stage4_hinv_jt_*`, `_stage4_delassus_*`, `_stage4_compute_rhs_world`, `_stage4_accumulate_rhs_world`
+- dense PGS dispatch / kernels: `_dispatch_dense_pgs_solve`, `_stage5_pgs_solve_world_loop`, `_stage5_pgs_solve_world_tiled_row`, `_stage5_pgs_solve_world_tiled_contact`, `_stage5_pgs_solve_world_streaming`
+- dense impulse application: `_stage6_apply_impulses_world`
+
+Matrix-free / mixed-path locations to analyze in later milestones:
+
+- articulated matrix-free gather and solve setup in `step()`: `S5_GatherJY`, `self._stage6_prepare_world_velocity()`, and the `pgs_mode == "matrix_free"` branch
+- diagonal-only articulated setup: `_stage4_diag_from_JY`
+- free-rigid matrix-free setup / solve: `_mf_pgs_setup`, `_mf_pgs_solve`, `_stage6b_mf_pgs`
+- fused two-phase dense+MF kernel factory: `TiledKernelFactory.get_pgs_solve_mf_gs_kernel()` and `_build_pgs_solve_mf_gs_kernel()`
+
+Scenarios and benchmark presets already present:
+
+- `g1_flat` and `h1_tabletop` are already first-class scenarios in `newton/tools/solver_benchmark.py`
+- solver presets already distinguish `fpgs_dense_loop`, `fpgs_dense_row`, `fpgs_dense_streaming`, `fpgs_split`, and `fpgs_matrix_free`
+- scenario defaults already encode different dense-constraint budgets and note that `h1_tabletop` routes rigid-body contacts to the matrix-free path
+
+Nightly benchmark planning and publication touchpoints:
+
+- benchmark plan: `benchmarks/nightly/nightly.yaml`
+- nightly dashboard source: `benchmarks/nightly/index.html`
+- nightly publication logic: `benchmarks/nightly/publish.py`
+- local/slurm wrappers: `benchmarks/nightly.sh`, `benchmarks/nightly_slurm.sh`
+
+Concrete nightly artifacts that must be preserved when `gh-pages` is eventually updated:
+
+- `nightly/runs.jsonl`
+- `nightly/points.jsonl`
+- `nightly/runs/<run_id>/meta.json`
+- `nightly/runs/<run_id>/summary.json`
+- `nightly/runs/<run_id>/...` render/profile artifacts copied by `benchmarks/nightly/publish.py`
+- `nightly/index.html`
+- branch-root `.nojekyll`
+
+Existing docs deployment workflows that currently touch `gh-pages` and therefore must not be reused blindly for the nightly-preserving update:
+
+- `.github/workflows/docs-release.yml`
+- `.github/workflows/docs-dev.yml`
+
+These workflows replace `stable/`, versioned docs, or `latest/` directly on `gh-pages`; they are useful references for docs build mechanics but not yet safe publication procedures for this explainer lane.
+
+## Immediate Next Action
+
+Advance M2: add data-extraction tooling and a checked-in raw-artifact schema for scenario-backed sizing, starting with `g1_flat` and `h1_tabletop`.
+
+## Change Log
+
+- 2026-04-13: Created ExecPlan, recorded branch/remotes/guardrails, and set up workflow-driven milestone execution for this workspace.
+- 2026-04-13: Completed M1 source inventory, chose a dedicated sibling docs page for the dense-vs-matrix-free explainer, and recorded the nightly artifacts that later publication steps must preserve.
