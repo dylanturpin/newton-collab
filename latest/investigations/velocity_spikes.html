@@ -875,12 +875,11 @@
 </section>
 <section id="replay-infrastructure">
 <h2>Replay Infrastructure<a class="headerlink" href="#replay-infrastructure" title="Link to this heading">#</a></h2>
-<p>We added opt-in capture hooks in <code class="docutils literal notranslate"><span class="pre">SolverFeatherPGS.step()</span></code> that snapshot full solver state (positions, velocities, Delassus matrix <span class="math notranslate nohighlight">\(C\)</span>, impulses <span class="math notranslate nohighlight">\(\lambda\)</span>, constraint metadata, <span class="math notranslate nohighlight">\(Y = \tilde{H}^{-1} J^T\)</span>) to <code class="docutils literal notranslate"><span class="pre">.npz</span></code> files whenever post-solve velocity exceeds a configurable threshold. Capture is dormant by default (zero overhead) and capped at 100 artifacts per session.</p>
-<p>A pure-numpy PGS replay harness (<code class="docutils literal notranslate"><span class="pre">spike_replay.py</span></code>) re-runs the solve from these snapshots. It is a line-by-line port of the Warp kernel <code class="docutils literal notranslate"><span class="pre">pgs_solve_loop</span></code> and reconstructs velocity via <span class="math notranslate nohighlight">\(v_{\text{out}} = \hat{v} + \sum_i Y_i \lambda_i\)</span>. All four captured artifacts replay with <strong>zero drift</strong> (max impulse/velocity deviation = 0.0), confirming faithful reproduction. This enables offline classification and fix experiments without GPU or Isaac Sim.</p>
+<p>We added opt-in capture hooks in <code class="docutils literal notranslate"><span class="pre">SolverFeatherPGS.step()</span></code> that snapshot full solver state (positions, velocities, Delassus matrix <span class="math notranslate nohighlight">\(C\)</span>, impulses <span class="math notranslate nohighlight">\(\lambda\)</span>, constraint metadata, <span class="math notranslate nohighlight">\(Y = \tilde{H}^{-1} J^T\)</span>) to <code class="docutils literal notranslate"><span class="pre">.npz</span></code> files whenever post-solve velocity exceeds a configurable threshold. Capture is off by default (zero overhead) and capped at 100 artifacts per session. A pure-numpy PGS replay harness reproduces captured frames with zero drift, enabling offline classification and fix experiments without GPU or Isaac Sim.</p>
 </section>
 <section id="spike-classification">
 <h2>Spike Classification<a class="headerlink" href="#spike-classification" title="Link to this heading">#</a></h2>
-<p>Replay of captured spike frames revealed four distinct classes.</p>
+<p>Replay of captured spike frames revealed three classes that matter.</p>
 <section id="class-1-unconstrained-hat-v-spike-dominant-60-of-observed-spikes">
 <h3>Class 1: Unconstrained <span class="math notranslate nohighlight">\(\hat{v}\)</span> Spike (DOMINANT, ~60% of observed spikes)<a class="headerlink" href="#class-1-unconstrained-hat-v-spike-dominant-60-of-observed-spikes" title="Link to this heading">#</a></h3>
 <p>The unconstrained velocity predictor <span class="math notranslate nohighlight">\(\hat{v}\)</span> already exceeds soft velocity limits <em>before</em> the PGS solve runs. The PGS has minimal effect because active constraints (e.g., cube-table contact) do not project onto the spiking arm DOFs.</p>
@@ -900,28 +899,22 @@
 <section id="class-3-joint-limit-cross-coupling-mild">
 <h3>Class 3: Joint-Limit Cross-Coupling (MILD)<a class="headerlink" href="#class-3-joint-limit-cross-coupling-mild" title="Link to this heading">#</a></h3>
 <p>When a joint overshoots its position limit, the correction impulse correctly stops the violating DOF, but mass matrix off-diagonal coupling (<span class="math notranslate nohighlight">\(Y\)</span> matrix) propagates the impulse to neighboring DOFs. For the Franka’s low-inertia wrist joints (0.03–0.05 kg·m²), even small limit violations produce non-trivial cross-coupled velocities.</p>
-<p>A 100-combination parameter sweep — omega 1.0→0.6, CFM 0→10⁻², iterations 8→64 — produces <strong>identical results</strong> (impulse variance &lt; 10⁻⁴). The PGS is already converged at 8 iterations. These spikes are the mathematically correct solution to the formulated constraint problem.</p>
+<p>A 100-combination parameter sweep (omega 1.0→0.6, CFM 0→10⁻², iterations 8→64) produces <strong>identical results</strong> (impulse variance &lt; 10⁻⁴). The PGS is already converged at 8 iterations. These spikes are the mathematically correct solution to the formulated constraint problem.</p>
 <p><strong>Peak:</strong> 1.94 rad/s (below soft limit). Not PGS-tunable.</p>
-</section>
-<section id="class-4-coupled-limit-contact-well-resolved">
-<h3>Class 4: Coupled Limit + Contact (WELL-RESOLVED)<a class="headerlink" href="#class-4-coupled-limit-contact-well-resolved" title="Link to this heading">#</a></h3>
-<p>When multiple joint limits and contacts are simultaneously active, the PGS solver handles the coupling well. <strong>Not</strong> a spike source for this task.</p>
-<p><strong>Peak:</strong> 0.97 rad/s (well below soft limits).</p>
 </section>
 <section id="summary">
 <h3>Summary<a class="headerlink" href="#summary" title="Link to this heading">#</a></h3>
 <p>| Class | Mechanism | Peak <span class="math notranslate nohighlight">\(|v_{\text{out}}|\)</span> | vs. Threshold | PGS-tunable? |
 |—|—|—|—|—|
-| 1 — Unconstrained <span class="math notranslate nohighlight">\(\hat{v}\)</span> | Drive torque → large <span class="math notranslate nohighlight">\(\hat{v}\)</span>, no opposing constraint | <strong>5.20 rad/s</strong> | 1.9× over | <strong>No</strong> |
-| 2 — Contact impulse | Contact Baumgarte → wrist DOF kick | <strong>2.70 rad/s</strong> | 1.04× over | Partially |
-| 3 — Joint-limit coupling | Limit correction → <span class="math notranslate nohighlight">\(Y\)</span> off-diagonals | <strong>1.94 rad/s</strong> | Below | No (converged) |
-| 4 — Coupled limit+contact | Mixed constraints | <strong>0.97 rad/s</strong> | Well below | N/A |</p>
+| 1. Unconstrained <span class="math notranslate nohighlight">\(\hat{v}\)</span> | Drive torque → large <span class="math notranslate nohighlight">\(\hat{v}\)</span>, no opposing constraint | <strong>5.20 rad/s</strong> | 1.9× over | <strong>No</strong> |
+| 2. Contact impulse | Contact Baumgarte → wrist DOF kick | <strong>2.70 rad/s</strong> | 1.04× over | Partially |
+| 3. Joint-limit coupling | Limit correction → <span class="math notranslate nohighlight">\(Y\)</span> off-diagonals | <strong>1.94 rad/s</strong> | Below | No (converged) |</p>
 </section>
 </section>
 <hr class="docutils" />
 <section id="fix-experiments">
 <h2>Fix Experiments<a class="headerlink" href="#fix-experiments" title="Link to this heading">#</a></h2>
-<p>Three candidate fixes tested on all four artifact classes via the replay harness.</p>
+<p>Three candidate fixes tested on all three spike classes via the replay harness.</p>
 <section id="fix-1-post-solve-velocity-clamping">
 <h3>Fix 1: Post-Solve Velocity Clamping<a class="headerlink" href="#fix-1-post-solve-velocity-clamping" title="Link to this heading">#</a></h3>
 <p>Clamp <span class="math notranslate nohighlight">\(v_{\text{out}}\)</span> per-DOF to <code class="docutils literal notranslate"><span class="pre">factor</span> <span class="pre">×</span> <span class="pre">vel_limit</span></code> after the PGS solve, before integration:</p>
@@ -957,16 +950,10 @@ v_{\text{out},i} = \text{clip}\!\left(v_{\text{out},i},\; -f \cdot v_{\lim,i},\;
 <td><p>1.944 (0%)</p></td>
 <td><p>1.944 (0%)</p></td>
 </tr>
-<tr class="row-odd"><td><p>Coupled limit+contact (4)</p></td>
-<td><p>0.968</p></td>
-<td><p>0.968 (0%)</p></td>
-<td><p>0.968 (0%)</p></td>
-<td><p>0.968 (0%)</p></td>
-</tr>
 </tbody>
 </table>
 </div>
-<p>Only fix effective against Class 1. At <code class="docutils literal notranslate"><span class="pre">factor=1.25</span></code>, the dominant spike drops from 5.20 to 2.72 rad/s — exactly at the termination threshold (47.7% reduction). Non-physical (discards kinetic energy) but fires only during transient spikes.</p>
+<p>Only fix effective against Class 1. At <code class="docutils literal notranslate"><span class="pre">factor=1.25</span></code>, the dominant spike drops from 5.20 to 2.72 rad/s, exactly at the termination threshold (47.7% reduction). Non-physical (discards kinetic energy) but fires only during transient spikes.</p>
 </section>
 <section id="fix-2-reduced-beta-baumgarte-correction">
 <h3>Fix 2: Reduced <span class="math notranslate nohighlight">\(\beta\)</span> (Baumgarte Correction)<a class="headerlink" href="#fix-2-reduced-beta-baumgarte-correction" title="Link to this heading">#</a></h3>
@@ -994,11 +981,6 @@ v_{\text{out},i} = \text{clip}\!\left(v_{\text{out},i},\; -f \cdot v_{\lim,i},\;
 <td><p>1.944</p></td>
 <td><p>3.190 (<strong>+64.1%</strong>)</p></td>
 <td><p>4.345 (<strong>+123.5%</strong>)</p></td>
-</tr>
-<tr class="row-odd"><td><p>Coupled limit+contact (4)</p></td>
-<td><p>0.968</p></td>
-<td><p>1.320 (+36.4%)</p></td>
-<td><p>1.909 (+97.2%)</p></td>
 </tr>
 </tbody>
 </table>
@@ -1036,16 +1018,10 @@ v_{\text{out},i} = \text{clip}\!\left(v_{\text{out},i},\; -f \cdot v_{\lim,i},\;
 <td><p>1.944 (0%)</p></td>
 <td><p>1.944 (0%)</p></td>
 </tr>
-<tr class="row-odd"><td><p>Coupled limit+contact (4)</p></td>
-<td><p>0.968</p></td>
-<td><p><strong>0.527 (−45.6%)</strong></p></td>
-<td><p>0.972 (−0.4%)</p></td>
-<td><p>1.155 (+19.3%)</p></td>
-</tr>
 </tbody>
 </table>
 </div>
-<p>Reduces Class 2 contact spikes without affecting joint limits. Conservative <span class="math notranslate nohighlight">\(c\)</span> = 0.0001 recommended — benefits contacts and coupled scenarios without destabilizing anything.</p>
+<p>Reduces Class 2 contact spikes without affecting joint limits. Conservative <span class="math notranslate nohighlight">\(c\)</span> = 0.0001 recommended.</p>
 </section>
 <section id="fix-summary">
 <h3>Fix Summary<a class="headerlink" href="#fix-summary" title="Link to this heading">#</a></h3>
@@ -1069,10 +1045,6 @@ v_{\text{out},i} = \text{clip}\!\left(v_{\text{out},i},\; -f \cdot v_{\lim,i},\;
 <td><p><strong>None</strong></p></td>
 <td><p>1.94 (unchanged; correct solution)</p></td>
 </tr>
-<tr class="row-odd"><td><p>4: Coupled limit+contact</p></td>
-<td><p><strong>Compliance (<span class="math notranslate nohighlight">\(c\)</span>=0.0001)</strong></p></td>
-<td><p>0.97 → 0.53 (−45.6%)</p></td>
-</tr>
 </tbody>
 </table>
 </div>
@@ -1082,10 +1054,10 @@ v_{\text{out},i} = \text{clip}\!\left(v_{\text{out},i},\; -f \cdot v_{\lim,i},\;
 <section id="possible-mitigation">
 <h2>Possible Mitigation<a class="headerlink" href="#possible-mitigation" title="Link to this heading">#</a></h2>
 <ol class="arabic simple">
-<li><p><strong>Post-solve velocity clamp at 1.25×</strong> — addresses Class 1 (dominant); no harm to other classes.</p></li>
-<li><p><strong>Contact compliance at 0.0001</strong> — addresses Class 2; no effect on joint limits.</p></li>
+<li><p><strong>Post-solve velocity clamp at 1.25×</strong> addresses Class 1 (dominant); no harm to other classes.</p></li>
+<li><p><strong>Contact compliance at 0.0001</strong> addresses Class 2; no effect on joint limits.</p></li>
 </ol>
-<p>Both are implemented on branch <code class="docutils literal notranslate"><span class="pre">dt/velocity-spike-claude</span></code>. Full training validation is pending — queued for dedicated hardware.</p>
+<p>Both are implemented on branch <code class="docutils literal notranslate"><span class="pre">dt/velocity-spike-claude</span></code>.</p>
 </section>
 </section>
 
@@ -1118,7 +1090,6 @@ v_{\text{out},i} = \text{clip}\!\left(v_{\text{out},i},\; -f \cdot v_{\lim,i},\;
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#class-1-unconstrained-hat-v-spike-dominant-60-of-observed-spikes">Class 1: Unconstrained <span class="math notranslate nohighlight">\(\hat{v}\)</span> Spike (DOMINANT, ~60% of observed spikes)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#class-2-contact-impulse-spike-moderate">Class 2: Contact Impulse Spike (MODERATE)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#class-3-joint-limit-cross-coupling-mild">Class 3: Joint-Limit Cross-Coupling (MILD)</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#class-4-coupled-limit-contact-well-resolved">Class 4: Coupled Limit + Contact (WELL-RESOLVED)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#summary">Summary</a></li>
 </ul>
 </li>

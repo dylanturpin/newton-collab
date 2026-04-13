@@ -9,13 +9,11 @@ During Isaac Lab training of the Franka cube-lift task, FeatherPGS produces tran
 
 ## Replay Infrastructure
 
-We added opt-in capture hooks in `SolverFeatherPGS.step()` that snapshot full solver state (positions, velocities, Delassus matrix $C$, impulses $\lambda$, constraint metadata, $Y = \tilde{H}^{-1} J^T$) to `.npz` files whenever post-solve velocity exceeds a configurable threshold. Capture is dormant by default (zero overhead) and capped at 100 artifacts per session.
-
-A pure-numpy PGS replay harness (`spike_replay.py`) re-runs the solve from these snapshots. It is a line-by-line port of the Warp kernel `pgs_solve_loop` and reconstructs velocity via $v_{\text{out}} = \hat{v} + \sum_i Y_i \lambda_i$. All four captured artifacts replay with **zero drift** (max impulse/velocity deviation = 0.0), confirming faithful reproduction. This enables offline classification and fix experiments without GPU or Isaac Sim.
+We added opt-in capture hooks in `SolverFeatherPGS.step()` that snapshot full solver state (positions, velocities, Delassus matrix $C$, impulses $\lambda$, constraint metadata, $Y = \tilde{H}^{-1} J^T$) to `.npz` files whenever post-solve velocity exceeds a configurable threshold. Capture is off by default (zero overhead) and capped at 100 artifacts per session. A pure-numpy PGS replay harness reproduces captured frames with zero drift, enabling offline classification and fix experiments without GPU or Isaac Sim.
 
 ## Spike Classification
 
-Replay of captured spike frames revealed four distinct classes.
+Replay of captured spike frames revealed three classes that matter.
 
 ### Class 1: Unconstrained $\hat{v}$ Spike (DOMINANT, ~60% of observed spikes)
 
@@ -41,30 +39,23 @@ When a wrist link contacts a surface, the contact Jacobian has lever arms throug
 
 When a joint overshoots its position limit, the correction impulse correctly stops the violating DOF, but mass matrix off-diagonal coupling ($Y$ matrix) propagates the impulse to neighboring DOFs. For the Franka's low-inertia wrist joints (0.03–0.05 kg·m²), even small limit violations produce non-trivial cross-coupled velocities.
 
-A 100-combination parameter sweep — omega 1.0→0.6, CFM 0→10⁻², iterations 8→64 — produces **identical results** (impulse variance < 10⁻⁴). The PGS is already converged at 8 iterations. These spikes are the mathematically correct solution to the formulated constraint problem.
+A 100-combination parameter sweep (omega 1.0→0.6, CFM 0→10⁻², iterations 8→64) produces **identical results** (impulse variance < 10⁻⁴). The PGS is already converged at 8 iterations. These spikes are the mathematically correct solution to the formulated constraint problem.
 
 **Peak:** 1.94 rad/s (below soft limit). Not PGS-tunable.
-
-### Class 4: Coupled Limit + Contact (WELL-RESOLVED)
-
-When multiple joint limits and contacts are simultaneously active, the PGS solver handles the coupling well. **Not** a spike source for this task.
-
-**Peak:** 0.97 rad/s (well below soft limits).
 
 ### Summary
 
 | Class | Mechanism | Peak $|v_{\text{out}}|$ | vs. Threshold | PGS-tunable? |
 |---|---|---|---|---|
-| 1 — Unconstrained $\hat{v}$ | Drive torque → large $\hat{v}$, no opposing constraint | **5.20 rad/s** | 1.9× over | **No** |
-| 2 — Contact impulse | Contact Baumgarte → wrist DOF kick | **2.70 rad/s** | 1.04× over | Partially |
-| 3 — Joint-limit coupling | Limit correction → $Y$ off-diagonals | **1.94 rad/s** | Below | No (converged) |
-| 4 — Coupled limit+contact | Mixed constraints | **0.97 rad/s** | Well below | N/A |
+| 1. Unconstrained $\hat{v}$ | Drive torque → large $\hat{v}$, no opposing constraint | **5.20 rad/s** | 1.9× over | **No** |
+| 2. Contact impulse | Contact Baumgarte → wrist DOF kick | **2.70 rad/s** | 1.04× over | Partially |
+| 3. Joint-limit coupling | Limit correction → $Y$ off-diagonals | **1.94 rad/s** | Below | No (converged) |
 
 ---
 
 ## Fix Experiments
 
-Three candidate fixes tested on all four artifact classes via the replay harness.
+Three candidate fixes tested on all three spike classes via the replay harness.
 
 ### Fix 1: Post-Solve Velocity Clamping
 
@@ -79,9 +70,8 @@ $$
 | Unconstrained $\hat{v}$ (1) | 5.200 | **2.719 (−47.7%)** | 3.262 (−37.3%) | 4.350 (−16.3%) |
 | Contact impulse (2) | 2.699 | 2.699 (0%) | 2.699 (0%) | 2.699 (0%) |
 | Joint-limit coupling (3) | 1.944 | 1.944 (0%) | 1.944 (0%) | 1.944 (0%) |
-| Coupled limit+contact (4) | 0.968 | 0.968 (0%) | 0.968 (0%) | 0.968 (0%) |
 
-Only fix effective against Class 1. At `factor=1.25`, the dominant spike drops from 5.20 to 2.72 rad/s — exactly at the termination threshold (47.7% reduction). Non-physical (discards kinetic energy) but fires only during transient spikes.
+Only fix effective against Class 1. At `factor=1.25`, the dominant spike drops from 5.20 to 2.72 rad/s, exactly at the termination threshold (47.7% reduction). Non-physical (discards kinetic energy) but fires only during transient spikes.
 
 ### Fix 2: Reduced $\beta$ (Baumgarte Correction)
 
@@ -92,7 +82,6 @@ Reduce the Baumgarte position correction factor ($\text{rhs} = \beta \cdot \phi 
 | Unconstrained $\hat{v}$ (1) | 5.200 | 5.200 (0%) | 5.200 (0%) |
 | Contact impulse (2) | 2.699 | **1.658 (−38.6%)** | 1.727 (−36.0%) |
 | Joint-limit coupling (3) | 1.944 | 3.190 (**+64.1%**) | 4.345 (**+123.5%**) |
-| Coupled limit+contact (4) | 0.968 | 1.320 (+36.4%) | 1.909 (+97.2%) |
 
 Mixed effect: helps contact spikes (Class 2) but **worsens** joint-limit spikes (Class 3) significantly. Rejected.
 
@@ -105,9 +94,8 @@ Add compliance $\alpha = c / \Delta t^2$ to the Delassus diagonal for contact-no
 | Unconstrained $\hat{v}$ (1) | 5.200 | 5.200 (0%) | 5.200 (0%) | 5.200 (0%) |
 | Contact impulse (2) | 2.699 | 1.940 (−28.1%) | **1.670 (−38.1%)** | 1.784 (−33.9%) |
 | Joint-limit coupling (3) | 1.944 | 1.944 (0%) | 1.944 (0%) | 1.944 (0%) |
-| Coupled limit+contact (4) | 0.968 | **0.527 (−45.6%)** | 0.972 (−0.4%) | 1.155 (+19.3%) |
 
-Reduces Class 2 contact spikes without affecting joint limits. Conservative $c$ = 0.0001 recommended — benefits contacts and coupled scenarios without destabilizing anything.
+Reduces Class 2 contact spikes without affecting joint limits. Conservative $c$ = 0.0001 recommended.
 
 ### Fix Summary
 
@@ -116,13 +104,12 @@ Reduces Class 2 contact spikes without affecting joint limits. Conservative $c$ 
 | 1: Unconstrained $\hat{v}$ | **Velocity clamp (1.25×)** | 5.20 → 2.72 (−47.7%) |
 | 2: Contact impulse | **Compliance ($c$=0.001)** | 2.70 → 1.67 (−38.1%) |
 | 3: Joint-limit coupling | **None** | 1.94 (unchanged; correct solution) |
-| 4: Coupled limit+contact | **Compliance ($c$=0.0001)** | 0.97 → 0.53 (−45.6%) |
 
 ---
 
 ## Possible Mitigation
 
-1. **Post-solve velocity clamp at 1.25×** — addresses Class 1 (dominant); no harm to other classes.
-2. **Contact compliance at 0.0001** — addresses Class 2; no effect on joint limits.
+1. **Post-solve velocity clamp at 1.25×** addresses Class 1 (dominant); no harm to other classes.
+2. **Contact compliance at 0.0001** addresses Class 2; no effect on joint limits.
 
-Both are implemented on branch `dt/velocity-spike-claude`. Full training validation is pending — queued for dedicated hardware.
+Both are implemented on branch `dt/velocity-spike-claude`.
