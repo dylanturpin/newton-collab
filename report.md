@@ -1,10 +1,10 @@
 # TGS Feasibility Study Notes
 
-This report is the main artifact for the `dt/tgs-feather-pgs-study` branch. It records what the current Isaac Lift configuration actually does, what PhysX TGS means in source terms, and what Stage 2 should implement next.
+This report is the main artifact for the `dt/tgs-feather-pgs-study` branch. It records what the current Isaac Lift configuration actually does, what PhysX TGS means in source terms, and the selectable smaller-step FeatherPGS path added in Stage 2.
 
 ## Scope of this pass
 
-This is the Stage 1 slice only. No selectable TGS experiment path exists yet. The work here establishes the baseline configuration and answers whether “TGS” is likely to be a pure settings change or a deeper solver change.
+This report now covers Stage 1 and the Stage 2 implementation slice. The codebase now has a selectable smaller-step FeatherPGS path for Franka lift, but no rollout, training, or throughput evidence has been collected yet.
 
 Repository baseline for this report:
 
@@ -126,11 +126,50 @@ That experiment should be described as “smaller-step FeatherPGS at fixed contr
 
 ## Stage 2 recommendation
 
-Stage 2 should implement an additive configuration path for `Isaac-Lift-Cube-Franka-v0` that makes the smaller-step regime selectable without hand edits. The first version does not need solver-kernel changes. It should:
+Stage 2 is now implemented as additive task variants in `skild-IL-solver`. The current baseline stays untouched, and Stage 3 can select the smaller-step path without local edits.
 
-- preserve the current FeatherPGS baseline untouched
-- add a named preset or variant for the smaller-step schedule
-- make it easy in Stage 3 to run with and without the Franka velocity-limit termination
+## Selectable Stage 2 path
+
+The Stage 2 implementation lives in:
+
+- `source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/lift/lift_env_cfg.py`
+- `source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/lift/config/franka/joint_pos_env_cfg.py`
+- `source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/lift/config/franka/__init__.py`
+
+The important correction from Stage 1 is that the existing Franka FeatherPGS baseline already executes four FeatherPGS solver calls per action:
+
+- `decimation=2`
+- `sim.dt=0.01`
+- `num_substeps=2`
+- solver step size `0.01 / 2 = 0.005 s`
+- solver calls per action `2 * 2 = 4`
+
+Because of that, a naive “`decimation=4`, `dt=0.005`, `num_substeps=1`” variant would not actually increase solver update frequency. It would preserve the same `0.005 s` FeatherPGS step size and the same four solver calls per action.
+
+The implemented smaller-step path instead halves the FeatherPGS step size and doubles solver updates per action:
+
+- `Isaac-Lift-Cube-Franka-FeatherPGS-TGS-v0`
+- `Isaac-Lift-Cube-Franka-FeatherPGS-TGS-Play-v0`
+- `Isaac-Lift-Cube-Franka-FeatherPGS-TGS-NoVelGuard-v0`
+- `Isaac-Lift-Cube-Franka-FeatherPGS-TGS-NoVelGuard-Play-v0`
+
+Those variants use:
+
+- `decimation=8`
+- `sim.dt=0.0025`
+- `sim.render_interval=8`
+- `LiftPhysicsCfg.feather_pgs_tgs`
+- `num_substeps=1`
+
+So the new schedule is:
+
+- policy action period: `8 * 0.0025 = 0.02 s`
+- FeatherPGS solver step size: `0.0025 / 1 = 0.0025 s`
+- FeatherPGS solver calls per action: `8 * 1 = 8`
+
+The `NoVelGuard` variants set `joint_vel_out_of_limit = None` and leave the position and effort guards unchanged. This gives Stage 3 a direct diagnosis path for “smaller-step FeatherPGS with the guard” versus “smaller-step FeatherPGS without the guard.”
+
+This is still a smaller-step approximation, not a true PhysX-style TGS port. It changes the outer simulation schedule, not the solver’s inner “update poses during position iterations” semantics.
 
 If that smaller-step path materially reduces velocity spikes or unlocks stable learning, it would justify a later deeper milestone to prototype true TGS-like inner-step pose updates in FeatherPGS. If it does not, a deeper TGS port is probably not worth the complexity.
 
@@ -158,9 +197,48 @@ PhysX inspection:
     sed -n '640,716p' /tmp/physics/physx/source/lowleveldynamics/shared/DyCpuGpu1dConstraint.h
     sed -n '1760,1945p' /tmp/physics/physx/snippets/snippetimmediatearticulation/SnippetImmediateArticulation.cpp
 
+Stage 2 config validation:
+
+    python3 - <<'PY'
+    import sys
+    sys.path.insert(0, '/workspace/skild-IL-solver/source/isaaclab_tasks')
+    sys.path.insert(0, '/workspace/skild-IL-solver/source/isaaclab_newton')
+    import isaaclab_tasks
+    from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
+
+    base = load_cfg_from_registry('Isaac-Lift-Cube-Franka-v0', 'env_cfg_entry_point')
+    tgs = load_cfg_from_registry('Isaac-Lift-Cube-Franka-FeatherPGS-TGS-v0', 'env_cfg_entry_point')
+    no_guard = load_cfg_from_registry('Isaac-Lift-Cube-Franka-FeatherPGS-TGS-NoVelGuard-v0', 'env_cfg_entry_point')
+    play = load_cfg_from_registry('Isaac-Lift-Cube-Franka-FeatherPGS-TGS-Play-v0', 'env_cfg_entry_point')
+
+    assert base.decimation == 2
+    assert abs(base.sim.dt - 0.01) < 1e-12
+    assert base.sim.physics.feather_pgs.num_substeps == 2
+
+    assert tgs.decimation == 8
+    assert abs(tgs.sim.dt - 0.0025) < 1e-12
+    assert tgs.sim.render_interval == 8
+    assert tgs.sim.physics.num_substeps == 1
+    assert tgs.terminations.joint_vel_out_of_limit is not None
+
+    assert no_guard.terminations.joint_vel_out_of_limit is None
+    assert play.scene.num_envs == 50
+    assert play.observations.policy.enable_corruption is False
+    print('lift_tgs_config_ok')
+    PY
+
 ## Validation recorded for this slice
 
-This pass only changed documentation artifacts. Focused validation was:
+Stage 1 validation remains the same. Stage 2 focused validation was:
 
+    python3 - <<'PY'
+    import sys
+    sys.path.insert(0, '/workspace/skild-IL-solver/source/isaaclab_tasks')
+    sys.path.insert(0, '/workspace/skild-IL-solver/source/isaaclab_newton')
+    import isaaclab_tasks
+    from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
+    ...
+    print('lift_tgs_config_ok')
+    PY
+    git -C /workspace/skild-IL-solver diff --check
     git -C /workspace/newton-collab diff --check
-    python3 -c "from pathlib import Path; assert Path('/workspace/newton-collab/report.md').read_text(); assert 'Stage 2 recommendation' in Path('/workspace/newton-collab/report.md').read_text(); assert 'Stage 1 slice completed' in Path('/workspace/.agent/execplans/tgs-feather-pgs-investigation.md').read_text()"
