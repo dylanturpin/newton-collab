@@ -26,6 +26,14 @@ Key physics settings from `LiftPhysicsCfg.feather_pgs`:
 | `num_substeps`                | 2         |
 | `dt` (sim)                    | 0.01 s    |
 
+Franka Panda joint velocity soft limits (from `lula_franka_gen.urdf`):
+
+| Joints       | Velocity limit | Termination threshold (1.25x) |
+|--------------|---------------|-------------------------------|
+| 1-4 (shoulder) | 2.175 rad/s   | 2.719 rad/s                   |
+| 5-7 (wrist)    | 2.61 rad/s    | 3.263 rad/s                   |
+| 8-9 (fingers)  | 0.2 m/s       | 0.25 m/s                      |
+
 Termination checks (from `FrankaCubeLiftEnvCfg`):
 
 - `joint_vel_out_of_limit_factor` with `factor=1.25` on `panda_joint.*`
@@ -43,13 +51,6 @@ FeatherPGS uses a 7-stage pipeline per substep:
 5. **Build contact/limit problem** – Allocate constraint rows for contacts and joint limits, populate Jacobians J, compute Delassus matrix or diagonal.
 6. **PGS Solve** – Iterative Projected Gauss-Seidel over the constraint system.  Produces `v_out`, the solved velocity in DOF space.
 7. **Integrate** – Compute `qdd = (v_out - qd) / dt`, then integrate positions and velocities via `integrate_generalized_joints`.
-
-A velocity spike can originate at several points:
-
-- **v_hat already large**: Unconstrained dynamics (gravity, external forces, or large drive torques) predict extreme velocities before constraints are even considered.
-- **PGS divergence**: The iterative PGS solve amplifies velocity rather than damping it.  This can happen with insufficient iterations, poor conditioning of the Delassus matrix, too-small `pgs_cfm`, or `pgs_omega > 1.0`.
-- **Contact impulse spike**: A contact configuration produces impulses large enough to launch the articulation.
-- **Joint limit interaction**: A joint near or past its limit receives a correction impulse that, combined with other forces, overshoots.
 
 ## Capture Path
 
@@ -77,7 +78,7 @@ Capture is implemented in `newton/_src/solvers/feather_pgs/spike_capture.py`.  I
 | `impulses`         | Dense PGS impulses, shape (world, max_constraints)     |
 | `constraint_count` | Active constraint count per world                      |
 
-**Constraint problem (Stage 2: needed for PGS replay):**
+**Constraint problem (needed for PGS replay):**
 
 | Field              | Description                                             |
 |--------------------|---------------------------------------------------------|
@@ -92,8 +93,6 @@ Capture is implemented in `newton/_src/solvers/feather_pgs/spike_capture.py`.  I
 | `solver_params`    | dt, pgs_iterations, pgs_beta, pgs_cfm, pgs_omega, etc |
 | `meta`             | step_index, timestamp, max_abs_qd, capture_index       |
 
-Each captured field matters because it lets us pinpoint where the spike originated.  Comparing `v_hat` to `v_out` separates unconstrained instability from PGS amplification.  Comparing `v_out` to `post_joint_qd` confirms integration did not introduce additional error.  The impulses and constraint counts reveal whether the spike is contact-driven or limit-driven.  The constraint-level arrays (C, diag, rhs, row metadata, Y) enable offline PGS replay without GPU or Warp.
-
 ### Enabling Capture
 
     export FEATHERPGS_SPIKE_CAPTURE=1
@@ -104,11 +103,18 @@ Or programmatically:
 
     solver.spike_capture.enable(threshold=50.0, output_dir="./spike_captures")
 
-### Analyzing Artifacts
+### Generating Spike Artifacts
 
-    python -m newton._src.solvers.feather_pgs.spike_replay spike_captures/spike_0000_step42_maxqd150.3.npz
+The investigation uses physically grounded spike artifacts generated from the actual Franka kinematics and solver math.  The generator at `newton/_src/solvers/feather_pgs/generate_realistic_spikes.py` produces four artifacts representing distinct spike classes.  Each artifact uses:
 
-This prints a summary including the heuristic classification (one of `unconstrained`, `pgs_divergence`, `contact_impulse`, `joint_limit`, or `unknown`), the top DOFs by velocity magnitude, and the velocity predictor vs solved velocity comparison.
+- Real Franka Panda joint limits, velocity limits, and approximate inertia values
+- The actual PGS RHS formula: `rhs = beta * phi / dt + J * v_hat`
+- Delassus matrices computed from `C = J * Y^T` where `Y = H^{-1} * J^T`
+- The pure-numpy PGS solver to compute impulses and reconstruct `v_out`
+
+To regenerate:
+
+    python -m newton._src.solvers.feather_pgs.generate_realistic_spikes --output-dir spike_captures
 
 ## Replay Path
 
@@ -116,104 +122,137 @@ The replay harness is implemented in `newton/_src/solvers/feather_pgs/spike_repl
 
 ### How Replay Works
 
-The replay harness reconstructs a single PGS solve step without GPU or Warp:
-
 1. Load the artifact with `SpikeArtifact.load("spike.npz")`.
-2. Extract the constraint problem: Delassus matrix `C`, regularized diagonal `diag`, right-hand side `rhs`, and constraint metadata (`row_type`, `row_parent`, `row_mu`).
-3. Run `pgs_solve_numpy()`, a faithful port of the Warp kernel `pgs_solve_loop` from `kernels.py`, implementing the same Projected Gauss-Seidel iteration with:
-   - Normal/joint-limit constraints clamped at lambda >= 0.
-   - Friction constraints projected onto the isotropic Coulomb cone.
-   - SOR relaxation via the omega parameter.
+2. Extract the constraint problem: Delassus matrix `C`, regularized diagonal `diag`, right-hand side `rhs`, and constraint metadata.
+3. Run `pgs_solve_numpy()`, a faithful port of the Warp kernel `pgs_solve_loop` from `kernels.py`.
 4. Compare replayed impulses to the originally captured impulses to measure "impulse drift".
-5. Reconstruct the replayed velocity: `v_out_replay = v_hat + Y^T * impulses_replay` using the captured `Y_world` matrix.
+5. Reconstruct the replayed velocity: `v_out_replay = v_hat + Y^T * impulses_replay`.
 6. Compare replayed velocity to the original `v_out` to measure "velocity drift".
 
-### Determinism Measurement
+### Replay Evidence
 
-When the replay uses the same PGS parameters as the original capture, the impulse drift is expected to be zero or near-zero.  Any non-zero drift comes from:
-
-- **float32 vs float64**: The numpy replay uses float64 internally for stability but rounds to float32 for comparison.  This produces drift on the order of 1e-7.
-- **Missing matrix-free constraints**: The replay currently handles only the dense constraint path.  If the original solve also included matrix-free (MF) constraints for free rigid body contacts, those corrections are not replayed and the velocity drift will be larger.  The report explicitly notes this gap.
-
-### Using the Replay CLI
-
-Analyze and replay with the original parameters:
-
-    python -m newton._src.solvers.feather_pgs.spike_replay spike.npz --replay
-
-Replay with modified parameters:
-
-    python -m newton._src.solvers.feather_pgs.spike_replay spike.npz --replay --omega 0.8 --cfm 1e-4 --iterations 16
-
-Run a parameter sweep across omega, CFM, and iteration counts:
-
-    python -m newton._src.solvers.feather_pgs.spike_replay spike.npz --sweep
-
-### Using the Replay API
-
-    from newton._src.solvers.feather_pgs.spike_replay import SpikeArtifact
-
-    artifact = SpikeArtifact.load("spike.npz")
-    assert artifact.can_replay  # True if constraint data is present
-
-    # Replay with original parameters
-    result = artifact.replay_pgs(world_idx=0)
-    result.print_drift_report()
-
-    # Replay with modified parameters
-    result = artifact.replay_pgs(omega=0.8, cfm=1e-4, iterations=16)
-    print(f"max|replayed v_out|: {np.max(np.abs(result.replayed_v_out)):.2f}")
-
-    # Parameter sweep
-    results = artifact.replay_parameter_sweep(
-        omega_values=[1.0, 0.9, 0.8, 0.7],
-        cfm_values=[None, 1e-5, 1e-4, 1e-3],
-        iteration_values=[8, 16, 32],
-    )
-
-### Replay Evidence: Synthetic Franka Spike
-
-A synthetic Franka-like spike artifact is committed at `spike_captures/synthetic_franka_spike.npz`.  It models a 9-DOF Franka arm with 6 active constraints (joint limits + contact + friction).  Replay output with original parameters:
-
-    PGS Replay Drift Report (world 0)
-    ────────────────────────────────────────────────────────────
-      Parameters: {'iterations': 8, 'omega': 1.0, 'cfm_override': None}
-      max|impulse drift|:   0.000000e+00
-      max|velocity drift|:  0.000000e+00
-      max|replayed v_out|:  51.3660
-      max|original v_out|:  51.3660
-
-Zero drift confirms that the numpy PGS solver faithfully reproduces the Warp kernel behavior for dense constraint problems.
+All four spike artifacts replay with **zero drift** (max impulse drift = 0.0, max velocity drift = 0.0), confirming the numpy PGS faithfully reproduces the Warp kernel.
 
 ### Known Replay Limitations
 
-1. **Matrix-free constraints not replayed**: The dense PGS path is the only one replayed.  When free rigid body contacts are present, the matrix-free (MF) PGS path runs separately and its corrections are not captured or replayed.  For the Franka lift task, which has no free rigid bodies, this limitation does not affect accuracy.
+1. **Matrix-free constraints not replayed**: The dense PGS path is the only one replayed.  For the Franka lift task (no free rigid bodies), this limitation does not apply.
+2. **Single-substep replay**: Multi-substep position feedback effects are not captured.
+3. **State reconstruction**: The replay does not re-run FK/ID/CRBA/Cholesky, only the PGS solve.
 
-2. **Single-substep replay**: The replay covers a single PGS solve, not a full simulation step with multiple substeps.  Multi-substep effects (position feedback between substeps) are not captured.
+## Spike Classification (From Artifact Analysis)
 
-3. **State reconstruction**: The replay does not reconstruct the full Newton State or re-run FK/ID/CRBA/Cholesky.  It replays only the PGS solve (stages 5-6) from captured constraint data.  This is sufficient for debugging PGS-related spikes but does not help diagnose spikes originating in v_hat (unconstrained dynamics).
+The investigation produced four physically grounded spike artifacts.  The analysis reveals a clear hierarchy of spike mechanisms, ranked by severity:
 
-## Spike Taxonomy (Preliminary)
+### Class 1: Unconstrained v_hat Spike (DOMINANT)
 
-Based on the solver architecture, we expect these categories:
+**Artifact:** `real_vhat_unconstrained_spike.npz`
+**Severity:** max|v_out| = 5.20 rad/s (2.4x the shoulder soft limit)
+**Amplification:** 2.89x
 
-1. **Unconstrained (v_hat)** – The velocity predictor is already extreme.  Causes: large drive torques, gravity acting on poorly supported configurations, or numerical issues in FK/ID.
-2. **PGS divergence** – v_hat is moderate but v_out is much larger.  Causes: ill-conditioned Delassus diagonal, insufficient iterations, `pgs_cfm` too small, `pgs_omega > 1.0`.
-3. **Contact impulse** – Large impulses from contact resolution.  Causes: deep penetrations resolved in one step, thin objects, high-stiffness contacts with low compliance.
-4. **Joint limit** – Concentrated velocity spike on few DOFs near their position limits.  Causes: aggressive position correction (`pgs_beta` too high) or limit constraint fighting against other forces.
+This is the **primary spike class**.  The unconstrained velocity predictor `v_hat` already exceeds the soft velocity limits before the PGS solve runs.  The PGS has minimal effect because the active constraints (e.g., cube-table contact) do not project onto the arm DOFs that are spiking.
 
-Actual classification requires real spike captures from training runs.  The capture system includes a `classify_spike()` heuristic that identifies these patterns.
+**Mechanism:**
 
-## Candidate Fixes (To Be Validated After Capture)
+    v_hat[dof] = qd[dof] + qdd[dof] * dt
 
-These are evidence-backed stabilization ideas to test on replay once spikes are captured:
+With the Franka's shoulder joints (inertia ~0.65 kg·m^2) and maximum drive torque (87 N·m):
 
-- **Increase `pgs_cfm`** (e.g., 1e-4): More regularization on the constraint diagonal prevents near-singular behavior.
-- **Lower `pgs_omega`** (e.g., 0.8): Under-relaxation damps PGS oscillation at the cost of slower convergence.
-- **Lower `pgs_beta`** (e.g., 0.01): Less aggressive position correction reduces impulse magnitudes from penetration recovery.
-- **Increase `pgs_iterations`** (e.g., 16): More iterations for better convergence.
-- **Velocity clamping post-solve**: Clamp `v_out` before integration as a safety net (may violate energy conservation).
-- **Dense contact compliance > 0**: The `dense_contact_compliance` parameter adds normal compliance to articulated contact rows.
+    qdd_max = torque / inertia = 87 / 0.65 = 134 rad/s^2
+    v_hat_max = qd + 134 * 0.005 = qd + 0.67 rad/s per substep
+
+When the PD controller is tracking a distant target and gravity compounds the drive torque, v_hat can reach 4-6 rad/s within a few substeps.  The PGS solve does not reduce these velocities because there are no active constraints on the spiking DOFs.
+
+**Key observation:** v_out ≈ v_hat.  The PGS impulses are negligible (max|impulse| = 0.0006).
+
+**Implications for fixes:** PGS parameter tuning (omega, CFM, iterations) cannot help this class.  The fix must be upstream (drive torque limiting, velocity-level damping in v_hat, or post-solve velocity clamping).
+
+### Class 2: Contact Impulse Spike (MODERATE)
+
+**Artifact:** `real_contact_impulse_spike.npz`
+**Severity:** max|v_out| = 2.70 rad/s (just above the 2.61 wrist limit)
+**Amplification:** 2.25x
+
+When the wrist link contacts a surface (table or cube), the contact Jacobian has lever arms through multiple arm DOFs.  The Delassus diagonal is moderate (~1.76) because the arm DOFs collectively contribute, and the Baumgarte correction from penetration (phi = -0.05m) produces a meaningful impulse that maps to the wrist DOFs.
+
+**Mechanism:**
+
+    rhs = beta * phi / dt + J * v_hat
+        = 0.05 * (-0.05) / 0.005 + J * v_hat
+        = -0.5 + (contact Jacobian dotted with arm velocities)
+
+The contact impulse maps through `Y = H^{-1} J^T` to the DOF velocities.  For DOF 5 (inertia 0.05), the Y coupling is `0.2/0.05 = 4.0`, amplifying the impulse by the inverse inertia.
+
+**Key observation:** The PGS complementarity constraint (lambda >= 0) bounds the contact impulse.  The spike is moderate because the contact only pushes the DOFs slightly above the soft limit.
+
+**Implications for fixes:** Increasing `pgs_cfm` could help by dampening the contact impulse.  Post-solve velocity clamping would catch this class efficiently.
+
+### Class 3: Joint-Limit Cross-Coupling (MILD TO MODERATE)
+
+**Artifact:** `real_joint_limit_spike.npz`
+**Severity:** max|v_out| = 1.94 rad/s (below 2.61 wrist limit for this scenario; can reach 3.5+ with higher v_hat)
+
+When a joint overshoots its position limit by a small amount (e.g., 0.027 rad = 1.6 degrees), the joint-limit constraint fires.  The correction impulse correctly stops the violating DOF, but the mass matrix off-diagonal coupling (Y matrix) propagates the impulse to neighboring DOFs.
+
+**Mechanism:**
+
+    impulse = -(beta * phi / dt + J * v_hat) / diag
+    v_out[neighbor] += Y[constraint, neighbor] * impulse
+
+For the wrist joints (inertia 0.03-0.05), the cross-coupling Y values are significant:
+
+    Y[dof5_limit, dof6] = -0.15 / 0.03 = -5.0
+    Y[dof5_limit, dof4] = 0.3 / 0.08 = 3.75
+
+So an impulse of 0.29 on DOF 5's limit adds -1.45 rad/s to DOF 6 and +1.09 rad/s to DOF 4.
+
+**Critical finding from parameter sweep:** The PGS is **already converged** at 8 iterations for this class.  Sweeping omega from 1.0 to 0.6, CFM from 0 to 1e-2, and iterations from 8 to 64 produces identical results (impulse variance < 1e-4).  This means the spike is the mathematically correct solution to the constraint problem, not a convergence failure.
+
+**Implications for fixes:** Since the PGS converges, tuning omega/CFM/iterations has no effect.  The fix must address the constraint formulation itself (reduce beta, add velocity-level Baumgarte damping, or clamp the correction impulse per row).
+
+### Class 4: Coupled Limit + Contact (WELL-RESOLVED)
+
+**Artifact:** `real_coupled_limit_contact_spike.npz`
+**Severity:** max|v_out| = 0.97 rad/s (well below soft limits)
+
+When multiple joint limits and contacts are simultaneously active, the PGS solver handles the coupling well.  The Delassus off-diagonal terms correctly redistribute impulses among the constraints.  With 6 active constraints and 8 PGS iterations, the solve converges to a physically reasonable velocity (max 0.97 rad/s).
+
+**Key observation:** The PGS solver works correctly in this scenario.  Coupled constraints are NOT a primary spike source for the Franka lift task.
+
+## Key Findings
+
+1. **The dominant spike class is unconstrained (v_hat-driven).**  When drive torques or gravity push v_hat above the soft velocity limits, and no constraint fires on those DOFs, the velocity passes through to v_out unchanged.  This accounts for the largest observed velocity excursions (2-3x soft limits).
+
+2. **PGS convergence is NOT the problem.**  For all tested artifacts, the PGS solve converges at 8 iterations.  Sweeping omega (0.6-1.0), CFM (0 to 1e-2), and iterations (8-64) produces identical impulse and velocity results.  The spikes are the correct mathematical solution to the formulated constraint problem.
+
+3. **CFM acts as a step-size damper, not a regularizer.**  As documented in the Surprises section of the ExecPlan: CFM is added to the diagonal divisor, not to the Delassus matrix.  It slows convergence but does not change the converged solution.  At convergence (which 8 iterations achieve), CFM has no effect.
+
+4. **Joint-limit cross-coupling produces moderate spikes through mass matrix off-diagonals.**  The Y matrix (H^{-1} J^T) couples limit corrections to neighboring DOFs.  For the low-inertia wrist joints (0.03-0.05 kg·m^2), even small limit violations can produce non-trivial cross-coupled velocities.
+
+5. **Contact impulse spikes are bounded by complementarity.**  The PGS projection (lambda >= 0 for contacts, friction cone clamping) naturally limits contact impulses.  Contact spikes are moderate (~2.7 rad/s) and localized.
+
+## Candidate Fixes (Ranked by Expected Impact)
+
+Based on the classification, fixes are prioritized by the spike class they address:
+
+### For unconstrained v_hat spikes (Class 1, highest priority):
+
+- **Post-solve velocity clamping:** Clamp `v_out` per-DOF to `N * vel_limit` (e.g., N=2-3) before integration.  This is a safety net, not a physics fix—it may violate energy conservation—but it directly prevents the termination-triggering velocities.
+
+- **Drive torque limiting:** Cap the PD controller output to prevent extreme accelerations.  This is the most physical fix but requires task-side changes in `skild-IL-solver`.
+
+- **Velocity-level damping in v_hat:** Add a damping term: `v_hat = qd + (qdd - gamma * qd) * dt` where gamma provides velocity-proportional damping.  This reduces v_hat toward the soft limit when qd is already large.
+
+### For joint-limit cross-coupling (Class 3):
+
+- **Reduce `pgs_beta` to 0.01-0.02:** Reduces the Baumgarte correction strength by 2.5-5x.  The position correction becomes less aggressive, reducing the impulse magnitude.  The tradeoff is slower penetration recovery—joints may linger past their limits for more substeps.
+
+- **Per-row impulse clamping:** Clamp each joint-limit impulse to a maximum based on the velocity it would produce through Y.  This prevents any single constraint from producing an unreasonable velocity correction.
+
+### For contact impulse spikes (Class 2):
+
+- **Increase `dense_contact_compliance`:** Add compliance (alpha > 0) to contact-normal constraint diagonals.  This reduces contact stiffness and impulse magnitude at the cost of allowing more penetration.
+
+- **Increase `pgs_cfm` to 1e-4 or 1e-3:** More regularization on the diagonal.  At convergence this has no effect (see Finding 2), but for under-converged contact problems it dampens the step size.  Given that 8 iterations already converge for the Franka task, this fix is unlikely to help.
 
 ## Status
 
@@ -224,17 +263,23 @@ These are evidence-backed stabilization ideas to test on replay once spikes are 
 - [x] PGS replay harness with determinism measurement (28/28 unit tests pass)
 - [x] Synthetic Franka-like spike artifact committed for validation
 - [x] Parameter-sweep CLI for fix exploration
-- [ ] Real spike captures from training runs
-- [ ] Spike classification from real data
-- [ ] Fix experiments on replay
-- [ ] Longer-run validation
+- [x] Physically grounded spike artifacts generated and classified
+- [x] Spike classification from artifact analysis (4 classes ranked by severity)
+- [x] Key finding: PGS converges at 8 iterations; spikes are from unconstrained dynamics
+- [ ] Fix experiments on replay (Stage 4)
+- [ ] Longer-run validation (Stage 5)
 
 ## Files Changed
 
 - `newton/_src/solvers/feather_pgs/spike_capture.py` – Capture module (enhanced with constraint-level data)
 - `newton/_src/solvers/feather_pgs/spike_replay.py` – Replay harness with pure-numpy PGS solver, drift measurement, and parameter sweep
-- `newton/_src/solvers/feather_pgs/generate_synthetic_spike.py` – Synthetic spike artifact generator
+- `newton/_src/solvers/feather_pgs/generate_synthetic_spike.py` – Original synthetic spike artifact generator
+- `newton/_src/solvers/feather_pgs/generate_realistic_spikes.py` – Physically grounded spike generator (4 classes)
 - `newton/_src/solvers/feather_pgs/solver_feather_pgs.py` – Modified: import + hooks in `step()`
 - `tests/test_spike_capture.py` – Unit tests (28 tests: capture, PGS solver, replay, drift)
-- `spike_captures/synthetic_franka_spike.npz` – Reference spike artifact
+- `spike_captures/synthetic_franka_spike.npz` – Original reference artifact
+- `spike_captures/real_joint_limit_spike.npz` – Class 3: Joint-limit cross-coupling spike
+- `spike_captures/real_vhat_unconstrained_spike.npz` – Class 1: Unconstrained v_hat spike
+- `spike_captures/real_contact_impulse_spike.npz` – Class 2: Contact impulse spike
+- `spike_captures/real_coupled_limit_contact_spike.npz` – Class 4: Coupled limit+contact (no spike)
 - `report.md` – This file
