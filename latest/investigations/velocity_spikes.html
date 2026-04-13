@@ -869,908 +869,90 @@
 <!-- SPDX-License-Identifier: CC-BY-4.0 -->
 <section class="tex2jax_ignore mathjax_ignore" id="velocity-spike-root-cause-analysis">
 <h1>Velocity Spike Root-Cause Analysis<a class="headerlink" href="#velocity-spike-root-cause-analysis" title="Link to this heading">#</a></h1>
-<section id="summary">
-<h2>Summary<a class="headerlink" href="#summary" title="Link to this heading">#</a></h2>
-<p>During Isaac Lab training of the Franka cube-lift task (<code class="docutils literal notranslate"><span class="pre">Isaac-Lift-Cube-Franka-v0</span></code>),
-the FeatherPGS solver produces transient velocity spikes that exceed the environment’s
-termination threshold (1.25 × joint velocity soft limits).  These spikes cause
-premature episode resets and degrade RL training reward curves.</p>
-<p>This investigation built capture-and-replay tooling from scratch, classified spikes into
-four mechanistic classes, tested three candidate fixes across 32 replay-based experiments,
-and landed a layered mitigation (post-solve velocity clamp + contact compliance) with 43
-passing unit tests and per-artifact quantitative validation.</p>
-<p>The dominant spike class (Class 1, ~60% of observed spikes) originates <em>upstream</em> of the
-PGS solve: the unconstrained velocity predictor <span class="math notranslate nohighlight">\(\hat{v}\)</span> already exceeds limits before
-any constraint is evaluated.  This means PGS parameter tuning (omega, CFM, iterations)
-<strong>cannot</strong> address the primary problem.</p>
+<section id="problem">
+<h2>Problem<a class="headerlink" href="#problem" title="Link to this heading">#</a></h2>
+<p>During Isaac Lab training of the Franka cube-lift task, FeatherPGS produces transient velocity spikes exceeding the environment’s termination threshold (1.25 × joint velocity soft limits), causing premature episode resets and degrading RL reward curves.</p>
 </section>
-<hr class="docutils" />
-<section id="task-configuration">
-<h2>Task Configuration<a class="headerlink" href="#task-configuration" title="Link to this heading">#</a></h2>
-<p>The Franka cube-lift task uses the following solver settings:</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Parameter</p></th>
-<th class="head"><p>Value</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">pgs_iterations</span></code></p></td>
-<td><p>8</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pgs_beta</span></code> (ERP / Baumgarte)</p></td>
-<td><p>0.05</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">pgs_cfm</span></code> (regularization)</p></td>
-<td><p>1.0 × 10<sup>-6</sup></p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pgs_omega</span></code> (SOR)</p></td>
-<td><p>1.0</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">num_substeps</span></code></p></td>
-<td><p>2</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dt</span></code> (sim)</p></td>
-<td><p>0.01 s → 0.005 s per substep</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dense_max_constraints</span></code></p></td>
-<td><p>64</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">enable_joint_limits</span></code></p></td>
-<td><p>True</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<p>Franka Panda joint velocity soft limits (from <code class="docutils literal notranslate"><span class="pre">lula_franka_gen.urdf</span></code>):</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Joint group</p></th>
-<th class="head"><p>Velocity limit</p></th>
-<th class="head"><p>Termination threshold (1.25×)</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>Joints 1-4 (shoulder/elbow)</p></td>
-<td><p>2.175 rad/s</p></td>
-<td><p>2.719 rad/s</p></td>
-</tr>
-<tr class="row-odd"><td><p>Joints 5-7 (wrist)</p></td>
-<td><p>2.61 rad/s</p></td>
-<td><p>3.263 rad/s</p></td>
-</tr>
-<tr class="row-even"><td><p>Joints 8-9 (fingers)</p></td>
-<td><p>0.2 m/s</p></td>
-<td><p>0.25 m/s</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<p>The environment terminates an episode when any joint velocity exceeds 1.25× the soft
-limit (<code class="docutils literal notranslate"><span class="pre">joint_vel_out_of_limit_factor</span></code> with <code class="docutils literal notranslate"><span class="pre">factor=1.25</span></code>).</p>
+<section id="replay-infrastructure">
+<h2>Replay Infrastructure<a class="headerlink" href="#replay-infrastructure" title="Link to this heading">#</a></h2>
+<p>We built capture hooks in <code class="docutils literal notranslate"><span class="pre">SolverFeatherPGS.step()</span></code> that snapshot full solver state (positions, velocities, Delassus matrix, impulses, constraint metadata) to <code class="docutils literal notranslate"><span class="pre">.npz</span></code> files when post-solve velocity exceeds a threshold. A pure-numpy PGS replay harness reproduces the Warp kernel with zero drift, enabling offline classification and fix experiments without GPU or Isaac Sim.</p>
 </section>
-<hr class="docutils" />
-<section id="methodology">
-<h2>Methodology<a class="headerlink" href="#methodology" title="Link to this heading">#</a></h2>
-<section id="approach">
-<h3>Approach<a class="headerlink" href="#approach" title="Link to this heading">#</a></h3>
-<p>The core idea was to build <strong>offline replay infrastructure</strong> that faithfully reproduces the
-PGS solve from captured solver state, enabling classification, parameter sweeps, and fix
-experiments without a GPU, without Isaac Sim, and without a running simulation.</p>
-<p>The investigation followed five stages:</p>
-<ol class="arabic simple">
-<li><p><strong>Capture instrumentation</strong> — opt-in hooks in the solver’s <code class="docutils literal notranslate"><span class="pre">step()</span></code> method</p></li>
-<li><p><strong>Replay harness</strong> — pure-numpy PGS solver matching the Warp kernel</p></li>
-<li><p><strong>Artifact generation</strong> — physically grounded Franka spike scenarios</p></li>
-<li><p><strong>Fix experiments</strong> — quantitative before/after across three candidate fixes</p></li>
-<li><p><strong>Production fix</strong> — kernel implementation, solver integration, config exposure</p></li>
-</ol>
-</section>
-<section id="capture-infrastructure">
-<h3>Capture Infrastructure<a class="headerlink" href="#capture-infrastructure" title="Link to this heading">#</a></h3>
-<p>The capture system (<code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/spike_capture.py</span></code>) hooks into
-<code class="docutils literal notranslate"><span class="pre">SolverFeatherPGS.step()</span></code> at two points:</p>
-<ol class="arabic simple">
-<li><p><strong>Pre-step hook</strong> — snapshots <code class="docutils literal notranslate"><span class="pre">state_in.joint_q</span></code> and <code class="docutils literal notranslate"><span class="pre">state_in.joint_qd</span></code> to CPU
-numpy arrays before the solver mutates anything.</p></li>
-<li><p><strong>Post-solve hook</strong> — after the PGS solve and velocity integration (Stage 7),
-reads <code class="docutils literal notranslate"><span class="pre">state_out.joint_qd</span></code> and checks <code class="docutils literal notranslate"><span class="pre">max(|qd|)</span></code> against a configurable threshold
-(default 50 rad/s).</p></li>
-</ol>
-<p>When a spike is detected, the hook serializes a <code class="docutils literal notranslate"><span class="pre">.npz</span></code> artifact containing the full solver
-snapshot:</p>
-<p><strong>State arrays:</strong></p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Field</p></th>
-<th class="head"><p>Shape</p></th>
-<th class="head"><p>Description</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">pre_joint_q</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(n_dofs,)</span></code></p></td>
-<td><p>Generalized positions before step</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pre_joint_qd</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(n_dofs,)</span></code></p></td>
-<td><p>Generalized velocities before step</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">post_joint_q</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(n_dofs,)</span></code></p></td>
-<td><p>Generalized positions after integration</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">post_joint_qd</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(n_dofs,)</span></code></p></td>
-<td><p>Generalized velocities after integration</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<p><strong>Solver intermediates:</strong></p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Field</p></th>
-<th class="head"><p>Shape</p></th>
-<th class="head"><p>Description</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">v_hat</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(total_dofs,)</span></code></p></td>
-<td><p>Velocity predictor (unconstrained)</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">v_out</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(total_dofs,)</span></code></p></td>
-<td><p>Post-PGS solved velocity</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">impulses</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(worlds,</span> <span class="pre">max_c)</span></code></p></td>
-<td><p>Dense PGS impulses</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<p><strong>Constraint problem (needed for faithful PGS replay):</strong></p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Field</p></th>
-<th class="head"><p>Shape</p></th>
-<th class="head"><p>Description</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">world_C</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(worlds,</span> <span class="pre">max_c,</span> <span class="pre">max_c)</span></code></p></td>
-<td><p>Delassus matrix <span class="math notranslate nohighlight">\(C = J \tilde{H}^{-1} J^T\)</span></p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">world_diag</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(worlds,</span> <span class="pre">max_c)</span></code></p></td>
-<td><p>Regularized diagonal (<span class="math notranslate nohighlight">\(C_{ii}\)</span> + CFM)</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">world_rhs</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(worlds,</span> <span class="pre">max_c)</span></code></p></td>
-<td><p>RHS bias: <span class="math notranslate nohighlight">\(\beta \phi / \Delta t + J \hat{v}\)</span></p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">world_row_type</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(worlds,</span> <span class="pre">max_c)</span></code></p></td>
-<td><p>0=contact, 1=target, 2=friction, 3=limit</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">world_row_parent</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(worlds,</span> <span class="pre">max_c)</span></code></p></td>
-<td><p>Parent row for friction cone projection</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">world_row_mu</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(worlds,</span> <span class="pre">max_c)</span></code></p></td>
-<td><p>Friction coefficient per row</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Y_world</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(worlds,</span> <span class="pre">max_c,</span> <span class="pre">max_dofs)</span></code></p></td>
-<td><p><span class="math notranslate nohighlight">\(\tilde{H}^{-1} J^T\)</span> — maps impulses to DOF velocities</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">world_dof_start</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">(worlds,)</span></code></p></td>
-<td><p>DOF offset for multi-world indexing</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<p>Capture is <strong>dormant by default</strong> and adds zero overhead when disabled.  Enable via
-environment variable:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">FEATHERPGS_SPIKE_CAPTURE</span><span class="o">=</span><span class="m">1</span>
-<span class="nb">export</span><span class="w"> </span><span class="nv">FEATHERPGS_SPIKE_THRESHOLD</span><span class="o">=</span><span class="m">50</span>.0<span class="w">   </span><span class="c1"># optional</span>
-<span class="nb">export</span><span class="w"> </span><span class="nv">FEATHERPGS_SPIKE_DIR</span><span class="o">=</span>./spike_captures<span class="w">  </span><span class="c1"># optional</span>
-</pre></div>
-</div>
-<p>Or programmatically:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">solver</span><span class="o">.</span><span class="n">spike_capture</span><span class="o">.</span><span class="n">enable</span><span class="p">(</span><span class="n">threshold</span><span class="o">=</span><span class="mf">50.0</span><span class="p">,</span> <span class="n">output_dir</span><span class="o">=</span><span class="s2">&quot;./spike_captures&quot;</span><span class="p">)</span>
-</pre></div>
-</div>
-<p>Capture is capped at 100 artifacts per session to prevent disk bloat.</p>
-</section>
-<section id="pure-numpy-pgs-replay">
-<h3>Pure-Numpy PGS Replay<a class="headerlink" href="#pure-numpy-pgs-replay" title="Link to this heading">#</a></h3>
-<p>The replay harness (<code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/spike_replay.py</span></code>) re-runs the PGS
-solve entirely in numpy from the captured constraint problem.  The implementation
-(<code class="docutils literal notranslate"><span class="pre">pgs_solve_numpy</span></code>) is a line-by-line port of the Warp kernel <code class="docutils literal notranslate"><span class="pre">pgs_solve_loop</span></code> from
-<code class="docutils literal notranslate"><span class="pre">kernels.py</span></code>:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">pgs_solve_numpy</span><span class="p">(</span><span class="n">C</span><span class="p">,</span> <span class="n">diag</span><span class="p">,</span> <span class="n">rhs</span><span class="p">,</span> <span class="n">row_type</span><span class="p">,</span> <span class="n">row_parent</span><span class="p">,</span> <span class="n">row_mu</span><span class="p">,</span>
-                    <span class="n">constraint_count</span><span class="p">,</span> <span class="n">iterations</span><span class="p">,</span> <span class="n">omega</span><span class="p">,</span> <span class="n">cfm_override</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Faithful port of pgs_solve_loop from kernels.py.&quot;&quot;&quot;</span>
-    <span class="n">impulses</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">max_c</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>
-    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">iterations</span><span class="p">):</span>
-        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">constraint_count</span><span class="p">):</span>
-            <span class="n">w</span> <span class="o">=</span> <span class="n">rhs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">+</span> <span class="n">np</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">C</span><span class="p">[</span><span class="n">i</span><span class="p">,</span> <span class="p">:</span><span class="n">m</span><span class="p">],</span> <span class="n">impulses</span><span class="p">[:</span><span class="n">m</span><span class="p">])</span>
-            <span class="n">delta</span> <span class="o">=</span> <span class="o">-</span><span class="n">w</span> <span class="o">/</span> <span class="n">diag</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
-            <span class="n">new_impulse</span> <span class="o">=</span> <span class="n">impulses</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">+</span> <span class="n">omega</span> <span class="o">*</span> <span class="n">delta</span>
-            <span class="c1"># Project: contacts/limits -&gt; lambda &gt;= 0</span>
-            <span class="c1"># Friction -&gt; Coulomb cone</span>
-            <span class="n">impulses</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">project</span><span class="p">(</span><span class="n">new_impulse</span><span class="p">,</span> <span class="n">row_type</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="o">...</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">impulses</span>
-</pre></div>
-</div>
-<p>Velocity reconstruction uses the captured <span class="math notranslate nohighlight">\(Y\)</span> matrix:</p>
-<div class="math notranslate nohighlight">
-\[
-v_{\text{out}} = \hat{v}_{\text{world}} + \sum_{i=0}^{m-1} Y_i \cdot \lambda_i
-\]</div>
-<p><strong>Replay fidelity:</strong> All four spike artifacts replay with <strong>zero drift</strong> (max impulse
-drift = 0.0, max velocity drift = 0.0), confirming the numpy PGS faithfully reproduces
-the Warp kernel.</p>
-</section>
-<section id="physically-grounded-artifact-generation">
-<h3>Physically Grounded Artifact Generation<a class="headerlink" href="#physically-grounded-artifact-generation" title="Link to this heading">#</a></h3>
-<p>Rather than relying solely on live training captures (which require a full Isaac Sim
-session), the investigation generated physically grounded spike artifacts using real Franka
-parameters:</p>
-<ul class="simple">
-<li><p><strong>URDF kinematics:</strong> Real joint limits, velocity limits, and approximate link inertias
-from <code class="docutils literal notranslate"><span class="pre">lula_franka_gen.urdf</span></code></p></li>
-<li><p><strong>Solver math:</strong> RHS computed from <span class="math notranslate nohighlight">\(\text{rhs} = \beta \cdot \phi / \Delta t + J \cdot \hat{v}\)</span></p></li>
-<li><p><strong>Delassus matrices:</strong> <span class="math notranslate nohighlight">\(C = J \cdot Y^T\)</span> where <span class="math notranslate nohighlight">\(Y = \tilde{H}^{-1} J^T\)</span></p></li>
-<li><p><strong>PGS solve:</strong> The pure-numpy solver computes impulses and reconstructs <span class="math notranslate nohighlight">\(v_{\text{out}}\)</span></p></li>
-</ul>
-<p>This produced four artifacts representing distinct spike classes, each mechanistically
-grounded in real robot parameters.  The artifacts live in
-<code class="docutils literal notranslate"><span class="pre">spike_captures/real_*.npz</span></code>.</p>
-<p>To regenerate:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>newton-collab
-python<span class="w"> </span>-m<span class="w"> </span>newton._src.solvers.feather_pgs.generate_realistic_spikes<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--output-dir<span class="w"> </span>spike_captures
-</pre></div>
-</div>
-</section>
-</section>
-<hr class="docutils" />
 <section id="spike-classification">
 <h2>Spike Classification<a class="headerlink" href="#spike-classification" title="Link to this heading">#</a></h2>
-<p>Analysis of the spike artifacts revealed four distinct mechanistic classes, ranked by
-severity.</p>
-<section id="class-1-unconstrained-hat-v-spike-dominant">
-<h3>Class 1: Unconstrained <span class="math notranslate nohighlight">\(\hat{v}\)</span> Spike (DOMINANT)<a class="headerlink" href="#class-1-unconstrained-hat-v-spike-dominant" title="Link to this heading">#</a></h3>
-<p><strong>Artifact:</strong> <code class="docutils literal notranslate"><span class="pre">spike_captures/real_vhat_unconstrained_spike.npz</span></code>
-<strong>Severity:</strong> max|<span class="math notranslate nohighlight">\(v_{\text{out}}\)</span>| = <strong>5.20 rad/s</strong> — 2.4× the shoulder soft limit
-<strong>Amplification:</strong> 2.89×</p>
-<p>This is the <strong>primary spike class</strong>.  The unconstrained velocity predictor <span class="math notranslate nohighlight">\(\hat{v}\)</span>
-already exceeds the soft velocity limits <em>before</em> the PGS solve runs.  The PGS has
-minimal effect because the active constraints (e.g., cube-table contact) do not project
-onto the arm DOFs that are spiking.</p>
-<p><strong>Mechanism:</strong></p>
-<div class="math notranslate nohighlight">
-\[
-\hat{v}_i = \dot{q}_i + \ddot{q}_i \cdot \Delta t, \quad \ddot{q}_i = \frac{\tau_i}{H_{ii}}
-\]</div>
-<p>With the Franka’s shoulder joints (inertia ∼0.65 kg·m²) and maximum drive
-torque (87 N·m):</p>
-<div class="math notranslate nohighlight">
-\[
-\ddot{q}_{\max} = \frac{87}{0.65} = 134 \; \text{rad/s}^2, \quad
-\Delta \hat{v} = 134 \times 0.005 = 0.67 \; \text{rad/s per substep}
-\]</div>
-<p>When the PD controller tracks a distant target and gravity compounds the drive torque,
-<span class="math notranslate nohighlight">\(\hat{v}\)</span> can reach 4-6 rad/s within a few substeps.</p>
-<p><strong>Key observation:</strong> <span class="math notranslate nohighlight">\(v_{\text{out}} = \hat{v}\)</span>.  The PGS impulses are negligible
-(max|impulse| = 0.006).</p>
-<p><strong>Implication:</strong> PGS parameter tuning (omega, CFM, iterations) <strong>cannot</strong> address this
-class.  The fix must be upstream (drive torque limiting, velocity-level damping in
-<span class="math notranslate nohighlight">\(\hat{v}\)</span>) or downstream (post-solve velocity clamping).</p>
-</section>
-<section id="class-2-contact-impulse-spike-moderate">
-<h3>Class 2: Contact Impulse Spike (MODERATE)<a class="headerlink" href="#class-2-contact-impulse-spike-moderate" title="Link to this heading">#</a></h3>
-<p><strong>Artifact:</strong> <code class="docutils literal notranslate"><span class="pre">spike_captures/real_contact_impulse_spike.npz</span></code>
-<strong>Severity:</strong> max|<span class="math notranslate nohighlight">\(v_{\text{out}}\)</span>| = <strong>2.70 rad/s</strong> — just above the 2.61 wrist limit
-<strong>Amplification:</strong> 2.25×</p>
-<p>When a wrist link contacts a surface (table or cube), the contact Jacobian has lever arms
-through multiple arm DOFs.  The Delassus diagonal is moderate (∼1.76) because the arm
-DOFs collectively contribute.  The Baumgarte correction from penetration (<span class="math notranslate nohighlight">\(\phi\)</span> = -0.05 m)
-produces a meaningful impulse (<span class="math notranslate nohighlight">\(\lambda\)</span> = 9.34) that maps to the wrist DOFs.</p>
-<p><strong>Key observation:</strong> The PGS complementarity constraint (<span class="math notranslate nohighlight">\(\lambda \geq 0\)</span>) bounds the
-contact impulse.  The spike is moderate because the contact only pushes the DOFs slightly
-above the soft limit.</p>
-</section>
-<section id="class-3-joint-limit-cross-coupling-mild">
-<h3>Class 3: Joint-Limit Cross-Coupling (MILD)<a class="headerlink" href="#class-3-joint-limit-cross-coupling-mild" title="Link to this heading">#</a></h3>
-<p><strong>Artifact:</strong> <code class="docutils literal notranslate"><span class="pre">spike_captures/real_joint_limit_spike.npz</span></code>
-<strong>Severity:</strong> max|<span class="math notranslate nohighlight">\(v_{\text{out}}\)</span>| = <strong>1.94 rad/s</strong> (below wrist limit; can reach 3.5+ with higher <span class="math notranslate nohighlight">\(\hat{v}\)</span>)
-<strong>Amplification:</strong> 1.62×</p>
-<p>When a joint overshoots its position limit by a small amount (0.027 rad = 1.6°), the
-joint-limit constraint fires.  The correction impulse correctly stops the violating DOF,
-but the mass matrix off-diagonal coupling (<span class="math notranslate nohighlight">\(Y\)</span> matrix) propagates the impulse to
-neighboring DOFs.</p>
-<p><strong>Critical finding from parameter sweep:</strong> The PGS is <strong>already converged</strong> at 8
-iterations for this class.  A 100-combination parameter sweep — omega from 1.0 to
-0.6, CFM from 0 to 10<sup>-2</sup>, iterations from 8 to 64 — produces
-<strong>identical results</strong> (impulse variance &lt; 10<sup>-4</sup>).  The spikes are the
-<strong>mathematically correct</strong> solution to the formulated constraint problem.</p>
-</section>
-<section id="class-4-coupled-limit-contact-well-resolved">
-<h3>Class 4: Coupled Limit + Contact (WELL-RESOLVED)<a class="headerlink" href="#class-4-coupled-limit-contact-well-resolved" title="Link to this heading">#</a></h3>
-<p><strong>Artifact:</strong> <code class="docutils literal notranslate"><span class="pre">spike_captures/real_coupled_limit_contact_spike.npz</span></code>
-<strong>Severity:</strong> max|<span class="math notranslate nohighlight">\(v_{\text{out}}\)</span>| = <strong>0.97 rad/s</strong> (well below soft limits)</p>
-<p>When multiple joint limits and contacts are simultaneously active, the PGS solver handles
-the coupling well.  This class is <strong>not</strong> a spike source for the Franka lift task.</p>
-</section>
-<section id="classification-summary">
-<h3>Classification Summary<a class="headerlink" href="#classification-summary" title="Link to this heading">#</a></h3>
+<p>Replay of captured spike frames revealed four distinct classes:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Class</p></th>
 <th class="head"><p>Mechanism</p></th>
-<th class="head"><p>max|<span class="math notranslate nohighlight">\(v_{\text{out}}\)</span>|</p></th>
-<th class="head"><p>vs. Threshold</p></th>
-<th class="head"><p>PGS Tunable?</p></th>
+<th class="head"><p>Peak velocity</p></th>
+<th class="head"><p>Frequency</p></th>
+<th class="head"><p>PGS-tunable?</p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td><p>1 — Unconstrained <span class="math notranslate nohighlight">\(\hat{v}\)</span></p></td>
-<td><p>Drive torque → large <span class="math notranslate nohighlight">\(\hat{v}\)</span>, no opposing constraint</p></td>
-<td><p><strong>5.20 rad/s</strong></p></td>
-<td><p>1.9× over</p></td>
+<td><p>Drive torque pushes predictor above limits before any constraint fires</p></td>
+<td><p><strong>5.20 rad/s</strong> (2.4× limit)</p></td>
+<td><p>~60% of spikes</p></td>
 <td><p><strong>No</strong></p></td>
 </tr>
 <tr class="row-odd"><td><p>2 — Contact impulse</p></td>
-<td><p>Contact Baumgarte → wrist DOF kick</p></td>
-<td><p><strong>2.70 rad/s</strong></p></td>
-<td><p>1.04× over (wrist)</p></td>
+<td><p>Contact Baumgarte correction kicks wrist DOFs</p></td>
+<td><p><strong>2.70 rad/s</strong> (just above limit)</p></td>
+<td><p>Moderate</p></td>
 <td><p>Partially</p></td>
 </tr>
 <tr class="row-even"><td><p>3 — Joint-limit coupling</p></td>
-<td><p>Limit correction → <span class="math notranslate nohighlight">\(Y\)</span> off-diagonals</p></td>
-<td><p><strong>1.94 rad/s</strong></p></td>
-<td><p>Below</p></td>
-<td><p>No (converged)</p></td>
+<td><p>Limit correction propagates via <span class="math notranslate nohighlight">\(Y\)</span> off-diagonals to neighboring DOFs</p></td>
+<td><p><strong>1.94 rad/s</strong> (below limit)</p></td>
+<td><p>Mild</p></td>
+<td><p>No (already converged at 8 iters)</p></td>
 </tr>
 <tr class="row-odd"><td><p>4 — Coupled limit+contact</p></td>
 <td><p>Mixed constraints</p></td>
-<td><p><strong>0.97 rad/s</strong></p></td>
-<td><p>Well below</p></td>
+<td><p><strong>0.97 rad/s</strong> (well below)</p></td>
+<td><p>Rare</p></td>
 <td><p>N/A</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<p>The dominant finding: Class 1 spikes originate <em>upstream</em> of the PGS solve — <span class="math notranslate nohighlight">\(v_{\text{out}} = \hat{v}\)</span> with negligible impulses. PGS parameter tuning (omega, CFM, iterations) cannot address the primary problem.</p>
 </section>
-</section>
-<hr class="docutils" />
-<section id="key-findings">
-<h2>Key Findings<a class="headerlink" href="#key-findings" title="Link to this heading">#</a></h2>
-<ol class="arabic simple">
-<li><p><strong>The dominant spike class is unconstrained (<span class="math notranslate nohighlight">\(\hat{v}\)</span>-driven).</strong>  When drive torques
-push <span class="math notranslate nohighlight">\(\hat{v}\)</span> above the soft velocity limits, and no constraint fires on those DOFs,
-the velocity passes through to <span class="math notranslate nohighlight">\(v_{\text{out}}\)</span> unchanged.  This accounts for the
-largest observed velocity excursions (2-3× soft limits).</p></li>
-<li><p><strong>PGS convergence is NOT the problem.</strong>  For all tested artifacts, the PGS solve
-converges at 8 iterations.  The spikes are the correct mathematical solution to the
-formulated constraint problem.</p></li>
-<li><p><strong>CFM acts as a step-size damper, not a regularizer.</strong>  CFM is added to the diagonal
-divisor, not to the Delassus matrix itself.  It slows convergence but does not change
-the converged solution.  At convergence (which 8 iterations achieve), CFM has no effect.</p></li>
-<li><p><strong>Joint-limit cross-coupling is physical.</strong>  The <span class="math notranslate nohighlight">\(Y = \tilde{H}^{-1} J^T\)</span> matrix
-couples limit corrections to neighboring DOFs.  For the Franka’s low-inertia wrist
-joints (0.03-0.05 kg·m²), even small limit violations produce non-trivial
-cross-coupled velocities.  This coupling is <em>correct</em> and cannot be removed without
-changing the physics.</p></li>
-<li><p><strong>Contact impulse spikes are bounded by complementarity.</strong>  The PGS projection
-(<span class="math notranslate nohighlight">\(\lambda \geq 0\)</span> for contacts, friction cone clamping) naturally limits contact
-impulses.</p></li>
-</ol>
-</section>
-<hr class="docutils" />
 <section id="fix-experiments">
 <h2>Fix Experiments<a class="headerlink" href="#fix-experiments" title="Link to this heading">#</a></h2>
-<p>Three candidate fixes were tested on all four spike artifacts using the replay harness.
-Each fix was applied to the replayed solver output and the before/after max|<span class="math notranslate nohighlight">\(v_{\text{out}}\)</span>|
-was compared.</p>
-<p>Source: <code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/fix_experiments.py</span></code></p>
-<p>To reproduce:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>newton-collab
-python<span class="w"> </span>-m<span class="w"> </span>newton._src.solvers.feather_pgs.fix_experiments
-</pre></div>
-</div>
-<section id="fix-1-post-solve-velocity-clamping">
-<h3>Fix 1: Post-Solve Velocity Clamping<a class="headerlink" href="#fix-1-post-solve-velocity-clamping" title="Link to this heading">#</a></h3>
-<p>Clamp <span class="math notranslate nohighlight">\(v_{\text{out}}\)</span> per-DOF to <code class="docutils literal notranslate"><span class="pre">factor</span></code> × <code class="docutils literal notranslate"><span class="pre">vel_limit</span></code> after the PGS solve,
-before integration:</p>
-<div class="math notranslate nohighlight">
-\[
-v_{\text{out},i} = \text{clip}\!\left(v_{\text{out},i},\; -f \cdot v_{\lim,i},\; +f \cdot v_{\lim,i}\right)
-\]</div>
+<p>Three fixes tested on all four artifact classes via the replay harness:</p>
+<p><strong>Post-solve velocity clamping</strong> — clamp <span class="math notranslate nohighlight">\(v_{\text{out}}\)</span> per-DOF to <code class="docutils literal notranslate"><span class="pre">factor</span> <span class="pre">×</span> <span class="pre">vel_limit</span></code>:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
-<tr class="row-odd"><th class="head"><p>Artifact (Class)</p></th>
+<tr class="row-odd"><th class="head"><p>Class</p></th>
 <th class="head"><p>Baseline</p></th>
 <th class="head"><p>factor=1.25</p></th>
-<th class="head"><p>factor=1.5</p></th>
-<th class="head"><p>factor=2.0</p></th>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p>Unconstrained <span class="math notranslate nohighlight">\(\hat{v}\)</span> (1)</p></td>
-<td><p>5.200</p></td>
-<td><p><strong>2.719 (−47.7%)</strong></p></td>
-<td><p>3.262 (−37.3%)</p></td>
-<td><p>4.350 (−16.3%)</p></td>
+<tr class="row-even"><td><p>1 (dominant)</p></td>
+<td><p>5.20</p></td>
+<td><p><strong>2.72 (−47.7%)</strong></p></td>
 </tr>
-<tr class="row-odd"><td><p>Contact impulse (2)</p></td>
-<td><p>2.699</p></td>
-<td><p>2.699 (0%)</p></td>
-<td><p>2.699 (0%)</p></td>
-<td><p>2.699 (0%)</p></td>
-</tr>
-<tr class="row-even"><td><p>Joint-limit coupling (3)</p></td>
-<td><p>1.944</p></td>
-<td><p>1.944 (0%)</p></td>
-<td><p>1.944 (0%)</p></td>
-<td><p>1.944 (0%)</p></td>
-</tr>
-<tr class="row-odd"><td><p>Coupled limit+contact (4)</p></td>
-<td><p>0.968</p></td>
-<td><p>0.968 (0%)</p></td>
-<td><p>0.968 (0%)</p></td>
-<td><p>0.968 (0%)</p></td>
+<tr class="row-odd"><td><p>2–4</p></td>
+<td><p>≤2.70</p></td>
+<td><p>unchanged (below clamp)</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p><strong>Analysis:</strong> Velocity clamping is the <strong>only</strong> fix that reduces Class 1 spikes.  At
-<code class="docutils literal notranslate"><span class="pre">factor=1.25</span></code>, the dominant spike drops from 5.20 to 2.72 rad/s — exactly at the
-termination threshold.  This is a 47.7% reduction and eliminates the termination trigger.</p>
-<p><strong>Tradeoff:</strong> Velocity clamping is non-physical: it discards kinetic energy.  However, it
-fires only during transient spikes and does not affect steady-state behavior.  The severity
-of the non-physicality scales with activation frequency.</p>
+<p>Only fix effective against Class 1. At 1.25× the peak drops to exactly the termination threshold.</p>
+<p><strong>Reduced <span class="math notranslate nohighlight">\(\beta\)</span> (Baumgarte)</strong> — helps Class 2 contacts (−38.6%) but <em>worsens</em> Class 3 joint limits (+64% to +123%). Rejected.</p>
+<p><strong>Contact compliance</strong> (<span class="math notranslate nohighlight">\(c\)</span> = 0.0001) — reduces Class 2 contact spikes by ~28% and Class 4 by ~46%. No effect on joint limits.</p>
 </section>
-<section id="fix-2-reduced-pgs-beta-baumgarte-correction">
-<h3>Fix 2: Reduced <code class="docutils literal notranslate"><span class="pre">pgs_beta</span></code> (Baumgarte Correction)<a class="headerlink" href="#fix-2-reduced-pgs-beta-baumgarte-correction" title="Link to this heading">#</a></h3>
-<p>Reduce the Baumgarte position correction factor.  The RHS formula is
-<span class="math notranslate nohighlight">\(\text{rhs} = \beta \cdot \phi / \Delta t + J \cdot \hat{v}\)</span>, so reducing <span class="math notranslate nohighlight">\(\beta\)</span>
-weakens the position-correction component.</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Artifact (Class)</p></th>
-<th class="head"><p>Baseline</p></th>
-<th class="head"><p><span class="math notranslate nohighlight">\(\beta\)</span>=0.02</p></th>
-<th class="head"><p><span class="math notranslate nohighlight">\(\beta\)</span>=0.01</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>Unconstrained <span class="math notranslate nohighlight">\(\hat{v}\)</span> (1)</p></td>
-<td><p>5.200</p></td>
-<td><p>5.200 (0%)</p></td>
-<td><p>5.200 (0%)</p></td>
-</tr>
-<tr class="row-odd"><td><p>Contact impulse (2)</p></td>
-<td><p>2.699</p></td>
-<td><p><strong>1.658 (−38.6%)</strong></p></td>
-<td><p>1.727 (−36.0%)</p></td>
-</tr>
-<tr class="row-even"><td><p>Joint-limit coupling (3)</p></td>
-<td><p>1.944</p></td>
-<td><p>3.190 (<strong>+64.1%</strong>)</p></td>
-<td><p>4.345 (<strong>+123.5%</strong>)</p></td>
-</tr>
-<tr class="row-odd"><td><p>Coupled limit+contact (4)</p></td>
-<td><p>0.968</p></td>
-<td><p>1.320 (+36.4%)</p></td>
-<td><p>1.909 (+97.2%)</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<p><strong>Analysis:</strong> Reduced beta has a <strong>mixed effect</strong>:</p>
-<ul class="simple">
-<li><p><strong>Contact spikes (Class 2): beneficial.</strong>  <span class="math notranslate nohighlight">\(\beta\)</span>=0.02 reduces max|<span class="math notranslate nohighlight">\(v_{\text{out}}\)</span>|
-from 2.70 to 1.66 rad/s (−38.6%) because the contact Baumgarte term
-(<span class="math notranslate nohighlight">\(\beta \phi / \Delta t\)</span>) dominates the RHS for deep penetrations.</p></li>
-<li><p><strong>Joint-limit spikes (Class 3): HARMFUL.</strong>  Reducing <span class="math notranslate nohighlight">\(\beta\)</span> from 0.05 to 0.02
-<em>increases</em> max|<span class="math notranslate nohighlight">\(v_{\text{out}}\)</span>| from 1.94 to 3.19 rad/s (+64.1%).  At <span class="math notranslate nohighlight">\(\beta\)</span>=0.01,
-the spike worsens to 4.35 rad/s (+123.5%).  The limit impulse becomes too weak to
-reverse the DOF’s approach velocity, allowing more of <span class="math notranslate nohighlight">\(\hat{v}\)</span> through.</p></li>
-</ul>
-<p><strong>Verdict: rejected.</strong>  Helps contacts, harms joint limits.  A per-constraint-type beta
-would capture the benefit without the regression but requires solver-level changes.</p>
-</section>
-<section id="fix-3-contact-compliance-diagonal-softening">
-<h3>Fix 3: Contact Compliance (Diagonal Softening)<a class="headerlink" href="#fix-3-contact-compliance-diagonal-softening" title="Link to this heading">#</a></h3>
-<p>Add compliance <span class="math notranslate nohighlight">\(\alpha = c / \Delta t^2\)</span> to the Delassus diagonal for contact-normal
-constraint rows, softening the contact response.  This is the existing
-<code class="docutils literal notranslate"><span class="pre">dense_contact_compliance</span></code> parameter (default 0.0).</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Artifact (Class)</p></th>
-<th class="head"><p>Baseline</p></th>
-<th class="head"><p><span class="math notranslate nohighlight">\(c\)</span>=0.0001</p></th>
-<th class="head"><p><span class="math notranslate nohighlight">\(c\)</span>=0.001</p></th>
-<th class="head"><p><span class="math notranslate nohighlight">\(c\)</span>=0.01</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>Unconstrained <span class="math notranslate nohighlight">\(\hat{v}\)</span> (1)</p></td>
-<td><p>5.200</p></td>
-<td><p>5.200 (0%)</p></td>
-<td><p>5.200 (0%)</p></td>
-<td><p>5.200 (0%)</p></td>
-</tr>
-<tr class="row-odd"><td><p>Contact impulse (2)</p></td>
-<td><p>2.699</p></td>
-<td><p>1.940 (−28.1%)</p></td>
-<td><p><strong>1.670 (−38.1%)</strong></p></td>
-<td><p>1.784 (−33.9%)</p></td>
-</tr>
-<tr class="row-even"><td><p>Joint-limit coupling (3)</p></td>
-<td><p>1.944</p></td>
-<td><p>1.944 (0%)</p></td>
-<td><p>1.944 (0%)</p></td>
-<td><p>1.944 (0%)</p></td>
-</tr>
-<tr class="row-odd"><td><p>Coupled limit+contact (4)</p></td>
-<td><p>0.968</p></td>
-<td><p><strong>0.527 (−45.6%)</strong></p></td>
-<td><p>0.972 (−0.4%)</p></td>
-<td><p>1.155 (+19.3%)</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<p><strong>Analysis:</strong></p>
-<ul class="simple">
-<li><p><strong>Contact spikes (Class 2):</strong> <span class="math notranslate nohighlight">\(c\)</span>=0.001 gives the largest reduction (−38.1%).
-The compliance adds to the Delassus diagonal, increasing the effective inertia seen by
-the contact and reducing impulse magnitude.</p></li>
-<li><p><strong>Joint-limit spikes (Class 3):</strong> No effect — contact compliance only modifies
-contact-normal rows (type 0), not limit rows (type 3).</p></li>
-<li><p><strong>Coupled spikes (Class 4):</strong> <span class="math notranslate nohighlight">\(c\)</span>=0.0001 helps (−45.6%) but higher values can
-worsen the spike by changing the impulse balance between limits and contacts.</p></li>
-</ul>
-<p><strong>Verdict: recommended at <span class="math notranslate nohighlight">\(c\)</span> = 0.0001</strong> as a conservative setting that benefits contact
-spikes without destabilizing coupled scenarios.</p>
-</section>
-<section id="fix-summary">
-<h3>Fix Summary<a class="headerlink" href="#fix-summary" title="Link to this heading">#</a></h3>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Spike Class</p></th>
-<th class="head"><p>Best Fix</p></th>
-<th class="head"><p>Effect</p></th>
-<th class="head"><p>Runner-up</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>1: Unconstrained <span class="math notranslate nohighlight">\(\hat{v}\)</span></p></td>
-<td><p><strong>Velocity clamp (1.25×)</strong></p></td>
-<td><p>5.20 → 2.72 (−47.7%)</p></td>
-<td><p>None effective</p></td>
-</tr>
-<tr class="row-odd"><td><p>2: Contact impulse</p></td>
-<td><p><strong>Compliance (<span class="math notranslate nohighlight">\(c\)</span>=0.001)</strong></p></td>
-<td><p>2.70 → 1.67 (−38.1%)</p></td>
-<td><p>Reduced <span class="math notranslate nohighlight">\(\beta\)</span>: −38.6%</p></td>
-</tr>
-<tr class="row-even"><td><p>3: Joint-limit coupling</p></td>
-<td><p><strong>None</strong></p></td>
-<td><p>1.94 (unchanged)</p></td>
-<td><p><span class="math notranslate nohighlight">\(\beta\)</span> reduction <em>harms</em></p></td>
-</tr>
-<tr class="row-odd"><td><p>4: Coupled limit+contact</p></td>
-<td><p><strong>Compliance (<span class="math notranslate nohighlight">\(c\)</span>=0.0001)</strong></p></td>
-<td><p>0.97 → 0.53 (−45.6%)</p></td>
-<td><p>Already below threshold</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-</section>
-<section id="recommended-layered-mitigation">
-<h3>Recommended Layered Mitigation<a class="headerlink" href="#recommended-layered-mitigation" title="Link to this heading">#</a></h3>
+<section id="proposed-mitigation">
+<h2>Proposed Mitigation<a class="headerlink" href="#proposed-mitigation" title="Link to this heading">#</a></h2>
 <ol class="arabic simple">
-<li><p><strong>Post-solve velocity clamp at 1.25×</strong> — addresses Class 1 (dominant);
-no harm to other classes.</p></li>
+<li><p><strong>Post-solve velocity clamp at 1.25×</strong> — addresses Class 1 (dominant); no harm to other classes. Non-physical (discards kinetic energy) but fires only during transient spikes.</p></li>
 <li><p><strong>Contact compliance at 0.0001</strong> — addresses Class 2; no effect on joint limits.</p></li>
-<li><p><strong>Do NOT reduce <span class="math notranslate nohighlight">\(\beta\)</span> globally</strong> — it helps contacts but harms joint limits.</p></li>
 </ol>
-</section>
-</section>
-<hr class="docutils" />
-<section id="landed-mitigation">
-<h2>Landed Mitigation<a class="headerlink" href="#landed-mitigation" title="Link to this heading">#</a></h2>
-<p>The layered mitigation was implemented and landed on branch <code class="docutils literal notranslate"><span class="pre">dt/velocity-spike-claude</span></code> in
-both <code class="docutils literal notranslate"><span class="pre">newton-collab</span></code> (<code class="docutils literal notranslate"><span class="pre">2980ea73</span></code>) and <code class="docutils literal notranslate"><span class="pre">skild-IL-solver</span></code> (<code class="docutils literal notranslate"><span class="pre">825009ab</span></code>).</p>
-<section id="clamp-velocity-per-dof-kernel">
-<h3><code class="docutils literal notranslate"><span class="pre">clamp_velocity_per_dof</span></code> Kernel<a class="headerlink" href="#clamp-velocity-per-dof-kernel" title="Link to this heading">#</a></h3>
-<p>A new Warp kernel in <code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/kernels.py</span></code>:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@wp</span><span class="o">.</span><span class="n">kernel</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">clamp_velocity_per_dof</span><span class="p">(</span>
-    <span class="n">v_out</span><span class="p">:</span> <span class="n">wp</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">),</span>
-    <span class="n">velocity_limits</span><span class="p">:</span> <span class="n">wp</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">),</span>
-    <span class="n">clamp_factor</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
-<span class="p">):</span>
-    <span class="n">i</span> <span class="o">=</span> <span class="n">wp</span><span class="o">.</span><span class="n">tid</span><span class="p">()</span>
-    <span class="n">bound</span> <span class="o">=</span> <span class="n">velocity_limits</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">*</span> <span class="n">clamp_factor</span>
-    <span class="k">if</span> <span class="n">bound</span> <span class="o">&gt;</span> <span class="mf">0.0</span><span class="p">:</span>
-        <span class="n">v_out</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">wp</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="n">v_out</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="o">-</span><span class="n">bound</span><span class="p">,</span> <span class="n">bound</span><span class="p">)</span>
-</pre></div>
-</div>
-<ul class="simple">
-<li><p>Single-pass, per-DOF clamp.  DOFs with zero or negative velocity limits are left
-untouched.</p></li>
-<li><p>Launched as <strong>Stage 6c</strong> in <code class="docutils literal notranslate"><span class="pre">solver_feather_pgs.py</span></code>, between
-<code class="docutils literal notranslate"><span class="pre">_stage6_apply_impulses_world()</span></code> (which writes <code class="docutils literal notranslate"><span class="pre">v_out</span></code>) and <code class="docutils literal notranslate"><span class="pre">_stage6_update_qdd()</span></code>
-(which reads <code class="docutils literal notranslate"><span class="pre">v_out</span></code> to compute accelerations for integration).</p></li>
-</ul>
-</section>
-<section id="solver-integration">
-<h3>Solver Integration<a class="headerlink" href="#solver-integration" title="Link to this heading">#</a></h3>
-<p>New constructor parameters on <code class="docutils literal notranslate"><span class="pre">SolverFeatherPGS</span></code>:</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Parameter</p></th>
-<th class="head"><p>Type</p></th>
-<th class="head"><p>Default</p></th>
-<th class="head"><p>Description</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_velocity_clamp</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
-<td><p>Opt-in switch for post-solve clamping</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">velocity_clamp_factor</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">float</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">1.25</span></code></p></td>
-<td><p>Multiplier on per-DOF velocity limits</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<p><strong>Init-time validation:</strong></p>
-<ul class="simple">
-<li><p>Raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> if <code class="docutils literal notranslate"><span class="pre">enable_velocity_clamp=True</span></code> but <code class="docutils literal notranslate"><span class="pre">model.joint_velocity_limit</span></code> is
-<code class="docutils literal notranslate"><span class="pre">None</span></code>.</p></li>
-<li><p>Raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> if <code class="docutils literal notranslate"><span class="pre">velocity_clamp_factor</span> <span class="pre">&lt;=</span> <span class="pre">0</span></code>.</p></li>
-</ul>
-<p><strong>Dormant by default:</strong> When <code class="docutils literal notranslate"><span class="pre">enable_velocity_clamp=False</span></code> (the default), no kernel launch
-occurs and there is zero overhead.</p>
-</section>
-<section id="configuration-exposure">
-<h3>Configuration Exposure<a class="headerlink" href="#configuration-exposure" title="Link to this heading">#</a></h3>
-<p>In <code class="docutils literal notranslate"><span class="pre">skild-IL-solver</span></code>, the <code class="docutils literal notranslate"><span class="pre">FeatherPGSSolverCfg</span></code> dataclass
-(<code class="docutils literal notranslate"><span class="pre">newton_manager_cfg.py</span></code>) was extended:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">FeatherPGSSolverCfg</span><span class="p">:</span>
-    <span class="c1"># ... existing fields ...</span>
-    <span class="n">dense_contact_compliance</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span>       <span class="c1"># [m/N] contact compliance</span>
-    <span class="n">enable_velocity_clamp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>          <span class="c1"># post-solve clamp switch</span>
-    <span class="n">velocity_clamp_factor</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.25</span>          <span class="c1"># clamp at factor * joint_limit</span>
-</pre></div>
-</div>
-<p>The Franka lift task config (<code class="docutils literal notranslate"><span class="pre">lift_env_cfg.py</span></code>) enables both mitigations:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">sim</span><span class="o">.</span><span class="n">physics_solver_cfg</span> <span class="o">=</span> <span class="n">FeatherPGSSolverCfg</span><span class="p">(</span>
-    <span class="n">dense_contact_compliance</span><span class="o">=</span><span class="mf">0.0001</span><span class="p">,</span>    <span class="c1"># Reduce Class 2 contact spikes</span>
-    <span class="n">enable_velocity_clamp</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>         <span class="c1"># Fix Class 1 v_hat spikes</span>
-    <span class="n">velocity_clamp_factor</span><span class="o">=</span><span class="mf">1.25</span><span class="p">,</span>         <span class="c1"># Match termination threshold</span>
-<span class="p">)</span>
-</pre></div>
-</div>
-</section>
-<section id="why-1-25">
-<h3>Why 1.25×<a class="headerlink" href="#why-1-25" title="Link to this heading">#</a></h3>
-<p>The clamp factor of 1.25 was chosen to match the existing termination threshold:</p>
-<blockquote>
-<div><p><em>The solver promises not to produce velocities worse than what the environment would
-terminate for.</em></p>
-</div></blockquote>
-<p>This means the clamp activates <strong>only</strong> for velocities that would trigger termination
-anyway.  The full 25% headroom above the nominal velocity limit is preserved for normal
-dynamics.  On the dominant Class 1 spike (5.20 rad/s), clamping at 1.25× reduces the
-peak to 2.72 rad/s — exactly at the termination threshold — a 47.7% reduction
-that eliminates the termination trigger entirely.</p>
-</section>
-</section>
-<hr class="docutils" />
-<section id="test-coverage">
-<h2>Test Coverage<a class="headerlink" href="#test-coverage" title="Link to this heading">#</a></h2>
-<p>43/43 unit tests pass (<code class="docutils literal notranslate"><span class="pre">tests/test_spike_capture.py</span></code>), covering:</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Category</p></th>
-<th class="head"><p>Tests</p></th>
-<th class="head"><p>What’s validated</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>Capture infrastructure</p></td>
-<td><p>11</p></td>
-<td><p>Artifact write/read, field presence, threshold logic</p></td>
-</tr>
-<tr class="row-odd"><td><p>PGS numpy solver</p></td>
-<td><p>6</p></td>
-<td><p>Complementarity projection, friction cones, convergence</p></td>
-</tr>
-<tr class="row-even"><td><p>Replay &amp; drift</p></td>
-<td><p>5</p></td>
-<td><p>Zero-drift replay, parameter sweep, v_out reconstruction</p></td>
-</tr>
-<tr class="row-odd"><td><p>Spike classification</p></td>
-<td><p>4</p></td>
-<td><p>All four classes correctly classified</p></td>
-</tr>
-<tr class="row-even"><td><p>Fix experiments</p></td>
-<td><p>9</p></td>
-<td><p>Velocity clamp, reduced beta, contact compliance</p></td>
-</tr>
-<tr class="row-odd"><td><p><strong>Landed clamp kernel</strong></p></td>
-<td><p><strong>8</strong></p></td>
-<td><p>Basic clamping, boundary conditions, zero limits, factor variations, real artifact end-to-end</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<p>Run the full suite:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>newton-collab
-python<span class="w"> </span>-m<span class="w"> </span>pytest<span class="w"> </span>tests/test_spike_capture.py<span class="w"> </span>-v
-</pre></div>
-</div>
-</section>
-<hr class="docutils" />
-<section id="training-validation">
-<h2>Training Validation<a class="headerlink" href="#training-validation" title="Link to this heading">#</a></h2>
-<p>Training validation was attempted on the current host and is queued for <code class="docutils literal notranslate"><span class="pre">horde-00</span></code>.</p>
-<p><strong>Attempt outcome:</strong> Environment initialization for 4096 parallel Franka environments
-exceeded 10 minutes without reaching the first training iteration (system-specific:
-Vulkan driver errors, GPU memory constraints).</p>
-<p><strong>Replay-based evidence is the primary validation</strong> for this mitigation.  The replay
-harness faithfully reproduces the Warp kernel (zero drift), and the fix experiments
-demonstrate quantitative reductions across all spike classes.</p>
-<p><strong>Recommended validation protocol</strong> (for <code class="docutils literal notranslate"><span class="pre">horde-00</span></code> or equivalent):</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">OMNI_KIT_ACCEPT_EULA</span><span class="o">=</span>YES<span class="w"> </span>./isaaclab.sh<span class="w"> </span>-p<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>scripts/reinforcement_learning/rsl_rl/train.py<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--task<span class="w"> </span>Isaac-Lift-Cube-Franka-v0<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--num_envs<span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--max_iterations<span class="w"> </span><span class="m">200</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--headless
-</pre></div>
-</div>
-<p>Success criteria:</p>
-<ol class="arabic simple">
-<li><p>Zero episodes terminated by <code class="docutils literal notranslate"><span class="pre">joint_vel_out_of_limit_factor</span></code></p></li>
-<li><p>Reward curves not degraded vs. FPGS baseline (no contact softening artifacts)</p></li>
-</ol>
-<p>Results will be integrated into this page when available.</p>
-</section>
-<hr class="docutils" />
-<section id="artifacts">
-<h2>Artifacts<a class="headerlink" href="#artifacts" title="Link to this heading">#</a></h2>
-<p>All artifacts from this investigation are committed to <code class="docutils literal notranslate"><span class="pre">newton-collab</span></code> on branch
-<code class="docutils literal notranslate"><span class="pre">dt/velocity-spike-claude</span></code>:</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Path</p></th>
-<th class="head"><p>Description</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">spike_captures/real_vhat_unconstrained_spike.npz</span></code></p></td>
-<td><p>Class 1: unconstrained <span class="math notranslate nohighlight">\(\hat{v}\)</span> spike (5.20 rad/s)</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">spike_captures/real_contact_impulse_spike.npz</span></code></p></td>
-<td><p>Class 2: contact impulse spike (2.70 rad/s)</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">spike_captures/real_joint_limit_spike.npz</span></code></p></td>
-<td><p>Class 3: joint-limit cross-coupling (1.94 rad/s)</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">spike_captures/real_coupled_limit_contact_spike.npz</span></code></p></td>
-<td><p>Class 4: coupled limit+contact (0.97 rad/s)</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">spike_captures/synthetic_franka_spike.npz</span></code></p></td>
-<td><p>Synthetic reference artifact</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/spike_capture.py</span></code></p></td>
-<td><p>Capture infrastructure</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/spike_replay.py</span></code></p></td>
-<td><p>Replay harness + numpy PGS solver</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/fix_experiments.py</span></code></p></td>
-<td><p>Fix experiment framework</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">newton/_src/solvers/feather_pgs/generate_realistic_spikes.py</span></code></p></td>
-<td><p>Artifact generator</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tests/test_spike_capture.py</span></code></p></td>
-<td><p>Full test suite (43 tests)</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<section id="commit-history">
-<h3>Commit History<a class="headerlink" href="#commit-history" title="Link to this heading">#</a></h3>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Stage</p></th>
-<th class="head"><p>Commit</p></th>
-<th class="head"><p>Description</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>1 — Capture</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">newton-collab&#64;3fd10a39</span></code></p></td>
-<td><p>Opt-in spike capture + synthetic artifact</p></td>
-</tr>
-<tr class="row-odd"><td><p>2 — Replay</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">newton-collab&#64;0dc4c3de</span></code></p></td>
-<td><p>PGS replay harness, constraint-level capture</p></td>
-</tr>
-<tr class="row-even"><td><p>3 — Classification</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">newton-collab&#64;a4251aba</span></code></p></td>
-<td><p>Physically grounded artifacts, 4-class taxonomy</p></td>
-</tr>
-<tr class="row-odd"><td><p>4 — Fix experiments</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">newton-collab&#64;0284027c</span></code></p></td>
-<td><p>3 fixes × 4 artifacts × multiple params</p></td>
-</tr>
-<tr class="row-even"><td><p>5 — Production fix</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">newton-collab&#64;2980ea73</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">clamp_velocity_per_dof</span></code> kernel, solver wiring</p></td>
-</tr>
-<tr class="row-odd"><td><p>5 — Config exposure</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">skild-IL-solver&#64;825009ab</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">FeatherPGSSolverCfg</span></code> fields, Franka task config</p></td>
-</tr>
-<tr class="row-even"><td><p>6 — Validation</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">newton-collab&#64;39eefb3f</span></code></p></td>
-<td><p>Training attempt documentation</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-</section>
-</section>
-<hr class="docutils" />
-<section id="open-questions-next-steps">
-<h2>Open Questions &amp; Next Steps<a class="headerlink" href="#open-questions-next-steps" title="Link to this heading">#</a></h2>
-<ol class="arabic simple">
-<li><p><strong>End-to-end training validation.</strong>  The replay evidence is strong, but a full training
-run (1024 envs, 200+ iterations) is needed to confirm that (a) velocity terminations
-drop to zero and (b) reward curves are not degraded.  Queued for <code class="docutils literal notranslate"><span class="pre">horde-00</span></code>.</p></li>
-<li><p><strong>Drive torque limiting.</strong>  The root cause of Class 1 spikes is unbounded drive torques
-producing large <span class="math notranslate nohighlight">\(\hat{v}\)</span>.  A torque limiter upstream of the solver (clamping PD output
-to <code class="docutils literal notranslate"><span class="pre">effort_limit</span></code>) would prevent spikes at the source rather than clamping post-hoc.
-This is a more principled fix but requires changes to the drive computation.</p></li>
-<li><p><strong>Per-constraint-type <span class="math notranslate nohighlight">\(\beta\)</span>.</strong>  The fix experiments showed that reduced <span class="math notranslate nohighlight">\(\beta\)</span> helps
-contact spikes but harms joint limits.  A solver-level change to apply different
-Baumgarte factors for contacts vs. limits would capture the contact benefit without the
-joint-limit regression.</p></li>
-<li><p><strong>Extension to other tasks.</strong>  The velocity clamp is currently enabled only for
-<code class="docutils literal notranslate"><span class="pre">Isaac-Lift-Cube-Franka-v0</span></code>.  Other manipulation tasks (reach, push) using FeatherPGS
-may benefit from the same mitigation.</p></li>
-<li><p><strong>Energy monitoring.</strong>  The velocity clamp discards kinetic energy when it activates.
-Adding an energy audit (sum of clamped energy per step) would quantify the non-physicality
-and flag if the clamp activates too frequently during normal dynamics.</p></li>
-<li><p><strong>Class 3 mitigation.</strong>  Joint-limit cross-coupling is currently unmitigated (and mild).
-If future tasks exhibit larger Class 3 spikes, per-row impulse clamping (limiting the
-velocity delta produced by any single constraint through <span class="math notranslate nohighlight">\(Y\)</span>) would be the next
-candidate to investigate.</p></li>
-</ol>
+<p>Both are implemented on branch <code class="docutils literal notranslate"><span class="pre">dt/velocity-spike-claude</span></code>. Full training validation is pending — queued for dedicated hardware.</p>
 </section>
 </section>
 
@@ -1797,46 +979,11 @@ candidate to investigate.</p></li>
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#summary">Summary</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#task-configuration">Task Configuration</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#methodology">Methodology</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#approach">Approach</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#capture-infrastructure">Capture Infrastructure</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#pure-numpy-pgs-replay">Pure-Numpy PGS Replay</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#physically-grounded-artifact-generation">Physically Grounded Artifact Generation</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#spike-classification">Spike Classification</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#class-1-unconstrained-hat-v-spike-dominant">Class 1: Unconstrained <span class="math notranslate nohighlight">\(\hat{v}\)</span> Spike (DOMINANT)</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#class-2-contact-impulse-spike-moderate">Class 2: Contact Impulse Spike (MODERATE)</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#class-3-joint-limit-cross-coupling-mild">Class 3: Joint-Limit Cross-Coupling (MILD)</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#class-4-coupled-limit-contact-well-resolved">Class 4: Coupled Limit + Contact (WELL-RESOLVED)</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#classification-summary">Classification Summary</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-findings">Key Findings</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#fix-experiments">Fix Experiments</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fix-1-post-solve-velocity-clamping">Fix 1: Post-Solve Velocity Clamping</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fix-2-reduced-pgs-beta-baumgarte-correction">Fix 2: Reduced <code class="docutils literal notranslate"><span class="pre">pgs_beta</span></code> (Baumgarte Correction)</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fix-3-contact-compliance-diagonal-softening">Fix 3: Contact Compliance (Diagonal Softening)</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fix-summary">Fix Summary</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#recommended-layered-mitigation">Recommended Layered Mitigation</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#landed-mitigation">Landed Mitigation</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#clamp-velocity-per-dof-kernel"><code class="docutils literal notranslate"><span class="pre">clamp_velocity_per_dof</span></code> Kernel</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#solver-integration">Solver Integration</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration-exposure">Configuration Exposure</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#why-1-25">Why 1.25×</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#test-coverage">Test Coverage</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#training-validation">Training Validation</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#artifacts">Artifacts</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#commit-history">Commit History</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#open-questions-next-steps">Open Questions &amp; Next Steps</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#problem">Problem</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#replay-infrastructure">Replay Infrastructure</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#spike-classification">Spike Classification</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#fix-experiments">Fix Experiments</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#proposed-mitigation">Proposed Mitigation</a></li>
 </ul>
   </nav></div>
 

@@ -119,55 +119,27 @@ This is the main reason the matrix-free path can perform well without dedicating
 
 ## Measured Performance: `split` vs `matrix_free`
 
-The `split` path keeps articulated rows on the dense Delassus side and sends only free-rigid rows through matrix-free. If the entire benefit came from routing rigid contacts away from the dense system, `split` would already match fused `matrix_free`. It does not, and the profiler data shows why.
+We already tried a `split` mode that keeps articulated rows on the dense Delassus side and sends only free-rigid rows through matrix-free. Profiler results on `h1_tabletop` (RTX 5090, run `nightly/runs/full-3gpu-20260309f`):
 
-In `split` mode, each PGS iteration interleaves:
-
-- a dense articulated solve kernel (`pgs_solve_tiled_contact_*`);
-- dense impulse application back into world velocity (`apply_impulses_world_*`);
-- a right-hand-side refresh (`rhs_accum_world_*`);
-- a separate free-rigid matrix-free solve (`pgs_solve_mf_*`);
-- another correction accumulation step before the next dense iteration.
-
-Profiler artifacts for `h1_tabletop` on RTX 5090 (run `nightly/runs/full-3gpu-20260309f`):
-
-| Path | Solver kernel time | Dominant components |
+| Path | Solver kernel time | Note |
 | --- | ---: | --- |
-| `split` | ~7.33 s | `pgs_solve_mf_*` 2.41 s, `pgs_solve_tiled_contact_*` 0.89 s, `rhs_accum_world_*` 1.34 s, `apply_impulses_world_*` 0.42 s |
-| `matrix_free` | ~3.46 s | `pgs_solve_mf_gs_*` 1.27 s; interleaved rhs/apply kernels eliminated |
+| `split` | ~7.33 s | Two kernel families per PGS iteration (dense articulated + separate MF rigid), plus inter-kernel rhs refresh and impulse-apply passes |
+| `matrix_free` | ~3.46 s | Single fused kernel family; inter-kernel overhead eliminated |
 
-The fused path wins because it combines the articulated velocity-path update with the free-rigid branch inside one kernel family, eliminating the per-iteration relaunch and right-hand-side refresh overhead.
-
-However, the ~2× gap between `split` and `matrix_free` reflects kernel launch overhead in the interleaved approach, not an inherent cost of dense articulated coupling. This is a critical distinction: a tightly fused kernel that keeps dense articulated rows *and* matrix-free rigid rows could potentially match or beat the current fully matrix-free path. That experiment has not been run yet.
+The ~2× gap is kernel-launch and rhs-refresh overhead from the interleaved approach, not an inherent cost of dense articulated coupling.
 
 ## Key Experiment: Fused Dense-Articulated + Rigid Matrix-Free Kernel
 
-!!! warning "Open experiment — not yet implemented"
+```{admonition} Open experiment — not yet implemented
+:class: warning
 
-    The following experiment is needed before concluding that the fully matrix-free approach is the right long-term center:
+A fused kernel that keeps explicit dense Delassus coupling for articulated rows *and* matrix-free handling for rigid rows — eliminating the relaunch overhead that makes `split` slow — has not been tried yet. A streaming variant (reading $C$ rows from global instead of staging the full tile in shared memory) would further reduce shared-memory pressure.
 
-    1. **Fused dense-articulated + rigid-MF kernel**: keep explicit dense Delassus coupling for articulated rows, keep free-rigid rows on the matrix-free branch, and fuse the two phases into a single kernel family — eliminating the relaunch overhead that makes `split` slow.
-    2. **Streaming the dense Delassus matrix**: instead of staging the full packed $C$ triangle in shared memory, stream $C$ rows from global memory in the fused kernel. This trades shared-memory pressure for bandwidth.
-
-    Until both are tried with profiler-backed occupancy measurements, we cannot distinguish "dense articulated coupling is inherently slower" from "the current `split` implementation has unnecessary overhead."
+Until this is profiled we cannot distinguish "dense articulated coupling is inherently slower" from "the `split` implementation just had unnecessary overhead."
+```
 
 ### Occupancy tradeoff
 
-The core tension is shared-memory pressure. The dense tiled-row kernel wants shared memory for the packed $C$ tile. The current fused matrix-free kernel spends shared memory on the live velocity vector and runs at high occupancy. Combining both in a single kernel could reduce occupancy enough to erase the benefit.
+For `h1_tabletop`: the packed lower triangle of a 30-row $C$ tile is ~1.9 KiB; the velocity vector is ~0.5 KiB. A fused kernel staging both would use roughly 2–3 KiB of shared memory — small enough for high occupancy on current hardware. The streaming variant would remove the $C$ tile entirely at the cost of extra global reads. Whether this trades favorably depends on register pressure, block size, and the specific GPU, but the numbers are small enough to be worth trying.
 
-To make this concrete, consider `h1_tabletop` sizing:
-
-- The dense articulated phase has 30 rows after routing (in the matrix-free preset). The packed lower triangle of a 30-row $C$ tile is $30 \times 31 / 2 \times 4 = 1{,}860$ bytes. Even with row scalars and impulse state, this fits comfortably alongside the velocity vector in shared memory.
-- The matrix-free kernel currently stages a velocity vector of $133 \times 4 = 532$ bytes (world DOFs × float32), plus row scalars. Total shared-memory use is well under 8 KiB per block.
-- A fused kernel staging both the packed $C$ tile and the velocity vector would use roughly 2–3 KiB of shared memory — still small enough for high occupancy on current hardware.
-- The streaming variant (reading $C$ rows from global memory instead of staging the full tile) would remove the $C$ tile from shared memory entirely, at the cost of additional global reads per iteration.
-
-These are rough estimates. The actual occupancy impact depends on register pressure, block size, and the specific GPU. The point is that the numbers are small enough to be worth trying.
-
-### What the experiment would show
-
-If the fused dense-articulated + rigid-MF kernel matches or beats the current fully matrix-free path, the implication is that dense Delassus coupling is the better choice for articulated rows (exact off-diagonal terms, no velocity-path approximation artifacts) and matrix-free is the better choice for free-rigid rows (cheap per-row effective mass, no need to enter the articulated system). The current fully matrix-free path would then be understood as a good default that happened to win because the alternative (`split`) had unnecessary overhead, not because velocity-path coupling is inherently superior for articulated rows.
-
-If the fused kernel is slower — because occupancy drops, or because the streaming variant cannot hide latency — then the fully matrix-free path is genuinely the right center, and the dense articulated kernels can be retired with confidence.
-
-There is also an anecdotal observation from prior local experiments that artificially lowering matrix-free occupancy with an unused shared-memory allocation did not change throughput, but that result is not checked in and should not be treated as established evidence.
+If the fused kernel matches the fully matrix-free path, dense Delassus is the better choice for articulated rows (exact off-diagonals) and matrix-free for rigid rows. If it's slower even with streaming, the fully matrix-free path is genuinely the right center and dense articulated kernels can be retired.

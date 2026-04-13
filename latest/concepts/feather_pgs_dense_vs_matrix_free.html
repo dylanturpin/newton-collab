@@ -1099,66 +1099,39 @@ v \leftarrow v + M_i^{-1}\, J_i^T\, \Delta p_i.
 </section>
 <section id="measured-performance-split-vs-matrix-free">
 <h2>Measured Performance: <code class="docutils literal notranslate"><span class="pre">split</span></code> vs <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code><a class="headerlink" href="#measured-performance-split-vs-matrix-free" title="Link to this heading">#</a></h2>
-<p>The <code class="docutils literal notranslate"><span class="pre">split</span></code> path keeps articulated rows on the dense Delassus side and sends only free-rigid rows through matrix-free. If the entire benefit came from routing rigid contacts away from the dense system, <code class="docutils literal notranslate"><span class="pre">split</span></code> would already match fused <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code>. It does not, and the profiler data shows why.</p>
-<p>In <code class="docutils literal notranslate"><span class="pre">split</span></code> mode, each PGS iteration interleaves:</p>
-<ul class="simple">
-<li><p>a dense articulated solve kernel (<code class="docutils literal notranslate"><span class="pre">pgs_solve_tiled_contact_*</span></code>);</p></li>
-<li><p>dense impulse application back into world velocity (<code class="docutils literal notranslate"><span class="pre">apply_impulses_world_*</span></code>);</p></li>
-<li><p>a right-hand-side refresh (<code class="docutils literal notranslate"><span class="pre">rhs_accum_world_*</span></code>);</p></li>
-<li><p>a separate free-rigid matrix-free solve (<code class="docutils literal notranslate"><span class="pre">pgs_solve_mf_*</span></code>);</p></li>
-<li><p>another correction accumulation step before the next dense iteration.</p></li>
-</ul>
-<p>Profiler artifacts for <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> on RTX 5090 (run <code class="docutils literal notranslate"><span class="pre">nightly/runs/full-3gpu-20260309f</span></code>):</p>
+<p>We already tried a <code class="docutils literal notranslate"><span class="pre">split</span></code> mode that keeps articulated rows on the dense Delassus side and sends only free-rigid rows through matrix-free. Profiler results on <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> (RTX 5090, run <code class="docutils literal notranslate"><span class="pre">nightly/runs/full-3gpu-20260309f</span></code>):</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Path</p></th>
 <th class="head text-right"><p>Solver kernel time</p></th>
-<th class="head"><p>Dominant components</p></th>
+<th class="head"><p>Note</p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">split</span></code></p></td>
 <td class="text-right"><p>~7.33 s</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">pgs_solve_mf_*</span></code> 2.41 s, <code class="docutils literal notranslate"><span class="pre">pgs_solve_tiled_contact_*</span></code> 0.89 s, <code class="docutils literal notranslate"><span class="pre">rhs_accum_world_*</span></code> 1.34 s, <code class="docutils literal notranslate"><span class="pre">apply_impulses_world_*</span></code> 0.42 s</p></td>
+<td><p>Two kernel families per PGS iteration (dense articulated + separate MF rigid), plus inter-kernel rhs refresh and impulse-apply passes</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">matrix_free</span></code></p></td>
 <td class="text-right"><p>~3.46 s</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">pgs_solve_mf_gs_*</span></code> 1.27 s; interleaved rhs/apply kernels eliminated</p></td>
+<td><p>Single fused kernel family; inter-kernel overhead eliminated</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>The fused path wins because it combines the articulated velocity-path update with the free-rigid branch inside one kernel family, eliminating the per-iteration relaunch and right-hand-side refresh overhead.</p>
-<p>However, the ~2× gap between <code class="docutils literal notranslate"><span class="pre">split</span></code> and <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> reflects kernel launch overhead in the interleaved approach, not an inherent cost of dense articulated coupling. This is a critical distinction: a tightly fused kernel that keeps dense articulated rows <em>and</em> matrix-free rigid rows could potentially match or beat the current fully matrix-free path. That experiment has not been run yet.</p>
+<p>The ~2× gap is kernel-launch and rhs-refresh overhead from the interleaved approach, not an inherent cost of dense articulated coupling.</p>
 </section>
 <section id="key-experiment-fused-dense-articulated-rigid-matrix-free-kernel">
 <h2>Key Experiment: Fused Dense-Articulated + Rigid Matrix-Free Kernel<a class="headerlink" href="#key-experiment-fused-dense-articulated-rigid-matrix-free-kernel" title="Link to this heading">#</a></h2>
-<p>!!! warning “Open experiment — not yet implemented”</p>
-<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>The following experiment is needed before concluding that the fully matrix-free approach is the right long-term center:
-
-1. **Fused dense-articulated + rigid-MF kernel**: keep explicit dense Delassus coupling for articulated rows, keep free-rigid rows on the matrix-free branch, and fuse the two phases into a single kernel family — eliminating the relaunch overhead that makes `split` slow.
-2. **Streaming the dense Delassus matrix**: instead of staging the full packed $C$ triangle in shared memory, stream $C$ rows from global memory in the fused kernel. This trades shared-memory pressure for bandwidth.
-
-Until both are tried with profiler-backed occupancy measurements, we cannot distinguish &quot;dense articulated coupling is inherently slower&quot; from &quot;the current `split` implementation has unnecessary overhead.&quot;
-</pre></div>
+<div class="warning admonition">
+<p class="admonition-title">Open experiment — not yet implemented</p>
+<p>A fused kernel that keeps explicit dense Delassus coupling for articulated rows <em>and</em> matrix-free handling for rigid rows — eliminating the relaunch overhead that makes <code class="docutils literal notranslate"><span class="pre">split</span></code> slow — has not been tried yet. A streaming variant (reading <span class="math notranslate nohighlight">\(C\)</span> rows from global instead of staging the full tile in shared memory) would further reduce shared-memory pressure.</p>
+<p>Until this is profiled we cannot distinguish “dense articulated coupling is inherently slower” from “the <code class="docutils literal notranslate"><span class="pre">split</span></code> implementation just had unnecessary overhead.”</p>
 </div>
 <section id="occupancy-tradeoff">
 <h3>Occupancy tradeoff<a class="headerlink" href="#occupancy-tradeoff" title="Link to this heading">#</a></h3>
-<p>The core tension is shared-memory pressure. The dense tiled-row kernel wants shared memory for the packed <span class="math notranslate nohighlight">\(C\)</span> tile. The current fused matrix-free kernel spends shared memory on the live velocity vector and runs at high occupancy. Combining both in a single kernel could reduce occupancy enough to erase the benefit.</p>
-<p>To make this concrete, consider <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> sizing:</p>
-<ul class="simple">
-<li><p>The dense articulated phase has 30 rows after routing (in the matrix-free preset). The packed lower triangle of a 30-row <span class="math notranslate nohighlight">\(C\)</span> tile is <span class="math notranslate nohighlight">\(30 \times 31 / 2 \times 4 = 1{,}860\)</span> bytes. Even with row scalars and impulse state, this fits comfortably alongside the velocity vector in shared memory.</p></li>
-<li><p>The matrix-free kernel currently stages a velocity vector of <span class="math notranslate nohighlight">\(133 \times 4 = 532\)</span> bytes (world DOFs × float32), plus row scalars. Total shared-memory use is well under 8 KiB per block.</p></li>
-<li><p>A fused kernel staging both the packed <span class="math notranslate nohighlight">\(C\)</span> tile and the velocity vector would use roughly 2–3 KiB of shared memory — still small enough for high occupancy on current hardware.</p></li>
-<li><p>The streaming variant (reading <span class="math notranslate nohighlight">\(C\)</span> rows from global memory instead of staging the full tile) would remove the <span class="math notranslate nohighlight">\(C\)</span> tile from shared memory entirely, at the cost of additional global reads per iteration.</p></li>
-</ul>
-<p>These are rough estimates. The actual occupancy impact depends on register pressure, block size, and the specific GPU. The point is that the numbers are small enough to be worth trying.</p>
-</section>
-<section id="what-the-experiment-would-show">
-<h3>What the experiment would show<a class="headerlink" href="#what-the-experiment-would-show" title="Link to this heading">#</a></h3>
-<p>If the fused dense-articulated + rigid-MF kernel matches or beats the current fully matrix-free path, the implication is that dense Delassus coupling is the better choice for articulated rows (exact off-diagonal terms, no velocity-path approximation artifacts) and matrix-free is the better choice for free-rigid rows (cheap per-row effective mass, no need to enter the articulated system). The current fully matrix-free path would then be understood as a good default that happened to win because the alternative (<code class="docutils literal notranslate"><span class="pre">split</span></code>) had unnecessary overhead, not because velocity-path coupling is inherently superior for articulated rows.</p>
-<p>If the fused kernel is slower — because occupancy drops, or because the streaming variant cannot hide latency — then the fully matrix-free path is genuinely the right center, and the dense articulated kernels can be retired with confidence.</p>
-<p>There is also an anecdotal observation from prior local experiments that artificially lowering matrix-free occupancy with an unused shared-memory allocation did not change throughput, but that result is not checked in and should not be treated as established evidence.</p>
+<p>For <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code>: the packed lower triangle of a 30-row <span class="math notranslate nohighlight">\(C\)</span> tile is ~1.9 KiB; the velocity vector is ~0.5 KiB. A fused kernel staging both would use roughly 2–3 KiB of shared memory — small enough for high occupancy on current hardware. The streaming variant would remove the <span class="math notranslate nohighlight">\(C\)</span> tile entirely at the cost of extra global reads. Whether this trades favorably depends on register pressure, block size, and the specific GPU, but the numbers are small enough to be worth trying.</p>
+<p>If the fused kernel matches the fully matrix-free path, dense Delassus is the better choice for articulated rows (exact off-diagonals) and matrix-free for rigid rows. If it’s slower even with streaming, the fully matrix-free path is genuinely the right center and dense articulated kernels can be retired.</p>
 </section>
 </section>
 </section>
@@ -1197,7 +1170,6 @@ Until both are tried with profiler-backed occupancy measurements, we cannot dist
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#measured-performance-split-vs-matrix-free">Measured Performance: <code class="docutils literal notranslate"><span class="pre">split</span></code> vs <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-experiment-fused-dense-articulated-rigid-matrix-free-kernel">Key Experiment: Fused Dense-Articulated + Rigid Matrix-Free Kernel</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#occupancy-tradeoff">Occupancy tradeoff</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-the-experiment-would-show">What the experiment would show</a></li>
 </ul>
 </li>
 </ul>
