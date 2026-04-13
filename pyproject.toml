@@ -296,6 +296,7 @@ IIT = "IIT"
 iit = "iit"
 PN = "PN"
 pnd = "pnd"
+Corse = "Corse"
 
 [tool.typos.default.extend-identifiers]
 PNGs = "PNGs"

@@ -1,0 +1,7 @@
+M	latest/.doctrees/environment.pickle
+M	latest/.doctrees/nbsphinx/tutorials/00_introduction.ipynb
+M	latest/.doctrees/tutorials/00_introduction.doctree
+M	latest/_static/recordings/00_introduction.viser
+M	latest/searchindex.js
+M	latest/tutorials/00_introduction.html
+M	latest/tutorials/00_introduction.ipynb
