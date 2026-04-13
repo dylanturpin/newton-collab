@@ -794,3 +794,93 @@ class TestSpikeArtifactReplay:
         assert not artifact.can_replay
         with pytest.raises(ValueError, match="constraint-level data"):
             artifact.replay_pgs()
+
+
+# ══════════════════════════════════════════════════════════════════
+# 6. Fix experiments (Stage 4)
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestFixExperiments:
+    """Validate the fix experiment functions produce correct results."""
+
+    def test_velocity_clamp_reduces_peak(self, tmp_capture_dir):
+        """Velocity clamping should reduce max velocity when it exceeds clamp."""
+        from newton._src.solvers.feather_pgs.fix_experiments import (
+            apply_velocity_clamp,
+            FRANKA_VEL_LIMITS,
+        )
+        # Create a velocity array with a spike on DOF 1
+        v_out = np.array([0.1, 6.0, 0.0, -4.0, 0.0, 0.5, 0.0, 0.0, 0.0], dtype=np.float32)
+        clamped = apply_velocity_clamp(v_out, clamp_factor=2.0)
+
+        # DOF 1 limit: 2.175, clamp at 2x = 4.35
+        assert abs(float(clamped[1])) <= 2.175 * 2.0 + 1e-6
+        # DOF 3 limit: 2.175, clamp at 2x = 4.35
+        assert abs(float(clamped[3])) <= 2.175 * 2.0 + 1e-6
+        # DOF 0 unchanged (below limit)
+        np.testing.assert_allclose(clamped[0], 0.1, atol=1e-6)
+
+    def test_velocity_clamp_noop_below_limit(self, tmp_capture_dir):
+        """Velocity clamping should not change velocities already below the clamp."""
+        from newton._src.solvers.feather_pgs.fix_experiments import apply_velocity_clamp
+        v_out = np.array([0.1, 0.5, 0.0, -1.0, 0.0, 0.3, 0.0, 0.0, 0.0], dtype=np.float32)
+        clamped = apply_velocity_clamp(v_out, clamp_factor=2.0)
+        np.testing.assert_allclose(clamped, v_out, atol=1e-6)
+
+    def test_reduced_beta_on_contact_artifact(self):
+        """Reduced beta should reduce contact impulse spike velocity."""
+        from newton._src.solvers.feather_pgs.fix_experiments import run_reduced_beta_experiment
+        artifact_path = Path(__file__).parent.parent / "spike_captures" / "real_contact_impulse_spike.npz"
+        if not artifact_path.exists():
+            pytest.skip("Spike artifact not found")
+        artifact = SpikeArtifact.load(artifact_path)
+        result = run_reduced_beta_experiment(artifact, new_beta=0.02)
+        # Beta reduction should reduce the contact impulse spike
+        assert result.fixed_max_v_out < result.baseline_max_v_out
+        assert result.reduction_pct > 0
+
+    def test_contact_compliance_on_contact_artifact(self):
+        """Contact compliance should reduce contact impulse spike velocity."""
+        from newton._src.solvers.feather_pgs.fix_experiments import run_contact_compliance_experiment
+        artifact_path = Path(__file__).parent.parent / "spike_captures" / "real_contact_impulse_spike.npz"
+        if not artifact_path.exists():
+            pytest.skip("Spike artifact not found")
+        artifact = SpikeArtifact.load(artifact_path)
+        result = run_contact_compliance_experiment(artifact, compliance=0.001)
+        # Contact compliance should reduce the contact impulse spike
+        assert result.fixed_max_v_out < result.baseline_max_v_out
+        assert result.reduction_pct > 0
+
+    def test_contact_compliance_no_effect_on_limit_only(self):
+        """Contact compliance should have no effect on joint-limit-only spikes."""
+        from newton._src.solvers.feather_pgs.fix_experiments import run_contact_compliance_experiment
+        artifact_path = Path(__file__).parent.parent / "spike_captures" / "real_joint_limit_spike.npz"
+        if not artifact_path.exists():
+            pytest.skip("Spike artifact not found")
+        artifact = SpikeArtifact.load(artifact_path)
+        result = run_contact_compliance_experiment(artifact, compliance=0.001)
+        # No contact constraints in this artifact -> no effect
+        assert abs(result.reduction_pct) < 0.1
+
+    def test_velocity_clamp_experiment_on_vhat_spike(self):
+        """Velocity clamp should reduce unconstrained v_hat spikes."""
+        from newton._src.solvers.feather_pgs.fix_experiments import run_velocity_clamp_experiment
+        artifact_path = Path(__file__).parent.parent / "spike_captures" / "real_vhat_unconstrained_spike.npz"
+        if not artifact_path.exists():
+            pytest.skip("Spike artifact not found")
+        artifact = SpikeArtifact.load(artifact_path)
+        result = run_velocity_clamp_experiment(artifact, clamp_factor=1.5)
+        assert result.fixed_max_v_out < result.baseline_max_v_out
+        assert result.reduction_pct > 30  # At least 30% reduction
+
+    def test_run_all_experiments_returns_results(self):
+        """run_all_experiments should return non-empty results."""
+        from newton._src.solvers.feather_pgs.fix_experiments import run_all_experiments
+        artifact_dir = Path(__file__).parent.parent / "spike_captures"
+        if not list(artifact_dir.glob("real_*.npz")):
+            pytest.skip("No spike artifacts found")
+        report = run_all_experiments(artifact_dir)
+        assert len(report.results) > 0
+        # Should have results for each artifact * each fix variant
+        assert len(report.results) >= 4 * 3  # At least 4 artifacts * 3 fix types
