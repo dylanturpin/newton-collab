@@ -87,14 +87,14 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
-## Pass Update (2026-04-13, pass 8)
+## Pass Update (2026-04-13, pass 9)
 
-M8 is the active milestone for this pass. This pass will:
+M9 is the active milestone for this pass. This pass will:
 
-- rebuild the docs into a clean temporary output tree instead of reusing the polluted `docs/_build/html` directory
-- refresh only `gh-pages/latest/` plus the small branch-root routing files needed for dev docs publication
-- preserve `gh-pages/nightly/` and other unrelated branch-root assets unchanged
-- record the exact changed-path inventory, push command, and resulting remote SHAs in this ExecPlan and the human handoff
+- add the investigations journal index under `docs/investigations/`
+- add the decision-facing code-path ablation section to the explainer page
+- wire the new journal into `docs/index.rst`
+- validate with the real docs build and `pre-commit`, but stop short of any new publication work
 
 ## Milestones
 
@@ -472,9 +472,76 @@ Existing docs deployment workflows that currently touch `gh-pages` and therefore
 
 These workflows replace `stable/`, versioned docs, or `latest/` directly on `gh-pages`; they are useful references for docs build mechanics but not yet safe publication procedures for this explainer lane.
 
+### M9. Add Investigations Journal + Code-Path Ablation Recommendation
+
+Status: complete
+
+This milestone addresses a standing team action item from a prior meeting:
+
+> Create a report with ablations / reasoning for choice of code paths.
+> Then we can finally clean them out from our code base.
+> Maybe have one branch that maintains old paths.
+> Already pretty easy to collapse the small kernel choice branching.
+> Harder one is the top-level: dense-delassus vs. matrix-free.
+> Gather enough info to make the decision.
+> Can think of main having a "distilled" version.
+
+The existing M1-M8 explainer page (`docs/concepts/feather_pgs_dense_vs_matrix_free.md`) already has the technical sizing data and kernel analysis. This milestone adds the *decision-facing* layer on top.
+
+Definition of done:
+
+1. Add a `docs/investigations/` directory with an `index.md` journal page.
+   - The journal page has dated section headers with brief summaries and links to individual investigation pages.
+   - The first entry (2026-04-13) should link to the existing explainer page and reference results from parallel workstreams.
+
+2. Add a **code-path ablation and recommendation** section to the existing explainer page (or a new companion page linked from it). This section should:
+   - Present a clear recommendation table: for each code path (`dense_loop`, `dense_row`, `dense_streaming`, `split`, `matrix_free`), state whether to KEEP, DEPRECATE, or REMOVE, with one-line reasoning.
+   - Reference the scenario sizing data already checked in under `.agent/data/` (link to the JSON artifacts).
+   - Reference the kernel memory analysis from M4.
+   - Note that the private API cleanup on branch `dturpin/fpgs-private-api-matrix-free` has already collapsed the public surface to matrix-free-only, providing implementation evidence that the collapse is feasible.
+   - Note the velocity spike investigation finding that the dominant spike class is unconstrained v_hat (not PGS divergence), which is solver-path-independent — this means the choice between dense and matrix-free does not affect the spike behavior.
+   - Include a brief "what to keep on a legacy branch" note for any deprecated paths.
+
+3. Wire `docs/investigations/index.md` into `docs/index.rst` as a new toctree section called "Investigations".
+
+4. The journal index entry for 2026-04-13 should include brief summaries (2-3 lines each) for:
+   - Dense vs matrix-free explainer (this page) — link to `concepts/feather_pgs_dense_vs_matrix_free`
+   - Velocity spike root-cause analysis — summarize: dominant class is unconstrained v_hat, PGS converges in 8 iterations, post-solve clamp + compliance recommended. Branch: `dt/velocity-spike-claude`.
+   - TGS feasibility study — summarize: equivalent physics at ~2x cost, velocity guard is dominant training blocker. Branch: `dt/tgs-feather-pgs-study`. (Results still in progress.)
+   - Private API matrix-free cleanup — summarize: collapsed public FeatherPGS surface to matrix-free-only, workflow accepted. Branch: `dturpin/fpgs-private-api-matrix-free`.
+
+5. Run docs build and pre-commit. Do NOT re-publish to `gh-pages` yet — just validate the build.
+
+Expected outputs:
+- `docs/investigations/index.md`
+- Updated `docs/concepts/feather_pgs_dense_vs_matrix_free.md` with ablation/recommendation section
+- Updated `docs/index.rst` with investigations toctree
+- Passing docs build
+
+Completed outputs (2026-04-13):
+
+- added the investigations journal landing page:
+  - `docs/investigations/index.md`
+- added a code-path ablation and recommendation section to the explainer page:
+  - `docs/concepts/feather_pgs_dense_vs_matrix_free.md`
+- wired the investigations journal into the docs navigation:
+  - `docs/index.rst`
+- updated the plan and handoff to record the new milestone state and follow-up publication gate
+
+Validation evidence:
+
+- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs docs/_build/html`
+- `uvx pre-commit run -a`
+
+### M10. Final Publication (source branch + gh-pages)
+
+Status: pending
+
+Same publication procedure as M7+M8: push source to `origin/feather_pgs`, rebuild docs, safely update `origin/gh-pages` preserving nightly data.
+
 ## Immediate Next Action
 
-Workflow complete. Keep the checked-in publication artifacts and handoff notes as the audit trail for the `gh-pages` update; do not republish `gh-pages` unless the docs content changes again.
+M9 is complete. Stop on the working branch with the validated docs changes committed locally. Do not start M10 publication work until another pass explicitly activates the final publication milestone.
 
 ## Change Log
 
