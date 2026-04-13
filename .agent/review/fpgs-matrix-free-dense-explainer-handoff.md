@@ -9,6 +9,7 @@
 - Completed M5: the docs draft now exists as a sibling concepts page with navigation wiring.
 - Completed M6: the docs build and required `pre-commit` validation now pass locally.
 - Completed M7: the finalized source/docs state has now been published to `origin/feather_pgs`.
+- Completed M8: the rendered docs have now been published safely to `origin/gh-pages` without touching the nightly benchmark payload.
 - Chosen docs structure: keep `docs/concepts/feather_pgs.md` as the overview page and add a sibling concepts page for the deep dense-vs-matrix-free comparison.
 - Recorded the initial inventory in `.agent/data/fpgs-matrix-free-dense-explainer/m1-source-inventory.md`.
 - Added checked-in schemas in `.agent/data/fpgs-matrix-free-dense-explainer/schema/`.
@@ -35,28 +36,49 @@
 - Accepted formatting-only `ruff` rewrites in two helper scripts:
   - `scripts/analysis/capture_fpgs_kernel_memory_artifacts.py`
   - `scripts/analysis/capture_fpgs_scenario_sizing.py`
+- Added `gh-pages` publication audit artifacts:
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m8-gh-pages-name-status.txt`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m8-gh-pages-nightly-diff.txt`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m8-gh-pages-summary.env`
 
 ## Key Findings From This Pass
 
-- The source/docs publication gate is now cleared: `origin/feather_pgs` was updated from `79f10ef3` to the explainer branch tip.
-- The explainer deliverable published cleanly without reopening docs-content work or touching `origin/gh-pages`.
-- This pass only updates publication bookkeeping in the living ExecPlan and handoff after the successful source-branch push.
+- The final publication milestone is complete: `origin/gh-pages` advanced from `cfd01f5f69909e9c90f7d637c6772d6f09df31e2` to `d7f564af85b2e4b298f1fe246149e6addc1a8565`.
+- The safe publication path worked as intended: only branch-root `404.html`, branch-root `.nojekyll`, and the `latest/` dev-docs payload were refreshed.
+- `nightly/` was preserved exactly. The checked-in `m8-gh-pages-nightly-diff.txt` artifact is empty, which confirms that the publication did not touch the benchmark dashboard data.
+- The new explainer page is now live in the published site as `latest/concepts/feather_pgs_dense_vs_matrix_free.html`.
 
 ## Recommended Next Pass
 
-- M8 remains explicitly gated and is now the only remaining incomplete milestone.
-- When publication of the rendered site is in scope, update only `origin/gh-pages` and preserve nightly benchmark assets while refreshing the docs payload.
-- Keep the `gh-pages` work docs-only and record exactly which paths changed and which nightly artifacts were intentionally left untouched.
+- No follow-up milestone remains in this workflow.
+- If docs content changes later, repeat the same clean-build-to-temp and `latest/`-only publication pattern instead of publishing from the in-repo `docs/_build/html` directory.
 
 ## Publication Record
 
-- Pre-publication remote state:
-  - `origin/feather_pgs` -> `79f10ef391c3931d135db76c6b9fe572c09895b3`
+- Pre-M8 remote state:
+  - `origin/feather_pgs` -> `8eac16b5b4cf564f60d704beeb7fe11f9ae89ed9`
   - `origin/gh-pages` -> `cfd01f5f69909e9c90f7d637c6772d6f09df31e2`
-- Source publication command:
+- Source publication command already completed before this pass:
   - `git push origin HEAD:feather_pgs`
-  - result: fast-forward update from `79f10ef3` to `ace07904`
-- `origin/gh-pages` was intentionally left untouched in this pass.
+  - result: `origin/feather_pgs` remained at `8eac16b5b4cf564f60d704beeb7fe11f9ae89ed9` during the M8 site publish
+- M8 clean docs rebuild:
+  - `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html`
+  - result: passed
+- M8 safe `gh-pages` publication commands:
+  - `git worktree add --detach /tmp/newton-gh-pages-fpgs-explainer origin/gh-pages`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer checkout -b fpgs-matrix-free-dense-explainer-gh-pages`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer add 404.html .nojekyll latest`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer commit -m "Publish FeatherPGS explainer docs"`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer push origin HEAD:gh-pages`
+  - result: fast-forward update from `cfd01f5f69909e9c90f7d637c6772d6f09df31e2` to `d7f564af85b2e4b298f1fe246149e6addc1a8565`
+- Post-M8 remote state:
+  - `origin/feather_pgs` -> `8eac16b5b4cf564f60d704beeb7fe11f9ae89ed9`
+  - `origin/gh-pages` -> `d7f564af85b2e4b298f1fe246149e6addc1a8565`
+- Exact changed-path inventory:
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m8-gh-pages-name-status.txt`
+- Exact nightly-preservation proof:
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m8-gh-pages-nightly-diff.txt`
+  - file size: `0` bytes
 
 ## Validation Evidence
 
@@ -73,6 +95,11 @@
 - `uv run --extra docs --extra sim sphinx-build -j auto -b html docs docs/_build/html`
   - result: passed
   - note: emitted existing multiple-toctree consistency notices for generated `docs/api/newton_*.rst` pages
+- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html`
+  - result: passed
+  - note: used for the final M8 `gh-pages` publication so the published payload came from a clean output tree
+- `git -C /tmp/newton-gh-pages-fpgs-explainer diff --name-only -- nightly`
+  - result: no output
 - `uvx pre-commit run -a`
   - first result: failed because `ruff` and `ruff format` rewrote two helper scripts
   - second result: passed
