@@ -3,10 +3,6 @@
 
 # Velocity Spike Root-Cause Analysis
 
-**Branch:** `dt/velocity-spike-claude`
-**Commits:** `newton-collab@3fd10a39` through `39eefb3f` | `skild-IL-solver@825009ab`
-**Status:** Mitigation landed; training validation in progress on `horde-00`
-
 ## Summary
 
 During Isaac Lab training of the Franka cube-lift task (`Isaac-Lift-Cube-Franka-v0`),
