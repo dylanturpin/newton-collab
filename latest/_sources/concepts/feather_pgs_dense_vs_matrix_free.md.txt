@@ -133,6 +133,41 @@ So the current observation is not "matrix-free wins because it uses less memory"
 
 This is why the explainer uses `g1_flat` as a control and `h1_tabletop` as the realistic mixed-world sizing example.
 
+## Code-Path Ablation Recommendation
+
+The current codebase still carries several FeatherPGS solve variants, but the checked-in data narrows the decision materially.
+
+Artifact references:
+
+- [Scenario sizing: `g1_flat` dense rows](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/.agent/data/fpgs-matrix-free-dense-explainer/scenarios/g1_flat/fpgs_dense_row.json)
+- [Scenario sizing: `g1_flat` matrix-free](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/.agent/data/fpgs-matrix-free-dense-explainer/scenarios/g1_flat/fpgs_matrix_free.json)
+- [Scenario sizing: `h1_tabletop` dense rows](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/.agent/data/fpgs-matrix-free-dense-explainer/scenarios/h1_tabletop/fpgs_dense_row.json)
+- [Scenario sizing: `h1_tabletop` matrix-free](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/.agent/data/fpgs-matrix-free-dense-explainer/scenarios/h1_tabletop/fpgs_matrix_free.json)
+- [Kernel memory analysis: dense tiled-row](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/.agent/data/fpgs-matrix-free-dense-explainer/kernels/dense-row.json)
+- [Kernel memory analysis: fused matrix-free GS](https://github.com/dylanturpin/newton-collab/blob/feather_pgs/.agent/data/fpgs-matrix-free-dense-explainer/kernels/matrix-free-gs.json)
+
+| Code path | Recommendation | Reason |
+| --- | --- | --- |
+| `dense_loop` | REMOVE | It keeps the full explicit Delassus formulation but does not offer a compelling maintenance or performance role relative to the tiled dense path. |
+| `dense_row` | DEPRECATE | It is still useful as the clearest explicit-operator baseline, but `h1_tabletop` shows the mixed-world cost of keeping all 117 active rows inside dense `C`. |
+| `dense_streaming` | DEPRECATE | It is the only remaining dense variant with a plausible optimization story, but the current evidence still points to matrix-free as the cleaner long-term path. |
+| `split` | REMOVE | It preserves branch complexity without changing the main conclusion: the matrix-free fused path is the version that explains the observed win. |
+| `matrix_free` | KEEP | It matches the current mixed-world result, keeps free-rigid rows out of the articulated dense system, and already has implementation proof from the private API cleanup branch. |
+
+Three observations drive the recommendation:
+
+1. The scenario data says the important case is not `g1_flat`, where both presets warm to the same 24 dense rows, but `h1_tabletop`, where dense keeps 117 active rows in `C` while matrix-free keeps only 30 articulated dense rows and routes 102 rows through the free-rigid matrix-free branch.
+2. The kernel analysis says the dense path spends its hot working set on staged Delassus tiles, while the fused matrix-free path spends it on the live velocity vector plus streamed `J` and `Y` data. That is the implementation-level reason the current matrix-free path performs well without a shared-memory Delassus tile.
+3. The private API cleanup branch `dturpin/fpgs-private-api-matrix-free` already collapsed the public FeatherPGS surface to matrix-free-only. That does not prove every private dense kernel should disappear immediately, but it does prove the main user-facing collapse is feasible.
+
+This recommendation is intentionally orthogonal to the velocity spike investigation. The spike study on branch `dt/velocity-spike-claude` found that the dominant spike class is unconstrained `v_hat`, not PGS divergence, and that PGS converges within 8 iterations on the reproduced traces. That means the dense-vs-matrix-free code-path choice should be made on solver complexity, kernel behavior, and mixed-world cost, not on the spike symptom itself.
+
+For a legacy branch, keep only the minimum dense baselines needed for regression checks and equivalence debugging:
+
+- keep `dense_row` as the explicit Delassus reference path;
+- keep `dense_streaming` only if a follow-up performance study still needs it;
+- drop `dense_loop` and `split` first, because they add branch surface without carrying distinct decision value in the current evidence set.
+
 ## Open Questions
 
 - The current evidence explains why the fused matrix-free kernel is competitive against the dense tiled-row kernel, but it does not yet fully quantify where the dense streaming variant closes or fails to close the gap.

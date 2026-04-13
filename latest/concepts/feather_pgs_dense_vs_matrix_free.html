@@ -366,6 +366,13 @@
 
 
 <li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../investigations/index.html">
+    Investigations
+  </a>
+</li>
+
+
+<li class=" ">
   <a class="nav-link dropdown-item nav-external" href="https://github.com/newton-physics/newton">
      GitHub
   </a>
@@ -678,6 +685,13 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="../investigations/index.html">
+    Investigations
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-external" href="https://github.com/newton-physics/newton">
      GitHub
   </a>
@@ -772,6 +786,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../faq.html">FAQ</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../migration.html">Migration Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../integrations/index.html">Integrations</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Investigations</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../investigations/index.html">Investigations</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Project Links</span></p>
 <ul class="nav bd-sidenav">
@@ -1054,6 +1072,63 @@ v \leftarrow v + MiJt_i \Delta \lambda_i.
 </ul>
 <p>This is why the explainer uses <code class="docutils literal notranslate"><span class="pre">g1_flat</span></code> as a control and <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> as the realistic mixed-world sizing example.</p>
 </section>
+<section id="code-path-ablation-recommendation">
+<h2>Code-Path Ablation Recommendation<a class="headerlink" href="#code-path-ablation-recommendation" title="Link to this heading">#</a></h2>
+<p>The current codebase still carries several FeatherPGS solve variants, but the checked-in data narrows the decision materially.</p>
+<p>Artifact references:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/.agent/data/fpgs-matrix-free-dense-explainer/scenarios/g1_flat/fpgs_dense_row.json">Scenario sizing: <code class="docutils literal notranslate"><span class="pre">g1_flat</span></code> dense rows</a></p></li>
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/.agent/data/fpgs-matrix-free-dense-explainer/scenarios/g1_flat/fpgs_matrix_free.json">Scenario sizing: <code class="docutils literal notranslate"><span class="pre">g1_flat</span></code> matrix-free</a></p></li>
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/.agent/data/fpgs-matrix-free-dense-explainer/scenarios/h1_tabletop/fpgs_dense_row.json">Scenario sizing: <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> dense rows</a></p></li>
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/.agent/data/fpgs-matrix-free-dense-explainer/scenarios/h1_tabletop/fpgs_matrix_free.json">Scenario sizing: <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> matrix-free</a></p></li>
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/.agent/data/fpgs-matrix-free-dense-explainer/kernels/dense-row.json">Kernel memory analysis: dense tiled-row</a></p></li>
+<li><p><a class="reference external" href="https://github.com/dylanturpin/newton-collab/blob/feather_pgs/.agent/data/fpgs-matrix-free-dense-explainer/kernels/matrix-free-gs.json">Kernel memory analysis: fused matrix-free GS</a></p></li>
+</ul>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Code path</p></th>
+<th class="head"><p>Recommendation</p></th>
+<th class="head"><p>Reason</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dense_loop</span></code></p></td>
+<td><p>REMOVE</p></td>
+<td><p>It keeps the full explicit Delassus formulation but does not offer a compelling maintenance or performance role relative to the tiled dense path.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dense_row</span></code></p></td>
+<td><p>DEPRECATE</p></td>
+<td><p>It is still useful as the clearest explicit-operator baseline, but <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> shows the mixed-world cost of keeping all 117 active rows inside dense <code class="docutils literal notranslate"><span class="pre">C</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dense_streaming</span></code></p></td>
+<td><p>DEPRECATE</p></td>
+<td><p>It is the only remaining dense variant with a plausible optimization story, but the current evidence still points to matrix-free as the cleaner long-term path.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">split</span></code></p></td>
+<td><p>REMOVE</p></td>
+<td><p>It preserves branch complexity without changing the main conclusion: the matrix-free fused path is the version that explains the observed win.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">matrix_free</span></code></p></td>
+<td><p>KEEP</p></td>
+<td><p>It matches the current mixed-world result, keeps free-rigid rows out of the articulated dense system, and already has implementation proof from the private API cleanup branch.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Three observations drive the recommendation:</p>
+<ol class="arabic simple">
+<li><p>The scenario data says the important case is not <code class="docutils literal notranslate"><span class="pre">g1_flat</span></code>, where both presets warm to the same 24 dense rows, but <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code>, where dense keeps 117 active rows in <code class="docutils literal notranslate"><span class="pre">C</span></code> while matrix-free keeps only 30 articulated dense rows and routes 102 rows through the free-rigid matrix-free branch.</p></li>
+<li><p>The kernel analysis says the dense path spends its hot working set on staged Delassus tiles, while the fused matrix-free path spends it on the live velocity vector plus streamed <code class="docutils literal notranslate"><span class="pre">J</span></code> and <code class="docutils literal notranslate"><span class="pre">Y</span></code> data. That is the implementation-level reason the current matrix-free path performs well without a shared-memory Delassus tile.</p></li>
+<li><p>The private API cleanup branch <code class="docutils literal notranslate"><span class="pre">dturpin/fpgs-private-api-matrix-free</span></code> already collapsed the public FeatherPGS surface to matrix-free-only. That does not prove every private dense kernel should disappear immediately, but it does prove the main user-facing collapse is feasible.</p></li>
+</ol>
+<p>This recommendation is intentionally orthogonal to the velocity spike investigation. The spike study on branch <code class="docutils literal notranslate"><span class="pre">dt/velocity-spike-claude</span></code> found that the dominant spike class is unconstrained <code class="docutils literal notranslate"><span class="pre">v_hat</span></code>, not PGS divergence, and that PGS converges within 8 iterations on the reproduced traces. That means the dense-vs-matrix-free code-path choice should be made on solver complexity, kernel behavior, and mixed-world cost, not on the spike symptom itself.</p>
+<p>For a legacy branch, keep only the minimum dense baselines needed for regression checks and equivalence debugging:</p>
+<ul class="simple">
+<li><p>keep <code class="docutils literal notranslate"><span class="pre">dense_row</span></code> as the explicit Delassus reference path;</p></li>
+<li><p>keep <code class="docutils literal notranslate"><span class="pre">dense_streaming</span></code> only if a follow-up performance study still needs it;</p></li>
+<li><p>drop <code class="docutils literal notranslate"><span class="pre">dense_loop</span></code> and <code class="docutils literal notranslate"><span class="pre">split</span></code> first, because they add branch surface without carrying distinct decision value in the current evidence set.</p></li>
+</ul>
+</section>
 <section id="open-questions">
 <h2>Open Questions<a class="headerlink" href="#open-questions" title="Link to this heading">#</a></h2>
 <ul class="simple">
@@ -1097,6 +1172,7 @@ v \leftarrow v + MiJt_i \Delta \lambda_i.
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#why-h1-tabletop-favors-matrix-free">Why <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> Favors Matrix-Free</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#control-case-g1-flat">Control Case: <code class="docutils literal notranslate"><span class="pre">g1_flat</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#code-path-ablation-recommendation">Code-Path Ablation Recommendation</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#open-questions">Open Questions</a></li>
 </ul>
   </nav></div>
