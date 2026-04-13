@@ -536,13 +536,63 @@ Validation evidence:
 
 ### M10. Final Publication (source branch + gh-pages)
 
-Status: in progress
+Status: complete
 
 Same publication procedure as M7+M8: push source to `origin/feather_pgs`, rebuild docs, safely update `origin/gh-pages` preserving nightly data.
 
+Completed outputs (2026-04-13):
+
+- committed the pending journal addition before final publication:
+  - `docs/investigations/index.md` now includes the "Warp kernel migration (Zach Corse)" section
+  - commit: `1999330f643c5914e3d417675d1c8fd0967976f0` (`Add Warp migration journal note`)
+- published the corrected source/docs head to `origin/feather_pgs`:
+  - `git push origin 1999330f:feather_pgs`
+  - result: fast-forward update from `ac1d83a000eb8eb531f2ef5c72f00760b84c2e5a` to `1999330f643c5914e3d417675d1c8fd0967976f0`
+- rebuilt the docs from the exact published source revision:
+  - detached-source proof build:
+    - `git worktree add --detach /tmp/newton-fpgs-m10-src-final 1999330f`
+    - `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html-m10-proof`
+    - result: passed
+  - publication payload build:
+    - `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html-m10-final`
+    - result: passed
+- published the corrected docs payload safely to `origin/gh-pages`:
+  - `git worktree add --detach /tmp/newton-gh-pages-fpgs-explainer-m10-final origin/gh-pages`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m10-final checkout -b fpgs-matrix-free-dense-explainer-gh-pages-m10-final`
+  - replaced `latest/` from `/tmp/fpgs-docs-html-m10-final/`
+  - preserved branch-root `404.html` because the docs build still does not emit a replacement `404.html`
+  - preserved `nightly/`, `index.html`, `stable/`, versioned release docs, and `switcher.json`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m10-final add .nojekyll latest`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m10-final commit -m "Publish FeatherPGS investigation docs"`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m10-final push origin HEAD:gh-pages`
+  - result: fast-forward update from `e682d645d84159b67a71e241696a304a5c4f4bd4` to `ff38559855cec148208e38f8df0f47dd30f89f1a`
+- checked in M10 publication audit artifacts:
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m10-gh-pages-name-status.txt`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m10-gh-pages-nightly-diff.txt`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m10-publication-summary.env`
+
+Validation evidence:
+
+- `git ls-remote --heads origin feather_pgs gh-pages`
+  - result after final publication: `origin/feather_pgs` at `1999330f643c5914e3d417675d1c8fd0967976f0`, `origin/gh-pages` at `ff38559855cec148208e38f8df0f47dd30f89f1a`
+- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html-m10-proof`
+  - result: passed from detached worktree `/tmp/newton-fpgs-m10-src-final`
+  - notable output: the same existing multiple-toctree consistency notices for generated `docs/api/newton_*.rst` pages appeared, but the build succeeded cleanly
+- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html-m10-final`
+  - result: passed
+- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs docs/_build/html`
+  - result: passed
+  - notable output: the same existing multiple-toctree consistency notices for generated `docs/api/newton_*.rst` pages appeared, but the build succeeded cleanly
+- `uvx pre-commit run -a`
+  - first result: failed because `typos` needed `Corse` allowlisted as a legitimate surname
+  - second result: passed after adding `Corse = "Corse"` under `[tool.typos.default.extend-words]` in `pyproject.toml`
+- `git -C /tmp/newton-gh-pages-fpgs-explainer-m10-final diff --name-only -- nightly > .agent/data/fpgs-matrix-free-dense-explainer/publication/m10-gh-pages-nightly-diff.txt`
+  - result: empty file, confirming no nightly-path edits
+- `git -C /tmp/newton-gh-pages-fpgs-explainer-m10-final diff --name-status e682d645d84159b67a71e241696a304a5c4f4bd4 ff38559855cec148208e38f8df0f47dd30f89f1a -- > .agent/data/fpgs-matrix-free-dense-explainer/publication/m10-gh-pages-name-status.txt`
+
 ## Immediate Next Action
 
-Commit the pending investigations journal update, then republish M10 from that new commit so both `origin/feather_pgs` and `origin/gh-pages` include the Zach Warp migration note.
+The gated publication milestone is complete. Stop on the working branch after committing the updated ExecPlan, handoff, `pyproject.toml`, and M10 publication artifacts locally. Do not begin any new content milestone in this pass.
 
 ## Change Log
 
@@ -551,3 +601,4 @@ Commit the pending investigations journal update, then republish M10 from that n
 - 2026-04-13: Completed M5 by landing the sibling dense-vs-matrix-free explainer page, wiring docs navigation, and refreshing kernel-artifact provenance for the checked-in evidence bundle.
 - 2026-04-13: Completed M7 by publishing the finalized source/docs state to `origin/feather_pgs` and leaving `origin/gh-pages` untouched for the later gated publication milestone.
 - 2026-04-13: Completed M8 by rebuilding the docs into `/tmp/fpgs-docs-html`, publishing the refreshed `latest/` payload to `origin/gh-pages`, and checking in exact changed-path and nightly-preservation artifacts.
+- 2026-04-13: Completed M10 by committing the Zach Warp migration journal note, publishing corrected source commit `1999330f` to `origin/feather_pgs`, republishing `origin/gh-pages` from the corrected docs build, and checking in exact changed-path and nightly-preservation artifacts for the final published state.
