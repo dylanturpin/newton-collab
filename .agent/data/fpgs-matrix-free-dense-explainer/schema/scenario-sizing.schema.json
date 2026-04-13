@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://newton.local/fpgs-matrix-free-dense-explainer/scenario-sizing.schema.json",
+  "title": "FeatherPGS scenario sizing artifact",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "provenance",
+    "scenario",
+    "solver_preset",
+    "capture",
+    "world_counts",
+    "logical_buffers"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "provenance": {
+      "type": "object",
+      "required": [
+        "generator",
+        "git_commit",
+        "generated_at_utc",
+        "source_files"
+      ],
+      "properties": {
+        "generator": {
+          "type": "string"
+        },
+        "git_commit": {
+          "type": "string"
+        },
+        "generated_at_utc": {
+          "type": "string"
+        },
+        "source_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "scenario": {
+      "type": "object",
+      "required": [
+        "name",
+        "description",
+        "robot",
+        "default_substeps",
+        "default_pgs_iterations",
+        "default_dense_max_constraints"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "robot": {
+          "type": "string"
+        },
+        "environment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "default_substeps": {
+          "type": "integer"
+        },
+        "default_pgs_iterations": {
+          "type": "integer"
+        },
+        "default_dense_max_constraints": {
+          "type": "integer"
+        },
+        "mujoco_settings": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": true
+    },
+    "solver_preset": {
+      "type": "object",
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "pgs_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "settings": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "capture": {
+      "type": "object",
+      "required": [
+        "num_worlds"
+      ],
+      "properties": {
+        "num_worlds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "device": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pgs_iterations": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "substeps": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "world_counts": {
+      "type": "object",
+      "required": [
+        "articulations",
+        "rigid_bodies",
+        "dense_constraint_rows",
+        "matrix_free_constraint_rows",
+        "articulation_dofs",
+        "world_dofs"
+      ],
+      "properties": {
+        "articulations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rigid_bodies": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "contacts_total": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "dense_constraint_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "matrix_free_constraint_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "articulation_dofs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "world_dofs": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "logical_buffers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "solver_scope",
+          "storage",
+          "dtype",
+          "logical_shape",
+          "bytes_per_element",
+          "source"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "solver_scope": {
+            "type": "string",
+            "enum": [
+              "shared",
+              "dense",
+              "matrix_free",
+              "split"
+            ]
+          },
+          "storage": {
+            "type": "string",
+            "enum": [
+              "global",
+              "shared",
+              "register",
+              "derived"
+            ]
+          },
+          "dtype": {
+            "type": "string"
+          },
+          "logical_shape": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "string"
+              ]
+            }
+          },
+          "per_world_elements": {
+            "type": [
+              "integer",
+              "string",
+              "null"
+            ]
+          },
+          "total_elements": {
+            "type": [
+              "integer",
+              "string",
+              "null"
+            ]
+          },
+          "bytes_per_element": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "total_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "populated_when": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "source": {
+            "type": "string"
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}
