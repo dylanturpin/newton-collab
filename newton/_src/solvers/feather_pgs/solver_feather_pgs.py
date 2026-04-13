@@ -34,6 +34,7 @@ from ..semi_implicit.kernels_particle import (
     eval_triangle_forces,
 )
 from ..solver import SolverBase
+from .spike_capture import SpikeCapture, SpikeCaptureConfig
 from .kernels import (
     TILE_THREADS,
     add_dense_contact_compliance_to_diag,
@@ -318,6 +319,9 @@ class SolverFeatherPGS(SolverBase):
             )
 
         self._init_double_buffer_stream()
+
+        # Velocity spike capture (dormant by default, see spike_capture.py)
+        self.spike_capture = SpikeCapture(SpikeCaptureConfig())
 
     def _compute_articulation_metadata(self, model):
         self._compute_articulation_indices(model)
@@ -1034,6 +1038,9 @@ class SolverFeatherPGS(SolverBase):
 
         model = self.model
 
+        # Spike capture: snapshot input state before the solver modifies it
+        self.spike_capture.pre_step(state_in, dt)
+
         if control is None:
             control = model.control(clone_variables=False)
         state_aug = self._prepare_augmented_state(state_in, state_out, control)
@@ -1473,6 +1480,9 @@ class SolverFeatherPGS(SolverBase):
                         self._J_bufs[self._buf_idx][size].zero_()
                 self._memset_done_event[self._buf_idx] = self._memset_stream.record_event()
                 self._buf_idx = 1 - self._buf_idx
+
+        # Spike capture: detect and record velocity spikes after integration
+        self.spike_capture.post_solve(self, state_in, state_out, dt)
 
         self._step += 1
         return state_out
