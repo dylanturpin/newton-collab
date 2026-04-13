@@ -1,0 +1,222 @@
+name: fpgs-matrix-free-dense-explainer
+trigger:
+  kind: manual
+
+policy:
+  maxAutoTurns: 100
+
+inputs:
+  - name: execplan
+    kind: workspace_file
+    path: .agent/execplans/fpgs-matrix-free-dense-explainer.md
+
+conversationSlots:
+  - key: implementer
+    strategy: create_new
+  - key: judge
+    strategy: create_new
+
+stages:
+  - key: implement
+    inputs:
+      - name: execplan
+        access: content
+      - name: judge_feedback
+        access: json
+      - name: implementation_checkout
+        access: snapshot
+    outputs:
+      - name: implementation_summary
+        kind: structured_output
+        fromStep: summarize
+      - name: execplan_snapshot
+        kind: workspace_file
+        path: .agent/execplans/fpgs-matrix-free-dense-explainer.md
+      - name: implementation_checkout
+        kind: workspace_snapshot
+        path: .
+    next: judge_stage
+    steps:
+      - key: execute
+        kind: agent_conversation
+        conversation: implementer
+        conversationBindingMode: refresh
+        provider: codex
+        model: gpt-5.4
+        modelOptions:
+          codex:
+            reasoningEffort: high
+            fastMode: false
+        prompt:
+          template: |
+            Read `.agent/execplans/fpgs-matrix-free-dense-explainer.md`, inspect the workspace, and continue that living ExecPlan.
+
+            This workflow is milestone-driven.
+            - The workspace root is the real git repo root.
+            - Work from the current branch `dturpin/fpgs-matrix-free-dense-explainer` unless the ExecPlan reaches an explicitly gated final publication milestone.
+            - Keep the ExecPlan accurate in place.
+            - Start each pass with a short replan update in the ExecPlan if the next milestone needs tightening.
+            - Advance exactly one milestone, or one clearly reviewable slice of the current milestone if the full milestone is not yet implementable end-to-end.
+            - End each pass in a reviewable state.
+            - If you complete a reviewable milestone slice, make a local git commit on the working branch before stopping.
+            - Do not begin the next milestone after the commit for that pass.
+
+            Hard guardrails:
+            - do not create a GitHub issue
+            - do not open a PR
+            - never push to `upstream`
+            - do not push any remote branch except `origin/feather_pgs` or `origin/gh-pages`
+            - only push `origin/feather_pgs` or `origin/gh-pages` when the ExecPlan says the work is actually complete and the relevant final publication milestone is active
+            - do not update `gh-pages` early
+            - preserve nightly benchmark data when `gh-pages` is eventually updated
+
+            Scope and content requirements:
+            - the main deliverable is a deep technical explainer comparing dense and matrix-free FeatherPGS
+            - emphasize concrete data, not just prose
+            - include explicit matrix/vector descriptions of the work done by each path
+            - include memory-layout discussion for the main PGS solve kernels
+            - include logical sizing and realistic scenario sizing, at minimum for `g1_flat` and `h1_tabletop`
+            - optionally use `~/repos/il-newton-dev` for representative Isaac Lab tasks if useful
+            - raw data is a first-class artifact and should be checked in under the paths defined by the ExecPlan
+            - prefer additive docs work
+            - add helper scripts if they materially improve data capture or safe docs publication
+
+            Validation expectations:
+            - run focused validation while you work
+            - before final acceptance, build docs with:
+              `uv run --extra docs --extra sim sphinx-build -j auto -b html docs docs/_build/html`
+            - run `uvx pre-commit run -a` before final acceptance, and earlier when practical
+
+            Human handoff artifact:
+            - create and maintain `.agent/review/fpgs-matrix-free-dense-explainer-handoff.md`
+
+            Latest judge feedback, if any:
+            {{ artifacts.judge_feedback.output.assistantText }}
+        responseFormat:
+          kind: none
+        transitions:
+          done: summarize
+
+      - key: summarize
+        kind: agent_conversation
+        conversation: implementer
+        conversationBindingMode: reuse
+        provider: codex
+        model: gpt-5.4
+        prompt:
+          template: |
+            Summarize this implementation pass in markdown.
+
+            Include:
+            - which milestone or milestone slice advanced
+            - what changed
+            - what validation ran
+            - whether a local commit was created
+            - whether any remote push happened, and to which allowed branch if so
+            - what remains before the ExecPlan is complete
+        responseFormat:
+          kind: none
+
+  - key: judge_stage
+    inputs:
+      - name: execplan
+        access: content
+      - name: implementation_summary
+        access: json
+      - name: execplan_snapshot
+        access: content
+      - name: implementation_checkout
+        access: snapshot
+    decision:
+      from: review
+      format:
+        kind: tagged_footer
+        tag: KANNA_DECISION
+        values: [accept, continue]
+    outputs:
+      - name: judge_feedback
+        kind: structured_output
+        fromStep: review
+    next:
+      accept: finalize
+      continue: implement
+    steps:
+      - key: review
+        kind: agent_conversation
+        conversation: judge
+        conversationBindingMode: refresh
+        provider: codex
+        model: gpt-5.4
+        modelOptions:
+          codex:
+            reasoningEffort: high
+            fastMode: false
+        prompt:
+          template: |
+            Review the current FeatherPGS dense-vs-matrix-free explainer workspace.
+
+            Inspect:
+            - `.agent/execplans/fpgs-matrix-free-dense-explainer.md`
+            - `.agent/review/fpgs-matrix-free-dense-explainer-handoff.md` if it exists
+            - any raw data artifacts under `.agent/data/fpgs-matrix-free-dense-explainer/`
+            - helper scripts added for extraction or docs publication
+            - the current branch and git status
+            - changed files, validation evidence, and commit / push state
+
+            Latest implementation summary:
+            {{ artifacts.implementation_summary.output.assistantText }}
+
+            Choose `accept` only if:
+            - the ExecPlan is complete
+            - the dense vs matrix-free explainer deliverable is complete and reviewable
+            - raw data artifacts are present and materially support the explainer
+            - the docs build passed with the real toolchain
+            - `uvx pre-commit run -a` ran successfully
+            - the current branch history is coherent
+            - no GitHub issue or PR was created
+            - no push happened to `upstream`
+            - no disallowed remote push happened
+            - any `origin/feather_pgs` or `origin/gh-pages` push happened only at the explicitly gated final publication milestones
+            - `gh-pages` was not touched early and nightly benchmark data was preserved
+            - the workspace looks ready for human review
+
+            Otherwise explain the remaining work concretely and end with:
+            KANNA_DECISION: continue
+        responseFormat:
+          kind: tagged_footer
+          tag: KANNA_DECISION
+          values: [accept, continue]
+
+  - key: finalize
+    inputs:
+      - name: execplan_snapshot
+        access: content
+      - name: implementation_checkout
+        access: snapshot
+    outputs:
+      - name: final_summary
+        kind: structured_output
+        fromStep: summarize_final
+    steps:
+      - key: summarize_final
+        kind: agent_conversation
+        conversation: implementer
+        conversationBindingMode: refresh
+        provider: codex
+        model: gpt-5.4
+        prompt:
+          template: |
+            The FeatherPGS dense-vs-matrix-free ExecPlan is accepted as complete.
+
+            Summarize the final result briefly.
+
+            Include:
+            - the final docs deliverable location
+            - where the raw data artifacts live
+            - the final working branch used during implementation
+            - whether `origin/feather_pgs` was updated
+            - whether `origin/gh-pages` was updated
+            - the key validation that ran
+            - any residual open questions intentionally documented
+        responseFormat:
+          kind: none
