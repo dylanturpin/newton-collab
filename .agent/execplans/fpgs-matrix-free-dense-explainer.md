@@ -87,16 +87,15 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
-## Pass Update (2026-04-13, pass 11)
+## Pass Update (2026-04-13, pass 12)
 
-M11 is the active milestone for this pass. This pass is intentionally scoped to one reviewable slice:
+M12 is the active milestone for this pass. This pass is intentionally scoped to the gated final publication flow:
 
-- tighten the explainer page so its notation matches `docs/concepts/feather_pgs.md`
-- replace the ambiguous scenario table with articulated-vs-free-rigid row counts, warm-contact totals, and human-readable sizes
-- add a profiler-backed explanation of why `split` is not equivalent to the fused `matrix_free` path on `h1_tabletop`
-- pick up the pending investigations journal reorder/update
-- validate locally with the real docs build and `pre-commit`
-- stop after a local commit; do not start M12 publication in this pass
+- publish the current finalized source/docs branch head to `origin/feather_pgs`
+- rebuild docs from that exact published revision
+- refresh `origin/gh-pages` safely while preserving `nightly/` and unrelated site assets
+- check in fresh M12 publication evidence and update the handoff
+- stop after the final publication state is recorded in-tree
 
 ## Milestones
 
@@ -649,13 +648,55 @@ Validation for this slice:
 
 ### M12. Final Publication (source branch + gh-pages)
 
-Status: pending
+Status: complete
 
 Same publication procedure as M7/M8/M10.
 
+Completed outputs (2026-04-13):
+
+- validated the final M11 clarity state again before publication:
+  - `uv run --extra docs --extra sim sphinx-build -j auto -b html docs docs/_build/html`
+  - `uvx pre-commit run -a`
+- published the finalized explainer/docs source commit to `origin/feather_pgs`:
+  - `git push origin 5cedd5c9647f4c9ff6d3ba82fc6187ce5a14d7ef:feather_pgs`
+  - result: fast-forward update from `1999330f643c5914e3d417675d1c8fd0967976f0` to `5cedd5c9647f4c9ff6d3ba82fc6187ce5a14d7ef`
+- rebuilt the docs from that exact published source revision:
+  - `git worktree add --detach /tmp/newton-fpgs-m12-src-final 5cedd5c9647f4c9ff6d3ba82fc6187ce5a14d7ef`
+  - `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html-m12-final`
+  - result: passed
+- refreshed `origin/gh-pages` safely from the detached build output:
+  - `git worktree add --detach /tmp/newton-gh-pages-fpgs-explainer-m12-final origin/gh-pages`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final checkout -b fpgs-matrix-free-dense-explainer-gh-pages-m12-final`
+  - replaced only `latest/` from `/tmp/fpgs-docs-html-m12-final/`
+  - refreshed branch-root `.nojekyll`
+  - preserved branch-root `404.html`, `nightly/`, `index.html`, `stable/`, versioned release docs, and `switcher.json`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final add .nojekyll latest`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final commit -m "Publish FeatherPGS explainer docs"`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final push origin HEAD:gh-pages`
+  - result: fast-forward update from `ff38559855cec148208e38f8df0f47dd30f89f1a` to `d20a6341e64501846e40a429137a51a4a8fad47a`
+- checked in fresh M12 publication audit artifacts:
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-name-status.txt`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-nightly-diff.txt`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m12-publication-summary.env`
+
+Validation evidence:
+
+- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs docs/_build/html`
+  - result: passed
+  - notable output: the same existing multiple-toctree consistency notices for generated `docs/api/newton_*.rst` pages remain, but the explainer docs still build cleanly
+- `uvx pre-commit run -a`
+  - result: passed
+- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html-m12-final`
+  - result: passed from detached worktree `/tmp/newton-fpgs-m12-src-final`
+- `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final diff --name-only ff38559855cec148208e38f8df0f47dd30f89f1a d20a6341e64501846e40a429137a51a4a8fad47a -- nightly > .agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-nightly-diff.txt`
+  - result: empty file, confirming no nightly-path edits
+- `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final diff --name-status ff38559855cec148208e38f8df0f47dd30f89f1a d20a6341e64501846e40a429137a51a4a8fad47a > .agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-name-status.txt`
+- `git ls-remote --heads origin feather_pgs gh-pages`
+  - result after M12 publication: `origin/feather_pgs` at `5cedd5c9647f4c9ff6d3ba82fc6187ce5a14d7ef`, `origin/gh-pages` at `d20a6341e64501846e40a429137a51a4a8fad47a`
+
 ## Immediate Next Action
 
-Finish the M11 slice by running the local docs build and `uvx pre-commit run -a`, then update the handoff and stop after a local commit. Do not begin M12 publication in this pass.
+No further milestone work remains in this ExecPlan. Keep `origin/feather_pgs` and `origin/gh-pages` unchanged unless a later follow-up explicitly reopens the explainer lane.
 
 ## Change Log
 
@@ -665,3 +706,4 @@ Finish the M11 slice by running the local docs build and `uvx pre-commit run -a`
 - 2026-04-13: Completed M7 by publishing the finalized source/docs state to `origin/feather_pgs` and leaving `origin/gh-pages` untouched for the later gated publication milestone.
 - 2026-04-13: Completed M8 by rebuilding the docs into `/tmp/fpgs-docs-html`, publishing the refreshed `latest/` payload to `origin/gh-pages`, and checking in exact changed-path and nightly-preservation artifacts.
 - 2026-04-13: Completed M10 by committing the Zach Warp migration journal note, publishing corrected source commit `1999330f` to `origin/feather_pgs`, republishing `origin/gh-pages` from the corrected docs build, and checking in exact changed-path and nightly-preservation artifacts for the final published state.
+- 2026-04-13: Completed M12 by publishing the final M11 clarity pass to `origin/feather_pgs`, rebuilding docs from exact source commit `5cedd5c9`, refreshing `origin/gh-pages` to `d20a6341` without touching `nightly/`, and checking in fresh M12 publication artifacts.
