@@ -68,6 +68,7 @@ Newton Physics
    :caption: Investigations
 
    investigations/index
+   investigations/velocity_spikes
 
 
 .. toctree::
