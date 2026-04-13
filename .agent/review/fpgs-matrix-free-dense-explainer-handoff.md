@@ -13,6 +13,7 @@
 - Completed M9: the docs now include an investigations journal and a decision-facing code-path ablation recommendation layer on top of the dense-vs-matrix-free explainer.
 - Completed M10: the final published source/docs state now includes the added "Warp kernel migration (Zach Corse)" journal note, and both `origin/feather_pgs` and `origin/gh-pages` have been refreshed to that corrected state.
 - Advanced M11 with a first reviewable clarity slice: the explainer page now has notation alignment with the main FeatherPGS concepts page, a clearer scenario-sizing table, and a profiler-backed explanation of why `split` is not equivalent to the fused `matrix_free` path.
+- Completed M12: the final M11 clarity pass is now published to `origin/feather_pgs`, and the rendered docs are now published to `origin/gh-pages` with fresh nightly-preservation evidence.
 - Chosen docs structure: keep `docs/concepts/feather_pgs.md` as the overview page and add a sibling concepts page for the deep dense-vs-matrix-free comparison.
 - Recorded the initial inventory in `.agent/data/fpgs-matrix-free-dense-explainer/m1-source-inventory.md`.
 - Added checked-in schemas in `.agent/data/fpgs-matrix-free-dense-explainer/schema/`.
@@ -58,6 +59,10 @@
   - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m10-gh-pages-name-status.txt`
   - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m10-gh-pages-nightly-diff.txt`
   - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m10-publication-summary.env`
+- Added final M12 publication audit artifacts:
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-name-status.txt`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-nightly-diff.txt`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m12-publication-summary.env`
 - Added a `typos` allowlist entry for the surname `Corse`:
   - `pyproject.toml`
 
@@ -80,8 +85,7 @@
 
 ## Recommended Next Pass
 
-- Finish M11 by rerunning the local docs build and `uvx pre-commit run -a` on top of the clarity edits, then commit the slice locally if validation passes.
-- If a later worker starts M12, treat it as a fresh publication milestone. Rebuild from the committed M11 source state and repeat the same nightly-preserving `origin/gh-pages` procedure used in M8/M10.
+- No further pass is required for this ExecPlan unless new FeatherPGS explainer work is explicitly opened.
 
 ## Validation Update
 
@@ -120,6 +124,31 @@
 - Exact nightly-preservation proof:
   - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m10-gh-pages-nightly-diff.txt`
   - file size: `0` bytes
+- Final M12 source publication:
+  - before: `origin/feather_pgs` -> `1999330f643c5914e3d417675d1c8fd0967976f0`
+  - command: `git push origin 5cedd5c9:feather_pgs`
+  - after: `origin/feather_pgs` -> `5cedd5c9647f4c9ff6d3ba82fc6187ce5a14d7ef`
+- Final M12 docs rebuild:
+  - detached-source proof build:
+    - `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html-m12-final`
+    - workdir: `/tmp/newton-fpgs-m12-src-final`
+    - result: passed
+- Final M12 `gh-pages` publication:
+  - before: `origin/gh-pages` -> `ff38559855cec148208e38f8df0f47dd30f89f1a`
+  - commands:
+    - `git worktree add --detach /tmp/newton-gh-pages-fpgs-explainer-m12-final origin/gh-pages`
+    - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final checkout -b fpgs-matrix-free-dense-explainer-gh-pages-m12-final`
+    - replace `latest/` from `/tmp/fpgs-docs-html-m12-final/`
+    - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final add .nojekyll latest`
+    - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final commit -m "Publish FeatherPGS explainer docs"`
+    - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final push origin HEAD:gh-pages`
+  - after: `origin/gh-pages` -> `d20a6341e64501846e40a429137a51a4a8fad47a`
+- Final M12 publication proofs:
+  - exact changed-path inventory:
+    - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-name-status.txt`
+  - exact nightly-preservation proof:
+    - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-nightly-diff.txt`
+    - file size: `0` bytes
 
 ## Validation Evidence
 
@@ -147,3 +176,10 @@
 - `uvx pre-commit run -a`
   - first result: failed because `typos` flagged the surname `Corse`
   - second result: passed after allowlisting `Corse` in `pyproject.toml`
+- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html-m12-final`
+  - result: passed
+  - note: executed from detached worktree `/tmp/newton-fpgs-m12-src-final` after publishing `5cedd5c9` to `origin/feather_pgs`
+- `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final diff --name-only -- nightly`
+  - result: no output
+- `git ls-remote --heads origin feather_pgs gh-pages`
+  - result: `origin/feather_pgs` at `5cedd5c9647f4c9ff6d3ba82fc6187ce5a14d7ef`, `origin/gh-pages` at `d20a6341e64501846e40a429137a51a4a8fad47a`
