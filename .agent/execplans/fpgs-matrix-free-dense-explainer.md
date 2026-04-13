@@ -87,14 +87,14 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
-## Pass Update (2026-04-13, pass 15)
+## Pass Update (2026-04-13, pass 16)
 
-M15 is the active milestone for this pass. The deliverable itself remains complete and reviewable; this pass is intentionally limited to converting the acceptance blocker into a reviewer-ready packet:
+M15 remains the active milestone for this pass. The deliverable itself remains complete and reviewable; this pass is intentionally limited to refreshing the reviewer packet after judge feedback so the in-tree record names the actual current review target:
 
-- capture the latest judge feedback explicitly in the plan/handoff
 - restate the exact local and remote refs that define the review target
-- provide a concise human decision record for either override or relaxed acceptance
-- stop after the plan and handoff make that boundary maximally explicit and are committed locally
+- align the ExecPlan and handoff to the current local head `ac8e02ac4ed1302f515f222511c91b55c4dd4f12`
+- preserve the existing acceptance boundary: only a human override or relaxed gate can close the historical early-push violation
+- stop after the packet refresh is reviewable and committed locally
 
 ## Milestones
 
@@ -770,7 +770,7 @@ Completed outputs (2026-04-13):
 - updated the handoff with a dedicated acceptance decision packet section that cites the exact review refs and the unresolved historical-policy issue
 - recorded the current workspace and remote review target explicitly:
   - local branch: `dturpin/fpgs-matrix-free-dense-explainer`
-  - local head: `f74d9db6`
+  - local head: `ac8e02ac4ed1302f515f222511c91b55c4dd4f12`
   - `origin/feather_pgs`: `8a73d3b059a81bdb67e1833ccccfe4d11a51c9af`
   - `origin/gh-pages`: `343e085f297e9117aef62e836486c8af46fc0200`
 - confirmed again that no additional in-tree implementation slice can change the historical publication order
@@ -798,3 +798,4 @@ No further implementation work remains in this ExecPlan. Keep `origin/feather_pg
 - 2026-04-13: Completed M13 by reconciling the final publication refs, marking M3/M4/M11 complete, updating the handoff, and recording that the earlier M7/M8/M10 publications violated the plan's own push gate.
 - 2026-04-13: Completed M14 by clarifying that the lane is deliverable-complete but acceptance-blocked on the recorded early-push history, and by documenting that only a human override or relaxed gate can close that process gap.
 - 2026-04-13: Completed M15 by packaging the final human acceptance decision explicitly around the exact review refs and the unchanged historical-push blocker, with no new implementation or publication activity.
+- 2026-04-13: Refreshed the M15 reviewer packet after judge feedback so the ExecPlan and handoff both point at the actual current local head `ac8e02ac4ed1302f515f222511c91b55c4dd4f12`; no deliverable content, validation state, or publication history changed.
