@@ -1,10 +1,10 @@
 # TGS Feasibility Study Notes
 
-This report is the main artifact for the `dt/tgs-feather-pgs-study` branch. It records what the current Isaac Lift configuration actually does, what PhysX TGS means in source terms, the selectable smaller-step FeatherPGS path added in Stage 2, and the first completed Newton-only rollout comparison from Stage 3B.
+This report is the main artifact for the `dt/tgs-feather-pgs-study` branch. It records what the current Isaac Lift configuration actually does, what PhysX TGS means in source terms, the selectable smaller-step FeatherPGS path added in Stage 2, the completed Newton-only rollout comparison from Stage 3B, and the first focused TGS-style training comparison from Stage 3C.
 
 ## Scope of this pass
 
-This report now covers Stage 1, the Stage 2 implementation slice, the Stage 3A bring-up pass that narrowed the runtime blockers, and a completed Stage 3B rollout comparison slice. The codebase now has a selectable smaller-step FeatherPGS path for Franka lift and a checked-in short-rollout harness, but it still does not have completed training or throughput comparisons.
+This report now covers Stage 1, the Stage 2 implementation slice, the Stage 3A bring-up pass that narrowed the runtime blockers, the completed Stage 3B rollout comparison slice, and a completed Stage 3C training slice focused on the velocity guard. The codebase now has a selectable smaller-step FeatherPGS path for Franka lift, a checked-in short-rollout harness, and initial guarded-versus-no-guard training evidence, but it still does not have completed throughput comparisons or a final Stage 4 recommendation.
 
 Repository baseline for this report:
 
@@ -367,10 +367,63 @@ This is enough to answer the Stage 3B question at rollout level:
 
 The MJWarp result needs one caution. The harness reads kinematic state after `env.step(...)`, and Isaac Lab auto-resets terminated environments inside `step()`. So the `peak_joint_vel=0.0` result for MJWarp should be interpreted as “the environment reset immediately on `joint_vel_out_of_limit` before a useful post-step state was observable,” not as proof that the offending pre-reset velocity was literally zero.
 
-## Current recommendation after Stage 3B
+## Stage 3C training slice: velocity guard comparison
 
-The next pass should stay narrow and move to Stage 3C:
+The first completed Stage 3C slice stayed deliberately narrow. Instead of trying to solve throughput and longer-horizon baseline parity in the same pass, it answered the immediate reviewer question: what happens if the TGS-style Franka lift task trains with and without `joint_vel_out_of_limit`?
 
-- run short training comparisons for baseline FeatherPGS, TGS-style FeatherPGS, and the no-velocity-guard variant
-- use the Stage 3B rollout harness as the reproducible pre-flight check before each training run
-- treat PhysX baseline and standalone throughput as environment blockers until `omni.physics` and/or a completing benchmark path is available in this workspace
+The command set was:
+
+    cd /workspace/skild-IL-solver
+    OMNI_KIT_ACCEPT_EULA=YES ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Lift-Cube-Franka-FeatherPGS-TGS-v0 --num_envs 32 --seed 7 --max_iterations 2 --headless
+    OMNI_KIT_ACCEPT_EULA=YES ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Lift-Cube-Franka-FeatherPGS-TGS-NoVelGuard-v0 --num_envs 32 --seed 7 --max_iterations 2 --headless
+
+Both runs used:
+
+- `num_envs=32`
+- `seed=7`
+- `max_iterations=2`
+- the same TGS-style smaller-step FeatherPGS schedule from Stage 2 (`dt=0.0025`, `decimation=8`, `num_substeps=1`)
+
+The generated log directories were:
+
+- guarded TGS: `skild-IL-solver/logs/rsl_rl/franka_lift/2026-04-13_17-15-13`
+- no-guard TGS: `skild-IL-solver/logs/rsl_rl/franka_lift/2026-04-13_17-16-18`
+
+The dumped `env.yaml` files confirm that these two runs match on solver schedule and differ only in the velocity-limit termination term:
+
+- guarded run: `joint_vel_out_of_limit` is present
+- no-guard run: `joint_vel_out_of_limit: null`
+
+The key iteration-2 metrics from the TensorBoard event files were:
+
+    guarded TGS (2026-04-13_17-15-13)
+      Train/mean_reward = 0.3553
+      Train/mean_episode_length = 1.01
+      Perf/total_fps = 214
+      Episode_Termination/joint_vel_out_of_limit = 1.0
+      Metrics/object_pose/position_error = 0.2093
+
+    no-guard TGS (2026-04-13_17-16-18)
+      Train/mean_reward = 0.7557
+      Train/mean_episode_length = 27.5
+      Perf/total_fps = 225
+      Episode_Termination/time_out = 0.0391
+      Metrics/object_pose/position_error = 0.2068
+
+The console logs tell the same story from the first iteration onward:
+
+- guarded TGS reached mean episode length `1.00` at iteration 1 and `1.01` at iteration 2, with `Episode_Termination/joint_vel_out_of_limit: 1.0000` throughout
+- no-guard TGS reached mean episode length `12.00` at iteration 1 and `27.50` at iteration 2, with no velocity-limit term remaining and only a small `time_out` fraction
+
+The practical conclusion from this slice is direct: on the selectable smaller-step FeatherPGS path, the velocity-limit guard is still the dominant early-learning failure mode in this workspace. Removing only that guard materially changes training behavior immediately, while keeping the same solver settings leaves the agent trapped in one-step episodes.
+
+This slice does not settle the full TGS question yet. It does not compare against baseline FeatherPGS training under a like-for-like selectable Newton training path, and it does not answer the throughput question beyond showing that guarded and no-guard runs under the same TGS-style schedule landed at similar training-loop FPS (`214` versus `225`).
+
+## Current recommendation after the Stage 3C training slice
+
+The next pass should stay narrow and finish the remaining Stage 3C work:
+
+- keep the Stage 3B rollout harness as the reproducible pre-flight check before any further training runs
+- treat the new Stage 3C evidence as confirmation that the velocity guard, not the smaller-step schedule alone, dominates early TGS-style training behavior
+- either produce throughput evidence with a completing benchmark path or close that item with a concrete reproducible blocker statement
+- then move to Stage 4 and write the final viability and cost-benefit recommendation so the study questions are answered in one place without inference
