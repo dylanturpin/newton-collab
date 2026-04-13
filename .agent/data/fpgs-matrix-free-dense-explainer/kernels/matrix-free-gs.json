@@ -1,0 +1,171 @@
+{
+  "schema_version": "1.0.0",
+  "provenance": {
+    "generator": "scripts/analysis/capture_fpgs_kernel_memory_artifacts.py",
+    "git_commit": "93f67400",
+    "generated_at_utc": "2026-04-13T17:07:54.888075Z",
+    "source_files": [
+      "newton/_src/solvers/feather_pgs/solver_feather_pgs.py",
+      "newton/_src/solvers/feather_pgs/kernels.py",
+      "scripts/analysis/capture_fpgs_kernel_memory_artifacts.py",
+      ".agent/data/fpgs-matrix-free-dense-explainer/scenarios/g1_flat/fpgs_matrix_free.json",
+      ".agent/data/fpgs-matrix-free-dense-explainer/scenarios/h1_tabletop/fpgs_matrix_free.json"
+    ]
+  },
+  "kernel": {
+    "id": "matrix-free-gs",
+    "name": "Two-phase articulated plus free-rigid matrix-free GS solve",
+    "source_file": "newton/_src/solvers/feather_pgs/solver_feather_pgs.py",
+    "source_symbol": "TiledKernelFactory._build_pgs_solve_mf_gs_kernel",
+    "phase": "stage6_matrix_free_pgs",
+    "modes": [
+      "matrix_free",
+      "split"
+    ]
+  },
+  "launch": {
+    "granularity": "one warp (32 threads) per world; dense articulated phase followed by a free-rigid MF phase",
+    "threads_per_block": 32,
+    "worlds_per_block": 1,
+    "sizing_symbols": [
+      "M_D = dense_max_constraints",
+      "M_MF = mf_max_constraints",
+      "D = max_world_dofs"
+    ]
+  },
+  "memory_layout": {
+    "global_reads": [
+      {
+        "name": "world_constraint_count/world_dof_start",
+        "location": "global",
+        "shape": "[world_count]",
+        "dtype": "int32",
+        "notes": "Sizes the dense articulated phase and locates the world velocity slice."
+      },
+      {
+        "name": "J_world/Y_world",
+        "location": "global",
+        "shape": "[world_count, M_D, D]",
+        "dtype": "float32",
+        "notes": "World-indexed articulated Jacobian rows and H^-1 J^T rows. Scenario bytes: g1_flat 50176 B combined, h1_tabletop 136192 B combined."
+      },
+      {
+        "name": "rhs/diag/world_impulses",
+        "location": "global",
+        "shape": "[world_count, M_D]",
+        "dtype": "float32",
+        "notes": "Articulated row bias, diagonal, and impulse state. rhs omits baked J*v_hat in matrix-free mode."
+      },
+      {
+        "name": "mf_meta_packed",
+        "location": "global",
+        "shape": "[world_count, M_MF * 4]",
+        "dtype": "int32",
+        "notes": "128-bit packed free-rigid metadata with dof offsets, eff_mass_inv, rhs, and row projection metadata. Scenario bytes: 8192 B."
+      },
+      {
+        "name": "mf_J_a/mf_J_b/mf_MiJt_a/mf_MiJt_b",
+        "location": "global",
+        "shape": "[world_count, M_MF, 6]",
+        "dtype": "float32",
+        "notes": "Free-rigid Jacobians and H^-1 J^T vectors streamed during the second phase."
+      },
+      {
+        "name": "mf_impulses",
+        "location": "global",
+        "shape": "[world_count, M_MF]",
+        "dtype": "float32",
+        "notes": "Warm-start state for the free-rigid rows."
+      }
+    ],
+    "global_writes": [
+      {
+        "name": "v_out",
+        "location": "global",
+        "shape": "[total_world_dofs]",
+        "dtype": "float32",
+        "notes": "The live velocity vector is written back after the combined articulated and MF sweep."
+      },
+      {
+        "name": "world_impulses/mf_impulses",
+        "location": "global",
+        "shape": "[world_count, M_D] and [world_count, M_MF]",
+        "dtype": "float32",
+        "notes": "Final impulse vectors for both phases."
+      }
+    ],
+    "shared_allocations": [
+      {
+        "name": "s_v",
+        "location": "shared",
+        "shape": "[D]",
+        "dtype": "float32",
+        "notes": "World velocity vector lives in shared memory across both phases of the solve."
+      },
+      {
+        "name": "s_lam_dense/s_rhs_dense/s_diag_dense/s_rtype_dense/s_parent_dense/s_mu_dense",
+        "location": "shared",
+        "shape": "[M_D] each",
+        "dtype": "float32/int32",
+        "notes": "Articulated row state and metadata preloaded before the dense phase."
+      },
+      {
+        "name": "s_lam_mf",
+        "location": "shared",
+        "shape": "[M_MF]",
+        "dtype": "float32",
+        "notes": "Free-rigid impulse state kept in shared memory for the second phase."
+      }
+    ],
+    "register_resident": [
+      {
+        "name": "prefetched J/Y lane slices",
+        "location": "register",
+        "shape": "ceil(D / 32) float pairs per lane",
+        "dtype": "float32",
+        "notes": "Software-pipeline registers for the current and next articulated row."
+      },
+      {
+        "name": "jv/residual/delta/new_impulse",
+        "location": "register",
+        "shape": "scalars per lane",
+        "dtype": "float32",
+        "notes": "Current articulated-row update state."
+      },
+      {
+        "name": "packed metadata fields",
+        "location": "register",
+        "shape": "small scalar set per lane",
+        "dtype": "int32/float32",
+        "notes": "Decoded from mf_meta_packed for the free-rigid branch."
+      }
+    ]
+  },
+  "operations": {
+    "streamed_inputs": [
+      "Articulated rows stream J_world and Y_world row slices instead of a preassembled Delassus matrix.",
+      "The free-rigid phase streams mf_J_* and mf_MiJt_* plus packed metadata from global memory."
+    ],
+    "preloaded_inputs": [
+      "The live world velocity vector v_out is preloaded into shared memory as s_v and reused across all iterations.",
+      "Dense articulated rhs, diag, impulses, and row metadata are staged into shared memory once per world.",
+      "Free-rigid impulses are staged into shared memory once; metadata is compressed into mf_meta_packed for coalesced loads."
+    ],
+    "recomputed_values": [
+      "Every articulated row recomputes J_i * v from the live shared velocity vector instead of reading C_i:.",
+      "Every free-rigid row recomputes J_i * v from the current shared body/world velocity state.",
+      "Only the diagonal C_ii is materialized explicitly for articulated rows; off-diagonal couplings are reconstructed on the fly through J and Y."
+    ],
+    "dominant_work": [
+      "Articulated phase: evaluate w_i = rhs_i + J_i * v, project lambda_i, then apply v += Y_i * delta_lambda_i.",
+      "Free-rigid phase: evaluate w_i = mf_rhs_i + J_i * v, project lambda_i, then apply v += MiJt_i * delta_lambda_i.",
+      "One shared velocity vector couples the articulated and free-rigid phases without assembling a dense mixed-world C matrix."
+    ]
+  },
+  "observations": [
+    "In g1_flat the matrix-free preset still allocates the larger articulated buffers (25088 B each for J_world and Y_world) but gains no free-rigid rows, so it is mostly a control case for the docs.",
+    "In h1_tabletop the matrix-free path routes 102 rows through the free-rigid branch and leaves only 30 articulated rows in the dense articulated phase.",
+    "For h1_tabletop the articulated matrix-free storage is dominated by J_world + Y_world (136192 B), while the free-rigid branch adds 63488 B.",
+    "This kernel is the main explanation target for the surprising result: it does not need a shared-memory copy of a dense Delassus matrix, only the velocity vector and scalar row state."
+  ]
+}
