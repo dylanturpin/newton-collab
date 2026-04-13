@@ -87,13 +87,16 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
-## Pass Update (2026-04-13, pass 3)
+## Pass Update (2026-04-13, pass 4)
 
-M3 now needs a concrete first capture slice rather than broader planning. This pass will:
+M4 now needs a concrete kernel-analysis slice that is directly grounded in the checked-in scenario artifacts. This pass will:
 
-- add a runtime-backed helper that records scenario sizing artifacts from the in-tree benchmark scenarios
-- capture reviewable dense-vs-matrix-free artifacts for `g1_flat` and `h1_tabletop`
-- keep the slice intentionally narrow: focus on `fpgs_dense_row` and `fpgs_matrix_free` first, leaving the other presets for a later M3 pass if needed
+- add a helper that emits reviewable kernel-memory artifacts in the M4 schema
+- cover the two most important kernels first:
+  - dense tiled-row PGS
+  - fused articulated-plus-free-rigid matrix-free GS
+- capture a doc-ready summary that ties the code-path analysis back to `g1_flat` and `h1_tabletop`
+- stop after this M4 slice rather than starting the docs draft in the same pass
 
 ## Milestones
 
@@ -199,7 +202,7 @@ Remaining M3 work:
 
 ### M4. Kernel Work / Memory Layout Analysis
 
-Status: pending
+Status: in progress
 
 Definition of done:
 
@@ -212,6 +215,36 @@ Definition of done:
 Expected outputs:
 
 - artifact notes and/or tables that can be pulled into docs directly
+
+Completed slice (2026-04-13):
+
+- added a kernel-artifact generator:
+  - `scripts/analysis/capture_fpgs_kernel_memory_artifacts.py`
+- generated the first reviewable M4 kernel artifacts:
+  - `.agent/data/fpgs-matrix-free-dense-explainer/kernels/dense-row.json`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/kernels/matrix-free-gs.json`
+- generated a doc-ready summary note tying kernel behavior back to the scenario artifacts:
+  - `.agent/data/fpgs-matrix-free-dense-explainer/m4-kernel-memory-summary.md`
+- recorded the first code-backed memory-layout findings:
+  - dense tiled-row stages the lower triangle of the explicit Delassus matrix `C` in shared memory and recomputes `sum_j C_ij lambda_j` from that staged tile on every sweep
+  - articulated matrix-free stages the live world velocity vector `v` in shared memory, streams `J_world` and `Y_world`, and recomputes `J_i v` instead of reading a stored dense row of `C`
+  - the fused matrix-free kernel also streams free-rigid `mf_J_*` and `mf_MiJt_*` data while keeping free-rigid impulses in shared memory
+  - `h1_tabletop` is the key mixed-world case so far: 117 dense rows in `fpgs_dense_row` versus 30 articulated dense rows plus 102 free-rigid matrix-free rows in `fpgs_matrix_free`
+
+Validation for this slice:
+
+- `uv run python scripts/analysis/capture_fpgs_kernel_memory_artifacts.py`
+- `python -m json.tool .agent/data/fpgs-matrix-free-dense-explainer/kernels/dense-row.json`
+- `python -m json.tool .agent/data/fpgs-matrix-free-dense-explainer/kernels/matrix-free-gs.json`
+
+Remaining M4 work:
+
+- add the remaining planned kernel artifacts if the final docs draft still needs them:
+  - `kernels/dense-loop.json`
+  - `kernels/dense-streaming.json`
+  - `kernels/tiled-contact-fused.json`
+- decide in the docs draft whether the existing M4 slice is already sufficient to explain the main performance observation, or whether the dense-streaming kernel needs equal depth
+- fold the kernel-memory notes into the docs page as tables and short code-path callouts
 
 ### M5. Draft the Explainer Content
 
@@ -354,7 +387,7 @@ These workflows replace `stable/`, versioned docs, or `latest/` directly on `gh-
 
 ## Immediate Next Action
 
-Advance M2: add data-extraction tooling and a checked-in raw-artifact schema for scenario-backed sizing, starting with `g1_flat` and `h1_tabletop`.
+Advance M5: draft the new sibling concepts page, using the checked-in M3 and M4 artifacts as the primary evidence base and linking back to `docs/concepts/feather_pgs.md` for background.
 
 ## Change Log
 

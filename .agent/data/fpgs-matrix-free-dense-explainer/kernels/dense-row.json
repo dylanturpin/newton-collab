@@ -1,0 +1,151 @@
+{
+  "schema_version": "1.0.0",
+  "provenance": {
+    "generator": "scripts/analysis/capture_fpgs_kernel_memory_artifacts.py",
+    "git_commit": "93f67400",
+    "generated_at_utc": "2026-04-13T17:07:54.888075Z",
+    "source_files": [
+      "newton/_src/solvers/feather_pgs/solver_feather_pgs.py",
+      "scripts/analysis/capture_fpgs_kernel_memory_artifacts.py",
+      ".agent/data/fpgs-matrix-free-dense-explainer/scenarios/g1_flat/fpgs_dense_row.json",
+      ".agent/data/fpgs-matrix-free-dense-explainer/scenarios/h1_tabletop/fpgs_dense_row.json"
+    ]
+  },
+  "kernel": {
+    "id": "dense-row",
+    "name": "Dense tiled-row PGS solve",
+    "source_file": "newton/_src/solvers/feather_pgs/solver_feather_pgs.py",
+    "source_symbol": "TiledKernelFactory._build_pgs_solve_tiled_row_kernel",
+    "phase": "stage5_dense_pgs",
+    "modes": [
+      "dense"
+    ]
+  },
+  "launch": {
+    "granularity": "one warp (32 threads) per world; one dense contact system per launch tile",
+    "threads_per_block": 32,
+    "worlds_per_block": 1,
+    "sizing_symbols": [
+      "M = dense_max_constraints",
+      "TILE_TRI = M * (M + 1) / 2"
+    ]
+  },
+  "memory_layout": {
+    "global_reads": [
+      {
+        "name": "world_constraint_count",
+        "location": "global",
+        "shape": "[world_count]",
+        "dtype": "int32",
+        "notes": "Per-world active row count m."
+      },
+      {
+        "name": "world_C",
+        "location": "global",
+        "shape": "[world_count, M, M]",
+        "dtype": "float32",
+        "notes": "Full Delassus matrix stored globally, then staged as a packed lower triangle in shared memory. Scenario bytes: g1_flat 4096 B, h1_tabletop 65536 B."
+      },
+      {
+        "name": "world_rhs",
+        "location": "global",
+        "shape": "[world_count, M]",
+        "dtype": "float32",
+        "notes": "Bias plus baked J*v_hat term."
+      },
+      {
+        "name": "world_diag",
+        "location": "global",
+        "shape": "[world_count, M]",
+        "dtype": "float32",
+        "notes": "Diagonal used as the PGS denominator."
+      },
+      {
+        "name": "world_impulses",
+        "location": "global",
+        "shape": "[world_count, M]",
+        "dtype": "float32",
+        "notes": "Warm-start values loaded before the sweep."
+      },
+      {
+        "name": "world_row_type/world_row_parent/world_row_mu",
+        "location": "global",
+        "shape": "[world_count, M]",
+        "dtype": "int32/float32",
+        "notes": "Projection metadata for contact, friction, and joint-limit rows."
+      }
+    ],
+    "global_writes": [
+      {
+        "name": "world_impulses",
+        "location": "global",
+        "shape": "[world_count, M]",
+        "dtype": "float32",
+        "notes": "Final impulses written back once after all iterations."
+      }
+    ],
+    "shared_allocations": [
+      {
+        "name": "s_Ctri",
+        "location": "shared",
+        "shape": "[M * (M + 1) / 2]",
+        "dtype": "float32",
+        "notes": "Packed lower triangle of C; this is the dominant shared-memory footprint."
+      },
+      {
+        "name": "s_lam/s_rhs/s_diag",
+        "location": "shared",
+        "shape": "[M] each",
+        "dtype": "float32",
+        "notes": "Impulse state and scalar row data resident across the full GS sweep."
+      },
+      {
+        "name": "s_rtype/s_parent/s_mu",
+        "location": "shared",
+        "shape": "[M] each",
+        "dtype": "int32/int32/float32",
+        "notes": "Per-row projection metadata staged once per world."
+      }
+    ],
+    "register_resident": [
+      {
+        "name": "my_sum/dot_sum/w_val/delta/new_impulse",
+        "location": "register",
+        "shape": "scalars per lane",
+        "dtype": "float32",
+        "notes": "Lane-local accumulators for the current row update."
+      },
+      {
+        "name": "j_k/jb_k/base_i",
+        "location": "register",
+        "shape": "small integer scalars per lane",
+        "dtype": "int32",
+        "notes": "Precomputed packed-triangle indexing terms."
+      }
+    ]
+  },
+  "operations": {
+    "streamed_inputs": [
+      "The kernel streams the full dense Delassus matrix C from global memory during the load phase.",
+      "world_constraint_count gates how much of the staged shared state is actually used."
+    ],
+    "preloaded_inputs": [
+      "C is repacked into s_Ctri once, then reused for every PGS iteration.",
+      "rhs, diag, impulses, and row metadata are loaded into shared memory before the solve loop."
+    ],
+    "recomputed_values": [
+      "Each row recomputes the full dot product sum_j C_ij * lambda_j from shared memory every sweep.",
+      "Friction sibling projection recomputes tangential magnitude from the updated shared impulses."
+    ],
+    "dominant_work": [
+      "For each active row i, evaluate w_i = rhs_i + sum_j C_ij * lambda_j.",
+      "Project lambda_i for unilateral contact / joint limit rows and the paired friction rows.",
+      "Store only the final impulse vector; no velocity vector is updated in this kernel."
+    ]
+  },
+  "observations": [
+    "The dense-row kernel removes repeated global reads of C during the sweep by staging the lower triangle in shared memory, but it still requires the full C allocation to exist beforehand.",
+    "In the review scenarios the explicit C allocation is modest for g1_flat (4096 B) but already 65,536 B for h1_tabletop at M=128, before counting J/Y construction and Delassus assembly.",
+    "h1_tabletop dense-row keeps all 117 active rows in the dense system; there is no free-rigid off-ramp in this mode."
+  ]
+}
