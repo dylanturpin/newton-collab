@@ -36,6 +36,7 @@ Newton Physics
    Extended Attributes <concepts/extended_attributes>
    Collisions and Contacts <concepts/collisions>
    FeatherPGS <concepts/feather_pgs>
+   FeatherPGS Dense vs Matrix-Free <concepts/feather_pgs_dense_vs_matrix_free>
    
 .. toctree::
    :maxdepth: 1

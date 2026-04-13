@@ -3,6 +3,8 @@
 
 # FeatherPGS
 
+For the data-heavy implementation comparison, including scenario-backed sizing tables and kernel memory-layout notes, see [FeatherPGS: Dense vs Matrix-Free](feather_pgs_dense_vs_matrix_free.md).
+
 ## Motivation and Background
 
 FeatherPGS is Newton's reduced-coordinate rigid-body contact solver built around Featherstone-style articulated dynamics, a semi-implicit step, and a projected Gauss-Seidel (PGS) contact solve. The core formulation uses a Schur-complement approach:

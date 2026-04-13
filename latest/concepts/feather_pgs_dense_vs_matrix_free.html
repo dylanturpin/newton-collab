@@ -1,0 +1,1153 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>FeatherPGS: Dense vs Matrix-Free &#8212; Newton Physics</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/sphinx-design.min.css?v=95c83b7e" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=b2b65678" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=1c471e8e"></script>
+    <script src="../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=f281be69"></script>
+    <script src="../_static/design-tabs.js?v=f930bc37"></script>
+    <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
+    <script>window.MathJax = {"tex": {"inlineMath": [["$", "$"], ["\\(", "\\)"]], "processEscapes": true, "packages": {"[+]": ["amsmath", "amssymb", "amsfonts"]}, "displayMath": [["$$", "$$"], ["\\[", "\\]"]], "processEnvironments": true, "tags": "ams", "macros": {"RR": "{\\mathbb{R}}", "bold": ["{\\mathbf{#1}}", 1], "vec": ["{\\mathbf{#1}}", 1]}}, "options": {"ignoreHtmlClass": "annotation", "processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'concepts/feather_pgs_dense_vs_matrix_free';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://dylanturpin.github.io/newton-collab/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="newton" href="../api/newton.html" />
+    <link rel="prev" title="FeatherPGS" href="feather_pgs.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/newton-logo-light.png" class="logo__image only-light" alt="Newton Physics Logo"/>
+    <img src="../_static/newton-logo-dark.png" class="logo__image only-dark pst-js-only" alt="Newton Physics Logo"/>
+  
+  
+    <p class="title logo__title">Newton Physics <span style='font-size: 0.8em; color: #888;'>(1.1.0.dev0)</span></p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+<nav>
+  <ul class="bd-navbar-elements navbar-nav">
+    
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/overview.html">
+    Overview
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/installation.html">
+    Installation
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/visualization.html">
+    Visualization
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/tutorials.html">
+    Tutorials
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/development.html">
+    Development
+  </a>
+</li>
+
+            <li class="nav-item dropdown">
+                <button class="btn dropdown-toggle nav-item" type="button"
+                data-bs-toggle="dropdown" aria-expanded="false"
+                aria-controls="pst-nav-more-links">
+                    More
+                </button>
+                <ul id="pst-nav-more-links" class="dropdown-menu">
+                    
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="worlds.html">
+    Worlds
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="articulations.html">
+    Articulations
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="mass_inertia.html">
+    Mass and Inertia
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="sites.html">
+    Sites
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="sensors.html">
+    Sensors
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="conventions.html">
+    Conventions
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="usd_parsing.html">
+    USD Parsing
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="custom_attributes.html">
+    Custom Attributes
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="extended_attributes.html">
+    Extended Attributes
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="collisions.html">
+    Collisions and Contacts
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="feather_pgs.html">
+    FeatherPGS
+  </a>
+</li>
+
+
+<li class=" current active">
+  <a class="nav-link dropdown-item nav-internal" href="#">
+    FeatherPGS Dense vs Matrix-Free
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton.html">
+    newton
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_geometry.html">
+    newton.geometry
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_ik.html">
+    newton.ik
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_math.html">
+    newton.math
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_selection.html">
+    newton.selection
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_sensors.html">
+    newton.sensors
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_solvers.html">
+    newton.solvers
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_usd.html">
+    newton.usd
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_utils.html">
+    newton.utils
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_viewer.html">
+    newton.viewer
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../faq.html">
+    FAQ
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../migration.html">
+    Migration Guide
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../integrations/index.html">
+    Integrations
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-external" href="https://github.com/newton-physics/newton">
+     GitHub
+  </a>
+</li>
+
+                </ul>
+            </li>
+            
+  </ul>
+</nav></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+        <div class="navbar-item">
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+<nav>
+  <ul class="bd-navbar-elements navbar-nav">
+    
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/overview.html">
+    Overview
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/installation.html">
+    Installation
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/visualization.html">
+    Visualization
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/tutorials.html">
+    Tutorials
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/development.html">
+    Development
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="worlds.html">
+    Worlds
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="articulations.html">
+    Articulations
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="mass_inertia.html">
+    Mass and Inertia
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="sites.html">
+    Sites
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="sensors.html">
+    Sensors
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="conventions.html">
+    Conventions
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="usd_parsing.html">
+    USD Parsing
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="custom_attributes.html">
+    Custom Attributes
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="extended_attributes.html">
+    Extended Attributes
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="collisions.html">
+    Collisions and Contacts
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="feather_pgs.html">
+    FeatherPGS
+  </a>
+</li>
+
+
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="#">
+    FeatherPGS Dense vs Matrix-Free
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton.html">
+    newton
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_geometry.html">
+    newton.geometry
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_ik.html">
+    newton.ik
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_math.html">
+    newton.math
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_selection.html">
+    newton.selection
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_sensors.html">
+    newton.sensors
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_solvers.html">
+    newton.solvers
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_usd.html">
+    newton.usd
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_utils.html">
+    newton.utils
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_viewer.html">
+    newton.viewer
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../faq.html">
+    FAQ
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../migration.html">
+    Migration Guide
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../integrations/index.html">
+    Integrations
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-external" href="https://github.com/newton-physics/newton">
+     GitHub
+  </a>
+</li>
+
+  </ul>
+</nav></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+          <div class="navbar-item">
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../guide/overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/visualization.html">Visualization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/tutorials.html">Tutorials</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/development.html">Development</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="worlds.html">Worlds</a></li>
+<li class="toctree-l1"><a class="reference internal" href="articulations.html">Articulations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="mass_inertia.html">Mass and Inertia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sites.html">Sites</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sensors.html">Sensors</a></li>
+<li class="toctree-l1"><a class="reference internal" href="conventions.html">Conventions</a></li>
+<li class="toctree-l1"><a class="reference internal" href="usd_parsing.html">USD Parsing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="custom_attributes.html">Custom Attributes</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="extended_attributes.html">Extended Attributes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="collisions.html">Collisions and Contacts</a></li>
+<li class="toctree-l1"><a class="reference internal" href="feather_pgs.html">FeatherPGS</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">FeatherPGS Dense vs Matrix-Free</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../api/newton.html">newton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_geometry.html">newton.geometry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_ik.html">newton.ik</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_math.html">newton.math</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_selection.html">newton.selection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_sensors.html">newton.sensors</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_solvers.html">newton.solvers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_usd.html">newton.usd</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_utils.html">newton.utils</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_viewer.html">newton.viewer</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Further Reading</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../faq.html">FAQ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../migration.html">Migration Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../integrations/index.html">Integrations</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Project Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/newton-physics/newton"> GitHub</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">FeatherPGS: Dense vs Matrix-Free</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <!-- SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+<section class="tex2jax_ignore mathjax_ignore" id="featherpgs-dense-vs-matrix-free">
+<h1>FeatherPGS: Dense vs Matrix-Free<a class="headerlink" href="#featherpgs-dense-vs-matrix-free" title="Link to this heading">#</a></h1>
+<p>This page is the data-heavy companion to <a class="reference internal" href="feather_pgs.html"><span class="std std-doc">FeatherPGS</span></a>. The overview page covers the formulation and mode taxonomy; this page focuses on what the current dense and matrix-free implementations actually materialize, stream, and update in the main PGS kernels.</p>
+<section id="comparison-setup">
+<h2>Comparison Setup<a class="headerlink" href="#comparison-setup" title="Link to this heading">#</a></h2>
+<p>The two paths share the same articulated dynamics front-end:</p>
+<div class="math notranslate nohighlight">
+\[
+\tilde{H} = H + \Delta t K_d + \Delta t^2 K_p,
+\qquad
+\hat{v} = \tilde{H}^{-1} b,
+\qquad
+Y = \tilde{H}^{-1} J^T.
+\]</div>
+<p>The main difference is how the contact coupling is presented to the Gauss-Seidel sweep.</p>
+<p>Dense path:</p>
+<div class="math notranslate nohighlight">
+\[
+C = JY = J \tilde{H}^{-1} J^T,
+\qquad
+w_i = rhs_i + \sum_j C_{ij}\lambda_j.
+\]</div>
+<p>Matrix-free articulated path:</p>
+<div class="math notranslate nohighlight">
+\[
+w_i = rhs_i + J_i v,
+\qquad
+v \leftarrow v + Y_i \Delta \lambda_i.
+\]</div>
+<p>The matrix-free path still depends on the same articulated operator. It does not remove <code class="docutils literal notranslate"><span class="pre">J</span></code> or <code class="docutils literal notranslate"><span class="pre">Y</span></code>; it removes the explicit dense Delassus matrix <code class="docutils literal notranslate"><span class="pre">C</span></code> and reconstructs off-diagonal coupling from the live velocity vector.</p>
+<p>For free-rigid contacts, the matrix-free path uses a second branch with spatial Jacobians and per-row effective masses:</p>
+<div class="math notranslate nohighlight">
+\[
+w_i = mf\_rhs_i + J_i v,
+\qquad
+v \leftarrow v + MiJt_i \Delta \lambda_i.
+\]</div>
+</section>
+<section id="logical-work-per-path">
+<h2>Logical Work Per Path<a class="headerlink" href="#logical-work-per-path" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Path</p></th>
+<th class="head"><p>Materialized arrays</p></th>
+<th class="head"><p>Per-row update</p></th>
+<th class="head"><p>Main implication</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Dense <code class="docutils literal notranslate"><span class="pre">fpgs_dense_row</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">J</span></code>, <code class="docutils literal notranslate"><span class="pre">Y</span></code>, dense <code class="docutils literal notranslate"><span class="pre">C</span></code>, <code class="docutils literal notranslate"><span class="pre">rhs</span></code>, <code class="docutils literal notranslate"><span class="pre">diag</span></code>, <code class="docutils literal notranslate"><span class="pre">impulses</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">w_i</span> <span class="pre">=</span> <span class="pre">rhs_i</span> <span class="pre">+</span> <span class="pre">\sum_j</span> <span class="pre">C_{ij}\lambda_j</span></code></p></td>
+<td><p>Pays the up-front <code class="docutils literal notranslate"><span class="pre">C</span></code> build and storage cost, then reuses staged tiles of <code class="docutils literal notranslate"><span class="pre">C</span></code> inside the sweep.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Matrix-free articulated phase</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">J_world</span></code>, <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>, <code class="docutils literal notranslate"><span class="pre">diag</span></code>, <code class="docutils literal notranslate"><span class="pre">rhs</span></code>, <code class="docutils literal notranslate"><span class="pre">impulses</span></code>, live <code class="docutils literal notranslate"><span class="pre">v_out</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">w_i</span> <span class="pre">=</span> <span class="pre">rhs_i</span> <span class="pre">+</span> <span class="pre">J_i</span> <span class="pre">v</span></code>; then <code class="docutils literal notranslate"><span class="pre">v</span> <span class="pre">+=</span> <span class="pre">Y_i</span> <span class="pre">\Delta\lambda_i</span></code></p></td>
+<td><p>Avoids storing dense <code class="docutils literal notranslate"><span class="pre">C</span></code>, but still stores world-indexed Jacobian and <code class="docutils literal notranslate"><span class="pre">H^{-1}J^T</span></code> rows.</p></td>
+</tr>
+<tr class="row-even"><td><p>Matrix-free free-rigid phase</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mf_J_*</span></code>, <code class="docutils literal notranslate"><span class="pre">mf_MiJt_*</span></code>, <code class="docutils literal notranslate"><span class="pre">mf_meta_packed</span></code>, <code class="docutils literal notranslate"><span class="pre">mf_impulses</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">w_i</span> <span class="pre">=</span> <span class="pre">mf_rhs_i</span> <span class="pre">+</span> <span class="pre">J_i</span> <span class="pre">v</span></code>; then <code class="docutils literal notranslate"><span class="pre">v</span> <span class="pre">+=</span> <span class="pre">MiJt_i</span> <span class="pre">\Delta\lambda_i</span></code></p></td>
+<td><p>Keeps mixed free-rigid contacts out of the articulated dense system.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="scenario-backed-sizing">
+<h2>Scenario-Backed Sizing<a class="headerlink" href="#scenario-backed-sizing" title="Link to this heading">#</a></h2>
+<p>Two checked-in benchmark scenarios anchor the comparison:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">g1_flat</span></code>: a control case with one articulation on flat ground.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code>: a mixed world with articulated contacts plus many free-rigid tabletop contacts.</p></li>
+</ul>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Scenario</p></th>
+<th class="head"><p>Preset</p></th>
+<th class="head text-right"><p>World DOFs</p></th>
+<th class="head text-right"><p>Active dense rows</p></th>
+<th class="head text-right"><p>Active MF rows</p></th>
+<th class="head"><p>Key stored objects</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">g1_flat</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fpgs_dense_row</span></code></p></td>
+<td class="text-right"><p>49</p></td>
+<td class="text-right"><p>24</p></td>
+<td class="text-right"><p>0</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">C</span></code>: 4096 B; <code class="docutils literal notranslate"><span class="pre">rhs</span></code> + <code class="docutils literal notranslate"><span class="pre">diag</span></code> + <code class="docutils literal notranslate"><span class="pre">impulses</span></code>: 384 B</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">g1_flat</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fpgs_matrix_free</span></code></p></td>
+<td class="text-right"><p>49</p></td>
+<td class="text-right"><p>24</p></td>
+<td class="text-right"><p>0</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">J_world</span></code> + <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>: 50176 B; scalar row state: 1536 B</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fpgs_dense_row</span></code></p></td>
+<td class="text-right"><p>133</p></td>
+<td class="text-right"><p>117</p></td>
+<td class="text-right"><p>0</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">C</span></code>: 65536 B; <code class="docutils literal notranslate"><span class="pre">rhs</span></code> + <code class="docutils literal notranslate"><span class="pre">diag</span></code> + <code class="docutils literal notranslate"><span class="pre">impulses</span></code>: 1536 B</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fpgs_matrix_free</span></code></p></td>
+<td class="text-right"><p>133</p></td>
+<td class="text-right"><p>30</p></td>
+<td class="text-right"><p>102</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">J_world</span></code> + <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>: 136192 B; free-rigid <code class="docutils literal notranslate"><span class="pre">mf_*</span></code>: 63488 B</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Three points matter in practice:</p>
+<ol class="arabic simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">g1_flat</span></code> is mostly a control. The matrix-free preset allocates its larger world-indexed buffers but gets no free-rigid row-routing benefit because the warm contact state has zero matrix-free rows.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> is the mixed-world case that explains the current result. Dense keeps all 117 active rows inside the explicit Delassus system, while matrix-free leaves only 30 articulated rows on that side and routes 102 rows through the free-rigid branch.</p></li>
+<li><p>Matrix-free is not “smaller everywhere.” In <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code>, <code class="docutils literal notranslate"><span class="pre">J_world</span> <span class="pre">+</span> <span class="pre">Y_world</span></code> is larger than dense <code class="docutils literal notranslate"><span class="pre">C</span></code>. The benefit comes from avoiding dense mixed-world coupling and from how the solve kernel uses that data, not from a universal byte-count reduction.</p></li>
+</ol>
+</section>
+<section id="what-the-kernels-actually-stage">
+<h2>What The Kernels Actually Stage<a class="headerlink" href="#what-the-kernels-actually-stage" title="Link to this heading">#</a></h2>
+<section id="dense-tiled-row-pgs">
+<h3>Dense tiled-row PGS<a class="headerlink" href="#dense-tiled-row-pgs" title="Link to this heading">#</a></h3>
+<p>The dense tiled-row kernel is a classic explicit-operator Gauss-Seidel sweep:</p>
+<ul class="simple">
+<li><p>global memory holds the full dense <code class="docutils literal notranslate"><span class="pre">C</span></code>, plus <code class="docutils literal notranslate"><span class="pre">rhs</span></code>, <code class="docutils literal notranslate"><span class="pre">diag</span></code>, impulse state, and row metadata;</p></li>
+<li><p>shared memory stages the packed lower triangle of <code class="docutils literal notranslate"><span class="pre">C</span></code> as <code class="docutils literal notranslate"><span class="pre">s_Ctri</span></code>, plus <code class="docutils literal notranslate"><span class="pre">s_lam</span></code>, <code class="docutils literal notranslate"><span class="pre">s_rhs</span></code>, <code class="docutils literal notranslate"><span class="pre">s_diag</span></code>, and row metadata;</p></li>
+<li><p>registers hold the lane-local dot-product accumulators and packed-triangle indices.</p></li>
+</ul>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Storage class</p></th>
+<th class="head"><p>Dominant payload</p></th>
+<th class="head"><p>Why it matters</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Global</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">C[world,</span> <span class="pre">M,</span> <span class="pre">M]</span></code>, <code class="docutils literal notranslate"><span class="pre">rhs</span></code>, <code class="docutils literal notranslate"><span class="pre">diag</span></code>, warm-start impulses</p></td>
+<td><p>The kernel still requires the full Delassus matrix to be built before the sweep begins.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Shared</p></td>
+<td><p>packed lower triangle of <code class="docutils literal notranslate"><span class="pre">C</span></code>, scalar row data, row metadata</p></td>
+<td><p>Shared memory removes repeated global reads of <code class="docutils literal notranslate"><span class="pre">C</span></code> during the sweep.</p></td>
+</tr>
+<tr class="row-even"><td><p>Registers</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">w_i</span></code>, <code class="docutils literal notranslate"><span class="pre">\Delta</span> <span class="pre">\lambda_i</span></code>, dot-product partial sums</p></td>
+<td><p>Each row still recomputes the full <code class="docutils literal notranslate"><span class="pre">\sum_j</span> <span class="pre">C_{ij}\lambda_j</span></code> from staged <code class="docutils literal notranslate"><span class="pre">C</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The important tradeoff is that shared memory helps only after the explicit Delassus matrix already exists.</p>
+</section>
+<section id="fused-articulated-plus-free-rigid-matrix-free-gs">
+<h3>Fused articulated plus free-rigid matrix-free GS<a class="headerlink" href="#fused-articulated-plus-free-rigid-matrix-free-gs" title="Link to this heading">#</a></h3>
+<p>The matrix-free kernel stages a different object: the live velocity vector.</p>
+<ul class="simple">
+<li><p>global memory streams <code class="docutils literal notranslate"><span class="pre">J_world</span></code> and <code class="docutils literal notranslate"><span class="pre">Y_world</span></code> for articulated rows, then <code class="docutils literal notranslate"><span class="pre">mf_J_*</span></code> and <code class="docutils literal notranslate"><span class="pre">mf_MiJt_*</span></code> for free-rigid rows;</p></li>
+<li><p>shared memory keeps <code class="docutils literal notranslate"><span class="pre">s_v</span></code>, the live world velocity vector, plus articulated and free-rigid impulse state;</p></li>
+<li><p>registers hold prefetched <code class="docutils literal notranslate"><span class="pre">J</span></code>/<code class="docutils literal notranslate"><span class="pre">Y</span></code> lane slices, row residuals, and decoded packed metadata.</p></li>
+</ul>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Storage class</p></th>
+<th class="head"><p>Dominant payload</p></th>
+<th class="head"><p>Why it matters</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Global</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">J_world</span></code>, <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>, <code class="docutils literal notranslate"><span class="pre">mf_J_*</span></code>, <code class="docutils literal notranslate"><span class="pre">mf_MiJt_*</span></code>, row scalars</p></td>
+<td><p>The kernel streams row data instead of reading a preassembled dense <code class="docutils literal notranslate"><span class="pre">C</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Shared</p></td>
+<td><p>live <code class="docutils literal notranslate"><span class="pre">v_out</span></code> slice, dense row scalars, <code class="docutils literal notranslate"><span class="pre">mf</span></code> impulse state</p></td>
+<td><p>One shared velocity vector couples the articulated and free-rigid phases.</p></td>
+</tr>
+<tr class="row-even"><td><p>Registers</p></td>
+<td><p>prefetched <code class="docutils literal notranslate"><span class="pre">J</span></code>/<code class="docutils literal notranslate"><span class="pre">Y</span></code> fragments, <code class="docutils literal notranslate"><span class="pre">J_i</span> <span class="pre">v</span></code>, <code class="docutils literal notranslate"><span class="pre">\Delta</span> <span class="pre">\lambda_i</span></code></p></td>
+<td><p>Off-diagonal couplings are reconstructed on the fly.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>This is the main reason the matrix-free path can perform well without dedicating shared memory to a Delassus tile: shared memory is spent on the velocity state, while coupling is recovered through <code class="docutils literal notranslate"><span class="pre">J_i</span> <span class="pre">v</span></code> and <code class="docutils literal notranslate"><span class="pre">Y_i</span> <span class="pre">\Delta</span> <span class="pre">\lambda_i</span></code>.</p>
+</section>
+</section>
+<section id="why-h1-tabletop-favors-matrix-free">
+<h2>Why <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> Favors Matrix-Free<a class="headerlink" href="#why-h1-tabletop-favors-matrix-free" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> is the clearest current example because it exercises both phases of the matrix-free kernel:</p>
+<ul class="simple">
+<li><p>the dense preset keeps all 117 active rows in one explicit world-level Delassus system;</p></li>
+<li><p>the matrix-free preset keeps only 30 articulated rows in the articulated phase;</p></li>
+<li><p>102 rows move to the free-rigid path, which never enters the dense articulated <code class="docutils literal notranslate"><span class="pre">C</span></code> build.</p></li>
+</ul>
+<p>That shift changes more than storage:</p>
+<ul class="simple">
+<li><p>dense pays for <code class="docutils literal notranslate"><span class="pre">J</span></code>, <code class="docutils literal notranslate"><span class="pre">Y</span></code>, and <code class="docutils literal notranslate"><span class="pre">C</span></code>, then performs row updates against staged <code class="docutils literal notranslate"><span class="pre">C</span></code>;</p></li>
+<li><p>matrix-free pays for <code class="docutils literal notranslate"><span class="pre">J_world</span></code> and <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>, but updates the live velocity vector directly and lets the free-rigid rows stay out of the articulated dense system;</p></li>
+<li><p>the kernel no longer needs a shared-memory copy of a dense mixed-world operator.</p></li>
+</ul>
+<p>So the current observation is not “matrix-free wins because it uses less memory” and not “matrix-free wins because shared memory disappears.” The better explanation is narrower: the current matrix-free implementation avoids materializing dense mixed-world coupling and spends its hot working set on <code class="docutils literal notranslate"><span class="pre">v</span></code>, scalar row state, and streamed Jacobian data instead.</p>
+</section>
+<section id="control-case-g1-flat">
+<h2>Control Case: <code class="docutils literal notranslate"><span class="pre">g1_flat</span></code><a class="headerlink" href="#control-case-g1-flat" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">g1_flat</span></code> matters because it prevents over-claiming:</p>
+<ul class="simple">
+<li><p>both presets warm to the same 24 dense rows and 49 world DOFs;</p></li>
+<li><p>the matrix-free preset has no free-rigid rows to route away from the articulated phase;</p></li>
+<li><p>it still allocates <code class="docutils literal notranslate"><span class="pre">J_world</span></code> and <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>, so this case is mostly a sanity check for equivalence rather than the scenario that motivates the matrix-free path.</p></li>
+</ul>
+<p>This is why the explainer uses <code class="docutils literal notranslate"><span class="pre">g1_flat</span></code> as a control and <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> as the realistic mixed-world sizing example.</p>
+</section>
+<section id="open-questions">
+<h2>Open Questions<a class="headerlink" href="#open-questions" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>The current evidence explains why the fused matrix-free kernel is competitive against the dense tiled-row kernel, but it does not yet fully quantify where the dense streaming variant closes or fails to close the gap.</p></li>
+<li><p>The current checked-in scenarios are single-world captures. A later scaling pass may still be useful to show how the same storage choices behave as <code class="docutils literal notranslate"><span class="pre">num_worlds</span></code> grows.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">g1_flat</span></code> shows that matrix-free can carry extra world-indexed storage without a routing benefit. The remaining performance question is exactly when the free-rigid row split is large enough to dominate those extra buffers.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#comparison-setup">Comparison Setup</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#logical-work-per-path">Logical Work Per Path</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#scenario-backed-sizing">Scenario-Backed Sizing</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-the-kernels-actually-stage">What The Kernels Actually Stage</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-tiled-row-pgs">Dense tiled-row PGS</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fused-articulated-plus-free-rigid-matrix-free-gs">Fused articulated plus free-rigid matrix-free GS</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#why-h1-tabletop-favors-matrix-free">Why <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> Favors Matrix-Free</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#control-case-g1-flat">Control Case: <code class="docutils literal notranslate"><span class="pre">g1_flat</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#open-questions">Open Questions</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+
+  <p class="copyright">
+    
+      © Copyright 2026, The Newton Developers. Documentation licensed under CC-BY-4.0.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+    <div class="footer-items__end">
+      
+        <div class="footer-item">
+<p class="theme-version">
+  <!-- # L10n: Setting the PST URL as an argument as this does not need to be localized -->
+  Built with the <a href="https://pydata-sphinx-theme.readthedocs.io/en/stable/index.html">PyData Sphinx Theme</a> 0.16.1.
+</p></div>
+      
+    </div>
+  
+</div>
+
+  </footer>
+  </body>
+</html>
