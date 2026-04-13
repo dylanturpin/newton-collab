@@ -863,7 +863,7 @@
 \[
 \tilde{H} = H + \Delta t K_d + \Delta t^2 K_p,
 \qquad
-\hat{v} = \tilde{H}^{-1} b,
+\hat{\dot{q}} = \tilde{H}^{-1} b,
 \qquad
 Y = \tilde{H}^{-1} J^T.
 \]</div>
@@ -873,22 +873,22 @@ Y = \tilde{H}^{-1} J^T.
 \[
 C = JY = J \tilde{H}^{-1} J^T,
 \qquad
-w_i = rhs_i + \sum_j C_{ij}\lambda_j.
+w_i = r_i + \sum_j C_{ij} p_j.
 \]</div>
 <p>Matrix-free articulated path:</p>
 <div class="math notranslate nohighlight">
 \[
-w_i = rhs_i + J_i v,
+w_i = \mathrm{bias}_i + J_i \dot{q},
 \qquad
-v \leftarrow v + Y_i \Delta \lambda_i.
+\dot{q} \leftarrow \dot{q} + Y_i \Delta p_i.
 \]</div>
-<p>The matrix-free path still depends on the same articulated operator. It does not remove <code class="docutils literal notranslate"><span class="pre">J</span></code> or <code class="docutils literal notranslate"><span class="pre">Y</span></code>; it removes the explicit dense Delassus matrix <code class="docutils literal notranslate"><span class="pre">C</span></code> and reconstructs off-diagonal coupling from the live velocity vector.</p>
+<p>The matrix-free path still depends on the same articulated operator. It does not remove <code class="docutils literal notranslate"><span class="pre">J</span></code> or <code class="docutils literal notranslate"><span class="pre">Y</span></code>; it removes the explicit dense Delassus matrix <code class="docutils literal notranslate"><span class="pre">C</span></code> and reconstructs off-diagonal coupling from the live corrected velocity vector (<code class="docutils literal notranslate"><span class="pre">v_out</span></code> in code).</p>
 <p>For free-rigid contacts, the matrix-free path uses a second branch with spatial Jacobians and per-row effective masses:</p>
 <div class="math notranslate nohighlight">
 \[
 w_i = mf\_rhs_i + J_i v,
 \qquad
-v \leftarrow v + MiJt_i \Delta \lambda_i.
+v \leftarrow v + MiJt_i \Delta p_i.
 \]</div>
 </section>
 <section id="logical-work-per-path">
@@ -933,48 +933,64 @@ v \leftarrow v + MiJt_i \Delta \lambda_i.
 <tr class="row-odd"><th class="head"><p>Scenario</p></th>
 <th class="head"><p>Preset</p></th>
 <th class="head text-right"><p>World DOFs</p></th>
-<th class="head text-right"><p>Active dense rows</p></th>
-<th class="head text-right"><p>Active MF rows</p></th>
-<th class="head"><p>Key stored objects</p></th>
+<th class="head text-right"><p>Warm contacts</p></th>
+<th class="head text-right"><p>Articulated rows</p></th>
+<th class="head text-right"><p>Free-rigid MF rows</p></th>
+<th class="head"><p>Articulated storage</p></th>
+<th class="head"><p>Free-rigid storage</p></th>
+<th class="head"><p>Row-state scalars</p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">g1_flat</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fpgs_dense_row</span></code></p></td>
 <td class="text-right"><p>49</p></td>
+<td class="text-right"><p>8</p></td>
 <td class="text-right"><p>24</p></td>
 <td class="text-right"><p>0</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">C</span></code>: 4096 B; <code class="docutils literal notranslate"><span class="pre">rhs</span></code> + <code class="docutils literal notranslate"><span class="pre">diag</span></code> + <code class="docutils literal notranslate"><span class="pre">impulses</span></code>: 384 B</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">C</span></code>: 4.0 KiB</p></td>
+<td><p>none</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rhs</span></code> + <code class="docutils literal notranslate"><span class="pre">diag</span></code> + <code class="docutils literal notranslate"><span class="pre">impulses</span></code>: 0.4 KiB</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">g1_flat</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fpgs_matrix_free</span></code></p></td>
 <td class="text-right"><p>49</p></td>
+<td class="text-right"><p>8</p></td>
 <td class="text-right"><p>24</p></td>
 <td class="text-right"><p>0</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">J_world</span></code> + <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>: 50176 B; scalar row state: 1536 B</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">J_world</span></code> + <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>: 49.0 KiB</p></td>
+<td><p>none</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rhs</span></code> + <code class="docutils literal notranslate"><span class="pre">diag</span></code> + <code class="docutils literal notranslate"><span class="pre">impulses</span></code>: 1.5 KiB</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fpgs_dense_row</span></code></p></td>
 <td class="text-right"><p>133</p></td>
+<td class="text-right"><p>229</p></td>
 <td class="text-right"><p>117</p></td>
 <td class="text-right"><p>0</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">C</span></code>: 65536 B; <code class="docutils literal notranslate"><span class="pre">rhs</span></code> + <code class="docutils literal notranslate"><span class="pre">diag</span></code> + <code class="docutils literal notranslate"><span class="pre">impulses</span></code>: 1536 B</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">C</span></code>: 64.0 KiB</p></td>
+<td><p>none</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rhs</span></code> + <code class="docutils literal notranslate"><span class="pre">diag</span></code> + <code class="docutils literal notranslate"><span class="pre">impulses</span></code>: 1.5 KiB</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fpgs_matrix_free</span></code></p></td>
 <td class="text-right"><p>133</p></td>
+<td class="text-right"><p>235</p></td>
 <td class="text-right"><p>30</p></td>
 <td class="text-right"><p>102</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">J_world</span></code> + <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>: 136192 B; free-rigid <code class="docutils literal notranslate"><span class="pre">mf_*</span></code>: 63488 B</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">J_world</span></code> + <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>: 133.0 KiB</p></td>
+<td><p>free-rigid <code class="docutils literal notranslate"><span class="pre">mf_*</span></code>: 62.0 KiB</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">rhs</span></code> + <code class="docutils literal notranslate"><span class="pre">diag</span></code> + <code class="docutils literal notranslate"><span class="pre">impulses</span></code>: 1.5 KiB</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<p>Here “articulated rows” means the rows that stay on the articulation-side solve (<code class="docutils literal notranslate"><span class="pre">C</span></code> in dense mode, <code class="docutils literal notranslate"><span class="pre">J_world</span></code>/<code class="docutils literal notranslate"><span class="pre">Y_world</span></code> in articulated matrix-free mode). “Free-rigid MF rows” means contacts routed into the specialized free-rigid matrix-free branch. The <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> totals do not add up the same across presets because these captures came from separate warmed states: the checked-in dense snapshot has 229 warm contacts, while the matrix-free snapshot has 235. Routing is part of the difference, but warm-state contact count also changed between captures.</p>
 <p>Three points matter in practice:</p>
 <ol class="arabic simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">g1_flat</span></code> is mostly a control. The matrix-free preset allocates its larger world-indexed buffers but gets no free-rigid row-routing benefit because the warm contact state has zero matrix-free rows.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> is the mixed-world case that explains the current result. Dense keeps all 117 active rows inside the explicit Delassus system, while matrix-free leaves only 30 articulated rows on that side and routes 102 rows through the free-rigid branch.</p></li>
-<li><p>Matrix-free is not “smaller everywhere.” In <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code>, <code class="docutils literal notranslate"><span class="pre">J_world</span> <span class="pre">+</span> <span class="pre">Y_world</span></code> is larger than dense <code class="docutils literal notranslate"><span class="pre">C</span></code>. The benefit comes from avoiding dense mixed-world coupling and from how the solve kernel uses that data, not from a universal byte-count reduction.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> is the mixed-world case that explains the current result. Dense keeps all 117 articulated rows inside the explicit Delassus system, while matrix-free leaves only 30 articulated rows on that side and routes 102 rows through the free-rigid branch.</p></li>
+<li><p>Matrix-free is not “smaller everywhere.” In <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code>, <code class="docutils literal notranslate"><span class="pre">J_world</span> <span class="pre">+</span> <span class="pre">Y_world</span></code> alone is larger than dense <code class="docutils literal notranslate"><span class="pre">C</span></code>. The benefit comes from avoiding dense mixed-world coupling and from how the solve kernel uses that data, not from a universal byte-count reduction.</p></li>
 </ol>
 </section>
 <section id="what-the-kernels-actually-stage">
@@ -1043,7 +1059,7 @@ v \leftarrow v + MiJt_i \Delta \lambda_i.
 </tbody>
 </table>
 </div>
-<p>This is the main reason the matrix-free path can perform well without dedicating shared memory to a Delassus tile: shared memory is spent on the velocity state, while coupling is recovered through <code class="docutils literal notranslate"><span class="pre">J_i</span> <span class="pre">v</span></code> and <code class="docutils literal notranslate"><span class="pre">Y_i</span> <span class="pre">\Delta</span> <span class="pre">\lambda_i</span></code>.</p>
+<p>This is the main reason the matrix-free path can perform well without dedicating shared memory to a Delassus tile: shared memory is spent on the velocity state, while coupling is recovered through <code class="docutils literal notranslate"><span class="pre">J_i</span> <span class="pre">v</span></code> and <code class="docutils literal notranslate"><span class="pre">Y_i</span> <span class="pre">\Delta</span> <span class="pre">p_i</span></code>.</p>
 </section>
 </section>
 <section id="why-h1-tabletop-favors-matrix-free">
@@ -1071,6 +1087,40 @@ v \leftarrow v + MiJt_i \Delta \lambda_i.
 <li><p>it still allocates <code class="docutils literal notranslate"><span class="pre">J_world</span></code> and <code class="docutils literal notranslate"><span class="pre">Y_world</span></code>, so this case is mostly a sanity check for equivalence rather than the scenario that motivates the matrix-free path.</p></li>
 </ul>
 <p>This is why the explainer uses <code class="docutils literal notranslate"><span class="pre">g1_flat</span></code> as a control and <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> as the realistic mixed-world sizing example.</p>
+</section>
+<section id="why-this-is-not-only-a-rigid-mf-story">
+<h2>Why This Is Not Only A “Rigid MF” Story<a class="headerlink" href="#why-this-is-not-only-a-rigid-mf-story" title="Link to this heading">#</a></h2>
+<p>The immediate objection to the <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> table is fair: most of the visible row-count change comes from the 102 free-rigid rows that leave the articulated solve, so maybe the result says only “the rigid matrix-free branch helps” rather than “the dense articulated solve is the wrong long-term center.”</p>
+<p>The current codebase already contains the most relevant counterexample: <code class="docutils literal notranslate"><span class="pre">split</span></code>. That path keeps the articulated rows on the dense Delassus side and sends only free-rigid rows through matrix-free. So if the whole story were “just route rigid contacts away,” <code class="docutils literal notranslate"><span class="pre">split</span></code> would already match the fused <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> path.</p>
+<p>The current implementation does not let it do that cheaply. In <code class="docutils literal notranslate"><span class="pre">split</span></code> mode, each PGS iteration interleaves:</p>
+<ul class="simple">
+<li><p>a dense articulated solve kernel (<code class="docutils literal notranslate"><span class="pre">pgs_solve_tiled_contact_*</span></code>);</p></li>
+<li><p>dense impulse application back into world velocity (<code class="docutils literal notranslate"><span class="pre">apply_impulses_world_*</span></code>);</p></li>
+<li><p>a right-hand-side refresh (<code class="docutils literal notranslate"><span class="pre">rhs_accum_world_*</span></code>);</p></li>
+<li><p>a separate free-rigid matrix-free solve (<code class="docutils literal notranslate"><span class="pre">pgs_solve_mf_*</span></code>);</p></li>
+<li><p>another correction accumulation step before the next dense iteration.</p></li>
+</ul>
+<p>That means <code class="docutils literal notranslate"><span class="pre">split</span></code> still reloads the dense articulated working set every iteration while also paying for a separate free-rigid kernel launch sequence.</p>
+<p>The fetched <code class="docutils literal notranslate"><span class="pre">origin/gh-pages</span></code> profiler artifacts show this directly for <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> on the RTX 5090 run <code class="docutils literal notranslate"><span class="pre">nightly/runs/full-3gpu-20260309f</span></code>:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">split</span></code> trace <code class="docutils literal notranslate"><span class="pre">.../h1_tabletop_ablation_5090__0007--h1-tabletop--split--s8--n8192.trace.json</span></code> spends about 7.33 s of measured kernel time in solver-related kernels.</p></li>
+<li><p>Within that window, <code class="docutils literal notranslate"><span class="pre">split</span></code> spends about 2.41 s in <code class="docutils literal notranslate"><span class="pre">pgs_solve_mf_*</span></code>, 0.89 s in the dense <code class="docutils literal notranslate"><span class="pre">pgs_solve_tiled_contact_*</span></code>, 1.34 s in repeated <code class="docutils literal notranslate"><span class="pre">rhs_accum_world_*</span></code>, and 0.42 s in repeated <code class="docutils literal notranslate"><span class="pre">apply_impulses_world_*</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">matrix_free</span></code> trace <code class="docutils literal notranslate"><span class="pre">.../h1_tabletop_ablation_5090__0008--h1-tabletop--matrix-free--s8--n8192.trace.json</span></code> spends about 3.46 s in solver-related kernels over the same measured window.</p></li>
+<li><p>In that fused path, the dominant solve kernel is <code class="docutils literal notranslate"><span class="pre">pgs_solve_mf_gs_*</span></code> at about 1.27 s total, and the repeated <code class="docutils literal notranslate"><span class="pre">rhs_accum_world_*</span></code> / <code class="docutils literal notranslate"><span class="pre">apply_impulses_world_*</span></code> pair from <code class="docutils literal notranslate"><span class="pre">split</span></code> disappears from the hot loop.</p></li>
+</ul>
+<p>So the evidence is narrower than “articulated matrix-free alone already wins,” but stronger than “only rigid routing matters.” The current fused path wins because it combines the articulated velocity-path update with the free-rigid matrix-free branch inside one solve kernel family, instead of alternating dense and matrix-free launches around a refreshed articulated right-hand side.</p>
+<p>This also explains why <code class="docutils literal notranslate"><span class="pre">split</span></code> remains a useful diagnostic path but not a convincing end state. It isolates the free-rigid routing idea, but it does not isolate it under the same kernel structure as <code class="docutils literal notranslate"><span class="pre">matrix_free</span></code>.</p>
+</section>
+<section id="fused-kernel-follow-up">
+<h2>Fused-Kernel Follow-Up<a class="headerlink" href="#fused-kernel-follow-up" title="Link to this heading">#</a></h2>
+<p>The remaining open question is whether a denser fused hybrid could recover the best of both worlds:</p>
+<ul class="simple">
+<li><p>keep explicit dense Delassus coupling for articulated rows;</p></li>
+<li><p>keep free-rigid rows on the matrix-free branch;</p></li>
+<li><p>fuse the two phases tightly enough that the relaunch and right-hand-side refresh costs seen in <code class="docutils literal notranslate"><span class="pre">split</span></code> disappear.</p></li>
+</ul>
+<p>That is plausible in principle, but the occupancy tradeoff is real. The dense tiled-row kernel wants shared memory for the packed <code class="docutils literal notranslate"><span class="pre">C</span></code> tile, while the current fused matrix-free kernel benefits from spending shared memory on the live velocity vector and running at high occupancy. Combining both could reduce residency enough to erase the benefit.</p>
+<p>The current checked-in profiler artifacts do not answer that occupancy question. They show timing and launch structure, not achieved occupancy. There is also an anecdotal observation from prior local experiments that artificially lowering matrix-free occupancy with an unused shared-memory allocation did not change throughput, but that result is not checked in and should not be treated as established evidence. The right next experiment is a profiler-backed retry of a fused dense+matrix-free kernel with explicit occupancy measurements.</p>
 </section>
 <section id="code-path-ablation-recommendation">
 <h2>Code-Path Ablation Recommendation<a class="headerlink" href="#code-path-ablation-recommendation" title="Link to this heading">#</a></h2>
@@ -1172,6 +1222,8 @@ v \leftarrow v + MiJt_i \Delta \lambda_i.
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#why-h1-tabletop-favors-matrix-free">Why <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code> Favors Matrix-Free</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#control-case-g1-flat">Control Case: <code class="docutils literal notranslate"><span class="pre">g1_flat</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#why-this-is-not-only-a-rigid-mf-story">Why This Is Not Only A “Rigid MF” Story</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#fused-kernel-follow-up">Fused-Kernel Follow-Up</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#code-path-ablation-recommendation">Code-Path Ablation Recommendation</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#open-questions">Open Questions</a></li>
 </ul>

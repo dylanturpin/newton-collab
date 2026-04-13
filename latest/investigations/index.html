@@ -864,11 +864,6 @@
 <p>Branch: <code class="docutils literal notranslate"><span class="pre">dt/velocity-spike-claude</span></code></p>
 <p>The current spike study says the dominant spike class is unconstrained <code class="docutils literal notranslate"><span class="pre">v_hat</span></code>, not a PGS convergence failure. On the reproduced traces, PGS converges in 8 iterations; the recommended mitigation is post-solve velocity clamping plus compliance-oriented follow-up work rather than a dense-vs-matrix-free path change.</p>
 </section>
-<section id="tgs-feasibility-study">
-<h3>TGS feasibility study<a class="headerlink" href="#tgs-feasibility-study" title="Link to this heading">#</a></h3>
-<p>Branch: <code class="docutils literal notranslate"><span class="pre">dt/tgs-feather-pgs-study</span></code></p>
-<p>The current TGS study reports equivalent physics at roughly 2x cost for the tested setup, with the velocity guard remaining the dominant training blocker. That keeps TGS in the “useful reference, not current winner” category while the results are still being finalized.</p>
-</section>
 <section id="private-api-matrix-free-cleanup">
 <h3>Private API matrix-free cleanup<a class="headerlink" href="#private-api-matrix-free-cleanup" title="Link to this heading">#</a></h3>
 <p>Branch: <code class="docutils literal notranslate"><span class="pre">dturpin/fpgs-private-api-matrix-free</span></code></p>
@@ -877,6 +872,11 @@
 <section id="warp-kernel-migration-zach-corse">
 <h3>Warp kernel migration (Zach Corse)<a class="headerlink" href="#warp-kernel-migration-zach-corse" title="Link to this heading">#</a></h3>
 <p>Zach converted the FeatherPGS kernels from raw CUDA strings to Warp, which is significantly easier to maintain, understand, and debug. The initial conversion showed a ~40% throughput reduction on <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code>, but after targeted Warp-side optimizations that gap has narrowed to ~9% — likely an acceptable tradeoff for the maintainability and debuggability gains. Release timing for this depends on landing the required Warp PRs upstream, and needs to be coordinated with the private FeatherPGS API changes in Newton.</p>
+</section>
+<section id="in-flight-tgs-feasibility-study">
+<h3>[In-flight] TGS feasibility study<a class="headerlink" href="#in-flight-tgs-feasibility-study" title="Link to this heading">#</a></h3>
+<p>Branch: <code class="docutils literal notranslate"><span class="pre">dt/tgs-feather-pgs-study</span></code></p>
+<p>Just kicked off. The TGS-style smaller-step path (doubled FeatherPGS solves per action at <code class="docutils literal notranslate"><span class="pre">sim.dt=0.0025</span></code>, <code class="docutils literal notranslate"><span class="pre">decimation=8</span></code>) shows equivalent physics at roughly 2× wall-clock cost. Early training comparisons suggest the velocity guard is the dominant training blocker — removing it allows learning to start — but the absolute reward numbers are low and need validation against a proper baseline. Assumptions and setup still need human verification before drawing conclusions.</p>
 </section>
 </section>
 </section>
@@ -907,9 +907,9 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">2026-04-13</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-vs-matrix-free-featherpgs-explainer"><span class="xref myst">Dense vs matrix-free FeatherPGS explainer</span></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#velocity-spike-root-cause-analysis">Velocity spike root-cause analysis</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tgs-feasibility-study">TGS feasibility study</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#private-api-matrix-free-cleanup">Private API matrix-free cleanup</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#warp-kernel-migration-zach-corse">Warp kernel migration (Zach Corse)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#in-flight-tgs-feasibility-study">[In-flight] TGS feasibility study</a></li>
 </ul>
 </li>
 </ul>
