@@ -173,17 +173,40 @@ class SpikeCapture:
     ) -> str:
         """Serialize a spike snapshot to an .npz file.
 
-        The artifact contains everything needed for an offline replay:
+        The artifact contains everything needed for an offline replay,
+        including the full dense constraint problem that allows re-running
+        the PGS solve in pure numpy without Warp or GPU.
+
+        State arrays:
 
         - **pre_joint_q**: generalized positions before the step
         - **pre_joint_qd**: generalized velocities before the step
         - **post_joint_q**: generalized positions after integration
         - **post_joint_qd**: generalized velocities after integration
+
+        Solver intermediates:
+
         - **v_out**: the solved velocity from PGS (before integration, in DOF space)
         - **v_hat**: the velocity predictor (unconstrained predicted velocity)
-        - **impulses**: the dense PGS impulses
-        - **solver_params**: a dict of scalar solver parameters
-        - **meta**: step index, timestamp, max_abs_qd
+        - **impulses**: the dense PGS impulses, shape ``(world_count, max_constraints)``
+
+        Constraint problem (needed for faithful PGS replay):
+
+        - **world_C**: Delassus matrix, shape ``(world_count, max_constraints, max_constraints)``
+        - **world_diag**: regularized diagonal, shape ``(world_count, max_constraints)``
+        - **world_rhs**: right-hand side bias, shape ``(world_count, max_constraints)``
+        - **world_row_type**: constraint type per row (0=contact, 1=target, 2=friction, 3=limit)
+        - **world_row_parent**: parent row index for friction rows (-1 otherwise)
+        - **world_row_mu**: friction coefficient per row
+        - **constraint_count**: active constraint count per world
+        - **Y_world**: inverse-mass–weighted Jacobian transpose,
+          shape ``(world_count, max_constraints, max_world_dofs)``,
+          used to reconstruct ``v_out = v_hat + Y^T impulses``
+
+        Scalar parameters and metadata:
+
+        - **solver_params**: dt, pgs_iterations, pgs_beta, pgs_cfm, pgs_omega, etc.
+        - **meta**: step_index, timestamp, max_abs_qd, capture_index
         """
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -212,6 +235,42 @@ class SpikeCapture:
         # Constraint counts per world
         if hasattr(solver, "constraint_count") and solver.constraint_count is not None:
             data["constraint_count"] = solver.constraint_count.numpy()
+
+        # ------------------------------------------------------------------
+        # Constraint problem arrays (Stage 2: needed for faithful PGS replay)
+        # ------------------------------------------------------------------
+        # Delassus matrix C = J * H^{-1} * J^T, shape (world, max_c, max_c)
+        if hasattr(solver, "C") and solver.C is not None:
+            data["world_C"] = solver.C.numpy()
+
+        # Regularized diagonal of C (after CFM addition)
+        if hasattr(solver, "diag") and solver.diag is not None:
+            data["world_diag"] = solver.diag.numpy()
+
+        # Right-hand side bias vector
+        if hasattr(solver, "rhs") and solver.rhs is not None:
+            data["world_rhs"] = solver.rhs.numpy()
+
+        # Constraint metadata arrays
+        if hasattr(solver, "row_type") and solver.row_type is not None:
+            data["world_row_type"] = solver.row_type.numpy()
+        if hasattr(solver, "row_parent") and solver.row_parent is not None:
+            data["world_row_parent"] = solver.row_parent.numpy()
+        if hasattr(solver, "row_mu") and solver.row_mu is not None:
+            data["world_row_mu"] = solver.row_mu.numpy()
+
+        # Y_world = H^{-1} J^T, shape (world, max_constraints, max_world_dofs)
+        # Needed to reconstruct v_out = v_hat + Y^T * impulses
+        if hasattr(solver, "Y_world") and solver.Y_world is not None:
+            data["Y_world"] = solver.Y_world.numpy()
+
+        # Dense max constraints (scalar, needed to interpret shapes)
+        if hasattr(solver, "dense_max_constraints"):
+            data["dense_max_constraints"] = np.array([solver.dense_max_constraints], dtype=np.int32)
+
+        # World DOF start offsets (for multi-world indexing into v_hat/v_out)
+        if hasattr(solver, "world_dof_start") and solver.world_dof_start is not None:
+            data["world_dof_start"] = solver.world_dof_start.numpy()
 
         # Scalar solver parameters packed as a structured dict
         data["solver_params"] = np.array([
