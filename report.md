@@ -1,10 +1,10 @@
 # TGS Feasibility Study Notes
 
-This report is the main artifact for the `dt/tgs-feather-pgs-study` branch. It records what the current Isaac Lift configuration actually does, what PhysX TGS means in source terms, and the selectable smaller-step FeatherPGS path added in Stage 2.
+This report is the main artifact for the `dt/tgs-feather-pgs-study` branch. It records what the current Isaac Lift configuration actually does, what PhysX TGS means in source terms, the selectable smaller-step FeatherPGS path added in Stage 2, and the first completed Newton-only rollout comparison from Stage 3B.
 
 ## Scope of this pass
 
-This report now covers Stage 1, the Stage 2 implementation slice, and a Stage 3A bring-up pass that narrowed the current runtime blockers. The codebase now has a selectable smaller-step FeatherPGS path for Franka lift, but it still does not have completed rollout, training, or throughput comparisons.
+This report now covers Stage 1, the Stage 2 implementation slice, the Stage 3A bring-up pass that narrowed the runtime blockers, and a completed Stage 3B rollout comparison slice. The codebase now has a selectable smaller-step FeatherPGS path for Franka lift and a checked-in short-rollout harness, but it still does not have completed training or throughput comparisons.
 
 Repository baseline for this report:
 
@@ -293,10 +293,84 @@ The standalone throughput path is also not ready yet. Even timeout-bounded minim
 
 Both commands exited with status `124`, and `/tmp/tgs_bench_mujoco*` was not created afterward.
 
-## Current recommendation after Stage 3A
+## Stage 3B rollout comparison
 
-The next pass should stay narrow:
+Stage 3B is now implemented with a checked-in Newton-only harness at:
 
-- finish one completed Newton-only short rollout harness that prints per-step metrics for MJWarp, baseline FeatherPGS, and the TGS-style FeatherPGS path
-- only after that succeeds, start the longer Franka lift training runs
+- `skild-IL-solver/scripts/benchmarks/compare_franka_lift_newton_rollout.py`
+
+The script runs one short deterministic rollout case at a time and prints a JSON summary containing:
+
+- mean wall-clock time per environment step
+- peak absolute joint velocity and peak velocity-limit ratio
+- object height and object linear speed bounds
+- which termination terms fired and on which steps
+
+The Stage 3B command set was:
+
+    cd /workspace/skild-IL-solver
+    OMNI_KIT_ACCEPT_EULA=YES ./isaaclab.sh -p scripts/benchmarks/compare_franka_lift_newton_rollout.py --case mjwarp --num_envs 1 --steps 32 --headless --summary-json /tmp/franka_rollout_mjwarp.json
+    OMNI_KIT_ACCEPT_EULA=YES ./isaaclab.sh -p scripts/benchmarks/compare_franka_lift_newton_rollout.py --case feather_pgs --num_envs 1 --steps 32 --headless --summary-json /tmp/franka_rollout_feather_pgs.json
+    OMNI_KIT_ACCEPT_EULA=YES ./isaaclab.sh -p scripts/benchmarks/compare_franka_lift_newton_rollout.py --case feather_pgs_tgs --num_envs 1 --steps 32 --headless --summary-json /tmp/franka_rollout_feather_pgs_tgs.json
+
+Each run used:
+
+- seed `7`
+- `num_envs=1`
+- `steps=32`
+- action mode `seeded-random`
+- action scale `0.2`
+
+The resulting summaries were:
+
+    {
+      "case": "mjwarp",
+      "mean_step_sec": 2.9311,
+      "peak_joint_vel": 0.0,
+      "peak_joint_vel_ratio": 0.0,
+      "peak_object_speed": 0.0,
+      "terminated_steps": [0, 1, ..., 31],
+      "termination_counts": {"joint_vel_out_of_limit": 32, ...}
+    }
+
+    {
+      "case": "feather_pgs",
+      "mean_step_sec": 0.0803,
+      "peak_joint_vel": 1.9995,
+      "peak_joint_vel_ratio": 2.7522,
+      "peak_object_speed": 0.7848,
+      "terminated_steps": [],
+      "termination_counts": {"joint_vel_out_of_limit": 0, ...}
+    }
+
+    {
+      "case": "feather_pgs_tgs",
+      "mean_step_sec": 0.1480,
+      "peak_joint_vel": 1.9658,
+      "peak_joint_vel_ratio": 2.7272,
+      "peak_object_speed": 0.7848,
+      "terminated_steps": [],
+      "termination_counts": {"joint_vel_out_of_limit": 0, ...}
+    }
+
+The practical Stage 3B conclusions from those runs are:
+
+- The short deterministic seeded-random rollout does not show an obvious stability win for the smaller-step TGS-style path over baseline FeatherPGS. Their peak joint velocity, peak normalized velocity, object-speed envelope, reward total, and no-reset behavior are nearly identical over 32 environment steps.
+- The smaller-step path is slower than baseline FeatherPGS in this harness. Baseline FeatherPGS averaged `0.0803 s` per environment step, while the TGS-style path averaged `0.1480 s` per step, roughly `1.84x` slower.
+- The current MJWarp comparison path is not healthy in this workspace for Franka lift under the same seeded action trace. It terminated on every single step with `joint_vel_out_of_limit`, and it was also dramatically slower than either FeatherPGS path because solver initialization alone took about `39 s`.
+
+This is enough to answer the Stage 3B question at rollout level:
+
+- baseline FeatherPGS and the TGS-style smaller-step path both complete the same short Newton-only rollout without resets
+- the TGS-style path does not obviously reduce short-horizon velocity spikes relative to baseline FeatherPGS
+- the available MJWarp baseline path is currently a failure case rather than a stable reference in this workspace
+
+The MJWarp result needs one caution. The harness reads kinematic state after `env.step(...)`, and Isaac Lab auto-resets terminated environments inside `step()`. So the `peak_joint_vel=0.0` result for MJWarp should be interpreted as “the environment reset immediately on `joint_vel_out_of_limit` before a useful post-step state was observable,” not as proof that the offending pre-reset velocity was literally zero.
+
+## Current recommendation after Stage 3B
+
+The next pass should stay narrow and move to Stage 3C:
+
+- run short training comparisons for baseline FeatherPGS, TGS-style FeatherPGS, and the no-velocity-guard variant
+- use the Stage 3B rollout harness as the reproducible pre-flight check before each training run
 - treat PhysX baseline and standalone throughput as environment blockers until `omni.physics` and/or a completing benchmark path is available in this workspace
