@@ -4,7 +4,7 @@ This report is the main artifact for the `dt/tgs-feather-pgs-study` branch. It r
 
 ## Scope of this pass
 
-This report now covers Stage 1 and the Stage 2 implementation slice. The codebase now has a selectable smaller-step FeatherPGS path for Franka lift, but no rollout, training, or throughput evidence has been collected yet.
+This report now covers Stage 1, the Stage 2 implementation slice, and a Stage 3A bring-up pass that narrowed the current runtime blockers. The codebase now has a selectable smaller-step FeatherPGS path for Franka lift, but it still does not have completed rollout, training, or throughput comparisons.
 
 Repository baseline for this report:
 
@@ -242,3 +242,61 @@ Stage 1 validation remains the same. Stage 2 focused validation was:
     PY
     git -C /workspace/skild-IL-solver diff --check
     git -C /workspace/newton-collab diff --check
+
+## Stage 3A runtime bring-up findings
+
+This pass did not produce the requested MJWarp versus FeatherPGS versus TGS-style comparison plots yet. It did establish the current launch recipe and the concrete blockers that prevented a same-pass comparison run.
+
+The first blocker was non-interactive Kit bootstrap. Isaac Lab in this workspace prompts for the Omniverse EULA unless `OMNI_KIT_ACCEPT_EULA=YES` is exported. Without that variable, even a trivial inline Python launcher fails before simulation startup with:
+
+    Do you accept the EULA? (Yes/No): Unable to bootstrap inner kit kernel: EOF when reading a line
+
+The second blocker is the intended PhysX baseline. After setting `OMNI_KIT_ACCEPT_EULA=YES`, the default Franka lift task still cannot launch in this workspace when `sim.physics` remains PhysX-backed because the environment is missing `omni.physics`:
+
+    ValueError: Could not resolve the input string 'isaaclab_physx.physics.physx_manager:PhysxManager' into callable object.
+    Received the error:
+     No module named 'omni.physics'.
+
+That means the practical Stage 3 rollout harness in this workspace must compare Newton-only configurations: MJWarp via an explicit `NewtonCfg(solver_cfg=MJWarpSolverCfg(), num_substeps=1, ...)`, baseline FeatherPGS via `LiftPhysicsCfg().feather_pgs`, and the Stage 2 TGS-style task or equivalent `LiftPhysicsCfg().feather_pgs_tgs`.
+
+The Newton-only FeatherPGS bring-up got furthest with this command:
+
+    cd /workspace/skild-IL-solver
+    OMNI_KIT_ACCEPT_EULA=YES ./isaaclab.sh -p - <<'PY'
+    import gymnasium as gym
+    import torch
+    import isaaclab_tasks
+    from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
+    from isaaclab_tasks.manager_based.manipulation.lift.lift_env_cfg import LiftPhysicsCfg
+
+    cfg = load_cfg_from_registry('Isaac-Lift-Cube-Franka-v0', 'env_cfg_entry_point')
+    cfg.scene.num_envs = 1
+    cfg.observations.policy.enable_corruption = False
+    cfg.seed = 7
+    cfg.sim.physics = LiftPhysicsCfg().feather_pgs
+    env = gym.make('Isaac-Lift-Cube-Franka-v0', cfg=cfg)
+    obs, info = env.reset()
+    ...
+    PY
+
+That run progressed past config parsing and USD stage construction, then emitted rigid-body inertia warnings such as:
+
+    Warning: The rigid body at /World/envs/env_0/Object has a possibly invalid inertia tensor ...
+
+but it did not reach the first printed rollout metrics within the pass after more than 60 seconds of runtime. I therefore do not treat it as completed rollout evidence yet.
+
+The standalone throughput path is also not ready yet. Even timeout-bounded minimal benchmark runs failed to complete and produced no artifact directory:
+
+    cd /workspace/newton-collab
+    timeout 120 python3 newton/tools/solver_benchmark.py --benchmark --scenario g1_flat --solver mujoco --num-worlds 64 --warmup-frames 5 --measure-frames 10 --viewer null --out /tmp/tgs_bench_mujoco
+    timeout 30 python3 newton/tools/solver_benchmark.py --benchmark --scenario g1_flat --solver mujoco --num-worlds 1 --warmup-frames 1 --measure-frames 1 --viewer null --out /tmp/tgs_bench_mujoco_1
+
+Both commands exited with status `124`, and `/tmp/tgs_bench_mujoco*` was not created afterward.
+
+## Current recommendation after Stage 3A
+
+The next pass should stay narrow:
+
+- finish one completed Newton-only short rollout harness that prints per-step metrics for MJWarp, baseline FeatherPGS, and the TGS-style FeatherPGS path
+- only after that succeeds, start the longer Franka lift training runs
+- treat PhysX baseline and standalone throughput as environment blockers until `omni.physics` and/or a completing benchmark path is available in this workspace
