@@ -54,6 +54,13 @@ Newton Physics
    api/newton_viewer
 
 .. toctree::
+   :maxdepth: 1
+   :hidden:
+   :caption: Investigations
+
+   Velocity Spikes <investigations/velocity_spikes>
+
+.. toctree::
    :hidden:
    :caption: Further Reading
 
