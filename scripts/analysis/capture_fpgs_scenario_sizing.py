@@ -181,7 +181,8 @@ def solver_world_dofs(solver: object, model: object) -> int:
         world_ends[world] = max(world_ends[world], dof_end)
 
     counts = [
-        0 if world_starts[world] is None else world_ends[world] - int(world_starts[world]) for world in range(world_count)
+        0 if world_starts[world] is None else world_ends[world] - int(world_starts[world])
+        for world in range(world_count)
     ]
     return max(counts, default=0)
 

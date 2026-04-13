@@ -87,14 +87,14 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
-## Pass Update (2026-04-13, pass 5)
+## Pass Update (2026-04-13, pass 6)
 
-M5 is now the next reviewable milestone. This pass will:
+M6 is the active milestone for this pass. This pass will:
 
-- land the sibling concepts page chosen in M1
-- wire it into docs navigation and the FeatherPGS overview page
-- ground the draft in the checked-in `g1_flat` / `h1_tabletop` M3 artifacts and the dense-row / matrix-free M4 kernel artifacts
-- refresh the stale kernel-artifact provenance before stopping
+- run the required local docs build with the real `uv` toolchain
+- run `uvx pre-commit run -a` and keep any non-behavioral formatting fixes it applies
+- record exact validation evidence in this ExecPlan and the human handoff
+- stop with M7 and M8 still gated and untouched
 
 ## Milestones
 
@@ -275,7 +275,7 @@ Completed outputs (2026-04-13):
 
 ### M6. Validate Docs Build and Tighten Presentation
 
-Status: pending
+Status: complete
 
 Definition of done:
 
@@ -289,6 +289,25 @@ Expected outputs:
 
 - passing local docs build
 - lint / formatting evidence
+
+Completed outputs (2026-04-13):
+
+- ran the required local docs build successfully:
+  - `uv run --extra docs --extra sim sphinx-build -j auto -b html docs docs/_build/html`
+- ran `uvx pre-commit run -a`; the first pass reformatted two analysis helpers without changing behavior:
+  - `scripts/analysis/capture_fpgs_kernel_memory_artifacts.py`
+  - `scripts/analysis/capture_fpgs_scenario_sizing.py`
+- reran `uvx pre-commit run -a` successfully on the formatted tree
+- confirmed the explainer page builds into `docs/_build/html/concepts/feather_pgs_dense_vs_matrix_free.html`
+
+Validation evidence:
+
+- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs docs/_build/html`
+  - result: passed
+  - notable output: Sphinx reported existing multiple-toctree consistency notices for several generated `docs/api/newton_*.rst` pages, but the build succeeded and the new explainer page emitted cleanly
+- `uvx pre-commit run -a`
+  - first result: failed because `ruff` / `ruff format` rewrote two helper scripts
+  - second result: passed after accepting those formatting-only edits
 
 ### M7. Final Source-Branch Publication
 

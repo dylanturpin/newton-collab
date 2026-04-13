@@ -8,7 +8,6 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_ROOT = REPO_ROOT / ".agent" / "data" / "fpgs-matrix-free-dense-explainer"
 SCENARIO_ROOT = ARTIFACT_ROOT / "scenarios"
@@ -407,7 +406,7 @@ def matrix_free_artifact(commit: str, generated_at: str, metrics: dict[str, dict
             ),
             (
                 f"For h1_tabletop the articulated matrix-free storage is dominated by J_world + Y_world ({h1['buffer_bytes']['J_world'] + h1['buffer_bytes']['Y_world']} B), "
-                f"while the free-rigid branch adds {sum(h1['buffer_bytes'][name] for name in ('mf_J_a','mf_J_b','mf_MiJt_a','mf_MiJt_b','mf_rhs','mf_impulses','mf_eff_mass_inv','mf_meta_packed'))} B."
+                f"while the free-rigid branch adds {sum(h1['buffer_bytes'][name] for name in ('mf_J_a', 'mf_J_b', 'mf_MiJt_a', 'mf_MiJt_b', 'mf_rhs', 'mf_impulses', 'mf_eff_mass_inv', 'mf_meta_packed'))} B."
             ),
             "This kernel is the main explanation target for the surprising result: it does not need a shared-memory copy of a dense Delassus matrix, only the velocity vector and scalar row state.",
         ],
@@ -434,15 +433,15 @@ This pass captures the first reviewable M4 slice: the dense tiled-row PGS kernel
 
 | Scenario | Preset | Active dense rows | Active MF rows | Key dense storage | Key matrix-free storage |
 | --- | --- | ---: | ---: | --- | --- |
-| `g1_flat` | `fpgs_dense_row` | {g1_dense['counts']['dense_constraint_rows']} | 0 | `C`: {g1_dense['buffer_bytes']['C']} B | n/a |
-| `g1_flat` | `fpgs_matrix_free` | {g1_mf['counts']['dense_constraint_rows']} | {g1_mf['counts']['matrix_free_constraint_rows']} | `rhs`+`diag`+`impulses`: {g1_mf['buffer_bytes']['rhs'] + g1_mf['buffer_bytes']['diag'] + g1_mf['buffer_bytes']['impulses']} B | `J_world`+`Y_world`: {g1_mf['buffer_bytes']['J_world'] + g1_mf['buffer_bytes']['Y_world']} B |
-| `h1_tabletop` | `fpgs_dense_row` | {h1_dense['counts']['dense_constraint_rows']} | 0 | `C`: {h1_dense['buffer_bytes']['C']} B | n/a |
-| `h1_tabletop` | `fpgs_matrix_free` | {h1_mf['counts']['dense_constraint_rows']} | {h1_mf['counts']['matrix_free_constraint_rows']} | `rhs`+`diag`+`impulses`: {h1_mf['buffer_bytes']['rhs'] + h1_mf['buffer_bytes']['diag'] + h1_mf['buffer_bytes']['impulses']} B | `J_world`+`Y_world`: {h1_mf['buffer_bytes']['J_world'] + h1_mf['buffer_bytes']['Y_world']} B; free-rigid `mf_*`: {sum(h1_mf['buffer_bytes'][name] for name in ('mf_J_a','mf_J_b','mf_MiJt_a','mf_MiJt_b','mf_rhs','mf_impulses','mf_eff_mass_inv','mf_meta_packed'))} B |
+| `g1_flat` | `fpgs_dense_row` | {g1_dense["counts"]["dense_constraint_rows"]} | 0 | `C`: {g1_dense["buffer_bytes"]["C"]} B | n/a |
+| `g1_flat` | `fpgs_matrix_free` | {g1_mf["counts"]["dense_constraint_rows"]} | {g1_mf["counts"]["matrix_free_constraint_rows"]} | `rhs`+`diag`+`impulses`: {g1_mf["buffer_bytes"]["rhs"] + g1_mf["buffer_bytes"]["diag"] + g1_mf["buffer_bytes"]["impulses"]} B | `J_world`+`Y_world`: {g1_mf["buffer_bytes"]["J_world"] + g1_mf["buffer_bytes"]["Y_world"]} B |
+| `h1_tabletop` | `fpgs_dense_row` | {h1_dense["counts"]["dense_constraint_rows"]} | 0 | `C`: {h1_dense["buffer_bytes"]["C"]} B | n/a |
+| `h1_tabletop` | `fpgs_matrix_free` | {h1_mf["counts"]["dense_constraint_rows"]} | {h1_mf["counts"]["matrix_free_constraint_rows"]} | `rhs`+`diag`+`impulses`: {h1_mf["buffer_bytes"]["rhs"] + h1_mf["buffer_bytes"]["diag"] + h1_mf["buffer_bytes"]["impulses"]} B | `J_world`+`Y_world`: {h1_mf["buffer_bytes"]["J_world"] + h1_mf["buffer_bytes"]["Y_world"]} B; free-rigid `mf_*`: {sum(h1_mf["buffer_bytes"][name] for name in ("mf_J_a", "mf_J_b", "mf_MiJt_a", "mf_MiJt_b", "mf_rhs", "mf_impulses", "mf_eff_mass_inv", "mf_meta_packed"))} B |
 
 ## Practical interpretation
 
 - `g1_flat` is a useful control case: matrix-free allocates larger world-indexed buffers, but the scenario has no free-rigid MF rows, so there is no row-routing benefit yet.
-- `h1_tabletop` is the important mixed-world case: dense-row keeps all {h1_dense['counts']['dense_constraint_rows']} active rows in the explicit Delassus system, while matrix-free moves {h1_mf['counts']['matrix_free_constraint_rows']} rows to the free-rigid branch and keeps only {h1_mf['counts']['dense_constraint_rows']} articulated rows on the articulated side.
+- `h1_tabletop` is the important mixed-world case: dense-row keeps all {h1_dense["counts"]["dense_constraint_rows"]} active rows in the explicit Delassus system, while matrix-free moves {h1_mf["counts"]["matrix_free_constraint_rows"]} rows to the free-rigid branch and keeps only {h1_mf["counts"]["dense_constraint_rows"]} articulated rows on the articulated side.
 - The dense-row kernel relies on shared memory for the packed lower triangle of `C`. The matrix-free GS kernel instead spends shared memory on the live velocity vector plus scalar row state and reconstructs couplings through `J*v` and `Y*delta_lambda`.
 - This is the first concrete evidence bundle for the docs claim that matrix-free can perform well without a shared-memory Delassus tile, while the dense path still pays the up-front `C` materialization cost.
 """
