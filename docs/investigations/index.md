@@ -28,3 +28,7 @@ The current TGS study reports equivalent physics at roughly 2x cost for the test
 Branch: `dturpin/fpgs-private-api-matrix-free`
 
 The private API cleanup collapsed the public FeatherPGS surface to matrix-free-only and removed now-dead solver branching around the public constructor knobs. That branch is the implementation proof that the matrix-free-only direction is operationally feasible, not just a docs-level recommendation.
+
+### Warp kernel migration (Zach Corse)
+
+Zach converted the FeatherPGS kernels from raw CUDA strings to Warp, which is significantly easier to maintain, understand, and debug. The initial conversion showed a ~40% throughput reduction on `h1_tabletop`, but after targeted Warp-side optimizations that gap has narrowed to ~9% — likely an acceptable tradeoff for the maintainability and debuggability gains. Release timing for this depends on landing the required Warp PRs upstream, and needs to be coordinated with the private FeatherPGS API changes in Newton.
