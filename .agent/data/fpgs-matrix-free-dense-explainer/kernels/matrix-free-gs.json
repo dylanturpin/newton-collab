@@ -2,8 +2,8 @@
   "schema_version": "1.0.0",
   "provenance": {
     "generator": "scripts/analysis/capture_fpgs_kernel_memory_artifacts.py",
-    "git_commit": "93f67400",
-    "generated_at_utc": "2026-04-13T17:07:54.888075Z",
+    "git_commit": "54bb7277",
+    "generated_at_utc": "2026-04-13T17:12:11.474619Z",
     "source_files": [
       "newton/_src/solvers/feather_pgs/solver_feather_pgs.py",
       "newton/_src/solvers/feather_pgs/kernels.py",
