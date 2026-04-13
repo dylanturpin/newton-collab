@@ -10,6 +10,7 @@
 - Completed M6: the docs build and required `pre-commit` validation now pass locally.
 - Completed M7: the finalized source/docs state has now been published to `origin/feather_pgs`.
 - Completed M8: the rendered docs have now been published safely to `origin/gh-pages` without touching the nightly benchmark payload.
+- Completed M9: the docs now include an investigations journal and a decision-facing code-path ablation recommendation layer on top of the dense-vs-matrix-free explainer.
 - Chosen docs structure: keep `docs/concepts/feather_pgs.md` as the overview page and add a sibling concepts page for the deep dense-vs-matrix-free comparison.
 - Recorded the initial inventory in `.agent/data/fpgs-matrix-free-dense-explainer/m1-source-inventory.md`.
 - Added checked-in schemas in `.agent/data/fpgs-matrix-free-dense-explainer/schema/`.
@@ -30,6 +31,11 @@
   - `docs/concepts/feather_pgs_dense_vs_matrix_free.md`
   - `docs/index.rst`
   - `docs/concepts/feather_pgs.md`
+- Added the investigations journal and navigation wiring:
+  - `docs/investigations/index.md`
+  - `docs/index.rst`
+- Added the code-path ablation and recommendation section to:
+  - `docs/concepts/feather_pgs_dense_vs_matrix_free.md`
 - Refreshed the kernel artifacts so their provenance matches the source revision used for the docs draft:
   - `.agent/data/fpgs-matrix-free-dense-explainer/kernels/dense-row.json`
   - `.agent/data/fpgs-matrix-free-dense-explainer/kernels/matrix-free-gs.json`
@@ -43,6 +49,9 @@
 
 ## Key Findings From This Pass
 
+- The explainer now includes a recommendation table covering `dense_loop`, `dense_row`, `dense_streaming`, `split`, and `matrix_free`, with explicit keep/deprecate/remove guidance tied back to the checked-in scenario and kernel artifacts.
+- The new `docs/investigations/index.md` page establishes a dated journal structure and cross-references parallel solver workstreams so the dense-vs-matrix-free report sits in a broader decision log rather than as an isolated page.
+- This pass is intentionally validation-only. It does not republish `origin/feather_pgs` or `origin/gh-pages`; the next pass, if needed, is the new final publication milestone.
 - The final publication milestone is complete: `origin/gh-pages` advanced from `cfd01f5f69909e9c90f7d637c6772d6f09df31e2` to `d7f564af85b2e4b298f1fe246149e6addc1a8565`.
 - The safe publication path worked as intended: only branch-root `404.html`, branch-root `.nojekyll`, and the `latest/` dev-docs payload were refreshed.
 - `nightly/` was preserved exactly. The checked-in `m8-gh-pages-nightly-diff.txt` artifact is empty, which confirms that the publication did not touch the benchmark dashboard data.
@@ -50,8 +59,8 @@
 
 ## Recommended Next Pass
 
-- No follow-up milestone remains in this workflow.
-- If docs content changes later, repeat the same clean-build-to-temp and `latest/`-only publication pattern instead of publishing from the in-repo `docs/_build/html` directory.
+- Activate M10 only if these M9 docs changes should be published.
+- Reuse the established M7/M8 publication procedure: push source to `origin/feather_pgs`, rebuild into a clean temp tree, and refresh only `gh-pages/latest/` plus the small branch-root routing files.
 
 ## Publication Record
 
