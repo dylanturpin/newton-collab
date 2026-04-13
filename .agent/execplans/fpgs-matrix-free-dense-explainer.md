@@ -87,13 +87,13 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
-## Pass Update (2026-04-13)
+## Pass Update (2026-04-13, pass 3)
 
-M2 needs a tighter first slice before runtime-backed capture starts. This pass will:
+M3 now needs a concrete first capture slice rather than broader planning. This pass will:
 
-- define the checked-in machine-readable schemas for scenario sizing and kernel memory-layout notes
-- add a bootstrap helper that emits the capture manifest from the benchmark scenario/preset surface already in-tree
-- stop short of recording scenario measurements; those remain M3 work once the schema is fixed
+- add a runtime-backed helper that records scenario sizing artifacts from the in-tree benchmark scenarios
+- capture reviewable dense-vs-matrix-free artifacts for `g1_flat` and `h1_tabletop`
+- keep the slice intentionally narrow: focus on `fpgs_dense_row` and `fpgs_matrix_free` first, leaving the other presets for a later M3 pass if needed
 
 ## Milestones
 
@@ -157,7 +157,7 @@ Validation for this milestone:
 
 ### M3. Scenario-Backed Dense vs Matrix-Free Data Capture
 
-Status: pending
+Status: in progress
 
 Definition of done:
 
@@ -170,6 +170,32 @@ Expected outputs:
 
 - versioned raw data artifacts
 - concise notes explaining provenance and scenario assumptions
+
+Completed slice (2026-04-13):
+
+- added runtime-backed capture helper:
+  - `scripts/analysis/capture_fpgs_scenario_sizing.py`
+- captured the first reviewable dense-vs-matrix-free artifact set under:
+  - `.agent/data/fpgs-matrix-free-dense-explainer/scenarios/g1_flat/fpgs_dense_row.json`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/scenarios/g1_flat/fpgs_matrix_free.json`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/scenarios/h1_tabletop/fpgs_dense_row.json`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/scenarios/h1_tabletop/fpgs_matrix_free.json`
+- first scenario-backed counts now checked in:
+  - `g1_flat`: 49 articulation DOFs, 24 dense rows in the warmed contact state, no matrix-free rows in the current single-articulation ground-contact setup
+  - `h1_tabletop` dense-row: 133 world DOFs, 117 dense rows in the warmed contact state
+  - `h1_tabletop` matrix-free: 133 world DOFs, 30 dense articulated rows plus 102 matrix-free free-rigid rows in the warmed contact state
+
+Validation for this slice:
+
+- `uv run --with GitPython --with usd-core --with scipy python scripts/analysis/capture_fpgs_scenario_sizing.py`
+- `python -m json.tool .agent/data/fpgs-matrix-free-dense-explainer/scenarios/g1_flat/fpgs_matrix_free.json`
+- `python -m json.tool .agent/data/fpgs-matrix-free-dense-explainer/scenarios/h1_tabletop/fpgs_dense_row.json`
+
+Remaining M3 work:
+
+- extend capture coverage to the remaining comparison presets from the manifest if they are still needed in the final explainer tables
+- decide whether to add a larger-world sizing slice in addition to the current per-world captures
+- fold the checked-in scenario data into doc-ready summary tables
 
 ### M4. Kernel Work / Memory Layout Analysis
 

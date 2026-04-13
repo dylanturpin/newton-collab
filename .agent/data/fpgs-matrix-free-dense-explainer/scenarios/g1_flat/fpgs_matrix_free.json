@@ -1,0 +1,417 @@
+{
+  "schema_version": "1.0.0",
+  "provenance": {
+    "generator": "scripts/analysis/capture_fpgs_scenario_sizing.py",
+    "git_commit": "9c881130",
+    "generated_at_utc": "2026-04-13T17:01:28.048647Z",
+    "source_files": [
+      "newton/tools/solver_benchmark.py",
+      "newton/_src/solvers/feather_pgs/solver_feather_pgs.py",
+      "scripts/analysis/capture_fpgs_scenario_sizing.py"
+    ]
+  },
+  "scenario": {
+    "name": "g1_flat",
+    "description": "G1 humanoid on flat ground",
+    "robot": "g1",
+    "environment": null,
+    "default_substeps": 2,
+    "default_pgs_iterations": 4,
+    "default_dense_max_constraints": 32,
+    "mujoco_settings": {
+      "njmax": 210,
+      "nconmax": 35,
+      "solver": "newton",
+      "integrator": "implicitfast",
+      "cone": "pyramidal",
+      "ls_parallel": true
+    }
+  },
+  "solver_preset": {
+    "name": "fpgs_matrix_free",
+    "type": "feather_pgs",
+    "pgs_mode": "matrix_free",
+    "settings": {
+      "pgs_mode": "matrix_free",
+      "cholesky_kernel": "tiled",
+      "trisolve_kernel": "tiled",
+      "hinv_jt_kernel": "tiled",
+      "delassus_kernel": "tiled",
+      "pgs_kernel": "tiled_contact",
+      "dense_max_constraints": 128,
+      "use_parallel_streams": true
+    }
+  },
+  "capture": {
+    "num_worlds": 1,
+    "device": "cuda:0",
+    "pgs_iterations": 4,
+    "substeps": 2
+  },
+  "world_counts": {
+    "articulations": 1,
+    "rigid_bodies": 44,
+    "contacts_total": 8,
+    "dense_constraint_rows": 24,
+    "matrix_free_constraint_rows": 0,
+    "articulation_dofs": 49,
+    "world_dofs": 49
+  },
+  "logical_buffers": [
+    {
+      "name": "H_by_size[49]",
+      "solver_scope": "shared",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        49,
+        49
+      ],
+      "per_world_elements": 2401,
+      "total_elements": 2401,
+      "bytes_per_element": 4,
+      "total_bytes": 9604,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.H_by_size[49]",
+      "notes": "Per-size grouped reduced mass blocks H."
+    },
+    {
+      "name": "L_by_size[49]",
+      "solver_scope": "shared",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        49,
+        49
+      ],
+      "per_world_elements": 2401,
+      "total_elements": 2401,
+      "bytes_per_element": 4,
+      "total_bytes": 9604,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.L_by_size[49]",
+      "notes": "Per-size grouped Cholesky factors of H."
+    },
+    {
+      "name": "J_by_size[49]",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128,
+        49
+      ],
+      "per_world_elements": 6272,
+      "total_elements": 6272,
+      "bytes_per_element": 4,
+      "total_bytes": 25088,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.J_by_size[49]",
+      "notes": "Dense articulation rows grouped by DOF size."
+    },
+    {
+      "name": "Y_by_size[49]",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128,
+        49
+      ],
+      "per_world_elements": 6272,
+      "total_elements": 6272,
+      "bytes_per_element": 4,
+      "total_bytes": 25088,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.Y_by_size[49]",
+      "notes": "Per-size H^{-1} J^T rows grouped by articulation DOF count."
+    },
+    {
+      "name": "J_world",
+      "solver_scope": "matrix_free",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128,
+        49
+      ],
+      "per_world_elements": 6272,
+      "total_elements": 6272,
+      "bytes_per_element": 4,
+      "total_bytes": 25088,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.J_world",
+      "notes": "World-consolidated Jacobian rows used by articulated matrix-free PGS."
+    },
+    {
+      "name": "Y_world",
+      "solver_scope": "matrix_free",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128,
+        49
+      ],
+      "per_world_elements": 6272,
+      "total_elements": 6272,
+      "bytes_per_element": 4,
+      "total_bytes": 25088,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.Y_world",
+      "notes": "World-consolidated H^{-1} J^T rows used by articulated matrix-free PGS."
+    },
+    {
+      "name": "rhs",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128
+      ],
+      "per_world_elements": 128,
+      "total_elements": 128,
+      "bytes_per_element": 4,
+      "total_bytes": 512,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.rhs",
+      "notes": null
+    },
+    {
+      "name": "diag",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128
+      ],
+      "per_world_elements": 128,
+      "total_elements": 128,
+      "bytes_per_element": 4,
+      "total_bytes": 512,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.diag",
+      "notes": "Dense path diagonal, reused as the articulated preconditioner in matrix-free mode."
+    },
+    {
+      "name": "impulses",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128
+      ],
+      "per_world_elements": 128,
+      "total_elements": 128,
+      "bytes_per_element": 4,
+      "total_bytes": 512,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.impulses",
+      "notes": null
+    },
+    {
+      "name": "mf_J_a",
+      "solver_scope": "matrix_free",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        512,
+        6
+      ],
+      "per_world_elements": 3072,
+      "total_elements": 3072,
+      "bytes_per_element": 4,
+      "total_bytes": 12288,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.mf_J_a",
+      "notes": null
+    },
+    {
+      "name": "mf_J_b",
+      "solver_scope": "matrix_free",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        512,
+        6
+      ],
+      "per_world_elements": 3072,
+      "total_elements": 3072,
+      "bytes_per_element": 4,
+      "total_bytes": 12288,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.mf_J_b",
+      "notes": null
+    },
+    {
+      "name": "mf_MiJt_a",
+      "solver_scope": "matrix_free",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        512,
+        6
+      ],
+      "per_world_elements": 3072,
+      "total_elements": 3072,
+      "bytes_per_element": 4,
+      "total_bytes": 12288,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.mf_MiJt_a",
+      "notes": null
+    },
+    {
+      "name": "mf_MiJt_b",
+      "solver_scope": "matrix_free",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        512,
+        6
+      ],
+      "per_world_elements": 3072,
+      "total_elements": 3072,
+      "bytes_per_element": 4,
+      "total_bytes": 12288,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.mf_MiJt_b",
+      "notes": null
+    },
+    {
+      "name": "mf_rhs",
+      "solver_scope": "matrix_free",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        512
+      ],
+      "per_world_elements": 512,
+      "total_elements": 512,
+      "bytes_per_element": 4,
+      "total_bytes": 2048,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.mf_rhs",
+      "notes": null
+    },
+    {
+      "name": "mf_impulses",
+      "solver_scope": "matrix_free",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        512
+      ],
+      "per_world_elements": 512,
+      "total_elements": 512,
+      "bytes_per_element": 4,
+      "total_bytes": 2048,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.mf_impulses",
+      "notes": null
+    },
+    {
+      "name": "mf_eff_mass_inv",
+      "solver_scope": "matrix_free",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        512
+      ],
+      "per_world_elements": 512,
+      "total_elements": 512,
+      "bytes_per_element": 4,
+      "total_bytes": 2048,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.mf_eff_mass_inv",
+      "notes": null
+    },
+    {
+      "name": "mf_meta_packed",
+      "solver_scope": "matrix_free",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.int32'>",
+      "logical_shape": [
+        1,
+        2048
+      ],
+      "per_world_elements": 2048,
+      "total_elements": 2048,
+      "bytes_per_element": 4,
+      "total_bytes": 8192,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.mf_meta_packed",
+      "notes": "Packed matrix-free metadata consumed by the fused tiled-contact kernel."
+    }
+  ],
+  "notes": [
+    "Captured after 30 warmup frames at 60 Hz with 2 substeps/frame.",
+    "Artifacts reflect solver allocation sizes plus realized dense/matrix-free row counts in the warmed scenario state.",
+    "Matrix-free capture still retains dense articulation buffers for grouped H/J/Y data and the diagonal preconditioner."
+  ]
+}

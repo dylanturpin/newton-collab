@@ -1,0 +1,315 @@
+{
+  "schema_version": "1.0.0",
+  "provenance": {
+    "generator": "scripts/analysis/capture_fpgs_scenario_sizing.py",
+    "git_commit": "9c881130",
+    "generated_at_utc": "2026-04-13T17:01:29.209064Z",
+    "source_files": [
+      "newton/tools/solver_benchmark.py",
+      "newton/_src/solvers/feather_pgs/solver_feather_pgs.py",
+      "scripts/analysis/capture_fpgs_scenario_sizing.py"
+    ]
+  },
+  "scenario": {
+    "name": "h1_tabletop",
+    "description": "H1 humanoid with tabletop objects",
+    "robot": "h1",
+    "environment": "tabletop",
+    "default_substeps": 8,
+    "default_pgs_iterations": 8,
+    "default_dense_max_constraints": 128,
+    "mujoco_settings": {
+      "njmax": 512,
+      "nconmax": 128,
+      "solver": "newton",
+      "integrator": "implicitfast",
+      "cone": "pyramidal",
+      "ls_parallel": true
+    }
+  },
+  "solver_preset": {
+    "name": "fpgs_dense_row",
+    "type": "feather_pgs",
+    "pgs_mode": "dense",
+    "settings": {
+      "cholesky_kernel": "tiled",
+      "trisolve_kernel": "tiled",
+      "hinv_jt_kernel": "tiled",
+      "delassus_kernel": "tiled",
+      "pgs_kernel": "tiled_row",
+      "pgs_mode": "dense",
+      "use_parallel_streams": true
+    }
+  },
+  "capture": {
+    "num_worlds": 1,
+    "device": "cuda:0",
+    "pgs_iterations": 8,
+    "substeps": 8
+  },
+  "world_counts": {
+    "articulations": 19,
+    "rigid_bodies": 38,
+    "contacts_total": 229,
+    "dense_constraint_rows": 117,
+    "matrix_free_constraint_rows": 0,
+    "articulation_dofs": 133,
+    "world_dofs": 133
+  },
+  "logical_buffers": [
+    {
+      "name": "H_by_size[6]",
+      "solver_scope": "shared",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        18,
+        6,
+        6
+      ],
+      "per_world_elements": 648,
+      "total_elements": 648,
+      "bytes_per_element": 4,
+      "total_bytes": 2592,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.H_by_size[6]",
+      "notes": "Per-size grouped reduced mass blocks H."
+    },
+    {
+      "name": "H_by_size[25]",
+      "solver_scope": "shared",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        25,
+        25
+      ],
+      "per_world_elements": 625,
+      "total_elements": 625,
+      "bytes_per_element": 4,
+      "total_bytes": 2500,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.H_by_size[25]",
+      "notes": "Per-size grouped reduced mass blocks H."
+    },
+    {
+      "name": "L_by_size[6]",
+      "solver_scope": "shared",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        18,
+        6,
+        6
+      ],
+      "per_world_elements": 648,
+      "total_elements": 648,
+      "bytes_per_element": 4,
+      "total_bytes": 2592,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.L_by_size[6]",
+      "notes": "Per-size grouped Cholesky factors of H."
+    },
+    {
+      "name": "L_by_size[25]",
+      "solver_scope": "shared",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        25,
+        25
+      ],
+      "per_world_elements": 625,
+      "total_elements": 625,
+      "bytes_per_element": 4,
+      "total_bytes": 2500,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.L_by_size[25]",
+      "notes": "Per-size grouped Cholesky factors of H."
+    },
+    {
+      "name": "J_by_size[6]",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        18,
+        128,
+        6
+      ],
+      "per_world_elements": 13824,
+      "total_elements": 13824,
+      "bytes_per_element": 4,
+      "total_bytes": 55296,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.J_by_size[6]",
+      "notes": "Dense articulation rows grouped by DOF size."
+    },
+    {
+      "name": "J_by_size[25]",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128,
+        25
+      ],
+      "per_world_elements": 3200,
+      "total_elements": 3200,
+      "bytes_per_element": 4,
+      "total_bytes": 12800,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.J_by_size[25]",
+      "notes": "Dense articulation rows grouped by DOF size."
+    },
+    {
+      "name": "Y_by_size[6]",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        18,
+        128,
+        6
+      ],
+      "per_world_elements": 13824,
+      "total_elements": 13824,
+      "bytes_per_element": 4,
+      "total_bytes": 55296,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.Y_by_size[6]",
+      "notes": "Per-size H^{-1} J^T rows grouped by articulation DOF count."
+    },
+    {
+      "name": "Y_by_size[25]",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128,
+        25
+      ],
+      "per_world_elements": 3200,
+      "total_elements": 3200,
+      "bytes_per_element": 4,
+      "total_bytes": 12800,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.Y_by_size[25]",
+      "notes": "Per-size H^{-1} J^T rows grouped by articulation DOF count."
+    },
+    {
+      "name": "C",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128,
+        128
+      ],
+      "per_world_elements": 16384,
+      "total_elements": 16384,
+      "bytes_per_element": 4,
+      "total_bytes": 65536,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.C",
+      "notes": null
+    },
+    {
+      "name": "rhs",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128
+      ],
+      "per_world_elements": 128,
+      "total_elements": 128,
+      "bytes_per_element": 4,
+      "total_bytes": 512,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.rhs",
+      "notes": null
+    },
+    {
+      "name": "diag",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128
+      ],
+      "per_world_elements": 128,
+      "total_elements": 128,
+      "bytes_per_element": 4,
+      "total_bytes": 512,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.diag",
+      "notes": "Dense path diagonal, reused as the articulated preconditioner in matrix-free mode."
+    },
+    {
+      "name": "impulses",
+      "solver_scope": "dense",
+      "storage": "global",
+      "dtype": "<class 'warp._src.types.float32'>",
+      "logical_shape": [
+        1,
+        128
+      ],
+      "per_world_elements": 128,
+      "total_elements": 128,
+      "bytes_per_element": 4,
+      "total_bytes": 512,
+      "populated_when": [
+        "allocated in solver initialization",
+        "scenario stepped through warmup frames"
+      ],
+      "source": "solver.impulses",
+      "notes": null
+    }
+  ],
+  "notes": [
+    "Captured after 30 warmup frames at 60 Hz with 8 substeps/frame.",
+    "Artifacts reflect solver allocation sizes plus realized dense/matrix-free row counts in the warmed scenario state.",
+    "Dense-row capture uses the dense articulated path only, so matrix-free row counts may be absent."
+  ]
+}
