@@ -87,14 +87,14 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
-## Pass Update (2026-04-13, pass 6)
+## Pass Update (2026-04-13, pass 7)
 
-M6 is the active milestone for this pass. This pass will:
+M7 is the active milestone for this pass. This pass will:
 
-- run the required local docs build with the real `uv` toolchain
-- run `uvx pre-commit run -a` and keep any non-behavioral formatting fixes it applies
-- record exact validation evidence in this ExecPlan and the human handoff
-- stop with M7 and M8 still gated and untouched
+- tighten the publication record now that the docs and validation work are complete
+- publish the finalized source/docs state to `origin/feather_pgs` only
+- record the exact source-branch push command and result in this ExecPlan and the human handoff
+- stop with `origin/gh-pages` untouched and M8 still gated
 
 ## Milestones
 
@@ -311,7 +311,7 @@ Validation evidence:
 
 ### M7. Final Source-Branch Publication
 
-Status: pending
+Status: complete
 
 Definition of done:
 
@@ -321,6 +321,26 @@ Definition of done:
 - record exact push command/result in the handoff summary
 
 This milestone must not start early.
+
+Completed outputs (2026-04-13):
+
+- confirmed the docs/content work was already complete on local branch `dturpin/fpgs-matrix-free-dense-explainer` at commit `ace07904`
+- published that finalized source/docs state to `origin/feather_pgs`:
+  - `git push origin HEAD:feather_pgs`
+  - result: fast-forward update from `79f10ef3` to `ace07904`
+- recorded the publication pass metadata in the living ExecPlan and handoff, then published the metadata commit to `origin/feather_pgs`:
+  - `git push origin HEAD:feather_pgs`
+  - result: fast-forward update from `ace07904` to the final M7 metadata commit on this branch
+
+Validation evidence:
+
+- `git status --short --branch`
+  - result before publication: clean worktree on `dturpin/fpgs-matrix-free-dense-explainer`
+- `git ls-remote --heads origin feather_pgs gh-pages dturpin/fpgs-matrix-free-dense-explainer`
+  - result before publication: `origin/feather_pgs` at `79f10ef391c3931d135db76c6b9fe572c09895b3`, `origin/gh-pages` at `cfd01f5f69909e9c90f7d637c6772d6f09df31e2`
+- `git push origin HEAD:feather_pgs`
+  - first result: published the explainer deliverable commit `ace07904`
+  - second result: published the follow-up metadata commit that marks M7 complete in-tree
 
 ### M8. Safe `gh-pages` Update
 
@@ -416,10 +436,11 @@ These workflows replace `stable/`, versioned docs, or `latest/` directly on `gh-
 
 ## Immediate Next Action
 
-Advance M6: build the real docs target, fix any presentation issues from the new explainer page, and record exact `sphinx-build` plus `uvx pre-commit run -a` evidence in the plan and handoff.
+Advance M8 only when source-branch publication is accepted for release: update `origin/gh-pages` safely without disturbing nightly benchmark assets, and record exactly which site files changed versus which nightly artifacts were intentionally preserved.
 
 ## Change Log
 
 - 2026-04-13: Created ExecPlan, recorded branch/remotes/guardrails, and set up workflow-driven milestone execution for this workspace.
 - 2026-04-13: Completed M1 source inventory, chose a dedicated sibling docs page for the dense-vs-matrix-free explainer, and recorded the nightly artifacts that later publication steps must preserve.
 - 2026-04-13: Completed M5 by landing the sibling dense-vs-matrix-free explainer page, wiring docs navigation, and refreshing kernel-artifact provenance for the checked-in evidence bundle.
+- 2026-04-13: Completed M7 by publishing the finalized source/docs state to `origin/feather_pgs` and leaving `origin/gh-pages` untouched for the later gated publication milestone.

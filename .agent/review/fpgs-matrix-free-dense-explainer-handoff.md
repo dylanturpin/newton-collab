@@ -8,6 +8,7 @@
 - Advanced the first M4 slice: checked-in kernel-work and memory-layout artifacts now exist for the dense tiled-row PGS kernel and the fused matrix-free GS kernel.
 - Completed M5: the docs draft now exists as a sibling concepts page with navigation wiring.
 - Completed M6: the docs build and required `pre-commit` validation now pass locally.
+- Completed M7: the finalized source/docs state has now been published to `origin/feather_pgs`.
 - Chosen docs structure: keep `docs/concepts/feather_pgs.md` as the overview page and add a sibling concepts page for the deep dense-vs-matrix-free comparison.
 - Recorded the initial inventory in `.agent/data/fpgs-matrix-free-dense-explainer/m1-source-inventory.md`.
 - Added checked-in schemas in `.agent/data/fpgs-matrix-free-dense-explainer/schema/`.
@@ -37,19 +38,25 @@
 
 ## Key Findings From This Pass
 
-- The validation gap called out by the judge is closed: the required docs build succeeded and `pre-commit` passes on the current tree.
-- The docs build emits the new explainer page successfully at `docs/_build/html/concepts/feather_pgs_dense_vs_matrix_free.html`.
-- The only code changes in this pass were formatting-only `ruff` rewrites in the two helper scripts listed above.
-- Sphinx still reports existing multiple-toctree consistency notices for generated `docs/api/newton_*.rst` pages; those notices are not introduced by this explainer work and did not block the build.
+- The source/docs publication gate is now cleared: `origin/feather_pgs` was updated from `79f10ef3` to the explainer branch tip.
+- The explainer deliverable published cleanly without reopening docs-content work or touching `origin/gh-pages`.
+- This pass only updates publication bookkeeping in the living ExecPlan and handoff after the successful source-branch push.
 
 ## Recommended Next Pass
 
-- M7 and M8 remain explicitly gated. Do not start publication work early.
-- If publication is in scope, begin with M7 only:
-  - confirm the working branch content is exactly what should be published
-  - push only to `origin/feather_pgs`
-  - record the exact push command and result
-- Leave `origin/gh-pages` untouched until the separate M8 publication milestone is active.
+- M8 remains explicitly gated and is now the only remaining incomplete milestone.
+- When publication of the rendered site is in scope, update only `origin/gh-pages` and preserve nightly benchmark assets while refreshing the docs payload.
+- Keep the `gh-pages` work docs-only and record exactly which paths changed and which nightly artifacts were intentionally left untouched.
+
+## Publication Record
+
+- Pre-publication remote state:
+  - `origin/feather_pgs` -> `79f10ef391c3931d135db76c6b9fe572c09895b3`
+  - `origin/gh-pages` -> `cfd01f5f69909e9c90f7d637c6772d6f09df31e2`
+- Source publication command:
+  - `git push origin HEAD:feather_pgs`
+  - result: fast-forward update from `79f10ef3` to `ace07904`
+- `origin/gh-pages` was intentionally left untouched in this pass.
 
 ## Validation Evidence
 
