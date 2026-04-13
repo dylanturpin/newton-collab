@@ -87,14 +87,15 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
-## Pass Update (2026-04-13, pass 9)
+## Pass Update (2026-04-13, pass 10)
 
-M9 is the active milestone for this pass. This pass will:
+M10 is the active milestone for this pass. This pass will:
 
-- add the investigations journal index under `docs/investigations/`
-- add the decision-facing code-path ablation section to the explainer page
-- wire the new journal into `docs/index.rst`
-- validate with the real docs build and `pre-commit`, but stop short of any new publication work
+- commit the pending `docs/investigations/index.md` addition for the "Warp kernel migration (Zach Corse)" journal note before any new publication push
+- publish that new source/docs commit to `origin/feather_pgs`
+- rebuild the docs from that exact commit in a clean tree
+- safely refresh `origin/gh-pages` while preserving `nightly/`
+- record exact remote/build/publication results in the ExecPlan and handoff
 
 ## Milestones
 
@@ -535,13 +536,13 @@ Validation evidence:
 
 ### M10. Final Publication (source branch + gh-pages)
 
-Status: pending
+Status: in progress
 
 Same publication procedure as M7+M8: push source to `origin/feather_pgs`, rebuild docs, safely update `origin/gh-pages` preserving nightly data.
 
 ## Immediate Next Action
 
-M9 is complete. Stop on the working branch with the validated docs changes committed locally. Do not start M10 publication work until another pass explicitly activates the final publication milestone.
+Commit the pending investigations journal update, then republish M10 from that new commit so both `origin/feather_pgs` and `origin/gh-pages` include the Zach Warp migration note.
 
 ## Change Log
 
