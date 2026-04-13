@@ -876,9 +876,8 @@
 <p>The main dense-vs-matrix-free report now ties the current FeatherPGS code paths to checked-in sizing artifacts for <code class="docutils literal notranslate"><span class="pre">g1_flat</span></code> and <code class="docutils literal notranslate"><span class="pre">h1_tabletop</span></code>, plus kernel-level memory-layout analysis. Its new ablation section turns that evidence into a concrete keep/deprecate/remove recommendation for the live solver variants.</p>
 </section>
 <section id="velocity-spike-root-cause-analysis">
-<h3>Velocity spike root-cause analysis<a class="headerlink" href="#velocity-spike-root-cause-analysis" title="Link to this heading">#</a></h3>
-<p>Branch: <code class="docutils literal notranslate"><span class="pre">dt/velocity-spike-claude</span></code></p>
-<p>The current spike study says the dominant spike class is unconstrained <code class="docutils literal notranslate"><span class="pre">v_hat</span></code>, not a PGS convergence failure. On the reproduced traces, PGS converges in 8 iterations; the recommended mitigation is post-solve velocity clamping plus compliance-oriented follow-up work rather than a dense-vs-matrix-free path change.</p>
+<h3><a class="reference internal" href="velocity_spikes.html"><span class="std std-doc">Velocity spike root-cause analysis</span></a><a class="headerlink" href="#velocity-spike-root-cause-analysis" title="Link to this heading">#</a></h3>
+<p>The dominant spike class is unconstrained <code class="docutils literal notranslate"><span class="pre">v_hat</span></code>, not a PGS convergence failure. On the reproduced traces, PGS converges in 8 iterations; the recommended mitigation is post-solve velocity clamping plus compliance-oriented follow-up work rather than a dense-vs-matrix-free path change.</p>
 </section>
 <section id="private-api-matrix-free-cleanup">
 <h3>Private API matrix-free cleanup<a class="headerlink" href="#private-api-matrix-free-cleanup" title="Link to this heading">#</a></h3>
@@ -922,7 +921,7 @@
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">2026-04-13</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-vs-matrix-free-featherpgs-explainer"><span class="xref myst">Dense vs matrix-free FeatherPGS explainer</span></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#velocity-spike-root-cause-analysis">Velocity spike root-cause analysis</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#velocity-spike-root-cause-analysis"><span class="xref myst">Velocity spike root-cause analysis</span></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#private-api-matrix-free-cleanup">Private API matrix-free cleanup</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#warp-kernel-migration-zach-corse">Warp kernel migration (Zach Corse)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#in-flight-tgs-feasibility-study">[In-flight] TGS feasibility study</a></li>
