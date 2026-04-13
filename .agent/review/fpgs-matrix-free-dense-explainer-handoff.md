@@ -12,6 +12,7 @@
 - Completed M8: the rendered docs have now been published safely to `origin/gh-pages` without touching the nightly benchmark payload.
 - Completed M9: the docs now include an investigations journal and a decision-facing code-path ablation recommendation layer on top of the dense-vs-matrix-free explainer.
 - Completed M10: the final published source/docs state now includes the added "Warp kernel migration (Zach Corse)" journal note, and both `origin/feather_pgs` and `origin/gh-pages` have been refreshed to that corrected state.
+- Advanced M11 with a first reviewable clarity slice: the explainer page now has notation alignment with the main FeatherPGS concepts page, a clearer scenario-sizing table, and a profiler-backed explanation of why `split` is not equivalent to the fused `matrix_free` path.
 - Chosen docs structure: keep `docs/concepts/feather_pgs.md` as the overview page and add a sibling concepts page for the deep dense-vs-matrix-free comparison.
 - Recorded the initial inventory in `.agent/data/fpgs-matrix-free-dense-explainer/m1-source-inventory.md`.
 - Added checked-in schemas in `.agent/data/fpgs-matrix-free-dense-explainer/schema/`.
@@ -37,6 +38,10 @@
   - `docs/index.rst`
 - Added the journal follow-up note:
   - `docs/investigations/index.md` now includes "Warp kernel migration (Zach Corse)"
+- Updated the investigations journal ordering:
+  - `docs/investigations/index.md` now moves the TGS note to the bottom and marks it `[In-flight]`
+- Updated the explainer page clarity and split-vs-fused analysis:
+  - `docs/concepts/feather_pgs_dense_vs_matrix_free.md`
 - Added the code-path ablation and recommendation section to:
   - `docs/concepts/feather_pgs_dense_vs_matrix_free.md`
 - Refreshed the kernel artifacts so their provenance matches the source revision used for the docs draft:
@@ -65,10 +70,26 @@
 - The safe publication path still worked as intended: only the `latest/` dev-docs payload and `.nojekyll` were refreshed in the final push, while branch-root `404.html`, `nightly/`, `index.html`, `stable/`, versioned release docs, and `switcher.json` were preserved.
 - `nightly/` was preserved exactly. The checked-in `m10-gh-pages-nightly-diff.txt` artifact is empty, which confirms that the final publication did not touch the benchmark dashboard data.
 - The investigations journal now includes the Zach Warp migration note in the published site in addition to the dense-vs-matrix-free explainer and related solver investigation links.
+- The explainer page now uses the same `\hat{\dot{q}}` / `p` notation as the main FeatherPGS concepts page instead of mixing that notation with `\lambda`-centric phrasing.
+- The scenario table is now easier to read because it distinguishes articulated rows from free-rigid matrix-free rows, adds warm-contact totals, and uses human-readable sizes instead of raw byte counts.
+- The checked-in `h1_tabletop` captures do not represent exactly the same warm state: the dense snapshot has 229 warm contacts, while the matrix-free snapshot has 235. The revised docs now say that explicitly instead of implying the row-total difference is purely routing.
+- The fetched `origin/gh-pages` `h1_tabletop` RTX 5090 trace JSONs now provide a concrete argument against treating `split` as equivalent to the fused `matrix_free` path:
+  - `split` spends about 7.33 s of measured solver-kernel time and repeatedly relaunches `pgs_solve_tiled_contact_*`, `rhs_accum_world_*`, `apply_impulses_world_*`, and `pgs_solve_mf_*`
+  - `matrix_free` spends about 3.46 s and concentrates its hot loop in `pgs_solve_mf_gs_*`
+  - this supports the docs claim that the current win is tied to fused kernel structure, not only to rigid-row routing
 
 ## Recommended Next Pass
 
-- No further milestone work is active in this lane. Start a new pass only if there is new solver-doc content to add on top of the now-published explainer.
+- Finish M11 by rerunning the local docs build and `uvx pre-commit run -a` on top of the clarity edits, then commit the slice locally if validation passes.
+- If a later worker starts M12, treat it as a fresh publication milestone. Rebuild from the committed M11 source state and repeat the same nightly-preserving `origin/gh-pages` procedure used in M8/M10.
+
+## Validation Update
+
+- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs docs/_build/html`
+  - result: passed
+  - note: Sphinx still reports the pre-existing multiple-toctree consistency notices for generated `docs/api/newton_*.rst` pages
+- `uvx pre-commit run -a`
+  - result: passed
 
 ## Publication Record
 

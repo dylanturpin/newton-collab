@@ -87,15 +87,16 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
-## Pass Update (2026-04-13, pass 10)
+## Pass Update (2026-04-13, pass 11)
 
-M10 is the active milestone for this pass. This pass will:
+M11 is the active milestone for this pass. This pass is intentionally scoped to one reviewable slice:
 
-- commit the pending `docs/investigations/index.md` addition for the "Warp kernel migration (Zach Corse)" journal note before any new publication push
-- publish that new source/docs commit to `origin/feather_pgs`
-- rebuild the docs from that exact commit in a clean tree
-- safely refresh `origin/gh-pages` while preserving `nightly/`
-- record exact remote/build/publication results in the ExecPlan and handoff
+- tighten the explainer page so its notation matches `docs/concepts/feather_pgs.md`
+- replace the ambiguous scenario table with articulated-vs-free-rigid row counts, warm-contact totals, and human-readable sizes
+- add a profiler-backed explanation of why `split` is not equivalent to the fused `matrix_free` path on `h1_tabletop`
+- pick up the pending investigations journal reorder/update
+- validate locally with the real docs build and `pre-commit`
+- stop after a local commit; do not start M12 publication in this pass
 
 ## Milestones
 
@@ -590,9 +591,71 @@ Validation evidence:
   - result: empty file, confirming no nightly-path edits
 - `git -C /tmp/newton-gh-pages-fpgs-explainer-m10-final diff --name-status e682d645d84159b67a71e241696a304a5c4f4bd4 ff38559855cec148208e38f8df0f47dd30f89f1a -- > .agent/data/fpgs-matrix-free-dense-explainer/publication/m10-gh-pages-name-status.txt`
 
+### M11. Explainer Page Clarity Pass + Hybrid/Fused Analysis
+
+Status: in progress
+
+This milestone addresses several readability and technical depth issues identified during human review.
+
+Definition of done:
+
+1. **Math symbol consistency**: Ensure the dense-vs-matrix-free explainer page uses the same symbol choices and presentation conventions as the main FeatherPGS concepts page at `docs/concepts/feather_pgs.md`. Fix any inconsistencies.
+
+2. **Scenario sizing table clarity**:
+   - The "Active dense rows" / "Active MF rows" columns are confusing because the matrix-free preset still has "dense rows." These are actually articulated-body constraints (including joint limits) vs free-rigid-body constraints routed through the matrix-free rigid path. The column headers and a brief note right after the table must make this clear.
+   - Address why the sum of dense + MF rows differs between presets (different contact counts at capture time? different routing?). Either explain or note it.
+   - Use human-readable sizes (kB) instead of raw bytes.
+   - Break up the "Key stored objects" column — the semicolon-separated lists are hard to parse. Either use line breaks within cells or split into multiple columns/rows.
+
+3. **Address the "it's all about rigid MF" objection**:
+   - After seeing the corrected table, the obvious reaction is: "all you've shown is that the rigid matrix-free path makes a big difference — that says nothing about dense vs matrix-free on the articulated contacts."
+   - Add a subsection or note addressing this. Key points:
+     - There IS a hybrid/split path that does dense Delassus on articulated contacts followed by MF on rigid contacts.
+     - But it's interleaved at the iteration level — you get many kernel launches and must reload C into shared memory each iteration.
+     - A fused kernel could potentially resolve this but may hit occupancy issues: the shared memory needed for the dense C tile may reduce occupancy for the MF portion (which runs well at high occupancy on its own).
+     - This is a genuine open question / TODO: retry a fused dense+MF kernel with occupancy measurements.
+   - Check the existing nsys profiles on gh-pages (nightly benchmark data) for any evidence about the split path or fused kernel attempts. Reference any relevant data.
+   - Note the anecdotal observation that artificially limiting the MF kernel's occupancy (via unused shared allocation) made no throughput difference — but flag this as unverified/unrecorded and a candidate for re-testing.
+
+4. **Update the journal index.md**: pick up the uncommitted changes (TGS moved to bottom with [In-flight] tag).
+
+5. Run docs build and pre-commit. Do NOT publish yet.
+
+Completed slice (2026-04-13):
+
+- updated `docs/concepts/feather_pgs_dense_vs_matrix_free.md` so the comparison formulas use the same `\hat{\dot{q}}` / `p` notation as `docs/concepts/feather_pgs.md`
+- replaced the ambiguous scenario table with explicit warm-contact counts, articulated-row counts, free-rigid matrix-free row counts, and human-readable storage sizes
+- added an explicit note explaining why the dense and matrix-free `h1_tabletop` row totals differ across the checked-in captures:
+  - dense capture: 229 warm contacts
+  - matrix-free capture: 235 warm contacts
+  - conclusion: the difference is not only routing; the warm-state contact set also changed between captures
+- added a profiler-backed `split` vs fused `matrix_free` analysis section using fetched `origin/gh-pages` trace JSON artifacts from `nightly/runs/full-3gpu-20260309f` on RTX 5090:
+  - `split`: about 7.33 s solver-kernel time in the measured window
+  - `matrix_free`: about 3.46 s solver-kernel time in the measured window
+  - `split` repeatedly relaunches dense `pgs_solve_tiled_contact_*`, `rhs_accum_world_*`, and `apply_impulses_world_*` around `pgs_solve_mf_*`
+  - fused `matrix_free` instead concentrates the hot loop in `pgs_solve_mf_gs_*`
+- picked up the pending investigations journal edit that moves the TGS note to the bottom and marks it `[In-flight]`
+
+Validation for this slice:
+
+- `git ls-tree -r --name-only origin/gh-pages | rg 'full-3gpu-20260309f/.+h1-tabletop.+(split|matrix-free|streaming-pgs|tiled-dense).+trace.json'`
+- `git show origin/gh-pages:nightly/runs/full-3gpu-20260309f/profiles/h1_tabletop_ablation_5090__0007/h1_tabletop_ablation_5090__0007--h1-tabletop--split--s8--n8192.trace.json`
+- local trace summarization with `jq` over temporary exports of the fetched `split`, `matrix_free`, `streaming_pgs`, and `tiled_dense` trace JSON artifacts
+- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs docs/_build/html`
+  - result: passed
+  - notable output: the same existing multiple-toctree consistency notices for generated `docs/api/newton_*.rst` pages remain, but the updated explainer and investigations pages built cleanly
+- `uvx pre-commit run -a`
+  - result: passed
+
+### M12. Final Publication (source branch + gh-pages)
+
+Status: pending
+
+Same publication procedure as M7/M8/M10.
+
 ## Immediate Next Action
 
-The gated publication milestone is complete. Stop on the working branch after committing the updated ExecPlan, handoff, `pyproject.toml`, and M10 publication artifacts locally. Do not begin any new content milestone in this pass.
+Finish the M11 slice by running the local docs build and `uvx pre-commit run -a`, then update the handoff and stop after a local commit. Do not begin M12 publication in this pass.
 
 ## Change Log
 
