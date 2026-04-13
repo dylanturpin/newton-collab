@@ -1,10 +1,10 @@
 # TGS Feasibility Study Notes
 
-This report is the main artifact for the `dt/tgs-feather-pgs-study` branch. It records what the current Isaac Lift configuration actually does, what PhysX TGS means in source terms, the selectable smaller-step FeatherPGS path added in Stage 2, the completed Newton-only rollout comparison from Stage 3B, and the first focused TGS-style training comparison from Stage 3C.
+This report is the main artifact for the `dt/tgs-feather-pgs-study` branch. It records what the current Isaac Lift configuration actually does, what PhysX TGS means in source terms, the selectable smaller-step FeatherPGS path added in Stage 2, the completed Newton-only rollout comparison from Stage 3B, and the completed Stage 3C training study up through the monitored 4096-environment runs.
 
 ## Scope of this pass
 
-This report now covers Stage 1, the Stage 2 implementation slice, the Stage 3A bring-up pass that narrowed the runtime blockers, the completed Stage 3B rollout comparison slice, and a completed Stage 3C training slice focused on the velocity guard. The codebase now has a selectable smaller-step FeatherPGS path for Franka lift, a checked-in short-rollout harness, and initial guarded-versus-no-guard training evidence, but it still does not have completed throughput comparisons or a final Stage 4 recommendation.
+This report now covers Stage 1, the Stage 2 implementation slice, the Stage 3A bring-up pass that narrowed the runtime blockers, the completed Stage 3B rollout comparison slice, the initial Stage 3C boot-only guard comparison, and the monitored 4096-environment Stage 3C training study. The codebase now has selectable Newton Franka lift tasks for MJWarp, baseline FeatherPGS, and the smaller-step TGS-style FeatherPGS path, and the report now includes training-quality and throughput evidence for those runnable Newton baselines in this workspace. Stage 4 final recommendation work is still outstanding.
 
 Repository baseline for this report:
 
@@ -419,11 +419,77 @@ The practical conclusion from this slice is direct: on the selectable smaller-st
 
 This slice does not settle the full TGS question yet. It does not compare against baseline FeatherPGS training under a like-for-like selectable Newton training path, and it does not answer the throughput question beyond showing that guarded and no-guard runs under the same TGS-style schedule landed at similar training-loop FPS (`214` versus `225`).
 
-## Current recommendation after the Stage 3C training slice
+Human review changed how to interpret this slice. The `32`-environment, `2`-iteration runs are useful only as boot checks. They establish that the selectable task IDs launch and that removing `joint_vel_out_of_limit` changes the immediate failure mode, but they are not sufficient for training-quality conclusions.
 
-The next pass should stay narrow and finish the remaining Stage 3C work:
+## Stage 3C monitored 4096-env training study
+
+To close Stage 3C at a meaningful scale, this pass used three monitored 4096-environment runs and compared them against an external reference curve supplied by the investigator. That reference says a healthy Franka lift run should show visible reward signal by about iteration `100`, strong growth by about `200`, and a plateau by about `300-500`. In approximate mean-reward terms, the supplied baseline landmarks were:
+
+- FeatherPGS reference: about `5` at `0-50`, `15` at `100`, `20` at `150`, `35` at `200`, and `75-88` by `300-600`
+- PhysX reference: about `5` at `0-50`, `20` at `100`, `80` at `150`, `120` at `200`, and `120-140` by `250-400`
+- MJWarp reference: about `5` at `0-50`, `25` at `100`, `75` at `150`, `110` at `200`, and roughly `120-135` by `250-400`
+
+Those reference numbers matter because this workspace still cannot run the stock PhysX-backed `Isaac-Lift-Cube-Franka-v0` task. The task resolves to a PhysX manager that imports `omni.physics`, and that module is still missing here. To keep the comparison reproducible without ad hoc config edits, this pass added explicit Newton task IDs:
+
+- `Isaac-Lift-Cube-Franka-MJWarp-v0`
+- `Isaac-Lift-Cube-Franka-FeatherPGS-v0`
+- `Isaac-Lift-Cube-Franka-FeatherPGS-NoVelGuard-v0`
+- plus their `-Play-v0` variants
+
+The monitored command set was:
+
+    cd /workspace/skild-IL-solver
+    OMNI_KIT_ACCEPT_EULA=YES ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Lift-Cube-Franka-MJWarp-v0 --num_envs 4096 --seed 7 --max_iterations 100 --headless 2>&1 | tee /tmp/mjwarp_4096_train.log
+    OMNI_KIT_ACCEPT_EULA=YES ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Lift-Cube-Franka-FeatherPGS-TGS-NoVelGuard-v0 --num_envs 4096 --seed 7 --max_iterations 300 --headless 2>&1 | tee /tmp/tgs_noguard_4096_train.log
+    OMNI_KIT_ACCEPT_EULA=YES ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Lift-Cube-Franka-FeatherPGS-v0 --num_envs 4096 --seed 7 --max_iterations 300 --headless 2>&1 | tee /tmp/featherpgs_4096_train.log
+
+The generated log directories were:
+
+- MJWarp: `skild-IL-solver/logs/rsl_rl/franka_lift/2026-04-13_17-34-19`
+- TGS no-guard: `skild-IL-solver/logs/rsl_rl/franka_lift/2026-04-13_17-40-30`
+- baseline FeatherPGS: `skild-IL-solver/logs/rsl_rl/franka_lift/2026-04-13_17-53-44`
+
+The monitoring rule was to inspect progress roughly every `50` iterations and kill a run once it had clearly flatlined after more than `100` iterations. That rule changed two of the runs:
+
+- TGS no-guard was launched for `300` iterations but stopped manually after iteration `207` because reward plateaued in the mid-teens between iterations `100` and `200`
+- baseline FeatherPGS was launched for `300` iterations but stopped manually after iteration `167` because reward remained near `1-2`, far below both the reference FeatherPGS curve and the TGS no-guard run
+
+The key checkpoints from the captured trainer logs were:
+
+    MJWarp (17:34:19, completed 100 iterations in 00:04:57)
+      iter 0:   reward 0.35, episode length 1.02, steps/s 12639, joint_vel_out_of_limit 0.9996
+      iter 50:  reward 0.68, episode length 1.95, steps/s 32887, joint_vel_out_of_limit 1.0000
+      iter 99:  reward 0.70, episode length 1.99, steps/s 34833, joint_vel_out_of_limit 1.0000
+
+    TGS no-guard (17:40:30, stopped at iter 207 after 00:12:02)
+      iter 0:   reward 0.70, episode length 21.99, steps/s 15623, time_out 0.0493
+      iter 50:  reward 8.93, episode length 235.29, steps/s 28748, time_out 0.8864
+      iter 100: reward 18.28, episode length 211.03, steps/s 27599, time_out 0.6499
+      iter 150: reward 16.88, episode length 206.06, steps/s 28966, time_out 0.6339
+      iter 200: reward 16.69, episode length 203.31, steps/s 27627, time_out 0.6454
+      iter 207: reward 15.62, episode length 200.15, steps/s 28956, time_out 0.6259
+
+    baseline FeatherPGS with guard (17:53:44, stopped at iter 167 after 00:05:29)
+      iter 0:   reward 0.37, episode length 1.04, steps/s 19829, joint_vel_out_of_limit 0.9987
+      iter 50:  reward 0.70, episode length 6.55, steps/s 52989, joint_vel_out_of_limit 1.0000
+      iter 100: reward 1.37, episode length 203.74, steps/s 50130, joint_vel_out_of_limit 0.2576
+      iter 150: reward 1.99, episode length 226.76, steps/s 49587, joint_vel_out_of_limit 0.1351
+      iter 167: reward 1.37, episode length 223.63, steps/s 48414, joint_vel_out_of_limit 0.1459
+
+The practical conclusions from this monitored Stage 3C study are:
+
+- The runnable MJWarp Franka baseline in this workspace does not resemble the supplied healthy MJWarp curve. It stayed stuck near `0.7` reward through `100` iterations, with almost every episode terminating on `joint_vel_out_of_limit`.
+- The TGS-style no-guard path is the only runnable path in this workspace that shows clear learning signal by iteration `100`. Its reward of `18.28` at `100` is consistent with “this run is actually learning,” but it plateaued early in the mid-teens instead of continuing toward the supplied FeatherPGS reference curve.
+- Baseline FeatherPGS with the default velocity guard underperforms badly. It eventually escaped the strict one-step regime, but even by `150` iterations it remained around `2` reward, which is far below both the supplied FeatherPGS reference (`~20` by `150`) and the TGS no-guard run.
+- Throughput cost is real but not catastrophic at trainer level. The TGS no-guard path ran at about `27.6k-28.9k` steps/s once warmed up, versus about `48.4k-53.0k` steps/s for baseline FeatherPGS and about `32.9k-34.8k` steps/s for MJWarp. Relative to baseline FeatherPGS, the TGS-style schedule was roughly `1.7x-1.9x` slower in these 4096-env training loops.
+- The main comparison is therefore not “TGS wins cleanly.” It is “the only path here that learns meaningfully is the smaller-step TGS-style path with the velocity guard removed, and it buys that signal at a significant throughput cost while still plateauing far below the supplied healthy long-run baselines.”
+
+## Current recommendation after the completed Stage 3C slice
+
+Stage 3C is now complete enough to support Stage 4. The next pass should stop changing training harnesses and instead write the final recommendation from the evidence already gathered:
 
 - keep the Stage 3B rollout harness as the reproducible pre-flight check before any further training runs
-- treat the new Stage 3C evidence as confirmation that the velocity guard, not the smaller-step schedule alone, dominates early TGS-style training behavior
-- either produce throughput evidence with a completing benchmark path or close that item with a concrete reproducible blocker statement
-- then move to Stage 4 and write the final viability and cost-benefit recommendation so the study questions are answered in one place without inference
+- treat the `32`-env, `2`-iteration runs as boot evidence only and use the monitored `4096`-env runs for actual training conclusions
+- treat the missing `omni.physics` module as a standing limitation on any PhysX-backed comparison in this workspace
+- use the supplied reference curve plus the monitored Stage 3C data to decide whether the smaller-step TGS-style path is worth its throughput cost and whether the baseline FeatherPGS result is fundamentally blocked by the velocity guard, by solver quality, or by both
+- write the final Stage 4 viability and cost-benefit recommendation so the study questions are answered in one place without inference
