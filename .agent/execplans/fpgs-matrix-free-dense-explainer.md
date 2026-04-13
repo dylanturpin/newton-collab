@@ -87,6 +87,14 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
+## Pass Update (2026-04-13)
+
+M2 needs a tighter first slice before runtime-backed capture starts. This pass will:
+
+- define the checked-in machine-readable schemas for scenario sizing and kernel memory-layout notes
+- add a bootstrap helper that emits the capture manifest from the benchmark scenario/preset surface already in-tree
+- stop short of recording scenario measurements; those remain M3 work once the schema is fixed
+
 ## Milestones
 
 ### M0. Orchestration Setup
@@ -118,7 +126,7 @@ Expected outputs:
 
 ### M2. Data Extraction Tooling and Schema
 
-Status: pending
+Status: complete
 
 Definition of done:
 
@@ -130,6 +138,22 @@ Expected outputs:
 
 - helper scripts if needed
 - initial raw artifact schema and output location
+
+Completed outputs:
+
+- checked-in schema files under `.agent/data/fpgs-matrix-free-dense-explainer/schema/`:
+  - `scenario-sizing.schema.json`
+  - `kernel-memory-analysis.schema.json`
+- bootstrap helper script:
+  - `scripts/analysis/bootstrap_fpgs_explainer_artifacts.py`
+- generated capture manifest:
+  - `.agent/data/fpgs-matrix-free-dense-explainer/m2-capture-manifest.json`
+
+Validation for this milestone:
+
+- `uv run python scripts/analysis/bootstrap_fpgs_explainer_artifacts.py`
+- `python -m json.tool .agent/data/fpgs-matrix-free-dense-explainer/schema/scenario-sizing.schema.json`
+- `python -m json.tool .agent/data/fpgs-matrix-free-dense-explainer/schema/kernel-memory-analysis.schema.json`
 
 ### M3. Scenario-Backed Dense vs Matrix-Free Data Capture
 

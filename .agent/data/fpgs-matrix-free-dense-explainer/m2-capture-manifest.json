@@ -1,0 +1,149 @@
+{
+  "artifact_root": ".agent/data/fpgs-matrix-free-dense-explainer",
+  "comparison_presets": [
+    {
+      "name": "fpgs_dense_loop",
+      "pgs_mode": "dense",
+      "settings": {
+        "cholesky_kernel": "loop",
+        "delassus_kernel": "par_row_col",
+        "hinv_jt_kernel": "par_row",
+        "pgs_kernel": "loop",
+        "pgs_mode": "dense",
+        "trisolve_kernel": "loop",
+        "use_parallel_streams": false
+      },
+      "type": "feather_pgs"
+    },
+    {
+      "name": "fpgs_dense_row",
+      "pgs_mode": "dense",
+      "settings": {
+        "cholesky_kernel": "tiled",
+        "delassus_kernel": "tiled",
+        "hinv_jt_kernel": "tiled",
+        "pgs_kernel": "tiled_row",
+        "pgs_mode": "dense",
+        "trisolve_kernel": "tiled",
+        "use_parallel_streams": true
+      },
+      "type": "feather_pgs"
+    },
+    {
+      "name": "fpgs_dense_streaming",
+      "pgs_mode": "dense",
+      "settings": {
+        "cholesky_kernel": "tiled",
+        "delassus_kernel": "tiled",
+        "hinv_jt_kernel": "par_row",
+        "pgs_kernel": "streaming",
+        "pgs_mode": "dense",
+        "trisolve_kernel": "tiled",
+        "use_parallel_streams": false
+      },
+      "type": "feather_pgs"
+    },
+    {
+      "name": "fpgs_split",
+      "pgs_mode": "split",
+      "settings": {
+        "cholesky_kernel": "tiled",
+        "delassus_kernel": "tiled",
+        "hinv_jt_kernel": "tiled",
+        "pgs_kernel": "tiled_contact",
+        "pgs_mode": "split",
+        "trisolve_kernel": "tiled",
+        "use_parallel_streams": true
+      },
+      "type": "feather_pgs"
+    },
+    {
+      "name": "fpgs_matrix_free",
+      "pgs_mode": "matrix_free",
+      "settings": {
+        "cholesky_kernel": "tiled",
+        "delassus_kernel": "tiled",
+        "dense_max_constraints": 128,
+        "hinv_jt_kernel": "tiled",
+        "pgs_kernel": "tiled_contact",
+        "pgs_mode": "matrix_free",
+        "trisolve_kernel": "tiled",
+        "use_parallel_streams": true
+      },
+      "type": "feather_pgs"
+    }
+  ],
+  "generated_at_utc": "2026-04-13T16:52:38.570908Z",
+  "git_commit": "aa68f425",
+  "notes": [
+    "Scenario-backed capture files are deferred to M3.",
+    "Kernel memory-layout artifacts are deferred to M4.",
+    "This manifest is generated from the checked-in benchmark surface and should be regenerated if scenario or preset names change."
+  ],
+  "planned_kernel_outputs": [
+    "kernels/dense-loop.json",
+    "kernels/dense-row.json",
+    "kernels/dense-streaming.json",
+    "kernels/matrix-free-gs.json",
+    "kernels/tiled-contact-fused.json"
+  ],
+  "required_scenarios": [
+    {
+      "default_dense_max_constraints": 32,
+      "default_pgs_iterations": 4,
+      "default_substeps": 2,
+      "description": "G1 humanoid on flat ground",
+      "environment": null,
+      "mujoco_settings": {
+        "cone": "pyramidal",
+        "integrator": "implicitfast",
+        "ls_parallel": true,
+        "nconmax": 35,
+        "njmax": 210,
+        "solver": "newton"
+      },
+      "name": "g1_flat",
+      "planned_outputs": [
+        "scenarios/g1_flat/fpgs_dense_loop.json",
+        "scenarios/g1_flat/fpgs_dense_row.json",
+        "scenarios/g1_flat/fpgs_dense_streaming.json",
+        "scenarios/g1_flat/fpgs_split.json",
+        "scenarios/g1_flat/fpgs_matrix_free.json"
+      ],
+      "robot": "g1"
+    },
+    {
+      "default_dense_max_constraints": 128,
+      "default_pgs_iterations": 8,
+      "default_substeps": 8,
+      "description": "H1 humanoid with tabletop objects",
+      "environment": "tabletop",
+      "mujoco_settings": {
+        "cone": "pyramidal",
+        "integrator": "implicitfast",
+        "ls_parallel": true,
+        "nconmax": 128,
+        "njmax": 512,
+        "solver": "newton"
+      },
+      "name": "h1_tabletop",
+      "planned_outputs": [
+        "scenarios/h1_tabletop/fpgs_dense_loop.json",
+        "scenarios/h1_tabletop/fpgs_dense_row.json",
+        "scenarios/h1_tabletop/fpgs_dense_streaming.json",
+        "scenarios/h1_tabletop/fpgs_split.json",
+        "scenarios/h1_tabletop/fpgs_matrix_free.json"
+      ],
+      "robot": "h1"
+    }
+  ],
+  "schema_version": "1.0.0",
+  "schemas": {
+    "kernel_memory_analysis": ".agent/data/fpgs-matrix-free-dense-explainer/schema/kernel-memory-analysis.schema.json",
+    "scenario_sizing": ".agent/data/fpgs-matrix-free-dense-explainer/schema/scenario-sizing.schema.json"
+  },
+  "source_files": [
+    "newton/tools/solver_benchmark.py",
+    "newton/_src/solvers/feather_pgs/solver_feather_pgs.py"
+  ]
+}

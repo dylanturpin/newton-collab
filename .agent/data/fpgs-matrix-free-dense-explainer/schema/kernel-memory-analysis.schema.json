@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://newton.local/fpgs-matrix-free-dense-explainer/kernel-memory-analysis.schema.json",
+  "title": "FeatherPGS kernel memory analysis artifact",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "provenance",
+    "kernel",
+    "launch",
+    "memory_layout",
+    "operations"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "provenance": {
+      "type": "object",
+      "required": [
+        "generator",
+        "git_commit",
+        "generated_at_utc",
+        "source_files"
+      ],
+      "properties": {
+        "generator": {
+          "type": "string"
+        },
+        "git_commit": {
+          "type": "string"
+        },
+        "generated_at_utc": {
+          "type": "string"
+        },
+        "source_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "kernel": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "source_file",
+        "phase",
+        "modes"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source_file": {
+          "type": "string"
+        },
+        "source_symbol": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase": {
+          "type": "string"
+        },
+        "modes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "launch": {
+      "type": "object",
+      "required": [
+        "granularity",
+        "threads_per_block"
+      ],
+      "properties": {
+        "granularity": {
+          "type": "string"
+        },
+        "threads_per_block": {
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "worlds_per_block": {
+          "type": [
+            "integer",
+            "string",
+            "null"
+          ]
+        },
+        "sizing_symbols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "memory_layout": {
+      "type": "object",
+      "required": [
+        "global_reads",
+        "global_writes",
+        "shared_allocations",
+        "register_resident"
+      ],
+      "properties": {
+        "global_reads": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/memoryItem"
+          }
+        },
+        "global_writes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/memoryItem"
+          }
+        },
+        "shared_allocations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/memoryItem"
+          }
+        },
+        "register_resident": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/memoryItem"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "operations": {
+      "type": "object",
+      "required": [
+        "streamed_inputs",
+        "preloaded_inputs",
+        "recomputed_values",
+        "dominant_work"
+      ],
+      "properties": {
+        "streamed_inputs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "preloaded_inputs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "recomputed_values": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dominant_work": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "memoryItem": {
+      "type": "object",
+      "required": [
+        "name",
+        "location"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        },
+        "shape": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dtype": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
