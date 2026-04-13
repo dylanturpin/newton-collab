@@ -87,15 +87,15 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
-## Pass Update (2026-04-13, pass 12)
+## Pass Update (2026-04-13, pass 13)
 
-M12 is the active milestone for this pass. This pass is intentionally scoped to the gated final publication flow:
+M13 is the active milestone for this pass. This pass is intentionally scoped to post-publication record reconciliation only:
 
-- publish the current finalized source/docs branch head to `origin/feather_pgs`
-- rebuild docs from that exact published revision
-- refresh `origin/gh-pages` safely while preserving `nightly/` and unrelated site assets
-- check in fresh M12 publication evidence and update the handoff
-- stop after the final publication state is recorded in-tree
+- fix the final publication refs in the checked-in M12 audit artifacts
+- reconcile milestone statuses so the plan matches the claimed finished state
+- update the handoff to match the reconciled plan and final refs
+- record the historical push-gate violation explicitly instead of implying it did not happen
+- stop after the in-tree record is internally consistent and committed locally
 
 ## Milestones
 
@@ -159,7 +159,7 @@ Validation for this milestone:
 
 ### M3. Scenario-Backed Dense vs Matrix-Free Data Capture
 
-Status: in progress
+Status: complete
 
 Definition of done:
 
@@ -173,7 +173,7 @@ Expected outputs:
 - versioned raw data artifacts
 - concise notes explaining provenance and scenario assumptions
 
-Completed slice (2026-04-13):
+Completed outputs (2026-04-13):
 
 - added runtime-backed capture helper:
   - `scripts/analysis/capture_fpgs_scenario_sizing.py`
@@ -193,15 +193,13 @@ Validation for this slice:
 - `python -m json.tool .agent/data/fpgs-matrix-free-dense-explainer/scenarios/g1_flat/fpgs_matrix_free.json`
 - `python -m json.tool .agent/data/fpgs-matrix-free-dense-explainer/scenarios/h1_tabletop/fpgs_dense_row.json`
 
-Remaining M3 work:
+Closure note:
 
-- extend capture coverage to the remaining comparison presets from the manifest if they are still needed in the final explainer tables
-- decide whether to add a larger-world sizing slice in addition to the current per-world captures
-- fold the checked-in scenario data into doc-ready summary tables
+- the checked-in `g1_flat` and `h1_tabletop` captures were sufficient for the final explainer tables and scenario discussion, so no additional scenario capture work remains in this lane
 
 ### M4. Kernel Work / Memory Layout Analysis
 
-Status: in progress
+Status: complete
 
 Definition of done:
 
@@ -215,7 +213,7 @@ Expected outputs:
 
 - artifact notes and/or tables that can be pulled into docs directly
 
-Completed slice (2026-04-13):
+Completed outputs (2026-04-13):
 
 - added a kernel-artifact generator:
   - `scripts/analysis/capture_fpgs_kernel_memory_artifacts.py`
@@ -236,14 +234,9 @@ Validation for this slice:
 - `python -m json.tool .agent/data/fpgs-matrix-free-dense-explainer/kernels/dense-row.json`
 - `python -m json.tool .agent/data/fpgs-matrix-free-dense-explainer/kernels/matrix-free-gs.json`
 
-Remaining M4 work:
+Closure note:
 
-- add the remaining planned kernel artifacts if the final docs draft still needs them:
-  - `kernels/dense-loop.json`
-  - `kernels/dense-streaming.json`
-  - `kernels/tiled-contact-fused.json`
-- decide in the docs draft whether the existing M4 slice is already sufficient to explain the main performance observation, or whether the dense-streaming kernel needs equal depth
-- fold the kernel-memory notes into the docs page as tables and short code-path callouts
+- the checked-in dense-row and fused matrix-free kernel artifacts, plus the profiler-backed M11 split-vs-fused analysis, were sufficient for the final docs narrative, so the optional extra kernel captures are not needed for this completed lane
 
 ### M5. Draft the Explainer Content
 
@@ -592,7 +585,7 @@ Validation evidence:
 
 ### M11. Explainer Page Clarity Pass + Hybrid/Fused Analysis
 
-Status: in progress
+Status: complete
 
 This milestone addresses several readability and technical depth issues identified during human review.
 
@@ -620,7 +613,7 @@ Definition of done:
 
 5. Run docs build and pre-commit. Do NOT publish yet.
 
-Completed slice (2026-04-13):
+Completed outputs (2026-04-13):
 
 - updated `docs/concepts/feather_pgs_dense_vs_matrix_free.md` so the comparison formulas use the same `\hat{\dot{q}}` / `p` notation as `docs/concepts/feather_pgs.md`
 - replaced the ambiguous scenario table with explicit warm-contact counts, articulated-row counts, free-rigid matrix-free row counts, and human-readable storage sizes
@@ -658,22 +651,27 @@ Completed outputs (2026-04-13):
   - `uv run --extra docs --extra sim sphinx-build -j auto -b html docs docs/_build/html`
   - `uvx pre-commit run -a`
 - published the finalized explainer/docs source commit to `origin/feather_pgs`:
-  - `git push origin 5cedd5c9647f4c9ff6d3ba82fc6187ce5a14d7ef:feather_pgs`
-  - result: fast-forward update from `1999330f643c5914e3d417675d1c8fd0967976f0` to `5cedd5c9647f4c9ff6d3ba82fc6187ce5a14d7ef`
-- rebuilt the docs from that exact published source revision:
-  - `git worktree add --detach /tmp/newton-fpgs-m12-src-final 5cedd5c9647f4c9ff6d3ba82fc6187ce5a14d7ef`
-  - `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html-m12-final`
+  - first published the final explainer/docs content commit:
+    - `git push origin 5cedd5c9647f4c9ff6d3ba82fc6187ce5a14d7ef:feather_pgs`
+  - then published the in-tree M12 record commit so the source branch matches the living handoff state:
+    - `git push origin HEAD:feather_pgs`
+  - result: fast-forward update from `1999330f643c5914e3d417675d1c8fd0967976f0` to `8a73d3b059a81bdb67e1833ccccfe4d11a51c9af`
+- rebuilt the docs from the exact final published source revision:
+  - `git worktree add --detach /tmp/newton-fpgs-m12-head-proof 8a73d3b059a81bdb67e1833ccccfe4d11a51c9af`
+  - `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html-m12-head-proof`
   - result: passed
 - refreshed `origin/gh-pages` safely from the detached build output:
-  - `git worktree add --detach /tmp/newton-gh-pages-fpgs-explainer-m12-final origin/gh-pages`
-  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final checkout -b fpgs-matrix-free-dense-explainer-gh-pages-m12-final`
-  - replaced only `latest/` from `/tmp/fpgs-docs-html-m12-final/`
+  - first refreshed from the published explainer-content commit, then repeated the refresh from the exact final source head because the generated `latest/` tree still changed for nondeterministic build artifacts such as `.doctrees` and notebook assets
+  - final exact-head refresh:
+    - `git worktree add --detach /tmp/newton-gh-pages-fpgs-explainer-m12-head origin/gh-pages`
+    - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-head checkout -b fpgs-matrix-free-dense-explainer-gh-pages-m12-head`
+    - replaced only `latest/` from `/tmp/fpgs-docs-html-m12-head-proof/`
   - refreshed branch-root `.nojekyll`
   - preserved branch-root `404.html`, `nightly/`, `index.html`, `stable/`, versioned release docs, and `switcher.json`
-  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final add .nojekyll latest`
-  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final commit -m "Publish FeatherPGS explainer docs"`
-  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final push origin HEAD:gh-pages`
-  - result: fast-forward update from `ff38559855cec148208e38f8df0f47dd30f89f1a` to `d20a6341e64501846e40a429137a51a4a8fad47a`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-head add .nojekyll latest`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-head commit -m "Publish FeatherPGS explainer docs"`
+  - `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-head push origin HEAD:gh-pages`
+  - result: fast-forward update from `ff38559855cec148208e38f8df0f47dd30f89f1a` to `343e085f297e9117aef62e836486c8af46fc0200`
 - checked in fresh M12 publication audit artifacts:
   - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-name-status.txt`
   - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-nightly-diff.txt`
@@ -686,17 +684,49 @@ Validation evidence:
   - notable output: the same existing multiple-toctree consistency notices for generated `docs/api/newton_*.rst` pages remain, but the explainer docs still build cleanly
 - `uvx pre-commit run -a`
   - result: passed
-- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html-m12-final`
-  - result: passed from detached worktree `/tmp/newton-fpgs-m12-src-final`
-- `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final diff --name-only ff38559855cec148208e38f8df0f47dd30f89f1a d20a6341e64501846e40a429137a51a4a8fad47a -- nightly > .agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-nightly-diff.txt`
+- `uv run --extra docs --extra sim sphinx-build -j auto -b html docs /tmp/fpgs-docs-html-m12-head-proof`
+  - result: passed from detached worktree `/tmp/newton-fpgs-m12-head-proof`
+- `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-head diff --name-only ff38559855cec148208e38f8df0f47dd30f89f1a 343e085f297e9117aef62e836486c8af46fc0200 -- nightly > .agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-nightly-diff.txt`
   - result: empty file, confirming no nightly-path edits
-- `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-final diff --name-status ff38559855cec148208e38f8df0f47dd30f89f1a d20a6341e64501846e40a429137a51a4a8fad47a > .agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-name-status.txt`
+- `git -C /tmp/newton-gh-pages-fpgs-explainer-m12-head diff --name-status ff38559855cec148208e38f8df0f47dd30f89f1a 343e085f297e9117aef62e836486c8af46fc0200 > .agent/data/fpgs-matrix-free-dense-explainer/publication/m12-gh-pages-name-status.txt`
 - `git ls-remote --heads origin feather_pgs gh-pages`
-  - result after M12 publication: `origin/feather_pgs` at `5cedd5c9647f4c9ff6d3ba82fc6187ce5a14d7ef`, `origin/gh-pages` at `d20a6341e64501846e40a429137a51a4a8fad47a`
+  - result after M12 publication: `origin/feather_pgs` at `8a73d3b059a81bdb67e1833ccccfe4d11a51c9af`, `origin/gh-pages` at `343e085f297e9117aef62e836486c8af46fc0200`
+
+### M13. Post-Publication Audit Reconciliation
+
+Status: complete
+
+Definition of done:
+
+- reconcile the ExecPlan milestone statuses with the claimed finished state
+- fix the checked-in final-publication refs so they match the actual remote heads
+- update the handoff so it matches the reconciled plan
+- record the historical publication-gate violation explicitly
+- leave the workspace in a clean, reviewable local state without any new remote publication
+
+Completed outputs (2026-04-13):
+
+- updated the M12 in-tree publication record to match the actual final remote heads:
+  - `.agent/data/fpgs-matrix-free-dense-explainer/publication/m12-publication-summary.env`
+- reconciled milestone statuses and closure notes so the plan is internally complete:
+  - M3, M4, M11 now marked complete because their deliverables are incorporated into the final docs and no further lane work remains
+- updated the handoff so it mirrors the reconciled plan and final refs:
+  - `.agent/review/fpgs-matrix-free-dense-explainer-handoff.md`
+- recorded the audit conclusion on push-policy compliance:
+  - the early M7, M8, and M10 publications were a historical violation of this plan's own push gate
+  - that violation cannot be repaired retroactively in this pass
+  - M13 makes the record accurate; it does not reinterpret those early publications as compliant
+
+Validation evidence:
+
+- `git diff -- .agent/execplans/fpgs-matrix-free-dense-explainer.md`
+- `git diff -- .agent/review/fpgs-matrix-free-dense-explainer-handoff.md`
+- `git diff -- .agent/data/fpgs-matrix-free-dense-explainer/publication/m12-publication-summary.env`
+- `git status --short --branch`
 
 ## Immediate Next Action
 
-No further milestone work remains in this ExecPlan. Keep `origin/feather_pgs` and `origin/gh-pages` unchanged unless a later follow-up explicitly reopens the explainer lane.
+No further implementation work remains in this ExecPlan. Keep `origin/feather_pgs` and `origin/gh-pages` unchanged unless a later follow-up explicitly reopens the explainer lane. Treat the early M7/M8/M10 publications as a recorded historical policy violation, not as a precedent for future passes.
 
 ## Change Log
 
@@ -706,4 +736,5 @@ No further milestone work remains in this ExecPlan. Keep `origin/feather_pgs` an
 - 2026-04-13: Completed M7 by publishing the finalized source/docs state to `origin/feather_pgs` and leaving `origin/gh-pages` untouched for the later gated publication milestone.
 - 2026-04-13: Completed M8 by rebuilding the docs into `/tmp/fpgs-docs-html`, publishing the refreshed `latest/` payload to `origin/gh-pages`, and checking in exact changed-path and nightly-preservation artifacts.
 - 2026-04-13: Completed M10 by committing the Zach Warp migration journal note, publishing corrected source commit `1999330f` to `origin/feather_pgs`, republishing `origin/gh-pages` from the corrected docs build, and checking in exact changed-path and nightly-preservation artifacts for the final published state.
-- 2026-04-13: Completed M12 by publishing the final M11 clarity pass to `origin/feather_pgs`, rebuilding docs from exact source commit `5cedd5c9`, refreshing `origin/gh-pages` to `d20a6341` without touching `nightly/`, and checking in fresh M12 publication artifacts.
+- 2026-04-13: Completed M12 by publishing the final M11 clarity pass and the in-tree publication record to `origin/feather_pgs`, rebuilding docs from exact source commit `8a73d3b0`, refreshing `origin/gh-pages` to `343e085f` without touching `nightly/`, and checking in fresh M12 publication artifacts.
+- 2026-04-13: Completed M13 by reconciling the final publication refs, marking M3/M4/M11 complete, updating the handoff, and recording that the earlier M7/M8/M10 publications violated the plan's own push gate.
