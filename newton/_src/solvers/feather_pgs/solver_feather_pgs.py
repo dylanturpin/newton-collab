@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import ClassVar
 
 import numpy as np
@@ -34,6 +35,7 @@ from ..semi_implicit.kernels_particle import (
     eval_triangle_forces,
 )
 from ..solver import SolverBase
+from .debug_capture import FeatherPGSCaptureConfig
 from .kernels import (
     TILE_THREADS,
     add_dense_contact_compliance_to_diag,
@@ -298,6 +300,9 @@ class SolverFeatherPGS(SolverBase):
         self._step = 0
         self._force_mass_update = False
         self._last_step_dt = None
+        self._capture_config = FeatherPGSCaptureConfig.from_env()
+        self._capture_sequence = 0
+        self._capture_pending: dict[str, object] | None = None
 
         self._compute_articulation_metadata(model)
 
@@ -1014,6 +1019,181 @@ class SolverFeatherPGS(SolverBase):
         self._memset_done_event[0] = main_stream.record_event()
         self._memset_done_event[1] = main_stream.record_event()
 
+    def _capture_warp_array(self, arrays: dict[str, np.ndarray], name: str, array) -> None:
+        """Copy a Warp array to host memory for an opt-in debug capture."""
+        if array is None:
+            return
+        arrays[name] = array.numpy()
+
+    def _capture_grouped_arrays(
+        self, arrays: dict[str, np.ndarray], prefix: str, grouped_arrays: dict[int, object]
+    ) -> None:
+        """Flatten per-size-group Warp arrays into a single capture payload."""
+        for size in sorted(grouped_arrays):
+            self._capture_warp_array(arrays, f"{prefix}_{size}", grouped_arrays[size])
+
+    def _capture_pre_solve_frame(self, state_in: State, contacts: Contacts, dt: float, solve_path: str) -> None:
+        """Snapshot the solver inputs immediately before the first PGS iteration."""
+        if self._capture_config is None:
+            return
+        if self._capture_sequence >= self._capture_config.max_frames:
+            return
+        if self._capture_pending is not None:
+            return
+
+        model = self.model
+        arrays: dict[str, np.ndarray] = {}
+        metadata = {
+            "capture_boundary": "pre_first_pgs_iteration",
+            "capture_created_at": datetime.now(timezone.utc).isoformat(),
+            "dense_max_constraints": self.dense_max_constraints,
+            "dt": dt,
+            "enable_contact_friction": self.enable_contact_friction,
+            "enable_joint_limits": self.enable_joint_limits,
+            "max_capture_frames": self._capture_config.max_frames,
+            "mf_max_constraints": self.mf_max_constraints,
+            "pgs_beta": self.pgs_beta,
+            "pgs_cfm": self.pgs_cfm,
+            "pgs_iterations": self.pgs_iterations,
+            "pgs_kernel": self.pgs_kernel,
+            "pgs_mode": self.pgs_mode,
+            "pgs_omega": self.pgs_omega,
+            "solve_path": solve_path,
+            "step": self._step,
+            "velocity_threshold": self._capture_config.velocity_threshold,
+            "world_count": self.world_count,
+        }
+
+        self._capture_warp_array(arrays, "state_in_joint_q", state_in.joint_q)
+        self._capture_warp_array(arrays, "state_in_joint_qd", state_in.joint_qd)
+        self._capture_warp_array(arrays, "state_in_body_q", state_in.body_q)
+        self._capture_warp_array(arrays, "state_in_body_qd", state_in.body_qd)
+        self._capture_warp_array(arrays, "art_to_world", self.art_to_world)
+        self._capture_warp_array(arrays, "art_size", self.art_size)
+        self._capture_warp_array(arrays, "art_group_idx", self.art_group_idx)
+        self._capture_warp_array(arrays, "articulation_dof_start", self.articulation_dof_start)
+        self._capture_warp_array(arrays, "articulation_H_rows", self.articulation_H_rows)
+        self._capture_warp_array(arrays, "articulation_origin", self.articulation_origin)
+        self._capture_warp_array(arrays, "body_to_articulation", self.body_to_articulation)
+        self._capture_warp_array(arrays, "body_to_joint", self.body_to_joint)
+        self._capture_warp_array(arrays, "joint_ancestor", model.joint_ancestor)
+        self._capture_warp_array(arrays, "joint_qd_start", model.joint_qd_start)
+        self._capture_warp_array(arrays, "shape_body", model.shape_body)
+        self._capture_warp_array(arrays, "shape_material_mu", self.shape_material_mu)
+        self._capture_warp_array(arrays, "qd_work", self.qd_work)
+        self._capture_warp_array(arrays, "v_hat", self.v_hat)
+        self._capture_warp_array(arrays, "slot_counter", self.slot_counter)
+        self._capture_warp_array(arrays, "constraint_count", self.constraint_count)
+        self._capture_warp_array(arrays, "contact_world", self.contact_world)
+        self._capture_warp_array(arrays, "contact_slot", self.contact_slot)
+        self._capture_warp_array(arrays, "contact_art_a", self.contact_art_a)
+        self._capture_warp_array(arrays, "contact_art_b", self.contact_art_b)
+        self._capture_warp_array(arrays, "contact_path", self.contact_path)
+        self._capture_warp_array(arrays, "row_type", self.row_type)
+        self._capture_warp_array(arrays, "row_parent", self.row_parent)
+        self._capture_warp_array(arrays, "row_mu", self.row_mu)
+        self._capture_warp_array(arrays, "row_beta", self.row_beta)
+        self._capture_warp_array(arrays, "row_cfm", self.row_cfm)
+        self._capture_warp_array(arrays, "phi", self.phi)
+        self._capture_warp_array(arrays, "target_velocity", self.target_velocity)
+        self._capture_warp_array(arrays, "rhs", self.rhs)
+        self._capture_warp_array(arrays, "diag", self.diag)
+        self._capture_warp_array(arrays, "impulses_pre_solve", self.impulses)
+        self._capture_grouped_arrays(arrays, "J_by_size", self.J_by_size)
+        self._capture_grouped_arrays(arrays, "Y_by_size", self.Y_by_size)
+        self._capture_grouped_arrays(arrays, "group_to_art", self.group_to_art)
+
+        if self.C is not None:
+            self._capture_warp_array(arrays, "C", self.C)
+        if self.J_world is not None:
+            self._capture_warp_array(arrays, "J_world", self.J_world)
+        if self.Y_world is not None:
+            self._capture_warp_array(arrays, "Y_world", self.Y_world)
+        if self.limit_slot is not None:
+            self._capture_warp_array(arrays, "limit_slot", self.limit_slot)
+        if self.limit_sign is not None:
+            self._capture_warp_array(arrays, "limit_sign", self.limit_sign)
+        if hasattr(self, "mf_constraint_count"):
+            self._capture_warp_array(arrays, "mf_constraint_count", self.mf_constraint_count)
+            self._capture_warp_array(arrays, "mf_slot_counter", self.mf_slot_counter)
+            self._capture_warp_array(arrays, "mf_body_a", self.mf_body_a)
+            self._capture_warp_array(arrays, "mf_body_b", self.mf_body_b)
+            self._capture_warp_array(arrays, "mf_J_a", self.mf_J_a)
+            self._capture_warp_array(arrays, "mf_J_b", self.mf_J_b)
+            self._capture_warp_array(arrays, "mf_MiJt_a", self.mf_MiJt_a)
+            self._capture_warp_array(arrays, "mf_MiJt_b", self.mf_MiJt_b)
+            self._capture_warp_array(arrays, "mf_rhs", self.mf_rhs)
+            self._capture_warp_array(arrays, "mf_impulses_pre_solve", self.mf_impulses)
+            self._capture_warp_array(arrays, "mf_eff_mass_inv", self.mf_eff_mass_inv)
+            self._capture_warp_array(arrays, "mf_row_type", self.mf_row_type)
+            self._capture_warp_array(arrays, "mf_row_parent", self.mf_row_parent)
+            self._capture_warp_array(arrays, "mf_row_mu", self.mf_row_mu)
+            self._capture_warp_array(arrays, "mf_phi", self.mf_phi)
+            self._capture_warp_array(arrays, "mf_dof_a", self.mf_dof_a)
+            self._capture_warp_array(arrays, "mf_dof_b", self.mf_dof_b)
+            self._capture_warp_array(arrays, "mf_meta_packed", self.mf_meta_packed)
+            self._capture_warp_array(arrays, "mf_body_count", self.mf_body_count)
+            self._capture_warp_array(arrays, "mf_body_list", self.mf_body_list)
+            self._capture_warp_array(arrays, "mf_body_dof_start", self.mf_body_dof_start)
+            self._capture_warp_array(arrays, "mf_local_body_a", self.mf_local_body_a)
+            self._capture_warp_array(arrays, "mf_local_body_b", self.mf_local_body_b)
+
+        if (
+            contacts is not None
+            and getattr(contacts, "rigid_contact_count", None) is not None
+            and contacts.rigid_contact_max > 0
+        ):
+            self._capture_warp_array(arrays, "contact_count_raw", contacts.rigid_contact_count)
+            self._capture_warp_array(arrays, "contact_shape0_raw", contacts.rigid_contact_shape0)
+            self._capture_warp_array(arrays, "contact_shape1_raw", contacts.rigid_contact_shape1)
+            self._capture_warp_array(arrays, "contact_point0_raw", contacts.rigid_contact_point0)
+            self._capture_warp_array(arrays, "contact_point1_raw", contacts.rigid_contact_point1)
+            self._capture_warp_array(arrays, "contact_normal_raw", contacts.rigid_contact_normal)
+            self._capture_warp_array(arrays, "contact_margin0_raw", contacts.rigid_contact_margin0)
+            self._capture_warp_array(arrays, "contact_margin1_raw", contacts.rigid_contact_margin1)
+
+        self._capture_pending = {
+            "arrays": arrays,
+            "metadata": metadata,
+        }
+
+    def _flush_capture_frame(self) -> None:
+        """Write the pending capture if the post-solve velocity trigger fires."""
+        if self._capture_pending is None or self._capture_config is None:
+            return
+
+        max_abs_velocity = 0.0
+        if self.v_out is not None:
+            v_out_np = self.v_out.numpy()
+            max_abs_velocity = float(np.max(np.abs(v_out_np))) if v_out_np.size else 0.0
+        else:
+            v_out_np = np.zeros((0,), dtype=np.float32)
+
+        if not self._capture_config.should_capture(max_abs_velocity):
+            self._capture_pending = None
+            return
+
+        pending = self._capture_pending
+        arrays = dict(pending["arrays"])
+        metadata = dict(pending["metadata"])
+        arrays["v_out"] = v_out_np
+        arrays["impulses_post_solve"] = self.impulses.numpy()
+        if hasattr(self, "mf_impulses"):
+            arrays["mf_impulses_post_solve"] = self.mf_impulses.numpy()
+        metadata["max_abs_velocity"] = max_abs_velocity
+        metadata["capture_sequence"] = self._capture_sequence
+
+        metadata_path, payload_path = self._capture_config.write_capture(
+            step=self._step,
+            sequence=self._capture_sequence,
+            metadata=metadata,
+            arrays=arrays,
+        )
+        self._capture_sequence += 1
+        self._capture_pending = None
+
+        print(f"[FeatherPGS capture] wrote {payload_path} with metadata {metadata_path}")
+
     @override
     def step(
         self,
@@ -1249,6 +1429,8 @@ class SolverFeatherPGS(SolverBase):
                     device=self.model.device,
                 )
 
+            self._capture_pre_solve_frame(state_in, contacts, dt, solve_path="matrix_free")
+
             # Two-phase GS kernel: split-style dense + MF in one pass
             with wp.ScopedTimer("S6_PGS_Solve", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
                 mf_gs_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_kernel(
@@ -1382,6 +1564,7 @@ class SolverFeatherPGS(SolverBase):
             # Split mode with mixed contacts: interleaved dense and MF, 1 iteration each
             self._mf_pgs_setup(state_aug, dt)
             self.v_mf_accum.zero_()
+            self._capture_pre_solve_frame(state_in, contacts, dt, solve_path="split_mixed")
 
             for _pgs_iter in range(self.pgs_iterations):
                 # Dense PGS (1 iteration, impulse space)
@@ -1436,6 +1619,8 @@ class SolverFeatherPGS(SolverBase):
 
         else:
             # Dense or split without mixed contacts: dense PGS, then optional MF
+            solve_path = "split_dense_then_mf" if self.pgs_mode == "split" else "dense"
+            self._capture_pre_solve_frame(state_in, contacts, dt, solve_path=solve_path)
             if self.pgs_debug:
                 self._pgs_convergence_log.append([])
                 for _pgs_dbg_iter in range(self.pgs_iterations):
@@ -1454,6 +1639,8 @@ class SolverFeatherPGS(SolverBase):
 
             if self.pgs_mode == "split" and self._has_free_rigid_bodies:
                 self._stage6b_mf_pgs(state_aug, dt)
+
+        self._flush_capture_frame()
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 7: Update qdd + integrate
