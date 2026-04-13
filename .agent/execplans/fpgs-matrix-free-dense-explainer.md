@@ -87,14 +87,14 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
-## Pass Update (2026-04-13, pass 14)
+## Pass Update (2026-04-13, pass 15)
 
-M14 is the active milestone for this pass. The deliverable itself is already complete and reviewable; this pass is intentionally limited to acceptance-handshake documentation:
+M15 is the active milestone for this pass. The deliverable itself remains complete and reviewable; this pass is intentionally limited to converting the acceptance blocker into a reviewer-ready packet:
 
-- record that the remaining blocker is the historical push-policy violation from the earlier M7/M8/M10 publications
-- state explicitly that this blocker is not repairable with further in-tree implementation work
-- direct the next reviewer either to accept with an explicit override or to relax the process criterion
-- stop after the plan and handoff make that boundary unambiguous and are committed locally
+- capture the latest judge feedback explicitly in the plan/handoff
+- restate the exact local and remote refs that define the review target
+- provide a concise human decision record for either override or relaxed acceptance
+- stop after the plan and handoff make that boundary maximally explicit and are committed locally
 
 ## Milestones
 
@@ -748,6 +748,40 @@ Validation evidence:
 - `git diff -- .agent/execplans/fpgs-matrix-free-dense-explainer.md .agent/review/fpgs-matrix-free-dense-explainer-handoff.md`
 - `git status --short --branch`
 
+### M15. Reviewer Decision Packet
+
+Status: complete
+
+Definition of done:
+
+- update the living plan and handoff with the latest judge feedback in plain language
+- record the exact review target refs:
+  - local branch/head
+  - `origin/feather_pgs`
+  - `origin/gh-pages`
+- provide a concise reviewer-facing decision packet that makes the remaining choice binary:
+  - accept with an explicit override acknowledging the historical M7/M8/M10 push-policy violation, or
+  - relax that acceptance criterion for this lane
+- leave the workspace on the working branch with no new remote publication activity
+
+Completed outputs (2026-04-13):
+
+- updated the ExecPlan pass framing so this final pass is explicitly a reviewer-decision packet rather than another implementation attempt
+- updated the handoff with a dedicated acceptance decision packet section that cites the exact review refs and the unresolved historical-policy issue
+- recorded the current workspace and remote review target explicitly:
+  - local branch: `dturpin/fpgs-matrix-free-dense-explainer`
+  - local head: `f74d9db6`
+  - `origin/feather_pgs`: `8a73d3b059a81bdb67e1833ccccfe4d11a51c9af`
+  - `origin/gh-pages`: `343e085f297e9117aef62e836486c8af46fc0200`
+- confirmed again that no additional in-tree implementation slice can change the historical publication order
+
+Validation evidence:
+
+- `git status --short --branch`
+  - result: clean worktree on `dturpin/fpgs-matrix-free-dense-explainer`
+- `git ls-remote --heads origin feather_pgs gh-pages`
+  - result: `origin/feather_pgs` at `8a73d3b059a81bdb67e1833ccccfe4d11a51c9af`, `origin/gh-pages` at `343e085f297e9117aef62e836486c8af46fc0200`
+
 ## Immediate Next Action
 
 No further implementation work remains in this ExecPlan. Keep `origin/feather_pgs` and `origin/gh-pages` unchanged unless a later follow-up explicitly reopens the explainer lane. Treat the early M7/M8/M10 publications as a recorded historical policy violation, not as a precedent for future passes. For acceptance, require either an explicit human override acknowledging that violation or a relaxed process gate; additional in-tree edits will not change the historical publication sequence.
@@ -763,3 +797,4 @@ No further implementation work remains in this ExecPlan. Keep `origin/feather_pg
 - 2026-04-13: Completed M12 by publishing the final M11 clarity pass and the in-tree publication record to `origin/feather_pgs`, rebuilding docs from exact source commit `8a73d3b0`, refreshing `origin/gh-pages` to `343e085f` without touching `nightly/`, and checking in fresh M12 publication artifacts.
 - 2026-04-13: Completed M13 by reconciling the final publication refs, marking M3/M4/M11 complete, updating the handoff, and recording that the earlier M7/M8/M10 publications violated the plan's own push gate.
 - 2026-04-13: Completed M14 by clarifying that the lane is deliverable-complete but acceptance-blocked on the recorded early-push history, and by documenting that only a human override or relaxed gate can close that process gap.
+- 2026-04-13: Completed M15 by packaging the final human acceptance decision explicitly around the exact review refs and the unchanged historical-push blocker, with no new implementation or publication activity.

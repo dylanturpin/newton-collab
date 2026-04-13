@@ -16,6 +16,7 @@
 - Completed M12: the final M11 clarity pass and the in-tree publication record are now published to `origin/feather_pgs`, and the rendered docs are now published to `origin/gh-pages` with fresh nightly-preservation evidence from the exact published source head.
 - Completed M13: the in-tree audit record is now reconciled to the actual final refs, the milestone statuses now match the claimed finished state, and the historical publication-gate violation is called out explicitly instead of being papered over.
 - Completed M14: the handoff and ExecPlan now state unambiguously that the deliverable is complete, but acceptance is still blocked by the historical early-push violation unless a human explicitly overrides that gate.
+- Completed M15: the handoff now includes a reviewer decision packet with the exact local and remote refs that define the review target and the single remaining human acceptance choice.
 - Chosen docs structure: keep `docs/concepts/feather_pgs.md` as the overview page and add a sibling concepts page for the deep dense-vs-matrix-free comparison.
 - Recorded the initial inventory in `.agent/data/fpgs-matrix-free-dense-explainer/m1-source-inventory.md`.
 - Added checked-in schemas in `.agent/data/fpgs-matrix-free-dense-explainer/schema/`.
@@ -103,6 +104,25 @@
 - Required human decision:
   - accept with an explicit override acknowledging the historical push-policy violation, or
   - relax that acceptance criterion for this lane.
+
+## Reviewer Decision Packet
+
+- Review target:
+  - local branch: `dturpin/fpgs-matrix-free-dense-explainer`
+  - local head: `f74d9db6`
+  - `origin/feather_pgs`: `8a73d3b059a81bdb67e1833ccccfe4d11a51c9af`
+  - `origin/gh-pages`: `343e085f297e9117aef62e836486c8af46fc0200`
+- Technical status:
+  - the explainer docs, raw data artifacts, helper scripts, and validation evidence are all present and reviewable in-tree
+  - no missing local implementation artifact is known at this point
+- Process status:
+  - the historical M7/M8/M10 remote pushes violated the ExecPlan's own publication gate
+  - that history cannot be changed by another local implementation pass
+- Required reviewer disposition:
+  - `override`: accept this lane while explicitly acknowledging the historical publication-order violation
+  - `relax`: change the acceptance rule so that this already-recorded violation no longer blocks closure
+- Non-option:
+  - another implementation pass without a changed acceptance rule will not resolve the blocking criterion
 
 ## Validation Update
 
