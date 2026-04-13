@@ -87,16 +87,14 @@ This ExecPlan resolves that conflict conservatively:
 
 If a different path is materially cleaner, update this section before moving files.
 
-## Pass Update (2026-04-13, pass 4)
+## Pass Update (2026-04-13, pass 5)
 
-M4 now needs a concrete kernel-analysis slice that is directly grounded in the checked-in scenario artifacts. This pass will:
+M5 is now the next reviewable milestone. This pass will:
 
-- add a helper that emits reviewable kernel-memory artifacts in the M4 schema
-- cover the two most important kernels first:
-  - dense tiled-row PGS
-  - fused articulated-plus-free-rigid matrix-free GS
-- capture a doc-ready summary that ties the code-path analysis back to `g1_flat` and `h1_tabletop`
-- stop after this M4 slice rather than starting the docs draft in the same pass
+- land the sibling concepts page chosen in M1
+- wire it into docs navigation and the FeatherPGS overview page
+- ground the draft in the checked-in `g1_flat` / `h1_tabletop` M3 artifacts and the dense-row / matrix-free M4 kernel artifacts
+- refresh the stale kernel-artifact provenance before stopping
 
 ## Milestones
 
@@ -248,7 +246,7 @@ Remaining M4 work:
 
 ### M5. Draft the Explainer Content
 
-Status: pending
+Status: complete
 
 Definition of done:
 
@@ -262,6 +260,18 @@ Expected outputs:
 
 - docs content in repo
 - updated handoff summary draft
+
+Completed outputs (2026-04-13):
+
+- added the sibling explainer page:
+  - `docs/concepts/feather_pgs_dense_vs_matrix_free.md`
+- wired the new page into concepts navigation:
+  - `docs/index.rst`
+- added an overview-page pointer to the new explainer:
+  - `docs/concepts/feather_pgs.md`
+- refreshed the checked-in kernel artifacts so their provenance matches the source revision used for the docs draft:
+  - `.agent/data/fpgs-matrix-free-dense-explainer/kernels/dense-row.json`
+  - `.agent/data/fpgs-matrix-free-dense-explainer/kernels/matrix-free-gs.json`
 
 ### M6. Validate Docs Build and Tighten Presentation
 
@@ -387,9 +397,10 @@ These workflows replace `stable/`, versioned docs, or `latest/` directly on `gh-
 
 ## Immediate Next Action
 
-Advance M5: draft the new sibling concepts page, using the checked-in M3 and M4 artifacts as the primary evidence base and linking back to `docs/concepts/feather_pgs.md` for background.
+Advance M6: build the real docs target, fix any presentation issues from the new explainer page, and record exact `sphinx-build` plus `uvx pre-commit run -a` evidence in the plan and handoff.
 
 ## Change Log
 
 - 2026-04-13: Created ExecPlan, recorded branch/remotes/guardrails, and set up workflow-driven milestone execution for this workspace.
 - 2026-04-13: Completed M1 source inventory, chose a dedicated sibling docs page for the dense-vs-matrix-free explainer, and recorded the nightly artifacts that later publication steps must preserve.
+- 2026-04-13: Completed M5 by landing the sibling dense-vs-matrix-free explainer page, wiring docs navigation, and refreshing kernel-artifact provenance for the checked-in evidence bundle.
