@@ -4316,7 +4316,9 @@ class TiledKernelFactory:
         are software-pipelined and lane-parallel (lanes 0-5 body A, 6-11
         body B). Metadata packed into vec4i for single 16-byte loads.
         tile_extract (sync-free on shared) for velocity reads,
-        tile_scatter_add (non-atomic) for velocity writes.
+        tile_scatter_add(atomic=False) for velocity writes (lanes write
+        distinct DOF indices), tile_scatter_masked for single-lane impulse
+        writes.
 
         Both phases share s_v in shared memory. All PGS iterations run
         inside the kernel (no global round-trip for v between phases).
@@ -4368,9 +4370,11 @@ class TiledKernelFactory:
             Y_row = wp.tile_load(Y_world[world, row], shape=(D_val,), storage="register", bounds_check=False)
             wp.tile_axpy(delta_impulse, Y_row, s_v)
 
-        # Phase 2: SIMT within tiled kernel — scalar per-thread code operating on
-        # shared tiles from Phase 1. No register tiles created; uses tile_extract
-        # (sync-free on shared) for reads and tile_scatter_add for writes.
+        # Phase 2: SIMT within tiled kernel — each lane holds one element of the
+        # 6-DOF body A/B operations (lanes 0-5 body A, 6-11 body B). Velocity reads
+        # use tile_extract on shared s_v (sync-free). Impulse writes use
+        # tile_scatter_masked; velocity writes use tile_scatter_add(atomic=False)
+        # since body A and body B DOF ranges don't overlap within a constraint.
         @wp.func
         def pgs_mf_phase(
             world: int,
