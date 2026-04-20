@@ -1387,7 +1387,6 @@ class SolverFeatherPGS(SolverBase):
                         outputs=[self.v_out],
                         block_dim=32,
                         device=self.model.device,
-                        specialize_strides=True,
                     )
         elif self.pgs_mode == "split" and self._has_mixed_contacts:
             # Split mode with mixed contacts: interleaved dense and MF, 1 iteration each
@@ -4337,7 +4336,7 @@ class TiledKernelFactory:
             J_row: wp.tile(dtype=float, shape=(D_val,), storage="register"),
         ) -> float:
             """Compute J·v from a pre-loaded J row. Scoped — register tiles freed on return."""
-            return wp.tile_dot(J_row, s_v)
+            return wp.tile_extract(wp.tile_dot(J_row, s_v), 0)
 
         @wp.func
         def load_J_row(
@@ -4355,7 +4354,7 @@ class TiledKernelFactory:
             delta_impulse: float,
         ):
             """Apply s_v += Y * delta using a pre-loaded Y row."""
-            wp.tile_axpy(s_v, Y_row, delta_impulse)
+            wp.tile_axpy(delta_impulse, Y_row, s_v)
 
         @wp.func
         def velocity_update(
@@ -4367,7 +4366,7 @@ class TiledKernelFactory:
         ):
             """Load Y row and apply s_v += Y * delta."""
             Y_row = wp.tile_load(Y_world[world, row], shape=(D_val,), storage="register", bounds_check=False)
-            wp.tile_axpy(s_v, Y_row, delta_impulse)
+            wp.tile_axpy(delta_impulse, Y_row, s_v)
 
         # Phase 2: SIMT within tiled kernel — scalar per-thread code operating on
         # shared tiles from Phase 1. No register tiles created; uses tile_extract
@@ -4468,7 +4467,7 @@ class TiledKernelFactory:
                         new_impulse = 0.0
                     else:
                         sib = wp.where(i == mf_par + 1, mf_par + 2, mf_par + 1)
-                        wp.tile_write_thread(s_lam_mf, i, new_impulse, lane == 0)
+                        wp.tile_scatter_masked(s_lam_mf, i, new_impulse, lane == 0)
                         a_val = new_impulse
                         b_val = wp.tile_extract(s_lam_mf, sib)
                         mag = wp.sqrt(a_val * a_val + b_val * b_val)
@@ -4477,7 +4476,7 @@ class TiledKernelFactory:
                             new_impulse = a_val * scale
                             sib_new = b_val * scale
                             sib_delta = sib_new - b_val
-                            wp.tile_write_thread(s_lam_mf, sib, sib_new, lane == 0)
+                            wp.tile_scatter_masked(s_lam_mf, sib, sib_new, lane == 0)
 
                             # Sibling velocity update — unpack sibling dofs from meta
                             sib_meta = mf_meta[world, sib]
@@ -4494,7 +4493,7 @@ class TiledKernelFactory:
                             wp.tile_scatter_add(s_v, sib_idx, sib_val, sib_idx >= 0, atomic=False)
 
                 delta_impulse = new_impulse - old_impulse
-                wp.tile_write_thread(s_lam_mf, i, new_impulse, lane == 0)
+                wp.tile_scatter_masked(s_lam_mf, i, new_impulse, lane == 0)
 
                 # Velocity update — lane-parallel scatter using prefetched MiJt
                 if delta_impulse != 0.0:
@@ -4627,7 +4626,7 @@ class TiledKernelFactory:
                             velocity_update(s_v, Y_world, world, row0 + 1, lam3[1] - old_f1)
                             velocity_update(s_v, Y_world, world, row0 + 2, lam3[2] - old_f2)
 
-                    wp.tile_write_thread(s_lam_contact, c, lam3, thread == 0)
+                    wp.tile_scatter_masked(s_lam_contact, c, lam3, thread == 0)
 
                 # ── Phase 1: Joint limits (tile API, scoped helpers) ──
                 for i in range(m_contact_rows, m_total):
