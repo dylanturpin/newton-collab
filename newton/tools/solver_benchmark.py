@@ -105,6 +105,39 @@ SCENARIOS = {
             "ls_parallel": True,
         },
     },
+    # -------------------------------------------------------------------------
+    # FPGS friction-mode verification scenes (issue #15 — FPGS Friction Modes
+    # 9/13). These match Miles' RAISim reference clips in
+    # ``artifacts/2026-04-16-slack-raisim/repos/mmacklin-newton-solver-raisim/
+    # newton/_src/solvers/raisim/render_tests.py`` so side-by-side comparisons
+    # stay apples-to-apples. All three use ``robot=None`` and their own
+    # ``environment`` tag consumed by ``build_model``. ``num_worlds`` is
+    # ignored by ``run_render`` (it forces a single world).
+    # -------------------------------------------------------------------------
+    "sphere_rest": {
+        "description": "Single sphere resting on the ground (FPGS friction verification)",
+        "robot": None,
+        "environment": "sphere_rest",
+        "default_substeps": 4,
+        "default_pgs_iterations": 16,
+        "default_dense_max_constraints": 32,
+    },
+    "sphere_stack": {
+        "description": "5-sphere stack on the ground (FPGS friction verification)",
+        "robot": None,
+        "environment": "sphere_stack",
+        "default_substeps": 4,
+        "default_pgs_iterations": 32,
+        "default_dense_max_constraints": 32,
+    },
+    "sliding_cube": {
+        "description": "Free-body cube sliding on ground with initial tangential velocity (FPGS friction verification)",
+        "robot": None,
+        "environment": "sliding_cube",
+        "default_substeps": 4,
+        "default_pgs_iterations": 16,
+        "default_dense_max_constraints": 32,
+    },
 }
 
 # =============================================================================
@@ -383,6 +416,92 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
 # =============================================================================
 
 
+def _build_friction_verification_scene(env: str, num_worlds: int):
+    """Build one of the FPGS friction-mode verification scenes.
+
+    These scenes are thin free-body ports of Miles' RAISim
+    ``render_tests.py`` builders (``_build_sphere_rest``,
+    ``_build_sphere_stack``) plus the ``sliding_cube`` helper already used
+    by the matrix-free friction-mode tests (see
+    ``newton/tests/test_feather_pgs_friction_mode_bisection_desaxce.py::
+    _build_sliding_cube_model``). Side-by-side comparison with Miles' clips
+    under
+    ``artifacts/2026-04-16-slack-raisim/web/reports/{sphere_rest,sphere_stack}.mp4``
+    is an explicit acceptance criterion of issue #15.
+
+    Args:
+        env: One of ``"sphere_rest"``, ``"sphere_stack"``, ``"sliding_cube"``.
+        num_worlds: Number of replicated worlds. Rendering forces 1.
+
+    Returns:
+        A finalized :class:`newton.Model`.
+    """
+    import warp as wp  # noqa: PLC0415
+
+    import newton  # noqa: PLC0415
+
+    world_builder = newton.ModelBuilder()
+    world_builder.default_shape_cfg.mu = 0.5
+
+    if env == "sphere_rest":
+        body = world_builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+            mass=1.0,
+        )
+        world_builder.add_shape_sphere(body=body, radius=0.3)
+
+    elif env == "sphere_stack":
+        r = 0.15
+        for i in range(5):
+            body = world_builder.add_body(
+                xform=wp.transform(
+                    wp.vec3(0.0, 0.0, r + 0.01 + i * (2.0 * r + 0.05)),
+                    wp.quat_identity(),
+                ),
+                mass=1.0,
+            )
+            world_builder.add_shape_sphere(body=body, radius=r)
+
+    elif env == "sliding_cube":
+        # Slightly lower friction so the cube slides rather than sticks —
+        # matches ``_build_sliding_cube_model`` in the bisection/de Saxcé
+        # friction-mode tests.
+        world_builder.default_shape_cfg.mu = 0.3
+        world_builder.default_shape_cfg.ke = 5.0e4
+        world_builder.default_shape_cfg.kd = 5.0e2
+        world_builder.default_shape_cfg.kf = 1.0e3
+        body = world_builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()),
+            mass=1.0,
+            inertia=wp.mat33(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1),
+        )
+        world_builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    else:
+        raise ValueError(f"Unknown friction-verification scene: {env!r}")
+
+    # Replicate across worlds and add a shared ground plane.
+    builder = newton.ModelBuilder()
+    builder.replicate(world_builder, max(1, int(num_worlds)))
+    builder.add_ground_plane()
+    model = builder.finalize()
+
+    # ``sliding_cube`` needs an initial tangential velocity seeded on the
+    # free-body root of every world. ``joint_qd[0:3]`` is world-frame linear
+    # velocity for a free-body joint.
+    if env == "sliding_cube":
+        joint_qd_np = model.joint_qd.numpy().copy()
+        n = joint_qd_np.size
+        # 6-DOF free joint per world: [vx, vy, vz, wx, wy, wz].
+        for base in range(0, n, 6):
+            if base + 2 < n:
+                joint_qd_np[base + 0] = 2.0
+                joint_qd_np[base + 1] = 0.0
+                joint_qd_np[base + 2] = 0.0
+        model.joint_qd.assign(joint_qd_np)
+
+    return model
+
+
 def build_model(args, scenario_cfg: dict):
     """Build and finalize the simulation model for a scenario.
 
@@ -401,6 +520,15 @@ def build_model(args, scenario_cfg: dict):
 
     robot = scenario_cfg["robot"]
     env = scenario_cfg.get("environment")
+
+    # FPGS friction-mode verification scenes (sphere_rest / sphere_stack /
+    # sliding_cube). These have no articulated robot — they are thin free-body
+    # scenes ported from Miles' RAISim render_tests reference so side-by-side
+    # comparison stays apples-to-apples. Build and return directly.
+    if robot is None and env in ("sphere_rest", "sphere_stack", "sliding_cube"):
+        model = _build_friction_verification_scene(env, args.num_worlds)
+        model.shape_margin.fill_(0.001)
+        return model
 
     # Robot setup
     if robot == "g1":
@@ -632,6 +760,23 @@ def create_solver(model, args, scenario_cfg: dict):
         dense_max_constraints = preset.get("dense_max_constraints", args.dense_max_constraints)
         pgs_mode = preset.get("pgs_mode", args.pgs_mode)
 
+        # SolverFeatherPGS rejects friction_mode != "current" unless
+        # pgs_mode == "matrix_free" (see
+        # newton/_src/solvers/feather_pgs/solver_feather_pgs.py). Auto-promote
+        # the relevant knobs so `--friction-mode bisection` etc. "just works"
+        # without the caller also having to pass --pgs-mode matrix_free and
+        # matrix-free-compatible kernels. An explicit
+        # `--solver fpgs_matrix_free` preset already forces these, so only
+        # promote when we are in the default / friction-mode-only path.
+        friction_mode = getattr(args, "friction_mode", "current")
+        if friction_mode != "current" and "pgs_mode" not in preset:
+            pgs_mode = "matrix_free"
+            # tiled_contact is the matrix-free PGS kernel; the other kernels
+            # default to "auto" when not pinned by the scenario/preset, which
+            # is fine for matrix_free.
+            if pgs == "loop" or pgs == "tiled_row" or pgs == "streaming":
+                pgs = "tiled_contact"
+
         solver_kwargs = {
             "update_mass_matrix_interval": 1,
             "pgs_iterations": pgs_iterations,
@@ -654,6 +799,7 @@ def create_solver(model, args, scenario_cfg: dict):
             "double_buffer": args.double_buffer,
             "nvtx": args.nvtx,
             "pgs_debug": getattr(args, "pgs_debug", False),
+            "friction_mode": friction_mode,
         }
         from newton._src.solvers import SolverFeatherPGS  # noqa: PLC0415
 
@@ -830,6 +976,12 @@ CAMERA_PRESETS = {
     "g1_cube_stack": ((3.0, -1.5, 2.5), -20.0, 155.0),
     "h1_flat": ((2.5, -1.0, 1.2), -15.0, 155.0),
     "h1_tabletop": ((2.77, -0.83, 2.40), -30.3, -198.6),
+    # FPGS friction-verification scenes: framed for a single small free
+    # body on the ground, tuned so the resting / stacking / sliding motion
+    # is clearly visible and matches Miles' RAISim reference clips.
+    "sphere_rest": ((1.8, -1.8, 1.0), -15.0, 135.0),
+    "sphere_stack": ((2.5, -2.5, 1.6), -15.0, 135.0),
+    "sliding_cube": ((1.5, -1.5, 0.9), -20.0, 135.0),
 }
 
 
@@ -887,9 +1039,15 @@ def run_render(args):
     out_dir = Path(args.out) if args.out else Path(".")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    video_path = out_dir / f"{args.scenario}.mp4"
+    # Include friction_mode in the filename so the FPGS friction-mode
+    # verification grid (4 modes × 5 scenes) can all share the same output
+    # directory without clobbering each other. Default "current" preserves
+    # backward compatibility: the filename stays `<scenario>.mp4`.
+    friction_mode = getattr(args, "friction_mode", "current")
+    video_basename = args.scenario if friction_mode == "current" else f"{args.scenario}__{friction_mode}"
+    video_path = out_dir / f"{video_basename}.mp4"
     solver_name = args.solver if args.solver == "mujoco" else "feather_pgs"
-    print(f"Rendering {num_frames} frames of {args.scenario} with {solver_name}")
+    print(f"Rendering {num_frames} frames of {args.scenario} with {solver_name} (friction_mode={friction_mode})")
     print(f"Resolution: {width}x{height}, substeps: {args.substeps}")
     print(f"Output: {video_path}")
 
@@ -971,8 +1129,9 @@ def run_render(args):
         render_fps=render_fps,
         width=width,
         height=height,
-        video_name=f"{args.scenario}.mp4",
+        video_name=f"{video_basename}.mp4",
     )
+    render_metadata["friction_mode"] = friction_mode
     write_render_artifacts(out_dir, metadata, render_metadata)
     print(f"Metadata saved: {out_dir / 'render_meta.json'}")
 
@@ -1123,6 +1282,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=["dense", "split", "matrix_free"],
         default="split",
         help="PGS mode: dense, split, or matrix_free",
+    )
+    parser.add_argument(
+        "--friction-mode",
+        type=str,
+        choices=["current", "bisection", "bisection_desaxce", "coulomb_newton"],
+        default="current",
+        help=(
+            "Per-row Coulomb friction strategy used by the FeatherPGS matrix-free "
+            "inner solve. Selecting anything other than 'current' forces "
+            "pgs_mode='matrix_free' (the solver rejects other pgs_mode values)."
+        ),
     )
     parser.add_argument(
         "--delassus-chunk-size",

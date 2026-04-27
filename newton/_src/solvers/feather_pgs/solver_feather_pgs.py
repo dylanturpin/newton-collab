@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from contextlib import contextmanager
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import numpy as np
 import warp as wp
@@ -38,6 +38,7 @@ from .kernels import (
     TILE_THREADS,
     add_dense_contact_compliance_to_diag,
     allocate_joint_limit_slots,
+    allocate_joint_velocity_limit_slots,
     allocate_world_contact_slots,
     apply_augmented_joint_tau,
     apply_augmented_mass_diagonal_grouped,
@@ -47,7 +48,7 @@ from .kernels import (
     build_mf_body_map,
     build_mf_contact_rows,
     cholesky_loop,
-    clamp_joint_tau,
+    clamp_augmented_joint_u0,
     compute_com_transforms,
     compute_composite_inertia,
     compute_contact_linear_force_from_impulses,
@@ -72,15 +73,21 @@ from .kernels import (
     finalize_mf_constraint_counts,
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
+    FRICTION_MODE_BISECTION,
+    FRICTION_MODE_BISECTION_DESAXCE,
+    FRICTION_MODE_COULOMB_NEWTON,
+    FRICTION_MODE_CURRENT,
     gather_JY_to_world,
     gather_tau_to_groups,
     hinv_jt_par_row,
     integrate_generalized_joints,
     pack_contact_linear_force_as_spatial,
     pgs_convergence_diagnostic_velocity,
+    pgs_ncp_residuals_diagnostic_velocity,
     pgs_solve_loop,
     pgs_solve_mf_loop,
     populate_joint_limit_J_for_size,
+    populate_joint_velocity_limit_J_for_size,
     populate_world_J_for_size,
     prepare_world_impulses,
     rhs_accum_world_par_art,
@@ -165,6 +172,7 @@ class SolverFeatherPGS(SolverBase):
         friction_smoothing: float = 1.0,
         enable_contact_friction: bool = True,
         enable_joint_limits: bool = False,
+        enable_joint_velocity_limits: bool = False,
         pgs_iterations: int = 12,
         pgs_beta: float = 0.2,
         pgs_cfm: float = 1.0e-6,
@@ -173,6 +181,7 @@ class SolverFeatherPGS(SolverBase):
         dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
         pgs_mode: str = "split",
+        friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
         mf_max_constraints: int = 512,
         # Kernel selection per operation
         cholesky_kernel: str = "auto",
@@ -190,6 +199,7 @@ class SolverFeatherPGS(SolverBase):
         double_buffer: bool = True,
         nvtx: bool = False,
         pgs_debug: bool = False,
+        effort_limit_mode: str = "actuator",
     ):
         """
         Args:
@@ -202,6 +212,18 @@ class SolverFeatherPGS(SolverBase):
                 constraints.  Each violated limit adds one constraint row.  Supported with
                 ``pgs_kernel="loop"`` and ``pgs_kernel="tiled_row"``; the ``"tiled_contact"``
                 and ``"streaming"`` PGS kernels are *not* compatible.  Defaults to False.
+            enable_joint_velocity_limits (bool, optional): Enforce joint velocity limits
+                (``model.joint_velocity_limit``) as per-DOF PGS constraints. Mirrors the
+                PhysX velocity-limit row: when ``|qdot_i| > qdot_max_i``, a single
+                signed-Jacobian row is added that projects ``qdot_i`` back onto the
+                bilateral box ``[-qdot_max_i, +qdot_max_i]`` through the articulated-body
+                response ``J M^-1 J^T + cfm``, so momentum redistributes correctly across
+                the articulation (rather than a naive joint-space clip which breaks
+                multi-body Newton's third law). No Baumgarte bias.
+
+                Only supported with ``pgs_mode="matrix_free"``; passing any other
+                ``pgs_mode`` together with ``enable_joint_velocity_limits=True`` raises
+                :class:`NotImplementedError` at construction. Defaults to False.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_beta (float, optional): ERP style position correction factor. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
@@ -219,6 +241,28 @@ class SolverFeatherPGS(SolverBase):
                 contacts. "matrix_free" skips C entirely, recomputes J*v each iteration, and uses only
                 the diagonal for preconditioning — O(max_constraints) memory instead of
                 O(max_constraints^2). Defaults to "split".
+            friction_mode (str, optional): Per-row Coulomb friction strategy used by the
+                ``pgs_mode="matrix_free"`` path. ``"current"`` (default) is the baseline
+                isotropic Coulomb cone projection that has been the FeatherPGS behavior
+                to date. ``"bisection"`` runs a RAISim-style bisection on the normal
+                impulse λ_n with the 2×2 tangential sub-problem re-solved at each
+                probe — ported from Miles Macklin's ``raisim/kernels.py``; wired in
+                the FPGS Friction Modes 5/13 slice.
+                ``"bisection_desaxce"`` (FPGS Friction Modes 6/13) runs the same
+                RAISim bisection with the de Saxce maximum-dissipation bias
+                correction (Le Lidec & Carpentier 2024): ``μ · ‖c_T‖`` is added to
+                the normal target velocity so sliding contacts also minimise the
+                ``r_mdp_dir`` / ``r_ds_compl`` residuals.
+                ``"coulomb_newton"`` (FPGS Friction Modes 7/13) runs Gilles
+                Daviet's scalar bracketed-Newton on the tangential-force
+                ratio α: a per-row 1D Newton iteration on the 3×3 Delassus
+                block that solves the Coulomb cone coupling directly (no
+                lagged de Saxce correction, no quartic).  Ported from
+                ``artifacts/2026-04-16-slack-raisim/coulomb_root_finding_warp.py``.
+                ``friction_mode`` is matrix-free only — passing
+                any value other than ``"current"`` with ``pgs_mode="dense"`` or
+                ``pgs_mode="split"`` raises ``ValueError``.
+                Defaults to ``"current"``.
             mf_max_constraints (int, optional): Maximum number of matrix-free constraints per world. Defaults to 512.
             cholesky_kernel (str, optional): "tiled", "loop", or "auto" for Cholesky factorization. Defaults to "auto".
             trisolve_kernel (str, optional): "tiled", "loop", or "auto" for triangular solve. Defaults to "auto".
@@ -238,6 +282,14 @@ class SolverFeatherPGS(SolverBase):
             small_dof_threshold (int, optional): DOF threshold for "auto" kernel selection. Defaults to 12.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
+            effort_limit_mode (str, optional): Retained only for legacy callers.
+                FeatherPGS now always clamps the explicit-PD actuator-drive contribution
+                (``u0`` in the augmented-row buffer) before it is added to
+                ``state.joint_tau``, matching MuJoCo's ``actuatorfrcrange`` and PhysX
+                articulation drive ``maxForce``. The rigid / passive / external bucket
+                is left uncapped; the implicit-PD drive response carried by
+                ``H_tilde^{-1}`` is not clamped. ``"actuator"`` (the new default) is
+                the only supported value. ``"net"`` is rejected with ``ValueError``.
         Auto selection behavior:
             - auto: size > threshold -> tiled, else loop/par_row.
             - Delassus auto/tiled: streaming kernel (handles any constraint count via chunking).
@@ -250,6 +302,7 @@ class SolverFeatherPGS(SolverBase):
         self.friction_smoothing = friction_smoothing
         self.enable_contact_friction = enable_contact_friction
         self.enable_joint_limits = enable_joint_limits
+        self.enable_joint_velocity_limits = enable_joint_velocity_limits
         self.pgs_iterations = pgs_iterations
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
@@ -260,11 +313,74 @@ class SolverFeatherPGS(SolverBase):
         if pgs_mode not in ("dense", "split", "matrix_free"):
             raise ValueError(f"pgs_mode must be 'dense', 'split', or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
+
+        # ``friction_mode`` is the selector for the per-row Coulomb step used by the
+        # matrix-free PGS kernel. Only ``"current"`` is wired today; the other three
+        # names are reserved for the upcoming FPGS Friction Modes strategy issues.
+        _valid_friction_modes = ("current", "bisection", "bisection_desaxce", "coulomb_newton")
+        if friction_mode not in _valid_friction_modes:
+            raise ValueError(
+                "friction_mode must be one of "
+                f"{list(_valid_friction_modes)}, got {friction_mode!r}"
+            )
+        if friction_mode != "current":
+            if pgs_mode != "matrix_free":
+                raise ValueError(
+                    "friction_mode is only supported with pgs_mode='matrix_free'; "
+                    f"got pgs_mode={pgs_mode!r} with friction_mode={friction_mode!r}. "
+                    "Select pgs_mode='matrix_free' or leave friction_mode='current'."
+                )
+            # pgs_mode == "matrix_free" with a non-baseline friction mode.
+            # ``"bisection"`` was wired in FPGS Friction Modes 5/13,
+            # ``"bisection_desaxce"`` in 6/13, and ``"coulomb_newton"``
+            # is wired here in 7/13.
+        self.friction_mode = friction_mode
+        # Numeric id consumed by the matrix-free PGS kernels.  Mirrors the
+        # :data:`FRICTION_MODE_*` constants in ``feather_pgs/kernels.py``
+        # so we dispatch once at construction rather than doing string
+        # comparisons per step.
+        if friction_mode == "bisection":
+            self._friction_mode_id = int(FRICTION_MODE_BISECTION)
+        elif friction_mode == "bisection_desaxce":
+            self._friction_mode_id = int(FRICTION_MODE_BISECTION_DESAXCE)
+        elif friction_mode == "coulomb_newton":
+            self._friction_mode_id = int(FRICTION_MODE_COULOMB_NEWTON)
+        else:
+            self._friction_mode_id = int(FRICTION_MODE_CURRENT)
+
+        # Joint velocity limits are scoped to the matrix-free path for issue #23.
+        # The dense / split paths still build the full Delassus matrix C and a
+        # tiled PGS kernel that bakes its unilateral-clamp row-type check into
+        # generated CUDA; supporting them cleanly is tracked as future work.
+        # Fail loudly here instead of silently running with a constraint that
+        # would only be enforced in some code paths.
+        if self.enable_joint_velocity_limits and self.pgs_mode != "matrix_free":
+            raise NotImplementedError(
+                "enable_joint_velocity_limits=True requires pgs_mode='matrix_free'. "
+                f"Got pgs_mode={self.pgs_mode!r}. The dense and split PGS paths "
+                "are explicitly out of scope for the joint velocity-limit row — "
+                "see https://github.com/dylanturpin/il-newton/issues/23."
+            )
+        if self.enable_joint_velocity_limits and not self.enable_joint_limits:
+            # The velocity-limit path reuses the per-world slot counter and
+            # the ``limit_slot`` allocation buffers only when both flags are
+            # on; otherwise it allocates its own buffers. We still require
+            # ``joint_dof_count > 0`` at buffer-allocation time for the per-DOF
+            # arrays to be meaningful; that check lives in
+            # :meth:`_allocate_buffers`.
+            pass
         self.mf_max_constraints = mf_max_constraints
         self._double_buffer = double_buffer
         self._nvtx = nvtx
         self.pgs_debug = pgs_debug
         self._pgs_convergence_log: list[np.ndarray] = []
+        # Per-step, per-iteration NCP / MDP residual log for the matrix_free
+        # debug path. Each entry is an ndarray of shape
+        # ``[pgs_iterations, world_count, 6]`` holding
+        # ``(r_compl, r_cone, r_gap, r_ds_compl, r_ds_dual, r_mdp_dir)``
+        # per world per iteration. Populated only when ``pgs_debug`` is
+        # ``True`` and ``pgs_mode == "matrix_free"``.
+        self._pgs_ncp_residual_log: list[np.ndarray] = []
         valid_cholesky = {"tiled", "loop", "auto"}
         if cholesky_kernel not in valid_cholesky:
             raise ValueError(f"cholesky_kernel must be one of {sorted(valid_cholesky)}")
@@ -284,6 +400,18 @@ class SolverFeatherPGS(SolverBase):
         valid_pgs = {"loop", "tiled_row", "tiled_contact", "streaming"}
         if pgs_kernel not in valid_pgs:
             raise ValueError(f"pgs_kernel must be one of {sorted(valid_pgs)}")
+
+        # Effort-limit clamp is always actuator-only: the explicit-PD drive bucket
+        # (``aug_row_u0``) is clamped to ``+/- joint_effort_limit`` before it
+        # is summed into ``joint_tau``. Matches MuJoCo's ``actuatorfrcrange``
+        # and PhysX articulation drive ``maxForce`` conventions.
+        if effort_limit_mode != "actuator":
+            raise ValueError(
+                "effort_limit_mode must be 'actuator' (the only supported semantics). "
+                f"Got {effort_limit_mode!r}. The legacy 'net' semantics has been removed; "
+                "see notes/2026-04-20/effort-limit.md for the fix rationale."
+            )
+        self.effort_limit_mode = "actuator"
 
         self.cholesky_kernel = cholesky_kernel
         self.trisolve_kernel = trisolve_kernel
@@ -797,6 +925,20 @@ class SolverFeatherPGS(SolverBase):
             self.limit_slot = None
             self.limit_sign = None
 
+        # Joint velocity-limit buffers (per-DOF tracking). Independent from the
+        # joint-position-limit buffers so the two flags can be used separately.
+        if self.enable_joint_velocity_limits and model.joint_dof_count > 0:
+            dof_count = model.joint_dof_count
+            self.velocity_limit_slot = wp.full(
+                (dof_count,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+            )
+            self.velocity_limit_sign = wp.zeros(
+                (dof_count,), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+        else:
+            self.velocity_limit_slot = None
+            self.velocity_limit_sign = None
+
     def _allocate_world_buffers(self, model):
         """Allocate world-level constraint system buffers for multi-articulation support."""
         if self.world_count == 0:
@@ -806,7 +948,7 @@ class SolverFeatherPGS(SolverBase):
         requires_grad = model.requires_grad
         max_constraints = self.dense_max_constraints
 
-        # Per-world constraint matrices and vectors
+        # Per-world constraint matrices and vectors. Matrix-free never assembles C.
         if self.pgs_mode != "matrix_free":
             self.C = wp.zeros(
                 (self.world_count, max_constraints, max_constraints),
@@ -817,6 +959,7 @@ class SolverFeatherPGS(SolverBase):
         else:
             self.C = None
 
+        # Matrix-free uses world-indexed J/Y for both dense and rigid phases.
         if self.pgs_mode == "matrix_free":
             self._compute_world_dof_mapping(model)
             self.J_world = wp.zeros(
@@ -942,6 +1085,10 @@ class SolverFeatherPGS(SolverBase):
         mf_max_c = self.mf_max_constraints
 
         self._diag_metrics = wp.zeros((worlds, 4), dtype=wp.float32, device=device)
+        # Per-world NCP / MDP residual scratch buffer ([worlds, 6]).
+        # Populated by :func:`pgs_ncp_residuals_diagnostic_velocity` on the
+        # matrix_free debug path and copied into :attr:`_pgs_ncp_residual_log`.
+        self._diag_ncp_metrics = wp.zeros((worlds, 6), dtype=wp.float32, device=device)
         self._diag_prev_impulses = wp.zeros((worlds, max_c), dtype=wp.float32, device=device)
         if hasattr(self, "mf_impulses"):
             self._diag_prev_mf_impulses = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device)
@@ -1013,6 +1160,20 @@ class SolverFeatherPGS(SolverBase):
         main_stream = wp.get_stream(self.model.device)
         self._memset_done_event[0] = main_stream.record_event()
         self._memset_done_event[1] = main_stream.record_event()
+
+    def reset_diagnostic_logs(self) -> None:
+        """Clear per-step PGS diagnostic logs populated when ``pgs_debug=True``.
+
+        :attr:`_pgs_convergence_log` and :attr:`_pgs_ncp_residual_log` are
+        append-only across :meth:`step` calls so one solver instance can
+        accumulate a trace across many frames.  A replay / sweep harness
+        that reuses a single solver to scan ``pgs_iterations`` over a
+        snapshot needs the logs reset between sweeps so each entry
+        corresponds to exactly one replayed step.  ``pgs_warmstart``
+        impulses and all device-side solver buffers are left untouched.
+        """
+        self._pgs_convergence_log = []
+        self._pgs_ncp_residual_log = []
 
     @override
     def step(
@@ -1153,7 +1314,6 @@ class SolverFeatherPGS(SolverBase):
                     )
 
         else:
-            # Existing Delassus path (unchanged)
             fused_ok = (
                 self._is_one_art_per_world
                 and self.hinv_jt_kernel != "par_row"
@@ -1256,10 +1416,12 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_max_constraints,
                     self.max_world_dofs,
                     self.model.device,
+                    friction_mode=self.friction_mode,
                 )
 
                 if self.pgs_debug:
                     self._pgs_convergence_log.append([])
+                    self._pgs_ncp_residual_log.append([])
                     for _pgs_dbg_iter in range(self.pgs_iterations):
                         # Snapshot impulses before this iteration
                         wp.copy(self._diag_prev_impulses, self.impulses)
@@ -1343,7 +1505,46 @@ class SolverFeatherPGS(SolverBase):
                         )
                         self._pgs_convergence_log[-1].append(row)
 
+                        # NCP / MDP residual diagnostic ([world, 6]):
+                        # (r_compl, r_cone, r_gap, r_ds_compl, r_ds_dual, r_mdp_dir)
+                        wp.launch(
+                            pgs_ncp_residuals_diagnostic_velocity,
+                            dim=self.world_count,
+                            inputs=[
+                                self.constraint_count,
+                                self.world_dof_start,
+                                self.rhs,
+                                self.impulses,
+                                self.row_type,
+                                self.row_parent,
+                                self.row_mu,
+                                self.phi,
+                                self.J_world,
+                                self.dense_max_constraints,
+                                self.max_world_dofs,
+                                self.mf_constraint_count,
+                                self.mf_rhs,
+                                self.mf_impulses,
+                                self.mf_row_type,
+                                self.mf_row_parent,
+                                self.mf_row_mu,
+                                self.mf_phi,
+                                self.mf_J_a,
+                                self.mf_J_b,
+                                self.mf_dof_a,
+                                self.mf_dof_b,
+                                self.mf_max_constraints,
+                                self.v_out,
+                            ],
+                            outputs=[self._diag_ncp_metrics],
+                            device=self.model.device,
+                        )
+                        ncp_np = self._diag_ncp_metrics.numpy().copy()
+                        self._pgs_ncp_residual_log[-1].append(ncp_np)
+
                     self._pgs_convergence_log[-1] = np.array(self._pgs_convergence_log[-1])
+                    # Stack per-iter [world, 6] arrays into [iters, world, 6].
+                    self._pgs_ncp_residual_log[-1] = np.stack(self._pgs_ncp_residual_log[-1], axis=0)
 
                 else:
                     wp.launch_tiled(
@@ -1379,7 +1580,7 @@ class SolverFeatherPGS(SolverBase):
                         device=self.model.device,
                     )
         elif self.pgs_mode == "split" and self._has_mixed_contacts:
-            # Split mode with mixed contacts: interleaved dense and MF, 1 iteration each
+            # Split mode with mixed contacts: interleaved dense and MF, 1 iteration each.
             self._mf_pgs_setup(state_aug, dt)
             self.v_mf_accum.zero_()
 
@@ -1755,11 +1956,37 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def _stage1_drives(self, state_in: State, state_aug: State, control: Control, dt: float):
+        """Populate ``state_aug.joint_tau`` and apply the effort-limit clamp.
+
+        Torque-bucket ownership after this routine returns:
+
+        - ``state_aug.joint_tau`` holds the rigid / passive / Coriolis /
+          gravity / external / :attr:`~newton.Control.joint_f` contribution
+          (populated by ``eval_rigid_tau``) summed with the explicit-PD
+          drive contribution ``u0`` (added by
+          :meth:`apply_augmented_joint_tau` from the augmented-row buffer
+          ``self.aug_row_u0``).
+        - ``self.aug_row_u0`` transiently owns the explicit-PD
+          actuator-drive contribution per augmented row before it is
+          accumulated into ``joint_tau``.
+        - The implicit-PD drive response is carried by ``self.aug_row_K``
+          and realized through ``H_tilde^{-1}`` during the linear solve.
+
+        :attr:`~newton.Model.joint_effort_limit` is always applied as
+        an **actuator-only** clamp on ``self.aug_row_u0`` *before* it is
+        added to ``joint_tau``; the rigid / passive / external bucket is
+        left uncapped (MuJoCo ``actuatorfrcrange`` / PhysX drive
+        ``maxForce`` convention).
+
+        """
         model = self.model
 
         if model.articulation_count:
             body_f = state_in.body_f if state_in.body_count else None
-            # evaluate joint torques
+            # Evaluate joint torques. After this launch `joint_tau` owns
+            # the rigid / passive / Coriolis / gravity / external /
+            # `control.joint_f` bucket only; the actuator-drive bucket has
+            # not been added yet.
             state_aug.body_ft_s.zero_()
             wp.launch(
                 eval_rigid_tau,
@@ -1787,15 +2014,45 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
+            # Populate `aug_row_u0` (and `aug_row_K`) with the explicit-PD
+            # actuator-drive bucket per augmented row.
             self.build_augmented_joint_targets(state_in, control, dt)
-            self.apply_augmented_joint_tau(state_in, state_aug, dt)
 
+            self._stage1_drives_apply_augmented_tau(state_aug)
+
+    def _stage1_drives_apply_augmented_tau(self, state_aug: State):
+        """Clamp (if needed) and fold the augmented-row ``u0`` into ``joint_tau``.
+
+        Factored out of :meth:`_stage1_drives` to keep the actuator-only
+        effort-limit clamp isolated from the rigid / passive / external
+        torque bucket.
+        """
+        model = self.model
+        if model.articulation_count == 0:
+            return
+
+        if self.articulation_max_dofs > 0:
+            # Actuator-only effort-limit clamp: cap the explicit-PD
+            # drive bucket (``u0``) to ``+/- joint_effort_limit`` before
+            # it is folded into ``joint_tau``. The rigid / passive /
+            # external bucket living in ``joint_tau`` is left uncapped;
+            # the implicit-PD drive response carried by
+            # ``H_tilde^{-1}`` is not clamped here either.
             wp.launch(
-                clamp_joint_tau,
-                dim=model.joint_dof_count,
-                inputs=[state_aug.joint_tau, model.joint_effort_limit],
+                clamp_augmented_joint_u0,
+                dim=model.articulation_count,
+                inputs=[
+                    self.articulation_max_dofs,
+                    self.aug_row_counts,
+                    self.aug_row_dof_index,
+                    model.joint_effort_limit,
+                ],
+                outputs=[self.aug_row_u0],
                 device=model.device,
             )
+
+        # Accumulate (clamped) ``u0`` into ``joint_tau``.
+        self.apply_augmented_joint_tau(None, state_aug, 0.0)
 
     def build_augmented_joint_targets(self, state_in: State, control: Control, dt: float):
         model = self.model
@@ -2259,6 +2516,66 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
 
+            # Allocate + populate joint velocity-limit rows (per-DOF clamp on
+            # |qdot_i| against model.joint_velocity_limit). Launched *after*
+            # joint-position-limit allocation so velocity-limit rows occupy
+            # the last per-world slots — matching PhysX's documented
+            # ordering where the vel-limit row fires after contact, drive,
+            # friction, and positional-limit rows (physx-deep-dive §7).
+            if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None:
+                wp.launch(
+                    allocate_joint_velocity_limit_slots,
+                    dim=model.articulation_count,
+                    inputs=[
+                        model.articulation_start,
+                        self.articulation_dof_start,
+                        self.articulation_H_rows,
+                        model.joint_type,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_velocity_limit,
+                        self.v_hat,
+                        self.art_to_world,
+                        max_constraints,
+                    ],
+                    outputs=[
+                        self.velocity_limit_slot,
+                        self.velocity_limit_sign,
+                        self.slot_counter,
+                    ],
+                    device=model.device,
+                )
+                for size in self.size_groups:
+                    n_arts = self.n_arts_by_size[size]
+                    wp.launch(
+                        populate_joint_velocity_limit_J_for_size,
+                        dim=n_arts,
+                        inputs=[
+                            model.articulation_start,
+                            self.articulation_dof_start,
+                            model.joint_type,
+                            model.joint_qd_start,
+                            model.joint_dof_dim,
+                            model.joint_velocity_limit,
+                            self.art_to_world,
+                            self.velocity_limit_slot,
+                            self.velocity_limit_sign,
+                            self.group_to_art[size],
+                            self.pgs_cfm,
+                        ],
+                        outputs=[
+                            self.J_by_size[size],
+                            self.row_type,
+                            self.row_parent,
+                            self.row_mu,
+                            self.row_beta,
+                            self.row_cfm,
+                            self.phi,
+                            self.target_velocity,
+                        ],
+                        device=model.device,
+                    )
+
             # Build MF contact rows
             if mf_active:
                 wp.launch(
@@ -2363,6 +2680,76 @@ class SolverFeatherPGS(SolverBase):
                             self.limit_sign,
                             self.group_to_art[size],
                             self.pgs_beta,
+                            self.pgs_cfm,
+                        ],
+                        outputs=[
+                            self.J_by_size[size],
+                            self.row_type,
+                            self.row_parent,
+                            self.row_mu,
+                            self.row_beta,
+                            self.row_cfm,
+                            self.phi,
+                            self.target_velocity,
+                        ],
+                        device=model.device,
+                    )
+
+        # Joint velocity-limit fallback path: activates when there are no
+        # contacts and the position-limit fallback did not already run us
+        # through the velocity-limit dispatch inside the contact block.
+        if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None:
+            has_contacts = (
+                contacts is not None
+                and getattr(contacts, "rigid_contact_count", None) is not None
+                and contacts.rigid_contact_max > 0
+            )
+            if not has_contacts:
+                # If the position-limit fallback above didn't zero J (because
+                # enable_joint_limits is off), we need to zero it here so
+                # prior-frame rows don't leak into the current solve.
+                if not (self.enable_joint_limits and self.limit_slot is not None):
+                    if self._H_bufs is None:
+                        for size in self.size_groups:
+                            self.J_by_size[size].zero_()
+                wp.launch(
+                    allocate_joint_velocity_limit_slots,
+                    dim=model.articulation_count,
+                    inputs=[
+                        model.articulation_start,
+                        self.articulation_dof_start,
+                        self.articulation_H_rows,
+                        model.joint_type,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_velocity_limit,
+                        self.v_hat,
+                        self.art_to_world,
+                        max_constraints,
+                    ],
+                    outputs=[
+                        self.velocity_limit_slot,
+                        self.velocity_limit_sign,
+                        self.slot_counter,
+                    ],
+                    device=model.device,
+                )
+                for size in self.size_groups:
+                    n_arts = self.n_arts_by_size[size]
+                    wp.launch(
+                        populate_joint_velocity_limit_J_for_size,
+                        dim=n_arts,
+                        inputs=[
+                            model.articulation_start,
+                            self.articulation_dof_start,
+                            model.joint_type,
+                            model.joint_qd_start,
+                            model.joint_dof_dim,
+                            model.joint_velocity_limit,
+                            self.art_to_world,
+                            self.velocity_limit_slot,
+                            self.velocity_limit_sign,
+                            self.group_to_art[size],
                             self.pgs_cfm,
                         ],
                         outputs=[
@@ -2833,6 +3220,7 @@ class SolverFeatherPGS(SolverBase):
                     self.articulation_dof_start,
                     iterations,
                     self.pgs_omega,
+                    self._friction_mode_id,
                 ],
                 outputs=[
                     self.mf_impulses,
@@ -2911,7 +3299,7 @@ class TiledKernelFactory:
     _pgs_solve_tiled_contact_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_streaming_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_mf_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
-    _pgs_solve_mf_gs_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
+    _pgs_solve_mf_gs_cache: ClassVar[dict[tuple[int, int, int, str, str], "wp.Kernel"]] = {}
     _pack_mf_meta_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _triangular_solve_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _delassus_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
@@ -3373,7 +3761,11 @@ class TiledKernelFactory:
                 float new_impulse = s_lam[i] + omega * delta;
                 int row_type = s_rtype[i];
 
-                if (row_type == 0 || row_type == 3) {{
+                // row_type 0=CONTACT, 3=JOINT_LIMIT, 4=JOINT_VELOCITY_LIMIT:
+                // unilateral lambda >= 0 projector. The velocity-limit row
+                // uses a signed Jacobian so one side of the bilateral
+                // [-qdot_max, +qdot_max] box is active at a time.
+                if (row_type == 0 || row_type == 3 || row_type == 4) {{
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                     s_lam[i] = new_impulse;
                 }} else if (row_type == 2) {{
@@ -4355,24 +4747,47 @@ class TiledKernelFactory:
 
     @classmethod
     def get_pgs_solve_mf_gs_kernel(
-        cls, max_constraints: int, mf_max_constraints: int, max_world_dofs: int, device: "wp.Device"
+        cls,
+        max_constraints: int,
+        mf_max_constraints: int,
+        max_world_dofs: int,
+        device: "wp.Device",
+        friction_mode: str = "current",
     ) -> "wp.Kernel":
         """Get or create a two-phase GS kernel for matrix-free articulated PGS.
 
         Phase 1 processes dense constraints (via J_world/Y_world at ``max_constraints``).
         Phase 2 processes MF constraints (via mf_J/mf_MiJt at ``mf_max_constraints``).
         Both phases share a single velocity vector in shared memory.
+
+        ``friction_mode`` selects the MF friction-row projection:
+
+        * ``"current"`` (default): isotropic Coulomb cone projection,
+          matching :func:`friction_step_current`.
+        * ``"bisection"``: RAISim-style bisection on λ_n (see
+          :func:`friction_step_bisection`), ported from Miles Macklin's
+          ``USE_BISECTION`` branch of ``raisim/kernels.py::gs_contact_sweep``.
+        * ``"bisection_desaxce"``: ``"bisection"`` with the de Saxce
+          max-dissipation bias (``μ · ‖c_T‖`` added to the normal
+          target) — FPGS Friction Modes 6/13.
+        * ``"coulomb_newton"``: Gilles Daviet's scalar bracketed-Newton
+          on α (see :func:`friction_step_coulomb_newton`) — FPGS
+          Friction Modes 7/13.
         """
-        key = (max_constraints, mf_max_constraints, max_world_dofs, device.arch)
+        key = (max_constraints, mf_max_constraints, max_world_dofs, device.arch, friction_mode)
         if key not in cls._pgs_solve_mf_gs_cache:
             cls._pgs_solve_mf_gs_cache[key] = cls._build_pgs_solve_mf_gs_kernel(
-                max_constraints, mf_max_constraints, max_world_dofs
+                max_constraints, mf_max_constraints, max_world_dofs, friction_mode
             )
         return cls._pgs_solve_mf_gs_cache[key]
 
     @classmethod
     def _build_pgs_solve_mf_gs_kernel(
-        cls, max_constraints: int, mf_max_constraints: int, max_world_dofs: int
+        cls,
+        max_constraints: int,
+        mf_max_constraints: int,
+        max_world_dofs: int,
+        friction_mode: str = "current",
     ) -> "wp.Kernel":
         """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -4456,6 +4871,557 @@ class TiledKernelFactory:
                         s_v[{d_expr}] += Y_world.data[sib_row_base + {d_expr}] * sib_delta;
                     }}""")
         dense_sib_v_code = "\n".join(dense_sib_v_parts)
+
+        # --- MF friction-row projection -------------------------------------
+        # ``friction_mode="current"`` keeps the legacy isotropic Coulomb
+        # cone projection (matches :func:`friction_step_current`).
+        # ``friction_mode="bisection"`` runs the RAISim bisection on λ_n
+        # (matches :func:`friction_step_bisection`).
+        # ``friction_mode="bisection_desaxce"`` runs the same bisection
+        # with the de Saxce max-dissipation bias (``μ · ‖c_T‖`` added to
+        # the normal target velocity) — FPGS Friction Modes 6/13.
+        # ``friction_mode="coulomb_newton"`` runs Gilles Daviet's scalar
+        # bracketed-Newton on α (matches
+        # :func:`friction_step_coulomb_newton`) — FPGS Friction Modes
+        # 7/13.  We inject one of these CUDA blocks into the MF phase;
+        # the outer row loop handles the standard ``delta_impulse``
+        # accounting for the first-friction row (and t2's delta
+        # collapses to zero because ``s_lam_mf[i_t2]`` is pre-written
+        # by the per-contact solve).
+        if friction_mode in ("bisection", "bisection_desaxce"):
+            mf_friction_block = """
+                    // __BISECTION_LABEL__
+                    int mf_par = packed_tp >> 16;
+                    int i_t1 = mf_par + 1;
+                    int i_t2 = mf_par + 2;
+
+                    if (i != i_t1) {
+                        // Second friction row of the triple: the bisection
+                        // that ran at i == i_t1 already wrote s_lam_mf[i_t2].
+                        // Collapse delta_impulse to zero so no further
+                        // v_out correction is applied for this row.
+                        new_impulse = s_lam_mf[i];
+                    } else {
+                        // First friction row of the triple. Run bisection on
+                        // (λ_n, λ_t1, λ_t2), apply v_out corrections for the
+                        // normal and t2 siblings in-place, and return
+                        // new_λ_t1 as the ``new_impulse`` so the outer kernel
+                        // applies the t1 v_out delta via its usual path.
+                        int n_mf6 = mf6_base + mf_par * 6;
+                        int t1_mf6 = mf6_base + i_t1 * 6;
+                        int t2_mf6 = mf6_base + i_t2 * 6;
+
+                        // Body indices are shared across the triple: read
+                        // from the parent row's packed meta.
+                        int parent_packed_dofs = mf_meta.data[off_meta + mf_par * 4];
+                        int dof_a_par = parent_packed_dofs >> 16;
+                        int dof_b_par = (parent_packed_dofs << 16) >> 16;
+                        // FPGS stores rhs = beta * phi / dt (negative on
+                        // penetration).  RAISim's bisection targets
+                        // ``u_n >= b_n`` with ``b_n = -erp * gap / dt``
+                        // (positive on penetration).  Flip the sign once
+                        // so the rest of this block mirrors RAISim.
+                        float target_vel_n = -__int_as_float(
+                            mf_meta.data[off_meta + mf_par * 4 + 2]);
+                        float mu = mf_row_mu.data[off_mf + i];
+
+                        float old_lambda_n = s_lam_mf[mf_par];
+                        float old_lambda_t1 = s_lam_mf[i_t1];
+                        float old_lambda_t2 = s_lam_mf[i_t2];
+
+                        float new_lambda_n = old_lambda_n;
+                        float new_lambda_t1 = old_lambda_t1;
+                        float new_lambda_t2 = old_lambda_t2;
+                        float d_n_total = 0.0f;
+                        float d_t2_total = 0.0f;
+
+                        // Lane 0 runs the serial bisection; other lanes
+                        // wait and then consume the broadcast results.
+                        if (lane == 0) {
+                            float u_n = 0.0f, u_t1 = 0.0f, u_t2 = 0.0f;
+                            if (dof_a_par >= 0) {
+                                for (int k = 0; k < 6; k++) {
+                                    float va = s_v[dof_a_par + k];
+                                    u_n  += mf_J_a.data[n_mf6  + k] * va;
+                                    u_t1 += mf_J_a.data[t1_mf6 + k] * va;
+                                    u_t2 += mf_J_a.data[t2_mf6 + k] * va;
+                                }
+                            }
+                            if (dof_b_par >= 0) {
+                                for (int k = 0; k < 6; k++) {
+                                    float vb = s_v[dof_b_par + k];
+                                    u_n  += mf_J_b.data[n_mf6  + k] * vb;
+                                    u_t1 += mf_J_b.data[t1_mf6 + k] * vb;
+                                    u_t2 += mf_J_b.data[t2_mf6 + k] * vb;
+                                }
+                            }
+
+                            // __DESAXCE_BIAS__
+
+                            float G_nn = 0.0f, G_nt1 = 0.0f, G_nt2 = 0.0f;
+                            float G_t1t1 = 0.0f, G_t1t2 = 0.0f, G_t2t2 = 0.0f;
+                            if (dof_a_par >= 0) {
+                                for (int k = 0; k < 6; k++) {
+                                    float Jna = mf_J_a.data[n_mf6  + k];
+                                    float Jt1a = mf_J_a.data[t1_mf6 + k];
+                                    float Jt2a = mf_J_a.data[t2_mf6 + k];
+                                    float Mna = mf_MiJt_a.data[n_mf6  + k];
+                                    float Mt1a = mf_MiJt_a.data[t1_mf6 + k];
+                                    float Mt2a = mf_MiJt_a.data[t2_mf6 + k];
+                                    G_nn   += Jna * Mna;
+                                    G_nt1  += Jna * Mt1a;
+                                    G_nt2  += Jna * Mt2a;
+                                    G_t1t1 += Jt1a * Mt1a;
+                                    G_t1t2 += Jt1a * Mt2a;
+                                    G_t2t2 += Jt2a * Mt2a;
+                                }
+                            }
+                            if (dof_b_par >= 0) {
+                                for (int k = 0; k < 6; k++) {
+                                    float Jnb = mf_J_b.data[n_mf6  + k];
+                                    float Jt1b = mf_J_b.data[t1_mf6 + k];
+                                    float Jt2b = mf_J_b.data[t2_mf6 + k];
+                                    float Mnb = mf_MiJt_b.data[n_mf6  + k];
+                                    float Mt1b = mf_MiJt_b.data[t1_mf6 + k];
+                                    float Mt2b = mf_MiJt_b.data[t2_mf6 + k];
+                                    G_nn   += Jnb * Mnb;
+                                    G_nt1  += Jnb * Mt1b;
+                                    G_nt2  += Jnb * Mt2b;
+                                    G_t1t1 += Jt1b * Mt1b;
+                                    G_t1t2 += Jt1b * Mt2b;
+                                    G_t2t2 += Jt2b * Mt2b;
+                                }
+                            }
+
+                            if (G_nn >= 1.0e-20f) {
+                                // Check separating contact (λ_n = 0 solves it)
+                                float u_n_at_zero = u_n + G_nn * (0.0f - old_lambda_n);
+                                if (u_n_at_zero >= target_vel_n) {
+                                    new_lambda_n = 0.0f;
+                                    new_lambda_t1 = 0.0f;
+                                    new_lambda_t2 = 0.0f;
+                                } else {
+                                    float lo = 0.0f;
+                                    float hi = fmaxf(
+                                        old_lambda_n * 2.0f,
+                                        (target_vel_n - u_n) / G_nn + old_lambda_n);
+                                    hi = fmaxf(hi, 1.0f);
+
+                                    for (int _bi = 0; _bi < 20; _bi++) {
+                                        float mid = 0.5f * (lo + hi);
+                                        float d_n = mid - old_lambda_n;
+                                        float ut1_eff = u_t1 + G_nt1 * d_n;
+                                        float ut2_eff = u_t2 + G_nt2 * d_n;
+
+                                        float det = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
+                                        float d_t1 = 0.0f, d_t2 = 0.0f;
+                                        if (fabsf(det) > 1.0e-20f) {
+                                            d_t1 = (-ut1_eff * G_t2t2 + ut2_eff * G_t1t2) / det;
+                                            d_t2 = ( ut1_eff * G_t1t2 - ut2_eff * G_t1t1) / det;
+                                        }
+                                        float trial_t1 = old_lambda_t1 + d_t1;
+                                        float trial_t2 = old_lambda_t2 + d_t2;
+
+                                        float flimit = mu * mid;
+                                        float tmag = sqrtf(
+                                            trial_t1 * trial_t1 + trial_t2 * trial_t2);
+                                        if (tmag > flimit && tmag > 1.0e-20f) {
+                                            float sc = flimit / tmag;
+                                            trial_t1 *= sc;
+                                            trial_t2 *= sc;
+                                        }
+                                        float d_t1_actual = trial_t1 - old_lambda_t1;
+                                        float d_t2_actual = trial_t2 - old_lambda_t2;
+                                        float u_n_trial = u_n + G_nn * d_n
+                                            + G_nt1 * d_t1_actual
+                                            + G_nt2 * d_t2_actual;
+                                        if (u_n_trial < target_vel_n) lo = mid;
+                                        else hi = mid;
+                                    }
+                                    new_lambda_n = 0.5f * (lo + hi);
+
+                                    float d_n_final = new_lambda_n - old_lambda_n;
+                                    float ut1_f = u_t1 + G_nt1 * d_n_final;
+                                    float ut2_f = u_t2 + G_nt2 * d_n_final;
+                                    float det_f = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
+                                    float d_t1_f = 0.0f, d_t2_f = 0.0f;
+                                    if (fabsf(det_f) > 1.0e-20f) {
+                                        d_t1_f = (-ut1_f * G_t2t2 + ut2_f * G_t1t2) / det_f;
+                                        d_t2_f = ( ut1_f * G_t1t2 - ut2_f * G_t1t1) / det_f;
+                                    }
+                                    new_lambda_t1 = old_lambda_t1 + d_t1_f;
+                                    new_lambda_t2 = old_lambda_t2 + d_t2_f;
+
+                                    float flimit_f = mu * new_lambda_n;
+                                    float tmag_f = sqrtf(
+                                        new_lambda_t1 * new_lambda_t1
+                                        + new_lambda_t2 * new_lambda_t2);
+                                    if (tmag_f > flimit_f && tmag_f > 1.0e-20f) {
+                                        float sc_f = flimit_f / tmag_f;
+                                        new_lambda_t1 *= sc_f;
+                                        new_lambda_t2 *= sc_f;
+                                    }
+                                }
+                                d_n_total = new_lambda_n - old_lambda_n;
+                                d_t2_total = new_lambda_t2 - old_lambda_t2;
+                                s_lam_mf[mf_par] = new_lambda_n;
+                                s_lam_mf[i_t2]   = new_lambda_t2;
+                            }
+                        }
+
+                        __syncwarp();
+                        new_lambda_t1 = __shfl_sync(MASK, new_lambda_t1, 0);
+                        d_n_total = __shfl_sync(MASK, d_n_total, 0);
+                        d_t2_total = __shfl_sync(MASK, d_t2_total, 0);
+
+                        // Apply the normal-row v_out delta (all lanes).
+                        if (d_n_total != 0.0f) {
+                            if (lane < 6 && dof_a_par >= 0) {
+                                s_v[dof_a_par + lane] +=
+                                    mf_MiJt_a.data[n_mf6 + lane] * d_n_total;
+                            }
+                            if (lane >= 6 && lane < 12 && dof_b_par >= 0) {
+                                s_v[dof_b_par + lane - 6] +=
+                                    mf_MiJt_b.data[n_mf6 + lane - 6] * d_n_total;
+                            }
+                        }
+                        // Apply the t2-row v_out delta (all lanes).
+                        if (d_t2_total != 0.0f) {
+                            if (lane < 6 && dof_a_par >= 0) {
+                                s_v[dof_a_par + lane] +=
+                                    mf_MiJt_a.data[t2_mf6 + lane] * d_t2_total;
+                            }
+                            if (lane >= 6 && lane < 12 && dof_b_par >= 0) {
+                                s_v[dof_b_par + lane - 6] +=
+                                    mf_MiJt_b.data[t2_mf6 + lane - 6] * d_t2_total;
+                            }
+                        }
+                        __syncwarp();
+                        new_impulse = new_lambda_t1;
+                    }
+"""
+            # Inject the per-mode label and the optional de Saxce bias
+            # correction (``μ · ‖c_T‖`` added to ``target_vel_n`` once per
+            # contact before the bisection) into the shared CUDA body.
+            if friction_mode == "bisection_desaxce":
+                mf_friction_block = mf_friction_block.replace(
+                    "// __BISECTION_LABEL__",
+                    '// friction_mode="bisection_desaxce": RAISim bisection + de Saxce bias (μ·‖c_T‖).',
+                )
+                mf_friction_block = mf_friction_block.replace(
+                    "// __DESAXCE_BIAS__",
+                    "{\n"
+                    "                                float c_T_mag = sqrtf(u_t1 * u_t1 + u_t2 * u_t2);\n"
+                    "                                target_vel_n = target_vel_n + mu * c_T_mag;\n"
+                    "                            }",
+                )
+            else:
+                mf_friction_block = mf_friction_block.replace(
+                    "// __BISECTION_LABEL__",
+                    '// friction_mode="bisection": RAISim-style bisection on λ_n.',
+                )
+                # Pure RAISim bisection: no de Saxce bias.
+                mf_friction_block = mf_friction_block.replace(
+                    "// __DESAXCE_BIAS__",
+                    "// (no de Saxce bias; friction_mode=\"bisection\".)",
+                )
+        elif friction_mode == "coulomb_newton":
+            # Gilles Daviet's 1D Coulomb Newton (7/13).  CUDA port of
+            # :func:`friction_step_coulomb_newton`; mirrors the
+            # bisection block's structure — lane 0 runs the serial
+            # scalar Newton, then broadcasts (new_t1, d_n, d_t2) to
+            # every lane via ``__shfl_sync`` so the v_out deltas for
+            # the normal / t2 rows are applied cooperatively.
+            mf_friction_block = """
+                    // friction_mode="coulomb_newton": Gilles Daviet's
+                    // scalar bracketed-Newton on α.  Ported from
+                    // ``coulomb_root_finding_warp.py::solve_coulomb`` —
+                    // see :func:`friction_step_coulomb_newton` for the
+                    // matrix-free row-data mapping.
+                    int mf_par = packed_tp >> 16;
+                    int i_t1 = mf_par + 1;
+                    int i_t2 = mf_par + 2;
+
+                    if (i != i_t1) {
+                        // Second friction row of the triple: the
+                        // Newton solve that ran at i == i_t1 already
+                        // wrote s_lam_mf[i_t2].  Collapse
+                        // delta_impulse to zero for this row.
+                        new_impulse = s_lam_mf[i];
+                    } else {
+                        int n_mf6 = mf6_base + mf_par * 6;
+                        int t1_mf6 = mf6_base + i_t1 * 6;
+                        int t2_mf6 = mf6_base + i_t2 * 6;
+
+                        int parent_packed_dofs = mf_meta.data[off_meta + mf_par * 4];
+                        int dof_a_par = parent_packed_dofs >> 16;
+                        int dof_b_par = (parent_packed_dofs << 16) >> 16;
+                        float target_vel_n = -__int_as_float(
+                            mf_meta.data[off_meta + mf_par * 4 + 2]);
+                        float mu = mf_row_mu.data[off_mf + i];
+
+                        float old_lambda_n = s_lam_mf[mf_par];
+                        float old_lambda_t1 = s_lam_mf[i_t1];
+                        float old_lambda_t2 = s_lam_mf[i_t2];
+
+                        float new_lambda_n = old_lambda_n;
+                        float new_lambda_t1 = old_lambda_t1;
+                        float new_lambda_t2 = old_lambda_t2;
+                        float d_n_total = 0.0f;
+                        float d_t2_total = 0.0f;
+
+                        if (lane == 0) {
+                            float u_n = 0.0f, u_t1 = 0.0f, u_t2 = 0.0f;
+                            if (dof_a_par >= 0) {
+                                for (int k = 0; k < 6; k++) {
+                                    float va = s_v[dof_a_par + k];
+                                    u_n  += mf_J_a.data[n_mf6  + k] * va;
+                                    u_t1 += mf_J_a.data[t1_mf6 + k] * va;
+                                    u_t2 += mf_J_a.data[t2_mf6 + k] * va;
+                                }
+                            }
+                            if (dof_b_par >= 0) {
+                                for (int k = 0; k < 6; k++) {
+                                    float vb = s_v[dof_b_par + k];
+                                    u_n  += mf_J_b.data[n_mf6  + k] * vb;
+                                    u_t1 += mf_J_b.data[t1_mf6 + k] * vb;
+                                    u_t2 += mf_J_b.data[t2_mf6 + k] * vb;
+                                }
+                            }
+
+                            float G_nn = 0.0f, G_nt1 = 0.0f, G_nt2 = 0.0f;
+                            float G_t1t1 = 0.0f, G_t1t2 = 0.0f, G_t2t2 = 0.0f;
+                            if (dof_a_par >= 0) {
+                                for (int k = 0; k < 6; k++) {
+                                    float Jna = mf_J_a.data[n_mf6  + k];
+                                    float Jt1a = mf_J_a.data[t1_mf6 + k];
+                                    float Jt2a = mf_J_a.data[t2_mf6 + k];
+                                    float Mna = mf_MiJt_a.data[n_mf6  + k];
+                                    float Mt1a = mf_MiJt_a.data[t1_mf6 + k];
+                                    float Mt2a = mf_MiJt_a.data[t2_mf6 + k];
+                                    G_nn   += Jna * Mna;
+                                    G_nt1  += Jna * Mt1a;
+                                    G_nt2  += Jna * Mt2a;
+                                    G_t1t1 += Jt1a * Mt1a;
+                                    G_t1t2 += Jt1a * Mt2a;
+                                    G_t2t2 += Jt2a * Mt2a;
+                                }
+                            }
+                            if (dof_b_par >= 0) {
+                                for (int k = 0; k < 6; k++) {
+                                    float Jnb = mf_J_b.data[n_mf6  + k];
+                                    float Jt1b = mf_J_b.data[t1_mf6 + k];
+                                    float Jt2b = mf_J_b.data[t2_mf6 + k];
+                                    float Mnb = mf_MiJt_b.data[n_mf6  + k];
+                                    float Mt1b = mf_MiJt_b.data[t1_mf6 + k];
+                                    float Mt2b = mf_MiJt_b.data[t2_mf6 + k];
+                                    G_nn   += Jnb * Mnb;
+                                    G_nt1  += Jnb * Mt1b;
+                                    G_nt2  += Jnb * Mt2b;
+                                    G_t1t1 += Jt1b * Mt1b;
+                                    G_t1t2 += Jt1b * Mt2b;
+                                    G_t2t2 += Jt2b * Mt2b;
+                                }
+                            }
+
+                            if (G_nn >= 1.0e-20f) {
+                                // u_free = u_current - G * lambda_old
+                                float u_free_n = u_n - (G_nn * old_lambda_n
+                                    + G_nt1 * old_lambda_t1
+                                    + G_nt2 * old_lambda_t2);
+                                float u_free_t1 = u_t1 - (G_nt1 * old_lambda_n
+                                    + G_t1t1 * old_lambda_t1
+                                    + G_t1t2 * old_lambda_t2);
+                                float u_free_t2 = u_t2 - (G_nt2 * old_lambda_n
+                                    + G_t1t2 * old_lambda_t1
+                                    + G_t2t2 * old_lambda_t2);
+
+                                if (u_free_n < target_vel_n) {
+                                    // Reference b vector shifted into the
+                                    // positive-target frame (b_N < 0 on
+                                    // penetrating contacts).
+                                    float bN = u_free_n - target_vel_n;
+                                    float bT0 = u_free_t1;
+                                    float bT1 = u_free_t2;
+
+                                    float WN = G_nn;
+                                    float wNT0 = G_nt1;
+                                    float wNT1 = G_nt2;
+                                    // A_T = W_T - wNT wNT^T / WN.
+                                    float AT00 = G_t1t1 - (wNT0 * wNT0) / WN;
+                                    float AT01 = G_t1t2 - (wNT0 * wNT1) / WN;
+                                    float AT10 = G_t1t2 - (wNT1 * wNT0) / WN;
+                                    float AT11 = G_t2t2 - (wNT1 * wNT1) / WN;
+                                    // c_T = bT - (bN / WN) * wNT.
+                                    float cT0 = bT0 - (bN / WN) * wNT0;
+                                    float cT1 = bT1 - (bN / WN) * wNT1;
+
+                                    // Sticking check at alpha = 0.
+                                    float inv_det0 = 1.0f /
+                                        (AT00 * AT11 - AT01 * AT10);
+                                    float s0_0 = (AT11 * cT0 - AT01 * cT1) * inv_det0;
+                                    float s0_1 = (AT00 * cT1 - AT10 * cT0) * inv_det0;
+                                    float norm_s0 = sqrtf(s0_0 * s0_0 + s0_1 * s0_1);
+                                    float phi0 = norm_s0 - mu *
+                                        (wNT0 * s0_0 + wNT1 * s0_1 - bN) / WN;
+
+                                    float last_s0 = 0.0f, last_s1 = 0.0f;
+                                    float alpha = 0.0f;
+
+                                    if (phi0 <= 0.0f) {
+                                        // Sticking: alpha = 0, s = s0.
+                                        last_s0 = s0_0;
+                                        last_s1 = s0_1;
+                                        alpha = 0.0f;
+                                    } else {
+                                        // Bracket: double hi until phi(hi) < 0.
+                                        float hi = 1.0f;
+                                        for (int _e = 0; _e < 30; _e++) {
+                                            float a_hi = AT00 + hi;
+                                            float d_hi = AT11 + hi;
+                                            float idet_hi = 1.0f /
+                                                (a_hi * d_hi - AT01 * AT10);
+                                            float sh0 = (d_hi * cT0 - AT01 * cT1) * idet_hi;
+                                            float sh1 = (a_hi * cT1 - AT10 * cT0) * idet_hi;
+                                            float ns_hi = sqrtf(sh0 * sh0 + sh1 * sh1);
+                                            float phi_hi = ns_hi - mu *
+                                                (wNT0 * sh0 + wNT1 * sh1 - bN) / WN;
+                                            if (phi_hi < 0.0f) break;
+                                            hi *= 2.0f;
+                                        }
+
+                                        float lo = 0.0f;
+                                        float x = 0.5f * (lo + hi);
+                                        float tol = 1.0e-6f + 1.0e-6f * phi0;
+
+                                        for (int _it = 0; _it < 50; _it++) {
+                                            float ax = AT00 + x;
+                                            float dx = AT11 + x;
+                                            float idet = 1.0f /
+                                                (ax * dx - AT01 * AT10);
+                                            float s0 = (dx * cT0 - AT01 * cT1) * idet;
+                                            float s1 = (ax * cT1 - AT10 * cT0) * idet;
+                                            float t0 = (dx * s0 - AT01 * s1) * idet;
+                                            float t1 = (ax * s1 - AT10 * s0) * idet;
+                                            float ns = sqrtf(s0 * s0 + s1 * s1);
+                                            float fx = ns - mu *
+                                                (wNT0 * s0 + wNT1 * s1 - bN) / WN;
+                                            float dfx = -(s0 * t0 + s1 * t1) / ns
+                                                + mu * (wNT0 * t0 + wNT1 * t1) / WN;
+
+                                            last_s0 = s0;
+                                            last_s1 = s1;
+
+                                            if (fabsf(fx) < tol
+                                                || fabsf(hi - lo) < 1.0e-6f * (1.0f + hi)) {
+                                                alpha = x;
+                                                break;
+                                            }
+
+                                            if (fx > 0.0f) lo = x;
+                                            else hi = x;
+
+                                            float x_new = 0.5f * (lo + hi);
+                                            if (dfx != 0.0f) {
+                                                float x_newton = x - fx / dfx;
+                                                if (x_newton > lo && x_newton < hi) {
+                                                    x_new = x_newton;
+                                                }
+                                            }
+                                            x = x_new;
+                                            alpha = x;
+                                        }
+                                    }
+
+                                    // Recover r_T, r_N from the last s.
+                                    float rT0 = -last_s0;
+                                    float rT1 = -last_s1;
+                                    float rN = -(wNT0 * rT0 + wNT1 * rT1 + bN) / WN;
+                                    new_lambda_n = rN;
+                                    new_lambda_t1 = rT0;
+                                    new_lambda_t2 = rT1;
+                                } else {
+                                    // Separating contact: zero impulse.
+                                    new_lambda_n = 0.0f;
+                                    new_lambda_t1 = 0.0f;
+                                    new_lambda_t2 = 0.0f;
+                                }
+
+                                d_n_total = new_lambda_n - old_lambda_n;
+                                d_t2_total = new_lambda_t2 - old_lambda_t2;
+                                s_lam_mf[mf_par] = new_lambda_n;
+                                s_lam_mf[i_t2]   = new_lambda_t2;
+                            }
+                        }
+
+                        __syncwarp();
+                        new_lambda_t1 = __shfl_sync(MASK, new_lambda_t1, 0);
+                        d_n_total = __shfl_sync(MASK, d_n_total, 0);
+                        d_t2_total = __shfl_sync(MASK, d_t2_total, 0);
+
+                        // Apply normal-row v_out delta (all lanes).
+                        if (d_n_total != 0.0f) {
+                            if (lane < 6 && dof_a_par >= 0) {
+                                s_v[dof_a_par + lane] +=
+                                    mf_MiJt_a.data[n_mf6 + lane] * d_n_total;
+                            }
+                            if (lane >= 6 && lane < 12 && dof_b_par >= 0) {
+                                s_v[dof_b_par + lane - 6] +=
+                                    mf_MiJt_b.data[n_mf6 + lane - 6] * d_n_total;
+                            }
+                        }
+                        // Apply t2-row v_out delta (all lanes).
+                        if (d_t2_total != 0.0f) {
+                            if (lane < 6 && dof_a_par >= 0) {
+                                s_v[dof_a_par + lane] +=
+                                    mf_MiJt_a.data[t2_mf6 + lane] * d_t2_total;
+                            }
+                            if (lane >= 6 && lane < 12 && dof_b_par >= 0) {
+                                s_v[dof_b_par + lane - 6] +=
+                                    mf_MiJt_b.data[t2_mf6 + lane - 6] * d_t2_total;
+                            }
+                        }
+                        __syncwarp();
+                        new_impulse = new_lambda_t1;
+                    }
+"""
+        else:
+            mf_friction_block = """
+                    // friction_mode="current": isotropic Coulomb cone clamp.
+                    int mf_par = packed_tp >> 16;
+                    float lambda_n = s_lam_mf[mf_par];
+                    float mu = mf_row_mu.data[off_mf + i];
+                    float radius = fmaxf(mu * lambda_n, 0.0f);
+
+                    if (radius <= 0.0f) {
+                        new_impulse = 0.0f;
+                    } else {
+                        int sib = (i == mf_par + 1) ? mf_par + 2 : mf_par + 1;
+                        s_lam_mf[i] = new_impulse;
+                        float a_val = new_impulse;
+                        float b_val = s_lam_mf[sib];
+                        float mag = sqrtf(a_val * a_val + b_val * b_val);
+                        if (mag > radius) {
+                            float scale = radius / mag;
+                            new_impulse = a_val * scale;
+                            float sib_new = b_val * scale;
+                            float sib_delta = sib_new - b_val;
+                            s_lam_mf[sib] = sib_new;
+
+                            // Sibling v update (can't prefetch — random sib index)
+                            int sib_packed_dofs = mf_meta.data[off_meta + sib * 4];
+                            int sib_dof_a = sib_packed_dofs >> 16;
+                            int sib_dof_b = (sib_packed_dofs << 16) >> 16;
+                            int sib_mf6 = mf6_base + sib * 6;
+                            if (lane < 6 && sib_dof_a >= 0) {
+                                s_v[sib_dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
+                            }
+                            if (lane >= 6 && lane < 12 && sib_dof_b >= 0) {
+                                s_v[sib_dof_b + lane - 6] += mf_MiJt_b.data[sib_mf6 + lane - 6] * sib_delta;
+                            }
+                        }
+                    }
+"""
 
         snippet = f"""
     #if defined(__CUDA_ARCH__)
@@ -4551,7 +5517,11 @@ class TiledKernelFactory:
                 float new_impulse = old_impulse + omega * delta;
                 int row_type = s_rtype_dense[i];
 
-                if (row_type == 0 || row_type == 3) {{
+                // row_type 0=CONTACT, 3=JOINT_LIMIT, 4=JOINT_VELOCITY_LIMIT:
+                // unilateral lambda >= 0 projector. The velocity-limit row
+                // uses a signed Jacobian so one side of the bilateral
+                // [-qdot_max, +qdot_max] box is active at a time.
+                if (row_type == 0 || row_type == 3 || row_type == 4) {{
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                 }} else if (row_type == 2) {{
                     int parent_idx = s_parent_dense[i];
@@ -4665,39 +5635,7 @@ class TiledKernelFactory:
                 if (mf_rt == 0) {{
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                 }} else if (mf_rt == 2) {{
-                    int mf_par = packed_tp >> 16;
-                    float lambda_n = s_lam_mf[mf_par];
-                    float mu = mf_row_mu.data[off_mf + i];
-                    float radius = fmaxf(mu * lambda_n, 0.0f);
-
-                    if (radius <= 0.0f) {{
-                        new_impulse = 0.0f;
-                    }} else {{
-                        int sib = (i == mf_par + 1) ? mf_par + 2 : mf_par + 1;
-                        s_lam_mf[i] = new_impulse;
-                        float a_val = new_impulse;
-                        float b_val = s_lam_mf[sib];
-                        float mag = sqrtf(a_val * a_val + b_val * b_val);
-                        if (mag > radius) {{
-                            float scale = radius / mag;
-                            new_impulse = a_val * scale;
-                            float sib_new = b_val * scale;
-                            float sib_delta = sib_new - b_val;
-                            s_lam_mf[sib] = sib_new;
-
-                            // Sibling v update (can't prefetch — random sib index)
-                            int sib_packed_dofs = mf_meta.data[off_meta + sib * 4];
-                            int sib_dof_a = sib_packed_dofs >> 16;
-                            int sib_dof_b = (sib_packed_dofs << 16) >> 16;
-                            int sib_mf6 = mf6_base + sib * 6;
-                            if (lane < 6 && sib_dof_a >= 0) {{
-                                s_v[sib_dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
-                            }}
-                            if (lane >= 6 && lane < 12 && sib_dof_b >= 0) {{
-                                s_v[sib_dof_b + lane - 6] += mf_MiJt_b.data[sib_mf6 + lane - 6] * sib_delta;
-                            }}
-                        }}
-                    }}
+                    {mf_friction_block}
                 }}
 
                 float delta_impulse = new_impulse - old_impulse;
@@ -4814,7 +5752,7 @@ class TiledKernelFactory:
                 v_out,
             )
 
-        name = f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}"
+        name = f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
         pgs_solve_mf_gs_template.__name__ = name
         pgs_solve_mf_gs_template.__qualname__ = name
         return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
