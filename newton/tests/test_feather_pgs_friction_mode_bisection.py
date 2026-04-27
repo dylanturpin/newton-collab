@@ -68,7 +68,6 @@ import newton.utils
 from newton._src.solvers import SolverFeatherPGS
 from newton.tests.unittest_utils import USD_AVAILABLE
 
-
 G1_ASSET_FOLDER = "unitree_g1"
 G1_USD_RELPATH = ("usd", "g1_isaac.usd")
 
@@ -84,9 +83,7 @@ def _build_sphere_on_plane_model(device: wp.context.Device) -> newton.Model:
     matrix-free contact problem.
     """
     builder = newton.ModelBuilder()
-    builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
-        limit_ke=0.0, limit_kd=0.0, friction=0.0
-    )
+    builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=0.0, limit_kd=0.0, friction=0.0)
     builder.default_shape_cfg.ke = 5.0e4
     builder.default_shape_cfg.kd = 5.0e2
     builder.default_shape_cfg.kf = 1.0e3
@@ -248,9 +245,7 @@ def _try_build_h1_tabletop_model(device: wp.context.Device) -> newton.Model | No
             hs = obj["half_size"]
             builder.add_shape_box(body_idx, hx=hs, hy=hs, hz=hs, cfg=obj_shape_cfg)
         elif obj["type"] == "capsule":
-            builder.add_shape_capsule(
-                body_idx, radius=obj["radius"], half_height=obj["half_height"], cfg=obj_shape_cfg
-            )
+            builder.add_shape_capsule(body_idx, radius=obj["radius"], half_height=obj["half_height"], cfg=obj_shape_cfg)
 
     builder.end_world()
 
@@ -295,12 +290,12 @@ def _run_sim(
     """
     if model is None:
         model = _build_sphere_on_plane_model(device)
-    solver_kwargs = dict(
-        pgs_mode="matrix_free",
-        friction_mode=friction_mode,
-        pgs_iterations=pgs_iterations,
-        pgs_debug=pgs_debug,
-    )
+    solver_kwargs = {
+        "pgs_mode": "matrix_free",
+        "friction_mode": friction_mode,
+        "pgs_iterations": pgs_iterations,
+        "pgs_debug": pgs_debug,
+    }
     # Some benchmark scenes (h1_tabletop in particular) have many
     # articulation constraints and need a larger dense_max_constraints
     # budget.  The MF kernel variant compiles per-key, so we set it
@@ -533,8 +528,7 @@ class TestFeatherPGSFrictionModeBisectionDiagnostic(unittest.TestCase):
         slack = 1.0e-4 + 0.05 * np.maximum(np.abs(r_compl_first), 1.0e-6)
         self.assertTrue(
             np.all(r_compl_last <= r_compl_first + slack),
-            f"r_compl did not decrease across GS iterations: "
-            f"first={r_compl_first}, last={r_compl_last}",
+            f"r_compl did not decrease across GS iterations: first={r_compl_first}, last={r_compl_last}",
         )
 
     def _compare_rcompl_across_iters(
@@ -573,10 +567,7 @@ class TestFeatherPGSFrictionModeBisectionDiagnostic(unittest.TestCase):
         num_iter_budget = r_compl_cur_all.shape[1]
         filtered_iters = [k for k in iters if k < num_iter_budget]
         if not filtered_iters:  # pragma: no cover - defensive
-            self.fail(
-                f"[{scenario_label}] none of the requested iters {iters} "
-                f"fit inside num_iters={num_iter_budget}"
-            )
+            self.fail(f"[{scenario_label}] none of the requested iters {iters} fit inside num_iters={num_iter_budget}")
 
         satisfying_steps: list[int] = []
         best_step: int | None = None
@@ -732,9 +723,7 @@ class TestFeatherPGSFrictionModeBisectionDiagnostic(unittest.TestCase):
                 bi_solver.step(state_0, state_1, control, contacts, sub_dt)
                 state_0, state_1 = state_1, state_0
 
-        self._compare_rcompl_across_iters(
-            cur_solver, bi_solver, iters=(5, 10, 20, 50), scenario_label="h1_tabletop"
-        )
+        self._compare_rcompl_across_iters(cur_solver, bi_solver, iters=(5, 10, 20, 50), scenario_label="h1_tabletop")
 
 
 if __name__ == "__main__":

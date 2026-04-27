@@ -48,13 +48,7 @@ import json
 import sys
 from pathlib import Path
 
-import matplotlib
-
-# Non-interactive backend: this script runs headless on CI and dev boxes.
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
+import numpy as np
 
 # =============================================================================
 # Constants kept in sync with scripts/solver_replay.py
@@ -85,10 +79,10 @@ _RESIDUAL_TITLES: dict[str, str] = {
 # across every plot in the series (acceptance criterion).
 _MODE_ORDER: tuple[str, ...] = ("current", "bisection", "bisection_desaxce", "coulomb_newton")
 _MODE_COLOURS: dict[str, str] = {
-    "current": "#1f77b4",            # matplotlib C0
-    "bisection": "#ff7f0e",          # C1
+    "current": "#1f77b4",  # matplotlib C0
+    "bisection": "#ff7f0e",  # C1
     "bisection_desaxce": "#2ca02c",  # C2
-    "coulomb_newton": "#d62728",     # C3
+    "coulomb_newton": "#d62728",  # C3
 }
 _MODE_MARKERS: dict[str, str] = {
     "current": "o",
@@ -187,7 +181,7 @@ def _collect_curves(replay: dict) -> dict[str, dict[str, list[tuple[int, float]]
             continue
         gs_sweeps = entry.get("gs_sweeps", {}) or {}
         # Sort numerically on the gs key (JSON keys are strings).
-        for gs_key in sorted(gs_sweeps, key=lambda k: int(k)):
+        for gs_key in sorted(gs_sweeps, key=int):
             sweep = gs_sweeps[gs_key]
             residuals = sweep.get("residuals")
             if not residuals:
@@ -215,6 +209,12 @@ def _plot_channel(
     out_path: Path,
 ) -> bool:
     """Draw a single residual-vs-GS-iter plot; return True on success."""
+    import matplotlib
+
+    # Non-interactive backend: this script runs headless on CI and dev boxes.
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     fig, ax = plt.subplots(figsize=(6.4, 4.2))
 
     plotted = False
@@ -289,7 +289,11 @@ def _render_contact_mix_markdown(contact_mix: dict, *, scenario: str, target_ste
         row_counts = counts.get(row_key, {})
         row_total = int(totals.get(row_key, sum(int(row_counts.get(c, 0)) for c in columns)))
         rendered_rows.append(
-            [_CONTACT_MIX_ROW_LABELS.get(row_key, row_key), *[_cell(row_counts.get(c, 0)) for c in columns], _cell(row_total)]
+            [
+                _CONTACT_MIX_ROW_LABELS.get(row_key, row_key),
+                *[_cell(row_counts.get(c, 0)) for c in columns],
+                _cell(row_total),
+            ]
         )
 
     # Column totals per-column + grand total.
@@ -349,9 +353,7 @@ def _emit(replay: dict, out_dir: Path) -> dict:
             f"(schema_version >= 1.2) for {scenario} step {target_step}._\n"
         )
     else:
-        contact_md = _render_contact_mix_markdown(
-            contact_mix, scenario=scenario, target_step=target_step
-        )
+        contact_md = _render_contact_mix_markdown(contact_mix, scenario=scenario, target_step=target_step)
     contact_md_path.write_text(contact_md, encoding="utf-8")
 
     manifest = {
@@ -363,9 +365,7 @@ def _emit(replay: dict, out_dir: Path) -> dict:
         "friction_mode_order": list(_MODE_ORDER),
         "residual_channels": list(_RESIDUAL_CHANNELS),
     }
-    (out_dir / "index.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    (out_dir / "index.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest
 
 

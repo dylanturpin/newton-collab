@@ -141,9 +141,7 @@ class TestFeatherPGSVelocityLimitAllocationKernel(unittest.TestCase):
     """Direct kernel tests for ``allocate_joint_velocity_limit_slots``."""
 
 
-def run_allocation_activates_only_over_limit(
-    test: TestFeatherPGSVelocityLimitAllocationKernel, device
-):
+def run_allocation_activates_only_over_limit(test: TestFeatherPGSVelocityLimitAllocationKernel, device):
     """Only DOFs whose ``|qdot|`` exceeds the per-axis limit get a slot."""
     # Layout: one articulation with two revolute DOFs, limits = 2.0 rad/s.
     dof_count = 2
@@ -160,9 +158,7 @@ def run_allocation_activates_only_over_limit(
     )
     joint_qd_start = wp.array(np.array([0, 1], dtype=np.int32), dtype=int, device=device)
     # Each joint has 0 linear, 1 angular DOF.
-    joint_dof_dim = wp.array(
-        np.array([[0, 1], [0, 1]], dtype=np.int32), dtype=int, ndim=2, device=device
-    )
+    joint_dof_dim = wp.array(np.array([[0, 1], [0, 1]], dtype=np.int32), dtype=int, ndim=2, device=device)
     joint_velocity_limit = wp.array(np.array([2.0, 2.0], dtype=np.float32), dtype=float, device=device)
     # DOF 0 well within limits; DOF 1 blown past the upper limit.
     joint_qd = wp.array(np.array([0.5, 3.5], dtype=np.float32), dtype=float, device=device)
@@ -204,9 +200,7 @@ def run_allocation_activates_only_over_limit(
     test.assertAlmostEqual(float(sign[1]), -1.0, places=6)
 
 
-def run_allocation_lower_vs_upper_sides(
-    test: TestFeatherPGSVelocityLimitAllocationKernel, device
-):
+def run_allocation_lower_vs_upper_sides(test: TestFeatherPGSVelocityLimitAllocationKernel, device):
     """Lower-limit violation → sign = +1; upper-limit violation → sign = -1.
 
     This is the direct signal that the bilateral ``[-qdot_max, +qdot_max]``
@@ -225,9 +219,7 @@ def run_allocation_lower_vs_upper_sides(
         device=device,
     )
     joint_qd_start = wp.array(np.array([0, 1], dtype=np.int32), dtype=int, device=device)
-    joint_dof_dim = wp.array(
-        np.array([[0, 1], [0, 1]], dtype=np.int32), dtype=int, ndim=2, device=device
-    )
+    joint_dof_dim = wp.array(np.array([[0, 1], [0, 1]], dtype=np.int32), dtype=int, ndim=2, device=device)
     joint_velocity_limit = wp.array(np.array([1.0, 1.0], dtype=np.float32), dtype=float, device=device)
     # DOF 0: below lower bound. DOF 1: above upper bound.
     joint_qd = wp.array(np.array([-5.0, 5.0], dtype=np.float32), dtype=float, device=device)
@@ -272,9 +264,7 @@ def run_allocation_lower_vs_upper_sides(
     test.assertAlmostEqual(float(sign[1]), -1.0, places=6)
 
 
-def run_allocation_nonpositive_limit_is_unlimited(
-    test: TestFeatherPGSVelocityLimitAllocationKernel, device
-):
+def run_allocation_nonpositive_limit_is_unlimited(test: TestFeatherPGSVelocityLimitAllocationKernel, device):
     """A non-positive ``qdot_max_i`` is treated as "no limit": no row allocated.
 
     This mirrors PhysX's ``recipResponse`` pinning on ``unitResponse <= 0``
@@ -287,9 +277,7 @@ def run_allocation_nonpositive_limit_is_unlimited(
     articulation_start = wp.array(np.array([0, 1], dtype=np.int32), dtype=int, device=device)
     articulation_dof_start = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
     articulation_H_rows = wp.array(np.array([dof_count], dtype=np.int32), dtype=int, device=device)
-    joint_type = wp.array(
-        np.array([int(JointType.REVOLUTE)], dtype=np.int32), dtype=int, device=device
-    )
+    joint_type = wp.array(np.array([int(JointType.REVOLUTE)], dtype=np.int32), dtype=int, device=device)
     joint_qd_start = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
     joint_dof_dim = wp.array(np.array([[0, 1]], dtype=np.int32), dtype=int, ndim=2, device=device)
     # Zero limit should be treated as unlimited and NOT allocate.
@@ -328,9 +316,7 @@ class TestFeatherPGSVelocityLimitPopulatorKernel(unittest.TestCase):
     """Direct kernel tests for ``populate_joint_velocity_limit_J_for_size``."""
 
 
-def run_populator_writes_signed_selector_row_and_metadata(
-    test: TestFeatherPGSVelocityLimitPopulatorKernel, device
-):
+def run_populator_writes_signed_selector_row_and_metadata(test: TestFeatherPGSVelocityLimitPopulatorKernel, device):
     """Populator writes J = sign*e_i, zero Baumgarte bias, and target_vel = -qdot_max.
 
     Build a 2-DOF layout where:
@@ -353,9 +339,7 @@ def run_populator_writes_signed_selector_row_and_metadata(
         device=device,
     )
     joint_qd_start = wp.array(np.array([0, 1], dtype=np.int32), dtype=int, device=device)
-    joint_dof_dim = wp.array(
-        np.array([[0, 1], [0, 1]], dtype=np.int32), dtype=int, ndim=2, device=device
-    )
+    joint_dof_dim = wp.array(np.array([[0, 1], [0, 1]], dtype=np.int32), dtype=int, ndim=2, device=device)
     qdot_max = np.array([3.0, 4.0], dtype=np.float32)
     joint_velocity_limit = wp.array(qdot_max, dtype=float, device=device)
 
@@ -418,27 +402,17 @@ def run_populator_writes_signed_selector_row_and_metadata(
     test.assertEqual(int(row_type[0, 1]), PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
 
     # No Baumgarte / ERP — matches PhysX.
-    np.testing.assert_allclose(
-        world_row_beta.numpy()[0, :2], np.zeros(2, dtype=np.float32), atol=1e-7
-    )
+    np.testing.assert_allclose(world_row_beta.numpy()[0, :2], np.zeros(2, dtype=np.float32), atol=1e-7)
     # phi = 0 (velocity-limit row has no positional bias quantity).
-    np.testing.assert_allclose(
-        world_phi.numpy()[0, :2], np.zeros(2, dtype=np.float32), atol=1e-7
-    )
+    np.testing.assert_allclose(world_phi.numpy()[0, :2], np.zeros(2, dtype=np.float32), atol=1e-7)
     # target_vel = -qdot_max for both signs; combined with the sign flip in J
     # this encodes the bilateral projection as a unilateral row with
     # ``lambda >= 0``.
-    np.testing.assert_allclose(
-        world_target_velocity.numpy()[0, :2], -qdot_max, atol=1e-7
-    )
+    np.testing.assert_allclose(world_target_velocity.numpy()[0, :2], -qdot_max, atol=1e-7)
     # cfm preserved.
-    np.testing.assert_allclose(
-        world_row_cfm.numpy()[0, :2], np.full(2, pgs_cfm, dtype=np.float32), atol=1e-7
-    )
+    np.testing.assert_allclose(world_row_cfm.numpy()[0, :2], np.full(2, pgs_cfm, dtype=np.float32), atol=1e-7)
     # No parent — the row is standalone (not a friction sibling).
-    np.testing.assert_array_equal(
-        world_row_parent.numpy()[0, :2], np.array([-1, -1], dtype=np.int32)
-    )
+    np.testing.assert_array_equal(world_row_parent.numpy()[0, :2], np.array([-1, -1], dtype=np.int32))
 
 
 class TestFeatherPGSVelocityLimitEndToEnd(unittest.TestCase):
@@ -510,9 +484,7 @@ def _step_and_read_qdot(
     return peak
 
 
-def run_end_to_end_flag_on_clamps_peak_qdot(
-    test: TestFeatherPGSVelocityLimitEndToEnd, device
-):
+def run_end_to_end_flag_on_clamps_peak_qdot(test: TestFeatherPGSVelocityLimitEndToEnd, device):
     """With the flag on, peak ``|qdot|`` stays near the velocity limit.
 
     Drives a stiff-PD pendulum with a far position target — the baseline
@@ -542,9 +514,7 @@ def run_end_to_end_flag_on_clamps_peak_qdot(
     test.assertLess(peak, velocity_limit * 1.5)
 
 
-def run_end_to_end_flag_on_is_tighter_than_flag_off(
-    test: TestFeatherPGSVelocityLimitEndToEnd, device
-):
+def run_end_to_end_flag_on_is_tighter_than_flag_off(test: TestFeatherPGSVelocityLimitEndToEnd, device):
     """Constrained FPGS has a smaller ``|qdot|`` peak than baseline FPGS.
 
     This is the direct smoke-scenario signal at Newton-library level
@@ -559,9 +529,7 @@ def run_end_to_end_flag_on_is_tighter_than_flag_off(
         device, velocity_limit=velocity_limit, target_ke=2000.0, target_kd=40.0
     )
     solver_b = SolverFeatherPGS(model_b, pgs_mode="matrix_free", pgs_iterations=32)
-    peak_baseline = _step_and_read_qdot(
-        model_b, solver_b, s0_b, s1_b, ctl_b, dt=1.0 / 120.0, n_steps=40
-    )
+    peak_baseline = _step_and_read_qdot(model_b, solver_b, s0_b, s1_b, ctl_b, dt=1.0 / 120.0, n_steps=40)
 
     # Constrained (flag on).
     model_c, s0_c, s1_c, ctl_c = _build_driven_pendulum(
@@ -573,9 +541,7 @@ def run_end_to_end_flag_on_is_tighter_than_flag_off(
         pgs_mode="matrix_free",
         pgs_iterations=32,
     )
-    peak_constrained = _step_and_read_qdot(
-        model_c, solver_c, s0_c, s1_c, ctl_c, dt=1.0 / 120.0, n_steps=40
-    )
+    peak_constrained = _step_and_read_qdot(model_c, solver_c, s0_c, s1_c, ctl_c, dt=1.0 / 120.0, n_steps=40)
 
     # Baseline must overshoot meaningfully (otherwise the scenario itself
     # isn't a valid witness).
@@ -586,9 +552,7 @@ def run_end_to_end_flag_on_is_tighter_than_flag_off(
     test.assertLess(peak_constrained, velocity_limit * 1.5)
 
 
-def run_end_to_end_flag_off_is_strict_noop(
-    test: TestFeatherPGSVelocityLimitEndToEnd, device
-):
+def run_end_to_end_flag_off_is_strict_noop(test: TestFeatherPGSVelocityLimitEndToEnd, device):
     """Flag off: per-step outputs are bit-exact to the pre-issue baseline.
 
     Same stiff-PD driven pendulum, same matrix-free pipeline, same seed
@@ -608,9 +572,7 @@ def run_end_to_end_flag_off_is_strict_noop(
     model_b, s0_b, s1_b, ctl_b = _build_driven_pendulum(
         device, velocity_limit=velocity_limit, target_ke=2000.0, target_kd=40.0
     )
-    solver_b = SolverFeatherPGS(
-        model_b, enable_joint_velocity_limits=False, pgs_mode="matrix_free"
-    )
+    solver_b = SolverFeatherPGS(model_b, enable_joint_velocity_limits=False, pgs_mode="matrix_free")
     peak_b = _step_and_read_qdot(model_b, solver_b, s0_b, s1_b, ctl_b, dt=1.0 / 120.0, n_steps=20)
 
     # Bit-exact match: flag-off is a strict no-op.

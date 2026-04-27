@@ -108,14 +108,10 @@ class TestFeatherPGSFrictionModeBisectionDeSaxce(unittest.TestCase):
     """``friction_mode="bisection_desaxce"`` is wired on ``pgs_mode="matrix_free"`` (6/13)."""
 
 
-def run_bisection_desaxce_construct_matrix_free(
-    test: TestFeatherPGSFrictionModeBisectionDeSaxce, device
-):
+def run_bisection_desaxce_construct_matrix_free(test: TestFeatherPGSFrictionModeBisectionDeSaxce, device):
     """``friction_mode="bisection_desaxce"`` constructs under matrix_free (6/13)."""
     model = _build_one_dof_pendulum_model(device)
-    solver = SolverFeatherPGS(
-        model, pgs_mode="matrix_free", friction_mode="bisection_desaxce"
-    )
+    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", friction_mode="bisection_desaxce")
     test.assertEqual(solver.friction_mode, "bisection_desaxce")
     test.assertEqual(solver.pgs_mode, "matrix_free")
 
@@ -124,9 +120,7 @@ class TestFeatherPGSFrictionModeCoulombNewton(unittest.TestCase):
     """``friction_mode="coulomb_newton"`` is wired on ``pgs_mode="matrix_free"`` (7/13)."""
 
 
-def run_coulomb_newton_construct_matrix_free(
-    test: TestFeatherPGSFrictionModeCoulombNewton, device
-):
+def run_coulomb_newton_construct_matrix_free(test: TestFeatherPGSFrictionModeCoulombNewton, device):
     """``friction_mode="coulomb_newton"`` constructs under matrix_free (7/13).
 
     Previously this constructor raised :class:`NotImplementedError`
@@ -135,9 +129,7 @@ def run_coulomb_newton_construct_matrix_free(
     the constructor succeeds and the mode round-trips on the solver.
     """
     model = _build_one_dof_pendulum_model(device)
-    solver = SolverFeatherPGS(
-        model, pgs_mode="matrix_free", friction_mode="coulomb_newton"
-    )
+    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", friction_mode="coulomb_newton")
     test.assertEqual(solver.friction_mode, "coulomb_newton")
     test.assertEqual(solver.pgs_mode, "matrix_free")
 

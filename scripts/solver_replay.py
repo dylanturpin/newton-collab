@@ -860,7 +860,7 @@ def _classify_path_rows(
     ``row_type == 3`` rows are counted separately as ``joint_limit``
     regardless of their friction status.
     """
-    buckets = {key: 0 for key in _CONTACT_MIX_COLUMNS}
+    buckets = dict.fromkeys(_CONTACT_MIX_COLUMNS, 0)
     worlds = impulses_np.shape[0]
     for world in range(worlds):
         n_rows = int(count_np[world])
@@ -925,12 +925,12 @@ def _capture_contact_mix(
     :func:`_classify_path_rows`.  Returns a dict shaped::
 
         {
-          "cone_tolerance": float,
-          "gs_probe": int,
-          "rows": ["articulated", "free_rigid"],
-          "columns": ["normal_only", ...],
-          "counts": {"articulated": {...}, "free_rigid": {...}},
-          "totals": {"articulated": int, "free_rigid": int, "grand_total": int},
+            "cone_tolerance": float,
+            "gs_probe": int,
+            "rows": ["articulated", "free_rigid"],
+            "columns": ["normal_only", ...],
+            "counts": {"articulated": {...}, "free_rigid": {...}},
+            "totals": {"articulated": int, "free_rigid": int, "grand_total": int},
         }
     """
     solver = _build_replay_solver(
@@ -952,7 +952,7 @@ def _capture_contact_mix(
         state_0, state_1 = state_1, state_0
 
     cone_tolerance = 0.05
-    articulated = {key: 0 for key in _CONTACT_MIX_COLUMNS}
+    articulated = dict.fromkeys(_CONTACT_MIX_COLUMNS, 0)
     try:
         articulated = _classify_path_rows(
             impulses_np=solver.impulses.numpy(),
@@ -965,7 +965,7 @@ def _capture_contact_mix(
     except Exception as exc:  # pragma: no cover - buffer-shape dependent
         sys.stderr.write(f"[solver_replay] contact_mix: dense-path classification failed ({exc}).\n")
 
-    free_rigid = {key: 0 for key in _CONTACT_MIX_COLUMNS}
+    free_rigid = dict.fromkeys(_CONTACT_MIX_COLUMNS, 0)
     mf_impulses = getattr(solver, "mf_impulses", None)
     if mf_impulses is not None:
         try:
@@ -1112,7 +1112,7 @@ def _try_save_snapshot_png(*, snapshot: _Snapshot, model: newton.Model, out_path
     return True
 
 
-def _shutdown_viewer_cleanly(viewer: "newton.viewer.ViewerGL") -> None:
+def _shutdown_viewer_cleanly(viewer: newton.viewer.ViewerGL) -> None:
     """Tear down a :class:`~newton.viewer.ViewerGL` without CUDA-GL noise.
 
     The viewer lazily creates a CUDA-registered GL pixel-buffer object in
@@ -1173,7 +1173,7 @@ def _write_rgb_png(frame_np: np.ndarray, out_path: Path) -> bool:
     to ``imageio``; logs + returns ``False`` if neither is available.
     """
     try:
-        from PIL import Image  # noqa: PLC0415
+        from PIL import Image
 
         Image.fromarray(frame_np, mode="RGB").save(out_path)
         return True

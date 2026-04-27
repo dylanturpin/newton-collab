@@ -65,9 +65,7 @@ def _build_sphere_on_plane_model(device: wp.context.Device) -> newton.Model:
     residuals at matched GS iterations.
     """
     builder = newton.ModelBuilder()
-    builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
-        limit_ke=0.0, limit_kd=0.0, friction=0.0
-    )
+    builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=0.0, limit_kd=0.0, friction=0.0)
     builder.default_shape_cfg.ke = 5.0e4
     builder.default_shape_cfg.kd = 5.0e2
     builder.default_shape_cfg.kf = 1.0e3
@@ -94,9 +92,7 @@ def _build_sliding_cube_model(
     scenario where the 6/13 benefit should show up most clearly.
     """
     builder = newton.ModelBuilder()
-    builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
-        limit_ke=0.0, limit_kd=0.0, friction=0.0
-    )
+    builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=0.0, limit_kd=0.0, friction=0.0)
     builder.default_shape_cfg.ke = 5.0e4
     builder.default_shape_cfg.kd = 5.0e2
     builder.default_shape_cfg.kf = 1.0e3
@@ -173,9 +169,7 @@ class TestFeatherPGSFrictionModeBisectionDeSaxceStability(unittest.TestCase):
         if device is None:
             self.skipTest("No warp device available")
 
-        joint_q, _solver, _model = _run_sim(
-            device, friction_mode="bisection_desaxce", num_steps=500
-        )
+        joint_q, _solver, _model = _run_sim(device, friction_mode="bisection_desaxce", num_steps=500)
 
         self.assertTrue(
             np.all(np.isfinite(joint_q)),
@@ -283,19 +277,14 @@ class TestFeatherPGSFrictionModeBisectionDeSaxceBenchmarkScenarios(unittest.Test
         # Free-joint root (first 7 entries): z is index 2.  A G1 standing
         # near z≈0.8m should neither fall through the ground nor rocket
         # upward within ~0.5s of passive dynamics.
-        self.assertGreater(
-            joint_q[2], 0.0, f"g1_flat bisection_desaxce torso fell through ground: z={joint_q[2]}"
-        )
-        self.assertLess(
-            joint_q[2], 2.0, f"g1_flat bisection_desaxce torso blew up: z={joint_q[2]}"
-        )
+        self.assertGreater(joint_q[2], 0.0, f"g1_flat bisection_desaxce torso fell through ground: z={joint_q[2]}")
+        self.assertLess(joint_q[2], 2.0, f"g1_flat bisection_desaxce torso blew up: z={joint_q[2]}")
         # No body velocity should have blown up.  Loose passive-dynamics
         # bound — matches the 5/13 test's envelope for this scene.
         self.assertLess(
             body_qd_max_abs,
             100.0,
-            f"g1_flat bisection_desaxce replay exhibited blowup: "
-            f"max|body_qd|={body_qd_max_abs:g}",
+            f"g1_flat bisection_desaxce replay exhibited blowup: max|body_qd|={body_qd_max_abs:g}",
         )
 
     def test_h1_tabletop_bisection_desaxce_stable(self):
@@ -355,8 +344,7 @@ class TestFeatherPGSFrictionModeBisectionDeSaxceBenchmarkScenarios(unittest.Test
         self.assertLess(
             body_qd_max_abs,
             100.0,
-            f"h1_tabletop bisection_desaxce replay exhibited blowup: "
-            f"max|body_qd|={body_qd_max_abs:g}",
+            f"h1_tabletop bisection_desaxce replay exhibited blowup: max|body_qd|={body_qd_max_abs:g}",
         )
 
         # Residual log populated with the 6-channel layout for every
@@ -432,10 +420,7 @@ class TestFeatherPGSFrictionModeBisectionDeSaxceResidualComparison(unittest.Test
         num_iter_budget = bi_all.shape[1]
         filtered_iters = [k for k in iters if k < num_iter_budget]
         if not filtered_iters:  # pragma: no cover - defensive
-            self.fail(
-                f"[{scenario_label}] none of the requested iters {iters} "
-                f"fit inside num_iters={num_iter_budget}"
-            )
+            self.fail(f"[{scenario_label}] none of the requested iters {iters} fit inside num_iters={num_iter_budget}")
 
         satisfying_steps: list[int] = []
         for step in range(bi_all.shape[0]):

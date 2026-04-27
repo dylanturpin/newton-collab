@@ -35,6 +35,10 @@ from ..semi_implicit.kernels_particle import (
 )
 from ..solver import SolverBase
 from .kernels import (
+    FRICTION_MODE_BISECTION,
+    FRICTION_MODE_BISECTION_DESAXCE,
+    FRICTION_MODE_COULOMB_NEWTON,
+    FRICTION_MODE_CURRENT,
     TILE_THREADS,
     add_dense_contact_compliance_to_diag,
     allocate_joint_limit_slots,
@@ -73,10 +77,6 @@ from .kernels import (
     finalize_mf_constraint_counts,
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
-    FRICTION_MODE_BISECTION,
-    FRICTION_MODE_BISECTION_DESAXCE,
-    FRICTION_MODE_COULOMB_NEWTON,
-    FRICTION_MODE_CURRENT,
     gather_JY_to_world,
     gather_tau_to_groups,
     hinv_jt_par_row,
@@ -245,7 +245,7 @@ class SolverFeatherPGS(SolverBase):
                 ``pgs_mode="matrix_free"`` path. ``"current"`` (default) is the baseline
                 isotropic Coulomb cone projection that has been the FeatherPGS behavior
                 to date. ``"bisection"`` runs a RAISim-style bisection on the normal
-                impulse λ_n with the 2×2 tangential sub-problem re-solved at each
+                impulse λ_n with the 2x2 tangential sub-problem re-solved at each
                 probe — ported from Miles Macklin's ``raisim/kernels.py``; wired in
                 the FPGS Friction Modes 5/13 slice.
                 ``"bisection_desaxce"`` (FPGS Friction Modes 6/13) runs the same
@@ -255,7 +255,7 @@ class SolverFeatherPGS(SolverBase):
                 ``r_mdp_dir`` / ``r_ds_compl`` residuals.
                 ``"coulomb_newton"`` (FPGS Friction Modes 7/13) runs Gilles
                 Daviet's scalar bracketed-Newton on the tangential-force
-                ratio α: a per-row 1D Newton iteration on the 3×3 Delassus
+                ratio alpha: a per-row 1D Newton iteration on the 3x3 Delassus
                 block that solves the Coulomb cone coupling directly (no
                 lagged de Saxce correction, no quartic).  Ported from
                 ``artifacts/2026-04-16-slack-raisim/coulomb_root_finding_warp.py``.
@@ -319,10 +319,7 @@ class SolverFeatherPGS(SolverBase):
         # names are reserved for the upcoming FPGS Friction Modes strategy issues.
         _valid_friction_modes = ("current", "bisection", "bisection_desaxce", "coulomb_newton")
         if friction_mode not in _valid_friction_modes:
-            raise ValueError(
-                "friction_mode must be one of "
-                f"{list(_valid_friction_modes)}, got {friction_mode!r}"
-            )
+            raise ValueError(f"friction_mode must be one of {list(_valid_friction_modes)}, got {friction_mode!r}")
         if friction_mode != "current":
             if pgs_mode != "matrix_free":
                 raise ValueError(
@@ -4771,7 +4768,7 @@ class TiledKernelFactory:
           max-dissipation bias (``μ · ‖c_T‖`` added to the normal
           target) — FPGS Friction Modes 6/13.
         * ``"coulomb_newton"``: Gilles Daviet's scalar bracketed-Newton
-          on α (see :func:`friction_step_coulomb_newton`) — FPGS
+          on alpha (see :func:`friction_step_coulomb_newton`) — FPGS
           Friction Modes 7/13.
         """
         key = (max_constraints, mf_max_constraints, max_world_dofs, device.arch, friction_mode)
@@ -4881,7 +4878,7 @@ class TiledKernelFactory:
         # with the de Saxce max-dissipation bias (``μ · ‖c_T‖`` added to
         # the normal target velocity) — FPGS Friction Modes 6/13.
         # ``friction_mode="coulomb_newton"`` runs Gilles Daviet's scalar
-        # bracketed-Newton on α (matches
+        # bracketed-Newton on alpha (matches
         # :func:`friction_step_coulomb_newton`) — FPGS Friction Modes
         # 7/13.  We inject one of these CUDA blocks into the MF phase;
         # the outer row loop handles the standard ``delta_impulse``
@@ -5123,7 +5120,7 @@ class TiledKernelFactory:
                 # Pure RAISim bisection: no de Saxce bias.
                 mf_friction_block = mf_friction_block.replace(
                     "// __DESAXCE_BIAS__",
-                    "// (no de Saxce bias; friction_mode=\"bisection\".)",
+                    '// (no de Saxce bias; friction_mode="bisection".)',
                 )
         elif friction_mode == "coulomb_newton":
             # Gilles Daviet's 1D Coulomb Newton (7/13).  CUDA port of
@@ -5134,7 +5131,7 @@ class TiledKernelFactory:
             # the normal / t2 rows are applied cooperatively.
             mf_friction_block = """
                     // friction_mode="coulomb_newton": Gilles Daviet's
-                    // scalar bracketed-Newton on α.  Ported from
+                    // scalar bracketed-Newton on alpha.  Ported from
                     // ``coulomb_root_finding_warp.py::solve_coulomb`` —
                     // see :func:`friction_step_coulomb_newton` for the
                     // matrix-free row-data mapping.

@@ -1040,7 +1040,7 @@ def run_render(args):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Include friction_mode in the filename so the FPGS friction-mode
-    # verification grid (4 modes × 5 scenes) can all share the same output
+    # verification grid (4 modes x 5 scenes) can all share the same output
     # directory without clobbering each other. Default "current" preserves
     # backward compatibility: the filename stays `<scenario>.mp4`.
     friction_mode = getattr(args, "friction_mode", "current")

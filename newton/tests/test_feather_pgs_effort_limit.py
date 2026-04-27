@@ -151,9 +151,7 @@ def run_clamp_augmented_joint_u0_clamps_only_drive(test: TestFeatherPGSEffortLim
     np.testing.assert_allclose(u0_out, np.array([5.0, -50.0], dtype=np.float32), rtol=0.0, atol=1e-7)
 
     # Rigid/passive bucket is untouched.
-    np.testing.assert_allclose(
-        joint_tau.numpy(), np.array([-9.81, 0.0], dtype=np.float32), rtol=0.0, atol=1e-6
-    )
+    np.testing.assert_allclose(joint_tau.numpy(), np.array([-9.81, 0.0], dtype=np.float32), rtol=0.0, atol=1e-6)
 
 
 def run_clamp_joint_tau_clamps_net_sum(test: TestFeatherPGSEffortLimitClamp, device):

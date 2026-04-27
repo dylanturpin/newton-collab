@@ -45,7 +45,7 @@ FRICTION_MODE_CURRENT = 0
 FRICTION_MODE_BISECTION = 1
 FRICTION_MODE_BISECTION_DESAXCE = 2
 # Gilles Daviet's scalar bracketed-Newton on the tangential-force ratio
-# α (FPGS Friction Modes 7/13).  The @wp.func implementation is
+# alpha (FPGS Friction Modes 7/13).  The @wp.func implementation is
 # :func:`friction_step_coulomb_newton`; the core solver is ported from
 # ``artifacts/2026-04-16-slack-raisim/coulomb_root_finding_warp.py``.
 FRICTION_MODE_COULOMB_NEWTON = 3
@@ -3520,7 +3520,7 @@ def compute_mf_effective_mass_and_rhs(
 # Gilles Daviet's 1D Coulomb Newton — ported from
 # ``artifacts/2026-04-16-slack-raisim/coulomb_root_finding_warp.py``.
 #
-# The scalar bracketed-Newton on the tangential-force ratio α solves the
+# The scalar bracketed-Newton on the tangential-force ratio alpha solves the
 # Coulomb cone coupling directly (no lagged de Saxce correction, no
 # quartic).  See the artifact's module docstring for the full
 # derivation; summary:
@@ -3691,9 +3691,7 @@ def solve_coulomb_row(W: wp.mat33, b: wp.vec3, mu: float) -> FPGSCoulombNewtonRe
     rT_final = -last_s
     rN_final = -(wp.dot(wNT, rT_final) + bN) / WN
 
-    return FPGSCoulombNewtonResult(
-        x, rN_final, rT_final[0], rT_final[1], float(iterations), 1.0
-    )
+    return FPGSCoulombNewtonResult(x, rN_final, rT_final[0], rT_final[1], float(iterations), 1.0)
 
 
 @wp.func
@@ -3818,7 +3816,7 @@ def friction_step_bisection(
     ``pgs_mode="matrix_free"``.  Ported from the ``USE_BISECTION`` branch
     of ``artifacts/2026-04-16-slack-raisim/repos/mmacklin-newton-solver-raisim
     /newton/_src/solvers/raisim/kernels.py`` (``gs_contact_sweep``, lines
-    ~687–803).  The de Saxce branch augments the normal target velocity
+    ~687-803).  The de Saxce branch augments the normal target velocity
     with ``μ · ‖c_T‖`` (Le Lidec & Carpentier 2024) to enforce the
     maximum dissipation principle on sliding contacts — the 5/13 vs 6/13
     split in the ``[FPGS Friction Modes]`` series.
@@ -3830,11 +3828,11 @@ def friction_step_bisection(
     on the second friction row (``i == parent + 2``).  It therefore:
 
     * Recomputes ``u_n, u_t1, u_t2`` from the current ``v_out``.
-    * Builds the 3×3 Delassus block ``G = J H⁻¹ Jᵀ`` on the fly from the
+    * Builds the 3x3 Delassus block ``G = J H⁻¹ Jᵀ`` on the fly from the
       per-row ``mf_J_*`` / ``mf_MiJt_*`` arrays.
     * Bisects ``λ_n`` in ``[0, hi]`` with
       :data:`_FPGS_BISECTION_ITERS` steps.  At each probe, solves the
-      2×2 tangential sub-problem and projects onto the Coulomb cone.
+      2x2 tangential sub-problem and projects onto the Coulomb cone.
     * Writes the final ``(λ_n, λ_t2)`` to ``mf_impulses`` directly and
       applies the corresponding ``v_out`` corrections for the normal
       row and the second friction row.  The first-friction-row ``v_out``
@@ -3979,7 +3977,7 @@ def friction_step_bisection(
     # current (pre-solve) tangential velocity.  This enforces the
     # maximum-dissipation principle on sliding contacts and drives the
     # ``r_mdp_dir`` / ``r_ds_compl`` residuals down — see
-    # ``raisim/kernels.py`` (lines ~687–698) for the reference impl.
+    # ``raisim/kernels.py`` (lines ~687-698) for the reference impl.
     if use_de_saxce != 0:
         c_T_mag = wp.sqrt(u_t1 * u_t1 + u_t2 * u_t2)
         target_vel_n = target_vel_n + mu_val * c_T_mag
@@ -4065,16 +4063,12 @@ def friction_step_bisection(
     if ba >= 0:
         for k in range(6):
             v_out[ds_a + k] = (
-                v_out[ds_a + k]
-                + mf_MiJt_a[world, i_n, k] * d_n_total
-                + mf_MiJt_a[world, i_t2, k] * d_t2_total
+                v_out[ds_a + k] + mf_MiJt_a[world, i_n, k] * d_n_total + mf_MiJt_a[world, i_t2, k] * d_t2_total
             )
     if bb >= 0:
         for k in range(6):
             v_out[ds_b + k] = (
-                v_out[ds_b + k]
-                + mf_MiJt_b[world, i_n, k] * d_n_total
-                + mf_MiJt_b[world, i_t2, k] * d_t2_total
+                v_out[ds_b + k] + mf_MiJt_b[world, i_n, k] * d_n_total + mf_MiJt_b[world, i_t2, k] * d_t2_total
             )
 
     # --- Store normal + second-friction impulses ------------------------
@@ -4294,9 +4288,15 @@ def friction_step_coulomb_newton(
 
     if u_free_n < target_vel_n:
         W = wp.mat33(
-            G_nn, G_nt1, G_nt2,
-            G_nt1, G_t1t1, G_t1t2,
-            G_nt2, G_t1t2, G_t2t2,
+            G_nn,
+            G_nt1,
+            G_nt2,
+            G_nt1,
+            G_t1t1,
+            G_t1t2,
+            G_nt2,
+            G_t1t2,
+            G_t2t2,
         )
         b_vec = wp.vec3(u_free_n - target_vel_n, u_free_t1, u_free_t2)
         res = solve_coulomb_row(W, b_vec, mu_val)
@@ -4311,16 +4311,12 @@ def friction_step_coulomb_newton(
     if ba >= 0:
         for k in range(6):
             v_out[ds_a + k] = (
-                v_out[ds_a + k]
-                + mf_MiJt_a[world, i_n, k] * d_n_total
-                + mf_MiJt_a[world, i_t2, k] * d_t2_total
+                v_out[ds_a + k] + mf_MiJt_a[world, i_n, k] * d_n_total + mf_MiJt_a[world, i_t2, k] * d_t2_total
             )
     if bb >= 0:
         for k in range(6):
             v_out[ds_b + k] = (
-                v_out[ds_b + k]
-                + mf_MiJt_b[world, i_n, k] * d_n_total
-                + mf_MiJt_b[world, i_t2, k] * d_t2_total
+                v_out[ds_b + k] + mf_MiJt_b[world, i_n, k] * d_n_total + mf_MiJt_b[world, i_t2, k] * d_t2_total
             )
 
     # Store normal + second-friction impulses.  The first-friction
@@ -4411,10 +4407,7 @@ def pgs_solve_mf_loop(
                 if new_impulse < 0.0:
                     new_impulse = 0.0
             elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-                if (
-                    friction_mode == FRICTION_MODE_BISECTION
-                    or friction_mode == FRICTION_MODE_BISECTION_DESAXCE
-                ):
+                if friction_mode == FRICTION_MODE_BISECTION or friction_mode == FRICTION_MODE_BISECTION_DESAXCE:
                     # Shared RAISim bisection step; the de Saxce branch
                     # of the [FPGS Friction Modes] series toggles the
                     # μ·‖c_T‖ bias correction via ``use_de_saxce``.
@@ -4441,7 +4434,7 @@ def pgs_solve_mf_loop(
                     )
                 elif friction_mode == FRICTION_MODE_COULOMB_NEWTON:
                     # Gilles Daviet's 1D Coulomb Newton (7/13): scalar
-                    # bracketed-Newton on α solves the cone coupling
+                    # bracketed-Newton on alpha solves the cone coupling
                     # directly.  See :func:`friction_step_coulomb_newton`.
                     new_impulse = friction_step_coulomb_newton(
                         world,

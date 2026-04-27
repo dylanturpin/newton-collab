@@ -45,7 +45,6 @@ from newton.tests.test_feather_pgs_friction_mode_bisection_desaxce import (
     _build_sliding_cube_model,
 )
 
-
 # ---------------------------------------------------------------------------
 # Random problem generation + NumPy reference (both ported verbatim from
 # ``coulomb_root_finding_warp.py``; kept local so the unit test stays
@@ -103,8 +102,10 @@ def _numpy_solve_one(W, b, mu, tol: float = 1.0e-10, max_iter: int = 50):
     lo = 0.0
     x = 0.5 * (lo + hi)
     last_s = None
+    iterations = 0
 
-    for it in range(1, max_iter + 1):
+    for _it in range(1, max_iter + 1):
+        iterations = _it
         M = AT + x * np.eye(2)
         s = np.linalg.solve(M, cT)
         t = np.linalg.solve(M, s)
@@ -126,7 +127,7 @@ def _numpy_solve_one(W, b, mu, tol: float = 1.0e-10, max_iter: int = 50):
 
     rT = -last_s
     rN = -(wNT @ rT + bN) / WN
-    return x, rN, rT, it, 1
+    return x, rN, rT, iterations, 1
 
 
 # ---------------------------------------------------------------------------
@@ -162,9 +163,7 @@ def _fpgs_solve_coulomb_batch_kernel(
 def _build_sphere_on_plane_model(device: wp.context.Device) -> newton.Model:
     """Deterministic sphere-on-ground scene (no downloaded assets)."""
     builder = newton.ModelBuilder()
-    builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
-        limit_ke=0.0, limit_kd=0.0, friction=0.0
-    )
+    builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=0.0, limit_kd=0.0, friction=0.0)
     builder.default_shape_cfg.ke = 5.0e4
     builder.default_shape_cfg.kd = 5.0e2
     builder.default_shape_cfg.kf = 1.0e3
@@ -308,9 +307,7 @@ class TestFeatherPGSFrictionModeCoulombNewtonKernel(unittest.TestCase):
     def test_matches_numpy_reference_small_batch(self):
         """256 random contacts: no status mismatches, |phi| < 5e-6."""
         n = 256
-        W_np, b_np, mu_np, _alpha_all, rN_all, rT_all, _iters_all, status_all = (
-            self._run_batch(n, seed=42)
-        )
+        W_np, b_np, mu_np, _alpha_all, rN_all, rT_all, _iters_all, status_all = self._run_batch(n, seed=42)
 
         mismatches = 0
         n_slide_verified = 0
@@ -319,9 +316,7 @@ class TestFeatherPGSFrictionModeCoulombNewtonKernel(unittest.TestCase):
         max_rT_err = 0.0
 
         for j in range(n):
-            _a_ref, rN_ref, rT_ref, _it_ref, st_ref = _numpy_solve_one(
-                W_np[j], b_np[j], mu_np[j]
-            )
+            _a_ref, rN_ref, rT_ref, _it_ref, st_ref = _numpy_solve_one(W_np[j], b_np[j], mu_np[j])
             st_wp = int(status_all[j])
             if st_ref != st_wp:
                 mismatches += 1
@@ -330,13 +325,8 @@ class TestFeatherPGSFrictionModeCoulombNewtonKernel(unittest.TestCase):
             if st_ref == 1:  # sliding
                 n_slide_verified += 1
                 max_rN_err = max(max_rN_err, abs(float(rN_all[j]) - rN_ref))
-                max_rT_err = max(
-                    max_rT_err, float(np.linalg.norm(rT_all[j] - rT_ref))
-                )
-                phi_res = abs(
-                    float(np.linalg.norm(rT_all[j]))
-                    - mu_np[j] * float(rN_all[j])
-                )
+                max_rT_err = max(max_rT_err, float(np.linalg.norm(rT_all[j] - rT_ref)))
+                phi_res = abs(float(np.linalg.norm(rT_all[j])) - mu_np[j] * float(rN_all[j]))
                 max_phi_residual = max(max_phi_residual, phi_res)
 
         self.assertEqual(
@@ -368,9 +358,7 @@ class TestFeatherPGSFrictionModeCoulombNewtonStability(unittest.TestCase):
         if device is None:
             self.skipTest("No warp device available")
 
-        joint_q, _solver, _model = _run_sim(
-            device, friction_mode="coulomb_newton", num_steps=240
-        )
+        joint_q, _solver, _model = _run_sim(device, friction_mode="coulomb_newton", num_steps=240)
         self.assertTrue(
             np.all(np.isfinite(joint_q)),
             f"coulomb_newton produced non-finite joint_q: {joint_q}",

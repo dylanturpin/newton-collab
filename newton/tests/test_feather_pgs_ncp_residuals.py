@@ -44,7 +44,6 @@ import newton.utils
 from newton._src.solvers import SolverFeatherPGS
 from newton.tests.unittest_utils import USD_AVAILABLE
 
-
 G1_ASSET_FOLDER = "unitree_g1"
 G1_USD_RELPATH = ("usd", "g1_isaac.usd")
 
@@ -130,9 +129,7 @@ def _build_sphere_on_plane_model(device: wp.context.Device) -> newton.Model:
     convergence log to exercise non-trivial impulse/rhs values.
     """
     builder = newton.ModelBuilder()
-    builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
-        limit_ke=0.0, limit_kd=0.0, friction=0.0
-    )
+    builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=0.0, limit_kd=0.0, friction=0.0)
     builder.default_shape_cfg.ke = 5.0e4
     builder.default_shape_cfg.kd = 5.0e2
     builder.default_shape_cfg.kf = 1.0e3
