@@ -1804,7 +1804,6 @@ def Xform "humanoid" (
         }
     }
 }
-
 def PhysicsScene "PhysicsScene" (
     apiSchemas = ["MjcSceneAPI", "PhysxSceneAPI"]
 )
@@ -1875,4 +1874,3 @@ def "Render" (
         }
     }
 }
-
