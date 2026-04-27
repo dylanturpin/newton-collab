@@ -24,8 +24,10 @@ from .types import GeoType
 # Configuration flag for multi-contact generation
 ENABLE_MULTI_CONTACT = True
 
-# Configuration flag for tiled BVH queries (experimental)
-ENABLE_TILE_BVH_QUERY = True
+# Configuration flag for tiled BVH queries (experimental).
+# Keep the portable non-tiled path until packaged Warp exposes the
+# tile_query_valid() helper used by upstream's tiled loop.
+ENABLE_TILE_BVH_QUERY = False
 
 # Type definitions for multi-contact manifolds
 _mat53f = wp.types.matrix((5, 3), wp.float32)
