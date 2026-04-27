@@ -61,13 +61,6 @@ Newton Physics
    Migration Guide <migration>
    Integrations <integrations/index>
 
-.. toctree::
-   :maxdepth: 1
-   :hidden:
-   :caption: Investigations
-
-   investigations/index
-
 
 .. toctree::
    :hidden:
