@@ -3205,10 +3205,18 @@ def compute_world_contact_bias(
         # Initialize with -target_velocity (will add J*v later)
         rhs = -target_vel
 
-        # For contacts and joint limits: add Baumgarte stabilization when violating
-        if row_type == PGS_CONSTRAINT_TYPE_CONTACT or row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
+        # Contacts inside the speculative gap should not become sticky ghost
+        # contacts.  For separation (phi > 0), allow closing by the current gap
+        # over this substep: Jv + phi / dt >= 0.  For penetration, keep the
+        # Baumgarte correction and let velocity-only passes scale it to zero.
+        if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
             if phi < 0.0:
-                rhs += bias_scale * beta * phi * inv_dt  # Negative for penetration / violation
+                rhs += bias_scale * beta * phi * inv_dt  # Negative for penetration
+            else:
+                rhs += phi * inv_dt
+        elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
+            if phi < 0.0:
+                rhs += bias_scale * beta * phi * inv_dt  # Negative for violation
         elif row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
             # PhysX-style drive rows use world_target_velocity as drive-row
             # input, not as a generic constraint target. Their RHS is handled
