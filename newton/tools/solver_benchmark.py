@@ -517,6 +517,7 @@ def build_model(args, scenario_cfg: dict):
     # Build articulation
     articulation_builder = newton.ModelBuilder()
     newton.solvers.SolverMuJoCo.register_custom_attributes(articulation_builder)
+    newton.solvers.SolverFeatherPGS.register_custom_attributes(articulation_builder)
 
     robot = scenario_cfg["robot"]
     env = scenario_cfg.get("environment")

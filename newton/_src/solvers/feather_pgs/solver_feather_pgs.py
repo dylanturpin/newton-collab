@@ -20,7 +20,7 @@ import numpy as np
 import warp as wp
 
 from ...core.types import override
-from ...sim import Contacts, Control, Model, State
+from ...sim import Contacts, Control, Model, ModelBuilder, State
 from ...sim.enums import JointType
 from ..featherstone.kernels import eval_fk_with_velocity_conversion
 from ..semi_implicit.kernels_contact import (
@@ -54,6 +54,7 @@ from .kernels import (
     build_mf_contact_rows,
     cholesky_loop,
     clamp_augmented_joint_u0,
+    clamp_free_root_velocity_limits,
     compute_com_transforms,
     compute_composite_inertia,
     compute_contact_linear_force_from_impulses,
@@ -166,6 +167,50 @@ class SolverFeatherPGS(SolverBase):
             state_in, state_out = state_out, state_in
 
     """
+
+    @classmethod
+    def register_custom_attributes(cls, builder: ModelBuilder) -> None:
+        """Register PhysX rigid-body attributes consumed by FeatherPGS."""
+
+        def _angular_velocity_deg_to_rad(value, _context):
+            if value is None:
+                return float("inf")
+            value = float(value)
+            if not np.isfinite(value):
+                return float("inf")
+            return value * np.pi / 180.0
+
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="rigid_body_max_linear_velocity",
+                frequency=Model.AttributeFrequency.BODY,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.float32,
+                default=float("inf"),
+                usd_attribute_name="physxRigidBody:maxLinearVelocity",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="rigid_body_max_angular_velocity",
+                frequency=Model.AttributeFrequency.BODY,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.float32,
+                default=float("inf"),
+                usd_attribute_name="physxRigidBody:maxAngularVelocity",
+                usd_value_transformer=_angular_velocity_deg_to_rad,
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="rigid_body_max_depenetration_velocity",
+                frequency=Model.AttributeFrequency.BODY,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.float32,
+                default=float("inf"),
+                usd_attribute_name="physxRigidBody:maxDepenetrationVelocity",
+            )
+        )
 
     def __init__(
         self,
@@ -342,6 +387,11 @@ class SolverFeatherPGS(SolverBase):
         if drive_mode == "physx_pgs" and self.pgs_mode != "matrix_free":
             raise NotImplementedError("drive_mode='physx_pgs' currently requires pgs_mode='matrix_free'")
         self.drive_mode = drive_mode
+        self.rigid_body_max_linear_velocity = getattr(model, "rigid_body_max_linear_velocity", None)
+        self.rigid_body_max_angular_velocity = getattr(model, "rigid_body_max_angular_velocity", None)
+        self._has_rigid_body_velocity_limits = (
+            self.rigid_body_max_linear_velocity is not None and self.rigid_body_max_angular_velocity is not None
+        )
 
         # ``friction_mode`` is the selector for the per-row Coulomb step used by the
         # matrix-free PGS kernel. Only ``"current"`` is wired today; the other three
@@ -1849,6 +1899,8 @@ class SolverFeatherPGS(SolverBase):
                         device=self.model.device,
                     )
 
+            self._stage6_clamp_rigid_velocity_limits()
+
             if self.pgs_velocity_iterations > 0:
                 wp.copy(self.v_out_snap, self.v_out)
                 self._stage6_integrate_position_from_velocity(state_in, state_aug, state_out, dt, self.v_out_snap)
@@ -1856,6 +1908,7 @@ class SolverFeatherPGS(SolverBase):
                 wp.copy(self.v_out, self.v_out_snap)
                 wp.copy(self.v_hat, self.v_out_snap)
                 self._run_matrix_free_velocity_post_solve()
+                self._stage6_clamp_rigid_velocity_limits()
         elif self.pgs_mode == "split" and self._has_mixed_contacts:
             # Split mode with mixed contacts: interleaved dense and MF, 1 iteration each.
             self._mf_pgs_setup(state_aug, dt)
@@ -1932,6 +1985,8 @@ class SolverFeatherPGS(SolverBase):
 
             if self.pgs_mode == "split" and self._has_free_rigid_bodies:
                 self._stage6b_mf_pgs(state_aug, dt)
+
+        self._stage6_clamp_rigid_velocity_limits()
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 7: Update qdd + integrate
@@ -3463,6 +3518,25 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage6_prepare_world_velocity(self):
         wp.copy(self.v_out, self.v_hat)
+
+    def _stage6_clamp_rigid_velocity_limits(self):
+        if not self._has_root_free or not self._has_rigid_body_velocity_limits:
+            return
+
+        wp.launch(
+            clamp_free_root_velocity_limits,
+            dim=self.model.articulation_count,
+            inputs=[
+                self.model.articulation_start,
+                self.model.joint_child,
+                self.articulation_root_is_free,
+                self.articulation_root_dof_start,
+                self.rigid_body_max_linear_velocity,
+                self.rigid_body_max_angular_velocity,
+            ],
+            outputs=[self.v_out],
+            device=self.model.device,
+        )
 
     def _stage6_apply_impulses_world(self, size: int):
         model = self.model

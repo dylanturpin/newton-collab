@@ -213,6 +213,50 @@ def convert_root_free_qd_local_to_world(
     qd[ds + 2] = v_com[2]
 
 
+@wp.kernel
+def clamp_free_root_velocity_limits(
+    articulation_start: wp.array(dtype=int),
+    joint_child: wp.array(dtype=int),
+    articulation_root_is_free: wp.array(dtype=int),
+    articulation_root_dof_start: wp.array(dtype=int),
+    rigid_body_max_linear_velocity: wp.array(dtype=float),
+    rigid_body_max_angular_velocity: wp.array(dtype=float),
+    # outputs
+    qd: wp.array(dtype=float),
+):
+    """Clamp free-root linear/angular velocity magnitudes to PhysX rigid-body limits."""
+    art = wp.tid()
+    if articulation_root_is_free[art] == 0:
+        return
+
+    root_joint = articulation_start[art]
+    root_body = joint_child[root_joint]
+    if root_body < 0:
+        return
+
+    ds = articulation_root_dof_start[art]
+
+    max_lin = rigid_body_max_linear_velocity[root_body]
+    if max_lin > 0.0 and wp.isfinite(max_lin):
+        lin = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
+        lin_speed = wp.length(lin)
+        if lin_speed > max_lin:
+            scale = max_lin / lin_speed
+            qd[ds + 0] = lin[0] * scale
+            qd[ds + 1] = lin[1] * scale
+            qd[ds + 2] = lin[2] * scale
+
+    max_ang = rigid_body_max_angular_velocity[root_body]
+    if max_ang > 0.0 and wp.isfinite(max_ang):
+        ang = wp.vec3(qd[ds + 3], qd[ds + 4], qd[ds + 5])
+        ang_speed = wp.length(ang)
+        if ang_speed > max_ang:
+            scale = max_ang / ang_speed
+            qd[ds + 3] = ang[0] * scale
+            qd[ds + 4] = ang[1] * scale
+            qd[ds + 5] = ang[2] * scale
+
+
 @wp.func
 def transform_spatial_inertia(t: wp.transform, I: wp.spatial_matrix):
     """
