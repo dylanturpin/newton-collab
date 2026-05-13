@@ -1566,6 +1566,7 @@ class SolverFeatherPGS(SolverBase):
                     else:
                         self._stage3_trisolve_loop(size, state_aug)
             self._stage3_compute_v_hat(state_in, state_aug, dt)
+            self._clamp_rigid_velocity_limits(self.v_hat)
 
         # Wait for pipelined collide (if running on separate stream)
         if collide_done_event is not None:
@@ -1907,6 +1908,7 @@ class SolverFeatherPGS(SolverBase):
                 contacts = self._rebuild_matrix_free_velocity_problem(state_out, state_aug, control, contacts, dt)
                 wp.copy(self.v_out, self.v_out_snap)
                 wp.copy(self.v_hat, self.v_out_snap)
+                self._clamp_rigid_velocity_limits(self.v_hat)
                 self._run_matrix_free_velocity_post_solve()
                 self._stage6_clamp_rigid_velocity_limits()
         elif self.pgs_mode == "split" and self._has_mixed_contacts:
@@ -3519,7 +3521,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage6_prepare_world_velocity(self):
         wp.copy(self.v_out, self.v_hat)
 
-    def _stage6_clamp_rigid_velocity_limits(self):
+    def _clamp_rigid_velocity_limits(self, qd: wp.array):
         if not self._has_root_free or not self._has_rigid_body_velocity_limits:
             return
 
@@ -3534,9 +3536,12 @@ class SolverFeatherPGS(SolverBase):
                 self.rigid_body_max_linear_velocity,
                 self.rigid_body_max_angular_velocity,
             ],
-            outputs=[self.v_out],
+            outputs=[qd],
             device=self.model.device,
         )
+
+    def _stage6_clamp_rigid_velocity_limits(self):
+        self._clamp_rigid_velocity_limits(self.v_out)
 
     def _stage6_apply_impulses_world(self, size: int):
         model = self.model
