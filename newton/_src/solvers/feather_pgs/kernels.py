@@ -1952,6 +1952,7 @@ def compute_physx_pgs_drive_desc(
     world_drive_geom_error: wp.array2d(dtype=float),
     world_drive_max_force: wp.array2d(dtype=float),
     dt: float,
+    position_bias_scale: float,
     # outputs
     world_drive_target_vel_bias: wp.array2d(dtype=float),
     world_drive_vel_multiplier: wp.array2d(dtype=float),
@@ -1983,7 +1984,7 @@ def compute_physx_pgs_drive_desc(
             x = 1.0 / (1.0 + a * unit_response)
 
         drive_bias_coeff = stiffness * x * dt
-        world_drive_target_vel_bias[world, i] = x * b + drive_bias_coeff * geom_error
+        world_drive_target_vel_bias[world, i] = x * b + position_bias_scale * drive_bias_coeff * geom_error
         world_drive_vel_multiplier[world, i] = -x * a
         # PGS path: PhysX uses 1 - x. TGS would use 1 and additional position bias.
         world_drive_impulse_multiplier[world, i] = 1.0 - x

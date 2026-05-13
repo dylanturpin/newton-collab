@@ -1430,7 +1430,7 @@ class SolverFeatherPGS(SolverBase):
             self._stage4_diag_from_JY(size)
         self._stage4_finalize_world_diag_cfm()
         self._stage4_add_dense_contact_compliance(dt)
-        self._stage4_compute_physx_drive_desc(dt)
+        self._stage4_compute_physx_drive_desc(dt, position_bias_scale=0.0 if include_unbiased_rhs else 1.0)
 
         self._stage4_compute_rhs_world(dt)
         if include_unbiased_rhs:
@@ -3327,7 +3327,7 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _stage4_compute_physx_drive_desc(self, dt: float):
+    def _stage4_compute_physx_drive_desc(self, dt: float, *, position_bias_scale: float = 1.0):
         if self.drive_mode != "physx_pgs":
             return
 
@@ -3345,6 +3345,7 @@ class SolverFeatherPGS(SolverBase):
                 self.drive_geom_error,
                 self.drive_max_force,
                 dt,
+                position_bias_scale,
             ],
             outputs=[
                 self.drive_target_vel_bias,
