@@ -3658,6 +3658,7 @@ def compute_mf_effective_mass_and_rhs(
     mf_body_Hinv: wp.array(dtype=wp.spatial_matrix),
     mf_phi: wp.array2d(dtype=float),
     mf_row_type: wp.array2d(dtype=int),
+    rigid_body_max_depenetration_velocity: wp.array(dtype=float),
     pgs_cfm: float,
     pgs_beta: float,
     dt: float,
@@ -3746,6 +3747,16 @@ def compute_mf_effective_mass_and_rhs(
         phi_val = mf_phi[world, i]
         if phi_val < 0.0:
             bias = pgs_beta * phi_val / dt
+            max_depen = 1.0e20
+            if ba >= 0:
+                max_depen = rigid_body_max_depenetration_velocity[ba]
+            if bb >= 0:
+                max_depen_b = rigid_body_max_depenetration_velocity[bb]
+                if max_depen_b > 0.0 and wp.isfinite(max_depen_b):
+                    if max_depen_b < max_depen:
+                        max_depen = max_depen_b
+            if max_depen > 0.0 and wp.isfinite(max_depen):
+                bias = wp.max(bias, -max_depen)
         else:
             bias = phi_val / dt
 

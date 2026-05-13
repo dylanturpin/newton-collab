@@ -389,6 +389,15 @@ class SolverFeatherPGS(SolverBase):
         self.drive_mode = drive_mode
         self.rigid_body_max_linear_velocity = getattr(model, "rigid_body_max_linear_velocity", None)
         self.rigid_body_max_angular_velocity = getattr(model, "rigid_body_max_angular_velocity", None)
+        self.rigid_body_max_depenetration_velocity = getattr(model, "rigid_body_max_depenetration_velocity", None)
+        if self.rigid_body_max_depenetration_velocity is None:
+            self.rigid_body_max_depenetration_velocity = wp.full(
+                model.body_count,
+                float("inf"),
+                dtype=wp.float32,
+                device=model.device,
+                requires_grad=model.requires_grad,
+            )
         self._has_rigid_body_velocity_limits = (
             self.rigid_body_max_linear_velocity is not None and self.rigid_body_max_angular_velocity is not None
         )
@@ -3602,6 +3611,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_body_Hinv,
                 self.mf_phi,
                 self.mf_row_type,
+                self.rigid_body_max_depenetration_velocity,
                 self.pgs_cfm,
                 self.pgs_beta,
                 dt,
