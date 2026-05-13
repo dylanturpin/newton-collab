@@ -3772,6 +3772,51 @@ def compute_mf_effective_mass_and_rhs(
     mf_rhs[world, i] = bias
 
 
+@wp.kernel
+def compute_mf_rhs_bias(
+    mf_constraint_count: wp.array(dtype=int),
+    mf_body_a: wp.array2d(dtype=int),
+    mf_body_b: wp.array2d(dtype=int),
+    mf_phi: wp.array2d(dtype=float),
+    mf_row_type: wp.array2d(dtype=int),
+    rigid_body_max_depenetration_velocity: wp.array(dtype=float),
+    pgs_beta: float,
+    dt: float,
+    bias_scale: float,
+    mf_max_constraints: int,
+    # outputs
+    mf_rhs: wp.array2d(dtype=float),
+):
+    """Compute only the MF contact RHS bias for a previously-built contact set."""
+    tid = wp.tid()
+    world = tid // mf_max_constraints
+    i = tid % mf_max_constraints
+    if i >= mf_constraint_count[world]:
+        return
+
+    bias = float(0.0)
+    if mf_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
+        phi_val = mf_phi[world, i]
+        if phi_val < 0.0:
+            bias = bias_scale * pgs_beta * phi_val / dt
+            max_depen = 1.0e20
+            ba = mf_body_a[world, i]
+            bb = mf_body_b[world, i]
+            if ba >= 0:
+                max_depen = rigid_body_max_depenetration_velocity[ba]
+            if bb >= 0:
+                max_depen_b = rigid_body_max_depenetration_velocity[bb]
+                if max_depen_b > 0.0 and wp.isfinite(max_depen_b):
+                    if max_depen_b < max_depen:
+                        max_depen = max_depen_b
+            if max_depen > 0.0 and wp.isfinite(max_depen):
+                bias = wp.max(bias, -max_depen)
+        else:
+            bias = phi_val / dt
+
+    mf_rhs[world, i] = bias
+
+
 # ---------------------------------------------------------------------------
 # Gilles Daviet's 1D Coulomb Newton — ported from
 # ``artifacts/2026-04-16-slack-raisim/coulomb_root_finding_warp.py``.

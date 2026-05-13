@@ -61,6 +61,7 @@ from .kernels import (
     compute_delta_and_accumulate,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
+    compute_mf_rhs_bias,
     compute_mf_world_dof_offsets,
     compute_spatial_inertia,
     compute_velocity_predictor,
@@ -1438,6 +1439,8 @@ class SolverFeatherPGS(SolverBase):
 
         if self._has_free_rigid_bodies:
             self._mf_pgs_setup(state_aug, dt)
+            if include_unbiased_rhs:
+                self._compute_mf_rhs_bias(dt, bias_scale=0.0, output=self.mf_rhs_unbiased)
             wp.launch(
                 compute_mf_world_dof_offsets,
                 dim=self.world_count * self.mf_max_constraints,
@@ -3625,6 +3628,27 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_rhs,
             ],
             device=model.device,
+        )
+
+    def _compute_mf_rhs_bias(self, dt: float, *, bias_scale: float, output: wp.array):
+        """Recompute MF contact RHS for the current rows without touching effective mass."""
+        wp.launch(
+            compute_mf_rhs_bias,
+            dim=self.world_count * self.mf_max_constraints,
+            inputs=[
+                self.mf_constraint_count,
+                self.mf_body_a,
+                self.mf_body_b,
+                self.mf_phi,
+                self.mf_row_type,
+                self.rigid_body_max_depenetration_velocity,
+                self.pgs_beta,
+                dt,
+                bias_scale,
+                self.mf_max_constraints,
+            ],
+            outputs=[output],
+            device=self.model.device,
         )
 
     def _mf_pgs_solve(self, iterations: int):
