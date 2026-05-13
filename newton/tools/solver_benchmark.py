@@ -526,9 +526,7 @@ def build_model(args, scenario_cfg: dict):
     # scenes ported from Miles' RAISim render_tests reference so side-by-side
     # comparison stays apples-to-apples. Build and return directly.
     if robot is None and env in ("sphere_rest", "sphere_stack", "sliding_cube"):
-        model = _build_friction_verification_scene(env, args.num_worlds)
-        model.shape_margin.fill_(0.001)
-        return model
+        return _build_friction_verification_scene(env, args.num_worlds)
 
     # Robot setup
     if robot == "g1":
@@ -706,8 +704,6 @@ def build_model(args, scenario_cfg: dict):
         builder.add_ground_plane()
         model = builder.finalize()
 
-    model.shape_margin.fill_(0.001)
-
     return model
 
 
@@ -776,6 +772,9 @@ def create_solver(model, args, scenario_cfg: dict):
             # is fine for matrix_free.
             if pgs == "loop" or pgs == "tiled_row" or pgs == "streaming":
                 pgs = "tiled_contact"
+        drive_mode = getattr(args, "drive_mode", "augmented")
+        if drive_mode == "physx_pgs" and "pgs_mode" not in preset:
+            pgs_mode = "matrix_free"
 
         solver_kwargs = {
             "update_mass_matrix_interval": 1,
@@ -800,6 +799,7 @@ def create_solver(model, args, scenario_cfg: dict):
             "nvtx": args.nvtx,
             "pgs_debug": getattr(args, "pgs_debug", False),
             "friction_mode": friction_mode,
+            "drive_mode": drive_mode,
         }
         from newton._src.solvers import SolverFeatherPGS  # noqa: PLC0415
 
@@ -1293,6 +1293,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "inner solve. Selecting anything other than 'current' forces "
             "pgs_mode='matrix_free' (the solver rejects other pgs_mode values)."
         ),
+    )
+    parser.add_argument(
+        "--drive-mode",
+        type=str,
+        choices=["augmented", "physx_pgs"],
+        default="augmented",
+        help="FeatherPGS joint target drive implementation.",
     )
     parser.add_argument(
         "--delassus-chunk-size",

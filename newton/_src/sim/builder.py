@@ -1159,7 +1159,7 @@ class ModelBuilder:
         """Per-world gravity vectors retained until :meth:`finalize <ModelBuilder.finalize>` populates
         :attr:`Model.gravity`."""
 
-        self.rigid_gap: float = 0.1
+        self.rigid_gap: float = 0.003
         """Default rigid contact gap [m] applied when adding a shape whose
         ``ModelBuilder.ShapeConfig.gap`` is ``None``. The resolved per-shape values are later
         propagated to :attr:`Model.shape_gap`."""
