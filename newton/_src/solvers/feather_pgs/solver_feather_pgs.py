@@ -241,6 +241,7 @@ class SolverFeatherPGS(SolverBase):
         speculative_dense_contact_compliance: float = 0.0,
         pgs_omega: float = 1.0,
         pgs_velocity_omega: float | None = None,
+        pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
         dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
         pgs_mode: str = "split",
@@ -326,6 +327,11 @@ class SolverFeatherPGS(SolverBase):
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             pgs_velocity_omega (float | None, optional): Relaxation factor for the velocity-only post-pass.
                 Defaults to ``pgs_omega`` when unset.
+            pgs_velocity_drive_mode (str, optional): Drive-row treatment during velocity-only post-pass
+                iterations. ``"freeze"`` keeps PhysX-style drive impulses from the biased position
+                solve and lets only contacts, friction, and limits clean up velocity residuals;
+                ``"active"`` continues updating drive rows during the velocity-only pass. Defaults
+                to ``"freeze"``.
             dense_max_constraints (int, optional): Maximum number of dense (articulation) contact constraint
                 rows stored per world. Free rigid body contacts are stored separately, bounded by
                 mf_max_constraints. Defaults to 32.
@@ -428,6 +434,12 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_omega = pgs_omega
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
         self.pgs_velocity_omega = self.pgs_omega if pgs_velocity_omega is None else float(pgs_velocity_omega)
+        if pgs_velocity_drive_mode not in ("active", "freeze"):
+            raise ValueError(
+                "pgs_velocity_drive_mode must be 'active' or 'freeze', "
+                f"got {pgs_velocity_drive_mode!r}"
+            )
+        self.pgs_velocity_drive_mode = pgs_velocity_drive_mode
         self.dense_max_constraints = dense_max_constraints
         self.pgs_warmstart = pgs_warmstart
         if self.pgs_warmstart and self.contact_friction_position_iterations >= 0:
@@ -1565,6 +1577,7 @@ class SolverFeatherPGS(SolverBase):
         omega: float,
         friction_start_iteration: int | None = None,
         iteration_offset: int = 0,
+        freeze_drive_rows: bool = False,
     ) -> None:
         if iterations <= 0:
             return
@@ -1610,6 +1623,7 @@ class SolverFeatherPGS(SolverBase):
                     row_phase,
                     int(friction_start_iteration),
                     int(iteration_offset),
+                    int(freeze_drive_rows),
                 ],
                 outputs=[self.v_out],
                 block_dim=32,
@@ -1629,17 +1643,33 @@ class SolverFeatherPGS(SolverBase):
             friction_start_iteration=self._contact_friction_start_iteration(
                 self.pgs_velocity_iterations, velocity_pass=True
             ),
+            freeze_drive_rows=self.pgs_velocity_drive_mode == "freeze",
         )
 
     def _conclude_matrix_free_position_problem(self, dt: float) -> None:
         """Switch the current q0 constraint problem to its velocity-iteration RHS."""
-        # PhysX PGS concludes generic 1D/contact rows, but reduced-coordinate
-        # articulation drive rows keep using the same implicit drive descriptor
-        # in velocity iterations.
-        self._stage4_compute_physx_drive_desc(dt, position_bias_scale=1.0)
-        self._stage4_compute_rhs_world(dt, bias_scale=0.0, output=self.rhs_unbiased)
+        # PhysX PGS concludes generic 1D/contact rows with zero geometric bias.
+        # PhysX PGS keeps articulation drive rows active in velocity
+        # iterations, but computeDriveImpulse subtracts the accumulated
+        # joint-position delta from the original drive position bias. The
+        # velocity-pass descriptor below approximates that delta as
+        # ``dt * J * v_position_solve``.
+        velocity_drive_position_delta_scale = 1.0 if self.pgs_velocity_drive_mode == "active" else 0.0
+        self._stage4_compute_physx_drive_desc(
+            dt,
+            position_bias_scale=1.0,
+            position_delta_velocity=self.v_out_snap,
+            position_delta_scale=velocity_drive_position_delta_scale,
+        )
+        self._stage4_compute_rhs_world(
+            dt,
+            bias_scale=0.0,
+            contact_speculative_scale=0.0,
+            joint_limit_speculative_scale=1.0,
+            output=self.rhs_unbiased,
+        )
         if self._has_free_rigid_bodies:
-            self._compute_mf_rhs_bias(dt, bias_scale=0.0, output=self.mf_rhs_unbiased)
+            self._compute_mf_rhs_bias(dt, bias_scale=0.0, speculative_scale=0.0, output=self.mf_rhs_unbiased)
 
     def _snapshot_matrix_free_position_problem(self, contacts: Contacts | None) -> None:
         """Copy the biased q0 position-solve problem before concluding rows for velocity iterations."""
@@ -1746,12 +1776,18 @@ class SolverFeatherPGS(SolverBase):
 
         self._stage4_compute_rhs_world(dt)
         if include_unbiased_rhs:
-            self._stage4_compute_rhs_world(dt, bias_scale=0.0, output=self.rhs_unbiased)
+            self._stage4_compute_rhs_world(
+                dt,
+                bias_scale=0.0,
+                contact_speculative_scale=0.0,
+                joint_limit_speculative_scale=1.0,
+                output=self.rhs_unbiased,
+            )
 
         if self._has_free_rigid_bodies:
             self._mf_pgs_setup(state_aug, dt)
             if include_unbiased_rhs:
-                self._compute_mf_rhs_bias(dt, bias_scale=0.0, output=self.mf_rhs_unbiased)
+                self._compute_mf_rhs_bias(dt, bias_scale=0.0, speculative_scale=0.0, output=self.mf_rhs_unbiased)
             wp.launch(
                 compute_mf_world_dof_offsets,
                 dim=self.world_count * self.mf_max_constraints,
@@ -3608,9 +3644,19 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _stage4_compute_physx_drive_desc(self, dt: float, *, position_bias_scale: float = 1.0):
+    def _stage4_compute_physx_drive_desc(
+        self,
+        dt: float,
+        *,
+        position_bias_scale: float = 1.0,
+        position_delta_velocity=None,
+        position_delta_scale: float = 0.0,
+    ):
         if self.drive_mode != "physx_pgs":
             return
+
+        if position_delta_velocity is None:
+            position_delta_velocity = self.v_hat
 
         wp.launch(
             compute_physx_pgs_drive_desc,
@@ -3618,8 +3664,12 @@ class SolverFeatherPGS(SolverBase):
             inputs=[
                 self.constraint_count,
                 self.dense_max_constraints,
+                self.world_dof_start,
+                self.max_world_dofs,
                 self.row_type,
                 self.diag,
+                self.J_world,
+                position_delta_velocity,
                 self.target_velocity,
                 self.drive_stiffness,
                 self.drive_damping,
@@ -3627,6 +3677,7 @@ class SolverFeatherPGS(SolverBase):
                 self.drive_max_force,
                 dt,
                 position_bias_scale,
+                position_delta_scale,
             ],
             outputs=[
                 self.drive_target_vel_bias,
@@ -3661,6 +3712,8 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         *,
         bias_scale: float = 1.0,
+        contact_speculative_scale: float = 1.0,
+        joint_limit_speculative_scale: float = 1.0,
         output=None,
     ):
         model = self.model
@@ -3677,6 +3730,8 @@ class SolverFeatherPGS(SolverBase):
                 self.target_velocity,
                 dt,
                 bias_scale,
+                contact_speculative_scale,
+                joint_limit_speculative_scale,
             ],
             outputs=[rhs_out],
             device=model.device,
@@ -4318,7 +4373,14 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _compute_mf_rhs_bias(self, dt: float, *, bias_scale: float, output: wp.array):
+    def _compute_mf_rhs_bias(
+        self,
+        dt: float,
+        *,
+        bias_scale: float,
+        speculative_scale: float = 1.0,
+        output: wp.array,
+    ):
         """Recompute MF contact RHS for the current rows without touching effective mass."""
         wp.launch(
             compute_mf_rhs_bias,
@@ -4333,6 +4395,7 @@ class SolverFeatherPGS(SolverBase):
                 self.pgs_beta,
                 dt,
                 bias_scale,
+                speculative_scale,
                 self.mf_max_constraints,
             ],
             outputs=[output],
@@ -7015,6 +7078,7 @@ class TiledKernelFactory:
                 // row_phase 0: all rows, 1: contact/friction rows, 2: internal articulation rows.
                 if (row_phase == 1 && row_type != 0 && row_type != 2) continue;
                 if (row_phase == 2 && row_type != 1 && row_type != 3 && row_type != 4) continue;
+                if (freeze_drive_rows != 0 && row_type == 1) continue;
                 if (row_type == 2 && global_iter < friction_start_iteration) {{
                     s_lam_dense[i] = 0.0f;
                     __syncwarp();
@@ -7221,6 +7285,7 @@ class TiledKernelFactory:
             row_phase: int,
             friction_start_iteration: int,
             iteration_offset: int,
+            freeze_drive_rows: int,
             # Output
             v_out: wp.array(dtype=float),
         ): ...
@@ -7256,6 +7321,7 @@ class TiledKernelFactory:
             row_phase: int,
             friction_start_iteration: int,
             iteration_offset: int,
+            freeze_drive_rows: int,
             # Output
             v_out: wp.array(dtype=float),
         ):
@@ -7289,6 +7355,7 @@ class TiledKernelFactory:
                 row_phase,
                 friction_start_iteration,
                 iteration_offset,
+                freeze_drive_rows,
                 v_out,
             )
 

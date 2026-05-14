@@ -1966,8 +1966,12 @@ def populate_physx_drive_J_for_size(
 def compute_physx_pgs_drive_desc(
     world_constraint_count: wp.array(dtype=int),
     max_constraints: int,
+    world_dof_start: wp.array(dtype=int),
+    max_world_dofs: int,
     world_row_type: wp.array2d(dtype=int),
     world_diag: wp.array2d(dtype=float),
+    world_J: wp.array3d(dtype=float),
+    position_delta_velocity: wp.array(dtype=float),
     world_target_velocity: wp.array2d(dtype=float),
     world_drive_stiffness: wp.array2d(dtype=float),
     world_drive_damping: wp.array2d(dtype=float),
@@ -1975,6 +1979,7 @@ def compute_physx_pgs_drive_desc(
     world_drive_max_force: wp.array2d(dtype=float),
     dt: float,
     position_bias_scale: float,
+    position_delta_scale: float,
     # outputs
     world_drive_target_vel_bias: wp.array2d(dtype=float),
     world_drive_vel_multiplier: wp.array2d(dtype=float),
@@ -2006,7 +2011,16 @@ def compute_physx_pgs_drive_desc(
             x = 1.0 / (1.0 + a * unit_response)
 
         drive_bias_coeff = stiffness * x * dt
-        world_drive_target_vel_bias[world, i] = x * b + position_bias_scale * drive_bias_coeff * geom_error
+        position_delta = float(0.0)
+        if position_delta_scale != 0.0:
+            dof_start = world_dof_start[world]
+            for d in range(max_world_dofs):
+                position_delta += world_J[world, i, d] * position_delta_velocity[dof_start + d]
+            position_delta = position_delta_scale * dt * position_delta
+
+        world_drive_target_vel_bias[world, i] = x * b + drive_bias_coeff * (
+            position_bias_scale * geom_error - position_delta
+        )
         world_drive_vel_multiplier[world, i] = -x * a
         # PGS path: PhysX uses 1 - x. TGS would use 1 and additional position bias.
         world_drive_impulse_multiplier[world, i] = 1.0 - x
@@ -3230,6 +3244,8 @@ def compute_world_contact_bias(
     world_target_velocity: wp.array2d(dtype=float),
     dt: float,
     bias_scale: float,
+    contact_speculative_scale: float,
+    joint_limit_speculative_scale: float,
     # outputs
     world_rhs: wp.array2d(dtype=float),
 ):
@@ -3261,14 +3277,14 @@ def compute_world_contact_bias(
             if phi < 0.0:
                 rhs += bias_scale * beta * phi * inv_dt  # Negative for penetration
             else:
-                rhs += phi * inv_dt
+                rhs += contact_speculative_scale * phi * inv_dt
         elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
             if phi < 0.0:
                 rhs += bias_scale * beta * phi * inv_dt  # Negative for violation
             else:
                 # Speculative finite-limit row: allow motion up to the bound
                 # during the step, matching PhysX's nextErr limit branch.
-                rhs += phi * inv_dt
+                rhs += joint_limit_speculative_scale * phi * inv_dt
         elif row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
             # PhysX-style drive rows use world_target_velocity as drive-row
             # input, not as a generic constraint target. Their RHS is handled
@@ -3846,6 +3862,7 @@ def compute_mf_rhs_bias(
     pgs_beta: float,
     dt: float,
     bias_scale: float,
+    speculative_scale: float,
     mf_max_constraints: int,
     # outputs
     mf_rhs: wp.array2d(dtype=float),
@@ -3875,7 +3892,7 @@ def compute_mf_rhs_bias(
             if max_depen > 0.0 and wp.isfinite(max_depen):
                 bias = wp.max(bias, -max_depen)
         else:
-            bias = phi_val / dt
+            bias = speculative_scale * phi_val / dt
 
     mf_rhs[world, i] = bias
 
