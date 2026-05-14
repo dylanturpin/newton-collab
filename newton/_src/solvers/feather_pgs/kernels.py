@@ -4683,6 +4683,8 @@ def pgs_solve_mf_loop(
     iterations: int,
     omega: float,
     friction_mode: int,
+    friction_start_iteration: int,
+    iteration_offset: int,
     # in/out
     mf_impulses: wp.array2d(dtype=float),
     v_out: wp.array(dtype=float),
@@ -4709,8 +4711,13 @@ def pgs_solve_mf_loop(
     if m_count == 0:
         return
 
-    for _ in range(iterations):
+    for it in range(iterations):
         for i in range(m_count):
+            row_type = mf_row_type[world, i]
+            if row_type == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + it < friction_start_iteration:
+                mf_impulses[world, i] = 0.0
+                continue
+
             eff_inv = mf_eff_mass_inv[world, i]
             if eff_inv <= 0.0:
                 continue
@@ -4735,8 +4742,6 @@ def pgs_solve_mf_loop(
             delta = -(jv + mf_rhs[world, i]) * eff_inv
             new_impulse = mf_impulses[world, i] + omega * delta
             old_impulse = mf_impulses[world, i]
-
-            row_type = mf_row_type[world, i]
 
             # Project
             if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
@@ -4961,6 +4966,8 @@ def pgs_solve_loop(
     world_row_type: wp.array2d(dtype=int),
     world_row_parent: wp.array2d(dtype=int),
     world_row_mu: wp.array2d(dtype=float),
+    friction_start_iteration: int,
+    iteration_offset: int,
 ):
     """
     World-level Projected Gauss-Seidel solver.
@@ -4973,8 +4980,13 @@ def pgs_solve_loop(
     if m == 0:
         return
 
-    for _ in range(iterations):
+    for it in range(iterations):
         for i in range(m):
+            row_type = world_row_type[world, i]
+            if row_type == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + it < friction_start_iteration:
+                world_impulses[world, i] = 0.0
+                continue
+
             # Compute residual: w = rhs_i + sum_j C_ij * lambda_j
             w = world_rhs[world, i]
             for j in range(m):
@@ -4986,7 +4998,6 @@ def pgs_solve_loop(
 
             delta = -w / denom
             new_impulse = world_impulses[world, i] + omega * delta
-            row_type = world_row_type[world, i]
 
             # --- Normal contact, joint limit, or joint velocity limit:
             #     lambda_n >= 0. The velocity-limit row uses a signed Jacobian

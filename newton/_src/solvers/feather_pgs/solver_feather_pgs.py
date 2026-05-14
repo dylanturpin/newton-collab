@@ -228,6 +228,7 @@ class SolverFeatherPGS(SolverBase):
         friction_smoothing: float = 1.0,
         enable_contact_friction: bool = True,
         contact_friction_gap_threshold: float = float("inf"),
+        contact_friction_position_iterations: int = -1,
         enable_joint_limits: bool = False,
         enable_joint_velocity_limits: bool = False,
         pgs_iterations: int = 12,
@@ -273,6 +274,13 @@ class SolverFeatherPGS(SolverBase):
                 ``phi <= contact_friction_gap_threshold``. This mirrors PhysX's separate friction-anchor
                 distance threshold while leaving speculative normal rows intact. Defaults to ``inf`` to
                 preserve legacy FeatherPGS behavior.
+            contact_friction_position_iterations (int, optional): Number of biased PGS position
+                iterations that solve contact-friction rows. ``-1`` preserves legacy FeatherPGS
+                behavior by solving friction in every position iteration; ``0`` skips position-pass
+                friction entirely; ``N > 0`` solves friction only in the final ``N`` position
+                iterations. Velocity-only post iterations always solve friction every iteration,
+                matching PhysX PGS's documented default of friction in the last three position
+                iterations and all velocity iterations. Defaults to ``-1``.
             enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
                 constraints.  Each violated limit adds one constraint row.  Supported with
                 ``pgs_kernel="loop"`` and ``pgs_kernel="tiled_row"``; the ``"tiled_contact"``
@@ -386,6 +394,12 @@ class SolverFeatherPGS(SolverBase):
         self.friction_smoothing = friction_smoothing
         self.enable_contact_friction = enable_contact_friction
         self.contact_friction_gap_threshold = contact_friction_gap_threshold
+        self.contact_friction_position_iterations = int(contact_friction_position_iterations)
+        if self.contact_friction_position_iterations < -1:
+            raise ValueError(
+                "contact_friction_position_iterations must be -1 for all position iterations, "
+                "or a non-negative last-N iteration count"
+            )
         self.enable_joint_limits = enable_joint_limits
         self.enable_joint_velocity_limits = enable_joint_velocity_limits
         self.pgs_iterations = pgs_iterations
@@ -397,6 +411,11 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_velocity_omega = self.pgs_omega if pgs_velocity_omega is None else float(pgs_velocity_omega)
         self.dense_max_constraints = dense_max_constraints
         self.pgs_warmstart = pgs_warmstart
+        if self.pgs_warmstart and self.contact_friction_position_iterations >= 0:
+            raise NotImplementedError(
+                "contact_friction_position_iterations with pgs_warmstart=True needs an explicit "
+                "pre-solve zeroing pass for skipped friction rows"
+            )
         if pgs_mode not in ("dense", "split", "matrix_free"):
             raise ValueError(f"pgs_mode must be 'dense', 'split', or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
@@ -1485,6 +1504,20 @@ class SolverFeatherPGS(SolverBase):
         self._pgs_convergence_log = []
         self._pgs_ncp_residual_log = []
 
+    def _contact_friction_start_iteration(self, iterations: int, *, velocity_pass: bool = False) -> int:
+        """Return the first local PGS iteration that should solve friction rows.
+
+        ``contact_friction_position_iterations=-1`` preserves the legacy all-iteration
+        position-pass behavior. Velocity-only post passes intentionally ignore the
+        position-pass limit and solve friction every iteration, matching PhysX PGS.
+        """
+        if velocity_pass or self.contact_friction_position_iterations < 0:
+            return 0
+        if iterations <= 0:
+            return 0
+        active = min(self.contact_friction_position_iterations, iterations)
+        return iterations - active
+
     def _pack_mf_meta(self, mf_rhs: wp.array) -> None:
         pack_kernel = TiledKernelFactory.get_pack_mf_meta_kernel(self.mf_max_constraints, self.model.device)
         wp.launch_tiled(
@@ -1511,9 +1544,13 @@ class SolverFeatherPGS(SolverBase):
         mf_meta: wp.array,
         iterations: int,
         omega: float,
+        friction_start_iteration: int | None = None,
+        iteration_offset: int = 0,
     ) -> None:
         if iterations <= 0:
             return
+        if friction_start_iteration is None:
+            friction_start_iteration = self._contact_friction_start_iteration(iterations)
         mf_gs_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_kernel(
             self.dense_max_constraints,
             self.mf_max_constraints,
@@ -1552,6 +1589,8 @@ class SolverFeatherPGS(SolverBase):
                     iterations,
                     omega,
                     row_phase,
+                    int(friction_start_iteration),
+                    int(iteration_offset),
                 ],
                 outputs=[self.v_out],
                 block_dim=32,
@@ -1568,6 +1607,9 @@ class SolverFeatherPGS(SolverBase):
             mf_meta=self.mf_meta_packed,
             iterations=self.pgs_velocity_iterations,
             omega=self.pgs_velocity_omega,
+            friction_start_iteration=self._contact_friction_start_iteration(
+                self.pgs_velocity_iterations, velocity_pass=True
+            ),
         )
 
     def _conclude_matrix_free_position_problem(self, dt: float) -> None:
@@ -1972,6 +2014,7 @@ class SolverFeatherPGS(SolverBase):
                 if self.pgs_debug:
                     self._pgs_convergence_log.append([])
                     self._pgs_ncp_residual_log.append([])
+                    friction_start_iteration = self._contact_friction_start_iteration(self.pgs_iterations)
                     for _pgs_dbg_iter in range(self.pgs_iterations):
                         # Snapshot impulses before this iteration
                         wp.copy(self._diag_prev_impulses, self.impulses)
@@ -1986,6 +2029,8 @@ class SolverFeatherPGS(SolverBase):
                             mf_meta=self.mf_meta_packed,
                             iterations=1,
                             omega=self.pgs_omega,
+                            friction_start_iteration=friction_start_iteration,
+                            iteration_offset=_pgs_dbg_iter,
                         )
 
                         # Diagnostic kernel
@@ -2081,6 +2126,7 @@ class SolverFeatherPGS(SolverBase):
                         mf_meta=self.mf_meta_packed,
                         iterations=self.pgs_iterations,
                         omega=self.pgs_omega,
+                        friction_start_iteration=self._contact_friction_start_iteration(self.pgs_iterations),
                     )
 
             self._stage6_clamp_rigid_velocity_limits()
@@ -2103,7 +2149,11 @@ class SolverFeatherPGS(SolverBase):
 
             for _pgs_iter in range(self.pgs_iterations):
                 # Dense PGS (1 iteration, impulse space)
-                self._dispatch_dense_pgs_solve(iterations=1)
+                self._dispatch_dense_pgs_solve(
+                    iterations=1,
+                    friction_start_iteration=self._contact_friction_start_iteration(self.pgs_iterations),
+                    iteration_offset=_pgs_iter,
+                )
 
                 # Rebuild v_out = v_hat + Y*impulses + MF_corrections
                 self._stage6_prepare_world_velocity()
@@ -2118,7 +2168,11 @@ class SolverFeatherPGS(SolverBase):
 
                 # Snapshot v_out, run MF, compute delta
                 wp.copy(self.v_out_snap, self.v_out)
-                self._mf_pgs_solve(iterations=1)
+                self._mf_pgs_solve(
+                    iterations=1,
+                    friction_start_iteration=self._contact_friction_start_iteration(self.pgs_iterations),
+                    iteration_offset=_pgs_iter,
+                )
 
                 # v_mf_accum += (v_out - v_out_snap); v_out_snap = delta
                 wp.launch(
@@ -2156,15 +2210,23 @@ class SolverFeatherPGS(SolverBase):
             # Dense or split without mixed contacts: dense PGS, then optional MF
             if self.pgs_debug:
                 self._pgs_convergence_log.append([])
+                friction_start_iteration = self._contact_friction_start_iteration(self.pgs_iterations)
                 for _pgs_dbg_iter in range(self.pgs_iterations):
                     prev_np = self.impulses.numpy().copy()
-                    self._dispatch_dense_pgs_solve(iterations=1)
+                    self._dispatch_dense_pgs_solve(
+                        iterations=1,
+                        friction_start_iteration=friction_start_iteration,
+                        iteration_offset=_pgs_dbg_iter,
+                    )
                     cur_np = self.impulses.numpy()
                     max_delta = float(np.max(np.abs(cur_np - prev_np)))
                     self._pgs_convergence_log[-1].append(np.array([max_delta, 0.0, 0.0, 0.0]))
                 self._pgs_convergence_log[-1] = np.array(self._pgs_convergence_log[-1])
             else:
-                self._dispatch_dense_pgs_solve(iterations=self.pgs_iterations)
+                self._dispatch_dense_pgs_solve(
+                    iterations=self.pgs_iterations,
+                    friction_start_iteration=self._contact_friction_start_iteration(self.pgs_iterations),
+                )
 
             self._stage6_prepare_world_velocity()
             for size in self.size_groups:
@@ -3628,10 +3690,23 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _dispatch_dense_pgs_solve(self, iterations: int):
+    def _dispatch_dense_pgs_solve(
+        self,
+        iterations: int,
+        friction_start_iteration: int | None = None,
+        iteration_offset: int = 0,
+    ):
         """Dispatch the dense PGS kernel with a given iteration count."""
         saved = self.pgs_iterations
+        saved_friction_start = getattr(self, "_pgs_friction_start_iteration", 0)
+        saved_iteration_offset = getattr(self, "_pgs_iteration_offset", 0)
         self.pgs_iterations = iterations
+        self._pgs_friction_start_iteration = (
+            self._contact_friction_start_iteration(iterations)
+            if friction_start_iteration is None
+            else int(friction_start_iteration)
+        )
+        self._pgs_iteration_offset = int(iteration_offset)
         if self.pgs_kernel == "tiled_row":
             self._stage5_pgs_solve_world_tiled_row()
         elif self.pgs_kernel == "tiled_contact":
@@ -3641,6 +3716,8 @@ class SolverFeatherPGS(SolverBase):
         else:
             self._stage5_pgs_solve_world_loop()
         self.pgs_iterations = saved
+        self._pgs_friction_start_iteration = saved_friction_start
+        self._pgs_iteration_offset = saved_iteration_offset
 
     def _stage5_pgs_solve_world_tiled_row(self):
         pgs_kernel = TiledKernelFactory.get_pgs_solve_tiled_row_kernel(self.dense_max_constraints, self.model.device)
@@ -3658,6 +3735,8 @@ class SolverFeatherPGS(SolverBase):
                 self.row_type,
                 self.row_parent,
                 self.row_mu,
+                self._pgs_friction_start_iteration,
+                self._pgs_iteration_offset,
             ],
             block_dim=32,
             device=self.model.device,
@@ -3679,6 +3758,8 @@ class SolverFeatherPGS(SolverBase):
                 self.row_type,
                 self.row_parent,
                 self.row_mu,
+                self._pgs_friction_start_iteration,
+                self._pgs_iteration_offset,
             ],
             device=self.model.device,
         )
@@ -4161,7 +4242,10 @@ class SolverFeatherPGS(SolverBase):
     def _stage6b_mf_pgs(self, state_aug: State, dt: float):
         """Run matrix-free PGS for free rigid body contacts."""
         self._mf_pgs_setup(state_aug, dt)
-        self._mf_pgs_solve(self.pgs_iterations)
+        self._mf_pgs_solve(
+            self.pgs_iterations,
+            friction_start_iteration=self._contact_friction_start_iteration(self.pgs_iterations),
+        )
 
     def _mf_pgs_setup(self, state_aug: State, dt: float):
         """MF PGS setup: compute Hinv, compute effective mass and RHS."""
@@ -4231,9 +4315,16 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _mf_pgs_solve(self, iterations: int):
+    def _mf_pgs_solve(
+        self,
+        iterations: int,
+        friction_start_iteration: int | None = None,
+        iteration_offset: int = 0,
+    ):
         """MF PGS solve with given iteration count."""
         model = self.model
+        if friction_start_iteration is None:
+            friction_start_iteration = self._contact_friction_start_iteration(iterations)
 
         # Build compact body map for standalone MF kernel
         wp.launch(
@@ -4283,6 +4374,8 @@ class SolverFeatherPGS(SolverBase):
                     self.v_out,
                     iterations,
                     self.pgs_omega,
+                    int(friction_start_iteration),
+                    int(iteration_offset),
                 ],
                 block_dim=32,
                 device=model.device,
@@ -4310,6 +4403,8 @@ class SolverFeatherPGS(SolverBase):
                     iterations,
                     self.pgs_omega,
                     self._friction_mode_id,
+                    int(friction_start_iteration),
+                    int(iteration_offset),
                 ],
                 outputs=[
                     self.mf_impulses,
@@ -4910,6 +5005,7 @@ class TiledKernelFactory:
     {precompute_j_code}
 
         for (int iter = 0; iter < iterations; iter++) {{
+            int global_iter = iteration_offset + iter;
             for (int i = 0; i < m; i++) {{
                 // NOTE: single-warp kernel; __syncwarp here is typically unnecessary unless divergence occurs
                 // before the dot. If you want max perf, try removing it after verifying correctness.
@@ -4932,6 +5028,10 @@ class TiledKernelFactory:
                 float delta = -w_val / denom;
                 float new_impulse = s_lam[i] + omega * delta;
                 int row_type = s_rtype[i];
+                if (row_type == 2 && global_iter < friction_start_iteration) {{
+                    s_lam[i] = 0.0f;
+                    continue;
+                }}
 
                 // row_type 0=CONTACT, 3=JOINT_LIMIT, 4=JOINT_VELOCITY_LIMIT:
                 // unilateral lambda >= 0 projector. The velocity-limit row
@@ -4983,6 +5083,8 @@ class TiledKernelFactory:
             world_row_type: wp.array2d(dtype=int),
             world_row_parent: wp.array2d(dtype=int),
             world_row_mu: wp.array2d(dtype=float),
+            friction_start_iteration: int,
+            iteration_offset: int,
         ): ...
 
         def pgs_solve_tiled_template(
@@ -4996,6 +5098,8 @@ class TiledKernelFactory:
             world_row_type: wp.array2d(dtype=int),
             world_row_parent: wp.array2d(dtype=int),
             world_row_mu: wp.array2d(dtype=float),
+            friction_start_iteration: int,
+            iteration_offset: int,
         ):
             world, _lane = wp.tid()
             pgs_solve_native(
@@ -5010,6 +5114,8 @@ class TiledKernelFactory:
                 world_row_type,
                 world_row_parent,
                 world_row_mu,
+                friction_start_iteration,
+                iteration_offset,
             )
 
         pgs_solve_tiled_template.__name__ = f"pgs_solve_tiled_row_{max_constraints}"
@@ -5619,7 +5725,14 @@ class TiledKernelFactory:
 
         if (lane == 0) {{
             for (int iter = 0; iter < iterations; iter++) {{
+                int global_iter = iteration_offset + iter;
                 for (int i = 0; i < m; i++) {{
+                    int row_type = mf_row_type.data[c_off + i];
+                    if (row_type == 2 && global_iter < friction_start_iteration) {{
+                        s_impulse[i] = 0.0f;
+                        continue;
+                    }}
+
                     float eff_inv = mf_eff_mass_inv.data[c_off + i];
                     if (eff_inv <= 0.0f) continue;
 
@@ -5660,8 +5773,6 @@ class TiledKernelFactory:
                     float delta = -(jv + rhs_i) * eff_inv;
                     float old_impulse = s_impulse[i];
                     float new_impulse = old_impulse + omega * delta;
-
-                    int row_type = mf_row_type.data[c_off + i];
 
                     // Project: contact or joint limit
                     if (row_type == 0 || row_type == 3) {{
@@ -5784,6 +5895,8 @@ class TiledKernelFactory:
             v_out: wp.array(dtype=float),
             iterations: int,
             omega: float,
+            friction_start_iteration: int,
+            iteration_offset: int,
         ): ...
 
         def pgs_solve_mf_template(
@@ -5805,6 +5918,8 @@ class TiledKernelFactory:
             v_out: wp.array(dtype=float),
             iterations: int,
             omega: float,
+            friction_start_iteration: int,
+            iteration_offset: int,
         ):
             world, _lane = wp.tid()
             pgs_solve_mf_native(
@@ -5827,6 +5942,8 @@ class TiledKernelFactory:
                 v_out,
                 iterations,
                 omega,
+                friction_start_iteration,
+                iteration_offset,
             )
 
         name = f"pgs_solve_mf_{mf_max_constraints}_{max_mf_bodies}"
@@ -6851,6 +6968,7 @@ class TiledKernelFactory:
 {dense_pipe_decl}
 
         for (int iter = 0; iter < iterations; iter++) {{
+            int global_iter = iteration_offset + iter;
 
             // ── Phase 1: Dense constraints (D-DOF warp-parallel, software-pipelined) ──
 
@@ -6873,6 +6991,11 @@ class TiledKernelFactory:
                 // row_phase 0: all rows, 1: contact/friction rows, 2: internal articulation rows.
                 if (row_phase == 1 && row_type != 0 && row_type != 2) continue;
                 if (row_phase == 2 && row_type != 1 && row_type != 3 && row_type != 4) continue;
+                if (row_type == 2 && global_iter < friction_start_iteration) {{
+                    s_lam_dense[i] = 0.0f;
+                    __syncwarp();
+                    continue;
+                }}
 
                 float denom = s_diag_dense[i];
                 if (denom <= 0.0f) continue;
@@ -6973,6 +7096,14 @@ class TiledKernelFactory:
                 int dof_a = packed_dofs >> 16;
                 int dof_b = (packed_dofs << 16) >> 16;
                 float mf_diag = __int_as_float(meta.y);
+                int packed_tp = meta.w;
+                int mf_rt = packed_tp & 0xFFFF;
+
+                if (mf_rt == 2 && global_iter < friction_start_iteration) {{
+                    s_lam_mf[i] = 0.0f;
+                    __syncwarp();
+                    continue;
+                }}
 
                 if (mf_diag <= 0.0f) continue;
 
@@ -6995,8 +7126,6 @@ class TiledKernelFactory:
                 float delta = -residual * mf_diag;
                 float old_impulse = s_lam_mf[i];
                 float new_impulse = old_impulse + omega * delta;
-                int packed_tp = meta.w;
-                int mf_rt = packed_tp & 0xFFFF;
 
                 if (mf_rt == 0) {{
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
@@ -7066,6 +7195,8 @@ class TiledKernelFactory:
             iterations: int,
             omega: float,
             row_phase: int,
+            friction_start_iteration: int,
+            iteration_offset: int,
             # Output
             v_out: wp.array(dtype=float),
         ): ...
@@ -7099,6 +7230,8 @@ class TiledKernelFactory:
             iterations: int,
             omega: float,
             row_phase: int,
+            friction_start_iteration: int,
+            iteration_offset: int,
             # Output
             v_out: wp.array(dtype=float),
         ):
@@ -7130,6 +7263,8 @@ class TiledKernelFactory:
                 iterations,
                 omega,
                 row_phase,
+                friction_start_iteration,
+                iteration_offset,
                 v_out,
             )
 
