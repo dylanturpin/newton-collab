@@ -454,19 +454,6 @@ class SolverFeatherPGS(SolverBase):
         else:
             self._friction_mode_id = int(FRICTION_MODE_CURRENT)
 
-        # Joint velocity limits are scoped to the matrix-free path for issue #23.
-        # The dense / split paths still build the full Delassus matrix C and a
-        # tiled PGS kernel that bakes its unilateral-clamp row-type check into
-        # generated CUDA; supporting them cleanly is tracked as future work.
-        # Fail loudly here instead of silently running with a constraint that
-        # would only be enforced in some code paths.
-        if self.enable_joint_velocity_limits and self.pgs_mode != "matrix_free":
-            raise NotImplementedError(
-                "enable_joint_velocity_limits=True requires pgs_mode='matrix_free'. "
-                f"Got pgs_mode={self.pgs_mode!r}. The dense and split PGS paths "
-                "are explicitly out of scope for the joint velocity-limit row — "
-                "see https://github.com/dylanturpin/il-newton/issues/23."
-            )
         if self.enable_joint_velocity_limits and not self.enable_joint_limits:
             # The velocity-limit path reuses the per-world slot counter and
             # the ``limit_slot`` allocation buffers only when both flags are
