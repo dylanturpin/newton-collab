@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 from contextlib import contextmanager
 from typing import ClassVar, Literal
 
@@ -39,6 +41,11 @@ from .kernels import (
     FRICTION_MODE_BISECTION_DESAXCE,
     FRICTION_MODE_COULOMB_NEWTON,
     FRICTION_MODE_CURRENT,
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_JOINT_TARGET,
+    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     TILE_THREADS,
     add_dense_contact_compliance_to_diag,
     allocate_joint_limit_slots,
@@ -533,6 +540,30 @@ class SolverFeatherPGS(SolverBase):
         self._dummy_contact_count = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_contact_row_type = wp.zeros((1, 1), dtype=wp.int32, device=model.device)
         self._dummy_contact_row_parent = wp.full((1, 1), -1, dtype=wp.int32, device=model.device)
+        self._debug_projected_root = os.getenv("IL_NEWTON_FPGS_PROJECTED_ROOT", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._debug_projected_root_maxfev = max(int(os.getenv("IL_NEWTON_FPGS_PROJECTED_ROOT_MAXFEV", "1000")), 1)
+        self._debug_projected_root_starts = min(
+            max(int(os.getenv("IL_NEWTON_FPGS_PROJECTED_ROOT_STARTS", "3")), 1),
+            3,
+        )
+        self._debug_projected_root_max_worlds = max(
+            int(os.getenv("IL_NEWTON_FPGS_PROJECTED_ROOT_MAX_WORLDS", "4")),
+            1,
+        )
+        self._debug_projected_root_verbose = os.getenv("IL_NEWTON_FPGS_PROJECTED_ROOT_VERBOSE", "1").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._debug_projected_root_worlds = self._parse_projected_root_worlds(
+            os.getenv("IL_NEWTON_FPGS_PROJECTED_ROOT_WORLDS", "")
+        )
 
         if model.shape_material_mu is not None:
             self.shape_material_mu = model.shape_material_mu
@@ -542,6 +573,18 @@ class SolverFeatherPGS(SolverBase):
             )
 
         self._init_double_buffer_stream()
+
+    @staticmethod
+    def _parse_projected_root_worlds(value: str) -> set[int] | None:
+        value = value.strip()
+        if not value or value.lower() == "all":
+            return None
+        worlds = set()
+        for item in value.split(","):
+            item = item.strip()
+            if item:
+                worlds.add(int(item))
+        return worlds
 
     def _compute_articulation_metadata(self, model):
         self._compute_articulation_indices(model)
@@ -2130,6 +2173,7 @@ class SolverFeatherPGS(SolverBase):
             if self.pgs_mode == "split" and self._has_free_rigid_bodies:
                 self._stage6b_mf_pgs(state_aug, dt)
 
+        self._maybe_run_debug_projected_root()
         self._stage6_clamp_rigid_velocity_limits()
 
         # ══════════════════════════════════════════════════════════════
@@ -3703,6 +3747,394 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage6_clamp_rigid_velocity_limits(self):
         self._clamp_rigid_velocity_limits(self.v_out)
+
+    def _maybe_run_debug_projected_root(self) -> None:
+        """Replace selected worlds' PGS velocity with a slow SciPy projected-root solve.
+
+        This is a diagnostic path only. It copies row data to CPU, solves one
+        world at a time, and copies the edited velocities/impulses back to the
+        Warp arrays before integration.
+        """
+
+        if not self._debug_projected_root:
+            return
+        if self.pgs_mode != "matrix_free":
+            raise RuntimeError("IL_NEWTON_FPGS_PROJECTED_ROOT currently requires pgs_mode='matrix_free'")
+
+        try:
+            from scipy.optimize import root
+        except Exception as exc:
+            raise RuntimeError("IL_NEWTON_FPGS_PROJECTED_ROOT requires scipy to be installed") from exc
+
+        dense_counts = self.constraint_count.numpy().astype(np.int64, copy=False)
+        mf_counts = self.mf_constraint_count.numpy().astype(np.int64, copy=False)
+        world_dof_start = self.world_dof_start.numpy().astype(np.int64, copy=False)
+        v_hat = self.v_hat.numpy().astype(np.float64, copy=False)
+        v_out = self.v_out.numpy().copy()
+        dense_impulses = self.impulses.numpy().copy()
+        mf_impulses = self.mf_impulses.numpy().copy()
+
+        dense_arrays = {
+            "J": self.J_world.numpy().astype(np.float64, copy=False),
+            "Y": self.Y_world.numpy().astype(np.float64, copy=False),
+            "rhs": self.rhs.numpy().astype(np.float64, copy=False),
+            "diag": self.diag.numpy().astype(np.float64, copy=False),
+            "row_type": self.row_type.numpy().astype(np.int64, copy=False),
+            "row_parent": self.row_parent.numpy().astype(np.int64, copy=False),
+            "row_mu": self.row_mu.numpy().astype(np.float64, copy=False),
+            "drive_target": self.drive_target_vel_bias.numpy().astype(np.float64, copy=False),
+            "drive_vel_mul": self.drive_vel_multiplier.numpy().astype(np.float64, copy=False),
+            "drive_imp_mul": self.drive_impulse_multiplier.numpy().astype(np.float64, copy=False),
+            "drive_max_imp": self.drive_max_impulse.numpy().astype(np.float64, copy=False),
+        }
+        mf_arrays = {
+            "rhs": self.mf_rhs.numpy().astype(np.float64, copy=False),
+            "eff_inv": self.mf_eff_mass_inv.numpy().astype(np.float64, copy=False),
+            "row_type": self.mf_row_type.numpy().astype(np.int64, copy=False),
+            "row_parent": self.mf_row_parent.numpy().astype(np.int64, copy=False),
+            "row_mu": self.mf_row_mu.numpy().astype(np.float64, copy=False),
+            "dof_a": self.mf_dof_a.numpy().astype(np.int64, copy=False),
+            "dof_b": self.mf_dof_b.numpy().astype(np.int64, copy=False),
+            "J_a": self.mf_J_a.numpy().astype(np.float64, copy=False),
+            "J_b": self.mf_J_b.numpy().astype(np.float64, copy=False),
+            "MiJt_a": self.mf_MiJt_a.numpy().astype(np.float64, copy=False),
+            "MiJt_b": self.mf_MiJt_b.numpy().astype(np.float64, copy=False),
+        }
+
+        if self._debug_projected_root_worlds is None:
+            worlds = [w for w in range(self.world_count) if dense_counts[w] or mf_counts[w]]
+            worlds = worlds[: self._debug_projected_root_max_worlds]
+        else:
+            worlds = [
+                w
+                for w in sorted(self._debug_projected_root_worlds)
+                if 0 <= w < self.world_count and (dense_counts[w] or mf_counts[w])
+            ]
+
+        for world in worlds:
+            problem = self._build_debug_projected_root_problem(
+                world,
+                dense_counts,
+                mf_counts,
+                world_dof_start,
+                v_hat,
+                dense_impulses,
+                mf_impulses,
+                dense_arrays,
+                mf_arrays,
+            )
+            if problem is None:
+                continue
+            solution, info = self._solve_debug_projected_root(problem, root)
+            v_reference = problem["v_hat"] + solution @ problem["Y"]
+            start = int(problem["world_dof_start"])
+            count = int(problem["dof_count"])
+            v_out[start : start + count] = v_reference.astype(v_out.dtype, copy=False)
+
+            dense_count = int(problem["dense_count"])
+            mf_count = int(problem["mf_count"])
+            if dense_count:
+                dense_impulses[world, :dense_count] = solution[:dense_count].astype(dense_impulses.dtype, copy=False)
+            if mf_count:
+                mf_impulses[world, :mf_count] = solution[dense_count : dense_count + mf_count].astype(
+                    mf_impulses.dtype,
+                    copy=False,
+                )
+
+            if self._debug_projected_root_verbose:
+                before = self._debug_projected_root_projected_residual_max(problem, problem["lambda_current"])
+                after = self._debug_projected_root_projected_residual_max(problem, solution)
+                delta_v = float(np.max(np.abs(v_reference - problem["v_current"]))) if count else 0.0
+                print(
+                    "[FPGS_PROJECTED_ROOT] "
+                    f"world={world} rows={solution.size} success={info['success']} "
+                    f"nfev={info['nfev']} objective={info['objective']:.3e} "
+                    f"residual={before:.3e}->{after:.3e} max|dv|={delta_v:.3e} "
+                    f"solve_ms={info['solve_ms']:.1f}",
+                    flush=True,
+                )
+
+        if worlds:
+            wp.copy(self.v_out, wp.from_numpy(v_out.astype(np.float32, copy=False), dtype=wp.float32, device=self.model.device))
+            wp.copy(
+                self.impulses,
+                wp.from_numpy(dense_impulses.astype(np.float32, copy=False), dtype=wp.float32, device=self.model.device),
+            )
+            wp.copy(
+                self.mf_impulses,
+                wp.from_numpy(mf_impulses.astype(np.float32, copy=False), dtype=wp.float32, device=self.model.device),
+            )
+
+    def _build_debug_projected_root_problem(
+        self,
+        world: int,
+        dense_counts: np.ndarray,
+        mf_counts: np.ndarray,
+        world_dof_start: np.ndarray,
+        v_hat: np.ndarray,
+        dense_impulses: np.ndarray,
+        mf_impulses: np.ndarray,
+        dense_arrays: dict[str, np.ndarray],
+        mf_arrays: dict[str, np.ndarray],
+    ) -> dict[str, np.ndarray] | None:
+        dense_count = int(dense_counts[world])
+        mf_count = int(mf_counts[world])
+        row_count = dense_count + mf_count
+        if row_count == 0:
+            return None
+
+        start = int(world_dof_start[world])
+        count = min(int(self.max_world_dofs), int(v_hat.shape[0]) - start)
+        if count <= 0:
+            return None
+
+        j_rows = np.zeros((row_count, count), dtype=np.float64)
+        y_rows = np.zeros((row_count, count), dtype=np.float64)
+        bias = np.zeros((row_count,), dtype=np.float64)
+        diag_eff_inv = np.zeros((row_count,), dtype=np.float64)
+        lambdas = np.zeros((row_count,), dtype=np.float64)
+        row_type = np.zeros((row_count,), dtype=np.int64)
+        row_parent = np.full((row_count,), -1, dtype=np.int64)
+        row_mu = np.zeros((row_count,), dtype=np.float64)
+        drive_target = np.zeros((row_count,), dtype=np.float64)
+        drive_vel_mul = np.zeros((row_count,), dtype=np.float64)
+        drive_imp_mul = np.ones((row_count,), dtype=np.float64)
+        drive_max_imp = np.full((row_count,), -1.0, dtype=np.float64)
+
+        if dense_count:
+            dense_slice = slice(0, dense_count)
+            j_rows[dense_slice] = dense_arrays["J"][world, :dense_count, :count]
+            y_rows[dense_slice] = dense_arrays["Y"][world, :dense_count, :count]
+            bias[dense_slice] = dense_arrays["rhs"][world, :dense_count]
+            diag = dense_arrays["diag"][world, :dense_count]
+            diag_eff_inv[dense_slice] = np.divide(1.0, diag, out=np.zeros_like(diag), where=diag > 0.0)
+            lambdas[dense_slice] = dense_impulses[world, :dense_count]
+            row_type[dense_slice] = dense_arrays["row_type"][world, :dense_count]
+            row_parent[dense_slice] = dense_arrays["row_parent"][world, :dense_count]
+            row_mu[dense_slice] = dense_arrays["row_mu"][world, :dense_count]
+            drive_target[dense_slice] = dense_arrays["drive_target"][world, :dense_count]
+            drive_vel_mul[dense_slice] = dense_arrays["drive_vel_mul"][world, :dense_count]
+            drive_imp_mul[dense_slice] = dense_arrays["drive_imp_mul"][world, :dense_count]
+            drive_max_imp[dense_slice] = dense_arrays["drive_max_imp"][world, :dense_count]
+
+        if mf_count:
+            mf_offset = dense_count
+            for row in range(mf_count):
+                out_row = mf_offset + row
+                dof_a = int(mf_arrays["dof_a"][world, row])
+                dof_b = int(mf_arrays["dof_b"][world, row])
+                if 0 <= dof_a < count:
+                    j_rows[out_row, dof_a : min(dof_a + 6, count)] += mf_arrays["J_a"][world, row, : max(0, min(6, count - dof_a))]
+                    y_rows[out_row, dof_a : min(dof_a + 6, count)] += mf_arrays["MiJt_a"][
+                        world, row, : max(0, min(6, count - dof_a))
+                    ]
+                if 0 <= dof_b < count:
+                    j_rows[out_row, dof_b : min(dof_b + 6, count)] += mf_arrays["J_b"][world, row, : max(0, min(6, count - dof_b))]
+                    y_rows[out_row, dof_b : min(dof_b + 6, count)] += mf_arrays["MiJt_b"][
+                        world, row, : max(0, min(6, count - dof_b))
+                    ]
+
+            mf_slice = slice(mf_offset, mf_offset + mf_count)
+            bias[mf_slice] = mf_arrays["rhs"][world, :mf_count]
+            diag_eff_inv[mf_slice] = mf_arrays["eff_inv"][world, :mf_count]
+            lambdas[mf_slice] = mf_impulses[world, :mf_count]
+            row_type[mf_slice] = mf_arrays["row_type"][world, :mf_count]
+            row_parent[mf_slice] = np.where(
+                mf_arrays["row_parent"][world, :mf_count] >= 0,
+                mf_arrays["row_parent"][world, :mf_count] + mf_offset,
+                -1,
+            )
+            row_mu[mf_slice] = mf_arrays["row_mu"][world, :mf_count]
+
+        local_v_hat = v_hat[start : start + count].astype(np.float64, copy=True)
+        return {
+            "world": np.array(world, dtype=np.int64),
+            "world_dof_start": np.array(start, dtype=np.int64),
+            "dof_count": np.array(count, dtype=np.int64),
+            "dense_count": np.array(dense_count, dtype=np.int64),
+            "mf_count": np.array(mf_count, dtype=np.int64),
+            "J": j_rows,
+            "Y": y_rows,
+            "A": j_rows @ y_rows.T,
+            "bias": bias,
+            "q_biased": j_rows @ local_v_hat + bias,
+            "q_unbiased": j_rows @ local_v_hat,
+            "diag_eff_inv": diag_eff_inv,
+            "lambda_current": lambdas,
+            "v_hat": local_v_hat,
+            "v_current": self.v_out.numpy()[start : start + count].astype(np.float64, copy=True),
+            "row_type": row_type,
+            "row_parent": row_parent,
+            "row_mu": row_mu,
+            "drive_mode": self.drive_mode,
+            "drive_target": drive_target,
+            "drive_vel_mul": drive_vel_mul,
+            "drive_imp_mul": drive_imp_mul,
+            "drive_max_imp": drive_max_imp,
+        }
+
+    def _solve_debug_projected_root(self, problem: dict[str, np.ndarray], root):
+        def residual_fn(x: np.ndarray) -> np.ndarray:
+            residual = problem["A"] @ x + problem["q_biased"]
+            return self._debug_projected_root_residual_vector(problem, x, residual)
+
+        starts = [
+            problem["lambda_current"],
+            np.zeros_like(problem["lambda_current"]),
+            self._debug_projected_root_project_impulses(problem, problem["lambda_current"]),
+        ]
+        best_solution = starts[0]
+        best_cost = np.inf
+        best_success = False
+        best_evals = 0
+        t0 = time.perf_counter()
+        for start in starts[: self._debug_projected_root_starts]:
+            result = root(
+                residual_fn,
+                np.asarray(start, dtype=np.float64),
+                method="df-sane",
+                options={
+                    "maxfev": self._debug_projected_root_maxfev,
+                    "fatol": 1.0e-10,
+                    "disp": False,
+                },
+            )
+            residual_norm_sq = float(np.dot(result.fun, result.fun))
+            cost = 0.5 * residual_norm_sq
+            if cost < best_cost:
+                best_cost = cost
+                best_solution = np.asarray(result.x, dtype=np.float64)
+                best_success = bool(result.success)
+                best_evals = int(getattr(result, "nfev", getattr(result, "nit", 0)))
+
+        solve_ms = (time.perf_counter() - t0) * 1000.0
+        solution = self._debug_projected_root_project_impulses(problem, best_solution)
+        return solution, {
+            "success": best_success or best_cost < 1.0e-8,
+            "nfev": best_evals,
+            "objective": best_cost,
+            "solve_ms": solve_ms,
+        }
+
+    @staticmethod
+    def _debug_projected_root_drive_fixed_point(problem: dict[str, np.ndarray], lambdas: np.ndarray) -> np.ndarray:
+        jv = problem["A"] @ lambdas + problem["q_unbiased"]
+        candidate = (
+            lambdas * problem["drive_imp_mul"]
+            + jv * problem["drive_vel_mul"]
+            + problem["drive_target"]
+        )
+        finite = (problem["drive_max_imp"] >= 0.0) & np.isfinite(problem["drive_max_imp"])
+        if np.any(finite):
+            candidate = candidate.copy()
+            candidate[finite] = np.minimum(
+                np.maximum(candidate[finite], -problem["drive_max_imp"][finite]),
+                problem["drive_max_imp"][finite],
+            )
+        return candidate
+
+    @classmethod
+    def _debug_projected_root_project_impulses(
+        cls, problem: dict[str, np.ndarray], lambdas: np.ndarray
+    ) -> np.ndarray:
+        projected = lambdas.copy()
+        row_type = problem["row_type"]
+        if problem.get("drive_mode") == "physx_pgs":
+            drive_rows = row_type == int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)
+            drive_candidate = cls._debug_projected_root_drive_fixed_point(problem, projected)
+            projected[drive_rows] = drive_candidate[drive_rows]
+
+        nonnegative = (
+            (row_type == int(PGS_CONSTRAINT_TYPE_CONTACT))
+            | (row_type == int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT))
+            | (row_type == int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT))
+        )
+        projected[nonnegative] = np.maximum(projected[nonnegative], 0.0)
+
+        for parent, tangent0, tangent1, mu in cls._debug_projected_root_friction_pairs(problem):
+            radius = max(mu * projected[parent], 0.0)
+            projected[[tangent0, tangent1]] = cls._debug_projected_root_project_disk(
+                projected[[tangent0, tangent1]], radius
+            )
+        return projected
+
+    @classmethod
+    def _debug_projected_root_residual_vector(
+        cls, problem: dict[str, np.ndarray], lambdas: np.ndarray, residual: np.ndarray
+    ) -> np.ndarray:
+        candidate = lambdas - problem["diag_eff_inv"] * residual
+        projected = candidate.copy()
+        row_type = problem["row_type"]
+        handled = np.zeros_like(lambdas, dtype=bool)
+
+        if problem.get("drive_mode") == "physx_pgs":
+            drive_rows = row_type == int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)
+            drive_candidate = cls._debug_projected_root_drive_fixed_point(problem, lambdas)
+            projected[drive_rows] = drive_candidate[drive_rows]
+            handled[drive_rows] = True
+
+        for i, kind in enumerate(row_type):
+            if kind in (
+                int(PGS_CONSTRAINT_TYPE_CONTACT),
+                int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT),
+                int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT),
+            ):
+                projected[i] = max(candidate[i], 0.0)
+                handled[i] = True
+
+        for parent, tangent0, tangent1, mu in cls._debug_projected_root_friction_pairs(problem):
+            radius = max(mu * lambdas[parent], 0.0)
+            projected[[tangent0, tangent1]] = cls._debug_projected_root_project_disk(
+                candidate[[tangent0, tangent1]], radius
+            )
+            handled[tangent0] = True
+            handled[tangent1] = True
+
+        for i, done in enumerate(handled):
+            if not done:
+                projected[i] = candidate[i]
+        return lambdas - projected
+
+    @classmethod
+    def _debug_projected_root_projected_residual_max(
+        cls, problem: dict[str, np.ndarray], lambdas: np.ndarray
+    ) -> float:
+        residual = problem["A"] @ lambdas + problem["q_biased"]
+        residual_vector = cls._debug_projected_root_residual_vector(problem, lambdas, residual)
+        max_residual = 0.0
+        handled = np.zeros_like(lambdas, dtype=bool)
+        for _parent, tangent0, tangent1, _mu in cls._debug_projected_root_friction_pairs(problem):
+            max_residual = max(max_residual, float(np.linalg.norm(residual_vector[[tangent0, tangent1]])))
+            handled[tangent0] = True
+            handled[tangent1] = True
+        scalar = np.abs(residual_vector[~handled])
+        if scalar.size:
+            max_residual = max(max_residual, float(np.max(scalar)))
+        return max_residual
+
+    @staticmethod
+    def _debug_projected_root_project_disk(tangent: np.ndarray, radius: float) -> np.ndarray:
+        if radius <= 0.0:
+            return np.zeros_like(tangent)
+        mag = float(np.linalg.norm(tangent))
+        if mag <= radius or mag == 0.0:
+            return tangent
+        return tangent * (radius / mag)
+
+    @staticmethod
+    def _debug_projected_root_friction_pairs(problem: dict[str, np.ndarray]) -> list[tuple[int, int, int, float]]:
+        row_type = problem["row_type"]
+        row_parent = problem["row_parent"]
+        row_mu = problem["row_mu"]
+        pairs = []
+        for row, kind in enumerate(row_type):
+            parent = int(row_parent[row])
+            if int(kind) != int(PGS_CONSTRAINT_TYPE_FRICTION) or parent < 0 or row != parent + 1:
+                continue
+            sibling = parent + 2
+            if sibling < len(row_type) and int(row_type[sibling]) == int(PGS_CONSTRAINT_TYPE_FRICTION):
+                pairs.append((parent, row, sibling, float(row_mu[row])))
+        return pairs
 
     def _stage6_apply_impulses_world(self, size: int):
         model = self.model
