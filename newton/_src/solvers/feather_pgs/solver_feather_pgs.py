@@ -220,6 +220,7 @@ class SolverFeatherPGS(SolverBase):
         update_mass_matrix_interval: int = 1,
         friction_smoothing: float = 1.0,
         enable_contact_friction: bool = True,
+        contact_friction_gap_threshold: float = float("inf"),
         enable_joint_limits: bool = False,
         enable_joint_velocity_limits: bool = False,
         pgs_iterations: int = 12,
@@ -260,6 +261,10 @@ class SolverFeatherPGS(SolverBase):
             update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the :meth:`step` function gets called). Defaults to 1.
             friction_smoothing (float, optional): The delta value for the Huber norm (see :func:`warp.math.norm_huber`) used for the friction velocity normalization. Defaults to 1.0.
             enable_contact_friction (bool, optional): Enables Coulomb friction contacts inside the PGS solve. Defaults to True.
+            contact_friction_gap_threshold (float, optional): Only build friction rows for contacts with
+                ``phi <= contact_friction_gap_threshold``. This mirrors PhysX's separate friction-anchor
+                distance threshold while leaving speculative normal rows intact. Defaults to ``inf`` to
+                preserve legacy FeatherPGS behavior.
             enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
                 constraints.  Each violated limit adds one constraint row.  Supported with
                 ``pgs_kernel="loop"`` and ``pgs_kernel="tiled_row"``; the ``"tiled_contact"``
@@ -367,6 +372,7 @@ class SolverFeatherPGS(SolverBase):
         self.update_mass_matrix_interval = update_mass_matrix_interval
         self.friction_smoothing = friction_smoothing
         self.enable_contact_friction = enable_contact_friction
+        self.contact_friction_gap_threshold = contact_friction_gap_threshold
         self.enable_joint_limits = enable_joint_limits
         self.enable_joint_velocity_limits = enable_joint_velocity_limits
         self.pgs_iterations = pgs_iterations
@@ -523,6 +529,9 @@ class SolverFeatherPGS(SolverBase):
         self._scatter_armature_to_groups(model)
         self._init_size_group_streams(model)
         self._dummy_contact_impulses = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
+        self._dummy_contact_count = wp.zeros((1,), dtype=wp.int32, device=model.device)
+        self._dummy_contact_row_type = wp.zeros((1, 1), dtype=wp.int32, device=model.device)
+        self._dummy_contact_row_parent = wp.full((1, 1), -1, dtype=wp.int32, device=model.device)
 
         if model.shape_material_mu is not None:
             self.shape_material_mu = model.shape_material_mu
@@ -834,6 +843,9 @@ class SolverFeatherPGS(SolverBase):
             self.qd_work = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_mf_accum = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_out_snap = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+            self._debug_stage3_qd_work = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+            self._debug_stage3_joint_qdd = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+            self._debug_stage3_v_hat = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
         else:
             self.M_blocks = None
             self.mass_update_mask = None
@@ -842,6 +854,9 @@ class SolverFeatherPGS(SolverBase):
             self.qd_work = None
             self.v_mf_accum = None
             self.v_out_snap = None
+            self._debug_stage3_qd_work = None
+            self._debug_stage3_joint_qdd = None
+            self._debug_stage3_v_hat = None
 
         if model.body_count:
             self.body_I_m = wp.empty(
@@ -1520,6 +1535,7 @@ class SolverFeatherPGS(SolverBase):
         if control is None:
             control = model.control(clone_variables=False)
         state_aug = self._prepare_augmented_state(state_in, state_out, control)
+        self._last_debug_state_aug = state_aug
 
         if collide_done_event is not None and state_in.particle_count > 0:
             wp.get_stream(self.model.device).wait_event(collide_done_event)
@@ -1579,6 +1595,9 @@ class SolverFeatherPGS(SolverBase):
                         self._stage3_trisolve_loop(size, state_aug)
             self._stage3_compute_v_hat(state_in, state_aug, dt)
             self._clamp_rigid_velocity_limits(self.v_hat)
+            wp.copy(self._debug_stage3_qd_work, self.qd_work)
+            wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
+            wp.copy(self._debug_stage3_v_hat, self.v_hat)
 
         # Wait for pipelined collide (if running on separate stream)
         if collide_done_event is not None:
@@ -2039,6 +2058,15 @@ class SolverFeatherPGS(SolverBase):
         mf_impulses = getattr(self, "mf_impulses", None)
         if mf_impulses is None:
             mf_impulses = self._dummy_contact_impulses
+        mf_constraint_count = getattr(self, "mf_constraint_count", None)
+        if mf_constraint_count is None:
+            mf_constraint_count = self._dummy_contact_count
+        mf_row_type = getattr(self, "mf_row_type", None)
+        if mf_row_type is None:
+            mf_row_type = self._dummy_contact_row_type
+        mf_row_parent = getattr(self, "mf_row_parent", None)
+        if mf_row_parent is None:
+            mf_row_parent = self._dummy_contact_row_parent
 
         wp.launch(
             compute_contact_linear_force_from_impulses,
@@ -2051,6 +2079,12 @@ class SolverFeatherPGS(SolverBase):
                 self.contact_path,
                 self.impulses,
                 mf_impulses,
+                self.constraint_count,
+                mf_constraint_count,
+                self.row_type,
+                self.row_parent,
+                mf_row_type,
+                mf_row_parent,
                 enable_friction_flag,
                 inv_dt,
             ],
@@ -2812,6 +2846,7 @@ class SolverFeatherPGS(SolverBase):
                     max_constraints,
                     self.mf_max_constraints,
                     enable_friction_flag,
+                    self.contact_friction_gap_threshold,
                 ],
                 outputs=[
                     self.contact_world,
@@ -2889,6 +2924,7 @@ class SolverFeatherPGS(SolverBase):
                         model.shape_transform,
                         self.shape_material_mu,
                         enable_friction_flag,
+                        self.contact_friction_gap_threshold,
                         self.pgs_beta,
                         self.pgs_cfm,
                     ],
@@ -3026,6 +3062,7 @@ class SolverFeatherPGS(SolverBase):
                         state_in.body_q,
                         self.shape_material_mu,
                         enable_friction_flag,
+                        self.contact_friction_gap_threshold,
                         self.pgs_beta,
                     ],
                     outputs=[

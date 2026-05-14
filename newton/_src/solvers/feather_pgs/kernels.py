@@ -1341,6 +1341,12 @@ def compute_contact_linear_force_from_impulses(
     contact_path: wp.array(dtype=wp.int32),
     world_impulses: wp.array2d(dtype=wp.float32),
     mf_impulses: wp.array2d(dtype=wp.float32),
+    world_constraint_count: wp.array(dtype=wp.int32),
+    mf_constraint_count: wp.array(dtype=wp.int32),
+    world_row_type: wp.array2d(dtype=wp.int32),
+    world_row_parent: wp.array2d(dtype=wp.int32),
+    mf_row_type: wp.array2d(dtype=wp.int32),
+    mf_row_parent: wp.array2d(dtype=wp.int32),
     enable_friction: int,
     inv_dt: float,
     # outputs
@@ -1368,12 +1374,28 @@ def compute_contact_linear_force_from_impulses(
         lam_t1 = 0.0
         if path == 0:
             lam_n = world_impulses[world, slot]
-            if enable_friction != 0:
+            count = world_constraint_count[world]
+            if (
+                enable_friction != 0
+                and slot + 2 < count
+                and world_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+                and world_row_parent[world, slot + 1] == slot
+                and world_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+                and world_row_parent[world, slot + 2] == slot
+            ):
                 lam_t0 = world_impulses[world, slot + 1]
                 lam_t1 = world_impulses[world, slot + 2]
         elif path == 1:
             lam_n = mf_impulses[world, slot]
-            if enable_friction != 0:
+            count = mf_constraint_count[world]
+            if (
+                enable_friction != 0
+                and slot + 2 < count
+                and mf_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+                and mf_row_parent[world, slot + 1] == slot
+                and mf_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+                and mf_row_parent[world, slot + 2] == slot
+            ):
                 lam_t0 = mf_impulses[world, slot + 1]
                 lam_t1 = mf_impulses[world, slot + 2]
 
@@ -2401,6 +2423,7 @@ def allocate_world_contact_slots(
     max_constraints: int,
     mf_max_constraints: int,
     enable_friction: int,
+    contact_friction_gap_threshold: float,
     # outputs
     contact_world: wp.array(dtype=int),
     contact_slot: wp.array(dtype=int),
@@ -2417,7 +2440,8 @@ def allocate_world_contact_slots(
     which articulations are involved. Contacts where both sides are free
     rigid bodies (or ground) are routed to the matrix-free path.
 
-    Each contact reserves 3 slots (normal + 2 friction) in its world's constraint buffer.
+    Each contact reserves 1 slot for the normal row and, when enabled below the
+    friction gap threshold, 2 adjacent slots for Coulomb friction rows.
     """
     c = wp.tid()
     total_contacts = contact_count[0]
@@ -2499,7 +2523,7 @@ def allocate_world_contact_slots(
 
     # Allocate slots (1 normal + 2 friction)
     slots_needed = 1
-    if enable_friction != 0:
+    if enable_friction != 0 and phi <= contact_friction_gap_threshold:
         slots_needed = 3
 
     if is_mf != 0:
@@ -2605,6 +2629,7 @@ def populate_world_J_for_size(
     shape_transform: wp.array(dtype=wp.transform),
     shape_material_mu: wp.array(dtype=float),
     enable_friction: int,
+    contact_friction_gap_threshold: float,
     pgs_beta: float,
     pgs_cfm: float,
     # outputs
@@ -2693,6 +2718,7 @@ def populate_world_J_for_size(
 
     # Compute tangent basis for friction
     t0, t1 = contact_tangent_basis(normal)
+    will_add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
 
     # Handle articulation A if it matches target size
     if art_a >= 0 and art_size[art_a] == target_size:
@@ -2718,7 +2744,7 @@ def populate_world_J_for_size(
             J_group,
         )
 
-        if enable_friction != 0:
+        if will_add_friction:
             # Friction row 1 (slot + 1)
             accumulate_jacobian_row_world(
                 body_a,
@@ -2778,7 +2804,7 @@ def populate_world_J_for_size(
             J_group,
         )
 
-        if enable_friction != 0:
+        if will_add_friction:
             accumulate_jacobian_row_world(
                 body_b,
                 -1.0,
@@ -2824,7 +2850,7 @@ def populate_world_J_for_size(
         world_phi[world, slot] = phi
         world_target_velocity[world, slot] = 0.0
 
-        if enable_friction != 0:
+        if will_add_friction:
             # Friction row 1
             world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 1] = slot
@@ -2853,7 +2879,7 @@ def populate_world_J_for_size(
         world_phi[world, slot] = phi
         world_target_velocity[world, slot] = 0.0
 
-        if enable_friction != 0:
+        if will_add_friction:
             world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 1] = slot
             world_row_mu[world, slot + 1] = mu
@@ -3388,6 +3414,7 @@ def build_mf_contact_rows(
     body_q: wp.array(dtype=wp.transform),
     shape_material_mu: wp.array(dtype=float),
     enable_friction: int,
+    contact_friction_gap_threshold: float,
     pgs_beta: float,
     # outputs
     mf_body_a: wp.array2d(dtype=int),
@@ -3469,10 +3496,11 @@ def build_mf_contact_rows(
 
     # Tangent basis
     t0, t1 = contact_tangent_basis(normal)
+    will_add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
 
     # Write rows for normal + friction
     for row_offset in range(3):
-        if row_offset > 0 and enable_friction == 0:
+        if row_offset > 0 and not will_add_friction:
             break
 
         row_idx = slot + row_offset
@@ -4797,14 +4825,14 @@ def finalize_mf_constraint_counts(
 ):
     """Clamp MF slot counter to max and store as constraint count.
 
-    See :func:`finalize_world_constraint_counts` for the gap-avoidance
-    rationale behind the ``slots_per_contact`` rounding.
+    ``slots_per_contact`` is kept for call-site compatibility.  The MF buffer
+    may contain a mix of 3-row normal+friction contacts and 1-row speculative
+    normal contacts, so rounding to a fixed stride would drop valid rows.
     """
     world = wp.tid()
     count = mf_slot_counter[world]
     if count > mf_max_constraints:
         count = mf_max_constraints
-    count = (count // slots_per_contact) * slots_per_contact
     mf_constraint_count[world] = count
 
 
