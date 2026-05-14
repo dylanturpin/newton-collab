@@ -134,7 +134,7 @@ def write_contact_simple(
         )
 
 
-def create_narrow_phase_primitive_kernel(writer_func: Any):
+def create_narrow_phase_primitive_kernel(writer_func: Any, enable_box_convex_aabb: bool = True):
     """
     Create a kernel for fast analytical collision detection of primitive shapes.
 
@@ -145,11 +145,13 @@ def create_narrow_phase_primitive_kernel(writer_func: Any):
 
     Args:
         writer_func: Contact writer function (e.g., write_contact_simple)
+        enable_box_convex_aabb: If true, route BOX-vs-CONVEX_MESH pairs through
+            the experimental local-AABB manifold shortcut.
 
     Returns:
         A warp kernel for primitive collision detection
     """
-    _module = f"narrow_phase_primitive_{writer_func.__name__}"
+    _module = f"narrow_phase_primitive_{writer_func.__name__}_{enable_box_convex_aabb}"
 
     @wp.kernel(enable_backward=False, module=_module)
     def narrow_phase_primitive_kernel(
@@ -517,7 +519,7 @@ def create_narrow_phase_primitive_kernel(writer_func: Any):
             # treats the convex hull's local AABB as an oriented box and emits
             # the first four contacts from the analytic box-box path.
             # -----------------------------------------------------------------
-            elif is_box_a and is_convex_mesh_b:
+            elif wp.static(enable_box_convex_aabb) and is_box_a and is_convex_mesh_b:
                 mesh_id = shape_source[shape_b]
                 if mesh_id != wp.uint64(0):
                     mesh_obj = wp.mesh_get(mesh_id)
@@ -1471,6 +1473,7 @@ class NarrowPhase:
         has_meshes: bool = True,
         has_heightfields: bool = False,
         use_lean_gjk_mpr: bool = False,
+        enable_box_convex_aabb: bool = True,
         deterministic: bool = False,
         contact_max: int | None = None,
         verify_buffers: bool = True,
@@ -1497,6 +1500,9 @@ class NarrowPhase:
                 Defaults to True for safety. Set to False when constructing from a model with no meshes.
             has_heightfields: Whether the scene contains any heightfield shapes (GeoType.HFIELD). When True,
                 heightfield collision buffers and kernels are allocated. Defaults to False.
+            enable_box_convex_aabb: Whether BOX-vs-CONVEX_MESH pairs should use
+                the experimental convex-mesh local-AABB box manifold shortcut.
+                When false, those pairs fall through to GJK/MPR.
             deterministic: Sort contacts after the narrow phase so that results are
                 independent of GPU thread scheduling.  Adds a radix sort + gather
                 pass.  Hydroelastic contacts are not yet covered.
@@ -1571,7 +1577,9 @@ class NarrowPhase:
 
         # Create the appropriate kernel variants
         # Primitive kernel handles lightweight primitives and routes remaining pairs
-        self.primitive_kernel = create_narrow_phase_primitive_kernel(writer_func)
+        self.primitive_kernel = create_narrow_phase_primitive_kernel(
+            writer_func, enable_box_convex_aabb=enable_box_convex_aabb
+        )
         # GJK/MPR kernel handles remaining convex-convex pairs
         if use_lean_gjk_mpr:
             # Use lean support function (CONVEX_MESH, BOX, SPHERE only) and lean post-processing

@@ -229,6 +229,8 @@ class SolverFeatherPGS(SolverBase):
         enable_contact_friction: bool = True,
         contact_friction_gap_threshold: float = float("inf"),
         contact_friction_position_iterations: int = -1,
+        contact_friction_shared_anchor: bool = False,
+        contact_shared_anchor: bool = False,
         enable_joint_limits: bool = False,
         enable_joint_velocity_limits: bool = False,
         pgs_iterations: int = 12,
@@ -236,6 +238,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_beta: float = 0.2,
         pgs_cfm: float = 1.0e-6,
         dense_contact_compliance: float = 0.0,
+        speculative_dense_contact_compliance: float = 0.0,
         pgs_omega: float = 1.0,
         pgs_velocity_omega: float | None = None,
         dense_max_constraints: int = 32,
@@ -281,6 +284,14 @@ class SolverFeatherPGS(SolverBase):
                 iterations. Velocity-only post iterations always solve friction every iteration,
                 matching PhysX PGS's documented default of friction in the last three position
                 iterations and all velocity iterations. Defaults to ``-1``.
+            contact_friction_shared_anchor (bool, optional): If true, friction rows use the midpoint
+                between the two contact witness points as the Jacobian point on both bodies. Normal
+                rows keep their original witness points. This avoids a tangential force couple when
+                the witnesses are separated along the contact normal. Defaults to False.
+            contact_shared_anchor (bool, optional): If true, all contact rows use the midpoint between
+                the two witness points as the Jacobian point on both bodies, matching PhysX contact
+                prep's single ``contact.point`` lever arm. ``phi`` is still computed from the original
+                witness points. Defaults to False.
             enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
                 constraints.  Each violated limit adds one constraint row.  Supported with
                 ``pgs_kernel="loop"`` and ``pgs_kernel="tiled_row"``; the ``"tiled_contact"``
@@ -306,6 +317,11 @@ class SolverFeatherPGS(SolverBase):
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
             dense_contact_compliance (float, optional): Normal contact compliance [m/N] applied
                 only to dense articulated contact rows. Converted to an impulse-space diagonal
+                term using ``compliance / dt^2``. Defaults to 0.0.
+            speculative_dense_contact_compliance (float, optional): Additional normal contact
+                compliance [m/N] applied only to dense articulated contact rows with ``phi > 0``.
+                This leaves penetrating dense contacts at the base compliance while softening
+                separated/speculative contact normals. Converted to an impulse-space diagonal
                 term using ``compliance / dt^2``. Defaults to 0.0.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             pgs_velocity_omega (float | None, optional): Relaxation factor for the velocity-only post-pass.
@@ -395,6 +411,8 @@ class SolverFeatherPGS(SolverBase):
         self.enable_contact_friction = enable_contact_friction
         self.contact_friction_gap_threshold = contact_friction_gap_threshold
         self.contact_friction_position_iterations = int(contact_friction_position_iterations)
+        self.contact_friction_shared_anchor = bool(contact_friction_shared_anchor)
+        self.contact_shared_anchor = bool(contact_shared_anchor)
         if self.contact_friction_position_iterations < -1:
             raise ValueError(
                 "contact_friction_position_iterations must be -1 for all position iterations, "
@@ -406,6 +424,7 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
         self.dense_contact_compliance = dense_contact_compliance
+        self.speculative_dense_contact_compliance = speculative_dense_contact_compliance
         self.pgs_omega = pgs_omega
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
         self.pgs_velocity_omega = self.pgs_omega if pgs_velocity_omega is None else float(pgs_velocity_omega)
@@ -3142,6 +3161,8 @@ class SolverFeatherPGS(SolverBase):
                         self.shape_material_mu,
                         enable_friction_flag,
                         self.contact_friction_gap_threshold,
+                        int(self.contact_friction_shared_anchor),
+                        int(self.contact_shared_anchor),
                         self.pgs_beta,
                         self.pgs_cfm,
                     ],
@@ -3280,6 +3301,8 @@ class SolverFeatherPGS(SolverBase):
                         self.shape_material_mu,
                         enable_friction_flag,
                         self.contact_friction_gap_threshold,
+                        int(self.contact_friction_shared_anchor),
+                        int(self.contact_shared_anchor),
                         self.pgs_beta,
                     ],
                     outputs=[
@@ -3572,14 +3595,15 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_add_dense_contact_compliance(self, dt: float):
-        if self.dense_contact_compliance <= 0.0:
+        if self.dense_contact_compliance <= 0.0 and self.speculative_dense_contact_compliance <= 0.0:
             return
 
         contact_alpha = float(self.dense_contact_compliance / (dt * dt))
+        speculative_contact_alpha = float(self.speculative_dense_contact_compliance / (dt * dt))
         wp.launch(
             add_dense_contact_compliance_to_diag,
             dim=self.world_count,
-            inputs=[self.constraint_count, self.row_type, contact_alpha],
+            inputs=[self.constraint_count, self.row_type, self.phi, contact_alpha, speculative_contact_alpha],
             outputs=[self.diag],
             device=self.model.device,
         )

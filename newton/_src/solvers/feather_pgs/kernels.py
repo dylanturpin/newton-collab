@@ -2633,6 +2633,8 @@ def populate_world_J_for_size(
     shape_material_mu: wp.array(dtype=float),
     enable_friction: int,
     contact_friction_gap_threshold: float,
+    contact_friction_shared_anchor: int,
+    contact_shared_anchor: int,
     pgs_beta: float,
     pgs_cfm: float,
     # outputs
@@ -2722,6 +2724,7 @@ def populate_world_J_for_size(
     # Compute tangent basis for friction
     t0, t1 = contact_tangent_basis(normal)
     will_add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
+    contact_anchor_world = 0.5 * (point_a_world + point_b_world)
 
     # Handle articulation A if it matches target size
     if art_a >= 0 and art_size[art_a] == target_size:
@@ -2730,10 +2733,14 @@ def populate_world_J_for_size(
         origin_a = articulation_origin[art_a]
 
         # Normal row (slot + 0)
+        point_a_normal_world = point_a_world
+        if contact_shared_anchor != 0:
+            point_a_normal_world = contact_anchor_world
+
         accumulate_jacobian_row_world(
             body_a,
             1.0,
-            point_a_world,
+            point_a_normal_world,
             origin_a,
             normal,
             body_to_joint,
@@ -2748,11 +2755,15 @@ def populate_world_J_for_size(
         )
 
         if will_add_friction:
+            point_a_friction_world = point_a_world
+            if contact_shared_anchor != 0 or contact_friction_shared_anchor != 0:
+                point_a_friction_world = contact_anchor_world
+
             # Friction row 1 (slot + 1)
             accumulate_jacobian_row_world(
                 body_a,
                 1.0,
-                point_a_world,
+                point_a_friction_world,
                 origin_a,
                 t0,
                 body_to_joint,
@@ -2769,7 +2780,7 @@ def populate_world_J_for_size(
             accumulate_jacobian_row_world(
                 body_a,
                 1.0,
-                point_a_world,
+                point_a_friction_world,
                 origin_a,
                 t1,
                 body_to_joint,
@@ -2790,10 +2801,14 @@ def populate_world_J_for_size(
         origin_b = articulation_origin[art_b]
 
         # Opposite sign for body B
+        point_b_normal_world = point_b_world
+        if contact_shared_anchor != 0:
+            point_b_normal_world = contact_anchor_world
+
         accumulate_jacobian_row_world(
             body_b,
             -1.0,
-            point_b_world,
+            point_b_normal_world,
             origin_b,
             normal,
             body_to_joint,
@@ -2808,10 +2823,14 @@ def populate_world_J_for_size(
         )
 
         if will_add_friction:
+            point_b_friction_world = point_b_world
+            if contact_shared_anchor != 0 or contact_friction_shared_anchor != 0:
+                point_b_friction_world = contact_anchor_world
+
             accumulate_jacobian_row_world(
                 body_b,
                 -1.0,
-                point_b_world,
+                point_b_friction_world,
                 origin_b,
                 t0,
                 body_to_joint,
@@ -2827,7 +2846,7 @@ def populate_world_J_for_size(
             accumulate_jacobian_row_world(
                 body_b,
                 -1.0,
-                point_b_world,
+                point_b_friction_world,
                 origin_b,
                 t1,
                 body_to_joint,
@@ -3422,6 +3441,8 @@ def build_mf_contact_rows(
     shape_material_mu: wp.array(dtype=float),
     enable_friction: int,
     contact_friction_gap_threshold: float,
+    contact_friction_shared_anchor: int,
+    contact_shared_anchor: int,
     pgs_beta: float,
     # outputs
     mf_body_a: wp.array2d(dtype=int),
@@ -3504,6 +3525,7 @@ def build_mf_contact_rows(
     # Tangent basis
     t0, t1 = contact_tangent_basis(normal)
     will_add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
+    contact_anchor_world = 0.5 * (point_a_world + point_b_world)
 
     # Write rows for normal + friction
     for row_offset in range(3):
@@ -3524,7 +3546,10 @@ def build_mf_contact_rows(
         if body_a >= 0:
             art_a = contact_art_a[c]
             origin_a = articulation_origin[art_a]
-            r_a = point_a_world - origin_a
+            point_a_row_world = point_a_world
+            if contact_shared_anchor != 0 or (row_offset > 0 and contact_friction_shared_anchor != 0):
+                point_a_row_world = contact_anchor_world
+            r_a = point_a_row_world - origin_a
             ang_a = wp.cross(r_a, d)
             mf_J_a[world, row_idx, 0] = d[0]
             mf_J_a[world, row_idx, 1] = d[1]
@@ -3537,7 +3562,10 @@ def build_mf_contact_rows(
         if body_b >= 0:
             art_b = contact_art_b[c]
             origin_b = articulation_origin[art_b]
-            r_b = point_b_world - origin_b
+            point_b_row_world = point_b_world
+            if contact_shared_anchor != 0 or (row_offset > 0 and contact_friction_shared_anchor != 0):
+                point_b_row_world = contact_anchor_world
+            r_b = point_b_row_world - origin_b
             ang_b = wp.cross(r_b, d)
             mf_J_b[world, row_idx, 0] = -d[0]
             mf_J_b[world, row_idx, 1] = -d[1]
@@ -5109,7 +5137,9 @@ def finalize_world_diag_cfm(
 def add_dense_contact_compliance_to_diag(
     world_constraint_count: wp.array(dtype=int),
     world_row_type: wp.array2d(dtype=int),
+    world_phi: wp.array2d(dtype=float),
     contact_alpha: float,
+    speculative_contact_alpha: float,
     # in/out
     world_diag: wp.array2d(dtype=float),
 ):
@@ -5118,7 +5148,8 @@ def add_dense_contact_compliance_to_diag(
     The dense articulated contact path uses a Delassus diagonal in impulse
     space. A compliance ``alpha = compliance / dt^2`` contributes an additional
     diagonal term for normal contact rows only, yielding a softer normal
-    response without changing friction or joint-limit rows.
+    response without changing friction or joint-limit rows. A separate
+    speculative term applies only while ``phi > 0``.
     """
     world = wp.tid()
     m = world_constraint_count[world]
@@ -5126,6 +5157,8 @@ def add_dense_contact_compliance_to_diag(
     for i in range(m):
         if world_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
             world_diag[world, i] += contact_alpha
+            if world_phi[world, i] > 0.0:
+                world_diag[world, i] += speculative_contact_alpha
 
 
 # =============================================================================

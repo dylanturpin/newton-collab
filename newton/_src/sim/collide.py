@@ -478,6 +478,7 @@ class CollisionPipeline:
         narrow_phase: NarrowPhase | None = None,
         sdf_hydroelastic_config: HydroelasticSDF.Config | None = None,
         deterministic: bool = False,
+        enable_box_convex_aabb: bool = True,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
         contact_matching_pos_threshold: float = 0.0005,
         contact_matching_normal_dot_threshold: float = 0.995,
@@ -517,6 +518,9 @@ class CollisionPipeline:
             deterministic: Sort contacts after the narrow phase so that results
                 are independent of GPU thread scheduling.  Adds a radix sort +
                 gather pass.  Hydroelastic contacts are not yet covered.
+            enable_box_convex_aabb: Whether BOX-vs-CONVEX_MESH pairs should use
+                the experimental local-AABB manifold shortcut. When false, those
+                pairs fall through to GJK/MPR.
             contact_matching: Frame-to-frame contact matching mode.  One of
                 ``"disabled"``, ``"latest"``, or ``"sticky"``.  Any
                 non-disabled mode implies ``deterministic=True`` and
@@ -737,6 +741,7 @@ class CollisionPipeline:
                 has_meshes=has_meshes,
                 has_heightfields=has_heightfields,
                 use_lean_gjk_mpr=use_lean_gjk_mpr,
+                enable_box_convex_aabb=enable_box_convex_aabb,
                 deterministic=deterministic,
                 verify_buffers=verify_buffers,
             )
