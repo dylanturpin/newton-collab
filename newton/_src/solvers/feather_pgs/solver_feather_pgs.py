@@ -245,7 +245,7 @@ class SolverFeatherPGS(SolverBase):
         dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
         pgs_mode: str = "split",
-        pgs_schedule: Literal["interleaved", "contact_then_internal"] = "interleaved",
+        pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
         mf_max_constraints: int = 512,
         # Kernel selection per operation
@@ -345,8 +345,9 @@ class SolverFeatherPGS(SolverBase):
             pgs_schedule (str, optional): Matrix-free row ordering. ``"interleaved"`` preserves the
                 legacy per-iteration dense+matrix-free sweep. ``"contact_then_internal"`` runs all
                 contact/friction sweeps first, then all internal articulation sweeps (drive, joint
-                limits, joint velocity limits). This is an experimental diagnostic schedule for hard
-                grasp/table contact cases. Defaults to ``"interleaved"``.
+                limits, joint velocity limits). ``"physx_grasp"`` approximates PhysX's two-pass
+                grabbing order by solving drive/position-limit rows first, then contacts/friction,
+                then joint velocity limits. Defaults to ``"interleaved"``.
             friction_mode (str, optional): Per-row Coulomb friction strategy used by the
                 ``pgs_mode="matrix_free"`` path. ``"current"`` (default) is the baseline
                 isotropic Coulomb cone projection that has been the FeatherPGS behavior
@@ -450,9 +451,9 @@ class SolverFeatherPGS(SolverBase):
         if pgs_mode not in ("dense", "split", "matrix_free"):
             raise ValueError(f"pgs_mode must be 'dense', 'split', or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
-        if pgs_schedule not in ("interleaved", "contact_then_internal"):
+        if pgs_schedule not in ("interleaved", "contact_then_internal", "physx_grasp"):
             raise ValueError(
-                "pgs_schedule must be 'interleaved' or 'contact_then_internal', "
+                "pgs_schedule must be 'interleaved', 'contact_then_internal', or 'physx_grasp', "
                 f"got {pgs_schedule!r}"
             )
         if pgs_schedule != "interleaved" and self.pgs_mode != "matrix_free":
@@ -1590,8 +1591,7 @@ class SolverFeatherPGS(SolverBase):
             self.model.device,
             friction_mode=self.friction_mode,
         )
-        row_phases = (1, 2) if self.pgs_schedule == "contact_then_internal" else (0,)
-        for row_phase in row_phases:
+        def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
             wp.launch_tiled(
                 mf_gs_kernel,
                 dim=[self.world_count],
@@ -1618,17 +1618,29 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_MiJt_a,
                     self.mf_MiJt_b,
                     self.mf_row_mu,
-                    iterations,
+                    phase_iterations,
                     omega,
                     row_phase,
                     int(friction_start_iteration),
-                    int(iteration_offset),
+                    int(phase_iteration_offset),
                     int(freeze_drive_rows),
                 ],
                 outputs=[self.v_out],
                 block_dim=32,
                 device=self.model.device,
             )
+
+        if self.pgs_schedule == "contact_then_internal":
+            row_phases = (1, 2)
+            for row_phase in row_phases:
+                launch_row_phase(row_phase, iterations, iteration_offset)
+        elif self.pgs_schedule == "physx_grasp":
+            for schedule_iter in range(iterations):
+                phase_iteration_offset = iteration_offset + schedule_iter
+                for row_phase in (3, 4, 5):
+                    launch_row_phase(row_phase, 1, phase_iteration_offset)
+        else:
+            launch_row_phase(0, iterations, iteration_offset)
 
     def _run_matrix_free_velocity_post_solve(self) -> None:
         if self.pgs_velocity_iterations <= 0:
@@ -7075,9 +7087,17 @@ class TiledKernelFactory:
                 }}
 
                 int row_type = s_rtype_dense[i];
-                // row_phase 0: all rows, 1: contact/friction rows, 2: internal articulation rows.
+                // row_phase 0: all rows.
+                // row_phase 1: contact/friction rows.
+                // row_phase 2: internal articulation rows.
+                // row_phase 3: PhysX-grasp first pass, drive/position-limit rows.
+                // row_phase 4: PhysX-grasp contact pass, contact/friction rows.
+                // row_phase 5: PhysX-grasp final pass, joint velocity-limit rows.
                 if (row_phase == 1 && row_type != 0 && row_type != 2) continue;
                 if (row_phase == 2 && row_type != 1 && row_type != 3 && row_type != 4) continue;
+                if (row_phase == 3 && row_type != 1 && row_type != 3) continue;
+                if (row_phase == 4 && row_type != 0 && row_type != 2) continue;
+                if (row_phase == 5 && row_type != 4) continue;
                 if (freeze_drive_rows != 0 && row_type == 1) continue;
                 if (row_type == 2 && global_iter < friction_start_iteration) {{
                     s_lam_dense[i] = 0.0f;
@@ -7177,7 +7197,7 @@ class TiledKernelFactory:
                     }}
                 }}
 
-                if (row_phase == 2) continue;
+                if (row_phase == 2 || row_phase == 3 || row_phase == 5) continue;
 
                 // Process constraint i
                 int packed_dofs = meta.x;
