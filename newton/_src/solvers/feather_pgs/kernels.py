@@ -2068,25 +2068,28 @@ def allocate_joint_limit_slots(
     limit_sign: wp.array(dtype=float),
     world_slot_counter: wp.array(dtype=int),
 ):
-    """Allocate constraint slots for violated joint limits.
+    """Allocate speculative constraint slots for finite joint limits.
 
-    For each articulation, checks all DOFs of PRISMATIC, REVOLUTE, and D6
-    joints against their limits.  When a DOF violates its lower or upper
-    limit, a single constraint slot is atomically reserved in the world's
-    slot counter (the same counter used by contacts).
+    PhysX articulation PGS keeps finite position-limit constraints available
+    before violation and lets the row's ``phi / dt`` term limit velocities that
+    would cross the bound during the step.  Mirror that by allocating separate
+    lower and upper rows for each finite limit.
 
-    Outputs per-DOF arrays ``limit_slot`` (world-constraint row, or -1) and
-    ``limit_sign`` (+1 for lower-limit violation, -1 for upper).
+    Outputs per-side arrays indexed as ``2 * dof + side`` where side 0 is the
+    lower row (+1 Jacobian sign) and side 1 is the upper row (-1 sign).
     """
     art = wp.tid()
     world = art_to_world[art]
 
-    # Initialize all DOFs of this articulation to "no limit active"
+    # Initialize all side rows of this articulation to "no limit row"
     dof_base = articulation_dof_start[art]
     dof_count = articulation_H_rows[art]
     for d in range(dof_count):
-        limit_slot[dof_base + d] = -1
-        limit_sign[dof_base + d] = 0.0
+        lower_idx = 2 * (dof_base + d)
+        limit_slot[lower_idx] = -1
+        limit_slot[lower_idx + 1] = -1
+        limit_sign[lower_idx] = 0.0
+        limit_sign[lower_idx + 1] = 0.0
 
     joint_start = articulation_start[art]
     joint_end = articulation_start[art + 1]
@@ -2108,18 +2111,18 @@ def allocate_joint_limit_slots(
             lower = joint_limit_lower[dof]
             upper = joint_limit_upper[dof]
 
-            # Lower limit violation (q < lower)
-            if q_val < lower:
+            lower_idx = 2 * dof
+            if wp.isfinite(lower):
                 slot = wp.atomic_add(world_slot_counter, world, 1)
                 if slot < max_constraints:
-                    limit_slot[dof] = slot
-                    limit_sign[dof] = 1.0
-            # Upper limit violation (q > upper)
-            elif q_val > upper:
+                    limit_slot[lower_idx] = slot
+                    limit_sign[lower_idx] = 1.0
+
+            if wp.isfinite(upper):
                 slot = wp.atomic_add(world_slot_counter, world, 1)
                 if slot < max_constraints:
-                    limit_slot[dof] = slot
-                    limit_sign[dof] = -1.0
+                    limit_slot[lower_idx + 1] = slot
+                    limit_sign[lower_idx + 1] = -1.0
 
 
 @wp.kernel
@@ -2152,9 +2155,8 @@ def populate_joint_limit_J_for_size(
     """Populate Jacobian and metadata for joint limit constraints.
 
     Launched once per size group with ``dim = n_arts_of_size``.  Each thread
-    walks the joints of one articulation and, for every DOF whose
-    ``limit_slot`` is non-negative (i.e. the limit was activated by
-    :func:`allocate_joint_limit_slots`), writes:
+    walks the joints of one articulation and, for every finite lower/upper row
+    whose ``limit_slot`` is non-negative, writes:
 
     * A single ±1 entry in the Jacobian at the DOF's local column.
     * Constraint metadata (type, phi, beta, cfm, etc.).
@@ -2180,34 +2182,35 @@ def populate_joint_limit_J_for_size(
 
         for axis in range(axis_count):
             dof = qd_start + axis
-            slot = limit_slot[dof]
-            if slot < 0:
-                continue
-
-            sign = limit_sign[dof]
             q_val = joint_q[q_start + axis]
             lower = joint_limit_lower[dof]
             upper = joint_limit_upper[dof]
 
-            # phi is negative when violating
-            phi = 0.0
-            if sign > 0.0:
-                phi = q_val - lower
-            else:
-                phi = upper - q_val
-
-            # Jacobian: single ±1 entry at the local DOF column
             local_dof = dof - dof_start
-            J_group[group_idx, slot, local_dof] = sign
+            lower_idx = 2 * dof
+            for side in range(2):
+                row_idx = lower_idx + side
+                slot = limit_slot[row_idx]
+                if slot < 0:
+                    continue
 
-            # Constraint metadata
-            world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
-            world_row_parent[world, slot] = -1
-            world_row_mu[world, slot] = 0.0
-            world_row_beta[world, slot] = pgs_beta
-            world_row_cfm[world, slot] = pgs_cfm
-            world_phi[world, slot] = phi
-            world_target_velocity[world, slot] = 0.0
+                sign = limit_sign[row_idx]
+                # phi is negative when violating and positive when separated.
+                phi = q_val - lower
+                if sign < 0.0:
+                    phi = upper - q_val
+
+                # Jacobian: single ±1 entry at the local DOF column.
+                J_group[group_idx, slot, local_dof] = sign
+
+                # Constraint metadata.
+                world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+                world_row_parent[world, slot] = -1
+                world_row_mu[world, slot] = 0.0
+                world_row_beta[world, slot] = pgs_beta
+                world_row_cfm[world, slot] = pgs_cfm
+                world_phi[world, slot] = phi
+                world_target_velocity[world, slot] = 0.0
 
 
 # =============================================================================
@@ -3243,6 +3246,10 @@ def compute_world_contact_bias(
         elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
             if phi < 0.0:
                 rhs += bias_scale * beta * phi * inv_dt  # Negative for violation
+            else:
+                # Speculative finite-limit row: allow motion up to the bound
+                # during the step, matching PhysX's nextErr limit branch.
+                rhs += phi * inv_dt
         elif row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
             # PhysX-style drive rows use world_target_velocity as drive-row
             # input, not as a generic constraint target. Their RHS is handled
