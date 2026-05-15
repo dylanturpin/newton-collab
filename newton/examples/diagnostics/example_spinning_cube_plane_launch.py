@@ -8,8 +8,9 @@ hand has already created a high-spin cube state.  It uses no IsaacLab, no robot,
 and no policy: one free box starts on a ground plane with a representative
 post-onset cube velocity captured from the FPGS Franka rollout.
 
-Command:
+Commands:
     python -m newton.examples.diagnostics.example_spinning_cube_plane_launch
+    python -m newton.examples.diagnostics.example_spinning_cube_plane_launch --velocity-mode roll-x --zero-vz
 """
 
 from __future__ import annotations
@@ -33,9 +34,13 @@ DEFAULT_HALF_EXTENT = 0.02
 # the IL capture, so the raw Newton repro uses only the local height and twist.
 CAPTURED_LINEAR_VEL = np.array([0.299165278673172, -1.654648780822754, 0.38417425751686096], dtype=np.float32)
 CAPTURED_ANGULAR_VEL = np.array([13.849493980407715, 5.491700649261475, -4.771509647369385], dtype=np.float32)
+DEFAULT_TRANSLATION_SPEED = float(abs(CAPTURED_LINEAR_VEL[1]))
+DEFAULT_ROLL_SPEED = float(abs(CAPTURED_ANGULAR_VEL[0]))
+DEFAULT_PITCH_SPEED = float(abs(CAPTURED_ANGULAR_VEL[1]))
+DEFAULT_YAW_SPEED = float(abs(CAPTURED_ANGULAR_VEL[2]))
 
 
-def _make_solver(model: newton.Model, *, pgs_iterations: int, pgs_beta: float) -> SolverFeatherPGS:
+def _make_fpgs_solver(model: newton.Model, *, pgs_iterations: int, pgs_beta: float) -> SolverFeatherPGS:
     return SolverFeatherPGS(
         model,
         update_mass_matrix_interval=1,
@@ -64,6 +69,26 @@ def _make_solver(model: newton.Model, *, pgs_iterations: int, pgs_beta: float) -
     )
 
 
+def _make_solver(model: newton.Model, args: argparse.Namespace):
+    if args.solver == "fpgs":
+        return _make_fpgs_solver(model, pgs_iterations=args.pgs_iterations, pgs_beta=args.pgs_beta)
+    if args.solver == "mujoco_warp":
+        return newton.solvers.SolverMuJoCo(
+            model,
+            use_mujoco_cpu=False,
+            use_mujoco_contacts=True,
+            solver=args.mj_solver,
+            integrator=args.mj_integrator,
+            iterations=args.mj_iterations,
+            ls_iterations=args.mj_ls_iterations,
+            njmax=args.mj_njmax,
+            nconmax=args.mj_nconmax,
+            enable_multiccd=args.mj_multiccd,
+            update_data_interval=1,
+        )
+    raise ValueError(f"Unsupported solver: {args.solver}")
+
+
 def build_model(args: argparse.Namespace) -> tuple[newton.Model, int]:
     builder = newton.ModelBuilder()
     builder.gravity = args.gravity
@@ -88,14 +113,61 @@ def seed_free_body_state(
     state: newton.State,
     *,
     initial_z: float,
+    velocity_mode: str,
+    linear_override: np.ndarray | None,
+    angular_override: np.ndarray | None,
     zero_vz: bool,
     scale_angular: float,
 ) -> np.ndarray:
     pose = np.array([[0.0, 0.0, initial_z, 0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
-    linear = CAPTURED_LINEAR_VEL.copy()
+    linear = np.zeros(3, dtype=np.float32)
+    angular = np.zeros(3, dtype=np.float32)
+
+    if velocity_mode == "captured":
+        linear = CAPTURED_LINEAR_VEL.copy()
+        angular = CAPTURED_ANGULAR_VEL.copy()
+    elif velocity_mode == "captured-translation":
+        linear = CAPTURED_LINEAR_VEL.copy()
+    elif velocity_mode == "captured-roll":
+        angular[0] = CAPTURED_ANGULAR_VEL[0]
+    elif velocity_mode == "captured-pitch":
+        angular[1] = CAPTURED_ANGULAR_VEL[1]
+    elif velocity_mode == "captured-yaw":
+        angular[2] = CAPTURED_ANGULAR_VEL[2]
+    elif velocity_mode == "translation-x":
+        linear[0] = DEFAULT_TRANSLATION_SPEED
+    elif velocity_mode == "translation-y":
+        linear[1] = -DEFAULT_TRANSLATION_SPEED
+    elif velocity_mode == "roll-x":
+        angular[0] = DEFAULT_ROLL_SPEED
+    elif velocity_mode == "pitch-y":
+        angular[1] = DEFAULT_ROLL_SPEED
+    elif velocity_mode == "yaw-z":
+        angular[2] = DEFAULT_ROLL_SPEED
+    elif velocity_mode == "slide-y-plus-roll-x":
+        linear[1] = -DEFAULT_TRANSLATION_SPEED
+        angular[0] = DEFAULT_ROLL_SPEED
+    elif velocity_mode == "slide-y-minus-roll-x":
+        linear[1] = -DEFAULT_TRANSLATION_SPEED
+        angular[0] = -DEFAULT_ROLL_SPEED
+    elif velocity_mode == "slide-x-plus-pitch-y":
+        linear[0] = DEFAULT_TRANSLATION_SPEED
+        angular[1] = DEFAULT_ROLL_SPEED
+    elif velocity_mode == "slide-x-minus-pitch-y":
+        linear[0] = DEFAULT_TRANSLATION_SPEED
+        angular[1] = -DEFAULT_ROLL_SPEED
+    elif velocity_mode == "custom":
+        pass
+    else:
+        raise ValueError(f"Unsupported velocity mode: {velocity_mode}")
+
+    if linear_override is not None:
+        linear = linear_override.astype(np.float32)
+    if angular_override is not None:
+        angular = angular_override.astype(np.float32)
     if zero_vz:
         linear[2] = 0.0
-    angular = CAPTURED_ANGULAR_VEL * np.float32(scale_angular)
+    angular = angular * np.float32(scale_angular)
     twist = np.concatenate((linear, angular)).astype(np.float32)
 
     state.body_q.assign(pose)
@@ -111,21 +183,28 @@ def seed_free_body_state(
 
 def run(args: argparse.Namespace) -> dict[str, object]:
     model, cube = build_model(args)
-    solver = _make_solver(model, pgs_iterations=args.pgs_iterations, pgs_beta=args.pgs_beta)
+    solver = _make_solver(model, args)
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
-    collision_pipeline = newton.CollisionPipeline(
-        model,
-        broad_phase="nxn",
-        contact_matching=args.contact_matching,
-        reduce_contacts=False,
-    )
-    contacts = collision_pipeline.contacts()
+    collision_pipeline = None
+    if args.solver == "fpgs":
+        collision_pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            contact_matching=args.contact_matching,
+            reduce_contacts=False,
+        )
+        contacts = collision_pipeline.contacts()
+    else:
+        contacts = model.contacts()
     twist = seed_free_body_state(
         model,
         state_0,
         initial_z=args.initial_z,
+        velocity_mode=args.velocity_mode,
+        linear_override=np.array(args.linear, dtype=np.float32) if args.linear is not None else None,
+        angular_override=np.array(args.angular, dtype=np.float32) if args.angular is not None else None,
         zero_vz=args.zero_vz,
         scale_angular=args.scale_angular,
     )
@@ -140,10 +219,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     for step in range(args.steps):
         state_0.clear_forces()
-        collision_pipeline.collide(state_0, contacts)
+        if collision_pipeline is not None:
+            collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, args.dt)
         if hasattr(solver, "update_contacts"):
-            solver.update_contacts(contacts)
+            if args.solver == "fpgs":
+                solver.update_contacts(contacts)
+            else:
+                solver.update_contacts(contacts, state_1)
         state_0, state_1 = state_1, state_0
 
         q = state_0.body_q.numpy()[cube]
@@ -178,6 +261,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     summary = {
         "steps": args.steps,
+        "solver": args.solver,
+        "velocity_mode": args.velocity_mode,
         "dt": args.dt,
         "half_extent": args.half_extent,
         "initial_z": args.initial_z,
@@ -209,9 +294,41 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kf", type=float, default=1.0e3)
     parser.add_argument("--pgs-iterations", type=int, default=16)
     parser.add_argument("--pgs-beta", type=float, default=0.05)
+    parser.add_argument("--solver", choices=("fpgs", "mujoco_warp"), default="fpgs")
+    parser.add_argument(
+        "--velocity-mode",
+        choices=(
+            "captured",
+            "captured-translation",
+            "captured-roll",
+            "captured-pitch",
+            "captured-yaw",
+            "translation-x",
+            "translation-y",
+            "roll-x",
+            "pitch-y",
+            "yaw-z",
+            "slide-y-plus-roll-x",
+            "slide-y-minus-roll-x",
+            "slide-x-plus-pitch-y",
+            "slide-x-minus-pitch-y",
+            "custom",
+        ),
+        default="captured",
+        help="Initial velocity seed. Axis modes isolate one translational or angular component.",
+    )
+    parser.add_argument("--linear", type=float, nargs=3, default=None, metavar=("VX", "VY", "VZ"))
+    parser.add_argument("--angular", type=float, nargs=3, default=None, metavar=("WX", "WY", "WZ"))
     parser.add_argument("--scale-angular", type=float, default=1.0)
     parser.add_argument("--zero-vz", action="store_true", help="Remove inherited upward velocity from the capture.")
     parser.add_argument("--contact-matching", choices=("disabled", "latest", "sticky"), default="sticky")
+    parser.add_argument("--mj-solver", choices=("cg", "newton"), default="newton")
+    parser.add_argument("--mj-integrator", choices=("euler", "rk4", "implicitfast"), default="implicitfast")
+    parser.add_argument("--mj-iterations", type=int, default=100)
+    parser.add_argument("--mj-ls-iterations", type=int, default=50)
+    parser.add_argument("--mj-njmax", type=int, default=128)
+    parser.add_argument("--mj-nconmax", type=int, default=64)
+    parser.add_argument("--mj-multiccd", action="store_true")
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument("--print-every", type=int, default=10)
     return parser
@@ -228,6 +345,8 @@ def main() -> None:
 
     print(
         "spinning_cube_plane_launch: "
+        f"solver={summary['solver']} "
+        f"mode={summary['velocity_mode']} "
         f"max_z_delta={summary['max_z_delta']:.6f}m "
         f"max_up_vel={summary['max_up_vel']:.6f}m/s "
         f"max_ang={summary['max_ang_norm']:.6f}rad/s"

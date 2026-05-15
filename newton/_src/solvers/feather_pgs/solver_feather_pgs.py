@@ -23,8 +23,8 @@ import warp as wp
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, State
+from ...sim.articulation import eval_fk
 from ...sim.enums import JointType
-from ..featherstone.kernels import eval_fk_with_velocity_conversion
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
@@ -4580,8 +4580,8 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-            # Match Featherstone FK writeback so FREE/DISTANCE body_qd stores COM velocity.
-            eval_fk_with_velocity_conversion(model, state_out.joint_q, state_out.joint_qd, state_out)
+            # FPGS stores state_out.joint_qd in Newton's public COM/world convention.
+            eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
 
         self.integrate_particles(model, state_in, state_out, dt)
 
@@ -4636,7 +4636,7 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[state_out.joint_q, state_out.joint_qd],
                 device=model.device,
             )
-            eval_fk_with_velocity_conversion(model, state_out.joint_q, state_out.joint_qd, state_out)
+            eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
 
         self.integrate_particles(model, state_in, state_out, dt)
 
@@ -4666,7 +4666,7 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[state_aug.joint_qdd],
                 device=model.device,
             )
-            eval_fk_with_velocity_conversion(model, state_out.joint_q, state_out.joint_qd, state_out)
+            eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
 
 
 class TiledKernelFactory:

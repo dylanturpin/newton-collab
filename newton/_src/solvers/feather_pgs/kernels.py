@@ -929,7 +929,14 @@ def compute_link_velocity(
     # body forces
     I_s = transform_spatial_inertia(X_sm_local, I_m)
 
-    f_b_s = I_s * a_s + spatial_cross_dual(v_s, I_s * v_s)
+    coriolis = spatial_cross_dual(v_s, I_s * v_s)
+    if parent < 0 and (type == JointType.FREE or type == JointType.DISTANCE):
+        # Root free bodies use a world-aligned frame centered at the root COM.
+        # In that convention the linear inertial wrench is m*a_com; the
+        # omega x (m*v_com) term from body-frame spatial algebra is spurious.
+        coriolis = wp.spatial_vector(wp.vec3(), wp.spatial_bottom(coriolis))
+
+    f_b_s = I_s * a_s + coriolis
 
     body_v_s[child] = v_s
     body_a_s[child] = a_s
