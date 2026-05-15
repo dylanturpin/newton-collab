@@ -40,12 +40,12 @@ DEFAULT_PITCH_SPEED = float(abs(CAPTURED_ANGULAR_VEL[1]))
 DEFAULT_YAW_SPEED = float(abs(CAPTURED_ANGULAR_VEL[2]))
 
 
-def _make_fpgs_solver(model: newton.Model, *, pgs_iterations: int, pgs_beta: float) -> SolverFeatherPGS:
+def _make_fpgs_solver(model: newton.Model, args: argparse.Namespace) -> SolverFeatherPGS:
     return SolverFeatherPGS(
         model,
         update_mass_matrix_interval=1,
-        pgs_iterations=pgs_iterations,
-        pgs_beta=pgs_beta,
+        pgs_iterations=args.pgs_iterations,
+        pgs_beta=args.pgs_beta,
         pgs_cfm=1.0e-6,
         pgs_omega=1.0,
         dense_max_constraints=512,
@@ -66,12 +66,15 @@ def _make_fpgs_solver(model: newton.Model, *, pgs_iterations: int, pgs_beta: flo
         pgs_debug=False,
         friction_mode="current",
         drive_mode="augmented",
+        contact_friction_shared_anchor=args.contact_friction_shared_anchor,
+        contact_friction_anchor_limit=args.contact_friction_anchor_limit,
+        contact_shared_anchor=args.contact_shared_anchor,
     )
 
 
 def _make_solver(model: newton.Model, args: argparse.Namespace):
     if args.solver == "fpgs":
-        return _make_fpgs_solver(model, pgs_iterations=args.pgs_iterations, pgs_beta=args.pgs_beta)
+        return _make_fpgs_solver(model, args)
     if args.solver == "mujoco_warp":
         return newton.solvers.SolverMuJoCo(
             model,
@@ -294,6 +297,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kf", type=float, default=1.0e3)
     parser.add_argument("--pgs-iterations", type=int, default=16)
     parser.add_argument("--pgs-beta", type=float, default=0.05)
+    parser.add_argument("--contact-friction-shared-anchor", action="store_true")
+    parser.add_argument("--contact-friction-anchor-limit", type=int, default=0)
+    parser.add_argument("--contact-shared-anchor", action="store_true")
     parser.add_argument("--solver", choices=("fpgs", "mujoco_warp"), default="fpgs")
     parser.add_argument(
         "--velocity-mode",
