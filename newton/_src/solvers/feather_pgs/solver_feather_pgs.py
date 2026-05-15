@@ -230,6 +230,7 @@ class SolverFeatherPGS(SolverBase):
         contact_friction_gap_threshold: float = float("inf"),
         contact_friction_position_iterations: int = -1,
         contact_friction_shared_anchor: bool = False,
+        contact_friction_scale: float = 1.0,
         contact_shared_anchor: bool = False,
         enable_joint_limits: bool = False,
         enable_joint_velocity_limits: bool = False,
@@ -289,6 +290,10 @@ class SolverFeatherPGS(SolverBase):
                 between the two contact witness points as the Jacobian point on both bodies. Normal
                 rows keep their original witness points. This avoids a tangential force couple when
                 the witnesses are separated along the contact normal. Defaults to False.
+            contact_friction_scale (float, optional): Multiplies the effective Coulomb coefficient
+                used by generated friction rows. This is a diagnostic hook for matching solver-prep
+                semantics such as PhysX's per-friction-anchor scaling; it does not affect normal
+                contact rows. Defaults to 1.0.
             contact_shared_anchor (bool, optional): If true, all contact rows use the midpoint between
                 the two witness points as the Jacobian point on both bodies, matching PhysX contact
                 prep's single ``contact.point`` lever arm. ``phi`` is still computed from the original
@@ -419,12 +424,15 @@ class SolverFeatherPGS(SolverBase):
         self.contact_friction_gap_threshold = contact_friction_gap_threshold
         self.contact_friction_position_iterations = int(contact_friction_position_iterations)
         self.contact_friction_shared_anchor = bool(contact_friction_shared_anchor)
+        self.contact_friction_scale = float(contact_friction_scale)
         self.contact_shared_anchor = bool(contact_shared_anchor)
         if self.contact_friction_position_iterations < -1:
             raise ValueError(
                 "contact_friction_position_iterations must be -1 for all position iterations, "
                 "or a non-negative last-N iteration count"
             )
+        if self.contact_friction_scale < 0.0:
+            raise ValueError("contact_friction_scale must be non-negative")
         self.enable_joint_limits = enable_joint_limits
         self.enable_joint_velocity_limits = enable_joint_velocity_limits
         self.pgs_iterations = pgs_iterations
@@ -3210,6 +3218,7 @@ class SolverFeatherPGS(SolverBase):
                         enable_friction_flag,
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
+                        self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
                         self.pgs_cfm,
@@ -3350,6 +3359,7 @@ class SolverFeatherPGS(SolverBase):
                         enable_friction_flag,
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
+                        self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
                     ],

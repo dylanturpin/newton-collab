@@ -1503,6 +1503,7 @@ def build_contact_rows_normal(
     contact_beta: float,
     contact_cfm: float,
     enable_friction: int,
+    contact_friction_scale: float,
     # Outputs
     constraint_counts: wp.array(dtype=int),
     Jc_out: wp.array(dtype=float),
@@ -1558,6 +1559,7 @@ def build_contact_rows_normal(
         mat_count += 1
     if mat_count > 0:
         mu /= float(mat_count)
+    friction_mu = mu * contact_friction_scale
 
     point_a_local = contact_point0[tid]
     point_b_local = contact_point1[tid]
@@ -1660,7 +1662,7 @@ def build_contact_rows_normal(
         target_velocity[row_index_1] = 0.0
         phi_out[row_index_1] = 0.0
         row_parent[row_index_1] = phi_index
-        row_mu[row_index_1] = mu
+        row_mu[row_index_1] = friction_mu
 
         accumulate_contact_jacobian_matrix_free(
             articulation,
@@ -1709,7 +1711,7 @@ def build_contact_rows_normal(
         target_velocity[row_index_2] = 0.0
         phi_out[row_index_2] = 0.0
         row_parent[row_index_2] = phi_index
-        row_mu[row_index_2] = mu
+        row_mu[row_index_2] = friction_mu
 
         accumulate_contact_jacobian_matrix_free(
             articulation,
@@ -2648,6 +2650,7 @@ def populate_world_J_for_size(
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
+    contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
     pgs_cfm: float,
@@ -2734,6 +2737,7 @@ def populate_world_J_for_size(
         mat_count += 1
     if mat_count > 0:
         mu /= float(mat_count)
+    friction_mu = mu * contact_friction_scale
 
     # Compute tangent basis for friction
     t0, t1 = contact_tangent_basis(normal)
@@ -2890,7 +2894,7 @@ def populate_world_J_for_size(
             # Friction row 1
             world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 1] = slot
-            world_row_mu[world, slot + 1] = mu
+            world_row_mu[world, slot + 1] = friction_mu
             world_row_beta[world, slot + 1] = 0.0
             world_row_cfm[world, slot + 1] = pgs_cfm
             world_phi[world, slot + 1] = 0.0
@@ -2899,7 +2903,7 @@ def populate_world_J_for_size(
             # Friction row 2
             world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 2] = slot
-            world_row_mu[world, slot + 2] = mu
+            world_row_mu[world, slot + 2] = friction_mu
             world_row_beta[world, slot + 2] = 0.0
             world_row_cfm[world, slot + 2] = pgs_cfm
             world_phi[world, slot + 2] = 0.0
@@ -2918,7 +2922,7 @@ def populate_world_J_for_size(
         if will_add_friction:
             world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 1] = slot
-            world_row_mu[world, slot + 1] = mu
+            world_row_mu[world, slot + 1] = friction_mu
             world_row_beta[world, slot + 1] = 0.0
             world_row_cfm[world, slot + 1] = pgs_cfm
             world_phi[world, slot + 1] = 0.0
@@ -2926,7 +2930,7 @@ def populate_world_J_for_size(
 
             world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 2] = slot
-            world_row_mu[world, slot + 2] = mu
+            world_row_mu[world, slot + 2] = friction_mu
             world_row_beta[world, slot + 2] = 0.0
             world_row_cfm[world, slot + 2] = pgs_cfm
             world_phi[world, slot + 2] = 0.0
@@ -3458,6 +3462,7 @@ def build_mf_contact_rows(
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
+    contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
     # outputs
@@ -3537,6 +3542,7 @@ def build_mf_contact_rows(
         mat_count += 1
     if mat_count > 0:
         mu /= float(mat_count)
+    friction_mu = mu * contact_friction_scale
 
     # Tangent basis
     t0, t1 = contact_tangent_basis(normal)
@@ -3601,7 +3607,10 @@ def build_mf_contact_rows(
             mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
             mf_row_parent[world, row_idx] = slot
             mf_phi[world, row_idx] = 0.0
-        mf_row_mu[world, row_idx] = mu
+        if row_offset == 0:
+            mf_row_mu[world, row_idx] = mu
+        else:
+            mf_row_mu[world, row_idx] = friction_mu
 
 
 @wp.func
