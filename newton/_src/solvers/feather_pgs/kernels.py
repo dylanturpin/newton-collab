@@ -257,6 +257,64 @@ def clamp_free_root_velocity_limits(
             qd[ds + 5] = ang[2] * scale
 
 
+@wp.kernel
+def prescale_joint_velocity_limits(
+    articulation_start: wp.array(dtype=int),
+    joint_type: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_dof_dim: wp.array(dtype=int, ndim=2),
+    joint_velocity_limit: wp.array(dtype=float),
+    # in/out
+    joint_qd: wp.array(dtype=float),
+):
+    """PhysX-style pre-solve joint velocity scaling.
+
+    PhysX computes a single ratio per articulation from maxJointVelocity and
+    applies that ratio to all articulation DOFs before building link velocities.
+    This is separate from the velocity-limit constraint rows solved later.
+    """
+    art = wp.tid()
+    joint_start = articulation_start[art]
+    joint_end = articulation_start[art + 1]
+
+    ratio = float(1.0)
+    for j in range(joint_start, joint_end):
+        jtype = joint_type[j]
+        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+            continue
+
+        lin_count = joint_dof_dim[j, 0]
+        ang_count = joint_dof_dim[j, 1]
+        axis_count = lin_count + ang_count
+        qd_start = joint_qd_start[j]
+
+        for axis in range(axis_count):
+            dof = qd_start + axis
+            limit = joint_velocity_limit[dof]
+            qd_abs = wp.abs(joint_qd[dof])
+            if limit > 0.0 and wp.isfinite(limit) and qd_abs > 0.0:
+                scale = limit / qd_abs
+                if scale < ratio:
+                    ratio = scale
+
+    if ratio >= 1.0:
+        return
+
+    for j in range(joint_start, joint_end):
+        jtype = joint_type[j]
+        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+            continue
+
+        lin_count = joint_dof_dim[j, 0]
+        ang_count = joint_dof_dim[j, 1]
+        axis_count = lin_count + ang_count
+        qd_start = joint_qd_start[j]
+
+        for axis in range(axis_count):
+            dof = qd_start + axis
+            joint_qd[dof] = joint_qd[dof] * ratio
+
+
 @wp.func
 def transform_spatial_inertia(t: wp.transform, I: wp.spatial_matrix):
     """
@@ -596,6 +654,8 @@ def jcalc_integrate(
     lin_axis_count: int,
     ang_axis_count: int,
     dt: float,
+    angular_damping: float,
+    parent: int,
     # outputs
     joint_q_new: wp.array(dtype=float),
     joint_qd_new: wp.array(dtype=float),
@@ -657,6 +717,7 @@ def jcalc_integrate(
         # symplectic Euler
         w_s = w_s + m_s * dt
         v_com = v_com + a_s * dt
+        w_s_integrate = w_s
 
         p_s = wp.vec3(joint_q[coord_start + 0], joint_q[coord_start + 1], joint_q[coord_start + 2])
 
@@ -664,13 +725,16 @@ def jcalc_integrate(
             joint_q[coord_start + 3], joint_q[coord_start + 4], joint_q[coord_start + 5], joint_q[coord_start + 6]
         )
         com_offset_world = wp.quat_rotate(r_s, body_com[child])
-        dpdt_s = v_com - wp.cross(w_s, com_offset_world)
+        dpdt_s = v_com - wp.cross(w_s_integrate, com_offset_world)
 
-        drdt_s = wp.quat(w_s, 0.0) * r_s * 0.5
+        drdt_s = wp.quat(w_s_integrate, 0.0) * r_s * 0.5
 
         # new orientation (normalized)
         p_s_new = p_s + dpdt_s * dt
         r_s_new = wp.normalize(r_s + drdt_s * dt)
+
+        if parent < 0:
+            w_s = w_s * (1.0 - angular_damping * dt)
 
         # update transform
         joint_q_new[coord_start + 0] = p_s_new[0]
@@ -1264,6 +1328,7 @@ def dense_solve(
 @wp.kernel
 def integrate_generalized_joints(
     joint_type: wp.array(dtype=int),
+    joint_parent: wp.array(dtype=int),
     joint_child: wp.array(dtype=int),
     joint_q_start: wp.array(dtype=int),
     joint_qd_start: wp.array(dtype=int),
@@ -1273,6 +1338,7 @@ def integrate_generalized_joints(
     joint_qd: wp.array(dtype=float),
     joint_qdd: wp.array(dtype=float),
     dt: float,
+    angular_damping: float,
     # outputs
     joint_q_new: wp.array(dtype=float),
     joint_qd_new: wp.array(dtype=float),
@@ -1281,6 +1347,7 @@ def integrate_generalized_joints(
     index = wp.tid()
 
     type = joint_type[index]
+    parent = joint_parent[index]
     child = joint_child[index]
     coord_start = joint_q_start[index]
     dof_start = joint_qd_start[index]
@@ -1299,6 +1366,8 @@ def integrate_generalized_joints(
         lin_axis_count,
         ang_axis_count,
         dt,
+        angular_damping,
+        parent,
         joint_q_new,
         joint_qd_new,
     )
@@ -2276,8 +2345,9 @@ def allocate_joint_velocity_limit_slots(
     * ``sign = -1`` — upper-limit violation (``qdot_i > +qdot_max``). The row
       pushes velocity back down (``J = -e_i``, ``target_vel = -qdot_max``).
 
-    The unilateral PGS projector (``lambda >= 0``) leaves satisfied rows at
-    zero impulse and activates the corresponding side before escape.
+    The matrix-free solver treats these rows as stateless PhysX-style clamp
+    rows: satisfied sides apply no impulse, and a violated side applies only
+    the current velocity overshoot correction.
 
     Outputs two entries per DOF in ``velocity_limit_slot`` (world-constraint
     row, or -1) and ``velocity_limit_sign`` (+1 / -1).
@@ -3681,6 +3751,130 @@ def build_mf_contact_rows(
             mf_row_mu[world, row_idx] = friction_mu
 
 
+@wp.kernel
+def allocate_rigid_velocity_limit_slots(
+    body_to_articulation: wp.array(dtype=int),
+    art_to_world: wp.array(dtype=int),
+    is_free_rigid: wp.array(dtype=int),
+    rigid_body_max_linear_velocity: wp.array(dtype=float),
+    rigid_body_max_angular_velocity: wp.array(dtype=float),
+    mf_max_constraints: int,
+    # outputs
+    rigid_velocity_limit_slot: wp.array(dtype=int),
+    rigid_velocity_limit_sign: wp.array(dtype=float),
+    mf_slot_counter: wp.array(dtype=int),
+):
+    """Allocate two signed MF velocity-limit rows per limited rigid velocity axis.
+
+    Free-rigid generalized velocity is stored as six root DOFs:
+    ``[lin_x, lin_y, lin_z, ang_x, ang_y, ang_z]``.  Each finite max speed
+    contributes lower/upper unilateral rows with Jacobians ``+e_i`` and
+    ``-e_i`` so the same stateless row projection used by articulated joint
+    velocity limits can clamp the current scalar speed.
+    """
+    body = wp.tid()
+    base = 12 * body
+
+    for row in range(12):
+        rigid_velocity_limit_slot[base + row] = -1
+        rigid_velocity_limit_sign[base + row] = 0.0
+
+    art = body_to_articulation[body]
+    if art < 0:
+        return
+    if is_free_rigid[art] == 0:
+        return
+
+    world = art_to_world[art]
+    if world < 0:
+        return
+
+    lin_limit = rigid_body_max_linear_velocity[body]
+    ang_limit = rigid_body_max_angular_velocity[body]
+
+    for axis in range(6):
+        limit = lin_limit
+        if axis >= 3:
+            limit = ang_limit
+        if limit <= 0.0 or not wp.isfinite(limit):
+            continue
+
+        lower_idx = base + 2 * axis
+        upper_idx = lower_idx + 1
+
+        lower_slot = wp.atomic_add(mf_slot_counter, world, 1)
+        if lower_slot < mf_max_constraints:
+            rigid_velocity_limit_slot[lower_idx] = lower_slot
+            rigid_velocity_limit_sign[lower_idx] = 1.0
+
+        upper_slot = wp.atomic_add(mf_slot_counter, world, 1)
+        if upper_slot < mf_max_constraints:
+            rigid_velocity_limit_slot[upper_idx] = upper_slot
+            rigid_velocity_limit_sign[upper_idx] = -1.0
+
+
+@wp.kernel
+def populate_rigid_velocity_limit_rows(
+    body_to_articulation: wp.array(dtype=int),
+    art_to_world: wp.array(dtype=int),
+    is_free_rigid: wp.array(dtype=int),
+    rigid_body_max_linear_velocity: wp.array(dtype=float),
+    rigid_body_max_angular_velocity: wp.array(dtype=float),
+    rigid_velocity_limit_slot: wp.array(dtype=int),
+    rigid_velocity_limit_sign: wp.array(dtype=float),
+    # outputs
+    mf_body_a: wp.array2d(dtype=int),
+    mf_body_b: wp.array2d(dtype=int),
+    mf_J_a: wp.array3d(dtype=float),
+    mf_J_b: wp.array3d(dtype=float),
+    mf_row_type: wp.array2d(dtype=int),
+    mf_row_parent: wp.array2d(dtype=int),
+    mf_row_mu: wp.array2d(dtype=float),
+    mf_phi: wp.array2d(dtype=float),
+):
+    """Populate MF rows for rigid-body linear/angular velocity limits."""
+    body = wp.tid()
+    art = body_to_articulation[body]
+    if art < 0:
+        return
+    if is_free_rigid[art] == 0:
+        return
+
+    world = art_to_world[art]
+    if world < 0:
+        return
+
+    lin_limit = rigid_body_max_linear_velocity[body]
+    ang_limit = rigid_body_max_angular_velocity[body]
+    base = 12 * body
+
+    for axis in range(6):
+        limit = lin_limit
+        if axis >= 3:
+            limit = ang_limit
+
+        for side in range(2):
+            row_idx = base + 2 * axis + side
+            slot = rigid_velocity_limit_slot[row_idx]
+            if slot < 0:
+                continue
+
+            sign = rigid_velocity_limit_sign[row_idx]
+            for k in range(6):
+                mf_J_a[world, slot, k] = 0.0
+                mf_J_b[world, slot, k] = 0.0
+            mf_J_a[world, slot, axis] = sign
+
+            mf_body_a[world, slot] = body
+            mf_body_b[world, slot] = -1
+            mf_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+            mf_row_parent[world, slot] = -1
+            mf_row_mu[world, slot] = 0.0
+            # For velocity-limit rows mf_phi stores qdot_max; contact rows
+            # use it as geometric gap. Row type disambiguates the meaning.
+            mf_phi[world, slot] = limit
+
+
 @wp.func
 def spatial_matrix_block_inverse(M: wp.spatial_matrix):
     """Invert a 6x6 spatial matrix using 3x3 block inversion.
@@ -3924,6 +4118,8 @@ def compute_mf_effective_mass_and_rhs(
                 bias = wp.max(bias, -max_depen)
         else:
             bias = phi_val / dt
+    elif rtype == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+        bias = mf_phi[world, i]
 
     mf_rhs[world, i] = bias
 
@@ -3952,7 +4148,8 @@ def compute_mf_rhs_bias(
         return
 
     bias = float(0.0)
-    if mf_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
+    row_type = mf_row_type[world, i]
+    if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
         phi_val = mf_phi[world, i]
         if phi_val < 0.0:
             bias = bias_scale * pgs_beta * phi_val / dt
@@ -3970,6 +4167,8 @@ def compute_mf_rhs_bias(
                 bias = wp.max(bias, -max_depen)
         else:
             bias = speculative_scale * phi_val / dt
+    elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+        bias = mf_phi[world, i]
 
     mf_rhs[world, i] = bias
 
@@ -4861,13 +5060,21 @@ def pgs_solve_mf_loop(
                     jv += mf_J_b[world, i, k] * v_out[ds_b + k]
 
             # PGS update: delta = -(J*v_current + bias) / d_ii
-            delta = -(jv + mf_rhs[world, i]) * eff_inv
+            residual = jv + mf_rhs[world, i]
+            delta = -residual * eff_inv
             new_impulse = mf_impulses[world, i] + omega * delta
             old_impulse = mf_impulses[world, i]
+            delta_impulse = float(0.0)
 
             # Project
             if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
                 if new_impulse < 0.0:
+                    new_impulse = 0.0
+            elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+                if residual < 0.0:
+                    delta_impulse = delta
+                    new_impulse = delta
+                else:
                     new_impulse = 0.0
             elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
                 if friction_mode == FRICTION_MODE_BISECTION or friction_mode == FRICTION_MODE_BISECTION_DESAXCE:
@@ -4933,7 +5140,8 @@ def pgs_solve_mf_loop(
                         v_out,
                     )
 
-            delta_impulse = new_impulse - old_impulse
+            if row_type != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+                delta_impulse = new_impulse - old_impulse
             mf_impulses[world, i] = new_impulse
 
             # Apply velocity correction: v += M_inv * J^T * delta_impulse

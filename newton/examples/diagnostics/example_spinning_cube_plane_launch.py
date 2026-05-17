@@ -43,6 +43,7 @@ DEFAULT_YAW_SPEED = float(abs(CAPTURED_ANGULAR_VEL[2]))
 def _make_fpgs_solver(model: newton.Model, args: argparse.Namespace) -> SolverFeatherPGS:
     return SolverFeatherPGS(
         model,
+        angular_damping=args.angular_damping,
         update_mass_matrix_interval=1,
         pgs_iterations=args.pgs_iterations,
         pgs_beta=args.pgs_beta,
@@ -267,6 +268,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "solver": args.solver,
         "velocity_mode": args.velocity_mode,
         "dt": args.dt,
+        "angular_damping": args.angular_damping,
         "half_extent": args.half_extent,
         "initial_z": args.initial_z,
         "initial_twist": [float(x) for x in twist],
@@ -292,6 +294,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gravity", type=float, default=-9.81, help="Scalar gravity along the model up vector.")
     parser.add_argument("--mass", type=float, default=0.1)
     parser.add_argument("--mu", type=float, default=1.0)
+    parser.add_argument("--angular-damping", type=float, default=0.05)
     parser.add_argument("--ke", type=float, default=5.0e4)
     parser.add_argument("--kd", type=float, default=5.0e2)
     parser.add_argument("--kf", type=float, default=1.0e3)

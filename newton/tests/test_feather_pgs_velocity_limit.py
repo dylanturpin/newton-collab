@@ -20,8 +20,9 @@ These tests cover the feature introduced in issue #23:
 1. **Parameter plumbing and guards** — the new ``enable_joint_velocity_limits``
    kwarg is accepted, stored, and bound to the supported PGS mode.
 2. **Allocation kernel** — the Warp kernel ``allocate_joint_velocity_limit_slots``
-   reserves a slot only when ``|qdot_i| > qdot_max_i`` and encodes the side of
-   the bilateral ``[-qdot_max, +qdot_max]`` box via the sign of the row.
+   reserves lower/upper slots for every finite ``qdot_max_i`` so the bilateral
+   ``[-qdot_max, +qdot_max]`` box is present before the predicted velocity
+   escapes.
 3. **Populator kernel** — the Warp kernel
    ``populate_joint_velocity_limit_J_for_size`` writes a signed ±1 selector row
    into the grouped Jacobian and sets the correct constraint metadata
@@ -48,7 +49,11 @@ from newton._src.solvers import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     allocate_joint_velocity_limit_slots,
+    allocate_rigid_velocity_limit_slots,
+    pgs_solve_mf_loop,
     populate_joint_velocity_limit_J_for_size,
+    populate_rigid_velocity_limit_rows,
+    prescale_joint_velocity_limits,
 )
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -96,7 +101,7 @@ def run_default_is_flag_off(test: TestFeatherPGSVelocityLimitFlag, device):
 
 
 def run_flag_on_allocates_buffers(test: TestFeatherPGSVelocityLimitFlag, device):
-    """Passing the flag allocates per-DOF buffers sized to ``joint_dof_count``."""
+    """Passing the flag allocates lower/upper buffers for each DOF."""
     model = _build_two_dof_pendulum_model(device)
     solver = SolverFeatherPGS(
         model,
@@ -106,35 +111,35 @@ def run_flag_on_allocates_buffers(test: TestFeatherPGSVelocityLimitFlag, device)
     test.assertTrue(solver.enable_joint_velocity_limits)
     test.assertIsNotNone(solver.velocity_limit_slot)
     test.assertIsNotNone(solver.velocity_limit_sign)
-    test.assertEqual(solver.velocity_limit_slot.shape, (model.joint_dof_count,))
-    test.assertEqual(solver.velocity_limit_sign.shape, (model.joint_dof_count,))
+    test.assertEqual(solver.velocity_limit_slot.shape, (2 * model.joint_dof_count,))
+    test.assertEqual(solver.velocity_limit_sign.shape, (2 * model.joint_dof_count,))
     # Default slot entry is -1 (no row active).
     np.testing.assert_array_equal(
         solver.velocity_limit_slot.numpy(),
-        -np.ones(model.joint_dof_count, dtype=np.int32),
+        -np.ones(2 * model.joint_dof_count, dtype=np.int32),
     )
 
 
-def run_flag_on_dense_mode_raises(test: TestFeatherPGSVelocityLimitFlag, device):
-    """The dense PGS path is out of scope for issue #23 and must raise."""
+def run_flag_on_dense_mode_accepts(test: TestFeatherPGSVelocityLimitFlag, device):
+    """The flag is accepted in dense mode."""
     model = _build_two_dof_pendulum_model(device)
-    with test.assertRaises(NotImplementedError):
-        SolverFeatherPGS(
-            model,
-            enable_joint_velocity_limits=True,
-            pgs_mode="dense",
-        )
+    solver = SolverFeatherPGS(
+        model,
+        enable_joint_velocity_limits=True,
+        pgs_mode="dense",
+    )
+    test.assertTrue(solver.enable_joint_velocity_limits)
 
 
-def run_flag_on_split_mode_raises(test: TestFeatherPGSVelocityLimitFlag, device):
-    """The split PGS path is out of scope for issue #23 and must raise."""
+def run_flag_on_split_mode_accepts(test: TestFeatherPGSVelocityLimitFlag, device):
+    """The flag is accepted in split mode."""
     model = _build_two_dof_pendulum_model(device)
-    with test.assertRaises(NotImplementedError):
-        SolverFeatherPGS(
-            model,
-            enable_joint_velocity_limits=True,
-            pgs_mode="split",
-        )
+    solver = SolverFeatherPGS(
+        model,
+        enable_joint_velocity_limits=True,
+        pgs_mode="split",
+    )
+    test.assertTrue(solver.enable_joint_velocity_limits)
 
 
 class TestFeatherPGSVelocityLimitAllocationKernel(unittest.TestCase):
@@ -142,7 +147,7 @@ class TestFeatherPGSVelocityLimitAllocationKernel(unittest.TestCase):
 
 
 def run_allocation_activates_only_over_limit(test: TestFeatherPGSVelocityLimitAllocationKernel, device):
-    """Only DOFs whose ``|qdot|`` exceeds the per-axis limit get a slot."""
+    """Every finite-limited DOF gets lower/upper slots regardless of current qdot."""
     # Layout: one articulation with two revolute DOFs, limits = 2.0 rad/s.
     dof_count = 2
     max_constraints = 8
@@ -160,12 +165,12 @@ def run_allocation_activates_only_over_limit(test: TestFeatherPGSVelocityLimitAl
     # Each joint has 0 linear, 1 angular DOF.
     joint_dof_dim = wp.array(np.array([[0, 1], [0, 1]], dtype=np.int32), dtype=int, ndim=2, device=device)
     joint_velocity_limit = wp.array(np.array([2.0, 2.0], dtype=np.float32), dtype=float, device=device)
-    # DOF 0 well within limits; DOF 1 blown past the upper limit.
+    # Current qdot no longer gates row creation.
     joint_qd = wp.array(np.array([0.5, 3.5], dtype=np.float32), dtype=float, device=device)
     art_to_world = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
 
-    velocity_limit_slot = wp.full((dof_count,), -1, dtype=wp.int32, device=device)
-    velocity_limit_sign = wp.zeros((dof_count,), dtype=wp.float32, device=device)
+    velocity_limit_slot = wp.full((2 * dof_count,), -1, dtype=wp.int32, device=device)
+    velocity_limit_sign = wp.zeros((2 * dof_count,), dtype=wp.float32, device=device)
     world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
 
     wp.launch(
@@ -191,21 +196,16 @@ def run_allocation_activates_only_over_limit(test: TestFeatherPGSVelocityLimitAl
     sign = velocity_limit_sign.numpy()
     counter = int(world_slot_counter.numpy()[0])
 
-    # Exactly one slot allocated — only DOF 1 was over limit.
-    test.assertEqual(counter, 1)
-    test.assertEqual(int(slot[0]), -1)
-    test.assertEqual(int(slot[1]), 0)
-    test.assertAlmostEqual(float(sign[0]), 0.0, places=6)
-    # Upper-limit violation → sign = -1 (J points in -i direction to push qdot down).
-    test.assertAlmostEqual(float(sign[1]), -1.0, places=6)
+    test.assertEqual(counter, 4)
+    np.testing.assert_array_equal(slot, np.array([0, 1, 2, 3], dtype=np.int32))
+    np.testing.assert_allclose(sign, np.array([1.0, -1.0, 1.0, -1.0], dtype=np.float32), atol=1e-7)
 
 
 def run_allocation_lower_vs_upper_sides(test: TestFeatherPGSVelocityLimitAllocationKernel, device):
-    """Lower-limit violation → sign = +1; upper-limit violation → sign = -1.
+    """Lower row uses sign +1; upper row uses sign -1.
 
     This is the direct signal that the bilateral ``[-qdot_max, +qdot_max]``
-    box is encoded via the sign of the Jacobian row, not by two separate
-    rows per DOF.
+    box is encoded by the sign of the two per-DOF Jacobian rows.
     """
     dof_count = 2
     max_constraints = 8
@@ -225,8 +225,8 @@ def run_allocation_lower_vs_upper_sides(test: TestFeatherPGSVelocityLimitAllocat
     joint_qd = wp.array(np.array([-5.0, 5.0], dtype=np.float32), dtype=float, device=device)
     art_to_world = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
 
-    velocity_limit_slot = wp.full((dof_count,), -1, dtype=wp.int32, device=device)
-    velocity_limit_sign = wp.zeros((dof_count,), dtype=wp.float32, device=device)
+    velocity_limit_slot = wp.full((2 * dof_count,), -1, dtype=wp.int32, device=device)
+    velocity_limit_sign = wp.zeros((2 * dof_count,), dtype=wp.float32, device=device)
     world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
 
     wp.launch(
@@ -252,16 +252,10 @@ def run_allocation_lower_vs_upper_sides(test: TestFeatherPGSVelocityLimitAllocat
     sign = velocity_limit_sign.numpy()
     counter = int(world_slot_counter.numpy()[0])
 
-    test.assertEqual(counter, 2)
-    # Both DOFs allocated; slot indices 0 and 1 (atomic_add order may vary
-    # but indices must be distinct and in [0, 2)).
-    test.assertIn(int(slot[0]), (0, 1))
-    test.assertIn(int(slot[1]), (0, 1))
-    test.assertNotEqual(int(slot[0]), int(slot[1]))
-    # Lower violation pushes qdot up: sign = +1.
-    test.assertAlmostEqual(float(sign[0]), 1.0, places=6)
-    # Upper violation pushes qdot down: sign = -1.
-    test.assertAlmostEqual(float(sign[1]), -1.0, places=6)
+    test.assertEqual(counter, 4)
+    np.testing.assert_array_equal(slot, np.array([0, 1, 2, 3], dtype=np.int32))
+    # Each DOF gets a lower row (+e_i) and an upper row (-e_i).
+    np.testing.assert_allclose(sign, np.array([1.0, -1.0, 1.0, -1.0], dtype=np.float32), atol=1e-7)
 
 
 def run_allocation_nonpositive_limit_is_unlimited(test: TestFeatherPGSVelocityLimitAllocationKernel, device):
@@ -285,8 +279,8 @@ def run_allocation_nonpositive_limit_is_unlimited(test: TestFeatherPGSVelocityLi
     joint_qd = wp.array(np.array([100.0], dtype=np.float32), dtype=float, device=device)
     art_to_world = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
 
-    velocity_limit_slot = wp.full((dof_count,), -1, dtype=wp.int32, device=device)
-    velocity_limit_sign = wp.zeros((dof_count,), dtype=wp.float32, device=device)
+    velocity_limit_slot = wp.full((2 * dof_count,), -1, dtype=wp.int32, device=device)
+    velocity_limit_sign = wp.zeros((2 * dof_count,), dtype=wp.float32, device=device)
     world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
 
     wp.launch(
@@ -310,6 +304,43 @@ def run_allocation_nonpositive_limit_is_unlimited(test: TestFeatherPGSVelocityLi
 
     test.assertEqual(int(world_slot_counter.numpy()[0]), 0)
     test.assertEqual(int(velocity_limit_slot.numpy()[0]), -1)
+    test.assertEqual(int(velocity_limit_slot.numpy()[1]), -1)
+
+
+class TestFeatherPGSVelocityLimitPrescaleKernel(unittest.TestCase):
+    """Direct kernel tests for PhysX-style pre-solve velocity scaling."""
+
+
+def run_prescale_uses_single_articulation_ratio(test: TestFeatherPGSVelocityLimitPrescaleKernel, device):
+    """The most over-limit DOF scales every scalar DOF in the articulation."""
+    articulation_start = wp.array(np.array([0, 3], dtype=np.int32), dtype=int, device=device)
+    joint_type = wp.array(
+        np.array([int(JointType.REVOLUTE), int(JointType.REVOLUTE), int(JointType.PRISMATIC)], dtype=np.int32),
+        dtype=int,
+        device=device,
+    )
+    joint_qd_start = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=int, device=device)
+    joint_dof_dim = wp.array(np.array([[0, 1], [0, 1], [1, 0]], dtype=np.int32), dtype=int, ndim=2, device=device)
+    joint_velocity_limit = wp.array(np.array([10.0, 5.0, 8.0], dtype=np.float32), dtype=float, device=device)
+    joint_qd = wp.array(np.array([2.0, 20.0, -4.0], dtype=np.float32), dtype=float, device=device)
+
+    wp.launch(
+        prescale_joint_velocity_limits,
+        dim=1,
+        inputs=[
+            articulation_start,
+            joint_type,
+            joint_qd_start,
+            joint_dof_dim,
+            joint_velocity_limit,
+        ],
+        outputs=[joint_qd],
+        device=device,
+    )
+
+    # DOF 1 is the limiting axis: 5 / 20 = 0.25. PhysX applies this same
+    # articulation-wide ratio to every scalar DOF before link velocities are built.
+    np.testing.assert_allclose(joint_qd.numpy(), np.array([0.5, 5.0, -1.0], dtype=np.float32), atol=1e-6)
 
 
 class TestFeatherPGSVelocityLimitPopulatorKernel(unittest.TestCase):
@@ -344,9 +375,9 @@ def run_populator_writes_signed_selector_row_and_metadata(test: TestFeatherPGSVe
     joint_velocity_limit = wp.array(qdot_max, dtype=float, device=device)
 
     art_to_world = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
-    # DOF 0 → slot 0, sign -1 (upper); DOF 1 → slot 1, sign +1 (lower).
-    velocity_limit_slot = wp.array(np.array([0, 1], dtype=np.int32), dtype=int, device=device)
-    velocity_limit_sign = wp.array(np.array([-1.0, 1.0], dtype=np.float32), dtype=float, device=device)
+    # DOF 0 lower/upper → slots 0/1; DOF 1 lower/upper → slots 2/3.
+    velocity_limit_slot = wp.array(np.array([0, 1, 2, 3], dtype=np.int32), dtype=int, device=device)
+    velocity_limit_sign = wp.array(np.array([1.0, -1.0, 1.0, -1.0], dtype=np.float32), dtype=float, device=device)
     group_to_art = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
 
     pgs_cfm = 1.0e-6
@@ -392,27 +423,36 @@ def run_populator_writes_signed_selector_row_and_metadata(test: TestFeatherPGSVe
 
     # J rows are single signed-±1 selector rows at (slot, local_dof).
     J = J_group.numpy()
-    test.assertAlmostEqual(float(J[0, 0, 0]), -1.0, places=6)  # slot 0 row, DOF 0 col
+    test.assertAlmostEqual(float(J[0, 0, 0]), 1.0, places=6)  # slot 0 lower row, DOF 0 col
     test.assertAlmostEqual(float(J[0, 0, 1]), 0.0, places=6)
-    test.assertAlmostEqual(float(J[0, 1, 0]), 0.0, places=6)
-    test.assertAlmostEqual(float(J[0, 1, 1]), 1.0, places=6)  # slot 1 row, DOF 1 col
+    test.assertAlmostEqual(float(J[0, 1, 0]), -1.0, places=6)  # slot 1 upper row, DOF 0 col
+    test.assertAlmostEqual(float(J[0, 1, 1]), 0.0, places=6)
+    test.assertAlmostEqual(float(J[0, 2, 0]), 0.0, places=6)
+    test.assertAlmostEqual(float(J[0, 2, 1]), 1.0, places=6)  # slot 2 lower row, DOF 1 col
+    test.assertAlmostEqual(float(J[0, 3, 0]), 0.0, places=6)
+    test.assertAlmostEqual(float(J[0, 3, 1]), -1.0, places=6)  # slot 3 upper row, DOF 1 col
 
     row_type = world_row_type.numpy()
     test.assertEqual(int(row_type[0, 0]), PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
     test.assertEqual(int(row_type[0, 1]), PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+    test.assertEqual(int(row_type[0, 2]), PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+    test.assertEqual(int(row_type[0, 3]), PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
 
     # No Baumgarte / ERP — matches PhysX.
-    np.testing.assert_allclose(world_row_beta.numpy()[0, :2], np.zeros(2, dtype=np.float32), atol=1e-7)
+    np.testing.assert_allclose(world_row_beta.numpy()[0, :4], np.zeros(4, dtype=np.float32), atol=1e-7)
     # phi = 0 (velocity-limit row has no positional bias quantity).
-    np.testing.assert_allclose(world_phi.numpy()[0, :2], np.zeros(2, dtype=np.float32), atol=1e-7)
+    np.testing.assert_allclose(world_phi.numpy()[0, :4], np.zeros(4, dtype=np.float32), atol=1e-7)
     # target_vel = -qdot_max for both signs; combined with the sign flip in J
-    # this encodes the bilateral projection as a unilateral row with
-    # ``lambda >= 0``.
-    np.testing.assert_allclose(world_target_velocity.numpy()[0, :2], -qdot_max, atol=1e-7)
+    # this identifies which side of the bilateral clamp is currently violated.
+    np.testing.assert_allclose(
+        world_target_velocity.numpy()[0, :4],
+        np.array([-qdot_max[0], -qdot_max[0], -qdot_max[1], -qdot_max[1]], dtype=np.float32),
+        atol=1e-7,
+    )
     # cfm preserved.
-    np.testing.assert_allclose(world_row_cfm.numpy()[0, :2], np.full(2, pgs_cfm, dtype=np.float32), atol=1e-7)
+    np.testing.assert_allclose(world_row_cfm.numpy()[0, :4], np.full(4, pgs_cfm, dtype=np.float32), atol=1e-7)
     # No parent — the row is standalone (not a friction sibling).
-    np.testing.assert_array_equal(world_row_parent.numpy()[0, :2], np.array([-1, -1], dtype=np.int32))
+    np.testing.assert_array_equal(world_row_parent.numpy()[0, :4], np.array([-1, -1, -1, -1], dtype=np.int32))
 
 
 class TestFeatherPGSVelocityLimitEndToEnd(unittest.TestCase):
@@ -579,6 +619,143 @@ def run_end_to_end_flag_off_is_strict_noop(test: TestFeatherPGSVelocityLimitEndT
     test.assertAlmostEqual(peak_a, peak_b, delta=1e-6)
 
 
+class TestFeatherPGSRigidVelocityLimitRows(unittest.TestCase):
+    """Direct matrix-free row tests for free-rigid velocity limits."""
+
+
+def run_rigid_velocity_limit_rows_allocate_and_populate(test: TestFeatherPGSRigidVelocityLimitRows, device):
+    """A limited free rigid body gets signed MF rows for all six speed axes."""
+    mf_max_constraints = 16
+    body_to_articulation = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
+    art_to_world = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
+    is_free_rigid = wp.array(np.array([1], dtype=np.int32), dtype=int, device=device)
+    max_linear = wp.array(np.array([1.0], dtype=np.float32), dtype=float, device=device)
+    max_angular = wp.array(np.array([2.0], dtype=np.float32), dtype=float, device=device)
+
+    slot = wp.full((12,), -1, dtype=wp.int32, device=device)
+    sign = wp.zeros((12,), dtype=wp.float32, device=device)
+    counter = wp.zeros((1,), dtype=wp.int32, device=device)
+
+    wp.launch(
+        allocate_rigid_velocity_limit_slots,
+        dim=1,
+        inputs=[
+            body_to_articulation,
+            art_to_world,
+            is_free_rigid,
+            max_linear,
+            max_angular,
+            mf_max_constraints,
+        ],
+        outputs=[slot, sign, counter],
+        device=device,
+    )
+
+    np.testing.assert_array_equal(slot.numpy(), np.arange(12, dtype=np.int32))
+    np.testing.assert_allclose(sign.numpy(), np.array([1.0, -1.0] * 6, dtype=np.float32))
+    test.assertEqual(int(counter.numpy()[0]), 12)
+
+    mf_body_a = wp.zeros((1, mf_max_constraints), dtype=wp.int32, device=device)
+    mf_body_b = wp.zeros((1, mf_max_constraints), dtype=wp.int32, device=device)
+    mf_J_a = wp.zeros((1, mf_max_constraints, 6), dtype=wp.float32, device=device)
+    mf_J_b = wp.zeros((1, mf_max_constraints, 6), dtype=wp.float32, device=device)
+    mf_row_type = wp.zeros((1, mf_max_constraints), dtype=wp.int32, device=device)
+    mf_row_parent = wp.full((1, mf_max_constraints), -1, dtype=wp.int32, device=device)
+    mf_row_mu = wp.zeros((1, mf_max_constraints), dtype=wp.float32, device=device)
+    mf_phi = wp.zeros((1, mf_max_constraints), dtype=wp.float32, device=device)
+
+    wp.launch(
+        populate_rigid_velocity_limit_rows,
+        dim=1,
+        inputs=[
+            body_to_articulation,
+            art_to_world,
+            is_free_rigid,
+            max_linear,
+            max_angular,
+            slot,
+            sign,
+        ],
+        outputs=[mf_body_a, mf_body_b, mf_J_a, mf_J_b, mf_row_type, mf_row_parent, mf_row_mu, mf_phi],
+        device=device,
+    )
+
+    np.testing.assert_array_equal(mf_body_a.numpy()[0, :12], np.zeros(12, dtype=np.int32))
+    np.testing.assert_array_equal(mf_body_b.numpy()[0, :12], -np.ones(12, dtype=np.int32))
+    np.testing.assert_array_equal(
+        mf_row_type.numpy()[0, :12],
+        np.full(12, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, dtype=np.int32),
+    )
+    np.testing.assert_allclose(
+        mf_phi.numpy()[0, :12],
+        np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0], dtype=np.float32),
+    )
+
+    J = mf_J_a.numpy()[0, :12]
+    expected_J = np.zeros((12, 6), dtype=np.float32)
+    for axis in range(6):
+        expected_J[2 * axis, axis] = 1.0
+        expected_J[2 * axis + 1, axis] = -1.0
+    np.testing.assert_allclose(J, expected_J, atol=1e-7)
+    np.testing.assert_allclose(mf_J_b.numpy()[0, :12], 0.0, atol=1e-7)
+
+
+def run_rigid_velocity_limit_row_solves_upper_bound(test: TestFeatherPGSRigidVelocityLimitRows, device):
+    """The MF row projection clamps a free body's scalar speed to the row limit."""
+    mf_constraint_count = wp.array(np.array([1], dtype=np.int32), dtype=int, device=device)
+    mf_body_a = wp.array(np.array([[0]], dtype=np.int32), dtype=int, ndim=2, device=device)
+    mf_body_b = wp.array(np.array([[-1]], dtype=np.int32), dtype=int, ndim=2, device=device)
+    mf_MiJt_a = wp.array(np.array([[[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0]]], dtype=np.float32), dtype=float, ndim=3, device=device)
+    mf_MiJt_b = wp.zeros((1, 1, 6), dtype=wp.float32, device=device)
+    mf_J_a = wp.array(np.array([[[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0]]], dtype=np.float32), dtype=float, ndim=3, device=device)
+    mf_J_b = wp.zeros((1, 1, 6), dtype=wp.float32, device=device)
+    mf_eff_mass_inv = wp.array(np.array([[1.0]], dtype=np.float32), dtype=float, ndim=2, device=device)
+    mf_rhs = wp.array(np.array([[1.0]], dtype=np.float32), dtype=float, ndim=2, device=device)
+    mf_row_type = wp.array(
+        np.array([[PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT]], dtype=np.int32),
+        dtype=int,
+        ndim=2,
+        device=device,
+    )
+    mf_row_parent = wp.full((1, 1), -1, dtype=wp.int32, device=device)
+    mf_row_mu = wp.zeros((1, 1), dtype=wp.float32, device=device)
+    body_to_articulation = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
+    art_dof_start = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
+    impulses = wp.zeros((1, 1), dtype=wp.float32, device=device)
+    v_out = wp.array(np.array([5.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32), dtype=float, device=device)
+
+    wp.launch(
+        pgs_solve_mf_loop,
+        dim=1,
+        inputs=[
+            mf_constraint_count,
+            mf_body_a,
+            mf_body_b,
+            mf_MiJt_a,
+            mf_MiJt_b,
+            mf_J_a,
+            mf_J_b,
+            mf_eff_mass_inv,
+            mf_rhs,
+            mf_row_type,
+            mf_row_parent,
+            mf_row_mu,
+            body_to_articulation,
+            art_dof_start,
+            1,  # iterations
+            1.0,  # omega; velocity-limit rows apply their direct delta
+            0,  # friction_mode
+            0,  # friction_start_iteration
+            0,  # iteration_offset
+        ],
+        outputs=[impulses, v_out],
+        device=device,
+    )
+
+    test.assertAlmostEqual(float(v_out.numpy()[0]), 1.0, delta=1e-6)
+    test.assertGreater(float(impulses.numpy()[0, 0]), 0.0)
+
+
 devices = get_test_devices()
 
 for device in devices:
@@ -596,14 +773,14 @@ for device in devices:
     )
     add_function_test(
         TestFeatherPGSVelocityLimitFlag,
-        f"test_flag_on_dense_mode_raises_{device}",
-        run_flag_on_dense_mode_raises,
+        f"test_flag_on_dense_mode_accepts_{device}",
+        run_flag_on_dense_mode_accepts,
         devices=[device],
     )
     add_function_test(
         TestFeatherPGSVelocityLimitFlag,
-        f"test_flag_on_split_mode_raises_{device}",
-        run_flag_on_split_mode_raises,
+        f"test_flag_on_split_mode_accepts_{device}",
+        run_flag_on_split_mode_accepts,
         devices=[device],
     )
     add_function_test(
@@ -625,9 +802,27 @@ for device in devices:
         devices=[device],
     )
     add_function_test(
+        TestFeatherPGSVelocityLimitPrescaleKernel,
+        f"test_prescale_uses_single_articulation_ratio_{device}",
+        run_prescale_uses_single_articulation_ratio,
+        devices=[device],
+    )
+    add_function_test(
         TestFeatherPGSVelocityLimitPopulatorKernel,
         f"test_populator_writes_signed_selector_row_and_metadata_{device}",
         run_populator_writes_signed_selector_row_and_metadata,
+        devices=[device],
+    )
+    add_function_test(
+        TestFeatherPGSRigidVelocityLimitRows,
+        f"test_rigid_velocity_limit_rows_allocate_and_populate_{device}",
+        run_rigid_velocity_limit_rows_allocate_and_populate,
+        devices=[device],
+    )
+    add_function_test(
+        TestFeatherPGSRigidVelocityLimitRows,
+        f"test_rigid_velocity_limit_row_solves_upper_bound_{device}",
+        run_rigid_velocity_limit_row_solves_upper_bound,
         devices=[device],
     )
     # End-to-end tests require the CUDA-native matrix-free PGS sweep

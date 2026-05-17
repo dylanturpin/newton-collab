@@ -51,6 +51,7 @@ from .kernels import (
     allocate_joint_limit_slots,
     allocate_joint_velocity_limit_slots,
     allocate_physx_drive_slots,
+    allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
     apply_augmented_joint_tau,
     apply_augmented_mass_diagonal_grouped,
@@ -97,9 +98,11 @@ from .kernels import (
     pgs_ncp_residuals_diagnostic_velocity,
     pgs_solve_loop,
     pgs_solve_mf_loop,
+    prescale_joint_velocity_limits,
     populate_physx_drive_J_for_size,
     populate_joint_limit_J_for_size,
     populate_joint_velocity_limit_J_for_size,
+    populate_rigid_velocity_limit_rows,
     populate_world_J_for_size,
     prepare_world_impulses,
     rhs_accum_world_par_art,
@@ -1423,6 +1426,19 @@ class SolverFeatherPGS(SolverBase):
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
 
+        if self._has_rigid_body_velocity_limits and body_count > 0:
+            # Twelve entries per free rigid body: lower/upper rows for the
+            # three linear and three angular velocity components.
+            self.rigid_velocity_limit_slot = wp.full(
+                (12 * body_count,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+            )
+            self.rigid_velocity_limit_sign = wp.zeros(
+                (12 * body_count,), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+        else:
+            self.rigid_velocity_limit_slot = None
+            self.rigid_velocity_limit_sign = None
+
         self.mf_body_Hinv = wp.zeros((body_count,), dtype=wp.spatial_matrix, device=device, requires_grad=requires_grad)
 
         # World-relative DOF offsets for two-phase GS kernel
@@ -2595,6 +2611,20 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[self.qd_work],
                 device=model.device,
             )
+        if self.enable_joint_velocity_limits:
+            wp.launch(
+                prescale_joint_velocity_limits,
+                dim=model.articulation_count,
+                inputs=[
+                    model.articulation_start,
+                    model.joint_type,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_velocity_limit,
+                ],
+                outputs=[self.qd_work],
+                device=model.device,
+            )
 
         wp.launch(
             eval_rigid_id,
@@ -3398,6 +3428,62 @@ class SolverFeatherPGS(SolverBase):
                     device=model.device,
                 )
 
+        # Rigid-body velocity limits are matrix-free rows, not post-solve
+        # clamps, in the MF path. Allocate after contacts so they occupy the
+        # last MF slots; the fused PGS kernel also solves row_type=4 in a
+        # final phase so articulated and rigid velocity-limit rows are both
+        # visited after drive/contact/friction/position-limit rows.
+        if mf_active and self.rigid_velocity_limit_slot is not None:
+            wp.launch(
+                allocate_rigid_velocity_limit_slots,
+                dim=model.body_count,
+                inputs=[
+                    self.body_to_articulation,
+                    self.art_to_world,
+                    is_free_rigid,
+                    self.rigid_body_max_linear_velocity,
+                    self.rigid_body_max_angular_velocity,
+                    self.mf_max_constraints,
+                ],
+                outputs=[
+                    self.rigid_velocity_limit_slot,
+                    self.rigid_velocity_limit_sign,
+                    self.mf_slot_counter,
+                ],
+                device=model.device,
+            )
+            wp.launch(
+                populate_rigid_velocity_limit_rows,
+                dim=model.body_count,
+                inputs=[
+                    self.body_to_articulation,
+                    self.art_to_world,
+                    is_free_rigid,
+                    self.rigid_body_max_linear_velocity,
+                    self.rigid_body_max_angular_velocity,
+                    self.rigid_velocity_limit_slot,
+                    self.rigid_velocity_limit_sign,
+                ],
+                outputs=[
+                    self.mf_body_a,
+                    self.mf_body_b,
+                    self.mf_J_a,
+                    self.mf_J_b,
+                    self.mf_row_type,
+                    self.mf_row_parent,
+                    self.mf_row_mu,
+                    self.mf_phi,
+                ],
+                device=model.device,
+            )
+            wp.launch(
+                finalize_mf_constraint_counts,
+                dim=self.world_count,
+                inputs=[self.mf_slot_counter, self.mf_max_constraints, 1],
+                outputs=[self.mf_constraint_count],
+                device=model.device,
+            )
+
         # Joint limit constraints (outside contact block — limits work with or without contacts)
         if self.enable_joint_limits and self.limit_slot is not None:
             has_contacts = (
@@ -3923,6 +4009,12 @@ class SolverFeatherPGS(SolverBase):
 
     def _clamp_rigid_velocity_limits(self, qd: wp.array):
         if not self._has_root_free or not self._has_rigid_body_velocity_limits:
+            return
+        if self.pgs_mode == "matrix_free" and getattr(self, "rigid_velocity_limit_slot", None) is not None:
+            # Matrix-free solves free-rigid velocity limits as rows now. Keep
+            # this direct clamp for dense/split legacy paths only, otherwise
+            # probes cannot distinguish row enforcement from a hidden final
+            # projection.
             return
 
         wp.launch(
@@ -4566,6 +4658,7 @@ class SolverFeatherPGS(SolverBase):
                 dim=model.joint_count,
                 inputs=[
                     model.joint_type,
+                    model.joint_parent,
                     model.joint_child,
                     model.joint_q_start,
                     model.joint_qd_start,
@@ -4575,6 +4668,7 @@ class SolverFeatherPGS(SolverBase):
                     state_in.joint_qd,
                     state_aug.joint_qdd,
                     dt,
+                    self.angular_damping,
                 ],
                 outputs=[state_out.joint_q, state_out.joint_qd],
                 device=model.device,
@@ -4623,6 +4717,7 @@ class SolverFeatherPGS(SolverBase):
                 dim=model.joint_count,
                 inputs=[
                     model.joint_type,
+                    model.joint_parent,
                     model.joint_child,
                     model.joint_q_start,
                     model.joint_qd_start,
@@ -4632,6 +4727,7 @@ class SolverFeatherPGS(SolverBase):
                     state_in.joint_qd,
                     state_aug.joint_qdd,
                     dt,
+                    self.angular_damping,
                 ],
                 outputs=[state_out.joint_q, state_out.joint_qd],
                 device=model.device,
@@ -7121,6 +7217,7 @@ class TiledKernelFactory:
                 if (row_phase == 3 && row_type != 1 && row_type != 3) continue;
                 if (row_phase == 4 && row_type != 0 && row_type != 2) continue;
                 if (row_phase == 5 && row_type != 4) continue;
+                if ((row_phase == 0 || row_phase == 2) && row_type == 4) continue;
                 if (freeze_drive_rows != 0 && row_type == 1) continue;
                 if (row_type == 2 && global_iter < friction_start_iteration) {{
                     s_lam_dense[i] = 0.0f;
@@ -7146,6 +7243,7 @@ class TiledKernelFactory:
                 float delta = -residual / denom;
                 float old_impulse = s_lam_dense[i];
                 float new_impulse = old_impulse + omega * delta;
+                float delta_impulse = 0.0f;
 
                 // row_type 1=JOINT_TARGET: PhysX PGS force-drive row.
                 // computeDriveImpulse(lambda, jointVel, jointDeltaPos=0,
@@ -7157,18 +7255,36 @@ class TiledKernelFactory:
                     float max_imp = s_drive_max_imp_dense[i];
                     if (new_impulse > max_imp) new_impulse = max_imp;
                     if (new_impulse < -max_imp) new_impulse = -max_imp;
+                    delta_impulse = new_impulse - old_impulse;
                 }}
-                // row_type 0=CONTACT, 3=JOINT_LIMIT, 4=JOINT_VELOCITY_LIMIT:
-                // unilateral lambda >= 0 projector. The velocity-limit row
-                // uses a signed Jacobian so one side of the bilateral
-                // [-qdot_max, +qdot_max] box is active at a time.
-                else if (row_type == 0 || row_type == 3 || row_type == 4) {{
+                // row_type 4=JOINT_VELOCITY_LIMIT:
+                // PhysX-style stateless bilateral speed projection. The row
+                // uses a signed Jacobian and target velocity so residual < 0
+                // means that side of the velocity box is currently violated.
+                // Do not accumulate lambda: each visit recomputes jointV and
+                // applies only the impulse needed for the current overshoot.
+                else if (row_type == 4) {{
+                    if (residual < 0.0f) {{
+                        // PhysX applies the clamp delta directly; it is not
+                        // a relaxed PGS correction.
+                        delta_impulse = delta;
+                        new_impulse = delta_impulse;
+                    }} else {{
+                        new_impulse = 0.0f;
+                    }}
+                }}
+                // row_type 0=CONTACT, 3=JOINT_LIMIT: unilateral lambda >= 0
+                // projector with accumulated impulse.
+                else if (row_type == 0 || row_type == 3) {{
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    delta_impulse = new_impulse - old_impulse;
                 }} else if (row_type == 2) {{
                     {dense_friction_block}
+                    delta_impulse = new_impulse - old_impulse;
+                }} else {{
+                    delta_impulse = new_impulse - old_impulse;
                 }}
 
-                float delta_impulse = new_impulse - old_impulse;
                 s_lam_dense[i] = new_impulse;
 
                 // V update using prefetched Y
@@ -7230,6 +7346,8 @@ class TiledKernelFactory:
                 int packed_tp = meta.w;
                 int mf_rt = packed_tp & 0xFFFF;
 
+                if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2) continue;
+                if (row_phase == 0 && mf_rt == 4) continue;
                 if (mf_rt == 2 && global_iter < friction_start_iteration) {{
                     s_lam_mf[i] = 0.0f;
                     __syncwarp();
@@ -7257,14 +7375,23 @@ class TiledKernelFactory:
                 float delta = -residual * mf_diag;
                 float old_impulse = s_lam_mf[i];
                 float new_impulse = old_impulse + omega * delta;
+                float delta_impulse = 0.0f;
 
                 if (mf_rt == 0) {{
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
+                }} else if (mf_rt == 4) {{
+                    if (residual < 0.0f) {{
+                        delta_impulse = delta;
+                        new_impulse = delta_impulse;
+                    }} else {{
+                        delta_impulse = 0.0f;
+                        new_impulse = 0.0f;
+                    }}
                 }} else if (mf_rt == 2) {{
                     {mf_friction_block}
                 }}
 
-                float delta_impulse = new_impulse - old_impulse;
+                if (mf_rt != 4) delta_impulse = new_impulse - old_impulse;
                 s_lam_mf[i] = new_impulse;
 
                 // V update using prefetched MiJt values
@@ -7277,6 +7404,90 @@ class TiledKernelFactory:
                     }}
                 }}
                 __syncwarp();
+            }}
+
+            // ── Final velocity-limit phase ──
+            // Default/interleaved solves skip row_type=4 above and visit both
+            // dense articulated limits and MF rigid limits here, after all
+            // drive/contact/friction/position-limit rows. Split schedules use
+            // row_phase 2/5 as their explicit final velocity-limit pass.
+            if (row_phase == 0 || row_phase == 2) {{
+                for (int i = 0; i < m_dense; i++) {{
+                    if (s_rtype_dense[i] != 4) continue;
+                    float denom = s_diag_dense[i];
+                    if (denom <= 0.0f) continue;
+
+                    float my_sum_vlim = 0.0f;
+                    int row_base_vlim = jy_world_base + i * {D};
+                    for (int d = lane; d < {D}; d += 32) {{
+                        my_sum_vlim += J_world.data[row_base_vlim + d] * s_v[d];
+                    }}
+                    my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 16);
+                    my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 8);
+                    my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 4);
+                    my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 2);
+                    my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 1);
+                    float jv_vlim = __shfl_sync(MASK, my_sum_vlim, 0);
+
+                    float residual_vlim = jv_vlim + s_rhs_dense[i];
+                    float delta_vlim = -residual_vlim / denom;
+                    float delta_impulse_vlim = 0.0f;
+                    if (residual_vlim < 0.0f) delta_impulse_vlim = delta_vlim;
+                    if (lane == 0) s_lam_dense[i] = delta_impulse_vlim;
+
+                    if (delta_impulse_vlim != 0.0f) {{
+                        for (int d = lane; d < {D}; d += 32) {{
+                            s_v[d] += Y_world.data[row_base_vlim + d] * delta_impulse_vlim;
+                        }}
+                    }}
+                    __syncwarp();
+                }}
+            }}
+
+            if (row_phase == 0 || row_phase == 2 || row_phase == 5) {{
+                for (int i = 0; i < m_mf; i++) {{
+                    int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);
+                    int packed_tp = meta.w;
+                    int mf_rt = packed_tp & 0xFFFF;
+                    if (mf_rt != 4) continue;
+
+                    int packed_dofs = meta.x;
+                    int dof_a = packed_dofs >> 16;
+                    int dof_b = (packed_dofs << 16) >> 16;
+                    float mf_diag = __int_as_float(meta.y);
+                    if (mf_diag <= 0.0f) continue;
+
+                    int row_mf6 = mf6_base + i * 6;
+                    float my_sum_mf_vlim = 0.0f;
+                    if (lane < 6 && dof_a >= 0) {{
+                        my_sum_mf_vlim = mf_J_a.data[row_mf6 + lane] * s_v[dof_a + lane];
+                    }}
+                    if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                        my_sum_mf_vlim = mf_J_b.data[row_mf6 + lane - 6] * s_v[dof_b + lane - 6];
+                    }}
+                    my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 16);
+                    my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 8);
+                    my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 4);
+                    my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 2);
+                    my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 1);
+                    float jv_mf_vlim = __shfl_sync(MASK, my_sum_mf_vlim, 0);
+
+                    float residual_mf_vlim = jv_mf_vlim + __int_as_float(meta.z);
+                    float delta_mf_vlim = -residual_mf_vlim * mf_diag;
+                    float delta_impulse_mf_vlim = 0.0f;
+                    if (residual_mf_vlim < 0.0f) delta_impulse_mf_vlim = delta_mf_vlim;
+                    if (lane == 0) s_lam_mf[i] = delta_impulse_mf_vlim;
+
+                    if (delta_impulse_mf_vlim != 0.0f) {{
+                        if (lane < 6 && dof_a >= 0) {{
+                            s_v[dof_a + lane] += mf_MiJt_a.data[row_mf6 + lane] * delta_impulse_mf_vlim;
+                        }}
+                        if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                            s_v[dof_b + lane - 6] += mf_MiJt_b.data[row_mf6 + lane - 6] * delta_impulse_mf_vlim;
+                        }}
+                    }}
+                    __syncwarp();
+                }}
             }}
         }}
 
