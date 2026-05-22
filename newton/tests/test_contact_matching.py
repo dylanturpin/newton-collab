@@ -457,7 +457,10 @@ def test_box_on_plane_multiple_contacts(test, device):
     with wp.ScopedDevice(device):
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
-        b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.15)))
+        # Keep the box at the plane surface. Margin-only contacts are no
+        # longer guaranteed for this pair, and this test is about stable
+        # identity matching for real generated contacts.
+        b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1)))
         builder.add_shape_box(body=b, hx=0.1, hy=0.1, hz=0.1)
 
         model = builder.finalize(device=device)

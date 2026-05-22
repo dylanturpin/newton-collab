@@ -77,6 +77,7 @@ def run_free_root_velocity_roundtrip(test: TestFeatherPGSFreeRootVelocity, devic
 def run_free_root_integration_uses_origin_velocity(test: TestFeatherPGSFreeRootVelocity, device):
     """Free-joint position integration should convert CoM velocity back to origin velocity."""
     joint_type = wp.array(np.array([int(JointType.FREE)], dtype=np.int32), dtype=int, device=device)
+    joint_parent = wp.array(np.array([-1], dtype=np.int32), dtype=int, device=device)
     joint_child = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
     joint_q_start = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
     joint_qd_start = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
@@ -94,6 +95,7 @@ def run_free_root_integration_uses_origin_velocity(test: TestFeatherPGSFreeRootV
         dim=1,
         inputs=[
             joint_type,
+            joint_parent,
             joint_child,
             joint_q_start,
             joint_qd_start,
@@ -103,6 +105,7 @@ def run_free_root_integration_uses_origin_velocity(test: TestFeatherPGSFreeRootV
             joint_qd,
             joint_qdd,
             0.1,
+            0.0,
         ],
         outputs=[joint_q_new, joint_qd_new],
         device=device,

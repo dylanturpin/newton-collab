@@ -2546,7 +2546,8 @@ class ModelBuilder:
                 damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
                 (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
             physx_missing_inertia_fallback: If True, bodies with authored positive mass but no authored diagonal
-                inertia use PhysX's 0.1 m small-sphere inertia fallback instead of shape-derived inertia.
+                inertia use PhysX's 0.1 m small-sphere inertia fallback instead of shape-derived inertia. This is
+                intended for IsaacLab/PhysX parity when PhysX reports the "possibly invalid inertia tensor" fallback.
 
         Returns:
             The returned mapping has the following entries:

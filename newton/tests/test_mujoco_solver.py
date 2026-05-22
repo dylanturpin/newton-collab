@@ -3940,6 +3940,10 @@ class TestMuJoCoSolverNewtonContacts(unittest.TestCase):
         builder.default_shape_cfg.ke = 1e4
         builder.default_shape_cfg.kd = 1000.0
         builder.default_shape_cfg.margin = 0.05
+        # The regression needs margin-only contacts. A detection gap keeps
+        # those candidates in Newton's contact set so MuJoCo can classify them
+        # inactive and exercise efc_address initialization.
+        builder.default_shape_cfg.gap = 0.1
         builder.add_ground_plane()
         tilt = wp.quat_from_axis_angle(wp.vec3(1, 0, 0), 0.3)
         b = builder.add_body(xform=wp.transform(wp.vec3(0, 0, 0.18), tilt))

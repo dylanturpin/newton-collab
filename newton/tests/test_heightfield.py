@@ -327,8 +327,9 @@ class TestHeightfield(unittest.TestCase):
         hfield = Heightfield(data=elevation, nrow=nrow, ncol=ncol, hx=5.0, hy=5.0, min_z=0.0, max_z=1.0)
         builder.add_shape_heightfield(heightfield=hfield)
 
-        # Sphere slightly above the heightfield surface
-        sphere_body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.2), wp.quat_identity()))
+        # Put the sphere on the heightfield surface. The native pipeline no
+        # longer emits margin-only heightfield contacts for this setup.
+        sphere_body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()))
         builder.add_shape_sphere(body=sphere_body, radius=0.1)
 
         model = builder.finalize()
