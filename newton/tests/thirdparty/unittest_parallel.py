@@ -131,6 +131,20 @@ def main(argv=None):
         help="Use multiprocessing instead of concurrent.futures.",
     )  # NVIDIA Modification
     group_parallel.add_argument(
+        "--shard-count",
+        metavar="COUNT",
+        type=int,
+        default=1,
+        help="Split discovered suites into COUNT deterministic shards (default: 1).",
+    )  # NVIDIA Modification
+    group_parallel.add_argument(
+        "--shard-index",
+        metavar="INDEX",
+        type=int,
+        default=0,
+        help="Run shard INDEX when --shard-count is greater than 1 (default: 0).",
+    )  # NVIDIA Modification
+    group_parallel.add_argument(
         "--serial-fallback",
         action="store_true",
         default=False,
@@ -168,6 +182,10 @@ def main(argv=None):
         parser.exit(
             status=2, message="--coverage was used, but coverage was not found. Is it installed?\n"
         )  # NVIDIA Modification
+    if args.shard_count < 1:
+        parser.exit(status=2, message="--shard-count must be at least 1\n")
+    if args.shard_index < 0 or args.shard_index >= args.shard_count:
+        parser.exit(status=2, message="--shard-index must be in [0, --shard-count)\n")
 
     process_count = max(0, args.jobs)
     if process_count == 0:
@@ -201,13 +219,26 @@ def main(argv=None):
         else:  # args.level == 'module'
             test_suites = list(_iter_module_suites(discover_suite))
 
+        if args.shard_count > 1:
+            total_suites = len(test_suites)
+            test_suites = [
+                suite for idx, suite in enumerate(test_suites) if idx % args.shard_count == args.shard_index
+            ]
+            print(
+                f"Selected shard {args.shard_index + 1}/{args.shard_count}: "
+                f"{len(test_suites)} of {total_suites} discovered test suites",
+                file=sys.stderr,
+            )
+
+        selected_test_count = sum(suite.countTestCases() for suite in test_suites)
+
         # Don't use more processes than test suites
         process_count = max(1, min(len(test_suites), process_count))
 
         if not args.serial_fallback:
             # Report test suites and processes
             print(
-                f"Running {len(test_suites)} test suites ({discover_suite.countTestCases()} total tests) across {process_count} processes",
+                f"Running {len(test_suites)} test suites ({selected_test_count} total tests) across {process_count} processes",
                 file=sys.stderr,
             )
             if args.verbose > 1:
