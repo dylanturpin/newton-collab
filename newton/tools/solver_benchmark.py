@@ -416,6 +416,15 @@ def build_run_command(args, solver_config: dict, num_worlds: int, substeps: int 
 # =============================================================================
 
 
+def register_solver_custom_attributes(builder) -> None:
+    """Register solver attributes needed by benchmark model import/building."""
+    import newton  # noqa: PLC0415
+    from newton._src.solvers import SolverFeatherPGS  # noqa: PLC0415
+
+    newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
+    SolverFeatherPGS.register_custom_attributes(builder)
+
+
 def _build_friction_verification_scene(env: str, num_worlds: int):
     """Build one of the FPGS friction-mode verification scenes.
 
@@ -516,8 +525,7 @@ def build_model(args, scenario_cfg: dict):
 
     # Build articulation
     articulation_builder = newton.ModelBuilder()
-    newton.solvers.SolverMuJoCo.register_custom_attributes(articulation_builder)
-    newton.solvers.SolverFeatherPGS.register_custom_attributes(articulation_builder)
+    register_solver_custom_attributes(articulation_builder)
 
     robot = scenario_cfg["robot"]
     env = scenario_cfg.get("environment")

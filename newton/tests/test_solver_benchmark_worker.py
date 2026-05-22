@@ -75,6 +75,15 @@ class TestSolverBenchmarkWorker(unittest.TestCase):
         self.assertNotIn("--ablation", command)
         self.assertNotIn("--plot", command)
 
+    def test_register_solver_custom_attributes_uses_private_feather_pgs(self):
+        import newton
+
+        builder = newton.ModelBuilder()
+
+        solver_benchmark.register_solver_custom_attributes(builder)
+
+        self.assertIn("rigid_body_max_linear_velocity", builder.custom_attributes)
+
     def test_write_benchmark_artifacts_writes_measurement_and_metadata(self):
         args = _make_args()
         measurement = solver_benchmark.build_measurement_row(
