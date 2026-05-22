@@ -4945,6 +4945,41 @@ def Xform "Articulation" (
         )
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_massapi_partial_body_physx_missing_inertia_fallback(self):
+        """The IsaacLab opt-in path should use PhysX's small-sphere inertia fallback."""
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        body = UsdGeom.Xform.Define(stage, "/World/Body")
+        body_prim = body.GetPrim()
+        UsdPhysics.RigidBodyAPI.Apply(body_prim)
+        UsdPhysics.MassAPI.Apply(body_prim).CreateMassAttr().Set(1.0)
+
+        collider = UsdGeom.Cube.Define(stage, "/World/Body/Collider")
+        collider.CreateSizeAttr().Set(2.0)
+        collider_prim = collider.GetPrim()
+        UsdPhysics.CollisionAPI.Apply(collider_prim)
+        collider_mass_api = UsdPhysics.MassAPI.Apply(collider_prim)
+        collider_mass_api.CreateMassAttr().Set(2.0)
+        collider_mass_api.CreateDiagonalInertiaAttr().Set(Gf.Vec3f(1.3333334, 1.3333334, 1.3333334))
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, physx_missing_inertia_fallback=True)
+        body_idx = result["path_body_map"]["/World/Body"]
+
+        self.assertAlmostEqual(builder.body_mass[body_idx], 1.0, places=6)
+        expected_diag = 0.4 * 1.0 * 0.1**2
+        inertia = np.array(builder.body_inertia[body_idx]).reshape(3, 3)
+        np.testing.assert_allclose(
+            np.diag(inertia), np.array([expected_diag, expected_diag, expected_diag]), atol=1e-6, rtol=1e-6
+        )
+        np.testing.assert_allclose(inertia - np.diag(np.diag(inertia)), np.zeros((3, 3)), atol=1e-7)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_massapi_authored_mass_without_inertia_scales_to_uniform_density(self):
         """Authored mass without inertia should produce inertia consistent with a uniform-density body.
 

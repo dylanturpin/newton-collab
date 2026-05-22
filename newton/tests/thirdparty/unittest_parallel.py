@@ -138,6 +138,20 @@ def main(argv=None):
         help="Timeout in seconds for collecting all parallel test results (default is 3600)",
     )  # NVIDIA Modification
     group_parallel.add_argument(
+        "--shard-count",
+        metavar="COUNT",
+        type=int,
+        default=1,
+        help="Split discovered suites into COUNT deterministic shards (default: 1).",
+    )  # NVIDIA Modification
+    group_parallel.add_argument(
+        "--shard-index",
+        metavar="INDEX",
+        type=int,
+        default=0,
+        help="Run shard INDEX when --shard-count is greater than 1 (default: 0).",
+    )  # NVIDIA Modification
+    group_parallel.add_argument(
         "--serial-fallback",
         action="store_true",
         default=False,
@@ -169,6 +183,10 @@ def main(argv=None):
     args = parser.parse_args(args=argv)
     if args.parallel_timeout <= 0:
         parser.error("--parallel-timeout must be greater than 0")
+    if args.shard_count < 1:
+        parser.error("--shard-count must be at least 1")
+    if args.shard_index < 0 or args.shard_index >= args.shard_count:
+        parser.error("--shard-index must be in [0, --shard-count)")
 
     if args.coverage_branch:
         args.coverage = args.coverage_branch
@@ -214,13 +232,26 @@ def main(argv=None):
         else:  # args.level == 'module'
             test_suites = list(_iter_module_suites(discover_suite))
 
+        if args.shard_count > 1:
+            total_suites = len(test_suites)
+            test_suites = [
+                suite for idx, suite in enumerate(test_suites) if idx % args.shard_count == args.shard_index
+            ]
+            print(
+                f"Selected shard {args.shard_index + 1}/{args.shard_count}: "
+                f"{len(test_suites)} of {total_suites} discovered test suites",
+                file=sys.stderr,
+            )
+
+        selected_test_count = sum(suite.countTestCases() for suite in test_suites)
+
         # Don't use more processes than test suites
         process_count = max(1, min(len(test_suites), process_count))
 
         if not args.serial_fallback:
             # Report test suites and processes
             print(
-                f"Running {len(test_suites)} test suites ({discover_suite.countTestCases()} total tests) across {process_count} processes",
+                f"Running {len(test_suites)} test suites ({selected_test_count} total tests) across {process_count} processes",
                 file=sys.stderr,
             )
             if args.verbose > 1:
@@ -279,7 +310,7 @@ def main(argv=None):
             # This entire path is an NVIDIA Modification
 
             # Report test suites and processes
-            print(f"Running {discover_suite.countTestCases()} total tests (serial fallback)", file=sys.stderr)
+            print(f"Running {selected_test_count} total tests (serial fallback)", file=sys.stderr)
             if args.verbose > 1:
                 print(file=sys.stderr)
 
@@ -288,7 +319,7 @@ def main(argv=None):
 
             with multiprocessing.Manager() as manager:
                 test_manager = ParallelTestManager(manager, args, temp_dir)
-                results = [test_manager.run_tests(discover_suite)]
+                results = [test_manager.run_tests(unittest.TestSuite(test_suites))]
 
         stop_time = time.perf_counter()
         test_duration = stop_time - start_time
