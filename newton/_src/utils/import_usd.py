@@ -89,6 +89,7 @@ def parse_usd(
     schema_resolvers: list[SchemaResolver] | None = None,
     force_position_velocity_actuation: bool = False,
     override_root_xform: bool = False,
+    physx_missing_inertia_fallback: bool = False,
 ) -> dict[str, Any]:
     """Parses a Universal Scene Description (USD) stage and adds rigid bodies, soft bodies, shapes, and joints to the given ModelBuilder.
 
@@ -213,6 +214,9 @@ def parse_usd(
             :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
             damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
             (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
+        physx_missing_inertia_fallback: If True, bodies with authored positive mass but no authored diagonal
+            inertia use PhysX's 0.1 m small-sphere inertia fallback instead of shape-derived inertia. This is
+            intended for IsaacLab/PhysX parity when PhysX reports the "possibly invalid inertia tensor" fallback.
 
     Returns:
         The returned mapping has the following entries:
@@ -3005,6 +3009,7 @@ def parse_usd(
             has_authored_mass = mass_api.GetMassAttr().HasAuthoredValue()
             has_authored_inertia = mass_api.GetDiagonalInertiaAttr().HasAuthoredValue()
             has_authored_com = mass_api.GetCenterOfMassAttr().HasAuthoredValue()
+            mass_compute_failed = False
 
             # Compute baseline mass properties via mass computer when at least one property needs resolving.
             if not (has_authored_mass and has_authored_inertia and has_authored_com):
@@ -3013,6 +3018,7 @@ def parse_usd(
                     _get_collision_mass_information
                 )
                 if cmp_mass < 0.0:
+                    mass_compute_failed = True
                     # ComputeMassProperties failed to discover colliders (e.g. shapes
                     # created by schema resolvers are not real USD prims). Fall back to
                     # builder-accumulated mass properties from add_shape_*() calls.
@@ -3083,7 +3089,23 @@ def parse_usd(
                     )
                 # When mass is authored but inertia is not, scale the accumulated
                 # inertia to be consistent with the authored mass.
-                if not has_authored_inertia and shape_accumulated_mass > 0.0 and mass > 0.0:
+                use_physx_missing_inertia_fallback = (
+                    not has_authored_inertia
+                    and mass > 0.0
+                    and (mass_compute_failed or physx_missing_inertia_fallback)
+                )
+                if use_physx_missing_inertia_fallback:
+                    radius = 0.1 / linear_unit if linear_unit > 0.0 else 0.1
+                    inertia_val = 0.4 * mass * radius * radius
+                    inertia = wp.mat33(np.eye(3, dtype=np.float32) * inertia_val)
+                    builder.body_inertia[body_id] = inertia
+                    builder.body_inv_inertia[body_id] = wp.inverse(inertia)
+                    if verbose:
+                        print(
+                            f"Applied PhysX small-sphere fallback inertia for body {body_path}: "
+                            f"diagonal elements = [{inertia_val}, {inertia_val}, {inertia_val}]"
+                        )
+                elif not has_authored_inertia and shape_accumulated_mass > 0.0 and mass > 0.0:
                     scale = mass / shape_accumulated_mass
                     builder.body_inertia[body_id] = wp.mat33(np.array(builder.body_inertia[body_id]) * scale)
                     builder.body_inv_inertia[body_id] = wp.inverse(builder.body_inertia[body_id])

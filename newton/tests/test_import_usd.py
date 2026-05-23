@@ -4945,6 +4945,34 @@ def Xform "Articulation" (
         )
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_massapi_authored_mass_without_inertia_can_use_physx_fallback(self):
+        """IsaacLab can request PhysX's small-sphere fallback for authored mass with missing inertia."""
+        from pxr import Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        body = UsdGeom.Xform.Define(stage, "/World/Body")
+        body_prim = body.GetPrim()
+        UsdPhysics.RigidBodyAPI.Apply(body_prim)
+        UsdPhysics.MassAPI.Apply(body_prim).CreateMassAttr().Set(1.0)
+
+        collider = UsdGeom.Cube.Define(stage, "/World/Body/Collider")
+        collider.CreateSizeAttr().Set(2.0)
+        UsdPhysics.CollisionAPI.Apply(collider.GetPrim())
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, physx_missing_inertia_fallback=True)
+        body_idx = result["path_body_map"]["/World/Body"]
+
+        inertia = np.array(builder.body_inertia[body_idx]).reshape(3, 3)
+        expected_diag = np.array([0.004, 0.004, 0.004], dtype=np.float32)
+        np.testing.assert_allclose(np.diag(inertia), expected_diag, atol=1e-7, rtol=1e-6)
+        np.testing.assert_allclose(inertia - np.diag(np.diag(inertia)), np.zeros((3, 3)), atol=1e-7)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_massapi_authored_mass_without_inertia_scales_to_uniform_density(self):
         """Authored mass without inertia should produce inertia consistent with a uniform-density body.
 
