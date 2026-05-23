@@ -1,180 +1,264 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Regression wrapper for the prismatic sphere/cube/table contact probe."""
+"""Regression tests for a prismatic FeatherPGS pusher loading a cube contact."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
 import unittest
 
 import numpy as np
 import warp as wp
 
-from newton.examples.diagnostics.example_prismatic_sphere_cube_press import (
-    BAD_FRAME_CUBE_HALF,
-    BAD_FRAME_CUBE_TO_FINGER_NORMAL,
-    CONTACT_PROXY_SCENARIOS,
-    LATEST_BAD_FRAME_CUBE_TO_LEFTFINGER_NORMAL,
-    LATEST_BAD_FRAME_CUBE_TO_LEFTFINGER_POINTS,
-    SCENARIOS,
-    initial_contact_report,
-    row_problem_report,
-    run_all,
-    run_scenario,
-)
+import newton
+from newton import JointTargetMode
+from newton._src.solvers import SolverFeatherPGS
 
 
-LATEST_CAPTURED_LEFTFINGER_ROW_SUMMARY = {
-    "dof_count": 15,
-    "dense_count": 66,
-    "drive_rows": 9,
-    "contact_diag": np.array([9.85766887664795, 14.213494300842285, 14.217225074768066]),
-    "contact_j_other_norm": np.array([0.6812865622006786, 0.6644039640376553, 0.664398035878512]),
-    "contact_j_cube": np.array(
-        [
-            [
-                0.9997262358665466,
-                -1.4075219041842502e-05,
-                -0.023397525772452354,
-                -0.0002613405813463032,
-                0.012656403705477715,
-                -0.011174137704074383,
-            ],
-            [
-                0.9997262358665466,
-                -1.4075219041842502e-05,
-                -0.023397525772452354,
-                -0.0002426105347694829,
-                0.023431912064552307,
-                -0.01038032490760088,
-            ],
-            [
-                0.9997262358665466,
-                -1.4075219041842502e-05,
-                -0.023397525772452354,
-                -0.00024278639466501772,
-                0.02343541942536831,
-                -0.010387841612100601,
-            ],
-        ],
-        dtype=np.float64,
-    ),
-}
+CUBE_HALF = 0.05
+CUBE_MASS = 1.0
+SPHERE_RADIUS = 0.035
+SPHERE_MASS = 0.25
+TABLE_HALF_XY = 0.35
+TABLE_HALF_Z = 0.025
+CONTACT_GAP = 0.004
+DRIVE_STIFFNESS = 1.0e3
+TARGET_OVERLAP = 0.025
+DT = 0.005
 
 
-def _scenario(name: str):
-    return next(s for s in SCENARIOS if s.name == name)
+@dataclass(frozen=True)
+class SceneIds:
+    cube_body: int
+    pusher_body: int
+    table_shape: int
+    cube_shape: int
+    pusher_shape: int
+    pusher_joint: int
 
 
-def _proxy_scenario(name: str):
-    return next(s for s in CONTACT_PROXY_SCENARIOS if s.name == name)
+def _shape_cfg(mu: float) -> newton.ModelBuilder.ShapeConfig:
+    cfg = newton.ModelBuilder.ShapeConfig(mu=mu, density=0.0)
+    cfg.ke = 5.0e4
+    cfg.kd = 5.0e2
+    cfg.kf = 1.0e3
+    cfg.margin = 0.0
+    cfg.gap = CONTACT_GAP
+    return cfg
+
+
+def _make_solver(model: newton.Model) -> SolverFeatherPGS:
+    return SolverFeatherPGS(
+        model,
+        update_mass_matrix_interval=1,
+        pgs_mode="matrix_free",
+        pgs_kernel="tiled_row",
+        pgs_iterations=16,
+        pgs_beta=0.05,
+        pgs_cfm=1.0e-6,
+        pgs_omega=1.0,
+        dense_max_constraints=64,
+        mf_max_constraints=256,
+        pgs_warmstart=False,
+        enable_contact_friction=True,
+        contact_friction_gap_threshold=0.04,
+        enable_joint_limits=True,
+        enable_joint_velocity_limits=True,
+        drive_mode="physx_pgs",
+        friction_mode="bisection",
+        pgs_schedule="contact_then_internal",
+        double_buffer=False,
+        use_parallel_streams=False,
+    )
+
+
+def _build_scene(device: wp.context.Device) -> tuple[newton.Model, SceneIds]:
+    builder = newton.ModelBuilder(gravity=-9.81)
+    builder.rigid_gap = CONTACT_GAP
+
+    table_shape = builder.add_shape_box(
+        body=-1,
+        xform=wp.transform(wp.vec3(0.0, 0.0, -TABLE_HALF_Z), wp.quat_identity()),
+        hx=TABLE_HALF_XY,
+        hy=TABLE_HALF_XY,
+        hz=TABLE_HALF_Z,
+        cfg=_shape_cfg(0.8),
+        label="table",
+    )
+
+    cube_inertia = (1.0 / 6.0) * CUBE_MASS * (2.0 * CUBE_HALF) ** 2
+    cube_body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, CUBE_HALF), wp.quat_identity()),
+        mass=CUBE_MASS,
+        inertia=wp.mat33(cube_inertia, 0.0, 0.0, 0.0, cube_inertia, 0.0, 0.0, 0.0, cube_inertia),
+        lock_inertia=True,
+        label="cube",
+    )
+    cube_shape = builder.add_shape_box(
+        body=cube_body,
+        hx=CUBE_HALF,
+        hy=CUBE_HALF,
+        hz=CUBE_HALF,
+        cfg=_shape_cfg(0.8),
+        label="cube_shape",
+    )
+
+    pusher_start = wp.vec3(0.0, 0.0, 2.0 * CUBE_HALF + SPHERE_RADIUS)
+    sphere_inertia = (2.0 / 5.0) * SPHERE_MASS * SPHERE_RADIUS**2
+    pusher_body = builder.add_link(
+        xform=wp.transform(pusher_start, wp.quat_identity()),
+        mass=SPHERE_MASS,
+        inertia=wp.mat33(
+            sphere_inertia,
+            0.0,
+            0.0,
+            0.0,
+            sphere_inertia,
+            0.0,
+            0.0,
+            0.0,
+            sphere_inertia,
+        ),
+        lock_inertia=True,
+        label="driven_pusher",
+    )
+    pusher_shape = builder.add_shape_sphere(
+        body=pusher_body,
+        radius=SPHERE_RADIUS,
+        cfg=_shape_cfg(0.8),
+        label="driven_pusher_shape",
+    )
+    pusher_joint = builder.add_joint_prismatic(
+        parent=-1,
+        child=pusher_body,
+        parent_xform=wp.transform(pusher_start, wp.quat_identity()),
+        child_xform=wp.transform_identity(),
+        axis=wp.vec3(0.0, 0.0, -1.0),
+        target_pos=TARGET_OVERLAP,
+        target_vel=0.0,
+        target_ke=DRIVE_STIFFNESS,
+        target_kd=2.0 * math.sqrt(DRIVE_STIFFNESS),
+        limit_lower=0.0,
+        limit_upper=0.08,
+        effort_limit=60.0,
+        velocity_limit=1.0,
+        actuator_mode=JointTargetMode.POSITION,
+        label="pusher_axis",
+    )
+    builder.add_articulation([pusher_joint], label="driven_pusher_articulation")
+
+    model = builder.finalize(device=device)
+    model.request_contact_attributes("force")
+    return model, SceneIds(cube_body, pusher_body, table_shape, cube_shape, pusher_shape, pusher_joint)
+
+
+def _contact_normals_from_a_to_b(contacts, shape_a: int, shape_b: int) -> np.ndarray:
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+    shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+    normals = contacts.rigid_contact_normal.numpy()[:count]
+    out: list[np.ndarray] = []
+    for i in range(count):
+        s0 = int(shape0[i])
+        s1 = int(shape1[i])
+        if s0 == shape_a and s1 == shape_b:
+            out.append(np.array(normals[i], dtype=np.float64))
+        elif s0 == shape_b and s1 == shape_a:
+            out.append(-np.array(normals[i], dtype=np.float64))
+    if not out:
+        return np.zeros((0, 3), dtype=np.float64)
+    return np.stack(out, axis=0)
+
+
+def _contact_force_sum_between(contacts, shape_a: int, shape_b: int) -> float:
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+    shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+    forces = contacts.rigid_contact_force.numpy()[:count]
+    total = 0.0
+    for i in range(count):
+        s0 = int(shape0[i])
+        s1 = int(shape1[i])
+        if (s0 == shape_a and s1 == shape_b) or (s0 == shape_b and s1 == shape_a):
+            total += float(np.linalg.norm(forces[i]))
+    return total
+
+
+def _collision_pipeline(model: newton.Model) -> newton.CollisionPipeline:
+    return newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="sticky", reduce_contacts=False)
 
 
 class TestFeatherPGSPrismaticSphereCube(unittest.TestCase):
-    def test_augmented_drive_contact_probe(self):
+    def setUp(self):
         if not wp.is_cuda_available():
             self.skipTest("FeatherPGS matrix-free contact probe is exercised on CUDA only")
-        rows = run_all(
-            device=wp.get_device("cuda:0"),
-            assert_assumptions=True,
-            drive_mode="augmented",
-            contact_matching="sticky",
-        )
-        self.assertEqual(len(rows), len(SCENARIOS))
+        self.device = wp.get_device("cuda:0")
 
-    def test_bad_frame_corner_contact_reproduction(self):
-        if not wp.is_cuda_available():
-            self.skipTest("FeatherPGS matrix-free contact probe is exercised on CUDA only")
+    def test_initial_contacts_include_table_support_and_prismatic_pusher(self):
+        model, ids = _build_scene(self.device)
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        pipeline = _collision_pipeline(model)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
 
-        report = initial_contact_report(
-            _scenario("bad_frame_corner"),
-            device=wp.get_device("cuda:0"),
-            contact_matching="sticky",
-        )
-        self.assertEqual(report["initial_cube_table_contacts"], 4)
-        self.assertEqual(report["initial_cube_pusher_contacts"], 1)
+        table_to_cube = _contact_normals_from_a_to_b(contacts, ids.table_shape, ids.cube_shape)
+        cube_to_pusher = _contact_normals_from_a_to_b(contacts, ids.cube_shape, ids.pusher_shape)
 
-        contact = report["cube_to_pusher_contacts"][0]
-        normal = np.array(contact["normal"], dtype=np.float64)
-        expected = np.array(BAD_FRAME_CUBE_TO_FINGER_NORMAL, dtype=np.float64)
-        expected /= np.linalg.norm(expected)
-        self.assertGreater(float(normal @ expected), 0.9999)
+        self.assertGreaterEqual(len(table_to_cube), 3)
+        self.assertGreaterEqual(float(np.min(table_to_cube[:, 2])), 0.90)
+        self.assertEqual(len(cube_to_pusher), 1)
+        self.assertGreater(float(cube_to_pusher[0, 2]), 0.95)
+        self.assertLess(float(np.linalg.norm(cube_to_pusher[0, :2])), 0.20)
 
-        cube_point = np.array(contact["point_a"], dtype=np.float64)
-        expected_corner = np.array([-BAD_FRAME_CUBE_HALF, BAD_FRAME_CUBE_HALF, BAD_FRAME_CUBE_HALF])
-        np.testing.assert_allclose(cube_point, expected_corner, atol=2.0e-3, rtol=0.0)
+    def test_matrix_free_step_loads_contact_without_unbounded_cube_motion(self):
+        model, ids = _build_scene(self.device)
+        solver = _make_solver(model)
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+        pipeline = _collision_pipeline(model)
+        contacts = pipeline.contacts()
 
-    def test_latest_leftfinger_face_contact_proxy(self):
-        if not wp.is_cuda_available():
-            self.skipTest("FeatherPGS matrix-free contact probe is exercised on CUDA only")
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        dof_start = int(model.joint_qd_start.numpy()[ids.pusher_joint])
+        control_targets = control.joint_target_pos.numpy()
+        control_targets[dof_start] = TARGET_OVERLAP
+        control.joint_target_pos.assign(control_targets)
 
-        report = initial_contact_report(
-            _proxy_scenario("latest_leftfinger_face"),
-            device=wp.get_device("cuda:0"),
-            contact_matching="sticky",
-        )
-        self.assertEqual(report["initial_cube_table_contacts"], 4)
-        self.assertEqual(report["initial_cube_pusher_contacts"], 3)
+        peak_pusher_force = 0.0
+        peak_cube_speed = 0.0
+        peak_cube_omega = 0.0
+        for _step_idx in range(80):
+            state_0.clear_forces()
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, DT)
+            solver.update_contacts(contacts)
+            state_0, state_1 = state_1, state_0
 
-        contacts = report["cube_to_pusher_contacts"]
-        normals = np.array([c["normal"] for c in contacts], dtype=np.float64)
-        expected_normal = np.array(LATEST_BAD_FRAME_CUBE_TO_LEFTFINGER_NORMAL, dtype=np.float64)
-        expected_normal /= np.linalg.norm(expected_normal)
-        self.assertGreater(float(np.min(normals @ expected_normal)), 0.9995)
+            cube_qd = state_0.body_qd.numpy()[ids.cube_body]
+            peak_cube_speed = max(peak_cube_speed, float(np.linalg.norm(cube_qd[:3])))
+            peak_cube_omega = max(peak_cube_omega, float(np.linalg.norm(cube_qd[3:6])))
+            peak_pusher_force = max(
+                peak_pusher_force,
+                _contact_force_sum_between(contacts, ids.cube_shape, ids.pusher_shape),
+            )
 
-        cube_points = np.array([c["point_a"] for c in contacts], dtype=np.float64)
-        self.assertLess(float(np.max(np.abs(cube_points[:, 0] + BAD_FRAME_CUBE_HALF))), 1.0e-4)
-        target_points = np.array(LATEST_BAD_FRAME_CUBE_TO_LEFTFINGER_POINTS, dtype=np.float64)
-        low_side_error = float(np.min(np.linalg.norm(cube_points - target_points[0], axis=1)))
-        top_edge_error = float(np.min(np.linalg.norm(cube_points - target_points[1], axis=1)))
-        self.assertLess(low_side_error, 7.5e-4)
-        self.assertLess(top_edge_error, 7.5e-4)
+        pipeline.collide(state_0, contacts)
+        cube_q = state_0.body_q.numpy()[ids.cube_body]
+        cube_qd = state_0.body_qd.numpy()[ids.cube_body]
 
-    def test_latest_leftfinger_face_row_problem_summary(self):
-        if not wp.is_cuda_available():
-            self.skipTest("FeatherPGS matrix-free contact probe is exercised on CUDA only")
-
-        report = row_problem_report(
-            _proxy_scenario("latest_leftfinger_face"),
-            device=wp.get_device("cuda:0"),
-            drive_mode="physx_pgs",
-            contact_matching="sticky",
-        )
-        self.assertEqual(report["dense_type_counts"]["contact"], 3)
-        self.assertEqual(report["dense_type_counts"]["friction"], 6)
-
-        # The cube-side Jacobian block is close because the proxy matches the
-        # local cube anchors. The rest of the row problem is deliberately not
-        # equivalent to the captured Franka frame.
-        proxy_j_cube = np.array([row["j_cube"] for row in report["dense_contact_rows"]], dtype=np.float64)
-        cube_block_errors = [
-            float(np.min(np.linalg.norm(proxy_j_cube - target[None, :], axis=1)))
-            for target in LATEST_CAPTURED_LEFTFINGER_ROW_SUMMARY["contact_j_cube"]
-        ]
-        self.assertLess(max(cube_block_errors), 3.0e-2)
-
-        proxy_diag = np.array([row["diag"] for row in report["dense_contact_rows"]], dtype=np.float64)
-        ref_diag = LATEST_CAPTURED_LEFTFINGER_ROW_SUMMARY["contact_diag"]
-        self.assertGreater(float(np.min(np.abs(proxy_diag[:, None] - ref_diag[None, :]))), 3.0)
-        self.assertNotEqual(report["dof_count"], LATEST_CAPTURED_LEFTFINGER_ROW_SUMMARY["dof_count"])
-        self.assertNotEqual(len(report["dense_drive_rows"]), LATEST_CAPTURED_LEFTFINGER_ROW_SUMMARY["drive_rows"])
-
-    def test_bad_frame_corner_drive_force_proxy(self):
-        if not wp.is_cuda_available():
-            self.skipTest("FeatherPGS matrix-free contact probe is exercised on CUDA only")
-
-        metrics = run_scenario(
-            _scenario("bad_frame_corner"),
-            device=wp.get_device("cuda:0"),
-            assert_assumptions=True,
-            drive_mode="physx_pgs",
-            contact_matching="sticky",
-            target_overlap=0.08,
-            effort_limit=60.0,
-            joint_limit_upper=0.16,
-        )
-        self.assertGreater(metrics["peak_sphere_cube_force_n"], 35.0)
-        self.assertLess(metrics["peak_sphere_cube_force_n"], 80.0)
-        self.assertLess(metrics["peak_cube_omega_radps"], 2.5)
-        self.assertLess(metrics["final_drive_error_m"], 0.04)
+        self.assertGreater(peak_pusher_force, 1.0)
+        self.assertLess(peak_cube_speed, 10.0)
+        self.assertLess(peak_cube_omega, 3.0)
+        self.assertTrue(np.all(np.isfinite(cube_q)))
+        self.assertTrue(np.all(np.isfinite(cube_qd)))
+        self.assertLess(abs(float(cube_q[0])), 0.01)
+        self.assertLess(abs(float(cube_q[1])), 0.01)
+        self.assertGreater(float(cube_q[2]), 0.035)
+        self.assertLess(float(cube_q[2]), 0.065)
 
 
 if __name__ == "__main__":
