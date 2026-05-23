@@ -133,7 +133,7 @@ def write_contact_simple(
         )
 
 
-def create_narrow_phase_primitive_kernel(writer_func: Any):
+def create_narrow_phase_primitive_kernel(writer_func: Any, enable_box_convex_aabb: bool = True):
     """
     Create a kernel for fast analytical collision detection of primitive shapes.
 
@@ -144,11 +144,13 @@ def create_narrow_phase_primitive_kernel(writer_func: Any):
 
     Args:
         writer_func: Contact writer function (e.g., write_contact_simple)
+        enable_box_convex_aabb: If true, route BOX-vs-CONVEX_MESH pairs through
+            the experimental local-AABB manifold shortcut.
 
     Returns:
         A warp kernel for primitive collision detection
     """
-    _module = f"narrow_phase_primitive_{writer_func.__name__}"
+    _module = f"narrow_phase_primitive_{writer_func.__name__}_{enable_box_convex_aabb}"
 
     @wp.kernel(enable_backward=False, module=_module)
     def narrow_phase_primitive_kernel(
@@ -332,7 +334,9 @@ def create_narrow_phase_primitive_kernel(writer_func: Any):
             is_capsule_b = type_b == GeoType.CAPSULE
             is_ellipsoid_b = type_b == GeoType.ELLIPSOID
             is_cylinder_b = type_b == GeoType.CYLINDER
+            is_box_a = type_a == GeoType.BOX
             is_box_b = type_b == GeoType.BOX
+            is_convex_mesh_b = type_b == GeoType.CONVEX_MESH
 
             # Compute effective radii for spheres and capsules
             # (radius that can be represented as Minkowski sum with a sphere)
@@ -505,6 +509,46 @@ def create_narrow_phase_primitive_kernel(writer_func: Any):
                 contact_dist_0, contact_pos_0, contact_normal = collide_sphere_box(
                     pos_a, sphere_radius, pos_b, box_rot, box_size
                 )
+
+            # -----------------------------------------------------------------
+            # Box-ConvexMesh collision using the convex hull's local AABB.
+            # USD box-like colliders often arrive as convex meshes; routing
+            # those through GJK/MPR gives only a single contact point, which is a
+            # poor manifold for grasp/table contacts. This path treats the
+            # convex hull's local AABB as an oriented box and emits the first
+            # four contacts from the analytic box-box path.
+            # -----------------------------------------------------------------
+            elif wp.static(enable_box_convex_aabb) and is_box_a and is_convex_mesh_b:
+                mesh_id = shape_source[shape_b]
+                if mesh_id != wp.uint64(0):
+                    mesh_obj = wp.mesh_get(mesh_id)
+                    if mesh_obj.points.shape[0] > 0:
+                        local_min = wp.cw_mul(mesh_obj.points[0], scale_b)
+                        local_max = local_min
+                        for mesh_vertex in range(1, mesh_obj.points.shape[0]):
+                            local_point = wp.cw_mul(mesh_obj.points[mesh_vertex], scale_b)
+                            local_min = wp.min(local_min, local_point)
+                            local_max = wp.max(local_max, local_point)
+
+                        box_a_rot = wp.quat_to_matrix(quat_a)
+                        box_b_rot = wp.quat_to_matrix(quat_b)
+                        box_b_center_local = 0.5 * (local_min + local_max)
+                        box_b_size = 0.5 * (local_max - local_min)
+                        box_b_pos = pos_b + box_b_rot @ box_b_center_local
+
+                        dists8_box, positions8_box, normals8_box = collide_box_box(
+                            pos_a, box_a_rot, scale_a, box_b_pos, box_b_rot, box_b_size, gap_sum
+                        )
+
+                        contact_dist_0 = dists8_box[0]
+                        contact_dist_1 = dists8_box[1]
+                        contact_dist_2 = dists8_box[2]
+                        contact_dist_3 = dists8_box[3]
+                        contact_pos_0 = wp.vec3(positions8_box[0, 0], positions8_box[0, 1], positions8_box[0, 2])
+                        contact_pos_1 = wp.vec3(positions8_box[1, 0], positions8_box[1, 1], positions8_box[1, 2])
+                        contact_pos_2 = wp.vec3(positions8_box[2, 0], positions8_box[2, 1], positions8_box[2, 2])
+                        contact_pos_3 = wp.vec3(positions8_box[3, 0], positions8_box[3, 1], positions8_box[3, 2])
+                        contact_normal = wp.vec3(normals8_box[0, 0], normals8_box[0, 1], normals8_box[0, 2])
 
             # =====================================================================
             # Write all contacts (single write block for 0 to 4 contacts)
@@ -1436,6 +1480,7 @@ class NarrowPhase:
         has_meshes: bool = True,
         has_heightfields: bool = False,
         use_lean_gjk_mpr: bool = False,
+        enable_box_convex_aabb: bool = True,
         deterministic: bool = False,
         contact_max: int | None = None,
         verify_buffers: bool = True,
@@ -1462,6 +1507,9 @@ class NarrowPhase:
                 Defaults to True for safety. Set to False when constructing from a model with no meshes.
             has_heightfields: Whether the scene contains any heightfield shapes (GeoType.HFIELD). When True,
                 heightfield collision buffers and kernels are allocated. Defaults to False.
+            enable_box_convex_aabb: Whether BOX-vs-CONVEX_MESH pairs should use
+                the experimental convex-mesh local-AABB box manifold shortcut.
+                When false, those pairs fall through to GJK/MPR.
             deterministic: Sort contacts after the narrow phase so that results are
                 independent of GPU thread scheduling.  Adds a radix sort + gather
                 pass.  Hydroelastic contacts are not yet covered.
@@ -1548,7 +1596,9 @@ class NarrowPhase:
 
         # Create the appropriate kernel variants
         # Primitive kernel handles lightweight primitives and routes remaining pairs
-        self.primitive_kernel = create_narrow_phase_primitive_kernel(writer_func)
+        self.primitive_kernel = create_narrow_phase_primitive_kernel(
+            writer_func, enable_box_convex_aabb=enable_box_convex_aabb
+        )
         # GJK/MPR kernel handles remaining convex-convex pairs
         if use_lean_gjk_mpr:
             # Use lean support function (CONVEX_MESH, BOX, SPHERE only) and lean post-processing
