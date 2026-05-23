@@ -2431,6 +2431,7 @@ class ModelBuilder:
         schema_resolvers: list[SchemaResolver] | None = None,
         force_position_velocity_actuation: bool = False,
         override_root_xform: bool = False,
+        physx_missing_inertia_fallback: bool = False,
     ) -> dict[str, Any]:
         """Parses a Universal Scene Description (USD) stage and adds rigid bodies, soft bodies, shapes, and joints to the given ModelBuilder.
 
@@ -2554,6 +2555,9 @@ class ModelBuilder:
                 :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
                 damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
                 (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
+            physx_missing_inertia_fallback: If True, bodies with authored positive mass but no authored diagonal
+                inertia use PhysX's 0.1 m small-sphere inertia fallback instead of shape-derived inertia. This is
+                intended for IsaacLab/PhysX parity when PhysX reports the "possibly invalid inertia tensor" fallback.
 
         Returns:
             The returned mapping has the following entries:
@@ -2626,6 +2630,7 @@ class ModelBuilder:
             schema_resolvers=schema_resolvers,
             force_position_velocity_actuation=force_position_velocity_actuation,
             override_root_xform=override_root_xform,
+            physx_missing_inertia_fallback=physx_missing_inertia_fallback,
         )
 
     def add_mjcf(
