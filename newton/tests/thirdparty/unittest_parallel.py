@@ -138,6 +138,18 @@ def main(argv=None):
         help="Timeout in seconds for collecting all parallel test results (default is 3600)",
     )  # NVIDIA Modification
     group_parallel.add_argument(
+        "--shard-count",
+        type=int,
+        default=1,
+        help="Split discovered test suites into this many deterministic shards (default is 1)",
+    )
+    group_parallel.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="Run only this zero-based shard index (default is 0)",
+    )
+    group_parallel.add_argument(
         "--serial-fallback",
         action="store_true",
         default=False,
@@ -169,6 +181,10 @@ def main(argv=None):
     args = parser.parse_args(args=argv)
     if args.parallel_timeout <= 0:
         parser.error("--parallel-timeout must be greater than 0")
+    if args.shard_count < 1:
+        parser.error("--shard-count must be at least 1")
+    if args.shard_index < 0 or args.shard_index >= args.shard_count:
+        parser.error("--shard-index must be in [0, --shard-count)")
 
     if args.coverage_branch:
         args.coverage = args.coverage_branch
@@ -213,6 +229,9 @@ def main(argv=None):
             test_suites = list(_iter_class_suites(discover_suite))
         else:  # args.level == 'module'
             test_suites = list(_iter_module_suites(discover_suite))
+
+        if args.shard_count > 1:
+            test_suites = [suite for i, suite in enumerate(test_suites) if i % args.shard_count == args.shard_index]
 
         # Don't use more processes than test suites
         process_count = max(1, min(len(test_suites), process_count))
