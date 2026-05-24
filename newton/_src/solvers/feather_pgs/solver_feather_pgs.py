@@ -498,9 +498,8 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
                 requires_grad=model.requires_grad,
             )
-        self._has_rigid_body_velocity_limits = (
-            self.rigid_body_max_linear_velocity is not None and self.rigid_body_max_angular_velocity is not None
-        )
+        self._has_joint_velocity_limits = False
+        self._has_rigid_body_velocity_limits = False
 
         # ``friction_mode`` is the selector for the per-row Coulomb step used by the
         # matrix-free PGS kernel. Only ``"current"`` is wired today; the other three
@@ -600,6 +599,7 @@ class SolverFeatherPGS(SolverBase):
         self._last_step_dt = None
 
         self._compute_articulation_metadata(model)
+        self._classify_active_velocity_limits(model)
 
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
@@ -667,6 +667,37 @@ class SolverFeatherPGS(SolverBase):
         self._is_homogeneous = (len(self.size_groups) == 1) if self.size_groups else True
         self._build_body_maps(model)
         self._classify_free_rigid_bodies(model)
+
+    def _classify_active_velocity_limits(self, model):
+        # Joint velocity limits are an explicit solver mode. IsaacLab may
+        # populate or update model.joint_velocity_limit through articulation
+        # plumbing after solver construction, so keep the small per-DOF slot
+        # buffers whenever the mode is enabled. The allocation/population
+        # kernels still skip non-finite or non-positive DOFs so unlimited
+        # joints do not create rows.
+        self._has_joint_velocity_limits = self.enable_joint_velocity_limits and model.joint_dof_count > 0
+
+        self._has_rigid_body_velocity_limits = False
+        if (
+            self._has_free_rigid_bodies
+            and self.rigid_body_max_linear_velocity is not None
+            and self.rigid_body_max_angular_velocity is not None
+            and self.body_to_articulation is not None
+            and self.is_free_rigid is not None
+            and model.body_count > 0
+        ):
+            linear_np = self.rigid_body_max_linear_velocity.numpy()
+            angular_np = self.rigid_body_max_angular_velocity.numpy()
+            body_to_art_np = self.body_to_articulation.numpy()
+            free_np = self.is_free_rigid.numpy()
+            for body, art in enumerate(body_to_art_np):
+                if art < 0 or free_np[art] == 0:
+                    continue
+                if (linear_np[body] > 0.0 and np.isfinite(linear_np[body])) or (
+                    angular_np[body] > 0.0 and np.isfinite(angular_np[body])
+                ):
+                    self._has_rigid_body_velocity_limits = True
+                    break
 
     def _compute_articulation_indices(self, model):
         # calculate total size and offsets of Jacobian and mass matrices for entire system
@@ -959,10 +990,6 @@ class SolverFeatherPGS(SolverBase):
             self.qd_work = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_mf_accum = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_out_snap = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
-            self._debug_stage3_qd_work = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
-            self._debug_stage3_joint_qdd = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
-            self._debug_stage3_v_hat = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
-            self._debug_position_v_out = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
         else:
             self.M_blocks = None
             self.mass_update_mask = None
@@ -971,10 +998,6 @@ class SolverFeatherPGS(SolverBase):
             self.qd_work = None
             self.v_mf_accum = None
             self.v_out_snap = None
-            self._debug_stage3_qd_work = None
-            self._debug_stage3_joint_qdd = None
-            self._debug_stage3_v_hat = None
-            self._debug_position_v_out = None
 
         if model.body_count:
             self.body_I_m = wp.empty(
@@ -1134,43 +1157,6 @@ class SolverFeatherPGS(SolverBase):
         self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_path = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self._debug_position_rigid_contact_count = wp.zeros((1,), dtype=wp.int32, device=device)
-        self._debug_position_contact_world = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_contact_slot = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_contact_art_a = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_contact_art_b = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_contact_path = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_rigid_contact_shape0 = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_rigid_contact_shape1 = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_rigid_contact_point0 = wp.zeros(
-            (max_contacts,), dtype=wp.vec3, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_rigid_contact_point1 = wp.zeros(
-            (max_contacts,), dtype=wp.vec3, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_rigid_contact_normal = wp.zeros(
-            (max_contacts,), dtype=wp.vec3, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_rigid_contact_margin0 = wp.zeros(
-            (max_contacts,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_rigid_contact_margin1 = wp.zeros(
-            (max_contacts,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
 
         # Joint position-limit buffers. PhysX keeps finite articulation limit
         # rows available speculatively, so store lower/upper rows separately.
@@ -1186,7 +1172,7 @@ class SolverFeatherPGS(SolverBase):
 
         # Joint velocity-limit buffers (per-DOF tracking). Independent from the
         # joint-position-limit buffers so the two flags can be used separately.
-        if self.enable_joint_velocity_limits and model.joint_dof_count > 0:
+        if self._has_joint_velocity_limits:
             dof_count = model.joint_dof_count
             # Two unilateral rows per limited DOF: lower (+e_i) and upper
             # (-e_i). Both rows are allocated every step for finite limits so
@@ -1243,13 +1229,9 @@ class SolverFeatherPGS(SolverBase):
                 device=device,
                 requires_grad=requires_grad,
             )
-            self._debug_position_J_world = wp.zeros_like(self.J_world, requires_grad=requires_grad)
-            self._debug_position_Y_world = wp.zeros_like(self.Y_world, requires_grad=requires_grad)
         else:
             self.J_world = None
             self.Y_world = None
-            self._debug_position_J_world = None
-            self._debug_position_Y_world = None
 
         self.rhs = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
@@ -1258,15 +1240,6 @@ class SolverFeatherPGS(SolverBase):
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.impulses = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_impulses = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_rhs = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_diag = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.diag = wp.zeros(
@@ -1280,16 +1253,7 @@ class SolverFeatherPGS(SolverBase):
         self.row_parent = wp.full(
             (self.world_count, max_constraints), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
         )
-        self._debug_position_row_type = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_row_parent = wp.full(
-            (self.world_count, max_constraints), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
         self.row_mu = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_row_mu = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.row_beta = wp.zeros(
@@ -1301,63 +1265,57 @@ class SolverFeatherPGS(SolverBase):
         self.phi = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._debug_position_phi = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
         self.target_velocity = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._debug_position_target_velocity = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.drive_stiffness = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.drive_damping = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.drive_geom_error = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self.drive_max_force = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
+        if self.drive_mode == "physx_pgs":
+            self.drive_stiffness = wp.zeros(
+                (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+            self.drive_damping = wp.zeros(
+                (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+            self.drive_geom_error = wp.zeros(
+                (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+            self.drive_max_force = wp.zeros(
+                (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+        else:
+            self.drive_stiffness = None
+            self.drive_damping = None
+            self.drive_geom_error = None
+            self.drive_max_force = None
+        drive_desc_cols = max_constraints if self.pgs_mode == "matrix_free" else 1
         self.drive_target_vel_bias = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+            (self.world_count, drive_desc_cols), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.drive_vel_multiplier = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+            (self.world_count, drive_desc_cols), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.drive_impulse_multiplier = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+            (self.world_count, drive_desc_cols), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.drive_max_impulse = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_drive_target_vel_bias = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_drive_vel_multiplier = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_drive_impulse_multiplier = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_drive_max_impulse = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+            (self.world_count, drive_desc_cols), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
 
         # Per-world constraint counts
         self.constraint_count = wp.zeros(
             (self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
-        self._debug_position_constraint_count = wp.zeros(
-            (self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
 
     def _allocate_mf_buffers(self, model):
         """Allocate buffers for matrix-free PGS path for free rigid body contacts."""
-        if self.pgs_mode == "dense" or (not self._has_free_rigid_bodies and self.pgs_mode != "matrix_free"):
+        if self.pgs_mode == "dense" or not self._has_free_rigid_bodies:
+            worlds = max(int(self.world_count), 1)
+            self.mf_slot_counter = wp.zeros(
+                (worlds,), dtype=wp.int32, device=model.device, requires_grad=model.requires_grad
+            )
+        if self.pgs_mode == "matrix_free" and not self._has_free_rigid_bodies:
+            self._allocate_inactive_mf_buffers(model)
+            return
+        if self.pgs_mode == "dense" or not self._has_free_rigid_bodies:
             return
 
         device = model.device
@@ -1367,45 +1325,23 @@ class SolverFeatherPGS(SolverBase):
         body_count = model.body_count
 
         self.mf_constraint_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_constraint_count = wp.zeros(
-            (worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
         self.mf_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
 
         self.mf_body_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_body_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_body_a = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_mf_body_b = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
 
         self.mf_J_a = wp.zeros((worlds, mf_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.mf_J_b = wp.zeros((worlds, mf_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
 
         self.mf_MiJt_a = wp.zeros((worlds, mf_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.mf_MiJt_b = wp.zeros((worlds, mf_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_J_a = wp.zeros_like(self.mf_J_a, requires_grad=requires_grad)
-        self._debug_position_mf_J_b = wp.zeros_like(self.mf_J_b, requires_grad=requires_grad)
-        self._debug_position_mf_MiJt_a = wp.zeros_like(self.mf_MiJt_a, requires_grad=requires_grad)
-        self._debug_position_mf_MiJt_b = wp.zeros_like(self.mf_MiJt_b, requires_grad=requires_grad)
 
         self.mf_rhs = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_rhs = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
         self.mf_rhs_unbiased = wp.zeros(
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.mf_impulses = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_impulses = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
         self.mf_eff_mass_inv = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_mf_eff_mass_inv = wp.zeros(
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
 
@@ -1413,18 +1349,6 @@ class SolverFeatherPGS(SolverBase):
         self.mf_row_parent = wp.full((worlds, mf_max_c), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_row_mu = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.mf_phi = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_row_type = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_mf_row_parent = wp.full(
-            (worlds, mf_max_c), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_mf_row_mu = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_mf_phi = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
-        )
 
         if self._has_rigid_body_velocity_limits and body_count > 0:
             # Twelve entries per free rigid body: lower/upper rows for the
@@ -1444,12 +1368,6 @@ class SolverFeatherPGS(SolverBase):
         # World-relative DOF offsets for two-phase GS kernel
         self.mf_dof_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_dof_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_dof_a = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self._debug_position_mf_dof_b = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
 
         # Packed MF metadata for two-phase GS kernel (int4 per constraint):
         #   .x = (dof_a << 16) | (dof_b & 0xFFFF)
@@ -1470,6 +1388,40 @@ class SolverFeatherPGS(SolverBase):
         self.mf_local_body_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_local_body_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
 
+    def _allocate_inactive_mf_buffers(self, model):
+        device = model.device
+        requires_grad = model.requires_grad
+        worlds = max(int(self.world_count), 1)
+
+        self.mf_constraint_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_body_a = wp.zeros((worlds, 1), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_body_b = wp.zeros((worlds, 1), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_J_a = wp.zeros((worlds, 1, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_J_b = wp.zeros((worlds, 1, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_MiJt_a = wp.zeros((worlds, 1, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_MiJt_b = wp.zeros((worlds, 1, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_rhs = wp.zeros((worlds, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_rhs_unbiased = wp.zeros((worlds, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_impulses = wp.zeros((worlds, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_eff_mass_inv = wp.zeros((worlds, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_row_type = wp.zeros((worlds, 1), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_row_parent = wp.full((worlds, 1), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_row_mu = wp.zeros((worlds, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_phi = wp.zeros((worlds, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.rigid_velocity_limit_slot = None
+        self.rigid_velocity_limit_sign = None
+        self.mf_body_Hinv = None
+        self.mf_dof_a = wp.zeros((worlds, 1), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_dof_b = wp.zeros((worlds, 1), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_meta_packed = wp.zeros((worlds, 4), dtype=wp.int32, device=device)
+        self.max_mf_bodies = 1
+        self.mf_body_list = wp.zeros((worlds, 1), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_body_dof_start = wp.zeros((worlds, 1), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_body_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_local_body_a = wp.zeros((worlds, 1), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_local_body_b = wp.zeros((worlds, 1), dtype=wp.int32, device=device, requires_grad=requires_grad)
+
     def _allocate_debug_buffers(self, model):
         """Allocate buffers for PGS convergence diagnostics."""
         if not self.pgs_debug:
@@ -1477,7 +1429,6 @@ class SolverFeatherPGS(SolverBase):
         device = model.device
         worlds = self.world_count
         max_c = self.dense_max_constraints
-        mf_max_c = self.mf_max_constraints
 
         self._diag_metrics = wp.zeros((worlds, 4), dtype=wp.float32, device=device)
         # Per-world NCP / MDP residual scratch buffer ([worlds, 6]).
@@ -1486,7 +1437,7 @@ class SolverFeatherPGS(SolverBase):
         self._diag_ncp_metrics = wp.zeros((worlds, 6), dtype=wp.float32, device=device)
         self._diag_prev_impulses = wp.zeros((worlds, max_c), dtype=wp.float32, device=device)
         if hasattr(self, "mf_impulses"):
-            self._diag_prev_mf_impulses = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device)
+            self._diag_prev_mf_impulses = wp.zeros(self.mf_impulses.shape, dtype=wp.float32, device=device)
         else:
             self._diag_prev_mf_impulses = None
 
@@ -1585,6 +1536,8 @@ class SolverFeatherPGS(SolverBase):
         return iterations - active
 
     def _pack_mf_meta(self, mf_rhs: wp.array) -> None:
+        if not self._has_free_rigid_bodies:
+            return
         pack_kernel = TiledKernelFactory.get_pack_mf_meta_kernel(self.mf_max_constraints, self.model.device)
         wp.launch_tiled(
             pack_kernel,
@@ -1602,6 +1555,18 @@ class SolverFeatherPGS(SolverBase):
             block_dim=32,
             device=self.model.device,
         )
+
+    def _record_stage3_dependency(self, state_aug: State) -> None:
+        if not self.model.device.is_cuda or self.v_out_snap is None or self.v_mf_accum is None:
+            return
+        # The former always-on stage-3 debug copies materialized qd_work,
+        # joint_qdd, and v_hat before later contact/solve stages consumed the
+        # predictor state. Preserve those producer dependencies without
+        # retaining diagnostic buffers; both scratch arrays are overwritten
+        # before every semantic use.
+        wp.copy(self.v_mf_accum, self.qd_work)
+        wp.copy(self.v_out_snap, state_aug.joint_qdd)
+        wp.copy(self.v_out_snap, self.v_hat)
 
     def _launch_matrix_free_gs_solve(
         self,
@@ -1716,59 +1681,6 @@ class SolverFeatherPGS(SolverBase):
         )
         if self._has_free_rigid_bodies:
             self._compute_mf_rhs_bias(dt, bias_scale=0.0, speculative_scale=0.0, output=self.mf_rhs_unbiased)
-
-    def _snapshot_matrix_free_position_problem(self, contacts: Contacts | None) -> None:
-        """Copy the biased q0 position-solve problem before concluding rows for velocity iterations."""
-        wp.copy(self._debug_position_constraint_count, self.constraint_count)
-        wp.copy(self._debug_position_impulses, self.impulses)
-        wp.copy(self._debug_position_rhs, self.rhs)
-        wp.copy(self._debug_position_diag, self.diag)
-        wp.copy(self._debug_position_phi, self.phi)
-        wp.copy(self._debug_position_row_type, self.row_type)
-        wp.copy(self._debug_position_row_parent, self.row_parent)
-        wp.copy(self._debug_position_row_mu, self.row_mu)
-        wp.copy(self._debug_position_target_velocity, self.target_velocity)
-        wp.copy(self._debug_position_drive_target_vel_bias, self.drive_target_vel_bias)
-        wp.copy(self._debug_position_drive_vel_multiplier, self.drive_vel_multiplier)
-        wp.copy(self._debug_position_drive_impulse_multiplier, self.drive_impulse_multiplier)
-        wp.copy(self._debug_position_drive_max_impulse, self.drive_max_impulse)
-        if self.J_world is not None:
-            wp.copy(self._debug_position_J_world, self.J_world)
-            wp.copy(self._debug_position_Y_world, self.Y_world)
-
-        if hasattr(self, "mf_constraint_count"):
-            wp.copy(self._debug_position_mf_constraint_count, self.mf_constraint_count)
-            wp.copy(self._debug_position_mf_impulses, self.mf_impulses)
-            wp.copy(self._debug_position_mf_rhs, self.mf_rhs)
-            wp.copy(self._debug_position_mf_eff_mass_inv, self.mf_eff_mass_inv)
-            wp.copy(self._debug_position_mf_J_a, self.mf_J_a)
-            wp.copy(self._debug_position_mf_J_b, self.mf_J_b)
-            wp.copy(self._debug_position_mf_MiJt_a, self.mf_MiJt_a)
-            wp.copy(self._debug_position_mf_MiJt_b, self.mf_MiJt_b)
-            wp.copy(self._debug_position_mf_phi, self.mf_phi)
-            wp.copy(self._debug_position_mf_row_type, self.mf_row_type)
-            wp.copy(self._debug_position_mf_row_parent, self.mf_row_parent)
-            wp.copy(self._debug_position_mf_row_mu, self.mf_row_mu)
-            wp.copy(self._debug_position_mf_body_a, self.mf_body_a)
-            wp.copy(self._debug_position_mf_body_b, self.mf_body_b)
-            wp.copy(self._debug_position_mf_dof_a, self.mf_dof_a)
-            wp.copy(self._debug_position_mf_dof_b, self.mf_dof_b)
-
-        if contacts is None or getattr(contacts, "rigid_contact_count", None) is None:
-            return
-        wp.copy(self._debug_position_rigid_contact_count, contacts.rigid_contact_count)
-        wp.copy(self._debug_position_contact_world, self.contact_world)
-        wp.copy(self._debug_position_contact_slot, self.contact_slot)
-        wp.copy(self._debug_position_contact_art_a, self.contact_art_a)
-        wp.copy(self._debug_position_contact_art_b, self.contact_art_b)
-        wp.copy(self._debug_position_contact_path, self.contact_path)
-        wp.copy(self._debug_position_rigid_contact_shape0, contacts.rigid_contact_shape0)
-        wp.copy(self._debug_position_rigid_contact_shape1, contacts.rigid_contact_shape1)
-        wp.copy(self._debug_position_rigid_contact_point0, contacts.rigid_contact_point0)
-        wp.copy(self._debug_position_rigid_contact_point1, contacts.rigid_contact_point1)
-        wp.copy(self._debug_position_rigid_contact_normal, contacts.rigid_contact_normal)
-        wp.copy(self._debug_position_rigid_contact_margin0, contacts.rigid_contact_margin0)
-        wp.copy(self._debug_position_rigid_contact_margin1, contacts.rigid_contact_margin1)
 
     def _zero_grouped_solve_buffers(self) -> None:
         for size in self.size_groups:
@@ -1954,9 +1866,7 @@ class SolverFeatherPGS(SolverBase):
                         self._stage3_trisolve_loop(size, state_aug)
             self._stage3_compute_v_hat(state_in, state_aug, dt)
             self._clamp_rigid_velocity_limits(self.v_hat)
-            wp.copy(self._debug_stage3_qd_work, self.qd_work)
-            wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
-            wp.copy(self._debug_stage3_v_hat, self.v_hat)
+            self._record_stage3_dependency(state_aug)
 
         # Wait for pipelined collide (if running on separate stream)
         if collide_done_event is not None:
@@ -2092,24 +2002,7 @@ class SolverFeatherPGS(SolverBase):
                 # Initialize v_out = v_hat before GS loop
                 self._stage6_prepare_world_velocity()
 
-                # Pack MF metadata into int4 structs for coalesced 128-bit loads
-                pack_kernel = TiledKernelFactory.get_pack_mf_meta_kernel(self.mf_max_constraints, self.model.device)
-                wp.launch_tiled(
-                    pack_kernel,
-                    dim=[self.world_count],
-                    inputs=[
-                        self.mf_constraint_count,
-                        self.mf_dof_a,
-                        self.mf_dof_b,
-                        self.mf_eff_mass_inv,
-                        self.mf_rhs,
-                        self.mf_row_type,
-                        self.mf_row_parent,
-                    ],
-                    outputs=[self.mf_meta_packed],
-                    block_dim=32,
-                    device=self.model.device,
-                )
+                self._pack_mf_meta(self.mf_rhs)
 
             with wp.ScopedTimer("S6_PGS_Solve", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
                 if self.pgs_debug:
@@ -2233,8 +2126,6 @@ class SolverFeatherPGS(SolverBase):
             self._stage6_clamp_rigid_velocity_limits()
 
             if self.pgs_velocity_iterations > 0:
-                wp.copy(self._debug_position_v_out, self.v_out)
-                self._snapshot_matrix_free_position_problem(contacts)
                 wp.copy(self.v_out_snap, self.v_out)
                 self._conclude_matrix_free_position_problem(dt)
                 wp.copy(self.v_out, self.v_out_snap)
@@ -2611,7 +2502,7 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[self.qd_work],
                 device=model.device,
             )
-        if self.enable_joint_velocity_limits:
+        if self._has_joint_velocity_limits:
             wp.launch(
                 prescale_joint_velocity_limits,
                 dim=model.articulation_count,
@@ -3076,9 +2967,7 @@ class SolverFeatherPGS(SolverBase):
             if self.is_free_rigid is not None
             else wp.zeros((1,), dtype=wp.int32, device=model.device)
         )
-        mf_slot_counter = (
-            self.mf_slot_counter if mf_active else wp.zeros((self.world_count,), dtype=wp.int32, device=model.device)
-        )
+        mf_slot_counter = self.mf_slot_counter
         j_buffers_zeroed = False
 
         drive_active = self.drive_mode == "physx_pgs" and self.drive_slot is not None
@@ -3321,7 +3210,7 @@ class SolverFeatherPGS(SolverBase):
             # the last per-world slots — matching PhysX's documented
             # ordering where the vel-limit row fires after contact, drive,
             # friction, and positional-limit rows (physx-deep-dive §7).
-            if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None:
+            if self._has_joint_velocity_limits and self.velocity_limit_slot is not None:
                 wp.launch(
                     allocate_joint_velocity_limit_slots,
                     dim=model.articulation_count,
@@ -3559,7 +3448,7 @@ class SolverFeatherPGS(SolverBase):
         # Joint velocity-limit fallback path: activates when there are no
         # contacts and the position-limit fallback did not already run us
         # through the velocity-limit dispatch inside the contact block.
-        if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None:
+        if self._has_joint_velocity_limits and self.velocity_limit_slot is not None:
             has_contacts = (
                 contacts is not None
                 and getattr(contacts, "rigid_contact_count", None) is not None
