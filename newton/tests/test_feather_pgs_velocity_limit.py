@@ -307,6 +307,57 @@ def run_allocation_nonpositive_limit_is_unlimited(test: TestFeatherPGSVelocityLi
     test.assertEqual(int(velocity_limit_slot.numpy()[1]), -1)
 
 
+def run_allocation_nonfinite_limit_is_unlimited(test: TestFeatherPGSVelocityLimitAllocationKernel, device):
+    """An infinite ``qdot_max_i`` is treated as disabled even beside finite DOFs."""
+    dof_count = 2
+    max_constraints = 8
+
+    articulation_start = wp.array(np.array([0, 2], dtype=np.int32), dtype=int, device=device)
+    articulation_dof_start = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
+    articulation_H_rows = wp.array(np.array([dof_count], dtype=np.int32), dtype=int, device=device)
+    joint_type = wp.array(
+        np.array([int(JointType.REVOLUTE), int(JointType.REVOLUTE)], dtype=np.int32),
+        dtype=int,
+        device=device,
+    )
+    joint_qd_start = wp.array(np.array([0, 1], dtype=np.int32), dtype=int, device=device)
+    joint_dof_dim = wp.array(np.array([[0, 1], [0, 1]], dtype=np.int32), dtype=int, ndim=2, device=device)
+    joint_velocity_limit = wp.array(np.array([float("inf"), 2.0], dtype=np.float32), dtype=float, device=device)
+    joint_qd = wp.array(np.array([100.0, 3.0], dtype=np.float32), dtype=float, device=device)
+    art_to_world = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
+
+    velocity_limit_slot = wp.full((2 * dof_count,), -1, dtype=wp.int32, device=device)
+    velocity_limit_sign = wp.zeros((2 * dof_count,), dtype=wp.float32, device=device)
+    world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
+
+    wp.launch(
+        allocate_joint_velocity_limit_slots,
+        dim=1,
+        inputs=[
+            articulation_start,
+            articulation_dof_start,
+            articulation_H_rows,
+            joint_type,
+            joint_qd_start,
+            joint_dof_dim,
+            joint_velocity_limit,
+            joint_qd,
+            art_to_world,
+            max_constraints,
+        ],
+        outputs=[velocity_limit_slot, velocity_limit_sign, world_slot_counter],
+        device=device,
+    )
+
+    np.testing.assert_array_equal(velocity_limit_slot.numpy(), np.array([-1, -1, 0, 1], dtype=np.int32))
+    np.testing.assert_allclose(
+        velocity_limit_sign.numpy(),
+        np.array([0.0, 0.0, 1.0, -1.0], dtype=np.float32),
+        atol=1.0e-7,
+    )
+    test.assertEqual(int(world_slot_counter.numpy()[0]), 2)
+
+
 class TestFeatherPGSVelocityLimitPrescaleKernel(unittest.TestCase):
     """Direct kernel tests for PhysX-style pre-solve velocity scaling."""
 
@@ -799,6 +850,12 @@ for device in devices:
         TestFeatherPGSVelocityLimitAllocationKernel,
         f"test_allocation_nonpositive_limit_is_unlimited_{device}",
         run_allocation_nonpositive_limit_is_unlimited,
+        devices=[device],
+    )
+    add_function_test(
+        TestFeatherPGSVelocityLimitAllocationKernel,
+        f"test_allocation_nonfinite_limit_is_unlimited_{device}",
+        run_allocation_nonfinite_limit_is_unlimited,
         devices=[device],
     )
     add_function_test(
