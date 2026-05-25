@@ -2386,7 +2386,7 @@ def allocate_joint_velocity_limit_slots(
             # Guard against degenerate limits. PhysX pins ``recipResponse``
             # off for ``unitResponse <= 0``; here we drop the row entirely if
             # the stored limit is non-positive (treated as "unlimited").
-            if qdot_max <= 0.0:
+            if qdot_max <= 0.0 or not wp.isfinite(qdot_max):
                 continue
 
             lower_idx = 2 * dof
@@ -2458,7 +2458,7 @@ def populate_joint_velocity_limit_J_for_size(
         for axis in range(axis_count):
             dof = qd_start + axis
             qdot_max = joint_velocity_limit[dof]
-            if qdot_max <= 0.0:
+            if qdot_max <= 0.0 or not wp.isfinite(qdot_max):
                 continue
 
             local_dof = dof - dof_start
