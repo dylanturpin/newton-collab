@@ -43,12 +43,14 @@ from .kernels import (
     FRICTION_MODE_CURRENT,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_DOF,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     TILE_THREADS,
     add_dense_contact_compliance_to_diag,
     allocate_joint_limit_slots,
+    allocate_joint_dof_slots,
     allocate_joint_velocity_limit_slots,
     allocate_physx_drive_slots,
     allocate_rigid_velocity_limit_slots,
@@ -100,6 +102,7 @@ from .kernels import (
     pgs_solve_mf_loop,
     prescale_joint_velocity_limits,
     populate_physx_drive_J_for_size,
+    populate_joint_dof_J_for_size,
     populate_joint_limit_J_for_size,
     populate_joint_velocity_limit_J_for_size,
     populate_rigid_velocity_limit_rows,
@@ -1208,6 +1211,22 @@ class SolverFeatherPGS(SolverBase):
         else:
             self.drive_slot = None
 
+        internal_dof_active = (
+            self.pgs_mode == "matrix_free"
+            and model.joint_dof_count > 0
+            and (
+                self.drive_mode == "physx_pgs"
+                or self.enable_joint_limits
+                or self.enable_joint_velocity_limits
+            )
+        )
+        if internal_dof_active:
+            self.joint_dof_slot = wp.full(
+                (model.joint_dof_count,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+            )
+        else:
+            self.joint_dof_slot = None
+
     def _allocate_world_buffers(self, model):
         """Allocate world-level constraint system buffers for multi-articulation support."""
         if self.world_count == 0:
@@ -1332,6 +1351,27 @@ class SolverFeatherPGS(SolverBase):
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.drive_max_impulse = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.joint_dof_index = wp.full(
+            (self.world_count, max_constraints), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.joint_dof_flags = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        self.joint_dof_lower_rhs = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.joint_dof_upper_rhs = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.joint_dof_velocity_limit = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.joint_dof_lower_impulse = wp.zeros(
+            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.joint_dof_upper_impulse = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self._debug_position_drive_target_vel_bias = wp.zeros(
@@ -1644,6 +1684,12 @@ class SolverFeatherPGS(SolverBase):
                     self.drive_vel_multiplier,
                     self.drive_impulse_multiplier,
                     self.drive_max_impulse,
+                    self.joint_dof_flags,
+                    self.joint_dof_lower_rhs,
+                    self.joint_dof_upper_rhs,
+                    self.joint_dof_velocity_limit,
+                    self.joint_dof_lower_impulse,
+                    self.joint_dof_upper_impulse,
                     self.mf_constraint_count,
                     mf_meta,
                     self.mf_impulses,
@@ -3081,7 +3127,94 @@ class SolverFeatherPGS(SolverBase):
         )
         j_buffers_zeroed = False
 
-        drive_active = self.drive_mode == "physx_pgs" and self.drive_slot is not None
+        internal_dof_active = self.pgs_mode == "matrix_free" and self.joint_dof_slot is not None
+        drive_active = self.drive_mode == "physx_pgs" and self.drive_slot is not None and not internal_dof_active
+        if internal_dof_active:
+            wp.launch(
+                allocate_joint_dof_slots,
+                dim=model.articulation_count,
+                inputs=[
+                    model.articulation_start,
+                    self.articulation_dof_start,
+                    self.articulation_H_rows,
+                    model.joint_type,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_target_ke,
+                    model.joint_target_kd,
+                    model.joint_limit_lower,
+                    model.joint_limit_upper,
+                    model.joint_velocity_limit,
+                    self.art_to_world,
+                    max_constraints,
+                    1 if self.drive_mode == "physx_pgs" else 0,
+                    1 if self.enable_joint_limits else 0,
+                    1 if self.enable_joint_velocity_limits else 0,
+                ],
+                outputs=[
+                    self.joint_dof_slot,
+                    self.joint_dof_flags,
+                    self.slot_counter,
+                ],
+                device=model.device,
+            )
+
+            if self._H_bufs is None:
+                for size in self.size_groups:
+                    self.J_by_size[size].zero_()
+                j_buffers_zeroed = True
+
+            for size in self.size_groups:
+                n_arts = self.n_arts_by_size[size]
+                wp.launch(
+                    populate_joint_dof_J_for_size,
+                    dim=n_arts,
+                    inputs=[
+                        model.articulation_start,
+                        self.articulation_dof_start,
+                        model.joint_type,
+                        model.joint_q_start,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_target_ke,
+                        model.joint_target_kd,
+                        model.joint_effort_limit,
+                        model.joint_limit_lower,
+                        model.joint_limit_upper,
+                        model.joint_velocity_limit,
+                        state_in.joint_q,
+                        control.joint_target_pos,
+                        control.joint_target_vel,
+                        self.art_to_world,
+                        self.joint_dof_slot,
+                        self.group_to_art[size],
+                        self.pgs_beta,
+                        self.pgs_cfm,
+                    ],
+                    outputs=[
+                        self.J_by_size[size],
+                        self.row_type,
+                        self.row_parent,
+                        self.row_mu,
+                        self.row_beta,
+                        self.row_cfm,
+                        self.phi,
+                        self.target_velocity,
+                        self.drive_stiffness,
+                        self.drive_damping,
+                        self.drive_geom_error,
+                        self.drive_max_force,
+                        self.joint_dof_index,
+                        self.joint_dof_flags,
+                        self.joint_dof_lower_rhs,
+                        self.joint_dof_upper_rhs,
+                        self.joint_dof_velocity_limit,
+                        self.joint_dof_lower_impulse,
+                        self.joint_dof_upper_impulse,
+                    ],
+                    device=model.device,
+                )
+
         if drive_active:
             wp.launch(
                 allocate_physx_drive_slots,
@@ -3194,7 +3327,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
             # Allocate joint limit constraint slots (same counter as contacts)
-            if self.enable_joint_limits and self.limit_slot is not None:
+            if self.enable_joint_limits and self.limit_slot is not None and not internal_dof_active:
                 wp.launch(
                     allocate_joint_limit_slots,
                     dim=model.articulation_count,
@@ -3279,7 +3412,7 @@ class SolverFeatherPGS(SolverBase):
                 )
 
             # Populate joint limit Jacobian rows (per size group)
-            if self.enable_joint_limits and self.limit_slot is not None:
+            if self.enable_joint_limits and self.limit_slot is not None and not internal_dof_active:
                 for size in self.size_groups:
                     n_arts = self.n_arts_by_size[size]
                     wp.launch(
@@ -3321,7 +3454,7 @@ class SolverFeatherPGS(SolverBase):
             # the last per-world slots — matching PhysX's documented
             # ordering where the vel-limit row fires after contact, drive,
             # friction, and positional-limit rows (physx-deep-dive §7).
-            if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None:
+            if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None and not internal_dof_active:
                 wp.launch(
                     allocate_joint_velocity_limit_slots,
                     dim=model.articulation_count,
@@ -3485,7 +3618,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
         # Joint limit constraints (outside contact block — limits work with or without contacts)
-        if self.enable_joint_limits and self.limit_slot is not None:
+        if self.enable_joint_limits and self.limit_slot is not None and not internal_dof_active:
             has_contacts = (
                 contacts is not None
                 and getattr(contacts, "rigid_contact_count", None) is not None
@@ -3559,7 +3692,7 @@ class SolverFeatherPGS(SolverBase):
         # Joint velocity-limit fallback path: activates when there are no
         # contacts and the position-limit fallback did not already run us
         # through the velocity-limit dispatch inside the contact block.
-        if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None:
+        if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None and not internal_dof_active:
             has_contacts = (
                 contacts is not None
                 and getattr(contacts, "rigid_contact_count", None) is not None
@@ -3849,12 +3982,13 @@ class SolverFeatherPGS(SolverBase):
                 self.row_beta,
                 self.row_type,
                 self.target_velocity,
+                self.joint_dof_flags,
                 dt,
                 bias_scale,
                 contact_speculative_scale,
                 joint_limit_speculative_scale,
             ],
-            outputs=[rhs_out],
+            outputs=[rhs_out, self.joint_dof_lower_rhs, self.joint_dof_upper_rhs],
             device=model.device,
         )
 
@@ -3886,7 +4020,7 @@ class SolverFeatherPGS(SolverBase):
             prepare_world_impulses,
             dim=self.world_count,
             inputs=[self.constraint_count, self.dense_max_constraints, warmstart_flag, self.row_type],
-            outputs=[self.impulses],
+            outputs=[self.impulses, self.joint_dof_lower_impulse, self.joint_dof_upper_impulse],
             device=self.model.device,
         )
 
@@ -4327,7 +4461,9 @@ class SolverFeatherPGS(SolverBase):
         projected = lambdas.copy()
         row_type = problem["row_type"]
         if problem.get("drive_mode") == "physx_pgs":
-            drive_rows = row_type == int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)
+            drive_rows = (row_type == int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)) | (
+                row_type == int(PGS_CONSTRAINT_TYPE_JOINT_DOF)
+            )
             drive_candidate = cls._debug_projected_root_drive_fixed_point(problem, projected)
             projected[drive_rows] = drive_candidate[drive_rows]
 
@@ -4355,7 +4491,9 @@ class SolverFeatherPGS(SolverBase):
         handled = np.zeros_like(lambdas, dtype=bool)
 
         if problem.get("drive_mode") == "physx_pgs":
-            drive_rows = row_type == int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)
+            drive_rows = (row_type == int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)) | (
+                row_type == int(PGS_CONSTRAINT_TYPE_JOINT_DOF)
+            )
             drive_candidate = cls._debug_projected_root_drive_fixed_point(problem, lambdas)
             projected[drive_rows] = drive_candidate[drive_rows]
             handled[drive_rows] = True
@@ -7154,6 +7292,12 @@ class TiledKernelFactory:
         __shared__ float s_drive_vel_mul_dense[{M_D}];
         __shared__ float s_drive_imp_mul_dense[{M_D}];
         __shared__ float s_drive_max_imp_dense[{M_D}];
+        __shared__ int   s_joint_dof_flags_dense[{M_D}];
+        __shared__ float s_joint_dof_lower_rhs_dense[{M_D}];
+        __shared__ float s_joint_dof_upper_rhs_dense[{M_D}];
+        __shared__ float s_joint_dof_velocity_limit_dense[{M_D}];
+        __shared__ float s_joint_dof_lower_impulse_dense[{M_D}];
+        __shared__ float s_joint_dof_upper_impulse_dense[{M_D}];
         __shared__ float s_lam_mf[{M_MF}];
 
         // ═══════════════════════════════════════════════════════
@@ -7170,6 +7314,12 @@ class TiledKernelFactory:
             s_drive_vel_mul_dense[i] = world_drive_vel_multiplier.data[off_dense + i];
             s_drive_imp_mul_dense[i] = world_drive_impulse_multiplier.data[off_dense + i];
             s_drive_max_imp_dense[i] = world_drive_max_impulse.data[off_dense + i];
+            s_joint_dof_flags_dense[i] = world_joint_dof_flags.data[off_dense + i];
+            s_joint_dof_lower_rhs_dense[i] = world_joint_dof_lower_rhs.data[off_dense + i];
+            s_joint_dof_upper_rhs_dense[i] = world_joint_dof_upper_rhs.data[off_dense + i];
+            s_joint_dof_velocity_limit_dense[i] = world_joint_dof_velocity_limit.data[off_dense + i];
+            s_joint_dof_lower_impulse_dense[i] = world_joint_dof_lower_impulse.data[off_dense + i];
+            s_joint_dof_upper_impulse_dense[i] = world_joint_dof_upper_impulse.data[off_dense + i];
         }}
         for (int i = lane; i < m_mf; i += 32) {{
             s_lam_mf[i] = mf_impulses.data[off_mf + i];
@@ -7213,11 +7363,12 @@ class TiledKernelFactory:
                 // row_phase 4: PhysX-grasp contact pass, contact/friction rows.
                 // row_phase 5: PhysX-grasp final pass, joint velocity-limit rows.
                 if (row_phase == 1 && row_type != 0 && row_type != 2) continue;
-                if (row_phase == 2 && row_type != 1 && row_type != 3 && row_type != 4) continue;
-                if (row_phase == 3 && row_type != 1 && row_type != 3) continue;
+                if (row_phase == 2 && row_type != 1 && row_type != 3 && row_type != 4 && row_type != 5) continue;
+                if (row_phase == 3 && row_type != 1 && row_type != 3 && row_type != 5) continue;
                 if (row_phase == 4 && row_type != 0 && row_type != 2) continue;
-                if (row_phase == 5 && row_type != 4) continue;
+                if (row_phase == 5 && row_type != 4 && row_type != 5) continue;
                 if ((row_phase == 0 || row_phase == 2) && row_type == 4) continue;
+                if (row_phase == 5 && (row_type == 4 || row_type == 5)) continue;
                 if (freeze_drive_rows != 0 && row_type == 1) continue;
                 if (row_type == 2 && global_iter < friction_start_iteration) {{
                     s_lam_dense[i] = 0.0f;
@@ -7256,6 +7407,72 @@ class TiledKernelFactory:
                     if (new_impulse > max_imp) new_impulse = max_imp;
                     if (new_impulse < -max_imp) new_impulse = -max_imp;
                     delta_impulse = new_impulse - old_impulse;
+                }}
+                // row_type 5=JOINT_DOF: one internal row per scalar DOF.
+                // Apply drive first, then the lower/upper finite-limit side
+                // pair.  The stateless velocity clamp is handled in the final
+                // velocity-limit phase below so it observes the row's latest
+                // drive/contact/limit velocity.
+                else if (row_type == 5) {{
+                    int flags = s_joint_dof_flags_dense[i];
+                    float jv_internal = jv;
+
+                    if ((flags & 1) != 0 && freeze_drive_rows == 0) {{
+                        float drive_new = old_impulse * s_drive_imp_mul_dense[i]
+                            + jv_internal * s_drive_vel_mul_dense[i]
+                            + s_drive_target_dense[i];
+                        float max_imp = s_drive_max_imp_dense[i];
+                        if (drive_new > max_imp) drive_new = max_imp;
+                        if (drive_new < -max_imp) drive_new = -max_imp;
+                        float drive_delta = drive_new - old_impulse;
+                        s_lam_dense[i] = drive_new;
+                        if (drive_delta != 0.0f) {{
+                            delta_impulse = drive_delta;
+                            {dense_v_update_code}
+                            jv_internal += denom * drive_delta;
+                            delta_impulse = 0.0f;
+                        }}
+                    }} else {{
+                        s_lam_dense[i] = 0.0f;
+                    }}
+
+                    if ((flags & 2) != 0) {{
+                        float low_old = s_joint_dof_lower_impulse_dense[i];
+                        float low_residual = jv_internal + s_joint_dof_lower_rhs_dense[i];
+                        float low_delta = -low_residual / denom;
+                        float low_new = low_old + omega * low_delta;
+                        if (low_new < 0.0f) low_new = 0.0f;
+                        float low_delta_impulse = low_new - low_old;
+                        s_joint_dof_lower_impulse_dense[i] = low_new;
+                        if (low_delta_impulse != 0.0f) {{
+                            delta_impulse = low_delta_impulse;
+                            {dense_v_update_code}
+                            jv_internal += denom * low_delta_impulse;
+                            delta_impulse = 0.0f;
+                        }}
+                    }} else {{
+                        s_joint_dof_lower_impulse_dense[i] = 0.0f;
+                    }}
+
+                    if ((flags & 4) != 0) {{
+                        float high_old_positive = -s_joint_dof_upper_impulse_dense[i];
+                        float high_residual = -jv_internal + s_joint_dof_upper_rhs_dense[i];
+                        float high_delta = -high_residual / denom;
+                        float high_new_positive = high_old_positive + omega * high_delta;
+                        if (high_new_positive < 0.0f) high_new_positive = 0.0f;
+                        float high_delta_impulse = -(high_new_positive - high_old_positive);
+                        s_joint_dof_upper_impulse_dense[i] = -high_new_positive;
+                        if (high_delta_impulse != 0.0f) {{
+                            delta_impulse = high_delta_impulse;
+                            {dense_v_update_code}
+                            delta_impulse = 0.0f;
+                        }}
+                    }} else {{
+                        s_joint_dof_upper_impulse_dense[i] = 0.0f;
+                    }}
+
+                    delta_impulse = 0.0f;
+                    new_impulse = s_lam_dense[i];
                 }}
                 // row_type 4=JOINT_VELOCITY_LIMIT:
                 // PhysX-style stateless bilateral speed projection. The row
@@ -7411,9 +7628,11 @@ class TiledKernelFactory:
             // dense articulated limits and MF rigid limits here, after all
             // drive/contact/friction/position-limit rows. Split schedules use
             // row_phase 2/5 as their explicit final velocity-limit pass.
-            if (row_phase == 0 || row_phase == 2) {{
+            if (row_phase == 0 || row_phase == 2 || row_phase == 5) {{
                 for (int i = 0; i < m_dense; i++) {{
-                    if (s_rtype_dense[i] != 4) continue;
+                    int row_type_vlim = s_rtype_dense[i];
+                    if (row_type_vlim != 4 && row_type_vlim != 5) continue;
+                    if (row_type_vlim == 5 && (s_joint_dof_flags_dense[i] & 8) == 0) continue;
                     float denom = s_diag_dense[i];
                     if (denom <= 0.0f) continue;
 
@@ -7429,11 +7648,22 @@ class TiledKernelFactory:
                     my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 1);
                     float jv_vlim = __shfl_sync(MASK, my_sum_vlim, 0);
 
-                    float residual_vlim = jv_vlim + s_rhs_dense[i];
-                    float delta_vlim = -residual_vlim / denom;
                     float delta_impulse_vlim = 0.0f;
-                    if (residual_vlim < 0.0f) delta_impulse_vlim = delta_vlim;
-                    if (lane == 0) s_lam_dense[i] = delta_impulse_vlim;
+                    if (row_type_vlim == 4) {{
+                        float residual_vlim = jv_vlim + s_rhs_dense[i];
+                        float delta_vlim = -residual_vlim / denom;
+                        if (residual_vlim < 0.0f) delta_impulse_vlim = delta_vlim;
+                    }} else {{
+                        float qdot_max = s_joint_dof_velocity_limit_dense[i];
+                        if (qdot_max > 0.0f) {{
+                            if (jv_vlim > qdot_max) {{
+                                delta_impulse_vlim = (qdot_max - jv_vlim) / denom;
+                            }} else if (jv_vlim < -qdot_max) {{
+                                delta_impulse_vlim = (-qdot_max - jv_vlim) / denom;
+                            }}
+                        }}
+                    }}
+                    if (lane == 0 && row_type_vlim == 4) s_lam_dense[i] = delta_impulse_vlim;
 
                     if (delta_impulse_vlim != 0.0f) {{
                         for (int d = lane; d < {D}; d += 32) {{
@@ -7499,6 +7729,8 @@ class TiledKernelFactory:
         }}
         for (int i = lane; i < m_dense; i += 32) {{
             world_impulses.data[off_dense + i] = s_lam_dense[i];
+            world_joint_dof_lower_impulse.data[off_dense + i] = s_joint_dof_lower_impulse_dense[i];
+            world_joint_dof_upper_impulse.data[off_dense + i] = s_joint_dof_upper_impulse_dense[i];
         }}
         for (int i = lane; i < m_mf; i += 32) {{
             mf_impulses.data[off_mf + i] = s_lam_mf[i];
@@ -7524,6 +7756,12 @@ class TiledKernelFactory:
             world_drive_vel_multiplier: wp.array2d(dtype=float),
             world_drive_impulse_multiplier: wp.array2d(dtype=float),
             world_drive_max_impulse: wp.array2d(dtype=float),
+            world_joint_dof_flags: wp.array2d(dtype=int),
+            world_joint_dof_lower_rhs: wp.array2d(dtype=float),
+            world_joint_dof_upper_rhs: wp.array2d(dtype=float),
+            world_joint_dof_velocity_limit: wp.array2d(dtype=float),
+            world_joint_dof_lower_impulse: wp.array2d(dtype=float),
+            world_joint_dof_upper_impulse: wp.array2d(dtype=float),
             # MF
             mf_constraint_count: wp.array(dtype=int),
             mf_meta: wp.array2d(dtype=int),
@@ -7560,6 +7798,12 @@ class TiledKernelFactory:
             world_drive_vel_multiplier: wp.array2d(dtype=float),
             world_drive_impulse_multiplier: wp.array2d(dtype=float),
             world_drive_max_impulse: wp.array2d(dtype=float),
+            world_joint_dof_flags: wp.array2d(dtype=int),
+            world_joint_dof_lower_rhs: wp.array2d(dtype=float),
+            world_joint_dof_upper_rhs: wp.array2d(dtype=float),
+            world_joint_dof_velocity_limit: wp.array2d(dtype=float),
+            world_joint_dof_lower_impulse: wp.array2d(dtype=float),
+            world_joint_dof_upper_impulse: wp.array2d(dtype=float),
             # MF
             mf_constraint_count: wp.array(dtype=int),
             mf_meta: wp.array2d(dtype=int),
@@ -7596,6 +7840,12 @@ class TiledKernelFactory:
                 world_drive_vel_multiplier,
                 world_drive_impulse_multiplier,
                 world_drive_max_impulse,
+                world_joint_dof_flags,
+                world_joint_dof_lower_rhs,
+                world_joint_dof_upper_rhs,
+                world_joint_dof_velocity_limit,
+                world_joint_dof_lower_impulse,
+                world_joint_dof_upper_impulse,
                 mf_constraint_count,
                 mf_meta,
                 mf_impulses,
