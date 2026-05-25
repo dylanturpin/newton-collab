@@ -237,6 +237,7 @@ class SolverFeatherPGS(SolverBase):
         contact_friction_scale: float = 1.0,
         contact_shared_anchor: bool = False,
         enable_joint_limits: bool = False,
+        joint_limit_activation_gap: float = float("inf"),
         enable_joint_velocity_limits: bool = False,
         pgs_iterations: int = 12,
         pgs_velocity_iterations: int = 0,
@@ -312,6 +313,10 @@ class SolverFeatherPGS(SolverBase):
                 constraints.  Each violated limit adds one constraint row.  Supported with
                 ``pgs_kernel="loop"`` and ``pgs_kernel="tiled_row"``; the ``"tiled_contact"``
                 and ``"streaming"`` PGS kernels are *not* compatible.  Defaults to False.
+            joint_limit_activation_gap (float, optional): Distance from a finite lower or upper
+                joint position limit at which to allocate that side's unilateral PGS row. ``inf``
+                preserves the historical behavior of allocating every finite limit row every step;
+                finite values allocate only violated or near-limit rows. Defaults to ``inf``.
             enable_joint_velocity_limits (bool, optional): Enforce joint velocity limits
                 (``model.joint_velocity_limit``) as per-DOF PGS constraints. Mirrors the
                 PhysX velocity-limit row: when ``|qdot_i| > qdot_max_i``, a single
@@ -447,6 +452,12 @@ class SolverFeatherPGS(SolverBase):
         if self.contact_friction_anchor_limit < 0:
             raise ValueError("contact_friction_anchor_limit must be non-negative")
         self.enable_joint_limits = enable_joint_limits
+        if joint_limit_activation_gap < 0.0:
+            raise ValueError(
+                "joint_limit_activation_gap must be non-negative or inf, "
+                f"got {joint_limit_activation_gap!r}"
+            )
+        self.joint_limit_activation_gap = float(joint_limit_activation_gap)
         self.enable_joint_velocity_limits = enable_joint_velocity_limits
         self.pgs_iterations = pgs_iterations
         self.pgs_beta = pgs_beta
@@ -3210,6 +3221,7 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_limit_upper,
                         state_in.joint_q,
                         self.art_to_world,
+                        self.joint_limit_activation_gap,
                         max_constraints,
                     ],
                     outputs=[
@@ -3508,6 +3520,7 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_limit_upper,
                         state_in.joint_q,
                         self.art_to_world,
+                        self.joint_limit_activation_gap,
                         max_constraints,
                     ],
                     outputs=[
