@@ -31,6 +31,12 @@ PGS_CONSTRAINT_TYPE_JOINT_LIMIT = 3
 # appendix). Finite limits create two unilateral rows every step: one lower
 # bound row and one upper bound row. No Baumgarte / ERP bias.
 PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT = 4
+PGS_CONSTRAINT_TYPE_JOINT_DOF = 5
+
+PGS_JOINT_DOF_HAS_DRIVE = 1
+PGS_JOINT_DOF_HAS_LOWER_LIMIT = 2
+PGS_JOINT_DOF_HAS_UPPER_LIMIT = 4
+PGS_JOINT_DOF_HAS_VELOCITY_LIMIT = 8
 
 # Numeric IDs for the ``friction_mode`` argument passed to the matrix-free
 # PGS solver kernels.  Mirrors the Python-side string enum on
@@ -2064,12 +2070,13 @@ def compute_physx_pgs_drive_desc(
     world_drive_impulse_multiplier: wp.array2d(dtype=float),
     world_drive_max_impulse: wp.array2d(dtype=float),
 ):
-    """Build PhysX PGS force-drive descriptor fields for dense joint target rows."""
+    """Build PhysX PGS force-drive descriptor fields for dense drive-capable rows."""
     world = wp.tid()
     m = world_constraint_count[world]
 
     for i in range(m):
-        if world_row_type[world, i] != PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+        row_type = world_row_type[world, i]
+        if row_type != PGS_CONSTRAINT_TYPE_JOINT_TARGET and row_type != PGS_CONSTRAINT_TYPE_JOINT_DOF:
             world_drive_target_vel_bias[world, i] = 0.0
             world_drive_vel_multiplier[world, i] = 0.0
             world_drive_impulse_multiplier[world, i] = 0.0
@@ -2490,6 +2497,209 @@ def populate_joint_velocity_limit_J_for_size(
                 # = qdot_max +/- qdot_i, which is negative exactly when the
                 # corresponding side of the box is violated.
                 world_target_velocity[world, slot] = -qdot_max
+
+
+# =============================================================================
+# Matrix-Free Internal DOF Constraint Kernels
+# =============================================================================
+
+
+@wp.kernel
+def allocate_joint_dof_slots(
+    articulation_start: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    articulation_H_rows: wp.array(dtype=int),
+    joint_type: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_dof_dim: wp.array(dtype=int, ndim=2),
+    joint_target_ke: wp.array(dtype=float),
+    joint_target_kd: wp.array(dtype=float),
+    joint_limit_lower: wp.array(dtype=float),
+    joint_limit_upper: wp.array(dtype=float),
+    joint_velocity_limit: wp.array(dtype=float),
+    art_to_world: wp.array(dtype=int),
+    max_constraints: int,
+    enable_drive: int,
+    enable_limits: int,
+    enable_velocity_limits: int,
+    # outputs
+    joint_dof_slot: wp.array(dtype=int),
+    joint_dof_flags: wp.array2d(dtype=int),
+    world_slot_counter: wp.array(dtype=int),
+):
+    """Allocate one matrix-free internal dense row for each participating scalar DOF."""
+    art = wp.tid()
+    world = art_to_world[art]
+
+    dof_base = articulation_dof_start[art]
+    dof_count = articulation_H_rows[art]
+    for d in range(dof_count):
+        joint_dof_slot[dof_base + d] = -1
+
+    joint_start = articulation_start[art]
+    joint_end = articulation_start[art + 1]
+
+    for j in range(joint_start, joint_end):
+        jtype = joint_type[j]
+        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+            continue
+
+        lin_count = joint_dof_dim[j, 0]
+        ang_count = joint_dof_dim[j, 1]
+        axis_count = lin_count + ang_count
+        qd_start = joint_qd_start[j]
+
+        for axis in range(axis_count):
+            dof = qd_start + axis
+            flags = int(0)
+
+            if enable_drive != 0:
+                stiffness = joint_target_ke[dof]
+                damping = joint_target_kd[dof]
+                if stiffness > 0.0 or damping > 0.0:
+                    flags = flags | PGS_JOINT_DOF_HAS_DRIVE
+
+            if enable_limits != 0:
+                if wp.isfinite(joint_limit_lower[dof]):
+                    flags = flags | PGS_JOINT_DOF_HAS_LOWER_LIMIT
+                if wp.isfinite(joint_limit_upper[dof]):
+                    flags = flags | PGS_JOINT_DOF_HAS_UPPER_LIMIT
+
+            if enable_velocity_limits != 0 and joint_velocity_limit[dof] > 0.0:
+                flags = flags | PGS_JOINT_DOF_HAS_VELOCITY_LIMIT
+
+            if flags == 0:
+                continue
+
+            slot = wp.atomic_add(world_slot_counter, world, 1)
+            if slot < max_constraints:
+                joint_dof_slot[dof] = slot
+                joint_dof_flags[world, slot] = flags
+
+
+@wp.kernel
+def populate_joint_dof_J_for_size(
+    articulation_start: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    joint_type: wp.array(dtype=int),
+    joint_q_start: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_dof_dim: wp.array(dtype=int, ndim=2),
+    joint_target_ke: wp.array(dtype=float),
+    joint_target_kd: wp.array(dtype=float),
+    joint_effort_limit: wp.array(dtype=float),
+    joint_limit_lower: wp.array(dtype=float),
+    joint_limit_upper: wp.array(dtype=float),
+    joint_velocity_limit: wp.array(dtype=float),
+    joint_q: wp.array(dtype=float),
+    joint_target_pos: wp.array(dtype=float),
+    joint_target_vel: wp.array(dtype=float),
+    art_to_world: wp.array(dtype=int),
+    joint_dof_slot: wp.array(dtype=int),
+    group_to_art: wp.array(dtype=int),
+    pgs_beta: float,
+    pgs_cfm: float,
+    # outputs
+    J_group: wp.array3d(dtype=float),
+    world_row_type: wp.array2d(dtype=int),
+    world_row_parent: wp.array2d(dtype=int),
+    world_row_mu: wp.array2d(dtype=float),
+    world_row_beta: wp.array2d(dtype=float),
+    world_row_cfm: wp.array2d(dtype=float),
+    world_phi: wp.array2d(dtype=float),
+    world_target_velocity: wp.array2d(dtype=float),
+    world_drive_stiffness: wp.array2d(dtype=float),
+    world_drive_damping: wp.array2d(dtype=float),
+    world_drive_geom_error: wp.array2d(dtype=float),
+    world_drive_max_force: wp.array2d(dtype=float),
+    world_joint_dof_index: wp.array2d(dtype=int),
+    world_joint_dof_flags: wp.array2d(dtype=int),
+    world_joint_dof_lower_rhs: wp.array2d(dtype=float),
+    world_joint_dof_upper_rhs: wp.array2d(dtype=float),
+    world_joint_dof_velocity_limit: wp.array2d(dtype=float),
+    world_joint_dof_lower_impulse: wp.array2d(dtype=float),
+    world_joint_dof_upper_impulse: wp.array2d(dtype=float),
+):
+    """Populate one internal matrix-free dense row per scalar DOF.
+
+    The row uses ``J = +e_i`` for the DOF. Lower-limit impulses are stored as
+    non-negative values and upper-limit impulses are stored as non-positive
+    values on the same row, matching PhysX's side-pair shape. The limit RHS
+    values are filled later because they depend on the substep dt and solve
+    bias scaling.
+    """
+    group_idx = wp.tid()
+    art = group_to_art[group_idx]
+    world = art_to_world[art]
+    dof_start = articulation_dof_start[art]
+
+    joint_start = articulation_start[art]
+    joint_end = articulation_start[art + 1]
+
+    for j in range(joint_start, joint_end):
+        jtype = joint_type[j]
+        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+            continue
+
+        lin_count = joint_dof_dim[j, 0]
+        ang_count = joint_dof_dim[j, 1]
+        axis_count = lin_count + ang_count
+        qd_start = joint_qd_start[j]
+        q_start = joint_q_start[j]
+
+        for axis in range(axis_count):
+            dof = qd_start + axis
+            slot = joint_dof_slot[dof]
+            if slot < 0:
+                continue
+
+            local_dof = dof - dof_start
+            q = joint_q[q_start + axis]
+            flags = world_joint_dof_flags[world, slot]
+
+            J_group[group_idx, slot, local_dof] = 1.0
+            world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_DOF
+            world_row_parent[world, slot] = -1
+            world_row_mu[world, slot] = 0.0
+            world_row_beta[world, slot] = pgs_beta
+            world_row_cfm[world, slot] = pgs_cfm
+            world_phi[world, slot] = 0.0
+            world_target_velocity[world, slot] = 0.0
+            world_joint_dof_index[world, slot] = dof
+
+            if (flags & PGS_JOINT_DOF_HAS_DRIVE) != 0:
+                world_drive_stiffness[world, slot] = joint_target_ke[dof]
+                world_drive_damping[world, slot] = joint_target_kd[dof]
+                world_drive_geom_error[world, slot] = joint_target_pos[dof] - q
+                world_drive_max_force[world, slot] = joint_effort_limit[dof]
+                world_target_velocity[world, slot] = joint_target_vel[dof]
+            else:
+                world_drive_stiffness[world, slot] = 0.0
+                world_drive_damping[world, slot] = 0.0
+                world_drive_geom_error[world, slot] = 0.0
+                world_drive_max_force[world, slot] = 0.0
+
+            # Store signed side separation. The RHS computation below preserves
+            # the existing FPGS speculative finite-limit approximation using
+            # q0 separation instead of PhysX's full TGS jointDeltaPos update.
+            lower_phi = float(0.0)
+            if (flags & PGS_JOINT_DOF_HAS_LOWER_LIMIT) != 0:
+                lower_phi = q - joint_limit_lower[dof]
+            upper_phi = float(0.0)
+            if (flags & PGS_JOINT_DOF_HAS_UPPER_LIMIT) != 0:
+                upper_phi = joint_limit_upper[dof] - q
+            world_joint_dof_lower_rhs[world, slot] = lower_phi
+            world_joint_dof_upper_rhs[world, slot] = upper_phi
+
+            if (flags & PGS_JOINT_DOF_HAS_VELOCITY_LIMIT) != 0:
+                world_joint_dof_velocity_limit[world, slot] = joint_velocity_limit[dof]
+            else:
+                world_joint_dof_velocity_limit[world, slot] = 0.0
+
+            if (flags & PGS_JOINT_DOF_HAS_LOWER_LIMIT) == 0:
+                world_joint_dof_lower_impulse[world, slot] = 0.0
+            if (flags & PGS_JOINT_DOF_HAS_UPPER_LIMIT) == 0:
+                world_joint_dof_upper_impulse[world, slot] = 0.0
 
 
 # =============================================================================
@@ -3361,12 +3571,15 @@ def compute_world_contact_bias(
     world_row_beta: wp.array2d(dtype=float),
     world_row_type: wp.array2d(dtype=int),
     world_target_velocity: wp.array2d(dtype=float),
+    world_joint_dof_flags: wp.array2d(dtype=int),
     dt: float,
     bias_scale: float,
     contact_speculative_scale: float,
     joint_limit_speculative_scale: float,
     # outputs
     world_rhs: wp.array2d(dtype=float),
+    world_joint_dof_lower_rhs: wp.array2d(dtype=float),
+    world_joint_dof_upper_rhs: wp.array2d(dtype=float),
 ):
     """Compute the RHS bias term for world-level PGS solve.
 
@@ -3409,6 +3622,29 @@ def compute_world_contact_bias(
             # input, not as a generic constraint target. Their RHS is handled
             # by the per-row drive descriptor in the matrix-free GS kernel.
             rhs = 0.0
+        elif row_type == PGS_CONSTRAINT_TYPE_JOINT_DOF:
+            # Combined internal rows do not have one scalar RHS. Their drive,
+            # low-limit, high-limit, and velocity-limit pieces are applied in
+            # order by the matrix-free GS kernel. The lower/upper side RHS
+            # values reuse the old finite-limit q0 speculative approximation.
+            rhs = 0.0
+            flags = world_joint_dof_flags[world, i]
+            if (flags & PGS_JOINT_DOF_HAS_LOWER_LIMIT) != 0:
+                low_phi = world_joint_dof_lower_rhs[world, i]
+                if low_phi < 0.0:
+                    world_joint_dof_lower_rhs[world, i] = bias_scale * beta * low_phi * inv_dt
+                else:
+                    world_joint_dof_lower_rhs[world, i] = joint_limit_speculative_scale * low_phi * inv_dt
+            else:
+                world_joint_dof_lower_rhs[world, i] = 0.0
+            if (flags & PGS_JOINT_DOF_HAS_UPPER_LIMIT) != 0:
+                high_phi = world_joint_dof_upper_rhs[world, i]
+                if high_phi < 0.0:
+                    world_joint_dof_upper_rhs[world, i] = bias_scale * beta * high_phi * inv_dt
+                else:
+                    world_joint_dof_upper_rhs[world, i] = joint_limit_speculative_scale * high_phi * inv_dt
+            else:
+                world_joint_dof_upper_rhs[world, i] = 0.0
         # PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT: no phi-based bias. The
         # constraint is an instantaneous velocity-space projection; the only
         # RHS contribution is ``-target_vel`` (already set above) plus the
@@ -3463,14 +3699,20 @@ def prepare_world_impulses(
     world_row_type: wp.array2d(dtype=int),
     # in/out
     world_impulses: wp.array2d(dtype=float),
+    world_joint_dof_lower_impulse: wp.array2d(dtype=float),
+    world_joint_dof_upper_impulse: wp.array2d(dtype=float),
 ):
     """Initialize world impulses (zero or warmstart)."""
     world = wp.tid()
     m = world_constraint_count[world]
 
     for i in range(max_constraints):
-        if warmstart == 0 or i >= m or world_row_type[world, i] == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+        row_type = world_row_type[world, i]
+        if warmstart == 0 or i >= m or row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET or row_type == PGS_CONSTRAINT_TYPE_JOINT_DOF:
             world_impulses[world, i] = 0.0
+        if warmstart == 0 or i >= m or row_type != PGS_CONSTRAINT_TYPE_JOINT_DOF:
+            world_joint_dof_lower_impulse[world, i] = 0.0
+            world_joint_dof_upper_impulse[world, i] = 0.0
 
 
 # =============================================================================
