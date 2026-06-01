@@ -1976,6 +1976,7 @@ def populate_physx_drive_J_for_size(
     joint_target_pos: wp.array(dtype=float),
     joint_target_vel: wp.array(dtype=float),
     art_to_world: wp.array(dtype=int),
+    world_dof_start: wp.array(dtype=int),
     drive_slot: wp.array(dtype=int),
     group_to_art: wp.array(dtype=int),
     # outputs
@@ -1991,6 +1992,8 @@ def populate_physx_drive_J_for_size(
     world_drive_damping: wp.array2d(dtype=float),
     world_drive_geom_error: wp.array2d(dtype=float),
     world_drive_max_force: wp.array2d(dtype=float),
+    world_row_dof: wp.array2d(dtype=int),
+    world_row_sign: wp.array2d(dtype=float),
 ):
     """Populate PhysX-style drive rows and row data for one articulation size group."""
     group_idx = wp.tid()
@@ -2038,6 +2041,8 @@ def populate_physx_drive_J_for_size(
             world_drive_damping[world, slot] = damping
             world_drive_geom_error[world, slot] = target_pos - q
             world_drive_max_force[world, slot] = joint_effort_limit[dof]
+            world_row_dof[world, slot] = dof - world_dof_start[world]
+            world_row_sign[world, slot] = 1.0
 
 
 @wp.kernel
@@ -2229,6 +2234,7 @@ def populate_joint_limit_J_for_size(
     joint_limit_upper: wp.array(dtype=float),
     joint_q: wp.array(dtype=float),
     art_to_world: wp.array(dtype=int),
+    world_dof_start: wp.array(dtype=int),
     limit_slot: wp.array(dtype=int),
     limit_sign: wp.array(dtype=float),
     group_to_art: wp.array(dtype=int),
@@ -2243,6 +2249,8 @@ def populate_joint_limit_J_for_size(
     world_row_cfm: wp.array2d(dtype=float),
     world_phi: wp.array2d(dtype=float),
     world_target_velocity: wp.array2d(dtype=float),
+    world_row_dof: wp.array2d(dtype=int),
+    world_row_sign: wp.array2d(dtype=float),
 ):
     """Populate Jacobian and metadata for joint limit constraints.
 
@@ -2303,6 +2311,8 @@ def populate_joint_limit_J_for_size(
                 world_row_cfm[world, slot] = pgs_cfm
                 world_phi[world, slot] = phi
                 world_target_velocity[world, slot] = 0.0
+                world_row_dof[world, slot] = dof - world_dof_start[world]
+                world_row_sign[world, slot] = sign
 
 
 # =============================================================================
@@ -2412,6 +2422,7 @@ def populate_joint_velocity_limit_J_for_size(
     joint_dof_dim: wp.array(dtype=int, ndim=2),
     joint_velocity_limit: wp.array(dtype=float),
     art_to_world: wp.array(dtype=int),
+    world_dof_start: wp.array(dtype=int),
     velocity_limit_slot: wp.array(dtype=int),
     velocity_limit_sign: wp.array(dtype=float),
     group_to_art: wp.array(dtype=int),
@@ -2425,6 +2436,8 @@ def populate_joint_velocity_limit_J_for_size(
     world_row_cfm: wp.array2d(dtype=float),
     world_phi: wp.array2d(dtype=float),
     world_target_velocity: wp.array2d(dtype=float),
+    world_row_dof: wp.array2d(dtype=int),
+    world_row_sign: wp.array2d(dtype=float),
 ):
     """Populate Jacobian and metadata for joint velocity-limit rows.
 
@@ -2490,6 +2503,8 @@ def populate_joint_velocity_limit_J_for_size(
                 # = qdot_max +/- qdot_i, which is negative exactly when the
                 # corresponding side of the box is violated.
                 world_target_velocity[world, slot] = -qdot_max
+                world_row_dof[world, slot] = dof - world_dof_start[world]
+                world_row_sign[world, slot] = sign
 
 
 # =============================================================================
@@ -5281,6 +5296,152 @@ def compute_mf_world_dof_offsets(
         mf_dof_b[world, c] = art_dof_start[body_to_articulation[bb]] - w_dof
     else:
         mf_dof_b[world, c] = -1
+
+
+@wp.kernel
+def pack_dense_constraint_row_streams(
+    world_constraint_count: wp.array(dtype=int),
+    world_row_type: wp.array2d(dtype=int),
+    world_row_parent: wp.array2d(dtype=int),
+    world_row_mu: wp.array2d(dtype=float),
+    world_row_dof: wp.array2d(dtype=int),
+    world_row_sign: wp.array2d(dtype=float),
+    world_diag: wp.array2d(dtype=float),
+    world_rhs: wp.array2d(dtype=float),
+    world_drive_target_vel_bias: wp.array2d(dtype=float),
+    world_drive_vel_multiplier: wp.array2d(dtype=float),
+    world_drive_impulse_multiplier: wp.array2d(dtype=float),
+    world_drive_max_impulse: wp.array2d(dtype=float),
+    max_constraints: int,
+    # outputs
+    dense_meta_packed: wp.array2d(dtype=int),
+    dense_scalar_packed: wp.array2d(dtype=float),
+):
+    """Pack dense articulated row metadata/scalars for the experimental row stream.
+
+    Metadata layout is four int32 values per row:
+      0: row_type in low 8 bits, phase mask in high bits
+      1: parent normal row, or -1
+      2: sibling tangent row, or -1
+      3: world-relative selector DOF for 1-DOF rows, or -1
+
+    Scalar layout is eight float32 values per row:
+      0: Delassus diagonal, 1: RHS, 2: friction mu, 3: selector sign,
+      4..7: PhysX drive target bias, velocity multiplier, impulse
+      multiplier, and max impulse.
+    """
+    tid = wp.tid()
+    world = tid // max_constraints
+    row = tid - world * max_constraints
+    if row >= world_constraint_count[world]:
+        return
+
+    row_type = world_row_type[world, row]
+    phase_mask = int(0)
+    if row_type == PGS_CONSTRAINT_TYPE_CONTACT or row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+        # Contact/friction rows participate in contact row phases 1 and 4.
+        phase_mask = phase_mask | 1
+    if (
+        row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET
+        or row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+        or row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+    ):
+        # Internal articulation rows participate in the split internal phase.
+        phase_mask = phase_mask | 2
+    if row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET or row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
+        # PhysX-grasp first phase: drive and position-limit rows.
+        phase_mask = phase_mask | 4
+    if row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+        # Final velocity-limit phase.
+        phase_mask = phase_mask | 16
+
+    parent = world_row_parent[world, row]
+    sibling = int(-1)
+    if row_type == PGS_CONSTRAINT_TYPE_FRICTION and parent >= 0:
+        if row == parent + 1:
+            sibling = parent + 2
+        else:
+            sibling = parent + 1
+
+    meta_base = row * 4
+    dense_meta_packed[world, meta_base + 0] = row_type | (phase_mask << 8)
+    dense_meta_packed[world, meta_base + 1] = parent
+    dense_meta_packed[world, meta_base + 2] = sibling
+    dense_meta_packed[world, meta_base + 3] = world_row_dof[world, row]
+
+    scalar_base = row * 8
+    dense_scalar_packed[world, scalar_base + 0] = world_diag[world, row]
+    dense_scalar_packed[world, scalar_base + 1] = world_rhs[world, row]
+    dense_scalar_packed[world, scalar_base + 2] = world_row_mu[world, row]
+    dense_scalar_packed[world, scalar_base + 3] = world_row_sign[world, row]
+    dense_scalar_packed[world, scalar_base + 4] = world_drive_target_vel_bias[world, row]
+    dense_scalar_packed[world, scalar_base + 5] = world_drive_vel_multiplier[world, row]
+    dense_scalar_packed[world, scalar_base + 6] = world_drive_impulse_multiplier[world, row]
+    dense_scalar_packed[world, scalar_base + 7] = world_drive_max_impulse[world, row]
+
+
+@wp.kernel
+def pack_mf_constraint_row_streams(
+    mf_constraint_count: wp.array(dtype=int),
+    mf_dof_a: wp.array2d(dtype=int),
+    mf_dof_b: wp.array2d(dtype=int),
+    mf_eff_mass_inv: wp.array2d(dtype=float),
+    mf_rhs: wp.array2d(dtype=float),
+    mf_row_type: wp.array2d(dtype=int),
+    mf_row_parent: wp.array2d(dtype=int),
+    mf_row_mu: wp.array2d(dtype=float),
+    mf_row_phi: wp.array2d(dtype=float),
+    mf_max_constraints: int,
+    # outputs
+    mf_meta_packed: wp.array2d(dtype=int),
+    mf_scalar_packed: wp.array2d(dtype=float),
+):
+    """Pack matrix-free row metadata/scalars for the experimental row stream.
+
+    Metadata layout is four int32 values per row:
+      0: (dof_a << 16) | (dof_b & 0xffff)
+      1: row_type in low 8 bits, phase mask in high bits
+      2: parent normal row, or -1
+      3: sibling tangent row, or -1
+
+    Scalar layout is four float32 values per row:
+      0: inverse diagonal, 1: RHS, 2: friction mu, 3: phi.
+    """
+    tid = wp.tid()
+    world = tid // mf_max_constraints
+    row = tid - world * mf_max_constraints
+    if row >= mf_constraint_count[world]:
+        return
+
+    row_type = mf_row_type[world, row]
+    phase_mask = int(0)
+    if row_type == PGS_CONSTRAINT_TYPE_CONTACT or row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+        phase_mask = phase_mask | 1
+    if row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+        phase_mask = phase_mask | 2
+        phase_mask = phase_mask | 16
+
+    parent = mf_row_parent[world, row]
+    sibling = int(-1)
+    if row_type == PGS_CONSTRAINT_TYPE_FRICTION and parent >= 0:
+        if row == parent + 1:
+            sibling = parent + 2
+        else:
+            sibling = parent + 1
+
+    dof_a = mf_dof_a[world, row]
+    dof_b = mf_dof_b[world, row]
+    meta_base = row * 4
+    mf_meta_packed[world, meta_base + 0] = (dof_a << 16) | (dof_b & 0xFFFF)
+    mf_meta_packed[world, meta_base + 1] = row_type | (phase_mask << 8)
+    mf_meta_packed[world, meta_base + 2] = parent
+    mf_meta_packed[world, meta_base + 3] = sibling
+
+    scalar_base = row * 4
+    mf_scalar_packed[world, scalar_base + 0] = mf_eff_mass_inv[world, row]
+    mf_scalar_packed[world, scalar_base + 1] = mf_rhs[world, row]
+    mf_scalar_packed[world, scalar_base + 2] = mf_row_mu[world, row]
+    mf_scalar_packed[world, scalar_base + 3] = mf_row_phi[world, row]
 
 
 @wp.kernel
