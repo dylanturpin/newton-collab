@@ -3186,8 +3186,11 @@ class SolverMuJoCo(SolverBase):
 
         enableflags = 0
         disableflags = 0
-        if not enable_multiccd:
-            disableflags |= mujoco.mjtDisableBit.mjDSBL_MULTICCD
+        # mjDSBL_MULTICCD is only present in MuJoCo versions with MultiCCD.
+        # Do not substitute mjDSBL_NATIVECCD; that disables a different path.
+        multiccd_disable_bit = getattr(mujoco.mjtDisableBit, "mjDSBL_MULTICCD", None)
+        if not enable_multiccd and multiccd_disable_bit is not None:
+            disableflags |= multiccd_disable_bit
         if disable_contacts:
             disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
         self.use_mujoco_cpu = use_mujoco_cpu
@@ -6667,6 +6670,30 @@ class SolverMuJoCo(SolverBase):
         mujoco_attrs = getattr(self.model, "mujoco", None)
         shape_geom_solimp = getattr(mujoco_attrs, "geom_solimp", None) if mujoco_attrs is not None else None
         shape_geom_solmix = getattr(mujoco_attrs, "geom_solmix", None) if mujoco_attrs is not None else None
+        geom_dataid = self.mjw_model.geom_dataid
+        if len(geom_dataid.shape) == 1:
+            # mujoco_warp 3.5 stores geom_dataid per geom; newer versions store
+            # it per [world, geom]. Adapt the older layout for the shared kernel.
+            geom_dataid_2d = getattr(self, "_geom_dataid_2d", None)
+            if (
+                geom_dataid_2d is None
+                or geom_dataid_2d.shape != (world_count, num_geoms)
+                or geom_dataid_2d.device != geom_dataid.device
+            ):
+                geom_dataid_2d = wp.array2d(
+                    shape=(world_count, num_geoms),
+                    dtype=geom_dataid.dtype,
+                    device=geom_dataid.device,
+                )
+                self._geom_dataid_2d = geom_dataid_2d
+            wp.launch(
+                repeat_array_kernel,
+                dim=world_count * num_geoms,
+                inputs=[geom_dataid, num_geoms],
+                outputs=[geom_dataid_2d.flatten()],
+                device=self.model.device,
+            )
+            geom_dataid = geom_dataid_2d
         wp.launch(
             update_geom_properties_kernel,
             dim=(world_count, num_geoms),
@@ -6679,7 +6706,7 @@ class SolverMuJoCo(SolverBase):
                 self.mjc_geom_to_newton_shape,
                 self.mjw_model.geom_type,
                 self._mujoco.mjtGeom.mjGEOM_MESH,
-                self.mjw_model.geom_dataid,
+                geom_dataid,
                 self.mjw_model.mesh_pos,
                 self.mjw_model.mesh_quat,
                 self.model.shape_material_mu_torsional,
