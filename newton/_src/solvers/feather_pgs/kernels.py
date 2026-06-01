@@ -2153,6 +2153,7 @@ def allocate_joint_limit_slots(
     joint_limit_lower: wp.array(dtype=float),
     joint_limit_upper: wp.array(dtype=float),
     joint_q: wp.array(dtype=float),
+    joint_limit_activation_gap: float,
     art_to_world: wp.array(dtype=int),
     max_constraints: int,
     # outputs
@@ -2160,12 +2161,13 @@ def allocate_joint_limit_slots(
     limit_sign: wp.array(dtype=float),
     world_slot_counter: wp.array(dtype=int),
 ):
-    """Allocate speculative constraint slots for finite joint limits.
+    """Allocate speculative constraint slots for active joint limits.
 
-    PhysX articulation PGS keeps finite position-limit constraints available
-    before violation and lets the row's ``phi / dt`` term limit velocities that
-    would cross the bound during the step.  Mirror that by allocating separate
-    lower and upper rows for each finite limit.
+    ``joint_limit_activation_gap`` controls how far from a finite position limit
+    a row becomes active. ``inf`` mirrors the historical behavior by allocating
+    separate lower and upper rows for every finite limit. Finite gaps allocate
+    only when the current joint coordinate violates a limit or is within that
+    distance of the limit.
 
     Outputs per-side arrays indexed as ``2 * dof + side`` where side 0 is the
     lower row (+1 Jacobian sign) and side 1 is the upper row (-1 sign).
@@ -2204,13 +2206,13 @@ def allocate_joint_limit_slots(
             upper = joint_limit_upper[dof]
 
             lower_idx = 2 * dof
-            if wp.isfinite(lower):
+            if wp.isfinite(lower) and q_val <= lower + joint_limit_activation_gap:
                 slot = wp.atomic_add(world_slot_counter, world, 1)
                 if slot < max_constraints:
                     limit_slot[lower_idx] = slot
                     limit_sign[lower_idx] = 1.0
 
-            if wp.isfinite(upper):
+            if wp.isfinite(upper) and q_val >= upper - joint_limit_activation_gap:
                 slot = wp.atomic_add(world_slot_counter, world, 1)
                 if slot < max_constraints:
                     limit_slot[lower_idx + 1] = slot
