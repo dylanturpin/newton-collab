@@ -2365,7 +2365,7 @@ class SolverFeatherPGS(SolverBase):
         return state_out
 
     @override
-    def update_contacts(self, contacts: Contacts) -> None:
+    def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         """Populate Newton contact-force buffers from the last FeatherPGS solve."""
         if contacts is None or contacts.rigid_contact_count is None:
             return
