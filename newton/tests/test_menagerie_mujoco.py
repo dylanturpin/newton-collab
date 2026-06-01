@@ -1633,7 +1633,9 @@ class TestMenagerieBase(unittest.TestCase):
 
         # Mirror SolverMuJoCo's enable_multiccd=False default. MuJoCo 3.8 turns
         # multi-CCD on by default; Newton disables it via mjDSBL_MULTICCD.
-        mj_model.opt.disableflags |= int(_mujoco.mjtDisableBit.mjDSBL_MULTICCD)
+        multiccd_disable_bit = getattr(_mujoco.mjtDisableBit, "mjDSBL_MULTICCD", None)
+        if multiccd_disable_bit is not None:
+            mj_model.opt.disableflags |= int(multiccd_disable_bit)
 
         # Create mujoco_warp model/data with multiple worlds
         # Note: put_model creates arrays with nworld=1, expansion happens in _ensure_models
