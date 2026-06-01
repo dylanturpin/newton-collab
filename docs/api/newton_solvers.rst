@@ -419,6 +419,7 @@ See the `DiffSim examples on GitHub`_ for the current reference workflows.
    :nosignatures:
 
    SolverBase
+   SolverFeatherPGS
    SolverFeatherstone
    SolverImplicitMPM
    SolverKamino
