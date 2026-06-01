@@ -237,6 +237,7 @@ class SolverFeatherPGS(SolverBase):
         contact_friction_scale: float = 1.0,
         contact_shared_anchor: bool = False,
         enable_joint_limits: bool = False,
+        joint_limit_activation_gap: float = float("inf"),
         enable_joint_velocity_limits: bool = False,
         pgs_iterations: int = 12,
         pgs_velocity_iterations: int = 0,
@@ -309,9 +310,14 @@ class SolverFeatherPGS(SolverBase):
                 prep's single ``contact.point`` lever arm. ``phi`` is still computed from the original
                 witness points. Defaults to False.
             enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
-                constraints.  Each violated limit adds one constraint row.  Supported with
+                constraints. Each active limit side adds one constraint row. Supported with
                 ``pgs_kernel="loop"`` and ``pgs_kernel="tiled_row"``; the ``"tiled_contact"``
                 and ``"streaming"`` PGS kernels are *not* compatible.  Defaults to False.
+            joint_limit_activation_gap (float, optional): Distance from a finite lower or upper
+                position limit at which a joint-limit PGS row becomes active. A lower row is
+                allocated when ``q <= lower + gap``; an upper row is allocated when
+                ``q >= upper - gap``. ``inf`` preserves the historical behavior of allocating all
+                finite limit rows every step. Must be non-negative and not NaN. Defaults to ``inf``.
             enable_joint_velocity_limits (bool, optional): Enforce joint velocity limits
                 (``model.joint_velocity_limit``) as per-DOF PGS constraints. Mirrors the
                 PhysX velocity-limit row: when ``|qdot_i| > qdot_max_i``, a single
@@ -447,6 +453,12 @@ class SolverFeatherPGS(SolverBase):
         if self.contact_friction_anchor_limit < 0:
             raise ValueError("contact_friction_anchor_limit must be non-negative")
         self.enable_joint_limits = enable_joint_limits
+        try:
+            self.joint_limit_activation_gap = float(joint_limit_activation_gap)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("joint_limit_activation_gap must be non-negative or inf") from exc
+        if np.isnan(self.joint_limit_activation_gap) or self.joint_limit_activation_gap < 0.0:
+            raise ValueError("joint_limit_activation_gap must be non-negative or inf")
         self.enable_joint_velocity_limits = enable_joint_velocity_limits
         self.pgs_iterations = pgs_iterations
         self.pgs_beta = pgs_beta
@@ -3209,6 +3221,7 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_limit_lower,
                         model.joint_limit_upper,
                         state_in.joint_q,
+                        self.joint_limit_activation_gap,
                         self.art_to_world,
                         max_constraints,
                     ],
@@ -3507,6 +3520,7 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_limit_lower,
                         model.joint_limit_upper,
                         state_in.joint_q,
+                        self.joint_limit_activation_gap,
                         self.art_to_world,
                         max_constraints,
                     ],
