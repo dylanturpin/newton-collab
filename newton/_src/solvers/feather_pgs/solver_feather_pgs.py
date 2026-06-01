@@ -271,6 +271,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_debug: bool = False,
         drive_mode: Literal["augmented", "physx_pgs"] = "augmented",
         effort_limit_mode: str = "actuator",
+        packed_constraint_rows: bool = False,
     ):
         """
         Args:
@@ -420,6 +421,11 @@ class SolverFeatherPGS(SolverBase):
                 is left uncapped; the implicit-PD drive response carried by
                 ``H_tilde^{-1}`` is not clamped. ``"actuator"`` (the new default) is
                 the only supported value. ``"net"`` is rejected with ``ValueError``.
+            packed_constraint_rows (bool, optional): Experimental matrix-free row-stream
+                prototype. When true, the fused matrix-free GS solve consumes packed dense
+                and matrix-free row metadata/scalar streams instead of separate row type,
+                parent, friction, and drive descriptor arrays. Only supported with
+                ``pgs_mode="matrix_free"``. Defaults to False.
         Auto selection behavior:
             - auto: size > threshold -> tiled, else loop/par_row.
             - Delassus auto/tiled: streaming kernel (handles any constraint count via chunking).
@@ -472,6 +478,9 @@ class SolverFeatherPGS(SolverBase):
         if pgs_mode not in ("dense", "split", "matrix_free"):
             raise ValueError(f"pgs_mode must be 'dense', 'split', or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
+        self.packed_constraint_rows = bool(packed_constraint_rows)
+        if self.packed_constraint_rows and self.pgs_mode != "matrix_free":
+            raise NotImplementedError("packed_constraint_rows=True currently requires pgs_mode='matrix_free'")
         if pgs_schedule not in ("interleaved", "contact_then_internal", "physx_grasp"):
             raise ValueError(
                 "pgs_schedule must be 'interleaved', 'contact_then_internal', or 'physx_grasp', "
@@ -508,6 +517,11 @@ class SolverFeatherPGS(SolverBase):
         _valid_friction_modes = ("current", "bisection", "bisection_desaxce", "coulomb_newton")
         if friction_mode not in _valid_friction_modes:
             raise ValueError(f"friction_mode must be one of {list(_valid_friction_modes)}, got {friction_mode!r}")
+        if self.packed_constraint_rows and friction_mode != "current":
+            raise NotImplementedError(
+                "packed_constraint_rows=True currently supports friction_mode='current' only; "
+                f"got {friction_mode!r}"
+            )
         if friction_mode != "current":
             if pgs_mode != "matrix_free":
                 raise ValueError(
@@ -553,6 +567,7 @@ class SolverFeatherPGS(SolverBase):
         # per world per iteration. Populated only when ``pgs_debug`` is
         # ``True`` and ``pgs_mode == "matrix_free"``.
         self._pgs_ncp_residual_log: list[np.ndarray] = []
+        self._last_matrix_free_packed_launch = False
         valid_cholesky = {"tiled", "loop", "auto"}
         if cholesky_kernel not in valid_cholesky:
             raise ValueError(f"cholesky_kernel must be one of {sorted(valid_cholesky)}")
@@ -1347,6 +1362,20 @@ class SolverFeatherPGS(SolverBase):
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
 
+        # Experimental packed dense row stream used only by the opt-in
+        # matrix-free packed GS kernel.  The legacy path continues to consume
+        # the separate metadata arrays above.
+        if self.pgs_mode == "matrix_free":
+            self.dense_meta_packed = wp.zeros(
+                (self.world_count, max_constraints * 4), dtype=wp.int32, device=device
+            )
+            self.dense_scalar_packed = wp.zeros(
+                (self.world_count, max_constraints * 8), dtype=wp.float32, device=device
+            )
+        else:
+            self.dense_meta_packed = None
+            self.dense_scalar_packed = None
+
         # Per-world constraint counts
         self.constraint_count = wp.zeros(
             (self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
@@ -1457,6 +1486,9 @@ class SolverFeatherPGS(SolverBase):
         #   .z = __float_as_int(rhs)
         #   .w = row_type | (row_parent << 16)
         self.mf_meta_packed = wp.zeros((worlds, mf_max_c * 4), dtype=wp.int32, device=device)
+        # Packed MF scalar stream for the packed-row prototype:
+        #   [0] = friction coefficient, [1] = phi, [2:4] reserved.
+        self.mf_scalar_packed = wp.zeros((worlds, mf_max_c * 4), dtype=wp.float32, device=device)
 
         # Body map buffers for tiled MF PGS kernel
         self.max_mf_bodies = 64
@@ -1585,20 +1617,71 @@ class SolverFeatherPGS(SolverBase):
         return iterations - active
 
     def _pack_mf_meta(self, mf_rhs: wp.array) -> None:
-        pack_kernel = TiledKernelFactory.get_pack_mf_meta_kernel(self.mf_max_constraints, self.model.device)
+        if self.packed_constraint_rows:
+            pack_kernel = TiledKernelFactory.get_pack_mf_row_stream_kernel(self.mf_max_constraints, self.model.device)
+            wp.launch_tiled(
+                pack_kernel,
+                dim=[self.world_count],
+                inputs=[
+                    self.mf_constraint_count,
+                    self.mf_dof_a,
+                    self.mf_dof_b,
+                    self.mf_eff_mass_inv,
+                    mf_rhs,
+                    self.mf_row_type,
+                    self.mf_row_parent,
+                    self.mf_row_mu,
+                    self.mf_phi,
+                ],
+                outputs=[self.mf_meta_packed, self.mf_scalar_packed],
+                block_dim=32,
+                device=self.model.device,
+            )
+        else:
+            pack_kernel = TiledKernelFactory.get_pack_mf_meta_kernel(self.mf_max_constraints, self.model.device)
+            wp.launch_tiled(
+                pack_kernel,
+                dim=[self.world_count],
+                inputs=[
+                    self.mf_constraint_count,
+                    self.mf_dof_a,
+                    self.mf_dof_b,
+                    self.mf_eff_mass_inv,
+                    mf_rhs,
+                    self.mf_row_type,
+                    self.mf_row_parent,
+                ],
+                outputs=[self.mf_meta_packed],
+                block_dim=32,
+                device=self.model.device,
+            )
+
+    def _pack_dense_row_stream(self, dense_rhs: wp.array) -> None:
+        if not self.packed_constraint_rows:
+            return
+        pack_kernel = TiledKernelFactory.get_pack_dense_row_stream_kernel(
+            self.dense_max_constraints,
+            self.max_world_dofs,
+            self.model.device,
+        )
         wp.launch_tiled(
             pack_kernel,
             dim=[self.world_count],
             inputs=[
-                self.mf_constraint_count,
-                self.mf_dof_a,
-                self.mf_dof_b,
-                self.mf_eff_mass_inv,
-                mf_rhs,
-                self.mf_row_type,
-                self.mf_row_parent,
+                self.constraint_count,
+                dense_rhs,
+                self.diag,
+                self.row_type,
+                self.row_parent,
+                self.row_mu,
+                self.drive_target_vel_bias,
+                self.drive_vel_multiplier,
+                self.drive_impulse_multiplier,
+                self.drive_max_impulse,
+                self.phi,
+                self.J_world,
             ],
-            outputs=[self.mf_meta_packed],
+            outputs=[self.dense_meta_packed, self.dense_scalar_packed],
             block_dim=32,
             device=self.model.device,
         )
@@ -1618,51 +1701,95 @@ class SolverFeatherPGS(SolverBase):
             return
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
-        mf_gs_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_kernel(
-            self.dense_max_constraints,
-            self.mf_max_constraints,
-            self.max_world_dofs,
-            self.model.device,
-            friction_mode=self.friction_mode,
-        )
-        def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
-            wp.launch_tiled(
-                mf_gs_kernel,
-                dim=[self.world_count],
-                inputs=[
-                    self.constraint_count,
-                    self.world_dof_start,
-                    dense_rhs,
-                    self.diag,
-                    self.impulses,
-                    self.J_world,
-                    self.Y_world,
-                    self.row_type,
-                    self.row_parent,
-                    self.row_mu,
-                    self.drive_target_vel_bias,
-                    self.drive_vel_multiplier,
-                    self.drive_impulse_multiplier,
-                    self.drive_max_impulse,
-                    self.mf_constraint_count,
-                    mf_meta,
-                    self.mf_impulses,
-                    self.mf_J_a,
-                    self.mf_J_b,
-                    self.mf_MiJt_a,
-                    self.mf_MiJt_b,
-                    self.mf_row_mu,
-                    phase_iterations,
-                    omega,
-                    row_phase,
-                    int(friction_start_iteration),
-                    int(phase_iteration_offset),
-                    int(freeze_drive_rows),
-                ],
-                outputs=[self.v_out],
-                block_dim=32,
-                device=self.model.device,
+        self._last_matrix_free_packed_launch = bool(self.packed_constraint_rows)
+        if self.packed_constraint_rows:
+            self._pack_dense_row_stream(dense_rhs)
+            mf_gs_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_packed_kernel(
+                self.dense_max_constraints,
+                self.mf_max_constraints,
+                self.max_world_dofs,
+                self.model.device,
+                friction_mode=self.friction_mode,
             )
+        else:
+            mf_gs_kernel = TiledKernelFactory.get_pgs_solve_mf_gs_kernel(
+                self.dense_max_constraints,
+                self.mf_max_constraints,
+                self.max_world_dofs,
+                self.model.device,
+                friction_mode=self.friction_mode,
+            )
+
+        def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
+            if self.packed_constraint_rows:
+                wp.launch_tiled(
+                    mf_gs_kernel,
+                    dim=[self.world_count],
+                    inputs=[
+                        self.constraint_count,
+                        self.world_dof_start,
+                        self.dense_meta_packed,
+                        self.dense_scalar_packed,
+                        self.impulses,
+                        self.J_world,
+                        self.Y_world,
+                        self.mf_constraint_count,
+                        mf_meta,
+                        self.mf_scalar_packed,
+                        self.mf_impulses,
+                        self.mf_J_a,
+                        self.mf_J_b,
+                        self.mf_MiJt_a,
+                        self.mf_MiJt_b,
+                        phase_iterations,
+                        omega,
+                        row_phase,
+                        int(friction_start_iteration),
+                        int(phase_iteration_offset),
+                        int(freeze_drive_rows),
+                    ],
+                    outputs=[self.v_out],
+                    block_dim=32,
+                    device=self.model.device,
+                )
+            else:
+                wp.launch_tiled(
+                    mf_gs_kernel,
+                    dim=[self.world_count],
+                    inputs=[
+                        self.constraint_count,
+                        self.world_dof_start,
+                        dense_rhs,
+                        self.diag,
+                        self.impulses,
+                        self.J_world,
+                        self.Y_world,
+                        self.row_type,
+                        self.row_parent,
+                        self.row_mu,
+                        self.drive_target_vel_bias,
+                        self.drive_vel_multiplier,
+                        self.drive_impulse_multiplier,
+                        self.drive_max_impulse,
+                        self.mf_constraint_count,
+                        mf_meta,
+                        self.mf_impulses,
+                        self.mf_J_a,
+                        self.mf_J_b,
+                        self.mf_MiJt_a,
+                        self.mf_MiJt_b,
+                        self.mf_row_mu,
+                        phase_iterations,
+                        omega,
+                        row_phase,
+                        int(friction_start_iteration),
+                        int(phase_iteration_offset),
+                        int(freeze_drive_rows),
+                    ],
+                    outputs=[self.v_out],
+                    block_dim=32,
+                    device=self.model.device,
+                )
 
         if self.pgs_schedule == "contact_then_internal":
             row_phases = (1, 2)
@@ -2092,24 +2219,10 @@ class SolverFeatherPGS(SolverBase):
                 # Initialize v_out = v_hat before GS loop
                 self._stage6_prepare_world_velocity()
 
-                # Pack MF metadata into int4 structs for coalesced 128-bit loads
-                pack_kernel = TiledKernelFactory.get_pack_mf_meta_kernel(self.mf_max_constraints, self.model.device)
-                wp.launch_tiled(
-                    pack_kernel,
-                    dim=[self.world_count],
-                    inputs=[
-                        self.mf_constraint_count,
-                        self.mf_dof_a,
-                        self.mf_dof_b,
-                        self.mf_eff_mass_inv,
-                        self.mf_rhs,
-                        self.mf_row_type,
-                        self.mf_row_parent,
-                    ],
-                    outputs=[self.mf_meta_packed],
-                    block_dim=32,
-                    device=self.model.device,
-                )
+                # Pack MF row metadata before the fused GS kernel. Packed mode
+                # also fills the MF scalar stream consumed by the experimental
+                # packed-row solve contract.
+                self._pack_mf_meta(self.mf_rhs)
 
             with wp.ScopedTimer("S6_PGS_Solve", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
                 if self.pgs_debug:
@@ -4785,7 +4898,10 @@ class TiledKernelFactory:
     _pgs_solve_streaming_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _pgs_solve_mf_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
     _pgs_solve_mf_gs_cache: ClassVar[dict[tuple[int, int, int, str, str], "wp.Kernel"]] = {}
+    _pgs_solve_mf_gs_packed_cache: ClassVar[dict[tuple[int, int, int, str, str], "wp.Kernel"]] = {}
     _pack_mf_meta_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
+    _pack_mf_row_stream_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
+    _pack_dense_row_stream_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
     _triangular_solve_cache: ClassVar[dict[tuple[int, str], "wp.Kernel"]] = {}
     _delassus_cache: ClassVar[dict[tuple[int, int, str], "wp.Kernel"]] = {}
 
@@ -6253,6 +6369,253 @@ class TiledKernelFactory:
         return wp.kernel(enable_backward=False, module="unique")(pack_mf_meta_template)
 
     @classmethod
+    def get_pack_mf_row_stream_kernel(cls, mf_max_constraints: int, device: "wp.Device") -> "wp.Kernel":
+        """Get or create the packed MF row-stream packer."""
+        key = (mf_max_constraints, device.arch)
+        if key not in cls._pack_mf_row_stream_cache:
+            cls._pack_mf_row_stream_cache[key] = cls._build_pack_mf_row_stream_kernel(mf_max_constraints)
+        return cls._pack_mf_row_stream_cache[key]
+
+    @classmethod
+    def _build_pack_mf_row_stream_kernel(cls, mf_max_constraints: int) -> "wp.Kernel":
+        """Build a kernel to pack MF metadata plus scalar row fields.
+
+        The int4 metadata keeps the legacy layout.  The scalar stream removes
+        ``mf_row_mu`` from the packed solve-kernel contract.
+        """
+        M_MF = mf_max_constraints
+
+        snippet = f"""
+    #if defined(__CUDA_ARCH__)
+        int lane = threadIdx.x;
+        int m_mf = mf_constraint_count.data[world];
+        if (m_mf > {M_MF}) m_mf = {M_MF};
+        int off_mf = world * {M_MF};
+        int off_meta = off_mf * 4;
+        int off_scalar = off_mf * 4;
+
+        for (int i = lane; i < m_mf; i += 32) {{
+            int da = mf_dof_a.data[off_mf + i];
+            int db = mf_dof_b.data[off_mf + i];
+            float diag = mf_eff_mass_inv.data[off_mf + i];
+            float rhs_val = mf_rhs.data[off_mf + i];
+            int rt = mf_row_type.data[off_mf + i];
+            int par = mf_row_parent.data[off_mf + i];
+
+            int4 packed;
+            packed.x = (da << 16) | (db & 0xFFFF);
+            packed.y = __float_as_int(diag);
+            packed.z = __float_as_int(rhs_val);
+            packed.w = rt | (par << 16);
+            *reinterpret_cast<int4*>(&mf_meta.data[off_meta + i * 4]) = packed;
+
+            int scalar_base = off_scalar + i * 4;
+            mf_scalars.data[scalar_base + 0] = mf_row_mu.data[off_mf + i];
+            mf_scalars.data[scalar_base + 1] = mf_phi.data[off_mf + i];
+            mf_scalars.data[scalar_base + 2] = 0.0f;
+            mf_scalars.data[scalar_base + 3] = 0.0f;
+        }}
+    #endif
+    """
+
+        @wp.func_native(snippet)
+        def pack_mf_row_stream_native(
+            world: int,
+            mf_constraint_count: wp.array(dtype=int),
+            mf_dof_a: wp.array2d(dtype=int),
+            mf_dof_b: wp.array2d(dtype=int),
+            mf_eff_mass_inv: wp.array2d(dtype=float),
+            mf_rhs: wp.array2d(dtype=float),
+            mf_row_type: wp.array2d(dtype=int),
+            mf_row_parent: wp.array2d(dtype=int),
+            mf_row_mu: wp.array2d(dtype=float),
+            mf_phi: wp.array2d(dtype=float),
+            mf_meta: wp.array2d(dtype=int),
+            mf_scalars: wp.array2d(dtype=float),
+        ): ...
+
+        def pack_mf_row_stream_template(
+            mf_constraint_count: wp.array(dtype=int),
+            mf_dof_a: wp.array2d(dtype=int),
+            mf_dof_b: wp.array2d(dtype=int),
+            mf_eff_mass_inv: wp.array2d(dtype=float),
+            mf_rhs: wp.array2d(dtype=float),
+            mf_row_type: wp.array2d(dtype=int),
+            mf_row_parent: wp.array2d(dtype=int),
+            mf_row_mu: wp.array2d(dtype=float),
+            mf_phi: wp.array2d(dtype=float),
+            mf_meta: wp.array2d(dtype=int),
+            mf_scalars: wp.array2d(dtype=float),
+        ):
+            world, _lane = wp.tid()
+            pack_mf_row_stream_native(
+                world,
+                mf_constraint_count,
+                mf_dof_a,
+                mf_dof_b,
+                mf_eff_mass_inv,
+                mf_rhs,
+                mf_row_type,
+                mf_row_parent,
+                mf_row_mu,
+                mf_phi,
+                mf_meta,
+                mf_scalars,
+            )
+
+        name = f"pack_mf_row_stream_{mf_max_constraints}"
+        pack_mf_row_stream_template.__name__ = name
+        pack_mf_row_stream_template.__qualname__ = name
+        return wp.kernel(enable_backward=False, module="unique")(pack_mf_row_stream_template)
+
+    @classmethod
+    def get_pack_dense_row_stream_kernel(
+        cls,
+        max_constraints: int,
+        max_world_dofs: int,
+        device: "wp.Device",
+    ) -> "wp.Kernel":
+        """Get or create the packed dense row-stream packer."""
+        key = (max_constraints, max_world_dofs, device.arch)
+        if key not in cls._pack_dense_row_stream_cache:
+            cls._pack_dense_row_stream_cache[key] = cls._build_pack_dense_row_stream_kernel(
+                max_constraints, max_world_dofs
+            )
+        return cls._pack_dense_row_stream_cache[key]
+
+    @classmethod
+    def _build_pack_dense_row_stream_kernel(cls, max_constraints: int, max_world_dofs: int) -> "wp.Kernel":
+        """Build a kernel to pack dense articulated row metadata/scalars."""
+        M_D = max_constraints
+        D = max_world_dofs
+
+        snippet = f"""
+    #if defined(__CUDA_ARCH__)
+        int lane = threadIdx.x;
+        int m_dense = world_constraint_count.data[world];
+        if (m_dense > {M_D}) m_dense = {M_D};
+        int off_dense = world * {M_D};
+        int off_meta = off_dense * 4;
+        int off_scalar = off_dense * 8;
+        int jy_world_base = world * {M_D} * {D};
+
+        for (int i = lane; i < m_dense; i += 32) {{
+            int rt = world_row_type.data[off_dense + i];
+            int par = world_row_parent.data[off_dense + i];
+            int selector = -1;
+            int selector_sign_bit = 0;
+
+            if (rt == 1 || rt == 3 || rt == 4) {{
+                float best_abs = 0.0f;
+                int row_base = jy_world_base + i * {D};
+                for (int d = 0; d < {D}; d++) {{
+                    float val = J_world.data[row_base + d];
+                    float av = fabsf(val);
+                    if (av > best_abs && av > 1.0e-6f) {{
+                        best_abs = av;
+                        selector = d;
+                        selector_sign_bit = (val < 0.0f) ? 1 : 0;
+                    }}
+                }}
+            }}
+
+            int sibling = -1;
+            if (rt == 2 && par >= 0) {{
+                sibling = (i == par + 1) ? par + 2 : par + 1;
+                if (sibling < 0 || sibling >= m_dense) sibling = -1;
+            }}
+
+            int phase_mask = 1;  // row_phase 0
+            if (rt == 0 || rt == 2) {{
+                phase_mask |= (1 << 1) | (1 << 4);
+            }}
+            if (rt == 1 || rt == 3) {{
+                phase_mask |= (1 << 2) | (1 << 3);
+            }}
+            if (rt == 4) {{
+                phase_mask |= (1 << 5);
+            }}
+
+            int4 packed;
+            packed.x = rt | (par << 16);
+            packed.y = selector;
+            packed.z = sibling;
+            packed.w = phase_mask | (selector_sign_bit << 16);
+            *reinterpret_cast<int4*>(&dense_meta.data[off_meta + i * 4]) = packed;
+
+            int scalar_base = off_scalar + i * 8;
+            dense_scalars.data[scalar_base + 0] = world_diag.data[off_dense + i];
+            dense_scalars.data[scalar_base + 1] = rhs_bias.data[off_dense + i];
+            dense_scalars.data[scalar_base + 2] = world_row_mu.data[off_dense + i];
+            dense_scalars.data[scalar_base + 3] = world_drive_target_vel_bias.data[off_dense + i];
+            dense_scalars.data[scalar_base + 4] = world_drive_vel_multiplier.data[off_dense + i];
+            dense_scalars.data[scalar_base + 5] = world_drive_impulse_multiplier.data[off_dense + i];
+            dense_scalars.data[scalar_base + 6] = world_drive_max_impulse.data[off_dense + i];
+            dense_scalars.data[scalar_base + 7] = world_phi.data[off_dense + i];
+        }}
+    #endif
+    """
+
+        @wp.func_native(snippet)
+        def pack_dense_row_stream_native(
+            world: int,
+            world_constraint_count: wp.array(dtype=int),
+            rhs_bias: wp.array2d(dtype=float),
+            world_diag: wp.array2d(dtype=float),
+            world_row_type: wp.array2d(dtype=int),
+            world_row_parent: wp.array2d(dtype=int),
+            world_row_mu: wp.array2d(dtype=float),
+            world_drive_target_vel_bias: wp.array2d(dtype=float),
+            world_drive_vel_multiplier: wp.array2d(dtype=float),
+            world_drive_impulse_multiplier: wp.array2d(dtype=float),
+            world_drive_max_impulse: wp.array2d(dtype=float),
+            world_phi: wp.array2d(dtype=float),
+            J_world: wp.array3d(dtype=float),
+            dense_meta: wp.array2d(dtype=int),
+            dense_scalars: wp.array2d(dtype=float),
+        ): ...
+
+        def pack_dense_row_stream_template(
+            world_constraint_count: wp.array(dtype=int),
+            rhs_bias: wp.array2d(dtype=float),
+            world_diag: wp.array2d(dtype=float),
+            world_row_type: wp.array2d(dtype=int),
+            world_row_parent: wp.array2d(dtype=int),
+            world_row_mu: wp.array2d(dtype=float),
+            world_drive_target_vel_bias: wp.array2d(dtype=float),
+            world_drive_vel_multiplier: wp.array2d(dtype=float),
+            world_drive_impulse_multiplier: wp.array2d(dtype=float),
+            world_drive_max_impulse: wp.array2d(dtype=float),
+            world_phi: wp.array2d(dtype=float),
+            J_world: wp.array3d(dtype=float),
+            dense_meta: wp.array2d(dtype=int),
+            dense_scalars: wp.array2d(dtype=float),
+        ):
+            world, _lane = wp.tid()
+            pack_dense_row_stream_native(
+                world,
+                world_constraint_count,
+                rhs_bias,
+                world_diag,
+                world_row_type,
+                world_row_parent,
+                world_row_mu,
+                world_drive_target_vel_bias,
+                world_drive_vel_multiplier,
+                world_drive_impulse_multiplier,
+                world_drive_max_impulse,
+                world_phi,
+                J_world,
+                dense_meta,
+                dense_scalars,
+            )
+
+        name = f"pack_dense_row_stream_{max_constraints}_{max_world_dofs}"
+        pack_dense_row_stream_template.__name__ = name
+        pack_dense_row_stream_template.__qualname__ = name
+        return wp.kernel(enable_backward=False, module="unique")(pack_dense_row_stream_template)
+
+    @classmethod
     def get_pgs_solve_mf_gs_kernel(
         cls,
         max_constraints: int,
@@ -7617,3 +7980,493 @@ class TiledKernelFactory:
         pgs_solve_mf_gs_template.__name__ = name
         pgs_solve_mf_gs_template.__qualname__ = name
         return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+
+    @classmethod
+    def get_pgs_solve_mf_gs_packed_kernel(
+        cls,
+        max_constraints: int,
+        mf_max_constraints: int,
+        max_world_dofs: int,
+        device: "wp.Device",
+        friction_mode: str = "current",
+    ) -> "wp.Kernel":
+        """Get or create the packed-row matrix-free GS kernel."""
+        if friction_mode != "current":
+            raise NotImplementedError(
+                "packed_constraint_rows currently supports friction_mode='current'; "
+                f"got {friction_mode!r}"
+            )
+        key = (max_constraints, mf_max_constraints, max_world_dofs, device.arch, friction_mode)
+        if key not in cls._pgs_solve_mf_gs_packed_cache:
+            cls._pgs_solve_mf_gs_packed_cache[key] = cls._build_pgs_solve_mf_gs_packed_kernel(
+                max_constraints, mf_max_constraints, max_world_dofs
+            )
+        return cls._pgs_solve_mf_gs_packed_cache[key]
+
+    @classmethod
+    def _build_pgs_solve_mf_gs_packed_kernel(
+        cls,
+        max_constraints: int,
+        mf_max_constraints: int,
+        max_world_dofs: int,
+    ) -> "wp.Kernel":
+        """Two-phase GS kernel whose row metadata contract is packed streams.
+
+        Dense row metadata/scalars and MF row scalars are supplied as packed
+        streams.  Contact/friction rows still use materialized J/Y rows in this
+        prototype, while 1-DOF dense joint target, joint limit, and joint
+        velocity-limit rows use packed selector metadata for J*v.
+        """
+        M_D = max_constraints
+        M_MF = mf_max_constraints
+        D = max_world_dofs
+
+        snippet = f"""
+    #if defined(__CUDA_ARCH__)
+        const unsigned MASK = 0xFFFFFFFF;
+        int lane = threadIdx.x;
+
+        int m_dense = world_constraint_count.data[world];
+        int m_mf = mf_constraint_count.data[world];
+        if (m_dense == 0 && m_mf == 0) return;
+        if (m_dense > {M_D}) m_dense = {M_D};
+        if (m_mf > {M_MF}) m_mf = {M_MF};
+
+        int w_dof_start = world_dof_start.data[world];
+        int off_dense = world * {M_D};
+        int off_dense_meta = off_dense * 4;
+        int off_dense_scalar = off_dense * 8;
+        int off_mf = world * {M_MF};
+        int off_meta = off_mf * 4;
+        int off_mf_scalar = off_mf * 4;
+        int jy_world_base = world * {M_D} * {D};
+        int mf6_base = world * {M_MF} * 6;
+
+        __shared__ float s_v[{D}];
+        __shared__ float s_lam_dense[{M_D}];
+        __shared__ float s_lam_mf[{M_MF}];
+
+        for (int d = lane; d < {D}; d += 32) {{
+            s_v[d] = v_out.data[w_dof_start + d];
+        }}
+        for (int i = lane; i < m_dense; i += 32) {{
+            s_lam_dense[i] = world_impulses.data[off_dense + i];
+        }}
+        for (int i = lane; i < m_mf; i += 32) {{
+            s_lam_mf[i] = mf_impulses.data[off_mf + i];
+        }}
+        __syncwarp();
+
+        for (int iter = 0; iter < iterations; iter++) {{
+            int global_iter = iteration_offset + iter;
+
+            // Dense articulated rows.  Metadata comes from dense_meta; scalar
+            // row fields come from dense_scalars.
+            for (int i = 0; i < m_dense; i++) {{
+                int4 meta = *reinterpret_cast<const int4*>(&dense_meta.data[off_dense_meta + i * 4]);
+                int packed_tp = meta.x;
+                int row_type = packed_tp & 0xFFFF;
+                int parent_idx = packed_tp >> 16;
+                int selector = meta.y;
+                int sibling = meta.z;
+                int flags = meta.w;
+                float selector_sign = ((flags & (1 << 16)) != 0) ? -1.0f : 1.0f;
+                int scalar_base = off_dense_scalar + i * 8;
+                float denom = dense_scalars.data[scalar_base + 0];
+                float rhs_val = dense_scalars.data[scalar_base + 1];
+                float mu_val = dense_scalars.data[scalar_base + 2];
+
+                if (row_phase == 1 && row_type != 0 && row_type != 2) continue;
+                if (row_phase == 2 && row_type != 1 && row_type != 3 && row_type != 4) continue;
+                if (row_phase == 3 && row_type != 1 && row_type != 3) continue;
+                if (row_phase == 4 && row_type != 0 && row_type != 2) continue;
+                if (row_phase == 5 && row_type != 4) continue;
+                if ((row_phase == 0 || row_phase == 2) && row_type == 4) continue;
+                if (freeze_drive_rows != 0 && row_type == 1) continue;
+                if (row_type == 2 && global_iter < friction_start_iteration) {{
+                    s_lam_dense[i] = 0.0f;
+                    __syncwarp();
+                    continue;
+                }}
+                if (denom <= 0.0f) continue;
+
+                int row_base = jy_world_base + i * {D};
+                float my_sum = 0.0f;
+                if ((row_type == 1 || row_type == 3 || row_type == 4) && selector >= 0 && selector < {D}) {{
+                    if (lane == 0) {{
+                        my_sum = selector_sign * s_v[selector];
+                    }}
+                }} else {{
+                    for (int d = lane; d < {D}; d += 32) {{
+                        my_sum += J_world.data[row_base + d] * s_v[d];
+                    }}
+                }}
+                my_sum += __shfl_down_sync(MASK, my_sum, 16);
+                my_sum += __shfl_down_sync(MASK, my_sum, 8);
+                my_sum += __shfl_down_sync(MASK, my_sum, 4);
+                my_sum += __shfl_down_sync(MASK, my_sum, 2);
+                my_sum += __shfl_down_sync(MASK, my_sum, 1);
+                float jv = __shfl_sync(MASK, my_sum, 0);
+
+                float residual = jv + rhs_val;
+                float delta = -residual / denom;
+                float old_impulse = s_lam_dense[i];
+                float new_impulse = old_impulse + omega * delta;
+                float delta_impulse = 0.0f;
+
+                if (row_type == 0) {{
+                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    delta_impulse = new_impulse - old_impulse;
+                }} else if (row_type == 3) {{
+                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    delta_impulse = new_impulse - old_impulse;
+                }} else if (row_type == 4) {{
+                    if (residual < 0.0f) {{
+                        delta_impulse = delta;
+                        new_impulse = delta_impulse;
+                    }} else {{
+                        delta_impulse = 0.0f;
+                        new_impulse = 0.0f;
+                    }}
+                }} else if (row_type == 1) {{
+                    float drive_target = dense_scalars.data[scalar_base + 3];
+                    float drive_vel_mul = dense_scalars.data[scalar_base + 4];
+                    float drive_imp_mul = dense_scalars.data[scalar_base + 5];
+                    float drive_max_imp = dense_scalars.data[scalar_base + 6];
+                    new_impulse = old_impulse * drive_imp_mul + jv * drive_vel_mul + drive_target;
+                    if (new_impulse > drive_max_imp) new_impulse = drive_max_imp;
+                    if (new_impulse < -drive_max_imp) new_impulse = -drive_max_imp;
+                    delta_impulse = new_impulse - old_impulse;
+                }} else if (row_type == 2) {{
+                    float lambda_n = (parent_idx >= 0 && parent_idx < m_dense) ? s_lam_dense[parent_idx] : 0.0f;
+                    float radius = fmaxf(mu_val * lambda_n, 0.0f);
+                    if (radius <= 0.0f) {{
+                        new_impulse = 0.0f;
+                    }} else {{
+                        if (sibling < 0 || sibling >= m_dense) {{
+                            sibling = (i == parent_idx + 1) ? parent_idx + 2 : parent_idx + 1;
+                        }}
+                        s_lam_dense[i] = new_impulse;
+                        if (sibling >= 0 && sibling < m_dense) {{
+                            float a_val = new_impulse;
+                            float b_val = s_lam_dense[sibling];
+                            float mag = sqrtf(a_val * a_val + b_val * b_val);
+                            if (mag > radius) {{
+                                float scale = radius / mag;
+                                new_impulse = a_val * scale;
+                                float sib_new = b_val * scale;
+                                float sib_delta = sib_new - b_val;
+                                s_lam_dense[sibling] = sib_new;
+                                int sib_row_base = jy_world_base + sibling * {D};
+                                if (sib_delta != 0.0f) {{
+                                    for (int d = lane; d < {D}; d += 32) {{
+                                        s_v[d] += Y_world.data[sib_row_base + d] * sib_delta;
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}
+                    delta_impulse = new_impulse - old_impulse;
+                }} else {{
+                    delta_impulse = new_impulse - old_impulse;
+                }}
+
+                s_lam_dense[i] = new_impulse;
+                if (delta_impulse != 0.0f) {{
+                    for (int d = lane; d < {D}; d += 32) {{
+                        s_v[d] += Y_world.data[row_base + d] * delta_impulse;
+                    }}
+                }}
+                __syncwarp();
+            }}
+
+            // Matrix-free free-rigid rows.  Row type, parent, diag, and RHS
+            // are in mf_meta; friction coefficient is in mf_scalars.
+            if (row_phase != 2 && row_phase != 3 && row_phase != 5) {{
+                for (int i = 0; i < m_mf; i++) {{
+                    int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);
+                    int packed_dofs = meta.x;
+                    int dof_a = packed_dofs >> 16;
+                    int dof_b = (packed_dofs << 16) >> 16;
+                    float mf_eff_inv = __int_as_float(meta.y);
+                    float mf_rhs_val = __int_as_float(meta.z);
+                    int packed_tp = meta.w;
+                    int mf_rt = packed_tp & 0xFFFF;
+                    int mf_parent = packed_tp >> 16;
+
+                    if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2) continue;
+                    if (row_phase == 0 && mf_rt == 4) continue;
+                    if (mf_rt == 2 && global_iter < friction_start_iteration) {{
+                        s_lam_mf[i] = 0.0f;
+                        __syncwarp();
+                        continue;
+                    }}
+                    if (mf_eff_inv <= 0.0f) continue;
+
+                    int row_mf6 = mf6_base + i * 6;
+                    float my_sum = 0.0f;
+                    if (lane < 6 && dof_a >= 0) {{
+                        my_sum = mf_J_a.data[row_mf6 + lane] * s_v[dof_a + lane];
+                    }}
+                    if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                        my_sum = mf_J_b.data[row_mf6 + lane - 6] * s_v[dof_b + lane - 6];
+                    }}
+                    my_sum += __shfl_down_sync(MASK, my_sum, 16);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 8);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 4);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 2);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 1);
+                    float jv = __shfl_sync(MASK, my_sum, 0);
+
+                    float residual = jv + mf_rhs_val;
+                    float delta = -residual * mf_eff_inv;
+                    float old_impulse = s_lam_mf[i];
+                    float new_impulse = old_impulse + omega * delta;
+                    float delta_impulse = 0.0f;
+
+                    if (mf_rt == 0) {{
+                        if (new_impulse < 0.0f) new_impulse = 0.0f;
+                        delta_impulse = new_impulse - old_impulse;
+                    }} else if (mf_rt == 4) {{
+                        if (residual < 0.0f) {{
+                            delta_impulse = delta;
+                            new_impulse = delta_impulse;
+                        }} else {{
+                            delta_impulse = 0.0f;
+                            new_impulse = 0.0f;
+                        }}
+                    }} else if (mf_rt == 2) {{
+                        float mu_val = mf_scalars.data[off_mf_scalar + i * 4 + 0];
+                        float lambda_n = (mf_parent >= 0 && mf_parent < m_mf) ? s_lam_mf[mf_parent] : 0.0f;
+                        float radius = fmaxf(mu_val * lambda_n, 0.0f);
+                        if (radius <= 0.0f) {{
+                            new_impulse = 0.0f;
+                        }} else {{
+                            int sib = (i == mf_parent + 1) ? mf_parent + 2 : mf_parent + 1;
+                            s_lam_mf[i] = new_impulse;
+                            if (sib >= 0 && sib < m_mf) {{
+                                float a_val = new_impulse;
+                                float b_val = s_lam_mf[sib];
+                                float mag = sqrtf(a_val * a_val + b_val * b_val);
+                                if (mag > radius) {{
+                                    float scale = radius / mag;
+                                    new_impulse = a_val * scale;
+                                    float sib_new = b_val * scale;
+                                    float sib_delta = sib_new - b_val;
+                                    s_lam_mf[sib] = sib_new;
+
+                                    int sib_meta0 = mf_meta.data[off_meta + sib * 4];
+                                    int sib_dof_a = sib_meta0 >> 16;
+                                    int sib_dof_b = (sib_meta0 << 16) >> 16;
+                                    int sib_mf6 = mf6_base + sib * 6;
+                                    if (sib_delta != 0.0f) {{
+                                        if (lane < 6 && sib_dof_a >= 0) {{
+                                            s_v[sib_dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
+                                        }}
+                                        if (lane >= 6 && lane < 12 && sib_dof_b >= 0) {{
+                                            s_v[sib_dof_b + lane - 6] += mf_MiJt_b.data[sib_mf6 + lane - 6] * sib_delta;
+                                        }}
+                                    }}
+                                }}
+                            }}
+                        }}
+                        delta_impulse = new_impulse - old_impulse;
+                    }}
+
+                    s_lam_mf[i] = new_impulse;
+                    if (delta_impulse != 0.0f) {{
+                        if (lane < 6 && dof_a >= 0) {{
+                            s_v[dof_a + lane] += mf_MiJt_a.data[row_mf6 + lane] * delta_impulse;
+                        }}
+                        if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                            s_v[dof_b + lane - 6] += mf_MiJt_b.data[row_mf6 + lane - 6] * delta_impulse;
+                        }}
+                    }}
+                    __syncwarp();
+                }}
+            }}
+
+            // Final dense velocity-limit phase for interleaved/contact-then-internal schedules.
+            if (row_phase == 0 || row_phase == 2) {{
+                for (int i = 0; i < m_dense; i++) {{
+                    int4 meta = *reinterpret_cast<const int4*>(&dense_meta.data[off_dense_meta + i * 4]);
+                    int row_type = meta.x & 0xFFFF;
+                    if (row_type != 4) continue;
+                    int selector = meta.y;
+                    int flags = meta.w;
+                    float selector_sign = ((flags & (1 << 16)) != 0) ? -1.0f : 1.0f;
+                    int scalar_base = off_dense_scalar + i * 8;
+                    float denom = dense_scalars.data[scalar_base + 0];
+                    if (denom <= 0.0f) continue;
+
+                    int row_base = jy_world_base + i * {D};
+                    float my_sum = 0.0f;
+                    if (selector >= 0 && selector < {D}) {{
+                        if (lane == 0) my_sum = selector_sign * s_v[selector];
+                    }} else {{
+                        for (int d = lane; d < {D}; d += 32) {{
+                            my_sum += J_world.data[row_base + d] * s_v[d];
+                        }}
+                    }}
+                    my_sum += __shfl_down_sync(MASK, my_sum, 16);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 8);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 4);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 2);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 1);
+                    float jv_vlim = __shfl_sync(MASK, my_sum, 0);
+
+                    float residual_vlim = jv_vlim + dense_scalars.data[scalar_base + 1];
+                    float delta_vlim = -residual_vlim / denom;
+                    float delta_impulse_vlim = 0.0f;
+                    if (residual_vlim < 0.0f) delta_impulse_vlim = delta_vlim;
+                    if (lane == 0) s_lam_dense[i] = delta_impulse_vlim;
+
+                    if (delta_impulse_vlim != 0.0f) {{
+                        for (int d = lane; d < {D}; d += 32) {{
+                            s_v[d] += Y_world.data[row_base + d] * delta_impulse_vlim;
+                        }}
+                    }}
+                    __syncwarp();
+                }}
+            }}
+
+            if (row_phase == 0 || row_phase == 2 || row_phase == 5) {{
+                for (int i = 0; i < m_mf; i++) {{
+                    int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);
+                    int mf_rt = meta.w & 0xFFFF;
+                    if (mf_rt != 4) continue;
+
+                    int packed_dofs = meta.x;
+                    int dof_a = packed_dofs >> 16;
+                    int dof_b = (packed_dofs << 16) >> 16;
+                    float mf_eff_inv = __int_as_float(meta.y);
+                    if (mf_eff_inv <= 0.0f) continue;
+
+                    int row_mf6 = mf6_base + i * 6;
+                    float my_sum = 0.0f;
+                    if (lane < 6 && dof_a >= 0) {{
+                        my_sum = mf_J_a.data[row_mf6 + lane] * s_v[dof_a + lane];
+                    }}
+                    if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                        my_sum = mf_J_b.data[row_mf6 + lane - 6] * s_v[dof_b + lane - 6];
+                    }}
+                    my_sum += __shfl_down_sync(MASK, my_sum, 16);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 8);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 4);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 2);
+                    my_sum += __shfl_down_sync(MASK, my_sum, 1);
+                    float jv_mf_vlim = __shfl_sync(MASK, my_sum, 0);
+
+                    float residual_mf_vlim = jv_mf_vlim + __int_as_float(meta.z);
+                    float delta_mf_vlim = -residual_mf_vlim * mf_eff_inv;
+                    float delta_impulse_mf_vlim = 0.0f;
+                    if (residual_mf_vlim < 0.0f) delta_impulse_mf_vlim = delta_mf_vlim;
+                    if (lane == 0) s_lam_mf[i] = delta_impulse_mf_vlim;
+
+                    if (delta_impulse_mf_vlim != 0.0f) {{
+                        if (lane < 6 && dof_a >= 0) {{
+                            s_v[dof_a + lane] += mf_MiJt_a.data[row_mf6 + lane] * delta_impulse_mf_vlim;
+                        }}
+                        if (lane >= 6 && lane < 12 && dof_b >= 0) {{
+                            s_v[dof_b + lane - 6] += mf_MiJt_b.data[row_mf6 + lane - 6] * delta_impulse_mf_vlim;
+                        }}
+                    }}
+                    __syncwarp();
+                }}
+            }}
+        }}
+
+        for (int d = lane; d < {D}; d += 32) {{
+            v_out.data[w_dof_start + d] = s_v[d];
+        }}
+        for (int i = lane; i < m_dense; i += 32) {{
+            world_impulses.data[off_dense + i] = s_lam_dense[i];
+        }}
+        for (int i = lane; i < m_mf; i += 32) {{
+            mf_impulses.data[off_mf + i] = s_lam_mf[i];
+        }}
+    #endif
+    """
+
+        @wp.func_native(snippet)
+        def pgs_solve_mf_gs_packed_native(
+            world: int,
+            world_constraint_count: wp.array(dtype=int),
+            world_dof_start: wp.array(dtype=int),
+            dense_meta: wp.array2d(dtype=int),
+            dense_scalars: wp.array2d(dtype=float),
+            world_impulses: wp.array2d(dtype=float),
+            J_world: wp.array3d(dtype=float),
+            Y_world: wp.array3d(dtype=float),
+            mf_constraint_count: wp.array(dtype=int),
+            mf_meta: wp.array2d(dtype=int),
+            mf_scalars: wp.array2d(dtype=float),
+            mf_impulses: wp.array2d(dtype=float),
+            mf_J_a: wp.array3d(dtype=float),
+            mf_J_b: wp.array3d(dtype=float),
+            mf_MiJt_a: wp.array3d(dtype=float),
+            mf_MiJt_b: wp.array3d(dtype=float),
+            iterations: int,
+            omega: float,
+            row_phase: int,
+            friction_start_iteration: int,
+            iteration_offset: int,
+            freeze_drive_rows: int,
+            v_out: wp.array(dtype=float),
+        ): ...
+
+        def pgs_solve_mf_gs_packed_template(
+            world_constraint_count: wp.array(dtype=int),
+            world_dof_start: wp.array(dtype=int),
+            dense_meta: wp.array2d(dtype=int),
+            dense_scalars: wp.array2d(dtype=float),
+            world_impulses: wp.array2d(dtype=float),
+            J_world: wp.array3d(dtype=float),
+            Y_world: wp.array3d(dtype=float),
+            mf_constraint_count: wp.array(dtype=int),
+            mf_meta: wp.array2d(dtype=int),
+            mf_scalars: wp.array2d(dtype=float),
+            mf_impulses: wp.array2d(dtype=float),
+            mf_J_a: wp.array3d(dtype=float),
+            mf_J_b: wp.array3d(dtype=float),
+            mf_MiJt_a: wp.array3d(dtype=float),
+            mf_MiJt_b: wp.array3d(dtype=float),
+            iterations: int,
+            omega: float,
+            row_phase: int,
+            friction_start_iteration: int,
+            iteration_offset: int,
+            freeze_drive_rows: int,
+            v_out: wp.array(dtype=float),
+        ):
+            world, _lane = wp.tid()
+            pgs_solve_mf_gs_packed_native(
+                world,
+                world_constraint_count,
+                world_dof_start,
+                dense_meta,
+                dense_scalars,
+                world_impulses,
+                J_world,
+                Y_world,
+                mf_constraint_count,
+                mf_meta,
+                mf_scalars,
+                mf_impulses,
+                mf_J_a,
+                mf_J_b,
+                mf_MiJt_a,
+                mf_MiJt_b,
+                iterations,
+                omega,
+                row_phase,
+                friction_start_iteration,
+                iteration_offset,
+                freeze_drive_rows,
+                v_out,
+            )
+
+        name = f"pgs_solve_mf_gs_packed_{max_constraints}_{mf_max_constraints}_{max_world_dofs}"
+        pgs_solve_mf_gs_packed_template.__name__ = name
+        pgs_solve_mf_gs_packed_template.__qualname__ = name
+        return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_packed_template)
