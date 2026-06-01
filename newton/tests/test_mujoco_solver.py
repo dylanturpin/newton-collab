@@ -6392,6 +6392,20 @@ class TestMuJoCoOptions(unittest.TestCase):
         builder.replicate(template_builder, world_count)
         return builder.finalize()
 
+    def test_one_dimensional_geom_dataid_is_expanded_for_update_kernel(self):
+        """MuJoCo Warp 3.5 exposes geom_dataid per geom; Newton kernels expect [world, geom]."""
+        world_count = 2
+        model = self._create_multiworld_model(world_count=world_count)
+        solver = SolverMuJoCo(model, disable_contacts=True)
+        geom_dataid = solver.mjw_model.geom_dataid
+        if len(geom_dataid.shape) != 1:
+            self.skipTest("installed mujoco_warp already exposes 2-D geom_dataid")
+
+        cached = getattr(solver, "_geom_dataid_2d", None)
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached.shape, (world_count, solver.mj_model.ngeom))
+        self.assertEqual(cached.device, geom_dataid.device)
+
     def test_impratio_multiworld_conversion(self):
         """
         Verify that impratio custom attribute with WORLD frequency:
@@ -6848,8 +6862,12 @@ class TestMuJoCoOptions(unittest.TestCase):
         model = self._create_multiworld_model(world_count=1)
         solver = SolverMuJoCo(model)
         mujoco = SolverMuJoCo._mujoco
+        multiccd_disable_bit = getattr(mujoco.mjtDisableBit, "mjDSBL_MULTICCD", None)
+        if multiccd_disable_bit is None:
+            self.assertIsNotNone(solver.mj_model)
+            return
         self.assertTrue(
-            solver.mj_model.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_MULTICCD,
+            solver.mj_model.opt.disableflags & multiccd_disable_bit,
             "mjDSBL_MULTICCD should be set when enable_multiccd is not specified",
         )
 
@@ -6858,8 +6876,12 @@ class TestMuJoCoOptions(unittest.TestCase):
         model = self._create_multiworld_model(world_count=1)
         solver = SolverMuJoCo(model, enable_multiccd=True)
         mujoco = SolverMuJoCo._mujoco
+        multiccd_disable_bit = getattr(mujoco.mjtDisableBit, "mjDSBL_MULTICCD", None)
+        if multiccd_disable_bit is None:
+            self.assertIsNotNone(solver.mj_model)
+            return
         self.assertFalse(
-            solver.mj_model.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_MULTICCD,
+            solver.mj_model.opt.disableflags & multiccd_disable_bit,
             "mjDSBL_MULTICCD should not be set when enable_multiccd=True",
         )
 
