@@ -3186,8 +3186,11 @@ class SolverMuJoCo(SolverBase):
 
         enableflags = 0
         disableflags = 0
-        if not enable_multiccd:
-            disableflags |= mujoco.mjtDisableBit.mjDSBL_MULTICCD
+        # mjDSBL_MULTICCD is only present in MuJoCo versions with MultiCCD.
+        # Do not substitute mjDSBL_NATIVECCD; that disables a different path.
+        multiccd_disable_bit = getattr(mujoco.mjtDisableBit, "mjDSBL_MULTICCD", None)
+        if not enable_multiccd and multiccd_disable_bit is not None:
+            disableflags |= multiccd_disable_bit
         if disable_contacts:
             disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
         self.use_mujoco_cpu = use_mujoco_cpu

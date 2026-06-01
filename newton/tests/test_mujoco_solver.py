@@ -6848,8 +6848,12 @@ class TestMuJoCoOptions(unittest.TestCase):
         model = self._create_multiworld_model(world_count=1)
         solver = SolverMuJoCo(model)
         mujoco = SolverMuJoCo._mujoco
+        multiccd_disable_bit = getattr(mujoco.mjtDisableBit, "mjDSBL_MULTICCD", None)
+        if multiccd_disable_bit is None:
+            self.assertIsNotNone(solver.mj_model)
+            return
         self.assertTrue(
-            solver.mj_model.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_MULTICCD,
+            solver.mj_model.opt.disableflags & multiccd_disable_bit,
             "mjDSBL_MULTICCD should be set when enable_multiccd is not specified",
         )
 
@@ -6858,8 +6862,12 @@ class TestMuJoCoOptions(unittest.TestCase):
         model = self._create_multiworld_model(world_count=1)
         solver = SolverMuJoCo(model, enable_multiccd=True)
         mujoco = SolverMuJoCo._mujoco
+        multiccd_disable_bit = getattr(mujoco.mjtDisableBit, "mjDSBL_MULTICCD", None)
+        if multiccd_disable_bit is None:
+            self.assertIsNotNone(solver.mj_model)
+            return
         self.assertFalse(
-            solver.mj_model.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_MULTICCD,
+            solver.mj_model.opt.disableflags & multiccd_disable_bit,
             "mjDSBL_MULTICCD should not be set when enable_multiccd=True",
         )
 
