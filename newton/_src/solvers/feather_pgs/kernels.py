@@ -2155,6 +2155,7 @@ def allocate_joint_limit_slots(
     joint_q: wp.array(dtype=float),
     art_to_world: wp.array(dtype=int),
     max_constraints: int,
+    joint_limit_activation_gap: float,
     # outputs
     limit_slot: wp.array(dtype=int),
     limit_sign: wp.array(dtype=float),
@@ -2204,13 +2205,13 @@ def allocate_joint_limit_slots(
             upper = joint_limit_upper[dof]
 
             lower_idx = 2 * dof
-            if wp.isfinite(lower):
+            if wp.isfinite(lower) and q_val <= lower + joint_limit_activation_gap:
                 slot = wp.atomic_add(world_slot_counter, world, 1)
                 if slot < max_constraints:
                     limit_slot[lower_idx] = slot
                     limit_sign[lower_idx] = 1.0
 
-            if wp.isfinite(upper):
+            if wp.isfinite(upper) and q_val >= upper - joint_limit_activation_gap:
                 slot = wp.atomic_add(world_slot_counter, world, 1)
                 if slot < max_constraints:
                     limit_slot[lower_idx + 1] = slot
