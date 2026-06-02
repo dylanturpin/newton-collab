@@ -545,6 +545,24 @@ class ViewerRerun(ViewerBase):
         rr.log(name, rr.LineStrips3D(line_strips, **rr_kwargs), static=not self.keep_historical_data)
 
     @override
+    def log_arrows(
+        self,
+        name: str,
+        starts: wp.array[wp.vec3] | None,
+        ends: wp.array[wp.vec3] | None,
+        colors: (wp.array[wp.vec3] | wp.array[wp.float32] | tuple[float, float, float] | list[float] | None),
+        width: float = 0.01,
+        hidden: bool = False,
+    ):
+        """Log arrow segments as Rerun line strips.
+
+        Rerun does not need the GL viewer's dedicated arrow shader for contact
+        inspection; the important part for recordings is a stable ``/contacts``
+        entity keyed on the active timelines.
+        """
+        self.log_lines(name, starts, ends, colors, width=width, hidden=hidden)
+
+    @override
     def log_array(self, name: str, array: wp.array[Any] | np.ndarray):
         """
         Log a generic array for visualization.
