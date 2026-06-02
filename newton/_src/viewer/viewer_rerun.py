@@ -55,6 +55,18 @@ class ViewerRerun(ViewerBase):
             return ctor(**kwargs)
 
     @staticmethod
+    def _set_rr_time(timeline: str, *, sequence: int | None = None, timestamp: float | None = None) -> None:
+        """Set a Rerun timeline across SDKs with either unified or legacy time APIs."""
+        if rr is None:
+            return
+        if hasattr(rr, "set_time"):
+            rr.set_time(timeline, sequence=sequence, timestamp=timestamp)
+        elif sequence is not None:
+            rr.set_time_sequence(timeline, sequence)
+        elif timestamp is not None:
+            rr.set_time_seconds(timeline, timestamp)
+
+    @staticmethod
     def _prepare_texture(texture: np.ndarray | str | None) -> np.ndarray | None:
         """Load and normalize texture data for rerun."""
         return normalize_texture(
@@ -167,10 +179,17 @@ class ViewerRerun(ViewerBase):
 
         # Initialize rerun using a blueprint that only shows the 3D view and a collapsed time panel
         blueprint = self._get_blueprint()
-        rr.init(self.app_id, default_blueprint=blueprint)
+        try:
+            rr.init(self.app_id, default_blueprint=blueprint)
+        except TypeError:
+            rr.init(self.app_id)
+            rr.send_blueprint(blueprint)
 
         if record_to_rrd is not None:
-            rr.save(record_to_rrd, default_blueprint=blueprint)
+            try:
+                rr.save(record_to_rrd, default_blueprint=blueprint)
+            except TypeError:
+                rr.save(record_to_rrd)
 
         try:
             self._mesh3d_params = set(inspect.signature(rr.Mesh3D).parameters)
@@ -184,14 +203,14 @@ class ViewerRerun(ViewerBase):
         if address is not None:
             rr.connect_grpc(address)
         elif not self.is_jupyter_notebook:
-            if serve_web_viewer:
+            if serve_web_viewer and hasattr(rr, "serve_grpc") and hasattr(rr, "serve_web_viewer"):
                 self._grpc_server_uri = rr.serve_grpc(grpc_port=grpc_port, default_blueprint=blueprint)
                 rr.serve_web_viewer(connect_to=self._grpc_server_uri, web_port=web_port)
-            else:
+            elif not serve_web_viewer or record_to_rrd is None:
                 rr.spawn(port=grpc_port)
 
         # Make sure the timeline is set up
-        rr.set_time("time", timestamp=0.0)
+        self._set_rr_time("time", timestamp=0.0)
 
     def _get_blueprint(self):
         scalar_panel = None
@@ -424,7 +443,7 @@ class ViewerRerun(ViewerBase):
         """
         self.time = time
         # Set the timeline for this frame
-        rr.set_time("time", timestamp=time)
+        self._set_rr_time("time", timestamp=time)
 
     @override
     def end_frame(self):
@@ -508,10 +527,12 @@ class ViewerRerun(ViewerBase):
         """
 
         if hidden:
-            return  # Do not log hidden lines
+            rr.log(name, rr.Clear(recursive=False))
+            return
 
         if starts is None or ends is None:
-            return  # Nothing to log
+            rr.log(name, rr.Clear(recursive=False))
+            return
 
         # Convert inputs to numpy for rerun API compatibility
         # Expecting starts/ends as wp arrays or numpy arrays
@@ -521,6 +542,7 @@ class ViewerRerun(ViewerBase):
 
         # Both starts and ends should be (N, 3)
         if starts_np is None or ends_np is None or len(starts_np) == 0:
+            rr.log(name, rr.Clear(recursive=False))
             return
 
         # LineStrips3D expects a list of line strips, where each strip is a sequence of points
@@ -650,14 +672,18 @@ class ViewerRerun(ViewerBase):
             hidden: Whether the points are hidden.
         """
         if hidden:
-            # Optionally, skip logging hidden points
+            rr.log(name, rr.Clear(recursive=False))
             return
 
         if points is None:
+            rr.log(name, rr.Clear(recursive=False))
             return
 
         pts = self._to_numpy(points)
         n_points = pts.shape[0]
+        if n_points == 0:
+            rr.log(name, rr.Clear(recursive=False))
+            return
 
         # Handle radii (point size)
         if radii is not None:
