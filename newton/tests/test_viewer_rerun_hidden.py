@@ -25,6 +25,8 @@ class TestViewerRerunHidden(unittest.TestCase):
         self.mock_rr.Clear = Mock(return_value=Mock())
         self.mock_rr.Mesh3D = Mock(return_value=Mock())
         self.mock_rr.InstancePoses3D = Mock(return_value=Mock())
+        self.mock_rr.LineStrips3D = Mock(return_value=Mock())
+        self.mock_rr.Points3D = Mock(return_value=Mock())
 
         self.mock_rrb = Mock()
         self.mock_rrb.Blueprint = Mock(return_value=Mock())
@@ -148,6 +150,30 @@ class TestViewerRerunHidden(unittest.TestCase):
 
         # No rr.log call should have been made
         self.mock_rr.log.assert_not_called()
+
+    def test_log_lines_hidden_and_empty_clear_entity(self):
+        """log_lines should clear stale line entities when hidden or empty."""
+        viewer = self._create_viewer()
+
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            viewer.log_lines("/contacts", None, None, None, hidden=True)
+            viewer.log_lines("/contacts", self._make_mock_wp_array([]), self._make_mock_wp_array([]), None)
+
+        self.assertEqual(self.mock_rr.Clear.call_count, 2)
+        self.assertEqual(self.mock_rr.log.call_count, 2)
+        self.mock_rr.log.assert_called_with("/contacts", self.mock_rr.Clear.return_value)
+
+    def test_log_points_hidden_and_empty_clear_entity(self):
+        """log_points should clear stale point entities when hidden or empty."""
+        viewer = self._create_viewer()
+
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            viewer.log_points("/contacts/points", None, hidden=True)
+            viewer.log_points("/contacts/points", self._make_mock_wp_array([]))
+
+        self.assertEqual(self.mock_rr.Clear.call_count, 2)
+        self.assertEqual(self.mock_rr.log.call_count, 2)
+        self.mock_rr.log.assert_called_with("/contacts/points", self.mock_rr.Clear.return_value)
 
 
 if __name__ == "__main__":
