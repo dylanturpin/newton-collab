@@ -508,10 +508,12 @@ class ViewerRerun(ViewerBase):
         """
 
         if hidden:
-            return  # Do not log hidden lines
+            rr.log(name, rr.Clear(recursive=False))
+            return
 
         if starts is None or ends is None:
-            return  # Nothing to log
+            rr.log(name, rr.Clear(recursive=False))
+            return
 
         # Convert inputs to numpy for rerun API compatibility
         # Expecting starts/ends as wp arrays or numpy arrays
@@ -521,6 +523,7 @@ class ViewerRerun(ViewerBase):
 
         # Both starts and ends should be (N, 3)
         if starts_np is None or ends_np is None or len(starts_np) == 0:
+            rr.log(name, rr.Clear(recursive=False))
             return
 
         # LineStrips3D expects a list of line strips, where each strip is a sequence of points
@@ -650,14 +653,18 @@ class ViewerRerun(ViewerBase):
             hidden: Whether the points are hidden.
         """
         if hidden:
-            # Optionally, skip logging hidden points
+            rr.log(name, rr.Clear(recursive=False))
             return
 
         if points is None:
+            rr.log(name, rr.Clear(recursive=False))
             return
 
         pts = self._to_numpy(points)
         n_points = pts.shape[0]
+        if n_points == 0:
+            rr.log(name, rr.Clear(recursive=False))
+            return
 
         # Handle radii (point size)
         if radii is not None:
