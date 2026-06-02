@@ -190,7 +190,9 @@ class ViewerRerun(ViewerBase):
             else:
                 rr.spawn(port=grpc_port)
 
-        # Make sure the timeline is set up
+        # Make sure both timelines are set up. ``sim_step`` is the canonical
+        # sample/sync timeline; ``time`` remains useful as viewer metadata.
+        rr.set_time("sim_step", sequence=0)
         rr.set_time("time", timestamp=0.0)
 
     def _get_blueprint(self):
@@ -202,7 +204,7 @@ class ViewerRerun(ViewerBase):
             rrb.Horizontal(
                 *[rrb.Spatial3DView(), scalar_panel] if scalar_panel is not None else [rrb.Spatial3DView()],
             ),
-            rrb.TimePanel(timeline="time", state="collapsed"),
+            rrb.TimePanel(timeline="sim_step", state="collapsed"),
             collapse_panels=True,
         )
 
@@ -415,15 +417,18 @@ class ViewerRerun(ViewerBase):
             rr.log(name, instance_poses, static=not self.keep_historical_data)
 
     @override
-    def begin_frame(self, time: float):
+    def begin_frame(self, time: float, *, sim_step: int | None = None):
         """
         Begin a new frame and set the timeline for rerun.
 
         Args:
             time: The current simulation time.
+            sim_step: Optional integer sample index for the canonical sequence timeline.
         """
         self.time = time
-        # Set the timeline for this frame
+        # Set the timelines for this frame.
+        if sim_step is not None:
+            rr.set_time("sim_step", sequence=int(sim_step))
         rr.set_time("time", timestamp=time)
 
     @override
@@ -584,6 +589,60 @@ class ViewerRerun(ViewerBase):
             rr.send_blueprint(blueprint)
         else:
             self._scalars[name] = val
+
+    @override
+    def log_contacts(self, contacts: newton.Contacts, state: newton.State):
+        """Log rigid contact normals, points, and a scalar count to Rerun."""
+
+        if not self.show_contacts:
+            rr.log("/contacts", rr.Clear(recursive=True))
+            return
+
+        max_contacts = contacts.rigid_contact_max
+        num_contacts = min(int(contacts.rigid_contact_count.numpy()[0]), max_contacts)
+        rr.log("/contacts/scalars/contact_count", rr.Scalars(num_contacts), static=not self.keep_scalar_history)
+
+        if self._contact_points0 is None or len(self._contact_points0) < max_contacts:
+            self._contact_points0 = wp.array(np.zeros((max_contacts, 3)), dtype=wp.vec3, device=self.device)
+            self._contact_points1 = wp.array(np.zeros((max_contacts, 3)), dtype=wp.vec3, device=self.device)
+
+        if max_contacts > 0:
+            from .kernels import compute_contact_lines  # noqa: PLC0415
+
+            wp.launch(
+                kernel=compute_contact_lines,
+                dim=max_contacts,
+                inputs=[
+                    state.body_q,
+                    self.model.shape_body,
+                    self.model.shape_world,
+                    self.world_offsets,
+                    self._visible_worlds_mask,
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    contacts.rigid_contact_point0,
+                    contacts.rigid_contact_offset0,
+                    contacts.rigid_contact_normal,
+                    0.1,
+                ],
+                outputs=[
+                    self._contact_points0,
+                    self._contact_points1,
+                ],
+                device=self.device,
+            )
+
+        if num_contacts > 0:
+            starts = self._contact_points0[:num_contacts]
+            ends = self._contact_points1[:num_contacts]
+        else:
+            starts = wp.array([], dtype=wp.vec3, device=self.device)
+            ends = wp.array([], dtype=wp.vec3, device=self.device)
+
+        colors = (0.0, 1.0, 0.0)
+        self.log_points("/contacts/points", starts, radii=0.01, colors=colors)
+        self.log_arrows("/contacts/normals", starts, ends, colors, width=0.01)
 
     @override
     def log_geo(
