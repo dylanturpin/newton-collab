@@ -3,7 +3,7 @@
 
 import unittest
 import warnings
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 # ruff: noqa: PLC0415
 
@@ -253,6 +253,27 @@ class TestViewerRerunInitArgs(unittest.TestCase):
                     # Verify parameters were stored correctly
                     self.assertTrue(viewer_true.keep_scalar_history)
                     self.assertFalse(viewer_false.keep_scalar_history)
+
+    def test_begin_frame_sets_sim_step_sequence_and_time_timestamp(self):
+        """Test that begin_frame writes both the canonical step and viewer time timelines."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        viewer = ViewerRerun(serve_web_viewer=False)
+
+                    self.mock_rr.set_time.reset_mock()
+                    viewer.begin_frame(0.02, sim_step=2)
+
+                    self.mock_rr.set_time.assert_has_calls(
+                        [
+                            call("sim_step", sequence=2),
+                            call("time", timestamp=0.02),
+                        ]
+                    )
 
 
 if __name__ == "__main__":
