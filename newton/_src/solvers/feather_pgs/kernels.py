@@ -2234,6 +2234,7 @@ def populate_joint_limit_J_for_size(
     group_to_art: wp.array(dtype=int),
     pgs_beta: float,
     pgs_cfm: float,
+    joint_limit_activation_gap: float,
     # outputs
     J_group: wp.array3d(dtype=float),
     world_row_type: wp.array2d(dtype=int),
@@ -2291,6 +2292,7 @@ def populate_joint_limit_J_for_size(
                 phi = q_val - lower
                 if sign < 0.0:
                     phi = upper - q_val
+                phi = phi - joint_limit_activation_gap
 
                 # Jacobian: single ±1 entry at the local DOF column.
                 J_group[group_idx, slot, local_dof] = sign
