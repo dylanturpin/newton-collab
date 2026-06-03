@@ -1058,10 +1058,10 @@ class ModelBuilder:
         # rigid joints
         self.joint_parent: list[int] = []
         """Parent body indices accumulated for :attr:`Model.joint_parent`."""
-        self.joint_parents: dict[int, list[int]] = {}
-        """Mapping from child body index to parent body indices used while composing articulations."""
-        self.joint_children: dict[int, list[int]] = {}
-        """Mapping from parent body index to child body indices used while composing articulations."""
+        self.joint_parents: dict[int, list[tuple[int, int]]] = {}
+        """Mapping from child body index to ``(parent_body, joint_idx)`` pairs (one per joint, no dedup)."""
+        self.joint_children: dict[int, list[tuple[int, int]]] = {}
+        """Mapping from parent body index to ``(child_body, joint_idx)`` pairs (one per joint, no dedup)."""
         self.joint_child: list[int] = []
         """Child body indices accumulated for :attr:`Model.joint_child`."""
         self.joint_axis: list[Vec3] = []
@@ -1119,6 +1119,9 @@ class ModelBuilder:
 
         self.joint_enabled: list[bool] = []
         """Joint enabled flags accumulated for :attr:`Model.joint_enabled`."""
+
+        self.joint_collision_filter_parent: list[bool] = []
+        """Per-joint resolved ``collision_filter_parent`` flag. Builder-only."""
 
         self.joint_q_start: list[int] = []
         """Joint coordinate start indices accumulated for :attr:`Model.joint_q_start`."""
@@ -1252,6 +1255,13 @@ class ModelBuilder:
             shape_b: Second shape index
         """
         self.shape_collision_filter_pairs.append((min(shape_a, shape_b), max(shape_a, shape_b)))
+
+    @staticmethod
+    def _default_filter_parent(joint_type: JointType, parent: int) -> bool:
+        """Default ``collision_filter_parent``: ``False`` for non-fixed joints to world; ``True`` otherwise."""
+        if parent == -1:
+            return joint_type == JointType.FIXED
+        return True
 
     def add_custom_attribute(self, attribute: CustomAttribute) -> None:
         """
@@ -3104,17 +3114,18 @@ class ModelBuilder:
             self.joint_parent.extend(new_parents)
             self.joint_child.extend(new_children)
 
-            # Update parent/child lookups
-            for p, c in zip(new_parents, new_children, strict=True):
+            # Update parent/child lookups.
+            for i, (p, c) in enumerate(zip(new_parents, new_children, strict=True)):
+                new_joint_idx = start_joint_idx + i
                 if c not in self.joint_parents:
-                    self.joint_parents[c] = [p]
+                    self.joint_parents[c] = [(p, new_joint_idx)]
                 else:
-                    self.joint_parents[c].append(p)
+                    self.joint_parents[c].append((p, new_joint_idx))
 
                 if p not in self.joint_children:
-                    self.joint_children[p] = [c]
-                elif c not in self.joint_children[p]:
-                    self.joint_children[p].append(c)
+                    self.joint_children[p] = [(c, new_joint_idx)]
+                else:
+                    self.joint_children[p].append((c, new_joint_idx))
 
             self.joint_q_start.extend([c + self.joint_coord_count for c in builder.joint_q_start])
             self.joint_qd_start.extend([c + self.joint_dof_count for c in builder.joint_qd_start])
@@ -3239,6 +3250,7 @@ class ModelBuilder:
             "body_qd",
             "joint_type",
             "joint_enabled",
+            "joint_collision_filter_parent",
             "joint_X_c",
             "joint_armature",
             "joint_axis",
@@ -3723,7 +3735,7 @@ class ModelBuilder:
         label: str | None = None,
         parent_xform: Transform | None = None,
         child_xform: Transform | None = None,
-        collision_filter_parent: bool = True,
+        collision_filter_parent: bool | None = None,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
     ) -> int:
@@ -3744,6 +3756,7 @@ class ModelBuilder:
             child_xform: The transform from the child body frame to the joint child anchor frame.
                 If None, the identity transform is used.
             collision_filter_parent: Whether to filter collisions between shapes of the parent and child bodies.
+                Defaults to ``False`` for non-fixed joints to world, ``True`` otherwise.
             enabled: Whether the joint is enabled (not considered by :class:`SolverFeatherstone`).
             custom_attributes: Dictionary of custom attribute keys (see :attr:`CustomAttribute.key`) to values. Note that custom attributes with frequency :attr:`Model.AttributeFrequency.JOINT_DOF` or :attr:`Model.AttributeFrequency.JOINT_COORD` can be provided as: (1) lists with length equal to the joint's DOF or coordinate count, (2) dicts mapping DOF/coordinate indices to values, or (3) a single scalar value that is broadcast to all DOFs/coordinates of the joint. For joints with zero DOFs (e.g., fixed joints), JOINT_DOF attributes are silently skipped. Custom attributes with frequency :attr:`Model.AttributeFrequency.JOINT` require a single value to be defined.
 
@@ -3754,6 +3767,9 @@ class ModelBuilder:
             linear_axes = []
         if angular_axes is None:
             angular_axes = []
+
+        if collision_filter_parent is None:
+            collision_filter_parent = self._default_filter_parent(joint_type, parent)
 
         if parent_xform is None:
             parent_xform = wp.transform()
@@ -3783,21 +3799,23 @@ class ModelBuilder:
             )
 
         self.joint_type.append(joint_type)
+        joint_idx = self.joint_count - 1
         self.joint_parent.append(parent)
         if child not in self.joint_parents:
-            self.joint_parents[child] = [parent]
+            self.joint_parents[child] = [(parent, joint_idx)]
         else:
-            self.joint_parents[child].append(parent)
+            self.joint_parents[child].append((parent, joint_idx))
         if parent not in self.joint_children:
-            self.joint_children[parent] = [child]
-        elif child not in self.joint_children[parent]:
-            self.joint_children[parent].append(child)
+            self.joint_children[parent] = [(child, joint_idx)]
+        else:
+            self.joint_children[parent].append((child, joint_idx))
         self.joint_child.append(child)
         self.joint_X_p.append(parent_xform)
         self.joint_X_c.append(child_xform)
         self.joint_label.append(label or f"joint_{self.joint_count}")
         self.joint_dof_dim.append((len(linear_axes), len(angular_axes)))
         self.joint_enabled.append(enabled)
+        self.joint_collision_filter_parent.append(collision_filter_parent)
         self.joint_world.append(self.current_world)
         self.joint_articulation.append(-1)
 
@@ -3863,7 +3881,7 @@ class ModelBuilder:
         self.joint_coord_count += coord_count
         self.joint_constraint_count += cts_count
 
-        if collision_filter_parent and parent > -1:
+        if collision_filter_parent:
             for child_shape in self.body_shapes[child]:
                 if not self.shape_flags[child_shape] & ShapeFlags.COLLIDE_SHAPES:
                     continue
@@ -3904,7 +3922,7 @@ class ModelBuilder:
         friction: float | None = None,
         actuator_mode: JointTargetMode | None = None,
         label: str | None = None,
-        collision_filter_parent: bool = True,
+        collision_filter_parent: bool | None = None,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
         **kwargs,
@@ -3997,7 +4015,7 @@ class ModelBuilder:
         friction: float | None = None,
         actuator_mode: JointTargetMode | None = None,
         label: str | None = None,
-        collision_filter_parent: bool = True,
+        collision_filter_parent: bool | None = None,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
     ) -> int:
@@ -4076,7 +4094,7 @@ class ModelBuilder:
         armature: float | None = None,
         friction: float | None = None,
         label: str | None = None,
-        collision_filter_parent: bool = True,
+        collision_filter_parent: bool | None = None,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
         actuator_mode: JointTargetMode | None = None,
@@ -4147,7 +4165,7 @@ class ModelBuilder:
         parent_xform: Transform | None = None,
         child_xform: Transform | None = None,
         label: str | None = None,
-        collision_filter_parent: bool = True,
+        collision_filter_parent: bool | None = None,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
     ) -> int:
@@ -4193,7 +4211,7 @@ class ModelBuilder:
         child_xform: Transform | None = None,
         parent: int = -1,
         label: str | None = None,
-        collision_filter_parent: bool = True,
+        collision_filter_parent: bool | None = None,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
     ) -> int:
@@ -4250,7 +4268,7 @@ class ModelBuilder:
         child_xform: Transform | None = None,
         min_distance: float = -1.0,
         max_distance: float = 1.0,
-        collision_filter_parent: bool = True,
+        collision_filter_parent: bool | None = None,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
     ) -> int:
@@ -4310,7 +4328,7 @@ class ModelBuilder:
         label: str | None = None,
         parent_xform: Transform | None = None,
         child_xform: Transform | None = None,
-        collision_filter_parent: bool = True,
+        collision_filter_parent: bool | None = None,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
         **kwargs,
@@ -4365,7 +4383,7 @@ class ModelBuilder:
         bend_stiffness: float | None = None,
         bend_damping: float | None = None,
         label: str | None = None,
-        collision_filter_parent: bool = True,
+        collision_filter_parent: bool | None = None,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
         **kwargs,
@@ -4882,6 +4900,7 @@ class ModelBuilder:
                 "parent_xform": wp.transform_expand(self.joint_X_p[i]),
                 "child_xform": wp.transform_expand(self.joint_X_c[i]),
                 "enabled": self.joint_enabled[i],
+                "collision_filter_parent": self.joint_collision_filter_parent[i],
                 "axes": [],
                 "axis_dim": self.joint_dof_dim[i],
                 "parent": parent,
@@ -5180,6 +5199,7 @@ class ModelBuilder:
         self.joint_dof_dim.clear()
         self.joint_target_pos.clear()
         self.joint_target_vel.clear()
+        self.joint_collision_filter_parent.clear()
         self.joint_world.clear()
         self.joint_articulation.clear()
         for joint in retained_joints:
@@ -5195,6 +5215,7 @@ class ModelBuilder:
             self.joint_cts.extend(joint["cts"])
             self.joint_armature.extend(joint["armature"])
             self.joint_enabled.append(joint["enabled"])
+            self.joint_collision_filter_parent.append(joint["collision_filter_parent"])
             self.joint_X_p.append(joint["parent_xform"])
             self.joint_X_c.append(joint["child_xform"])
             self.joint_dof_dim.append(joint["axis_dim"])
@@ -5312,16 +5333,16 @@ class ModelBuilder:
         # Rebuild parent/child lookups
         self.joint_parents.clear()
         self.joint_children.clear()
-        for p, c in zip(self.joint_parent, self.joint_child, strict=True):
+        for i, (p, c) in enumerate(zip(self.joint_parent, self.joint_child, strict=True)):
             if c not in self.joint_parents:
-                self.joint_parents[c] = [p]
+                self.joint_parents[c] = [(p, i)]
             else:
-                self.joint_parents[c].append(p)
+                self.joint_parents[c].append((p, i))
 
             if p not in self.joint_children:
-                self.joint_children[p] = [c]
-            elif c not in self.joint_children[p]:
-                self.joint_children[p].append(c)
+                self.joint_children[p] = [(c, i)]
+            else:
+                self.joint_children[p].append((c, i))
 
         return {
             "body_remap": body_remap,
@@ -5504,14 +5525,15 @@ class ModelBuilder:
         self.shape_sdf_max_resolution.append(cfg.sdf_max_resolution)
         self.shape_sdf_texture_format.append(cfg.sdf_texture_format)
 
-        if cfg.has_shape_collision and cfg.collision_filter_parent and body > -1 and body in self.joint_parents:
-            for parent_body in self.joint_parents[body]:
-                if parent_body > -1:
-                    for parent_shape in self.body_shapes[parent_body]:
-                        self.add_shape_collision_filter_pair(parent_shape, shape)
-
-        if cfg.has_shape_collision and cfg.collision_filter_parent and body > -1 and body in self.joint_children:
-            for child_body in self.joint_children[body]:
+        if cfg.has_shape_collision and cfg.collision_filter_parent:
+            for parent_body, joint_idx in self.joint_parents.get(body, ()):
+                if not self.joint_collision_filter_parent[joint_idx]:
+                    continue
+                for parent_shape in self.body_shapes[parent_body]:
+                    self.add_shape_collision_filter_pair(parent_shape, shape)
+            for child_body, joint_idx in self.joint_children.get(body, ()):
+                if not self.joint_collision_filter_parent[joint_idx]:
+                    continue
                 for child_shape in self.body_shapes[child_body]:
                     self.add_shape_collision_filter_pair(shape, child_shape)
 
