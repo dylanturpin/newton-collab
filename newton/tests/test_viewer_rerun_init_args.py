@@ -164,6 +164,66 @@ class TestViewerRerunInitArgs(unittest.TestCase):
                     self.assertIn("default_blueprint", call_args[1])
                     self.assertEqual(call_args[1]["default_blueprint"], self.mock_blueprint)
 
+    def test_blueprint_time_panel_keeps_timeline_when_supported(self):
+        """Test that older rerun TimePanel constructors still receive the timeline argument."""
+        time_panel_calls = []
+
+        def time_panel(*, timeline=None, state=None):
+            time_panel_calls.append({"timeline": timeline, "state": state})
+            return Mock()
+
+        self.mock_rrb.TimePanel = time_panel
+
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        _ = ViewerRerun(serve_web_viewer=False)
+
+        self.assertEqual(time_panel_calls, [{"timeline": "time", "state": "collapsed"}])
+
+    def test_blueprint_time_panel_retries_without_timeline_when_unsupported(self):
+        """Test compatibility with newer rerun TimePanel constructors that removed timeline."""
+        time_panel_calls = []
+
+        def time_panel(*, state=None):
+            time_panel_calls.append({"state": state})
+            return Mock()
+
+        self.mock_rrb.TimePanel = time_panel
+
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        _ = ViewerRerun(serve_web_viewer=False)
+
+        self.assertEqual(time_panel_calls, [{"state": "collapsed"}])
+
+    def test_blueprint_time_panel_reraises_unrelated_type_error(self):
+        """Test that TimePanel construction errors unrelated to timeline compatibility are not hidden."""
+
+        def time_panel(*, timeline=None, state=None):
+            raise TypeError("state must be collapsed")
+
+        self.mock_rrb.TimePanel = time_panel
+
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        with self.assertRaisesRegex(TypeError, "state must be collapsed"):
+                            _ = ViewerRerun(serve_web_viewer=False)
+
     def test_record_to_rrd_calls_save(self):
         """Test that providing record_to_rrd calls rr.save() with blueprint."""
         with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):

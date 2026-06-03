@@ -202,9 +202,18 @@ class ViewerRerun(ViewerBase):
             rrb.Horizontal(
                 *[rrb.Spatial3DView(), scalar_panel] if scalar_panel is not None else [rrb.Spatial3DView()],
             ),
-            rrb.TimePanel(timeline="time", state="collapsed"),
+            self._build_time_panel(),
             collapse_panels=True,
         )
+
+    @staticmethod
+    def _build_time_panel():
+        try:
+            return rrb.TimePanel(timeline="time", state="collapsed")
+        except TypeError as exc:
+            if "timeline" not in str(exc):
+                raise
+            return rrb.TimePanel(state="collapsed")
 
     @override
     def log_mesh(
