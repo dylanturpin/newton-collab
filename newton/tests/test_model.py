@@ -493,6 +493,143 @@ class TestModelMesh(unittest.TestCase):
         self.assertIn((shape0, shape2), model.shape_collision_filter_pairs)
         self.assertIn((shape1, shape2), model.shape_collision_filter_pairs)
 
+    def test_collision_filter_fixed_to_world_static_shapes(self):
+        """Bodies fixed to world auto-filter against world-static shapes in any construction order."""
+
+        def joint_first():
+            builder = ModelBuilder()
+            body = builder.add_link()
+            builder.add_joint_fixed(parent=-1, child=body)
+            body_shape = builder.add_shape_sphere(body=body, radius=0.5)
+            static_shape = builder.add_ground_plane()
+            return builder, body_shape, static_shape
+
+        def static_shape_first():
+            builder = ModelBuilder()
+            static_shape = builder.add_ground_plane()
+            body = builder.add_link()
+            builder.add_joint_fixed(parent=-1, child=body)
+            body_shape = builder.add_shape_sphere(body=body, radius=0.5)
+            return builder, body_shape, static_shape
+
+        def body_shape_first():
+            builder = ModelBuilder()
+            body = builder.add_link()
+            body_shape = builder.add_shape_sphere(body=body, radius=0.5)
+            builder.add_joint_fixed(parent=-1, child=body)
+            static_shape = builder.add_ground_plane()
+            return builder, body_shape, static_shape
+
+        for case_name, build in (
+            ("joint before shapes", joint_first),
+            ("static shape before joint", static_shape_first),
+            ("body shape before joint", body_shape_first),
+        ):
+            with self.subTest(case=case_name):
+                builder, body_shape, static_shape = build()
+                pair = (min(body_shape, static_shape), max(body_shape, static_shape))
+                self.assertEqual(builder.shape_collision_filter_pairs.count(pair), 1)
+
+    def test_collision_filter_floating_base_not_filtered_to_world(self):
+        """Floating-base bodies must be able to collide with world-static shapes by default."""
+
+        builder = ModelBuilder()
+        body = builder.add_link()
+        builder.add_joint_free(parent=-1, child=body)
+        body_shape = builder.add_shape_sphere(body=body, radius=0.5)
+        static_shape = builder.add_ground_plane()
+        pair = (min(body_shape, static_shape), max(body_shape, static_shape))
+        self.assertNotIn(pair, builder.shape_collision_filter_pairs)
+
+    def test_collision_filter_revolute_to_world_default_not_filtered(self):
+        """Non-fixed joints to world do not auto-filter against world-static shapes by default."""
+
+        builder = ModelBuilder()
+        body = builder.add_link()
+        builder.add_joint_revolute(parent=-1, child=body, axis=newton.Axis.Z)
+        body_shape = builder.add_shape_sphere(body=body, radius=0.5)
+        static_shape = builder.add_ground_plane()
+        pair = (min(body_shape, static_shape), max(body_shape, static_shape))
+        self.assertNotIn(pair, builder.shape_collision_filter_pairs)
+
+    def test_collision_filter_revolute_to_world_explicit_filter(self):
+        """Explicit ``collision_filter_parent=True`` is honored for non-fixed joints to world."""
+
+        builder = ModelBuilder()
+        body = builder.add_link()
+        body_shape = builder.add_shape_sphere(body=body, radius=0.5)
+        static_shape = builder.add_ground_plane()
+        builder.add_joint_revolute(parent=-1, child=body, axis=newton.Axis.Z, collision_filter_parent=True)
+        pair = (min(body_shape, static_shape), max(body_shape, static_shape))
+        self.assertEqual(builder.shape_collision_filter_pairs.count(pair), 1)
+
+    def test_collision_filter_real_parent_default_filtered(self):
+        """Joints between real bodies retain the legacy parent-child auto-filter default."""
+
+        builder = ModelBuilder()
+        parent = builder.add_link()
+        child = builder.add_link()
+        parent_shape = builder.add_shape_sphere(body=parent, radius=0.5)
+        child_shape = builder.add_shape_sphere(body=child, radius=0.5)
+        builder.add_joint_free(parent=parent, child=child)
+        pair = (min(parent_shape, child_shape), max(parent_shape, child_shape))
+        self.assertEqual(builder.shape_collision_filter_pairs.count(pair), 1)
+
+    def test_collision_filter_fixed_to_world_opt_out(self):
+        """``collision_filter_parent=False`` suppresses fixed-to-world auto-filtering."""
+
+        builder = ModelBuilder()
+        body = builder.add_link()
+        body_shape = builder.add_shape_sphere(body=body, radius=0.5)
+        static_shape = builder.add_ground_plane()
+        builder.add_joint_fixed(parent=-1, child=body, collision_filter_parent=False)
+        pair = (min(body_shape, static_shape), max(body_shape, static_shape))
+        self.assertNotIn(pair, builder.shape_collision_filter_pairs)
+
+    def test_collision_filter_fixed_to_world_survives_add_builder(self):
+        """Copied/imported fixed-to-world joints retain their parent-filter semantics."""
+
+        def build_proto():
+            proto = ModelBuilder()
+            body = proto.add_link()
+            proto.add_joint_fixed(parent=-1, child=body)
+            return proto
+
+        def static_shape_first():
+            builder = ModelBuilder()
+            builder.add_builder(build_proto())
+            static_shape = builder.add_ground_plane()
+            body_shape = builder.add_shape_sphere(body=0, radius=0.5)
+            return builder, body_shape, static_shape
+
+        def body_shape_first():
+            builder = ModelBuilder()
+            builder.add_builder(build_proto())
+            body_shape = builder.add_shape_sphere(body=0, radius=0.5)
+            static_shape = builder.add_ground_plane()
+            return builder, body_shape, static_shape
+
+        for case_name, build in (("static shape first", static_shape_first), ("body shape first", body_shape_first)):
+            with self.subTest(case=case_name):
+                builder, body_shape, static_shape = build()
+                pair = (min(body_shape, static_shape), max(body_shape, static_shape))
+                self.assertEqual(builder.shape_collision_filter_pairs.count(pair), 1)
+
+    def test_collision_filter_floating_base_add_builder_not_filtered_to_world(self):
+        """Copied/imported floating bases keep world-static contacts by default."""
+
+        proto = ModelBuilder()
+        body = proto.add_link()
+        proto.add_joint_free(parent=-1, child=body)
+
+        builder = ModelBuilder()
+        builder.add_builder(proto)
+        body_shape = builder.add_shape_sphere(body=0, radius=0.5)
+        static_shape = builder.add_ground_plane()
+        pair = (min(body_shape, static_shape), max(body_shape, static_shape))
+
+        self.assertNotIn(pair, builder.shape_collision_filter_pairs)
+
     def test_validate_structure_invalid_shape_body(self):
         """Test that _validate_structure catches invalid shape_body references."""
         builder = ModelBuilder()
