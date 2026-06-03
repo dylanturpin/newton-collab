@@ -25,6 +25,7 @@ class TestViewerRerunHidden(unittest.TestCase):
         self.mock_rr.Clear = Mock(return_value=Mock())
         self.mock_rr.Mesh3D = Mock(return_value=Mock())
         self.mock_rr.InstancePoses3D = Mock(return_value=Mock())
+        self.mock_rr.LineStrips3D = Mock(return_value=Mock())
 
         self.mock_rrb = Mock()
         self.mock_rrb.Blueprint = Mock(return_value=Mock())
@@ -148,6 +149,28 @@ class TestViewerRerunHidden(unittest.TestCase):
 
         # No rr.log call should have been made
         self.mock_rr.log.assert_not_called()
+
+    def test_log_lines_none_updates_empty_entity(self):
+        """log_lines should overwrite stale line data when there is nothing visible."""
+        viewer = self._create_viewer()
+
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            viewer.log_lines("/contacts", None, None, colors=None)
+
+        self.mock_rr.LineStrips3D.assert_called_once_with([])
+        self.mock_rr.log.assert_called_once_with("/contacts", self.mock_rr.LineStrips3D.return_value, static=True)
+
+    def test_log_lines_empty_updates_empty_entity(self):
+        """Zero-length line batches should still be logged so old Rerun frames do not persist."""
+        viewer = self._create_viewer()
+        starts = self._make_mock_wp_array([])
+        ends = self._make_mock_wp_array([])
+
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            viewer.log_lines("/contacts", starts, ends, colors=None)
+
+        self.mock_rr.LineStrips3D.assert_called_once_with([])
+        self.mock_rr.log.assert_called_once_with("/contacts", self.mock_rr.LineStrips3D.return_value, static=True)
 
 
 if __name__ == "__main__":
