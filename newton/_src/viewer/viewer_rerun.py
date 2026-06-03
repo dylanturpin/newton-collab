@@ -45,14 +45,14 @@ class ViewerRerun(ViewerBase):
         return np.asarray(x)
 
     @staticmethod
-    def _call_rr_constructor(ctor, **kwargs):
+    def _call_rr_constructor(ctor, *args, **kwargs):
         """Call a rerun constructor with only supported keyword args."""
         try:
             signature = inspect.signature(ctor)
             allowed = {k: v for k, v in kwargs.items() if k in signature.parameters}
-            return ctor(**allowed)
+            return ctor(*args, **allowed)
         except Exception:
-            return ctor(**kwargs)
+            return ctor(*args, **kwargs)
 
     @staticmethod
     def _prepare_texture(texture: np.ndarray | str | None) -> np.ndarray | None:
@@ -198,11 +198,12 @@ class ViewerRerun(ViewerBase):
         if len(self._scalars) > 0:
             scalar_panel = rrb.TimeSeriesView()
 
-        return rrb.Blueprint(
+        return self._call_rr_constructor(
+            rrb.Blueprint,
             rrb.Horizontal(
                 *[rrb.Spatial3DView(), scalar_panel] if scalar_panel is not None else [rrb.Spatial3DView()],
             ),
-            rrb.TimePanel(timeline="time", state="collapsed"),
+            self._call_rr_constructor(rrb.TimePanel, timeline="time", state="collapsed"),
             collapse_panels=True,
         )
 
