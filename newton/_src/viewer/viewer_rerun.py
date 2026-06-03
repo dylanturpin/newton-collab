@@ -185,13 +185,45 @@ class ViewerRerun(ViewerBase):
             rr.connect_grpc(address)
         elif not self.is_jupyter_notebook:
             if serve_web_viewer:
-                self._grpc_server_uri = rr.serve_grpc(grpc_port=grpc_port, default_blueprint=blueprint)
-                rr.serve_web_viewer(connect_to=self._grpc_server_uri, web_port=web_port)
+                self._serve_web_viewer(
+                    grpc_port=grpc_port,
+                    web_port=web_port,
+                    blueprint=blueprint,
+                    record_to_rrd=record_to_rrd,
+                )
             else:
                 rr.spawn(port=grpc_port)
 
         # Make sure the timeline is set up
-        rr.set_time("time", timestamp=0.0)
+        self._set_time_seconds("time", 0.0)
+
+    def _serve_web_viewer(self, *, grpc_port: int, web_port: int, blueprint, record_to_rrd: str | None) -> None:
+        serve_grpc = getattr(rr, "serve_grpc", None)
+        serve_web_viewer = getattr(rr, "serve_web_viewer", None)
+        if callable(serve_grpc) and callable(serve_web_viewer):
+            self._grpc_server_uri = serve_grpc(grpc_port=grpc_port, default_blueprint=blueprint)
+            serve_web_viewer(connect_to=self._grpc_server_uri, web_port=web_port)
+            return
+
+        # rerun-sdk 0.22.x has rr.save and native RRD support, but predates
+        # serve_grpc. Keep the file sink active instead of switching modes.
+        if record_to_rrd is not None:
+            return
+
+        serve_web = getattr(rr, "serve_web", None)
+        if callable(serve_web):
+            serve_web(open_browser=False, web_port=web_port, default_blueprint=blueprint)
+            return
+
+        raise AttributeError("rerun does not provide serve_grpc/serve_web_viewer or serve_web")
+
+    @staticmethod
+    def _set_time_seconds(timeline: str, seconds: float) -> None:
+        set_time = getattr(rr, "set_time", None)
+        if callable(set_time):
+            set_time(timeline, timestamp=float(seconds))
+            return
+        rr.set_time_seconds(timeline, float(seconds))
 
     def _get_blueprint(self):
         scalar_panel = None
@@ -202,9 +234,18 @@ class ViewerRerun(ViewerBase):
             rrb.Horizontal(
                 *[rrb.Spatial3DView(), scalar_panel] if scalar_panel is not None else [rrb.Spatial3DView()],
             ),
-            rrb.TimePanel(timeline="time", state="collapsed"),
+            self._build_time_panel(),
             collapse_panels=True,
         )
+
+    @staticmethod
+    def _build_time_panel():
+        try:
+            return rrb.TimePanel(timeline="time", state="collapsed")
+        except TypeError as exc:
+            if "timeline" not in str(exc):
+                raise
+            return rrb.TimePanel(state="collapsed")
 
     @override
     def log_mesh(
@@ -424,7 +465,7 @@ class ViewerRerun(ViewerBase):
         """
         self.time = time
         # Set the timeline for this frame
-        rr.set_time("time", timestamp=time)
+        self._set_time_seconds("time", time)
 
     @override
     def end_frame(self):
