@@ -45,14 +45,30 @@ class ViewerRerun(ViewerBase):
         return np.asarray(x)
 
     @staticmethod
-    def _call_rr_constructor(ctor, **kwargs):
+    def _call_rr_constructor(ctor, *args, **kwargs):
         """Call a rerun constructor with only supported keyword args."""
         try:
             signature = inspect.signature(ctor)
             allowed = {k: v for k, v in kwargs.items() if k in signature.parameters}
-            return ctor(**allowed)
+            return ctor(*args, **allowed)
         except Exception:
-            return ctor(**kwargs)
+            return ctor(*args, **kwargs)
+
+    @staticmethod
+    def _rr_func(name: str):
+        func = getattr(rr, name, None)
+        return func if callable(func) else None
+
+    def _set_rr_time_seconds(self, timeline: str, timestamp: float) -> None:
+        set_time = self._rr_func("set_time")
+        if set_time is not None:
+            self._call_rr_constructor(set_time, timeline, timestamp=float(timestamp))
+            return
+        set_time_seconds = self._rr_func("set_time_seconds")
+        if set_time_seconds is not None:
+            self._call_rr_constructor(set_time_seconds, timeline, seconds=float(timestamp))
+            return
+        raise AttributeError("rerun SDK does not provide set_time or set_time_seconds")
 
     @staticmethod
     def _prepare_texture(texture: np.ndarray | str | None) -> np.ndarray | None:
@@ -182,27 +198,40 @@ class ViewerRerun(ViewerBase):
         # Launch viewer client
         self.is_jupyter_notebook = is_jupyter_notebook()
         if address is not None:
-            rr.connect_grpc(address)
+            connect = self._rr_func("connect_grpc") or self._rr_func("connect")
+            if connect is None:
+                raise AttributeError("rerun SDK does not provide connect_grpc or connect")
+            connect(address)
         elif not self.is_jupyter_notebook:
-            if serve_web_viewer:
-                self._grpc_server_uri = rr.serve_grpc(grpc_port=grpc_port, default_blueprint=blueprint)
-                rr.serve_web_viewer(connect_to=self._grpc_server_uri, web_port=web_port)
+            serve_grpc = self._rr_func("serve_grpc")
+            serve_web_viewer_fn = self._rr_func("serve_web_viewer")
+            spawn = self._rr_func("spawn")
+            if serve_web_viewer and serve_grpc is not None and serve_web_viewer_fn is not None:
+                self._grpc_server_uri = serve_grpc(grpc_port=grpc_port, default_blueprint=blueprint)
+                serve_web_viewer_fn(connect_to=self._grpc_server_uri, web_port=web_port)
+            elif serve_web_viewer and record_to_rrd is not None:
+                # Older NumPy-compatible rerun SDKs can record RRDs but do not
+                # expose the live web/grpc serving APIs.
+                pass
+            elif spawn is not None:
+                spawn(port=grpc_port)
             else:
-                rr.spawn(port=grpc_port)
+                raise AttributeError("rerun SDK does not provide serve_grpc/serve_web_viewer or spawn")
 
         # Make sure the timeline is set up
-        rr.set_time("time", timestamp=0.0)
+        self._set_rr_time_seconds("time", 0.0)
 
     def _get_blueprint(self):
         scalar_panel = None
         if len(self._scalars) > 0:
             scalar_panel = rrb.TimeSeriesView()
 
-        return rrb.Blueprint(
+        return self._call_rr_constructor(
+            rrb.Blueprint,
             rrb.Horizontal(
                 *[rrb.Spatial3DView(), scalar_panel] if scalar_panel is not None else [rrb.Spatial3DView()],
             ),
-            rrb.TimePanel(timeline="time", state="collapsed"),
+            self._call_rr_constructor(rrb.TimePanel, timeline="time", state="collapsed"),
             collapse_panels=True,
         )
 
@@ -424,7 +453,7 @@ class ViewerRerun(ViewerBase):
         """
         self.time = time
         # Set the timeline for this frame
-        rr.set_time("time", timestamp=time)
+        self._set_rr_time_seconds("time", time)
 
     @override
     def end_frame(self):
