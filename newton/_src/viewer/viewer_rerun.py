@@ -197,7 +197,11 @@ class ViewerRerun(ViewerBase):
 
         # Launch viewer client
         self.is_jupyter_notebook = is_jupyter_notebook()
-        if address is not None:
+        if record_to_rrd is not None:
+            # Rerun SDKs use a single active sink. Starting a live viewer after
+            # rr.save() can replace the file sink and leave the RRD empty.
+            pass
+        elif address is not None:
             connect = self._rr_func("connect_grpc") or self._rr_func("connect")
             if connect is None:
                 raise AttributeError("rerun SDK does not provide connect_grpc or connect")
@@ -499,7 +503,13 @@ class ViewerRerun(ViewerBase):
                 pass
             self._viewer_process = None
 
-        # Disconnect from rerun
+        # Flush and disconnect from rerun
+        try:
+            flush = self._rr_func("flush")
+            if flush is not None:
+                flush()
+        except Exception:
+            pass
         try:
             rr.disconnect()
         except Exception:

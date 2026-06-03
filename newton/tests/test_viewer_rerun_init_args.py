@@ -163,6 +163,10 @@ class TestViewerRerunInitArgs(unittest.TestCase):
                     call_args = self.mock_rr.init.call_args
                     self.assertIn("default_blueprint", call_args[1])
                     self.assertEqual(call_args[1]["default_blueprint"], self.mock_blueprint)
+                    self.mock_rr.connect_grpc.assert_not_called()
+                    self.mock_rr.serve_grpc.assert_not_called()
+                    self.mock_rr.serve_web_viewer.assert_not_called()
+                    self.mock_rr.spawn.assert_not_called()
 
     def test_record_to_rrd_calls_save(self):
         """Test that providing record_to_rrd calls rr.save() with blueprint."""
