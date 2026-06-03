@@ -83,7 +83,9 @@ __all__ += [
 # ==================================================================================
 # submodule APIs
 # ==================================================================================
-from . import actuators, geometry, ik, math, selection, sensors, solvers, usd, utils, viewer  # noqa: E402
+from importlib import import_module
+
+from . import actuators, geometry, ik, math, selection, sensors, usd, utils, viewer  # noqa: E402
 
 __all__ += [
     "actuators",
@@ -97,3 +99,11 @@ __all__ += [
     "utils",
     "viewer",
 ]
+
+
+def __getattr__(name: str):
+    if name == "solvers":
+        module = import_module(f"{__name__}.{name}")
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
