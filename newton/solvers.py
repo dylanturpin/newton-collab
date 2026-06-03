@@ -404,7 +404,6 @@ from ._src.solvers import (
     SolverBase,
     SolverFeatherPGS,
     SolverFeatherstone,
-    SolverImplicitMPM,
     SolverKamino,
     SolverMuJoCo,
     SolverSemiImplicit,
@@ -431,3 +430,12 @@ __all__ = [
     "SolverXPBD",
     "style3d",
 ]
+
+
+def __getattr__(name: str):
+    if name != "SolverImplicitMPM":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from ._src.solvers import SolverImplicitMPM
+
+    globals()[name] = SolverImplicitMPM
+    return SolverImplicitMPM
