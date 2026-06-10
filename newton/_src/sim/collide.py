@@ -13,6 +13,7 @@ from ..geometry.broad_phase_sap import BroadPhaseSAP
 from ..geometry.collision_core import compute_tight_aabb_from_support
 from ..geometry.contact_data import ContactData, make_contact_sort_key
 from ..geometry.contact_match import ContactMatcher
+from ..geometry.contact_reduction import MAX_CONTACTS_PER_PAIR
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import ShapeFlags
@@ -275,19 +276,52 @@ def compute_shape_aabbs(
     geom_xform[shape_id] = X_ws
 
 
+# Per-pair worst-case contact counts established by the narrow phase:
+#
+# * Convex-convex pairs (all primitive GeoTypes, CONVEX_MESH, and planes) are
+#   handled either by the analytic primitive fast path, which writes at most 4
+#   contacts per pair (``narrow_phase.py::narrow_phase_primitive_kernel``,
+#   contact slots 0-3), or by the GJK/MPR multi-contact path, which writes at
+#   most 4 manifold points plus 1 deepest contact = 5 per pair
+#   (``multicontact.py::build_manifold``: ``count_out = min(num_manifold_points, 4)``
+#   followed by an optional deepest-contact write).
+_CONVEX_PAIR_MAX_CONTACTS = 5
+#
+# * Mesh/heightfield-involved pairs (mesh-convex, mesh-plane, mesh-mesh,
+#   heightfield-*) and hydroelastic SDF-SDF pairs route their per-triangle /
+#   per-vertex contacts through contact reduction, which retains at most
+#   ``NUM_NORMAL_BINS * (NUM_SPATIAL_DIRECTIONS + 1) + NUM_VOXEL_DEPTH_SLOTS``
+#   slots per pair (240 with the default icosahedron configuration; the
+#   hydroelastic export adds 1 synthetic anchor contact). ``contact_reduction.py``
+#   asserts at import time that the slot count never exceeds
+#   ``MAX_CONTACTS_PER_PAIR`` (255, the hard architectural limit that keeps
+#   per-pair contact indices representable in 8 bits), so MAX_CONTACTS_PER_PAIR
+#   is a provable per-pair bound for every reduced path regardless of the
+#   reduction configuration.
+_MESH_PAIR_MAX_CONTACTS = MAX_CONTACTS_PER_PAIR
+
+
 def _estimate_rigid_contact_max(model: Model) -> int:
     """
     Estimate the maximum number of rigid contacts for the collision pipeline.
 
-    Uses a linear neighbor-budget estimate assuming each non-plane shape contacts
-    at most ``MAX_NEIGHBORS_PER_SHAPE`` others (spatial locality).  The non-plane
-    term is additive across independent worlds so a single-pool computation is
-    correct.  The plane term (each plane vs all non-planes in its world) would be
-    quadratic if computed globally, so it is evaluated per world when metadata is
-    available.
+    When precomputed contact pairs are available (``model.shape_contact_pairs``,
+    produced by ``ModelBuilder.find_shape_contact_pairs`` for every finalized
+    model), the estimate is the exact sum of per-pair worst-case contact counts
+    over the actual pair list: each pair is classified by the GeoTypes (and
+    hydroelastic flags) of its two shapes and assigned the narrow phase's hard
+    per-pair cap. This is a provable upper bound — every broad phase mode
+    (explicit, nxn, sap) applies the same world/group/filter-pair logic as
+    ``find_shape_contact_pairs``, so any candidate pair reaching the narrow
+    phase is contained in the precomputed list. Crucially, shapes that
+    participate in no contact pair (e.g. visual-only meshes) contribute nothing.
 
-    When precomputed contact pairs are available their count is used as an
-    alternative tighter bound (``min`` of heuristic and pair-based estimate).
+    Otherwise falls back to a linear neighbor-budget estimate assuming each
+    non-plane shape contacts at most ``MAX_NEIGHBORS_PER_SHAPE`` others (spatial
+    locality).  The non-plane term is additive across independent worlds so a
+    single-pool computation is correct.  The plane term (each plane vs all
+    non-planes in its world) would be quadratic if computed globally, so it is
+    evaluated per world when metadata is available.
 
     Args:
         model: The simulation model.
@@ -300,13 +334,48 @@ def _estimate_rigid_contact_max(model: Model) -> int:
 
     shape_types = model.shape_type.numpy()
 
-    # Primitive pairs (GJK/MPR) produce up to 5 manifold contacts.
-    # Mesh-involved pairs (SDF + contact reduction) typically retain ~40.
+    # Heuristic contacts-per-pair constants for the fallback (no precomputed
+    # pairs) branches below. Mesh-involved pairs (SDF + contact reduction)
+    # typically retain ~40.
     PRIMITIVE_CPP = 5
     MESH_CPP = 40
     MAX_NEIGHBORS_PER_SHAPE = 20
 
     mesh_mask = (shape_types == int(GeoType.MESH)) | (shape_types == int(GeoType.HFIELD))
+
+    # ------------------------------------------------------------------
+    # Pair-aware exact bound: sum of per-pair worst cases over the actual
+    # precomputed contact pairs.
+    # ------------------------------------------------------------------
+    shape_contact_pairs = getattr(model, "shape_contact_pairs", None)
+    if getattr(model, "shape_contact_pair_count", 0) > 0 and shape_contact_pairs is not None:
+        # One-time host transfer at pipeline/solver init (can be large for many
+        # worlds, e.g. ~655k pairs; init-only cost is acceptable).
+        pairs = shape_contact_pairs.numpy().reshape(-1, 2)
+
+        # Mesh/heightfield-involved pairs go through contact reduction.
+        pair_is_mesh = mesh_mask[pairs[:, 0]] | mesh_mask[pairs[:, 1]]
+
+        # Pairs where both shapes are hydroelastic route to the SDF-SDF
+        # hydroelastic path, which is also bounded by the reduction slots.
+        shape_flags = getattr(model, "shape_flags", None)
+        if shape_flags is not None:
+            hydro_mask = (shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0
+            pair_is_mesh |= hydro_mask[pairs[:, 0]] & hydro_mask[pairs[:, 1]]
+
+        num_mesh_pairs = int(np.count_nonzero(pair_is_mesh))
+        num_convex_pairs = int(len(pairs)) - num_mesh_pairs
+        pair_contacts = num_convex_pairs * _CONVEX_PAIR_MAX_CONTACTS + num_mesh_pairs * _MESH_PAIR_MAX_CONTACTS
+
+        # The pair sum IS the bound: the broad phase can never emit a candidate
+        # pair outside the precomputed list, so taking min() with the
+        # neighbor-budget heuristic could only cut capacity below the provable
+        # worst case (the heuristic is an estimate, not a bound). Bypass it.
+        return max(1000, pair_contacts)
+
+    # ------------------------------------------------------------------
+    # Fallback: neighbor-budget heuristic (no precomputed pairs available).
+    # ------------------------------------------------------------------
     plane_mask = shape_types == int(GeoType.PLANE)
     non_plane_mask = ~plane_mask
     num_meshes = int(np.count_nonzero(mesh_mask))
@@ -366,7 +435,9 @@ def _estimate_rigid_contact_max(model: Model) -> int:
 
     total_contacts = non_plane_contacts + plane_contacts
 
-    # When precomputed contact pairs are available, use as a tighter bound.
+    # Legacy fallback: a pair count is known but the pair list itself is not
+    # available (only possible for hand-assembled models; ModelBuilder.finalize
+    # always populates shape_contact_pairs). Use the count as a tighter bound.
     if hasattr(model, "shape_contact_pair_count") and model.shape_contact_pair_count > 0:
         weighted_cpp = max(avg_cpp, PRIMITIVE_CPP)
         pair_contacts = int(model.shape_contact_pair_count) * weighted_cpp

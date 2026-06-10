@@ -12,7 +12,12 @@ import newton
 from newton import GeoType
 from newton._src.geometry import create_mesh_terrain
 from newton._src.geometry.flags import ShapeFlags
-from newton._src.sim.collide import _compute_per_world_shape_pairs_max, _estimate_rigid_contact_max
+from newton._src.sim.collide import (
+    _CONVEX_PAIR_MAX_CONTACTS,
+    _MESH_PAIR_MAX_CONTACTS,
+    _compute_per_world_shape_pairs_max,
+    _estimate_rigid_contact_max,
+)
 from newton.examples import test_body_state
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 
@@ -866,6 +871,132 @@ class TestContactEstimator(unittest.TestCase):
 
         estimate = _estimate_rigid_contact_max(model)
         self.assertEqual(estimate, 1500)
+
+    # ------------------------------------------------------------------
+    # Pair-aware estimator tests (builder-based scenes, CPU)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cube_mesh(hs: float = 0.1) -> newton.Mesh:
+        vertices = np.array(
+            [
+                [-hs, -hs, -hs],
+                [hs, -hs, -hs],
+                [hs, hs, -hs],
+                [-hs, hs, -hs],
+                [-hs, -hs, hs],
+                [hs, -hs, hs],
+                [hs, hs, hs],
+                [-hs, hs, hs],
+            ],
+            dtype=np.float32,
+        )
+        indices = np.array(
+            [
+                0,
+                3,
+                2,
+                0,
+                2,
+                1,
+                4,
+                5,
+                6,
+                4,
+                6,
+                7,
+                0,
+                1,
+                5,
+                0,
+                5,
+                4,
+                2,
+                3,
+                7,
+                2,
+                7,
+                6,
+                0,
+                4,
+                7,
+                0,
+                7,
+                3,
+                1,
+                2,
+                6,
+                1,
+                6,
+                5,
+            ],
+            dtype=np.int32,
+        )
+        return newton.Mesh(vertices, indices)
+
+    @classmethod
+    def _build_box_scene(cls, num_boxes: int, mesh_mode: str | None = None) -> newton.Model:
+        """Ground plane + ``num_boxes`` free-body boxes, optionally plus a mesh shape.
+
+        mesh_mode:
+            None         -- no mesh shape
+            "colliding"  -- mesh shape that participates in collision
+            "visual"     -- mesh shape with has_shape_collision=False (render-only)
+        """
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        for i in range(num_boxes):
+            b = builder.add_body(xform=wp.transform(wp.vec3(0.5 * float(i), 0.0, 0.5), wp.quat_identity()))
+            builder.add_shape_box(body=b, hx=0.1, hy=0.1, hz=0.1)
+        if mesh_mode is not None:
+            cfg = None
+            if mesh_mode == "visual":
+                cfg = newton.ModelBuilder.ShapeConfig(has_shape_collision=False)
+            b = builder.add_body(xform=wp.transform(wp.vec3(-1.0, 0.0, 0.5), wp.quat_identity()))
+            builder.add_shape_mesh(body=b, mesh=cls._cube_mesh(), cfg=cfg)
+        return builder.finalize(device="cpu")
+
+    def test_pair_aware_sum_of_budgets(self):
+        """Estimate equals the sum of per-pair worst-case budgets over the actual pairs."""
+        model = self._build_box_scene(num_boxes=25)
+        # 25 boxes + ground plane: C(25,2)=300 box-box + 25 plane-box = 325 pairs,
+        # all convex (GJK/MPR budget: 4 manifold points + 1 deepest contact = 5).
+        self.assertEqual(model.shape_contact_pair_count, 325)
+        estimate = _estimate_rigid_contact_max(model)
+        self.assertEqual(estimate, 325 * _CONVEX_PAIR_MAX_CONTACTS)
+
+    def test_pair_aware_mesh_pair_budget(self):
+        """Mesh-involved pairs are budgeted with the contact-reduction per-pair cap."""
+        model = self._build_box_scene(num_boxes=25, mesh_mode="colliding")
+        # 26 additional mesh-involved pairs: mesh-plane + 25 mesh-box.
+        self.assertEqual(model.shape_contact_pair_count, 351)
+        estimate = _estimate_rigid_contact_max(model)
+        self.assertEqual(estimate, 325 * _CONVEX_PAIR_MAX_CONTACTS + 26 * _MESH_PAIR_MAX_CONTACTS)
+
+    def test_visual_mesh_does_not_inflate_estimate(self):
+        """A non-colliding (visual-only) mesh shape must not change the estimate."""
+        model_plain = self._build_box_scene(num_boxes=25)
+        model_visual = self._build_box_scene(num_boxes=25, mesh_mode="visual")
+        # The visual mesh adds a shape but no contact pairs.
+        self.assertEqual(model_visual.shape_count, model_plain.shape_count + 1)
+        self.assertEqual(model_visual.shape_contact_pair_count, model_plain.shape_contact_pair_count)
+        self.assertEqual(
+            _estimate_rigid_contact_max(model_visual),
+            _estimate_rigid_contact_max(model_plain),
+        )
+
+    def test_explicit_rigid_contact_max_override_wins(self):
+        """An explicit model.rigid_contact_max (>0) bypasses the estimator."""
+        model = self._build_box_scene(num_boxes=4)
+        model.rigid_contact_max = 777777
+        pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+        self.assertEqual(pipeline.rigid_contact_max, 777777)
+
+    def test_minimum_allocation_floor(self):
+        """Small pair sums are floored at the 1000-contact minimum allocation."""
+        model = self._build_box_scene(num_boxes=2)
+        # 2 boxes + plane: 3 pairs * 5 = 15 -> floored to 1000.
+        self.assertEqual(_estimate_rigid_contact_max(model), 1000)
 
 
 class TestShapePairsMaxScaling(unittest.TestCase):
