@@ -2327,6 +2327,7 @@ def allocate_joint_velocity_limit_slots(
     joint_dof_dim: wp.array(dtype=int, ndim=2),
     joint_velocity_limit: wp.array(dtype=float),
     joint_qd: wp.array(dtype=float),
+    velocity_limit_activation_fraction: float,
     art_to_world: wp.array(dtype=int),
     max_constraints: int,
     # outputs
@@ -2350,6 +2351,16 @@ def allocate_joint_velocity_limit_slots(
     The matrix-free solver treats these rows as stateless PhysX-style clamp
     rows: satisfied sides apply no impulse, and a violated side applies only
     the current velocity overshoot correction.
+
+    ``velocity_limit_activation_fraction`` proximity-gates the allocation:
+    with a positive fraction the lower/upper pair is reserved only when
+    ``|joint_qd[dof]| >= fraction * qdot_max``, i.e. the DOF is close enough
+    to the velocity box edge that the rows could act. A fraction of ``0.0``
+    short-circuits the gate (``joint_qd`` is not even read) so the default
+    allocation and slot ordering are bit-identical to the historical
+    always-allocate behavior. Because the gate samples the pre-solve
+    velocity, a DOF that crosses the threshold during a step is clamped one
+    step late.
 
     Outputs two entries per DOF in ``velocity_limit_slot`` (world-constraint
     row, or -1) and ``velocity_limit_sign`` (+1 / -1).
@@ -2390,6 +2401,14 @@ def allocate_joint_velocity_limit_slots(
             # the stored limit is non-positive (treated as "unlimited").
             if qdot_max <= 0.0:
                 continue
+
+            # Proximity gate: only reserve the row pair when the DOF speed is
+            # within ``fraction * qdot_max`` of the box edge. The fraction==0
+            # branch short-circuits before reading ``joint_qd`` so the default
+            # path allocates exactly as before (same slots, same order).
+            if velocity_limit_activation_fraction > 0.0:
+                if wp.abs(joint_qd[dof]) < velocity_limit_activation_fraction * qdot_max:
+                    continue
 
             lower_idx = 2 * dof
             upper_idx = lower_idx + 1
@@ -3760,6 +3779,9 @@ def allocate_rigid_velocity_limit_slots(
     is_free_rigid: wp.array(dtype=int),
     rigid_body_max_linear_velocity: wp.array(dtype=float),
     rigid_body_max_angular_velocity: wp.array(dtype=float),
+    articulation_root_dof_start: wp.array(dtype=int),
+    joint_qd: wp.array(dtype=float),
+    velocity_limit_activation_fraction: float,
     mf_max_constraints: int,
     # outputs
     rigid_velocity_limit_slot: wp.array(dtype=int),
@@ -3773,6 +3795,15 @@ def allocate_rigid_velocity_limit_slots(
     contributes lower/upper unilateral rows with Jacobians ``+e_i`` and
     ``-e_i`` so the same stateless row projection used by articulated joint
     velocity limits can clamp the current scalar speed.
+
+    ``velocity_limit_activation_fraction`` proximity-gates the allocation per
+    axis, mirroring :func:`allocate_joint_velocity_limit_slots`: a positive
+    fraction reserves the lower/upper pair only when the axis speed read from
+    ``joint_qd`` at the free root's DOFs satisfies
+    ``|qd[axis]| >= fraction * limit``. A fraction of ``0.0`` short-circuits
+    the gate (``articulation_root_dof_start`` / ``joint_qd`` are not read) so
+    the default allocation and slot ordering match the historical behavior
+    exactly.
     """
     body = wp.tid()
     base = 12 * body
@@ -3800,6 +3831,15 @@ def allocate_rigid_velocity_limit_slots(
             limit = ang_limit
         if limit <= 0.0 or not wp.isfinite(limit):
             continue
+
+        # Proximity gate: only reserve the pair when this axis is within
+        # ``fraction * limit`` of the box edge. The fraction==0 branch
+        # short-circuits before any velocity read so the default path
+        # allocates exactly as before (same slots, same order).
+        if velocity_limit_activation_fraction > 0.0:
+            root_dof = articulation_root_dof_start[art] + axis
+            if wp.abs(joint_qd[root_dof]) < velocity_limit_activation_fraction * limit:
+                continue
 
         lower_idx = base + 2 * axis
         upper_idx = lower_idx + 1

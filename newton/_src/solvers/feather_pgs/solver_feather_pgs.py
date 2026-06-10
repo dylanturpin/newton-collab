@@ -239,6 +239,7 @@ class SolverFeatherPGS(SolverBase):
         enable_joint_limits: bool = False,
         joint_limit_activation_gap: float = float("inf"),
         enable_joint_velocity_limits: bool = False,
+        velocity_limit_activation_fraction: float = 0.0,
         pgs_iterations: int = 12,
         pgs_velocity_iterations: int = 0,
         pgs_beta: float = 0.2,
@@ -337,6 +338,14 @@ class SolverFeatherPGS(SolverBase):
                 Only supported with ``pgs_mode="matrix_free"``; passing any other
                 ``pgs_mode`` together with ``enable_joint_velocity_limits=True`` raises
                 :class:`NotImplementedError` at construction. Defaults to False.
+            velocity_limit_activation_fraction (float, optional): Proximity gate for velocity-limit
+                row allocation. ``0.0`` allocates the lower/upper row pair for every finitely
+                limited joint DOF and free-rigid-body axis each step, preserving the historical
+                behavior exactly. A positive fraction allocates a pair only when the current
+                speed satisfies ``|qd| >= fraction * limit``, skipping rows that would be exact
+                no-op clamps. Because the gate samples the pre-solve velocity, a DOF crossing the
+                threshold between steps is clamped one step late. Must be non-negative and not
+                NaN. Defaults to ``0.0``.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_velocity_iterations (int, optional): Additional matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
@@ -467,6 +476,12 @@ class SolverFeatherPGS(SolverBase):
         if np.isnan(self.joint_limit_activation_gap) or self.joint_limit_activation_gap < 0.0:
             raise ValueError("joint_limit_activation_gap must be non-negative or inf")
         self.enable_joint_velocity_limits = enable_joint_velocity_limits
+        try:
+            self.velocity_limit_activation_fraction = float(velocity_limit_activation_fraction)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("velocity_limit_activation_fraction must be non-negative") from exc
+        if np.isnan(self.velocity_limit_activation_fraction) or self.velocity_limit_activation_fraction < 0.0:
+            raise ValueError("velocity_limit_activation_fraction must be non-negative")
         self.pgs_iterations = pgs_iterations
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
@@ -3519,6 +3534,7 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_dof_dim,
                         model.joint_velocity_limit,
                         self.v_hat,
+                        self.velocity_limit_activation_fraction,
                         self.art_to_world,
                         max_constraints,
                     ],
@@ -3619,6 +3635,13 @@ class SolverFeatherPGS(SolverBase):
         # final phase so articulated and rigid velocity-limit rows are both
         # visited after drive/contact/friction/position-limit rows.
         if mf_active and self.rigid_velocity_limit_slot is not None:
+            # Dummy when no articulation metadata exists; the kernel only
+            # reads it for free-rigid roots, which then cannot occur.
+            root_dof_start = (
+                self.articulation_root_dof_start
+                if self.articulation_root_dof_start is not None
+                else wp.zeros((1,), dtype=wp.int32, device=model.device)
+            )
             wp.launch(
                 allocate_rigid_velocity_limit_slots,
                 dim=model.body_count,
@@ -3628,6 +3651,9 @@ class SolverFeatherPGS(SolverBase):
                     is_free_rigid,
                     self.rigid_body_max_linear_velocity,
                     self.rigid_body_max_angular_velocity,
+                    root_dof_start,
+                    self.v_hat,
+                    self.velocity_limit_activation_fraction,
                     self.mf_max_constraints,
                 ],
                 outputs=[
@@ -3772,6 +3798,7 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_dof_dim,
                         model.joint_velocity_limit,
                         self.v_hat,
+                        self.velocity_limit_activation_fraction,
                         self.art_to_world,
                         max_constraints,
                     ],
