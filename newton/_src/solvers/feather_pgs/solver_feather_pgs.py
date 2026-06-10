@@ -684,6 +684,9 @@ class SolverFeatherPGS(SolverBase):
         self._dummy_contact_count = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_contact_row_type = wp.zeros((1, 1), dtype=wp.int32, device=model.device)
         self._dummy_contact_row_parent = wp.full((1, 1), -1, dtype=wp.int32, device=model.device)
+        # Persistent dummy for the mf_slot_counter output of
+        # allocate_world_contact_slots when the MF path is inactive (the
+        # kernel never writes it when has_free_rigid == 0).
         self._debug_projected_root = os.getenv("IL_NEWTON_FPGS_PROJECTED_ROOT", "").lower() in {
             "1",
             "true",
@@ -1481,6 +1484,16 @@ class SolverFeatherPGS(SolverBase):
         if self.pgs_mode == "dense" or (not self._has_free_rigid_bodies and self.pgs_mode != "matrix_free"):
             return
 
+        if not self._has_free_rigid_bodies:
+            # pgs_mode == "matrix_free" with no free rigid bodies: the step
+            # path still passes mf_* arrays to kernels (pack_mf_meta, the
+            # fused GS solve, the PGS diagnostics), but mf_constraint_count
+            # stays zero so every mf access is bounded by m_mf == 0 and no
+            # element is ever read or written. One-slot dummies stand in for
+            # the large (worlds, mf_max_constraints, ...) buffers.
+            self._allocate_mf_dummy_buffers(model)
+            return
+
         device = model.device
         requires_grad = model.requires_grad
         worlds = self.world_count
@@ -1598,6 +1611,49 @@ class SolverFeatherPGS(SolverBase):
         self.mf_body_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_local_body_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_local_body_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
+
+    def _allocate_mf_dummy_buffers(self, model):
+        """Allocate one-slot MF dummies for matrix_free models with no free rigid bodies.
+
+        ``mf_constraint_count`` is allocated zero and never written on this
+        path (``finalize_mf_constraint_counts`` only launches when MF is
+        active), so the generated pack/GS kernels and the PGS diagnostics
+        never dereference an mf element: every access sits inside a loop
+        bounded by ``m_mf = mf_constraint_count[world] == 0``. Only the
+        per-world count must keep its real width; the per-constraint arrays
+        shrink to a single slot. The split-only buffers (``mf_body_Hinv``,
+        ``mf_body_list`` et al., ``max_mf_bodies``) are skipped entirely so
+        the tiled MF PGS kernel is not built.
+        """
+        device = model.device
+        requires_grad = model.requires_grad
+        worlds = self.world_count
+
+        self.mf_constraint_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.mf_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+
+        for name in ("mf_body_a", "mf_body_b", "mf_dof_a", "mf_dof_b", "mf_row_type"):
+            setattr(self, name, wp.zeros((worlds, 1), dtype=wp.int32, device=device, requires_grad=requires_grad))
+        self.mf_row_parent = wp.full((worlds, 1), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
+        for name in ("mf_rhs", "mf_rhs_unbiased", "mf_impulses", "mf_eff_mass_inv", "mf_row_mu", "mf_phi"):
+            setattr(self, name, wp.zeros((worlds, 1), dtype=wp.float32, device=device, requires_grad=requires_grad))
+        for name in ("mf_J_a", "mf_J_b", "mf_MiJt_a", "mf_MiJt_b"):
+            setattr(self, name, wp.zeros((worlds, 1, 6), dtype=wp.float32, device=device, requires_grad=requires_grad))
+        self.mf_meta_packed = wp.zeros((worlds, 4), dtype=wp.int32, device=device)
+
+        if self._has_rigid_body_velocity_limits and model.body_count > 0:
+            # Only the ``is not None`` checks observe these on the inactive
+            # path; allocating them keeps the matrix_free clamp semantics of
+            # _clamp_rigid_velocity_limits identical to the full allocation.
+            self.rigid_velocity_limit_slot = wp.full(
+                (1,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+            )
+            self.rigid_velocity_limit_sign = wp.zeros(
+                (1,), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+        else:
+            self.rigid_velocity_limit_slot = None
+            self.rigid_velocity_limit_sign = None
 
     def _allocate_debug_buffers(self, model):
         """Allocate buffers for PGS convergence diagnostics."""
@@ -1948,7 +2004,7 @@ class SolverFeatherPGS(SolverBase):
             wp.copy(self._debug_position_J_world, self.J_world)
             wp.copy(self._debug_position_Y_world, self.Y_world)
 
-        if hasattr(self, "mf_constraint_count"):
+        if self._has_free_rigid_bodies and hasattr(self, "mf_constraint_count"):
             wp.copy(self._debug_position_mf_constraint_count, self.mf_constraint_count)
             wp.copy(self._debug_position_mf_impulses, self.mf_impulses)
             wp.copy(self._debug_position_mf_rhs, self.mf_rhs)
