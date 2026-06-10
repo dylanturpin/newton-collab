@@ -47,7 +47,6 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-    TILE_THREADS,
     add_dense_contact_compliance_to_diag,
     allocate_joint_limit_slots,
     allocate_joint_velocity_limit_slots,
@@ -273,6 +272,8 @@ class SolverFeatherPGS(SolverBase):
         pgs_debug: bool = False,
         drive_mode: Literal["augmented", "physx_pgs"] = "augmented",
         effort_limit_mode: str = "actuator",
+        serial_kernel_block_dim: int = 256,
+        tile_threads: int = 64,
     ):
         """
         Args:
@@ -442,6 +443,18 @@ class SolverFeatherPGS(SolverBase):
                 is left uncapped; the implicit-PD drive response carried by
                 ``H_tilde^{-1}`` is not clamped. ``"actuator"`` (the new default) is
                 the only supported value. ``"net"`` is rejected with ``ValueError``.
+            serial_kernel_block_dim (int, optional): CUDA block size for the serial
+                one-thread-per-articulation kernels (``eval_rigid_fk``, ``eval_rigid_id``,
+                ``eval_rigid_tau``, ``update_articulation_origins``,
+                ``update_articulation_root_com_offsets``). These kernels have no
+                cross-thread reductions, so changing this value is bit-identical; it only
+                changes occupancy/grid shape. Must be a positive multiple of 32.
+                Defaults to 256 (the Warp default).
+            tile_threads (int, optional): Threads per block for the tiled
+                Cholesky / triangular-solve / H^-1 J^T kernels. Tile primitives may
+                change floating-point reduction order with the block size, so non-default
+                values are not bit-identical (results stay within numerical tolerance).
+                Must be one of {32, 64, 128, 256}. Defaults to 64.
         Auto selection behavior:
             - auto: size > threshold -> tiled, else loop/par_row.
             - Delassus auto/tiled: streaming kernel (handles any constraint count via chunking).
@@ -628,6 +641,15 @@ class SolverFeatherPGS(SolverBase):
                 "see notes/2026-04-20/effort-limit.md for the fix rationale."
             )
         self.effort_limit_mode = "actuator"
+
+        self.serial_kernel_block_dim = int(serial_kernel_block_dim)
+        if self.serial_kernel_block_dim <= 0 or self.serial_kernel_block_dim % 32 != 0:
+            raise ValueError(
+                f"serial_kernel_block_dim must be a positive multiple of 32, got {serial_kernel_block_dim!r}"
+            )
+        self.tile_threads = int(tile_threads)
+        if self.tile_threads not in (32, 64, 128, 256):
+            raise ValueError(f"tile_threads must be one of (32, 64, 128, 256), got {tile_threads!r}")
 
         self.cholesky_kernel = cholesky_kernel
         self.trisolve_kernel = trisolve_kernel
@@ -1638,8 +1660,10 @@ class SolverFeatherPGS(SolverBase):
                 self._delassus_kernels_by_size[size] = None
                 continue
 
-            self._cholesky_kernels_by_size[size] = _get_cholesky_kernel(size, device_arch)
-            self._triangular_solve_kernels_by_size[size] = _get_triangular_solve_kernel(size, device_arch)
+            self._cholesky_kernels_by_size[size] = _get_cholesky_kernel(size, device_arch, self.tile_threads)
+            self._triangular_solve_kernels_by_size[size] = _get_triangular_solve_kernel(
+                size, device_arch, self.tile_threads
+            )
             if self.dense_max_constraints <= 0:
                 self._hinv_jt_kernels_by_size[size] = None
                 self._hinv_jt_fused_kernels_by_size[size] = None
@@ -1647,10 +1671,10 @@ class SolverFeatherPGS(SolverBase):
                 continue
 
             self._hinv_jt_kernels_by_size[size] = _get_hinv_jt_kernel(
-                size, self.dense_max_constraints, device_arch
+                size, self.dense_max_constraints, device_arch, self.tile_threads
             )
             self._hinv_jt_fused_kernels_by_size[size] = _get_hinv_jt_fused_kernel(
-                size, self.dense_max_constraints, device_arch
+                size, self.dense_max_constraints, device_arch, self.tile_threads
             )
             self._delassus_kernels_by_size[size] = _get_delassus_kernel(
                 size, self.dense_max_constraints, device_arch, chunk_size=self.delassus_chunk_size
@@ -2766,6 +2790,7 @@ class SolverFeatherPGS(SolverBase):
                 model.joint_dof_dim,
             ],
             outputs=[state_in.body_q, state_aug.body_q_com],
+            block_dim=self.serial_kernel_block_dim,
             device=model.device,
         )
 
@@ -2779,6 +2804,7 @@ class SolverFeatherPGS(SolverBase):
                 model.body_com,
             ],
             outputs=[self.articulation_origin],
+            block_dim=self.serial_kernel_block_dim,
             device=model.device,
         )
         wp.launch(
@@ -2791,6 +2817,7 @@ class SolverFeatherPGS(SolverBase):
                 model.body_com,
             ],
             outputs=[self.articulation_root_com_offset],
+            block_dim=self.serial_kernel_block_dim,
             device=model.device,
         )
         # evaluate joint inertias, motion vectors, and forces
@@ -2850,6 +2877,7 @@ class SolverFeatherPGS(SolverBase):
                 state_aug.body_f_s,
                 state_aug.body_a_s,
             ],
+            block_dim=self.serial_kernel_block_dim,
             device=model.device,
         )
         if model.body_count:
@@ -2923,6 +2951,7 @@ class SolverFeatherPGS(SolverBase):
                     state_aug.body_ft_s,
                     state_aug.joint_tau,
                 ],
+                block_dim=self.serial_kernel_block_dim,
                 device=model.device,
             )
 
@@ -3160,7 +3189,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mass_update_mask,
             ],
             outputs=[self.L_by_size[size]],
-            block_dim=TILE_THREADS,
+            block_dim=self.tile_threads,
             device=model.device,
         )
 
@@ -3211,7 +3240,7 @@ class SolverFeatherPGS(SolverBase):
                 self.tau_by_size[size],
             ],
             outputs=[self.qdd_by_size[size]],
-            block_dim=TILE_THREADS,
+            block_dim=self.tile_threads,
             device=model.device,
         )
         wp.launch(
@@ -3875,7 +3904,7 @@ class SolverFeatherPGS(SolverBase):
                 self.constraint_count,
             ],
             outputs=[self.Y_by_size[size]],
-            block_dim=TILE_THREADS,
+            block_dim=self.tile_threads,
             device=model.device,
         )
 
@@ -3897,7 +3926,7 @@ class SolverFeatherPGS(SolverBase):
                 self.row_cfm,
             ],
             outputs=[self.C, self.diag, self.Y_by_size[size]],
-            block_dim=TILE_THREADS,
+            block_dim=self.tile_threads,
             device=model.device,
         )
 
@@ -4990,7 +5019,7 @@ class SolverFeatherPGS(SolverBase):
 
 
 @cache
-def _get_hinv_jt_kernel(n_dofs: int, max_constraints: int, device_arch: str) -> "wp.Kernel":
+def _get_hinv_jt_kernel(n_dofs: int, max_constraints: int, device_arch: str, tile_threads: int = 64) -> "wp.Kernel":
     """Build specialized H^-1*J^T kernel for given dimensions.
 
     Solves Y = H^-1 * J^T using tiled Cholesky solve:
@@ -5037,12 +5066,14 @@ def _get_hinv_jt_kernel(n_dofs: int, max_constraints: int, device_arch: str) -> 
         Y_out_tile = wp.tile_transpose(X_tile)
         wp.tile_store(Y_group[idx], Y_out_tile)
 
-    hinv_jt_tiled_template.__name__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}"
-    hinv_jt_tiled_template.__qualname__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}"
+    hinv_jt_tiled_template.__name__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}_bd{tile_threads}"
+    hinv_jt_tiled_template.__qualname__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}_bd{tile_threads}"
     return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_template)
 
 @cache
-def _get_hinv_jt_fused_kernel(n_dofs: int, max_constraints: int, device_arch: str) -> "wp.Kernel":
+def _get_hinv_jt_fused_kernel(
+    n_dofs: int, max_constraints: int, device_arch: str, tile_threads: int = 64
+) -> "wp.Kernel":
     """Build specialized fused H^-1*J^T + Delassus kernel for given dimensions."""
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
     TILE_CONSTRAINTS_LOCAL = wp.constant(int(max_constraints))
@@ -5092,8 +5123,8 @@ def _get_hinv_jt_fused_kernel(n_dofs: int, max_constraints: int, device_arch: st
             for i in range(n_constraints):
                 world_diag[world, i] = C_tile[i, i] + row_cfm[world, i]
 
-    hinv_jt_tiled_fused_template.__name__ = f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}"
-    hinv_jt_tiled_fused_template.__qualname__ = f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}"
+    hinv_jt_tiled_fused_template.__name__ = f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}_bd{tile_threads}"
+    hinv_jt_tiled_fused_template.__qualname__ = f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}_bd{tile_threads}"
     return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_fused_template)
 
 @cache
@@ -5190,7 +5221,7 @@ for (int ci = 0; ci < num_chunks; ci++) {{
     return wp.kernel(enable_backward=False, module="unique")(delassus_template)
 
 @cache
-def _get_cholesky_kernel(n_dofs: int, device_arch: str) -> "wp.Kernel":
+def _get_cholesky_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) -> "wp.Kernel":
     """Build specialized Cholesky kernel for given DOF count.
 
     Computes L such that H + diag(armature) = L * L^T.
@@ -5225,12 +5256,12 @@ def _get_cholesky_kernel(n_dofs: int, device_arch: str) -> "wp.Kernel":
         # Store result
         wp.tile_store(L_group[idx], L_tile)
 
-    cholesky_tiled_template.__name__ = f"cholesky_tiled_{n_dofs}"
-    cholesky_tiled_template.__qualname__ = f"cholesky_tiled_{n_dofs}"
+    cholesky_tiled_template.__name__ = f"cholesky_tiled_{n_dofs}_bd{tile_threads}"
+    cholesky_tiled_template.__qualname__ = f"cholesky_tiled_{n_dofs}_bd{tile_threads}"
     return wp.kernel(enable_backward=False, module="unique")(cholesky_tiled_template)
 
 @cache
-def _get_triangular_solve_kernel(n_dofs: int, device_arch: str) -> "wp.Kernel":
+def _get_triangular_solve_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) -> "wp.Kernel":
     """Build specialized triangular solve kernel for given DOF count.
 
     Solves L * L^T * x = b for x using tiled forward and backward substitution.
@@ -5255,8 +5286,8 @@ def _get_triangular_solve_kernel(n_dofs: int, device_arch: str) -> "wp.Kernel":
 
         wp.tile_store(qdd_group[idx], qdd_tile)
 
-    trisolve_tiled_template.__name__ = f"trisolve_tiled_{n_dofs}"
-    trisolve_tiled_template.__qualname__ = f"trisolve_tiled_{n_dofs}"
+    trisolve_tiled_template.__name__ = f"trisolve_tiled_{n_dofs}_bd{tile_threads}"
+    trisolve_tiled_template.__qualname__ = f"trisolve_tiled_{n_dofs}_bd{tile_threads}"
     return wp.kernel(enable_backward=False, module="unique")(trisolve_tiled_template)
 
 @cache
