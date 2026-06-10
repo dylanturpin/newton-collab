@@ -480,8 +480,13 @@ class SolverFeatherPGS(SolverBase):
             self.velocity_limit_activation_fraction = float(velocity_limit_activation_fraction)
         except (TypeError, ValueError) as exc:
             raise ValueError("velocity_limit_activation_fraction must be non-negative") from exc
-        if np.isnan(self.velocity_limit_activation_fraction) or self.velocity_limit_activation_fraction < 0.0:
-            raise ValueError("velocity_limit_activation_fraction must be non-negative")
+        frac = self.velocity_limit_activation_fraction
+        if np.isnan(frac) or not (0.0 <= frac <= 1.0 or np.isinf(frac)):
+            # Finite values above 1 would leave speeds in
+            # (limit, fraction*limit) permanently unclamped: the row only
+            # allocates at |qd| >= fraction * limit. inf stays valid as an
+            # explicit never-activate kill-switch.
+            raise ValueError("velocity_limit_activation_fraction must be in [0, 1] or inf")
         self.pgs_iterations = pgs_iterations
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
