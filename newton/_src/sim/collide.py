@@ -319,11 +319,14 @@ def _estimate_rigid_contact_max(model: Model) -> int:
     model), the estimate is the exact sum of per-pair worst-case contact counts
     over the actual pair list: each pair is classified by the GeoTypes (and
     hydroelastic flags) of its two shapes and assigned the narrow phase's hard
-    per-pair cap. This is a provable upper bound — every broad phase mode
-    (explicit, nxn, sap) applies the same world/group/filter-pair logic as
-    ``find_shape_contact_pairs``, so any candidate pair reaching the narrow
-    phase is contained in the precomputed list. Crucially, shapes that
-    participate in no contact pair (e.g. visual-only meshes) contribute nothing.
+    per-pair cap. Every broad phase mode (explicit, nxn, sap) applies the same
+    world/group/filter-pair logic as ``find_shape_contact_pairs``, so any
+    candidate pair reaching the narrow phase is contained in the precomputed
+    list and the sum is a provable worst case. For dense pair graphs the sum is
+    capped by a spatial-locality estimate (see the inline comment); where that
+    cap binds, capacity is physically motivated rather than provable, matching
+    the pre-pair-aware behavior. Crucially, shapes that participate in no
+    contact pair (e.g. visual-only meshes) contribute nothing to either term.
     The per-pair caps assume contact reduction is enabled (the default for
     mesh/hydroelastic paths); with ``reduce_contacts=False`` no static bound
     exists and overflow remains detectable via ``contact_count > contact_max``.
@@ -379,20 +382,40 @@ def _estimate_rigid_contact_max(model: Model) -> int:
             pair_is_hydro = np.zeros(len(pairs), dtype=bool)
         pair_is_mesh = pair_is_mesh & ~pair_is_hydro
 
-        num_hydro_pairs = int(np.count_nonzero(pair_is_hydro))
-        num_mesh_pairs = int(np.count_nonzero(pair_is_mesh))
-        num_convex_pairs = int(len(pairs)) - num_mesh_pairs - num_hydro_pairs
-        pair_contacts = (
-            num_convex_pairs * _CONVEX_PAIR_MAX_CONTACTS
-            + num_mesh_pairs * _MESH_PAIR_MAX_CONTACTS
-            + num_hydro_pairs * _HYDRO_PAIR_MAX_CONTACTS
-        )
+        pair_cap = np.full(len(pairs), _CONVEX_PAIR_MAX_CONTACTS, dtype=np.int64)
+        pair_cap[pair_is_mesh] = _MESH_PAIR_MAX_CONTACTS
+        pair_cap[pair_is_hydro] = _HYDRO_PAIR_MAX_CONTACTS
+        pair_contacts = int(pair_cap.sum())
 
-        # The pair sum IS the bound: the broad phase can never emit a candidate
-        # pair outside the precomputed list, so taking min() with the
-        # neighbor-budget heuristic could only cut capacity below the provable
-        # worst case (the heuristic is an estimate, not a bound). Bypass it.
-        return max(1000, pair_contacts)
+        # The pair sum is the combinatorial worst case, but for dense pair
+        # graphs (e.g. thousands of mutually collidable shapes piled in one
+        # world) it explodes quadratically while only a bounded number of
+        # neighbors can touch a shape simultaneously. Cap it with a
+        # spatial-locality estimate, mirroring the pre-pair-aware behavior:
+        # plane-involved pairs keep their full per-pair budget (a ground plane
+        # really can contact every shape resting on it at once), and each
+        # non-plane shape is budgeted for at most MAX_NEIGHBORS_PER_SHAPE
+        # simultaneous neighbors at its own per-pair cap (halved to avoid
+        # double-counting both shapes of a pair). Where this cap binds the
+        # capacity is physically motivated rather than a provable bound -
+        # exactly as before this estimator existed; where the pair sum binds
+        # (typical multi-world robot scenes) it is a provable worst case.
+        plane_shape = shape_types == int(GeoType.PLANE)
+        pair_has_plane = plane_shape[pairs[:, 0]] | plane_shape[pairs[:, 1]]
+        plane_pair_contacts = int(pair_cap[pair_has_plane].sum())
+        nonplane_pairs = pairs[~pair_has_plane]
+        if len(nonplane_pairs) > 0:
+            active_shapes = np.unique(nonplane_pairs)
+            shape_cap = np.full(len(active_shapes), _CONVEX_PAIR_MAX_CONTACTS, dtype=np.int64)
+            shape_cap[mesh_mask[active_shapes]] = _MESH_PAIR_MAX_CONTACTS
+            if shape_flags is not None:
+                shape_cap[hydro_mask[active_shapes]] = _HYDRO_PAIR_MAX_CONTACTS
+            nonplane_locality = int(shape_cap.sum()) * MAX_NEIGHBORS_PER_SHAPE // 2
+        else:
+            nonplane_locality = 0
+        locality_cap = plane_pair_contacts + nonplane_locality
+
+        return max(1000, min(pair_contacts, locality_cap))
 
     # ------------------------------------------------------------------
     # Fallback: neighbor-budget heuristic (no precomputed pairs available).

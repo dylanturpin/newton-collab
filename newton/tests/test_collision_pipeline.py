@@ -908,6 +908,24 @@ class TestContactEstimator(unittest.TestCase):
         return newton.Mesh(vertices, indices)
 
     @classmethod
+    def _build_multi_world_scene(
+        cls, num_worlds: int, boxes_per_world: int, mesh_per_world: bool = False
+    ) -> newton.Model:
+        """Global ground plane + ``num_worlds`` worlds of free-body boxes (and optionally one colliding mesh)."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        for _ in range(num_worlds):
+            builder.begin_world()
+            for i in range(boxes_per_world):
+                b = builder.add_body(xform=wp.transform(wp.vec3(0.5 * float(i), 0.0, 0.5), wp.quat_identity()))
+                builder.add_shape_box(body=b, hx=0.1, hy=0.1, hz=0.1)
+            if mesh_per_world:
+                b = builder.add_body(xform=wp.transform(wp.vec3(-1.0, 0.0, 0.5), wp.quat_identity()))
+                builder.add_shape_mesh(body=b, mesh=cls._cube_mesh())
+            builder.end_world()
+        return builder.finalize(device="cpu")
+
+    @classmethod
     def _build_box_scene(cls, num_boxes: int, mesh_mode: str | None = None) -> newton.Model:
         """Ground plane + ``num_boxes`` free-body boxes, optionally plus a mesh shape.
 
@@ -930,21 +948,33 @@ class TestContactEstimator(unittest.TestCase):
         return builder.finalize(device="cpu")
 
     def test_pair_aware_sum_of_budgets(self):
-        """Estimate equals the sum of per-pair worst-case budgets over the actual pairs."""
-        model = self._build_box_scene(num_boxes=25)
-        # 25 boxes + ground plane: C(25,2)=300 box-box + 25 plane-box = 325 pairs,
-        # all convex (GJK/MPR budget: 4 manifold points + 1 deepest contact = 5).
-        self.assertEqual(model.shape_contact_pair_count, 325)
-        estimate = _estimate_rigid_contact_max(model)
-        self.assertEqual(estimate, 325 * _CONVEX_PAIR_MAX_CONTACTS)
+        """For sparse multi-world scenes the estimate is the exact per-pair budget sum."""
+        model = self._build_multi_world_scene(num_worlds=100, boxes_per_world=2)
+        # Per world: 1 box-box + 2 plane-box pairs = 3 pairs, all convex.
+        self.assertEqual(model.shape_contact_pair_count, 300)
+        # Locality cap (plane pairs full + 200 boxes * 20 neighbors * 5 // 2)
+        # is far larger, so the provable pair sum binds.
+        self.assertEqual(_estimate_rigid_contact_max(model), 300 * _CONVEX_PAIR_MAX_CONTACTS)
 
     def test_pair_aware_mesh_pair_budget(self):
         """Mesh-involved pairs are budgeted with the contact-reduction per-pair cap."""
-        model = self._build_box_scene(num_boxes=25, mesh_mode="colliding")
-        # 26 additional mesh-involved pairs: mesh-plane + 25 mesh-box.
-        self.assertEqual(model.shape_contact_pair_count, 351)
-        estimate = _estimate_rigid_contact_max(model)
-        self.assertEqual(estimate, 325 * _CONVEX_PAIR_MAX_CONTACTS + 26 * _MESH_PAIR_MAX_CONTACTS)
+        model = self._build_multi_world_scene(num_worlds=50, boxes_per_world=2, mesh_per_world=True)
+        # Per world: 1 box-box + 2 plane-box (convex) + 2 mesh-box + 1 plane-mesh (mesh) = 6 pairs.
+        self.assertEqual(model.shape_contact_pair_count, 300)
+        expected = 50 * (3 * _CONVEX_PAIR_MAX_CONTACTS + 3 * _MESH_PAIR_MAX_CONTACTS)
+        self.assertEqual(_estimate_rigid_contact_max(model), expected)
+
+    def test_locality_cap_binds_for_dense_single_world(self):
+        """Dense single-world pair graphs are capped by the spatial-locality estimate."""
+        model = self._build_box_scene(num_boxes=25)
+        # Pair sum: C(25,2)=300 box-box + 25 plane-box = 325 pairs * 5 = 1625.
+        self.assertEqual(model.shape_contact_pair_count, 325)
+        # Locality cap: plane pairs keep their budget (25 * 5) and the 25 boxes
+        # are budgeted for 20 simultaneous neighbors each (halved per pair):
+        # 125 + 25 * 5 * 20 // 2 = 1375 < 1625, so the cap binds.
+        plane_term = 25 * _CONVEX_PAIR_MAX_CONTACTS
+        locality = 25 * _CONVEX_PAIR_MAX_CONTACTS * 20 // 2
+        self.assertEqual(_estimate_rigid_contact_max(model), plane_term + locality)
 
     def test_visual_mesh_does_not_inflate_estimate(self):
         """A non-colliding (visual-only) mesh shape must not change the estimate."""
@@ -960,13 +990,14 @@ class TestContactEstimator(unittest.TestCase):
 
     def test_hydroelastic_pair_budget(self):
         """Hydro-hydro pairs get the anchor-augmented per-pair budget."""
-        model = self._build_box_scene(num_boxes=25)
+        model = self._build_multi_world_scene(num_worlds=50, boxes_per_world=2)
         flags = model.shape_flags.numpy()
         flags |= int(ShapeFlags.HYDROELASTIC)
         model.shape_flags = wp.array(flags, dtype=wp.int32, device=model.device)
-        # All 325 pairs become hydro-hydro: budgeted at MAX_CONTACTS_PER_PAIR
-        # plus one anchor contact per normal bin.
-        self.assertEqual(_estimate_rigid_contact_max(model), 325 * _HYDRO_PAIR_MAX_CONTACTS)
+        # All 150 pairs become hydro-hydro: budgeted at MAX_CONTACTS_PER_PAIR
+        # plus one anchor contact per normal bin; the locality cap (which also
+        # uses the hydro budget per shape) stays larger, so the sum binds.
+        self.assertEqual(_estimate_rigid_contact_max(model), 150 * _HYDRO_PAIR_MAX_CONTACTS)
 
     def test_explicit_rigid_contact_max_override_wins(self):
         """An explicit model.rigid_contact_max (>0) bypasses the estimator."""
