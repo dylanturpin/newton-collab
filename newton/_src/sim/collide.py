@@ -13,7 +13,7 @@ from ..geometry.broad_phase_sap import BroadPhaseSAP
 from ..geometry.collision_core import compute_tight_aabb_from_support
 from ..geometry.contact_data import ContactData, make_contact_sort_key
 from ..geometry.contact_match import ContactMatcher
-from ..geometry.contact_reduction import MAX_CONTACTS_PER_PAIR
+from ..geometry.contact_reduction import MAX_CONTACTS_PER_PAIR, NUM_NORMAL_BINS
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import ShapeFlags
@@ -291,14 +291,23 @@ _CONVEX_PAIR_MAX_CONTACTS = 5
 #   heightfield-*) and hydroelastic SDF-SDF pairs route their per-triangle /
 #   per-vertex contacts through contact reduction, which retains at most
 #   ``NUM_NORMAL_BINS * (NUM_SPATIAL_DIRECTIONS + 1) + NUM_VOXEL_DEPTH_SLOTS``
-#   slots per pair (240 with the default icosahedron configuration; the
-#   hydroelastic export adds 1 synthetic anchor contact). ``contact_reduction.py``
-#   asserts at import time that the slot count never exceeds
-#   ``MAX_CONTACTS_PER_PAIR`` (255, the hard architectural limit that keeps
-#   per-pair contact indices representable in 8 bits), so MAX_CONTACTS_PER_PAIR
-#   is a provable per-pair bound for every reduced path regardless of the
-#   reduction configuration.
+#   slots per pair (240 with the default icosahedron configuration).
+#   ``contact_reduction.py`` asserts at import time that the slot count never
+#   exceeds ``MAX_CONTACTS_PER_PAIR`` (255, the hard architectural limit that
+#   keeps per-pair contact indices representable in 8 bits), so
+#   MAX_CONTACTS_PER_PAIR bounds every reduced mesh path. The bound assumes
+#   contact reduction is enabled (the default); with ``reduce_contacts=False``
+#   mesh paths write unreduced per-triangle/per-vertex contacts and no static
+#   estimate is possible.
 _MESH_PAIR_MAX_CONTACTS = MAX_CONTACTS_PER_PAIR
+#
+# * Hydroelastic SDF-SDF pairs additionally export one synthetic anchor
+#   contact PER ACTIVE NORMAL BIN when ``anchor_contact`` (or
+#   ``moment_matching``, which implies it) is enabled
+#   (``contact_reduction_hydroelastic.py::export_hydroelastic_reduced_contacts_kernel``),
+#   on top of the reduced slots — worst case ``MAX_CONTACTS_PER_PAIR +
+#   NUM_NORMAL_BINS`` per pair.
+_HYDRO_PAIR_MAX_CONTACTS = MAX_CONTACTS_PER_PAIR + NUM_NORMAL_BINS
 
 
 def _estimate_rigid_contact_max(model: Model) -> int:
@@ -315,6 +324,9 @@ def _estimate_rigid_contact_max(model: Model) -> int:
     ``find_shape_contact_pairs``, so any candidate pair reaching the narrow
     phase is contained in the precomputed list. Crucially, shapes that
     participate in no contact pair (e.g. visual-only meshes) contribute nothing.
+    The per-pair caps assume contact reduction is enabled (the default for
+    mesh/hydroelastic paths); with ``reduce_contacts=False`` no static bound
+    exists and overflow remains detectable via ``contact_count > contact_max``.
 
     Otherwise falls back to a linear neighbor-budget estimate assuming each
     non-plane shape contacts at most ``MAX_NEIGHBORS_PER_SHAPE`` others (spatial
@@ -357,15 +369,24 @@ def _estimate_rigid_contact_max(model: Model) -> int:
         pair_is_mesh = mesh_mask[pairs[:, 0]] | mesh_mask[pairs[:, 1]]
 
         # Pairs where both shapes are hydroelastic route to the SDF-SDF
-        # hydroelastic path, which is also bounded by the reduction slots.
+        # hydroelastic path, whose anchor export can exceed the reduction
+        # slots by one contact per normal bin.
         shape_flags = getattr(model, "shape_flags", None)
         if shape_flags is not None:
             hydro_mask = (shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0
-            pair_is_mesh |= hydro_mask[pairs[:, 0]] & hydro_mask[pairs[:, 1]]
+            pair_is_hydro = hydro_mask[pairs[:, 0]] & hydro_mask[pairs[:, 1]]
+        else:
+            pair_is_hydro = np.zeros(len(pairs), dtype=bool)
+        pair_is_mesh = pair_is_mesh & ~pair_is_hydro
 
+        num_hydro_pairs = int(np.count_nonzero(pair_is_hydro))
         num_mesh_pairs = int(np.count_nonzero(pair_is_mesh))
-        num_convex_pairs = int(len(pairs)) - num_mesh_pairs
-        pair_contacts = num_convex_pairs * _CONVEX_PAIR_MAX_CONTACTS + num_mesh_pairs * _MESH_PAIR_MAX_CONTACTS
+        num_convex_pairs = int(len(pairs)) - num_mesh_pairs - num_hydro_pairs
+        pair_contacts = (
+            num_convex_pairs * _CONVEX_PAIR_MAX_CONTACTS
+            + num_mesh_pairs * _MESH_PAIR_MAX_CONTACTS
+            + num_hydro_pairs * _HYDRO_PAIR_MAX_CONTACTS
+        )
 
         # The pair sum IS the bound: the broad phase can never emit a candidate
         # pair outside the precomputed list, so taking min() with the

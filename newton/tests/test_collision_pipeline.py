@@ -14,6 +14,7 @@ from newton._src.geometry import create_mesh_terrain
 from newton._src.geometry.flags import ShapeFlags
 from newton._src.sim.collide import (
     _CONVEX_PAIR_MAX_CONTACTS,
+    _HYDRO_PAIR_MAX_CONTACTS,
     _MESH_PAIR_MAX_CONTACTS,
     _compute_per_world_shape_pairs_max,
     _estimate_rigid_contact_max,
@@ -891,47 +892,19 @@ class TestContactEstimator(unittest.TestCase):
             ],
             dtype=np.float32,
         )
+        # fmt: off
         indices = np.array(
             [
-                0,
-                3,
-                2,
-                0,
-                2,
-                1,
-                4,
-                5,
-                6,
-                4,
-                6,
-                7,
-                0,
-                1,
-                5,
-                0,
-                5,
-                4,
-                2,
-                3,
-                7,
-                2,
-                7,
-                6,
-                0,
-                4,
-                7,
-                0,
-                7,
-                3,
-                1,
-                2,
-                6,
-                1,
-                6,
-                5,
+                0, 3, 2, 0, 2, 1,  # -z
+                4, 5, 6, 4, 6, 7,  # +z
+                0, 1, 5, 0, 5, 4,  # -y
+                2, 3, 7, 2, 7, 6,  # +y
+                0, 4, 7, 0, 7, 3,  # -x
+                1, 2, 6, 1, 6, 5,  # +x
             ],
             dtype=np.int32,
         )
+        # fmt: on
         return newton.Mesh(vertices, indices)
 
     @classmethod
@@ -984,6 +957,16 @@ class TestContactEstimator(unittest.TestCase):
             _estimate_rigid_contact_max(model_visual),
             _estimate_rigid_contact_max(model_plain),
         )
+
+    def test_hydroelastic_pair_budget(self):
+        """Hydro-hydro pairs get the anchor-augmented per-pair budget."""
+        model = self._build_box_scene(num_boxes=25)
+        flags = model.shape_flags.numpy()
+        flags |= int(ShapeFlags.HYDROELASTIC)
+        model.shape_flags = wp.array(flags, dtype=wp.int32, device=model.device)
+        # All 325 pairs become hydro-hydro: budgeted at MAX_CONTACTS_PER_PAIR
+        # plus one anchor contact per normal bin.
+        self.assertEqual(_estimate_rigid_contact_max(model), 325 * _HYDRO_PAIR_MAX_CONTACTS)
 
     def test_explicit_rigid_contact_max_override_wins(self):
         """An explicit model.rigid_contact_max (>0) bypasses the estimator."""
