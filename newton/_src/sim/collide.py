@@ -349,9 +349,10 @@ def _estimate_rigid_contact_max(model: Model) -> int:
 
     shape_types = model.shape_type.numpy()
 
-    # Heuristic contacts-per-pair constants for the fallback (no precomputed
-    # pairs) branches below. Mesh-involved pairs (SDF + contact reduction)
-    # typically retain ~40.
+    # Heuristic constants. PRIMITIVE_CPP/MESH_CPP serve only the fallback
+    # (no precomputed pairs) branches below; MAX_NEIGHBORS_PER_SHAPE also
+    # bounds the pair-aware branch's spatial-locality cap above, so changing
+    # it affects dense-scene capacity in both paths.
     PRIMITIVE_CPP = 5
     MESH_CPP = 40
     MAX_NEIGHBORS_PER_SHAPE = 20
@@ -393,7 +394,10 @@ def _estimate_rigid_contact_max(model: Model) -> int:
         # neighbors can touch a shape simultaneously. Cap it with a
         # spatial-locality estimate, mirroring the pre-pair-aware behavior:
         # plane-involved pairs keep their full per-pair budget (a ground plane
-        # really can contact every shape resting on it at once), and each
+        # really can contact every shape resting on it at once; heightfield
+        # terrains are plane-like too but are classified non-plane here,
+        # matching the legacy heuristic - overflow stays detectable via
+        # contact_count > contact_max), and each
         # non-plane shape is budgeted for at most MAX_NEIGHBORS_PER_SHAPE
         # simultaneous neighbors at its own per-pair cap (halved to avoid
         # double-counting both shapes of a pair). Where this cap binds the
