@@ -297,10 +297,7 @@ add_example_test(
     name="cable.example_cable_pile",
     devices=test_devices,
     use_viewer=True,
-    # ~30s in isolation, but heavily load-sensitive: the parallel test runner
-    # can co-schedule this CPU subprocess with other CPU-hungry tests, and the
-    # default 600s ceiling has been hit on CI when the schedule shifts.
-    test_options={"num-frames": 20, "test_timeout": 1800},
+    test_options={"num-frames": 20},
 )
 
 
