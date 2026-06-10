@@ -277,7 +277,14 @@ class SolverFeatherPGS(SolverBase):
         Args:
             model (Model): the model to be simulated.
             angular_damping (float, optional): Angular damping factor. Defaults to 0.05.
-            update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the :meth:`step` function gets called). Defaults to 1.
+            update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the
+                :meth:`step` function gets called). The cadence flag is evaluated on the host each step, so under
+                CUDA graph capture the 0/1 pattern is baked at capture time: with K steps captured per graph,
+                replays repeat the captured K-step pattern, so only intervals whose pattern fits the capture are
+                honored (a 2-step graph captured at step 0 bakes [1, 0]; interval=2 is exact while interval>=3
+                silently degrades to an effective interval of 2). Intervals must divide or equal the captured
+                step pattern to behave as requested. Per-articulation limit-count changes still trigger a
+                device-side mass refresh on skipped steps. Defaults to 1.
             friction_smoothing (float, optional): The delta value for the Huber norm (see :func:`warp.math.norm_huber`) used for the friction velocity normalization. Defaults to 1.0.
             enable_contact_friction (bool, optional): Enables Coulomb friction contacts inside the PGS solve. Defaults to True.
             contact_friction_gap_threshold (float, optional): Only build friction rows for contacts with
@@ -614,6 +621,9 @@ class SolverFeatherPGS(SolverBase):
 
         self._step = 0
         self._force_mass_update = False
+        # Host mirror of the global mass-update flag evaluated by the last
+        # _stage1_crba call; gates the per-step H memsets (see _stage1_crba).
+        self._mass_update_global_flag = True
         self._last_step_dt = None
 
         self._compute_articulation_metadata(model)
@@ -2507,11 +2517,23 @@ class SolverFeatherPGS(SolverBase):
         # Double-buffer: fork memset stream to zero current buffer for reuse.
         # ScopedStream(sync_enter=True) records an event on the main stream and
         # makes the memset stream wait — this is what forks it into graph capture.
+        # J must be zeroed every step (constraint rows are rebuilt per step),
+        # but H is only zeroed on steps whose host-evaluated global mass-update
+        # flag was 1 (see _stage1_crba): with update_mass_matrix_interval=N and
+        # graphs capturing a multiple of N steps, each buffer ping-pongs with
+        # period 2 and is consumed by steps of a fixed flag parity, so the
+        # baked memset cadence matches the baked rebuild cadence. Skipping the
+        # H memset is safe in every configuration because crba_fill_par_dof
+        # stores all structural nonzeros of a masked articulation before
+        # apply_augmented_mass_diagonal_grouped adds onto the freshly stored
+        # diagonal, structural zeros are never written after allocation, and
+        # the Cholesky kernels never read H when mass_update_mask is 0.
         if self._memset_stream is not None:
             with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=False):
                 with wp.ScopedStream(self._memset_stream):
                     for size in self.size_groups:
-                        self._H_bufs[self._buf_idx][size].zero_()
+                        if self._mass_update_global_flag:
+                            self._H_bufs[self._buf_idx][size].zero_()
                         self._J_bufs[self._buf_idx][size].zero_()
                 self._memset_done_event[self._buf_idx] = self._memset_stream.record_event()
                 self._buf_idx = 1 - self._buf_idx
@@ -3004,6 +3026,15 @@ class SolverFeatherPGS(SolverBase):
     def _stage1_crba(self, state_aug: State):
         model = self.model
         global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
+        # NOTE: this host-evaluated flag is BAKED into CUDA graphs at capture
+        # time. With K physics steps captured per graph, replays repeat the
+        # K-step flag pattern captured starting at the capture-time _step, so
+        # only intervals that divide the captured pattern behave as requested
+        # (e.g. a 2-step graph captured at _step=0 bakes [1, 0]: interval=2 is
+        # exact, interval>=3 silently degrades to an effective interval of 2).
+        # The same flag gates the H memsets below and at end of step so the
+        # baked memset cadence always matches the baked update cadence.
+        self._mass_update_global_flag = bool(global_flag)
 
         wp.launch(
             build_mass_update_mask,
@@ -3030,9 +3061,19 @@ class SolverFeatherPGS(SolverBase):
             block_dim=128,
         )
 
+        # Zeroing H is hygiene, not a correctness requirement: H is only read
+        # by the Cholesky kernels, which early-exit when mass_update_mask is 0,
+        # and a masked rebuild never relies on a zeroed buffer because
+        # crba_fill_par_dof STORES every structural nonzero (full ancestor
+        # chain incl. the whole diagonal) before apply_augmented_mass_diagonal
+        # _grouped ADDS K onto that freshly stored diagonal under the same
+        # mask. Structural zeros are written by no kernel and stay zero from
+        # allocation. Skipping the memset on global_flag==0 steps therefore
+        # leaves limit-change refreshes (device-side mask) exact while saving
+        # the per-step memset.
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
-            if self._H_bufs is None:  # not double-buffered
+            if self._H_bufs is None and global_flag:  # not double-buffered
                 self.H_by_size[size].zero_()
             wp.launch(
                 crba_fill_par_dof,
