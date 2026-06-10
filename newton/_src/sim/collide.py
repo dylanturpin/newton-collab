@@ -860,8 +860,25 @@ class CollisionPipeline:
             use_lean_gjk_mpr = False
             if hasattr(model, "shape_type") and model.shape_type is not None:
                 shape_types = model.shape_type.numpy()
-                has_heightfields = bool((shape_types == int(GeoType.HFIELD)).any())
-                has_meshes = bool((shape_types == int(GeoType.MESH)).any())
+                # Gate the mesh/heightfield narrow-phase stages pair-aware:
+                # only shapes that can appear in a contact pair count. With
+                # the explicit broad phase that is the filtered pair list;
+                # with NXN/SAP the broad phase only emits pairs for shapes
+                # with COLLIDE_SHAPES set. Visual-only meshes therefore no
+                # longer construct or launch the mesh-SDF subpipeline.
+                pair_shape_types = shape_types
+                if self.shape_pairs_filtered is not None:
+                    pairs = self.shape_pairs_filtered
+                    pairs_np = pairs.numpy() if hasattr(pairs, "numpy") else np.asarray(pairs)
+                    pair_idx = np.unique(pairs_np.reshape(-1).astype(np.int64))
+                    pair_idx = pair_idx[(pair_idx >= 0) & (pair_idx < len(shape_types))]
+                    pair_shape_types = shape_types[pair_idx]
+                elif shape_flags is not None:
+                    flags_np = shape_flags.numpy() if hasattr(shape_flags, "numpy") else np.asarray(shape_flags)
+                    if len(flags_np) == len(shape_types):
+                        pair_shape_types = shape_types[(flags_np & int(ShapeFlags.COLLIDE_SHAPES)) != 0]
+                has_heightfields = bool((pair_shape_types == int(GeoType.HFIELD)).any())
+                has_meshes = bool((pair_shape_types == int(GeoType.MESH)).any())
                 # Use lean GJK/MPR kernel when scene has no capsules, ellipsoids,
                 # cylinders, or cones (which need full support function and axial
                 # rolling post-processing)
