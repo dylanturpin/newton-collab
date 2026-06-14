@@ -135,6 +135,18 @@ def localize_parent_indices(
             parent_local_arr[idx] = -1
 
 
+@wp.kernel
+def _accumulate_row_watermark(
+    counts: wp.array(dtype=wp.int32),
+    watermark: wp.array(dtype=wp.int32),
+):
+    # Per-world reduce-max into a single scalar slot. Read-only on ``counts``;
+    # writes only the separate ``watermark`` buffer, so this is numerics-neutral.
+    # Matches the perf-harness pattern in newton_solver_core_perf.py.
+    tid = wp.tid()
+    wp.atomic_max(watermark, 0, counts[tid])
+
+
 class SolverFeatherPGS(SolverBase):
     """A semi-implicit integrator using symplectic Euler that operates
     on reduced (also called generalized) coordinates to simulate articulated rigid body dynamics
@@ -274,6 +286,7 @@ class SolverFeatherPGS(SolverBase):
         effort_limit_mode: str = "actuator",
         serial_kernel_block_dim: int = 256,
         tile_threads: int = 64,
+        row_watermark: bool = False,
     ):
         """
         Args:
@@ -687,6 +700,28 @@ class SolverFeatherPGS(SolverBase):
         # Persistent dummy for the mf_slot_counter output of
         # allocate_world_contact_slots when the MF path is inactive (the
         # kernel never writes it when has_free_rigid == 0).
+
+        # Opt-in, behavior-neutral constraint/contact row high-water telemetry.
+        # When enabled, allocate three 1-element int32 device watermark buffers
+        # ONCE here (before any CUDA-graph capture) and accumulate running maxima
+        # of the per-world dense / matrix-free / rigid-contact row counts at the
+        # end of every captured step() (see step()). The kernel only reads the
+        # live counts and writes these separate buffers, so it never mutates
+        # solver state and is numerics-neutral. Buffers are never re-zeroed
+        # inside the captured region — the marks are whole-run running maxima
+        # (warmup included). Read back via constraint_row_watermarks() outside
+        # the captured region.
+        self._row_watermark = bool(row_watermark)
+        if self._row_watermark:
+            wm_device = self.constraint_count.device
+            self._row_watermark_dense = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_watermark_mf = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_watermark_contact = wp.zeros(1, dtype=wp.int32, device=wm_device)
+        else:
+            self._row_watermark_dense = None
+            self._row_watermark_mf = None
+            self._row_watermark_contact = None
+
         self._debug_projected_root = os.getenv("IL_NEWTON_FPGS_PROJECTED_ROOT", "").lower() in {
             "1",
             "true",
@@ -2638,8 +2673,62 @@ class SolverFeatherPGS(SolverBase):
                 self._memset_done_event[self._buf_idx] = self._memset_stream.record_event()
                 self._buf_idx = 1 - self._buf_idx
 
+        # Opt-in row high-water telemetry (behavior-neutral). Launched here, at
+        # the end of step() after _stage4_build_rows has finalized the per-world
+        # counts, so the atomic-max runs inside the captured graph every step and
+        # catches mid-run peaks. Read-only on the counts; writes only the
+        # separate watermark buffers. No-op when the flag is off (nothing
+        # allocated, nothing launched), keeping the captured graph identical.
+        if self._row_watermark:
+            wp.launch(
+                _accumulate_row_watermark,
+                dim=self.constraint_count.shape[0],
+                inputs=[self.constraint_count, self._row_watermark_dense],
+                device=self.constraint_count.device,
+            )
+            mf_counts = getattr(self, "mf_constraint_count", None)
+            if mf_counts is not None and mf_counts.shape[0] > 0:
+                wp.launch(
+                    _accumulate_row_watermark,
+                    dim=mf_counts.shape[0],
+                    inputs=[mf_counts, self._row_watermark_mf],
+                    device=mf_counts.device,
+                )
+            if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
+                contact_counts = contacts.rigid_contact_count
+                wp.launch(
+                    _accumulate_row_watermark,
+                    dim=contact_counts.shape[0],
+                    inputs=[contact_counts, self._row_watermark_contact],
+                    device=contact_counts.device,
+                )
+
         self._step += 1
         return state_out
+
+    def constraint_row_watermarks(self) -> dict:
+        """Return the opt-in constraint/contact row high-water marks.
+
+        These are whole-run running maxima (warmup included) of the per-world
+        dense / matrix-free / rigid-contact row counts, accumulated inside the
+        captured :meth:`step` when ``row_watermark`` is enabled. Reads
+        ``.numpy()[0]`` from the device buffers and so must be called OUTSIDE any
+        captured/timed region (it forces a device sync).
+
+        Returns ``0`` for every field when the telemetry was not enabled, so the
+        caller never has to special-case the off path.
+        """
+        if not self._row_watermark:
+            return {
+                "dense_high_water": 0,
+                "mf_high_water": 0,
+                "contact_high_water": 0,
+            }
+        return {
+            "dense_high_water": int(self._row_watermark_dense.numpy()[0]),
+            "mf_high_water": int(self._row_watermark_mf.numpy()[0]),
+            "contact_high_water": int(self._row_watermark_contact.numpy()[0]),
+        }
 
     @override
     def update_contacts(self, contacts: Contacts) -> None:

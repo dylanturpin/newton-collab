@@ -4,6 +4,7 @@
 
 ### Added
 
+- Add opt-in, behavior-neutral `row_watermark` parameter to `SolverFeatherPGS` that accumulates per-world running high-water marks of the dense, matrix-free, and rigid-contact constraint-row counts inside the captured `step()`, exposed via `SolverFeatherPGS.constraint_row_watermarks()`. Disabled by default; when off, no buffers are allocated and no kernels launch, leaving the captured graph and numerics unchanged.
 - Add opt-in `validate_mesh` parameter to `ModelBuilder.add_cloth_mesh()`, `ModelBuilder.add_soft_mesh()`, and `style3d.add_cloth_mesh()` that warns on degenerate geometry; add public `newton.utils.validate_triangle_mesh()` and `newton.utils.validate_tet_mesh()` utilities
 - Add `ViewerGL.show_loading_splash()` / `ViewerGL.hide_loading_splash()` displaying a stylized Newton's-cradle overlay while the GL viewer waits on Warp kernel compilation; raised automatically by `newton.examples.init()` for visible GL viewers
 - Add `cable_cross_slide_table` example demonstrating a cable-driven XY table
