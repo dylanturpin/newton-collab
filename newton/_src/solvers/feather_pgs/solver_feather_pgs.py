@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import time
 from contextlib import contextmanager
@@ -21,6 +22,15 @@ from typing import Literal
 
 import numpy as np
 import warp as wp
+
+# --- env-gated capture of pgs_solve_mf_gs kernel inputs, for standalone ncu replay ---
+# Off unless FEATHER_PGS_CAPTURE_KERNEL=1. Snapshots the dominant FPGS contact-solve
+# kernel's inputs + launch config at a chosen step/phase to .npz/.json so the kernel can
+# be profiled in isolation under Nsight Compute on the target GPU. Zero overhead when off.
+_FPGS_CAPTURE = os.environ.get("FEATHER_PGS_CAPTURE_KERNEL") == "1"
+_FPGS_CAPTURE_STEP = int(os.environ.get("FEATHER_PGS_CAPTURE_STEP", "-1"))
+_FPGS_CAPTURE_PHASE = os.environ.get("FEATHER_PGS_CAPTURE_PHASE")  # None = any phase
+_FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture")
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, State
@@ -1926,6 +1936,61 @@ class SolverFeatherPGS(SolverBase):
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
 
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
+            if (
+                _FPGS_CAPTURE
+                and getattr(self, "_fpgs_step_n", -1) == _FPGS_CAPTURE_STEP
+                and (_FPGS_CAPTURE_PHASE is None or row_phase == int(_FPGS_CAPTURE_PHASE))
+            ):
+                os.makedirs(_FPGS_CAPTURE_DIR, exist_ok=True)
+                _arrs = {
+                    "constraint_count": self.constraint_count,
+                    "world_dof_start": self.world_dof_start,
+                    "dense_rhs": dense_rhs,
+                    "diag": self.diag,
+                    "impulses": self.impulses,  # RMW: pre-launch snapshot
+                    "J_world": self.J_world,
+                    "Y_world": self.Y_world,
+                    "row_type": self.row_type,
+                    "row_parent": self.row_parent,
+                    "row_mu": self.row_mu,
+                    "drive_target_vel_bias": self.drive_target_vel_bias,
+                    "drive_vel_multiplier": self.drive_vel_multiplier,
+                    "drive_impulse_multiplier": self.drive_impulse_multiplier,
+                    "drive_max_impulse": self.drive_max_impulse,
+                    "mf_constraint_count": self.mf_constraint_count,
+                    "mf_meta": mf_meta,
+                    "mf_impulses": self.mf_impulses,  # RMW: pre-launch snapshot
+                    "mf_J_a": self.mf_J_a,
+                    "mf_J_b": self.mf_J_b,
+                    "mf_MiJt_a": self.mf_MiJt_a,
+                    "mf_MiJt_b": self.mf_MiJt_b,
+                    "mf_row_mu": self.mf_row_mu,
+                    "v_out": self.v_out,  # RMW: pre-launch snapshot
+                }
+                _base = os.path.join(_FPGS_CAPTURE_DIR, f"mfgs_step{self._fpgs_step_n}_phase{row_phase}")
+                # .numpy() is a synchronous D2H copy; no wp.synchronize() (AGENTS.md rule)
+                np.savez(_base + ".npz", **{_k: _v.numpy() for _k, _v in _arrs.items()})
+                with open(_base + ".json", "w") as _f:
+                    json.dump(
+                        {
+                            "dense_max_constraints": int(self.dense_max_constraints),
+                            "mf_max_constraints": int(self.mf_max_constraints),
+                            "max_world_dofs": int(self.max_world_dofs),
+                            "friction_mode": str(self.friction_mode),
+                            "device_arch": int(self.model.device.arch),  # INT warp arch code
+                            "world_count": int(self.world_count),
+                            "block_dim": 32,
+                            "iterations": int(phase_iterations),
+                            "omega": float(omega),
+                            "row_phase": int(row_phase),
+                            "friction_start_iteration": int(friction_start_iteration),
+                            "iteration_offset": int(phase_iteration_offset),
+                            "freeze_drive_rows": int(freeze_drive_rows),
+                        },
+                        _f,
+                        indent=2,
+                    )
+                print(f"[fpgs-capture] wrote {_base}.npz/.json", flush=True)
             wp.launch_tiled(
                 mf_gs_kernel,
                 dim=[self.world_count],
@@ -2186,6 +2251,8 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        if _FPGS_CAPTURE:
+            self._fpgs_step_n = getattr(self, "_fpgs_step_n", -1) + 1
         if self._last_step_dt is None:
             self._last_step_dt = dt
         elif abs(self._last_step_dt - dt) > 1.0e-8:
@@ -7384,6 +7451,240 @@ def _get_pgs_solve_mf_gs_kernel(
                 }
 """
 
+    # ── Final MF velocity-limit pass: three mutually-exclusive, default-off variants ──
+    # The mf_rt==4 rows are single-DOF velocity clamps. The loop body is selected here as
+    # `mf_vlimit_block` and substituted into the snippet f-string at the {mf_vlimit_block}
+    # placeholder (the outer `if (row_phase == 0 || 2 || 5) {{ ... }}` wrapper stays in the
+    # f-string). All three branches are bit-identical to one another; only the SERIAL branch
+    # runs by default. Blocks use single C braces (they are variable VALUES inserted after the
+    # f-string is evaluated, not f-string literals). Indented 12 spaces to align under the
+    # wrapper. Selection (mutually exclusive, parallel supersedes pipeline):
+    #   FEATHER_PGS_MFGS_VLIMIT_PARALLEL=1  -> parallel  (owner-lane partition; removes the
+    #                                          12-lane reduction + per-row __syncwarp)
+    #   FEATHER_PGS_MFGS_VLIMIT_PIPELINE=1  -> pipelined (serial chain, prefetched loads)
+    #   (neither)                           -> serial    (original warp-reduction loop)
+    #
+    # SERIAL baseline: the exact original warp-reduction loop — one row per step, 12-lane J
+    # dot + shfl reduction, per-row __syncwarp.
+    mf_vlimit_block_serial = """\
+            for (int i = 0; i < m_mf; i++) {
+                int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);
+                int packed_tp = meta.w;
+                int mf_rt = packed_tp & 0xFFFF;
+                if (mf_rt != 4) continue;
+
+                int packed_dofs = meta.x;
+                int dof_a = packed_dofs >> 16;
+                int dof_b = (packed_dofs << 16) >> 16;
+                float mf_diag = __int_as_float(meta.y);
+                if (mf_diag <= 0.0f) continue;
+
+                int row_mf6 = mf6_base + i * 6;
+                float my_sum_mf_vlim = 0.0f;
+                if (lane < 6 && dof_a >= 0) {
+                    my_sum_mf_vlim = mf_J_a.data[row_mf6 + lane] * s_v[dof_a + lane];
+                }
+                if (lane >= 6 && lane < 12 && dof_b >= 0) {
+                    my_sum_mf_vlim = mf_J_b.data[row_mf6 + lane - 6] * s_v[dof_b + lane - 6];
+                }
+                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 16);
+                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 8);
+                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 4);
+                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 2);
+                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 1);
+                float jv_mf_vlim = __shfl_sync(MASK, my_sum_mf_vlim, 0);
+
+                float residual_mf_vlim = jv_mf_vlim + __int_as_float(meta.z);
+                float delta_mf_vlim = -residual_mf_vlim * mf_diag;
+                float delta_impulse_mf_vlim = 0.0f;
+                if (residual_mf_vlim < 0.0f) delta_impulse_mf_vlim = delta_mf_vlim;
+                if (lane == 0) s_lam_mf[i] = delta_impulse_mf_vlim;
+
+                if (delta_impulse_mf_vlim != 0.0f) {
+                    if (lane < 6 && dof_a >= 0) {
+                        s_v[dof_a + lane] += mf_MiJt_a.data[row_mf6 + lane] * delta_impulse_mf_vlim;
+                    }
+                    if (lane >= 6 && lane < 12 && dof_b >= 0) {
+                        s_v[dof_b + lane - 6] += mf_MiJt_b.data[row_mf6 + lane - 6] * delta_impulse_mf_vlim;
+                    }
+                }
+                __syncwarp();
+            }"""
+
+    # PARALLEL variant (FEATHER_PGS_MFGS_VLIMIT_PARALLEL): owner-lane partition across bodies.
+    # Lane L processes every mf_rt==4 row whose owner == L, in ascending i (which IS the serial
+    # visitation order). owner = dof_a & 31 keys purely on the body base dof, so two rows can
+    # map to the same lane only if they belong to the same body — meaning every pair of rows
+    # that could write a shared s_v entry is handled by one lane, serially, in original order.
+    # Distinct lanes therefore touch disjoint s_v ranges: no cross-lane race, no per-row
+    # __syncwarp. The J dot collapses to its single nonzero term: the scalar 6-term sum equals
+    # the warp reduction bit-for-bit because the other 5 products are exactly 0.0 (single-
+    # component selector). A single trailing __syncwarp republishes s_v to the whole warp before
+    # downstream phases read it across lanes.
+    mf_vlimit_block_parallel = """\
+            for (int i = 0; i < m_mf; i++) {
+                int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);
+                int packed_tp = meta.w;
+                int mf_rt = packed_tp & 0xFFFF;
+                if (mf_rt != 4) continue;
+
+                int packed_dofs = meta.x;
+                int dof_a = packed_dofs >> 16;
+                int dof_b = (packed_dofs << 16) >> 16;
+                float mf_diag = __int_as_float(meta.y);
+                if (mf_diag <= 0.0f) continue;
+
+                // Owner partition: key on the body base dof so any two rows that
+                // could share an s_v write land on the same lane (serialized,
+                // in-order); distinct lanes are guaranteed disjoint.
+                int owner_mf_vlim = ((dof_a >= 0) ? dof_a : 0) & 31;
+                if (lane != owner_mf_vlim) continue;
+
+                int row_mf6 = mf6_base + i * 6;
+
+                // Single-component J selector: the 6-term scalar dot equals the
+                // original warp reduction bit-for-bit (5 products are exact 0.0).
+                float jv_mf_vlim = 0.0f;
+                if (dof_a >= 0) {
+                    jv_mf_vlim += mf_J_a.data[row_mf6 + 0] * s_v[dof_a + 0];
+                    jv_mf_vlim += mf_J_a.data[row_mf6 + 1] * s_v[dof_a + 1];
+                    jv_mf_vlim += mf_J_a.data[row_mf6 + 2] * s_v[dof_a + 2];
+                    jv_mf_vlim += mf_J_a.data[row_mf6 + 3] * s_v[dof_a + 3];
+                    jv_mf_vlim += mf_J_a.data[row_mf6 + 4] * s_v[dof_a + 4];
+                    jv_mf_vlim += mf_J_a.data[row_mf6 + 5] * s_v[dof_a + 5];
+                }
+                if (dof_b >= 0) {
+                    jv_mf_vlim += mf_J_b.data[row_mf6 + 0] * s_v[dof_b + 0];
+                    jv_mf_vlim += mf_J_b.data[row_mf6 + 1] * s_v[dof_b + 1];
+                    jv_mf_vlim += mf_J_b.data[row_mf6 + 2] * s_v[dof_b + 2];
+                    jv_mf_vlim += mf_J_b.data[row_mf6 + 3] * s_v[dof_b + 3];
+                    jv_mf_vlim += mf_J_b.data[row_mf6 + 4] * s_v[dof_b + 4];
+                    jv_mf_vlim += mf_J_b.data[row_mf6 + 5] * s_v[dof_b + 5];
+                }
+
+                float residual_mf_vlim = jv_mf_vlim + __int_as_float(meta.z);
+                float delta_mf_vlim = -residual_mf_vlim * mf_diag;
+                float delta_impulse_mf_vlim = 0.0f;
+                if (residual_mf_vlim < 0.0f) delta_impulse_mf_vlim = delta_mf_vlim;
+                s_lam_mf[i] = delta_impulse_mf_vlim;
+
+                if (delta_impulse_mf_vlim != 0.0f) {
+                    if (dof_a >= 0) {
+                        s_v[dof_a + 0] += mf_MiJt_a.data[row_mf6 + 0] * delta_impulse_mf_vlim;
+                        s_v[dof_a + 1] += mf_MiJt_a.data[row_mf6 + 1] * delta_impulse_mf_vlim;
+                        s_v[dof_a + 2] += mf_MiJt_a.data[row_mf6 + 2] * delta_impulse_mf_vlim;
+                        s_v[dof_a + 3] += mf_MiJt_a.data[row_mf6 + 3] * delta_impulse_mf_vlim;
+                        s_v[dof_a + 4] += mf_MiJt_a.data[row_mf6 + 4] * delta_impulse_mf_vlim;
+                        s_v[dof_a + 5] += mf_MiJt_a.data[row_mf6 + 5] * delta_impulse_mf_vlim;
+                    }
+                    if (dof_b >= 0) {
+                        s_v[dof_b + 0] += mf_MiJt_b.data[row_mf6 + 0] * delta_impulse_mf_vlim;
+                        s_v[dof_b + 1] += mf_MiJt_b.data[row_mf6 + 1] * delta_impulse_mf_vlim;
+                        s_v[dof_b + 2] += mf_MiJt_b.data[row_mf6 + 2] * delta_impulse_mf_vlim;
+                        s_v[dof_b + 3] += mf_MiJt_b.data[row_mf6 + 3] * delta_impulse_mf_vlim;
+                        s_v[dof_b + 4] += mf_MiJt_b.data[row_mf6 + 4] * delta_impulse_mf_vlim;
+                        s_v[dof_b + 5] += mf_MiJt_b.data[row_mf6 + 5] * delta_impulse_mf_vlim;
+                    }
+                }
+            }
+            __syncwarp();"""
+
+    # PIPELINED variant (FEATHER_PGS_MFGS_VLIMIT_PIPELINE): the serial warp-reduction chain with
+    # software-pipelined loads, mirroring the main mf loop's prefetch. Hoist the next row's
+    # meta + J/MiJt into registers while the current row computes. CRITICAL for bit-identity:
+    # advance the pipeline (prefetch row i+1) BEFORE the `mf_rt != 4 continue`, so skipped rows
+    # still issue their loads — same flat indices, same arithmetic, only load *timing* moves
+    # earlier. (Parallel supersedes this: it removes the serial chain that this only hides.)
+    mf_vlimit_block_pipeline = """\
+            // Pipeline registers: prefetch next row's meta + J/MiJt while current computes.
+            int4 vl_pre_meta;
+            float vl_pre_Ja = 0.0f, vl_pre_Jb = 0.0f;
+            float vl_pre_MiJta = 0.0f, vl_pre_MiJtb = 0.0f;
+            if (m_mf > 0) {
+                vl_pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta]);
+                if (lane < 6) {
+                    vl_pre_Ja = mf_J_a.data[mf6_base + lane];
+                    vl_pre_MiJta = mf_MiJt_a.data[mf6_base + lane];
+                }
+                if (lane >= 6 && lane < 12) {
+                    vl_pre_Jb = mf_J_b.data[mf6_base + lane - 6];
+                    vl_pre_MiJtb = mf_MiJt_b.data[mf6_base + lane - 6];
+                }
+            }
+            for (int i = 0; i < m_mf; i++) {
+                // Consume prefetched data for row i.
+                int4 meta = vl_pre_meta;
+                float cur_Ja = vl_pre_Ja;
+                float cur_Jb = vl_pre_Jb;
+                float cur_MiJta = vl_pre_MiJta;
+                float cur_MiJtb = vl_pre_MiJtb;
+
+                // Prefetch row i+1 BEFORE the early-exit so the pipeline advances on
+                // skipped (non-rt==4) rows too — identical loads, only timing moves up.
+                if (i + 1 < m_mf) {
+                    int vl_next_mf6 = mf6_base + (i + 1) * 6;
+                    vl_pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i + 1) * 4]);
+                    if (lane < 6) {
+                        vl_pre_Ja = mf_J_a.data[vl_next_mf6 + lane];
+                        vl_pre_MiJta = mf_MiJt_a.data[vl_next_mf6 + lane];
+                    }
+                    if (lane >= 6 && lane < 12) {
+                        vl_pre_Jb = mf_J_b.data[vl_next_mf6 + lane - 6];
+                        vl_pre_MiJtb = mf_MiJt_b.data[vl_next_mf6 + lane - 6];
+                    }
+                }
+
+                int packed_tp = meta.w;
+                int mf_rt = packed_tp & 0xFFFF;
+                if (mf_rt != 4) continue;
+
+                int packed_dofs = meta.x;
+                int dof_a = packed_dofs >> 16;
+                int dof_b = (packed_dofs << 16) >> 16;
+                float mf_diag = __int_as_float(meta.y);
+                if (mf_diag <= 0.0f) continue;
+
+                float my_sum_mf_vlim = 0.0f;
+                if (lane < 6 && dof_a >= 0) {
+                    my_sum_mf_vlim = cur_Ja * s_v[dof_a + lane];
+                }
+                if (lane >= 6 && lane < 12 && dof_b >= 0) {
+                    my_sum_mf_vlim = cur_Jb * s_v[dof_b + lane - 6];
+                }
+                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 16);
+                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 8);
+                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 4);
+                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 2);
+                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 1);
+                float jv_mf_vlim = __shfl_sync(MASK, my_sum_mf_vlim, 0);
+
+                float residual_mf_vlim = jv_mf_vlim + __int_as_float(meta.z);
+                float delta_mf_vlim = -residual_mf_vlim * mf_diag;
+                float delta_impulse_mf_vlim = 0.0f;
+                if (residual_mf_vlim < 0.0f) delta_impulse_mf_vlim = delta_mf_vlim;
+                if (lane == 0) s_lam_mf[i] = delta_impulse_mf_vlim;
+
+                if (delta_impulse_mf_vlim != 0.0f) {
+                    if (lane < 6 && dof_a >= 0) {
+                        s_v[dof_a + lane] += cur_MiJta * delta_impulse_mf_vlim;
+                    }
+                    if (lane >= 6 && lane < 12 && dof_b >= 0) {
+                        s_v[dof_b + lane - 6] += cur_MiJtb * delta_impulse_mf_vlim;
+                    }
+                }
+                __syncwarp();
+            }"""
+
+    def _flag_on(name):
+        return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+    if _flag_on("FEATHER_PGS_MFGS_VLIMIT_PARALLEL"):
+        mf_vlimit_block = mf_vlimit_block_parallel
+    elif _flag_on("FEATHER_PGS_MFGS_VLIMIT_PIPELINE"):
+        mf_vlimit_block = mf_vlimit_block_pipeline
+    else:
+        mf_vlimit_block = mf_vlimit_block_serial
+
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
@@ -7412,10 +7713,11 @@ def _get_pgs_solve_mf_gs_kernel(
     __shared__ int   s_rtype_dense[{M_D}];
     __shared__ int   s_parent_dense[{M_D}];
     __shared__ float s_mu_dense[{M_D}];
-    __shared__ float s_drive_target_dense[{M_D}];
-    __shared__ float s_drive_vel_mul_dense[{M_D}];
-    __shared__ float s_drive_imp_mul_dense[{M_D}];
-    __shared__ float s_drive_max_imp_dense[{M_D}];
+    // ncu occupancy fix: the 4 drive-row metadata arrays (4*M_D floats = 8 KB at
+    // M_D=512) are read exactly once, at the single row_type==1 site, so caching
+    // them in shared memory only wasted occupancy-critical space. They now stream
+    // from global (world_drive_*) at that site. Bit-identical: same source arrays,
+    // same flat index off_dense+i, same arithmetic order.
     __shared__ float s_lam_mf[{M_MF}];
 
     // ═══════════════════════════════════════════════════════
@@ -7428,10 +7730,6 @@ def _get_pgs_solve_mf_gs_kernel(
         s_rtype_dense[i] = world_row_type.data[off_dense + i];
         s_parent_dense[i] = world_row_parent.data[off_dense + i];
         s_mu_dense[i] = world_row_mu.data[off_dense + i];
-        s_drive_target_dense[i] = world_drive_target_vel_bias.data[off_dense + i];
-        s_drive_vel_mul_dense[i] = world_drive_vel_multiplier.data[off_dense + i];
-        s_drive_imp_mul_dense[i] = world_drive_impulse_multiplier.data[off_dense + i];
-        s_drive_max_imp_dense[i] = world_drive_max_impulse.data[off_dense + i];
     }}
     for (int i = lane; i < m_mf; i += 32) {{
         s_lam_mf[i] = mf_impulses.data[off_mf + i];
@@ -7511,10 +7809,10 @@ def _get_pgs_solve_mf_gs_kernel(
             // computeDriveImpulse(lambda, jointVel, jointDeltaPos=0,
             // elapsedTime=0, driveDesc), then clamp to maxForce * dt.
             if (row_type == 1) {{
-                new_impulse = old_impulse * s_drive_imp_mul_dense[i]
-                    + jv * s_drive_vel_mul_dense[i]
-                    + s_drive_target_dense[i];
-                float max_imp = s_drive_max_imp_dense[i];
+                new_impulse = old_impulse * world_drive_impulse_multiplier.data[off_dense + i]
+                    + jv * world_drive_vel_multiplier.data[off_dense + i]
+                    + world_drive_target_vel_bias.data[off_dense + i];
+                float max_imp = world_drive_max_impulse.data[off_dense + i];
                 if (new_impulse > max_imp) new_impulse = max_imp;
                 if (new_impulse < -max_imp) new_impulse = -max_imp;
                 delta_impulse = new_impulse - old_impulse;
@@ -7707,49 +8005,7 @@ def _get_pgs_solve_mf_gs_kernel(
         }}
 
         if (row_phase == 0 || row_phase == 2 || row_phase == 5) {{
-            for (int i = 0; i < m_mf; i++) {{
-                int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);
-                int packed_tp = meta.w;
-                int mf_rt = packed_tp & 0xFFFF;
-                if (mf_rt != 4) continue;
-
-                int packed_dofs = meta.x;
-                int dof_a = packed_dofs >> 16;
-                int dof_b = (packed_dofs << 16) >> 16;
-                float mf_diag = __int_as_float(meta.y);
-                if (mf_diag <= 0.0f) continue;
-
-                int row_mf6 = mf6_base + i * 6;
-                float my_sum_mf_vlim = 0.0f;
-                if (lane < 6 && dof_a >= 0) {{
-                    my_sum_mf_vlim = mf_J_a.data[row_mf6 + lane] * s_v[dof_a + lane];
-                }}
-                if (lane >= 6 && lane < 12 && dof_b >= 0) {{
-                    my_sum_mf_vlim = mf_J_b.data[row_mf6 + lane - 6] * s_v[dof_b + lane - 6];
-                }}
-                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 16);
-                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 8);
-                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 4);
-                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 2);
-                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 1);
-                float jv_mf_vlim = __shfl_sync(MASK, my_sum_mf_vlim, 0);
-
-                float residual_mf_vlim = jv_mf_vlim + __int_as_float(meta.z);
-                float delta_mf_vlim = -residual_mf_vlim * mf_diag;
-                float delta_impulse_mf_vlim = 0.0f;
-                if (residual_mf_vlim < 0.0f) delta_impulse_mf_vlim = delta_mf_vlim;
-                if (lane == 0) s_lam_mf[i] = delta_impulse_mf_vlim;
-
-                if (delta_impulse_mf_vlim != 0.0f) {{
-                    if (lane < 6 && dof_a >= 0) {{
-                        s_v[dof_a + lane] += mf_MiJt_a.data[row_mf6 + lane] * delta_impulse_mf_vlim;
-                    }}
-                    if (lane >= 6 && lane < 12 && dof_b >= 0) {{
-                        s_v[dof_b + lane - 6] += mf_MiJt_b.data[row_mf6 + lane - 6] * delta_impulse_mf_vlim;
-                    }}
-                }}
-                __syncwarp();
-            }}
+{mf_vlimit_block}
         }}
     }}
 
@@ -7767,6 +8023,71 @@ def _get_pgs_solve_mf_gs_kernel(
     }}
 #endif
 """
+
+    # NOTE: the mf velocity-limit loop body is selected above as `mf_vlimit_block`
+    # (serial / parallel / pipelined) and substituted into the snippet f-string at the
+    # {mf_vlimit_block} placeholder. FEATHER_PGS_MFGS_VLIMIT_PIPELINE is handled there as
+    # the third branch; the former post-f-string snippet.replace for it is gone (parallel
+    # supersedes it — parallel removes the serial chain that the pipeline only hides).
+
+    # perf (opt-in): guard the MAIN mf loop's J/MiJt prefetch for rows that will be skipped.
+    # The main loop prefetches mf_J_a/b + mf_MiJt_a/b for EVERY next row, but in row_phase==0
+    # it `continue`s on mf_rt==4 rows without ever consuming them. The next row's type is
+    # already in pre_meta.w, so gate the 4 Jacobian prefetches on `next_rt != 4`. The mf_meta
+    # prefetch stays unconditional. Bit-identical: a skipped row never reads those registers.
+    # Opt-in via FEATHER_PGS_MFGS_MAIN_GUARD_PREFETCH=1 (default off = original).
+    if os.environ.get("FEATHER_PGS_MFGS_MAIN_GUARD_PREFETCH", "").strip().lower() in ("1", "true", "yes", "on"):
+        _guard_orig = """            // Prefetch constraint i+1 (loads issued now, complete during compute)
+            if (i + 1 < m_mf) {
+                int next_mf6 = mf6_base + (i + 1) * 6;
+                pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i + 1) * 4]);
+                if (lane < 6) {
+                    pre_Ja = mf_J_a.data[next_mf6 + lane];
+                    pre_MiJta = mf_MiJt_a.data[next_mf6 + lane];
+                }
+                if (lane >= 6 && lane < 12) {
+                    pre_Jb = mf_J_b.data[next_mf6 + lane - 6];
+                    pre_MiJtb = mf_MiJt_b.data[next_mf6 + lane - 6];
+                }
+            }"""
+        _guard_new = """            // Prefetch constraint i+1 (loads issued now, complete during compute)
+            if (i + 1 < m_mf) {
+                int next_mf6 = mf6_base + (i + 1) * 6;
+                pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i + 1) * 4]);
+                // Skip the wasted J/MiJt prefetch for rows that row_phase==0 will `continue`
+                // on (mf_rt==4) — they are never consumed. next_rt is already in pre_meta.w.
+                int next_rt = pre_meta.w & 0xFFFF;
+                if (next_rt != 4) {
+                    if (lane < 6) {
+                        pre_Ja = mf_J_a.data[next_mf6 + lane];
+                        pre_MiJta = mf_MiJt_a.data[next_mf6 + lane];
+                    }
+                    if (lane >= 6 && lane < 12) {
+                        pre_Jb = mf_J_b.data[next_mf6 + lane - 6];
+                        pre_MiJtb = mf_MiJt_b.data[next_mf6 + lane - 6];
+                    }
+                }
+            }"""
+        if _guard_orig not in snippet:
+            raise RuntimeError("FEATHER_PGS_MFGS_MAIN_GUARD_PREFETCH: main-loop prefetch block not found")
+        snippet = snippet.replace(_guard_orig, _guard_new)
+
+    # ncu occupancy fix (opt-in): stream the matrix-free impulse vector from global
+    # (mf_impulses) instead of holding it resident as s_lam_mf[M_MF] in shared memory.
+    # s_lam_mf is the dominant smem consumer (M_MF*4 bytes); the GS coupling runs through
+    # s_v (the world velocity), not lambda, so each row needs only its own impulse (+ a
+    # friction parent's). Aliasing mf_impulses via a volatile pointer keeps the existing
+    # __syncwarp cross-lane visibility (warp lanes share L1) and updates impulses in place.
+    # Value-preserving -> bit-identical; cuts smem so occupancy stops scaling with the mf
+    # capacity. Opt-in via FEATHER_PGS_MFGS_STREAM_LAMBDA=1 (default off = resident smem).
+    if os.environ.get("FEATHER_PGS_MFGS_STREAM_LAMBDA", "").strip().lower() in ("1", "true", "yes", "on"):
+        import re as _re
+
+        snippet = snippet.replace(
+            f"    __shared__ float s_lam_mf[{M_MF}];",
+            "    volatile float* g_lam_mf = (volatile float*)(&mf_impulses.data[off_mf]);",
+        )
+        snippet = _re.sub(r"s_lam_mf\[([^\]]*)\]", r"g_lam_mf[\1]", snippet)
 
     @wp.func_native(snippet)
     def pgs_solve_mf_gs_native(
@@ -7878,4 +8199,15 @@ def _get_pgs_solve_mf_gs_kernel(
     name = f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+    # ncu occupancy fix (opt-in): at small-D (RL) specializations this kernel is
+    # register-bound (170 regs/thread -> Block Limit Registers = 8), so capping
+    # registers via CUDA __launch_bounds__ lets more 32-thread (one-warp-per-world)
+    # blocks co-reside per SM and hide the dominant long-scoreboard global-load
+    # latency. block_dim is always 32 here, so maxThreadsPerBlock=32. Bit-identical
+    # (no math change) unless NVCC spills. Set FEATHER_PGS_MFGS_MIN_BLOCKS to the
+    # target minimum blocks/SM (e.g. 12/16/24) to sweep; unset = baseline (no cap).
+    kernel_kwargs = {"enable_backward": False, "module": "unique"}
+    _min_blocks = os.environ.get("FEATHER_PGS_MFGS_MIN_BLOCKS", "").strip()
+    if _min_blocks:
+        kernel_kwargs["launch_bounds"] = (32, int(_min_blocks))
+    return wp.kernel(**kernel_kwargs)(pgs_solve_mf_gs_template)
