@@ -1808,6 +1808,29 @@ class SolverFeatherPGS(SolverBase):
                 friction_mode=self.friction_mode,
             )
 
+            # MVP thread-per-world variant (one THREAD/world, global world-innermost
+            # state, no smem/shfl). Gated by FEATHER_PGS_MFGS_THREAD_PER_WORLD=1.
+            # Default ("0"/unset) leaves the warp path above as the bit-identity
+            # reference. This MVP only builds + exposes the tpw kernel (for the
+            # cube-probe replay / micro-bench); the integrated step-time launcher
+            # with GPU world-innermost transpose passes is a follow-up, so the
+            # full step() still uses the warp kernel. See
+            # _get_pgs_solve_mf_gs_kernel_tpw for scope (friction_mode='current',
+            # row_phase 0).
+            self._pgs_solve_mf_gs_kernel_tpw = None
+            self.mf_gs_thread_per_world = (
+                os.environ.get("FEATHER_PGS_MFGS_THREAD_PER_WORLD", "0") == "1"
+            )
+            if self.mf_gs_thread_per_world and self.friction_mode == "current":
+                self._pgs_solve_mf_gs_kernel_tpw = _get_pgs_solve_mf_gs_kernel_tpw(
+                    self.dense_max_constraints,
+                    self.mf_max_constraints,
+                    self.max_world_dofs,
+                    self.world_count,
+                    device_arch,
+                    friction_mode=self.friction_mode,
+                )
+
         self._pgs_solve_mf_kernel = None
         if model.device.is_cuda and hasattr(self, "max_mf_bodies") and self.mf_max_constraints > 0:
             self._pgs_solve_mf_kernel = _get_pgs_solve_mf_kernel(
@@ -7879,3 +7902,396 @@ def _get_pgs_solve_mf_gs_kernel(
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# THREAD-PER-WORLD VARIANT (MVP)  -- gated by FEATHER_PGS_MFGS_THREAD_PER_WORLD
+# ════════════════════════════════════════════════════════════════════════════
+# One THREAD (not one warp) per world. Per-world state lives in GLOBAL memory
+# laid out WORLD-INNERMOST (world = fastest-varying index) so 32 adjacent
+# threads = 32 adjacent worlds read contiguous addresses -> coalesced.
+# No __shared__, no __shfl_*, no __syncwarp(): each thread runs the full serial
+# O(N) GS sweep over its own world.
+#
+# Scope of this MVP (matches the design doc): friction_mode="current" and
+# pgs_schedule default (row_phase == 0) ONLY. It faithfully ports:
+#   - dense GS row sweep (drive rt1, contact/limit rt0/rt3, friction rt2
+#     isotropic-cone "current", velocity-limit rt4 final pass)
+#   - mf contact rt0, mf velocity-limit rt4, mf friction rt2 "current"
+# It does NOT port the bisection / desaxce / coulomb_newton friction ports
+# nor the split row_phase schedules (1..5). Those raise NotImplementedError
+# in the launcher so the default path is the only one wired up.
+#
+# GLOBAL world-innermost layout (W = world_count):
+#   v_g            (D,   W)   index d*W + world
+#   mf_lam_g       (M_MF,W)   index i*W + world
+#   dense state    (M_D, W)   index i*W + world   (lam/rhs/diag/rtype/parent/
+#                                                  mu/drive_target/drive_vmul/
+#                                                  drive_imul/drive_maximp)
+#   J_g, Y_g       (M_D,D,W)  index (i*D + d)*W + world
+#   mf_J_a/_b      (M_MF,6,W) index (i*6 + k)*W + world
+#   mf_MiJt_a/_b   (M_MF,6,W) index (i*6 + k)*W + world
+#   mf_meta_g      (M_MF,4,W) index (i*4 + f)*W + world   (4 SCALAR int loads;
+#                                                          the int4 vector load
+#                                                          is invalid here -- the
+#                                                          4 components are W ints
+#                                                          apart, not adjacent)
+#   m_dense_g, m_mf_g, w_dof_start_g : (W,)  per-world scalars
+def _get_pgs_solve_mf_gs_kernel_tpw(
+    max_constraints: int,
+    mf_max_constraints: int,
+    max_world_dofs: int,
+    world_count: int,
+    device_arch: str,
+    friction_mode: str = "current",
+) -> "wp.Kernel":
+    """Thread-per-world MVP of the mf-GS solve (friction_mode='current', row_phase 0).
+
+    See module comment above for layout. world = wp.tid() (1-D). State is global,
+    world-innermost. No smem / shfl / syncwarp.
+    """
+    if friction_mode != "current":
+        raise NotImplementedError(
+            f"thread-per-world MVP supports friction_mode='current' only, got {friction_mode!r}"
+        )
+    M_D = max_constraints
+    M_MF = mf_max_constraints
+    D = max_world_dofs
+    W = world_count
+
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    int W = {W};
+    int m_dense = m_dense_g.data[world];
+    int m_mf = m_mf_g.data[world];
+    if (m_dense == 0 && m_mf == 0) return;
+    if (m_dense > {M_D}) m_dense = {M_D};
+    if (m_mf > {M_MF}) m_mf = {M_MF};
+    int w_dof_start = w_dof_start_g.data[world];
+
+    // World-innermost element strides
+    // v_g[d]      -> d*W + world
+    // dense[i]    -> i*W + world
+    // J/Y[i][d]   -> (i*{D} + d)*W + world
+    // mf6[i][k]   -> (i*6 + k)*W + world
+    // mf_meta[i][f] -> (i*4 + f)*W + world
+
+    for (int iter = 0; iter < iterations; iter++) {{
+        int global_iter = iteration_offset + iter;
+
+        // ── Phase 1: Dense constraints (serial D-DOF dot/update) ──
+        for (int i = 0; i < m_dense; i++) {{
+            int row_type = rtype_g.data[i*W + world];
+            // row_phase 0 only.
+            if (freeze_drive_rows != 0 && row_type == 1) continue;
+            if (row_type == 4) continue;  // velocity-limit handled in final pass
+            if (row_type == 2 && global_iter < friction_start_iteration) {{
+                lam_g.data[i*W + world] = 0.0f;
+                continue;
+            }}
+            float denom = diag_g.data[i*W + world];
+            if (denom <= 0.0f) continue;
+
+            int jy_row = i*{D};
+            float jv = 0.0f;
+            for (int d = 0; d < {D}; d++) {{
+                jv += J_g.data[(jy_row + d)*W + world] * v_g.data[d*W + world];
+            }}
+
+            float residual = jv + rhs_g.data[i*W + world];
+            float delta = -residual / denom;
+            float old_impulse = lam_g.data[i*W + world];
+            float new_impulse = old_impulse + omega * delta;
+            float delta_impulse = 0.0f;
+
+            if (row_type == 1) {{
+                new_impulse = old_impulse * drive_imul_g.data[i*W + world]
+                    + jv * drive_vmul_g.data[i*W + world]
+                    + drive_target_g.data[i*W + world];
+                float max_imp = drive_maximp_g.data[i*W + world];
+                if (new_impulse > max_imp) new_impulse = max_imp;
+                if (new_impulse < -max_imp) new_impulse = -max_imp;
+                delta_impulse = new_impulse - old_impulse;
+            }} else if (row_type == 0 || row_type == 3) {{
+                if (new_impulse < 0.0f) new_impulse = 0.0f;
+                delta_impulse = new_impulse - old_impulse;
+            }} else if (row_type == 2) {{
+                // dense friction_mode="current": legacy isotropic-cone clamp.
+                int parent_idx = parent_g.data[i*W + world];
+                float lambda_n = lam_g.data[parent_idx*W + world];
+                float mu = mu_g.data[i*W + world];
+                float radius = fmaxf(mu * lambda_n, 0.0f);
+                if (radius <= 0.0f) {{
+                    new_impulse = 0.0f;
+                }} else {{
+                    int sib = (i == parent_idx + 1) ? parent_idx + 2 : parent_idx + 1;
+                    lam_g.data[i*W + world] = new_impulse;
+                    float a_val = new_impulse;
+                    float b_val = lam_g.data[sib*W + world];
+                    float mag = sqrtf(a_val * a_val + b_val * b_val);
+                    if (mag > radius) {{
+                        float scale = radius / mag;
+                        new_impulse = a_val * scale;
+                        float sib_new = b_val * scale;
+                        float sib_delta = sib_new - b_val;
+                        lam_g.data[sib*W + world] = sib_new;
+                        int sib_jy = sib*{D};
+                        for (int d = 0; d < {D}; d++) {{
+                            v_g.data[d*W + world] += Y_g.data[(sib_jy + d)*W + world] * sib_delta;
+                        }}
+                    }}
+                }}
+                delta_impulse = new_impulse - old_impulse;
+            }} else {{
+                delta_impulse = new_impulse - old_impulse;
+            }}
+
+            lam_g.data[i*W + world] = new_impulse;
+            if (delta_impulse != 0.0f) {{
+                for (int d = 0; d < {D}; d++) {{
+                    v_g.data[d*W + world] += Y_g.data[(jy_row + d)*W + world] * delta_impulse;
+                }}
+            }}
+        }}
+
+        // ── Phase 2: MF constraints (serial 6+6 DOF dot/update) ──
+        for (int i = 0; i < m_mf; i++) {{
+            int meta0 = mf_meta_g.data[(i*4 + 0)*W + world];
+            int meta1 = mf_meta_g.data[(i*4 + 1)*W + world];
+            int meta2 = mf_meta_g.data[(i*4 + 2)*W + world];
+            int meta3 = mf_meta_g.data[(i*4 + 3)*W + world];
+            int dof_a = meta0 >> 16;
+            int dof_b = (meta0 << 16) >> 16;
+            float mf_diag = __int_as_float(meta1);
+            int packed_tp = meta3;
+            int mf_rt = packed_tp & 0xFFFF;
+
+            if (mf_rt == 4) continue;  // velocity-limit handled in final pass
+            if (mf_rt == 2 && global_iter < friction_start_iteration) {{
+                mf_lam_g.data[i*W + world] = 0.0f;
+                continue;
+            }}
+            if (mf_diag <= 0.0f) continue;
+
+            int mf6 = i*6;
+            float jv = 0.0f;
+            if (dof_a >= 0) {{
+                for (int k = 0; k < 6; k++) {{
+                    jv += mf_J_a.data[(mf6 + k)*W + world] * v_g.data[(dof_a + k)*W + world];
+                }}
+            }}
+            if (dof_b >= 0) {{
+                for (int k = 0; k < 6; k++) {{
+                    jv += mf_J_b.data[(mf6 + k)*W + world] * v_g.data[(dof_b + k)*W + world];
+                }}
+            }}
+
+            float residual = jv + __int_as_float(meta2);
+            float delta = -residual * mf_diag;
+            float old_impulse = mf_lam_g.data[i*W + world];
+            float new_impulse = old_impulse + omega * delta;
+            float delta_impulse = 0.0f;
+
+            if (mf_rt == 0) {{
+                if (new_impulse < 0.0f) new_impulse = 0.0f;
+            }} else if (mf_rt == 2) {{
+                // mf friction_mode="current": isotropic Coulomb cone clamp.
+                int mf_par = packed_tp >> 16;
+                float lambda_n = mf_lam_g.data[mf_par*W + world];
+                float mu = mf_row_mu.data[i*W + world];
+                float radius = fmaxf(mu * lambda_n, 0.0f);
+                if (radius <= 0.0f) {{
+                    new_impulse = 0.0f;
+                }} else {{
+                    int sib = (i == mf_par + 1) ? mf_par + 2 : mf_par + 1;
+                    mf_lam_g.data[i*W + world] = new_impulse;
+                    float a_val = new_impulse;
+                    float b_val = mf_lam_g.data[sib*W + world];
+                    float mag = sqrtf(a_val * a_val + b_val * b_val);
+                    if (mag > radius) {{
+                        float scale = radius / mag;
+                        new_impulse = a_val * scale;
+                        float sib_new = b_val * scale;
+                        float sib_delta = sib_new - b_val;
+                        mf_lam_g.data[sib*W + world] = sib_new;
+                        int sib_meta0 = mf_meta_g.data[(sib*4 + 0)*W + world];
+                        int sib_dof_a = sib_meta0 >> 16;
+                        int sib_dof_b = (sib_meta0 << 16) >> 16;
+                        int sib_mf6 = sib*6;
+                        if (sib_dof_a >= 0) {{
+                            for (int k = 0; k < 6; k++) {{
+                                v_g.data[(sib_dof_a + k)*W + world] += mf_MiJt_a.data[(sib_mf6 + k)*W + world] * sib_delta;
+                            }}
+                        }}
+                        if (sib_dof_b >= 0) {{
+                            for (int k = 0; k < 6; k++) {{
+                                v_g.data[(sib_dof_b + k)*W + world] += mf_MiJt_b.data[(sib_mf6 + k)*W + world] * sib_delta;
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+
+            delta_impulse = new_impulse - old_impulse;
+            mf_lam_g.data[i*W + world] = new_impulse;
+            if (delta_impulse != 0.0f) {{
+                if (dof_a >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        v_g.data[(dof_a + k)*W + world] += mf_MiJt_a.data[(mf6 + k)*W + world] * delta_impulse;
+                    }}
+                }}
+                if (dof_b >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        v_g.data[(dof_b + k)*W + world] += mf_MiJt_b.data[(mf6 + k)*W + world] * delta_impulse;
+                    }}
+                }}
+            }}
+        }}
+
+        // ── Final velocity-limit phase: dense rt4 ──
+        for (int i = 0; i < m_dense; i++) {{
+            if (rtype_g.data[i*W + world] != 4) continue;
+            float denom = diag_g.data[i*W + world];
+            if (denom <= 0.0f) continue;
+            int jy_row = i*{D};
+            float jv = 0.0f;
+            for (int d = 0; d < {D}; d++) {{
+                jv += J_g.data[(jy_row + d)*W + world] * v_g.data[d*W + world];
+            }}
+            float residual = jv + rhs_g.data[i*W + world];
+            float delta = -residual / denom;
+            float delta_impulse = 0.0f;
+            if (residual < 0.0f) delta_impulse = delta;
+            lam_g.data[i*W + world] = delta_impulse;
+            if (delta_impulse != 0.0f) {{
+                for (int d = 0; d < {D}; d++) {{
+                    v_g.data[d*W + world] += Y_g.data[(jy_row + d)*W + world] * delta_impulse;
+                }}
+            }}
+        }}
+
+        // ── Final velocity-limit phase: mf rt4 ──
+        for (int i = 0; i < m_mf; i++) {{
+            int meta0 = mf_meta_g.data[(i*4 + 0)*W + world];
+            int meta1 = mf_meta_g.data[(i*4 + 1)*W + world];
+            int meta2 = mf_meta_g.data[(i*4 + 2)*W + world];
+            int meta3 = mf_meta_g.data[(i*4 + 3)*W + world];
+            int mf_rt = meta3 & 0xFFFF;
+            if (mf_rt != 4) continue;
+            int dof_a = meta0 >> 16;
+            int dof_b = (meta0 << 16) >> 16;
+            float mf_diag = __int_as_float(meta1);
+            if (mf_diag <= 0.0f) continue;
+            int mf6 = i*6;
+            float jv = 0.0f;
+            if (dof_a >= 0) {{
+                for (int k = 0; k < 6; k++) {{
+                    jv += mf_J_a.data[(mf6 + k)*W + world] * v_g.data[(dof_a + k)*W + world];
+                }}
+            }}
+            if (dof_b >= 0) {{
+                for (int k = 0; k < 6; k++) {{
+                    jv += mf_J_b.data[(mf6 + k)*W + world] * v_g.data[(dof_b + k)*W + world];
+                }}
+            }}
+            float residual = jv + __int_as_float(meta2);
+            float delta = -residual * mf_diag;
+            float delta_impulse = 0.0f;
+            if (residual < 0.0f) delta_impulse = delta;
+            mf_lam_g.data[i*W + world] = delta_impulse;
+            if (delta_impulse != 0.0f) {{
+                if (dof_a >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        v_g.data[(dof_a + k)*W + world] += mf_MiJt_a.data[(mf6 + k)*W + world] * delta_impulse;
+                    }}
+                }}
+                if (dof_b >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        v_g.data[(dof_b + k)*W + world] += mf_MiJt_b.data[(mf6 + k)*W + world] * delta_impulse;
+                    }}
+                }}
+            }}
+        }}
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def pgs_solve_mf_gs_tpw_native(
+        world: int,
+        m_dense_g: wp.array(dtype=int),
+        m_mf_g: wp.array(dtype=int),
+        w_dof_start_g: wp.array(dtype=int),
+        lam_g: wp.array(dtype=float),
+        rhs_g: wp.array(dtype=float),
+        diag_g: wp.array(dtype=float),
+        rtype_g: wp.array(dtype=int),
+        parent_g: wp.array(dtype=int),
+        mu_g: wp.array(dtype=float),
+        drive_target_g: wp.array(dtype=float),
+        drive_vmul_g: wp.array(dtype=float),
+        drive_imul_g: wp.array(dtype=float),
+        drive_maximp_g: wp.array(dtype=float),
+        J_g: wp.array(dtype=float),
+        Y_g: wp.array(dtype=float),
+        mf_meta_g: wp.array(dtype=int),
+        mf_lam_g: wp.array(dtype=float),
+        mf_J_a: wp.array(dtype=float),
+        mf_J_b: wp.array(dtype=float),
+        mf_MiJt_a: wp.array(dtype=float),
+        mf_MiJt_b: wp.array(dtype=float),
+        mf_row_mu: wp.array(dtype=float),
+        v_g: wp.array(dtype=float),
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        freeze_drive_rows: int,
+    ): ...
+
+    def pgs_solve_mf_gs_tpw_template(
+        m_dense_g: wp.array(dtype=int),
+        m_mf_g: wp.array(dtype=int),
+        w_dof_start_g: wp.array(dtype=int),
+        lam_g: wp.array(dtype=float),
+        rhs_g: wp.array(dtype=float),
+        diag_g: wp.array(dtype=float),
+        rtype_g: wp.array(dtype=int),
+        parent_g: wp.array(dtype=int),
+        mu_g: wp.array(dtype=float),
+        drive_target_g: wp.array(dtype=float),
+        drive_vmul_g: wp.array(dtype=float),
+        drive_imul_g: wp.array(dtype=float),
+        drive_maximp_g: wp.array(dtype=float),
+        J_g: wp.array(dtype=float),
+        Y_g: wp.array(dtype=float),
+        mf_meta_g: wp.array(dtype=int),
+        mf_lam_g: wp.array(dtype=float),
+        mf_J_a: wp.array(dtype=float),
+        mf_J_b: wp.array(dtype=float),
+        mf_MiJt_a: wp.array(dtype=float),
+        mf_MiJt_b: wp.array(dtype=float),
+        mf_row_mu: wp.array(dtype=float),
+        v_g: wp.array(dtype=float),
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        freeze_drive_rows: int,
+    ):
+        world = wp.tid()
+        pgs_solve_mf_gs_tpw_native(
+            world,
+            m_dense_g, m_mf_g, w_dof_start_g,
+            lam_g, rhs_g, diag_g, rtype_g, parent_g, mu_g,
+            drive_target_g, drive_vmul_g, drive_imul_g, drive_maximp_g,
+            J_g, Y_g,
+            mf_meta_g, mf_lam_g, mf_J_a, mf_J_b, mf_MiJt_a, mf_MiJt_b, mf_row_mu,
+            v_g,
+            iterations, omega, friction_start_iteration, iteration_offset, freeze_drive_rows,
+        )
+
+    name = f"pgs_solve_mf_gs_tpw_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{world_count}_{friction_mode}"
+    pgs_solve_mf_gs_tpw_template.__name__ = name
+    pgs_solve_mf_gs_tpw_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_tpw_template)

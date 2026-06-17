@@ -1,0 +1,15 @@
+{
+  "dense_max_constraints": 512,
+  "mf_max_constraints": 4096,
+  "max_world_dofs": 609,
+  "friction_mode": "current",
+  "device_arch": 120,
+  "world_count": 256,
+  "block_dim": 32,
+  "iterations": 8,
+  "omega": 1.0,
+  "row_phase": 0,
+  "friction_start_iteration": 0,
+  "iteration_offset": 0,
+  "freeze_drive_rows": 0
+}
