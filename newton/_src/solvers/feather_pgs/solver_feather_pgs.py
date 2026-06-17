@@ -8511,6 +8511,31 @@ def _get_pgs_solve_mf_gs_kernel(
         _smem_tag += "_sdrv"
     name += _smem_tag
 
+    # ── REGISTER CAP (opt-in, ncu occupancy lever #2) ───────────────────────
+    # Streaming (above) cuts smem so occupancy stops being smem-bound, but it
+    # pushes registers up (128 -> ~142 on the colored kernel), so at higher W the
+    # kernel becomes REGISTER-bound and occupancy drops again (W4 -> 3 blk/SM,
+    # W8 -> 1). Capping registers via warp's kernel_kwargs lets more 32*W-thread
+    # blocks co-reside per SM so the parallel WIDTH (W) can actually pay off.
+    #
+    # Route (the warp kernel_kwargs `launch_bounds`, which DOES work — distinct
+    # from inline __launch_bounds__ in the func_native snippet, which warp's
+    # NVRTC->ptxas path can't emit; warp has no maxrregcount module option in this
+    # build, so launch_bounds is THE register-cap lever):
+    #   FEATHER_PGS_MFGS_MIN_BLOCKS=<n> -> launch_bounds=(32*W, n): emits CUDA
+    #       __launch_bounds__(maxThreadsPerBlock=32*W, minBlocksPerMultiprocessor=n).
+    #       ptxas treats n as a per-SM resident-block target and TRIMS registers to
+    #       try to honor it (soft cap; may spill to local mem if n is too aggressive
+    #       for the kernel's live state).
+    # block_dim is 32*W for the colored path, 32 for serial/W1. Bit-identical
+    # (no math change) unless ptxas spills.
+    kernel_kwargs = {"enable_backward": False, "module": "unique"}
+    _bd = 32 * MFGS_WARPS if MFGS_COLORED else 32
+    _min_blocks = os.environ.get("FEATHER_PGS_MFGS_MIN_BLOCKS", "").strip()
+    if _min_blocks:
+        kernel_kwargs["launch_bounds"] = (_bd, int(_min_blocks))
+        name += f"_mb{int(_min_blocks)}"
+
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+    return wp.kernel(**kernel_kwargs)(pgs_solve_mf_gs_template)

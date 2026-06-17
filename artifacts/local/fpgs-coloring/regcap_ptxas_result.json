@@ -1,0 +1,223 @@
+[
+  {
+    "label": "serial-resident",
+    "W": 1,
+    "stream": false,
+    "min_blocks": null,
+    "regs": 127,
+    "smem": 40324,
+    "spill_store": 0,
+    "spill_load": 0,
+    "blk_per_sm": 2,
+    "lim": {
+      "reg": 16,
+      "smem": 2,
+      "thr": 48
+    },
+    "warps_per_sm": 2
+  },
+  {
+    "label": "serial-stream",
+    "W": 1,
+    "stream": true,
+    "min_blocks": null,
+    "regs": 130,
+    "smem": 15748,
+    "spill_store": 0,
+    "spill_load": 0,
+    "blk_per_sm": 6,
+    "lim": {
+      "reg": 15,
+      "smem": 6,
+      "thr": 48
+    },
+    "warps_per_sm": 6
+  },
+  {
+    "label": "W1-stream",
+    "W": 1,
+    "stream": true,
+    "min_blocks": null,
+    "regs": 127,
+    "smem": 15748,
+    "spill_store": 0,
+    "spill_load": 0,
+    "blk_per_sm": 6,
+    "lim": {
+      "reg": 16,
+      "smem": 6,
+      "thr": 48
+    },
+    "warps_per_sm": 6
+  },
+  {
+    "label": "W2-resident",
+    "W": 2,
+    "stream": false,
+    "min_blocks": null,
+    "regs": 128,
+    "smem": 40324,
+    "spill_store": 0,
+    "spill_load": 0,
+    "blk_per_sm": 2,
+    "lim": {
+      "reg": 8,
+      "smem": 2,
+      "thr": 24
+    },
+    "warps_per_sm": 4
+  },
+  {
+    "label": "W2-stream",
+    "W": 2,
+    "stream": true,
+    "min_blocks": null,
+    "regs": 159,
+    "smem": 15748,
+    "spill_store": 0,
+    "spill_load": 0,
+    "blk_per_sm": 6,
+    "lim": {
+      "reg": 6,
+      "smem": 6,
+      "thr": 24
+    },
+    "warps_per_sm": 12
+  },
+  {
+    "label": "W4-stream",
+    "W": 4,
+    "stream": true,
+    "min_blocks": null,
+    "regs": 159,
+    "smem": 15748,
+    "spill_store": 0,
+    "spill_load": 0,
+    "blk_per_sm": 3,
+    "lim": {
+      "reg": 3,
+      "smem": 6,
+      "thr": 12
+    },
+    "warps_per_sm": 12
+  },
+  {
+    "label": "W4-stream-mb4",
+    "W": 4,
+    "stream": true,
+    "min_blocks": 4,
+    "regs": 128,
+    "smem": 15748,
+    "spill_store": 20,
+    "spill_load": 20,
+    "blk_per_sm": 4,
+    "lim": {
+      "reg": 4,
+      "smem": 6,
+      "thr": 12
+    },
+    "warps_per_sm": 16
+  },
+  {
+    "label": "W4-stream-mb6",
+    "W": 4,
+    "stream": true,
+    "min_blocks": 6,
+    "regs": 80,
+    "smem": 15748,
+    "spill_store": 384,
+    "spill_load": 240,
+    "blk_per_sm": 6,
+    "lim": {
+      "reg": 6,
+      "smem": 6,
+      "thr": 12
+    },
+    "warps_per_sm": 24
+  },
+  {
+    "label": "W4-stream-mb8",
+    "W": 4,
+    "stream": true,
+    "min_blocks": 8,
+    "regs": 64,
+    "smem": 15748,
+    "spill_store": 588,
+    "spill_load": 320,
+    "blk_per_sm": 6,
+    "lim": {
+      "reg": 8,
+      "smem": 6,
+      "thr": 12
+    },
+    "warps_per_sm": 24
+  },
+  {
+    "label": "W8-stream",
+    "W": 8,
+    "stream": true,
+    "min_blocks": null,
+    "regs": 159,
+    "smem": 15748,
+    "spill_store": 0,
+    "spill_load": 0,
+    "blk_per_sm": 1,
+    "lim": {
+      "reg": 1,
+      "smem": 6,
+      "thr": 6
+    },
+    "warps_per_sm": 8
+  },
+  {
+    "label": "W8-stream-mb4",
+    "W": 8,
+    "stream": true,
+    "min_blocks": 4,
+    "regs": 64,
+    "smem": 15748,
+    "spill_store": 588,
+    "spill_load": 320,
+    "blk_per_sm": 4,
+    "lim": {
+      "reg": 4,
+      "smem": 6,
+      "thr": 6
+    },
+    "warps_per_sm": 32
+  },
+  {
+    "label": "W8-stream-mb6",
+    "W": 8,
+    "stream": true,
+    "min_blocks": 6,
+    "regs": 40,
+    "smem": 15748,
+    "spill_store": 696,
+    "spill_load": 480,
+    "blk_per_sm": 6,
+    "lim": {
+      "reg": 6,
+      "smem": 6,
+      "thr": 6
+    },
+    "warps_per_sm": 48
+  },
+  {
+    "label": "W8-stream-mb8",
+    "W": 8,
+    "stream": true,
+    "min_blocks": 8,
+    "regs": 153,
+    "smem": 15748,
+    "spill_store": 0,
+    "spill_load": 0,
+    "blk_per_sm": 1,
+    "lim": {
+      "reg": 1,
+      "smem": 6,
+      "thr": 6
+    },
+    "warps_per_sm": 8
+  }
+]
