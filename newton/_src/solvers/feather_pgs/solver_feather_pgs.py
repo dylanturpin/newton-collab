@@ -8194,6 +8194,77 @@ def _get_pgs_solve_mf_gs_kernel(
 #endif
 """
 
+    # ────────────────────────────────────────────────────────────────────
+    # SMEM-OCCUPANCY transforms (opt-in, default off = resident smem).
+    # The colored MF-GS kernel is smem-occupancy-bound at ~2 blocks/SM
+    # (~39.4 KB smem/block on sm_86). The two dominant smem consumers are:
+    #   s_lam_mf[M_MF]       = M_MF*4 bytes  (16384 B at M_MF=4096) — DOMINANT
+    #   4x s_drive_*_dense   = 4*M_D*4 bytes (8192 B at M_D=512)
+    # Streaming either to global memory cuts smem/block so more blocks/SM are
+    # resident -> more warps to hide the long-scoreboard global-load latency,
+    # which is the precondition for the colored kernel's parallel WIDTH (W) to
+    # pay off. Both transforms are value-preserving string rewrites of the
+    # already-assembled `snippet`; they touch no math (same source arrays, same
+    # flat indices, same arithmetic order) and so are bit-identical to resident.
+    # Ported from the newton-collab "streaming+vlimit" perf experiment stash.
+    def _smem_flag_on(name):
+        return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+    # STREAM_LAMBDA: alias s_lam_mf to a volatile pointer into global mf_impulses
+    # instead of holding the matrix-free impulse vector resident in shared memory.
+    # The GS coupling between rows runs through s_v (the world velocity), not
+    # lambda; each row needs only its own impulse (+ a friction parent/sibling),
+    # and those friction rows always share an owning warp (node round-robin), so
+    # __syncwarp's L1 visibility suffices intra-warp while the existing per-color
+    # __syncthreads provides the cross-warp fence. mf_impulses is already the
+    # load source and store sink for s_lam_mf (LOAD/STORE loops copy in/out at the
+    # SAME flat index off_mf+i), so aliasing is value-consistent -> bit-identical.
+    if _smem_flag_on("FEATHER_PGS_MFGS_STREAM_LAMBDA"):
+        import re as _re_sl
+
+        _decl = f"    __shared__ float s_lam_mf[{M_MF}];"
+        if _decl not in snippet:
+            raise RuntimeError("FEATHER_PGS_MFGS_STREAM_LAMBDA: s_lam_mf shared decl not found")
+        snippet = snippet.replace(
+            _decl,
+            "    volatile float* g_lam_mf = (volatile float*)(&mf_impulses.data[off_mf]);",
+        )
+        snippet = _re_sl.sub(r"s_lam_mf\[([^\]]*)\]", r"g_lam_mf[\1]", snippet)
+
+    # STREAM_DRIVE: the 4 drive-row metadata arrays (4*M_D floats) are read once,
+    # at the single row_type==1 site, so caching them in shared memory only wasted
+    # occupancy-critical space. Stream them from global (world_drive_*) at that
+    # site. Bit-identical: same source arrays, same flat index off_dense+i.
+    if _smem_flag_on("FEATHER_PGS_MFGS_STREAM_DRIVE"):
+        _drive_decls = (
+            f"    __shared__ float s_drive_target_dense[{M_D}];\n"
+            f"    __shared__ float s_drive_vel_mul_dense[{M_D}];\n"
+            f"    __shared__ float s_drive_imp_mul_dense[{M_D}];\n"
+            f"    __shared__ float s_drive_max_imp_dense[{M_D}];\n"
+        )
+        if _drive_decls not in snippet:
+            raise RuntimeError("FEATHER_PGS_MFGS_STREAM_DRIVE: drive shared decls not found")
+        snippet = snippet.replace(_drive_decls, "")
+        _drive_load = (
+            "        s_drive_target_dense[i] = world_drive_target_vel_bias.data[off_dense + i];\n"
+            "        s_drive_vel_mul_dense[i] = world_drive_vel_multiplier.data[off_dense + i];\n"
+            "        s_drive_imp_mul_dense[i] = world_drive_impulse_multiplier.data[off_dense + i];\n"
+            "        s_drive_max_imp_dense[i] = world_drive_max_impulse.data[off_dense + i];\n"
+        )
+        if _drive_load not in snippet:
+            raise RuntimeError("FEATHER_PGS_MFGS_STREAM_DRIVE: drive load block not found")
+        snippet = snippet.replace(_drive_load, "")
+        snippet = snippet.replace(
+            "                new_impulse = old_impulse * s_drive_imp_mul_dense[i]\n"
+            "                    + jv * s_drive_vel_mul_dense[i]\n"
+            "                    + s_drive_target_dense[i];\n"
+            "                float max_imp = s_drive_max_imp_dense[i];",
+            "                new_impulse = old_impulse * world_drive_impulse_multiplier.data[off_dense + i]\n"
+            "                    + jv * world_drive_vel_multiplier.data[off_dense + i]\n"
+            "                    + world_drive_target_vel_bias.data[off_dense + i];\n"
+            "                float max_imp = world_drive_max_impulse.data[off_dense + i];",
+        )
+
     if not MFGS_COLORED:
 
         @wp.func_native(snippet)
@@ -8429,6 +8500,16 @@ def _get_pgs_solve_mf_gs_kernel(
             )
 
         name = f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}_colored{MAX_COLORS}_w{MFGS_WARPS}"
+
+    # The smem-streaming transforms rewrite `snippet` AFTER the module-name hash is
+    # otherwise fixed, so encode them into `name` to give streaming variants a
+    # distinct kernel-cache key (otherwise warp reuses the stale resident cubin).
+    _smem_tag = ""
+    if _smem_flag_on("FEATHER_PGS_MFGS_STREAM_LAMBDA"):
+        _smem_tag += "_slam"
+    if _smem_flag_on("FEATHER_PGS_MFGS_STREAM_DRIVE"):
+        _smem_tag += "_sdrv"
+    name += _smem_tag
 
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
