@@ -13,7 +13,12 @@ import json
 import os
 import sys
 
-WORKTREE = "/home/dturpin/repos/il-newton-dev/.claude/worktrees/smem-color"
+# WORKTREE/repo root holding the `newton` package to bench. Override with
+# ABENCH_NEWTON_ROOT for non-local runs (e.g. a cloned repo on a Slurm node).
+WORKTREE = os.environ.get(
+    "ABENCH_NEWTON_ROOT",
+    "/home/dturpin/repos/il-newton-dev/.claude/worktrees/smem-color",
+)
 sys.path.insert(0, WORKTREE)
 sys.path.insert(0, "/tmp")
 
@@ -32,8 +37,10 @@ if os.environ.get("WARP_CACHE_PATH"):
     wp.config.kernel_cache_dir = os.environ["WARP_CACHE_PATH"]
 wp.init()
 
-meta = json.load(open("/tmp/cap892.json"))
-z = np.load("/tmp/cap892.npz")
+# Capture path prefix (`<prefix>.json` + `<prefix>.npz`); override for non-local runs.
+CAP = os.environ.get("ABENCH_CAP", "/tmp/cap892")
+meta = json.load(open(CAP + ".json"))
+z = np.load(CAP + ".npz")
 M_D = int(meta["dense_max_constraints"])
 M_MF = int(meta["mf_max_constraints"])
 D = int(meta["max_world_dofs"])
