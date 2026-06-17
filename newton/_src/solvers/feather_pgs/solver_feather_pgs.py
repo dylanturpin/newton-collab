@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import time
 from contextlib import contextmanager
@@ -21,6 +22,15 @@ from typing import Literal
 
 import numpy as np
 import warp as wp
+
+# --- env-gated capture of pgs_solve_mf_gs kernel inputs, for standalone ncu replay ---
+# Off unless FEATHER_PGS_CAPTURE_KERNEL=1. Snapshots the dominant FPGS contact-solve
+# kernel's inputs + launch config at a chosen step/phase to .npz/.json so the kernel can
+# be profiled in isolation under Nsight Compute on the target GPU. Zero overhead when off.
+_FPGS_CAPTURE = os.environ.get("FEATHER_PGS_CAPTURE_KERNEL") == "1"
+_FPGS_CAPTURE_STEP = int(os.environ.get("FEATHER_PGS_CAPTURE_STEP", "-1"))
+_FPGS_CAPTURE_PHASE = os.environ.get("FEATHER_PGS_CAPTURE_PHASE")  # None = any phase
+_FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture")
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, State
@@ -1926,6 +1936,61 @@ class SolverFeatherPGS(SolverBase):
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
 
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
+            if (
+                _FPGS_CAPTURE
+                and getattr(self, "_fpgs_step_n", -1) == _FPGS_CAPTURE_STEP
+                and (_FPGS_CAPTURE_PHASE is None or row_phase == int(_FPGS_CAPTURE_PHASE))
+            ):
+                os.makedirs(_FPGS_CAPTURE_DIR, exist_ok=True)
+                _arrs = {
+                    "constraint_count": self.constraint_count,
+                    "world_dof_start": self.world_dof_start,
+                    "dense_rhs": dense_rhs,
+                    "diag": self.diag,
+                    "impulses": self.impulses,  # RMW: pre-launch snapshot
+                    "J_world": self.J_world,
+                    "Y_world": self.Y_world,
+                    "row_type": self.row_type,
+                    "row_parent": self.row_parent,
+                    "row_mu": self.row_mu,
+                    "drive_target_vel_bias": self.drive_target_vel_bias,
+                    "drive_vel_multiplier": self.drive_vel_multiplier,
+                    "drive_impulse_multiplier": self.drive_impulse_multiplier,
+                    "drive_max_impulse": self.drive_max_impulse,
+                    "mf_constraint_count": self.mf_constraint_count,
+                    "mf_meta": mf_meta,
+                    "mf_impulses": self.mf_impulses,  # RMW: pre-launch snapshot
+                    "mf_J_a": self.mf_J_a,
+                    "mf_J_b": self.mf_J_b,
+                    "mf_MiJt_a": self.mf_MiJt_a,
+                    "mf_MiJt_b": self.mf_MiJt_b,
+                    "mf_row_mu": self.mf_row_mu,
+                    "v_out": self.v_out,  # RMW: pre-launch snapshot
+                }
+                _base = os.path.join(_FPGS_CAPTURE_DIR, f"mfgs_step{self._fpgs_step_n}_phase{row_phase}")
+                # .numpy() is a synchronous D2H copy; no wp.synchronize() (AGENTS.md rule)
+                np.savez(_base + ".npz", **{_k: _v.numpy() for _k, _v in _arrs.items()})
+                with open(_base + ".json", "w") as _f:
+                    json.dump(
+                        {
+                            "dense_max_constraints": int(self.dense_max_constraints),
+                            "mf_max_constraints": int(self.mf_max_constraints),
+                            "max_world_dofs": int(self.max_world_dofs),
+                            "friction_mode": str(self.friction_mode),
+                            "device_arch": int(self.model.device.arch),  # INT warp arch code
+                            "world_count": int(self.world_count),
+                            "block_dim": 32,
+                            "iterations": int(phase_iterations),
+                            "omega": float(omega),
+                            "row_phase": int(row_phase),
+                            "friction_start_iteration": int(friction_start_iteration),
+                            "iteration_offset": int(phase_iteration_offset),
+                            "freeze_drive_rows": int(freeze_drive_rows),
+                        },
+                        _f,
+                        indent=2,
+                    )
+                print(f"[fpgs-capture] wrote {_base}.npz/.json", flush=True)
             wp.launch_tiled(
                 mf_gs_kernel,
                 dim=[self.world_count],
@@ -2186,6 +2251,8 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        if _FPGS_CAPTURE:
+            self._fpgs_step_n = getattr(self, "_fpgs_step_n", -1) + 1
         if self._last_step_dt is None:
             self._last_step_dt = dt
         elif abs(self._last_step_dt - dt) > 1.0e-8:
