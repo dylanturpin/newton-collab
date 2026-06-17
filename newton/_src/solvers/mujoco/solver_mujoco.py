@@ -4814,6 +4814,27 @@ class SolverMuJoCo(SolverBase):
                 else:
                     geom_params["margin"] = authored_margin
 
+                # Coerce warp/numpy array & scalar values to native python types: the
+                # installed mujoco `add_geom` pybind overload only accepts plain
+                # Sequence[float]/float, and rejects warp vec/quat and numpy arrays
+                # (TypeError: incompatible function arguments) for box geoms.
+                _seq_keys = {
+                    "pos", "quat", "axisangle", "xyaxes", "zaxis", "euler", "fromto",
+                    "size", "friction", "solref", "solimp", "rgba", "fluid_coefs", "userdata",
+                }
+                _flt_keys = {"solmix", "margin", "gap", "mass", "density", "fitscale"}
+                for _k in list(geom_params):
+                    _v = geom_params[_k]
+                    if _k in _seq_keys:
+                        geom_params[_k] = [float(_x) for _x in _v]
+                    elif _k in _flt_keys:
+                        geom_params[_k] = float(_v)
+                # contype/conaffinity are 32-bit collision masks; 1<<31 (color 31)
+                # is 2147483648, which overflows mujoco's *signed* int32 field and
+                # raises "incompatible function arguments". Wrap uint32 -> int32.
+                for _k in ("contype", "conaffinity"):
+                    if _k in geom_params:
+                        geom_params[_k] = ((int(geom_params[_k]) + 2**31) % 2**32) - 2**31
                 body.add_geom(**geom_params)
                 # store the geom name instead of assuming index
                 shape_mapping[shape] = name
