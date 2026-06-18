@@ -3773,6 +3773,101 @@ def build_mf_contact_rows(
 
 
 @wp.kernel
+def gather_mf_warmstart(
+    contact_count: wp.array(dtype=int),
+    contact_path: wp.array(dtype=int),
+    contact_slot: wp.array(dtype=int),
+    contact_world: wp.array(dtype=int),
+    match_index: wp.array(dtype=int),  # rigid_contact_match_index (sorted-current -> prev-sorted idx)
+    prev_slot_sorted: wp.array(dtype=int),  # prev-sorted contact idx -> prev base MF slot (or -1)
+    prev_mf_impulses: wp.array2d(dtype=float),
+    prev_mf_row_type: wp.array2d(dtype=int),
+    mf_row_type: wp.array2d(dtype=int),  # THIS step's row types (already built)
+    decay: float,
+    mf_max_c: int,
+    # in-out
+    mf_impulses: wp.array2d(dtype=float),
+):
+    """Seed this step's MF impulse buffer from the previous step's converged
+    impulses, matched by contact identity.
+
+    Runs after ``allocate_world_contact_slots`` + ``build_mf_contact_rows`` (so
+    ``contact_slot`` and ``mf_row_type`` are populated for this step) and after
+    the warm-start branch has zeroed ``mf_impulses``. One thread per contact;
+    each writes only its own disjoint slot range, so unmatched / cold contacts
+    keep the zero left by the memset and no stale slot survives.
+
+    ``match_index[c] >= 0`` is the previous frame's *sorted* contact index;
+    ``prev_slot_sorted`` is keyed the same way (see solver writeback), so
+    ``prev_slot = prev_slot_sorted[match_index[c]]`` is the base slot that
+    contact occupied last step. Friction rows are only seeded when BOTH this
+    step and the previous step allocated a friction row at the corresponding
+    offset (guards the variable 1-vs-3 stride).
+    """
+    c = wp.tid()
+    if c >= contact_count[0]:
+        return
+    if contact_path[c] != 1:  # MF path only
+        return
+    new_slot = contact_slot[c]
+    if new_slot < 0:
+        return
+
+    world = contact_world[c]
+
+    mi = match_index[c]
+    matched = mi >= 0
+    prev_slot = int(-1)
+    if matched:
+        prev_slot = prev_slot_sorted[mi]
+
+    # Normal row (offset 0): always present for an MF contact.
+    if matched and prev_slot >= 0 and prev_mf_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+        mf_impulses[world, new_slot] = decay * prev_mf_impulses[world, prev_slot]
+    # else: leave 0 (already memset)
+
+    # Friction rows (offsets 1, 2): only if THIS step allocated them here.
+    for r in range(1, 3):
+        new_r = new_slot + r
+        if new_r < mf_max_c:
+            if mf_row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION:
+                prev_r = prev_slot + r
+                if (
+                    matched
+                    and prev_slot >= 0
+                    and prev_r < mf_max_c
+                    and prev_mf_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
+                ):
+                    mf_impulses[world, new_r] = decay * prev_mf_impulses[world, prev_r]
+                # else: leave 0
+
+
+@wp.kernel
+def snapshot_mf_prev_slots(
+    contact_count: wp.array(dtype=int),
+    contact_path: wp.array(dtype=int),
+    contact_slot: wp.array(dtype=int),
+    # out
+    prev_slot_sorted: wp.array(dtype=int),
+):
+    """Record, per current sorted contact index, the base MF slot it occupied
+    this step (or -1 if it was not MF-routed / inactive). Run at the END of the
+    step so next step's ``rigid_contact_match_index`` (referencing this frame's
+    *sorted* index) resolves through it. One thread per contact-array slot;
+    indices beyond ``contact_count`` are written -1 so stale entries from a
+    larger previous frame can't leak.
+    """
+    c = wp.tid()
+    if c >= contact_count[0]:
+        prev_slot_sorted[c] = -1
+        return
+    if contact_path[c] != 1:
+        prev_slot_sorted[c] = -1
+        return
+    prev_slot_sorted[c] = contact_slot[c]
+
+
+@wp.kernel
 def allocate_rigid_velocity_limit_slots(
     body_to_articulation: wp.array(dtype=int),
     art_to_world: wp.array(dtype=int),
