@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import re
 import time
 from contextlib import contextmanager
 from functools import cache
@@ -7767,6 +7768,21 @@ def _get_pgs_solve_mf_gs_kernel(
     }}
 #endif
 """
+
+    # ncu occupancy fix (opt-in): stream the matrix-free impulse vector from global
+    # (mf_impulses) instead of holding it resident as s_lam_mf[M_MF] in shared memory.
+    # s_lam_mf is the dominant smem consumer (M_MF*4 bytes); the GS coupling runs through
+    # s_v (the world velocity), not lambda, so each row needs only its own impulse (+ a
+    # friction parent's). Aliasing mf_impulses via a volatile pointer keeps the existing
+    # __syncwarp cross-lane visibility (warp lanes share L1) and updates impulses in place.
+    # Value-preserving -> bit-identical; cuts smem so occupancy stops scaling with the mf
+    # capacity. Opt-in via FEATHER_PGS_MFGS_STREAM_LAMBDA=1 (default off = resident smem).
+    if os.environ.get("FEATHER_PGS_MFGS_STREAM_LAMBDA", "").strip().lower() in ("1", "true", "yes", "on"):
+        snippet = snippet.replace(
+            f"    __shared__ float s_lam_mf[{M_MF}];",
+            "    volatile float* g_lam_mf = (volatile float*)(&mf_impulses.data[off_mf]);",
+        )
+        snippet = re.sub(r"s_lam_mf\[([^\]]*)\]", r"g_lam_mf[\1]", snippet)
 
     @wp.func_native(snippet)
     def pgs_solve_mf_gs_native(
