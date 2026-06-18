@@ -35,6 +35,7 @@
 
 ### Fixed
 
+- Fix `import newton` failing when `warp.fem` is unavailable (e.g. the `omni.warp.core` build shipped in Omniverse Kit) by guarding the eager `SolverImplicitMPM` import in `newton._src.solvers`; the symbol is set to `None` when the MPM solver cannot be imported.
 - Fix `eval_fk()` overwriting VBD-simulated `JointType.CABLE` body poses.
 - Fix `SolverXPBD` `body_parent_f` reporting to include `Control.joint_f` contributions and accumulate multiple inbound joint contributions, matching the `SolverMuJoCo` and `SolverFeatherstone` convention.
 - Fix MJCF `xyaxes` parsing to treat the second vector as Y and derive Z from X cross Y.
