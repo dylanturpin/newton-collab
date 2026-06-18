@@ -4,7 +4,11 @@
 from .feather_pgs import SolverFeatherPGS
 from .featherstone import SolverFeatherstone
 from .flags import SolverNotifyFlags
-from .implicit_mpm import SolverImplicitMPM
+
+try:
+    from .implicit_mpm import SolverImplicitMPM
+except Exception:  # warp.fem may be unavailable (e.g. omni.warp.core in GUI/Kit mode)
+    SolverImplicitMPM = None
 from .kamino import SolverKamino
 from .mujoco import SolverMuJoCo
 from .semi_implicit import SolverSemiImplicit
