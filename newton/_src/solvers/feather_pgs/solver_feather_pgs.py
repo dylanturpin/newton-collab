@@ -90,6 +90,7 @@ from .kernels import (
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
     gather_JY_to_world,
+    gather_mf_warmstart,
     gather_tau_to_groups,
     hinv_jt_par_row,
     integrate_generalized_joints,
@@ -107,6 +108,7 @@ from .kernels import (
     prepare_world_impulses,
     rhs_accum_world_par_art,
     scatter_qdd_from_groups,
+    snapshot_mf_prev_slots,
     trisolve_loop,
     update_articulation_origins,
     update_articulation_root_com_offsets,
@@ -263,6 +265,8 @@ class SolverFeatherPGS(SolverBase):
         pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
         dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
+        mf_warmstart: bool = False,
+        mf_warmstart_decay: float = 1.0,
         pgs_mode: str = "split",
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
@@ -535,6 +539,26 @@ class SolverFeatherPGS(SolverBase):
                 "contact_friction_position_iterations with pgs_warmstart=True needs an explicit "
                 "pre-solve zeroing pass for skipped friction rows"
             )
+
+        # ── Matrix-free (MF) warm-starting ──────────────────────────────────
+        # Carry the previous step's converged MF contact impulses into this
+        # step's GS solve as the initial guess, gathered by *contact identity*
+        # (Newton's frame-to-frame ``rigid_contact_match_index``) rather than by
+        # the nondeterministic atomic-allocated slot. Default OFF: when off the
+        # MF impulse buffer is zeroed exactly as before and no new state is
+        # allocated, so the determinism/bit-identity ladder is unaffected.
+        _env_ws = os.getenv("IL_NEWTON_FPGS_MF_WARMSTART", "0").lower() in {"1", "true", "yes", "on"}
+        self._mf_warmstart_enabled = bool(mf_warmstart) or _env_ws
+        try:
+            self._mf_warmstart_decay = float(os.getenv("IL_NEWTON_FPGS_MF_WARMSTART_DECAY", str(mf_warmstart_decay)))
+        except (TypeError, ValueError):
+            self._mf_warmstart_decay = float(mf_warmstart_decay)
+        # Allocated lazily in :meth:`_allocate_mf_buffers` only when enabled.
+        self._ws_prev_mf_impulses = None
+        self._ws_prev_mf_row_type = None
+        self._ws_prev_slot_sorted = None
+        self._ws_warned_no_match = False
+
         if pgs_mode not in ("dense", "split", "matrix_free"):
             raise ValueError(f"pgs_mode must be 'dense', 'split', or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
@@ -1270,6 +1294,7 @@ class SolverFeatherPGS(SolverBase):
 
             max_contacts = int(_estimate_rigid_contact_max(model))
         max_contacts = max(max_contacts, 1)
+        self._max_contacts_alloc = max_contacts
         self.contact_world = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_slot = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
@@ -1577,6 +1602,24 @@ class SolverFeatherPGS(SolverBase):
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.mf_impulses = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+
+        # MF warm-start carry buffers. Allocated ONLY when the feature is on so
+        # the default-off path has zero memory / CUDA-graph delta. ``prev_mf_*``
+        # snapshot last step's converged impulses + their row-type table;
+        # ``_ws_prev_slot_sorted`` records, per *current sorted contact index*,
+        # the base MF slot that contact occupied last step. Because FeatherPGS
+        # consumes the already-sorted contact arrays, the contact array index is
+        # the sorted index, so next step's ``rigid_contact_match_index`` (which
+        # references the previous frame's *sorted* index) indexes directly into
+        # this table — no matcher permutation access required.
+        if self._mf_warmstart_enabled:
+            self._ws_prev_mf_impulses = wp.zeros(
+                (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+            self._ws_prev_mf_row_type = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device)
+            self._ws_prev_slot_sorted = wp.full(
+                (getattr(self, "_max_contacts_alloc", 1),), -1, dtype=wp.int32, device=device
+            )
         self._debug_position_mf_impulses = wp.zeros(
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         ) if self._debug_buffers_enabled else None
@@ -2650,6 +2693,23 @@ class SolverFeatherPGS(SolverBase):
                 self._stage6_update_qdd(state_in, state_aug, dt)
                 self._stage6_integrate(state_in, state_aug, state_out, dt)
 
+        # ── MF warm-start carry: snapshot this step's converged impulses +
+        # row-type table + per-(sorted)-contact slot map so step N+1 can seed
+        # from them by contact identity. Only runs when the feature is on, so
+        # the default-off launch sequence is unchanged.
+        if self._mf_warmstart_enabled and self._has_free_rigid_bodies and self.pgs_mode != "dense":
+            with wp.ScopedTimer("S7_MF_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+                wp.copy(self._ws_prev_mf_impulses, self.mf_impulses)
+                wp.copy(self._ws_prev_mf_row_type, self.mf_row_type)
+                if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
+                    wp.launch(
+                        snapshot_mf_prev_slots,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[contacts.rigid_contact_count, self.contact_path, self.contact_slot],
+                        outputs=[self._ws_prev_slot_sorted],
+                        device=model.device,
+                    )
+
         # Double-buffer: fork memset stream to zero current buffer for reuse.
         # ScopedStream(sync_enter=True) records an event on the main stream and
         # makes the memset stream wait — this is what forks it into graph capture.
@@ -3446,6 +3506,12 @@ class SolverFeatherPGS(SolverBase):
         if mf_active:
             self.mf_slot_counter.zero_()  # atomic-add counter
             self.mf_constraint_count.zero_()  # finalize only runs when contacts exist
+            # Zero unconditionally here. When warm-start is OFF this is the
+            # original behavior (bit-identical). When ON this also guarantees a
+            # clean buffer on steps where the contact block is skipped (no
+            # contacts this frame); the seed pass after build_mf_contact_rows
+            # re-memsets and gathers when contacts ARE present, and the carry
+            # itself lives in _ws_prev_mf_impulses, so this zero is harmless.
             self.mf_impulses.zero_()  # PGS reads before first write
             # mf_J_a/b, mf_MiJt_a/b: writers cover all used slots, readers gated by body >= 0
             # mf_body_a/b, mf_row_type, mf_row_parent, mf_row_mu, mf_phi: unconditionally overwritten
@@ -3808,6 +3874,42 @@ class SolverFeatherPGS(SolverBase):
                     outputs=[self.mf_constraint_count],
                     device=model.device,
                 )
+
+                # ── MF warm-start seed ────────────────────────────────────
+                # contact_slot + mf_row_type are now populated for THIS step.
+                # mf_impulses was already memset at the top of this method
+                # (covers vel-limit rows, padding tail, and any contact that
+                # returns early in the gather); here we gather matched contacts'
+                # previous impulses into their current slots by identity. The
+                # carry itself lives in _ws_prev_mf_impulses.
+                if self._mf_warmstart_enabled:
+                    match_index = getattr(contacts, "rigid_contact_match_index", None)
+                    if match_index is None:
+                        raise NotImplementedError(
+                            "FeatherPGS mf_warmstart=True requires the Contacts buffer to be "
+                            "created with contact_matching enabled (rigid_contact_match_index "
+                            "is None). Build the CollisionPipeline / Contacts with "
+                            'contact_matching="latest" (or "sticky").'
+                        )
+                    wp.launch(
+                        gather_mf_warmstart,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            self.contact_path,
+                            self.contact_slot,
+                            self.contact_world,
+                            match_index,
+                            self._ws_prev_slot_sorted,
+                            self._ws_prev_mf_impulses,
+                            self._ws_prev_mf_row_type,
+                            self.mf_row_type,
+                            self._mf_warmstart_decay,
+                            self.mf_max_constraints,
+                        ],
+                        outputs=[self.mf_impulses],
+                        device=model.device,
+                    )
 
         # Rigid-body velocity limits are matrix-free rows, not post-solve
         # clamps, in the MF path. Allocate after contacts so they occupy the
