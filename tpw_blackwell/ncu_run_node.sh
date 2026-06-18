@@ -43,10 +43,14 @@ echo "######## STEP 0: WARP-CACHE PREWARM (compile serial kernel, no ncu) ######
 NCU_N="$NCU_N" NCU_NWARM=2 NCU_NPROF=0 "$PY" "$BDIR/ncu_serial_replay.py" || { echo "prewarm failed"; exit 4; }
 
 echo
-echo "######## STEP 1: NCU PROFILE (set=basic, kernel=pgs_solve_mf_gs, 1 warm launch) ########"
+# NCU_SECTIONS overrides the default "--set basic" (e.g. to add WarpStateStats/
+# SchedulerStats stall sections). Word-split intentionally.
+NCU_SET_ARGS="${NCU_SECTIONS:---set basic}"
+echo "######## STEP 1: NCU PROFILE (args=[$NCU_SET_ARGS], kernel=pgs_solve_mf_gs, 1 warm launch) ########"
 echo "ncu N=$NCU_N NWARM=$NCU_NWARM launch-skip=$SKIP launch-count=1"
 set -x
-ncu --set basic \
+# shellcheck disable=SC2086
+ncu $NCU_SET_ARGS \
     --kernel-name "regex:pgs_solve_mf_gs" \
     --launch-count 1 \
     --launch-skip "$SKIP" \
