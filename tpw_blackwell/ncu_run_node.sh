@@ -71,5 +71,14 @@ if [ -f "$OUT".ncu-rep ]; then
 fi
 
 echo
+echo "######## STEP 3: COPY ARTIFACTS TO RUN_DIR (/workspace/slurm-run) ########"
+RUN_DIR="${RUN_DIR:-/workspace/slurm-run}"
+if [ -d "$RUN_DIR" ]; then
+  cp -v "$OUT".ncu-rep "$RUN_DIR/" 2>/dev/null || echo "no ncu-rep to copy"
+  cp -v "$DETAILS" "$RUN_DIR/" 2>/dev/null || echo "no details.txt to copy"
+  cp -v "$RAW" "$RUN_DIR/" 2>/dev/null || echo "no raw.txt to copy"
+fi
+
+echo
 echo "######## ALL DONE  ncu_rc=$NCU_RC ########"
 exit "$NCU_RC"
