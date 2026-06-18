@@ -1808,6 +1808,33 @@ class SolverFeatherPGS(SolverBase):
                 friction_mode=self.friction_mode,
             )
 
+            # MVP thread-per-world variant (one THREAD/world, global world-innermost
+            # state, no smem/shfl). Gated by FEATHER_PGS_MFGS_THREAD_PER_WORLD=1.
+            # Default ("0"/unset) leaves the warp path above as the bit-identity
+            # reference. This MVP only builds + exposes the tpw kernel (for the
+            # cube-probe replay / micro-bench); the integrated step-time launcher
+            # with GPU world-innermost transpose passes is a follow-up, so the
+            # full step() still uses the warp kernel. See
+            # _get_pgs_solve_mf_gs_kernel_tpw for scope (friction_mode='current',
+            # row_phase 0).
+            self._pgs_solve_mf_gs_kernel_tpw = None
+            self.mf_gs_thread_per_world = (
+                os.environ.get("FEATHER_PGS_MFGS_THREAD_PER_WORLD", "0") == "1"
+            )
+            if self.mf_gs_thread_per_world and self.friction_mode == "current":
+                self._pgs_solve_mf_gs_kernel_tpw = _get_pgs_solve_mf_gs_kernel_tpw(
+                    self.dense_max_constraints,
+                    self.mf_max_constraints,
+                    self.max_world_dofs,
+                    self.world_count,
+                    device_arch,
+                    friction_mode=self.friction_mode,
+                )
+                # World-innermost scratch buffers + transpose passes are
+                # allocated lazily on the first tpw launch (need mf_max_c which
+                # is only known once mf buffers exist).
+                self._tpw_scratch = None
+
         self._pgs_solve_mf_kernel = None
         if model.device.is_cuda and hasattr(self, "max_mf_bodies") and self.mf_max_constraints > 0:
             self._pgs_solve_mf_kernel = _get_pgs_solve_mf_kernel(
@@ -1906,6 +1933,172 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
+    def _alloc_tpw_scratch(self) -> None:
+        """Lazily allocate the world-innermost scratch buffers used by the
+        thread-per-world (tpw) kernel.
+
+        The warp path packs state world-major; the tpw kernel wants it
+        world-innermost (world = fastest index). We keep the world-major
+        assembly untouched and transpose into these scratch buffers each step
+        around the tpw launch. See the module transpose kernels for the layout.
+        """
+        if getattr(self, "_tpw_scratch", None) is not None:
+            return
+        device = self.model.device
+        W = self.world_count
+        M_D = self.dense_max_constraints
+        M_MF = self.mf_max_constraints
+        D = self.max_world_dofs
+        z = lambda n, dt: wp.zeros((n,), dtype=dt, device=device)  # noqa: E731
+        self._tpw_scratch = {
+            # dense (M_D, W)
+            "lam_g": z(M_D * W, wp.float32),
+            "rhs_g": z(M_D * W, wp.float32),
+            "diag_g": z(M_D * W, wp.float32),
+            "rtype_g": z(M_D * W, wp.int32),
+            "parent_g": z(M_D * W, wp.int32),
+            "mu_g": z(M_D * W, wp.float32),
+            "drive_target_g": z(M_D * W, wp.float32),
+            "drive_vmul_g": z(M_D * W, wp.float32),
+            "drive_imul_g": z(M_D * W, wp.float32),
+            "drive_maximp_g": z(M_D * W, wp.float32),
+            # dense (M_D, D, W)
+            "J_g": z(M_D * D * W, wp.float32),
+            "Y_g": z(M_D * D * W, wp.float32),
+            # mf
+            "mf_meta_g": z(M_MF * 4 * W, wp.int32),
+            "mf_lam_g": z(M_MF * W, wp.float32),
+            "mf_J_a": z(M_MF * 6 * W, wp.float32),
+            "mf_J_b": z(M_MF * 6 * W, wp.float32),
+            "mf_MiJt_a": z(M_MF * 6 * W, wp.float32),
+            "mf_MiJt_b": z(M_MF * 6 * W, wp.float32),
+            "mf_row_mu": z(M_MF * W, wp.float32),
+            # velocity (D, W)
+            "v_g": z(D * W, wp.float32),
+            # per-world scalars
+            "w_dof_start_g": wp.zeros((W,), dtype=wp.int32, device=device),
+        }
+
+    def _launch_matrix_free_gs_solve_tpw(
+        self,
+        *,
+        dense_rhs: wp.array,
+        mf_meta: wp.array,
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        freeze_drive_rows: bool,
+    ) -> None:
+        """Thread-per-world variant of the mf-GS solve, wired into step().
+
+        Keeps the existing world-major assembly (``dense_rhs``, ``mf_meta`` and
+        all ``self.*`` solver arrays). Transposes those inputs into
+        world-innermost scratch buffers on the GPU, runs the tpw kernel
+        (one thread per world), then scatters the resulting velocities back into
+        ``self.v_out`` and transposes the impulses back so warmstart is
+        preserved. The per-step transpose cost is intentionally INCLUDED in the
+        measured step time (see ``_alloc_tpw_scratch`` caveat).
+
+        Only the default schedule (``row_phase == 0``) is supported, matching
+        the tpw MVP scope; callers gate on this.
+        """
+        self._alloc_tpw_scratch()
+        s = self._tpw_scratch
+        device = self.model.device
+        W = self.world_count
+        M_D = self.dense_max_constraints
+        M_MF = self.mf_max_constraints
+        D = self.max_world_dofs
+
+        # --- Transpose world-major inputs -> world-innermost scratch ---
+        # dense (W, M_D) f32
+        for src, dst in (
+            (self.impulses, s["lam_g"]),
+            (dense_rhs, s["rhs_g"]),
+            (self.diag, s["diag_g"]),
+            (self.row_mu, s["mu_g"]),
+            (self.drive_target_vel_bias, s["drive_target_g"]),
+            (self.drive_vel_multiplier, s["drive_vmul_g"]),
+            (self.drive_impulse_multiplier, s["drive_imul_g"]),
+            (self.drive_max_impulse, s["drive_maximp_g"]),
+        ):
+            wp.launch(_tpw_transpose_2d_f32, dim=(W, M_D), inputs=[src, W, M_D], outputs=[dst], device=device)
+        # dense (W, M_D) i32
+        for src, dst in (
+            (self.row_type, s["rtype_g"]),
+            (self.row_parent, s["parent_g"]),
+        ):
+            wp.launch(_tpw_transpose_2d_i32, dim=(W, M_D), inputs=[src, W, M_D], outputs=[dst], device=device)
+        # dense (W, M_D, D) f32
+        for src, dst in (
+            (self.J_world, s["J_g"]),
+            (self.Y_world, s["Y_g"]),
+        ):
+            wp.launch(_tpw_transpose_3d_f32, dim=(W, M_D, D), inputs=[src, W, M_D, D], outputs=[dst], device=device)
+        # mf (W, M_MF) f32
+        for src, dst in (
+            (self.mf_impulses, s["mf_lam_g"]),
+            (self.mf_row_mu, s["mf_row_mu"]),
+        ):
+            wp.launch(_tpw_transpose_2d_f32, dim=(W, M_MF), inputs=[src, W, M_MF], outputs=[dst], device=device)
+        # mf (W, M_MF, 6) f32
+        for src, dst in (
+            (self.mf_J_a, s["mf_J_a"]),
+            (self.mf_J_b, s["mf_J_b"]),
+            (self.mf_MiJt_a, s["mf_MiJt_a"]),
+            (self.mf_MiJt_b, s["mf_MiJt_b"]),
+        ):
+            wp.launch(_tpw_transpose_3d_f32, dim=(W, M_MF, 6), inputs=[src, W, M_MF, 6], outputs=[dst], device=device)
+        # mf_meta_packed (W, M_MF*4) i32
+        wp.launch(_tpw_transpose_meta_i32, dim=(W, M_MF * 4), inputs=[mf_meta, W, M_MF], outputs=[s["mf_meta_g"]], device=device)
+        # v gather (flat global v_out -> (D, W))
+        wp.launch(_tpw_gather_v, dim=(W, D), inputs=[self.v_out, self.world_dof_start, W, D], outputs=[s["v_g"]], device=device)
+
+        # --- Launch the thread-per-world kernel (one thread per world) ---
+        wp.launch(
+            self._pgs_solve_mf_gs_kernel_tpw,
+            dim=W,
+            inputs=[
+                self.constraint_count,
+                self.mf_constraint_count,
+                self.world_dof_start,
+                s["lam_g"],
+                s["rhs_g"],
+                s["diag_g"],
+                s["rtype_g"],
+                s["parent_g"],
+                s["mu_g"],
+                s["drive_target_g"],
+                s["drive_vmul_g"],
+                s["drive_imul_g"],
+                s["drive_maximp_g"],
+                s["J_g"],
+                s["Y_g"],
+                s["mf_meta_g"],
+                s["mf_lam_g"],
+                s["mf_J_a"],
+                s["mf_J_b"],
+                s["mf_MiJt_a"],
+                s["mf_MiJt_b"],
+                s["mf_row_mu"],
+                s["v_g"],
+                int(iterations),
+                float(omega),
+                int(friction_start_iteration),
+                int(iteration_offset),
+                int(freeze_drive_rows),
+            ],
+            block_dim=int(getattr(self, "tpw_block_dim", 256)),
+            device=device,
+        )
+
+        # --- Scatter v_g back into the global v_out; transpose impulses back ---
+        wp.launch(_tpw_scatter_v, dim=(W, D), inputs=[s["v_g"], self.world_dof_start, W, D], outputs=[self.v_out], device=device)
+        # Impulses written back world-major for warmstart parity with warp path.
+        wp.launch(_tpw_untranspose_2d_f32, dim=(W, M_D), inputs=[s["lam_g"], W, M_D], outputs=[self.impulses], device=device)
+        wp.launch(_tpw_untranspose_2d_f32, dim=(W, M_MF), inputs=[s["mf_lam_g"], W, M_MF], outputs=[self.mf_impulses], device=device)
+
     def _launch_matrix_free_gs_solve(
         self,
         *,
@@ -1921,6 +2114,27 @@ class SolverFeatherPGS(SolverBase):
             return
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
+        # Thread-per-world path (opt-in via FEATHER_PGS_MFGS_THREAD_PER_WORLD=1).
+        # Only the default schedule (row_phase 0) is ported; other schedules fall
+        # through to the warp kernel so behavior is unchanged when they are used.
+        if (
+            getattr(self, "mf_gs_thread_per_world", False)
+            and self._pgs_solve_mf_gs_kernel_tpw is not None
+            and self.pgs_schedule not in ("contact_then_internal", "physx_grasp")
+        ):
+            if not getattr(self, "_tpw_marker_logged", False):
+                print("[FPGS-TPW] thread-per-world MF solve path ACTIVE", flush=True)
+                self._tpw_marker_logged = True
+            self._launch_matrix_free_gs_solve_tpw(
+                dense_rhs=dense_rhs,
+                mf_meta=mf_meta,
+                iterations=iterations,
+                omega=omega,
+                friction_start_iteration=int(friction_start_iteration),
+                iteration_offset=iteration_offset,
+                freeze_drive_rows=freeze_drive_rows,
+            )
+            return
         mf_gs_kernel = self._pgs_solve_mf_gs_kernel
         if mf_gs_kernel is None:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
@@ -7879,3 +8093,466 @@ def _get_pgs_solve_mf_gs_kernel(
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# WORLD-MAJOR <-> WORLD-INNERMOST TRANSPOSE PASSES (for thread-per-world wiring)
+# ════════════════════════════════════════════════════════════════════════════
+# The warp (one-warp-per-world) path packs solver state WORLD-MAJOR: a (W, R)
+# 2-D array is row-major so element [world, r] lives at world*R + r, and a
+# (W, R, K) array at (world*R + r)*K + k. The thread-per-world kernel instead
+# wants state WORLD-INNERMOST (world = fastest index) so 32 adjacent threads
+# touch 32 adjacent worlds (coalesced): [r, world] at r*W + world, and
+# [r, k, world] at (r*K + k)*W + world. These kernels do that transpose on the
+# GPU around the tpw launch. They are launched with one thread per source
+# element so the access pattern is perfectly coalesced on the read side.
+#
+# CAVEAT (documented for the bench): a production tpw design would PACK state
+# world-innermost natively at assembly time and skip these passes entirely.
+# Here we transpose every step purely to get a first comparable full-step number
+# on top of the existing world-major assembly; the transpose time is INCLUDED in
+# the full-step measurement, so the reported tpw full-step number is pessimistic
+# relative to a native world-innermost packing.
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_transpose_2d_f32(src: wp.array2d(dtype=float), W: int, R: int, dst: wp.array(dtype=float)):
+    # src[world, r] (world-major)  ->  dst[r*W + world] (world-innermost)
+    world, r = wp.tid()
+    dst[r * W + world] = src[world, r]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_transpose_2d_i32(src: wp.array2d(dtype=int), W: int, R: int, dst: wp.array(dtype=int)):
+    world, r = wp.tid()
+    dst[r * W + world] = src[world, r]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_untranspose_2d_f32(src: wp.array(dtype=float), W: int, R: int, dst: wp.array2d(dtype=float)):
+    # world-innermost src[r*W + world]  ->  world-major dst[world, r]
+    world, r = wp.tid()
+    dst[world, r] = src[r * W + world]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_transpose_3d_f32(src: wp.array3d(dtype=float), W: int, R: int, K: int, dst: wp.array(dtype=float)):
+    # src[world, r, k] (world-major)  ->  dst[(r*K + k)*W + world] (world-innermost)
+    world, r, k = wp.tid()
+    dst[(r * K + k) * W + world] = src[world, r, k]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_transpose_meta_i32(src: wp.array2d(dtype=int), W: int, M_MF: int, dst: wp.array(dtype=int)):
+    # mf_meta_packed is stored (W, M_MF*4) row-major: src[world, i*4 + f].
+    # tpw wants mf_meta_g[(i*4 + f)*W + world] -- the (i, f) index is preserved,
+    # only world is moved to innermost.
+    world, c = wp.tid()  # c in [0, M_MF*4)
+    dst[c * W + world] = src[world, c]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_gather_v(v_out: wp.array(dtype=float), world_dof_start: wp.array(dtype=int), W: int, D: int, v_g: wp.array(dtype=float)):
+    # v_g[d*W + world] = v_out[world_dof_start[world] + d]
+    world, d = wp.tid()
+    v_g[d * W + world] = v_out[world_dof_start[world] + d]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_scatter_v(v_g: wp.array(dtype=float), world_dof_start: wp.array(dtype=int), W: int, D: int, v_out: wp.array(dtype=float)):
+    # v_out[world_dof_start[world] + d] = v_g[d*W + world]
+    world, d = wp.tid()
+    v_out[world_dof_start[world] + d] = v_g[d * W + world]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# THREAD-PER-WORLD VARIANT (MVP)  -- gated by FEATHER_PGS_MFGS_THREAD_PER_WORLD
+# ════════════════════════════════════════════════════════════════════════════
+# One THREAD (not one warp) per world. Per-world state lives in GLOBAL memory
+# laid out WORLD-INNERMOST (world = fastest-varying index) so 32 adjacent
+# threads = 32 adjacent worlds read contiguous addresses -> coalesced.
+# No __shared__, no __shfl_*, no __syncwarp(): each thread runs the full serial
+# O(N) GS sweep over its own world.
+#
+# Scope of this MVP (matches the design doc): friction_mode="current" and
+# pgs_schedule default (row_phase == 0) ONLY. It faithfully ports:
+#   - dense GS row sweep (drive rt1, contact/limit rt0/rt3, friction rt2
+#     isotropic-cone "current", velocity-limit rt4 final pass)
+#   - mf contact rt0, mf velocity-limit rt4, mf friction rt2 "current"
+# It does NOT port the bisection / desaxce / coulomb_newton friction ports
+# nor the split row_phase schedules (1..5). Those raise NotImplementedError
+# in the launcher so the default path is the only one wired up.
+#
+# GLOBAL world-innermost layout (W = world_count):
+#   v_g            (D,   W)   index d*W + world
+#   mf_lam_g       (M_MF,W)   index i*W + world
+#   dense state    (M_D, W)   index i*W + world   (lam/rhs/diag/rtype/parent/
+#                                                  mu/drive_target/drive_vmul/
+#                                                  drive_imul/drive_maximp)
+#   J_g, Y_g       (M_D,D,W)  index (i*D + d)*W + world
+#   mf_J_a/_b      (M_MF,6,W) index (i*6 + k)*W + world
+#   mf_MiJt_a/_b   (M_MF,6,W) index (i*6 + k)*W + world
+#   mf_meta_g      (M_MF,4,W) index (i*4 + f)*W + world   (4 SCALAR int loads;
+#                                                          the int4 vector load
+#                                                          is invalid here -- the
+#                                                          4 components are W ints
+#                                                          apart, not adjacent)
+#   m_dense_g, m_mf_g, w_dof_start_g : (W,)  per-world scalars
+def _get_pgs_solve_mf_gs_kernel_tpw(
+    max_constraints: int,
+    mf_max_constraints: int,
+    max_world_dofs: int,
+    world_count: int,
+    device_arch: str,
+    friction_mode: str = "current",
+) -> "wp.Kernel":
+    """Thread-per-world MVP of the mf-GS solve (friction_mode='current', row_phase 0).
+
+    See module comment above for layout. world = wp.tid() (1-D). State is global,
+    world-innermost. No smem / shfl / syncwarp.
+    """
+    if friction_mode != "current":
+        raise NotImplementedError(
+            f"thread-per-world MVP supports friction_mode='current' only, got {friction_mode!r}"
+        )
+    M_D = max_constraints
+    M_MF = mf_max_constraints
+    D = max_world_dofs
+    W = world_count
+
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    int W = {W};
+    int m_dense = m_dense_g.data[world];
+    int m_mf = m_mf_g.data[world];
+    if (m_dense == 0 && m_mf == 0) return;
+    if (m_dense > {M_D}) m_dense = {M_D};
+    if (m_mf > {M_MF}) m_mf = {M_MF};
+    int w_dof_start = w_dof_start_g.data[world];
+
+    // World-innermost element strides
+    // v_g[d]      -> d*W + world
+    // dense[i]    -> i*W + world
+    // J/Y[i][d]   -> (i*{D} + d)*W + world
+    // mf6[i][k]   -> (i*6 + k)*W + world
+    // mf_meta[i][f] -> (i*4 + f)*W + world
+
+    for (int iter = 0; iter < iterations; iter++) {{
+        int global_iter = iteration_offset + iter;
+
+        // ── Phase 1: Dense constraints (serial D-DOF dot/update) ──
+        for (int i = 0; i < m_dense; i++) {{
+            int row_type = rtype_g.data[i*W + world];
+            // row_phase 0 only.
+            if (freeze_drive_rows != 0 && row_type == 1) continue;
+            if (row_type == 4) continue;  // velocity-limit handled in final pass
+            if (row_type == 2 && global_iter < friction_start_iteration) {{
+                lam_g.data[i*W + world] = 0.0f;
+                continue;
+            }}
+            float denom = diag_g.data[i*W + world];
+            if (denom <= 0.0f) continue;
+
+            int jy_row = i*{D};
+            float jv = 0.0f;
+            for (int d = 0; d < {D}; d++) {{
+                jv += J_g.data[(jy_row + d)*W + world] * v_g.data[d*W + world];
+            }}
+
+            float residual = jv + rhs_g.data[i*W + world];
+            float delta = -residual / denom;
+            float old_impulse = lam_g.data[i*W + world];
+            float new_impulse = old_impulse + omega * delta;
+            float delta_impulse = 0.0f;
+
+            if (row_type == 1) {{
+                new_impulse = old_impulse * drive_imul_g.data[i*W + world]
+                    + jv * drive_vmul_g.data[i*W + world]
+                    + drive_target_g.data[i*W + world];
+                float max_imp = drive_maximp_g.data[i*W + world];
+                if (new_impulse > max_imp) new_impulse = max_imp;
+                if (new_impulse < -max_imp) new_impulse = -max_imp;
+                delta_impulse = new_impulse - old_impulse;
+            }} else if (row_type == 0 || row_type == 3) {{
+                if (new_impulse < 0.0f) new_impulse = 0.0f;
+                delta_impulse = new_impulse - old_impulse;
+            }} else if (row_type == 2) {{
+                // dense friction_mode="current": legacy isotropic-cone clamp.
+                int parent_idx = parent_g.data[i*W + world];
+                float lambda_n = lam_g.data[parent_idx*W + world];
+                float mu = mu_g.data[i*W + world];
+                float radius = fmaxf(mu * lambda_n, 0.0f);
+                if (radius <= 0.0f) {{
+                    new_impulse = 0.0f;
+                }} else {{
+                    int sib = (i == parent_idx + 1) ? parent_idx + 2 : parent_idx + 1;
+                    lam_g.data[i*W + world] = new_impulse;
+                    float a_val = new_impulse;
+                    float b_val = lam_g.data[sib*W + world];
+                    float mag = sqrtf(a_val * a_val + b_val * b_val);
+                    if (mag > radius) {{
+                        float scale = radius / mag;
+                        new_impulse = a_val * scale;
+                        float sib_new = b_val * scale;
+                        float sib_delta = sib_new - b_val;
+                        lam_g.data[sib*W + world] = sib_new;
+                        int sib_jy = sib*{D};
+                        for (int d = 0; d < {D}; d++) {{
+                            v_g.data[d*W + world] += Y_g.data[(sib_jy + d)*W + world] * sib_delta;
+                        }}
+                    }}
+                }}
+                delta_impulse = new_impulse - old_impulse;
+            }} else {{
+                delta_impulse = new_impulse - old_impulse;
+            }}
+
+            lam_g.data[i*W + world] = new_impulse;
+            if (delta_impulse != 0.0f) {{
+                for (int d = 0; d < {D}; d++) {{
+                    v_g.data[d*W + world] += Y_g.data[(jy_row + d)*W + world] * delta_impulse;
+                }}
+            }}
+        }}
+
+        // ── Phase 2: MF constraints (serial 6+6 DOF dot/update) ──
+        for (int i = 0; i < m_mf; i++) {{
+            int meta0 = mf_meta_g.data[(i*4 + 0)*W + world];
+            int meta1 = mf_meta_g.data[(i*4 + 1)*W + world];
+            int meta2 = mf_meta_g.data[(i*4 + 2)*W + world];
+            int meta3 = mf_meta_g.data[(i*4 + 3)*W + world];
+            int dof_a = meta0 >> 16;
+            int dof_b = (meta0 << 16) >> 16;
+            float mf_diag = __int_as_float(meta1);
+            int packed_tp = meta3;
+            int mf_rt = packed_tp & 0xFFFF;
+
+            if (mf_rt == 4) continue;  // velocity-limit handled in final pass
+            if (mf_rt == 2 && global_iter < friction_start_iteration) {{
+                mf_lam_g.data[i*W + world] = 0.0f;
+                continue;
+            }}
+            if (mf_diag <= 0.0f) continue;
+
+            int mf6 = i*6;
+            float jv = 0.0f;
+            if (dof_a >= 0) {{
+                for (int k = 0; k < 6; k++) {{
+                    jv += mf_J_a.data[(mf6 + k)*W + world] * v_g.data[(dof_a + k)*W + world];
+                }}
+            }}
+            if (dof_b >= 0) {{
+                for (int k = 0; k < 6; k++) {{
+                    jv += mf_J_b.data[(mf6 + k)*W + world] * v_g.data[(dof_b + k)*W + world];
+                }}
+            }}
+
+            float residual = jv + __int_as_float(meta2);
+            float delta = -residual * mf_diag;
+            float old_impulse = mf_lam_g.data[i*W + world];
+            float new_impulse = old_impulse + omega * delta;
+            float delta_impulse = 0.0f;
+
+            if (mf_rt == 0) {{
+                if (new_impulse < 0.0f) new_impulse = 0.0f;
+            }} else if (mf_rt == 2) {{
+                // mf friction_mode="current": isotropic Coulomb cone clamp.
+                int mf_par = packed_tp >> 16;
+                float lambda_n = mf_lam_g.data[mf_par*W + world];
+                float mu = mf_row_mu.data[i*W + world];
+                float radius = fmaxf(mu * lambda_n, 0.0f);
+                if (radius <= 0.0f) {{
+                    new_impulse = 0.0f;
+                }} else {{
+                    int sib = (i == mf_par + 1) ? mf_par + 2 : mf_par + 1;
+                    mf_lam_g.data[i*W + world] = new_impulse;
+                    float a_val = new_impulse;
+                    float b_val = mf_lam_g.data[sib*W + world];
+                    float mag = sqrtf(a_val * a_val + b_val * b_val);
+                    if (mag > radius) {{
+                        float scale = radius / mag;
+                        new_impulse = a_val * scale;
+                        float sib_new = b_val * scale;
+                        float sib_delta = sib_new - b_val;
+                        mf_lam_g.data[sib*W + world] = sib_new;
+                        int sib_meta0 = mf_meta_g.data[(sib*4 + 0)*W + world];
+                        int sib_dof_a = sib_meta0 >> 16;
+                        int sib_dof_b = (sib_meta0 << 16) >> 16;
+                        int sib_mf6 = sib*6;
+                        if (sib_dof_a >= 0) {{
+                            for (int k = 0; k < 6; k++) {{
+                                v_g.data[(sib_dof_a + k)*W + world] += mf_MiJt_a.data[(sib_mf6 + k)*W + world] * sib_delta;
+                            }}
+                        }}
+                        if (sib_dof_b >= 0) {{
+                            for (int k = 0; k < 6; k++) {{
+                                v_g.data[(sib_dof_b + k)*W + world] += mf_MiJt_b.data[(sib_mf6 + k)*W + world] * sib_delta;
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+
+            delta_impulse = new_impulse - old_impulse;
+            mf_lam_g.data[i*W + world] = new_impulse;
+            if (delta_impulse != 0.0f) {{
+                if (dof_a >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        v_g.data[(dof_a + k)*W + world] += mf_MiJt_a.data[(mf6 + k)*W + world] * delta_impulse;
+                    }}
+                }}
+                if (dof_b >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        v_g.data[(dof_b + k)*W + world] += mf_MiJt_b.data[(mf6 + k)*W + world] * delta_impulse;
+                    }}
+                }}
+            }}
+        }}
+
+        // ── Final velocity-limit phase: dense rt4 ──
+        for (int i = 0; i < m_dense; i++) {{
+            if (rtype_g.data[i*W + world] != 4) continue;
+            float denom = diag_g.data[i*W + world];
+            if (denom <= 0.0f) continue;
+            int jy_row = i*{D};
+            float jv = 0.0f;
+            for (int d = 0; d < {D}; d++) {{
+                jv += J_g.data[(jy_row + d)*W + world] * v_g.data[d*W + world];
+            }}
+            float residual = jv + rhs_g.data[i*W + world];
+            float delta = -residual / denom;
+            float delta_impulse = 0.0f;
+            if (residual < 0.0f) delta_impulse = delta;
+            lam_g.data[i*W + world] = delta_impulse;
+            if (delta_impulse != 0.0f) {{
+                for (int d = 0; d < {D}; d++) {{
+                    v_g.data[d*W + world] += Y_g.data[(jy_row + d)*W + world] * delta_impulse;
+                }}
+            }}
+        }}
+
+        // ── Final velocity-limit phase: mf rt4 ──
+        for (int i = 0; i < m_mf; i++) {{
+            int meta0 = mf_meta_g.data[(i*4 + 0)*W + world];
+            int meta1 = mf_meta_g.data[(i*4 + 1)*W + world];
+            int meta2 = mf_meta_g.data[(i*4 + 2)*W + world];
+            int meta3 = mf_meta_g.data[(i*4 + 3)*W + world];
+            int mf_rt = meta3 & 0xFFFF;
+            if (mf_rt != 4) continue;
+            int dof_a = meta0 >> 16;
+            int dof_b = (meta0 << 16) >> 16;
+            float mf_diag = __int_as_float(meta1);
+            if (mf_diag <= 0.0f) continue;
+            int mf6 = i*6;
+            float jv = 0.0f;
+            if (dof_a >= 0) {{
+                for (int k = 0; k < 6; k++) {{
+                    jv += mf_J_a.data[(mf6 + k)*W + world] * v_g.data[(dof_a + k)*W + world];
+                }}
+            }}
+            if (dof_b >= 0) {{
+                for (int k = 0; k < 6; k++) {{
+                    jv += mf_J_b.data[(mf6 + k)*W + world] * v_g.data[(dof_b + k)*W + world];
+                }}
+            }}
+            float residual = jv + __int_as_float(meta2);
+            float delta = -residual * mf_diag;
+            float delta_impulse = 0.0f;
+            if (residual < 0.0f) delta_impulse = delta;
+            mf_lam_g.data[i*W + world] = delta_impulse;
+            if (delta_impulse != 0.0f) {{
+                if (dof_a >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        v_g.data[(dof_a + k)*W + world] += mf_MiJt_a.data[(mf6 + k)*W + world] * delta_impulse;
+                    }}
+                }}
+                if (dof_b >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        v_g.data[(dof_b + k)*W + world] += mf_MiJt_b.data[(mf6 + k)*W + world] * delta_impulse;
+                    }}
+                }}
+            }}
+        }}
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def pgs_solve_mf_gs_tpw_native(
+        world: int,
+        m_dense_g: wp.array(dtype=int),
+        m_mf_g: wp.array(dtype=int),
+        w_dof_start_g: wp.array(dtype=int),
+        lam_g: wp.array(dtype=float),
+        rhs_g: wp.array(dtype=float),
+        diag_g: wp.array(dtype=float),
+        rtype_g: wp.array(dtype=int),
+        parent_g: wp.array(dtype=int),
+        mu_g: wp.array(dtype=float),
+        drive_target_g: wp.array(dtype=float),
+        drive_vmul_g: wp.array(dtype=float),
+        drive_imul_g: wp.array(dtype=float),
+        drive_maximp_g: wp.array(dtype=float),
+        J_g: wp.array(dtype=float),
+        Y_g: wp.array(dtype=float),
+        mf_meta_g: wp.array(dtype=int),
+        mf_lam_g: wp.array(dtype=float),
+        mf_J_a: wp.array(dtype=float),
+        mf_J_b: wp.array(dtype=float),
+        mf_MiJt_a: wp.array(dtype=float),
+        mf_MiJt_b: wp.array(dtype=float),
+        mf_row_mu: wp.array(dtype=float),
+        v_g: wp.array(dtype=float),
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        freeze_drive_rows: int,
+    ): ...
+
+    def pgs_solve_mf_gs_tpw_template(
+        m_dense_g: wp.array(dtype=int),
+        m_mf_g: wp.array(dtype=int),
+        w_dof_start_g: wp.array(dtype=int),
+        lam_g: wp.array(dtype=float),
+        rhs_g: wp.array(dtype=float),
+        diag_g: wp.array(dtype=float),
+        rtype_g: wp.array(dtype=int),
+        parent_g: wp.array(dtype=int),
+        mu_g: wp.array(dtype=float),
+        drive_target_g: wp.array(dtype=float),
+        drive_vmul_g: wp.array(dtype=float),
+        drive_imul_g: wp.array(dtype=float),
+        drive_maximp_g: wp.array(dtype=float),
+        J_g: wp.array(dtype=float),
+        Y_g: wp.array(dtype=float),
+        mf_meta_g: wp.array(dtype=int),
+        mf_lam_g: wp.array(dtype=float),
+        mf_J_a: wp.array(dtype=float),
+        mf_J_b: wp.array(dtype=float),
+        mf_MiJt_a: wp.array(dtype=float),
+        mf_MiJt_b: wp.array(dtype=float),
+        mf_row_mu: wp.array(dtype=float),
+        v_g: wp.array(dtype=float),
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        freeze_drive_rows: int,
+    ):
+        world = wp.tid()
+        pgs_solve_mf_gs_tpw_native(
+            world,
+            m_dense_g, m_mf_g, w_dof_start_g,
+            lam_g, rhs_g, diag_g, rtype_g, parent_g, mu_g,
+            drive_target_g, drive_vmul_g, drive_imul_g, drive_maximp_g,
+            J_g, Y_g,
+            mf_meta_g, mf_lam_g, mf_J_a, mf_J_b, mf_MiJt_a, mf_MiJt_b, mf_row_mu,
+            v_g,
+            iterations, omega, friction_start_iteration, iteration_offset, freeze_drive_rows,
+        )
+
+    name = f"pgs_solve_mf_gs_tpw_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{world_count}_{friction_mode}"
+    pgs_solve_mf_gs_tpw_template.__name__ = name
+    pgs_solve_mf_gs_tpw_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_tpw_template)
