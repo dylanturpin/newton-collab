@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import re
 import time
@@ -22,6 +23,15 @@ from typing import Literal
 
 import numpy as np
 import warp as wp
+
+# --- env-gated capture of pgs_solve_mf_gs kernel inputs, for standalone replay/bench ---
+# Off unless FEATHER_PGS_CAPTURE_KERNEL=1. Snapshots the dominant FPGS contact-solve
+# kernel's inputs + launch config at a chosen step/phase to .npz/.json so the kernel can
+# be replayed/profiled in isolation on the target GPU. Zero overhead when off.
+_FPGS_CAPTURE = os.environ.get("FEATHER_PGS_CAPTURE_KERNEL") == "1"
+_FPGS_CAPTURE_STEP = int(os.environ.get("FEATHER_PGS_CAPTURE_STEP", "-1"))
+_FPGS_CAPTURE_PHASE = os.environ.get("FEATHER_PGS_CAPTURE_PHASE")  # None = any phase
+_FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture")
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, State
@@ -90,6 +100,7 @@ from .kernels import (
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
     gather_JY_to_world,
+    gather_mf_warmstart,
     gather_tau_to_groups,
     hinv_jt_par_row,
     integrate_generalized_joints,
@@ -107,6 +118,7 @@ from .kernels import (
     prepare_world_impulses,
     rhs_accum_world_par_art,
     scatter_qdd_from_groups,
+    snapshot_mf_prev_slots,
     trisolve_loop,
     update_articulation_origins,
     update_articulation_root_com_offsets,
@@ -263,6 +275,8 @@ class SolverFeatherPGS(SolverBase):
         pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
         dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
+        mf_warmstart: bool = False,
+        mf_warmstart_decay: float = 1.0,
         pgs_mode: str = "split",
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
@@ -535,6 +549,26 @@ class SolverFeatherPGS(SolverBase):
                 "contact_friction_position_iterations with pgs_warmstart=True needs an explicit "
                 "pre-solve zeroing pass for skipped friction rows"
             )
+
+        # ── Matrix-free (MF) warm-starting ──────────────────────────────────
+        # Carry the previous step's converged MF contact impulses into this
+        # step's GS solve as the initial guess, gathered by *contact identity*
+        # (Newton's frame-to-frame ``rigid_contact_match_index``) rather than by
+        # the nondeterministic atomic-allocated slot. Default OFF: when off the
+        # MF impulse buffer is zeroed exactly as before and no new state is
+        # allocated, so the determinism/bit-identity ladder is unaffected.
+        _env_ws = os.getenv("IL_NEWTON_FPGS_MF_WARMSTART", "0").lower() in {"1", "true", "yes", "on"}
+        self._mf_warmstart_enabled = bool(mf_warmstart) or _env_ws
+        try:
+            self._mf_warmstart_decay = float(os.getenv("IL_NEWTON_FPGS_MF_WARMSTART_DECAY", str(mf_warmstart_decay)))
+        except (TypeError, ValueError):
+            self._mf_warmstart_decay = float(mf_warmstart_decay)
+        # Allocated lazily in :meth:`_allocate_mf_buffers` only when enabled.
+        self._ws_prev_mf_impulses = None
+        self._ws_prev_mf_row_type = None
+        self._ws_prev_slot_sorted = None
+        self._ws_warned_no_match = False
+
         if pgs_mode not in ("dense", "split", "matrix_free"):
             raise ValueError(f"pgs_mode must be 'dense', 'split', or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
@@ -1270,6 +1304,7 @@ class SolverFeatherPGS(SolverBase):
 
             max_contacts = int(_estimate_rigid_contact_max(model))
         max_contacts = max(max_contacts, 1)
+        self._max_contacts_alloc = max_contacts
         self.contact_world = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_slot = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
@@ -1577,6 +1612,24 @@ class SolverFeatherPGS(SolverBase):
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.mf_impulses = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+
+        # MF warm-start carry buffers. Allocated ONLY when the feature is on so
+        # the default-off path has zero memory / CUDA-graph delta. ``prev_mf_*``
+        # snapshot last step's converged impulses + their row-type table;
+        # ``_ws_prev_slot_sorted`` records, per *current sorted contact index*,
+        # the base MF slot that contact occupied last step. Because FeatherPGS
+        # consumes the already-sorted contact arrays, the contact array index is
+        # the sorted index, so next step's ``rigid_contact_match_index`` (which
+        # references the previous frame's *sorted* index) indexes directly into
+        # this table — no matcher permutation access required.
+        if self._mf_warmstart_enabled:
+            self._ws_prev_mf_impulses = wp.zeros(
+                (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+            self._ws_prev_mf_row_type = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device)
+            self._ws_prev_slot_sorted = wp.full(
+                (getattr(self, "_max_contacts_alloc", 1),), -1, dtype=wp.int32, device=device
+            )
         self._debug_position_mf_impulses = wp.zeros(
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         ) if self._debug_buffers_enabled else None
@@ -1809,6 +1862,49 @@ class SolverFeatherPGS(SolverBase):
                 friction_mode=self.friction_mode,
             )
 
+            # K-threads-per-world colored MF-GS variant (Blackwell saturation
+            # lever). Gated by FEATHER_PGS_MFGS_KPW=1 with K from
+            # FEATHER_PGS_MFGS_KPW_K (in {1,2,4,8}, default 4) and per-world color
+            # cap from FEATHER_PGS_MFGS_KPW_MAX_COLORS (default 64). This builds +
+            # exposes the kpw solve kernel; the integrated step-time launcher (GPU
+            # world-innermost transpose + per-step coloring refresh) is a
+            # follow-up, so the full step() still uses the warp kernel above. See
+            # _get_pgs_solve_mf_gs_kernel_kpw for the world-innermost layout and
+            # scope (friction_mode='current', row_phase 0).
+            self._pgs_solve_mf_gs_kernel_kpw = None
+            self.mf_gs_k_per_world = os.environ.get("FEATHER_PGS_MFGS_KPW", "0") == "1"
+            self.mf_gs_k_per_world_k = int(os.environ.get("FEATHER_PGS_MFGS_KPW_K", "4"))
+            self.mf_gs_k_per_world_max_colors = int(
+                os.environ.get("FEATHER_PGS_MFGS_KPW_MAX_COLORS", "64")
+            )
+            if self.mf_gs_k_per_world and self.friction_mode == "current":
+                self._pgs_solve_mf_gs_kernel_kpw = _get_pgs_solve_mf_gs_kernel_kpw(
+                    self.dense_max_constraints,
+                    self.mf_max_constraints,
+                    self.max_world_dofs,
+                    self.world_count,
+                    self.mf_gs_k_per_world_max_colors,
+                    device_arch,
+                    k_threads=self.mf_gs_k_per_world_k,
+                    friction_mode=self.friction_mode,
+                )
+                print(
+                    f"[FEATHER_PGS][kpw] built pgs_solve_mf_gs_kpw kernel "
+                    f"(K={self.mf_gs_k_per_world_k}, "
+                    f"max_colors={self.mf_gs_k_per_world_max_colors}, "
+                    f"W={self.world_count}, M_D={self.dense_max_constraints}, "
+                    f"M_MF={self.mf_max_constraints}, D={self.max_world_dofs}); "
+                    f"NOTE: live step() launcher not wired -- step() uses the warp "
+                    f"kernel. kernel build key contains '_kpw_'.",
+                    flush=True,
+                )
+            elif self.mf_gs_k_per_world and self.friction_mode != "current":
+                print(
+                    f"[FEATHER_PGS][kpw] FEATHER_PGS_MFGS_KPW=1 ignored: "
+                    f"friction_mode={self.friction_mode!r} (kpw supports 'current' only)",
+                    flush=True,
+                )
+
         self._pgs_solve_mf_kernel = None
         if model.device.is_cuda and hasattr(self, "max_mf_bodies") and self.mf_max_constraints > 0:
             self._pgs_solve_mf_kernel = _get_pgs_solve_mf_kernel(
@@ -1927,6 +2023,61 @@ class SolverFeatherPGS(SolverBase):
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
 
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
+            if (
+                _FPGS_CAPTURE
+                and getattr(self, "_fpgs_step_n", -1) == _FPGS_CAPTURE_STEP
+                and (_FPGS_CAPTURE_PHASE is None or row_phase == int(_FPGS_CAPTURE_PHASE))
+            ):
+                os.makedirs(_FPGS_CAPTURE_DIR, exist_ok=True)
+                _arrs = {
+                    "constraint_count": self.constraint_count,
+                    "world_dof_start": self.world_dof_start,
+                    "dense_rhs": dense_rhs,
+                    "diag": self.diag,
+                    "impulses": self.impulses,  # RMW: pre-launch snapshot
+                    "J_world": self.J_world,
+                    "Y_world": self.Y_world,
+                    "row_type": self.row_type,
+                    "row_parent": self.row_parent,
+                    "row_mu": self.row_mu,
+                    "drive_target_vel_bias": self.drive_target_vel_bias,
+                    "drive_vel_multiplier": self.drive_vel_multiplier,
+                    "drive_impulse_multiplier": self.drive_impulse_multiplier,
+                    "drive_max_impulse": self.drive_max_impulse,
+                    "mf_constraint_count": self.mf_constraint_count,
+                    "mf_meta": mf_meta,
+                    "mf_impulses": self.mf_impulses,  # RMW: pre-launch snapshot
+                    "mf_J_a": self.mf_J_a,
+                    "mf_J_b": self.mf_J_b,
+                    "mf_MiJt_a": self.mf_MiJt_a,
+                    "mf_MiJt_b": self.mf_MiJt_b,
+                    "mf_row_mu": self.mf_row_mu,
+                    "v_out": self.v_out,  # RMW: pre-launch snapshot
+                }
+                _base = os.path.join(_FPGS_CAPTURE_DIR, f"mfgs_step{self._fpgs_step_n}_phase{row_phase}")
+                # .numpy() is a synchronous D2H copy; no wp.synchronize() (AGENTS.md rule)
+                np.savez(_base + ".npz", **{_k: _v.numpy() for _k, _v in _arrs.items()})
+                with open(_base + ".json", "w") as _f:
+                    json.dump(
+                        {
+                            "dense_max_constraints": int(self.dense_max_constraints),
+                            "mf_max_constraints": int(self.mf_max_constraints),
+                            "max_world_dofs": int(self.max_world_dofs),
+                            "friction_mode": str(self.friction_mode),
+                            "device_arch": int(self.model.device.arch),  # INT warp arch code
+                            "world_count": int(self.world_count),
+                            "block_dim": 32,
+                            "iterations": int(phase_iterations),
+                            "omega": float(omega),
+                            "row_phase": int(row_phase),
+                            "friction_start_iteration": int(friction_start_iteration),
+                            "iteration_offset": int(phase_iteration_offset),
+                            "freeze_drive_rows": int(freeze_drive_rows),
+                        },
+                        _f,
+                        indent=2,
+                    )
+                print(f"[fpgs-capture] wrote {_base}.npz/.json", flush=True)
             wp.launch_tiled(
                 mf_gs_kernel,
                 dim=[self.world_count],
@@ -2187,6 +2338,8 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        if _FPGS_CAPTURE:
+            self._fpgs_step_n = getattr(self, "_fpgs_step_n", -1) + 1
         if self._last_step_dt is None:
             self._last_step_dt = dt
         elif abs(self._last_step_dt - dt) > 1.0e-8:
@@ -2649,6 +2802,23 @@ class SolverFeatherPGS(SolverBase):
             else:
                 self._stage6_update_qdd(state_in, state_aug, dt)
                 self._stage6_integrate(state_in, state_aug, state_out, dt)
+
+        # ── MF warm-start carry: snapshot this step's converged impulses +
+        # row-type table + per-(sorted)-contact slot map so step N+1 can seed
+        # from them by contact identity. Only runs when the feature is on, so
+        # the default-off launch sequence is unchanged.
+        if self._mf_warmstart_enabled and self._has_free_rigid_bodies and self.pgs_mode != "dense":
+            with wp.ScopedTimer("S7_MF_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+                wp.copy(self._ws_prev_mf_impulses, self.mf_impulses)
+                wp.copy(self._ws_prev_mf_row_type, self.mf_row_type)
+                if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
+                    wp.launch(
+                        snapshot_mf_prev_slots,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[contacts.rigid_contact_count, self.contact_path, self.contact_slot],
+                        outputs=[self._ws_prev_slot_sorted],
+                        device=model.device,
+                    )
 
         # Double-buffer: fork memset stream to zero current buffer for reuse.
         # ScopedStream(sync_enter=True) records an event on the main stream and
@@ -3446,6 +3616,12 @@ class SolverFeatherPGS(SolverBase):
         if mf_active:
             self.mf_slot_counter.zero_()  # atomic-add counter
             self.mf_constraint_count.zero_()  # finalize only runs when contacts exist
+            # Zero unconditionally here. When warm-start is OFF this is the
+            # original behavior (bit-identical). When ON this also guarantees a
+            # clean buffer on steps where the contact block is skipped (no
+            # contacts this frame); the seed pass after build_mf_contact_rows
+            # re-memsets and gathers when contacts ARE present, and the carry
+            # itself lives in _ws_prev_mf_impulses, so this zero is harmless.
             self.mf_impulses.zero_()  # PGS reads before first write
             # mf_J_a/b, mf_MiJt_a/b: writers cover all used slots, readers gated by body >= 0
             # mf_body_a/b, mf_row_type, mf_row_parent, mf_row_mu, mf_phi: unconditionally overwritten
@@ -3808,6 +3984,42 @@ class SolverFeatherPGS(SolverBase):
                     outputs=[self.mf_constraint_count],
                     device=model.device,
                 )
+
+                # ── MF warm-start seed ────────────────────────────────────
+                # contact_slot + mf_row_type are now populated for THIS step.
+                # mf_impulses was already memset at the top of this method
+                # (covers vel-limit rows, padding tail, and any contact that
+                # returns early in the gather); here we gather matched contacts'
+                # previous impulses into their current slots by identity. The
+                # carry itself lives in _ws_prev_mf_impulses.
+                if self._mf_warmstart_enabled:
+                    match_index = getattr(contacts, "rigid_contact_match_index", None)
+                    if match_index is None:
+                        raise NotImplementedError(
+                            "FeatherPGS mf_warmstart=True requires the Contacts buffer to be "
+                            "created with contact_matching enabled (rigid_contact_match_index "
+                            "is None). Build the CollisionPipeline / Contacts with "
+                            'contact_matching="latest" (or "sticky").'
+                        )
+                    wp.launch(
+                        gather_mf_warmstart,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            self.contact_path,
+                            self.contact_slot,
+                            self.contact_world,
+                            match_index,
+                            self._ws_prev_slot_sorted,
+                            self._ws_prev_mf_impulses,
+                            self._ws_prev_mf_row_type,
+                            self.mf_row_type,
+                            self._mf_warmstart_decay,
+                            self.mf_max_constraints,
+                        ],
+                        outputs=[self.mf_impulses],
+                        device=model.device,
+                    )
 
         # Rigid-body velocity limits are matrix-free rows, not post-solve
         # clamps, in the MF path. Allocate after contacts so they occupy the
@@ -7895,3 +8107,467 @@ def _get_pgs_solve_mf_gs_kernel(
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# K-threads-per-world colored MF-GS solve (Blackwell saturation lever).
+#
+# PORTED from the kpw worktree (branch kpw-colored-mfgs). This is the SOLVE
+# kernel factory ONLY. It consumes a GLOBAL, WORLD-INNERMOST transposed state
+# layout (NOT the production world-outermost (N, M_D, D) arrays) plus a per-world
+# dynamic contact coloring CSR. A live step() launcher (GPU world-innermost
+# transpose of all ~15 state arrays + a per-step on-device coloring refresh +
+# transpose-back of v_g) is STILL A FOLLOW-UP and is not wired here, so step()
+# continues to use the warp kernel. The flag-gated build in __init__ exercises
+# this factory (compile + activation marker) so the kernel exists in the
+# production tree; benchmarking is via the standalone replay harness
+# (tpw_blackwell/kpw_node_bench.py in the kpw worktree).
+#
+# GLOBAL world-innermost layout (W = world_count):
+#   v_g            (D,   W)   index d*W + world
+#   mf_lam_g       (M_MF,W)   index i*W + world
+#   dense state    (M_D, W)   index i*W + world
+#   J_g, Y_g       (M_D*D, W) 2-D row-major; index (i*D + d)*W + world  (2-D so no
+#                             single dim exceeds Warp's 2^31 per-dim limit at W>=8192)
+#   mf_J_a/_b      (M_MF*6,W) index (i*6 + k)*W + world
+#   mf_MiJt_a/_b   (M_MF*6,W) index (i*6 + k)*W + world
+#   mf_meta_g      (M_MF*4,W) index (i*4 + f)*W + world
+#   coloring CSR   mf_color_offsets [W*(MAX_COLORS+1)], mf_color_rows [W*M_MF],
+#                  mf_n_colors [W]
+#   grid = W*K flat threads; world = gtid//K, slot = gtid - world*K (K consecutive
+#   lanes -> one warp). K in {1,2,4,8,16,32}; K=1 == thread-per-world semantics.
+
+def _get_pgs_solve_mf_gs_kernel_kpw(
+    max_constraints: int,
+    mf_max_constraints: int,
+    max_world_dofs: int,
+    world_count: int,
+    max_colors: int,
+    device_arch: str,
+    k_threads: int = 1,
+    friction_mode: str = "current",
+) -> "wp.Kernel":
+    """K-threads-per-world colored MF-GS solve (friction_mode='current', row_phase 0).
+
+    Generalizes :func:`_get_pgs_solve_mf_gs_kernel_tpw` from 1 thread/world to
+    ``K`` threads/world (``K`` in {1,2,4,8}), keeping its global, world-innermost,
+    coalesced state. The grid is ``W*K`` flat threads:
+
+        gtid  = wp.tid()      # 0 .. W*K-1
+        world = gtid / K
+        slot  = gtid - world*K   # 0 .. K-1, K consecutive lanes -> one warp
+
+    The MF contact phase (rt0 normal + rt2 friction children) is driven by the
+    per-world dynamic contact coloring CSR (``mf_color_offsets`` /
+    ``mf_color_rows`` / ``mf_n_colors``). Within a color the K slots process the
+    color's contact NODES in chunks of K: node ordinal ``q`` is owned by slot
+    ``q % K``. Same-color nodes are body-disjoint (coloring guarantee), so the K
+    slots' ``v_g`` writes never collide -> NO atomics. A friction triple
+    {normal, t1, t2} is ONE node handled by ONE slot sequentially (the
+    normal->friction coupling stays register-local). A ``__syncwarp`` after each
+    color enforces the Gauss-Seidel RAW dependency (color c+1 reads color c's
+    writes). Odd remainders: trailing slots find no owned node and no-op.
+
+    The dense Phase-1 and the dense/mf rt4 final phases are NOT colored yet, so
+    only slot 0 of each world runs them (serial, bit-matching tpw), bracketed by
+    ``__syncwarp`` so the other slots see the dense writes before/after the MF
+    phase. ``K=1`` reduces to the tpw kernel semantics exactly (single slot owns
+    every node; per-color syncwarp is a no-op on a 1-lane world mask).
+    """
+    if friction_mode != "current":
+        raise NotImplementedError(
+            f"K-per-world MVP supports friction_mode='current' only, got {friction_mode!r}"
+        )
+    if k_threads not in (1, 2, 4, 8, 16, 32):
+        raise ValueError(f"k_threads must divide 32 and be in {{1,2,4,8,16,32}}, got {k_threads}")
+    M_D = max_constraints
+    M_MF = mf_max_constraints
+    D = max_world_dofs
+    W = world_count
+    K = k_threads
+    MAX_COLORS = max_colors
+
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    // 64-bit world stride: every global index here is (expr)*W + world with
+    // expr up to ~M_D*D (~3e5) and W up to ~1.6e4, so the product reaches ~5e9
+    // and overflows int32 for W >= ~6888. Making W a `long long` promotes every
+    // `*W` product (and the trailing `+ world`/`+ slot`) to 64-bit, so all the
+    // `.data[(...)*W + world]` accesses index correctly at large world counts.
+    long long W = {W};
+    int m_dense = m_dense_g.data[world];
+    int m_mf = m_mf_g.data[world];
+    if (m_dense == 0 && m_mf == 0) return;
+    if (m_dense > {M_D}) m_dense = {M_D};
+    if (m_mf > {M_MF}) m_mf = {M_MF};
+
+    // Per-world syncwarp mask: this world's K slots are K consecutive lanes.
+    int lane = threadIdx.x & 31;
+    unsigned int world_mask = (((unsigned int)((1u << {K}) - 1u)) << (lane - slot));
+
+    // Coloring CSR bases (host layout: offsets [W*(MAX_COLORS+1)], rows [W*M_MF]).
+    int off_co = world * ({MAX_COLORS} + 1);
+    int off_cr = world * {M_MF};
+    int mf_nc = mf_n_colors.data[world];
+
+    // World-innermost element strides (same as tpw):
+    // v_g[d] -> d*W+world; dense[i] -> i*W+world; J/Y[i][d] -> (i*D+d)*W+world;
+    // mf6[i][k] -> (i*6+k)*W+world; mf_meta[i][f] -> (i*4+f)*W+world.
+
+    for (int iter = 0; iter < iterations; iter++) {{
+        int global_iter = iteration_offset + iter;
+
+        // ── Phase 1: Dense constraints (serial; slot 0 only) ──
+        if (slot == 0) {{
+        for (int i = 0; i < m_dense; i++) {{
+            int row_type = rtype_g.data[i*W + world];
+            if (freeze_drive_rows != 0 && row_type == 1) continue;
+            if (row_type == 4) continue;  // velocity-limit handled in final pass
+            if (row_type == 2 && global_iter < friction_start_iteration) {{
+                lam_g.data[i*W + world] = 0.0f;
+                continue;
+            }}
+            float denom = diag_g.data[i*W + world];
+            if (denom <= 0.0f) continue;
+
+            int jy_row = i*{D};
+            float jv = 0.0f;
+            for (int d = 0; d < {D}; d++) {{
+                jv += J_g.data[(jy_row + d)*W + world] * v_g.data[d*W + world];
+            }}
+
+            float residual = jv + rhs_g.data[i*W + world];
+            float delta = -residual / denom;
+            float old_impulse = lam_g.data[i*W + world];
+            float new_impulse = old_impulse + omega * delta;
+            float delta_impulse = 0.0f;
+
+            if (row_type == 1) {{
+                new_impulse = old_impulse * drive_imul_g.data[i*W + world]
+                    + jv * drive_vmul_g.data[i*W + world]
+                    + drive_target_g.data[i*W + world];
+                float max_imp = drive_maximp_g.data[i*W + world];
+                if (new_impulse > max_imp) new_impulse = max_imp;
+                if (new_impulse < -max_imp) new_impulse = -max_imp;
+                delta_impulse = new_impulse - old_impulse;
+            }} else if (row_type == 0 || row_type == 3) {{
+                if (new_impulse < 0.0f) new_impulse = 0.0f;
+                delta_impulse = new_impulse - old_impulse;
+            }} else if (row_type == 2) {{
+                int parent_idx = parent_g.data[i*W + world];
+                float lambda_n = lam_g.data[parent_idx*W + world];
+                float mu = mu_g.data[i*W + world];
+                float radius = fmaxf(mu * lambda_n, 0.0f);
+                if (radius <= 0.0f) {{
+                    new_impulse = 0.0f;
+                }} else {{
+                    int sib = (i == parent_idx + 1) ? parent_idx + 2 : parent_idx + 1;
+                    lam_g.data[i*W + world] = new_impulse;
+                    float a_val = new_impulse;
+                    float b_val = lam_g.data[sib*W + world];
+                    float mag = sqrtf(a_val * a_val + b_val * b_val);
+                    if (mag > radius) {{
+                        float scale = radius / mag;
+                        new_impulse = a_val * scale;
+                        float sib_new = b_val * scale;
+                        float sib_delta = sib_new - b_val;
+                        lam_g.data[sib*W + world] = sib_new;
+                        int sib_jy = sib*{D};
+                        for (int d = 0; d < {D}; d++) {{
+                            v_g.data[d*W + world] += Y_g.data[(sib_jy + d)*W + world] * sib_delta;
+                        }}
+                    }}
+                }}
+                delta_impulse = new_impulse - old_impulse;
+            }} else {{
+                delta_impulse = new_impulse - old_impulse;
+            }}
+
+            lam_g.data[i*W + world] = new_impulse;
+            if (delta_impulse != 0.0f) {{
+                for (int d = 0; d < {D}; d++) {{
+                    v_g.data[d*W + world] += Y_g.data[(jy_row + d)*W + world] * delta_impulse;
+                }}
+            }}
+        }}
+        }}  // slot 0 dense
+        __syncwarp(world_mask);
+
+        // ── Phase 2: MF contact constraints, COLOR-DRIVEN, K-per-world ──
+        // Walk each color's CSR rows; node ordinal q owned by slot (q % K).
+        // The owning slot processes the whole node (rt0 normal + consecutive
+        // rt2 friction children) sequentially. Same-color nodes are
+        // body-disjoint -> the K slots' v_g writes never collide.
+        for (int c = 0; c < mf_nc; c++) {{
+            int cs = mf_color_offsets.data[off_co + c];
+            int ce = mf_color_offsets.data[off_co + c + 1];
+            int node_ord = -1;   // ordinal of current node within this color
+            for (int kk = cs; kk < ce; kk++) {{
+                int i = mf_color_rows.data[off_cr + kk];
+                int meta3_ns = mf_meta_g.data[(i*4 + 3)*W + world];
+                int rt_ns = meta3_ns & 0xFFFF;
+                if (rt_ns == 0) node_ord++;   // rt0 normal begins a node
+                // Only the slot owning this node executes its rows.
+                if ((node_ord % {K}) != slot) continue;
+
+                int meta0 = mf_meta_g.data[(i*4 + 0)*W + world];
+                int meta1 = mf_meta_g.data[(i*4 + 1)*W + world];
+                int meta2 = mf_meta_g.data[(i*4 + 2)*W + world];
+                int meta3 = meta3_ns;
+                int dof_a = meta0 >> 16;
+                int dof_b = (meta0 << 16) >> 16;
+                float mf_diag = __int_as_float(meta1);
+                int packed_tp = meta3;
+                int mf_rt = packed_tp & 0xFFFF;
+
+                if (mf_rt == 4) continue;  // velocity-limit handled in final pass
+                if (mf_rt == 2 && global_iter < friction_start_iteration) {{
+                    mf_lam_g.data[i*W + world] = 0.0f;
+                    continue;
+                }}
+                if (mf_diag <= 0.0f) continue;
+
+                int mf6 = i*6;
+                float jv = 0.0f;
+                if (dof_a >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        jv += mf_J_a.data[(mf6 + k)*W + world] * v_g.data[(dof_a + k)*W + world];
+                    }}
+                }}
+                if (dof_b >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        jv += mf_J_b.data[(mf6 + k)*W + world] * v_g.data[(dof_b + k)*W + world];
+                    }}
+                }}
+
+                float residual = jv + __int_as_float(meta2);
+                float delta = -residual * mf_diag;
+                float old_impulse = mf_lam_g.data[i*W + world];
+                float new_impulse = old_impulse + omega * delta;
+                float delta_impulse = 0.0f;
+
+                if (mf_rt == 0) {{
+                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                }} else if (mf_rt == 2) {{
+                    int mf_par = packed_tp >> 16;
+                    float lambda_n = mf_lam_g.data[mf_par*W + world];
+                    float mu = mf_row_mu.data[i*W + world];
+                    float radius = fmaxf(mu * lambda_n, 0.0f);
+                    if (radius <= 0.0f) {{
+                        new_impulse = 0.0f;
+                    }} else {{
+                        int sib = (i == mf_par + 1) ? mf_par + 2 : mf_par + 1;
+                        mf_lam_g.data[i*W + world] = new_impulse;
+                        float a_val = new_impulse;
+                        float b_val = mf_lam_g.data[sib*W + world];
+                        float mag = sqrtf(a_val * a_val + b_val * b_val);
+                        if (mag > radius) {{
+                            float scale = radius / mag;
+                            new_impulse = a_val * scale;
+                            float sib_new = b_val * scale;
+                            float sib_delta = sib_new - b_val;
+                            mf_lam_g.data[sib*W + world] = sib_new;
+                            int sib_meta0 = mf_meta_g.data[(sib*4 + 0)*W + world];
+                            int sib_dof_a = sib_meta0 >> 16;
+                            int sib_dof_b = (sib_meta0 << 16) >> 16;
+                            int sib_mf6 = sib*6;
+                            if (sib_dof_a >= 0) {{
+                                for (int k = 0; k < 6; k++) {{
+                                    v_g.data[(sib_dof_a + k)*W + world] += mf_MiJt_a.data[(sib_mf6 + k)*W + world] * sib_delta;
+                                }}
+                            }}
+                            if (sib_dof_b >= 0) {{
+                                for (int k = 0; k < 6; k++) {{
+                                    v_g.data[(sib_dof_b + k)*W + world] += mf_MiJt_b.data[(sib_mf6 + k)*W + world] * sib_delta;
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+
+                delta_impulse = new_impulse - old_impulse;
+                mf_lam_g.data[i*W + world] = new_impulse;
+                if (delta_impulse != 0.0f) {{
+                    if (dof_a >= 0) {{
+                        for (int k = 0; k < 6; k++) {{
+                            v_g.data[(dof_a + k)*W + world] += mf_MiJt_a.data[(mf6 + k)*W + world] * delta_impulse;
+                        }}
+                    }}
+                    if (dof_b >= 0) {{
+                        for (int k = 0; k < 6; k++) {{
+                            v_g.data[(dof_b + k)*W + world] += mf_MiJt_b.data[(mf6 + k)*W + world] * delta_impulse;
+                        }}
+                    }}
+                }}
+            }}
+            __syncwarp(world_mask);   // Gauss-Seidel: color c+1 reads color c
+        }}
+
+        // ── Final velocity-limit phase: dense rt4 (serial; slot 0 only) ──
+        if (slot == 0) {{
+        for (int i = 0; i < m_dense; i++) {{
+            if (rtype_g.data[i*W + world] != 4) continue;
+            float denom = diag_g.data[i*W + world];
+            if (denom <= 0.0f) continue;
+            int jy_row = i*{D};
+            float jv = 0.0f;
+            for (int d = 0; d < {D}; d++) {{
+                jv += J_g.data[(jy_row + d)*W + world] * v_g.data[d*W + world];
+            }}
+            float residual = jv + rhs_g.data[i*W + world];
+            float delta = -residual / denom;
+            float delta_impulse = 0.0f;
+            if (residual < 0.0f) delta_impulse = delta;
+            lam_g.data[i*W + world] = delta_impulse;
+            if (delta_impulse != 0.0f) {{
+                for (int d = 0; d < {D}; d++) {{
+                    v_g.data[d*W + world] += Y_g.data[(jy_row + d)*W + world] * delta_impulse;
+                }}
+            }}
+        }}
+        }}  // slot 0 dense rt4
+        __syncwarp(world_mask);
+
+        // ── Final velocity-limit phase: mf rt4 (serial; slot 0 only) ──
+        if (slot == 0) {{
+        for (int i = 0; i < m_mf; i++) {{
+            int meta0 = mf_meta_g.data[(i*4 + 0)*W + world];
+            int meta1 = mf_meta_g.data[(i*4 + 1)*W + world];
+            int meta2 = mf_meta_g.data[(i*4 + 2)*W + world];
+            int meta3 = mf_meta_g.data[(i*4 + 3)*W + world];
+            int mf_rt = meta3 & 0xFFFF;
+            if (mf_rt != 4) continue;
+            int dof_a = meta0 >> 16;
+            int dof_b = (meta0 << 16) >> 16;
+            float mf_diag = __int_as_float(meta1);
+            if (mf_diag <= 0.0f) continue;
+            int mf6 = i*6;
+            float jv = 0.0f;
+            if (dof_a >= 0) {{
+                for (int k = 0; k < 6; k++) {{
+                    jv += mf_J_a.data[(mf6 + k)*W + world] * v_g.data[(dof_a + k)*W + world];
+                }}
+            }}
+            if (dof_b >= 0) {{
+                for (int k = 0; k < 6; k++) {{
+                    jv += mf_J_b.data[(mf6 + k)*W + world] * v_g.data[(dof_b + k)*W + world];
+                }}
+            }}
+            float residual = jv + __int_as_float(meta2);
+            float delta = -residual * mf_diag;
+            float delta_impulse = 0.0f;
+            if (residual < 0.0f) delta_impulse = delta;
+            mf_lam_g.data[i*W + world] = delta_impulse;
+            if (delta_impulse != 0.0f) {{
+                if (dof_a >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        v_g.data[(dof_a + k)*W + world] += mf_MiJt_a.data[(mf6 + k)*W + world] * delta_impulse;
+                    }}
+                }}
+                if (dof_b >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        v_g.data[(dof_b + k)*W + world] += mf_MiJt_b.data[(mf6 + k)*W + world] * delta_impulse;
+                    }}
+                }}
+            }}
+        }}
+        }}  // slot 0 mf rt4
+        __syncwarp(world_mask);
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def pgs_solve_mf_gs_kpw_native(
+        world: int,
+        slot: int,
+        m_dense_g: wp.array(dtype=int),
+        m_mf_g: wp.array(dtype=int),
+        w_dof_start_g: wp.array(dtype=int),
+        lam_g: wp.array(dtype=float),
+        rhs_g: wp.array(dtype=float),
+        diag_g: wp.array(dtype=float),
+        rtype_g: wp.array(dtype=int),
+        parent_g: wp.array(dtype=int),
+        mu_g: wp.array(dtype=float),
+        drive_target_g: wp.array(dtype=float),
+        drive_vmul_g: wp.array(dtype=float),
+        drive_imul_g: wp.array(dtype=float),
+        drive_maximp_g: wp.array(dtype=float),
+        # J_g/Y_g are 2-D (M_D*D, W): their flat length M_D*D*W exceeds the
+        # Warp 2^31 per-dimension array-length limit for W >= ~8192. As a 2-D
+        # row-major array, .data[r*W + world] (== the kernel's (i*D+d)*W+world)
+        # indexes the identical buffer, and no single dim exceeds 2^31.
+        J_g: wp.array(dtype=float, ndim=2),
+        Y_g: wp.array(dtype=float, ndim=2),
+        mf_meta_g: wp.array(dtype=int),
+        mf_lam_g: wp.array(dtype=float),
+        mf_J_a: wp.array(dtype=float),
+        mf_J_b: wp.array(dtype=float),
+        mf_MiJt_a: wp.array(dtype=float),
+        mf_MiJt_b: wp.array(dtype=float),
+        mf_row_mu: wp.array(dtype=float),
+        mf_color_offsets: wp.array(dtype=int),
+        mf_color_rows: wp.array(dtype=int),
+        mf_n_colors: wp.array(dtype=int),
+        v_g: wp.array(dtype=float),
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        freeze_drive_rows: int,
+    ): ...
+
+    def pgs_solve_mf_gs_kpw_template(
+        m_dense_g: wp.array(dtype=int),
+        m_mf_g: wp.array(dtype=int),
+        w_dof_start_g: wp.array(dtype=int),
+        lam_g: wp.array(dtype=float),
+        rhs_g: wp.array(dtype=float),
+        diag_g: wp.array(dtype=float),
+        rtype_g: wp.array(dtype=int),
+        parent_g: wp.array(dtype=int),
+        mu_g: wp.array(dtype=float),
+        drive_target_g: wp.array(dtype=float),
+        drive_vmul_g: wp.array(dtype=float),
+        drive_imul_g: wp.array(dtype=float),
+        drive_maximp_g: wp.array(dtype=float),
+        J_g: wp.array(dtype=float, ndim=2),
+        Y_g: wp.array(dtype=float, ndim=2),
+        mf_meta_g: wp.array(dtype=int),
+        mf_lam_g: wp.array(dtype=float),
+        mf_J_a: wp.array(dtype=float),
+        mf_J_b: wp.array(dtype=float),
+        mf_MiJt_a: wp.array(dtype=float),
+        mf_MiJt_b: wp.array(dtype=float),
+        mf_row_mu: wp.array(dtype=float),
+        mf_color_offsets: wp.array(dtype=int),
+        mf_color_rows: wp.array(dtype=int),
+        mf_n_colors: wp.array(dtype=int),
+        v_g: wp.array(dtype=float),
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        freeze_drive_rows: int,
+    ):
+        gtid = wp.tid()
+        world = gtid // K
+        slot = gtid - world * K
+        pgs_solve_mf_gs_kpw_native(
+            world,
+            slot,
+            m_dense_g, m_mf_g, w_dof_start_g,
+            lam_g, rhs_g, diag_g, rtype_g, parent_g, mu_g,
+            drive_target_g, drive_vmul_g, drive_imul_g, drive_maximp_g,
+            J_g, Y_g,
+            mf_meta_g, mf_lam_g, mf_J_a, mf_J_b, mf_MiJt_a, mf_MiJt_b, mf_row_mu,
+            mf_color_offsets, mf_color_rows, mf_n_colors,
+            v_g,
+            iterations, omega, friction_start_iteration, iteration_offset, freeze_drive_rows,
+        )
+
+    name = f"pgs_solve_mf_gs_kpw_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{world_count}_{max_colors}_{k_threads}_{friction_mode}"
+    pgs_solve_mf_gs_kpw_template.__name__ = name
+    pgs_solve_mf_gs_kpw_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_kpw_template)
