@@ -123,8 +123,11 @@ def build_world_innermost(N):
     out["dvmul"] = dT("drive_vel_multiplier", np.float32)
     out["dimul"] = dT("drive_impulse_multiplier", np.float32)
     out["dmaximp"] = dT("drive_max_impulse", np.float32)
-    out["J"] = np.ascontiguousarray(np.transpose(z["J_world"][idx], (1, 2, 0)).astype(np.float32)).reshape(-1)
-    out["Y"] = np.ascontiguousarray(np.transpose(z["Y_world"][idx], (1, 2, 0)).astype(np.float32)).reshape(-1)
+    # J/Y are 2-D (M_D*D, N): flat length M_D*D*N exceeds Warp's 2^31 per-dim
+    # array limit for N >= ~8192. Row-major (M_D*D, N) keeps .data[r*N+world]
+    # (== the kernel's (i*D+d)*W+world) identical while no single dim > 2^31.
+    out["J"] = np.ascontiguousarray(np.transpose(z["J_world"][idx], (1, 2, 0)).astype(np.float32)).reshape(M_D * D, N)
+    out["Y"] = np.ascontiguousarray(np.transpose(z["Y_world"][idx], (1, 2, 0)).astype(np.float32)).reshape(M_D * D, N)
     meta4 = z["mf_meta"][idx].reshape(N, M_MF, 4)
     out["mf_meta"] = np.ascontiguousarray(np.transpose(meta4, (1, 2, 0)).astype(np.int32)).reshape(-1)
 

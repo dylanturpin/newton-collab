@@ -8688,8 +8688,12 @@ def _get_pgs_solve_mf_gs_kernel_kpw(
         drive_vmul_g: wp.array(dtype=float),
         drive_imul_g: wp.array(dtype=float),
         drive_maximp_g: wp.array(dtype=float),
-        J_g: wp.array(dtype=float),
-        Y_g: wp.array(dtype=float),
+        # J_g/Y_g are 2-D (M_D*D, W): their flat length M_D*D*W exceeds the
+        # Warp 2^31 per-dimension array-length limit for W >= ~8192. As a 2-D
+        # row-major array, .data[r*W + world] (== the kernel's (i*D+d)*W+world)
+        # indexes the identical buffer, and no single dim exceeds 2^31.
+        J_g: wp.array(dtype=float, ndim=2),
+        Y_g: wp.array(dtype=float, ndim=2),
         mf_meta_g: wp.array(dtype=int),
         mf_lam_g: wp.array(dtype=float),
         mf_J_a: wp.array(dtype=float),
@@ -8722,8 +8726,8 @@ def _get_pgs_solve_mf_gs_kernel_kpw(
         drive_vmul_g: wp.array(dtype=float),
         drive_imul_g: wp.array(dtype=float),
         drive_maximp_g: wp.array(dtype=float),
-        J_g: wp.array(dtype=float),
-        Y_g: wp.array(dtype=float),
+        J_g: wp.array(dtype=float, ndim=2),
+        Y_g: wp.array(dtype=float, ndim=2),
         mf_meta_g: wp.array(dtype=int),
         mf_lam_g: wp.array(dtype=float),
         mf_J_a: wp.array(dtype=float),
