@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import re
 import time
@@ -72,9 +73,9 @@ from .kernels import (
     compute_mf_effective_mass_and_rhs,
     compute_mf_rhs_bias,
     compute_mf_world_dof_offsets,
+    compute_physx_pgs_drive_desc,
     compute_spatial_inertia,
     compute_velocity_predictor,
-    compute_physx_pgs_drive_desc,
     compute_world_contact_bias,
     convert_root_free_qd_local_to_world,
     convert_root_free_qd_world_to_local,
@@ -90,6 +91,7 @@ from .kernels import (
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
     gather_JY_to_world,
+    gather_mf_warmstart,
     gather_tau_to_groups,
     hinv_jt_par_row,
     integrate_generalized_joints,
@@ -98,15 +100,16 @@ from .kernels import (
     pgs_ncp_residuals_diagnostic_velocity,
     pgs_solve_loop,
     pgs_solve_mf_loop,
-    prescale_joint_velocity_limits,
-    populate_physx_drive_J_for_size,
     populate_joint_limit_J_for_size,
     populate_joint_velocity_limit_J_for_size,
+    populate_physx_drive_J_for_size,
     populate_rigid_velocity_limit_rows,
     populate_world_J_for_size,
     prepare_world_impulses,
+    prescale_joint_velocity_limits,
     rhs_accum_world_par_art,
     scatter_qdd_from_groups,
+    snapshot_mf_prev_slots,
     trisolve_loop,
     update_articulation_origins,
     update_articulation_root_com_offsets,
@@ -115,13 +118,22 @@ from .kernels import (
     vector_add_inplace,
 )
 
+# --- env-gated capture of pgs_solve_mf_gs kernel inputs, for standalone replay/bench ---
+# Off unless FEATHER_PGS_CAPTURE_KERNEL=1. Snapshots the dominant FPGS contact-solve
+# kernel's inputs + launch config at a chosen step/phase to .npz/.json so the kernel can
+# be replayed/profiled in isolation on the target GPU. Zero overhead when off.
+_FPGS_CAPTURE = os.environ.get("FEATHER_PGS_CAPTURE_KERNEL") == "1"
+_FPGS_CAPTURE_STEP = int(os.environ.get("FEATHER_PGS_CAPTURE_STEP", "-1"))
+_FPGS_CAPTURE_PHASE = os.environ.get("FEATHER_PGS_CAPTURE_PHASE")  # None = any phase
+_FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture")
+
 
 @wp.kernel
 def localize_parent_indices(
-    counts: wp.array(dtype=int),
+    counts: wp.array[int],
     max_constraints: int,
-    parent_arr: wp.array(dtype=int),
-    parent_local_arr: wp.array(dtype=int),
+    parent_arr: wp.array[int],
+    parent_local_arr: wp.array[int],
 ):
     art = wp.tid()
     m = counts[art]
@@ -138,8 +150,8 @@ def localize_parent_indices(
 
 @wp.kernel
 def _accumulate_row_watermark(
-    counts: wp.array(dtype=wp.int32),
-    watermark: wp.array(dtype=wp.int32),
+    counts: wp.array[wp.int32],
+    watermark: wp.array[wp.int32],
 ):
     # Per-world reduce-max into a single scalar slot. Read-only on ``counts``;
     # writes only the separate ``watermark`` buffer, so this is numerics-neutral.
@@ -263,6 +275,8 @@ class SolverFeatherPGS(SolverBase):
         pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
         dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
+        mf_warmstart: bool = False,
+        mf_warmstart_decay: float = 1.0,
         pgs_mode: str = "split",
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
@@ -523,10 +537,7 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
         self.pgs_velocity_omega = self.pgs_omega if pgs_velocity_omega is None else float(pgs_velocity_omega)
         if pgs_velocity_drive_mode not in ("active", "freeze"):
-            raise ValueError(
-                "pgs_velocity_drive_mode must be 'active' or 'freeze', "
-                f"got {pgs_velocity_drive_mode!r}"
-            )
+            raise ValueError(f"pgs_velocity_drive_mode must be 'active' or 'freeze', got {pgs_velocity_drive_mode!r}")
         self.pgs_velocity_drive_mode = pgs_velocity_drive_mode
         self.dense_max_constraints = dense_max_constraints
         self.pgs_warmstart = pgs_warmstart
@@ -535,13 +546,32 @@ class SolverFeatherPGS(SolverBase):
                 "contact_friction_position_iterations with pgs_warmstart=True needs an explicit "
                 "pre-solve zeroing pass for skipped friction rows"
             )
+
+        # ── Matrix-free (MF) warm-starting ──────────────────────────────────
+        # Carry the previous step's converged MF contact impulses into this
+        # step's GS solve as the initial guess, gathered by *contact identity*
+        # (Newton's frame-to-frame ``rigid_contact_match_index``) rather than by
+        # the nondeterministic atomic-allocated slot. Default OFF: when off the
+        # MF impulse buffer is zeroed exactly as before and no new state is
+        # allocated, so the determinism/bit-identity ladder is unaffected.
+        _env_ws = os.getenv("IL_NEWTON_FPGS_MF_WARMSTART", "0").lower() in {"1", "true", "yes", "on"}
+        self._mf_warmstart_enabled = bool(mf_warmstart) or _env_ws
+        try:
+            self._mf_warmstart_decay = float(os.getenv("IL_NEWTON_FPGS_MF_WARMSTART_DECAY", str(mf_warmstart_decay)))
+        except (TypeError, ValueError):
+            self._mf_warmstart_decay = float(mf_warmstart_decay)
+        # Allocated lazily in :meth:`_allocate_mf_buffers` only when enabled.
+        self._ws_prev_mf_impulses = None
+        self._ws_prev_mf_row_type = None
+        self._ws_prev_slot_sorted = None
+        self._ws_warned_no_match = False
+
         if pgs_mode not in ("dense", "split", "matrix_free"):
             raise ValueError(f"pgs_mode must be 'dense', 'split', or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
         if pgs_schedule not in ("interleaved", "contact_then_internal", "physx_grasp"):
             raise ValueError(
-                "pgs_schedule must be 'interleaved', 'contact_then_internal', or 'physx_grasp', "
-                f"got {pgs_schedule!r}"
+                f"pgs_schedule must be 'interleaved', 'contact_then_internal', or 'physx_grasp', got {pgs_schedule!r}"
             )
         if pgs_schedule != "interleaved" and self.pgs_mode != "matrix_free":
             raise ValueError("pgs_schedule is currently only supported with pgs_mode='matrix_free'")
@@ -764,9 +794,9 @@ class SolverFeatherPGS(SolverBase):
             return None
         worlds = set()
         for item in value.split(","):
-            item = item.strip()
-            if item:
-                worlds.add(int(item))
+            token = item.strip()
+            if token:
+                worlds.add(int(token))
         return worlds
 
     def _compute_articulation_metadata(self, model):
@@ -1270,6 +1300,7 @@ class SolverFeatherPGS(SolverBase):
 
             max_contacts = int(_estimate_rigid_contact_max(model))
         max_contacts = max(max_contacts, 1)
+        self._max_contacts_alloc = max_contacts
         self.contact_world = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_slot = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
@@ -1279,50 +1310,72 @@ class SolverFeatherPGS(SolverBase):
         self._debug_position_rigid_contact_count = (
             wp.zeros((1,), dtype=wp.int32, device=device) if self._debug_buffers_enabled else None
         )
-        self._debug_position_contact_world = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_contact_slot = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_contact_art_a = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_contact_art_b = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_contact_path = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_rigid_contact_shape0 = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_rigid_contact_shape1 = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_rigid_contact_point0 = wp.zeros(
-            (max_contacts,), dtype=wp.vec3, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_rigid_contact_point1 = wp.zeros(
-            (max_contacts,), dtype=wp.vec3, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_rigid_contact_normal = wp.zeros(
-            (max_contacts,), dtype=wp.vec3, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_rigid_contact_margin0 = wp.zeros(
-            (max_contacts,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_rigid_contact_margin1 = wp.zeros(
-            (max_contacts,), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_contact_world = (
+            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_contact_slot = (
+            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_contact_art_a = (
+            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_contact_art_b = (
+            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_contact_path = (
+            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_rigid_contact_shape0 = (
+            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_rigid_contact_shape1 = (
+            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_rigid_contact_point0 = (
+            wp.zeros((max_contacts,), dtype=wp.vec3, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_rigid_contact_point1 = (
+            wp.zeros((max_contacts,), dtype=wp.vec3, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_rigid_contact_normal = (
+            wp.zeros((max_contacts,), dtype=wp.vec3, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_rigid_contact_margin0 = (
+            wp.zeros((max_contacts,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_rigid_contact_margin1 = (
+            wp.zeros((max_contacts,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
 
         # Joint position-limit buffers. PhysX keeps finite articulation limit
         # rows available speculatively, so store lower/upper rows separately.
         if self.enable_joint_limits and model.joint_dof_count > 0:
             dof_count = model.joint_dof_count
-            self.limit_slot = wp.full(
-                (2 * dof_count,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
-            )
+            self.limit_slot = wp.full((2 * dof_count,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
             self.limit_sign = wp.zeros((2 * dof_count,), dtype=wp.float32, device=device, requires_grad=requires_grad)
         else:
             self.limit_slot = None
@@ -1420,15 +1473,21 @@ class SolverFeatherPGS(SolverBase):
         self.impulses = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._debug_position_impulses = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_rhs = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_diag = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_impulses = (
+            wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_rhs = (
+            wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_diag = (
+            wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
         self.diag = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
@@ -1440,18 +1499,24 @@ class SolverFeatherPGS(SolverBase):
         self.row_parent = wp.full(
             (self.world_count, max_constraints), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
         )
-        self._debug_position_row_type = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_row_parent = wp.full(
-            (self.world_count, max_constraints), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_row_type = (
+            wp.zeros((self.world_count, max_constraints), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_row_parent = (
+            wp.full((self.world_count, max_constraints), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
         self.row_mu = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._debug_position_row_mu = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_row_mu = (
+            wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
         self.row_beta = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
@@ -1461,15 +1526,19 @@ class SolverFeatherPGS(SolverBase):
         self.phi = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._debug_position_phi = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_phi = (
+            wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
         self.target_velocity = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._debug_position_target_velocity = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_target_velocity = (
+            wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
         self.drive_stiffness = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
@@ -1494,26 +1563,36 @@ class SolverFeatherPGS(SolverBase):
         self.drive_max_impulse = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._debug_position_drive_target_vel_bias = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_drive_vel_multiplier = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_drive_impulse_multiplier = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_drive_max_impulse = wp.zeros(
-            (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_drive_target_vel_bias = (
+            wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_drive_vel_multiplier = (
+            wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_drive_impulse_multiplier = (
+            wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_drive_max_impulse = (
+            wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
 
         # Per-world constraint counts
         self.constraint_count = wp.zeros(
             (self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
-        self._debug_position_constraint_count = wp.zeros(
-            (self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_constraint_count = (
+            wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
 
     def _allocate_mf_buffers(self, model):
         """Allocate buffers for matrix-free PGS path for free rigid body contacts."""
@@ -1537,19 +1616,25 @@ class SolverFeatherPGS(SolverBase):
         body_count = model.body_count
 
         self.mf_constraint_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_constraint_count = wp.zeros(
-            (worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_mf_constraint_count = (
+            wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
         self.mf_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
 
         self.mf_body_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_body_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_body_a = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_mf_body_b = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_mf_body_a = (
+            wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_mf_body_b = (
+            wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
 
         self.mf_J_a = wp.zeros((worlds, mf_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.mf_J_b = wp.zeros((worlds, mf_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
@@ -1570,39 +1655,71 @@ class SolverFeatherPGS(SolverBase):
         )
 
         self.mf_rhs = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_rhs = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_mf_rhs = (
+            wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
         self.mf_rhs_unbiased = wp.zeros(
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.mf_impulses = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_impulses = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+
+        # MF warm-start carry buffers. Allocated ONLY when the feature is on so
+        # the default-off path has zero memory / CUDA-graph delta. ``prev_mf_*``
+        # snapshot last step's converged impulses + their row-type table;
+        # ``_ws_prev_slot_sorted`` records, per *current sorted contact index*,
+        # the base MF slot that contact occupied last step. Because FeatherPGS
+        # consumes the already-sorted contact arrays, the contact array index is
+        # the sorted index, so next step's ``rigid_contact_match_index`` (which
+        # references the previous frame's *sorted* index) indexes directly into
+        # this table — no matcher permutation access required.
+        if self._mf_warmstart_enabled:
+            self._ws_prev_mf_impulses = wp.zeros(
+                (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+            self._ws_prev_mf_row_type = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device)
+            self._ws_prev_slot_sorted = wp.full(
+                (getattr(self, "_max_contacts_alloc", 1),), -1, dtype=wp.int32, device=device
+            )
+        self._debug_position_mf_impulses = (
+            wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
         self.mf_eff_mass_inv = wp.zeros(
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self._debug_position_mf_eff_mass_inv = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_mf_eff_mass_inv = (
+            wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
 
         self.mf_row_type = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_row_parent = wp.full((worlds, mf_max_c), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_row_mu = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.mf_phi = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_row_type = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_mf_row_parent = wp.full(
-            (worlds, mf_max_c), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_mf_row_mu = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_mf_phi = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_mf_row_type = (
+            wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_mf_row_parent = (
+            wp.full((worlds, mf_max_c), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_mf_row_mu = (
+            wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_mf_phi = (
+            wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
 
         if self._has_rigid_body_velocity_limits and body_count > 0:
             # Twelve entries per free rigid body: lower/upper rows for the
@@ -1622,12 +1739,16 @@ class SolverFeatherPGS(SolverBase):
         # World-relative DOF offsets for two-phase GS kernel
         self.mf_dof_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_dof_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self._debug_position_mf_dof_a = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
-        self._debug_position_mf_dof_b = wp.zeros(
-            (worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
-        ) if self._debug_buffers_enabled else None
+        self._debug_position_mf_dof_a = (
+            wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
+        self._debug_position_mf_dof_b = (
+            wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
+            if self._debug_buffers_enabled
+            else None
+        )
 
         # Packed MF metadata for two-phase GS kernel (int4 per constraint):
         #   .x = (dof_a << 16) | (dof_b & 0xFFFF)
@@ -1927,6 +2048,61 @@ class SolverFeatherPGS(SolverBase):
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
 
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
+            if (
+                _FPGS_CAPTURE
+                and getattr(self, "_fpgs_step_n", -1) == _FPGS_CAPTURE_STEP
+                and (_FPGS_CAPTURE_PHASE is None or row_phase == int(_FPGS_CAPTURE_PHASE))
+            ):
+                os.makedirs(_FPGS_CAPTURE_DIR, exist_ok=True)
+                _arrs = {
+                    "constraint_count": self.constraint_count,
+                    "world_dof_start": self.world_dof_start,
+                    "dense_rhs": dense_rhs,
+                    "diag": self.diag,
+                    "impulses": self.impulses,  # RMW: pre-launch snapshot
+                    "J_world": self.J_world,
+                    "Y_world": self.Y_world,
+                    "row_type": self.row_type,
+                    "row_parent": self.row_parent,
+                    "row_mu": self.row_mu,
+                    "drive_target_vel_bias": self.drive_target_vel_bias,
+                    "drive_vel_multiplier": self.drive_vel_multiplier,
+                    "drive_impulse_multiplier": self.drive_impulse_multiplier,
+                    "drive_max_impulse": self.drive_max_impulse,
+                    "mf_constraint_count": self.mf_constraint_count,
+                    "mf_meta": mf_meta,
+                    "mf_impulses": self.mf_impulses,  # RMW: pre-launch snapshot
+                    "mf_J_a": self.mf_J_a,
+                    "mf_J_b": self.mf_J_b,
+                    "mf_MiJt_a": self.mf_MiJt_a,
+                    "mf_MiJt_b": self.mf_MiJt_b,
+                    "mf_row_mu": self.mf_row_mu,
+                    "v_out": self.v_out,  # RMW: pre-launch snapshot
+                }
+                _base = os.path.join(_FPGS_CAPTURE_DIR, f"mfgs_step{self._fpgs_step_n}_phase{row_phase}")
+                # .numpy() is a synchronous D2H copy; no wp.synchronize() (AGENTS.md rule)
+                np.savez(_base + ".npz", **{_k: _v.numpy() for _k, _v in _arrs.items()})
+                with open(_base + ".json", "w") as _f:
+                    json.dump(
+                        {
+                            "dense_max_constraints": int(self.dense_max_constraints),
+                            "mf_max_constraints": int(self.mf_max_constraints),
+                            "max_world_dofs": int(self.max_world_dofs),
+                            "friction_mode": str(self.friction_mode),
+                            "device_arch": int(self.model.device.arch),  # INT warp arch code
+                            "world_count": int(self.world_count),
+                            "block_dim": 32,
+                            "iterations": int(phase_iterations),
+                            "omega": float(omega),
+                            "row_phase": int(row_phase),
+                            "friction_start_iteration": int(friction_start_iteration),
+                            "iteration_offset": int(phase_iteration_offset),
+                            "freeze_drive_rows": int(freeze_drive_rows),
+                        },
+                        _f,
+                        indent=2,
+                    )
+                print(f"[fpgs-capture] wrote {_base}.npz/.json", flush=True)
             wp.launch_tiled(
                 mf_gs_kernel,
                 dim=[self.world_count],
@@ -2187,6 +2363,8 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        if _FPGS_CAPTURE:
+            self._fpgs_step_n = getattr(self, "_fpgs_step_n", -1) + 1
         if self._last_step_dt is None:
             self._last_step_dt = dt
         elif abs(self._last_step_dt - dt) > 1.0e-8:
@@ -2649,6 +2827,23 @@ class SolverFeatherPGS(SolverBase):
             else:
                 self._stage6_update_qdd(state_in, state_aug, dt)
                 self._stage6_integrate(state_in, state_aug, state_out, dt)
+
+        # ── MF warm-start carry: snapshot this step's converged impulses +
+        # row-type table + per-(sorted)-contact slot map so step N+1 can seed
+        # from them by contact identity. Only runs when the feature is on, so
+        # the default-off launch sequence is unchanged.
+        if self._mf_warmstart_enabled and self._has_free_rigid_bodies and self.pgs_mode != "dense":
+            with wp.ScopedTimer("S7_MF_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+                wp.copy(self._ws_prev_mf_impulses, self.mf_impulses)
+                wp.copy(self._ws_prev_mf_row_type, self.mf_row_type)
+                if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
+                    wp.launch(
+                        snapshot_mf_prev_slots,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[contacts.rigid_contact_count, self.contact_path, self.contact_slot],
+                        outputs=[self._ws_prev_slot_sorted],
+                        device=model.device,
+                    )
 
         # Double-buffer: fork memset stream to zero current buffer for reuse.
         # ScopedStream(sync_enter=True) records an event on the main stream and
@@ -3446,6 +3641,12 @@ class SolverFeatherPGS(SolverBase):
         if mf_active:
             self.mf_slot_counter.zero_()  # atomic-add counter
             self.mf_constraint_count.zero_()  # finalize only runs when contacts exist
+            # Zero unconditionally here. When warm-start is OFF this is the
+            # original behavior (bit-identical). When ON this also guarantees a
+            # clean buffer on steps where the contact block is skipped (no
+            # contacts this frame); the seed pass after build_mf_contact_rows
+            # re-memsets and gathers when contacts ARE present, and the carry
+            # itself lives in _ws_prev_mf_impulses, so this zero is harmless.
             self.mf_impulses.zero_()  # PGS reads before first write
             # mf_J_a/b, mf_MiJt_a/b: writers cover all used slots, readers gated by body >= 0
             # mf_body_a/b, mf_row_type, mf_row_parent, mf_row_mu, mf_phi: unconditionally overwritten
@@ -3808,6 +4009,42 @@ class SolverFeatherPGS(SolverBase):
                     outputs=[self.mf_constraint_count],
                     device=model.device,
                 )
+
+                # ── MF warm-start seed ────────────────────────────────────
+                # contact_slot + mf_row_type are now populated for THIS step.
+                # mf_impulses was already memset at the top of this method
+                # (covers vel-limit rows, padding tail, and any contact that
+                # returns early in the gather); here we gather matched contacts'
+                # previous impulses into their current slots by identity. The
+                # carry itself lives in _ws_prev_mf_impulses.
+                if self._mf_warmstart_enabled:
+                    match_index = getattr(contacts, "rigid_contact_match_index", None)
+                    if match_index is None:
+                        raise NotImplementedError(
+                            "FeatherPGS mf_warmstart=True requires the Contacts buffer to be "
+                            "created with contact_matching enabled (rigid_contact_match_index "
+                            "is None). Build the CollisionPipeline / Contacts with "
+                            'contact_matching="latest" (or "sticky").'
+                        )
+                    wp.launch(
+                        gather_mf_warmstart,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            self.contact_path,
+                            self.contact_slot,
+                            self.contact_world,
+                            match_index,
+                            self._ws_prev_slot_sorted,
+                            self._ws_prev_mf_impulses,
+                            self._ws_prev_mf_row_type,
+                            self.mf_row_type,
+                            self._mf_warmstart_decay,
+                            self.mf_max_constraints,
+                        ],
+                        outputs=[self.mf_impulses],
+                        device=model.device,
+                    )
 
         # Rigid-body velocity limits are matrix-free rows, not post-solve
         # clamps, in the MF path. Allocate after contacts so they occupy the
@@ -4541,10 +4778,15 @@ class SolverFeatherPGS(SolverBase):
                 )
 
         if worlds:
-            wp.copy(self.v_out, wp.from_numpy(v_out.astype(np.float32, copy=False), dtype=wp.float32, device=self.model.device))
+            wp.copy(
+                self.v_out,
+                wp.from_numpy(v_out.astype(np.float32, copy=False), dtype=wp.float32, device=self.model.device),
+            )
             wp.copy(
                 self.impulses,
-                wp.from_numpy(dense_impulses.astype(np.float32, copy=False), dtype=wp.float32, device=self.model.device),
+                wp.from_numpy(
+                    dense_impulses.astype(np.float32, copy=False), dtype=wp.float32, device=self.model.device
+                ),
             )
             wp.copy(
                 self.mf_impulses,
@@ -4610,12 +4852,16 @@ class SolverFeatherPGS(SolverBase):
                 dof_a = int(mf_arrays["dof_a"][world, row])
                 dof_b = int(mf_arrays["dof_b"][world, row])
                 if 0 <= dof_a < count:
-                    j_rows[out_row, dof_a : min(dof_a + 6, count)] += mf_arrays["J_a"][world, row, : max(0, min(6, count - dof_a))]
+                    j_rows[out_row, dof_a : min(dof_a + 6, count)] += mf_arrays["J_a"][
+                        world, row, : max(0, min(6, count - dof_a))
+                    ]
                     y_rows[out_row, dof_a : min(dof_a + 6, count)] += mf_arrays["MiJt_a"][
                         world, row, : max(0, min(6, count - dof_a))
                     ]
                 if 0 <= dof_b < count:
-                    j_rows[out_row, dof_b : min(dof_b + 6, count)] += mf_arrays["J_b"][world, row, : max(0, min(6, count - dof_b))]
+                    j_rows[out_row, dof_b : min(dof_b + 6, count)] += mf_arrays["J_b"][
+                        world, row, : max(0, min(6, count - dof_b))
+                    ]
                     y_rows[out_row, dof_b : min(dof_b + 6, count)] += mf_arrays["MiJt_b"][
                         world, row, : max(0, min(6, count - dof_b))
                     ]
@@ -4705,11 +4951,7 @@ class SolverFeatherPGS(SolverBase):
     @staticmethod
     def _debug_projected_root_drive_fixed_point(problem: dict[str, np.ndarray], lambdas: np.ndarray) -> np.ndarray:
         jv = problem["A"] @ lambdas + problem["q_unbiased"]
-        candidate = (
-            lambdas * problem["drive_imp_mul"]
-            + jv * problem["drive_vel_mul"]
-            + problem["drive_target"]
-        )
+        candidate = lambdas * problem["drive_imp_mul"] + jv * problem["drive_vel_mul"] + problem["drive_target"]
         finite = (problem["drive_max_imp"] >= 0.0) & np.isfinite(problem["drive_max_imp"])
         if np.any(finite):
             candidate = candidate.copy()
@@ -4720,9 +4962,7 @@ class SolverFeatherPGS(SolverBase):
         return candidate
 
     @classmethod
-    def _debug_projected_root_project_impulses(
-        cls, problem: dict[str, np.ndarray], lambdas: np.ndarray
-    ) -> np.ndarray:
+    def _debug_projected_root_project_impulses(cls, problem: dict[str, np.ndarray], lambdas: np.ndarray) -> np.ndarray:
         projected = lambdas.copy()
         row_type = problem["row_type"]
         if problem.get("drive_mode") == "physx_pgs":
@@ -4782,9 +5022,7 @@ class SolverFeatherPGS(SolverBase):
         return lambdas - projected
 
     @classmethod
-    def _debug_projected_root_projected_residual_max(
-        cls, problem: dict[str, np.ndarray], lambdas: np.ndarray
-    ) -> float:
+    def _debug_projected_root_projected_residual_max(cls, problem: dict[str, np.ndarray], lambdas: np.ndarray) -> float:
         residual = problem["A"] @ lambdas + problem["q_biased"]
         residual_vector = cls._debug_projected_root_residual_vector(problem, lambdas, residual)
         max_residual = 0.0
@@ -5179,13 +5417,13 @@ def _get_hinv_jt_kernel(n_dofs: int, max_constraints: int, device_arch: str, til
     TILE_CONSTRAINTS_LOCAL = wp.constant(int(max_constraints))
 
     def hinv_jt_tiled_template(
-        L_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
-        J_group: wp.array3d(dtype=float),  # [n_arts, max_c, n_dofs]
-        group_to_art: wp.array(dtype=int),
-        art_to_world: wp.array(dtype=int),
-        world_constraint_count: wp.array(dtype=int),
+        L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
+        J_group: wp.array3d[float],  # [n_arts, max_c, n_dofs]
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        world_constraint_count: wp.array[int],
         # output
-        Y_group: wp.array3d(dtype=float),  # [n_arts, max_c, n_dofs]
+        Y_group: wp.array3d[float],  # [n_arts, max_c, n_dofs]
     ):
         idx = wp.tid()
         art = group_to_art[idx]
@@ -5216,6 +5454,7 @@ def _get_hinv_jt_kernel(n_dofs: int, max_constraints: int, device_arch: str, til
     hinv_jt_tiled_template.__qualname__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}_bd{tile_threads}"
     return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_template)
 
+
 @cache
 def _get_hinv_jt_fused_kernel(
     n_dofs: int, max_constraints: int, device_arch: str, tile_threads: int = 64
@@ -5225,16 +5464,16 @@ def _get_hinv_jt_fused_kernel(
     TILE_CONSTRAINTS_LOCAL = wp.constant(int(max_constraints))
 
     def hinv_jt_tiled_fused_template(
-        L_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
-        J_group: wp.array3d(dtype=float),  # [n_arts, max_c, n_dofs]
-        group_to_art: wp.array(dtype=int),
-        art_to_world: wp.array(dtype=int),
-        world_constraint_count: wp.array(dtype=int),
-        row_cfm: wp.array2d(dtype=float),
+        L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
+        J_group: wp.array3d[float],  # [n_arts, max_c, n_dofs]
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        world_constraint_count: wp.array[int],
+        row_cfm: wp.array2d[float],
         # outputs
-        world_C: wp.array3d(dtype=float),  # [world_count, max_c, max_c]
-        world_diag: wp.array2d(dtype=float),  # [world_count, max_c]
-        Y_group: wp.array3d(dtype=float),  # [n_arts, max_c, n_dofs]
+        world_C: wp.array3d[float],  # [world_count, max_c, max_c]
+        world_diag: wp.array2d[float],  # [world_count, max_c]
+        Y_group: wp.array3d[float],  # [n_arts, max_c, n_dofs]
     ):
         idx, thread = wp.tid()
         art = group_to_art[idx]
@@ -5272,6 +5511,7 @@ def _get_hinv_jt_fused_kernel(
     hinv_jt_tiled_fused_template.__name__ = f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}_bd{tile_threads}"
     hinv_jt_tiled_fused_template.__qualname__ = f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}_bd{tile_threads}"
     return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_fused_template)
+
 
 @cache
 def _get_delassus_kernel(
@@ -5337,24 +5577,24 @@ for (int ci = 0; ci < num_chunks; ci++) {{
     @wp.func_native(snippet)
     def delassus_native(
         idx: int,
-        J_group: wp.array3d(dtype=float),
-        Y_group: wp.array3d(dtype=float),
-        group_to_art: wp.array(dtype=int),
-        art_to_world: wp.array(dtype=int),
-        world_constraint_count: wp.array(dtype=int),
-        world_C: wp.array3d(dtype=float),
-        world_diag: wp.array2d(dtype=float),
+        J_group: wp.array3d[float],
+        Y_group: wp.array3d[float],
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        world_constraint_count: wp.array[int],
+        world_C: wp.array3d[float],
+        world_diag: wp.array2d[float],
     ): ...
 
     def delassus_template(
-        J_group: wp.array3d(dtype=float),
-        Y_group: wp.array3d(dtype=float),
-        group_to_art: wp.array(dtype=int),
-        art_to_world: wp.array(dtype=int),
-        world_constraint_count: wp.array(dtype=int),
+        J_group: wp.array3d[float],
+        Y_group: wp.array3d[float],
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        world_constraint_count: wp.array[int],
         n_arts: int,
-        world_C: wp.array3d(dtype=float),
-        world_diag: wp.array2d(dtype=float),
+        world_C: wp.array3d[float],
+        world_diag: wp.array2d[float],
     ):
         idx, _lane = wp.tid()
         if idx < n_arts:
@@ -5366,6 +5606,7 @@ for (int ci = 0; ci < num_chunks; ci++) {{
     delassus_template.__qualname__ = f"delassus_streaming_{n_dofs}_{max_constraints}_chunk{CHUNK}"
     return wp.kernel(enable_backward=False, module="unique")(delassus_template)
 
+
 @cache
 def _get_cholesky_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) -> "wp.Kernel":
     """Build specialized Cholesky kernel for given DOF count.
@@ -5376,12 +5617,12 @@ def _get_cholesky_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) 
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
 
     def cholesky_tiled_template(
-        H_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
-        R_group: wp.array2d(dtype=float),  # [n_arts, n_dofs] armature
-        group_to_art: wp.array(dtype=int),
-        mass_update_mask: wp.array(dtype=int),
+        H_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
+        R_group: wp.array2d[float],  # [n_arts, n_dofs] armature
+        group_to_art: wp.array[int],
+        mass_update_mask: wp.array[int],
         # output
-        L_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
+        L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
     ):
         idx = wp.tid()
         art = group_to_art[idx]
@@ -5406,6 +5647,7 @@ def _get_cholesky_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) 
     cholesky_tiled_template.__qualname__ = f"cholesky_tiled_{n_dofs}_bd{tile_threads}"
     return wp.kernel(enable_backward=False, module="unique")(cholesky_tiled_template)
 
+
 @cache
 def _get_triangular_solve_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) -> "wp.Kernel":
     """Build specialized triangular solve kernel for given DOF count.
@@ -5415,9 +5657,9 @@ def _get_triangular_solve_kernel(n_dofs: int, device_arch: str, tile_threads: in
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
 
     def trisolve_tiled_template(
-        L_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, n_dofs]
-        tau_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, 1]
-        qdd_group: wp.array3d(dtype=float),  # [n_arts, n_dofs, 1]
+        L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
+        tau_group: wp.array3d[float],  # [n_arts, n_dofs, 1]
+        qdd_group: wp.array3d[float],  # [n_arts, n_dofs, 1]
     ):
         idx = wp.tid()
         L_tile = wp.tile_load(L_group[idx], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
@@ -5435,6 +5677,7 @@ def _get_triangular_solve_kernel(n_dofs: int, device_arch: str, tile_threads: in
     trisolve_tiled_template.__name__ = f"trisolve_tiled_{n_dofs}_bd{tile_threads}"
     trisolve_tiled_template.__qualname__ = f"trisolve_tiled_{n_dofs}_bd{tile_threads}"
     return wp.kernel(enable_backward=False, module="unique")(trisolve_tiled_template)
+
 
 @cache
 def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "wp.Kernel":
@@ -5484,9 +5727,7 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
     for k in range(ELEMS_PER_THREAD_1D):
         j = k * 32
         if j < TILE_M:
-            precompute_j.append(
-                f"    const int j{k} = lane + {j};\n    const int jb{k} = (j{k} * (j{k} + 1)) >> 1;"
-            )
+            precompute_j.append(f"    const int j{k} = lane + {j};\n    const int jb{k} = (j{k} * (j{k} + 1)) >> 1;")
     precompute_j_code = "\n".join(precompute_j)
 
     # Dot code: guarded on j_k < m
@@ -5620,31 +5861,31 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
     @wp.func_native(snippet)
     def pgs_solve_native(
         world: int,
-        world_constraint_count: wp.array(dtype=int),
-        world_diag: wp.array2d(dtype=float),
-        world_C: wp.array3d(dtype=float),
-        world_rhs: wp.array2d(dtype=float),
-        world_impulses: wp.array2d(dtype=float),
+        world_constraint_count: wp.array[int],
+        world_diag: wp.array2d[float],
+        world_C: wp.array3d[float],
+        world_rhs: wp.array2d[float],
+        world_impulses: wp.array2d[float],
         iterations: int,
         omega: float,
-        world_row_type: wp.array2d(dtype=int),
-        world_row_parent: wp.array2d(dtype=int),
-        world_row_mu: wp.array2d(dtype=float),
+        world_row_type: wp.array2d[int],
+        world_row_parent: wp.array2d[int],
+        world_row_mu: wp.array2d[float],
         friction_start_iteration: int,
         iteration_offset: int,
     ): ...
 
     def pgs_solve_tiled_template(
-        world_constraint_count: wp.array(dtype=int),
-        world_diag: wp.array2d(dtype=float),
-        world_C: wp.array3d(dtype=float),
-        world_rhs: wp.array2d(dtype=float),
-        world_impulses: wp.array2d(dtype=float),
+        world_constraint_count: wp.array[int],
+        world_diag: wp.array2d[float],
+        world_C: wp.array3d[float],
+        world_rhs: wp.array2d[float],
+        world_impulses: wp.array2d[float],
         iterations: int,
         omega: float,
-        world_row_type: wp.array2d(dtype=int),
-        world_row_parent: wp.array2d(dtype=int),
-        world_row_mu: wp.array2d(dtype=float),
+        world_row_type: wp.array2d[int],
+        world_row_parent: wp.array2d[int],
+        world_row_mu: wp.array2d[float],
         friction_start_iteration: int,
         iteration_offset: int,
     ):
@@ -5668,6 +5909,7 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
     pgs_solve_tiled_template.__name__ = f"pgs_solve_tiled_row_{max_constraints}"
     pgs_solve_tiled_template.__qualname__ = f"pgs_solve_tiled_row_{max_constraints}"
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_tiled_template)
+
 
 @cache
 def _get_pgs_solve_tiled_contact_kernel(max_constraints: int, device_arch: str) -> "wp.Kernel":
@@ -5883,23 +6125,23 @@ def _get_pgs_solve_tiled_contact_kernel(max_constraints: int, device_arch: str) 
     @wp.func_native(snippet)
     def pgs_solve_contact_native(
         world: int,
-        world_constraint_count: wp.array(dtype=int),
-        world_C: wp.array3d(dtype=float),
-        world_rhs: wp.array2d(dtype=float),
-        world_impulses: wp.array2d(dtype=float),
+        world_constraint_count: wp.array[int],
+        world_C: wp.array3d[float],
+        world_rhs: wp.array2d[float],
+        world_impulses: wp.array2d[float],
         iterations: int,
         omega: float,
-        world_row_mu: wp.array2d(dtype=float),
+        world_row_mu: wp.array2d[float],
     ): ...
 
     def pgs_solve_tiled_contact_template(
-        world_constraint_count: wp.array(dtype=int),
-        world_C: wp.array3d(dtype=float),
-        world_rhs: wp.array2d(dtype=float),
-        world_impulses: wp.array2d(dtype=float),
+        world_constraint_count: wp.array[int],
+        world_C: wp.array3d[float],
+        world_rhs: wp.array2d[float],
+        world_impulses: wp.array2d[float],
         iterations: int,
         omega: float,
-        world_row_mu: wp.array2d(dtype=float),
+        world_row_mu: wp.array2d[float],
     ):
         world, _lane = wp.tid()
         pgs_solve_contact_native(
@@ -5917,10 +6159,9 @@ def _get_pgs_solve_tiled_contact_kernel(max_constraints: int, device_arch: str) 
     pgs_solve_tiled_contact_template.__qualname__ = f"pgs_solve_tiled_contact_{max_constraints}"
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_tiled_contact_template)
 
+
 @cache
-def _get_pgs_solve_streaming_kernel(
-    max_constraints: int, device_arch: str, pgs_chunk_size: int = 1
-) -> "wp.Kernel":
+def _get_pgs_solve_streaming_kernel(max_constraints: int, device_arch: str, pgs_chunk_size: int = 1) -> "wp.Kernel":
     """Streaming contact-wise PGS kernel that streams block-rows from global memory.
 
     Unlike tiled_contact which loads the entire Delassus matrix into shared memory,
@@ -6153,23 +6394,23 @@ def _get_pgs_solve_streaming_kernel(
     @wp.func_native(snippet)
     def pgs_solve_streaming_native(
         world: int,
-        world_constraint_count: wp.array(dtype=int),
-        world_C: wp.array3d(dtype=float),
-        world_rhs: wp.array2d(dtype=float),
-        world_impulses: wp.array2d(dtype=float),
+        world_constraint_count: wp.array[int],
+        world_C: wp.array3d[float],
+        world_rhs: wp.array2d[float],
+        world_impulses: wp.array2d[float],
         iterations: int,
         omega: float,
-        world_row_mu: wp.array2d(dtype=float),
+        world_row_mu: wp.array2d[float],
     ): ...
 
     def pgs_solve_streaming_template(
-        world_constraint_count: wp.array(dtype=int),
-        world_C: wp.array3d(dtype=float),
-        world_rhs: wp.array2d(dtype=float),
-        world_impulses: wp.array2d(dtype=float),
+        world_constraint_count: wp.array[int],
+        world_C: wp.array3d[float],
+        world_rhs: wp.array2d[float],
+        world_impulses: wp.array2d[float],
         iterations: int,
         omega: float,
-        world_row_mu: wp.array2d(dtype=float),
+        world_row_mu: wp.array2d[float],
     ):
         world, _lane = wp.tid()
         pgs_solve_streaming_native(
@@ -6187,10 +6428,9 @@ def _get_pgs_solve_streaming_kernel(
     pgs_solve_streaming_template.__qualname__ = f"pgs_solve_streaming_{max_constraints}_chunk{pgs_chunk_size}"
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_streaming_template)
 
+
 @cache
-def _get_pgs_solve_mf_kernel(
-    mf_max_constraints: int, max_mf_bodies: int, device_arch: str
-) -> "wp.Kernel":
+def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device_arch: str) -> "wp.Kernel":
     """Matrix-free PGS with body velocities and impulses in shared memory.
 
     Uses one warp (32 threads) per world. Body velocities and impulses live
@@ -6402,22 +6642,22 @@ def _get_pgs_solve_mf_kernel(
     @wp.func_native(snippet)
     def pgs_solve_mf_native(
         world: int,
-        mf_constraint_count: wp.array(dtype=int),
-        mf_body_count: wp.array(dtype=int),
-        mf_body_dof_start: wp.array2d(dtype=int),
-        mf_local_body_a: wp.array2d(dtype=int),
-        mf_local_body_b: wp.array2d(dtype=int),
-        mf_J_a: wp.array3d(dtype=float),
-        mf_J_b: wp.array3d(dtype=float),
-        mf_MiJt_a: wp.array3d(dtype=float),
-        mf_MiJt_b: wp.array3d(dtype=float),
-        mf_eff_mass_inv: wp.array2d(dtype=float),
-        mf_rhs: wp.array2d(dtype=float),
-        mf_row_type: wp.array2d(dtype=int),
-        mf_row_parent: wp.array2d(dtype=int),
-        mf_row_mu: wp.array2d(dtype=float),
-        mf_impulses: wp.array2d(dtype=float),
-        v_out: wp.array(dtype=float),
+        mf_constraint_count: wp.array[int],
+        mf_body_count: wp.array[int],
+        mf_body_dof_start: wp.array2d[int],
+        mf_local_body_a: wp.array2d[int],
+        mf_local_body_b: wp.array2d[int],
+        mf_J_a: wp.array3d[float],
+        mf_J_b: wp.array3d[float],
+        mf_MiJt_a: wp.array3d[float],
+        mf_MiJt_b: wp.array3d[float],
+        mf_eff_mass_inv: wp.array2d[float],
+        mf_rhs: wp.array2d[float],
+        mf_row_type: wp.array2d[int],
+        mf_row_parent: wp.array2d[int],
+        mf_row_mu: wp.array2d[float],
+        mf_impulses: wp.array2d[float],
+        v_out: wp.array[float],
         iterations: int,
         omega: float,
         friction_start_iteration: int,
@@ -6425,22 +6665,22 @@ def _get_pgs_solve_mf_kernel(
     ): ...
 
     def pgs_solve_mf_template(
-        mf_constraint_count: wp.array(dtype=int),
-        mf_body_count: wp.array(dtype=int),
-        mf_body_dof_start: wp.array2d(dtype=int),
-        mf_local_body_a: wp.array2d(dtype=int),
-        mf_local_body_b: wp.array2d(dtype=int),
-        mf_J_a: wp.array3d(dtype=float),
-        mf_J_b: wp.array3d(dtype=float),
-        mf_MiJt_a: wp.array3d(dtype=float),
-        mf_MiJt_b: wp.array3d(dtype=float),
-        mf_eff_mass_inv: wp.array2d(dtype=float),
-        mf_rhs: wp.array2d(dtype=float),
-        mf_row_type: wp.array2d(dtype=int),
-        mf_row_parent: wp.array2d(dtype=int),
-        mf_row_mu: wp.array2d(dtype=float),
-        mf_impulses: wp.array2d(dtype=float),
-        v_out: wp.array(dtype=float),
+        mf_constraint_count: wp.array[int],
+        mf_body_count: wp.array[int],
+        mf_body_dof_start: wp.array2d[int],
+        mf_local_body_a: wp.array2d[int],
+        mf_local_body_b: wp.array2d[int],
+        mf_J_a: wp.array3d[float],
+        mf_J_b: wp.array3d[float],
+        mf_MiJt_a: wp.array3d[float],
+        mf_MiJt_b: wp.array3d[float],
+        mf_eff_mass_inv: wp.array2d[float],
+        mf_rhs: wp.array2d[float],
+        mf_row_type: wp.array2d[int],
+        mf_row_parent: wp.array2d[int],
+        mf_row_mu: wp.array2d[float],
+        mf_impulses: wp.array2d[float],
+        v_out: wp.array[float],
         iterations: int,
         omega: float,
         friction_start_iteration: int,
@@ -6475,6 +6715,7 @@ def _get_pgs_solve_mf_kernel(
     pgs_solve_mf_template.__name__ = name
     pgs_solve_mf_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_template)
+
 
 @cache
 def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.Kernel":
@@ -6513,25 +6754,25 @@ def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.K
     @wp.func_native(snippet)
     def pack_mf_meta_native(
         world: int,
-        mf_constraint_count: wp.array(dtype=int),
-        mf_dof_a: wp.array2d(dtype=int),
-        mf_dof_b: wp.array2d(dtype=int),
-        mf_eff_mass_inv: wp.array2d(dtype=float),
-        mf_rhs: wp.array2d(dtype=float),
-        mf_row_type: wp.array2d(dtype=int),
-        mf_row_parent: wp.array2d(dtype=int),
-        mf_meta: wp.array2d(dtype=int),
+        mf_constraint_count: wp.array[int],
+        mf_dof_a: wp.array2d[int],
+        mf_dof_b: wp.array2d[int],
+        mf_eff_mass_inv: wp.array2d[float],
+        mf_rhs: wp.array2d[float],
+        mf_row_type: wp.array2d[int],
+        mf_row_parent: wp.array2d[int],
+        mf_meta: wp.array2d[int],
     ): ...
 
     def pack_mf_meta_template(
-        mf_constraint_count: wp.array(dtype=int),
-        mf_dof_a: wp.array2d(dtype=int),
-        mf_dof_b: wp.array2d(dtype=int),
-        mf_eff_mass_inv: wp.array2d(dtype=float),
-        mf_rhs: wp.array2d(dtype=float),
-        mf_row_type: wp.array2d(dtype=int),
-        mf_row_parent: wp.array2d(dtype=int),
-        mf_meta: wp.array2d(dtype=int),
+        mf_constraint_count: wp.array[int],
+        mf_dof_a: wp.array2d[int],
+        mf_dof_b: wp.array2d[int],
+        mf_eff_mass_inv: wp.array2d[float],
+        mf_rhs: wp.array2d[float],
+        mf_row_type: wp.array2d[int],
+        mf_row_parent: wp.array2d[int],
+        mf_meta: wp.array2d[int],
     ):
         world, _lane = wp.tid()
         pack_mf_meta_native(
@@ -6550,6 +6791,7 @@ def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.K
     pack_mf_meta_template.__name__ = name
     pack_mf_meta_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pack_mf_meta_template)
+
 
 @cache
 def _get_pgs_solve_mf_gs_kernel(
@@ -6581,9 +6823,7 @@ def _get_pgs_solve_mf_gs_kernel(
     # --- Code generation for dense phase (D-wide dot/update, software-pipelined) ---
 
     # Pipeline register declarations
-    dense_pipe_decl = "\n".join(
-        [f"        float pre_dJ_{k} = 0.0f, pre_dY_{k} = 0.0f;" for k in range(ELEMS_PER_LANE)]
-    )
+    dense_pipe_decl = "\n".join([f"        float pre_dJ_{k} = 0.0f, pre_dY_{k} = 0.0f;" for k in range(ELEMS_PER_LANE)])
 
     # Initial prefetch (constraint 0)
     dense_prefetch_init_parts = []
@@ -7788,29 +8028,29 @@ def _get_pgs_solve_mf_gs_kernel(
     def pgs_solve_mf_gs_native(
         world: int,
         # Dense
-        world_constraint_count: wp.array(dtype=int),
-        world_dof_start: wp.array(dtype=int),
-        rhs_bias: wp.array2d(dtype=float),
-        world_diag: wp.array2d(dtype=float),
-        world_impulses: wp.array2d(dtype=float),
-        J_world: wp.array3d(dtype=float),
-        Y_world: wp.array3d(dtype=float),
-        world_row_type: wp.array2d(dtype=int),
-        world_row_parent: wp.array2d(dtype=int),
-        world_row_mu: wp.array2d(dtype=float),
-        world_drive_target_vel_bias: wp.array2d(dtype=float),
-        world_drive_vel_multiplier: wp.array2d(dtype=float),
-        world_drive_impulse_multiplier: wp.array2d(dtype=float),
-        world_drive_max_impulse: wp.array2d(dtype=float),
+        world_constraint_count: wp.array[int],
+        world_dof_start: wp.array[int],
+        rhs_bias: wp.array2d[float],
+        world_diag: wp.array2d[float],
+        world_impulses: wp.array2d[float],
+        J_world: wp.array3d[float],
+        Y_world: wp.array3d[float],
+        world_row_type: wp.array2d[int],
+        world_row_parent: wp.array2d[int],
+        world_row_mu: wp.array2d[float],
+        world_drive_target_vel_bias: wp.array2d[float],
+        world_drive_vel_multiplier: wp.array2d[float],
+        world_drive_impulse_multiplier: wp.array2d[float],
+        world_drive_max_impulse: wp.array2d[float],
         # MF
-        mf_constraint_count: wp.array(dtype=int),
-        mf_meta: wp.array2d(dtype=int),
-        mf_impulses: wp.array2d(dtype=float),
-        mf_J_a: wp.array3d(dtype=float),
-        mf_J_b: wp.array3d(dtype=float),
-        mf_MiJt_a: wp.array3d(dtype=float),
-        mf_MiJt_b: wp.array3d(dtype=float),
-        mf_row_mu: wp.array2d(dtype=float),
+        mf_constraint_count: wp.array[int],
+        mf_meta: wp.array2d[int],
+        mf_impulses: wp.array2d[float],
+        mf_J_a: wp.array3d[float],
+        mf_J_b: wp.array3d[float],
+        mf_MiJt_a: wp.array3d[float],
+        mf_MiJt_b: wp.array3d[float],
+        mf_row_mu: wp.array2d[float],
         # Shared
         iterations: int,
         omega: float,
@@ -7819,34 +8059,34 @@ def _get_pgs_solve_mf_gs_kernel(
         iteration_offset: int,
         freeze_drive_rows: int,
         # Output
-        v_out: wp.array(dtype=float),
+        v_out: wp.array[float],
     ): ...
 
     def pgs_solve_mf_gs_template(
         # Dense
-        world_constraint_count: wp.array(dtype=int),
-        world_dof_start: wp.array(dtype=int),
-        rhs_bias: wp.array2d(dtype=float),
-        world_diag: wp.array2d(dtype=float),
-        world_impulses: wp.array2d(dtype=float),
-        J_world: wp.array3d(dtype=float),
-        Y_world: wp.array3d(dtype=float),
-        world_row_type: wp.array2d(dtype=int),
-        world_row_parent: wp.array2d(dtype=int),
-        world_row_mu: wp.array2d(dtype=float),
-        world_drive_target_vel_bias: wp.array2d(dtype=float),
-        world_drive_vel_multiplier: wp.array2d(dtype=float),
-        world_drive_impulse_multiplier: wp.array2d(dtype=float),
-        world_drive_max_impulse: wp.array2d(dtype=float),
+        world_constraint_count: wp.array[int],
+        world_dof_start: wp.array[int],
+        rhs_bias: wp.array2d[float],
+        world_diag: wp.array2d[float],
+        world_impulses: wp.array2d[float],
+        J_world: wp.array3d[float],
+        Y_world: wp.array3d[float],
+        world_row_type: wp.array2d[int],
+        world_row_parent: wp.array2d[int],
+        world_row_mu: wp.array2d[float],
+        world_drive_target_vel_bias: wp.array2d[float],
+        world_drive_vel_multiplier: wp.array2d[float],
+        world_drive_impulse_multiplier: wp.array2d[float],
+        world_drive_max_impulse: wp.array2d[float],
         # MF
-        mf_constraint_count: wp.array(dtype=int),
-        mf_meta: wp.array2d(dtype=int),
-        mf_impulses: wp.array2d(dtype=float),
-        mf_J_a: wp.array3d(dtype=float),
-        mf_J_b: wp.array3d(dtype=float),
-        mf_MiJt_a: wp.array3d(dtype=float),
-        mf_MiJt_b: wp.array3d(dtype=float),
-        mf_row_mu: wp.array2d(dtype=float),
+        mf_constraint_count: wp.array[int],
+        mf_meta: wp.array2d[int],
+        mf_impulses: wp.array2d[float],
+        mf_J_a: wp.array3d[float],
+        mf_J_b: wp.array3d[float],
+        mf_MiJt_a: wp.array3d[float],
+        mf_MiJt_b: wp.array3d[float],
+        mf_row_mu: wp.array2d[float],
         # Shared
         iterations: int,
         omega: float,
@@ -7855,7 +8095,7 @@ def _get_pgs_solve_mf_gs_kernel(
         iteration_offset: int,
         freeze_drive_rows: int,
         # Output
-        v_out: wp.array(dtype=float),
+        v_out: wp.array[float],
     ):
         world, _lane = wp.tid()
         pgs_solve_mf_gs_native(
