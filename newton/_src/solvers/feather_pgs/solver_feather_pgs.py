@@ -1844,6 +1844,12 @@ class SolverFeatherPGS(SolverBase):
             self.mf_gs_k_per_world_max_colors = int(
                 os.environ.get("FEATHER_PGS_MFGS_KPW_MAX_COLORS", "64")
             )
+            # Thread->(world,slot) lane layout within a warp: "interleaved"
+            # (default, original) or "slotmajor" (coalescing-restoring relayout).
+            # Pure addressing-pattern change; solved state is bit-identical.
+            self.mf_gs_k_per_world_lane_layout = os.environ.get(
+                "FEATHER_PGS_MFGS_KPW_LANE_LAYOUT", "interleaved"
+            )
             if self.mf_gs_k_per_world and self.friction_mode == "current":
                 self._pgs_solve_mf_gs_kernel_kpw = _get_pgs_solve_mf_gs_kernel_kpw(
                     self.dense_max_constraints,
@@ -1854,6 +1860,7 @@ class SolverFeatherPGS(SolverBase):
                     device_arch,
                     k_threads=self.mf_gs_k_per_world_k,
                     friction_mode=self.friction_mode,
+                    lane_layout=self.mf_gs_k_per_world_lane_layout,
                 )
 
         self._pgs_solve_mf_kernel = None
@@ -8340,6 +8347,7 @@ def _get_pgs_solve_mf_gs_kernel_kpw(
     device_arch: str,
     k_threads: int = 1,
     friction_mode: str = "current",
+    lane_layout: str = "interleaved",
 ) -> "wp.Kernel":
     """K-threads-per-world colored MF-GS solve (friction_mode='current', row_phase 0).
 
@@ -8367,6 +8375,31 @@ def _get_pgs_solve_mf_gs_kernel_kpw(
     ``__syncwarp`` so the other slots see the dense writes before/after the MF
     phase. ``K=1`` reduces to the tpw kernel semantics exactly (single slot owns
     every node; per-color syncwarp is a no-op on a 1-lane world mask).
+
+    ``lane_layout`` selects the thread->(world,slot) mapping WITHIN a warp; both
+    layouts run the IDENTICAL Gauss-Seidel math (same set of (world,slot) work
+    items, same per-color barriers), so the solved state is bit-identical -- only
+    the global-memory access PATTERN (hence kernel time) differs:
+
+    - ``"interleaved"`` (default, the original behavior): ``world = gtid // K``,
+      ``slot = gtid % K``. The K slots of a world occupy K CONSECUTIVE lanes
+      ``[w*K .. w*K+K-1]``. Since all global accesses are world-innermost
+      ``(expr)*W + world``, adjacent lanes share the same ``world`` for K>1, so a
+      32-lane load touches only ``32/K`` distinct columns (K-fold redundant /
+      non-coalesced at K>1).
+
+    - ``"slotmajor"`` (new): with ``WPW = 32 // K`` worlds-per-warp,
+      ``world = warp*WPW + lane % WPW`` and ``slot = lane // WPW``. For a fixed
+      slot, the ``WPW`` lanes decode to CONSECUTIVE worlds, so the world-innermost
+      accesses are unit-stride / fully coalesced across the slot-group (recovers
+      the K=1 tpw access efficiency at K>1). The K slots of one world live at
+      lanes ``world_in_warp + j*WPW`` (j=0..K-1) -> same warp, so the per-color
+      ``__syncwarp`` (strided mask) stays intra-warp. At K=1 (WPW=32) the mapping
+      reduces to ``world = gtid``, ``slot = 0`` -- identical to interleaved K=1.
+      The grid must be rounded to whole warps (``ceil(W/WPW)*32``) with a
+      ``world < W`` guard for a partial last warp; for ``W % WPW == 0`` (e.g. the
+      bench's tiled counts) ``ceil(W/WPW)*32 == W*K`` so the launch dim is
+      unchanged.
     """
     if friction_mode != "current":
         raise NotImplementedError(
@@ -8374,12 +8407,49 @@ def _get_pgs_solve_mf_gs_kernel_kpw(
         )
     if k_threads not in (1, 2, 4, 8, 16, 32):
         raise ValueError(f"k_threads must divide 32 and be in {{1,2,4,8,16,32}}, got {k_threads}")
+    if lane_layout not in ("interleaved", "slotmajor"):
+        raise ValueError(
+            f"lane_layout must be 'interleaved' or 'slotmajor', got {lane_layout!r}"
+        )
     M_D = max_constraints
     M_MF = mf_max_constraints
     D = max_world_dofs
     W = world_count
     K = k_threads
     MAX_COLORS = max_colors
+    WPW = 32 // K  # worlds per warp (slotmajor); K | 32 guaranteed above
+    # Template-visible (Warp-constant-folded) selectors for the thread mapping.
+    WPW_CONST = WPW
+    LANE_SLOTMAJOR = 1 if lane_layout == "slotmajor" else 0
+
+    if lane_layout == "slotmajor":
+        # Partial-warp guard: under slotmajor a warp holds WPW worlds; the grid is
+        # rounded up to whole warps (ceil(W/WPW)*32), so the last warp may carry
+        # lanes whose `world >= W`. All K slot-lanes of a given world decode to the
+        # SAME world value (world_in_warp = lane % WPW is constant across the K
+        # slots of one world), so for any world either ALL its K lanes are in-range
+        # or ALL are OOB -> the strided __syncwarp below never names a mix of
+        # in/out-of-range lanes (no barrier mismatch hang). OOB lanes return here,
+        # before touching m_dense_g.data[world] (which would be an OOB read).
+        guard_block = "    if (world >= W) return;\n"
+        # Per-world syncwarp mask: slotmajor uses a STRIDED mask -- the K set bits
+        # are at world_in_warp + j*WPW (j=0..K-1), WPW positions apart. The loop is
+        # fully unrolled (K, WPW are f-string literals) -> a constant bit pattern.
+        # __syncwarp accepts an arbitrary (non-contiguous) mask.
+        mask_block = (
+            "    int lane = threadIdx.x & 31;\n"
+            f"    int wiw = lane % {WPW};\n"
+            "    unsigned int world_mask = 0u;\n"
+            "    #pragma unroll\n"
+            f"    for (int j = 0; j < {K}; j++) world_mask |= (1u << (wiw + j*{WPW}));\n"
+        )
+    else:  # interleaved (original behavior)
+        guard_block = ""
+        mask_block = (
+            "    // Per-world syncwarp mask: this world's K slots are K consecutive lanes.\n"
+            "    int lane = threadIdx.x & 31;\n"
+            f"    unsigned int world_mask = (((unsigned int)((1u << {K}) - 1u)) << (lane - slot));\n"
+        )
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -8389,15 +8459,13 @@ def _get_pgs_solve_mf_gs_kernel_kpw(
     // `*W` product (and the trailing `+ world`/`+ slot`) to 64-bit, so all the
     // `.data[(...)*W + world]` accesses index correctly at large world counts.
     long long W = {W};
-    int m_dense = m_dense_g.data[world];
+{guard_block}    int m_dense = m_dense_g.data[world];
     int m_mf = m_mf_g.data[world];
     if (m_dense == 0 && m_mf == 0) return;
     if (m_dense > {M_D}) m_dense = {M_D};
     if (m_mf > {M_MF}) m_mf = {M_MF};
 
-    // Per-world syncwarp mask: this world's K slots are K consecutive lanes.
-    int lane = threadIdx.x & 31;
-    unsigned int world_mask = (((unsigned int)((1u << {K}) - 1u)) << (lane - slot));
+{mask_block}
 
     // Coloring CSR bases (host layout: offsets [W*(MAX_COLORS+1)], rows [W*M_MF]).
     int off_co = world * ({MAX_COLORS} + 1);
@@ -8746,8 +8814,18 @@ def _get_pgs_solve_mf_gs_kernel_kpw(
         freeze_drive_rows: int,
     ):
         gtid = wp.tid()
-        world = gtid // K
-        slot = gtid - world * K
+        if LANE_SLOTMAJOR == 1:
+            # slot-major within warp: WPW worlds per warp, consecutive lanes ->
+            # consecutive worlds (restores world-innermost coalescing at K>1).
+            warp = gtid // 32
+            lane = gtid - warp * 32
+            world_in_warp = lane % WPW_CONST
+            slot = lane // WPW_CONST
+            world = warp * WPW_CONST + world_in_warp
+        else:
+            # interleaved (original): K consecutive lanes -> one world.
+            world = gtid // K
+            slot = gtid - world * K
         pgs_solve_mf_gs_kpw_native(
             world,
             slot,
@@ -8761,7 +8839,7 @@ def _get_pgs_solve_mf_gs_kernel_kpw(
             iterations, omega, friction_start_iteration, iteration_offset, freeze_drive_rows,
         )
 
-    name = f"pgs_solve_mf_gs_kpw_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{world_count}_{max_colors}_{k_threads}_{friction_mode}"
+    name = f"pgs_solve_mf_gs_kpw_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{world_count}_{max_colors}_{k_threads}_{friction_mode}_{lane_layout}"
     pgs_solve_mf_gs_kpw_template.__name__ = name
     pgs_solve_mf_gs_kpw_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_kpw_template)

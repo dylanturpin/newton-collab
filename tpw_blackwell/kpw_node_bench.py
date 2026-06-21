@@ -410,7 +410,8 @@ def run():
         for K in Ks:
             try:
                 d2 = make_warp_inputs(wi)
-                kpw_kernel = _get_pgs_solve_mf_gs_kernel_kpw(M_D, M_MF, D, N, MAX_COLORS, arch, k_threads=K, friction_mode="current")
+                _layout = os.environ.get("KPW_LAYOUT", "interleaved")
+                kpw_kernel = _get_pgs_solve_mf_gs_kernel_kpw(M_D, M_MF, D, N, MAX_COLORS, arch, k_threads=K, friction_mode="current", lane_layout=_layout)
                 if N == Ns[0] and K == Ks[0]:
                     print(f"  KPW kernel key = {kname(kpw_kernel)}", flush=True)
                 assert "_kpw_" in kname(kpw_kernel)
