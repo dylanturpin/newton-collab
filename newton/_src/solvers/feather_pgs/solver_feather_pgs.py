@@ -691,6 +691,69 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(
                 f"serial_kernel_block_dim must be a positive multiple of 32, got {serial_kernel_block_dim!r}"
             )
+
+        # Colored matrix-free Gauss-Seidel configuration (opt-in wide-warp port).
+        # Read the env flags ONCE at init so the per-step coloring refresh, the CSR
+        # allocation, and the GS-kernel build (_get_pgs_solve_mf_gs_kernel reads the
+        # same env vars) all agree on the same variant for the lifetime of this
+        # solver. When OFF (default), the CSR is never populated and the serial
+        # launch path is used unchanged (byte-identical serial GS). The multi-warp
+        # parallelism is gated on FEATHER_PGS_MFGS_WARPS > 1, which itself requires
+        # FEATHER_PGS_MFGS_COLORED=1.
+        self._mfgs_colored = os.environ.get("FEATHER_PGS_MFGS_COLORED", "0").lower() in {"1", "true", "yes", "on"}
+        self._mfgs_max_colors = max(int(os.environ.get("FEATHER_PGS_MFGS_MAX_COLORS", "16")), 1)
+        self._mfgs_warps = max(int(os.environ.get("FEATHER_PGS_MFGS_WARPS", "1")), 1) if self._mfgs_colored else 1
+        # Host coloring is a slow Phase-0 oracle (super-linear in world count). The
+        # per-world contact topology in a settled scene changes slowly, so the CSR
+        # can be reused for several steps. FEATHER_PGS_MFGS_COLOR_REFRESH=N rebuilds
+        # the coloring only every N solver-coloring opportunities (1 = every step,
+        # the default/correct setting). Large N isolates the SOLVE-KERNEL cost from
+        # the host-coloring overhead (and is a legitimate amortization for stable
+        # contact graphs). This is a measurement/perf knob, not a correctness one.
+        self._mfgs_color_refresh = max(int(os.environ.get("FEATHER_PGS_MFGS_COLOR_REFRESH", "1")), 1)
+        self._mfgs_color_refresh_counter = 0
+
+        # Coloring-free K=1 (thread-per-world, world-innermost coalesced) MF-GS
+        # solve path (opt-in, DEFAULT OFF). When FEATHER_PGS_TPW_K1 is set, the
+        # default-schedule (row_phase 0, friction_mode 'current') MF-GS solve is
+        # routed through the ported kpw kernel at K=1: one thread per world,
+        # fed a TRIVIAL single-color CSR (color 0 holds every MF row in natural
+        # ascending order). At K=1 the kpw kernel reduces to the serial
+        # warp-per-world semantics exactly (slot 0 owns every node; per-color
+        # __syncwarp is a no-op on a 1-lane mask), and natural-order single-color
+        # traversal matches the serial row order -- so NO graph coloring is
+        # needed (coloring-free). Read ONCE at init: the kernel build, the
+        # world-innermost scratch allocation, and the launch path must all agree
+        # for the solver's lifetime. When OFF (default) the K=1 kernel is never
+        # built, no scratch is allocated, and _launch_matrix_free_gs_solve takes
+        # its existing serial/colored launch path byte-identically.
+        #
+        # Mutually exclusive with the colored multi-warp path: both want to own
+        # the MF-GS launch, so refuse to enable K=1 alongside colored mode.
+        self._tpw_k1 = os.environ.get("FEATHER_PGS_TPW_K1", "0").lower() in {"1", "true", "yes", "on"}
+        # F1c: kill the idle-launch waste in the J/Y world-inner transpose. The
+        # default _tpw_k1_transpose_jy_to_inner spawns W*M_D*D threads and early-
+        # returns ~91% of them on dense-sparse (cube/grasp) scenes -> thread-spawn
+        # bound. When on, swap in _tpw_k1_transpose_jy_to_inner_f1c (dim=(W,D), one
+        # thread per (world,d) looping the live rows): M_D-x fewer threads, static
+        # launch dims, byte-identical writes. Only meaningful when _tpw_k1 is on.
+        self._k1_f1c = os.environ.get("FEATHER_PGS_TPW_K1_F1C", "0").lower() in {"1", "true", "yes", "on"}
+        # F2: deferred (recommend_implement=false). The flag is read so the env is
+        # forwarded and an explicit error can guard against accidental enablement.
+        # See F2_DEFERRED.md for the rationale (shared world-outer mf6 buffers feed
+        # 6+ non-K1 consumers; only a dual-write variant is safe and its payoff is
+        # unmeasured/likely below the 8.4% nsys headline). Not implemented.
+        self._k1_f2 = os.environ.get("FEATHER_PGS_TPW_K1_F2", "0").lower() in {"1", "true", "yes", "on"}
+        if self._k1_f2:
+            raise ValueError(
+                "FEATHER_PGS_TPW_K1_F2 is not implemented (deferred). See F2_DEFERRED.md."
+            )
+        if self._tpw_k1 and self._mfgs_colored:
+            raise ValueError(
+                "FEATHER_PGS_TPW_K1 is mutually exclusive with FEATHER_PGS_MFGS_COLORED "
+                "(both claim the MF-GS solve launch). Enable at most one."
+            )
+
         self.tile_threads = int(tile_threads)
         if self.tile_threads not in (32, 64, 128, 256):
             raise ValueError(f"tile_threads must be one of (32, 64, 128, 256), got {tile_threads!r}")
@@ -1757,6 +1820,8 @@ class SolverFeatherPGS(SolverBase):
         #   .w = row_type | (row_parent << 16)
         self.mf_meta_packed = wp.zeros((worlds, mf_max_c * 4), dtype=wp.int32, device=device)
 
+        self._allocate_mf_coloring_csr(device, worlds, mf_max_c)
+
         # Body map buffers for tiled MF PGS kernel
         self.max_mf_bodies = 64
         self.mf_body_list = wp.zeros(
@@ -1797,6 +1862,8 @@ class SolverFeatherPGS(SolverBase):
         for name in ("mf_J_a", "mf_J_b", "mf_MiJt_a", "mf_MiJt_b"):
             setattr(self, name, wp.zeros((worlds, 1, 6), dtype=wp.float32, device=device, requires_grad=requires_grad))
         self.mf_meta_packed = wp.zeros((worlds, 4), dtype=wp.int32, device=device)
+
+        self._allocate_mf_coloring_csr(device, worlds, 1)
 
         if self._has_rigid_body_velocity_limits and model.body_count > 0:
             # Only the ``is not None`` checks observe these on the inactive
@@ -1930,6 +1997,28 @@ class SolverFeatherPGS(SolverBase):
                 friction_mode=self.friction_mode,
             )
 
+        # Coloring-free K=1 (thread-per-world) MF-GS kernel, opt-in (default OFF).
+        # Built only when FEATHER_PGS_TPW_K1 is set AND the shape supports it AND
+        # friction_mode=='current' (the only mode the kpw kernel supports). When
+        # OFF, stays None -> _launch_matrix_free_gs_solve takes its existing path.
+        self._pgs_solve_mf_gs_kernel_k1 = None
+        if (
+            self._tpw_k1
+            and self._pgs_solve_mf_gs_kernel is not None
+            and self.friction_mode == "current"
+        ):
+            self._pgs_solve_mf_gs_kernel_k1 = _get_pgs_solve_mf_gs_kernel_kpw(
+                self.dense_max_constraints,
+                self.mf_max_constraints,
+                self.max_world_dofs,
+                self.world_count,
+                self._mfgs_max_colors,
+                device_arch,
+                k_threads=1,
+                friction_mode="current",
+            )
+            self._allocate_tpw_k1_buffers(model)
+
         self._pgs_solve_mf_kernel = None
         if model.device.is_cuda and hasattr(self, "max_mf_bodies") and self.mf_max_constraints > 0:
             self._pgs_solve_mf_kernel = _get_pgs_solve_mf_kernel(
@@ -2007,6 +2096,336 @@ class SolverFeatherPGS(SolverBase):
         active = min(self.contact_friction_position_iterations, iterations)
         return iterations - active
 
+    def _allocate_mf_coloring_csr(self, device, worlds: int, mf_max_c: int) -> None:
+        """Allocate the per-world coloring CSR consumed by the colored MF GS kernel.
+
+        Three flat int32 arrays, laid out exactly as the kernel indexes them
+        (``_get_pgs_solve_mf_gs_kernel`` colored variant):
+
+        * ``mf_color_offsets`` -- flat ``[worlds * (MAX_COLORS + 1)]``; world ``w``
+          owns slots ``[w*(MAX_COLORS+1), (w+1)*(MAX_COLORS+1))``. Entry ``c`` is the
+          start index (into that world's ``mf_color_rows`` span) of color ``c``;
+          entry ``c+1`` is its end. Unused colors point past the last emitted row.
+        * ``mf_color_rows`` -- flat ``[worlds * mf_max_c]``; world ``w`` owns
+          ``[w*mf_max_c, (w+1)*mf_max_c)``. The visiting order of MF row slots,
+          grouped by color, each contact triple's 3 rows kept consecutive
+          (normal, t1, t2).
+        * ``mf_n_colors`` -- ``[worlds]``; number of active colors in world ``w``.
+
+        Allocated regardless of the env flag so the buffers (and the kernel input
+        wiring) are always present; only populated when colored mode is on.
+        """
+        # Pure index/metadata CSR -- never differentiable.
+        self.mf_color_offsets = wp.zeros(
+            (worlds * (self._mfgs_max_colors + 1),), dtype=wp.int32, device=device
+        )
+        self.mf_color_rows = wp.zeros((worlds * mf_max_c,), dtype=wp.int32, device=device)
+        self.mf_n_colors = wp.ones((worlds,), dtype=wp.int32, device=device)
+        # Host staging buffers (filled by _refresh_mf_coloring, then uploaded).
+        self._mf_color_offsets_host = np.zeros((worlds, self._mfgs_max_colors + 1), dtype=np.int32)
+        self._mf_color_rows_host = np.zeros((worlds, mf_max_c), dtype=np.int32)
+        self._mf_n_colors_host = np.ones((worlds,), dtype=np.int32)
+        # Per-step host coloring wall time (seconds), for cost reporting.
+        self._mf_coloring_last_s = 0.0
+
+    def _allocate_tpw_k1_buffers(self, model) -> None:
+        """Allocate the world-innermost scratch + trivial CSR for the K=1 path.
+
+        Only called when ``FEATHER_PGS_TPW_K1`` is on. Pre-allocates (once at
+        init) every world-innermost buffer the K=1 (kpw) kernel consumes, sized
+        to the solver's fixed shape (M_D dense rows, M_MF mf rows, D dofs, W
+        worlds). The step-time launch transposes the world-outer step buffers
+        into these via the ``_tpw_k1_transpose_*`` kernels, launches the K=1
+        kernel, and scatters ``v_g`` back into ``v_out``. The trivial single-color
+        CSR (``mf_color_offsets``/``mf_color_rows``/``mf_n_colors`` allocated by
+        ``_allocate_mf_coloring_csr``) is (re)built each step from the live
+        ``mf_constraint_count`` by ``_tpw_k1_build_trivial_csr`` -- coloring-free.
+
+        All buffers are pure solve scratch (never differentiable).
+        """
+        device = model.device
+        W = self.world_count
+        M_D = self.dense_max_constraints
+        M_MF = self.mf_max_constraints
+        D = self.max_world_dofs
+
+        f32 = wp.float32
+        i32 = wp.int32
+        # Per-row world-inner scalar flats (M, W) -> [i*W + world].
+        self._k1_lam = wp.zeros((M_D * W,), dtype=f32, device=device)
+        self._k1_rhs = wp.zeros((M_D * W,), dtype=f32, device=device)
+        self._k1_diag = wp.zeros((M_D * W,), dtype=f32, device=device)
+        self._k1_rtype = wp.zeros((M_D * W,), dtype=i32, device=device)
+        self._k1_parent = wp.zeros((M_D * W,), dtype=i32, device=device)
+        self._k1_mu = wp.zeros((M_D * W,), dtype=f32, device=device)
+        self._k1_dtarget = wp.zeros((M_D * W,), dtype=f32, device=device)
+        self._k1_dvmul = wp.zeros((M_D * W,), dtype=f32, device=device)
+        self._k1_dimul = wp.zeros((M_D * W,), dtype=f32, device=device)
+        self._k1_dmaximp = wp.zeros((M_D * W,), dtype=f32, device=device)
+        # J/Y kept 2-D (M_D*D, W) so no single dim exceeds Warp's 2^31 limit.
+        self._k1_J = wp.zeros((M_D * D, W), dtype=f32, device=device)
+        self._k1_Y = wp.zeros((M_D * D, W), dtype=f32, device=device)
+        # MF world-inner flats.
+        self._k1_mf_meta = wp.zeros((M_MF * 4 * W,), dtype=i32, device=device)
+        self._k1_mf_lam = wp.zeros((M_MF * W,), dtype=f32, device=device)
+        self._k1_mf_J_a = wp.zeros((M_MF * 6 * W,), dtype=f32, device=device)
+        self._k1_mf_J_b = wp.zeros((M_MF * 6 * W,), dtype=f32, device=device)
+        self._k1_mf_MiJt_a = wp.zeros((M_MF * 6 * W,), dtype=f32, device=device)
+        self._k1_mf_MiJt_b = wp.zeros((M_MF * 6 * W,), dtype=f32, device=device)
+        self._k1_mf_row_mu = wp.zeros((M_MF * W,), dtype=f32, device=device)
+        # v world-inner (D, W) -> [d*W + world].
+        self._k1_v_g = wp.zeros((D * W,), dtype=f32, device=device)
+        # Per-world scalar counts (no transpose; kernel reads [world]).
+        self._k1_w_dof_start = wp.zeros((W,), dtype=i32, device=device)
+        # Trivial single-color CSR lives in the (otherwise idle when colored is
+        # off) coloring buffers allocated by _allocate_mf_coloring_csr.
+
+    def _build_tpw_k1_inputs(
+        self,
+        *,
+        dense_rhs: wp.array,
+        mf_meta: wp.array,
+    ) -> None:
+        """Transpose world-outer step buffers into the world-inner K=1 scratch.
+
+        Runs the ``build_world_innermost`` transpose recipe on-device, then
+        rebuilds the trivial single-color CSR from the live ``mf_constraint_count``.
+        Reuses the existing ``mf_color_*`` buffers for the CSR.
+        """
+        device = self.model.device
+        W = self.world_count
+        M_D = self.dense_max_constraints
+        M_MF = self.mf_max_constraints
+        D = self.max_world_dofs
+
+        # Per-row dense scalar flats (W, M_D) -> [i*W + world]. F1 count-gated:
+        # dense_cnt == self.constraint_count (the kpw m_dense_g bound) so rows
+        # i >= constraint_count[world] are skipped (never read by the kpw kernel).
+        dense_cnt = self.constraint_count
+        for src, dst, is_int in (
+            (self.impulses, self._k1_lam, False),
+            (dense_rhs, self._k1_rhs, False),
+            (self.diag, self._k1_diag, False),
+            (self.row_type, self._k1_rtype, True),
+            (self.row_parent, self._k1_parent, True),
+            (self.row_mu, self._k1_mu, False),
+            (self.drive_target_vel_bias, self._k1_dtarget, False),
+            (self.drive_vel_multiplier, self._k1_dvmul, False),
+            (self.drive_impulse_multiplier, self._k1_dimul, False),
+            (self.drive_max_impulse, self._k1_dmaximp, False),
+        ):
+            kern = _tpw_k1_transpose_2d_to_inner_int if is_int else _tpw_k1_transpose_2d_to_inner
+            wp.launch(kern, dim=(W, M_D), inputs=[src, W, dense_cnt], outputs=[dst], device=device)
+
+        # J/Y (W, M_D, D) -> (M_D*D, W). F1 count-gated (skips dead dense rows).
+        # F1c (default off): swap the dim=(W,M_D,D) per-thread early-return kernel
+        # for a dim=(W,D) one-thread-per-(world,d) loop -> M_D-x fewer threads,
+        # static grid, byte-identical writes. Off = the current launch verbatim.
+        if self._k1_f1c:
+            wp.launch(
+                _tpw_k1_transpose_jy_to_inner_f1c, dim=(W, D),
+                inputs=[self.J_world, W, M_D, D, dense_cnt], outputs=[self._k1_J], device=device,
+            )
+            wp.launch(
+                _tpw_k1_transpose_jy_to_inner_f1c, dim=(W, D),
+                inputs=[self.Y_world, W, M_D, D, dense_cnt], outputs=[self._k1_Y], device=device,
+            )
+        else:
+            wp.launch(
+                _tpw_k1_transpose_jy_to_inner, dim=(W, M_D, D),
+                inputs=[self.J_world, W, D, dense_cnt], outputs=[self._k1_J], device=device,
+            )
+            wp.launch(
+                _tpw_k1_transpose_jy_to_inner, dim=(W, M_D, D),
+                inputs=[self.Y_world, W, D, dense_cnt], outputs=[self._k1_Y], device=device,
+            )
+
+        # MF per-row scalar flats (W, M_MF) -> [i*W + world]. F1b count-gated by the
+        # LIVE mf row count (mf_constraint_count == the kpw m_mf_g bound): skip dead
+        # MF rows i >= m_mf. Big on robot scenes (h1 ~14% live, franka ~53%), ~neutral
+        # on p10/p11 (MF nearly full). Reuses the generic gated 2D transpose kernel.
+        mf_cnt = self.mf_constraint_count
+        wp.launch(
+            _tpw_k1_transpose_2d_to_inner, dim=(W, M_MF),
+            inputs=[self.mf_impulses, W, mf_cnt], outputs=[self._k1_mf_lam], device=device,
+        )
+        wp.launch(
+            _tpw_k1_transpose_2d_to_inner, dim=(W, M_MF),
+            inputs=[self.mf_row_mu, W, mf_cnt], outputs=[self._k1_mf_row_mu], device=device,
+        )
+        # MF 6-component flats (W, M_MF, 6) -> [(i*6+k)*W + world]. F1b count-gated.
+        for src, dst in (
+            (self.mf_J_a, self._k1_mf_J_a),
+            (self.mf_J_b, self._k1_mf_J_b),
+            (self.mf_MiJt_a, self._k1_mf_MiJt_a),
+            (self.mf_MiJt_b, self._k1_mf_MiJt_b),
+        ):
+            wp.launch(
+                _tpw_k1_transpose_mf6_to_inner, dim=(W, M_MF, 6),
+                inputs=[src, W, mf_cnt], outputs=[dst], device=device,
+            )
+        # mf_meta (W, M_MF*4) -> [(i*4+f)*W + world]. F1b count-gated.
+        wp.launch(
+            _tpw_k1_transpose_meta_to_inner, dim=(W, M_MF, 4),
+            inputs=[mf_meta, W, M_MF, mf_cnt], outputs=[self._k1_mf_meta], device=device,
+        )
+
+        # v_out (world-outer, world_dof_start offsets) -> v_g (D, W).
+        wp.launch(
+            _tpw_k1_gather_v_to_inner, dim=(W, D),
+            inputs=[self.v_out, self.world_dof_start, W, D], outputs=[self._k1_v_g], device=device,
+        )
+
+        # Trivial single-color CSR from live mf_constraint_count (coloring-free).
+        wp.launch(
+            _tpw_k1_build_trivial_csr, dim=W,
+            inputs=[self.mf_constraint_count, M_MF, self._mfgs_max_colors],
+            outputs=[self.mf_color_offsets, self.mf_color_rows, self.mf_n_colors],
+            device=device,
+        )
+
+    def _refresh_mf_coloring(self) -> None:
+        """Rebuild the per-world coloring CSR from the LIVE packed MF metadata.
+
+        Host (CPU) ``color_graph`` oracle: copy ``mf_meta_packed`` + per-world
+        ``mf_constraint_count`` to host, decode each row's dof bases / row_type /
+        row_parent, group contact triples (rt0 normal + its rt2 friction children),
+        build the contact-triple conflict graph (two triples conflict iff they
+        share a body dof-base), color it with Newton's MCS+balance ``color_graph``,
+        pack the CSR keeping each triple's 3 rows consecutive (normal-first), and
+        upload.
+
+        NOTE: This is the Phase-0 host oracle. It is slow and super-linear in world
+        count; acceptable for small/medium probe runs but dominates at high env
+        counts (device coloring is the eventual replacement).
+        """
+        from newton._src.sim.graph_coloring import color_graph
+
+        t0 = time.perf_counter()
+        worlds = self.world_count
+        mf_max_c = self.mf_max_constraints
+        max_colors = self._mfgs_max_colors
+
+        # .numpy() performs a synchronous D->H copy (completes outstanding work).
+        meta = self.mf_meta_packed.numpy().reshape(worlds, mf_max_c, 4)
+        counts = self.mf_constraint_count.numpy()
+
+        offsets_host = self._mf_color_offsets_host
+        rows_host = self._mf_color_rows_host
+        ncolors_host = self._mf_n_colors_host
+        offsets_host.fill(0)
+        rows_host.fill(0)
+        ncolors_host.fill(1)
+
+        for w in range(worlds):
+            Mw = int(min(int(counts[w]), mf_max_c))
+            if Mw <= 0:
+                # No MF rows: single empty color, all offsets at 0.
+                ncolors_host[w] = 1
+                continue
+            meta_w = meta[w, :Mw].astype(np.int64)
+            packed = meta_w[:, 0].astype(np.int32)
+            dof_a = (packed >> 16).astype(np.int64)
+            dof_b = ((packed << 16) >> 16).astype(np.int64)  # sign-extended low16
+            rt = (meta_w[:, 3] & 0xFFFF).astype(np.int64)
+            parent = (meta_w[:, 3] >> 16).astype(np.int64)
+
+            # Group rt2 friction rows under their rt0 normal parent.
+            children: dict[int, list[int]] = {}
+            for i in range(Mw):
+                if rt[i] == 2:
+                    children.setdefault(int(parent[i]), []).append(i)
+
+            # A node = a contact triple keyed by its rt0 normal row (normal first,
+            # frictions ascending). rt!=0 non-normal rows are folded in as children
+            # of their parent; standalone non-(0/2) rows (e.g. rt4) are excluded.
+            node_rows: list[list[int]] = []
+            node_bodies: list[set[int]] = []
+            for i in range(Mw):
+                if rt[i] != 0:
+                    continue
+                rows = [i] + sorted(children.get(i, []))
+                bodies: set[int] = set()
+                for r in rows:
+                    if dof_a[r] >= 0:
+                        bodies.add(int(dof_a[r]))
+                    if dof_b[r] >= 0:
+                        bodies.add(int(dof_b[r]))
+                node_rows.append(rows)
+                node_bodies.append(bodies)
+
+            n = len(node_rows)
+            if n == 0:
+                ncolors_host[w] = 1
+                continue
+
+            # Conflict edges: two triples conflict iff they share a body dof-base.
+            body_to_nodes: dict[int, list[int]] = {}
+            for ni, bodies in enumerate(node_bodies):
+                for b in bodies:
+                    body_to_nodes.setdefault(b, []).append(ni)
+            edges: set[tuple[int, int]] = set()
+            for ns in body_to_nodes.values():
+                for x in range(len(ns)):
+                    for y in range(x + 1, len(ns)):
+                        a, c = ns[x], ns[y]
+                        edges.add((a, c) if a < c else (c, a))
+
+            if not edges:
+                # No conflicts: all triples in one color (preserve emission order).
+                color = np.zeros(n, dtype=np.int32)
+                ncolors = 1
+            else:
+                edge_arr = wp.array(
+                    np.array(sorted(edges), dtype=np.int32), dtype=wp.int32, device="cpu"
+                )
+                groups = color_graph(n, edge_arr, balance_colors=True)
+                color = np.full(n, -1, dtype=np.int32)
+                for c, grp in enumerate(groups):
+                    color[np.asarray(grp)] = c
+                ncolors = len(groups)
+
+            if ncolors > max_colors:
+                # Too many colors for the CSR width: fall back to the degenerate
+                # single-color (serial-order) CSR for this world so the kernel
+                # stays correct (just no extra parallelism for this world).
+                rows_host[w, :Mw] = np.arange(Mw, dtype=np.int32)
+                offsets_host[w, 1:] = Mw
+                ncolors_host[w] = 1
+                continue
+
+            # Pack CSR: group nodes by color, emit each triple's rows consecutively.
+            by_color: dict[int, list[int]] = {}
+            for ni, c in enumerate(color):
+                by_color.setdefault(int(c), []).append(ni)
+            pos = 0
+            for c in range(ncolors):
+                offsets_host[w, c] = pos
+                for ni in by_color.get(c, []):
+                    for r in node_rows[ni]:
+                        rows_host[w, pos] = r
+                        pos += 1
+            for c in range(ncolors, max_colors + 1):
+                offsets_host[w, c] = pos
+            ncolors_host[w] = ncolors
+
+        # Upload host staging -> device CSR (flat layout the kernel indexes).
+        self.mf_color_offsets.assign(np.ascontiguousarray(offsets_host.reshape(-1)))
+        self.mf_color_rows.assign(np.ascontiguousarray(rows_host.reshape(-1)))
+        self.mf_n_colors.assign(np.ascontiguousarray(ncolors_host))
+        self._mf_coloring_last_s = time.perf_counter() - t0
+        self._mf_coloring_calls = getattr(self, "_mf_coloring_calls", 0) + 1
+
+        # Opt-in per-step coloring-cost telemetry.
+        if os.environ.get("FEATHER_PGS_MFGS_DEBUG", "0").lower() in {"1", "true", "yes", "on"}:
+            nc = ncolors_host
+            print(
+                f"[mfgs-color] call={self._mf_coloring_calls} worlds={worlds} "
+                f"host_color_ms={self._mf_coloring_last_s * 1e3:.3f} "
+                f"n_colors(min/med/max)={int(nc.min())}/{int(np.median(nc))}/{int(nc.max())}",
+                flush=True,
+            )
+
     def _pack_mf_meta(self, mf_rhs: wp.array) -> None:
         pack_kernel = self._pack_mf_meta_kernel
         if pack_kernel is None:
@@ -2047,7 +2466,81 @@ class SolverFeatherPGS(SolverBase):
         if mf_gs_kernel is None:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
 
+        def launch_k1_row_phase(phase_iterations: int, phase_iteration_offset: int) -> None:
+            # Coloring-free K=1 (thread-per-world) path. Transpose the world-outer
+            # step buffers into world-inner scratch, build a trivial single-color
+            # CSR, launch the kpw kernel at K=1 (flat grid dim=W, block_dim=256),
+            # then scatter v_g back into v_out. row_phase is always 0 here (the
+            # kpw kernel supports the default schedule / friction_mode='current').
+            self._build_tpw_k1_inputs(dense_rhs=dense_rhs, mf_meta=mf_meta)
+            # Build the input list in the exact kpw_input_list order. m_dense_g is
+            # the dense per-world row count (constraint_count); m_mf_g is
+            # mf_constraint_count; w_dof_start_g is the (unused) zeros vector.
+            kin = [
+                self.constraint_count,
+                self.mf_constraint_count,
+                self._k1_w_dof_start,
+                self._k1_lam,
+                self._k1_rhs,
+                self._k1_diag,
+                self._k1_rtype,
+                self._k1_parent,
+                self._k1_mu,
+                self._k1_dtarget,
+                self._k1_dvmul,
+                self._k1_dimul,
+                self._k1_dmaximp,
+                self._k1_J,
+                self._k1_Y,
+                self._k1_mf_meta,
+                self._k1_mf_lam,
+                self._k1_mf_J_a,
+                self._k1_mf_J_b,
+                self._k1_mf_MiJt_a,
+                self._k1_mf_MiJt_b,
+                self._k1_mf_row_mu,
+                self.mf_color_offsets,
+                self.mf_color_rows,
+                self.mf_n_colors,
+                self._k1_v_g,
+                int(phase_iterations),
+                float(omega),
+                int(friction_start_iteration),
+                int(phase_iteration_offset),
+                int(freeze_drive_rows),
+            ]
+            wp.launch(
+                self._pgs_solve_mf_gs_kernel_k1,
+                dim=self.world_count,  # K=1 -> dim = W
+                inputs=kin,
+                block_dim=256,
+                device=self.model.device,
+            )
+            # Scatter v_g (world-inner) back into v_out (world-outer). The K=1
+            # kernel reads/writes the dense lam (self._k1_lam) and mf lam
+            # (self._k1_mf_lam) scratch in place; the persistent impulses /
+            # mf_impulses are re-gathered from scratch each step (the serial
+            # path is RMW on self.impulses but the K=1 path's converged velocity
+            # is what downstream consumes, so v_out is the only output to mirror).
+            wp.launch(
+                _tpw_k1_scatter_v_from_inner,
+                dim=(self.world_count, self.max_world_dofs),
+                inputs=[self._k1_v_g, self.world_dof_start, self.world_count, self.max_world_dofs],
+                outputs=[self.v_out],
+                device=self.model.device,
+            )
+
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
+            # Coloring-free K=1 (thread-per-world) MF-GS path (opt-in, default
+            # OFF). Only the default schedule (row_phase 0) is supported by the
+            # kpw kernel; other row_phases fall through to the serial/colored path.
+            if (
+                self._tpw_k1
+                and row_phase == 0
+                and getattr(self, "_pgs_solve_mf_gs_kernel_k1", None) is not None
+            ):
+                launch_k1_row_phase(phase_iterations, phase_iteration_offset)
+                return
             if (
                 _FPGS_CAPTURE
                 and getattr(self, "_fpgs_step_n", -1) == _FPGS_CAPTURE_STEP
@@ -2103,41 +2596,51 @@ class SolverFeatherPGS(SolverBase):
                         indent=2,
                     )
                 print(f"[fpgs-capture] wrote {_base}.npz/.json", flush=True)
+            # Colored path: the kernel signature carries three extra CSR inputs
+            # after mf_row_mu and the block launches 32*W threads (W warps cooperate
+            # per world). Serial path: no CSR inputs, single warp (block_dim=32).
+            # The kernel variant was selected at init from the same env flags, so
+            # the input list and block_dim must match it here.
+            inputs = [
+                self.constraint_count,
+                self.world_dof_start,
+                dense_rhs,
+                self.diag,
+                self.impulses,
+                self.J_world,
+                self.Y_world,
+                self.row_type,
+                self.row_parent,
+                self.row_mu,
+                self.drive_target_vel_bias,
+                self.drive_vel_multiplier,
+                self.drive_impulse_multiplier,
+                self.drive_max_impulse,
+                self.mf_constraint_count,
+                mf_meta,
+                self.mf_impulses,
+                self.mf_J_a,
+                self.mf_J_b,
+                self.mf_MiJt_a,
+                self.mf_MiJt_b,
+                self.mf_row_mu,
+            ]
+            if self._mfgs_colored:
+                inputs += [self.mf_color_offsets, self.mf_color_rows, self.mf_n_colors]
+            inputs += [
+                phase_iterations,
+                omega,
+                row_phase,
+                int(friction_start_iteration),
+                int(phase_iteration_offset),
+                int(freeze_drive_rows),
+            ]
             wp.launch_tiled(
                 mf_gs_kernel,
                 dim=[self.world_count],
-                inputs=[
-                    self.constraint_count,
-                    self.world_dof_start,
-                    dense_rhs,
-                    self.diag,
-                    self.impulses,
-                    self.J_world,
-                    self.Y_world,
-                    self.row_type,
-                    self.row_parent,
-                    self.row_mu,
-                    self.drive_target_vel_bias,
-                    self.drive_vel_multiplier,
-                    self.drive_impulse_multiplier,
-                    self.drive_max_impulse,
-                    self.mf_constraint_count,
-                    mf_meta,
-                    self.mf_impulses,
-                    self.mf_J_a,
-                    self.mf_J_b,
-                    self.mf_MiJt_a,
-                    self.mf_MiJt_b,
-                    self.mf_row_mu,
-                    phase_iterations,
-                    omega,
-                    row_phase,
-                    int(friction_start_iteration),
-                    int(phase_iteration_offset),
-                    int(freeze_drive_rows),
-                ],
+                inputs=inputs,
                 outputs=[self.v_out],
-                block_dim=32,
+                block_dim=(32 * self._mfgs_warps if self._mfgs_colored else 32),
                 device=self.model.device,
             )
 
@@ -2589,6 +3092,17 @@ class SolverFeatherPGS(SolverBase):
 
                 # Pack MF metadata into int4 structs for coalesced 128-bit loads
                 self._pack_mf_meta(self.mf_rhs)
+
+                # Colored MF Gauss-Seidel: rebuild the per-world coloring CSR from
+                # the LIVE packed metadata + row_parent before the GS launch. The
+                # conflict graph depends only on dof bases / row_type / row_parent
+                # (the .x and .w packed words), which are stable for the rest of
+                # this step, so the velocity post-solve reuses this same CSR. OFF
+                # by default -> serial path untouched.
+                if self._mfgs_colored:
+                    if (self._mfgs_color_refresh_counter % self._mfgs_color_refresh) == 0:
+                        self._refresh_mf_coloring()
+                    self._mfgs_color_refresh_counter += 1
 
             with wp.ScopedTimer("S6_PGS_Solve", print=False, use_nvtx=self._nvtx, synchronize=False):
                 if self.pgs_debug:
@@ -6817,6 +7331,22 @@ def _get_pgs_solve_mf_gs_kernel(
     M_MF = mf_max_constraints
     D = max_world_dofs
 
+    # ── Colored / wide-warp MF Gauss-Seidel (opt-in wide-warp port) ──
+    # When FEATHER_PGS_MFGS_COLORED is set, the serial matrix-free row loop is
+    # re-expressed as a per-color CSR loop (3 extra kernel inputs). At the
+    # degenerate setting n_colors=1 with a single color listing every row in
+    # original slot order, the emitted code visits rows in the exact same order
+    # and performs the exact same loads / float math / reductions / lambda stores
+    # as the serial loop -> byte-identical to the serial path. The CSR only
+    # changes the *visiting order inside the solve*, never the storage slot.
+    # FEATHER_PGS_MFGS_WARPS=W (>1, colored only) makes W warps cooperate per
+    # world (block_dim=32*W); independent contact nodes within a color are
+    # distributed round-robin across the W warps. W=1 reproduces the single-warp
+    # colored path exactly. Default OFF leaves the serial f-string untouched.
+    MFGS_COLORED = os.environ.get("FEATHER_PGS_MFGS_COLORED", "0").lower() in {"1", "true", "yes", "on"}
+    MAX_COLORS = max(int(os.environ.get("FEATHER_PGS_MFGS_MAX_COLORS", "16")), 1)
+    MFGS_WARPS = max(int(os.environ.get("FEATHER_PGS_MFGS_WARPS", "1")), 1) if MFGS_COLORED else 1
+
     # How many DOF elements each lane handles (ceil(D/32))
     ELEMS_PER_LANE = (D + 31) // 32
 
@@ -7625,10 +8155,286 @@ def _get_pgs_solve_mf_gs_kernel(
                 }
 """
 
+    # ════════════════════════════════════════════════════════════════════
+    # MF main Gauss-Seidel loop body assembly (serial vs colored CSR).
+    #
+    # The per-row update body is identical between the two paths; only the
+    # loop scaffolding (prefetch-init, loop header, prefetch-next) differs.
+    # `mf_main_loop` is built here as a plain string (real single braces) and
+    # inserted into the snippet f-string via {mf_main_loop}; values
+    # interpolated into an f-string are taken verbatim, so the C braces inside
+    # are NOT re-interpreted by the outer f-string. The friction block is
+    # spliced in via the __MF_FRICTION_BLOCK__ sentinel.
+    # CSR base-offset declarations: only emitted on the colored path so the
+    # serial f-string (and the OFF kernel cache key) is completely unchanged.
+    if MFGS_COLORED:
+        mf_color_offsets_decl = f"    int off_co = world * ({MAX_COLORS} + 1);\n    int off_cr = world * {M_MF};"
+    else:
+        mf_color_offsets_decl = ""
+
+    mf_row_body = """
+            if (row_phase == 2 || row_phase == 3 || row_phase == 5) continue;
+
+            // Process constraint i
+            int packed_dofs = meta.x;
+            int dof_a = packed_dofs >> 16;
+            int dof_b = (packed_dofs << 16) >> 16;
+            float mf_diag = __int_as_float(meta.y);
+            int packed_tp = meta.w;
+            int mf_rt = packed_tp & 0xFFFF;
+
+            if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2) continue;
+            if (row_phase == 0 && mf_rt == 4) continue;
+            if (mf_rt == 2 && global_iter < friction_start_iteration) {
+                s_lam_mf[i] = 0.0f;
+                __syncwarp();
+                continue;
+            }
+
+            if (mf_diag <= 0.0f) continue;
+
+            // J · v using prefetched J values
+            float my_sum = 0.0f;
+            if (lane < 6 && dof_a >= 0) {
+                my_sum = cur_Ja * s_v[dof_a + lane];
+            }
+            if (lane >= 6 && lane < 12 && dof_b >= 0) {
+                my_sum = cur_Jb * s_v[dof_b + lane - 6];
+            }
+            my_sum += __shfl_down_sync(MASK, my_sum, 16);
+            my_sum += __shfl_down_sync(MASK, my_sum, 8);
+            my_sum += __shfl_down_sync(MASK, my_sum, 4);
+            my_sum += __shfl_down_sync(MASK, my_sum, 2);
+            my_sum += __shfl_down_sync(MASK, my_sum, 1);
+            float jv = __shfl_sync(MASK, my_sum, 0);
+
+            float residual = jv + __int_as_float(meta.z);
+            float delta = -residual * mf_diag;
+            float old_impulse = s_lam_mf[i];
+            float new_impulse = old_impulse + omega * delta;
+            float delta_impulse = 0.0f;
+
+            if (mf_rt == 0) {
+                if (new_impulse < 0.0f) new_impulse = 0.0f;
+            } else if (mf_rt == 4) {
+                if (residual < 0.0f) {
+                    delta_impulse = delta;
+                    new_impulse = delta_impulse;
+                } else {
+                    delta_impulse = 0.0f;
+                    new_impulse = 0.0f;
+                }
+            } else if (mf_rt == 2) {
+                __MF_FRICTION_BLOCK__
+            }
+
+            if (mf_rt != 4) delta_impulse = new_impulse - old_impulse;
+            s_lam_mf[i] = new_impulse;
+
+            // V update using prefetched MiJt values
+            if (delta_impulse != 0.0f) {
+                if (lane < 6 && dof_a >= 0) {
+                    s_v[dof_a + lane] += cur_MiJta * delta_impulse;
+                }
+                if (lane >= 6 && lane < 12 && dof_b >= 0) {
+                    s_v[dof_b + lane - 6] += cur_MiJtb * delta_impulse;
+                }
+            }
+            __syncwarp();
+"""
+
+    if not MFGS_COLORED:
+        # ── Serial path (default): byte-for-byte the original loop. ──
+        mf_main_loop = (
+            """
+        // Pipeline registers: prefetch next constraint's global data
+        int4 pre_meta;
+        float pre_Ja = 0.0f, pre_Jb = 0.0f;
+        float pre_MiJta = 0.0f, pre_MiJtb = 0.0f;
+
+        // Prefetch constraint 0
+        if (m_mf > 0) {
+            pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta]);
+            if (lane < 6) {
+                pre_Ja = mf_J_a.data[mf6_base + lane];
+                pre_MiJta = mf_MiJt_a.data[mf6_base + lane];
+            }
+            if (lane >= 6 && lane < 12) {
+                pre_Jb = mf_J_b.data[mf6_base + lane - 6];
+                pre_MiJtb = mf_MiJt_b.data[mf6_base + lane - 6];
+            }
+        }
+
+        for (int i = 0; i < m_mf; i++) {
+            // Consume prefetched data for constraint i
+            int4 meta = pre_meta;
+            float cur_Ja = pre_Ja;
+            float cur_Jb = pre_Jb;
+            float cur_MiJta = pre_MiJta;
+            float cur_MiJtb = pre_MiJtb;
+
+            // Prefetch constraint i+1 (loads issued now, complete during compute)
+            if (i + 1 < m_mf) {
+                int next_mf6 = mf6_base + (i + 1) * 6;
+                pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i + 1) * 4]);
+                if (lane < 6) {
+                    pre_Ja = mf_J_a.data[next_mf6 + lane];
+                    pre_MiJta = mf_MiJt_a.data[next_mf6 + lane];
+                }
+                if (lane >= 6 && lane < 12) {
+                    pre_Jb = mf_J_b.data[next_mf6 + lane - 6];
+                    pre_MiJtb = mf_MiJt_b.data[next_mf6 + lane - 6];
+                }
+            }
+"""
+            + mf_row_body
+            + "        }"
+        )
+    elif MFGS_WARPS == 1:
+        # ── Colored CSR path, single warp (Phase 1 bit-identity anchor) ──
+        # Two-level loop: for each color, walk its rows from the CSR. At
+        # n_colors=1 (a single color listing rows 0..m_mf-1 in slot order) the
+        # visited sequence, prefetch addresses, float math, reductions, and
+        # lambda stores are identical to the serial loop -- byte-for-byte.
+        mf_main_loop = (
+            """
+        // Pipeline registers: prefetch next constraint's global data
+        int4 pre_meta;
+        float pre_Ja = 0.0f, pre_Jb = 0.0f;
+        float pre_MiJta = 0.0f, pre_MiJtb = 0.0f;
+
+        int mf_nc = mf_n_colors.data[world];
+        for (int c = 0; c < mf_nc; c++) {
+            int cs = mf_color_offsets.data[off_co + c];
+            int ce = mf_color_offsets.data[off_co + c + 1];
+            if (ce <= cs) continue;
+
+            // Prefetch the first row of this color.
+            int i_pf0 = mf_color_rows.data[off_cr + cs];
+            int pf0_mf6 = mf6_base + i_pf0 * 6;
+            pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i_pf0 * 4]);
+            if (lane < 6) {
+                pre_Ja = mf_J_a.data[pf0_mf6 + lane];
+                pre_MiJta = mf_MiJt_a.data[pf0_mf6 + lane];
+            }
+            if (lane >= 6 && lane < 12) {
+                pre_Jb = mf_J_b.data[pf0_mf6 + lane - 6];
+                pre_MiJtb = mf_MiJt_b.data[pf0_mf6 + lane - 6];
+            }
+
+            for (int kk = cs; kk < ce; kk++) {
+                int i = mf_color_rows.data[off_cr + kk];
+
+                // Consume prefetched data for constraint i
+                int4 meta = pre_meta;
+                float cur_Ja = pre_Ja;
+                float cur_Jb = pre_Jb;
+                float cur_MiJta = pre_MiJta;
+                float cur_MiJtb = pre_MiJtb;
+
+                // Prefetch the next CSR row within this color.
+                if (kk + 1 < ce) {
+                    int i_next = mf_color_rows.data[off_cr + kk + 1];
+                    int next_mf6 = mf6_base + i_next * 6;
+                    pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i_next * 4]);
+                    if (lane < 6) {
+                        pre_Ja = mf_J_a.data[next_mf6 + lane];
+                        pre_MiJta = mf_MiJt_a.data[next_mf6 + lane];
+                    }
+                    if (lane >= 6 && lane < 12) {
+                        pre_Jb = mf_J_b.data[next_mf6 + lane - 6];
+                        pre_MiJtb = mf_MiJt_b.data[next_mf6 + lane - 6];
+                    }
+                }
+"""
+            + mf_row_body
+            + """            }
+            __syncwarp();   // per-color barrier (W=1: warp-local)
+        }"""
+        )
+    else:
+        # ── Colored CSR path, MULTI-WARP-per-world (W = N_WARPS) ──
+        # block_dim = 32*W. Each warp (warp_id = threadIdx.x>>5) cooperates on a
+        # world's block; within each color the independent NODES are distributed
+        # round-robin across the W warps at NODE granularity so a contact triple
+        # ({normal,t1,t2}, emitted consecutively in mf_color_rows) always lands
+        # ENTIRELY on one warp (its friction block reaches s_lam_mf[parent] +
+        # sibling via intra-warp __shfl/__syncwarp). A node-start is any row with
+        # mf_rt != 2 (rt0 normal / standalone); rt2 friction rows ride with the
+        # preceding normal. Warp owns node ordinal q iff q % N_WARPS == warp_id.
+        # The per-color barrier is __syncthreads() (cross-warp) because color c+1
+        # may read s_v written by color c on another warp. The i+1 software
+        # prefetch is dropped; each owned row loads its J/MiJt directly.
+        N_WARPS = MFGS_WARPS
+        mf_main_loop = (
+            f"""
+        int warp_id = threadIdx.x >> 5;
+        int mf_nc = mf_n_colors.data[world];
+        for (int c = 0; c < mf_nc; c++) {{
+            int cs = mf_color_offsets.data[off_co + c];
+            int ce = mf_color_offsets.data[off_co + c + 1];
+
+            // Walk this color's rows; assign whole nodes round-robin to warps.
+            int node_ord = -1;       // ordinal of the current node within color
+            for (int kk = cs; kk < ce; kk++) {{
+                int i = mf_color_rows.data[off_cr + kk];
+                int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);
+                int row_rt = meta.w & 0xFFFF;
+                if (row_rt != 2) node_ord++;   // node-start (normal / standalone)
+                // Only the warp that owns this node executes its rows.
+                if ((node_ord % {N_WARPS}) != warp_id) continue;
+
+                // Direct (non-prefetched) loads for the owned row i.
+                int row_mf6 = mf6_base + i * 6;
+                float cur_Ja = 0.0f, cur_Jb = 0.0f;
+                float cur_MiJta = 0.0f, cur_MiJtb = 0.0f;
+                if (lane < 6) {{
+                    cur_Ja = mf_J_a.data[row_mf6 + lane];
+                    cur_MiJta = mf_MiJt_a.data[row_mf6 + lane];
+                }}
+                if (lane >= 6 && lane < 12) {{
+                    cur_Jb = mf_J_b.data[row_mf6 + lane - 6];
+                    cur_MiJtb = mf_MiJt_b.data[row_mf6 + lane - 6];
+                }}
+"""
+            + mf_row_body
+            + """            }
+            __syncthreads();   // per-color barrier (W>1: cross-warp)
+        }"""
+        )
+
+    # Splice the friction block verbatim so the rendered text matches the
+    # original `{mf_friction_block}` interpolation exactly.
+    mf_main_loop = mf_main_loop.replace(
+        "                __MF_FRICTION_BLOCK__", "                " + mf_friction_block
+    )
+
+    # ── Multi-warp template fragments ──────────────────────────────────
+    # For W=1 (serial OR colored-single-warp) these reduce to the original
+    # single-warp text exactly: lane=threadIdx.x, stride 32, no warp_id guard.
+    # For W>1 the block is 32*W threads; lane is the in-warp lane, LOAD/STORE
+    # stride over the whole block, and the single-warp-only sections (dense
+    # solve, dense-vlim tail, mf-rt4 tail) run on warp 0 with a __syncthreads()
+    # so all warps see the updated s_v before the MF color loop.
+    if MFGS_WARPS > 1:
+        lane_decl = "int lane = threadIdx.x & 31;\n    int blk_warp_id = threadIdx.x >> 5;"
+        ld_stride = str(32 * MFGS_WARPS)
+        ld_index = "threadIdx.x"
+        w0_open = "if (blk_warp_id == 0) {"
+        w0_close = "}\n        __syncthreads();"
+        load_barrier = "__syncthreads();"
+    else:
+        lane_decl = "int lane = threadIdx.x;"
+        ld_stride = "32"
+        ld_index = "lane"
+        w0_open = ""
+        w0_close = ""
+        load_barrier = "__syncwarp();"
+
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
-    int lane = threadIdx.x;
+    {lane_decl}
 
     int m_dense = world_constraint_count.data[world];
     int m_mf = mf_constraint_count.data[world];
@@ -7642,7 +8448,7 @@ def _get_pgs_solve_mf_gs_kernel(
     int off_meta = off_mf * 4;
     int jy_world_base = world * {M_D} * {D};
     int mf6_base = world * {M_MF} * 6;
-
+{mf_color_offsets_decl}
     // ═══════════════════════════════════════════════════════
     // SHARED MEMORY
     // ═══════════════════════════════════════════════════════
@@ -7662,7 +8468,7 @@ def _get_pgs_solve_mf_gs_kernel(
     // ═══════════════════════════════════════════════════════
     // LOAD PHASE
     // ═══════════════════════════════════════════════════════
-    for (int i = lane; i < m_dense; i += 32) {{
+    for (int i = {ld_index}; i < m_dense; i += {ld_stride}) {{
         s_lam_dense[i] = world_impulses.data[off_dense + i];
         s_rhs_dense[i] = rhs_bias.data[off_dense + i];
         s_diag_dense[i] = world_diag.data[off_dense + i];
@@ -7674,13 +8480,13 @@ def _get_pgs_solve_mf_gs_kernel(
         s_drive_imp_mul_dense[i] = world_drive_impulse_multiplier.data[off_dense + i];
         s_drive_max_imp_dense[i] = world_drive_max_impulse.data[off_dense + i];
     }}
-    for (int i = lane; i < m_mf; i += 32) {{
+    for (int i = {ld_index}; i < m_mf; i += {ld_stride}) {{
         s_lam_mf[i] = mf_impulses.data[off_mf + i];
     }}
-    for (int d = lane; d < {D}; d += 32) {{
+    for (int d = {ld_index}; d < {D}; d += {ld_stride}) {{
         s_v[d] = v_out.data[w_dof_start + d];
     }}
-    __syncwarp();
+    {load_barrier}
 
     // ═══════════════════════════════════════════════════════
     // SOLVE PHASE
@@ -7692,7 +8498,7 @@ def _get_pgs_solve_mf_gs_kernel(
         int global_iter = iteration_offset + iter;
 
         // ── Phase 1: Dense constraints (D-DOF warp-parallel, software-pipelined) ──
-
+        {w0_open}
         // Prefetch constraint 0
         if (m_dense > 0) {{
             {dense_prefetch_init_code}
@@ -7796,124 +8602,17 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
             __syncwarp();
         }}
+        {w0_close}
 
         // ── Phase 2: MF constraints (6-DOF per body, software-pipelined) ──
-
-        // Pipeline registers: prefetch next constraint's global data
-        int4 pre_meta;
-        float pre_Ja = 0.0f, pre_Jb = 0.0f;
-        float pre_MiJta = 0.0f, pre_MiJtb = 0.0f;
-
-        // Prefetch constraint 0
-        if (m_mf > 0) {{
-            pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta]);
-            if (lane < 6) {{
-                pre_Ja = mf_J_a.data[mf6_base + lane];
-                pre_MiJta = mf_MiJt_a.data[mf6_base + lane];
-            }}
-            if (lane >= 6 && lane < 12) {{
-                pre_Jb = mf_J_b.data[mf6_base + lane - 6];
-                pre_MiJtb = mf_MiJt_b.data[mf6_base + lane - 6];
-            }}
-        }}
-
-        for (int i = 0; i < m_mf; i++) {{
-            // Consume prefetched data for constraint i
-            int4 meta = pre_meta;
-            float cur_Ja = pre_Ja;
-            float cur_Jb = pre_Jb;
-            float cur_MiJta = pre_MiJta;
-            float cur_MiJtb = pre_MiJtb;
-
-            // Prefetch constraint i+1 (loads issued now, complete during compute)
-            if (i + 1 < m_mf) {{
-                int next_mf6 = mf6_base + (i + 1) * 6;
-                pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i + 1) * 4]);
-                if (lane < 6) {{
-                    pre_Ja = mf_J_a.data[next_mf6 + lane];
-                    pre_MiJta = mf_MiJt_a.data[next_mf6 + lane];
-                }}
-                if (lane >= 6 && lane < 12) {{
-                    pre_Jb = mf_J_b.data[next_mf6 + lane - 6];
-                    pre_MiJtb = mf_MiJt_b.data[next_mf6 + lane - 6];
-                }}
-            }}
-
-            if (row_phase == 2 || row_phase == 3 || row_phase == 5) continue;
-
-            // Process constraint i
-            int packed_dofs = meta.x;
-            int dof_a = packed_dofs >> 16;
-            int dof_b = (packed_dofs << 16) >> 16;
-            float mf_diag = __int_as_float(meta.y);
-            int packed_tp = meta.w;
-            int mf_rt = packed_tp & 0xFFFF;
-
-            if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2) continue;
-            if (row_phase == 0 && mf_rt == 4) continue;
-            if (mf_rt == 2 && global_iter < friction_start_iteration) {{
-                s_lam_mf[i] = 0.0f;
-                __syncwarp();
-                continue;
-            }}
-
-            if (mf_diag <= 0.0f) continue;
-
-            // J · v using prefetched J values
-            float my_sum = 0.0f;
-            if (lane < 6 && dof_a >= 0) {{
-                my_sum = cur_Ja * s_v[dof_a + lane];
-            }}
-            if (lane >= 6 && lane < 12 && dof_b >= 0) {{
-                my_sum = cur_Jb * s_v[dof_b + lane - 6];
-            }}
-            my_sum += __shfl_down_sync(MASK, my_sum, 16);
-            my_sum += __shfl_down_sync(MASK, my_sum, 8);
-            my_sum += __shfl_down_sync(MASK, my_sum, 4);
-            my_sum += __shfl_down_sync(MASK, my_sum, 2);
-            my_sum += __shfl_down_sync(MASK, my_sum, 1);
-            float jv = __shfl_sync(MASK, my_sum, 0);
-
-            float residual = jv + __int_as_float(meta.z);
-            float delta = -residual * mf_diag;
-            float old_impulse = s_lam_mf[i];
-            float new_impulse = old_impulse + omega * delta;
-            float delta_impulse = 0.0f;
-
-            if (mf_rt == 0) {{
-                if (new_impulse < 0.0f) new_impulse = 0.0f;
-            }} else if (mf_rt == 4) {{
-                if (residual < 0.0f) {{
-                    delta_impulse = delta;
-                    new_impulse = delta_impulse;
-                }} else {{
-                    delta_impulse = 0.0f;
-                    new_impulse = 0.0f;
-                }}
-            }} else if (mf_rt == 2) {{
-                {mf_friction_block}
-            }}
-
-            if (mf_rt != 4) delta_impulse = new_impulse - old_impulse;
-            s_lam_mf[i] = new_impulse;
-
-            // V update using prefetched MiJt values
-            if (delta_impulse != 0.0f) {{
-                if (lane < 6 && dof_a >= 0) {{
-                    s_v[dof_a + lane] += cur_MiJta * delta_impulse;
-                }}
-                if (lane >= 6 && lane < 12 && dof_b >= 0) {{
-                    s_v[dof_b + lane - 6] += cur_MiJtb * delta_impulse;
-                }}
-            }}
-            __syncwarp();
-        }}
+{mf_main_loop}
 
         // ── Final velocity-limit phase ──
         // Default/interleaved solves skip row_type=4 above and visit both
         // dense articulated limits and MF rigid limits here, after all
         // drive/contact/friction/position-limit rows. Split schedules use
         // row_phase 2/5 as their explicit final velocity-limit pass.
+        {w0_open}
         if (row_phase == 0 || row_phase == 2) {{
             for (int i = 0; i < m_dense; i++) {{
                 if (s_rtype_dense[i] != 4) continue;
@@ -7992,18 +8691,19 @@ def _get_pgs_solve_mf_gs_kernel(
                 __syncwarp();
             }}
         }}
+        {w0_close}
     }}
 
     // ═══════════════════════════════════════════════════════
     // STORE PHASE
     // ═══════════════════════════════════════════════════════
-    for (int d = lane; d < {D}; d += 32) {{
+    for (int d = {ld_index}; d < {D}; d += {ld_stride}) {{
         v_out.data[w_dof_start + d] = s_v[d];
     }}
-    for (int i = lane; i < m_dense; i += 32) {{
+    for (int i = {ld_index}; i < m_dense; i += {ld_stride}) {{
         world_impulses.data[off_dense + i] = s_lam_dense[i];
     }}
-    for (int i = lane; i < m_mf; i += 32) {{
+    for (int i = {ld_index}; i < m_mf; i += {ld_stride}) {{
         mf_impulses.data[off_mf + i] = s_lam_mf[i];
     }}
 #endif
@@ -8024,114 +8724,887 @@ def _get_pgs_solve_mf_gs_kernel(
         )
         snippet = re.sub(r"s_lam_mf\[([^\]]*)\]", r"g_lam_mf[\1]", snippet)
 
-    @wp.func_native(snippet)
-    def pgs_solve_mf_gs_native(
-        world: int,
-        # Dense
-        world_constraint_count: wp.array[int],
-        world_dof_start: wp.array[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        J_world: wp.array3d[float],
-        Y_world: wp.array3d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_drive_target_vel_bias: wp.array2d[float],
-        world_drive_vel_multiplier: wp.array2d[float],
-        world_drive_impulse_multiplier: wp.array2d[float],
-        world_drive_max_impulse: wp.array2d[float],
-        # MF
-        mf_constraint_count: wp.array[int],
-        mf_meta: wp.array2d[int],
-        mf_impulses: wp.array2d[float],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_row_mu: wp.array2d[float],
-        # Shared
-        iterations: int,
-        omega: float,
-        row_phase: int,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        freeze_drive_rows: int,
-        # Output
-        v_out: wp.array[float],
-    ): ...
+    if not MFGS_COLORED:
 
-    def pgs_solve_mf_gs_template(
-        # Dense
-        world_constraint_count: wp.array[int],
-        world_dof_start: wp.array[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        J_world: wp.array3d[float],
-        Y_world: wp.array3d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_drive_target_vel_bias: wp.array2d[float],
-        world_drive_vel_multiplier: wp.array2d[float],
-        world_drive_impulse_multiplier: wp.array2d[float],
-        world_drive_max_impulse: wp.array2d[float],
-        # MF
-        mf_constraint_count: wp.array[int],
-        mf_meta: wp.array2d[int],
-        mf_impulses: wp.array2d[float],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_row_mu: wp.array2d[float],
-        # Shared
-        iterations: int,
-        omega: float,
-        row_phase: int,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        freeze_drive_rows: int,
-        # Output
-        v_out: wp.array[float],
-    ):
-        world, _lane = wp.tid()
-        pgs_solve_mf_gs_native(
-            world,
-            world_constraint_count,
-            world_dof_start,
-            rhs_bias,
-            world_diag,
-            world_impulses,
-            J_world,
-            Y_world,
-            world_row_type,
-            world_row_parent,
-            world_row_mu,
-            world_drive_target_vel_bias,
-            world_drive_vel_multiplier,
-            world_drive_impulse_multiplier,
-            world_drive_max_impulse,
-            mf_constraint_count,
-            mf_meta,
-            mf_impulses,
-            mf_J_a,
-            mf_J_b,
-            mf_MiJt_a,
-            mf_MiJt_b,
-            mf_row_mu,
-            iterations,
-            omega,
-            row_phase,
-            friction_start_iteration,
-            iteration_offset,
-            freeze_drive_rows,
-            v_out,
-        )
+        @wp.func_native(snippet)
+        def pgs_solve_mf_gs_native(
+            world: int,
+            # Dense
+            world_constraint_count: wp.array[int],
+            world_dof_start: wp.array[int],
+            rhs_bias: wp.array2d[float],
+            world_diag: wp.array2d[float],
+            world_impulses: wp.array2d[float],
+            J_world: wp.array3d[float],
+            Y_world: wp.array3d[float],
+            world_row_type: wp.array2d[int],
+            world_row_parent: wp.array2d[int],
+            world_row_mu: wp.array2d[float],
+            world_drive_target_vel_bias: wp.array2d[float],
+            world_drive_vel_multiplier: wp.array2d[float],
+            world_drive_impulse_multiplier: wp.array2d[float],
+            world_drive_max_impulse: wp.array2d[float],
+            # MF
+            mf_constraint_count: wp.array[int],
+            mf_meta: wp.array2d[int],
+            mf_impulses: wp.array2d[float],
+            mf_J_a: wp.array3d[float],
+            mf_J_b: wp.array3d[float],
+            mf_MiJt_a: wp.array3d[float],
+            mf_MiJt_b: wp.array3d[float],
+            mf_row_mu: wp.array2d[float],
+            # Shared
+            iterations: int,
+            omega: float,
+            row_phase: int,
+            friction_start_iteration: int,
+            iteration_offset: int,
+            freeze_drive_rows: int,
+            # Output
+            v_out: wp.array[float],
+        ): ...
 
-    name = f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
+        def pgs_solve_mf_gs_template(
+            # Dense
+            world_constraint_count: wp.array[int],
+            world_dof_start: wp.array[int],
+            rhs_bias: wp.array2d[float],
+            world_diag: wp.array2d[float],
+            world_impulses: wp.array2d[float],
+            J_world: wp.array3d[float],
+            Y_world: wp.array3d[float],
+            world_row_type: wp.array2d[int],
+            world_row_parent: wp.array2d[int],
+            world_row_mu: wp.array2d[float],
+            world_drive_target_vel_bias: wp.array2d[float],
+            world_drive_vel_multiplier: wp.array2d[float],
+            world_drive_impulse_multiplier: wp.array2d[float],
+            world_drive_max_impulse: wp.array2d[float],
+            # MF
+            mf_constraint_count: wp.array[int],
+            mf_meta: wp.array2d[int],
+            mf_impulses: wp.array2d[float],
+            mf_J_a: wp.array3d[float],
+            mf_J_b: wp.array3d[float],
+            mf_MiJt_a: wp.array3d[float],
+            mf_MiJt_b: wp.array3d[float],
+            mf_row_mu: wp.array2d[float],
+            # Shared
+            iterations: int,
+            omega: float,
+            row_phase: int,
+            friction_start_iteration: int,
+            iteration_offset: int,
+            freeze_drive_rows: int,
+            # Output
+            v_out: wp.array[float],
+        ):
+            world, _lane = wp.tid()
+            pgs_solve_mf_gs_native(
+                world,
+                world_constraint_count,
+                world_dof_start,
+                rhs_bias,
+                world_diag,
+                world_impulses,
+                J_world,
+                Y_world,
+                world_row_type,
+                world_row_parent,
+                world_row_mu,
+                world_drive_target_vel_bias,
+                world_drive_vel_multiplier,
+                world_drive_impulse_multiplier,
+                world_drive_max_impulse,
+                mf_constraint_count,
+                mf_meta,
+                mf_impulses,
+                mf_J_a,
+                mf_J_b,
+                mf_MiJt_a,
+                mf_MiJt_b,
+                mf_row_mu,
+                iterations,
+                omega,
+                row_phase,
+                friction_start_iteration,
+                iteration_offset,
+                freeze_drive_rows,
+                v_out,
+            )
+
+        name = f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
+
+    else:
+        # ── Colored CSR variant: three extra inputs after mf_row_mu. ──
+        # The snippet references mf_color_offsets / mf_color_rows / mf_n_colors
+        # by name; Warp wires them from this signature. The kernel name carries
+        # "_colored<MAX_COLORS>_w<W>" so the warp kernel cache keys on the variant.
+        @wp.func_native(snippet)
+        def pgs_solve_mf_gs_native(
+            world: int,
+            # Dense
+            world_constraint_count: wp.array[int],
+            world_dof_start: wp.array[int],
+            rhs_bias: wp.array2d[float],
+            world_diag: wp.array2d[float],
+            world_impulses: wp.array2d[float],
+            J_world: wp.array3d[float],
+            Y_world: wp.array3d[float],
+            world_row_type: wp.array2d[int],
+            world_row_parent: wp.array2d[int],
+            world_row_mu: wp.array2d[float],
+            world_drive_target_vel_bias: wp.array2d[float],
+            world_drive_vel_multiplier: wp.array2d[float],
+            world_drive_impulse_multiplier: wp.array2d[float],
+            world_drive_max_impulse: wp.array2d[float],
+            # MF
+            mf_constraint_count: wp.array[int],
+            mf_meta: wp.array2d[int],
+            mf_impulses: wp.array2d[float],
+            mf_J_a: wp.array3d[float],
+            mf_J_b: wp.array3d[float],
+            mf_MiJt_a: wp.array3d[float],
+            mf_MiJt_b: wp.array3d[float],
+            mf_row_mu: wp.array2d[float],
+            # MF coloring CSR
+            mf_color_offsets: wp.array[int],
+            mf_color_rows: wp.array[int],
+            mf_n_colors: wp.array[int],
+            # Shared
+            iterations: int,
+            omega: float,
+            row_phase: int,
+            friction_start_iteration: int,
+            iteration_offset: int,
+            freeze_drive_rows: int,
+            # Output
+            v_out: wp.array[float],
+        ): ...
+
+        def pgs_solve_mf_gs_template(
+            # Dense
+            world_constraint_count: wp.array[int],
+            world_dof_start: wp.array[int],
+            rhs_bias: wp.array2d[float],
+            world_diag: wp.array2d[float],
+            world_impulses: wp.array2d[float],
+            J_world: wp.array3d[float],
+            Y_world: wp.array3d[float],
+            world_row_type: wp.array2d[int],
+            world_row_parent: wp.array2d[int],
+            world_row_mu: wp.array2d[float],
+            world_drive_target_vel_bias: wp.array2d[float],
+            world_drive_vel_multiplier: wp.array2d[float],
+            world_drive_impulse_multiplier: wp.array2d[float],
+            world_drive_max_impulse: wp.array2d[float],
+            # MF
+            mf_constraint_count: wp.array[int],
+            mf_meta: wp.array2d[int],
+            mf_impulses: wp.array2d[float],
+            mf_J_a: wp.array3d[float],
+            mf_J_b: wp.array3d[float],
+            mf_MiJt_a: wp.array3d[float],
+            mf_MiJt_b: wp.array3d[float],
+            mf_row_mu: wp.array2d[float],
+            # MF coloring CSR
+            mf_color_offsets: wp.array[int],
+            mf_color_rows: wp.array[int],
+            mf_n_colors: wp.array[int],
+            # Shared
+            iterations: int,
+            omega: float,
+            row_phase: int,
+            friction_start_iteration: int,
+            iteration_offset: int,
+            freeze_drive_rows: int,
+            # Output
+            v_out: wp.array[float],
+        ):
+            world, _lane = wp.tid()
+            pgs_solve_mf_gs_native(
+                world,
+                world_constraint_count,
+                world_dof_start,
+                rhs_bias,
+                world_diag,
+                world_impulses,
+                J_world,
+                Y_world,
+                world_row_type,
+                world_row_parent,
+                world_row_mu,
+                world_drive_target_vel_bias,
+                world_drive_vel_multiplier,
+                world_drive_impulse_multiplier,
+                world_drive_max_impulse,
+                mf_constraint_count,
+                mf_meta,
+                mf_impulses,
+                mf_J_a,
+                mf_J_b,
+                mf_MiJt_a,
+                mf_MiJt_b,
+                mf_row_mu,
+                mf_color_offsets,
+                mf_color_rows,
+                mf_n_colors,
+                iterations,
+                omega,
+                row_phase,
+                friction_start_iteration,
+                iteration_offset,
+                freeze_drive_rows,
+                v_out,
+            )
+
+        name = f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}_colored{MAX_COLORS}_w{MFGS_WARPS}"
+
+    # The STREAM_LAMBDA transform rewrites `snippet` after the resident-snippet
+    # name is otherwise fixed, so tag streaming variants to give them a distinct
+    # kernel-cache key (otherwise warp reuses the stale resident cubin).
+    if os.environ.get("FEATHER_PGS_MFGS_STREAM_LAMBDA", "").strip().lower() in ("1", "true", "yes", "on"):
+        name += "_slam"
+
+    # ── REGISTER CAP (opt-in occupancy lever) ───────────────────────────────
+    # The warp kernel_kwargs `launch_bounds` route emits CUDA
+    # __launch_bounds__(maxThreadsPerBlock=32*W, minBlocksPerMultiprocessor=n);
+    # ptxas treats n as a per-SM resident-block target and TRIMS registers to try
+    # to honor it (soft cap; may spill if too aggressive). Lets more 32*W-thread
+    # blocks co-reside so the parallel WIDTH (W) can pay off. Bit-identical unless
+    # ptxas spills. OFF by default.
+    kernel_kwargs = {"enable_backward": False, "module": "unique"}
+    _bd = 32 * MFGS_WARPS if MFGS_COLORED else 32
+    _min_blocks = os.environ.get("FEATHER_PGS_MFGS_MIN_BLOCKS", "").strip()
+    if _min_blocks:
+        kernel_kwargs["launch_bounds"] = (_bd, int(_min_blocks))
+        name += f"_mb{int(_min_blocks)}"
+
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+    return wp.kernel(**kernel_kwargs)(pgs_solve_mf_gs_template)
+
+
+def _get_pgs_solve_mf_gs_kernel_kpw(
+    max_constraints: int,
+    mf_max_constraints: int,
+    max_world_dofs: int,
+    world_count: int,
+    max_colors: int,
+    device_arch: str,
+    k_threads: int = 1,
+    friction_mode: str = "current",
+) -> "wp.Kernel":
+    """K-threads-per-world colored MF-GS solve (friction_mode='current', row_phase 0).
+
+    Ported from the ``kpw`` worktree. Generalizes the serial warp-per-world
+    MF-GS solve from 1 thread/world to ``K`` threads/world (``K`` in
+    {1,2,4,8,16,32}), using a GLOBAL, WORLD-INNERMOST, COALESCED state layout:
+    every global index is ``(expr)*W + world`` so adjacent threads (adjacent
+    ``world``) read adjacent addresses. The grid is ``W*K`` FLAT threads launched
+    via ``wp.launch`` (NOT ``wp.launch_tiled``) at ``block_dim=256``::
+
+        gtid  = wp.tid()      # 0 .. W*K-1
+        world = gtid / K
+        slot  = gtid - world*K   # 0 .. K-1, K consecutive lanes -> one warp
+
+    The MF contact phase (rt0 normal + rt2 friction children) is driven by the
+    per-world contact-coloring CSR (``mf_color_offsets`` / ``mf_color_rows`` /
+    ``mf_n_colors``). Within a color the K slots process the color's contact
+    NODES in chunks of K: node ordinal ``q`` is owned by slot ``q % K``. Same-color
+    nodes are body-disjoint (coloring guarantee), so the K slots' ``v_g`` writes
+    never collide -> NO atomics. A friction triple {normal, t1, t2} is ONE node
+    handled by ONE slot sequentially. A ``__syncwarp`` after each color enforces
+    the Gauss-Seidel RAW dependency (color c+1 reads color c's writes).
+
+    The dense Phase-1 and the dense/mf rt4 final phases are NOT colored, so only
+    slot 0 of each world runs them (serial, bit-matching the serial kernel),
+    bracketed by ``__syncwarp``.
+
+    ``K=1`` reduces to the serial warp-per-world (thread-per-world) semantics
+    EXACTLY: ``slot==0`` always, ``node_ord % 1 == 0 == slot`` for every node so
+    the single thread processes every contact node in CSR order, and the per-color
+    ``__syncwarp`` is a no-op on a 1-lane world mask. With a TRIVIAL single-color
+    CSR (color 0 holds all rows in natural ascending order), the K=1 traversal is
+    the same row order as the serial kernel, so NO graph coloring is needed.
+    """
+    if friction_mode != "current":
+        raise NotImplementedError(
+            f"K-per-world MVP supports friction_mode='current' only, got {friction_mode!r}"
+        )
+    if k_threads not in (1, 2, 4, 8, 16, 32):
+        raise ValueError(f"k_threads must divide 32 and be in {{1,2,4,8,16,32}}, got {k_threads}")
+    M_D = max_constraints
+    M_MF = mf_max_constraints
+    D = max_world_dofs
+    W = world_count
+    K = k_threads
+    MAX_COLORS = max_colors
+
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    // 64-bit world stride: every global index here is (expr)*W + world with
+    // expr up to ~M_D*D (~3e5) and W up to ~1.6e4, so the product reaches ~5e9
+    // and overflows int32 for W >= ~6888. Making W a `long long` promotes every
+    // `*W` product (and the trailing `+ world`/`+ slot`) to 64-bit, so all the
+    // `.data[(...)*W + world]` accesses index correctly at large world counts.
+    long long W = {W};
+    int m_dense = m_dense_g.data[world];
+    int m_mf = m_mf_g.data[world];
+    if (m_dense == 0 && m_mf == 0) return;
+    if (m_dense > {M_D}) m_dense = {M_D};
+    if (m_mf > {M_MF}) m_mf = {M_MF};
+
+    // Per-world syncwarp mask: this world's K slots are K consecutive lanes.
+    int lane = threadIdx.x & 31;
+    unsigned int world_mask = (((unsigned int)((1u << {K}) - 1u)) << (lane - slot));
+
+    // Coloring CSR bases (host layout: offsets [W*(MAX_COLORS+1)], rows [W*M_MF]).
+    int off_co = world * ({MAX_COLORS} + 1);
+    int off_cr = world * {M_MF};
+    int mf_nc = mf_n_colors.data[world];
+
+    // World-innermost element strides (same as tpw):
+    // v_g[d] -> d*W+world; dense[i] -> i*W+world; J/Y[i][d] -> (i*D+d)*W+world;
+    // mf6[i][k] -> (i*6+k)*W+world; mf_meta[i][f] -> (i*4+f)*W+world.
+
+    for (int iter = 0; iter < iterations; iter++) {{
+        int global_iter = iteration_offset + iter;
+
+        // ── Phase 1: Dense constraints (serial; slot 0 only) ──
+        if (slot == 0) {{
+        for (int i = 0; i < m_dense; i++) {{
+            int row_type = rtype_g.data[i*W + world];
+            if (freeze_drive_rows != 0 && row_type == 1) continue;
+            if (row_type == 4) continue;  // velocity-limit handled in final pass
+            if (row_type == 2 && global_iter < friction_start_iteration) {{
+                lam_g.data[i*W + world] = 0.0f;
+                continue;
+            }}
+            float denom = diag_g.data[i*W + world];
+            if (denom <= 0.0f) continue;
+
+            int jy_row = i*{D};
+            float jv = 0.0f;
+            for (int d = 0; d < {D}; d++) {{
+                jv += J_g.data[(jy_row + d)*W + world] * v_g.data[d*W + world];
+            }}
+
+            float residual = jv + rhs_g.data[i*W + world];
+            float delta = -residual / denom;
+            float old_impulse = lam_g.data[i*W + world];
+            float new_impulse = old_impulse + omega * delta;
+            float delta_impulse = 0.0f;
+
+            if (row_type == 1) {{
+                new_impulse = old_impulse * drive_imul_g.data[i*W + world]
+                    + jv * drive_vmul_g.data[i*W + world]
+                    + drive_target_g.data[i*W + world];
+                float max_imp = drive_maximp_g.data[i*W + world];
+                if (new_impulse > max_imp) new_impulse = max_imp;
+                if (new_impulse < -max_imp) new_impulse = -max_imp;
+                delta_impulse = new_impulse - old_impulse;
+            }} else if (row_type == 0 || row_type == 3) {{
+                if (new_impulse < 0.0f) new_impulse = 0.0f;
+                delta_impulse = new_impulse - old_impulse;
+            }} else if (row_type == 2) {{
+                int parent_idx = parent_g.data[i*W + world];
+                float lambda_n = lam_g.data[parent_idx*W + world];
+                float mu = mu_g.data[i*W + world];
+                float radius = fmaxf(mu * lambda_n, 0.0f);
+                if (radius <= 0.0f) {{
+                    new_impulse = 0.0f;
+                }} else {{
+                    int sib = (i == parent_idx + 1) ? parent_idx + 2 : parent_idx + 1;
+                    lam_g.data[i*W + world] = new_impulse;
+                    float a_val = new_impulse;
+                    float b_val = lam_g.data[sib*W + world];
+                    float mag = sqrtf(a_val * a_val + b_val * b_val);
+                    if (mag > radius) {{
+                        float scale = radius / mag;
+                        new_impulse = a_val * scale;
+                        float sib_new = b_val * scale;
+                        float sib_delta = sib_new - b_val;
+                        lam_g.data[sib*W + world] = sib_new;
+                        int sib_jy = sib*{D};
+                        for (int d = 0; d < {D}; d++) {{
+                            v_g.data[d*W + world] += Y_g.data[(sib_jy + d)*W + world] * sib_delta;
+                        }}
+                    }}
+                }}
+                delta_impulse = new_impulse - old_impulse;
+            }} else {{
+                delta_impulse = new_impulse - old_impulse;
+            }}
+
+            lam_g.data[i*W + world] = new_impulse;
+            if (delta_impulse != 0.0f) {{
+                for (int d = 0; d < {D}; d++) {{
+                    v_g.data[d*W + world] += Y_g.data[(jy_row + d)*W + world] * delta_impulse;
+                }}
+            }}
+        }}
+        }}  // slot 0 dense
+        __syncwarp(world_mask);
+
+        // ── Phase 2: MF contact constraints, COLOR-DRIVEN, K-per-world ──
+        // Walk each color's CSR rows; node ordinal q owned by slot (q % K).
+        // The owning slot processes the whole node (rt0 normal + consecutive
+        // rt2 friction children) sequentially. Same-color nodes are
+        // body-disjoint -> the K slots' v_g writes never collide.
+        for (int c = 0; c < mf_nc; c++) {{
+            int cs = mf_color_offsets.data[off_co + c];
+            int ce = mf_color_offsets.data[off_co + c + 1];
+            int node_ord = -1;   // ordinal of current node within this color
+            for (int kk = cs; kk < ce; kk++) {{
+                int i = mf_color_rows.data[off_cr + kk];
+                int meta3_ns = mf_meta_g.data[(i*4 + 3)*W + world];
+                int rt_ns = meta3_ns & 0xFFFF;
+                if (rt_ns == 0) node_ord++;   // rt0 normal begins a node
+                // Only the slot owning this node executes its rows.
+                if ((node_ord % {K}) != slot) continue;
+
+                int meta0 = mf_meta_g.data[(i*4 + 0)*W + world];
+                int meta1 = mf_meta_g.data[(i*4 + 1)*W + world];
+                int meta2 = mf_meta_g.data[(i*4 + 2)*W + world];
+                int meta3 = meta3_ns;
+                int dof_a = meta0 >> 16;
+                int dof_b = (meta0 << 16) >> 16;
+                float mf_diag = __int_as_float(meta1);
+                int packed_tp = meta3;
+                int mf_rt = packed_tp & 0xFFFF;
+
+                if (mf_rt == 4) continue;  // velocity-limit handled in final pass
+                if (mf_rt == 2 && global_iter < friction_start_iteration) {{
+                    mf_lam_g.data[i*W + world] = 0.0f;
+                    continue;
+                }}
+                if (mf_diag <= 0.0f) continue;
+
+                int mf6 = i*6;
+                float jv = 0.0f;
+                if (dof_a >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        jv += mf_J_a.data[(mf6 + k)*W + world] * v_g.data[(dof_a + k)*W + world];
+                    }}
+                }}
+                if (dof_b >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        jv += mf_J_b.data[(mf6 + k)*W + world] * v_g.data[(dof_b + k)*W + world];
+                    }}
+                }}
+
+                float residual = jv + __int_as_float(meta2);
+                float delta = -residual * mf_diag;
+                float old_impulse = mf_lam_g.data[i*W + world];
+                float new_impulse = old_impulse + omega * delta;
+                float delta_impulse = 0.0f;
+
+                if (mf_rt == 0) {{
+                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                }} else if (mf_rt == 2) {{
+                    int mf_par = packed_tp >> 16;
+                    float lambda_n = mf_lam_g.data[mf_par*W + world];
+                    float mu = mf_row_mu.data[i*W + world];
+                    float radius = fmaxf(mu * lambda_n, 0.0f);
+                    if (radius <= 0.0f) {{
+                        new_impulse = 0.0f;
+                    }} else {{
+                        int sib = (i == mf_par + 1) ? mf_par + 2 : mf_par + 1;
+                        mf_lam_g.data[i*W + world] = new_impulse;
+                        float a_val = new_impulse;
+                        float b_val = mf_lam_g.data[sib*W + world];
+                        float mag = sqrtf(a_val * a_val + b_val * b_val);
+                        if (mag > radius) {{
+                            float scale = radius / mag;
+                            new_impulse = a_val * scale;
+                            float sib_new = b_val * scale;
+                            float sib_delta = sib_new - b_val;
+                            mf_lam_g.data[sib*W + world] = sib_new;
+                            int sib_meta0 = mf_meta_g.data[(sib*4 + 0)*W + world];
+                            int sib_dof_a = sib_meta0 >> 16;
+                            int sib_dof_b = (sib_meta0 << 16) >> 16;
+                            int sib_mf6 = sib*6;
+                            if (sib_dof_a >= 0) {{
+                                for (int k = 0; k < 6; k++) {{
+                                    v_g.data[(sib_dof_a + k)*W + world] += mf_MiJt_a.data[(sib_mf6 + k)*W + world] * sib_delta;
+                                }}
+                            }}
+                            if (sib_dof_b >= 0) {{
+                                for (int k = 0; k < 6; k++) {{
+                                    v_g.data[(sib_dof_b + k)*W + world] += mf_MiJt_b.data[(sib_mf6 + k)*W + world] * sib_delta;
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+
+                delta_impulse = new_impulse - old_impulse;
+                mf_lam_g.data[i*W + world] = new_impulse;
+                if (delta_impulse != 0.0f) {{
+                    if (dof_a >= 0) {{
+                        for (int k = 0; k < 6; k++) {{
+                            v_g.data[(dof_a + k)*W + world] += mf_MiJt_a.data[(mf6 + k)*W + world] * delta_impulse;
+                        }}
+                    }}
+                    if (dof_b >= 0) {{
+                        for (int k = 0; k < 6; k++) {{
+                            v_g.data[(dof_b + k)*W + world] += mf_MiJt_b.data[(mf6 + k)*W + world] * delta_impulse;
+                        }}
+                    }}
+                }}
+            }}
+            __syncwarp(world_mask);   // Gauss-Seidel: color c+1 reads color c
+        }}
+
+        // ── Final velocity-limit phase: dense rt4 (serial; slot 0 only) ──
+        if (slot == 0) {{
+        for (int i = 0; i < m_dense; i++) {{
+            if (rtype_g.data[i*W + world] != 4) continue;
+            float denom = diag_g.data[i*W + world];
+            if (denom <= 0.0f) continue;
+            int jy_row = i*{D};
+            float jv = 0.0f;
+            for (int d = 0; d < {D}; d++) {{
+                jv += J_g.data[(jy_row + d)*W + world] * v_g.data[d*W + world];
+            }}
+            float residual = jv + rhs_g.data[i*W + world];
+            float delta = -residual / denom;
+            float delta_impulse = 0.0f;
+            if (residual < 0.0f) delta_impulse = delta;
+            lam_g.data[i*W + world] = delta_impulse;
+            if (delta_impulse != 0.0f) {{
+                for (int d = 0; d < {D}; d++) {{
+                    v_g.data[d*W + world] += Y_g.data[(jy_row + d)*W + world] * delta_impulse;
+                }}
+            }}
+        }}
+        }}  // slot 0 dense rt4
+        __syncwarp(world_mask);
+
+        // ── Final velocity-limit phase: mf rt4 (serial; slot 0 only) ──
+        if (slot == 0) {{
+        for (int i = 0; i < m_mf; i++) {{
+            int meta0 = mf_meta_g.data[(i*4 + 0)*W + world];
+            int meta1 = mf_meta_g.data[(i*4 + 1)*W + world];
+            int meta2 = mf_meta_g.data[(i*4 + 2)*W + world];
+            int meta3 = mf_meta_g.data[(i*4 + 3)*W + world];
+            int mf_rt = meta3 & 0xFFFF;
+            if (mf_rt != 4) continue;
+            int dof_a = meta0 >> 16;
+            int dof_b = (meta0 << 16) >> 16;
+            float mf_diag = __int_as_float(meta1);
+            if (mf_diag <= 0.0f) continue;
+            int mf6 = i*6;
+            float jv = 0.0f;
+            if (dof_a >= 0) {{
+                for (int k = 0; k < 6; k++) {{
+                    jv += mf_J_a.data[(mf6 + k)*W + world] * v_g.data[(dof_a + k)*W + world];
+                }}
+            }}
+            if (dof_b >= 0) {{
+                for (int k = 0; k < 6; k++) {{
+                    jv += mf_J_b.data[(mf6 + k)*W + world] * v_g.data[(dof_b + k)*W + world];
+                }}
+            }}
+            float residual = jv + __int_as_float(meta2);
+            float delta = -residual * mf_diag;
+            float delta_impulse = 0.0f;
+            if (residual < 0.0f) delta_impulse = delta;
+            mf_lam_g.data[i*W + world] = delta_impulse;
+            if (delta_impulse != 0.0f) {{
+                if (dof_a >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        v_g.data[(dof_a + k)*W + world] += mf_MiJt_a.data[(mf6 + k)*W + world] * delta_impulse;
+                    }}
+                }}
+                if (dof_b >= 0) {{
+                    for (int k = 0; k < 6; k++) {{
+                        v_g.data[(dof_b + k)*W + world] += mf_MiJt_b.data[(mf6 + k)*W + world] * delta_impulse;
+                    }}
+                }}
+            }}
+        }}
+        }}  // slot 0 mf rt4
+        __syncwarp(world_mask);
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def pgs_solve_mf_gs_kpw_native(
+        world: int,
+        slot: int,
+        m_dense_g: wp.array(dtype=int),
+        m_mf_g: wp.array(dtype=int),
+        w_dof_start_g: wp.array(dtype=int),
+        lam_g: wp.array(dtype=float),
+        rhs_g: wp.array(dtype=float),
+        diag_g: wp.array(dtype=float),
+        rtype_g: wp.array(dtype=int),
+        parent_g: wp.array(dtype=int),
+        mu_g: wp.array(dtype=float),
+        drive_target_g: wp.array(dtype=float),
+        drive_vmul_g: wp.array(dtype=float),
+        drive_imul_g: wp.array(dtype=float),
+        drive_maximp_g: wp.array(dtype=float),
+        # J_g/Y_g are 2-D (M_D*D, W): their flat length M_D*D*W exceeds the
+        # Warp 2^31 per-dimension array-length limit for W >= ~8192. As a 2-D
+        # row-major array, .data[r*W + world] (== the kernel's (i*D+d)*W+world)
+        # indexes the identical buffer, and no single dim exceeds 2^31.
+        J_g: wp.array(dtype=float, ndim=2),
+        Y_g: wp.array(dtype=float, ndim=2),
+        mf_meta_g: wp.array(dtype=int),
+        mf_lam_g: wp.array(dtype=float),
+        mf_J_a: wp.array(dtype=float),
+        mf_J_b: wp.array(dtype=float),
+        mf_MiJt_a: wp.array(dtype=float),
+        mf_MiJt_b: wp.array(dtype=float),
+        mf_row_mu: wp.array(dtype=float),
+        mf_color_offsets: wp.array(dtype=int),
+        mf_color_rows: wp.array(dtype=int),
+        mf_n_colors: wp.array(dtype=int),
+        v_g: wp.array(dtype=float),
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        freeze_drive_rows: int,
+    ): ...
+
+    def pgs_solve_mf_gs_kpw_template(
+        m_dense_g: wp.array(dtype=int),
+        m_mf_g: wp.array(dtype=int),
+        w_dof_start_g: wp.array(dtype=int),
+        lam_g: wp.array(dtype=float),
+        rhs_g: wp.array(dtype=float),
+        diag_g: wp.array(dtype=float),
+        rtype_g: wp.array(dtype=int),
+        parent_g: wp.array(dtype=int),
+        mu_g: wp.array(dtype=float),
+        drive_target_g: wp.array(dtype=float),
+        drive_vmul_g: wp.array(dtype=float),
+        drive_imul_g: wp.array(dtype=float),
+        drive_maximp_g: wp.array(dtype=float),
+        J_g: wp.array(dtype=float, ndim=2),
+        Y_g: wp.array(dtype=float, ndim=2),
+        mf_meta_g: wp.array(dtype=int),
+        mf_lam_g: wp.array(dtype=float),
+        mf_J_a: wp.array(dtype=float),
+        mf_J_b: wp.array(dtype=float),
+        mf_MiJt_a: wp.array(dtype=float),
+        mf_MiJt_b: wp.array(dtype=float),
+        mf_row_mu: wp.array(dtype=float),
+        mf_color_offsets: wp.array(dtype=int),
+        mf_color_rows: wp.array(dtype=int),
+        mf_n_colors: wp.array(dtype=int),
+        v_g: wp.array(dtype=float),
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        freeze_drive_rows: int,
+    ):
+        gtid = wp.tid()
+        world = gtid // K
+        slot = gtid - world * K
+        pgs_solve_mf_gs_kpw_native(
+            world,
+            slot,
+            m_dense_g, m_mf_g, w_dof_start_g,
+            lam_g, rhs_g, diag_g, rtype_g, parent_g, mu_g,
+            drive_target_g, drive_vmul_g, drive_imul_g, drive_maximp_g,
+            J_g, Y_g,
+            mf_meta_g, mf_lam_g, mf_J_a, mf_J_b, mf_MiJt_a, mf_MiJt_b, mf_row_mu,
+            mf_color_offsets, mf_color_rows, mf_n_colors,
+            v_g,
+            iterations, omega, friction_start_iteration, iteration_offset, freeze_drive_rows,
+        )
+
+    name = f"pgs_solve_mf_gs_kpw_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{world_count}_{max_colors}_{k_threads}_{friction_mode}"
+    pgs_solve_mf_gs_kpw_template.__name__ = name
+    pgs_solve_mf_gs_kpw_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_kpw_template)
+
+
+# ── World-outer -> world-innermost transpose kernels for the K=1 (kpw) path ──
+# The K=1 kernel needs WORLD-INNERMOST coalesced buffers (.data[(expr)*W+world])
+# but the step()-time buffers are WORLD-OUTERMOST (arr[world, ...]). These kernels
+# do the build_world_innermost transpose on-device (Option A "transpose-per-step"
+# from the integration design): a handful of strided-copy launches into pre-
+# allocated world-inner scratch. The numpy recipe they reproduce is in the kpw
+# bench's build_world_innermost (kpw_node_bench.py:107-145). All are pure index
+# remaps (no math) so they cannot perturb the solve numerics; they only run when
+# FEATHER_PGS_TPW_K1 is on.
+
+
+# OPTION F1 (count-gated transpose): the dense transposes below are launched over
+# the FULL allocated dense capacity (W, M_D[, D]) but the kpw kernel only ever reads
+# dense rows i < m_dense = constraint_count[world] (every J_g/Y_g/dense-scalar read
+# sits inside `for (i = 0; i < m_dense; i++)`; friction children are contiguous and
+# < m_dense). So copying rows i >= constraint_count[world] moves bytes that are never
+# read -> skip them. This is BYTE-IDENTICAL for the kpw result (dead rows leave stale
+# scratch that is inert; only v_g is mirrored back) and saves ~all dead-row traffic on
+# dense-light scenes (p10/p11, where free rigids route through MF so constraint_count
+# << M_D). dense_cnt MUST be the SAME array passed as the kpw m_dense_g bound
+# (self.constraint_count) or live rows would be silently dropped.
+@wp.kernel(enable_backward=False)
+def _tpw_k1_transpose_2d_to_inner(
+    src: wp.array2d(dtype=wp.float32),  # world-outer (W, M)
+    W: wp.int32,
+    dense_cnt: wp.array(dtype=wp.int32),  # live dense row count per world
+    dst: wp.array(dtype=wp.float32),  # world-inner flat, dst[i*W + world]
+):
+    world, i = wp.tid()
+    if i >= dense_cnt[world]:
+        return  # row not read by the kpw dense loop (i < m_dense); skip dead bytes
+    dst[i * W + world] = src[world, i]
+
+
+# Ungated 2D transpose for the MF per-row scalars (M_MF rows are all live up to
+# mf_constraint_count; they are NOT dense rows and must not be gated by dense_cnt).
+@wp.kernel(enable_backward=False)
+def _tpw_k1_transpose_2d_to_inner_nogate(
+    src: wp.array2d(dtype=wp.float32),  # world-outer (W, M)
+    W: wp.int32,
+    dst: wp.array(dtype=wp.float32),  # world-inner flat, dst[i*W + world]
+):
+    world, i = wp.tid()
+    dst[i * W + world] = src[world, i]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_k1_transpose_2d_to_inner_int(
+    src: wp.array2d(dtype=wp.int32),
+    W: wp.int32,
+    dense_cnt: wp.array(dtype=wp.int32),  # live dense row count per world
+    dst: wp.array(dtype=wp.int32),
+):
+    world, i = wp.tid()
+    if i >= dense_cnt[world]:
+        return  # row not read by the kpw dense loop; skip dead bytes
+    dst[i * W + world] = src[world, i]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_k1_transpose_jy_to_inner(
+    src: wp.array3d(dtype=wp.float32),  # world-outer (W, M_D, D)
+    W: wp.int32,
+    D: wp.int32,
+    dense_cnt: wp.array(dtype=wp.int32),  # live dense row count per world
+    dst: wp.array2d(dtype=wp.float32),  # world-inner (M_D*D, W); dst[(i*D+d), world]
+):
+    world, i, d = wp.tid()
+    if i >= dense_cnt[world]:
+        return  # row not read by the kpw dense loop; skips ~all J/Y bytes on p10/p11
+    dst[i * D + d, world] = src[world, i, d]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_k1_transpose_jy_to_inner_f1c(
+    src: wp.array3d(dtype=wp.float32),  # world-outer (W, M_D, D)
+    W: wp.int32,
+    M_D: wp.int32,
+    D: wp.int32,
+    dense_cnt: wp.array(dtype=wp.int32),  # live dense row count per world
+    dst: wp.array2d(dtype=wp.float32),  # world-inner (M_D*D, W); dst[(i*D+d), world]
+):
+    # F1c: one thread per (world, d); loop the few LIVE dense rows internally.
+    # Static grid dim=(W, D) -> M_D-x fewer threads than the dim=(W, M_D, D)
+    # variant, no idle early-returns. Writes the EXACT same live slots
+    # (i < min(dense_cnt[world], M_D)) and never touches dead rows -> byte-
+    # identical _k1_J/_k1_Y for the kpw dense loop. The M_D clamp mirrors the
+    # kpw kernel's own `if (m_dense > M_D) m_dense = M_D`.
+    world, d = wp.tid()
+    n = dense_cnt[world]
+    if n > M_D:
+        n = M_D
+    for i in range(n):
+        dst[i * D + d, world] = src[world, i, d]
+
+
+# OPTION F1b (count-gated MF/rigid transpose): symmetric to F1 but for the
+# matrix-free (rigid-contact) rows. The kpw mf phase clamps m_mf = mf_cnt[world]
+# and only walks the per-world color-CSR rows 0..m_mf-1, so MF rows i >= mf_cnt
+# are never read -> skip copying them. Byte-identical for the kpw result; saves
+# the dead-row copy on scenes where mf_constraint_count << M_MF (robot scenes:
+# h1 ~14% live, franka ~53% live). On p10/p11 MF is nearly full so this is ~neutral.
+@wp.kernel(enable_backward=False)
+def _tpw_k1_transpose_mf6_to_inner(
+    src: wp.array3d(dtype=wp.float32),  # world-outer (W, M_MF, 6)
+    W: wp.int32,
+    mf_cnt: wp.array(dtype=wp.int32),  # live MF row count per world
+    dst: wp.array(dtype=wp.float32),  # world-inner flat, dst[(i*6+k)*W + world]
+):
+    world, i, k = wp.tid()
+    if i >= mf_cnt[world]:
+        return  # MF row not read by the kpw mf phase (CSR holds 0..m_mf-1); skip
+    dst[(i * 6 + k) * W + world] = src[world, i, k]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_k1_transpose_meta_to_inner(
+    src: wp.array2d(dtype=wp.int32),  # world-outer (W, M_MF*4) packed meta
+    W: wp.int32,
+    M_MF: wp.int32,
+    mf_cnt: wp.array(dtype=wp.int32),  # live MF row count per world
+    dst: wp.array(dtype=wp.int32),  # world-inner flat, dst[(i*4+f)*W + world]
+):
+    world, i, f = wp.tid()
+    if i >= mf_cnt[world]:
+        return  # MF row not read by the kpw mf phase; skip dead rows
+    dst[(i * 4 + f) * W + world] = src[world, i * 4 + f]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_k1_gather_v_to_inner(
+    v_out: wp.array(dtype=wp.float32),  # world-outer flat, indexed by world_dof_start
+    world_dof_start: wp.array(dtype=wp.int32),
+    W: wp.int32,
+    D: wp.int32,
+    v_g: wp.array(dtype=wp.float32),  # world-inner flat, v_g[d*W + world]
+):
+    world, d = wp.tid()
+    v_g[d * W + world] = v_out[world_dof_start[world] + d]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_k1_scatter_v_from_inner(
+    v_g: wp.array(dtype=wp.float32),  # world-inner flat, v_g[d*W + world]
+    world_dof_start: wp.array(dtype=wp.int32),
+    W: wp.int32,
+    D: wp.int32,
+    v_out: wp.array(dtype=wp.float32),  # world-outer flat
+):
+    world, d = wp.tid()
+    v_out[world_dof_start[world] + d] = v_g[d * W + world]
+
+
+@wp.kernel(enable_backward=False)
+def _tpw_k1_build_trivial_csr(
+    mf_constraint_count: wp.array(dtype=wp.int32),
+    mf_max_c: wp.int32,
+    max_colors: wp.int32,
+    offsets: wp.array(dtype=wp.int32),  # flat [W*(max_colors+1)]
+    rows: wp.array(dtype=wp.int32),  # flat [W*mf_max_c]
+    n_colors: wp.array(dtype=wp.int32),  # [W]
+):
+    # Trivial single-color CSR: color 0 holds rows 0..Mw-1 in natural ascending
+    # order (== serial visiting order); all later color offsets clamp to Mw.
+    # Mirrors the build_coloring `ncolors > max_colors` fallback exactly. At K=1
+    # this is the coloring-free path (no graph coloring oracle).
+    world = wp.tid()
+    Mw = wp.min(mf_constraint_count[world], mf_max_c)
+    if Mw < 0:
+        Mw = wp.int32(0)
+    off_co = world * (max_colors + 1)
+    offsets[off_co + 0] = wp.int32(0)
+    for c in range(1, max_colors + 1):
+        offsets[off_co + c] = Mw
+    off_cr = world * mf_max_c
+    for r in range(mf_max_c):
+        if r < Mw:
+            rows[off_cr + r] = r
+        else:
+            rows[off_cr + r] = wp.int32(0)
+    n_colors[world] = wp.int32(1)
