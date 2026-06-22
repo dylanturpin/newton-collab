@@ -3576,7 +3576,7 @@ def gather_JY_to_world(
 # =============================================================================
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def build_mf_contact_rows(
     contact_count: wp.array[int],
     contact_point0: wp.array[wp.vec3],
@@ -3602,6 +3602,8 @@ def build_mf_contact_rows(
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
+    emit_k1_inner: int,
+    W: int,
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -3611,6 +3613,8 @@ def build_mf_contact_rows(
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
     mf_phi: wp.array2d[float],
+    k1_mf_J_a: wp.array[float],
+    k1_mf_J_b: wp.array[float],
 ):
     """Build MF constraint rows for contacts between free rigid bodies / ground.
 
@@ -3770,6 +3774,19 @@ def build_mf_contact_rows(
             mf_row_mu[world, row_idx] = mu
         else:
             mf_row_mu[world, row_idx] = friction_mu
+
+        # F2 (default off, compile-constant gate -> dead-code-eliminated when
+        # emit_k1_inner==0): copy-through this row's FINAL world-outer 6-wide
+        # J_a/J_b into the K=1 world-inner flats, exactly mirroring the
+        # _tpw_k1_transpose_mf6_to_inner per-row copy (same source bytes, same
+        # dst[(i*6+k)*W + world] layout, same i<mf_cnt live-row gate). Reading
+        # the world-outer row AFTER the conditional sub-stores copies the same
+        # stale bytes (e.g. mf_J_b when body_b<0) the transpose would copy, so
+        # byte-identity is a tautology. Skips the separate transpose launch.
+        if emit_k1_inner != 0:
+            for k in range(6):
+                k1_mf_J_a[(row_idx * 6 + k) * W + world] = mf_J_a[world, row_idx, k]
+                k1_mf_J_b[(row_idx * 6 + k) * W + world] = mf_J_b[world, row_idx, k]
 
 
 @wp.kernel
@@ -3950,7 +3967,7 @@ def allocate_rigid_velocity_limit_slots(
             rigid_velocity_limit_sign[upper_idx] = -1.0
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def populate_rigid_velocity_limit_rows(
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
@@ -3959,6 +3976,8 @@ def populate_rigid_velocity_limit_rows(
     rigid_body_max_angular_velocity: wp.array[float],
     rigid_velocity_limit_slot: wp.array[int],
     rigid_velocity_limit_sign: wp.array[float],
+    emit_k1_inner: int,
+    W: int,
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -3968,6 +3987,8 @@ def populate_rigid_velocity_limit_rows(
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
     mf_phi: wp.array2d[float],
+    k1_mf_J_a: wp.array[float],
+    k1_mf_J_b: wp.array[float],
 ):
     """Populate MF rows for rigid-body linear/angular velocity limits."""
     body = wp.tid()
@@ -4010,6 +4031,16 @@ def populate_rigid_velocity_limit_rows(
             # For velocity-limit rows mf_phi stores qdot_max; contact rows
             # use it as geometric gap. Row type disambiguates the meaning.
             mf_phi[world, slot] = limit
+
+            # F2 (default off, dead-code-eliminated when emit_k1_inner==0):
+            # copy-through this rt4 row's FINAL world-outer J_a/J_b into the
+            # K=1 world-inner flats, mirroring _tpw_k1_transpose_mf6_to_inner
+            # for the velocity-limit slots this kernel produces. mf_J_b is the
+            # all-zeros it just wrote (bb==-1), matching the transpose's copy.
+            if emit_k1_inner != 0:
+                for k in range(6):
+                    k1_mf_J_a[(slot * 6 + k) * W + world] = mf_J_a[world, slot, k]
+                    k1_mf_J_b[(slot * 6 + k) * W + world] = mf_J_b[world, slot, k]
 
 
 @wp.func
@@ -4144,7 +4175,7 @@ def compute_mf_body_Hinv(
     mf_body_Hinv[b] = spatial_matrix_block_inverse(body_I_s[b])
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def compute_mf_effective_mass_and_rhs(
     mf_constraint_count: wp.array[int],
     mf_body_a: wp.array2d[int],
@@ -4159,11 +4190,15 @@ def compute_mf_effective_mass_and_rhs(
     pgs_beta: float,
     dt: float,
     mf_max_constraints: int,
+    emit_k1_inner: int,
+    W: int,
     # outputs
     mf_eff_mass_inv: wp.array2d[float],
     mf_MiJt_a: wp.array3d[float],
     mf_MiJt_b: wp.array3d[float],
     mf_rhs: wp.array2d[float],
+    k1_mf_MiJt_a: wp.array[float],
+    k1_mf_MiJt_b: wp.array[float],
 ):
     """Compute effective mass diagonal, H^-1*J^T, and RHS bias for MF constraints.
 
@@ -4259,6 +4294,18 @@ def compute_mf_effective_mass_and_rhs(
         bias = mf_phi[world, i]
 
     mf_rhs[world, i] = bias
+
+    # F2 (default off, dead-code-eliminated when emit_k1_inner==0): copy-through
+    # this live row's FINAL world-outer MiJt_a/MiJt_b into the K=1 world-inner
+    # flats, mirroring _tpw_k1_transpose_mf6_to_inner. The grid early-returns on
+    # i >= mf_constraint_count[world], so this covers exactly the i<mf_cnt rows
+    # the transpose copied. Reading the world-outer row AFTER the conditional
+    # ba>=0 / bb>=0 stores copies the same stale bytes (e.g. mf_MiJt_b on a
+    # vel-limit bb==-1 row) the transpose would copy -> byte-identical.
+    if emit_k1_inner != 0:
+        for k in range(6):
+            k1_mf_MiJt_a[(i * 6 + k) * W + world] = mf_MiJt_a[world, i, k]
+            k1_mf_MiJt_b[(i * 6 + k) * W + world] = mf_MiJt_b[world, i, k]
 
 
 @wp.kernel
