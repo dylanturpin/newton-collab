@@ -176,6 +176,15 @@ _FPGS_COMPACT_FUSED_FREE_FLUSH = os.environ.get("FEATHER_PGS_COMPACT_FUSED_FREE_
     "yes",
     "on",
 }
+_FPGS_COMPACT_FULL_FUSED_ITERATIONS = os.environ.get("FEATHER_PGS_COMPACT_FULL_FUSED_ITERATIONS", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_FPGS_COMPACT_FULL_FUSED_MAX_ARTS_PER_WORLD = int(
+    os.environ.get("FEATHER_PGS_COMPACT_FULL_FUSED_MAX_ARTS_PER_WORLD", "16")
+)
 
 
 @wp.kernel
@@ -627,6 +636,7 @@ class SolverFeatherPGS(SolverBase):
         )
         self.compact_fused_free_flush = _FPGS_COMPACT_FUSED_FREE_FLUSH
         self.compact_active_free_flush = _FPGS_COMPACT_ACTIVE_FREE_FLUSH and not self.compact_fused_free_flush
+        self.compact_full_fused_iterations = _FPGS_COMPACT_FULL_FUSED_ITERATIONS
         self.pgs_warmstart = pgs_warmstart
         if self.pgs_warmstart and self.contact_friction_position_iterations >= 0:
             raise NotImplementedError(
@@ -826,8 +836,10 @@ class SolverFeatherPGS(SolverBase):
         # _stage1_crba call; gates the per-step H memsets (see _stage1_crba).
         self._mass_update_global_flag = True
         self._last_step_dt = None
+        self._compact_full_fused_arts_per_world = 0
 
         self._compute_articulation_metadata(model)
+        self._compact_full_fused_size = self._select_compact_full_fused_size()
 
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
@@ -921,6 +933,47 @@ class SolverFeatherPGS(SolverBase):
             and self.articulated_dense_response_mode in ("compact_cholesky", "compact_tree")
             and self._has_non_free_articulations
         )
+
+    def _select_compact_full_fused_size(self) -> int | None:
+        if not self.compact_full_fused_iterations or not self._compact_contacts_enabled():
+            return None
+        if self.compact_shared_row_solver:
+            return None
+
+        candidates: list[int] = []
+        for size in self.size_groups:
+            size_i = int(size)
+            if size_i <= 0 or self.n_arts_by_size.get(size, 0) <= 0:
+                continue
+            if not self._compact_tree_has_non_free_by_size.get(size_i, True):
+                continue
+            if not self._compact_tree_single_dof_by_size.get(size_i, False):
+                return None
+            arts_per_world = self._compact_non_free_arts_per_world(size_i)
+            if (
+                _FPGS_COMPACT_FULL_FUSED_MAX_ARTS_PER_WORLD > 0
+                and arts_per_world > _FPGS_COMPACT_FULL_FUSED_MAX_ARTS_PER_WORLD
+            ):
+                return None
+            self._compact_full_fused_arts_per_world = max(arts_per_world, 1)
+            candidates.append(size_i)
+
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
+
+    def _compact_non_free_arts_per_world(self, size: int) -> int:
+        if self.art_to_world is None or self.is_free_rigid is None or self.art_size is None:
+            return int(self.n_arts_by_size.get(size, 0))
+        art_size_np = self.art_size.numpy()
+        art_to_world_np = self.art_to_world.numpy()
+        is_free_rigid_np = self.is_free_rigid.numpy()
+        counts = np.zeros(max(int(self.world_count), 1), dtype=np.int32)
+        for art_idx in np.where((art_size_np == size) & (is_free_rigid_np == 0))[0]:
+            world_idx = int(art_to_world_np[int(art_idx)])
+            if 0 <= world_idx < counts.size:
+                counts[world_idx] += 1
+        return int(np.max(counts)) if counts.size else 0
 
     def _compute_articulation_metadata(self, model):
         self._compute_articulation_indices(model)
@@ -2294,6 +2347,8 @@ class SolverFeatherPGS(SolverBase):
             )
 
         self._pgs_solve_compact_kernel = None
+        self._pgs_solve_compact_full_fused_kernel = None
+        self._compact_full_fused_block_dim = 0
         if (
             model.device.is_cuda
             and self._compact_contacts_enabled()
@@ -2308,6 +2363,17 @@ class SolverFeatherPGS(SolverBase):
                 self._pgs_solve_compact_kernel = _get_pgs_solve_compact_contact_kernel(
                     self.compact_max_constraints, device_arch
                 )
+                fused_size = getattr(self, "_compact_full_fused_size", None)
+                if fused_size is not None:
+                    n_fused_arts = max(int(getattr(self, "_compact_full_fused_arts_per_world", 0)), 1)
+                    fused_warps = min(max(n_fused_arts + 1, 2), 32)
+                    self._compact_full_fused_block_dim = 32 * fused_warps
+                    self._pgs_solve_compact_full_fused_kernel = _get_pgs_solve_compact_full_fused_kernel(
+                        self.compact_max_constraints,
+                        self.max_compact_bodies,
+                        int(fused_size),
+                        device_arch,
+                    )
 
         self._propagate_compact_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         if model.device.is_cuda and self._compact_contacts_enabled() and self.compact_warp_propagation:
@@ -2971,6 +3037,78 @@ class SolverFeatherPGS(SolverBase):
             and not self.compact_shared_row_solver
         )
 
+    def _launch_compact_full_fused_iterations(
+        self,
+        *,
+        rhs: wp.array,
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+    ) -> bool:
+        kernel = getattr(self, "_pgs_solve_compact_full_fused_kernel", None)
+        fused_size = getattr(self, "_compact_full_fused_size", None)
+        if kernel is None or fused_size is None or iterations <= 0:
+            return False
+
+        n_arts = int(self.n_arts_by_size.get(fused_size, 0))
+        if n_arts <= 0:
+            return False
+
+        wp.launch_tiled(
+            kernel,
+            dim=[self.world_count],
+            inputs=[
+                self.compact_constraint_count,
+                self.compact_body_count,
+                self.compact_body_list,
+                self.max_compact_bodies,
+                self.compact_body_a,
+                self.compact_body_b,
+                self.compact_MiJt_a,
+                self.compact_MiJt_b,
+                self.compact_J_a,
+                self.compact_J_b,
+                self.compact_eff_mass_inv,
+                rhs,
+                self.compact_row_type,
+                self.compact_row_parent,
+                self.compact_row_mu,
+                self.body_to_articulation,
+                self.is_free_rigid,
+                self.articulation_root_dof_start,
+                self.articulation_root_com_offset,
+                self.group_to_art[fused_size],
+                self.art_to_world,
+                n_arts,
+                self.model.articulation_start,
+                self.model.joint_parent,
+                self.model.joint_child,
+                self.model.joint_qd_start,
+                self.compact_joint_S_flat,
+                self.compact_body_com_rel,
+                self.compact_tree_U,
+                self.compact_tree_D_inv,
+                iterations,
+                omega,
+                int(friction_start_iteration),
+                int(iteration_offset),
+            ],
+            outputs=[
+                self.compact_impulses,
+                self.compact_tree_pA,
+                self.compact_tree_u,
+                self.compact_tree_qdd,
+                self.compact_tree_body_delta,
+                self.compact_body_qd,
+                self.compact_body_impulses,
+                self.v_out,
+            ],
+            block_dim=max(int(self._compact_full_fused_block_dim), 64),
+            device=self.model.device,
+        )
+        return True
+
     def _compact_pgs_solve_one_iteration(
         self,
         *,
@@ -3106,6 +3244,15 @@ class SolverFeatherPGS(SolverBase):
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
         launch_existing_phases = self.compact_existing_row_phases != "skip"
+
+        if not launch_existing_phases and self._launch_compact_full_fused_iterations(
+            rhs=compact_rhs,
+            iterations=iterations,
+            omega=omega,
+            friction_start_iteration=friction_start_iteration,
+            iteration_offset=iteration_offset,
+        ):
+            return
 
         def launch_existing(row_phase: int, global_iter: int) -> None:
             if not launch_existing_phases:
@@ -5282,6 +5429,7 @@ class SolverFeatherPGS(SolverBase):
                     or self.compact_shared_row_solver
                     or self.compact_active_free_flush
                     or self.compact_fused_free_flush
+                    or self._compact_full_fused_size is not None
                 ):
                     if self.compact_fast_body_map or self.compact_shared_row_solver:
                         wp.launch(
@@ -8367,6 +8515,514 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
     pgs_solve_compact_template.__name__ = name
     pgs_solve_compact_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_compact_template)
+
+
+@cache
+def _get_pgs_solve_compact_full_fused_kernel(
+    compact_max_constraints: int,
+    max_compact_bodies: int,
+    target_size: int,
+    device_arch: str,
+) -> "wp.Kernel":
+    """Build a block-per-world compact solve kernel with row solve, propagation, and flush fused."""
+    M = compact_max_constraints
+    contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
+    friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
+
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warp_count = blockDim.x >> 5;
+    const int prop_warps = (warp_count > 1) ? (warp_count - 1) : 1;
+    const unsigned mask = 0xffffffffu;
+    int m = compact_constraint_count.data[world];
+    if (m > {M}) m = {M};
+    const int world_base = world * {M};
+
+    for (int it = 0; it < iterations; ++it) {{
+        const int global_iter = iteration_offset + it;
+
+        if (warp == 0) {{
+            for (int i = 0; i < m; ++i) {{
+                const int off = world_base + i;
+                const int row_type = compact_row_type.data[off];
+                if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
+                    if (lane == 0) compact_impulses.data[off] = 0.0f;
+                    __syncwarp(mask);
+                    continue;
+                }}
+
+                const float eff_inv = compact_eff_mass_inv.data[off];
+                if (eff_inv <= 0.0f) {{
+                    __syncwarp(mask);
+                    continue;
+                }}
+
+                const int ba = compact_body_a.data[off];
+                const int bb = compact_body_b.data[off];
+                int active_body = -1;
+                int active_k = -1;
+                float active_J = 0.0f;
+                float active_MiJt = 0.0f;
+                float partial = 0.0f;
+                if (lane < 6 && ba >= 0) {{
+                    const int elem = off * 6 + lane;
+                    active_body = ba;
+                    active_k = lane;
+                    active_J = compact_J_a.data[elem];
+                    active_MiJt = compact_MiJt_a.data[elem];
+                    partial = active_J * compact_body_qd.data[ba * 6 + lane];
+                }} else if (lane >= 6 && lane < 12 && bb >= 0) {{
+                    const int k = lane - 6;
+                    const int elem = off * 6 + k;
+                    active_body = bb;
+                    active_k = k;
+                    active_J = compact_J_b.data[elem];
+                    active_MiJt = compact_MiJt_b.data[elem];
+                    partial = active_J * compact_body_qd.data[bb * 6 + k];
+                }}
+                for (int offset = 16; offset > 0; offset >>= 1) {{
+                    partial += __shfl_down_sync(mask, partial, offset);
+                }}
+
+                float delta_impulse = 0.0f;
+                int sib = -1;
+                float sib_delta = 0.0f;
+                if (lane == 0) {{
+                    const float residual = partial + compact_rhs.data[off];
+                    const float old_impulse = compact_impulses.data[off];
+                    float new_impulse = old_impulse + omega * (-residual * eff_inv);
+
+                    if (row_type == {contact_type}) {{
+                        if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    }} else if (row_type == {friction_type}) {{
+                        const int parent_idx = compact_row_parent.data[off];
+                        const float lambda_n = compact_impulses.data[world_base + parent_idx];
+                        const float radius = fmaxf(compact_row_mu.data[off] * lambda_n, 0.0f);
+                        if (radius <= 0.0f) {{
+                            new_impulse = 0.0f;
+                        }} else {{
+                            sib = parent_idx + 1;
+                            if (i == parent_idx + 1) sib = parent_idx + 2;
+                            compact_impulses.data[off] = new_impulse;
+                            const int sib_off = world_base + sib;
+                            const float other = compact_impulses.data[sib_off];
+                            const float mag = sqrtf(new_impulse * new_impulse + other * other);
+                            if (mag > radius) {{
+                                const float scale = radius / mag;
+                                new_impulse *= scale;
+                                const float sib_new = other * scale;
+                                sib_delta = sib_new - other;
+                                compact_impulses.data[sib_off] = sib_new;
+                            }}
+                        }}
+                    }}
+
+                    delta_impulse = new_impulse - old_impulse;
+                    compact_impulses.data[off] = new_impulse;
+                }}
+
+                sib = __shfl_sync(mask, sib, 0);
+                sib_delta = __shfl_sync(mask, sib_delta, 0);
+                if (sib_delta != 0.0f) {{
+                    const int sib_off = world_base + sib;
+                    const int sib_ba = compact_body_a.data[sib_off];
+                    const int sib_bb = compact_body_b.data[sib_off];
+                    if (lane < 6 && sib_ba >= 0) {{
+                        compact_body_qd.data[sib_ba * 6 + lane] += compact_MiJt_a.data[sib_off * 6 + lane] * sib_delta;
+                        compact_body_impulses.data[sib_ba * 6 + lane] += compact_J_a.data[sib_off * 6 + lane] * sib_delta;
+                    }} else if (lane >= 6 && lane < 12 && sib_bb >= 0) {{
+                        const int k = lane - 6;
+                        compact_body_qd.data[sib_bb * 6 + k] += compact_MiJt_b.data[sib_off * 6 + k] * sib_delta;
+                        compact_body_impulses.data[sib_bb * 6 + k] += compact_J_b.data[sib_off * 6 + k] * sib_delta;
+                    }}
+                }}
+
+                delta_impulse = __shfl_sync(mask, delta_impulse, 0);
+                if (delta_impulse != 0.0f && active_body >= 0) {{
+                    compact_body_qd.data[active_body * 6 + active_k] += active_MiJt * delta_impulse;
+                    compact_body_impulses.data[active_body * 6 + active_k] += active_J * delta_impulse;
+                }}
+                __syncwarp(mask);
+            }}
+        }}
+
+        __syncthreads();
+
+        if (warp > 0) {{
+            for (int group_idx = warp - 1; group_idx < n_arts; group_idx += prop_warps) {{
+                const int art = group_to_art.data[group_idx];
+                if (art_to_world.data[art] != world) {{
+                    continue;
+                }}
+                const int joint_start = articulation_start.data[art];
+                const int joint_end = articulation_start.data[art + 1];
+
+                int has_impulse = 0;
+
+                for (int joint = joint_start; joint < joint_end; ++joint) {{
+                    const int body = joint_child.data[joint];
+                    if (lane < 6) {{
+                        compact_tree_pA.data[body * 6 + lane] = 0.0f;
+                        compact_tree_body_delta.data[body * 6 + lane] = 0.0f;
+                    }}
+                    if (lane == 0) {{
+                        const int dof_start = joint_qd_start.data[joint];
+                        const int dof_end = joint_qd_start.data[joint + 1];
+                        for (int dof = dof_start; dof < dof_end; ++dof) {{
+                            compact_tree_u.data[dof] = 0.0f;
+                            compact_tree_qdd.data[dof] = 0.0f;
+                        }}
+
+                        const float fx = compact_body_impulses.data[body * 6 + 0];
+                        const float fy = compact_body_impulses.data[body * 6 + 1];
+                        const float fz = compact_body_impulses.data[body * 6 + 2];
+                        const float tx = compact_body_impulses.data[body * 6 + 3];
+                        const float ty = compact_body_impulses.data[body * 6 + 4];
+                        const float tz = compact_body_impulses.data[body * 6 + 5];
+                        if (fx * fx + fy * fy + fz * fz + tx * tx + ty * ty + tz * tz > 0.0f) {{
+                            has_impulse = 1;
+                        }}
+                    }}
+
+                    if (lane < 6) {{
+                        const float fx = compact_body_impulses.data[body * 6 + 0];
+                        const float fy = compact_body_impulses.data[body * 6 + 1];
+                        const float fz = compact_body_impulses.data[body * 6 + 2];
+                        const float tx = compact_body_impulses.data[body * 6 + 3];
+                        const float ty = compact_body_impulses.data[body * 6 + 4];
+                        const float tz = compact_body_impulses.data[body * 6 + 5];
+                        float value = 0.0f;
+                        if (lane == 0) value = -fx;
+                        else if (lane == 1) value = -fy;
+                        else if (lane == 2) value = -fz;
+                        else if (lane == 3) value = -tx;
+                        else if (lane == 4) value = -ty;
+                        else value = -tz;
+                        compact_tree_pA.data[body * 6 + lane] = value;
+                    }}
+                    __syncwarp(mask);
+                }}
+
+                has_impulse = __shfl_sync(mask, has_impulse, 0);
+                if (has_impulse != 0) {{
+                    for (int offset = 0; offset < joint_end - joint_start; ++offset) {{
+                        const int joint = joint_end - 1 - offset;
+                        const int child = joint_child.data[joint];
+                        const int parent = joint_parent.data[joint];
+                        const int dof_start = joint_qd_start.data[joint];
+                        const int dof_end = joint_qd_start.data[joint + 1];
+                        const int has_dof = (dof_start < dof_end);
+                        const int gdof = dof_start;
+
+                        float u = 0.0f;
+                        if (has_dof && lane < 6) {{
+                            u = -compact_joint_S_flat.data[gdof * 6 + lane] * compact_tree_pA.data[child * 6 + lane];
+                        }}
+                        for (int shfl = 16; shfl > 0; shfl >>= 1) {{
+                            u += __shfl_down_sync(mask, u, shfl);
+                        }}
+                        u = __shfl_sync(mask, u, 0);
+                        if (has_dof && lane == 0) {{
+                            compact_tree_u.data[gdof] = u;
+                        }}
+
+                        if (parent >= 0 && lane < 6) {{
+                            float propagated = compact_tree_pA.data[child * 6 + lane];
+                            if (has_dof) {{
+                                const float inv_d = compact_tree_D_inv.data[joint * 36];
+                                propagated += compact_tree_U.data[gdof * 6 + lane] * inv_d * u;
+                            }}
+                            const float ex = compact_body_com_rel.data[child * 3 + 0] - compact_body_com_rel.data[parent * 3 + 0];
+                            const float ey = compact_body_com_rel.data[child * 3 + 1] - compact_body_com_rel.data[parent * 3 + 1];
+                            const float ez = compact_body_com_rel.data[child * 3 + 2] - compact_body_com_rel.data[parent * 3 + 2];
+                            if (lane >= 3) {{
+                                const float inv_d = has_dof ? compact_tree_D_inv.data[joint * 36] : 0.0f;
+                                const float px = compact_tree_pA.data[child * 6 + 0]
+                                    + (has_dof ? compact_tree_U.data[gdof * 6 + 0] * inv_d * u : 0.0f);
+                                const float py = compact_tree_pA.data[child * 6 + 1]
+                                    + (has_dof ? compact_tree_U.data[gdof * 6 + 1] * inv_d * u : 0.0f);
+                                const float pz = compact_tree_pA.data[child * 6 + 2]
+                                    + (has_dof ? compact_tree_U.data[gdof * 6 + 2] * inv_d * u : 0.0f);
+                                if (lane == 3) propagated += ey * pz - ez * py;
+                                else if (lane == 4) propagated += ez * px - ex * pz;
+                                else propagated += ex * py - ey * px;
+                            }}
+                            compact_tree_pA.data[parent * 6 + lane] += propagated;
+                        }}
+                        __syncwarp(mask);
+                    }}
+
+                    for (int joint = joint_start; joint < joint_end; ++joint) {{
+                        const int child = joint_child.data[joint];
+                        const int parent = joint_parent.data[joint];
+                        const int dof_start = joint_qd_start.data[joint];
+                        const int dof_end = joint_qd_start.data[joint + 1];
+                        const int has_dof = (dof_start < dof_end);
+                        const int gdof = dof_start;
+
+                        float parent_delta = 0.0f;
+                        if (parent >= 0 && lane < 6) {{
+                            parent_delta = compact_tree_body_delta.data[parent * 6 + lane];
+                            const float ex = compact_body_com_rel.data[child * 3 + 0] - compact_body_com_rel.data[parent * 3 + 0];
+                            const float ey = compact_body_com_rel.data[child * 3 + 1] - compact_body_com_rel.data[parent * 3 + 1];
+                            const float ez = compact_body_com_rel.data[child * 3 + 2] - compact_body_com_rel.data[parent * 3 + 2];
+                            const float wx = compact_tree_body_delta.data[parent * 6 + 3];
+                            const float wy = compact_tree_body_delta.data[parent * 6 + 4];
+                            const float wz = compact_tree_body_delta.data[parent * 6 + 5];
+                            if (lane == 0) parent_delta += wy * ez - wz * ey;
+                            else if (lane == 1) parent_delta += wz * ex - wx * ez;
+                            else if (lane == 2) parent_delta += wx * ey - wy * ex;
+                        }}
+
+                        float qdd = 0.0f;
+                        if (has_dof) {{
+                            float parent_term = 0.0f;
+                            if (parent >= 0 && lane < 6) {{
+                                parent_term = compact_tree_U.data[gdof * 6 + lane] * parent_delta;
+                            }}
+                            for (int shfl = 16; shfl > 0; shfl >>= 1) {{
+                                parent_term += __shfl_down_sync(mask, parent_term, shfl);
+                            }}
+                            parent_term = __shfl_sync(mask, parent_term, 0);
+                            qdd = compact_tree_D_inv.data[joint * 36] * (compact_tree_u.data[gdof] - parent_term);
+                            if (lane == 0) {{
+                                compact_tree_qdd.data[gdof] = qdd;
+                                v_out.data[gdof] += qdd;
+                            }}
+                            qdd = __shfl_sync(mask, qdd, 0);
+                        }}
+
+                        if (lane < 6) {{
+                            float value = parent_delta;
+                            if (has_dof) {{
+                                value += compact_joint_S_flat.data[gdof * 6 + lane] * qdd;
+                            }}
+                            compact_tree_body_delta.data[child * 6 + lane] = value;
+                        }}
+                        __syncwarp(mask);
+                    }}
+                }}
+
+                for (int joint = joint_start; joint < joint_end; ++joint) {{
+                    const int child = joint_child.data[joint];
+                    const int parent = joint_parent.data[joint];
+                    const int dof_start = joint_qd_start.data[joint];
+                    const int dof_end = joint_qd_start.data[joint + 1];
+                    const int has_dof = (dof_start < dof_end);
+                    const int gdof = dof_start;
+
+                    if (lane < 6) {{
+                        float value = 0.0f;
+                        if (parent >= 0) {{
+                            value = compact_tree_body_delta.data[parent * 6 + lane];
+                            const float ex = compact_body_com_rel.data[child * 3 + 0] - compact_body_com_rel.data[parent * 3 + 0];
+                            const float ey = compact_body_com_rel.data[child * 3 + 1] - compact_body_com_rel.data[parent * 3 + 1];
+                            const float ez = compact_body_com_rel.data[child * 3 + 2] - compact_body_com_rel.data[parent * 3 + 2];
+                            const float wx = compact_tree_body_delta.data[parent * 6 + 3];
+                            const float wy = compact_tree_body_delta.data[parent * 6 + 4];
+                            const float wz = compact_tree_body_delta.data[parent * 6 + 5];
+                            if (lane == 0) value += wy * ez - wz * ey;
+                            else if (lane == 1) value += wz * ex - wx * ez;
+                            else if (lane == 2) value += wx * ey - wy * ex;
+                        }}
+                        if (has_dof) {{
+                            value += compact_joint_S_flat.data[gdof * 6 + lane] * v_out.data[gdof];
+                        }}
+                        compact_tree_body_delta.data[child * 6 + lane] = value;
+                    }}
+                    __syncwarp(mask);
+
+                    if (lane < 6) {{
+                        compact_body_qd.data[child * 6 + lane] = compact_tree_body_delta.data[child * 6 + lane];
+                        compact_body_impulses.data[child * 6 + lane] = 0.0f;
+                    }}
+                }}
+            }}
+        }}
+
+        __syncthreads();
+
+        if (warp == 0) {{
+            int n_bodies = compact_body_count.data[world];
+            if (n_bodies > max_compact_bodies) n_bodies = max_compact_bodies;
+            const int body_base = world * max_compact_bodies;
+            for (int local_body = 0; local_body < n_bodies; ++local_body) {{
+                const int flush_body = compact_body_list.data[body_base + local_body];
+                const int art = (flush_body >= 0) ? body_to_articulation.data[flush_body] : -1;
+                if (flush_body >= 0 && art >= 0 && is_free_rigid.data[art] != 0 && lane < 6) {{
+                    const float qdk = compact_body_qd.data[flush_body * 6 + lane];
+                    const float qd0 = __shfl_sync(0x3fu, qdk, 0);
+                    const float qd1 = __shfl_sync(0x3fu, qdk, 1);
+                    const float qd2 = __shfl_sync(0x3fu, qdk, 2);
+                    const float qd3 = __shfl_sync(0x3fu, qdk, 3);
+                    const float qd4 = __shfl_sync(0x3fu, qdk, 4);
+                    const float qd5 = __shfl_sync(0x3fu, qdk, 5);
+                    const auto com_offset = articulation_root_com_offset.data[art];
+                    const float ox = com_offset[0];
+                    const float oy = com_offset[1];
+                    const float oz = com_offset[2];
+                    const int dof_start = articulation_root_dof_start.data[art];
+                    if (lane == 0) v_out.data[dof_start + 0] = qd0 - (qd4 * oz - qd5 * oy);
+                    else if (lane == 1) v_out.data[dof_start + 1] = qd1 - (qd5 * ox - qd3 * oz);
+                    else if (lane == 2) v_out.data[dof_start + 2] = qd2 - (qd3 * oy - qd4 * ox);
+                    else if (lane == 3) v_out.data[dof_start + 3] = qd3;
+                    else if (lane == 4) v_out.data[dof_start + 4] = qd4;
+                    else v_out.data[dof_start + 5] = qd5;
+                    compact_body_impulses.data[flush_body * 6 + lane] = 0.0f;
+                }}
+                __syncwarp(mask);
+            }}
+        }}
+
+        __syncthreads();
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def pgs_solve_compact_full_fused_native(
+        world: int,
+        compact_constraint_count: wp.array[int],
+        compact_body_count: wp.array[int],
+        compact_body_list: wp.array2d[int],
+        max_compact_bodies: int,
+        compact_body_a: wp.array2d[int],
+        compact_body_b: wp.array2d[int],
+        compact_MiJt_a: wp.array3d[float],
+        compact_MiJt_b: wp.array3d[float],
+        compact_J_a: wp.array3d[float],
+        compact_J_b: wp.array3d[float],
+        compact_eff_mass_inv: wp.array2d[float],
+        compact_rhs: wp.array2d[float],
+        compact_row_type: wp.array2d[int],
+        compact_row_parent: wp.array2d[int],
+        compact_row_mu: wp.array2d[float],
+        body_to_articulation: wp.array[int],
+        is_free_rigid: wp.array[int],
+        articulation_root_dof_start: wp.array[int],
+        articulation_root_com_offset: wp.array[wp.vec3],
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        n_arts: int,
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        compact_joint_S_flat: wp.array2d[float],
+        compact_body_com_rel: wp.array2d[float],
+        compact_tree_U: wp.array2d[float],
+        compact_tree_D_inv: wp.array3d[float],
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        compact_impulses: wp.array2d[float],
+        compact_tree_pA: wp.array2d[float],
+        compact_tree_u: wp.array[float],
+        compact_tree_qdd: wp.array[float],
+        compact_tree_body_delta: wp.array2d[float],
+        compact_body_qd: wp.array2d[float],
+        compact_body_impulses: wp.array2d[float],
+        v_out: wp.array[float],
+    ): ...
+
+    def pgs_solve_compact_full_fused_template(
+        compact_constraint_count: wp.array[int],
+        compact_body_count: wp.array[int],
+        compact_body_list: wp.array2d[int],
+        max_compact_bodies: int,
+        compact_body_a: wp.array2d[int],
+        compact_body_b: wp.array2d[int],
+        compact_MiJt_a: wp.array3d[float],
+        compact_MiJt_b: wp.array3d[float],
+        compact_J_a: wp.array3d[float],
+        compact_J_b: wp.array3d[float],
+        compact_eff_mass_inv: wp.array2d[float],
+        compact_rhs: wp.array2d[float],
+        compact_row_type: wp.array2d[int],
+        compact_row_parent: wp.array2d[int],
+        compact_row_mu: wp.array2d[float],
+        body_to_articulation: wp.array[int],
+        is_free_rigid: wp.array[int],
+        articulation_root_dof_start: wp.array[int],
+        articulation_root_com_offset: wp.array[wp.vec3],
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        n_arts: int,
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        compact_joint_S_flat: wp.array2d[float],
+        compact_body_com_rel: wp.array2d[float],
+        compact_tree_U: wp.array2d[float],
+        compact_tree_D_inv: wp.array3d[float],
+        iterations: int,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+        compact_impulses: wp.array2d[float],
+        compact_tree_pA: wp.array2d[float],
+        compact_tree_u: wp.array[float],
+        compact_tree_qdd: wp.array[float],
+        compact_tree_body_delta: wp.array2d[float],
+        compact_body_qd: wp.array2d[float],
+        compact_body_impulses: wp.array2d[float],
+        v_out: wp.array[float],
+    ):
+        world, _lane = wp.tid()
+        pgs_solve_compact_full_fused_native(
+            world,
+            compact_constraint_count,
+            compact_body_count,
+            compact_body_list,
+            max_compact_bodies,
+            compact_body_a,
+            compact_body_b,
+            compact_MiJt_a,
+            compact_MiJt_b,
+            compact_J_a,
+            compact_J_b,
+            compact_eff_mass_inv,
+            compact_rhs,
+            compact_row_type,
+            compact_row_parent,
+            compact_row_mu,
+            body_to_articulation,
+            is_free_rigid,
+            articulation_root_dof_start,
+            articulation_root_com_offset,
+            group_to_art,
+            art_to_world,
+            n_arts,
+            articulation_start,
+            joint_parent,
+            joint_child,
+            joint_qd_start,
+            compact_joint_S_flat,
+            compact_body_com_rel,
+            compact_tree_U,
+            compact_tree_D_inv,
+            iterations,
+            omega,
+            friction_start_iteration,
+            iteration_offset,
+            compact_impulses,
+            compact_tree_pA,
+            compact_tree_u,
+            compact_tree_qdd,
+            compact_tree_body_delta,
+            compact_body_qd,
+            compact_body_impulses,
+            v_out,
+        )
+
+    name = f"pgs_solve_compact_full_fused_{compact_max_constraints}_{max_compact_bodies}_{target_size}"
+    pgs_solve_compact_full_fused_template.__name__ = name
+    pgs_solve_compact_full_fused_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_compact_full_fused_template)
 
 
 @cache
