@@ -2601,10 +2601,8 @@ class SolverFeatherPGS(SolverBase):
                     self.model.joint_child,
                     self.model.joint_qd_start,
                     self.model.joint_dof_dim,
-                    self._current_compact_joint_S_s,
-                    self._current_compact_body_q,
-                    self.model.body_com,
-                    self.articulation_origin,
+                    self.compact_joint_S_flat,
+                    self.compact_body_com_rel,
                     self.v_out,
                 ],
                 outputs=[
@@ -2644,8 +2642,13 @@ class SolverFeatherPGS(SolverBase):
         if self.model.joint_dof_count > 0:
             wp.launch(
                 flatten_compact_joint_S,
-                dim=self.model.joint_dof_count * 6,
-                inputs=[state_aug.joint_S_s],
+                dim=self.model.joint_count,
+                inputs=[
+                    self.model.joint_child,
+                    self.model.joint_qd_start,
+                    state_aug.joint_S_s,
+                    self.compact_body_com_rel,
+                ],
                 outputs=[self.compact_joint_S_flat],
                 device=self.model.device,
             )
@@ -2667,13 +2670,15 @@ class SolverFeatherPGS(SolverBase):
                     self.model.joint_child,
                     self.model.joint_qd_start,
                     self.model.joint_dof_dim,
-                    state_aug.joint_S_s,
+                    self.compact_joint_S_flat,
                     self.model.joint_armature,
                     self.articulation_max_dofs,
                     self.aug_row_counts,
                     self.aug_row_dof_index,
                     self.aug_row_K,
-                    state_aug.body_I_s,
+                    self.body_I_m,
+                    state_aug.body_q_com,
+                    self.compact_body_com_rel,
                 ],
                 outputs=[
                     self.compact_tree_Ia,
@@ -2694,10 +2699,8 @@ class SolverFeatherPGS(SolverBase):
                         self.model.joint_child,
                         self.model.joint_qd_start,
                         self.model.joint_dof_dim,
-                        state_aug.joint_S_s,
-                        state.body_q,
-                        self.model.body_com,
-                        self.articulation_origin,
+                        self.compact_joint_S_flat,
+                        self.compact_body_com_rel,
                         self.compact_tree_U,
                         self.compact_tree_D_inv,
                     ],
@@ -2716,9 +2719,6 @@ class SolverFeatherPGS(SolverBase):
                         self.compact_body_count,
                         self.compact_body_list,
                         self.body_to_articulation,
-                        state.body_q,
-                        self.model.body_com,
-                        self.articulation_origin,
                         self.group_to_art[size],
                         self.art_to_world,
                         self.model.articulation_start,
@@ -2726,8 +2726,9 @@ class SolverFeatherPGS(SolverBase):
                         self.model.joint_child,
                         self.model.joint_qd_start,
                         self.model.joint_dof_dim,
-                        state_aug.joint_S_s,
+                        self.compact_joint_S_flat,
                         self.max_compact_bodies,
+                        self.compact_body_com_rel,
                         self.compact_tree_U,
                         self.compact_tree_D_inv,
                     ],
@@ -2750,10 +2751,8 @@ class SolverFeatherPGS(SolverBase):
                     self.model.joint_child,
                     self.model.joint_qd_start,
                     self.model.joint_dof_dim,
-                    state_aug.joint_S_s,
-                    state.body_q,
-                    self.model.body_com,
-                    self.articulation_origin,
+                    self.compact_joint_S_flat,
+                    self.compact_body_com_rel,
                     self.v_out,
                 ],
                 outputs=[
@@ -2875,10 +2874,8 @@ class SolverFeatherPGS(SolverBase):
                     self.model.joint_child,
                     self.model.joint_qd_start,
                     self.model.joint_dof_dim,
-                    self._current_compact_joint_S_s,
-                    self._current_compact_body_q,
-                    self.model.body_com,
-                    self.articulation_origin,
+                    self.compact_joint_S_flat,
+                    self.compact_body_com_rel,
                     self.compact_tree_U,
                     self.compact_tree_D_inv,
                     self.compact_body_impulses,
@@ -8464,16 +8461,13 @@ def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch:
             const float tx = compact_body_impulses.data[body * 6 + 3];
             const float ty = compact_body_impulses.data[body * 6 + 4];
             const float tz = compact_body_impulses.data[body * 6 + 5];
-            const float rx = compact_body_com_rel.data[body * 3 + 0];
-            const float ry = compact_body_com_rel.data[body * 3 + 1];
-            const float rz = compact_body_com_rel.data[body * 3 + 2];
             float value = 0.0f;
             if (lane == 0) value = -fx;
             else if (lane == 1) value = -fy;
             else if (lane == 2) value = -fz;
-            else if (lane == 3) value = -(tx + ry * fz - rz * fy);
-            else if (lane == 4) value = -(ty + rz * fx - rx * fz);
-            else value = -(tz + rx * fy - ry * fx);
+            else if (lane == 3) value = -tx;
+            else if (lane == 4) value = -ty;
+            else value = -tz;
             compact_tree_pA.data[body * 6 + lane] = value;
         }
         __syncwarp(mask);
@@ -8508,6 +8502,21 @@ def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch:
                     const float inv_d = compact_tree_D_inv.data[joint * 36];
                     propagated += compact_tree_U.data[gdof * 6 + lane] * inv_d * u;
                 }
+                const float ex = compact_body_com_rel.data[child * 3 + 0] - compact_body_com_rel.data[parent * 3 + 0];
+                const float ey = compact_body_com_rel.data[child * 3 + 1] - compact_body_com_rel.data[parent * 3 + 1];
+                const float ez = compact_body_com_rel.data[child * 3 + 2] - compact_body_com_rel.data[parent * 3 + 2];
+                if (lane >= 3) {
+                    const float inv_d = has_dof ? compact_tree_D_inv.data[joint * 36] : 0.0f;
+                    const float px = compact_tree_pA.data[child * 6 + 0]
+                        + (has_dof ? compact_tree_U.data[gdof * 6 + 0] * inv_d * u : 0.0f);
+                    const float py = compact_tree_pA.data[child * 6 + 1]
+                        + (has_dof ? compact_tree_U.data[gdof * 6 + 1] * inv_d * u : 0.0f);
+                    const float pz = compact_tree_pA.data[child * 6 + 2]
+                        + (has_dof ? compact_tree_U.data[gdof * 6 + 2] * inv_d * u : 0.0f);
+                    if (lane == 3) propagated += ey * pz - ez * py;
+                    else if (lane == 4) propagated += ez * px - ex * pz;
+                    else propagated += ex * py - ey * px;
+                }
                 compact_tree_pA.data[parent * 6 + lane] += propagated;
             }
             __syncwarp(mask);
@@ -8524,13 +8533,22 @@ def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch:
             float parent_delta = 0.0f;
             if (parent >= 0 && lane < 6) {
                 parent_delta = compact_tree_body_delta.data[parent * 6 + lane];
+                const float ex = compact_body_com_rel.data[child * 3 + 0] - compact_body_com_rel.data[parent * 3 + 0];
+                const float ey = compact_body_com_rel.data[child * 3 + 1] - compact_body_com_rel.data[parent * 3 + 1];
+                const float ez = compact_body_com_rel.data[child * 3 + 2] - compact_body_com_rel.data[parent * 3 + 2];
+                const float wx = compact_tree_body_delta.data[parent * 6 + 3];
+                const float wy = compact_tree_body_delta.data[parent * 6 + 4];
+                const float wz = compact_tree_body_delta.data[parent * 6 + 5];
+                if (lane == 0) parent_delta += wy * ez - wz * ey;
+                else if (lane == 1) parent_delta += wz * ex - wx * ez;
+                else if (lane == 2) parent_delta += wx * ey - wy * ex;
             }
 
             float qdd = 0.0f;
             if (has_dof) {
                 float parent_term = 0.0f;
                 if (parent >= 0 && lane < 6) {
-                    parent_term = compact_tree_U.data[gdof * 6 + lane] * compact_tree_body_delta.data[parent * 6 + lane];
+                    parent_term = compact_tree_U.data[gdof * 6 + lane] * parent_delta;
                 }
                 for (int shfl = 16; shfl > 0; shfl >>= 1) {
                     parent_term += __shfl_down_sync(mask, parent_term, shfl);
@@ -8569,6 +8587,15 @@ def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch:
             float value = 0.0f;
             if (parent >= 0) {
                 value = compact_tree_body_delta.data[parent * 6 + lane];
+                const float ex = compact_body_com_rel.data[child * 3 + 0] - compact_body_com_rel.data[parent * 3 + 0];
+                const float ey = compact_body_com_rel.data[child * 3 + 1] - compact_body_com_rel.data[parent * 3 + 1];
+                const float ez = compact_body_com_rel.data[child * 3 + 2] - compact_body_com_rel.data[parent * 3 + 2];
+                const float wx = compact_tree_body_delta.data[parent * 6 + 3];
+                const float wy = compact_tree_body_delta.data[parent * 6 + 4];
+                const float wz = compact_tree_body_delta.data[parent * 6 + 5];
+                if (lane == 0) value += wy * ez - wz * ey;
+                else if (lane == 1) value += wz * ex - wx * ez;
+                else if (lane == 2) value += wx * ey - wy * ex;
             }
             if (has_dof) {
                 value += compact_joint_S_flat.data[gdof * 6 + lane] * v_out.data[gdof];
@@ -8578,23 +8605,7 @@ def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch:
         __syncwarp(mask);
 
         if (lane < 6) {
-            const float lin_x = compact_tree_body_delta.data[child * 6 + 0];
-            const float lin_y = compact_tree_body_delta.data[child * 6 + 1];
-            const float lin_z = compact_tree_body_delta.data[child * 6 + 2];
-            const float ang_x = compact_tree_body_delta.data[child * 6 + 3];
-            const float ang_y = compact_tree_body_delta.data[child * 6 + 4];
-            const float ang_z = compact_tree_body_delta.data[child * 6 + 5];
-            const float rx = compact_body_com_rel.data[child * 3 + 0];
-            const float ry = compact_body_com_rel.data[child * 3 + 1];
-            const float rz = compact_body_com_rel.data[child * 3 + 2];
-            float qd = 0.0f;
-            if (lane == 0) qd = lin_x + ang_y * rz - ang_z * ry;
-            else if (lane == 1) qd = lin_y + ang_z * rx - ang_x * rz;
-            else if (lane == 2) qd = lin_z + ang_x * ry - ang_y * rx;
-            else if (lane == 3) qd = ang_x;
-            else if (lane == 4) qd = ang_y;
-            else qd = ang_z;
-            compact_body_qd.data[child * 6 + lane] = qd;
+            compact_body_qd.data[child * 6 + lane] = compact_tree_body_delta.data[child * 6 + lane];
             compact_body_impulses.data[child * 6 + lane] = 0.0f;
         }
     }

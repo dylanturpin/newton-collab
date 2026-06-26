@@ -899,6 +899,27 @@ def spatial_cross_dual(a: wp.spatial_vector, b: wp.spatial_vector):
 
 
 @wp.func
+def translate_twist_between_parallel_frames(twist: wp.spatial_vector, dest_minus_source: wp.vec3):
+    """Translate a world-aligned twist from one origin to another."""
+    lin = wp.spatial_top(twist)
+    ang = wp.spatial_bottom(twist)
+    return wp.spatial_vector(lin + wp.cross(ang, dest_minus_source), ang)
+
+
+@wp.func
+def translate_wrench_between_parallel_frames(wrench: wp.spatial_vector, source_minus_dest: wp.vec3):
+    """Translate a world-aligned wrench from one origin to another."""
+    force = wp.spatial_top(wrench)
+    torque = wp.spatial_bottom(wrench)
+    return wp.spatial_vector(force, torque + wp.cross(source_minus_dest, force))
+
+
+@wp.func
+def spatial_inertia_to_parallel_frame(I: wp.spatial_matrix, source_minus_dest: wp.vec3):
+    return transform_spatial_inertia(wp.transform(source_minus_dest, wp.quat_identity()), I)
+
+
+@wp.func
 def dense_index(stride: int, i: int, j: int):
     return i * stride + j
 
@@ -5152,15 +5173,36 @@ def compute_compact_body_com_rel(
 
 @wp.kernel
 def flatten_compact_joint_S(
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
     joint_S_s: wp.array[wp.spatial_vector],
+    compact_body_com_rel: wp.array2d[float],
     # outputs
     compact_joint_S_flat: wp.array2d[float],
 ):
-    tid = wp.tid()
-    dof = tid // 6
-    axis = tid - dof * 6
-    S = joint_S_s[dof]
-    compact_joint_S_flat[dof, axis] = S[axis]
+    joint = wp.tid()
+    child = joint_child[joint]
+    if child < 0:
+        return
+
+    child_rel = wp.vec3(
+        compact_body_com_rel[child, 0],
+        compact_body_com_rel[child, 1],
+        compact_body_com_rel[child, 2],
+    )
+    dof_start = joint_qd_start[joint]
+    dof_end = joint_qd_start[joint + 1]
+    for dof in range(dof_start, dof_end):
+        S = joint_S_s[dof]
+        lin = wp.vec3(S[0], S[1], S[2])
+        ang = wp.vec3(S[3], S[4], S[5])
+        lin_child = lin + wp.cross(ang, child_rel)
+        compact_joint_S_flat[dof, 0] = lin_child[0]
+        compact_joint_S_flat[dof, 1] = lin_child[1]
+        compact_joint_S_flat[dof, 2] = lin_child[2]
+        compact_joint_S_flat[dof, 3] = ang[0]
+        compact_joint_S_flat[dof, 4] = ang[1]
+        compact_joint_S_flat[dof, 5] = ang[2]
 
 
 @wp.kernel
@@ -5172,13 +5214,15 @@ def factor_compact_tree_for_size(
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
-    joint_S_s: wp.array[wp.spatial_vector],
+    compact_joint_S_flat: wp.array2d[float],
     joint_armature: wp.array[float],
     max_dofs: int,
     aug_row_counts: wp.array[int],
     aug_row_dof_index: wp.array[int],
     aug_row_K: wp.array[float],
-    body_I_s: wp.array[wp.spatial_matrix],
+    body_I_m: wp.array[wp.spatial_matrix],
+    body_q_com: wp.array[wp.transform],
+    compact_body_com_rel: wp.array2d[float],
     # outputs
     compact_tree_Ia: wp.array3d[float],
     compact_tree_U: wp.array2d[float],
@@ -5199,7 +5243,8 @@ def factor_compact_tree_for_size(
 
     for joint in range(joint_start, joint_end):
         body = joint_child[joint]
-        I = body_I_s[body]
+        X_com_world = wp.transform(wp.vec3(), wp.transform_get_rotation(body_q_com[body]))
+        I = transform_spatial_inertia(X_com_world, body_I_m[body])
         for r in range(6):
             for c in range(6):
                 compact_tree_Ia[body, r, c] = I[r, c]
@@ -5225,21 +5270,19 @@ def factor_compact_tree_for_size(
 
         for a in range(dof_count):
             gdof = dof_start + a
-            S = joint_S_s[gdof]
             for r in range(6):
                 value = float(0.0)
                 for c in range(6):
-                    value += compact_tree_Ia[child, r, c] * S[c]
+                    value += compact_tree_Ia[child, r, c] * compact_joint_S_flat[gdof, c]
                 compact_tree_U[gdof, r] = value
 
         for a in range(dof_count):
             gdof_a = dof_start + a
-            S_a = joint_S_s[gdof_a]
             for b in range(dof_count):
                 gdof_b = dof_start + b
                 value = float(0.0)
                 for r in range(6):
-                    value += S_a[r] * compact_tree_U[gdof_b, r]
+                    value += compact_joint_S_flat[gdof_a, r] * compact_tree_U[gdof_b, r]
                 if a == b:
                     value += joint_armature[gdof_a]
                     aug_count = aug_row_counts[art]
@@ -5289,9 +5332,8 @@ def factor_compact_tree_for_size(
                 diag = compact_tree_D_chol[joint, i, i]
                 compact_tree_D_inv[joint, i, col] = v / diag
 
-        # Reduce the child's articulated inertia across this joint and push it
-        # into the parent. All quantities are already expressed in the common
-        # articulation-origin world frame, so there is no edge transform here.
+        # Reduce the child's articulated inertia across this joint in the child
+        # COM frame.
         for r in range(6):
             for c in range(6):
                 reduced = compact_tree_Ia[child, r, c]
@@ -5304,9 +5346,75 @@ def factor_compact_tree_for_size(
                 compact_tree_Ia[child, r, c] = reduced
 
         if parent >= 0:
-            for r in range(6):
-                for c in range(6):
-                    compact_tree_Ia[parent, r, c] = compact_tree_Ia[parent, r, c] + compact_tree_Ia[child, r, c]
+            child_rel = wp.vec3(
+                compact_body_com_rel[child, 0],
+                compact_body_com_rel[child, 1],
+                compact_body_com_rel[child, 2],
+            )
+            parent_rel = wp.vec3(
+                compact_body_com_rel[parent, 0],
+                compact_body_com_rel[parent, 1],
+                compact_body_com_rel[parent, 2],
+            )
+            child_minus_parent = child_rel - parent_rel
+            for c in range(6):
+                basis = wp.spatial_vector()
+                if c == 0:
+                    basis = wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                elif c == 1:
+                    basis = wp.spatial_vector(0.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+                elif c == 2:
+                    basis = wp.spatial_vector(0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+                elif c == 3:
+                    basis = wp.spatial_vector(0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+                elif c == 4:
+                    basis = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+                else:
+                    basis = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+
+                v_child = translate_twist_between_parallel_frames(basis, child_minus_parent)
+                I_child = wp.spatial_matrix(
+                    compact_tree_Ia[child, 0, 0],
+                    compact_tree_Ia[child, 0, 1],
+                    compact_tree_Ia[child, 0, 2],
+                    compact_tree_Ia[child, 0, 3],
+                    compact_tree_Ia[child, 0, 4],
+                    compact_tree_Ia[child, 0, 5],
+                    compact_tree_Ia[child, 1, 0],
+                    compact_tree_Ia[child, 1, 1],
+                    compact_tree_Ia[child, 1, 2],
+                    compact_tree_Ia[child, 1, 3],
+                    compact_tree_Ia[child, 1, 4],
+                    compact_tree_Ia[child, 1, 5],
+                    compact_tree_Ia[child, 2, 0],
+                    compact_tree_Ia[child, 2, 1],
+                    compact_tree_Ia[child, 2, 2],
+                    compact_tree_Ia[child, 2, 3],
+                    compact_tree_Ia[child, 2, 4],
+                    compact_tree_Ia[child, 2, 5],
+                    compact_tree_Ia[child, 3, 0],
+                    compact_tree_Ia[child, 3, 1],
+                    compact_tree_Ia[child, 3, 2],
+                    compact_tree_Ia[child, 3, 3],
+                    compact_tree_Ia[child, 3, 4],
+                    compact_tree_Ia[child, 3, 5],
+                    compact_tree_Ia[child, 4, 0],
+                    compact_tree_Ia[child, 4, 1],
+                    compact_tree_Ia[child, 4, 2],
+                    compact_tree_Ia[child, 4, 3],
+                    compact_tree_Ia[child, 4, 4],
+                    compact_tree_Ia[child, 4, 5],
+                    compact_tree_Ia[child, 5, 0],
+                    compact_tree_Ia[child, 5, 1],
+                    compact_tree_Ia[child, 5, 2],
+                    compact_tree_Ia[child, 5, 3],
+                    compact_tree_Ia[child, 5, 4],
+                    compact_tree_Ia[child, 5, 5],
+                )
+                w_child = I_child * v_child
+                w_parent = translate_wrench_between_parallel_frames(w_child, child_minus_parent)
+                for r in range(6):
+                    compact_tree_Ia[parent, r, c] = compact_tree_Ia[parent, r, c] + w_parent[r]
 
 
 @wp.kernel
@@ -5314,9 +5422,6 @@ def compute_compact_tree_body_response_for_size(
     compact_body_count: wp.array[int],
     compact_body_list: wp.array2d[int],
     body_to_articulation: wp.array[int],
-    body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    articulation_origin: wp.array[wp.vec3],
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
     articulation_start: wp.array[int],
@@ -5324,8 +5429,9 @@ def compute_compact_tree_body_response_for_size(
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
-    joint_S_s: wp.array[wp.spatial_vector],
+    compact_joint_S_flat: wp.array2d[float],
     max_compact_bodies: int,
+    compact_body_com_rel: wp.array2d[float],
     compact_tree_U: wp.array2d[float],
     compact_tree_D_inv: wp.array3d[float],
     # scratch
@@ -5351,11 +5457,6 @@ def compute_compact_tree_body_response_for_size(
             continue
         if body_to_articulation[target_body] != art:
             continue
-
-        X_wb = body_q[target_body]
-        com_world = wp.transform_point(X_wb, body_com[target_body])
-        origin = articulation_origin[art]
-        com_rel = com_world - origin
 
         for basis in range(6):
             for joint in range(joint_start, joint_end):
@@ -5383,14 +5484,13 @@ def compute_compact_tree_body_response_for_size(
                 torque_com = wp.vec3(0.0, 1.0, 0.0)
             else:
                 torque_com = wp.vec3(0.0, 0.0, 1.0)
-            torque_origin = torque_com + wp.cross(com_rel, force)
 
             compact_tree_pA[target_body, 0] = -force[0]
             compact_tree_pA[target_body, 1] = -force[1]
             compact_tree_pA[target_body, 2] = -force[2]
-            compact_tree_pA[target_body, 3] = -torque_origin[0]
-            compact_tree_pA[target_body, 4] = -torque_origin[1]
-            compact_tree_pA[target_body, 5] = -torque_origin[2]
+            compact_tree_pA[target_body, 3] = -torque_com[0]
+            compact_tree_pA[target_body, 4] = -torque_com[1]
+            compact_tree_pA[target_body, 5] = -torque_com[2]
 
             for offset in range(joint_end - joint_start):
                 joint = joint_end - 1 - offset
@@ -5401,31 +5501,75 @@ def compute_compact_tree_body_response_for_size(
 
                 for a in range(dof_count):
                     gdof = dof_start + a
-                    S = joint_S_s[gdof]
                     v = float(0.0)
                     for r in range(6):
-                        v -= S[r] * compact_tree_pA[child, r]
+                        v -= compact_joint_S_flat[gdof, r] * compact_tree_pA[child, r]
                     compact_tree_u[gdof] = v
 
                 if parent >= 0:
+                    p0 = compact_tree_pA[child, 0]
+                    p1 = compact_tree_pA[child, 1]
+                    p2 = compact_tree_pA[child, 2]
+                    p3 = compact_tree_pA[child, 3]
+                    p4 = compact_tree_pA[child, 4]
+                    p5 = compact_tree_pA[child, 5]
+                    for a in range(dof_count):
+                        gdof_a = dof_start + a
+                        coeff = float(0.0)
+                        for b in range(dof_count):
+                            gdof_b = dof_start + b
+                            coeff += compact_tree_D_inv[joint, a, b] * compact_tree_u[gdof_b]
+                        p0 += compact_tree_U[gdof_a, 0] * coeff
+                        p1 += compact_tree_U[gdof_a, 1] * coeff
+                        p2 += compact_tree_U[gdof_a, 2] * coeff
+                        p3 += compact_tree_U[gdof_a, 3] * coeff
+                        p4 += compact_tree_U[gdof_a, 4] * coeff
+                        p5 += compact_tree_U[gdof_a, 5] * coeff
+
+                    child_rel = wp.vec3(
+                        compact_body_com_rel[child, 0],
+                        compact_body_com_rel[child, 1],
+                        compact_body_com_rel[child, 2],
+                    )
+                    parent_rel = wp.vec3(
+                        compact_body_com_rel[parent, 0],
+                        compact_body_com_rel[parent, 1],
+                        compact_body_com_rel[parent, 2],
+                    )
+                    child_minus_parent = child_rel - parent_rel
+                    propagated_child = wp.spatial_vector(p0, p1, p2, p3, p4, p5)
+                    propagated_parent = translate_wrench_between_parallel_frames(propagated_child, child_minus_parent)
                     for r in range(6):
-                        propagated = compact_tree_pA[child, r]
-                        for a in range(dof_count):
-                            gdof_a = dof_start + a
-                            for b in range(dof_count):
-                                gdof_b = dof_start + b
-                                propagated += (
-                                    compact_tree_U[gdof_a, r]
-                                    * compact_tree_D_inv[joint, a, b]
-                                    * compact_tree_u[gdof_b]
-                                )
-                        compact_tree_pA[parent, r] = compact_tree_pA[parent, r] + propagated
+                        compact_tree_pA[parent, r] = compact_tree_pA[parent, r] + propagated_parent[r]
 
             for joint in range(joint_start, joint_end):
                 child = joint_child[joint]
                 parent = joint_parent[joint]
                 dof_start = joint_qd_start[joint]
                 dof_count = joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
+                parent_delta_child = wp.spatial_vector()
+                if parent >= 0:
+                    parent_delta_parent = wp.spatial_vector(
+                        compact_tree_body_delta[parent, 0],
+                        compact_tree_body_delta[parent, 1],
+                        compact_tree_body_delta[parent, 2],
+                        compact_tree_body_delta[parent, 3],
+                        compact_tree_body_delta[parent, 4],
+                        compact_tree_body_delta[parent, 5],
+                    )
+                    child_rel = wp.vec3(
+                        compact_body_com_rel[child, 0],
+                        compact_body_com_rel[child, 1],
+                        compact_body_com_rel[child, 2],
+                    )
+                    parent_rel = wp.vec3(
+                        compact_body_com_rel[parent, 0],
+                        compact_body_com_rel[parent, 1],
+                        compact_body_com_rel[parent, 2],
+                    )
+                    parent_delta_child = translate_twist_between_parallel_frames(
+                        parent_delta_parent, child_rel - parent_rel
+                    )
 
                 for a in range(dof_count):
                     gdof_a = dof_start + a
@@ -5435,37 +5579,19 @@ def compute_compact_tree_body_response_for_size(
                         parent_term = float(0.0)
                         if parent >= 0:
                             for r in range(6):
-                                parent_term += compact_tree_U[gdof_b, r] * compact_tree_body_delta[parent, r]
+                                parent_term += compact_tree_U[gdof_b, r] * parent_delta_child[r]
                         qdd += compact_tree_D_inv[joint, a, b] * (compact_tree_u[gdof_b] - parent_term)
                     compact_tree_qdd[gdof_a] = qdd
 
                 for r in range(6):
-                    value = float(0.0)
-                    if parent >= 0:
-                        value = compact_tree_body_delta[parent, r]
+                    value = parent_delta_child[r]
                     for a in range(dof_count):
                         gdof = dof_start + a
-                        S = joint_S_s[gdof]
-                        value += S[r] * compact_tree_qdd[gdof]
+                        value += compact_joint_S_flat[gdof, r] * compact_tree_qdd[gdof]
                     compact_tree_body_delta[child, r] = value
 
-            lin = wp.vec3(
-                compact_tree_body_delta[target_body, 0],
-                compact_tree_body_delta[target_body, 1],
-                compact_tree_body_delta[target_body, 2],
-            )
-            ang = wp.vec3(
-                compact_tree_body_delta[target_body, 3],
-                compact_tree_body_delta[target_body, 4],
-                compact_tree_body_delta[target_body, 5],
-            )
-            v_com = lin + wp.cross(ang, com_rel)
-            compact_body_response[target_body, 0, basis] = v_com[0]
-            compact_body_response[target_body, 1, basis] = v_com[1]
-            compact_body_response[target_body, 2, basis] = v_com[2]
-            compact_body_response[target_body, 3, basis] = ang[0]
-            compact_body_response[target_body, 4, basis] = ang[1]
-            compact_body_response[target_body, 5, basis] = ang[2]
+            for r in range(6):
+                compact_body_response[target_body, r, basis] = compact_tree_body_delta[target_body, r]
 
 
 @wp.kernel
@@ -5476,13 +5602,11 @@ def compute_compact_tree_body_response_revolute_for_size(
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
-    joint_S_s: wp.array[wp.spatial_vector],
-    body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    articulation_origin: wp.array[wp.vec3],
+    compact_joint_S_flat: wp.array2d[float],
+    compact_body_com_rel: wp.array2d[float],
     compact_tree_U: wp.array2d[float],
     compact_tree_D_inv: wp.array3d[float],
-    # scratch/output: overwritten with origin-frame body response matrices
+    # scratch/output: overwritten with local-COM body response matrices
     compact_tree_Ia: wp.array3d[float],
     compact_tree_body_delta: wp.array2d[float],
     # outputs
@@ -5499,87 +5623,113 @@ def compute_compact_tree_body_response_revolute_for_size(
         parent = joint_parent[joint]
         dof_start = joint_qd_start[joint]
         dof_count = joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
+        edge = wp.vec3()
+        if parent >= 0:
+            child_rel = wp.vec3(
+                compact_body_com_rel[child, 0],
+                compact_body_com_rel[child, 1],
+                compact_body_com_rel[child, 2],
+            )
+            parent_rel = wp.vec3(
+                compact_body_com_rel[parent, 0],
+                compact_body_com_rel[parent, 1],
+                compact_body_com_rel[parent, 2],
+            )
+            edge = child_rel - parent_rel
 
         if dof_count == 0:
-            for row in range(6):
-                for col in range(6):
-                    value = float(0.0)
-                    if parent >= 0:
-                        value = compact_tree_Ia[parent, row, col]
-                    compact_tree_Ia[child, row, col] = value
+            for col in range(6):
+                basis = wp.spatial_vector()
+                if col == 0:
+                    basis = wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                elif col == 1:
+                    basis = wp.spatial_vector(0.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+                elif col == 2:
+                    basis = wp.spatial_vector(0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+                elif col == 3:
+                    basis = wp.spatial_vector(0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+                elif col == 4:
+                    basis = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+                else:
+                    basis = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+
+                child_delta = wp.spatial_vector()
+                if parent >= 0:
+                    parent_wrench = translate_wrench_between_parallel_frames(basis, edge)
+                    parent_delta = wp.spatial_vector()
+                    for row in range(6):
+                        v = float(0.0)
+                        for p_col in range(6):
+                            v += compact_tree_Ia[parent, row, p_col] * parent_wrench[p_col]
+                        compact_tree_body_delta[child, row] = v
+                    parent_delta = wp.spatial_vector(
+                        compact_tree_body_delta[child, 0],
+                        compact_tree_body_delta[child, 1],
+                        compact_tree_body_delta[child, 2],
+                        compact_tree_body_delta[child, 3],
+                        compact_tree_body_delta[child, 4],
+                        compact_tree_body_delta[child, 5],
+                    )
+                    child_delta = translate_twist_between_parallel_frames(parent_delta, edge)
+
+                for row in range(6):
+                    compact_tree_Ia[child, row, col] = child_delta[row]
+                    compact_body_response[child, row, col] = child_delta[row]
         else:
             gdof = dof_start
-            S = joint_S_s[gdof]
             inv_d = compact_tree_D_inv[joint, 0, 0]
             for col in range(6):
-                for row in range(6):
-                    parent_delta = float(0.0)
-                    if parent >= 0:
+                basis = wp.spatial_vector()
+                if col == 0:
+                    basis = wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                elif col == 1:
+                    basis = wp.spatial_vector(0.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+                elif col == 2:
+                    basis = wp.spatial_vector(0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+                elif col == 3:
+                    basis = wp.spatial_vector(0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+                elif col == 4:
+                    basis = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+                else:
+                    basis = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+
+                s_dot_f = compact_joint_S_flat[gdof, col]
+                p_child = wp.spatial_vector(
+                    basis[0] - compact_tree_U[gdof, 0] * inv_d * s_dot_f,
+                    basis[1] - compact_tree_U[gdof, 1] * inv_d * s_dot_f,
+                    basis[2] - compact_tree_U[gdof, 2] * inv_d * s_dot_f,
+                    basis[3] - compact_tree_U[gdof, 3] * inv_d * s_dot_f,
+                    basis[4] - compact_tree_U[gdof, 4] * inv_d * s_dot_f,
+                    basis[5] - compact_tree_U[gdof, 5] * inv_d * s_dot_f,
+                )
+
+                parent_delta_child = wp.spatial_vector()
+                if parent >= 0:
+                    p_parent = translate_wrench_between_parallel_frames(p_child, edge)
+                    for row in range(6):
+                        value = float(0.0)
                         for p_col in range(6):
-                            P_entry = float(0.0)
-                            if p_col == col:
-                                P_entry = 1.0
-                            P_entry -= compact_tree_U[gdof, p_col] * inv_d * S[col]
-                            parent_delta += compact_tree_Ia[parent, row, p_col] * P_entry
-                    compact_tree_body_delta[child, row] = parent_delta
+                            value += compact_tree_Ia[parent, row, p_col] * p_parent[p_col]
+                        compact_tree_body_delta[child, row] = value
+                    parent_delta_parent = wp.spatial_vector(
+                        compact_tree_body_delta[child, 0],
+                        compact_tree_body_delta[child, 1],
+                        compact_tree_body_delta[child, 2],
+                        compact_tree_body_delta[child, 3],
+                        compact_tree_body_delta[child, 4],
+                        compact_tree_body_delta[child, 5],
+                    )
+                    parent_delta_child = translate_twist_between_parallel_frames(parent_delta_parent, edge)
 
                 parent_dot = float(0.0)
                 for row in range(6):
-                    parent_dot += compact_tree_U[gdof, row] * compact_tree_body_delta[child, row]
-                qdd = inv_d * (S[col] - parent_dot)
+                    parent_dot += compact_tree_U[gdof, row] * parent_delta_child[row]
+                qdd = inv_d * (s_dot_f - parent_dot)
+
                 for row in range(6):
-                    compact_tree_Ia[child, row, col] = compact_tree_body_delta[child, row] + S[row] * qdd
-
-        X_wb = body_q[child]
-        com_world = wp.transform_point(X_wb, body_com[child])
-        origin = articulation_origin[art]
-        com_rel = com_world - origin
-
-        for col in range(6):
-            force = wp.vec3(0.0)
-            torque_com = wp.vec3(0.0)
-            if col == 0:
-                force = wp.vec3(1.0, 0.0, 0.0)
-            elif col == 1:
-                force = wp.vec3(0.0, 1.0, 0.0)
-            elif col == 2:
-                force = wp.vec3(0.0, 0.0, 1.0)
-            elif col == 3:
-                torque_com = wp.vec3(1.0, 0.0, 0.0)
-            elif col == 4:
-                torque_com = wp.vec3(0.0, 1.0, 0.0)
-            else:
-                torque_com = wp.vec3(0.0, 0.0, 1.0)
-            torque_origin = torque_com + wp.cross(com_rel, force)
-
-            for row in range(6):
-                value = (
-                    compact_tree_Ia[child, row, 0] * force[0]
-                    + compact_tree_Ia[child, row, 1] * force[1]
-                    + compact_tree_Ia[child, row, 2] * force[2]
-                    + compact_tree_Ia[child, row, 3] * torque_origin[0]
-                    + compact_tree_Ia[child, row, 4] * torque_origin[1]
-                    + compact_tree_Ia[child, row, 5] * torque_origin[2]
-                )
-                compact_tree_body_delta[child, row] = value
-            origin_lin = wp.vec3(
-                compact_tree_body_delta[child, 0],
-                compact_tree_body_delta[child, 1],
-                compact_tree_body_delta[child, 2],
-            )
-            origin_ang = wp.vec3(
-                compact_tree_body_delta[child, 3],
-                compact_tree_body_delta[child, 4],
-                compact_tree_body_delta[child, 5],
-            )
-            v_com = origin_lin + wp.cross(origin_ang, com_rel)
-
-            compact_body_response[child, 0, col] = v_com[0]
-            compact_body_response[child, 1, col] = v_com[1]
-            compact_body_response[child, 2, col] = v_com[2]
-            compact_body_response[child, 3, col] = origin_ang[0]
-            compact_body_response[child, 4, col] = origin_ang[1]
-            compact_body_response[child, 5, col] = origin_ang[2]
+                    value = parent_delta_child[row] + compact_joint_S_flat[gdof, row] * qdd
+                    compact_tree_Ia[child, row, col] = value
+                    compact_body_response[child, row, col] = value
 
 @wp.kernel
 def refresh_compact_tree_body_qd_for_size(
@@ -5589,10 +5739,8 @@ def refresh_compact_tree_body_qd_for_size(
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
-    joint_S_s: wp.array[wp.spatial_vector],
-    body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    articulation_origin: wp.array[wp.vec3],
+    compact_joint_S_flat: wp.array2d[float],
+    compact_body_com_rel: wp.array2d[float],
     v_out: wp.array[float],
     # scratch
     compact_tree_body_delta: wp.array2d[float],
@@ -5610,38 +5758,35 @@ def refresh_compact_tree_body_qd_for_size(
         parent = joint_parent[joint]
         dof_start = joint_qd_start[joint]
         dof_count = joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
+        parent_delta_child = wp.spatial_vector()
+        if parent >= 0:
+            parent_delta_parent = wp.spatial_vector(
+                compact_tree_body_delta[parent, 0],
+                compact_tree_body_delta[parent, 1],
+                compact_tree_body_delta[parent, 2],
+                compact_tree_body_delta[parent, 3],
+                compact_tree_body_delta[parent, 4],
+                compact_tree_body_delta[parent, 5],
+            )
+            child_rel = wp.vec3(
+                compact_body_com_rel[child, 0],
+                compact_body_com_rel[child, 1],
+                compact_body_com_rel[child, 2],
+            )
+            parent_rel = wp.vec3(
+                compact_body_com_rel[parent, 0],
+                compact_body_com_rel[parent, 1],
+                compact_body_com_rel[parent, 2],
+            )
+            parent_delta_child = translate_twist_between_parallel_frames(parent_delta_parent, child_rel - parent_rel)
 
         for r in range(6):
-            value = float(0.0)
-            if parent >= 0:
-                value = compact_tree_body_delta[parent, r]
+            value = parent_delta_child[r]
             for a in range(dof_count):
                 gdof = dof_start + a
-                S = joint_S_s[gdof]
-                value += S[r] * v_out[gdof]
+                value += compact_joint_S_flat[gdof, r] * v_out[gdof]
             compact_tree_body_delta[child, r] = value
-
-        X_wb = body_q[child]
-        com_world = wp.transform_point(X_wb, body_com[child])
-        origin = articulation_origin[art]
-        com_rel = com_world - origin
-        lin = wp.vec3(
-            compact_tree_body_delta[child, 0],
-            compact_tree_body_delta[child, 1],
-            compact_tree_body_delta[child, 2],
-        )
-        ang = wp.vec3(
-            compact_tree_body_delta[child, 3],
-            compact_tree_body_delta[child, 4],
-            compact_tree_body_delta[child, 5],
-        )
-        v_com = lin + wp.cross(ang, com_rel)
-        compact_body_qd[child, 0] = v_com[0]
-        compact_body_qd[child, 1] = v_com[1]
-        compact_body_qd[child, 2] = v_com[2]
-        compact_body_qd[child, 3] = ang[0]
-        compact_body_qd[child, 4] = ang[1]
-        compact_body_qd[child, 5] = ang[2]
+            compact_body_qd[child, r] = value
 
 
 @wp.kernel
@@ -5688,10 +5833,8 @@ def propagate_compact_tree_impulses_for_size(
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
-    joint_S_s: wp.array[wp.spatial_vector],
-    body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    articulation_origin: wp.array[wp.vec3],
+    compact_joint_S_flat: wp.array2d[float],
+    compact_body_com_rel: wp.array2d[float],
     compact_tree_U: wp.array2d[float],
     compact_tree_D_inv: wp.array3d[float],
     compact_body_impulses: wp.array2d[float],
@@ -5734,18 +5877,13 @@ def propagate_compact_tree_impulses_for_size(
         )
         if wp.length_sq(force) + wp.length_sq(torque_com) > 0.0:
             has_impulse = int(1)
-        X_wb = body_q[body]
-        com_world = wp.transform_point(X_wb, body_com[body])
-        origin = articulation_origin[art]
-        com_rel = com_world - origin
-        torque_origin = torque_com + wp.cross(com_rel, force)
 
         compact_tree_pA[body, 0] = -force[0]
         compact_tree_pA[body, 1] = -force[1]
         compact_tree_pA[body, 2] = -force[2]
-        compact_tree_pA[body, 3] = -torque_origin[0]
-        compact_tree_pA[body, 4] = -torque_origin[1]
-        compact_tree_pA[body, 5] = -torque_origin[2]
+        compact_tree_pA[body, 3] = -torque_com[0]
+        compact_tree_pA[body, 4] = -torque_com[1]
+        compact_tree_pA[body, 5] = -torque_com[2]
 
     if has_impulse != 0:
         for offset in range(joint_end - joint_start):
@@ -5757,31 +5895,73 @@ def propagate_compact_tree_impulses_for_size(
 
             for a in range(dof_count):
                 gdof = dof_start + a
-                S = joint_S_s[gdof]
                 value = float(0.0)
                 for r in range(6):
-                    value -= S[r] * compact_tree_pA[child, r]
+                    value -= compact_joint_S_flat[gdof, r] * compact_tree_pA[child, r]
                 compact_tree_u[gdof] = value
 
             if parent >= 0:
+                p0 = compact_tree_pA[child, 0]
+                p1 = compact_tree_pA[child, 1]
+                p2 = compact_tree_pA[child, 2]
+                p3 = compact_tree_pA[child, 3]
+                p4 = compact_tree_pA[child, 4]
+                p5 = compact_tree_pA[child, 5]
+                for a in range(dof_count):
+                    gdof_a = dof_start + a
+                    coeff = float(0.0)
+                    for b in range(dof_count):
+                        gdof_b = dof_start + b
+                        coeff += compact_tree_D_inv[joint, a, b] * compact_tree_u[gdof_b]
+                    p0 += compact_tree_U[gdof_a, 0] * coeff
+                    p1 += compact_tree_U[gdof_a, 1] * coeff
+                    p2 += compact_tree_U[gdof_a, 2] * coeff
+                    p3 += compact_tree_U[gdof_a, 3] * coeff
+                    p4 += compact_tree_U[gdof_a, 4] * coeff
+                    p5 += compact_tree_U[gdof_a, 5] * coeff
+
+                child_rel = wp.vec3(
+                    compact_body_com_rel[child, 0],
+                    compact_body_com_rel[child, 1],
+                    compact_body_com_rel[child, 2],
+                )
+                parent_rel = wp.vec3(
+                    compact_body_com_rel[parent, 0],
+                    compact_body_com_rel[parent, 1],
+                    compact_body_com_rel[parent, 2],
+                )
+                child_minus_parent = child_rel - parent_rel
+                propagated_child = wp.spatial_vector(p0, p1, p2, p3, p4, p5)
+                propagated_parent = translate_wrench_between_parallel_frames(propagated_child, child_minus_parent)
                 for r in range(6):
-                    propagated = compact_tree_pA[child, r]
-                    for a in range(dof_count):
-                        gdof_a = dof_start + a
-                        for b in range(dof_count):
-                            gdof_b = dof_start + b
-                            propagated += (
-                                compact_tree_U[gdof_a, r]
-                                * compact_tree_D_inv[joint, a, b]
-                                * compact_tree_u[gdof_b]
-                            )
-                    compact_tree_pA[parent, r] = compact_tree_pA[parent, r] + propagated
+                    compact_tree_pA[parent, r] = compact_tree_pA[parent, r] + propagated_parent[r]
 
         for joint in range(joint_start, joint_end):
             child = joint_child[joint]
             parent = joint_parent[joint]
             dof_start = joint_qd_start[joint]
             dof_count = joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
+            parent_delta_child = wp.spatial_vector()
+            if parent >= 0:
+                parent_delta_parent = wp.spatial_vector(
+                    compact_tree_body_delta[parent, 0],
+                    compact_tree_body_delta[parent, 1],
+                    compact_tree_body_delta[parent, 2],
+                    compact_tree_body_delta[parent, 3],
+                    compact_tree_body_delta[parent, 4],
+                    compact_tree_body_delta[parent, 5],
+                )
+                child_rel = wp.vec3(
+                    compact_body_com_rel[child, 0],
+                    compact_body_com_rel[child, 1],
+                    compact_body_com_rel[child, 2],
+                )
+                parent_rel = wp.vec3(
+                    compact_body_com_rel[parent, 0],
+                    compact_body_com_rel[parent, 1],
+                    compact_body_com_rel[parent, 2],
+                )
+                parent_delta_child = translate_twist_between_parallel_frames(parent_delta_parent, child_rel - parent_rel)
 
             for a in range(dof_count):
                 gdof_a = dof_start + a
@@ -5791,19 +5971,16 @@ def propagate_compact_tree_impulses_for_size(
                     parent_term = float(0.0)
                     if parent >= 0:
                         for r in range(6):
-                            parent_term += compact_tree_U[gdof_b, r] * compact_tree_body_delta[parent, r]
+                            parent_term += compact_tree_U[gdof_b, r] * parent_delta_child[r]
                     qdd += compact_tree_D_inv[joint, a, b] * (compact_tree_u[gdof_b] - parent_term)
                 compact_tree_qdd[gdof_a] = qdd
                 v_out[gdof_a] = v_out[gdof_a] + qdd
 
             for r in range(6):
-                value = float(0.0)
-                if parent >= 0:
-                    value = compact_tree_body_delta[parent, r]
+                value = parent_delta_child[r]
                 for a in range(dof_count):
                     gdof = dof_start + a
-                    S = joint_S_s[gdof]
-                    value += S[r] * compact_tree_qdd[gdof]
+                    value += compact_joint_S_flat[gdof, r] * compact_tree_qdd[gdof]
                 compact_tree_body_delta[child, r] = value
 
     # Recompute full live body velocities from updated generalized velocities
@@ -5813,38 +5990,35 @@ def propagate_compact_tree_impulses_for_size(
         parent = joint_parent[joint]
         dof_start = joint_qd_start[joint]
         dof_count = joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
+        parent_delta_child = wp.spatial_vector()
+        if parent >= 0:
+            parent_delta_parent = wp.spatial_vector(
+                compact_tree_body_delta[parent, 0],
+                compact_tree_body_delta[parent, 1],
+                compact_tree_body_delta[parent, 2],
+                compact_tree_body_delta[parent, 3],
+                compact_tree_body_delta[parent, 4],
+                compact_tree_body_delta[parent, 5],
+            )
+            child_rel = wp.vec3(
+                compact_body_com_rel[child, 0],
+                compact_body_com_rel[child, 1],
+                compact_body_com_rel[child, 2],
+            )
+            parent_rel = wp.vec3(
+                compact_body_com_rel[parent, 0],
+                compact_body_com_rel[parent, 1],
+                compact_body_com_rel[parent, 2],
+            )
+            parent_delta_child = translate_twist_between_parallel_frames(parent_delta_parent, child_rel - parent_rel)
 
         for r in range(6):
-            value = float(0.0)
-            if parent >= 0:
-                value = compact_tree_body_delta[parent, r]
+            value = parent_delta_child[r]
             for a in range(dof_count):
                 gdof = dof_start + a
-                S = joint_S_s[gdof]
-                value += S[r] * v_out[gdof]
+                value += compact_joint_S_flat[gdof, r] * v_out[gdof]
             compact_tree_body_delta[child, r] = value
-
-        X_wb = body_q[child]
-        com_world = wp.transform_point(X_wb, body_com[child])
-        origin = articulation_origin[art]
-        com_rel = com_world - origin
-        lin = wp.vec3(
-            compact_tree_body_delta[child, 0],
-            compact_tree_body_delta[child, 1],
-            compact_tree_body_delta[child, 2],
-        )
-        ang = wp.vec3(
-            compact_tree_body_delta[child, 3],
-            compact_tree_body_delta[child, 4],
-            compact_tree_body_delta[child, 5],
-        )
-        v_com = lin + wp.cross(ang, com_rel)
-        compact_body_qd[child, 0] = v_com[0]
-        compact_body_qd[child, 1] = v_com[1]
-        compact_body_qd[child, 2] = v_com[2]
-        compact_body_qd[child, 3] = ang[0]
-        compact_body_qd[child, 4] = ang[1]
-        compact_body_qd[child, 5] = ang[2]
+            compact_body_qd[child, r] = value
         for r in range(6):
             compact_body_impulses[child, r] = 0.0
 

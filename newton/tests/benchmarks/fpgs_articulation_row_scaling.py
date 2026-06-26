@@ -481,64 +481,122 @@ def _run_case_path(
 def _cases_for_preset(preset: str) -> list[BenchCase]:
     if preset == "smoke":
         return [
-            BenchCase("contact_rows", "free_pairs=2", "free_free", free_pairs=2),
-            BenchCase("contact_rows", "A=1,L=4,contacts=1", "articulated_free", articulations=1, links=4, contacts_per_articulation=1),
-            BenchCase("contact_rows", "A=1,L=4,contacts=2", "articulated_free", articulations=1, links=4, contacts_per_articulation=2),
-            BenchCase("chain_depth", "L=2", "articulated_free", articulations=1, links=2, contacts_per_articulation=1),
-            BenchCase("chain_depth", "L=4", "articulated_free", articulations=1, links=4, contacts_per_articulation=1),
-            BenchCase("articulation_count", "A=1", "articulated_free", articulations=1, links=4, contacts_per_articulation=1),
-            BenchCase("articulation_count", "A=2", "articulated_free", articulations=2, links=4, contacts_per_articulation=1),
-        ]
-    if preset == "default":
-        return [
-            BenchCase("contact_rows", "free_pairs=2 (~8 rigid contacts)", "free_free", free_pairs=2),
-            BenchCase("contact_rows", "free_pairs=16 (~64 rigid contacts)", "free_free", free_pairs=16),
-            BenchCase("contact_rows", "free_pairs=64 (~256 rigid contacts)", "free_free", free_pairs=64),
+            BenchCase("free_free_dof", "free_pairs=2", "free_free", free_pairs=2),
             BenchCase(
-                "contact_rows",
-                "A=1,L=64,contact_boxes=1 (~4 rigid contacts)",
+                "articulated_contact_rows",
+                "L=4,boxes=1",
                 "articulated_free",
                 articulations=1,
-                links=64,
+                links=4,
                 contacts_per_articulation=1,
             ),
             BenchCase(
-                "contact_rows",
-                "A=1,L=64,contact_boxes=16 (~64 rigid contacts)",
+                "articulated_contact_rows",
+                "L=4,boxes=2",
                 "articulated_free",
                 articulations=1,
-                links=64,
-                contacts_per_articulation=16,
+                links=4,
+                contacts_per_articulation=2,
+            ),
+            BenchCase("chain_depth", "L=2,boxes=2", "articulated_free", articulations=1, links=2, contacts_per_articulation=2),
+            BenchCase("chain_depth", "L=4,boxes=4", "articulated_free", articulations=1, links=4, contacts_per_articulation=4),
+            BenchCase("articulation_count", "A=1,L=4", "articulated_free", articulations=1, links=4, contacts_per_articulation=1),
+            BenchCase("articulation_count", "A=2,L=4", "articulated_free", articulations=2, links=4, contacts_per_articulation=1),
+        ]
+    if preset == "default":
+        return [
+            BenchCase("free_free_dof", "free_pairs=2", "free_free", free_pairs=2),
+            BenchCase("free_free_dof", "free_pairs=8", "free_free", free_pairs=8),
+            BenchCase("free_free_dof", "free_pairs=21", "free_free", free_pairs=21),
+            BenchCase(
+                "articulated_contact_rows",
+                "L=4,boxes=4",
+                "articulated_free",
+                articulations=1,
+                links=4,
+                contacts_per_articulation=4,
             ),
             BenchCase(
-                "contact_rows",
-                "A=1,L=64,contact_boxes=64 (~256 rigid contacts)",
+                "articulated_contact_rows",
+                "L=16,boxes=8",
+                "articulated_free",
+                articulations=1,
+                links=16,
+                contacts_per_articulation=8,
+            ),
+            BenchCase(
+                "articulated_contact_rows",
+                "L=64,boxes=32",
                 "articulated_free",
                 articulations=1,
                 links=64,
-                contacts_per_articulation=64,
+                contacts_per_articulation=32,
             ),
-            BenchCase("chain_depth", "L=8", "articulated_free", articulations=1, links=8, contacts_per_articulation=1),
-            BenchCase("chain_depth", "L=32", "articulated_free", articulations=1, links=32, contacts_per_articulation=1),
-            BenchCase("chain_depth", "L=64", "articulated_free", articulations=1, links=64, contacts_per_articulation=1),
-            BenchCase("articulation_count", "A=1 (~4 rigid contacts)", "articulated_free", articulations=1, links=16, contacts_per_articulation=1),
-            BenchCase("articulation_count", "A=16 (~64 rigid contacts)", "articulated_free", articulations=16, links=16, contacts_per_articulation=1),
-            BenchCase("articulation_count", "A=64 (~256 rigid contacts)", "articulated_free", articulations=64, links=16, contacts_per_articulation=1),
+            BenchCase("chain_depth", "L=2,boxes=2", "articulated_free", articulations=1, links=2, contacts_per_articulation=2),
+            BenchCase("chain_depth", "L=8,boxes=8", "articulated_free", articulations=1, links=8, contacts_per_articulation=8),
+            BenchCase("chain_depth", "L=32,boxes=32", "articulated_free", articulations=1, links=32, contacts_per_articulation=32),
+            BenchCase("chain_depth", "L=64,boxes=64", "articulated_free", articulations=1, links=64, contacts_per_articulation=64),
+            BenchCase("articulation_count", "A=1,L=16", "articulated_free", articulations=1, links=16, contacts_per_articulation=1),
+            BenchCase("articulation_count", "A=2,L=16", "articulated_free", articulations=2, links=16, contacts_per_articulation=1),
+            BenchCase("articulation_count", "A=16,L=16", "articulated_free", articulations=16, links=16, contacts_per_articulation=1),
+            BenchCase("articulation_count", "A=64,L=16", "articulated_free", articulations=64, links=16, contacts_per_articulation=1),
         ]
     if preset == "stress":
-        return [
-            BenchCase("contact_rows", "free_pairs=64 (~256 rigid contacts)", "free_free", free_pairs=64),
-            BenchCase(
-                "contact_rows",
-                "A=1,L=64,contact_boxes=64 (~256 rigid contacts)",
-                "articulated_free",
-                articulations=1,
-                links=64,
-                contacts_per_articulation=64,
-            ),
-            BenchCase("chain_depth", "L=64", "articulated_free", articulations=1, links=64, contacts_per_articulation=1),
-            BenchCase("articulation_count", "A=64 (~256 rigid contacts)", "articulated_free", articulations=64, links=16, contacts_per_articulation=1),
-        ]
+        cases: list[BenchCase] = []
+        for free_pairs in (1, 2, 4, 8, 16, 21):
+            cases.append(
+                BenchCase(
+                    "free_free_dof",
+                    f"free_pairs={free_pairs}",
+                    "free_free",
+                    free_pairs=free_pairs,
+                )
+            )
+
+        contact_row_cases = (
+            (4, 4),
+            (16, 8),
+            (16, 16),
+            (64, 8),
+            (64, 32),
+            (64, 64),
+        )
+        for links, contact_boxes in contact_row_cases:
+            cases.append(
+                BenchCase(
+                    "articulated_contact_rows",
+                    f"L={links},boxes={contact_boxes}",
+                    "articulated_free",
+                    articulations=1,
+                    links=links,
+                    contacts_per_articulation=contact_boxes,
+                )
+            )
+
+        for links in (2, 16, 32, 64):
+            cases.append(
+                BenchCase(
+                    "chain_depth",
+                    f"L={links},boxes={links}",
+                    "articulated_free",
+                    articulations=1,
+                    links=links,
+                    contacts_per_articulation=links,
+                )
+            )
+
+        for articulations in (1, 2, 16, 32, 64, 128):
+            cases.append(
+                BenchCase(
+                    "articulation_count",
+                    f"A={articulations},L=16",
+                    "articulated_free",
+                    articulations=articulations,
+                    links=16,
+                    contacts_per_articulation=1,
+                )
+            )
+        return cases
     raise ValueError(f"unknown preset {preset!r}")
 
 
@@ -619,16 +677,25 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
         "State-error columns are omitted for free/free controls because compact rows are inactive there and both rows execute "
         "the same order-sensitive MF kernel; articulated/free rows report error against `mf_immediate`."
     )
+    if args.preset == "stress":
+        lines.append(
+            "The 128-link chain-depth case is omitted for now: the current tiled Cholesky factorization exceeds "
+            "shared memory on this GPU for a 128-DOF articulation group (OOSM)."
+        )
+        lines.append(
+            "The `chain_depth` sweep uses one contact box per link (`boxes=L`), so both scalar contact rows and "
+            "articulation DOF grow with chain depth."
+        )
 
     for sweep in dict.fromkeys(result.sweep for result in results):
         lines.append("")
         lines.append(f"## {sweep}")
         lines.append("")
         lines.append(
-            "| case | kind | path | compact | D | cap dense/mf/compact | rows dense/mf/compact | contacts | ms/step | row MiB | propagation MiB | qd rel L2 | state Linf |"
+            "| case | path | D | cap dense/mf/compact | rows dense/mf/compact | contacts | ms/step | row MiB | propagation MiB | qd rel L2 | state Linf |"
         )
         lines.append(
-            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
         )
         for result in results:
             if result.sweep != sweep:
@@ -638,9 +705,7 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
                 + " | ".join(
                     [
                         result.label,
-                        result.case_kind,
                         result.path,
-                        "yes" if result.compact_active else "no",
                         str(result.joint_dof_count),
                         f"{result.dense_row_capacity}/{result.mf_row_capacity}/{result.compact_row_capacity}",
                         f"{result.dense_rows_total}/{result.mf_rows_total}/{result.compact_rows_total}",
