@@ -3219,6 +3219,14 @@ class SolverFeatherPGS(SolverBase):
         def launch_compact(global_iter: int) -> None:
             if launch_existing_phases:
                 self._refresh_compact_body_qd_from_vout()
+            if self._launch_compact_full_fused_iterations(
+                rhs=compact_rhs,
+                iterations=1,
+                omega=omega,
+                friction_start_iteration=friction_start_iteration,
+                iteration_offset=global_iter,
+            ):
+                return
             self._compact_pgs_solve_one_iteration(
                 rhs=compact_rhs,
                 omega=omega,
