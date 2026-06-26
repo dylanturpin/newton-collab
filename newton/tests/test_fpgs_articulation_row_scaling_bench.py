@@ -72,6 +72,8 @@ def test_fpgs_articulation_row_scaling_benchmark_smoke(tmp_path):
     assert articulated_compact["propagation_extra_mib"] > 0.0
     assert articulated_compact["dense_rows_total"] == 0
     assert articulated_compact["compact_rows_total"] > 0
+    if articulated_baseline["joint_dof_count"] >= 64:
+        assert articulated_compact["row_solver_mib"] < articulated_baseline["row_solver_mib"]
 
     for row in results:
         assert np.isfinite(row["ms_per_step"])
@@ -90,8 +92,8 @@ def test_fpgs_articulation_row_scaling_benchmark_smoke(tmp_path):
                 # Compact-tree uses deferred propagation, so high-contact smoke
                 # rows are not expected to be bit-close to immediate D-wide GS
                 # after only two iterations. Keep this as a gross sanity bound.
-                assert row["joint_qd_rel_l2"] < 2.0e-1
-                assert row["state_linf"] < 2.0e-1
+                assert row["joint_qd_rel_l2"] < 1.0e-1
+                assert row["state_linf"] < 1.0e-1
 
 
 def test_fpgs_articulation_operator_diagnostic_smoke(tmp_path):
@@ -121,18 +123,81 @@ def test_fpgs_articulation_operator_diagnostic_smoke(tmp_path):
     results = json.loads((out_dir / "operator_diagnostic.json").read_text(encoding="utf-8"))
     assert results
     assert "row operator `J_world @ Y_world.T`" in summary
-    assert "operator_match" in summary or "operator_mismatch" in summary
+    assert "operator_match" in summary
     for row in results:
         assert row["rows"] > 0
         assert row["D"] > 0
         assert row["sampled_sources"] > 0
-        assert row["operator_status"] in {"operator_match", "operator_mismatch"}
+        assert row["operator_status"] == "operator_match"
         assert np.isfinite(row["rel_fro"])
         assert np.isfinite(row["abs_linf"])
         assert np.isfinite(row["qd_rel_l2"])
         assert np.isfinite(row["qd_abs_linf"])
+        assert row["rel_fro"] <= 1.0e-4
+        assert row["abs_linf"] <= 1.0e-4
         assert row["mass_condition_est"] is None or np.isfinite(row["mass_condition_est"])
         assert row["worst_columns"]
+
+
+def test_fpgs_compact_debug_residuals_include_compact_rows():
+    wp.init()
+    if not wp.get_device("cuda:0").is_cuda:
+        pytest.skip("CUDA is required for compact PGS debug diagnostics")
+
+    script = Path(__file__).parent / "benchmarks" / "fpgs_articulation_row_scaling.py"
+    spec = importlib.util.spec_from_file_location("fpgs_articulation_row_scaling", script)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    case = module.BenchCase(
+        "debug_compact",
+        "L=4,boxes=1",
+        "articulated_free",
+        articulations=1,
+        links=4,
+        contacts_per_articulation=1,
+    )
+    model, initial, contacts = module._prepare_case_run(case, "cuda:0")
+    solver = module.SolverFeatherPGS(
+        model,
+        pgs_mode="matrix_free",
+        articulated_dense_response_mode="compact_tree",
+        hinv_jt_kernel="par_row",
+        pgs_iterations=2,
+        enable_contact_friction=True,
+        dense_max_constraints=16,
+        mf_max_constraints=16,
+        compact_max_constraints=16,
+        compact_fast_body_map=True,
+        compact_existing_row_phases="auto",
+        compact_warp_propagation=True,
+        pgs_warmstart=False,
+        mf_warmstart=False,
+        pgs_debug=True,
+    )
+
+    state_in = model.state()
+    state_out = model.state()
+    module._restore_state(model, state_in, initial)
+    module._restore_state(model, state_out, initial)
+    state_in.clear_forces()
+    state_out.clear_forces()
+    solver.step(state_in, state_out, model.control(), contacts, 1.0 / 120.0)
+    wp.synchronize()
+
+    assert int(np.sum(solver.compact_constraint_count.numpy())) > 0
+    assert solver._pgs_convergence_log
+    assert solver._pgs_ncp_residual_log
+    convergence = solver._pgs_convergence_log[-1]
+    ncp = solver._pgs_ncp_residual_log[-1]
+    assert convergence.shape == (2, 4)
+    assert ncp.shape == (2, model.world_count, 6)
+    assert np.all(np.isfinite(convergence))
+    assert np.all(np.isfinite(ncp))
+    assert np.max(convergence[:, 0]) > 0.0
 
 
 def test_fpgs_articulation_row_scaling_stress_case_coverage():

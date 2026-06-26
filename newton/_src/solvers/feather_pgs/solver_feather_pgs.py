@@ -2150,6 +2150,7 @@ class SolverFeatherPGS(SolverBase):
         worlds = self.world_count
         max_c = self.dense_max_constraints
         mf_max_c = self.mf_max_constraints
+        compact_max_c = self.compact_max_constraints
 
         self._diag_metrics = wp.zeros((worlds, 4), dtype=wp.float32, device=device)
         # Per-world NCP / MDP residual scratch buffer ([worlds, 6]).
@@ -2161,6 +2162,17 @@ class SolverFeatherPGS(SolverBase):
             self._diag_prev_mf_impulses = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device)
         else:
             self._diag_prev_mf_impulses = None
+        if getattr(self, "compact_impulses", None) is not None:
+            self._diag_prev_compact_impulses = wp.zeros((worlds, compact_max_c), dtype=wp.float32, device=device)
+        else:
+            self._diag_prev_compact_impulses = None
+        self._diag_zero_constraint_count = wp.zeros((worlds,), dtype=wp.int32, device=device)
+        self._diag_dummy_float_rows = wp.zeros((worlds, 1), dtype=wp.float32, device=device)
+        self._diag_dummy_int_rows = wp.zeros((worlds, 1), dtype=wp.int32, device=device)
+        self._diag_dummy_row_parent = wp.full((worlds, 1), -1, dtype=wp.int32, device=device)
+        self._diag_dummy_jacobian = wp.zeros((worlds, 1, 6), dtype=wp.float32, device=device)
+        self._diag_dummy_body_index = wp.full((worlds, 1), -1, dtype=wp.int32, device=device)
+        self._diag_dummy_body_qd = wp.zeros((1, 6), dtype=wp.float32, device=device)
 
     def _scatter_armature_to_groups(self, model):
         """Copy armature from model (DOF-ordered) to size-grouped storage."""
@@ -3058,12 +3070,15 @@ class SolverFeatherPGS(SolverBase):
             )
 
         def launch_compact(global_iter: int) -> None:
+            if launch_existing_phases:
+                self._refresh_compact_body_qd_from_vout()
             self._compact_pgs_solve_one_iteration(
                 rhs=compact_rhs,
                 omega=omega,
                 friction_start_iteration=friction_start_iteration,
                 iteration_offset=global_iter,
             )
+            self._flush_compact_free_body_response()
 
         if self.pgs_schedule == "contact_then_internal":
             for local_iter in range(iterations):
@@ -3093,8 +3108,6 @@ class SolverFeatherPGS(SolverBase):
                 global_iter = iteration_offset + local_iter
                 launch_existing(0, global_iter)
                 launch_compact(global_iter)
-
-        self._flush_compact_free_body_response()
 
     def _launch_matrix_free_gs_solve_deferred_cholesky(
         self,
@@ -3665,12 +3678,49 @@ class SolverFeatherPGS(SolverBase):
                 if self.pgs_debug:
                     self._pgs_convergence_log.append([])
                     self._pgs_ncp_residual_log.append([])
+                    compact_constraint_count = (
+                        self.compact_constraint_count
+                        if self.compact_constraint_count is not None
+                        else self._diag_zero_constraint_count
+                    )
+                    compact_rhs = self.compact_rhs if self.compact_rhs is not None else self._diag_dummy_float_rows
+                    compact_impulses = (
+                        self.compact_impulses if self.compact_impulses is not None else self._diag_dummy_float_rows
+                    )
+                    compact_prev_impulses = (
+                        self._diag_prev_compact_impulses
+                        if self._diag_prev_compact_impulses is not None
+                        else self._diag_dummy_float_rows
+                    )
+                    compact_row_type = (
+                        self.compact_row_type if self.compact_row_type is not None else self._diag_dummy_int_rows
+                    )
+                    compact_row_parent = (
+                        self.compact_row_parent
+                        if self.compact_row_parent is not None
+                        else self._diag_dummy_row_parent
+                    )
+                    compact_row_mu = self.compact_row_mu if self.compact_row_mu is not None else self._diag_dummy_float_rows
+                    compact_phi = self.compact_phi if self.compact_phi is not None else self._diag_dummy_float_rows
+                    compact_J_a = self.compact_J_a if self.compact_J_a is not None else self._diag_dummy_jacobian
+                    compact_J_b = self.compact_J_b if self.compact_J_b is not None else self._diag_dummy_jacobian
+                    compact_body_a = (
+                        self.compact_body_a if self.compact_body_a is not None else self._diag_dummy_body_index
+                    )
+                    compact_body_b = (
+                        self.compact_body_b if self.compact_body_b is not None else self._diag_dummy_body_index
+                    )
+                    compact_body_qd = (
+                        self.compact_body_qd if self.compact_body_qd is not None else self._diag_dummy_body_qd
+                    )
                     friction_start_iteration = self._contact_friction_start_iteration(self.pgs_iterations)
                     for _pgs_dbg_iter in range(self.pgs_iterations):
                         # Snapshot impulses before this iteration
                         wp.copy(self._diag_prev_impulses, self.impulses)
                         if self._diag_prev_mf_impulses is not None:
                             wp.copy(self._diag_prev_mf_impulses, self.mf_impulses)
+                        if self._diag_prev_compact_impulses is not None and self.compact_impulses is not None:
+                            wp.copy(self._diag_prev_compact_impulses, self.compact_impulses)
 
                         # Run 1 diagnostic iteration. For the experimental split
                         # schedule this is one contact phase followed by one
@@ -3709,6 +3759,19 @@ class SolverFeatherPGS(SolverBase):
                                 self.mf_dof_a,
                                 self.mf_dof_b,
                                 self.mf_max_constraints,
+                                compact_constraint_count,
+                                compact_rhs,
+                                compact_impulses,
+                                compact_prev_impulses,
+                                compact_row_type,
+                                compact_row_parent,
+                                compact_row_mu,
+                                compact_J_a,
+                                compact_J_b,
+                                compact_body_a,
+                                compact_body_b,
+                                compact_body_qd,
+                                self.compact_max_constraints,
                                 self.v_out,
                             ],
                             outputs=[self._diag_metrics],
@@ -3756,6 +3819,19 @@ class SolverFeatherPGS(SolverBase):
                                 self.mf_dof_a,
                                 self.mf_dof_b,
                                 self.mf_max_constraints,
+                                compact_constraint_count,
+                                compact_rhs,
+                                compact_impulses,
+                                compact_row_type,
+                                compact_row_parent,
+                                compact_row_mu,
+                                compact_phi,
+                                compact_J_a,
+                                compact_J_b,
+                                compact_body_a,
+                                compact_body_b,
+                                compact_body_qd,
+                                self.compact_max_constraints,
                                 self.v_out,
                             ],
                             outputs=[self._diag_ncp_metrics],

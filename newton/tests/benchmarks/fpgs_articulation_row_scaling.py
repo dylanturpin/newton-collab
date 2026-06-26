@@ -388,6 +388,7 @@ def _run_case_path(
     compact_existing_row_phases: str,
     compact_shared_row_solver: bool,
     compact_warp_propagation: bool,
+    compact_max_constraints_override: int | None,
     model: newton.Model | None = None,
     initial: dict[str, np.ndarray] | None = None,
     contacts: newton.Contacts | None = None,
@@ -399,6 +400,8 @@ def _run_case_path(
     dense_capacity = row_capacity
     mf_capacity = row_capacity
     compact_capacity = row_capacity
+    if compact_max_constraints_override is not None:
+        compact_capacity = compact_max_constraints_override
     if case.case_kind == "articulated_free":
         # These scenes intentionally contain articulated/free contacts but no
         # free/free contact pairs. Keep MF capacity at a small internal margin
@@ -664,7 +667,8 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
         f"compact_fast_body_map={args.compact_fast_body_map}, "
         f"compact_existing_row_phases={args.compact_existing_row_phases}, "
         f"compact_shared_row_solver={args.compact_shared_row_solver}, "
-        f"compact_warp_propagation={args.compact_warp_propagation}."
+        f"compact_warp_propagation={args.compact_warp_propagation}, "
+        f"compact_max_constraints={args.compact_max_constraints}."
     )
     lines.append("")
     lines.append(
@@ -779,6 +783,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--compact-shared-row-solver", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compact-warp-propagation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--compact-max-constraints",
+        type=int,
+        default=None,
+        help="Override compact_max_constraints for capacity-sensitivity profiling.",
+    )
     parser.add_argument("--no-plots", action="store_true")
     return parser.parse_args()
 
@@ -821,6 +831,7 @@ def main() -> None:
                 compact_existing_row_phases=args.compact_existing_row_phases,
                 compact_shared_row_solver=args.compact_shared_row_solver,
                 compact_warp_propagation=args.compact_warp_propagation,
+                compact_max_constraints_override=args.compact_max_constraints,
                 model=model,
                 initial=initial,
                 contacts=contacts,

@@ -90,6 +90,13 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 articulated_dense_response_mode="compact_tree",
                 friction_mode="bisection",
             )
+        compact_debug = SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            articulated_dense_response_mode="compact_tree",
+            pgs_debug=True,
+        )
+        self.assertEqual(compact_debug.articulated_dense_response_mode, "compact_tree")
 
     def test_deferred_cholesky_accepts_matrix_free_friction_modes(self):
         model = _build_chain_model(num_links=2, num_worlds=1)

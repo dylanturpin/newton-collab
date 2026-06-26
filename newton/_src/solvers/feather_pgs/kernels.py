@@ -8005,6 +8005,20 @@ def pgs_convergence_diagnostic_velocity(
     mf_dof_a: wp.array2d[int],
     mf_dof_b: wp.array2d[int],
     mf_max_constraints: int,
+    # Compact articulated body-space constraints
+    compact_constraint_count: wp.array[int],
+    compact_rhs: wp.array2d[float],
+    compact_impulses: wp.array2d[float],
+    prev_compact_impulses: wp.array2d[float],
+    compact_row_type: wp.array2d[int],
+    compact_row_parent: wp.array2d[int],
+    compact_row_mu: wp.array2d[float],
+    compact_J_a: wp.array3d[float],
+    compact_J_b: wp.array3d[float],
+    compact_body_a: wp.array2d[int],
+    compact_body_b: wp.array2d[int],
+    compact_body_qd: wp.array2d[float],
+    compact_max_constraints: int,
     # Velocity
     v_out: wp.array[float],
     # Output: [worlds, 4]
@@ -8022,6 +8036,7 @@ def pgs_convergence_diagnostic_velocity(
 
     m_dense = constraint_count[world]
     m_mf = mf_constraint_count[world]
+    m_compact = compact_constraint_count[world]
     w_dof_start = world_dof_start[world]
 
     max_dl = float(0.0)
@@ -8109,6 +8124,47 @@ def pgs_convergence_diagnostic_velocity(
                 if t_mag < radius * 0.999:
                     tang_res += residual * residual
 
+    # --- Compact articulated body-space constraints ---
+    for i in range(m_compact):
+        lam = compact_impulses[world, i]
+        prev_lam = prev_compact_impulses[world, i]
+        dl = wp.abs(lam - prev_lam)
+        if dl > max_dl:
+            max_dl = dl
+
+        ba = compact_body_a[world, i]
+        bb = compact_body_b[world, i]
+        jv = float(0.0)
+        if ba >= 0:
+            for k in range(6):
+                jv += compact_J_a[world, i, k] * compact_body_qd[ba, k]
+        if bb >= 0:
+            for k in range(6):
+                jv += compact_J_b[world, i, k] * compact_body_qd[bb, k]
+        residual = jv + compact_rhs[world, i]
+
+        rt = compact_row_type[world, i]
+        if rt == PGS_CONSTRAINT_TYPE_CONTACT:
+            comp_gap += lam * residual
+            fb_val = wp.sqrt(lam * lam + residual * residual) - lam - residual
+            fb_merit += fb_val * fb_val
+        elif rt == PGS_CONSTRAINT_TYPE_FRICTION:
+            parent_idx = compact_row_parent[world, i]
+            lambda_n = compact_impulses[world, parent_idx]
+            mu = compact_row_mu[world, i]
+            radius = mu * lambda_n
+            if radius > 0.0:
+                if i == parent_idx + 1:
+                    sib = parent_idx + 2
+                else:
+                    sib = parent_idx + 1
+                if sib < compact_max_constraints and sib < m_compact:
+                    lam_t1 = compact_impulses[world, i]
+                    lam_t2 = compact_impulses[world, sib]
+                    t_mag = wp.sqrt(lam_t1 * lam_t1 + lam_t2 * lam_t2)
+                    if t_mag < radius * 0.999:
+                        tang_res += residual * residual
+
     metrics[world, 0] = max_dl
     metrics[world, 1] = comp_gap
     metrics[world, 2] = tang_res
@@ -8147,6 +8203,20 @@ def pgs_ncp_residuals_diagnostic_velocity(
     mf_dof_a: wp.array2d[int],
     mf_dof_b: wp.array2d[int],
     mf_max_constraints: int,
+    # Compact articulated body-space constraints
+    compact_constraint_count: wp.array[int],
+    compact_rhs: wp.array2d[float],
+    compact_impulses: wp.array2d[float],
+    compact_row_type: wp.array2d[int],
+    compact_row_parent: wp.array2d[int],
+    compact_row_mu: wp.array2d[float],
+    compact_row_phi: wp.array2d[float],
+    compact_J_a: wp.array3d[float],
+    compact_J_b: wp.array3d[float],
+    compact_body_a: wp.array2d[int],
+    compact_body_b: wp.array2d[int],
+    compact_body_qd: wp.array2d[float],
+    compact_max_constraints: int,
     # Velocity
     v_out: wp.array[float],
     # Output: [worlds, 6]
@@ -8201,6 +8271,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
 
     m_dense = constraint_count[world]
     m_mf = mf_constraint_count[world]
+    m_compact = compact_constraint_count[world]
     w_dof_start = world_dof_start[world]
 
     r_compl = float(0.0)
@@ -8355,6 +8426,96 @@ def pgs_ncp_residuals_diagnostic_velocity(
                 if dof_b2 >= 0:
                     for k in range(6):
                         u_t2 += mf_J_b[world, i2, k] * v_out[dof_b2 + k]
+
+        tang_mag = wp.sqrt(lt1 * lt1 + lt2 * lt2)
+        cone = tang_mag - mu * ln
+        if cone > r_cone:
+            r_cone = cone
+
+        c_T = wp.sqrt(u_t1 * u_t1 + u_t2 * u_t2)
+        u_n_aug = u_n + mu * c_T
+        ds_inner = wp.abs(ln * u_n_aug + lt1 * u_t1 + lt2 * u_t2)
+        if ds_inner > r_ds_compl:
+            r_ds_compl = ds_inner
+
+        dual_viol = mu * c_T - u_n_aug
+        if dual_viol > r_ds_dual:
+            r_ds_dual = dual_viol
+
+        if c_T > 1.0e-8 and ln > 1.0e-8:
+            expected_t1 = -mu * ln * (u_t1 / c_T)
+            expected_t2 = -mu * ln * (u_t2 / c_T)
+            dir_err = wp.sqrt((lt1 - expected_t1) * (lt1 - expected_t1) + (lt2 - expected_t2) * (lt2 - expected_t2))
+            expected_mag = mu * ln
+            if expected_mag > 1.0e-8:
+                dir_err = dir_err / expected_mag
+            if dir_err > r_mdp_dir:
+                r_mdp_dir = dir_err
+
+    # ---- Compact articulated body-space constraints ----
+    for i in range(m_compact):
+        rt = compact_row_type[world, i]
+        if rt != PGS_CONSTRAINT_TYPE_CONTACT:
+            continue
+
+        ba = compact_body_a[world, i]
+        bb = compact_body_b[world, i]
+        u_n = float(0.0)
+        if ba >= 0:
+            for k in range(6):
+                u_n += compact_J_a[world, i, k] * compact_body_qd[ba, k]
+        if bb >= 0:
+            for k in range(6):
+                u_n += compact_J_b[world, i, k] * compact_body_qd[bb, k]
+        b_n = compact_rhs[world, i]
+        ln = compact_impulses[world, i]
+
+        ubn = u_n + b_n
+        if ln < ubn:
+            compl = wp.abs(ln)
+        else:
+            compl = wp.abs(ubn)
+        if compl > r_compl:
+            r_compl = compl
+
+        neg_phi = -compact_row_phi[world, i]
+        if neg_phi > r_gap:
+            r_gap = neg_phi
+
+        lt1 = float(0.0)
+        lt2 = float(0.0)
+        u_t1 = float(0.0)
+        u_t2 = float(0.0)
+        mu = float(0.0)
+
+        i1 = i + 1
+        if i1 < compact_max_constraints and i1 < m_compact:
+            if compact_row_type[world, i1] == PGS_CONSTRAINT_TYPE_FRICTION and compact_row_parent[world, i1] == i:
+                lt1 = compact_impulses[world, i1]
+                mu = compact_row_mu[world, i1]
+                ba1 = compact_body_a[world, i1]
+                bb1 = compact_body_b[world, i1]
+                if ba1 >= 0:
+                    for k in range(6):
+                        u_t1 += compact_J_a[world, i1, k] * compact_body_qd[ba1, k]
+                if bb1 >= 0:
+                    for k in range(6):
+                        u_t1 += compact_J_b[world, i1, k] * compact_body_qd[bb1, k]
+
+        i2 = i + 2
+        if i2 < compact_max_constraints and i2 < m_compact:
+            if compact_row_type[world, i2] == PGS_CONSTRAINT_TYPE_FRICTION and compact_row_parent[world, i2] == i:
+                lt2 = compact_impulses[world, i2]
+                if mu == 0.0:
+                    mu = compact_row_mu[world, i2]
+                ba2 = compact_body_a[world, i2]
+                bb2 = compact_body_b[world, i2]
+                if ba2 >= 0:
+                    for k in range(6):
+                        u_t2 += compact_J_a[world, i2, k] * compact_body_qd[ba2, k]
+                if bb2 >= 0:
+                    for k in range(6):
+                        u_t2 += compact_J_b[world, i2, k] * compact_body_qd[bb2, k]
 
         tang_mag = wp.sqrt(lt1 * lt1 + lt2 * lt2)
         cone = tang_mag - mu * ln
