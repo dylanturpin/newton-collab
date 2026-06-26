@@ -5826,6 +5826,54 @@ def flush_compact_free_body_qd_to_vout(
 
 
 @wp.kernel
+def flush_compact_active_free_body_qd_to_vout(
+    compact_body_count: wp.array[int],
+    compact_body_list: wp.array2d[int],
+    max_compact_bodies: int,
+    body_to_articulation: wp.array[int],
+    is_free_rigid: wp.array[int],
+    articulation_root_dof_start: wp.array[int],
+    articulation_root_com_offset: wp.array[wp.vec3],
+    # in/out
+    compact_body_qd: wp.array2d[float],
+    compact_body_impulses: wp.array2d[float],
+    v_out: wp.array[float],
+):
+    """Write compact live free-rigid velocities for touched compact bodies."""
+    tid = wp.tid()
+    world = tid // max_compact_bodies
+    local_body = tid - world * max_compact_bodies
+    if local_body >= compact_body_count[world]:
+        return
+
+    body = compact_body_list[world, local_body]
+    if body < 0:
+        return
+
+    art = body_to_articulation[body]
+    if art < 0:
+        return
+    if is_free_rigid[art] == 0:
+        return
+
+    dof_start = articulation_root_dof_start[art]
+    v_com = wp.vec3(compact_body_qd[body, 0], compact_body_qd[body, 1], compact_body_qd[body, 2])
+    w = wp.vec3(compact_body_qd[body, 3], compact_body_qd[body, 4], compact_body_qd[body, 5])
+    com_offset = articulation_root_com_offset[art]
+    v_local = v_com - wp.cross(w, com_offset)
+
+    v_out[dof_start + 0] = v_local[0]
+    v_out[dof_start + 1] = v_local[1]
+    v_out[dof_start + 2] = v_local[2]
+    v_out[dof_start + 3] = w[0]
+    v_out[dof_start + 4] = w[1]
+    v_out[dof_start + 5] = w[2]
+
+    for r in range(6):
+        compact_body_impulses[body, r] = 0.0
+
+
+@wp.kernel
 def propagate_compact_tree_impulses_for_size(
     group_to_art: wp.array[int],
     articulation_start: wp.array[int],
