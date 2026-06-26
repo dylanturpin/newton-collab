@@ -172,6 +172,8 @@ _FPGS_COMPACT_FULL_FUSED_ITERATIONS = os.environ.get("FEATHER_PGS_COMPACT_FULL_F
 _FPGS_COMPACT_FULL_FUSED_MAX_ARTS_PER_WORLD = int(
     os.environ.get("FEATHER_PGS_COMPACT_FULL_FUSED_MAX_ARTS_PER_WORLD", "16")
 )
+_FPGS_COMPACT_FULL_FUSED_MAX_SIZE = int(os.environ.get("FEATHER_PGS_COMPACT_FULL_FUSED_MAX_SIZE", "16"))
+_FPGS_COMPACT_FULL_FUSED_PROP_WARPS = int(os.environ.get("FEATHER_PGS_COMPACT_FULL_FUSED_PROP_WARPS", "0"))
 
 
 @wp.kernel
@@ -933,6 +935,8 @@ class SolverFeatherPGS(SolverBase):
             if not self._compact_tree_has_non_free_by_size.get(size_i, True):
                 continue
             if not self._compact_tree_single_dof_by_size.get(size_i, False):
+                return None
+            if _FPGS_COMPACT_FULL_FUSED_MAX_SIZE > 0 and size_i > _FPGS_COMPACT_FULL_FUSED_MAX_SIZE:
                 return None
             arts_per_world = self._compact_non_free_arts_per_world(size_i)
             if (
@@ -2351,7 +2355,10 @@ class SolverFeatherPGS(SolverBase):
                 fused_size = getattr(self, "_compact_full_fused_size", None)
                 if fused_size is not None:
                     n_fused_arts = max(int(getattr(self, "_compact_full_fused_arts_per_world", 0)), 1)
-                    fused_warps = min(max(n_fused_arts + 1, 2), 32)
+                    prop_warps = n_fused_arts
+                    if _FPGS_COMPACT_FULL_FUSED_PROP_WARPS > 0:
+                        prop_warps = min(prop_warps, _FPGS_COMPACT_FULL_FUSED_PROP_WARPS)
+                    fused_warps = min(max(prop_warps + 1, 2), 32)
                     self._compact_full_fused_block_dim = 32 * fused_warps
                     self._pgs_solve_compact_full_fused_kernel = _get_pgs_solve_compact_full_fused_kernel(
                         self.compact_max_constraints,

@@ -789,6 +789,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override compact_max_constraints for capacity-sensitivity profiling.",
     )
+    parser.add_argument(
+        "--case",
+        action="append",
+        default=[],
+        help=(
+            "Run only matching cases. Use either an exact label, e.g. 'A=64,L=16', "
+            "or 'sweep|label', e.g. 'articulation_count|A=64,L=16'. May be repeated."
+        ),
+    )
     parser.add_argument("--no-plots", action="store_true")
     return parser.parse_args()
 
@@ -811,6 +820,15 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cases = _cases_for_preset(args.preset)
+    if args.case:
+        requested = set(args.case)
+        cases = [
+            case
+            for case in cases
+            if case.label in requested or f"{case.sweep}|{case.label}" in requested
+        ]
+        if not cases:
+            raise ValueError(f"--case filters did not match any {args.preset!r} cases: {sorted(requested)}")
 
     results: list[RunResult] = []
     final_states: dict[tuple[str, str, str], dict[str, np.ndarray]] = {}
