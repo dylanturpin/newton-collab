@@ -103,7 +103,6 @@ from .kernels import (
     finalize_world_diag_cfm,
     factor_compact_tree_for_size,
     flatten_compact_joint_S,
-    flush_compact_active_free_body_qd_to_vout,
     flush_compact_free_body_qd_to_vout,
     gather_JY_to_world,
     gather_mf_warmstart,
@@ -159,18 +158,6 @@ _FPGS_COMPACT_FAST_BODY_MAP = os.environ.get("FEATHER_PGS_COMPACT_FAST_BODY_MAP"
     "on",
 }
 _FPGS_COMPACT_WARP_PROPAGATION = os.environ.get("FEATHER_PGS_COMPACT_WARP_PROPAGATION", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_FPGS_COMPACT_ACTIVE_FREE_FLUSH = os.environ.get("FEATHER_PGS_COMPACT_ACTIVE_FREE_FLUSH", "0").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_FPGS_COMPACT_FUSED_FREE_FLUSH = os.environ.get("FEATHER_PGS_COMPACT_FUSED_FREE_FLUSH", "0").lower() in {
     "1",
     "true",
     "yes",
@@ -634,8 +621,6 @@ class SolverFeatherPGS(SolverBase):
             if compact_warp_propagation is None
             else bool(compact_warp_propagation)
         )
-        self.compact_fused_free_flush = _FPGS_COMPACT_FUSED_FREE_FLUSH
-        self.compact_active_free_flush = _FPGS_COMPACT_ACTIVE_FREE_FLUSH and not self.compact_fused_free_flush
         self.compact_full_fused_iterations = _FPGS_COMPACT_FULL_FUSED_ITERATIONS
         self.pgs_warmstart = pgs_warmstart
         if self.pgs_warmstart and self.contact_friction_position_iterations >= 0:
@@ -2992,27 +2977,6 @@ class SolverFeatherPGS(SolverBase):
             or self.is_free_rigid is None
         ):
             return
-        if self.compact_active_free_flush and self.compact_body_count is not None and self.compact_body_list is not None:
-            wp.launch(
-                flush_compact_active_free_body_qd_to_vout,
-                dim=self.world_count * self.max_compact_bodies,
-                inputs=[
-                    self.compact_body_count,
-                    self.compact_body_list,
-                    self.max_compact_bodies,
-                    self.body_to_articulation,
-                    self.is_free_rigid,
-                    self.articulation_root_dof_start,
-                    self.articulation_root_com_offset,
-                ],
-                outputs=[
-                    self.compact_body_qd,
-                    self.compact_body_impulses,
-                    self.v_out,
-                ],
-                device=self.model.device,
-            )
-            return
         wp.launch(
             flush_compact_free_body_qd_to_vout,
             dim=self.model.body_count,
@@ -3028,13 +2992,6 @@ class SolverFeatherPGS(SolverBase):
                 self.v_out,
             ],
             device=self.model.device,
-        )
-
-    def _compact_free_body_flush_is_fused(self) -> bool:
-        return bool(
-            self.compact_fused_free_flush
-            and getattr(self, "_pgs_solve_compact_kernel", None) is not None
-            and not self.compact_shared_row_solver
         )
 
     def _launch_compact_full_fused_iterations(
@@ -3160,9 +3117,6 @@ class SolverFeatherPGS(SolverBase):
                     dim=[self.world_count],
                     inputs=[
                         self.compact_constraint_count,
-                        self.compact_body_count,
-                        self.compact_body_list,
-                        self.max_compact_bodies,
                         self.compact_body_a,
                         self.compact_body_b,
                         self.compact_MiJt_a,
@@ -3174,11 +3128,6 @@ class SolverFeatherPGS(SolverBase):
                         self.compact_row_type,
                         self.compact_row_parent,
                         self.compact_row_mu,
-                        self.body_to_articulation,
-                        self.is_free_rigid,
-                        self.articulation_root_dof_start,
-                        self.articulation_root_com_offset,
-                        int(self.compact_fused_free_flush),
                         1,
                         omega,
                         int(friction_start_iteration),
@@ -3188,7 +3137,6 @@ class SolverFeatherPGS(SolverBase):
                         self.compact_impulses,
                         self.compact_body_qd,
                         self.compact_body_impulses,
-                        self.v_out,
                     ],
                     block_dim=32,
                     device=self.model.device,
@@ -3277,8 +3225,7 @@ class SolverFeatherPGS(SolverBase):
                 friction_start_iteration=friction_start_iteration,
                 iteration_offset=global_iter,
             )
-            if not self._compact_free_body_flush_is_fused():
-                self._flush_compact_free_body_response()
+            self._flush_compact_free_body_response()
 
         if self.pgs_schedule == "contact_then_internal":
             for local_iter in range(iterations):
@@ -5427,8 +5374,6 @@ class SolverFeatherPGS(SolverBase):
                 if (
                     self._compact_tree_requires_body_map
                     or self.compact_shared_row_solver
-                    or self.compact_active_free_flush
-                    or self.compact_fused_free_flush
                     or self._compact_full_fused_size is not None
                 ):
                     if self.compact_fast_body_map or self.compact_shared_row_solver:
@@ -8381,37 +8326,6 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
         }}
     }}
 
-    if (fuse_free_body_flush != 0) {{
-        int n_bodies = compact_body_count.data[world];
-        if (n_bodies > max_compact_bodies) n_bodies = max_compact_bodies;
-        const int body_base = world * max_compact_bodies;
-        for (int local_body = 0; local_body < n_bodies; ++local_body) {{
-            const int flush_body = compact_body_list.data[body_base + local_body];
-            const int art = (flush_body >= 0) ? body_to_articulation.data[flush_body] : -1;
-            if (flush_body >= 0 && art >= 0 && is_free_rigid.data[art] != 0 && lane < 6) {{
-                const float qdk = compact_body_qd.data[flush_body * 6 + lane];
-                const float qd0 = __shfl_sync(0x3fu, qdk, 0);
-                const float qd1 = __shfl_sync(0x3fu, qdk, 1);
-                const float qd2 = __shfl_sync(0x3fu, qdk, 2);
-                const float qd3 = __shfl_sync(0x3fu, qdk, 3);
-                const float qd4 = __shfl_sync(0x3fu, qdk, 4);
-                const float qd5 = __shfl_sync(0x3fu, qdk, 5);
-                const auto com_offset = articulation_root_com_offset.data[art];
-                const float ox = com_offset[0];
-                const float oy = com_offset[1];
-                const float oz = com_offset[2];
-                const int dof_start = articulation_root_dof_start.data[art];
-                if (lane == 0) v_out.data[dof_start + 0] = qd0 - (qd4 * oz - qd5 * oy);
-                else if (lane == 1) v_out.data[dof_start + 1] = qd1 - (qd5 * ox - qd3 * oz);
-                else if (lane == 2) v_out.data[dof_start + 2] = qd2 - (qd3 * oy - qd4 * ox);
-                else if (lane == 3) v_out.data[dof_start + 3] = qd3;
-                else if (lane == 4) v_out.data[dof_start + 4] = qd4;
-                else v_out.data[dof_start + 5] = qd5;
-                compact_body_impulses.data[flush_body * 6 + lane] = 0.0f;
-            }}
-            __syncwarp();
-        }}
-    }}
 #endif
 """
 
@@ -8419,9 +8333,6 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
     def pgs_solve_compact_native(
         world: int,
         compact_constraint_count: wp.array[int],
-        compact_body_count: wp.array[int],
-        compact_body_list: wp.array2d[int],
-        max_compact_bodies: int,
         compact_body_a: wp.array2d[int],
         compact_body_b: wp.array2d[int],
         compact_MiJt_a: wp.array3d[float],
@@ -8433,11 +8344,6 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
         compact_row_type: wp.array2d[int],
         compact_row_parent: wp.array2d[int],
         compact_row_mu: wp.array2d[float],
-        body_to_articulation: wp.array[int],
-        is_free_rigid: wp.array[int],
-        articulation_root_dof_start: wp.array[int],
-        articulation_root_com_offset: wp.array[wp.vec3],
-        fuse_free_body_flush: int,
         iterations: int,
         omega: float,
         friction_start_iteration: int,
@@ -8445,14 +8351,10 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
         compact_impulses: wp.array2d[float],
         compact_body_qd: wp.array2d[float],
         compact_body_impulses: wp.array2d[float],
-        v_out: wp.array[float],
     ): ...
 
     def pgs_solve_compact_template(
         compact_constraint_count: wp.array[int],
-        compact_body_count: wp.array[int],
-        compact_body_list: wp.array2d[int],
-        max_compact_bodies: int,
         compact_body_a: wp.array2d[int],
         compact_body_b: wp.array2d[int],
         compact_MiJt_a: wp.array3d[float],
@@ -8464,11 +8366,6 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
         compact_row_type: wp.array2d[int],
         compact_row_parent: wp.array2d[int],
         compact_row_mu: wp.array2d[float],
-        body_to_articulation: wp.array[int],
-        is_free_rigid: wp.array[int],
-        articulation_root_dof_start: wp.array[int],
-        articulation_root_com_offset: wp.array[wp.vec3],
-        fuse_free_body_flush: int,
         iterations: int,
         omega: float,
         friction_start_iteration: int,
@@ -8476,15 +8373,11 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
         compact_impulses: wp.array2d[float],
         compact_body_qd: wp.array2d[float],
         compact_body_impulses: wp.array2d[float],
-        v_out: wp.array[float],
     ):
         world, _lane = wp.tid()
         pgs_solve_compact_native(
             world,
             compact_constraint_count,
-            compact_body_count,
-            compact_body_list,
-            max_compact_bodies,
             compact_body_a,
             compact_body_b,
             compact_MiJt_a,
@@ -8496,11 +8389,6 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
             compact_row_type,
             compact_row_parent,
             compact_row_mu,
-            body_to_articulation,
-            is_free_rigid,
-            articulation_root_dof_start,
-            articulation_root_com_offset,
-            fuse_free_body_flush,
             iterations,
             omega,
             friction_start_iteration,
@@ -8508,7 +8396,6 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
             compact_impulses,
             compact_body_qd,
             compact_body_impulses,
-            v_out,
         )
 
     name = f"pgs_solve_compact_contact_{compact_max_constraints}"
