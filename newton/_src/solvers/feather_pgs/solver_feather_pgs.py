@@ -60,26 +60,20 @@ from .kernels import (
     apply_impulses_world_par_dof,
     build_augmented_joint_rows,
     build_mass_update_mask,
-    build_compact_body_map,
-    build_compact_body_map_slow,
-    build_compact_contact_rows,
+    build_propagation_body_map,
+    build_propagation_contact_rows,
     build_mf_body_map,
     build_mf_contact_rows,
     cholesky_loop,
     clamp_augmented_joint_u0,
     clamp_free_root_velocity_limits,
-    accumulate_deferred_dense_tau_from_J,
-    accumulate_deferred_dense_tau_from_J_world,
     compute_com_transforms,
     compute_composite_inertia,
     compute_contact_linear_force_from_impulses,
-    compute_compact_active_body_B_for_size,
-    compute_compact_body_B_for_size,
-    compute_compact_body_com_rel,
-    compute_compact_effective_mass_and_rhs,
-    compute_compact_rhs_bias,
+    compute_propagation_body_com_rel,
+    compute_propagation_effective_mass_and_rhs,
+    compute_propagation_rhs_bias,
     compute_delta_and_accumulate,
-    compute_dense_impulse_delta,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
     compute_mf_rhs_bias,
@@ -101,9 +95,9 @@ from .kernels import (
     finalize_mf_constraint_counts,
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
-    factor_compact_tree_for_size,
-    flatten_compact_joint_S,
-    flush_compact_free_body_qd_to_vout,
+    factor_propagation_tree_for_size,
+    flatten_propagation_joint_S,
+    flush_propagation_free_body_qd_to_vout,
     gather_JY_to_world,
     gather_mf_warmstart,
     gather_tau_to_groups,
@@ -121,21 +115,16 @@ from .kernels import (
     populate_world_J_for_size,
     prepare_world_impulses,
     prescale_joint_velocity_limits,
-    assemble_compact_active_body_response_for_size,
-    assemble_compact_body_response_for_size,
-    compute_compact_tree_body_response_for_size,
-    compute_compact_tree_body_response_revolute_for_size,
-    pgs_solve_compact_contact_loop,
-    propagate_compact_body_impulses_for_size,
-    propagate_compact_tree_impulses_for_size,
+    compute_propagation_tree_body_response_for_size,
+    compute_propagation_tree_body_response_revolute_for_size,
+    pgs_solve_propagation_contact_loop,
+    propagate_tree_impulses_for_size,
     rhs_accum_world_par_art,
-    refresh_compact_body_qd_from_vout,
-    refresh_compact_free_body_qd_from_vout,
-    refresh_compact_tree_body_qd_for_size,
+    refresh_propagation_body_qd_from_vout,
+    refresh_propagation_free_body_qd_from_vout,
+    refresh_propagation_tree_body_qd_for_size,
     scatter_qdd_from_groups,
     snapshot_mf_prev_slots,
-    solve_compact_active_body_response_for_size,
-    solve_compact_body_response_for_size,
     trisolve_loop,
     update_articulation_origins,
     update_articulation_root_com_offsets,
@@ -152,29 +141,9 @@ _FPGS_CAPTURE = os.environ.get("FEATHER_PGS_CAPTURE_KERNEL") == "1"
 _FPGS_CAPTURE_STEP = int(os.environ.get("FEATHER_PGS_CAPTURE_STEP", "-1"))
 _FPGS_CAPTURE_PHASE = os.environ.get("FEATHER_PGS_CAPTURE_PHASE")  # None = any phase
 _FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture")
-_FPGS_COMPACT_FAST_BODY_MAP = os.environ.get("FEATHER_PGS_COMPACT_FAST_BODY_MAP", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_FPGS_COMPACT_WARP_PROPAGATION = os.environ.get("FEATHER_PGS_COMPACT_WARP_PROPAGATION", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_FPGS_COMPACT_FULL_FUSED_ITERATIONS = os.environ.get("FEATHER_PGS_COMPACT_FULL_FUSED_ITERATIONS", "0").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_FPGS_COMPACT_FULL_FUSED_MAX_ARTS_PER_WORLD = int(
-    os.environ.get("FEATHER_PGS_COMPACT_FULL_FUSED_MAX_ARTS_PER_WORLD", "16")
-)
-_FPGS_COMPACT_FULL_FUSED_MAX_SIZE = int(os.environ.get("FEATHER_PGS_COMPACT_FULL_FUSED_MAX_SIZE", "16"))
-_FPGS_COMPACT_FULL_FUSED_PROP_WARPS = int(os.environ.get("FEATHER_PGS_COMPACT_FULL_FUSED_PROP_WARPS", "0"))
+_PROPAGATION_FUSED_MAX_ARTS_PER_WORLD = 16
+_PROPAGATION_FUSED_MAX_SIZE = 16
+_PROPAGATION_FUSED_PROP_WARPS = 0
 _HINV_JT_TILED_AUTO_SHARED_LIMIT_BYTES = 96 * 1024
 
 
@@ -328,16 +297,10 @@ class SolverFeatherPGS(SolverBase):
         mf_warmstart: bool = False,
         mf_warmstart_decay: float = 1.0,
         pgs_mode: str = "split",
-        articulated_dense_response_mode: Literal[
-            "immediate", "deferred_cholesky", "compact_cholesky", "compact_tree"
-        ] = "immediate",
+        articulated_contact_response: Literal["immediate", "propagation", "propagation-fused"] = "immediate",
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
         mf_max_constraints: int = 512,
-        compact_max_constraints: int | None = None,
-        compact_fast_body_map: bool | None = None,
-        compact_shared_row_solver: bool = False,
-        compact_warp_propagation: bool | None = None,
         # Kernel selection per operation
         cholesky_kernel: str = "auto",
         trisolve_kernel: str = "auto",
@@ -465,17 +428,13 @@ class SolverFeatherPGS(SolverBase):
                 contacts. "matrix_free" skips C entirely, recomputes J*v each iteration, and uses only
                 the diagonal for preconditioning — O(max_constraints) memory instead of
                 O(max_constraints^2). Defaults to "split".
-            articulated_dense_response_mode (str, optional): Response application for dense articulated
-                rows under ``pgs_mode="matrix_free"``. ``"immediate"`` is the existing path: each
-                dense row applies ``Y_world * delta_lambda`` immediately inside the generated GS
-                kernel. ``"deferred_cholesky"`` is an opt-in correctness path: each one-iteration
-                solve records dense impulse deltas, accumulates ``J^T * delta_lambda`` into
-                generalized impulse space, and propagates it through the existing Cholesky factor
-                before the next iteration. ``"compact_tree"`` routes contacts touching non-free
-                articulations to fixed-size body-space rows, computes body response from a
-                tree factorization, and propagates deferred body impulses through the articulation
-                tree once per PGS iteration. ``"compact_cholesky"`` is retained as the older
-                diagnostic compact route name and is not the benchmarked replacement. Defaults to
+            articulated_contact_response (str, optional): Contact response for articulated rows
+                under ``pgs_mode="matrix_free"``. ``"immediate"`` is the existing D-wide row path.
+                ``"propagation"`` routes contacts touching non-free articulations to fixed-size
+                body-space rows, computes body response from the articulation tree, and propagates
+                deferred body impulses through the tree once per PGS iteration.
+                ``"propagation-fused"`` uses the same response model and enables the fused
+                propagation kernel for supported single-DOF articulation groups. Defaults to
                 ``"immediate"``.
             pgs_schedule (str, optional): Matrix-free row ordering. ``"interleaved"`` preserves the
                 legacy per-iteration dense+matrix-free sweep. ``"contact_then_internal"`` runs all
@@ -609,16 +568,13 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(f"pgs_velocity_drive_mode must be 'active' or 'freeze', got {pgs_velocity_drive_mode!r}")
         self.pgs_velocity_drive_mode = pgs_velocity_drive_mode
         self.dense_max_constraints = dense_max_constraints
-        self.compact_fast_body_map = (
-            _FPGS_COMPACT_FAST_BODY_MAP if compact_fast_body_map is None else bool(compact_fast_body_map)
-        )
-        self.compact_shared_row_solver = bool(compact_shared_row_solver)
-        self.compact_warp_propagation = (
-            _FPGS_COMPACT_WARP_PROPAGATION
-            if compact_warp_propagation is None
-            else bool(compact_warp_propagation)
-        )
-        self.compact_full_fused_iterations = _FPGS_COMPACT_FULL_FUSED_ITERATIONS
+        if articulated_contact_response not in ("immediate", "propagation", "propagation-fused"):
+            raise ValueError(
+                "articulated_contact_response must be 'immediate', 'propagation', or "
+                f"'propagation-fused', got {articulated_contact_response!r}"
+            )
+        self.articulated_contact_response = articulated_contact_response
+        self.propagation_full_fused_iterations = articulated_contact_response == "propagation-fused"
         self.pgs_warmstart = pgs_warmstart
         if self.pgs_warmstart and self.contact_friction_position_iterations >= 0:
             raise NotImplementedError(
@@ -648,26 +604,11 @@ class SolverFeatherPGS(SolverBase):
         if pgs_mode not in ("dense", "split", "matrix_free"):
             raise ValueError(f"pgs_mode must be 'dense', 'split', or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
-        if articulated_dense_response_mode not in (
-            "immediate",
-            "deferred_cholesky",
-            "compact_cholesky",
-            "compact_tree",
-        ):
-            raise ValueError(
-                "articulated_dense_response_mode must be 'immediate', 'deferred_cholesky', "
-                "'compact_cholesky', or 'compact_tree', "
-                f"got {articulated_dense_response_mode!r}"
-            )
-        if (
-            articulated_dense_response_mode in ("deferred_cholesky", "compact_cholesky", "compact_tree")
-            and self.pgs_mode != "matrix_free"
-        ):
+        if articulated_contact_response != "immediate" and self.pgs_mode != "matrix_free":
             raise NotImplementedError(
-                f"articulated_dense_response_mode={articulated_dense_response_mode!r} currently requires "
+                f"articulated_contact_response={articulated_contact_response!r} currently requires "
                 "pgs_mode='matrix_free'"
             )
-        self.articulated_dense_response_mode = articulated_dense_response_mode
         if pgs_schedule not in ("interleaved", "contact_then_internal", "physx_grasp"):
             raise ValueError(
                 f"pgs_schedule must be 'interleaved', 'contact_then_internal', or 'physx_grasp', got {pgs_schedule!r}"
@@ -710,9 +651,9 @@ class SolverFeatherPGS(SolverBase):
                     f"got pgs_mode={pgs_mode!r} with friction_mode={friction_mode!r}. "
                     "Select pgs_mode='matrix_free' or leave friction_mode='current'."
                 )
-            if articulated_dense_response_mode in ("compact_cholesky", "compact_tree"):
+            if articulated_contact_response != "immediate":
                 raise NotImplementedError(
-                    f"articulated_dense_response_mode={articulated_dense_response_mode!r} currently supports "
+                    f"articulated_contact_response={articulated_contact_response!r} currently supports "
                     "friction_mode='current' only"
                 )
             # pgs_mode == "matrix_free" with a non-baseline friction mode.
@@ -742,15 +683,12 @@ class SolverFeatherPGS(SolverBase):
             # :meth:`_allocate_buffers`.
             pass
         self.mf_max_constraints = mf_max_constraints
-        # Compact articulated-contact rows replace the old D-wide dense
-        # articulated rows, not ordinary free/free MF rows. Default the compact
-        # capacity to dense capacity so mixed scenes with many free bodies do
-        # not allocate compact rows at the much larger MF contact cap.
-        self.compact_max_constraints = int(
-            dense_max_constraints if compact_max_constraints is None else compact_max_constraints
-        )
-        if self.compact_max_constraints < 1:
-            raise ValueError("compact_max_constraints must be positive")
+        # Propagation rows replace the old D-wide dense articulated rows, not
+        # ordinary free/free MF rows. Keep their capacity tied to dense rows so
+        # mixed scenes with many free bodies do not allocate at the larger MF cap.
+        self.propagation_max_constraints = int(dense_max_constraints)
+        if self.propagation_max_constraints < 1:
+            raise ValueError("propagation_max_constraints must be positive")
         self._double_buffer = double_buffer
         self._nvtx = nvtx
         self.pgs_debug = pgs_debug
@@ -824,16 +762,16 @@ class SolverFeatherPGS(SolverBase):
         # _stage1_crba call; gates the per-step H memsets (see _stage1_crba).
         self._mass_update_global_flag = True
         self._last_step_dt = None
-        self._compact_full_fused_arts_per_world = 0
+        self._propagation_full_fused_arts_per_world = 0
 
         self._compute_articulation_metadata(model)
-        self._compact_full_fused_size = self._select_compact_full_fused_size()
+        self._propagation_full_fused_size = self._select_propagation_full_fused_size()
 
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
         self._allocate_mf_buffers(model)
-        self._allocate_compact_buffers(model)
+        self._allocate_propagation_buffers(model)
         self._allocate_debug_buffers(model)
         self._scatter_armature_to_groups(model)
         self._init_tiled_kernels(model)
@@ -915,17 +853,15 @@ class SolverFeatherPGS(SolverBase):
                 worlds.add(int(token))
         return worlds
 
-    def _compact_contacts_enabled(self) -> bool:
+    def _propagation_contacts_enabled(self) -> bool:
         return (
             self.pgs_mode == "matrix_free"
-            and self.articulated_dense_response_mode in ("compact_cholesky", "compact_tree")
+            and self.articulated_contact_response in ("propagation", "propagation-fused")
             and self._has_non_free_articulations
         )
 
-    def _select_compact_full_fused_size(self) -> int | None:
-        if not self.compact_full_fused_iterations or not self._compact_contacts_enabled():
-            return None
-        if self.compact_shared_row_solver:
+    def _select_propagation_full_fused_size(self) -> int | None:
+        if not self.propagation_full_fused_iterations or not self._propagation_contacts_enabled():
             return None
 
         candidates: list[int] = []
@@ -933,26 +869,26 @@ class SolverFeatherPGS(SolverBase):
             size_i = int(size)
             if size_i <= 0 or self.n_arts_by_size.get(size, 0) <= 0:
                 continue
-            if not self._compact_tree_has_non_free_by_size.get(size_i, True):
+            if not self._propagation_tree_has_non_free_by_size.get(size_i, True):
                 continue
-            if not self._compact_tree_single_dof_by_size.get(size_i, False):
+            if not self._propagation_tree_single_dof_by_size.get(size_i, False):
                 return None
-            if _FPGS_COMPACT_FULL_FUSED_MAX_SIZE > 0 and size_i > _FPGS_COMPACT_FULL_FUSED_MAX_SIZE:
+            if _PROPAGATION_FUSED_MAX_SIZE > 0 and size_i > _PROPAGATION_FUSED_MAX_SIZE:
                 return None
-            arts_per_world = self._compact_non_free_arts_per_world(size_i)
+            arts_per_world = self._propagation_non_free_arts_per_world(size_i)
             if (
-                _FPGS_COMPACT_FULL_FUSED_MAX_ARTS_PER_WORLD > 0
-                and arts_per_world > _FPGS_COMPACT_FULL_FUSED_MAX_ARTS_PER_WORLD
+                _PROPAGATION_FUSED_MAX_ARTS_PER_WORLD > 0
+                and arts_per_world > _PROPAGATION_FUSED_MAX_ARTS_PER_WORLD
             ):
                 return None
-            self._compact_full_fused_arts_per_world = max(arts_per_world, 1)
+            self._propagation_full_fused_arts_per_world = max(arts_per_world, 1)
             candidates.append(size_i)
 
         if len(candidates) != 1:
             return None
         return candidates[0]
 
-    def _compact_non_free_arts_per_world(self, size: int) -> int:
+    def _propagation_non_free_arts_per_world(self, size: int) -> int:
         if self.art_to_world is None or self.is_free_rigid is None or self.art_size is None:
             return int(self.n_arts_by_size.get(size, 0))
         art_size_np = self.art_size.numpy()
@@ -974,9 +910,9 @@ class SolverFeatherPGS(SolverBase):
         self._is_homogeneous = (len(self.size_groups) == 1) if self.size_groups else True
         self._build_body_maps(model)
         self._classify_free_rigid_bodies(model)
-        self._compact_tree_single_dof_by_size: dict[int, bool] = {}
-        self._compact_tree_has_non_free_by_size: dict[int, bool] = {}
-        self._compact_tree_requires_body_map = False
+        self._propagation_tree_single_dof_by_size: dict[int, bool] = {}
+        self._propagation_tree_has_non_free_by_size: dict[int, bool] = {}
+        self._propagation_tree_requires_body_map = False
         if model.joint_count:
             joint_dof_dim = model.joint_dof_dim.numpy()
             joint_dof_count = np.sum(joint_dof_dim, axis=1)
@@ -997,16 +933,16 @@ class SolverFeatherPGS(SolverBase):
                     joint_end = int(articulation_start[art + 1])
                     if np.any(joint_dof_count[joint_start:joint_end] > 1):
                         ok = False
-                self._compact_tree_single_dof_by_size[int(size)] = ok
-                self._compact_tree_has_non_free_by_size[int(size)] = has_non_free
+                self._propagation_tree_single_dof_by_size[int(size)] = ok
+                self._propagation_tree_has_non_free_by_size[int(size)] = has_non_free
                 if not ok:
-                    self._compact_tree_requires_body_map = True
-            self._compact_tree_single_dof_joints = bool(np.all(joint_dof_count <= 1))
+                    self._propagation_tree_requires_body_map = True
+            self._propagation_tree_single_dof_joints = bool(np.all(joint_dof_count <= 1))
         else:
-            self._compact_tree_single_dof_joints = True
-            self._compact_tree_single_dof_by_size = {int(size): True for size in self.size_groups}
-            self._compact_tree_has_non_free_by_size = {int(size): False for size in self.size_groups}
-            self._compact_tree_requires_body_map = False
+            self._propagation_tree_single_dof_joints = True
+            self._propagation_tree_single_dof_by_size = {int(size): True for size in self.size_groups}
+            self._propagation_tree_has_non_free_by_size = {int(size): False for size in self.size_groups}
+            self._propagation_tree_requires_body_map = False
         self._setup_world_size_grouping(model)
 
     def _compute_articulation_indices(self, model):
@@ -1377,17 +1313,10 @@ class SolverFeatherPGS(SolverBase):
             self.qd_work = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_mf_accum = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_out_snap = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
-            if self.articulated_dense_response_mode == "deferred_cholesky" and self._has_non_free_articulations:
-                self._deferred_dense_tau = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
-                self._deferred_dense_qd_delta = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
-            else:
-                self._deferred_dense_tau = None
-                self._deferred_dense_qd_delta = None
-            self._compact_tau = None
-            if self.articulated_dense_response_mode == "compact_cholesky" and self._has_non_free_articulations:
-                self._compact_qd_delta = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
-            else:
-                self._compact_qd_delta = None
+            self._deferred_dense_tau = None
+            self._deferred_dense_qd_delta = None
+            self._propagation_tau = None
+            self._propagation_qd_delta = None
             # The stage-3 snapshots stay unconditional (small: one dof-vector
             # each): the rsl_rl NaN-anomaly dumper reads them in default
             # configs, where _debug_buffers_enabled is False.
@@ -1409,8 +1338,8 @@ class SolverFeatherPGS(SolverBase):
             self.v_out_snap = None
             self._deferred_dense_tau = None
             self._deferred_dense_qd_delta = None
-            self._compact_tau = None
-            self._compact_qd_delta = None
+            self._propagation_tau = None
+            self._propagation_qd_delta = None
             self._debug_stage3_qd_work = None
             self._debug_stage3_joint_qdd = None
             self._debug_stage3_v_hat = None
@@ -1743,19 +1672,6 @@ class SolverFeatherPGS(SolverBase):
         self.impulses = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        if self.articulated_dense_response_mode == "deferred_cholesky" and self._has_non_free_articulations:
-            self._deferred_dense_prev_impulses = wp.zeros(
-                (self.world_count, max_constraints),
-                dtype=wp.float32,
-                device=device,
-                requires_grad=requires_grad,
-            )
-            self._deferred_dense_delta_impulses = wp.zeros(
-                (self.world_count, max_constraints),
-                dtype=wp.float32,
-                device=device,
-                requires_grad=requires_grad,
-            )
         self._debug_position_impulses = (
             wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
             if self._debug_buffers_enabled
@@ -2095,56 +2011,56 @@ class SolverFeatherPGS(SolverBase):
             self.rigid_velocity_limit_slot = None
             self.rigid_velocity_limit_sign = None
 
-    def _allocate_compact_buffers(self, model):
-        """Allocate compact articulated-contact buffers for compact_cholesky mode."""
-        if not self._compact_contacts_enabled():
-            self.compact_constraint_count = None
-            self.compact_slot_counter = None
-            self.compact_body_a = None
-            self.compact_body_b = None
-            self.compact_J_a = None
-            self.compact_J_b = None
-            self.compact_MiJt_a = None
-            self.compact_MiJt_b = None
-            self.compact_rhs = None
-            self.compact_rhs_unbiased = None
-            self.compact_impulses = None
-            self.compact_eff_mass_inv = None
-            self.compact_row_type = None
-            self.compact_row_parent = None
-            self.compact_row_mu = None
-            self.compact_phi = None
-            self.compact_body_B = None
-            self.compact_body_qd_response = None
-            self.compact_body_response = None
-            self.compact_body_qd = None
-            self.compact_body_impulses = None
-            self.compact_body_com_rel = None
-            self.compact_body_seen = None
-            self.compact_body_local_slot = None
-            self.compact_joint_S_flat = None
-            self.compact_tree_Ia = None
-            self.compact_tree_U = None
-            self.compact_tree_D_chol = None
-            self.compact_tree_D_inv = None
-            self.compact_tree_pA = None
-            self.compact_tree_u = None
-            self.compact_tree_qdd = None
-            self.compact_tree_body_delta = None
-            self.compact_body_count = None
-            self.compact_body_list = None
-            self._current_compact_joint_S_s = None
-            self._current_compact_body_q = None
-            self.max_compact_bodies = 0
+    def _allocate_propagation_buffers(self, model):
+        """Allocate fixed-size articulated-contact propagation buffers."""
+        if not self._propagation_contacts_enabled():
+            self.propagation_constraint_count = None
+            self.propagation_slot_counter = None
+            self.propagation_body_a = None
+            self.propagation_body_b = None
+            self.propagation_J_a = None
+            self.propagation_J_b = None
+            self.propagation_MiJt_a = None
+            self.propagation_MiJt_b = None
+            self.propagation_rhs = None
+            self.propagation_rhs_unbiased = None
+            self.propagation_impulses = None
+            self.propagation_eff_mass_inv = None
+            self.propagation_row_type = None
+            self.propagation_row_parent = None
+            self.propagation_row_mu = None
+            self.propagation_phi = None
+            self.propagation_body_B = None
+            self.propagation_body_qd_response = None
+            self.propagation_body_response = None
+            self.propagation_body_qd = None
+            self.propagation_body_impulses = None
+            self.propagation_body_com_rel = None
+            self.propagation_body_seen = None
+            self.propagation_body_local_slot = None
+            self.propagation_joint_S_flat = None
+            self.propagation_tree_Ia = None
+            self.propagation_tree_U = None
+            self.propagation_tree_D_chol = None
+            self.propagation_tree_D_inv = None
+            self.propagation_tree_pA = None
+            self.propagation_tree_u = None
+            self.propagation_tree_qdd = None
+            self.propagation_tree_body_delta = None
+            self.propagation_body_count = None
+            self.propagation_body_list = None
+            self._current_propagation_joint_S_s = None
+            self._current_propagation_body_q = None
+            self.max_propagation_bodies = 0
             return
 
         device = model.device
         requires_grad = model.requires_grad
         worlds = self.world_count
-        compact_max_c = self.compact_max_constraints
+        propagation_max_c = self.propagation_max_constraints
         body_count = model.body_count
         max_dofs = max(int(self.articulation_max_dofs), 1)
-        self.compact_response_max_dofs = max_dofs
+        self.propagation_response_max_dofs = max_dofs
         body_to_art_np = self.body_to_articulation.numpy()
         art_to_world_np = self.art_to_world.numpy()
         world_body_counts = np.zeros((worlds,), dtype=np.int32)
@@ -2153,97 +2069,85 @@ class SolverFeatherPGS(SolverBase):
                 world = art_to_world_np[art]
                 if world >= 0:
                     world_body_counts[world] += 1
-        self.max_compact_bodies = max(int(world_body_counts.max()) if world_body_counts.size else 0, 1)
+        self.max_propagation_bodies = max(int(world_body_counts.max()) if world_body_counts.size else 0, 1)
 
-        self.compact_constraint_count = wp.zeros(
+        self.propagation_constraint_count = wp.zeros(
             (worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
-        self.compact_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self.compact_body_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self.compact_body_list = wp.full(
-            (worlds, self.max_compact_bodies), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+        self.propagation_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.propagation_body_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.propagation_body_list = wp.full(
+            (worlds, self.max_propagation_bodies), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
         )
 
-        self.compact_body_a = wp.zeros(
-            (worlds, compact_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
+        self.propagation_body_a = wp.zeros(
+            (worlds, propagation_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
-        self.compact_body_b = wp.zeros(
-            (worlds, compact_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
+        self.propagation_body_b = wp.zeros(
+            (worlds, propagation_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
-        self.compact_J_a = wp.zeros(
-            (worlds, compact_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
+        self.propagation_J_a = wp.zeros(
+            (worlds, propagation_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.compact_J_b = wp.zeros(
-            (worlds, compact_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
+        self.propagation_J_b = wp.zeros(
+            (worlds, propagation_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.compact_MiJt_a = wp.zeros(
-            (worlds, compact_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
+        self.propagation_MiJt_a = wp.zeros(
+            (worlds, propagation_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.compact_MiJt_b = wp.zeros(
-            (worlds, compact_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
+        self.propagation_MiJt_b = wp.zeros(
+            (worlds, propagation_max_c, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.compact_rhs = wp.zeros(
-            (worlds, compact_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+        self.propagation_rhs = wp.zeros(
+            (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.compact_rhs_unbiased = wp.zeros(
-            (worlds, compact_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+        self.propagation_rhs_unbiased = wp.zeros(
+            (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.compact_impulses = wp.zeros(
-            (worlds, compact_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+        self.propagation_impulses = wp.zeros(
+            (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.compact_eff_mass_inv = wp.zeros(
-            (worlds, compact_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+        self.propagation_eff_mass_inv = wp.zeros(
+            (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.compact_row_type = wp.zeros(
-            (worlds, compact_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
+        self.propagation_row_type = wp.zeros(
+            (worlds, propagation_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
-        self.compact_row_parent = wp.full(
-            (worlds, compact_max_c), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+        self.propagation_row_parent = wp.full(
+            (worlds, propagation_max_c), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
         )
-        self.compact_row_mu = wp.zeros(
-            (worlds, compact_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+        self.propagation_row_mu = wp.zeros(
+            (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.compact_phi = wp.zeros(
-            (worlds, compact_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+        self.propagation_phi = wp.zeros(
+            (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
 
-        # The benchmarked compact_tree path must not allocate body_count * 6 * D
-        # storage, because that is the scaling problem this route is intended to
-        # remove. The compact_cholesky diagnostic mode keeps these buffers as an
-        # MF-equivalence diagnostic for the fixed-size body-space row formulation.
-        if self.articulated_dense_response_mode == "compact_cholesky":
-            self.compact_body_B = wp.zeros(
-                (body_count, 6, max_dofs), dtype=wp.float32, device=device, requires_grad=requires_grad
-            )
-            self.compact_body_qd_response = wp.zeros(
-                (body_count, 6, max_dofs), dtype=wp.float32, device=device, requires_grad=requires_grad
-            )
-        else:
-            self.compact_body_B = None
-            self.compact_body_qd_response = None
-        self.compact_body_response = wp.zeros(
+        self.propagation_body_B = None
+        self.propagation_body_qd_response = None
+        self.propagation_body_response = wp.zeros(
             (body_count, 6, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.compact_body_qd = wp.zeros((body_count, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.compact_body_impulses = wp.zeros(
+        self.propagation_body_qd = wp.zeros((body_count, 6), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.propagation_body_impulses = wp.zeros(
             (body_count, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.compact_body_com_rel = wp.zeros((body_count, 3), dtype=wp.float32, device=device)
-        self.compact_body_seen = wp.zeros((body_count,), dtype=wp.int32, device=device)
-        self.compact_body_local_slot = wp.zeros((body_count,), dtype=wp.int32, device=device)
-        self._current_compact_joint_S_s = None
-        self._current_compact_body_q = None
+        self.propagation_body_com_rel = wp.zeros((body_count, 3), dtype=wp.float32, device=device)
+        self.propagation_body_seen = wp.zeros((body_count,), dtype=wp.int32, device=device)
+        self.propagation_body_local_slot = wp.zeros((body_count,), dtype=wp.int32, device=device)
+        self._current_propagation_joint_S_s = None
+        self._current_propagation_body_q = None
         joint_count = max(int(model.joint_count), 1)
         joint_dof_count = max(int(model.joint_dof_count), 1)
-        self.compact_joint_S_flat = wp.zeros((joint_dof_count, 6), dtype=wp.float32, device=device)
-        self.compact_tree_Ia = wp.zeros((body_count, 6, 6), dtype=wp.float32, device=device)
-        self.compact_tree_U = wp.zeros((joint_dof_count, 6), dtype=wp.float32, device=device)
-        self.compact_tree_D_chol = wp.zeros((joint_count, 6, 6), dtype=wp.float32, device=device)
-        self.compact_tree_D_inv = wp.zeros((joint_count, 6, 6), dtype=wp.float32, device=device)
-        self.compact_tree_pA = wp.zeros((body_count, 6), dtype=wp.float32, device=device)
-        self.compact_tree_u = wp.zeros((joint_dof_count,), dtype=wp.float32, device=device)
-        self.compact_tree_qdd = wp.zeros((joint_dof_count,), dtype=wp.float32, device=device)
-        self.compact_tree_body_delta = wp.zeros((body_count, 6), dtype=wp.float32, device=device)
+        self.propagation_joint_S_flat = wp.zeros((joint_dof_count, 6), dtype=wp.float32, device=device)
+        self.propagation_tree_Ia = wp.zeros((body_count, 6, 6), dtype=wp.float32, device=device)
+        self.propagation_tree_U = wp.zeros((joint_dof_count, 6), dtype=wp.float32, device=device)
+        self.propagation_tree_D_chol = wp.zeros((joint_count, 6, 6), dtype=wp.float32, device=device)
+        self.propagation_tree_D_inv = wp.zeros((joint_count, 6, 6), dtype=wp.float32, device=device)
+        self.propagation_tree_pA = wp.zeros((body_count, 6), dtype=wp.float32, device=device)
+        self.propagation_tree_u = wp.zeros((joint_dof_count,), dtype=wp.float32, device=device)
+        self.propagation_tree_qdd = wp.zeros((joint_dof_count,), dtype=wp.float32, device=device)
+        self.propagation_tree_body_delta = wp.zeros((body_count, 6), dtype=wp.float32, device=device)
 
     def _allocate_debug_buffers(self, model):
         """Allocate buffers for PGS convergence diagnostics."""
@@ -2253,7 +2157,7 @@ class SolverFeatherPGS(SolverBase):
         worlds = self.world_count
         max_c = self.dense_max_constraints
         mf_max_c = self.mf_max_constraints
-        compact_max_c = self.compact_max_constraints
+        propagation_max_c = self.propagation_max_constraints
 
         self._diag_metrics = wp.zeros((worlds, 4), dtype=wp.float32, device=device)
         # Per-world NCP / MDP residual scratch buffer ([worlds, 6]).
@@ -2265,10 +2169,10 @@ class SolverFeatherPGS(SolverBase):
             self._diag_prev_mf_impulses = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device)
         else:
             self._diag_prev_mf_impulses = None
-        if getattr(self, "compact_impulses", None) is not None:
-            self._diag_prev_compact_impulses = wp.zeros((worlds, compact_max_c), dtype=wp.float32, device=device)
+        if getattr(self, "propagation_impulses", None) is not None:
+            self._diag_prev_propagation_impulses = wp.zeros((worlds, propagation_max_c), dtype=wp.float32, device=device)
         else:
-            self._diag_prev_compact_impulses = None
+            self._diag_prev_propagation_impulses = None
         self._diag_zero_constraint_count = wp.zeros((worlds,), dtype=wp.int32, device=device)
         self._diag_dummy_float_rows = wp.zeros((worlds, 1), dtype=wp.float32, device=device)
         self._diag_dummy_int_rows = wp.zeros((worlds, 1), dtype=wp.int32, device=device)
@@ -2395,52 +2299,46 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_max_constraints, self.max_mf_bodies, device_arch
             )
 
-        self._pgs_solve_compact_kernel = None
-        self._pgs_solve_compact_full_fused_kernel = None
-        self._compact_full_fused_block_dim = 0
+        self._pgs_solve_propagation_kernel = None
+        self._pgs_solve_propagation_full_fused_kernel = None
+        self._propagation_full_fused_block_dim = 0
         if (
             model.device.is_cuda
-            and self._compact_contacts_enabled()
-            and self.compact_max_constraints > 0
-            and os.environ.get("FEATHER_PGS_COMPACT_WARP_ROWS", "1") != "0"
+            and self._propagation_contacts_enabled()
+            and self.propagation_max_constraints > 0
         ):
-            if self.compact_shared_row_solver:
-                self._pgs_solve_compact_kernel = _get_pgs_solve_compact_contact_shared_kernel(
-                    self.compact_max_constraints, self.max_compact_bodies, device_arch
+            self._pgs_solve_propagation_kernel = _get_pgs_solve_propagation_contact_kernel(
+                self.propagation_max_constraints, device_arch
+            )
+            fused_size = getattr(self, "_propagation_full_fused_size", None)
+            if fused_size is not None:
+                n_fused_arts = max(int(getattr(self, "_propagation_full_fused_arts_per_world", 0)), 1)
+                if _PROPAGATION_FUSED_PROP_WARPS > 0:
+                    prop_warps = min(n_fused_arts, _PROPAGATION_FUSED_PROP_WARPS)
+                    fused_warps = min(max(prop_warps + 1, 2), 32)
+                else:
+                    fused_warps = 1
+                self._propagation_full_fused_block_dim = 32 * fused_warps
+                self._pgs_solve_propagation_full_fused_kernel = _get_pgs_solve_propagation_full_fused_kernel(
+                    self.propagation_max_constraints,
+                    self.max_propagation_bodies,
+                    int(fused_size),
+                    device_arch,
                 )
-            else:
-                self._pgs_solve_compact_kernel = _get_pgs_solve_compact_contact_kernel(
-                    self.compact_max_constraints, device_arch
-                )
-                fused_size = getattr(self, "_compact_full_fused_size", None)
-                if fused_size is not None:
-                    n_fused_arts = max(int(getattr(self, "_compact_full_fused_arts_per_world", 0)), 1)
-                    if _FPGS_COMPACT_FULL_FUSED_PROP_WARPS > 0:
-                        prop_warps = min(n_fused_arts, _FPGS_COMPACT_FULL_FUSED_PROP_WARPS)
-                        fused_warps = min(max(prop_warps + 1, 2), 32)
-                    else:
-                        fused_warps = 1
-                    self._compact_full_fused_block_dim = 32 * fused_warps
-                    self._pgs_solve_compact_full_fused_kernel = _get_pgs_solve_compact_full_fused_kernel(
-                        self.compact_max_constraints,
-                        self.max_compact_bodies,
-                        int(fused_size),
-                        device_arch,
-                    )
 
-        self._propagate_compact_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
-        if model.device.is_cuda and self._compact_contacts_enabled() and self.compact_warp_propagation:
+        self._propagate_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
+        if model.device.is_cuda and self._propagation_contacts_enabled():
             for size in self.size_groups:
                 if (
                     size > 0
-                    and self._compact_tree_has_non_free_by_size.get(int(size), True)
-                    and self._compact_tree_single_dof_by_size.get(int(size), False)
+                    and self._propagation_tree_has_non_free_by_size.get(int(size), True)
+                    and self._propagation_tree_single_dof_by_size.get(int(size), False)
                 ):
-                    self._propagate_compact_tree_warp_kernels_by_size[int(size)] = (
-                        _get_propagate_compact_tree_impulses_revolute_kernel(int(size), device_arch)
+                    self._propagate_tree_warp_kernels_by_size[int(size)] = (
+                        _get_propagate_tree_impulses_revolute_kernel(int(size), device_arch)
                     )
                 else:
-                    self._propagate_compact_tree_warp_kernels_by_size[int(size)] = None
+                    self._propagate_tree_warp_kernels_by_size[int(size)] = None
 
     def _init_size_group_streams(self, model):
         """Initialize CUDA streams for parallel kernel launches across size groups.
@@ -2667,78 +2565,15 @@ class SolverFeatherPGS(SolverBase):
         else:
             launch_row_phase(0, iterations, iteration_offset)
 
-    def _propagate_deferred_dense_response(self) -> None:
-        if self._deferred_dense_prev_impulses is None or self._deferred_dense_delta_impulses is None:
-            raise RuntimeError("Deferred dense response buffers were not allocated")
-        if self._deferred_dense_tau is None or self._deferred_dense_qd_delta is None:
-            raise RuntimeError("Deferred dense response DOF buffers were not allocated")
-
-        wp.launch(
-            compute_dense_impulse_delta,
-            dim=(self.world_count, self.dense_max_constraints),
-            inputs=[
-                self.constraint_count,
-                self.dense_max_constraints,
-                self.impulses,
-                self._deferred_dense_prev_impulses,
-            ],
-            outputs=[self._deferred_dense_delta_impulses],
-            device=self.model.device,
-        )
-
-        self._deferred_dense_tau.zero_()
-        wp.launch(
-            accumulate_deferred_dense_tau_from_J_world,
-            dim=int(self.world_count * self.dense_max_constraints * self.max_world_dofs),
-            inputs=[
-                self.world_dof_start,
-                self.world_dof_count,
-                self.world_deferred_dof_mask,
-                self.constraint_count,
-                self._deferred_dense_delta_impulses,
-                self.J_world,
-                self.max_world_dofs,
-                self.dense_max_constraints,
-            ],
-            outputs=[self._deferred_dense_tau],
-            device=self.model.device,
-        )
-
-        self._deferred_dense_qd_delta.zero_()
-        for size in self.size_groups:
-            n_arts = self.n_arts_by_size[size]
-            if n_arts <= 0 or size <= 0:
-                continue
-            wp.launch(
-                trisolve_loop,
-                dim=n_arts,
-                inputs=[
-                    self.L_by_size[size],
-                    self.group_to_art[size],
-                    self.articulation_dof_start,
-                    size,
-                    self._deferred_dense_tau,
-                ],
-                outputs=[self._deferred_dense_qd_delta],
-                device=self.model.device,
-            )
-
-        wp.launch(
-            vector_add_inplace,
-            dim=self.v_out.size,
-            inputs=[self.v_out, self._deferred_dense_qd_delta],
-            device=self.model.device,
-        )
-
-    def _refresh_compact_body_qd_from_vout(self) -> None:
-        if not self._compact_contacts_enabled() or self.compact_body_qd is None:
+    def _refresh_propagation_body_qd_from_vout(self) -> None:
+        if not self._propagation_contacts_enabled() or self.propagation_body_qd is None:
             return
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
             if n_arts <= 0 or size <= 0:
                 continue
             wp.launch(
-                refresh_compact_tree_body_qd_for_size,
+                refresh_propagation_tree_body_qd_for_size,
                 dim=n_arts,
                 inputs=[
                     self.group_to_art[size],
@@ -2747,28 +2582,28 @@ class SolverFeatherPGS(SolverBase):
                     self.model.joint_child,
                     self.model.joint_qd_start,
                     self.model.joint_dof_dim,
-                    self.compact_joint_S_flat,
-                    self.compact_body_com_rel,
+                    self.propagation_joint_S_flat,
+                    self.propagation_body_com_rel,
                     self.v_out,
                 ],
                 outputs=[
-                    self.compact_tree_body_delta,
-                    self.compact_body_qd,
+                    self.propagation_tree_body_delta,
+                    self.propagation_body_qd,
                 ],
                 device=self.model.device,
             )
-        self._refresh_compact_free_body_qd_from_vout()
+        self._refresh_propagation_free_body_qd_from_vout()
 
-    def _refresh_compact_free_body_qd_from_vout(self) -> None:
+    def _refresh_propagation_free_body_qd_from_vout(self) -> None:
         if (
-            not self._compact_contacts_enabled()
-            or self.compact_body_qd is None
+            not self._propagation_contacts_enabled()
+            or self.propagation_body_qd is None
             or not self._has_free_rigid_bodies
             or self.is_free_rigid is None
         ):
             return
         wp.launch(
-            refresh_compact_free_body_qd_from_vout,
+            refresh_propagation_free_body_qd_from_vout,
             dim=self.model.body_count,
             inputs=[
                 self.body_to_articulation,
@@ -2777,27 +2612,27 @@ class SolverFeatherPGS(SolverBase):
                 self.articulation_root_com_offset,
                 self.v_out,
             ],
-            outputs=[self.compact_body_qd],
+            outputs=[self.propagation_body_qd],
             device=self.model.device,
         )
 
-    def _compact_pgs_setup(self, state: State, state_aug: State, dt: float) -> None:
-        if not self._compact_contacts_enabled():
+    def _propagation_pgs_setup(self, state: State, state_aug: State, dt: float) -> None:
+        if not self._propagation_contacts_enabled():
             return
 
-        self._current_compact_joint_S_s = state_aug.joint_S_s
-        self._current_compact_body_q = state.body_q
-        # Compact live body velocities are derived from v_out during setup.
+        self._current_propagation_joint_S_s = state_aug.joint_S_s
+        self._current_propagation_body_q = state.body_q
+        # Propagation live body velocities are derived from v_out during setup.
         # Reset v_out to the current predictor here so repeated step() calls do
-        # not seed compact rows from the previous solve's final velocity.
+        # not seed propagation rows from the previous solve's final velocity.
         self._stage6_prepare_world_velocity()
-        self.compact_body_response.zero_()
-        self.compact_tree_Ia.zero_()
-        self.compact_tree_U.zero_()
-        self.compact_tree_D_chol.zero_()
-        self.compact_tree_D_inv.zero_()
+        self.propagation_body_response.zero_()
+        self.propagation_tree_Ia.zero_()
+        self.propagation_tree_U.zero_()
+        self.propagation_tree_D_chol.zero_()
+        self.propagation_tree_D_inv.zero_()
         wp.launch(
-            compute_compact_body_com_rel,
+            compute_propagation_body_com_rel,
             dim=self.model.body_count,
             inputs=[
                 self.body_to_articulation,
@@ -2805,138 +2640,22 @@ class SolverFeatherPGS(SolverBase):
                 self.model.body_com,
                 self.articulation_origin,
             ],
-            outputs=[self.compact_body_com_rel],
+            outputs=[self.propagation_body_com_rel],
             device=self.model.device,
         )
         if self.model.joint_dof_count > 0:
             wp.launch(
-                flatten_compact_joint_S,
+                flatten_propagation_joint_S,
                 dim=self.model.joint_count,
                 inputs=[
                     self.model.joint_child,
                     self.model.joint_qd_start,
                     state_aug.joint_S_s,
-                    self.compact_body_com_rel,
+                    self.propagation_body_com_rel,
                 ],
-                outputs=[self.compact_joint_S_flat],
+                outputs=[self.propagation_joint_S_flat],
                 device=self.model.device,
             )
-
-        if self.articulated_dense_response_mode == "compact_cholesky":
-            if self.compact_body_B is None or self.compact_body_qd_response is None:
-                raise RuntimeError("compact_cholesky requires dense compact body response buffers")
-            self.compact_body_B.zero_()
-            self.compact_body_qd_response.zero_()
-            for size in self.size_groups:
-                n_arts = self.n_arts_by_size[size]
-                if n_arts <= 0 or size <= 0:
-                    continue
-                wp.launch(
-                    compute_compact_active_body_B_for_size,
-                    dim=int(self.world_count * self.max_compact_bodies * 6),
-                    inputs=[
-                        self.compact_body_count,
-                        self.compact_body_list,
-                        self.body_to_articulation,
-                        self.body_to_joint,
-                        state.body_q,
-                        self.model.body_com,
-                        self.art_size,
-                        self.articulation_dof_start,
-                        self.articulation_origin,
-                        self.model.joint_ancestor,
-                        self.model.joint_qd_start,
-                        state_aug.joint_S_s,
-                        size,
-                        self.max_compact_bodies,
-                        self.compact_response_max_dofs,
-                    ],
-                    outputs=[self.compact_body_B],
-                    device=self.model.device,
-                )
-                wp.launch(
-                    solve_compact_active_body_response_for_size,
-                    dim=int(self.world_count * self.max_compact_bodies * 6),
-                    inputs=[
-                        self.L_by_size[size],
-                        self.compact_body_count,
-                        self.compact_body_list,
-                        self.body_to_articulation,
-                        self.art_size,
-                        self.art_group_idx,
-                        size,
-                        self.max_compact_bodies,
-                        self.compact_response_max_dofs,
-                        self.compact_body_B,
-                    ],
-                    outputs=[self.compact_body_qd_response],
-                    device=self.model.device,
-                )
-                wp.launch(
-                    assemble_compact_active_body_response_for_size,
-                    dim=int(self.world_count * self.max_compact_bodies),
-                    inputs=[
-                        self.compact_body_count,
-                        self.compact_body_list,
-                        self.body_to_articulation,
-                        self.art_size,
-                        size,
-                        self.max_compact_bodies,
-                        self.compact_response_max_dofs,
-                        self.compact_body_B,
-                        self.compact_body_qd_response,
-                    ],
-                    outputs=[self.compact_body_response],
-                    device=self.model.device,
-                )
-            wp.launch(
-                refresh_compact_body_qd_from_vout,
-                dim=int(self.model.body_count * 6),
-                inputs=[
-                    self.body_to_articulation,
-                    self.art_size,
-                    self.articulation_dof_start,
-                    self.compact_response_max_dofs,
-                    self.compact_body_B,
-                    self.v_out,
-                ],
-                outputs=[self.compact_body_qd],
-                device=self.model.device,
-            )
-            self._refresh_compact_free_body_qd_from_vout()
-            self.compact_rhs.zero_()
-            self.compact_eff_mass_inv.zero_()
-            self.compact_MiJt_a.zero_()
-            self.compact_MiJt_b.zero_()
-            wp.launch(
-                compute_compact_effective_mass_and_rhs,
-                dim=self.world_count * self.compact_max_constraints,
-                inputs=[
-                    self.compact_constraint_count,
-                    self.compact_body_a,
-                    self.compact_body_b,
-                    self.compact_J_a,
-                    self.compact_J_b,
-                    self.compact_body_response,
-                    self.compact_phi,
-                    self.compact_row_type,
-                    self.rigid_body_max_depenetration_velocity,
-                    self.pgs_cfm,
-                    self.pgs_beta,
-                    self.dense_contact_compliance,
-                    self.speculative_dense_contact_compliance,
-                    dt,
-                    self.compact_max_constraints,
-                ],
-                outputs=[
-                    self.compact_eff_mass_inv,
-                    self.compact_MiJt_a,
-                    self.compact_MiJt_b,
-                    self.compact_rhs,
-                ],
-                device=self.model.device,
-            )
-            return
 
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
@@ -2945,7 +2664,7 @@ class SolverFeatherPGS(SolverBase):
             if size <= 0:
                 continue
             wp.launch(
-                factor_compact_tree_for_size,
+                factor_propagation_tree_for_size,
                 dim=n_arts,
                 inputs=[
                     self.group_to_art[size],
@@ -2955,7 +2674,7 @@ class SolverFeatherPGS(SolverBase):
                     self.model.joint_child,
                     self.model.joint_qd_start,
                     self.model.joint_dof_dim,
-                    self.compact_joint_S_flat,
+                    self.propagation_joint_S_flat,
                     self.model.joint_armature,
                     self.articulation_max_dofs,
                     self.aug_row_counts,
@@ -2963,19 +2682,19 @@ class SolverFeatherPGS(SolverBase):
                     self.aug_row_K,
                     self.body_I_m,
                     state_aug.body_q_com,
-                    self.compact_body_com_rel,
+                    self.propagation_body_com_rel,
                 ],
                 outputs=[
-                    self.compact_tree_Ia,
-                    self.compact_tree_U,
-                    self.compact_tree_D_chol,
-                    self.compact_tree_D_inv,
+                    self.propagation_tree_Ia,
+                    self.propagation_tree_U,
+                    self.propagation_tree_D_chol,
+                    self.propagation_tree_D_inv,
                 ],
                 device=self.model.device,
             )
-            if self._compact_tree_single_dof_by_size.get(int(size), False):
+            if self._propagation_tree_single_dof_by_size.get(int(size), False):
                 wp.launch(
-                    compute_compact_tree_body_response_revolute_for_size,
+                    compute_propagation_tree_body_response_revolute_for_size,
                     dim=n_arts,
                     inputs=[
                         self.group_to_art[size],
@@ -2984,25 +2703,25 @@ class SolverFeatherPGS(SolverBase):
                         self.model.joint_child,
                         self.model.joint_qd_start,
                         self.model.joint_dof_dim,
-                        self.compact_joint_S_flat,
-                        self.compact_body_com_rel,
-                        self.compact_tree_U,
-                        self.compact_tree_D_inv,
+                        self.propagation_joint_S_flat,
+                        self.propagation_body_com_rel,
+                        self.propagation_tree_U,
+                        self.propagation_tree_D_inv,
                     ],
                     outputs=[
-                        self.compact_tree_Ia,
-                        self.compact_tree_body_delta,
-                        self.compact_body_response,
+                        self.propagation_tree_Ia,
+                        self.propagation_tree_body_delta,
+                        self.propagation_body_response,
                     ],
                     device=self.model.device,
                 )
             else:
                 wp.launch(
-                    compute_compact_tree_body_response_for_size,
+                    compute_propagation_tree_body_response_for_size,
                     dim=n_arts,
                     inputs=[
-                        self.compact_body_count,
-                        self.compact_body_list,
+                        self.propagation_body_count,
+                        self.propagation_body_list,
                         self.body_to_articulation,
                         self.group_to_art[size],
                         self.art_to_world,
@@ -3011,23 +2730,23 @@ class SolverFeatherPGS(SolverBase):
                         self.model.joint_child,
                         self.model.joint_qd_start,
                         self.model.joint_dof_dim,
-                        self.compact_joint_S_flat,
-                        self.max_compact_bodies,
-                        self.compact_body_com_rel,
-                        self.compact_tree_U,
-                        self.compact_tree_D_inv,
+                        self.propagation_joint_S_flat,
+                        self.max_propagation_bodies,
+                        self.propagation_body_com_rel,
+                        self.propagation_tree_U,
+                        self.propagation_tree_D_inv,
                     ],
                     outputs=[
-                        self.compact_tree_pA,
-                        self.compact_tree_u,
-                        self.compact_tree_qdd,
-                        self.compact_tree_body_delta,
-                        self.compact_body_response,
+                        self.propagation_tree_pA,
+                        self.propagation_tree_u,
+                        self.propagation_tree_qdd,
+                        self.propagation_tree_body_delta,
+                        self.propagation_body_response,
                     ],
                     device=self.model.device,
                 )
             wp.launch(
-                refresh_compact_tree_body_qd_for_size,
+                refresh_propagation_tree_body_qd_for_size,
                 dim=n_arts,
                 inputs=[
                     self.group_to_art[size],
@@ -3036,52 +2755,52 @@ class SolverFeatherPGS(SolverBase):
                     self.model.joint_child,
                     self.model.joint_qd_start,
                     self.model.joint_dof_dim,
-                    self.compact_joint_S_flat,
-                    self.compact_body_com_rel,
+                    self.propagation_joint_S_flat,
+                    self.propagation_body_com_rel,
                     self.v_out,
                 ],
                 outputs=[
-                    self.compact_tree_body_delta,
-                    self.compact_body_qd,
+                    self.propagation_tree_body_delta,
+                    self.propagation_body_qd,
                 ],
                 device=self.model.device,
             )
-        self._refresh_compact_free_body_qd_from_vout()
+        self._refresh_propagation_free_body_qd_from_vout()
 
-        self.compact_rhs.zero_()
-        self.compact_eff_mass_inv.zero_()
-        self.compact_MiJt_a.zero_()
-        self.compact_MiJt_b.zero_()
+        self.propagation_rhs.zero_()
+        self.propagation_eff_mass_inv.zero_()
+        self.propagation_MiJt_a.zero_()
+        self.propagation_MiJt_b.zero_()
         wp.launch(
-            compute_compact_effective_mass_and_rhs,
-            dim=self.world_count * self.compact_max_constraints,
+            compute_propagation_effective_mass_and_rhs,
+            dim=self.world_count * self.propagation_max_constraints,
             inputs=[
-                self.compact_constraint_count,
-                self.compact_body_a,
-                self.compact_body_b,
-                self.compact_J_a,
-                self.compact_J_b,
-                self.compact_body_response,
-                self.compact_phi,
-                self.compact_row_type,
+                self.propagation_constraint_count,
+                self.propagation_body_a,
+                self.propagation_body_b,
+                self.propagation_J_a,
+                self.propagation_J_b,
+                self.propagation_body_response,
+                self.propagation_phi,
+                self.propagation_row_type,
                 self.rigid_body_max_depenetration_velocity,
                 self.pgs_cfm,
                 self.pgs_beta,
                 self.dense_contact_compliance,
                 self.speculative_dense_contact_compliance,
                 dt,
-                self.compact_max_constraints,
+                self.propagation_max_constraints,
             ],
             outputs=[
-                self.compact_eff_mass_inv,
-                self.compact_MiJt_a,
-                self.compact_MiJt_b,
-                self.compact_rhs,
+                self.propagation_eff_mass_inv,
+                self.propagation_MiJt_a,
+                self.propagation_MiJt_b,
+                self.propagation_rhs,
             ],
             device=self.model.device,
         )
 
-    def _compute_compact_rhs_bias(
+    def _compute_propagation_rhs_bias(
         self,
         dt: float,
         *,
@@ -3089,70 +2808,39 @@ class SolverFeatherPGS(SolverBase):
         speculative_scale: float = 1.0,
         output: wp.array,
     ) -> None:
-        if not self._compact_contacts_enabled():
+        if not self._propagation_contacts_enabled():
             return
         wp.launch(
-            compute_compact_rhs_bias,
-            dim=self.world_count * self.compact_max_constraints,
+            compute_propagation_rhs_bias,
+            dim=self.world_count * self.propagation_max_constraints,
             inputs=[
-                self.compact_constraint_count,
-                self.compact_body_a,
-                self.compact_body_b,
-                self.compact_phi,
-                self.compact_row_type,
+                self.propagation_constraint_count,
+                self.propagation_body_a,
+                self.propagation_body_b,
+                self.propagation_phi,
+                self.propagation_row_type,
                 self.rigid_body_max_depenetration_velocity,
                 self.pgs_beta,
                 dt,
                 bias_scale,
                 speculative_scale,
-                self.compact_max_constraints,
+                self.propagation_max_constraints,
             ],
             outputs=[output],
             device=self.model.device,
         )
 
-    def _propagate_compact_response(self) -> None:
-        if not self._compact_contacts_enabled():
-            return
-
-        if self.articulated_dense_response_mode == "compact_cholesky":
-            if self.compact_body_B is None or self._compact_qd_delta is None:
-                raise RuntimeError("compact_cholesky propagation requires dense compact response buffers")
-            self._compact_qd_delta.zero_()
-            for size in self.size_groups:
-                n_arts = self.n_arts_by_size[size]
-                if n_arts <= 0 or size <= 0:
-                    continue
-                wp.launch(
-                    propagate_compact_body_impulses_for_size,
-                    dim=n_arts,
-                    inputs=[
-                        self.L_by_size[size],
-                        self.group_to_art[size],
-                        self.model.articulation_start,
-                        self.model.joint_child,
-                        self.articulation_dof_start,
-                        size,
-                        self.compact_response_max_dofs,
-                        self.compact_body_B,
-                        self.compact_body_impulses,
-                    ],
-                    outputs=[
-                        self._compact_qd_delta,
-                        self.compact_body_qd,
-                        self.v_out,
-                    ],
-                    device=self.model.device,
-                )
+    def _propagate_response(self) -> None:
+        if not self._propagation_contacts_enabled():
             return
 
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
             if n_arts <= 0 or size <= 0:
                 continue
-            if not self._compact_tree_has_non_free_by_size.get(int(size), True):
+            if not self._propagation_tree_has_non_free_by_size.get(int(size), True):
                 continue
-            warp_kernel = getattr(self, "_propagate_compact_tree_warp_kernels_by_size", {}).get(int(size))
+            warp_kernel = getattr(self, "_propagate_tree_warp_kernels_by_size", {}).get(int(size))
             if warp_kernel is not None:
                 wp.launch_tiled(
                     warp_kernel,
@@ -3163,18 +2851,18 @@ class SolverFeatherPGS(SolverBase):
                         self.model.joint_parent,
                         self.model.joint_child,
                         self.model.joint_qd_start,
-                        self.compact_joint_S_flat,
-                        self.compact_body_com_rel,
-                        self.compact_tree_U,
-                        self.compact_tree_D_inv,
-                        self.compact_body_impulses,
+                        self.propagation_joint_S_flat,
+                        self.propagation_body_com_rel,
+                        self.propagation_tree_U,
+                        self.propagation_tree_D_inv,
+                        self.propagation_body_impulses,
                     ],
                     outputs=[
-                        self.compact_tree_pA,
-                        self.compact_tree_u,
-                        self.compact_tree_qdd,
-                        self.compact_tree_body_delta,
-                        self.compact_body_qd,
+                        self.propagation_tree_pA,
+                        self.propagation_tree_u,
+                        self.propagation_tree_qdd,
+                        self.propagation_tree_body_delta,
+                        self.propagation_body_qd,
                         self.v_out,
                     ],
                     block_dim=32,
@@ -3182,7 +2870,7 @@ class SolverFeatherPGS(SolverBase):
                 )
                 continue
             wp.launch(
-                propagate_compact_tree_impulses_for_size,
+                propagate_tree_impulses_for_size,
                 dim=n_arts,
                 inputs=[
                     self.group_to_art[size],
@@ -3191,33 +2879,33 @@ class SolverFeatherPGS(SolverBase):
                     self.model.joint_child,
                     self.model.joint_qd_start,
                     self.model.joint_dof_dim,
-                    self.compact_joint_S_flat,
-                    self.compact_body_com_rel,
-                    self.compact_tree_U,
-                    self.compact_tree_D_inv,
-                    self.compact_body_impulses,
+                    self.propagation_joint_S_flat,
+                    self.propagation_body_com_rel,
+                    self.propagation_tree_U,
+                    self.propagation_tree_D_inv,
+                    self.propagation_body_impulses,
                 ],
                 outputs=[
-                    self.compact_tree_pA,
-                    self.compact_tree_u,
-                    self.compact_tree_qdd,
-                    self.compact_tree_body_delta,
-                    self.compact_body_qd,
+                    self.propagation_tree_pA,
+                    self.propagation_tree_u,
+                    self.propagation_tree_qdd,
+                    self.propagation_tree_body_delta,
+                    self.propagation_body_qd,
                     self.v_out,
                 ],
                 device=self.model.device,
             )
 
-    def _flush_compact_free_body_response(self) -> None:
+    def _flush_propagation_free_body_response(self) -> None:
         if (
-            not self._compact_contacts_enabled()
-            or self.compact_body_qd is None
+            not self._propagation_contacts_enabled()
+            or self.propagation_body_qd is None
             or not self._has_free_rigid_bodies
             or self.is_free_rigid is None
         ):
             return
         wp.launch(
-            flush_compact_free_body_qd_to_vout,
+            flush_propagation_free_body_qd_to_vout,
             dim=self.model.body_count,
             inputs=[
                 self.body_to_articulation,
@@ -3226,14 +2914,14 @@ class SolverFeatherPGS(SolverBase):
                 self.articulation_root_com_offset,
             ],
             outputs=[
-                self.compact_body_qd,
-                self.compact_body_impulses,
+                self.propagation_body_qd,
+                self.propagation_body_impulses,
                 self.v_out,
             ],
             device=self.model.device,
         )
 
-    def _launch_compact_full_fused_iterations(
+    def _launch_propagation_full_fused_iterations(
         self,
         *,
         rhs: wp.array,
@@ -3242,8 +2930,8 @@ class SolverFeatherPGS(SolverBase):
         friction_start_iteration: int,
         iteration_offset: int,
     ) -> bool:
-        kernel = getattr(self, "_pgs_solve_compact_full_fused_kernel", None)
-        fused_size = getattr(self, "_compact_full_fused_size", None)
+        kernel = getattr(self, "_pgs_solve_propagation_full_fused_kernel", None)
+        fused_size = getattr(self, "_propagation_full_fused_size", None)
         if kernel is None or fused_size is None or iterations <= 0:
             return False
 
@@ -3255,21 +2943,21 @@ class SolverFeatherPGS(SolverBase):
             kernel,
             dim=[self.world_count],
             inputs=[
-                self.compact_constraint_count,
-                self.compact_body_count,
-                self.compact_body_list,
-                self.max_compact_bodies,
-                self.compact_body_a,
-                self.compact_body_b,
-                self.compact_MiJt_a,
-                self.compact_MiJt_b,
-                self.compact_J_a,
-                self.compact_J_b,
-                self.compact_eff_mass_inv,
+                self.propagation_constraint_count,
+                self.propagation_body_count,
+                self.propagation_body_list,
+                self.max_propagation_bodies,
+                self.propagation_body_a,
+                self.propagation_body_b,
+                self.propagation_MiJt_a,
+                self.propagation_MiJt_b,
+                self.propagation_J_a,
+                self.propagation_J_b,
+                self.propagation_eff_mass_inv,
                 rhs,
-                self.compact_row_type,
-                self.compact_row_parent,
-                self.compact_row_mu,
+                self.propagation_row_type,
+                self.propagation_row_parent,
+                self.propagation_row_mu,
                 self.body_to_articulation,
                 self.is_free_rigid,
                 self.articulation_root_dof_start,
@@ -3280,31 +2968,31 @@ class SolverFeatherPGS(SolverBase):
                 self.model.joint_parent,
                 self.model.joint_child,
                 self.model.joint_qd_start,
-                self.compact_joint_S_flat,
-                self.compact_body_com_rel,
-                self.compact_tree_U,
-                self.compact_tree_D_inv,
+                self.propagation_joint_S_flat,
+                self.propagation_body_com_rel,
+                self.propagation_tree_U,
+                self.propagation_tree_D_inv,
                 iterations,
                 omega,
                 int(friction_start_iteration),
                 int(iteration_offset),
             ],
             outputs=[
-                self.compact_impulses,
-                self.compact_tree_pA,
-                self.compact_tree_u,
-                self.compact_tree_qdd,
-                self.compact_tree_body_delta,
-                self.compact_body_qd,
-                self.compact_body_impulses,
+                self.propagation_impulses,
+                self.propagation_tree_pA,
+                self.propagation_tree_u,
+                self.propagation_tree_qdd,
+                self.propagation_tree_body_delta,
+                self.propagation_body_qd,
+                self.propagation_body_impulses,
                 self.v_out,
             ],
-            block_dim=max(int(self._compact_full_fused_block_dim), 32),
+            block_dim=max(int(self._propagation_full_fused_block_dim), 32),
             device=self.model.device,
         )
         return True
 
-    def _compact_pgs_solve_one_iteration(
+    def _propagation_pgs_solve_one_iteration(
         self,
         *,
         rhs: wp.array,
@@ -3312,110 +3000,76 @@ class SolverFeatherPGS(SolverBase):
         friction_start_iteration: int,
         iteration_offset: int,
     ) -> None:
-        if not self._compact_contacts_enabled():
+        if not self._propagation_contacts_enabled():
             return
-        compact_kernel = getattr(self, "_pgs_solve_compact_kernel", None)
-        if compact_kernel is not None:
-            if self.compact_shared_row_solver:
-                wp.launch_tiled(
-                    compact_kernel,
-                    dim=[self.world_count],
-                    inputs=[
-                        self.compact_constraint_count,
-                        self.compact_body_count,
-                        self.compact_body_list,
-                        self.compact_body_local_slot,
-                        self.compact_body_a,
-                        self.compact_body_b,
-                        self.compact_MiJt_a,
-                        self.compact_MiJt_b,
-                        self.compact_J_a,
-                        self.compact_J_b,
-                        self.compact_eff_mass_inv,
-                        rhs,
-                        self.compact_row_type,
-                        self.compact_row_parent,
-                        self.compact_row_mu,
-                        1,
-                        omega,
-                        int(friction_start_iteration),
-                        int(iteration_offset),
-                    ],
-                    outputs=[
-                        self.compact_impulses,
-                        self.compact_body_qd,
-                        self.compact_body_impulses,
-                    ],
-                    block_dim=32,
-                    device=self.model.device,
-                )
-            else:
-                wp.launch_tiled(
-                    compact_kernel,
-                    dim=[self.world_count],
-                    inputs=[
-                        self.compact_constraint_count,
-                        self.compact_body_a,
-                        self.compact_body_b,
-                        self.compact_MiJt_a,
-                        self.compact_MiJt_b,
-                        self.compact_J_a,
-                        self.compact_J_b,
-                        self.compact_eff_mass_inv,
-                        rhs,
-                        self.compact_row_type,
-                        self.compact_row_parent,
-                        self.compact_row_mu,
-                        1,
-                        omega,
-                        int(friction_start_iteration),
-                        int(iteration_offset),
-                    ],
-                    outputs=[
-                        self.compact_impulses,
-                        self.compact_body_qd,
-                        self.compact_body_impulses,
-                    ],
-                    block_dim=32,
-                    device=self.model.device,
-                )
-        else:
-            wp.launch(
-                pgs_solve_compact_contact_loop,
-                dim=self.world_count,
+        propagation_kernel = getattr(self, "_pgs_solve_propagation_kernel", None)
+        if propagation_kernel is not None:
+            wp.launch_tiled(
+                propagation_kernel,
+                dim=[self.world_count],
                 inputs=[
-                    self.compact_constraint_count,
-                    self.compact_body_a,
-                    self.compact_body_b,
-                    self.compact_MiJt_a,
-                    self.compact_MiJt_b,
-                    self.compact_J_a,
-                    self.compact_J_b,
-                    self.compact_eff_mass_inv,
+                    self.propagation_constraint_count,
+                    self.propagation_body_a,
+                    self.propagation_body_b,
+                    self.propagation_MiJt_a,
+                    self.propagation_MiJt_b,
+                    self.propagation_J_a,
+                    self.propagation_J_b,
+                    self.propagation_eff_mass_inv,
                     rhs,
-                    self.compact_row_type,
-                    self.compact_row_parent,
-                    self.compact_row_mu,
-                    self.compact_max_constraints,
+                    self.propagation_row_type,
+                    self.propagation_row_parent,
+                    self.propagation_row_mu,
                     1,
                     omega,
                     int(friction_start_iteration),
                     int(iteration_offset),
                 ],
                 outputs=[
-                    self.compact_impulses,
-                    self.compact_body_qd,
-                    self.compact_body_impulses,
+                    self.propagation_impulses,
+                    self.propagation_body_qd,
+                    self.propagation_body_impulses,
+                ],
+                block_dim=32,
+                device=self.model.device,
+            )
+        else:
+            wp.launch(
+                pgs_solve_propagation_contact_loop,
+                dim=self.world_count,
+                inputs=[
+                    self.propagation_constraint_count,
+                    self.propagation_body_a,
+                    self.propagation_body_b,
+                    self.propagation_MiJt_a,
+                    self.propagation_MiJt_b,
+                    self.propagation_J_a,
+                    self.propagation_J_b,
+                    self.propagation_eff_mass_inv,
+                    rhs,
+                    self.propagation_row_type,
+                    self.propagation_row_parent,
+                    self.propagation_row_mu,
+                    self.propagation_max_constraints,
+                    1,
+                    omega,
+                    int(friction_start_iteration),
+                    int(iteration_offset),
+                ],
+                outputs=[
+                    self.propagation_impulses,
+                    self.propagation_body_qd,
+                    self.propagation_body_impulses,
                 ],
                 device=self.model.device,
             )
-        self._propagate_compact_response()
+        self._propagate_response()
 
-    def _launch_matrix_free_gs_solve_compact_tree(
+    def _launch_matrix_free_gs_solve_propagation_tree(
         self,
         *,
         dense_rhs: wp.array,
-        compact_rhs: wp.array,
+        propagation_rhs: wp.array,
         mf_meta: wp.array,
         iterations: int,
         omega: float,
@@ -3425,8 +3079,8 @@ class SolverFeatherPGS(SolverBase):
     ) -> None:
         if iterations <= 0:
             return
-        if self.articulated_dense_response_mode not in ("compact_cholesky", "compact_tree"):
-            raise RuntimeError("Compact tree solve requested while articulated_dense_response_mode is not compact")
+        if not self._propagation_contacts_enabled():
+            raise RuntimeError("Propagation solve requested while articulated_contact_response is 'immediate'")
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
 
@@ -3442,29 +3096,29 @@ class SolverFeatherPGS(SolverBase):
                 row_phase_override=row_phase,
             )
 
-        def launch_compact(global_iter: int) -> None:
-            self._refresh_compact_body_qd_from_vout()
-            if self._launch_compact_full_fused_iterations(
-                rhs=compact_rhs,
+        def launch_propagation(global_iter: int) -> None:
+            self._refresh_propagation_body_qd_from_vout()
+            if self._launch_propagation_full_fused_iterations(
+                rhs=propagation_rhs,
                 iterations=1,
                 omega=omega,
                 friction_start_iteration=friction_start_iteration,
                 iteration_offset=global_iter,
             ):
                 return
-            self._compact_pgs_solve_one_iteration(
-                rhs=compact_rhs,
+            self._propagation_pgs_solve_one_iteration(
+                rhs=propagation_rhs,
                 omega=omega,
                 friction_start_iteration=friction_start_iteration,
                 iteration_offset=global_iter,
             )
-            self._flush_compact_free_body_response()
+            self._flush_propagation_free_body_response()
 
         if self.pgs_schedule == "contact_then_internal":
             for local_iter in range(iterations):
                 global_iter = iteration_offset + local_iter
                 launch_existing(1, global_iter)
-                launch_compact(global_iter)
+                launch_propagation(global_iter)
             self._launch_matrix_free_gs_solve(
                 dense_rhs=dense_rhs,
                 mf_meta=mf_meta,
@@ -3480,70 +3134,23 @@ class SolverFeatherPGS(SolverBase):
                 global_iter = iteration_offset + local_iter
                 launch_existing(3, global_iter)
                 launch_existing(4, global_iter)
-                launch_compact(global_iter)
+                launch_propagation(global_iter)
                 launch_existing(5, global_iter)
         else:
             for local_iter in range(iterations):
                 global_iter = iteration_offset + local_iter
                 # A single legacy phase-0 launch solved dense/MF rows and the
-                # velocity-limit tail before compact rows existed. Once
-                # articulated contacts move to the compact phase, running that
+                # velocity-limit tail before propagation rows existed. Once
+                # articulated contacts move to the propagation phase, running that
                 # whole legacy phase first leaves velocity-limit rows blind to
-                # compact contact impulses until the next iteration. Use the
-                # existing three-pass contact schedule so compact contacts are
+                # propagation contact impulses until the next iteration. Use the
+                # existing three-pass contact schedule so propagation contacts are
                 # visible to the same-iteration velocity-limit pass while dense
                 # and free/free contact rows remain covered.
                 launch_existing(3, global_iter)  # dense drive/position-limit rows
                 launch_existing(4, global_iter)  # dense/MF contact/friction rows
-                launch_compact(global_iter)
+                launch_propagation(global_iter)
                 launch_existing(5, global_iter)  # dense/MF velocity-limit rows
-
-    def _launch_matrix_free_gs_solve_deferred_cholesky(
-        self,
-        *,
-        dense_rhs: wp.array,
-        mf_meta: wp.array,
-        iterations: int,
-        omega: float,
-        friction_start_iteration: int | None = None,
-        iteration_offset: int = 0,
-        freeze_drive_rows: bool = False,
-    ) -> None:
-        if iterations <= 0:
-            return
-        if self.articulated_dense_response_mode != "deferred_cholesky":
-            raise RuntimeError("Deferred Cholesky solve requested while articulated_dense_response_mode is immediate")
-        if friction_start_iteration is None:
-            friction_start_iteration = self._contact_friction_start_iteration(iterations)
-
-        wp.copy(self._deferred_dense_prev_impulses, self.impulses)
-
-        def launch_one_phase(row_phase: int, global_iter: int) -> None:
-            self._launch_matrix_free_gs_solve(
-                dense_rhs=dense_rhs,
-                mf_meta=mf_meta,
-                iterations=1,
-                omega=omega,
-                friction_start_iteration=friction_start_iteration,
-                iteration_offset=global_iter,
-                freeze_drive_rows=freeze_drive_rows,
-                row_phase_override=row_phase,
-                defer_dense_response=True,
-            )
-            self._propagate_deferred_dense_response()
-
-        if self.pgs_schedule == "contact_then_internal":
-            for row_phase in (1, 2):
-                for local_iter in range(iterations):
-                    launch_one_phase(row_phase, iteration_offset + local_iter)
-        elif self.pgs_schedule == "physx_grasp":
-            for local_iter in range(iterations):
-                global_iter = iteration_offset + local_iter
-                for row_phase in (3, 4, 5):
-                    launch_one_phase(row_phase, global_iter)
-        else:
-            for local_iter in range(iterations):
-                launch_one_phase(0, iteration_offset + local_iter)
 
     def _launch_matrix_free_position_solve(
         self,
@@ -3552,19 +3159,10 @@ class SolverFeatherPGS(SolverBase):
         friction_start_iteration: int | None = None,
         iteration_offset: int = 0,
     ) -> None:
-        if self.articulated_dense_response_mode in ("compact_cholesky", "compact_tree") and self._has_non_free_articulations:
-            self._launch_matrix_free_gs_solve_compact_tree(
+        if self._propagation_contacts_enabled():
+            self._launch_matrix_free_gs_solve_propagation_tree(
                 dense_rhs=self.rhs,
-                compact_rhs=self.compact_rhs,
-                mf_meta=self.mf_meta_packed,
-                iterations=iterations,
-                omega=self.pgs_omega,
-                friction_start_iteration=friction_start_iteration,
-                iteration_offset=iteration_offset,
-            )
-        elif self.articulated_dense_response_mode == "deferred_cholesky" and self._has_non_free_articulations:
-            self._launch_matrix_free_gs_solve_deferred_cholesky(
-                dense_rhs=self.rhs,
+                propagation_rhs=self.propagation_rhs,
                 mf_meta=self.mf_meta_packed,
                 iterations=iterations,
                 omega=self.pgs_omega,
@@ -3586,21 +3184,10 @@ class SolverFeatherPGS(SolverBase):
             return
 
         self._pack_mf_meta(self.mf_rhs_unbiased)
-        if self.articulated_dense_response_mode in ("compact_cholesky", "compact_tree") and self._has_non_free_articulations:
-            self._launch_matrix_free_gs_solve_compact_tree(
+        if self._propagation_contacts_enabled():
+            self._launch_matrix_free_gs_solve_propagation_tree(
                 dense_rhs=self.rhs_unbiased,
-                compact_rhs=self.compact_rhs_unbiased,
-                mf_meta=self.mf_meta_packed,
-                iterations=self.pgs_velocity_iterations,
-                omega=self.pgs_velocity_omega,
-                friction_start_iteration=self._contact_friction_start_iteration(
-                    self.pgs_velocity_iterations, velocity_pass=True
-                ),
-                freeze_drive_rows=self.pgs_velocity_drive_mode == "freeze",
-            )
-        elif self.articulated_dense_response_mode == "deferred_cholesky" and self._has_non_free_articulations:
-            self._launch_matrix_free_gs_solve_deferred_cholesky(
-                dense_rhs=self.rhs_unbiased,
+                propagation_rhs=self.propagation_rhs_unbiased,
                 mf_meta=self.mf_meta_packed,
                 iterations=self.pgs_velocity_iterations,
                 omega=self.pgs_velocity_omega,
@@ -3645,12 +3232,12 @@ class SolverFeatherPGS(SolverBase):
         )
         if self._has_free_rigid_bodies:
             self._compute_mf_rhs_bias(dt, bias_scale=0.0, speculative_scale=0.0, output=self.mf_rhs_unbiased)
-        if self._compact_contacts_enabled():
-            self._compute_compact_rhs_bias(
+        if self._propagation_contacts_enabled():
+            self._compute_propagation_rhs_bias(
                 dt,
                 bias_scale=0.0,
                 speculative_scale=0.0,
-                output=self.compact_rhs_unbiased,
+                output=self.propagation_rhs_unbiased,
             )
 
     def _snapshot_matrix_free_position_problem(self, contacts: Contacts | None) -> None:
@@ -3787,14 +3374,14 @@ class SolverFeatherPGS(SolverBase):
                 device=self.model.device,
             )
 
-        if self._compact_contacts_enabled():
-            self._compact_pgs_setup(state, state_aug, dt)
+        if self._propagation_contacts_enabled():
+            self._propagation_pgs_setup(state, state_aug, dt)
             if include_unbiased_rhs:
-                self._compute_compact_rhs_bias(
+                self._compute_propagation_rhs_bias(
                     dt,
                     bias_scale=0.0,
                     speculative_scale=0.0,
-                    output=self.compact_rhs_unbiased,
+                    output=self.propagation_rhs_unbiased,
                 )
 
         # Skipped under the J/Y alias (identity layout, see
@@ -3972,9 +3559,9 @@ class SolverFeatherPGS(SolverBase):
                         device=self.model.device,
                     )
 
-            if self._compact_contacts_enabled():
-                with wp.ScopedTimer("S4_Compact_Setup", print=False, use_nvtx=self._nvtx, synchronize=False):
-                    self._compact_pgs_setup(state_in, state_aug, dt)
+            if self._propagation_contacts_enabled():
+                with wp.ScopedTimer("S4_Propagation_Setup", print=False, use_nvtx=self._nvtx, synchronize=False):
+                    self._propagation_pgs_setup(state_in, state_aug, dt)
 
         else:
             fused_ok = (
@@ -4057,40 +3644,40 @@ class SolverFeatherPGS(SolverBase):
                 if self.pgs_debug:
                     self._pgs_convergence_log.append([])
                     self._pgs_ncp_residual_log.append([])
-                    compact_constraint_count = (
-                        self.compact_constraint_count
-                        if self.compact_constraint_count is not None
+                    propagation_constraint_count = (
+                        self.propagation_constraint_count
+                        if self.propagation_constraint_count is not None
                         else self._diag_zero_constraint_count
                     )
-                    compact_rhs = self.compact_rhs if self.compact_rhs is not None else self._diag_dummy_float_rows
-                    compact_impulses = (
-                        self.compact_impulses if self.compact_impulses is not None else self._diag_dummy_float_rows
+                    propagation_rhs = self.propagation_rhs if self.propagation_rhs is not None else self._diag_dummy_float_rows
+                    propagation_impulses = (
+                        self.propagation_impulses if self.propagation_impulses is not None else self._diag_dummy_float_rows
                     )
-                    compact_prev_impulses = (
-                        self._diag_prev_compact_impulses
-                        if self._diag_prev_compact_impulses is not None
+                    propagation_prev_impulses = (
+                        self._diag_prev_propagation_impulses
+                        if self._diag_prev_propagation_impulses is not None
                         else self._diag_dummy_float_rows
                     )
-                    compact_row_type = (
-                        self.compact_row_type if self.compact_row_type is not None else self._diag_dummy_int_rows
+                    propagation_row_type = (
+                        self.propagation_row_type if self.propagation_row_type is not None else self._diag_dummy_int_rows
                     )
-                    compact_row_parent = (
-                        self.compact_row_parent
-                        if self.compact_row_parent is not None
+                    propagation_row_parent = (
+                        self.propagation_row_parent
+                        if self.propagation_row_parent is not None
                         else self._diag_dummy_row_parent
                     )
-                    compact_row_mu = self.compact_row_mu if self.compact_row_mu is not None else self._diag_dummy_float_rows
-                    compact_phi = self.compact_phi if self.compact_phi is not None else self._diag_dummy_float_rows
-                    compact_J_a = self.compact_J_a if self.compact_J_a is not None else self._diag_dummy_jacobian
-                    compact_J_b = self.compact_J_b if self.compact_J_b is not None else self._diag_dummy_jacobian
-                    compact_body_a = (
-                        self.compact_body_a if self.compact_body_a is not None else self._diag_dummy_body_index
+                    propagation_row_mu = self.propagation_row_mu if self.propagation_row_mu is not None else self._diag_dummy_float_rows
+                    propagation_phi = self.propagation_phi if self.propagation_phi is not None else self._diag_dummy_float_rows
+                    propagation_J_a = self.propagation_J_a if self.propagation_J_a is not None else self._diag_dummy_jacobian
+                    propagation_J_b = self.propagation_J_b if self.propagation_J_b is not None else self._diag_dummy_jacobian
+                    propagation_body_a = (
+                        self.propagation_body_a if self.propagation_body_a is not None else self._diag_dummy_body_index
                     )
-                    compact_body_b = (
-                        self.compact_body_b if self.compact_body_b is not None else self._diag_dummy_body_index
+                    propagation_body_b = (
+                        self.propagation_body_b if self.propagation_body_b is not None else self._diag_dummy_body_index
                     )
-                    compact_body_qd = (
-                        self.compact_body_qd if self.compact_body_qd is not None else self._diag_dummy_body_qd
+                    propagation_body_qd = (
+                        self.propagation_body_qd if self.propagation_body_qd is not None else self._diag_dummy_body_qd
                     )
                     friction_start_iteration = self._contact_friction_start_iteration(self.pgs_iterations)
                     for _pgs_dbg_iter in range(self.pgs_iterations):
@@ -4098,8 +3685,8 @@ class SolverFeatherPGS(SolverBase):
                         wp.copy(self._diag_prev_impulses, self.impulses)
                         if self._diag_prev_mf_impulses is not None:
                             wp.copy(self._diag_prev_mf_impulses, self.mf_impulses)
-                        if self._diag_prev_compact_impulses is not None and self.compact_impulses is not None:
-                            wp.copy(self._diag_prev_compact_impulses, self.compact_impulses)
+                        if self._diag_prev_propagation_impulses is not None and self.propagation_impulses is not None:
+                            wp.copy(self._diag_prev_propagation_impulses, self.propagation_impulses)
 
                         # Run 1 diagnostic iteration. For the experimental split
                         # schedule this is one contact phase followed by one
@@ -4138,19 +3725,19 @@ class SolverFeatherPGS(SolverBase):
                                 self.mf_dof_a,
                                 self.mf_dof_b,
                                 self.mf_max_constraints,
-                                compact_constraint_count,
-                                compact_rhs,
-                                compact_impulses,
-                                compact_prev_impulses,
-                                compact_row_type,
-                                compact_row_parent,
-                                compact_row_mu,
-                                compact_J_a,
-                                compact_J_b,
-                                compact_body_a,
-                                compact_body_b,
-                                compact_body_qd,
-                                self.compact_max_constraints,
+                                propagation_constraint_count,
+                                propagation_rhs,
+                                propagation_impulses,
+                                propagation_prev_impulses,
+                                propagation_row_type,
+                                propagation_row_parent,
+                                propagation_row_mu,
+                                propagation_J_a,
+                                propagation_J_b,
+                                propagation_body_a,
+                                propagation_body_b,
+                                propagation_body_qd,
+                                self.propagation_max_constraints,
                                 self.v_out,
                             ],
                             outputs=[self._diag_metrics],
@@ -4198,19 +3785,19 @@ class SolverFeatherPGS(SolverBase):
                                 self.mf_dof_a,
                                 self.mf_dof_b,
                                 self.mf_max_constraints,
-                                compact_constraint_count,
-                                compact_rhs,
-                                compact_impulses,
-                                compact_row_type,
-                                compact_row_parent,
-                                compact_row_mu,
-                                compact_phi,
-                                compact_J_a,
-                                compact_J_b,
-                                compact_body_a,
-                                compact_body_b,
-                                compact_body_qd,
-                                self.compact_max_constraints,
+                                propagation_constraint_count,
+                                propagation_rhs,
+                                propagation_impulses,
+                                propagation_row_type,
+                                propagation_row_parent,
+                                propagation_row_mu,
+                                propagation_phi,
+                                propagation_J_a,
+                                propagation_J_b,
+                                propagation_body_a,
+                                propagation_body_b,
+                                propagation_body_qd,
+                                self.propagation_max_constraints,
                                 self.v_out,
                             ],
                             outputs=[self._diag_ncp_metrics],
@@ -4467,18 +4054,18 @@ class SolverFeatherPGS(SolverBase):
         mf_row_parent = getattr(self, "mf_row_parent", None)
         if mf_row_parent is None:
             mf_row_parent = self._dummy_contact_row_parent
-        compact_impulses = getattr(self, "compact_impulses", None)
-        if compact_impulses is None:
-            compact_impulses = self._dummy_contact_impulses
-        compact_constraint_count = getattr(self, "compact_constraint_count", None)
-        if compact_constraint_count is None:
-            compact_constraint_count = self._dummy_contact_count
-        compact_row_type = getattr(self, "compact_row_type", None)
-        if compact_row_type is None:
-            compact_row_type = self._dummy_contact_row_type
-        compact_row_parent = getattr(self, "compact_row_parent", None)
-        if compact_row_parent is None:
-            compact_row_parent = self._dummy_contact_row_parent
+        propagation_impulses = getattr(self, "propagation_impulses", None)
+        if propagation_impulses is None:
+            propagation_impulses = self._dummy_contact_impulses
+        propagation_constraint_count = getattr(self, "propagation_constraint_count", None)
+        if propagation_constraint_count is None:
+            propagation_constraint_count = self._dummy_contact_count
+        propagation_row_type = getattr(self, "propagation_row_type", None)
+        if propagation_row_type is None:
+            propagation_row_type = self._dummy_contact_row_type
+        propagation_row_parent = getattr(self, "propagation_row_parent", None)
+        if propagation_row_parent is None:
+            propagation_row_parent = self._dummy_contact_row_parent
 
         wp.launch(
             compute_contact_linear_force_from_impulses,
@@ -4491,16 +4078,16 @@ class SolverFeatherPGS(SolverBase):
                 self.contact_path,
                 self.impulses,
                 mf_impulses,
-                compact_impulses,
+                propagation_impulses,
                 self.constraint_count,
                 mf_constraint_count,
-                compact_constraint_count,
+                propagation_constraint_count,
                 self.row_type,
                 self.row_parent,
                 mf_row_type,
                 mf_row_parent,
-                compact_row_type,
-                compact_row_parent,
+                propagation_row_type,
+                propagation_row_parent,
                 enable_friction_flag,
                 inv_dt,
             ],
@@ -5170,7 +4757,7 @@ class SolverFeatherPGS(SolverBase):
         model = self.model
         max_constraints = self.dense_max_constraints
         mf_active = self._has_free_rigid_bodies and self.pgs_mode != "dense"
-        compact_active = self._compact_contacts_enabled()
+        propagation_active = self._propagation_contacts_enabled()
 
         # Zero world-level buffers (only arrays that require it)
         self.slot_counter.zero_()  # atomic-add counter
@@ -5188,27 +4775,27 @@ class SolverFeatherPGS(SolverBase):
             # mf_J_a/b, mf_MiJt_a/b: writers cover all used slots, readers gated by body >= 0
             # mf_body_a/b, mf_row_type, mf_row_parent, mf_row_mu, mf_phi: unconditionally overwritten
             # constraint_count: fully overwritten by finalize_world_constraint_counts
-        if compact_active:
-            self.compact_slot_counter.zero_()
-            self.compact_constraint_count.zero_()
-            self.compact_impulses.zero_()
-            self.compact_J_a.zero_()
-            self.compact_J_b.zero_()
-            self.compact_MiJt_a.zero_()
-            self.compact_MiJt_b.zero_()
-            self.compact_body_impulses.zero_()
-            self.compact_body_count.zero_()
-            self.compact_body_seen.zero_()
+        if propagation_active:
+            self.propagation_slot_counter.zero_()
+            self.propagation_constraint_count.zero_()
+            self.propagation_impulses.zero_()
+            self.propagation_J_a.zero_()
+            self.propagation_J_b.zero_()
+            self.propagation_MiJt_a.zero_()
+            self.propagation_MiJt_b.zero_()
+            self.propagation_body_impulses.zero_()
+            self.propagation_body_count.zero_()
+            self.propagation_body_seen.zero_()
 
         has_free_rigid_flag = 1 if mf_active else 0
-        compact_flag = 1 if compact_active else 0
+        propagation_flag = 1 if propagation_active else 0
         # Dummy arrays when MF is not active (kernel still needs valid pointers).
         # Preallocated in __init__: a per-step wp.zeros here would add an
         # allocation + memset every step and, under CUDA graph capture, leave
         # the graph holding a pointer to a freed temporary.
         is_free_rigid = self.is_free_rigid if self.is_free_rigid is not None else self._dummy_is_free_rigid
         mf_slot_counter = self.mf_slot_counter if mf_active else self._dummy_mf_slot_counter
-        compact_slot_counter = self.compact_slot_counter if compact_active else self._dummy_mf_slot_counter
+        propagation_slot_counter = self.propagation_slot_counter if propagation_active else self._dummy_mf_slot_counter
         j_buffers_zeroed = False
 
         drive_active = self.drive_mode == "physx_pgs" and self.drive_slot is not None
@@ -5305,10 +4892,10 @@ class SolverFeatherPGS(SolverBase):
                     self.art_to_world,
                     is_free_rigid,
                     has_free_rigid_flag,
-                    compact_flag,
+                    propagation_flag,
                     max_constraints,
                     self.mf_max_constraints,
-                    self.compact_max_constraints,
+                    self.propagation_max_constraints,
                     enable_friction_flag,
                     self.contact_friction_gap_threshold,
                     self.contact_friction_anchor_limit,
@@ -5321,7 +4908,7 @@ class SolverFeatherPGS(SolverBase):
                     self.slot_counter,
                     self.contact_path,
                     mf_slot_counter,
-                    compact_slot_counter,
+                    propagation_slot_counter,
                 ],
                 device=model.device,
             )
@@ -5554,9 +5141,9 @@ class SolverFeatherPGS(SolverBase):
                     device=model.device,
                 )
 
-            if compact_active:
+            if propagation_active:
                 wp.launch(
-                    build_compact_contact_rows,
+                    build_propagation_contact_rows,
                     dim=contacts.rigid_contact_max,
                     inputs=[
                         contacts.rigid_contact_count,
@@ -5582,68 +5169,46 @@ class SolverFeatherPGS(SolverBase):
                         int(self.contact_shared_anchor),
                     ],
                     outputs=[
-                        self.compact_body_a,
-                        self.compact_body_b,
-                        self.compact_J_a,
-                        self.compact_J_b,
-                        self.compact_row_type,
-                        self.compact_row_parent,
-                        self.compact_row_mu,
-                        self.compact_phi,
+                        self.propagation_body_a,
+                        self.propagation_body_b,
+                        self.propagation_J_a,
+                        self.propagation_J_b,
+                        self.propagation_row_type,
+                        self.propagation_row_parent,
+                        self.propagation_row_mu,
+                        self.propagation_phi,
                     ],
                     device=model.device,
                 )
 
-            if compact_active:
+            if propagation_active:
                 slots_per_contact = 3 if self.enable_contact_friction else 1
                 wp.launch(
                     finalize_mf_constraint_counts,
                     dim=self.world_count,
-                    inputs=[self.compact_slot_counter, self.compact_max_constraints, slots_per_contact],
-                    outputs=[self.compact_constraint_count],
+                    inputs=[self.propagation_slot_counter, self.propagation_max_constraints, slots_per_contact],
+                    outputs=[self.propagation_constraint_count],
                     device=model.device,
                 )
-                if (
-                    self._compact_tree_requires_body_map
-                    or self.compact_shared_row_solver
-                    or self._compact_full_fused_size is not None
-                ):
-                    if self.compact_fast_body_map or self.compact_shared_row_solver:
-                        wp.launch(
-                            build_compact_body_map,
-                            dim=self.world_count * self.compact_max_constraints,
-                            inputs=[
-                                self.compact_constraint_count,
-                                self.compact_body_a,
-                                self.compact_body_b,
-                                self.compact_max_constraints,
-                                self.max_compact_bodies,
-                                self.compact_body_seen,
-                            ],
-                            outputs=[
-                                self.compact_body_list,
-                                self.compact_body_count,
-                                self.compact_body_local_slot,
-                            ],
-                            device=model.device,
-                        )
-                    else:
-                        wp.launch(
-                            build_compact_body_map_slow,
-                            dim=self.world_count,
-                            inputs=[
-                                self.compact_constraint_count,
-                                self.compact_body_a,
-                                self.compact_body_b,
-                                self.compact_max_constraints,
-                                self.max_compact_bodies,
-                            ],
-                            outputs=[
-                                self.compact_body_list,
-                                self.compact_body_count,
-                            ],
-                            device=model.device,
-                        )
+                if self._propagation_tree_requires_body_map or self._propagation_full_fused_size is not None:
+                    wp.launch(
+                        build_propagation_body_map,
+                        dim=self.world_count * self.propagation_max_constraints,
+                        inputs=[
+                            self.propagation_constraint_count,
+                            self.propagation_body_a,
+                            self.propagation_body_b,
+                            self.propagation_max_constraints,
+                            self.max_propagation_bodies,
+                            self.propagation_body_seen,
+                        ],
+                        outputs=[
+                            self.propagation_body_list,
+                            self.propagation_body_count,
+                            self.propagation_body_local_slot,
+                        ],
+                        device=model.device,
+                    )
 
             if mf_active:
                 slots_per_contact = 3 if self.enable_contact_friction else 1
@@ -6822,7 +6387,7 @@ class SolverFeatherPGS(SolverBase):
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
 
-        # Build compact body map for standalone MF kernel
+        # Build propagation body map for standalone MF kernel
         wp.launch(
             build_mf_body_map,
             dim=self.world_count,
@@ -8439,16 +8004,16 @@ def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.K
 
 
 @cache
-def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_arch: str) -> "wp.Kernel":
-    """Build a one-warp compact contact GS kernel for fixed-size body rows."""
-    M = compact_max_constraints
+def _get_pgs_solve_propagation_contact_kernel(propagation_max_constraints: int, device_arch: str) -> "wp.Kernel":
+    """Build a one-warp propagation contact GS kernel for fixed-size body rows."""
+    M = propagation_max_constraints
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const int lane = threadIdx.x & 31;
-    int m = compact_constraint_count.data[world];
+    int m = propagation_constraint_count.data[world];
     if (m > {M}) m = {M};
     const int world_base = world * {M};
 
@@ -8456,21 +8021,21 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
         const int global_iter = iteration_offset + it;
         for (int i = 0; i < m; ++i) {{
             const int off = world_base + i;
-            const int row_type = compact_row_type.data[off];
+            const int row_type = propagation_row_type.data[off];
             if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
-                if (lane == 0) compact_impulses.data[off] = 0.0f;
+                if (lane == 0) propagation_impulses.data[off] = 0.0f;
                 __syncwarp();
                 continue;
             }}
 
-            const float eff_inv = compact_eff_mass_inv.data[off];
+            const float eff_inv = propagation_eff_mass_inv.data[off];
             if (eff_inv <= 0.0f) {{
                 __syncwarp();
                 continue;
             }}
 
-            const int ba = compact_body_a.data[off];
-            const int bb = compact_body_b.data[off];
+            const int ba = propagation_body_a.data[off];
+            const int bb = propagation_body_b.data[off];
             int active_body = -1;
             int active_k = -1;
             float active_J = 0.0f;
@@ -8480,17 +8045,17 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
                 const int elem = off * 6 + lane;
                 active_body = ba;
                 active_k = lane;
-                active_J = compact_J_a.data[elem];
-                active_MiJt = compact_MiJt_a.data[elem];
-                partial = active_J * compact_body_qd.data[ba * 6 + lane];
+                active_J = propagation_J_a.data[elem];
+                active_MiJt = propagation_MiJt_a.data[elem];
+                partial = active_J * propagation_body_qd.data[ba * 6 + lane];
             }} else if (lane >= 6 && lane < 12 && bb >= 0) {{
                 const int k = lane - 6;
                 const int elem = off * 6 + k;
                 active_body = bb;
                 active_k = k;
-                active_J = compact_J_b.data[elem];
-                active_MiJt = compact_MiJt_b.data[elem];
-                partial = active_J * compact_body_qd.data[bb * 6 + k];
+                active_J = propagation_J_b.data[elem];
+                active_MiJt = propagation_MiJt_b.data[elem];
+                partial = active_J * propagation_body_qd.data[bb * 6 + k];
             }}
             for (int offset = 16; offset > 0; offset >>= 1) {{
                 partial += __shfl_down_sync(0xffffffff, partial, offset);
@@ -8500,59 +8065,59 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
             int sib = -1;
             float sib_delta = 0.0f;
             if (lane == 0) {{
-                const float residual = partial + compact_rhs.data[off];
-                const float old_impulse = compact_impulses.data[off];
+                const float residual = partial + propagation_rhs.data[off];
+                const float old_impulse = propagation_impulses.data[off];
                 float new_impulse = old_impulse + omega * (-residual * eff_inv);
 
                 if (row_type == {contact_type}) {{
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                 }} else if (row_type == {friction_type}) {{
-                    const int parent_idx = compact_row_parent.data[off];
-                    const float lambda_n = compact_impulses.data[world_base + parent_idx];
-                    const float radius = fmaxf(compact_row_mu.data[off] * lambda_n, 0.0f);
+                    const int parent_idx = propagation_row_parent.data[off];
+                    const float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
                     if (radius <= 0.0f) {{
                         new_impulse = 0.0f;
                     }} else {{
                         sib = parent_idx + 1;
                         if (i == parent_idx + 1) sib = parent_idx + 2;
-                        compact_impulses.data[off] = new_impulse;
+                        propagation_impulses.data[off] = new_impulse;
                         const int sib_off = world_base + sib;
-                        const float other = compact_impulses.data[sib_off];
+                        const float other = propagation_impulses.data[sib_off];
                         const float mag = sqrtf(new_impulse * new_impulse + other * other);
                         if (mag > radius) {{
                             const float scale = radius / mag;
                             new_impulse *= scale;
                             const float sib_new = other * scale;
                             sib_delta = sib_new - other;
-                            compact_impulses.data[sib_off] = sib_new;
+                            propagation_impulses.data[sib_off] = sib_new;
                         }}
                     }}
                 }}
 
                 delta_impulse = new_impulse - old_impulse;
-                compact_impulses.data[off] = new_impulse;
+                propagation_impulses.data[off] = new_impulse;
             }}
 
             sib = __shfl_sync(0xffffffff, sib, 0);
             sib_delta = __shfl_sync(0xffffffff, sib_delta, 0);
             if (sib_delta != 0.0f) {{
                 const int sib_off = world_base + sib;
-                const int sib_ba = compact_body_a.data[sib_off];
-                const int sib_bb = compact_body_b.data[sib_off];
+                const int sib_ba = propagation_body_a.data[sib_off];
+                const int sib_bb = propagation_body_b.data[sib_off];
                 if (lane < 6 && sib_ba >= 0) {{
-                    compact_body_qd.data[sib_ba * 6 + lane] += compact_MiJt_a.data[sib_off * 6 + lane] * sib_delta;
-                    compact_body_impulses.data[sib_ba * 6 + lane] += compact_J_a.data[sib_off * 6 + lane] * sib_delta;
+                    propagation_body_qd.data[sib_ba * 6 + lane] += propagation_MiJt_a.data[sib_off * 6 + lane] * sib_delta;
+                    propagation_body_impulses.data[sib_ba * 6 + lane] += propagation_J_a.data[sib_off * 6 + lane] * sib_delta;
                 }} else if (lane >= 6 && lane < 12 && sib_bb >= 0) {{
                     const int k = lane - 6;
-                    compact_body_qd.data[sib_bb * 6 + k] += compact_MiJt_b.data[sib_off * 6 + k] * sib_delta;
-                    compact_body_impulses.data[sib_bb * 6 + k] += compact_J_b.data[sib_off * 6 + k] * sib_delta;
+                    propagation_body_qd.data[sib_bb * 6 + k] += propagation_MiJt_b.data[sib_off * 6 + k] * sib_delta;
+                    propagation_body_impulses.data[sib_bb * 6 + k] += propagation_J_b.data[sib_off * 6 + k] * sib_delta;
                 }}
             }}
 
             delta_impulse = __shfl_sync(0xffffffff, delta_impulse, 0);
             if (delta_impulse != 0.0f && active_body >= 0) {{
-                compact_body_qd.data[active_body * 6 + active_k] += active_MiJt * delta_impulse;
-                compact_body_impulses.data[active_body * 6 + active_k] += active_J * delta_impulse;
+                propagation_body_qd.data[active_body * 6 + active_k] += active_MiJt * delta_impulse;
+                propagation_body_impulses.data[active_body * 6 + active_k] += active_J * delta_impulse;
             }}
             __syncwarp();
         }}
@@ -8562,89 +8127,89 @@ def _get_pgs_solve_compact_contact_kernel(compact_max_constraints: int, device_a
 """
 
     @wp.func_native(snippet)
-    def pgs_solve_compact_native(
+    def pgs_solve_propagation_native(
         world: int,
-        compact_constraint_count: wp.array[int],
-        compact_body_a: wp.array2d[int],
-        compact_body_b: wp.array2d[int],
-        compact_MiJt_a: wp.array3d[float],
-        compact_MiJt_b: wp.array3d[float],
-        compact_J_a: wp.array3d[float],
-        compact_J_b: wp.array3d[float],
-        compact_eff_mass_inv: wp.array2d[float],
-        compact_rhs: wp.array2d[float],
-        compact_row_type: wp.array2d[int],
-        compact_row_parent: wp.array2d[int],
-        compact_row_mu: wp.array2d[float],
+        propagation_constraint_count: wp.array[int],
+        propagation_body_a: wp.array2d[int],
+        propagation_body_b: wp.array2d[int],
+        propagation_MiJt_a: wp.array3d[float],
+        propagation_MiJt_b: wp.array3d[float],
+        propagation_J_a: wp.array3d[float],
+        propagation_J_b: wp.array3d[float],
+        propagation_eff_mass_inv: wp.array2d[float],
+        propagation_rhs: wp.array2d[float],
+        propagation_row_type: wp.array2d[int],
+        propagation_row_parent: wp.array2d[int],
+        propagation_row_mu: wp.array2d[float],
         iterations: int,
         omega: float,
         friction_start_iteration: int,
         iteration_offset: int,
-        compact_impulses: wp.array2d[float],
-        compact_body_qd: wp.array2d[float],
-        compact_body_impulses: wp.array2d[float],
+        propagation_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        propagation_body_impulses: wp.array2d[float],
     ): ...
 
-    def pgs_solve_compact_template(
-        compact_constraint_count: wp.array[int],
-        compact_body_a: wp.array2d[int],
-        compact_body_b: wp.array2d[int],
-        compact_MiJt_a: wp.array3d[float],
-        compact_MiJt_b: wp.array3d[float],
-        compact_J_a: wp.array3d[float],
-        compact_J_b: wp.array3d[float],
-        compact_eff_mass_inv: wp.array2d[float],
-        compact_rhs: wp.array2d[float],
-        compact_row_type: wp.array2d[int],
-        compact_row_parent: wp.array2d[int],
-        compact_row_mu: wp.array2d[float],
+    def pgs_solve_propagation_template(
+        propagation_constraint_count: wp.array[int],
+        propagation_body_a: wp.array2d[int],
+        propagation_body_b: wp.array2d[int],
+        propagation_MiJt_a: wp.array3d[float],
+        propagation_MiJt_b: wp.array3d[float],
+        propagation_J_a: wp.array3d[float],
+        propagation_J_b: wp.array3d[float],
+        propagation_eff_mass_inv: wp.array2d[float],
+        propagation_rhs: wp.array2d[float],
+        propagation_row_type: wp.array2d[int],
+        propagation_row_parent: wp.array2d[int],
+        propagation_row_mu: wp.array2d[float],
         iterations: int,
         omega: float,
         friction_start_iteration: int,
         iteration_offset: int,
-        compact_impulses: wp.array2d[float],
-        compact_body_qd: wp.array2d[float],
-        compact_body_impulses: wp.array2d[float],
+        propagation_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        propagation_body_impulses: wp.array2d[float],
     ):
         world, _lane = wp.tid()
-        pgs_solve_compact_native(
+        pgs_solve_propagation_native(
             world,
-            compact_constraint_count,
-            compact_body_a,
-            compact_body_b,
-            compact_MiJt_a,
-            compact_MiJt_b,
-            compact_J_a,
-            compact_J_b,
-            compact_eff_mass_inv,
-            compact_rhs,
-            compact_row_type,
-            compact_row_parent,
-            compact_row_mu,
+            propagation_constraint_count,
+            propagation_body_a,
+            propagation_body_b,
+            propagation_MiJt_a,
+            propagation_MiJt_b,
+            propagation_J_a,
+            propagation_J_b,
+            propagation_eff_mass_inv,
+            propagation_rhs,
+            propagation_row_type,
+            propagation_row_parent,
+            propagation_row_mu,
             iterations,
             omega,
             friction_start_iteration,
             iteration_offset,
-            compact_impulses,
-            compact_body_qd,
-            compact_body_impulses,
+            propagation_impulses,
+            propagation_body_qd,
+            propagation_body_impulses,
         )
 
-    name = f"pgs_solve_compact_contact_{compact_max_constraints}"
-    pgs_solve_compact_template.__name__ = name
-    pgs_solve_compact_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_compact_template)
+    name = f"pgs_solve_propagation_contact_{propagation_max_constraints}"
+    pgs_solve_propagation_template.__name__ = name
+    pgs_solve_propagation_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_template)
 
 
 @cache
-def _get_pgs_solve_compact_full_fused_kernel(
-    compact_max_constraints: int,
-    max_compact_bodies: int,
+def _get_pgs_solve_propagation_full_fused_kernel(
+    propagation_max_constraints: int,
+    max_propagation_bodies: int,
     target_size: int,
     device_arch: str,
 ) -> "wp.Kernel":
-    """Build a block-per-world compact solve kernel with row solve, propagation, and flush fused."""
-    M = compact_max_constraints
+    """Build a block-per-world propagation solve kernel with row solve, propagation, and flush fused."""
+    M = propagation_max_constraints
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
 
@@ -8656,7 +8221,7 @@ def _get_pgs_solve_compact_full_fused_kernel(
     const int prop_warp_start = (warp_count > 1) ? 1 : 0;
     const int prop_warps = (warp_count > 1) ? (warp_count - 1) : 1;
     const unsigned mask = 0xffffffffu;
-    int m = compact_constraint_count.data[world];
+    int m = propagation_constraint_count.data[world];
     if (m > {M}) m = {M};
     const int world_base = world * {M};
 
@@ -8666,21 +8231,21 @@ def _get_pgs_solve_compact_full_fused_kernel(
         if (warp == 0) {{
             for (int i = 0; i < m; ++i) {{
                 const int off = world_base + i;
-                const int row_type = compact_row_type.data[off];
+                const int row_type = propagation_row_type.data[off];
                 if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
-                    if (lane == 0) compact_impulses.data[off] = 0.0f;
+                    if (lane == 0) propagation_impulses.data[off] = 0.0f;
                     __syncwarp(mask);
                     continue;
                 }}
 
-                const float eff_inv = compact_eff_mass_inv.data[off];
+                const float eff_inv = propagation_eff_mass_inv.data[off];
                 if (eff_inv <= 0.0f) {{
                     __syncwarp(mask);
                     continue;
                 }}
 
-                const int ba = compact_body_a.data[off];
-                const int bb = compact_body_b.data[off];
+                const int ba = propagation_body_a.data[off];
+                const int bb = propagation_body_b.data[off];
                 int active_body = -1;
                 int active_k = -1;
                 float active_J = 0.0f;
@@ -8690,17 +8255,17 @@ def _get_pgs_solve_compact_full_fused_kernel(
                     const int elem = off * 6 + lane;
                     active_body = ba;
                     active_k = lane;
-                    active_J = compact_J_a.data[elem];
-                    active_MiJt = compact_MiJt_a.data[elem];
-                    partial = active_J * compact_body_qd.data[ba * 6 + lane];
+                    active_J = propagation_J_a.data[elem];
+                    active_MiJt = propagation_MiJt_a.data[elem];
+                    partial = active_J * propagation_body_qd.data[ba * 6 + lane];
                 }} else if (lane >= 6 && lane < 12 && bb >= 0) {{
                     const int k = lane - 6;
                     const int elem = off * 6 + k;
                     active_body = bb;
                     active_k = k;
-                    active_J = compact_J_b.data[elem];
-                    active_MiJt = compact_MiJt_b.data[elem];
-                    partial = active_J * compact_body_qd.data[bb * 6 + k];
+                    active_J = propagation_J_b.data[elem];
+                    active_MiJt = propagation_MiJt_b.data[elem];
+                    partial = active_J * propagation_body_qd.data[bb * 6 + k];
                 }}
                 for (int offset = 16; offset > 0; offset >>= 1) {{
                     partial += __shfl_down_sync(mask, partial, offset);
@@ -8710,59 +8275,59 @@ def _get_pgs_solve_compact_full_fused_kernel(
                 int sib = -1;
                 float sib_delta = 0.0f;
                 if (lane == 0) {{
-                    const float residual = partial + compact_rhs.data[off];
-                    const float old_impulse = compact_impulses.data[off];
+                    const float residual = partial + propagation_rhs.data[off];
+                    const float old_impulse = propagation_impulses.data[off];
                     float new_impulse = old_impulse + omega * (-residual * eff_inv);
 
                     if (row_type == {contact_type}) {{
                         if (new_impulse < 0.0f) new_impulse = 0.0f;
                     }} else if (row_type == {friction_type}) {{
-                        const int parent_idx = compact_row_parent.data[off];
-                        const float lambda_n = compact_impulses.data[world_base + parent_idx];
-                        const float radius = fmaxf(compact_row_mu.data[off] * lambda_n, 0.0f);
+                        const int parent_idx = propagation_row_parent.data[off];
+                        const float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                        const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
                         if (radius <= 0.0f) {{
                             new_impulse = 0.0f;
                         }} else {{
                             sib = parent_idx + 1;
                             if (i == parent_idx + 1) sib = parent_idx + 2;
-                            compact_impulses.data[off] = new_impulse;
+                            propagation_impulses.data[off] = new_impulse;
                             const int sib_off = world_base + sib;
-                            const float other = compact_impulses.data[sib_off];
+                            const float other = propagation_impulses.data[sib_off];
                             const float mag = sqrtf(new_impulse * new_impulse + other * other);
                             if (mag > radius) {{
                                 const float scale = radius / mag;
                                 new_impulse *= scale;
                                 const float sib_new = other * scale;
                                 sib_delta = sib_new - other;
-                                compact_impulses.data[sib_off] = sib_new;
+                                propagation_impulses.data[sib_off] = sib_new;
                             }}
                         }}
                     }}
 
                     delta_impulse = new_impulse - old_impulse;
-                    compact_impulses.data[off] = new_impulse;
+                    propagation_impulses.data[off] = new_impulse;
                 }}
 
                 sib = __shfl_sync(mask, sib, 0);
                 sib_delta = __shfl_sync(mask, sib_delta, 0);
                 if (sib_delta != 0.0f) {{
                     const int sib_off = world_base + sib;
-                    const int sib_ba = compact_body_a.data[sib_off];
-                    const int sib_bb = compact_body_b.data[sib_off];
+                    const int sib_ba = propagation_body_a.data[sib_off];
+                    const int sib_bb = propagation_body_b.data[sib_off];
                     if (lane < 6 && sib_ba >= 0) {{
-                        compact_body_qd.data[sib_ba * 6 + lane] += compact_MiJt_a.data[sib_off * 6 + lane] * sib_delta;
-                        compact_body_impulses.data[sib_ba * 6 + lane] += compact_J_a.data[sib_off * 6 + lane] * sib_delta;
+                        propagation_body_qd.data[sib_ba * 6 + lane] += propagation_MiJt_a.data[sib_off * 6 + lane] * sib_delta;
+                        propagation_body_impulses.data[sib_ba * 6 + lane] += propagation_J_a.data[sib_off * 6 + lane] * sib_delta;
                     }} else if (lane >= 6 && lane < 12 && sib_bb >= 0) {{
                         const int k = lane - 6;
-                        compact_body_qd.data[sib_bb * 6 + k] += compact_MiJt_b.data[sib_off * 6 + k] * sib_delta;
-                        compact_body_impulses.data[sib_bb * 6 + k] += compact_J_b.data[sib_off * 6 + k] * sib_delta;
+                        propagation_body_qd.data[sib_bb * 6 + k] += propagation_MiJt_b.data[sib_off * 6 + k] * sib_delta;
+                        propagation_body_impulses.data[sib_bb * 6 + k] += propagation_J_b.data[sib_off * 6 + k] * sib_delta;
                     }}
                 }}
 
                 delta_impulse = __shfl_sync(mask, delta_impulse, 0);
                 if (delta_impulse != 0.0f && active_body >= 0) {{
-                    compact_body_qd.data[active_body * 6 + active_k] += active_MiJt * delta_impulse;
-                    compact_body_impulses.data[active_body * 6 + active_k] += active_J * delta_impulse;
+                    propagation_body_qd.data[active_body * 6 + active_k] += active_MiJt * delta_impulse;
+                    propagation_body_impulses.data[active_body * 6 + active_k] += active_J * delta_impulse;
                 }}
                 __syncwarp(mask);
             }}
@@ -8785,35 +8350,35 @@ def _get_pgs_solve_compact_full_fused_kernel(
                 for (int joint = joint_start; joint < joint_end; ++joint) {{
                     const int body = joint_child.data[joint];
                     if (lane < 6) {{
-                        compact_tree_pA.data[body * 6 + lane] = 0.0f;
-                        compact_tree_body_delta.data[body * 6 + lane] = 0.0f;
+                        propagation_tree_pA.data[body * 6 + lane] = 0.0f;
+                        propagation_tree_body_delta.data[body * 6 + lane] = 0.0f;
                     }}
                     if (lane == 0) {{
                         const int dof_start = joint_qd_start.data[joint];
                         const int dof_end = joint_qd_start.data[joint + 1];
                         for (int dof = dof_start; dof < dof_end; ++dof) {{
-                            compact_tree_u.data[dof] = 0.0f;
-                            compact_tree_qdd.data[dof] = 0.0f;
+                            propagation_tree_u.data[dof] = 0.0f;
+                            propagation_tree_qdd.data[dof] = 0.0f;
                         }}
 
-                        const float fx = compact_body_impulses.data[body * 6 + 0];
-                        const float fy = compact_body_impulses.data[body * 6 + 1];
-                        const float fz = compact_body_impulses.data[body * 6 + 2];
-                        const float tx = compact_body_impulses.data[body * 6 + 3];
-                        const float ty = compact_body_impulses.data[body * 6 + 4];
-                        const float tz = compact_body_impulses.data[body * 6 + 5];
+                        const float fx = propagation_body_impulses.data[body * 6 + 0];
+                        const float fy = propagation_body_impulses.data[body * 6 + 1];
+                        const float fz = propagation_body_impulses.data[body * 6 + 2];
+                        const float tx = propagation_body_impulses.data[body * 6 + 3];
+                        const float ty = propagation_body_impulses.data[body * 6 + 4];
+                        const float tz = propagation_body_impulses.data[body * 6 + 5];
                         if (fx * fx + fy * fy + fz * fz + tx * tx + ty * ty + tz * tz > 0.0f) {{
                             has_impulse = 1;
                         }}
                     }}
 
                     if (lane < 6) {{
-                        const float fx = compact_body_impulses.data[body * 6 + 0];
-                        const float fy = compact_body_impulses.data[body * 6 + 1];
-                        const float fz = compact_body_impulses.data[body * 6 + 2];
-                        const float tx = compact_body_impulses.data[body * 6 + 3];
-                        const float ty = compact_body_impulses.data[body * 6 + 4];
-                        const float tz = compact_body_impulses.data[body * 6 + 5];
+                        const float fx = propagation_body_impulses.data[body * 6 + 0];
+                        const float fy = propagation_body_impulses.data[body * 6 + 1];
+                        const float fz = propagation_body_impulses.data[body * 6 + 2];
+                        const float tx = propagation_body_impulses.data[body * 6 + 3];
+                        const float ty = propagation_body_impulses.data[body * 6 + 4];
+                        const float tz = propagation_body_impulses.data[body * 6 + 5];
                         float value = 0.0f;
                         if (lane == 0) value = -fx;
                         else if (lane == 1) value = -fy;
@@ -8821,7 +8386,7 @@ def _get_pgs_solve_compact_full_fused_kernel(
                         else if (lane == 3) value = -tx;
                         else if (lane == 4) value = -ty;
                         else value = -tz;
-                        compact_tree_pA.data[body * 6 + lane] = value;
+                        propagation_tree_pA.data[body * 6 + lane] = value;
                     }}
                     __syncwarp(mask);
                 }}
@@ -8839,38 +8404,38 @@ def _get_pgs_solve_compact_full_fused_kernel(
 
                         float u = 0.0f;
                         if (has_dof && lane < 6) {{
-                            u = -compact_joint_S_flat.data[gdof * 6 + lane] * compact_tree_pA.data[child * 6 + lane];
+                            u = -propagation_joint_S_flat.data[gdof * 6 + lane] * propagation_tree_pA.data[child * 6 + lane];
                         }}
                         for (int shfl = 16; shfl > 0; shfl >>= 1) {{
                             u += __shfl_down_sync(mask, u, shfl);
                         }}
                         u = __shfl_sync(mask, u, 0);
                         if (has_dof && lane == 0) {{
-                            compact_tree_u.data[gdof] = u;
+                            propagation_tree_u.data[gdof] = u;
                         }}
 
                         if (parent >= 0 && lane < 6) {{
-                            float propagated = compact_tree_pA.data[child * 6 + lane];
+                            float propagated = propagation_tree_pA.data[child * 6 + lane];
                             if (has_dof) {{
-                                const float inv_d = compact_tree_D_inv.data[joint * 36];
-                                propagated += compact_tree_U.data[gdof * 6 + lane] * inv_d * u;
+                                const float inv_d = propagation_tree_D_inv.data[joint * 36];
+                                propagated += propagation_tree_U.data[gdof * 6 + lane] * inv_d * u;
                             }}
-                            const float ex = compact_body_com_rel.data[child * 3 + 0] - compact_body_com_rel.data[parent * 3 + 0];
-                            const float ey = compact_body_com_rel.data[child * 3 + 1] - compact_body_com_rel.data[parent * 3 + 1];
-                            const float ez = compact_body_com_rel.data[child * 3 + 2] - compact_body_com_rel.data[parent * 3 + 2];
+                            const float ex = propagation_body_com_rel.data[child * 3 + 0] - propagation_body_com_rel.data[parent * 3 + 0];
+                            const float ey = propagation_body_com_rel.data[child * 3 + 1] - propagation_body_com_rel.data[parent * 3 + 1];
+                            const float ez = propagation_body_com_rel.data[child * 3 + 2] - propagation_body_com_rel.data[parent * 3 + 2];
                             if (lane >= 3) {{
-                                const float inv_d = has_dof ? compact_tree_D_inv.data[joint * 36] : 0.0f;
-                                const float px = compact_tree_pA.data[child * 6 + 0]
-                                    + (has_dof ? compact_tree_U.data[gdof * 6 + 0] * inv_d * u : 0.0f);
-                                const float py = compact_tree_pA.data[child * 6 + 1]
-                                    + (has_dof ? compact_tree_U.data[gdof * 6 + 1] * inv_d * u : 0.0f);
-                                const float pz = compact_tree_pA.data[child * 6 + 2]
-                                    + (has_dof ? compact_tree_U.data[gdof * 6 + 2] * inv_d * u : 0.0f);
+                                const float inv_d = has_dof ? propagation_tree_D_inv.data[joint * 36] : 0.0f;
+                                const float px = propagation_tree_pA.data[child * 6 + 0]
+                                    + (has_dof ? propagation_tree_U.data[gdof * 6 + 0] * inv_d * u : 0.0f);
+                                const float py = propagation_tree_pA.data[child * 6 + 1]
+                                    + (has_dof ? propagation_tree_U.data[gdof * 6 + 1] * inv_d * u : 0.0f);
+                                const float pz = propagation_tree_pA.data[child * 6 + 2]
+                                    + (has_dof ? propagation_tree_U.data[gdof * 6 + 2] * inv_d * u : 0.0f);
                                 if (lane == 3) propagated += ey * pz - ez * py;
                                 else if (lane == 4) propagated += ez * px - ex * pz;
                                 else propagated += ex * py - ey * px;
                             }}
-                            compact_tree_pA.data[parent * 6 + lane] += propagated;
+                            propagation_tree_pA.data[parent * 6 + lane] += propagated;
                         }}
                         __syncwarp(mask);
                     }}
@@ -8885,13 +8450,13 @@ def _get_pgs_solve_compact_full_fused_kernel(
 
                         float parent_delta = 0.0f;
                         if (parent >= 0 && lane < 6) {{
-                            parent_delta = compact_tree_body_delta.data[parent * 6 + lane];
-                            const float ex = compact_body_com_rel.data[child * 3 + 0] - compact_body_com_rel.data[parent * 3 + 0];
-                            const float ey = compact_body_com_rel.data[child * 3 + 1] - compact_body_com_rel.data[parent * 3 + 1];
-                            const float ez = compact_body_com_rel.data[child * 3 + 2] - compact_body_com_rel.data[parent * 3 + 2];
-                            const float wx = compact_tree_body_delta.data[parent * 6 + 3];
-                            const float wy = compact_tree_body_delta.data[parent * 6 + 4];
-                            const float wz = compact_tree_body_delta.data[parent * 6 + 5];
+                            parent_delta = propagation_tree_body_delta.data[parent * 6 + lane];
+                            const float ex = propagation_body_com_rel.data[child * 3 + 0] - propagation_body_com_rel.data[parent * 3 + 0];
+                            const float ey = propagation_body_com_rel.data[child * 3 + 1] - propagation_body_com_rel.data[parent * 3 + 1];
+                            const float ez = propagation_body_com_rel.data[child * 3 + 2] - propagation_body_com_rel.data[parent * 3 + 2];
+                            const float wx = propagation_tree_body_delta.data[parent * 6 + 3];
+                            const float wy = propagation_tree_body_delta.data[parent * 6 + 4];
+                            const float wz = propagation_tree_body_delta.data[parent * 6 + 5];
                             if (lane == 0) parent_delta += wy * ez - wz * ey;
                             else if (lane == 1) parent_delta += wz * ex - wx * ez;
                             else if (lane == 2) parent_delta += wx * ey - wy * ex;
@@ -8901,15 +8466,15 @@ def _get_pgs_solve_compact_full_fused_kernel(
                         if (has_dof) {{
                             float parent_term = 0.0f;
                             if (parent >= 0 && lane < 6) {{
-                                parent_term = compact_tree_U.data[gdof * 6 + lane] * parent_delta;
+                                parent_term = propagation_tree_U.data[gdof * 6 + lane] * parent_delta;
                             }}
                             for (int shfl = 16; shfl > 0; shfl >>= 1) {{
                                 parent_term += __shfl_down_sync(mask, parent_term, shfl);
                             }}
                             parent_term = __shfl_sync(mask, parent_term, 0);
-                            qdd = compact_tree_D_inv.data[joint * 36] * (compact_tree_u.data[gdof] - parent_term);
+                            qdd = propagation_tree_D_inv.data[joint * 36] * (propagation_tree_u.data[gdof] - parent_term);
                             if (lane == 0) {{
-                                compact_tree_qdd.data[gdof] = qdd;
+                                propagation_tree_qdd.data[gdof] = qdd;
                                 v_out.data[gdof] += qdd;
                             }}
                             qdd = __shfl_sync(mask, qdd, 0);
@@ -8918,9 +8483,9 @@ def _get_pgs_solve_compact_full_fused_kernel(
                         if (lane < 6) {{
                             float value = parent_delta;
                             if (has_dof) {{
-                                value += compact_joint_S_flat.data[gdof * 6 + lane] * qdd;
+                                value += propagation_joint_S_flat.data[gdof * 6 + lane] * qdd;
                             }}
-                            compact_tree_body_delta.data[child * 6 + lane] = value;
+                            propagation_tree_body_delta.data[child * 6 + lane] = value;
                         }}
                         __syncwarp(mask);
                     }}
@@ -8937,27 +8502,27 @@ def _get_pgs_solve_compact_full_fused_kernel(
                     if (lane < 6) {{
                         float value = 0.0f;
                         if (parent >= 0) {{
-                            value = compact_tree_body_delta.data[parent * 6 + lane];
-                            const float ex = compact_body_com_rel.data[child * 3 + 0] - compact_body_com_rel.data[parent * 3 + 0];
-                            const float ey = compact_body_com_rel.data[child * 3 + 1] - compact_body_com_rel.data[parent * 3 + 1];
-                            const float ez = compact_body_com_rel.data[child * 3 + 2] - compact_body_com_rel.data[parent * 3 + 2];
-                            const float wx = compact_tree_body_delta.data[parent * 6 + 3];
-                            const float wy = compact_tree_body_delta.data[parent * 6 + 4];
-                            const float wz = compact_tree_body_delta.data[parent * 6 + 5];
+                            value = propagation_tree_body_delta.data[parent * 6 + lane];
+                            const float ex = propagation_body_com_rel.data[child * 3 + 0] - propagation_body_com_rel.data[parent * 3 + 0];
+                            const float ey = propagation_body_com_rel.data[child * 3 + 1] - propagation_body_com_rel.data[parent * 3 + 1];
+                            const float ez = propagation_body_com_rel.data[child * 3 + 2] - propagation_body_com_rel.data[parent * 3 + 2];
+                            const float wx = propagation_tree_body_delta.data[parent * 6 + 3];
+                            const float wy = propagation_tree_body_delta.data[parent * 6 + 4];
+                            const float wz = propagation_tree_body_delta.data[parent * 6 + 5];
                             if (lane == 0) value += wy * ez - wz * ey;
                             else if (lane == 1) value += wz * ex - wx * ez;
                             else if (lane == 2) value += wx * ey - wy * ex;
                         }}
                         if (has_dof) {{
-                            value += compact_joint_S_flat.data[gdof * 6 + lane] * v_out.data[gdof];
+                            value += propagation_joint_S_flat.data[gdof * 6 + lane] * v_out.data[gdof];
                         }}
-                        compact_tree_body_delta.data[child * 6 + lane] = value;
+                        propagation_tree_body_delta.data[child * 6 + lane] = value;
                     }}
                     __syncwarp(mask);
 
                     if (lane < 6) {{
-                        compact_body_qd.data[child * 6 + lane] = compact_tree_body_delta.data[child * 6 + lane];
-                        compact_body_impulses.data[child * 6 + lane] = 0.0f;
+                        propagation_body_qd.data[child * 6 + lane] = propagation_tree_body_delta.data[child * 6 + lane];
+                        propagation_body_impulses.data[child * 6 + lane] = 0.0f;
                     }}
                 }}
             }}
@@ -8966,14 +8531,14 @@ def _get_pgs_solve_compact_full_fused_kernel(
         __syncthreads();
 
         if (warp == 0) {{
-            int n_bodies = compact_body_count.data[world];
-            if (n_bodies > max_compact_bodies) n_bodies = max_compact_bodies;
-            const int body_base = world * max_compact_bodies;
+            int n_bodies = propagation_body_count.data[world];
+            if (n_bodies > max_propagation_bodies) n_bodies = max_propagation_bodies;
+            const int body_base = world * max_propagation_bodies;
             for (int local_body = 0; local_body < n_bodies; ++local_body) {{
-                const int flush_body = compact_body_list.data[body_base + local_body];
+                const int flush_body = propagation_body_list.data[body_base + local_body];
                 const int art = (flush_body >= 0) ? body_to_articulation.data[flush_body] : -1;
                 if (flush_body >= 0 && art >= 0 && is_free_rigid.data[art] != 0 && lane < 6) {{
-                    const float qdk = compact_body_qd.data[flush_body * 6 + lane];
+                    const float qdk = propagation_body_qd.data[flush_body * 6 + lane];
                     const float qd0 = __shfl_sync(0x3fu, qdk, 0);
                     const float qd1 = __shfl_sync(0x3fu, qdk, 1);
                     const float qd2 = __shfl_sync(0x3fu, qdk, 2);
@@ -8991,7 +8556,7 @@ def _get_pgs_solve_compact_full_fused_kernel(
                     else if (lane == 3) v_out.data[dof_start + 3] = qd3;
                     else if (lane == 4) v_out.data[dof_start + 4] = qd4;
                     else v_out.data[dof_start + 5] = qd5;
-                    compact_body_impulses.data[flush_body * 6 + lane] = 0.0f;
+                    propagation_body_impulses.data[flush_body * 6 + lane] = 0.0f;
                 }}
                 __syncwarp(mask);
             }}
@@ -9003,23 +8568,23 @@ def _get_pgs_solve_compact_full_fused_kernel(
 """
 
     @wp.func_native(snippet)
-    def pgs_solve_compact_full_fused_native(
+    def pgs_solve_propagation_full_fused_native(
         world: int,
-        compact_constraint_count: wp.array[int],
-        compact_body_count: wp.array[int],
-        compact_body_list: wp.array2d[int],
-        max_compact_bodies: int,
-        compact_body_a: wp.array2d[int],
-        compact_body_b: wp.array2d[int],
-        compact_MiJt_a: wp.array3d[float],
-        compact_MiJt_b: wp.array3d[float],
-        compact_J_a: wp.array3d[float],
-        compact_J_b: wp.array3d[float],
-        compact_eff_mass_inv: wp.array2d[float],
-        compact_rhs: wp.array2d[float],
-        compact_row_type: wp.array2d[int],
-        compact_row_parent: wp.array2d[int],
-        compact_row_mu: wp.array2d[float],
+        propagation_constraint_count: wp.array[int],
+        propagation_body_count: wp.array[int],
+        propagation_body_list: wp.array2d[int],
+        max_propagation_bodies: int,
+        propagation_body_a: wp.array2d[int],
+        propagation_body_b: wp.array2d[int],
+        propagation_MiJt_a: wp.array3d[float],
+        propagation_MiJt_b: wp.array3d[float],
+        propagation_J_a: wp.array3d[float],
+        propagation_J_b: wp.array3d[float],
+        propagation_eff_mass_inv: wp.array2d[float],
+        propagation_rhs: wp.array2d[float],
+        propagation_row_type: wp.array2d[int],
+        propagation_row_parent: wp.array2d[int],
+        propagation_row_mu: wp.array2d[float],
         body_to_articulation: wp.array[int],
         is_free_rigid: wp.array[int],
         articulation_root_dof_start: wp.array[int],
@@ -9030,40 +8595,40 @@ def _get_pgs_solve_compact_full_fused_kernel(
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
         joint_qd_start: wp.array[int],
-        compact_joint_S_flat: wp.array2d[float],
-        compact_body_com_rel: wp.array2d[float],
-        compact_tree_U: wp.array2d[float],
-        compact_tree_D_inv: wp.array3d[float],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        propagation_tree_U: wp.array2d[float],
+        propagation_tree_D_inv: wp.array3d[float],
         iterations: int,
         omega: float,
         friction_start_iteration: int,
         iteration_offset: int,
-        compact_impulses: wp.array2d[float],
-        compact_tree_pA: wp.array2d[float],
-        compact_tree_u: wp.array[float],
-        compact_tree_qdd: wp.array[float],
-        compact_tree_body_delta: wp.array2d[float],
-        compact_body_qd: wp.array2d[float],
-        compact_body_impulses: wp.array2d[float],
+        propagation_impulses: wp.array2d[float],
+        propagation_tree_pA: wp.array2d[float],
+        propagation_tree_u: wp.array[float],
+        propagation_tree_qdd: wp.array[float],
+        propagation_tree_body_delta: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        propagation_body_impulses: wp.array2d[float],
         v_out: wp.array[float],
     ): ...
 
-    def pgs_solve_compact_full_fused_template(
-        compact_constraint_count: wp.array[int],
-        compact_body_count: wp.array[int],
-        compact_body_list: wp.array2d[int],
-        max_compact_bodies: int,
-        compact_body_a: wp.array2d[int],
-        compact_body_b: wp.array2d[int],
-        compact_MiJt_a: wp.array3d[float],
-        compact_MiJt_b: wp.array3d[float],
-        compact_J_a: wp.array3d[float],
-        compact_J_b: wp.array3d[float],
-        compact_eff_mass_inv: wp.array2d[float],
-        compact_rhs: wp.array2d[float],
-        compact_row_type: wp.array2d[int],
-        compact_row_parent: wp.array2d[int],
-        compact_row_mu: wp.array2d[float],
+    def pgs_solve_propagation_full_fused_template(
+        propagation_constraint_count: wp.array[int],
+        propagation_body_count: wp.array[int],
+        propagation_body_list: wp.array2d[int],
+        max_propagation_bodies: int,
+        propagation_body_a: wp.array2d[int],
+        propagation_body_b: wp.array2d[int],
+        propagation_MiJt_a: wp.array3d[float],
+        propagation_MiJt_b: wp.array3d[float],
+        propagation_J_a: wp.array3d[float],
+        propagation_J_b: wp.array3d[float],
+        propagation_eff_mass_inv: wp.array2d[float],
+        propagation_rhs: wp.array2d[float],
+        propagation_row_type: wp.array2d[int],
+        propagation_row_parent: wp.array2d[int],
+        propagation_row_mu: wp.array2d[float],
         body_to_articulation: wp.array[int],
         is_free_rigid: wp.array[int],
         articulation_root_dof_start: wp.array[int],
@@ -9074,41 +8639,41 @@ def _get_pgs_solve_compact_full_fused_kernel(
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
         joint_qd_start: wp.array[int],
-        compact_joint_S_flat: wp.array2d[float],
-        compact_body_com_rel: wp.array2d[float],
-        compact_tree_U: wp.array2d[float],
-        compact_tree_D_inv: wp.array3d[float],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        propagation_tree_U: wp.array2d[float],
+        propagation_tree_D_inv: wp.array3d[float],
         iterations: int,
         omega: float,
         friction_start_iteration: int,
         iteration_offset: int,
-        compact_impulses: wp.array2d[float],
-        compact_tree_pA: wp.array2d[float],
-        compact_tree_u: wp.array[float],
-        compact_tree_qdd: wp.array[float],
-        compact_tree_body_delta: wp.array2d[float],
-        compact_body_qd: wp.array2d[float],
-        compact_body_impulses: wp.array2d[float],
+        propagation_impulses: wp.array2d[float],
+        propagation_tree_pA: wp.array2d[float],
+        propagation_tree_u: wp.array[float],
+        propagation_tree_qdd: wp.array[float],
+        propagation_tree_body_delta: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        propagation_body_impulses: wp.array2d[float],
         v_out: wp.array[float],
     ):
         world, _lane = wp.tid()
-        pgs_solve_compact_full_fused_native(
+        pgs_solve_propagation_full_fused_native(
             world,
-            compact_constraint_count,
-            compact_body_count,
-            compact_body_list,
-            max_compact_bodies,
-            compact_body_a,
-            compact_body_b,
-            compact_MiJt_a,
-            compact_MiJt_b,
-            compact_J_a,
-            compact_J_b,
-            compact_eff_mass_inv,
-            compact_rhs,
-            compact_row_type,
-            compact_row_parent,
-            compact_row_mu,
+            propagation_constraint_count,
+            propagation_body_count,
+            propagation_body_list,
+            max_propagation_bodies,
+            propagation_body_a,
+            propagation_body_b,
+            propagation_MiJt_a,
+            propagation_MiJt_b,
+            propagation_J_a,
+            propagation_J_b,
+            propagation_eff_mass_inv,
+            propagation_rhs,
+            propagation_row_type,
+            propagation_row_parent,
+            propagation_row_mu,
             body_to_articulation,
             is_free_rigid,
             articulation_root_dof_start,
@@ -9119,48 +8684,48 @@ def _get_pgs_solve_compact_full_fused_kernel(
             joint_parent,
             joint_child,
             joint_qd_start,
-            compact_joint_S_flat,
-            compact_body_com_rel,
-            compact_tree_U,
-            compact_tree_D_inv,
+            propagation_joint_S_flat,
+            propagation_body_com_rel,
+            propagation_tree_U,
+            propagation_tree_D_inv,
             iterations,
             omega,
             friction_start_iteration,
             iteration_offset,
-            compact_impulses,
-            compact_tree_pA,
-            compact_tree_u,
-            compact_tree_qdd,
-            compact_tree_body_delta,
-            compact_body_qd,
-            compact_body_impulses,
+            propagation_impulses,
+            propagation_tree_pA,
+            propagation_tree_u,
+            propagation_tree_qdd,
+            propagation_tree_body_delta,
+            propagation_body_qd,
+            propagation_body_impulses,
             v_out,
         )
 
-    name = f"pgs_solve_compact_full_fused_{compact_max_constraints}_{max_compact_bodies}_{target_size}"
-    pgs_solve_compact_full_fused_template.__name__ = name
-    pgs_solve_compact_full_fused_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_compact_full_fused_template)
+    name = f"pgs_solve_propagation_full_fused_{propagation_max_constraints}_{max_propagation_bodies}_{target_size}"
+    pgs_solve_propagation_full_fused_template.__name__ = name
+    pgs_solve_propagation_full_fused_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_full_fused_template)
 
 
 @cache
-def _get_pgs_solve_compact_contact_shared_kernel(
-    compact_max_constraints: int, max_compact_bodies: int, device_arch: str
+def _get_pgs_solve_propagation_contact_shared_kernel(
+    propagation_max_constraints: int, max_propagation_bodies: int, device_arch: str
 ) -> "wp.Kernel":
-    """Build a one-warp compact GS kernel with live compact body state in shared memory."""
-    M = compact_max_constraints
-    B = max(max_compact_bodies, 1)
+    """Build a one-warp propagation GS kernel with live propagation body state in shared memory."""
+    M = propagation_max_constraints
+    B = max(max_propagation_bodies, 1)
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const int lane = threadIdx.x & 31;
-    int m = compact_constraint_count.data[world];
+    int m = propagation_constraint_count.data[world];
     if (m > {M}) m = {M};
     if (m <= 0) return;
 
-    int n_bodies = compact_body_count.data[world];
+    int n_bodies = propagation_body_count.data[world];
     if (n_bodies > {B}) n_bodies = {B};
 
     const int world_base = world * {M};
@@ -9172,9 +8737,9 @@ def _get_pgs_solve_compact_contact_shared_kernel(
     for (int idx = lane; idx < n_bodies * 6; idx += 32) {{
         const int local_body = idx / 6;
         const int k = idx - local_body * 6;
-        const int body = compact_body_list.data[body_base + local_body];
+        const int body = propagation_body_list.data[body_base + local_body];
         float qd = 0.0f;
-        if (body >= 0) qd = compact_body_qd.data[body * 6 + k];
+        if (body >= 0) qd = propagation_body_qd.data[body * 6 + k];
         s_body_qd[idx] = qd;
         s_body_impulses[idx] = 0.0f;
     }}
@@ -9184,32 +8749,32 @@ def _get_pgs_solve_compact_contact_shared_kernel(
         const int global_iter = iteration_offset + it;
         for (int i = 0; i < m; ++i) {{
             const int off = world_base + i;
-            const int row_type = compact_row_type.data[off];
+            const int row_type = propagation_row_type.data[off];
             if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
-                if (lane == 0) compact_impulses.data[off] = 0.0f;
+                if (lane == 0) propagation_impulses.data[off] = 0.0f;
                 __syncwarp();
                 continue;
             }}
 
-            const float eff_inv = compact_eff_mass_inv.data[off];
+            const float eff_inv = propagation_eff_mass_inv.data[off];
             if (eff_inv <= 0.0f) {{
                 __syncwarp();
                 continue;
             }}
 
-            const int ba = compact_body_a.data[off];
-            const int bb = compact_body_b.data[off];
+            const int ba = propagation_body_a.data[off];
+            const int bb = propagation_body_b.data[off];
             int la = -1;
             int lb = -1;
-            if (ba >= 0) la = compact_body_local_slot.data[ba];
-            if (bb >= 0) lb = compact_body_local_slot.data[bb];
+            if (ba >= 0) la = propagation_body_local_slot.data[ba];
+            if (bb >= 0) lb = propagation_body_local_slot.data[bb];
 
             float partial = 0.0f;
             if (lane < 6 && la >= 0 && la < n_bodies) {{
-                partial = compact_J_a.data[off * 6 + lane] * s_body_qd[la * 6 + lane];
+                partial = propagation_J_a.data[off * 6 + lane] * s_body_qd[la * 6 + lane];
             }} else if (lane >= 6 && lane < 12 && lb >= 0 && lb < n_bodies) {{
                 const int k = lane - 6;
-                partial = compact_J_b.data[off * 6 + k] * s_body_qd[lb * 6 + k];
+                partial = propagation_J_b.data[off * 6 + k] * s_body_qd[lb * 6 + k];
             }}
             for (int offset = 16; offset > 0; offset >>= 1) {{
                 partial += __shfl_down_sync(0xffffffff, partial, offset);
@@ -9219,68 +8784,68 @@ def _get_pgs_solve_compact_contact_shared_kernel(
             int sib = -1;
             float sib_delta = 0.0f;
             if (lane == 0) {{
-                const float residual = partial + compact_rhs.data[off];
-                const float old_impulse = compact_impulses.data[off];
+                const float residual = partial + propagation_rhs.data[off];
+                const float old_impulse = propagation_impulses.data[off];
                 float new_impulse = old_impulse + omega * (-residual * eff_inv);
 
                 if (row_type == {contact_type}) {{
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                 }} else if (row_type == {friction_type}) {{
-                    const int parent_idx = compact_row_parent.data[off];
-                    const float lambda_n = compact_impulses.data[world_base + parent_idx];
-                    const float radius = fmaxf(compact_row_mu.data[off] * lambda_n, 0.0f);
+                    const int parent_idx = propagation_row_parent.data[off];
+                    const float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
                     if (radius <= 0.0f) {{
                         new_impulse = 0.0f;
                     }} else {{
                         sib = parent_idx + 1;
                         if (i == parent_idx + 1) sib = parent_idx + 2;
-                        compact_impulses.data[off] = new_impulse;
+                        propagation_impulses.data[off] = new_impulse;
                         const int sib_off = world_base + sib;
-                        const float other = compact_impulses.data[sib_off];
+                        const float other = propagation_impulses.data[sib_off];
                         const float mag = sqrtf(new_impulse * new_impulse + other * other);
                         if (mag > radius) {{
                             const float scale = radius / mag;
                             new_impulse *= scale;
                             const float sib_new = other * scale;
                             sib_delta = sib_new - other;
-                            compact_impulses.data[sib_off] = sib_new;
+                            propagation_impulses.data[sib_off] = sib_new;
                         }}
                     }}
                 }}
 
                 delta_impulse = new_impulse - old_impulse;
-                compact_impulses.data[off] = new_impulse;
+                propagation_impulses.data[off] = new_impulse;
             }}
 
             sib = __shfl_sync(0xffffffff, sib, 0);
             sib_delta = __shfl_sync(0xffffffff, sib_delta, 0);
             if (sib_delta != 0.0f) {{
                 const int sib_off = world_base + sib;
-                const int sib_ba = compact_body_a.data[sib_off];
-                const int sib_bb = compact_body_b.data[sib_off];
+                const int sib_ba = propagation_body_a.data[sib_off];
+                const int sib_bb = propagation_body_b.data[sib_off];
                 int sib_la = -1;
                 int sib_lb = -1;
-                if (sib_ba >= 0) sib_la = compact_body_local_slot.data[sib_ba];
-                if (sib_bb >= 0) sib_lb = compact_body_local_slot.data[sib_bb];
+                if (sib_ba >= 0) sib_la = propagation_body_local_slot.data[sib_ba];
+                if (sib_bb >= 0) sib_lb = propagation_body_local_slot.data[sib_bb];
                 if (lane < 6 && sib_la >= 0 && sib_la < n_bodies) {{
-                    s_body_qd[sib_la * 6 + lane] += compact_MiJt_a.data[sib_off * 6 + lane] * sib_delta;
-                    s_body_impulses[sib_la * 6 + lane] += compact_J_a.data[sib_off * 6 + lane] * sib_delta;
+                    s_body_qd[sib_la * 6 + lane] += propagation_MiJt_a.data[sib_off * 6 + lane] * sib_delta;
+                    s_body_impulses[sib_la * 6 + lane] += propagation_J_a.data[sib_off * 6 + lane] * sib_delta;
                 }} else if (lane >= 6 && lane < 12 && sib_lb >= 0 && sib_lb < n_bodies) {{
                     const int k = lane - 6;
-                    s_body_qd[sib_lb * 6 + k] += compact_MiJt_b.data[sib_off * 6 + k] * sib_delta;
-                    s_body_impulses[sib_lb * 6 + k] += compact_J_b.data[sib_off * 6 + k] * sib_delta;
+                    s_body_qd[sib_lb * 6 + k] += propagation_MiJt_b.data[sib_off * 6 + k] * sib_delta;
+                    s_body_impulses[sib_lb * 6 + k] += propagation_J_b.data[sib_off * 6 + k] * sib_delta;
                 }}
             }}
 
             delta_impulse = __shfl_sync(0xffffffff, delta_impulse, 0);
             if (delta_impulse != 0.0f) {{
                 if (lane < 6 && la >= 0 && la < n_bodies) {{
-                    s_body_qd[la * 6 + lane] += compact_MiJt_a.data[off * 6 + lane] * delta_impulse;
-                    s_body_impulses[la * 6 + lane] += compact_J_a.data[off * 6 + lane] * delta_impulse;
+                    s_body_qd[la * 6 + lane] += propagation_MiJt_a.data[off * 6 + lane] * delta_impulse;
+                    s_body_impulses[la * 6 + lane] += propagation_J_a.data[off * 6 + lane] * delta_impulse;
                 }} else if (lane >= 6 && lane < 12 && lb >= 0 && lb < n_bodies) {{
                     const int k = lane - 6;
-                    s_body_qd[lb * 6 + k] += compact_MiJt_b.data[off * 6 + k] * delta_impulse;
-                    s_body_impulses[lb * 6 + k] += compact_J_b.data[off * 6 + k] * delta_impulse;
+                    s_body_qd[lb * 6 + k] += propagation_MiJt_b.data[off * 6 + k] * delta_impulse;
+                    s_body_impulses[lb * 6 + k] += propagation_J_b.data[off * 6 + k] * delta_impulse;
                 }}
             }}
             __syncwarp();
@@ -9290,102 +8855,102 @@ def _get_pgs_solve_compact_contact_shared_kernel(
     for (int idx = lane; idx < n_bodies * 6; idx += 32) {{
         const int local_body = idx / 6;
         const int k = idx - local_body * 6;
-        const int body = compact_body_list.data[body_base + local_body];
+        const int body = propagation_body_list.data[body_base + local_body];
         if (body >= 0) {{
-            compact_body_qd.data[body * 6 + k] = s_body_qd[idx];
-            compact_body_impulses.data[body * 6 + k] = s_body_impulses[idx];
+            propagation_body_qd.data[body * 6 + k] = s_body_qd[idx];
+            propagation_body_impulses.data[body * 6 + k] = s_body_impulses[idx];
         }}
     }}
 #endif
 """
 
     @wp.func_native(snippet)
-    def pgs_solve_compact_shared_native(
+    def pgs_solve_propagation_shared_native(
         world: int,
-        compact_constraint_count: wp.array[int],
-        compact_body_count: wp.array[int],
-        compact_body_list: wp.array2d[int],
-        compact_body_local_slot: wp.array[int],
-        compact_body_a: wp.array2d[int],
-        compact_body_b: wp.array2d[int],
-        compact_MiJt_a: wp.array3d[float],
-        compact_MiJt_b: wp.array3d[float],
-        compact_J_a: wp.array3d[float],
-        compact_J_b: wp.array3d[float],
-        compact_eff_mass_inv: wp.array2d[float],
-        compact_rhs: wp.array2d[float],
-        compact_row_type: wp.array2d[int],
-        compact_row_parent: wp.array2d[int],
-        compact_row_mu: wp.array2d[float],
+        propagation_constraint_count: wp.array[int],
+        propagation_body_count: wp.array[int],
+        propagation_body_list: wp.array2d[int],
+        propagation_body_local_slot: wp.array[int],
+        propagation_body_a: wp.array2d[int],
+        propagation_body_b: wp.array2d[int],
+        propagation_MiJt_a: wp.array3d[float],
+        propagation_MiJt_b: wp.array3d[float],
+        propagation_J_a: wp.array3d[float],
+        propagation_J_b: wp.array3d[float],
+        propagation_eff_mass_inv: wp.array2d[float],
+        propagation_rhs: wp.array2d[float],
+        propagation_row_type: wp.array2d[int],
+        propagation_row_parent: wp.array2d[int],
+        propagation_row_mu: wp.array2d[float],
         iterations: int,
         omega: float,
         friction_start_iteration: int,
         iteration_offset: int,
-        compact_impulses: wp.array2d[float],
-        compact_body_qd: wp.array2d[float],
-        compact_body_impulses: wp.array2d[float],
+        propagation_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        propagation_body_impulses: wp.array2d[float],
     ): ...
 
-    def pgs_solve_compact_shared_template(
-        compact_constraint_count: wp.array[int],
-        compact_body_count: wp.array[int],
-        compact_body_list: wp.array2d[int],
-        compact_body_local_slot: wp.array[int],
-        compact_body_a: wp.array2d[int],
-        compact_body_b: wp.array2d[int],
-        compact_MiJt_a: wp.array3d[float],
-        compact_MiJt_b: wp.array3d[float],
-        compact_J_a: wp.array3d[float],
-        compact_J_b: wp.array3d[float],
-        compact_eff_mass_inv: wp.array2d[float],
-        compact_rhs: wp.array2d[float],
-        compact_row_type: wp.array2d[int],
-        compact_row_parent: wp.array2d[int],
-        compact_row_mu: wp.array2d[float],
+    def pgs_solve_propagation_shared_template(
+        propagation_constraint_count: wp.array[int],
+        propagation_body_count: wp.array[int],
+        propagation_body_list: wp.array2d[int],
+        propagation_body_local_slot: wp.array[int],
+        propagation_body_a: wp.array2d[int],
+        propagation_body_b: wp.array2d[int],
+        propagation_MiJt_a: wp.array3d[float],
+        propagation_MiJt_b: wp.array3d[float],
+        propagation_J_a: wp.array3d[float],
+        propagation_J_b: wp.array3d[float],
+        propagation_eff_mass_inv: wp.array2d[float],
+        propagation_rhs: wp.array2d[float],
+        propagation_row_type: wp.array2d[int],
+        propagation_row_parent: wp.array2d[int],
+        propagation_row_mu: wp.array2d[float],
         iterations: int,
         omega: float,
         friction_start_iteration: int,
         iteration_offset: int,
-        compact_impulses: wp.array2d[float],
-        compact_body_qd: wp.array2d[float],
-        compact_body_impulses: wp.array2d[float],
+        propagation_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        propagation_body_impulses: wp.array2d[float],
     ):
         world, _lane = wp.tid()
-        pgs_solve_compact_shared_native(
+        pgs_solve_propagation_shared_native(
             world,
-            compact_constraint_count,
-            compact_body_count,
-            compact_body_list,
-            compact_body_local_slot,
-            compact_body_a,
-            compact_body_b,
-            compact_MiJt_a,
-            compact_MiJt_b,
-            compact_J_a,
-            compact_J_b,
-            compact_eff_mass_inv,
-            compact_rhs,
-            compact_row_type,
-            compact_row_parent,
-            compact_row_mu,
+            propagation_constraint_count,
+            propagation_body_count,
+            propagation_body_list,
+            propagation_body_local_slot,
+            propagation_body_a,
+            propagation_body_b,
+            propagation_MiJt_a,
+            propagation_MiJt_b,
+            propagation_J_a,
+            propagation_J_b,
+            propagation_eff_mass_inv,
+            propagation_rhs,
+            propagation_row_type,
+            propagation_row_parent,
+            propagation_row_mu,
             iterations,
             omega,
             friction_start_iteration,
             iteration_offset,
-            compact_impulses,
-            compact_body_qd,
-            compact_body_impulses,
+            propagation_impulses,
+            propagation_body_qd,
+            propagation_body_impulses,
         )
 
-    name = f"pgs_solve_compact_contact_shared_{compact_max_constraints}_{B}"
-    pgs_solve_compact_shared_template.__name__ = name
-    pgs_solve_compact_shared_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_compact_shared_template)
+    name = f"pgs_solve_propagation_contact_shared_{propagation_max_constraints}_{B}"
+    pgs_solve_propagation_shared_template.__name__ = name
+    pgs_solve_propagation_shared_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_shared_template)
 
 
 @cache
-def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch: str) -> "wp.Kernel":
-    """Build a one-warp compact tree propagation kernel for 0/1-DOF joint trees."""
+def _get_propagate_tree_impulses_revolute_kernel(size: int, device_arch: str) -> "wp.Kernel":
+    """Build a one-warp propagation tree propagation kernel for 0/1-DOF joint trees."""
     snippet = """
 #if defined(__CUDA_ARCH__)
     const int lane = threadIdx.x & 31;
@@ -9399,35 +8964,35 @@ def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch:
     for (int joint = joint_start; joint < joint_end; ++joint) {
         const int body = joint_child.data[joint];
         if (lane < 6) {
-            compact_tree_pA.data[body * 6 + lane] = 0.0f;
-            compact_tree_body_delta.data[body * 6 + lane] = 0.0f;
+            propagation_tree_pA.data[body * 6 + lane] = 0.0f;
+            propagation_tree_body_delta.data[body * 6 + lane] = 0.0f;
         }
         if (lane == 0) {
             const int dof_start = joint_qd_start.data[joint];
             const int dof_end = joint_qd_start.data[joint + 1];
             for (int dof = dof_start; dof < dof_end; ++dof) {
-                compact_tree_u.data[dof] = 0.0f;
-                compact_tree_qdd.data[dof] = 0.0f;
+                propagation_tree_u.data[dof] = 0.0f;
+                propagation_tree_qdd.data[dof] = 0.0f;
             }
 
-            const float fx = compact_body_impulses.data[body * 6 + 0];
-            const float fy = compact_body_impulses.data[body * 6 + 1];
-            const float fz = compact_body_impulses.data[body * 6 + 2];
-            const float tx = compact_body_impulses.data[body * 6 + 3];
-            const float ty = compact_body_impulses.data[body * 6 + 4];
-            const float tz = compact_body_impulses.data[body * 6 + 5];
+            const float fx = propagation_body_impulses.data[body * 6 + 0];
+            const float fy = propagation_body_impulses.data[body * 6 + 1];
+            const float fz = propagation_body_impulses.data[body * 6 + 2];
+            const float tx = propagation_body_impulses.data[body * 6 + 3];
+            const float ty = propagation_body_impulses.data[body * 6 + 4];
+            const float tz = propagation_body_impulses.data[body * 6 + 5];
             if (fx * fx + fy * fy + fz * fz + tx * tx + ty * ty + tz * tz > 0.0f) {
                 has_impulse = 1;
             }
         }
 
         if (lane < 6) {
-            const float fx = compact_body_impulses.data[body * 6 + 0];
-            const float fy = compact_body_impulses.data[body * 6 + 1];
-            const float fz = compact_body_impulses.data[body * 6 + 2];
-            const float tx = compact_body_impulses.data[body * 6 + 3];
-            const float ty = compact_body_impulses.data[body * 6 + 4];
-            const float tz = compact_body_impulses.data[body * 6 + 5];
+            const float fx = propagation_body_impulses.data[body * 6 + 0];
+            const float fy = propagation_body_impulses.data[body * 6 + 1];
+            const float fz = propagation_body_impulses.data[body * 6 + 2];
+            const float tx = propagation_body_impulses.data[body * 6 + 3];
+            const float ty = propagation_body_impulses.data[body * 6 + 4];
+            const float tz = propagation_body_impulses.data[body * 6 + 5];
             float value = 0.0f;
             if (lane == 0) value = -fx;
             else if (lane == 1) value = -fy;
@@ -9435,7 +9000,7 @@ def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch:
             else if (lane == 3) value = -tx;
             else if (lane == 4) value = -ty;
             else value = -tz;
-            compact_tree_pA.data[body * 6 + lane] = value;
+            propagation_tree_pA.data[body * 6 + lane] = value;
         }
         __syncwarp(mask);
     }
@@ -9453,38 +9018,38 @@ def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch:
 
             float u = 0.0f;
             if (has_dof && lane < 6) {
-                u = -compact_joint_S_flat.data[gdof * 6 + lane] * compact_tree_pA.data[child * 6 + lane];
+                u = -propagation_joint_S_flat.data[gdof * 6 + lane] * propagation_tree_pA.data[child * 6 + lane];
             }
             for (int shfl = 16; shfl > 0; shfl >>= 1) {
                 u += __shfl_down_sync(mask, u, shfl);
             }
             u = __shfl_sync(mask, u, 0);
             if (has_dof && lane == 0) {
-                compact_tree_u.data[gdof] = u;
+                propagation_tree_u.data[gdof] = u;
             }
 
             if (parent >= 0 && lane < 6) {
-                float propagated = compact_tree_pA.data[child * 6 + lane];
+                float propagated = propagation_tree_pA.data[child * 6 + lane];
                 if (has_dof) {
-                    const float inv_d = compact_tree_D_inv.data[joint * 36];
-                    propagated += compact_tree_U.data[gdof * 6 + lane] * inv_d * u;
+                    const float inv_d = propagation_tree_D_inv.data[joint * 36];
+                    propagated += propagation_tree_U.data[gdof * 6 + lane] * inv_d * u;
                 }
-                const float ex = compact_body_com_rel.data[child * 3 + 0] - compact_body_com_rel.data[parent * 3 + 0];
-                const float ey = compact_body_com_rel.data[child * 3 + 1] - compact_body_com_rel.data[parent * 3 + 1];
-                const float ez = compact_body_com_rel.data[child * 3 + 2] - compact_body_com_rel.data[parent * 3 + 2];
+                const float ex = propagation_body_com_rel.data[child * 3 + 0] - propagation_body_com_rel.data[parent * 3 + 0];
+                const float ey = propagation_body_com_rel.data[child * 3 + 1] - propagation_body_com_rel.data[parent * 3 + 1];
+                const float ez = propagation_body_com_rel.data[child * 3 + 2] - propagation_body_com_rel.data[parent * 3 + 2];
                 if (lane >= 3) {
-                    const float inv_d = has_dof ? compact_tree_D_inv.data[joint * 36] : 0.0f;
-                    const float px = compact_tree_pA.data[child * 6 + 0]
-                        + (has_dof ? compact_tree_U.data[gdof * 6 + 0] * inv_d * u : 0.0f);
-                    const float py = compact_tree_pA.data[child * 6 + 1]
-                        + (has_dof ? compact_tree_U.data[gdof * 6 + 1] * inv_d * u : 0.0f);
-                    const float pz = compact_tree_pA.data[child * 6 + 2]
-                        + (has_dof ? compact_tree_U.data[gdof * 6 + 2] * inv_d * u : 0.0f);
+                    const float inv_d = has_dof ? propagation_tree_D_inv.data[joint * 36] : 0.0f;
+                    const float px = propagation_tree_pA.data[child * 6 + 0]
+                        + (has_dof ? propagation_tree_U.data[gdof * 6 + 0] * inv_d * u : 0.0f);
+                    const float py = propagation_tree_pA.data[child * 6 + 1]
+                        + (has_dof ? propagation_tree_U.data[gdof * 6 + 1] * inv_d * u : 0.0f);
+                    const float pz = propagation_tree_pA.data[child * 6 + 2]
+                        + (has_dof ? propagation_tree_U.data[gdof * 6 + 2] * inv_d * u : 0.0f);
                     if (lane == 3) propagated += ey * pz - ez * py;
                     else if (lane == 4) propagated += ez * px - ex * pz;
                     else propagated += ex * py - ey * px;
                 }
-                compact_tree_pA.data[parent * 6 + lane] += propagated;
+                propagation_tree_pA.data[parent * 6 + lane] += propagated;
             }
             __syncwarp(mask);
         }
@@ -9499,13 +9064,13 @@ def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch:
 
             float parent_delta = 0.0f;
             if (parent >= 0 && lane < 6) {
-                parent_delta = compact_tree_body_delta.data[parent * 6 + lane];
-                const float ex = compact_body_com_rel.data[child * 3 + 0] - compact_body_com_rel.data[parent * 3 + 0];
-                const float ey = compact_body_com_rel.data[child * 3 + 1] - compact_body_com_rel.data[parent * 3 + 1];
-                const float ez = compact_body_com_rel.data[child * 3 + 2] - compact_body_com_rel.data[parent * 3 + 2];
-                const float wx = compact_tree_body_delta.data[parent * 6 + 3];
-                const float wy = compact_tree_body_delta.data[parent * 6 + 4];
-                const float wz = compact_tree_body_delta.data[parent * 6 + 5];
+                parent_delta = propagation_tree_body_delta.data[parent * 6 + lane];
+                const float ex = propagation_body_com_rel.data[child * 3 + 0] - propagation_body_com_rel.data[parent * 3 + 0];
+                const float ey = propagation_body_com_rel.data[child * 3 + 1] - propagation_body_com_rel.data[parent * 3 + 1];
+                const float ez = propagation_body_com_rel.data[child * 3 + 2] - propagation_body_com_rel.data[parent * 3 + 2];
+                const float wx = propagation_tree_body_delta.data[parent * 6 + 3];
+                const float wy = propagation_tree_body_delta.data[parent * 6 + 4];
+                const float wz = propagation_tree_body_delta.data[parent * 6 + 5];
                 if (lane == 0) parent_delta += wy * ez - wz * ey;
                 else if (lane == 1) parent_delta += wz * ex - wx * ez;
                 else if (lane == 2) parent_delta += wx * ey - wy * ex;
@@ -9515,15 +9080,15 @@ def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch:
             if (has_dof) {
                 float parent_term = 0.0f;
                 if (parent >= 0 && lane < 6) {
-                    parent_term = compact_tree_U.data[gdof * 6 + lane] * parent_delta;
+                    parent_term = propagation_tree_U.data[gdof * 6 + lane] * parent_delta;
                 }
                 for (int shfl = 16; shfl > 0; shfl >>= 1) {
                     parent_term += __shfl_down_sync(mask, parent_term, shfl);
                 }
                 parent_term = __shfl_sync(mask, parent_term, 0);
-                qdd = compact_tree_D_inv.data[joint * 36] * (compact_tree_u.data[gdof] - parent_term);
+                qdd = propagation_tree_D_inv.data[joint * 36] * (propagation_tree_u.data[gdof] - parent_term);
                 if (lane == 0) {
-                    compact_tree_qdd.data[gdof] = qdd;
+                    propagation_tree_qdd.data[gdof] = qdd;
                     v_out.data[gdof] += qdd;
                 }
                 qdd = __shfl_sync(mask, qdd, 0);
@@ -9532,9 +9097,9 @@ def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch:
             if (lane < 6) {
                 float value = parent_delta;
                 if (has_dof) {
-                    value += compact_joint_S_flat.data[gdof * 6 + lane] * qdd;
+                    value += propagation_joint_S_flat.data[gdof * 6 + lane] * qdd;
                 }
-                compact_tree_body_delta.data[child * 6 + lane] = value;
+                propagation_tree_body_delta.data[child * 6 + lane] = value;
             }
             __syncwarp(mask);
         }
@@ -9553,96 +9118,96 @@ def _get_propagate_compact_tree_impulses_revolute_kernel(size: int, device_arch:
         if (lane < 6) {
             float value = 0.0f;
             if (parent >= 0) {
-                value = compact_tree_body_delta.data[parent * 6 + lane];
-                const float ex = compact_body_com_rel.data[child * 3 + 0] - compact_body_com_rel.data[parent * 3 + 0];
-                const float ey = compact_body_com_rel.data[child * 3 + 1] - compact_body_com_rel.data[parent * 3 + 1];
-                const float ez = compact_body_com_rel.data[child * 3 + 2] - compact_body_com_rel.data[parent * 3 + 2];
-                const float wx = compact_tree_body_delta.data[parent * 6 + 3];
-                const float wy = compact_tree_body_delta.data[parent * 6 + 4];
-                const float wz = compact_tree_body_delta.data[parent * 6 + 5];
+                value = propagation_tree_body_delta.data[parent * 6 + lane];
+                const float ex = propagation_body_com_rel.data[child * 3 + 0] - propagation_body_com_rel.data[parent * 3 + 0];
+                const float ey = propagation_body_com_rel.data[child * 3 + 1] - propagation_body_com_rel.data[parent * 3 + 1];
+                const float ez = propagation_body_com_rel.data[child * 3 + 2] - propagation_body_com_rel.data[parent * 3 + 2];
+                const float wx = propagation_tree_body_delta.data[parent * 6 + 3];
+                const float wy = propagation_tree_body_delta.data[parent * 6 + 4];
+                const float wz = propagation_tree_body_delta.data[parent * 6 + 5];
                 if (lane == 0) value += wy * ez - wz * ey;
                 else if (lane == 1) value += wz * ex - wx * ez;
                 else if (lane == 2) value += wx * ey - wy * ex;
             }
             if (has_dof) {
-                value += compact_joint_S_flat.data[gdof * 6 + lane] * v_out.data[gdof];
+                value += propagation_joint_S_flat.data[gdof * 6 + lane] * v_out.data[gdof];
             }
-            compact_tree_body_delta.data[child * 6 + lane] = value;
+            propagation_tree_body_delta.data[child * 6 + lane] = value;
         }
         __syncwarp(mask);
 
         if (lane < 6) {
-            compact_body_qd.data[child * 6 + lane] = compact_tree_body_delta.data[child * 6 + lane];
-            compact_body_impulses.data[child * 6 + lane] = 0.0f;
+            propagation_body_qd.data[child * 6 + lane] = propagation_tree_body_delta.data[child * 6 + lane];
+            propagation_body_impulses.data[child * 6 + lane] = 0.0f;
         }
     }
 #endif
 """
 
     @wp.func_native(snippet)
-    def propagate_compact_tree_impulses_revolute_native(
+    def propagate_tree_impulses_revolute_native(
         group_idx: int,
         group_to_art: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
         joint_qd_start: wp.array[int],
-        compact_joint_S_flat: wp.array2d[float],
-        compact_body_com_rel: wp.array2d[float],
-        compact_tree_U: wp.array2d[float],
-        compact_tree_D_inv: wp.array3d[float],
-        compact_body_impulses: wp.array2d[float],
-        compact_tree_pA: wp.array2d[float],
-        compact_tree_u: wp.array[float],
-        compact_tree_qdd: wp.array[float],
-        compact_tree_body_delta: wp.array2d[float],
-        compact_body_qd: wp.array2d[float],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        propagation_tree_U: wp.array2d[float],
+        propagation_tree_D_inv: wp.array3d[float],
+        propagation_body_impulses: wp.array2d[float],
+        propagation_tree_pA: wp.array2d[float],
+        propagation_tree_u: wp.array[float],
+        propagation_tree_qdd: wp.array[float],
+        propagation_tree_body_delta: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
         v_out: wp.array[float],
     ): ...
 
-    def propagate_compact_tree_impulses_revolute_template(
+    def propagate_tree_impulses_revolute_template(
         group_to_art: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
         joint_qd_start: wp.array[int],
-        compact_joint_S_flat: wp.array2d[float],
-        compact_body_com_rel: wp.array2d[float],
-        compact_tree_U: wp.array2d[float],
-        compact_tree_D_inv: wp.array3d[float],
-        compact_body_impulses: wp.array2d[float],
-        compact_tree_pA: wp.array2d[float],
-        compact_tree_u: wp.array[float],
-        compact_tree_qdd: wp.array[float],
-        compact_tree_body_delta: wp.array2d[float],
-        compact_body_qd: wp.array2d[float],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        propagation_tree_U: wp.array2d[float],
+        propagation_tree_D_inv: wp.array3d[float],
+        propagation_body_impulses: wp.array2d[float],
+        propagation_tree_pA: wp.array2d[float],
+        propagation_tree_u: wp.array[float],
+        propagation_tree_qdd: wp.array[float],
+        propagation_tree_body_delta: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
         v_out: wp.array[float],
     ):
         group_idx, _lane = wp.tid()
-        propagate_compact_tree_impulses_revolute_native(
+        propagate_tree_impulses_revolute_native(
             group_idx,
             group_to_art,
             articulation_start,
             joint_parent,
             joint_child,
             joint_qd_start,
-            compact_joint_S_flat,
-            compact_body_com_rel,
-            compact_tree_U,
-            compact_tree_D_inv,
-            compact_body_impulses,
-            compact_tree_pA,
-            compact_tree_u,
-            compact_tree_qdd,
-            compact_tree_body_delta,
-            compact_body_qd,
+            propagation_joint_S_flat,
+            propagation_body_com_rel,
+            propagation_tree_U,
+            propagation_tree_D_inv,
+            propagation_body_impulses,
+            propagation_tree_pA,
+            propagation_tree_u,
+            propagation_tree_qdd,
+            propagation_tree_body_delta,
+            propagation_body_qd,
             v_out,
         )
 
-    name = f"propagate_compact_tree_impulses_revolute_{size}"
-    propagate_compact_tree_impulses_revolute_template.__name__ = name
-    propagate_compact_tree_impulses_revolute_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(propagate_compact_tree_impulses_revolute_template)
+    name = f"propagate_tree_impulses_revolute_{size}"
+    propagate_tree_impulses_revolute_template.__name__ = name
+    propagate_tree_impulses_revolute_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(propagate_tree_impulses_revolute_template)
 
 
 @cache

@@ -36,15 +36,13 @@ def test_fpgs_articulation_row_scaling_benchmark_smoke(tmp_path):
     assert (out_dir / "results.csv").is_file()
     results = json.loads((out_dir / "results.json").read_text(encoding="utf-8"))
     paths = {row["path"] for row in results}
-    assert paths == {"mf_immediate", "compact_tree"}
+    assert paths == {"mf_immediate", "propagation"}
     assert not (
         paths
         & {
             "new_free_fused",
             "new_articulated_fused",
             "mf_local_plus_propagation",
-            "deferred_cholesky",
-            "compact_cholesky",
         }
     )
     assert "SolverFeatherPGS.step" in summary
@@ -57,23 +55,23 @@ def test_fpgs_articulation_row_scaling_benchmark_smoke(tmp_path):
     assert free_rows
     assert articulated_rows
 
-    free_compact = next(row for row in free_rows if row["path"] == "compact_tree")
-    assert free_compact["compact_active"] is False
-    assert free_compact["propagation_extra_mib"] == 0.0
-    assert free_compact["dense_rows_total"] == 0
-    assert free_compact["mf_rows_total"] > 0
-    assert free_compact["compact_rows_total"] == 0
+    free_propagation = next(row for row in free_rows if row["path"] == "propagation")
+    assert free_propagation["propagation_active"] is False
+    assert free_propagation["propagation_extra_mib"] == 0.0
+    assert free_propagation["dense_rows_total"] == 0
+    assert free_propagation["mf_rows_total"] > 0
+    assert free_propagation["propagation_rows_total"] == 0
 
     articulated_baseline = next(row for row in articulated_rows if row["path"] == "mf_immediate")
-    articulated_compact = next(row for row in articulated_rows if row["path"] == "compact_tree")
+    articulated_propagation = next(row for row in articulated_rows if row["path"] == "propagation")
     assert articulated_baseline["dense_rows_total"] > 0
-    assert articulated_baseline["compact_rows_total"] == 0
-    assert articulated_compact["compact_active"] is True
-    assert articulated_compact["propagation_extra_mib"] > 0.0
-    assert articulated_compact["dense_rows_total"] == 0
-    assert articulated_compact["compact_rows_total"] > 0
+    assert articulated_baseline["propagation_rows_total"] == 0
+    assert articulated_propagation["propagation_active"] is True
+    assert articulated_propagation["propagation_extra_mib"] > 0.0
+    assert articulated_propagation["dense_rows_total"] == 0
+    assert articulated_propagation["propagation_rows_total"] > 0
     if articulated_baseline["joint_dof_count"] >= 64:
-        assert articulated_compact["row_solver_mib"] < articulated_baseline["row_solver_mib"]
+        assert articulated_propagation["row_solver_mib"] < articulated_baseline["row_solver_mib"]
 
     for row in results:
         assert np.isfinite(row["ms_per_step"])
@@ -88,8 +86,8 @@ def test_fpgs_articulation_row_scaling_benchmark_smoke(tmp_path):
         else:
             assert np.isfinite(row["joint_qd_rel_l2"])
             assert np.isfinite(row["state_linf"])
-            if row["path"] == "compact_tree":
-                # Compact-tree uses deferred propagation, so high-contact smoke
+            if row["path"] == "propagation":
+                # Propagation uses deferred articulation response, so high-contact smoke
                 # rows are not expected to be bit-close to immediate D-wide GS
                 # after only two iterations. Keep this as a gross sanity bound.
                 assert row["joint_qd_rel_l2"] < 1.0e-1
@@ -139,10 +137,10 @@ def test_fpgs_articulation_operator_diagnostic_smoke(tmp_path):
         assert row["worst_columns"]
 
 
-def test_fpgs_compact_debug_residuals_include_compact_rows():
+def test_fpgs_propagation_debug_residuals_include_propagation_rows():
     wp.init()
     if not wp.get_device("cuda:0").is_cuda:
-        pytest.skip("CUDA is required for compact PGS debug diagnostics")
+        pytest.skip("CUDA is required for propagation PGS debug diagnostics")
 
     script = Path(__file__).parent / "benchmarks" / "fpgs_articulation_row_scaling.py"
     spec = importlib.util.spec_from_file_location("fpgs_articulation_row_scaling", script)
@@ -153,7 +151,7 @@ def test_fpgs_compact_debug_residuals_include_compact_rows():
     spec.loader.exec_module(module)
 
     case = module.BenchCase(
-        "debug_compact",
+        "debug_propagation",
         "L=4,boxes=1",
         "articulated_free",
         articulations=1,
@@ -164,15 +162,12 @@ def test_fpgs_compact_debug_residuals_include_compact_rows():
     solver = module.SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
-        articulated_dense_response_mode="compact_tree",
+        articulated_contact_response="propagation",
         hinv_jt_kernel="par_row",
         pgs_iterations=2,
         enable_contact_friction=True,
         dense_max_constraints=16,
         mf_max_constraints=16,
-        compact_max_constraints=16,
-        compact_fast_body_map=True,
-        compact_warp_propagation=True,
         pgs_warmstart=False,
         mf_warmstart=False,
         pgs_debug=True,
@@ -187,7 +182,7 @@ def test_fpgs_compact_debug_residuals_include_compact_rows():
     solver.step(state_in, state_out, model.control(), contacts, 1.0 / 120.0)
     wp.synchronize()
 
-    assert int(np.sum(solver.compact_constraint_count.numpy())) > 0
+    assert int(np.sum(solver.propagation_constraint_count.numpy())) > 0
     assert solver._pgs_convergence_log
     assert solver._pgs_ncp_residual_log
     convergence = solver._pgs_convergence_log[-1]
@@ -227,20 +222,20 @@ def test_fpgs_articulation_accuracy_probe_smoke(tmp_path):
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     results = json.loads((out_dir / "accuracy_probe.json").read_text(encoding="utf-8"))
     assert "Contacts are generated once" in summary
-    assert {row["path"] for row in results} == {"mf_immediate", "compact_tree"}
+    assert {row["path"] for row in results} == {"mf_immediate", "propagation"}
     assert {row["pgs_iterations"] for row in results} == {1, 2}
 
-    compact_rows = [row for row in results if row["path"] == "compact_tree"]
-    assert compact_rows
+    propagation_rows = [row for row in results if row["path"] == "propagation"]
+    assert propagation_rows
     for row in results:
         assert np.isfinite(row["final_r_compl"])
         assert np.isfinite(row["self_ref_joint_qd_abs_linf"])
         assert np.isfinite(row["mf_ref_joint_qd_abs_linf"])
         assert row["self_ref_joint_qd_abs_linf"] >= 0.0
         assert row["mf_ref_joint_qd_abs_linf"] >= 0.0
-    for row in compact_rows:
+    for row in propagation_rows:
         assert row["dense_rows_total"] == 0
-        assert row["compact_rows_total"] > 0
+        assert row["propagation_rows_total"] > 0
         assert np.isfinite(row["same_iter_vs_mf_joint_qd_abs_linf"])
         assert row["same_iter_vs_mf_joint_qd_abs_linf"] >= 0.0
 

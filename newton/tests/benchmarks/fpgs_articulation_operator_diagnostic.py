@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare D-wide and compact-tree articulated contact row operators.
+"""Compare D-wide and propagation articulated contact row operators.
 
 This diagnostic is intentionally not an end-state PGS comparison. It builds the
 same contact problem through ``SolverFeatherPGS.step`` with zero PGS iterations,
@@ -10,12 +10,12 @@ then compares the row-to-row Delassus operator:
     W = J H^-1 J^T
 
 For the current D-wide path, W is computed directly from ``J_world`` and
-``Y_world``. For the compact-tree path, each source row is injected as a unit
-compact row impulse, the actual compact propagation kernel is run once, and the
-resulting target row velocities are sampled through the compact row Jacobians.
+``Y_world``. For the propagation path, each source row is injected as a unit
+body-space row impulse, the actual propagation kernel is run once, and the
+resulting target row velocities are sampled through the body-space row Jacobians.
 
 If these operators match, later state differences are solve ordering or
-underconvergence. If they do not match, the compact math/setup is different from
+underconvergence. If they do not match, the propagation math/setup is different from
 the current production operator before PGS convergence enters the picture.
 """
 
@@ -140,7 +140,6 @@ def _make_solver(
     path: str,
     *,
     enable_contact_friction: bool,
-    compact_warp_propagation: bool,
     cholesky_kernel: str,
     trisolve_kernel: str,
     hinv_jt_kernel: str,
@@ -148,17 +147,12 @@ def _make_solver(
     row_capacity = _planned_row_capacity(case)
     dense_capacity = row_capacity
     mf_capacity = 16
-    compact_capacity = row_capacity
-    if path in ("compact_cholesky", "compact_tree"):
-        dense_capacity = 16
-    mode = "immediate"
-    if path in ("compact_cholesky", "compact_tree"):
-        mode = path
+    response_mode = "propagation" if path == "propagation" else "immediate"
 
     return SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
-        articulated_dense_response_mode=mode,
+        articulated_contact_response=response_mode,
         cholesky_kernel=cholesky_kernel,
         trisolve_kernel=trisolve_kernel,
         hinv_jt_kernel=hinv_jt_kernel,
@@ -167,10 +161,6 @@ def _make_solver(
         enable_contact_friction=enable_contact_friction,
         dense_max_constraints=dense_capacity,
         mf_max_constraints=mf_capacity,
-        compact_max_constraints=compact_capacity,
-        compact_fast_body_map=True,
-        compact_shared_row_solver=False,
-        compact_warp_propagation=compact_warp_propagation if path == "compact_tree" else False,
         pgs_warmstart=False,
         mf_warmstart=False,
     )
@@ -277,34 +267,34 @@ def _contact_row_map(
     return out
 
 
-def _dense_rows_in_compact_order(
+def _dense_rows_in_propagation_order(
     old_solver: SolverFeatherPGS,
-    compact_solver: SolverFeatherPGS,
+    propagation_solver: SolverFeatherPGS,
     world: int,
     row_count: int,
 ) -> tuple[np.ndarray, bool]:
     old_parent = old_solver.row_parent.numpy()[world, :row_count].astype(np.int32, copy=True)
-    compact_parent = compact_solver.compact_row_parent.numpy()[world, :row_count].astype(np.int32, copy=True)
+    propagation_parent = propagation_solver.propagation_row_parent.numpy()[world, :row_count].astype(np.int32, copy=True)
     dense_by_key = _contact_row_map(old_solver, world, 0, row_count, old_parent)
-    compact_by_key = _contact_row_map(compact_solver, world, 2, row_count, compact_parent)
+    propagation_by_key = _contact_row_map(propagation_solver, world, 2, row_count, propagation_parent)
 
     dense_rows = np.full(row_count, -1, dtype=np.int32)
-    for key, compact_row in compact_by_key.items():
+    for key, propagation_row in propagation_by_key.items():
         dense_row = dense_by_key.get(key)
-        if dense_row is not None and 0 <= compact_row < row_count:
-            dense_rows[compact_row] = int(dense_row)
+        if dense_row is not None and 0 <= propagation_row < row_count:
+            dense_rows[propagation_row] = int(dense_row)
 
     complete = bool(np.all(dense_rows >= 0))
     if not complete:
         missing = np.where(dense_rows < 0)[0][:8].tolist()
         raise RuntimeError(
-            f"world {world}: could not align dense rows to compact contact rows; missing compact rows {missing}"
+            f"world {world}: could not align dense rows to propagation contact rows; missing propagation rows {missing}"
         )
     return dense_rows, bool(np.array_equal(dense_rows, np.arange(row_count, dtype=np.int32)))
 
 
-def _compact_target_velocities(
-    compact_qd: np.ndarray,
+def _propagation_target_velocities(
+    propagation_qd: np.ndarray,
     body_a: np.ndarray,
     body_b: np.ndarray,
     J_a: np.ndarray,
@@ -316,35 +306,35 @@ def _compact_target_velocities(
         ba = int(body_a[row])
         bb = int(body_b[row])
         if ba >= 0:
-            out[row] += float(np.dot(J_a[row], compact_qd[ba]))
+            out[row] += float(np.dot(J_a[row], propagation_qd[ba]))
         if bb >= 0:
-            out[row] += float(np.dot(J_b[row], compact_qd[bb]))
+            out[row] += float(np.dot(J_b[row], propagation_qd[bb]))
     return out
 
 
-def _zero_compact_propagation_state(solver: SolverFeatherPGS) -> None:
+def _zero_propagation_state(solver: SolverFeatherPGS) -> None:
     solver.v_out.zero_()
-    solver.compact_body_qd.zero_()
-    solver.compact_body_impulses.zero_()
-    for name in ("compact_tree_pA", "compact_tree_u", "compact_tree_qdd", "compact_tree_body_delta"):
+    solver.propagation_body_qd.zero_()
+    solver.propagation_body_impulses.zero_()
+    for name in ("propagation_tree_pA", "propagation_tree_u", "propagation_tree_qdd", "propagation_tree_body_delta"):
         array = getattr(solver, name, None)
         if array is not None:
             array.zero_()
 
 
-def _compact_operator_columns(
+def _propagation_operator_columns(
     solver: SolverFeatherPGS,
     world: int,
     source_rows: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    compact_counts = solver.compact_constraint_count.numpy().astype(np.int32, copy=False)
-    row_count = int(compact_counts[world])
-    body_a = solver.compact_body_a.numpy()[world, :row_count].astype(np.int32, copy=True)
-    body_b = solver.compact_body_b.numpy()[world, :row_count].astype(np.int32, copy=True)
-    J_a = solver.compact_J_a.numpy()[world, :row_count].astype(np.float64, copy=True)
-    J_b = solver.compact_J_b.numpy()[world, :row_count].astype(np.float64, copy=True)
-    MiJt_a = solver.compact_MiJt_a.numpy()[world, :row_count].astype(np.float64, copy=True)
-    MiJt_b = solver.compact_MiJt_b.numpy()[world, :row_count].astype(np.float64, copy=True)
+    propagation_counts = solver.propagation_constraint_count.numpy().astype(np.int32, copy=False)
+    row_count = int(propagation_counts[world])
+    body_a = solver.propagation_body_a.numpy()[world, :row_count].astype(np.int32, copy=True)
+    body_b = solver.propagation_body_b.numpy()[world, :row_count].astype(np.int32, copy=True)
+    J_a = solver.propagation_J_a.numpy()[world, :row_count].astype(np.float64, copy=True)
+    J_b = solver.propagation_J_b.numpy()[world, :row_count].astype(np.float64, copy=True)
+    MiJt_a = solver.propagation_MiJt_a.numpy()[world, :row_count].astype(np.float64, copy=True)
+    MiJt_b = solver.propagation_MiJt_b.numpy()[world, :row_count].astype(np.float64, copy=True)
 
     body_count = solver.model.body_count
     world_start = int(solver.world_dof_start.numpy()[world])
@@ -364,16 +354,16 @@ def _compact_operator_columns(
             body_qd[bb] += MiJt_b[source].astype(np.float32, copy=False)
             body_impulses[bb] += J_b[source].astype(np.float32, copy=False)
 
-        local_only[:, out_col] = _compact_target_velocities(body_qd.astype(np.float64), body_a, body_b, J_a, J_b)
+        local_only[:, out_col] = _propagation_target_velocities(body_qd.astype(np.float64), body_a, body_b, J_a, J_b)
 
-        _zero_compact_propagation_state(solver)
-        solver.compact_body_qd.assign(body_qd)
-        solver.compact_body_impulses.assign(body_impulses)
-        solver._propagate_compact_response()
+        _zero_propagation_state(solver)
+        solver.propagation_body_qd.assign(body_qd)
+        solver.propagation_body_impulses.assign(body_impulses)
+        solver._propagate_response()
         wp.synchronize()
 
-        qd_after = solver.compact_body_qd.numpy().astype(np.float64, copy=True)
-        propagated[:, out_col] = _compact_target_velocities(qd_after, body_a, body_b, J_a, J_b)
+        qd_after = solver.propagation_body_qd.numpy().astype(np.float64, copy=True)
+        propagated[:, out_col] = _propagation_target_velocities(qd_after, body_a, body_b, J_a, J_b)
         qd_propagated[:, out_col] = solver.v_out.numpy()[world_start : world_start + world_width].astype(
             np.float64, copy=True
         )
@@ -562,7 +552,6 @@ def _diagnose_case(
     device: str,
     dt: float,
     enable_contact_friction: bool,
-    compact_warp_propagation: bool,
     cholesky_kernel: str,
     trisolve_kernel: str,
     hinv_jt_kernel: str,
@@ -570,7 +559,6 @@ def _diagnose_case(
     abs_tol: float,
     rel_tol: float,
     worst_limit: int,
-    compact_path: str,
 ) -> list[OperatorDiagnosticResult]:
     model, initial, contacts = _prepare_case_run(case, device)
     old_solver = _make_solver(
@@ -578,74 +566,72 @@ def _diagnose_case(
         case,
         "mf_immediate",
         enable_contact_friction=enable_contact_friction,
-        compact_warp_propagation=compact_warp_propagation,
         cholesky_kernel=cholesky_kernel,
         trisolve_kernel=trisolve_kernel,
         hinv_jt_kernel=hinv_jt_kernel,
     )
-    compact_solver = _make_solver(
+    propagation_solver = _make_solver(
         model,
         case,
-        compact_path,
+        "propagation",
         enable_contact_friction=enable_contact_friction,
-        compact_warp_propagation=compact_warp_propagation,
         cholesky_kernel=cholesky_kernel,
         trisolve_kernel=trisolve_kernel,
         hinv_jt_kernel=hinv_jt_kernel,
     )
     _run_zero_iteration_setup(model, old_solver, contacts, initial, dt=dt)
-    _run_zero_iteration_setup(model, compact_solver, contacts, initial, dt=dt)
+    _run_zero_iteration_setup(model, propagation_solver, contacts, initial, dt=dt)
 
     dense_counts = old_solver.constraint_count.numpy().astype(np.int32, copy=False)
-    compact_counts = compact_solver.compact_constraint_count.numpy().astype(np.int32, copy=False)
-    body_to_art, body_to_link, body_is_free = _body_link_maps(compact_solver)
+    propagation_counts = propagation_solver.propagation_constraint_count.numpy().astype(np.int32, copy=False)
+    body_to_art, body_to_link, body_is_free = _body_link_maps(propagation_solver)
     rigid_contacts = int(contacts.rigid_contact_count.numpy()[0])
 
     results: list[OperatorDiagnosticResult] = []
     for world in range(old_solver.world_count):
         dense_rows = int(dense_counts[world])
-        compact_rows = int(compact_counts[world])
-        if dense_rows == 0 and compact_rows == 0:
+        propagation_rows = int(propagation_counts[world])
+        if dense_rows == 0 and propagation_rows == 0:
             continue
-        if dense_rows != compact_rows:
+        if dense_rows != propagation_rows:
             raise RuntimeError(
-                f"{case.label} world {world}: dense rows {dense_rows} != compact rows {compact_rows}"
+                f"{case.label} world {world}: dense rows {dense_rows} != propagation rows {propagation_rows}"
             )
 
         source_rows = _select_sources(dense_rows, max_sources)
         old_full = _world_operator_from_jy(old_solver, world)
-        dense_rows_for_compact, row_order_identity = _dense_rows_in_compact_order(
-            old_solver, compact_solver, world, dense_rows
+        dense_rows_for_propagation, row_order_identity = _dense_rows_in_propagation_order(
+            old_solver, propagation_solver, world, dense_rows
         )
-        old_aligned = old_full[np.ix_(dense_rows_for_compact, dense_rows_for_compact)]
+        old_aligned = old_full[np.ix_(dense_rows_for_propagation, dense_rows_for_propagation)]
         old = old_aligned[:, source_rows]
-        compact, local_only, compact_qd = _compact_operator_columns(compact_solver, world, source_rows)
-        diff = compact - old
+        propagation, local_only, propagation_qd = _propagation_operator_columns(propagation_solver, world, source_rows)
+        diff = propagation - old
         local_diff = local_only - old
         width = int(old_solver.world_dof_count.numpy()[world])
         old_Y = old_solver.Y_world.numpy()[world, :dense_rows, :width].astype(np.float64, copy=True)
-        old_qd = old_Y[dense_rows_for_compact[source_rows]].T
+        old_qd = old_Y[dense_rows_for_propagation[source_rows]].T
         nonfree_qd_mask, mass_condition = _nonfree_world_dof_mask_and_condition(old_solver, world)
-        qd_diff = compact_qd[nonfree_qd_mask] - old_qd[nonfree_qd_mask]
+        qd_diff = propagation_qd[nonfree_qd_mask] - old_qd[nonfree_qd_mask]
 
         row_type_old_raw = old_solver.row_type.numpy()[world, :dense_rows].astype(np.int32, copy=True)
         row_parent_old_raw = old_solver.row_parent.numpy()[world, :dense_rows].astype(np.int32, copy=True)
-        old_to_compact = np.full(dense_rows, -1, dtype=np.int32)
-        for compact_row, dense_row in enumerate(dense_rows_for_compact):
-            old_to_compact[int(dense_row)] = compact_row
-        row_type_old = row_type_old_raw[dense_rows_for_compact]
-        row_parent_old_selected = row_parent_old_raw[dense_rows_for_compact]
+        old_to_propagation = np.full(dense_rows, -1, dtype=np.int32)
+        for propagation_row, dense_row in enumerate(dense_rows_for_propagation):
+            old_to_propagation[int(dense_row)] = propagation_row
+        row_type_old = row_type_old_raw[dense_rows_for_propagation]
+        row_parent_old_selected = row_parent_old_raw[dense_rows_for_propagation]
         row_parent_old = np.full_like(row_parent_old_selected, -1)
         parent_mask = row_parent_old_selected >= 0
-        row_parent_old[parent_mask] = old_to_compact[row_parent_old_selected[parent_mask]]
-        row_type_compact = compact_solver.compact_row_type.numpy()[world, :dense_rows].astype(np.int32, copy=True)
-        row_parent_compact = compact_solver.compact_row_parent.numpy()[world, :dense_rows].astype(np.int32, copy=True)
-        row_type_mismatch = int(np.count_nonzero(row_type_old != row_type_compact))
-        row_parent_mismatch = int(np.count_nonzero(row_parent_old != row_parent_compact))
+        row_parent_old[parent_mask] = old_to_propagation[row_parent_old_selected[parent_mask]]
+        row_type_propagation = propagation_solver.propagation_row_type.numpy()[world, :dense_rows].astype(np.int32, copy=True)
+        row_parent_propagation = propagation_solver.propagation_row_parent.numpy()[world, :dense_rows].astype(np.int32, copy=True)
+        row_type_mismatch = int(np.count_nonzero(row_type_old != row_type_propagation))
+        row_parent_mismatch = int(np.count_nonzero(row_parent_old != row_parent_propagation))
 
-        body_a = compact_solver.compact_body_a.numpy()[world, :dense_rows].astype(np.int32, copy=True)
-        body_b = compact_solver.compact_body_b.numpy()[world, :dense_rows].astype(np.int32, copy=True)
-        row_type = row_type_compact
+        body_a = propagation_solver.propagation_body_a.numpy()[world, :dense_rows].astype(np.int32, copy=True)
+        body_b = propagation_solver.propagation_body_b.numpy()[world, :dense_rows].astype(np.int32, copy=True)
+        row_type = row_type_propagation
         worst = _worst_columns(
             diff,
             old,
@@ -670,11 +656,11 @@ def _diagnose_case(
         )
 
         diag_old = np.array([old_aligned[int(source), int(source)] for source in source_rows], dtype=np.float64)
-        diag_compact = np.array([compact[int(source), col] for col, source in enumerate(source_rows)], dtype=np.float64)
-        diag_diff = diag_compact - diag_old
+        diag_propagation = np.array([propagation[int(source), col] for col, source in enumerate(source_rows)], dtype=np.float64)
+        diag_diff = diag_propagation - diag_old
 
         abs_linf = float(np.max(np.abs(diff))) if diff.size else 0.0
-        rel_fro = _rel_l2(compact, old)
+        rel_fro = _rel_l2(propagation, old)
         status = "operator_match" if abs_linf <= abs_tol and rel_fro <= rel_tol else "operator_mismatch"
 
         results.append(
@@ -696,10 +682,10 @@ def _diagnose_case(
                 operator_status=status,
                 rel_fro=rel_fro,
                 abs_linf=abs_linf,
-                diag_rel_l2=_rel_l2(diag_compact, diag_old),
+                diag_rel_l2=_rel_l2(diag_propagation, diag_old),
                 diag_abs_linf=float(np.max(np.abs(diag_diff))) if diag_diff.size else 0.0,
-                offdiag_rel_l2=_offdiag_rel(compact, old, source_rows),
-                qd_rel_l2=_rel_l2(compact_qd[nonfree_qd_mask], old_qd[nonfree_qd_mask])
+                offdiag_rel_l2=_offdiag_rel(propagation, old, source_rows),
+                qd_rel_l2=_rel_l2(propagation_qd[nonfree_qd_mask], old_qd[nonfree_qd_mask])
                 if np.any(nonfree_qd_mask)
                 else 0.0,
                 qd_abs_linf=float(np.max(np.abs(qd_diff))) if qd_diff.size else 0.0,
@@ -719,14 +705,14 @@ def _write_summary(path: Path, results: list[OperatorDiagnosticResult], args: ar
     lines = [
         "# FPGS Articulation Operator Diagnostic",
         "",
-        "This compares the old D-wide row operator `J_world @ Y_world.T` with the compact-tree operator formed by unit row impulse injection plus the actual compact propagation kernel.",
+        "This compares the old D-wide row operator `J_world @ Y_world.T` with the propagation operator formed by unit row impulse injection plus the actual propagation kernel.",
         "",
         f"Classification: {'operator mismatch found' if any_mismatch else 'all sampled operators match'}.",
         f"Tolerance: abs_linf <= {args.abs_tol:g} and rel_fro <= {args.rel_tol:g}.",
-        f"Friction rows: {'on' if not args.no_friction else 'off'}. Compact warp propagation: {args.compact_warp_propagation}.",
+        f"Friction rows: {'on' if not args.no_friction else 'off'}.",
         f"Dense baseline kernels: cholesky={args.cholesky_kernel}, trisolve={args.trisolve_kernel}, hinv_jt={args.hinv_jt_kernel}.",
         "",
-        "If this table reports `operator_match`, end-state differences at finite PGS iterations are convergence or ordering effects. If it reports `operator_mismatch`, the compact operator differs before PGS convergence is relevant.",
+        "If this table reports `operator_match`, end-state differences at finite PGS iterations are convergence or ordering effects. If it reports `operator_mismatch`, the propagation operator differs before PGS convergence is relevant.",
         "",
         "| case | world | D | rows | contacts | sampled cols | row order | status | rel Fro | abs Linf | diag rel | diag Linf | offdiag rel | qd rel | qd Linf | cond est | local-only rel |",
         "| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -802,10 +788,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--abs-tol", type=float, default=1.0e-4)
     parser.add_argument("--rel-tol", type=float, default=1.0e-3)
     parser.add_argument("--joint-armature", type=float, default=0.0)
-    parser.add_argument("--compact-path", choices=("compact_tree", "compact_cholesky"), default="compact_tree")
     parser.add_argument("--worst-limit", type=int, default=8)
     parser.add_argument("--no-friction", action="store_true")
-    parser.add_argument("--compact-warp-propagation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cholesky-kernel", choices=("auto", "loop", "tiled"), default="auto")
     parser.add_argument("--trisolve-kernel", choices=("auto", "loop", "tiled"), default="auto")
     parser.add_argument("--hinv-jt-kernel", choices=("auto", "par_row", "tiled"), default="par_row")
@@ -844,7 +828,6 @@ def main() -> None:
                 device=args.device,
                 dt=args.dt,
                 enable_contact_friction=not args.no_friction,
-                compact_warp_propagation=args.compact_warp_propagation,
                 cholesky_kernel=args.cholesky_kernel,
                 trisolve_kernel=args.trisolve_kernel,
                 hinv_jt_kernel=args.hinv_jt_kernel,
@@ -852,7 +835,6 @@ def main() -> None:
                 abs_tol=args.abs_tol,
                 rel_tol=args.rel_tol,
                 worst_limit=args.worst_limit,
-                compact_path=args.compact_path,
             )
         )
 

@@ -1438,16 +1438,16 @@ def compute_contact_linear_force_from_impulses(
     contact_path: wp.array[wp.int32],
     world_impulses: wp.array2d[wp.float32],
     mf_impulses: wp.array2d[wp.float32],
-    compact_impulses: wp.array2d[wp.float32],
+    propagation_impulses: wp.array2d[wp.float32],
     world_constraint_count: wp.array[wp.int32],
     mf_constraint_count: wp.array[wp.int32],
-    compact_constraint_count: wp.array[wp.int32],
+    propagation_constraint_count: wp.array[wp.int32],
     world_row_type: wp.array2d[wp.int32],
     world_row_parent: wp.array2d[wp.int32],
     mf_row_type: wp.array2d[wp.int32],
     mf_row_parent: wp.array2d[wp.int32],
-    compact_row_type: wp.array2d[wp.int32],
-    compact_row_parent: wp.array2d[wp.int32],
+    propagation_row_type: wp.array2d[wp.int32],
+    propagation_row_parent: wp.array2d[wp.int32],
     enable_friction: int,
     inv_dt: float,
     # outputs
@@ -1500,18 +1500,18 @@ def compute_contact_linear_force_from_impulses(
                 lam_t0 = mf_impulses[world, slot + 1]
                 lam_t1 = mf_impulses[world, slot + 2]
         elif path == 2:
-            lam_n = compact_impulses[world, slot]
-            count = compact_constraint_count[world]
+            lam_n = propagation_impulses[world, slot]
+            count = propagation_constraint_count[world]
             if (
                 enable_friction != 0
                 and slot + 2 < count
-                and compact_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
-                and compact_row_parent[world, slot + 1] == slot
-                and compact_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
-                and compact_row_parent[world, slot + 2] == slot
+                and propagation_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+                and propagation_row_parent[world, slot + 1] == slot
+                and propagation_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+                and propagation_row_parent[world, slot + 2] == slot
             ):
-                lam_t0 = compact_impulses[world, slot + 1]
-                lam_t1 = compact_impulses[world, slot + 2]
+                lam_t0 = propagation_impulses[world, slot + 1]
+                lam_t1 = propagation_impulses[world, slot + 2]
 
         force = lam_n * normal
         if enable_friction != 0:
@@ -2575,10 +2575,10 @@ def allocate_world_contact_slots(
     art_to_world: wp.array[int],
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
-    compact_articulated_contacts: int,
+    propagation_articulated_contacts: int,
     max_constraints: int,
     mf_max_constraints: int,
-    compact_max_constraints: int,
+    propagation_max_constraints: int,
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_anchor_limit: int,
@@ -2590,7 +2590,7 @@ def allocate_world_contact_slots(
     world_slot_counter: wp.array[int],
     contact_path: wp.array[int],
     mf_slot_counter: wp.array[int],
-    compact_slot_counter: wp.array[int],
+    propagation_slot_counter: wp.array[int],
 ):
     """
     Phase 1 of multi-articulation contact building.
@@ -2673,11 +2673,11 @@ def allocate_world_contact_slots(
     phi = wp.dot(normal, point_a_world - point_b_world)
 
     # Classify: MF path if both sides are free rigid or ground.
-    # Compact path is an opt-in matrix-free route for any contact touching a
+    # Propagation path is an opt-in matrix-free route for any contact touching a
     # non-free articulation. It stores fixed-size body-space rows instead of
     # D-wide generalized rows.
     is_mf = 0
-    is_compact = 0
+    is_propagation = 0
     a_is_free_or_ground = art_a < 0
     b_is_free_or_ground = art_b < 0
     if has_free_rigid != 0:
@@ -2685,11 +2685,11 @@ def allocate_world_contact_slots(
         b_is_free_or_ground = (art_b < 0) or (is_free_rigid[art_b] != 0)
         if a_is_free_or_ground and b_is_free_or_ground:
             is_mf = 1
-    if compact_articulated_contacts != 0 and is_mf == 0:
+    if propagation_articulated_contacts != 0 and is_mf == 0:
         a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
         b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
         if a_non_free or b_non_free:
-            is_compact = 1
+            is_propagation = 1
 
     friction_anchor_rank = int(0)
     if contact_friction_anchor_limit > 0:
@@ -2724,12 +2724,12 @@ def allocate_world_contact_slots(
         contact_art_a[c] = art_a
         contact_art_b[c] = art_b
         contact_path[c] = 1
-    elif is_compact != 0:
-        # Compact articulated matrix-free path
-        slot = wp.atomic_add(compact_slot_counter, world, slots_needed)
-        if slot + slots_needed > compact_max_constraints:
+    elif is_propagation != 0:
+        # Propagation articulated matrix-free path
+        slot = wp.atomic_add(propagation_slot_counter, world, slots_needed)
+        if slot + slots_needed > propagation_max_constraints:
             # Roll back the counter so finalize sees only filled slots
-            wp.atomic_add(compact_slot_counter, world, -slots_needed)
+            wp.atomic_add(propagation_slot_counter, world, -slots_needed)
             contact_slot[c] = -1
             contact_path[c] = -1
             return
@@ -3839,7 +3839,7 @@ def build_mf_contact_rows(
 
 
 @wp.kernel
-def build_compact_contact_rows(
+def build_propagation_contact_rows(
     contact_count: wp.array[int],
     contact_point0: wp.array[wp.vec3],
     contact_point1: wp.array[wp.vec3],
@@ -3862,14 +3862,14 @@ def build_compact_contact_rows(
     contact_friction_scale: float,
     contact_shared_anchor: int,
     # outputs
-    compact_body_a: wp.array2d[int],
-    compact_body_b: wp.array2d[int],
-    compact_J_a: wp.array3d[float],
-    compact_J_b: wp.array3d[float],
-    compact_row_type: wp.array2d[int],
-    compact_row_parent: wp.array2d[int],
-    compact_row_mu: wp.array2d[float],
-    compact_phi: wp.array2d[float],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
+    propagation_phi: wp.array2d[float],
 ):
     """Build fixed-size body-space rows for contacts touching non-free articulations."""
     c = wp.tid()
@@ -3983,12 +3983,12 @@ def build_compact_contact_rows(
                 point_a_row_world = contact_anchor_world
             r_a = point_a_row_world - com_a
             ang_a = wp.cross(r_a, d)
-            compact_J_a[world, row_idx, 0] = d[0]
-            compact_J_a[world, row_idx, 1] = d[1]
-            compact_J_a[world, row_idx, 2] = d[2]
-            compact_J_a[world, row_idx, 3] = ang_a[0]
-            compact_J_a[world, row_idx, 4] = ang_a[1]
-            compact_J_a[world, row_idx, 5] = ang_a[2]
+            propagation_J_a[world, row_idx, 0] = d[0]
+            propagation_J_a[world, row_idx, 1] = d[1]
+            propagation_J_a[world, row_idx, 2] = d[2]
+            propagation_J_a[world, row_idx, 3] = ang_a[0]
+            propagation_J_a[world, row_idx, 4] = ang_a[1]
+            propagation_J_a[world, row_idx, 5] = ang_a[2]
 
         if body_b >= 0:
             point_b_row_world = point_b_world
@@ -3996,26 +3996,26 @@ def build_compact_contact_rows(
                 point_b_row_world = contact_anchor_world
             r_b = point_b_row_world - com_b
             ang_b = wp.cross(r_b, d)
-            compact_J_b[world, row_idx, 0] = -d[0]
-            compact_J_b[world, row_idx, 1] = -d[1]
-            compact_J_b[world, row_idx, 2] = -d[2]
-            compact_J_b[world, row_idx, 3] = -ang_b[0]
-            compact_J_b[world, row_idx, 4] = -ang_b[1]
-            compact_J_b[world, row_idx, 5] = -ang_b[2]
+            propagation_J_b[world, row_idx, 0] = -d[0]
+            propagation_J_b[world, row_idx, 1] = -d[1]
+            propagation_J_b[world, row_idx, 2] = -d[2]
+            propagation_J_b[world, row_idx, 3] = -ang_b[0]
+            propagation_J_b[world, row_idx, 4] = -ang_b[1]
+            propagation_J_b[world, row_idx, 5] = -ang_b[2]
 
-        compact_body_a[world, row_idx] = body_a
-        compact_body_b[world, row_idx] = body_b
+        propagation_body_a[world, row_idx] = body_a
+        propagation_body_b[world, row_idx] = body_b
 
         if row_offset == 0:
-            compact_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
-            compact_row_parent[world, row_idx] = -1
-            compact_phi[world, row_idx] = phi
-            compact_row_mu[world, row_idx] = mu
+            propagation_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
+            propagation_row_parent[world, row_idx] = -1
+            propagation_phi[world, row_idx] = phi
+            propagation_row_mu[world, row_idx] = mu
         else:
-            compact_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
-            compact_row_parent[world, row_idx] = slot
-            compact_phi[world, row_idx] = 0.0
-            compact_row_mu[world, row_idx] = friction_mu
+            propagation_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
+            propagation_row_parent[world, row_idx] = slot
+            propagation_phi[world, row_idx] = 0.0
+            propagation_row_mu[world, row_idx] = friction_mu
 
 
 @wp.kernel
@@ -4557,7 +4557,7 @@ def compute_mf_rhs_bias(
 
 
 @wp.kernel
-def compute_compact_body_B_for_size(
+def compute_propagation_body_B_for_size(
     body_to_articulation: wp.array[int],
     body_to_joint: wp.array[int],
     body_q: wp.array[wp.transform],
@@ -4571,7 +4571,7 @@ def compute_compact_body_B_for_size(
     target_size: int,
     max_dofs: int,
     # outputs
-    compact_body_B: wp.array3d[float],
+    propagation_body_B: wp.array3d[float],
 ):
     """Store B_body rows mapping generalized qd to body COM spatial velocity."""
     tid = wp.tid()
@@ -4615,15 +4615,15 @@ def compute_compact_body_B_for_size(
                     value = ang[1]
                 else:
                     value = ang[2]
-                compact_body_B[body, basis, local_dof] = value
+                propagation_body_B[body, basis, local_dof] = value
 
         curr_joint = joint_ancestor[curr_joint]
 
 
 @wp.kernel
-def compute_compact_active_body_B_for_size(
-    compact_body_count: wp.array[int],
-    compact_body_list: wp.array2d[int],
+def compute_propagation_active_body_B_for_size(
+    propagation_body_count: wp.array[int],
+    propagation_body_list: wp.array2d[int],
     body_to_articulation: wp.array[int],
     body_to_joint: wp.array[int],
     body_q: wp.array[wp.transform],
@@ -4635,20 +4635,20 @@ def compute_compact_active_body_B_for_size(
     joint_qd_start: wp.array[int],
     joint_S_s: wp.array[wp.spatial_vector],
     target_size: int,
-    max_compact_bodies: int,
+    max_propagation_bodies: int,
     max_dofs: int,
     # outputs
-    compact_body_B: wp.array3d[float],
+    propagation_body_B: wp.array3d[float],
 ):
     tid = wp.tid()
-    world = tid // (max_compact_bodies * 6)
-    rem = tid - world * max_compact_bodies * 6
+    world = tid // (max_propagation_bodies * 6)
+    rem = tid - world * max_propagation_bodies * 6
     local_body = rem // 6
     basis = rem - local_body * 6
 
-    if local_body >= compact_body_count[world]:
+    if local_body >= propagation_body_count[world]:
         return
-    body = compact_body_list[world, local_body]
+    body = propagation_body_list[world, local_body]
     if body < 0:
         return
 
@@ -4689,22 +4689,22 @@ def compute_compact_active_body_B_for_size(
                     value = ang[1]
                 else:
                     value = ang[2]
-                compact_body_B[body, basis, local_dof] = value
+                propagation_body_B[body, basis, local_dof] = value
 
         curr_joint = joint_ancestor[curr_joint]
 
 
 @wp.kernel
-def solve_compact_body_response_for_size(
+def solve_propagation_body_response_for_size(
     L_group: wp.array3d[float],
     body_to_articulation: wp.array[int],
     art_size: wp.array[int],
     art_group_idx: wp.array[int],
     target_size: int,
     max_dofs: int,
-    compact_body_B: wp.array3d[float],
+    propagation_body_B: wp.array3d[float],
     # outputs
-    compact_body_qd_response: wp.array3d[float],
+    propagation_body_qd_response: wp.array3d[float],
 ):
     """Solve H * qd = B^T e_basis for one body-space basis per thread."""
     tid = wp.tid()
@@ -4723,58 +4723,58 @@ def solve_compact_body_response_for_size(
     for i in range(target_size):
         if i >= max_dofs:
             continue
-        val = compact_body_B[body, basis, i]
+        val = propagation_body_B[body, basis, i]
         for k in range(i):
             L_ik = L_group[group_idx, i, k]
-            val -= L_ik * compact_body_qd_response[body, basis, k]
+            val -= L_ik * propagation_body_qd_response[body, basis, k]
 
         L_ii = L_group[group_idx, i, i]
         if L_ii != 0.0:
-            compact_body_qd_response[body, basis, i] = val / L_ii
+            propagation_body_qd_response[body, basis, i] = val / L_ii
         else:
-            compact_body_qd_response[body, basis, i] = 0.0
+            propagation_body_qd_response[body, basis, i] = 0.0
 
     # Backward substitution: L^T * qd = z.
     for i_rev in range(target_size):
         i = target_size - 1 - i_rev
         if i >= max_dofs:
             continue
-        val = compact_body_qd_response[body, basis, i]
+        val = propagation_body_qd_response[body, basis, i]
         for k in range(i + 1, target_size):
             L_ki = L_group[group_idx, k, i]
-            val -= L_ki * compact_body_qd_response[body, basis, k]
+            val -= L_ki * propagation_body_qd_response[body, basis, k]
 
         L_ii = L_group[group_idx, i, i]
         if L_ii != 0.0:
-            compact_body_qd_response[body, basis, i] = val / L_ii
+            propagation_body_qd_response[body, basis, i] = val / L_ii
         else:
-            compact_body_qd_response[body, basis, i] = 0.0
+            propagation_body_qd_response[body, basis, i] = 0.0
 
 
 @wp.kernel
-def solve_compact_active_body_response_for_size(
+def solve_propagation_active_body_response_for_size(
     L_group: wp.array3d[float],
-    compact_body_count: wp.array[int],
-    compact_body_list: wp.array2d[int],
+    propagation_body_count: wp.array[int],
+    propagation_body_list: wp.array2d[int],
     body_to_articulation: wp.array[int],
     art_size: wp.array[int],
     art_group_idx: wp.array[int],
     target_size: int,
-    max_compact_bodies: int,
+    max_propagation_bodies: int,
     max_dofs: int,
-    compact_body_B: wp.array3d[float],
+    propagation_body_B: wp.array3d[float],
     # outputs
-    compact_body_qd_response: wp.array3d[float],
+    propagation_body_qd_response: wp.array3d[float],
 ):
     tid = wp.tid()
-    world = tid // (max_compact_bodies * 6)
-    rem = tid - world * max_compact_bodies * 6
+    world = tid // (max_propagation_bodies * 6)
+    rem = tid - world * max_propagation_bodies * 6
     local_body = rem // 6
     basis = rem - local_body * 6
 
-    if local_body >= compact_body_count[world]:
+    if local_body >= propagation_body_count[world]:
         return
-    body = compact_body_list[world, local_body]
+    body = propagation_body_list[world, local_body]
     if body < 0:
         return
 
@@ -4789,39 +4789,39 @@ def solve_compact_active_body_response_for_size(
     for i in range(target_size):
         if i >= max_dofs:
             continue
-        val = compact_body_B[body, basis, i]
+        val = propagation_body_B[body, basis, i]
         for k in range(i):
-            val -= L_group[group_idx, i, k] * compact_body_qd_response[body, basis, k]
+            val -= L_group[group_idx, i, k] * propagation_body_qd_response[body, basis, k]
         L_ii = L_group[group_idx, i, i]
         if L_ii != 0.0:
-            compact_body_qd_response[body, basis, i] = val / L_ii
+            propagation_body_qd_response[body, basis, i] = val / L_ii
         else:
-            compact_body_qd_response[body, basis, i] = 0.0
+            propagation_body_qd_response[body, basis, i] = 0.0
 
     for i_rev in range(target_size):
         i = target_size - 1 - i_rev
         if i >= max_dofs:
             continue
-        val = compact_body_qd_response[body, basis, i]
+        val = propagation_body_qd_response[body, basis, i]
         for k in range(i + 1, target_size):
-            val -= L_group[group_idx, k, i] * compact_body_qd_response[body, basis, k]
+            val -= L_group[group_idx, k, i] * propagation_body_qd_response[body, basis, k]
         L_ii = L_group[group_idx, i, i]
         if L_ii != 0.0:
-            compact_body_qd_response[body, basis, i] = val / L_ii
+            propagation_body_qd_response[body, basis, i] = val / L_ii
         else:
-            compact_body_qd_response[body, basis, i] = 0.0
+            propagation_body_qd_response[body, basis, i] = 0.0
 
 
 @wp.kernel
-def assemble_compact_body_response_for_size(
+def assemble_propagation_body_response_for_size(
     body_to_articulation: wp.array[int],
     art_size: wp.array[int],
     target_size: int,
     max_dofs: int,
-    compact_body_B: wp.array3d[float],
-    compact_body_qd_response: wp.array3d[float],
+    propagation_body_B: wp.array3d[float],
+    propagation_body_qd_response: wp.array3d[float],
     # outputs
-    compact_body_response: wp.array3d[float],
+    propagation_body_response: wp.array3d[float],
 ):
     """Assemble R_body = B_body * H^-1 * B_body^T as a 6x6 matrix."""
     body = wp.tid()
@@ -4836,30 +4836,30 @@ def assemble_compact_body_response_for_size(
             value = float(0.0)
             for d in range(target_size):
                 if d < max_dofs:
-                    value += compact_body_B[body, row, d] * compact_body_qd_response[body, col, d]
-            compact_body_response[body, row, col] = value
+                    value += propagation_body_B[body, row, d] * propagation_body_qd_response[body, col, d]
+            propagation_body_response[body, row, col] = value
 
 
 @wp.kernel
-def assemble_compact_active_body_response_for_size(
-    compact_body_count: wp.array[int],
-    compact_body_list: wp.array2d[int],
+def assemble_propagation_active_body_response_for_size(
+    propagation_body_count: wp.array[int],
+    propagation_body_list: wp.array2d[int],
     body_to_articulation: wp.array[int],
     art_size: wp.array[int],
     target_size: int,
-    max_compact_bodies: int,
+    max_propagation_bodies: int,
     max_dofs: int,
-    compact_body_B: wp.array3d[float],
-    compact_body_qd_response: wp.array3d[float],
+    propagation_body_B: wp.array3d[float],
+    propagation_body_qd_response: wp.array3d[float],
     # outputs
-    compact_body_response: wp.array3d[float],
+    propagation_body_response: wp.array3d[float],
 ):
     tid = wp.tid()
-    world = tid // max_compact_bodies
-    local_body = tid - world * max_compact_bodies
-    if local_body >= compact_body_count[world]:
+    world = tid // max_propagation_bodies
+    local_body = tid - world * max_propagation_bodies
+    if local_body >= propagation_body_count[world]:
         return
-    body = compact_body_list[world, local_body]
+    body = propagation_body_list[world, local_body]
     if body < 0:
         return
 
@@ -4874,20 +4874,20 @@ def assemble_compact_active_body_response_for_size(
             value = float(0.0)
             for d in range(target_size):
                 if d < max_dofs:
-                    value += compact_body_B[body, row, d] * compact_body_qd_response[body, col, d]
-            compact_body_response[body, row, col] = value
+                    value += propagation_body_B[body, row, d] * propagation_body_qd_response[body, col, d]
+            propagation_body_response[body, row, col] = value
 
 
 @wp.kernel
-def refresh_compact_body_qd_from_vout(
+def refresh_propagation_body_qd_from_vout(
     body_to_articulation: wp.array[int],
     art_size: wp.array[int],
     art_dof_start: wp.array[int],
     max_dofs: int,
-    compact_body_B: wp.array3d[float],
+    propagation_body_B: wp.array3d[float],
     v_out: wp.array[float],
     # outputs
-    compact_body_qd: wp.array2d[float],
+    propagation_body_qd: wp.array2d[float],
 ):
     """Refresh body COM spatial velocities from the current generalized velocity."""
     tid = wp.tid()
@@ -4896,7 +4896,7 @@ def refresh_compact_body_qd_from_vout(
 
     art = body_to_articulation[body]
     if art < 0:
-        compact_body_qd[body, basis] = 0.0
+        propagation_body_qd[body, basis] = 0.0
         return
 
     n_dofs = art_size[art]
@@ -4904,42 +4904,42 @@ def refresh_compact_body_qd_from_vout(
     value = float(0.0)
     for d in range(n_dofs):
         if d < max_dofs:
-            value += compact_body_B[body, basis, d] * v_out[dof_start + d]
-    compact_body_qd[body, basis] = value
+            value += propagation_body_B[body, basis, d] * v_out[dof_start + d]
+    propagation_body_qd[body, basis] = value
 
 
 @wp.kernel
-def compute_compact_effective_mass_and_rhs(
-    compact_constraint_count: wp.array[int],
-    compact_body_a: wp.array2d[int],
-    compact_body_b: wp.array2d[int],
-    compact_J_a: wp.array3d[float],
-    compact_J_b: wp.array3d[float],
-    compact_body_response: wp.array3d[float],
-    compact_phi: wp.array2d[float],
-    compact_row_type: wp.array2d[int],
+def compute_propagation_effective_mass_and_rhs(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_body_response: wp.array3d[float],
+    propagation_phi: wp.array2d[float],
+    propagation_row_type: wp.array2d[int],
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_cfm: float,
     pgs_beta: float,
     dense_contact_compliance: float,
     speculative_dense_contact_compliance: float,
     dt: float,
-    compact_max_constraints: int,
+    propagation_max_constraints: int,
     # outputs
-    compact_eff_mass_inv: wp.array2d[float],
-    compact_MiJt_a: wp.array3d[float],
-    compact_MiJt_b: wp.array3d[float],
-    compact_rhs: wp.array2d[float],
+    propagation_eff_mass_inv: wp.array2d[float],
+    propagation_MiJt_a: wp.array3d[float],
+    propagation_MiJt_b: wp.array3d[float],
+    propagation_rhs: wp.array2d[float],
 ):
     tid = wp.tid()
-    world = tid // compact_max_constraints
-    i = tid - world * compact_max_constraints
-    if i >= compact_constraint_count[world]:
+    world = tid // propagation_max_constraints
+    i = tid - world * propagation_max_constraints
+    if i >= propagation_constraint_count[world]:
         return
 
-    ba = compact_body_a[world, i]
-    bb = compact_body_b[world, i]
-    row_type = compact_row_type[world, i]
+    ba = propagation_body_a[world, i]
+    bb = propagation_body_b[world, i]
+    row_type = propagation_row_type[world, i]
 
     d = pgs_cfm
 
@@ -4947,33 +4947,33 @@ def compute_compact_effective_mass_and_rhs(
         for r in range(6):
             value = float(0.0)
             for c in range(6):
-                value += compact_body_response[ba, r, c] * compact_J_a[world, i, c]
-            compact_MiJt_a[world, i, r] = value
-            d += compact_J_a[world, i, r] * value
+                value += propagation_body_response[ba, r, c] * propagation_J_a[world, i, c]
+            propagation_MiJt_a[world, i, r] = value
+            d += propagation_J_a[world, i, r] * value
 
     if bb >= 0:
         for r in range(6):
             value = float(0.0)
             for c in range(6):
-                value += compact_body_response[bb, r, c] * compact_J_b[world, i, c]
-            compact_MiJt_b[world, i, r] = value
-            d += compact_J_b[world, i, r] * value
+                value += propagation_body_response[bb, r, c] * propagation_J_b[world, i, c]
+            propagation_MiJt_b[world, i, r] = value
+            d += propagation_J_b[world, i, r] * value
 
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
         compliance = dense_contact_compliance
-        if compact_phi[world, i] > 0.0:
+        if propagation_phi[world, i] > 0.0:
             compliance += speculative_dense_contact_compliance
         if compliance != 0.0 and dt > 0.0:
             d += compliance / (dt * dt)
 
     if d > 0.0:
-        compact_eff_mass_inv[world, i] = 1.0 / d
+        propagation_eff_mass_inv[world, i] = 1.0 / d
     else:
-        compact_eff_mass_inv[world, i] = 0.0
+        propagation_eff_mass_inv[world, i] = 0.0
 
     bias = float(0.0)
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        phi_val = compact_phi[world, i]
+        phi_val = propagation_phi[world, i]
         if phi_val < 0.0:
             bias = pgs_beta * phi_val / dt
             max_depen = 1.0e20
@@ -4988,39 +4988,39 @@ def compute_compact_effective_mass_and_rhs(
                 bias = wp.max(bias, -max_depen)
         else:
             bias = phi_val / dt
-    compact_rhs[world, i] = bias
+    propagation_rhs[world, i] = bias
 
 
 @wp.kernel
-def compute_compact_rhs_bias(
-    compact_constraint_count: wp.array[int],
-    compact_body_a: wp.array2d[int],
-    compact_body_b: wp.array2d[int],
-    compact_phi: wp.array2d[float],
-    compact_row_type: wp.array2d[int],
+def compute_propagation_rhs_bias(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_phi: wp.array2d[float],
+    propagation_row_type: wp.array2d[int],
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_beta: float,
     dt: float,
     bias_scale: float,
     speculative_scale: float,
-    compact_max_constraints: int,
+    propagation_max_constraints: int,
     # outputs
-    compact_rhs: wp.array2d[float],
+    propagation_rhs: wp.array2d[float],
 ):
     tid = wp.tid()
-    world = tid // compact_max_constraints
-    i = tid - world * compact_max_constraints
-    if i >= compact_constraint_count[world]:
+    world = tid // propagation_max_constraints
+    i = tid - world * propagation_max_constraints
+    if i >= propagation_constraint_count[world]:
         return
 
     bias = float(0.0)
-    row_type = compact_row_type[world, i]
+    row_type = propagation_row_type[world, i]
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        phi_val = compact_phi[world, i]
+        phi_val = propagation_phi[world, i]
         if phi_val < 0.0:
             bias = bias_scale * pgs_beta * phi_val / dt
-            ba = compact_body_a[world, i]
-            bb = compact_body_b[world, i]
+            ba = propagation_body_a[world, i]
+            bb = propagation_body_b[world, i]
             max_depen = 1.0e20
             if ba >= 0:
                 max_depen = rigid_body_max_depenetration_velocity[ba]
@@ -5033,19 +5033,19 @@ def compute_compact_rhs_bias(
                 bias = wp.max(bias, -max_depen)
         else:
             bias = speculative_scale * phi_val / dt
-    compact_rhs[world, i] = bias
+    propagation_rhs[world, i] = bias
 
 
 @wp.kernel
-def accumulate_compact_body_impulses_to_tau(
+def accumulate_propagation_body_impulses_to_tau(
     body_to_articulation: wp.array[int],
     art_size: wp.array[int],
     art_dof_start: wp.array[int],
     max_dofs: int,
-    compact_body_B: wp.array3d[float],
-    compact_body_impulses: wp.array2d[float],
+    propagation_body_B: wp.array3d[float],
+    propagation_body_impulses: wp.array2d[float],
     # outputs
-    compact_tau: wp.array[float],
+    propagation_tau: wp.array[float],
 ):
     tid = wp.tid()
     body = tid // max_dofs
@@ -5060,104 +5060,104 @@ def accumulate_compact_body_impulses_to_tau(
 
     value = float(0.0)
     for basis in range(6):
-        value += compact_body_B[body, basis, local_dof] * compact_body_impulses[body, basis]
+        value += propagation_body_B[body, basis, local_dof] * propagation_body_impulses[body, basis]
     if value != 0.0:
-        wp.atomic_add(compact_tau, art_dof_start[art] + local_dof, value)
+        wp.atomic_add(propagation_tau, art_dof_start[art] + local_dof, value)
 
 
 @wp.kernel
-def build_compact_body_map(
-    compact_constraint_count: wp.array[int],
-    compact_body_a: wp.array2d[int],
-    compact_body_b: wp.array2d[int],
-    compact_max_constraints: int,
-    max_compact_bodies: int,
-    compact_body_seen: wp.array[int],
+def build_propagation_body_map(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_max_constraints: int,
+    max_propagation_bodies: int,
+    propagation_body_seen: wp.array[int],
     # outputs
-    compact_body_list: wp.array2d[int],
-    compact_body_count: wp.array[int],
-    compact_body_local_slot: wp.array[int],
+    propagation_body_list: wp.array2d[int],
+    propagation_body_count: wp.array[int],
+    propagation_body_local_slot: wp.array[int],
 ):
     tid = wp.tid()
-    world = tid // compact_max_constraints
-    i = tid - world * compact_max_constraints
-    m = compact_constraint_count[world]
-    if m > compact_max_constraints:
-        m = compact_max_constraints
+    world = tid // propagation_max_constraints
+    i = tid - world * propagation_max_constraints
+    m = propagation_constraint_count[world]
+    if m > propagation_max_constraints:
+        m = propagation_max_constraints
     if i >= m:
         return
 
-    ba = compact_body_a[world, i]
+    ba = propagation_body_a[world, i]
     if ba >= 0:
-        old = wp.atomic_add(compact_body_seen, ba, 1)
+        old = wp.atomic_add(propagation_body_seen, ba, 1)
         if old == 0:
-            slot = wp.atomic_add(compact_body_count, world, 1)
-            if slot < max_compact_bodies:
-                compact_body_list[world, slot] = ba
-                compact_body_local_slot[ba] = slot
+            slot = wp.atomic_add(propagation_body_count, world, 1)
+            if slot < max_propagation_bodies:
+                propagation_body_list[world, slot] = ba
+                propagation_body_local_slot[ba] = slot
 
-    bb = compact_body_b[world, i]
+    bb = propagation_body_b[world, i]
     if bb >= 0:
-        old = wp.atomic_add(compact_body_seen, bb, 1)
+        old = wp.atomic_add(propagation_body_seen, bb, 1)
         if old == 0:
-            slot = wp.atomic_add(compact_body_count, world, 1)
-            if slot < max_compact_bodies:
-                compact_body_list[world, slot] = bb
-                compact_body_local_slot[bb] = slot
+            slot = wp.atomic_add(propagation_body_count, world, 1)
+            if slot < max_propagation_bodies:
+                propagation_body_list[world, slot] = bb
+                propagation_body_local_slot[bb] = slot
 
 
 @wp.kernel
-def build_compact_body_map_slow(
-    compact_constraint_count: wp.array[int],
-    compact_body_a: wp.array2d[int],
-    compact_body_b: wp.array2d[int],
-    compact_max_constraints: int,
-    max_compact_bodies: int,
+def build_propagation_body_map_slow(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_max_constraints: int,
+    max_propagation_bodies: int,
     # outputs
-    compact_body_list: wp.array2d[int],
-    compact_body_count: wp.array[int],
+    propagation_body_list: wp.array2d[int],
+    propagation_body_count: wp.array[int],
 ):
-    """Reference compact body map builder with O(rows * active bodies) dedup."""
+    """Reference propagation body map builder with O(rows * active bodies) dedup."""
     world = wp.tid()
-    m = compact_constraint_count[world]
-    if m > compact_max_constraints:
-        m = compact_max_constraints
+    m = propagation_constraint_count[world]
+    if m > propagation_max_constraints:
+        m = propagation_max_constraints
 
     n_bodies = int(0)
     for i in range(m):
-        ba = compact_body_a[world, i]
+        ba = propagation_body_a[world, i]
         if ba >= 0:
             found = int(0)
             for b in range(n_bodies):
-                if compact_body_list[world, b] == ba:
+                if propagation_body_list[world, b] == ba:
                     found = int(1)
                     break
-            if found == 0 and n_bodies < max_compact_bodies:
-                compact_body_list[world, n_bodies] = ba
+            if found == 0 and n_bodies < max_propagation_bodies:
+                propagation_body_list[world, n_bodies] = ba
                 n_bodies += int(1)
 
-        bb = compact_body_b[world, i]
+        bb = propagation_body_b[world, i]
         if bb >= 0:
             found = int(0)
             for b in range(n_bodies):
-                if compact_body_list[world, b] == bb:
+                if propagation_body_list[world, b] == bb:
                     found = int(1)
                     break
-            if found == 0 and n_bodies < max_compact_bodies:
-                compact_body_list[world, n_bodies] = bb
+            if found == 0 and n_bodies < max_propagation_bodies:
+                propagation_body_list[world, n_bodies] = bb
                 n_bodies += int(1)
 
-    compact_body_count[world] = n_bodies
+    propagation_body_count[world] = n_bodies
 
 
 @wp.kernel
-def compute_compact_body_com_rel(
+def compute_propagation_body_com_rel(
     body_to_articulation: wp.array[int],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     articulation_origin: wp.array[wp.vec3],
     # outputs
-    compact_body_com_rel: wp.array2d[float],
+    propagation_body_com_rel: wp.array2d[float],
 ):
     body = wp.tid()
     art = body_to_articulation[body]
@@ -5166,19 +5166,19 @@ def compute_compact_body_com_rel(
 
     com_world = wp.transform_point(body_q[body], body_com[body])
     rel = com_world - articulation_origin[art]
-    compact_body_com_rel[body, 0] = rel[0]
-    compact_body_com_rel[body, 1] = rel[1]
-    compact_body_com_rel[body, 2] = rel[2]
+    propagation_body_com_rel[body, 0] = rel[0]
+    propagation_body_com_rel[body, 1] = rel[1]
+    propagation_body_com_rel[body, 2] = rel[2]
 
 
 @wp.kernel
-def flatten_compact_joint_S(
+def flatten_propagation_joint_S(
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_S_s: wp.array[wp.spatial_vector],
-    compact_body_com_rel: wp.array2d[float],
+    propagation_body_com_rel: wp.array2d[float],
     # outputs
-    compact_joint_S_flat: wp.array2d[float],
+    propagation_joint_S_flat: wp.array2d[float],
 ):
     joint = wp.tid()
     child = joint_child[joint]
@@ -5186,9 +5186,9 @@ def flatten_compact_joint_S(
         return
 
     child_rel = wp.vec3(
-        compact_body_com_rel[child, 0],
-        compact_body_com_rel[child, 1],
-        compact_body_com_rel[child, 2],
+        propagation_body_com_rel[child, 0],
+        propagation_body_com_rel[child, 1],
+        propagation_body_com_rel[child, 2],
     )
     dof_start = joint_qd_start[joint]
     dof_end = joint_qd_start[joint + 1]
@@ -5197,16 +5197,16 @@ def flatten_compact_joint_S(
         lin = wp.vec3(S[0], S[1], S[2])
         ang = wp.vec3(S[3], S[4], S[5])
         lin_child = lin + wp.cross(ang, child_rel)
-        compact_joint_S_flat[dof, 0] = lin_child[0]
-        compact_joint_S_flat[dof, 1] = lin_child[1]
-        compact_joint_S_flat[dof, 2] = lin_child[2]
-        compact_joint_S_flat[dof, 3] = ang[0]
-        compact_joint_S_flat[dof, 4] = ang[1]
-        compact_joint_S_flat[dof, 5] = ang[2]
+        propagation_joint_S_flat[dof, 0] = lin_child[0]
+        propagation_joint_S_flat[dof, 1] = lin_child[1]
+        propagation_joint_S_flat[dof, 2] = lin_child[2]
+        propagation_joint_S_flat[dof, 3] = ang[0]
+        propagation_joint_S_flat[dof, 4] = ang[1]
+        propagation_joint_S_flat[dof, 5] = ang[2]
 
 
 @wp.kernel
-def factor_compact_tree_for_size(
+def factor_propagation_tree_for_size(
     group_to_art: wp.array[int],
     articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
@@ -5214,7 +5214,7 @@ def factor_compact_tree_for_size(
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
-    compact_joint_S_flat: wp.array2d[float],
+    propagation_joint_S_flat: wp.array2d[float],
     joint_armature: wp.array[float],
     max_dofs: int,
     aug_row_counts: wp.array[int],
@@ -5222,12 +5222,12 @@ def factor_compact_tree_for_size(
     aug_row_K: wp.array[float],
     body_I_m: wp.array[wp.spatial_matrix],
     body_q_com: wp.array[wp.transform],
-    compact_body_com_rel: wp.array2d[float],
+    propagation_body_com_rel: wp.array2d[float],
     # outputs
-    compact_tree_Ia: wp.array3d[float],
-    compact_tree_U: wp.array2d[float],
-    compact_tree_D_chol: wp.array3d[float],
-    compact_tree_D_inv: wp.array3d[float],
+    propagation_tree_Ia: wp.array3d[float],
+    propagation_tree_U: wp.array2d[float],
+    propagation_tree_D_chol: wp.array3d[float],
+    propagation_tree_D_inv: wp.array3d[float],
 ):
     """Factor one size group into articulated-body inertia terms.
 
@@ -5247,17 +5247,17 @@ def factor_compact_tree_for_size(
         I = transform_spatial_inertia(X_com_world, body_I_m[body])
         for r in range(6):
             for c in range(6):
-                compact_tree_Ia[body, r, c] = I[r, c]
+                propagation_tree_Ia[body, r, c] = I[r, c]
 
         dof_start = joint_qd_start[joint]
         dof_end = joint_qd_start[joint + 1]
         for dof in range(dof_start, dof_end):
             for r in range(6):
-                compact_tree_U[dof, r] = 0.0
+                propagation_tree_U[dof, r] = 0.0
         for r in range(6):
             for c in range(6):
-                compact_tree_D_chol[joint, r, c] = 0.0
-                compact_tree_D_inv[joint, r, c] = 0.0
+                propagation_tree_D_chol[joint, r, c] = 0.0
+                propagation_tree_D_inv[joint, r, c] = 0.0
 
     for offset in range(joint_end - joint_start):
         joint = joint_end - 1 - offset
@@ -5273,8 +5273,8 @@ def factor_compact_tree_for_size(
             for r in range(6):
                 value = float(0.0)
                 for c in range(6):
-                    value += compact_tree_Ia[child, r, c] * compact_joint_S_flat[gdof, c]
-                compact_tree_U[gdof, r] = value
+                    value += propagation_tree_Ia[child, r, c] * propagation_joint_S_flat[gdof, c]
+                propagation_tree_U[gdof, r] = value
 
         for a in range(dof_count):
             gdof_a = dof_start + a
@@ -5282,7 +5282,7 @@ def factor_compact_tree_for_size(
                 gdof_b = dof_start + b
                 value = float(0.0)
                 for r in range(6):
-                    value += compact_joint_S_flat[gdof_a, r] * compact_tree_U[gdof_b, r]
+                    value += propagation_joint_S_flat[gdof_a, r] * propagation_tree_U[gdof_b, r]
                 if a == b:
                     value += joint_armature[gdof_a]
                     aug_count = aug_row_counts[art]
@@ -5292,25 +5292,25 @@ def factor_compact_tree_for_size(
                             K = aug_row_K[row_index]
                             if K > 0.0:
                                 value += K
-                compact_tree_D_chol[joint, a, b] = value
+                propagation_tree_D_chol[joint, a, b] = value
 
         # Cholesky factorization of the small joint-space block D.
         for j in range(dof_count):
-            s = compact_tree_D_chol[joint, j, j]
+            s = propagation_tree_D_chol[joint, j, j]
             for k in range(j):
-                chol_jk = compact_tree_D_chol[joint, j, k]
+                chol_jk = propagation_tree_D_chol[joint, j, k]
                 s -= chol_jk * chol_jk
             if s <= 1.0e-12:
                 s = 1.0e-12
             s = wp.sqrt(s)
-            compact_tree_D_chol[joint, j, j] = s
+            propagation_tree_D_chol[joint, j, j] = s
             inv_s = 1.0 / s
 
             for i in range(j + 1, dof_count):
-                v = compact_tree_D_chol[joint, i, j]
+                v = propagation_tree_D_chol[joint, i, j]
                 for k in range(j):
-                    v -= compact_tree_D_chol[joint, i, k] * compact_tree_D_chol[joint, j, k]
-                compact_tree_D_chol[joint, i, j] = v * inv_s
+                    v -= propagation_tree_D_chol[joint, i, k] * propagation_tree_D_chol[joint, j, k]
+                propagation_tree_D_chol[joint, i, j] = v * inv_s
 
         # Invert D one column at a time using the Cholesky factor. D_inv[:, col]
         # first holds the forward solve, then the final inverse column.
@@ -5320,41 +5320,41 @@ def factor_compact_tree_for_size(
                 if i == col:
                     v = 1.0
                 for k in range(i):
-                    v -= compact_tree_D_chol[joint, i, k] * compact_tree_D_inv[joint, k, col]
-                diag = compact_tree_D_chol[joint, i, i]
-                compact_tree_D_inv[joint, i, col] = v / diag
+                    v -= propagation_tree_D_chol[joint, i, k] * propagation_tree_D_inv[joint, k, col]
+                diag = propagation_tree_D_chol[joint, i, i]
+                propagation_tree_D_inv[joint, i, col] = v / diag
 
             for i_rev in range(dof_count):
                 i = dof_count - 1 - i_rev
-                v = compact_tree_D_inv[joint, i, col]
+                v = propagation_tree_D_inv[joint, i, col]
                 for k in range(i + 1, dof_count):
-                    v -= compact_tree_D_chol[joint, k, i] * compact_tree_D_inv[joint, k, col]
-                diag = compact_tree_D_chol[joint, i, i]
-                compact_tree_D_inv[joint, i, col] = v / diag
+                    v -= propagation_tree_D_chol[joint, k, i] * propagation_tree_D_inv[joint, k, col]
+                diag = propagation_tree_D_chol[joint, i, i]
+                propagation_tree_D_inv[joint, i, col] = v / diag
 
         # Reduce the child's articulated inertia across this joint in the child
         # COM frame.
         for r in range(6):
             for c in range(6):
-                reduced = compact_tree_Ia[child, r, c]
+                reduced = propagation_tree_Ia[child, r, c]
                 for a in range(dof_count):
                     gdof_a = dof_start + a
-                    U_ar = compact_tree_U[gdof_a, r]
+                    U_ar = propagation_tree_U[gdof_a, r]
                     for b in range(dof_count):
                         gdof_b = dof_start + b
-                        reduced -= U_ar * compact_tree_D_inv[joint, a, b] * compact_tree_U[gdof_b, c]
-                compact_tree_Ia[child, r, c] = reduced
+                        reduced -= U_ar * propagation_tree_D_inv[joint, a, b] * propagation_tree_U[gdof_b, c]
+                propagation_tree_Ia[child, r, c] = reduced
 
         if parent >= 0:
             child_rel = wp.vec3(
-                compact_body_com_rel[child, 0],
-                compact_body_com_rel[child, 1],
-                compact_body_com_rel[child, 2],
+                propagation_body_com_rel[child, 0],
+                propagation_body_com_rel[child, 1],
+                propagation_body_com_rel[child, 2],
             )
             parent_rel = wp.vec3(
-                compact_body_com_rel[parent, 0],
-                compact_body_com_rel[parent, 1],
-                compact_body_com_rel[parent, 2],
+                propagation_body_com_rel[parent, 0],
+                propagation_body_com_rel[parent, 1],
+                propagation_body_com_rel[parent, 2],
             )
             child_minus_parent = child_rel - parent_rel
             for c in range(6):
@@ -5374,53 +5374,53 @@ def factor_compact_tree_for_size(
 
                 v_child = translate_twist_between_parallel_frames(basis, child_minus_parent)
                 I_child = wp.spatial_matrix(
-                    compact_tree_Ia[child, 0, 0],
-                    compact_tree_Ia[child, 0, 1],
-                    compact_tree_Ia[child, 0, 2],
-                    compact_tree_Ia[child, 0, 3],
-                    compact_tree_Ia[child, 0, 4],
-                    compact_tree_Ia[child, 0, 5],
-                    compact_tree_Ia[child, 1, 0],
-                    compact_tree_Ia[child, 1, 1],
-                    compact_tree_Ia[child, 1, 2],
-                    compact_tree_Ia[child, 1, 3],
-                    compact_tree_Ia[child, 1, 4],
-                    compact_tree_Ia[child, 1, 5],
-                    compact_tree_Ia[child, 2, 0],
-                    compact_tree_Ia[child, 2, 1],
-                    compact_tree_Ia[child, 2, 2],
-                    compact_tree_Ia[child, 2, 3],
-                    compact_tree_Ia[child, 2, 4],
-                    compact_tree_Ia[child, 2, 5],
-                    compact_tree_Ia[child, 3, 0],
-                    compact_tree_Ia[child, 3, 1],
-                    compact_tree_Ia[child, 3, 2],
-                    compact_tree_Ia[child, 3, 3],
-                    compact_tree_Ia[child, 3, 4],
-                    compact_tree_Ia[child, 3, 5],
-                    compact_tree_Ia[child, 4, 0],
-                    compact_tree_Ia[child, 4, 1],
-                    compact_tree_Ia[child, 4, 2],
-                    compact_tree_Ia[child, 4, 3],
-                    compact_tree_Ia[child, 4, 4],
-                    compact_tree_Ia[child, 4, 5],
-                    compact_tree_Ia[child, 5, 0],
-                    compact_tree_Ia[child, 5, 1],
-                    compact_tree_Ia[child, 5, 2],
-                    compact_tree_Ia[child, 5, 3],
-                    compact_tree_Ia[child, 5, 4],
-                    compact_tree_Ia[child, 5, 5],
+                    propagation_tree_Ia[child, 0, 0],
+                    propagation_tree_Ia[child, 0, 1],
+                    propagation_tree_Ia[child, 0, 2],
+                    propagation_tree_Ia[child, 0, 3],
+                    propagation_tree_Ia[child, 0, 4],
+                    propagation_tree_Ia[child, 0, 5],
+                    propagation_tree_Ia[child, 1, 0],
+                    propagation_tree_Ia[child, 1, 1],
+                    propagation_tree_Ia[child, 1, 2],
+                    propagation_tree_Ia[child, 1, 3],
+                    propagation_tree_Ia[child, 1, 4],
+                    propagation_tree_Ia[child, 1, 5],
+                    propagation_tree_Ia[child, 2, 0],
+                    propagation_tree_Ia[child, 2, 1],
+                    propagation_tree_Ia[child, 2, 2],
+                    propagation_tree_Ia[child, 2, 3],
+                    propagation_tree_Ia[child, 2, 4],
+                    propagation_tree_Ia[child, 2, 5],
+                    propagation_tree_Ia[child, 3, 0],
+                    propagation_tree_Ia[child, 3, 1],
+                    propagation_tree_Ia[child, 3, 2],
+                    propagation_tree_Ia[child, 3, 3],
+                    propagation_tree_Ia[child, 3, 4],
+                    propagation_tree_Ia[child, 3, 5],
+                    propagation_tree_Ia[child, 4, 0],
+                    propagation_tree_Ia[child, 4, 1],
+                    propagation_tree_Ia[child, 4, 2],
+                    propagation_tree_Ia[child, 4, 3],
+                    propagation_tree_Ia[child, 4, 4],
+                    propagation_tree_Ia[child, 4, 5],
+                    propagation_tree_Ia[child, 5, 0],
+                    propagation_tree_Ia[child, 5, 1],
+                    propagation_tree_Ia[child, 5, 2],
+                    propagation_tree_Ia[child, 5, 3],
+                    propagation_tree_Ia[child, 5, 4],
+                    propagation_tree_Ia[child, 5, 5],
                 )
                 w_child = I_child * v_child
                 w_parent = translate_wrench_between_parallel_frames(w_child, child_minus_parent)
                 for r in range(6):
-                    compact_tree_Ia[parent, r, c] = compact_tree_Ia[parent, r, c] + w_parent[r]
+                    propagation_tree_Ia[parent, r, c] = propagation_tree_Ia[parent, r, c] + w_parent[r]
 
 
 @wp.kernel
-def compute_compact_tree_body_response_for_size(
-    compact_body_count: wp.array[int],
-    compact_body_list: wp.array2d[int],
+def compute_propagation_tree_body_response_for_size(
+    propagation_body_count: wp.array[int],
+    propagation_body_list: wp.array2d[int],
     body_to_articulation: wp.array[int],
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
@@ -5429,30 +5429,30 @@ def compute_compact_tree_body_response_for_size(
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
-    compact_joint_S_flat: wp.array2d[float],
-    max_compact_bodies: int,
-    compact_body_com_rel: wp.array2d[float],
-    compact_tree_U: wp.array2d[float],
-    compact_tree_D_inv: wp.array3d[float],
+    propagation_joint_S_flat: wp.array2d[float],
+    max_propagation_bodies: int,
+    propagation_body_com_rel: wp.array2d[float],
+    propagation_tree_U: wp.array2d[float],
+    propagation_tree_D_inv: wp.array3d[float],
     # scratch
-    compact_tree_pA: wp.array2d[float],
-    compact_tree_u: wp.array[float],
-    compact_tree_qdd: wp.array[float],
-    compact_tree_body_delta: wp.array2d[float],
+    propagation_tree_pA: wp.array2d[float],
+    propagation_tree_u: wp.array[float],
+    propagation_tree_qdd: wp.array[float],
+    propagation_tree_body_delta: wp.array2d[float],
     # outputs
-    compact_body_response: wp.array3d[float],
+    propagation_body_response: wp.array3d[float],
 ):
-    """Compute exact 6x6 COM response for active compact bodies by tree solves."""
+    """Compute exact 6x6 COM response for active propagation bodies by tree solves."""
     group_idx = wp.tid()
     art = group_to_art[group_idx]
     world = art_to_world[art]
     joint_start = articulation_start[art]
     joint_end = articulation_start[art + 1]
 
-    for local_body in range(max_compact_bodies):
-        if local_body >= compact_body_count[world]:
+    for local_body in range(max_propagation_bodies):
+        if local_body >= propagation_body_count[world]:
             break
-        target_body = compact_body_list[world, local_body]
+        target_body = propagation_body_list[world, local_body]
         if target_body < 0:
             continue
         if body_to_articulation[target_body] != art:
@@ -5462,13 +5462,13 @@ def compute_compact_tree_body_response_for_size(
             for joint in range(joint_start, joint_end):
                 body = joint_child[joint]
                 for r in range(6):
-                    compact_tree_pA[body, r] = 0.0
-                    compact_tree_body_delta[body, r] = 0.0
+                    propagation_tree_pA[body, r] = 0.0
+                    propagation_tree_body_delta[body, r] = 0.0
                 dof_start = joint_qd_start[joint]
                 dof_end = joint_qd_start[joint + 1]
                 for dof in range(dof_start, dof_end):
-                    compact_tree_u[dof] = 0.0
-                    compact_tree_qdd[dof] = 0.0
+                    propagation_tree_u[dof] = 0.0
+                    propagation_tree_qdd[dof] = 0.0
 
             force = wp.vec3(0.0)
             torque_com = wp.vec3(0.0)
@@ -5485,12 +5485,12 @@ def compute_compact_tree_body_response_for_size(
             else:
                 torque_com = wp.vec3(0.0, 0.0, 1.0)
 
-            compact_tree_pA[target_body, 0] = -force[0]
-            compact_tree_pA[target_body, 1] = -force[1]
-            compact_tree_pA[target_body, 2] = -force[2]
-            compact_tree_pA[target_body, 3] = -torque_com[0]
-            compact_tree_pA[target_body, 4] = -torque_com[1]
-            compact_tree_pA[target_body, 5] = -torque_com[2]
+            propagation_tree_pA[target_body, 0] = -force[0]
+            propagation_tree_pA[target_body, 1] = -force[1]
+            propagation_tree_pA[target_body, 2] = -force[2]
+            propagation_tree_pA[target_body, 3] = -torque_com[0]
+            propagation_tree_pA[target_body, 4] = -torque_com[1]
+            propagation_tree_pA[target_body, 5] = -torque_com[2]
 
             for offset in range(joint_end - joint_start):
                 joint = joint_end - 1 - offset
@@ -5503,44 +5503,44 @@ def compute_compact_tree_body_response_for_size(
                     gdof = dof_start + a
                     v = float(0.0)
                     for r in range(6):
-                        v -= compact_joint_S_flat[gdof, r] * compact_tree_pA[child, r]
-                    compact_tree_u[gdof] = v
+                        v -= propagation_joint_S_flat[gdof, r] * propagation_tree_pA[child, r]
+                    propagation_tree_u[gdof] = v
 
                 if parent >= 0:
-                    p0 = compact_tree_pA[child, 0]
-                    p1 = compact_tree_pA[child, 1]
-                    p2 = compact_tree_pA[child, 2]
-                    p3 = compact_tree_pA[child, 3]
-                    p4 = compact_tree_pA[child, 4]
-                    p5 = compact_tree_pA[child, 5]
+                    p0 = propagation_tree_pA[child, 0]
+                    p1 = propagation_tree_pA[child, 1]
+                    p2 = propagation_tree_pA[child, 2]
+                    p3 = propagation_tree_pA[child, 3]
+                    p4 = propagation_tree_pA[child, 4]
+                    p5 = propagation_tree_pA[child, 5]
                     for a in range(dof_count):
                         gdof_a = dof_start + a
                         coeff = float(0.0)
                         for b in range(dof_count):
                             gdof_b = dof_start + b
-                            coeff += compact_tree_D_inv[joint, a, b] * compact_tree_u[gdof_b]
-                        p0 += compact_tree_U[gdof_a, 0] * coeff
-                        p1 += compact_tree_U[gdof_a, 1] * coeff
-                        p2 += compact_tree_U[gdof_a, 2] * coeff
-                        p3 += compact_tree_U[gdof_a, 3] * coeff
-                        p4 += compact_tree_U[gdof_a, 4] * coeff
-                        p5 += compact_tree_U[gdof_a, 5] * coeff
+                            coeff += propagation_tree_D_inv[joint, a, b] * propagation_tree_u[gdof_b]
+                        p0 += propagation_tree_U[gdof_a, 0] * coeff
+                        p1 += propagation_tree_U[gdof_a, 1] * coeff
+                        p2 += propagation_tree_U[gdof_a, 2] * coeff
+                        p3 += propagation_tree_U[gdof_a, 3] * coeff
+                        p4 += propagation_tree_U[gdof_a, 4] * coeff
+                        p5 += propagation_tree_U[gdof_a, 5] * coeff
 
                     child_rel = wp.vec3(
-                        compact_body_com_rel[child, 0],
-                        compact_body_com_rel[child, 1],
-                        compact_body_com_rel[child, 2],
+                        propagation_body_com_rel[child, 0],
+                        propagation_body_com_rel[child, 1],
+                        propagation_body_com_rel[child, 2],
                     )
                     parent_rel = wp.vec3(
-                        compact_body_com_rel[parent, 0],
-                        compact_body_com_rel[parent, 1],
-                        compact_body_com_rel[parent, 2],
+                        propagation_body_com_rel[parent, 0],
+                        propagation_body_com_rel[parent, 1],
+                        propagation_body_com_rel[parent, 2],
                     )
                     child_minus_parent = child_rel - parent_rel
                     propagated_child = wp.spatial_vector(p0, p1, p2, p3, p4, p5)
                     propagated_parent = translate_wrench_between_parallel_frames(propagated_child, child_minus_parent)
                     for r in range(6):
-                        compact_tree_pA[parent, r] = compact_tree_pA[parent, r] + propagated_parent[r]
+                        propagation_tree_pA[parent, r] = propagation_tree_pA[parent, r] + propagated_parent[r]
 
             for joint in range(joint_start, joint_end):
                 child = joint_child[joint]
@@ -5550,22 +5550,22 @@ def compute_compact_tree_body_response_for_size(
                 parent_delta_child = wp.spatial_vector()
                 if parent >= 0:
                     parent_delta_parent = wp.spatial_vector(
-                        compact_tree_body_delta[parent, 0],
-                        compact_tree_body_delta[parent, 1],
-                        compact_tree_body_delta[parent, 2],
-                        compact_tree_body_delta[parent, 3],
-                        compact_tree_body_delta[parent, 4],
-                        compact_tree_body_delta[parent, 5],
+                        propagation_tree_body_delta[parent, 0],
+                        propagation_tree_body_delta[parent, 1],
+                        propagation_tree_body_delta[parent, 2],
+                        propagation_tree_body_delta[parent, 3],
+                        propagation_tree_body_delta[parent, 4],
+                        propagation_tree_body_delta[parent, 5],
                     )
                     child_rel = wp.vec3(
-                        compact_body_com_rel[child, 0],
-                        compact_body_com_rel[child, 1],
-                        compact_body_com_rel[child, 2],
+                        propagation_body_com_rel[child, 0],
+                        propagation_body_com_rel[child, 1],
+                        propagation_body_com_rel[child, 2],
                     )
                     parent_rel = wp.vec3(
-                        compact_body_com_rel[parent, 0],
-                        compact_body_com_rel[parent, 1],
-                        compact_body_com_rel[parent, 2],
+                        propagation_body_com_rel[parent, 0],
+                        propagation_body_com_rel[parent, 1],
+                        propagation_body_com_rel[parent, 2],
                     )
                     parent_delta_child = translate_twist_between_parallel_frames(
                         parent_delta_parent, child_rel - parent_rel
@@ -5579,38 +5579,38 @@ def compute_compact_tree_body_response_for_size(
                         parent_term = float(0.0)
                         if parent >= 0:
                             for r in range(6):
-                                parent_term += compact_tree_U[gdof_b, r] * parent_delta_child[r]
-                        qdd += compact_tree_D_inv[joint, a, b] * (compact_tree_u[gdof_b] - parent_term)
-                    compact_tree_qdd[gdof_a] = qdd
+                                parent_term += propagation_tree_U[gdof_b, r] * parent_delta_child[r]
+                        qdd += propagation_tree_D_inv[joint, a, b] * (propagation_tree_u[gdof_b] - parent_term)
+                    propagation_tree_qdd[gdof_a] = qdd
 
                 for r in range(6):
                     value = parent_delta_child[r]
                     for a in range(dof_count):
                         gdof = dof_start + a
-                        value += compact_joint_S_flat[gdof, r] * compact_tree_qdd[gdof]
-                    compact_tree_body_delta[child, r] = value
+                        value += propagation_joint_S_flat[gdof, r] * propagation_tree_qdd[gdof]
+                    propagation_tree_body_delta[child, r] = value
 
             for r in range(6):
-                compact_body_response[target_body, r, basis] = compact_tree_body_delta[target_body, r]
+                propagation_body_response[target_body, r, basis] = propagation_tree_body_delta[target_body, r]
 
 
 @wp.kernel
-def compute_compact_tree_body_response_revolute_for_size(
+def compute_propagation_tree_body_response_revolute_for_size(
     group_to_art: wp.array[int],
     articulation_start: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
-    compact_joint_S_flat: wp.array2d[float],
-    compact_body_com_rel: wp.array2d[float],
-    compact_tree_U: wp.array2d[float],
-    compact_tree_D_inv: wp.array3d[float],
+    propagation_joint_S_flat: wp.array2d[float],
+    propagation_body_com_rel: wp.array2d[float],
+    propagation_tree_U: wp.array2d[float],
+    propagation_tree_D_inv: wp.array3d[float],
     # scratch/output: overwritten with local-COM body response matrices
-    compact_tree_Ia: wp.array3d[float],
-    compact_tree_body_delta: wp.array2d[float],
+    propagation_tree_Ia: wp.array3d[float],
+    propagation_tree_body_delta: wp.array2d[float],
     # outputs
-    compact_body_response: wp.array3d[float],
+    propagation_body_response: wp.array3d[float],
 ):
     """Compute per-link response matrices for 0/1-DOF joint trees."""
     group_idx = wp.tid()
@@ -5626,14 +5626,14 @@ def compute_compact_tree_body_response_revolute_for_size(
         edge = wp.vec3()
         if parent >= 0:
             child_rel = wp.vec3(
-                compact_body_com_rel[child, 0],
-                compact_body_com_rel[child, 1],
-                compact_body_com_rel[child, 2],
+                propagation_body_com_rel[child, 0],
+                propagation_body_com_rel[child, 1],
+                propagation_body_com_rel[child, 2],
             )
             parent_rel = wp.vec3(
-                compact_body_com_rel[parent, 0],
-                compact_body_com_rel[parent, 1],
-                compact_body_com_rel[parent, 2],
+                propagation_body_com_rel[parent, 0],
+                propagation_body_com_rel[parent, 1],
+                propagation_body_com_rel[parent, 2],
             )
             edge = child_rel - parent_rel
 
@@ -5660,24 +5660,24 @@ def compute_compact_tree_body_response_revolute_for_size(
                     for row in range(6):
                         v = float(0.0)
                         for p_col in range(6):
-                            v += compact_tree_Ia[parent, row, p_col] * parent_wrench[p_col]
-                        compact_tree_body_delta[child, row] = v
+                            v += propagation_tree_Ia[parent, row, p_col] * parent_wrench[p_col]
+                        propagation_tree_body_delta[child, row] = v
                     parent_delta = wp.spatial_vector(
-                        compact_tree_body_delta[child, 0],
-                        compact_tree_body_delta[child, 1],
-                        compact_tree_body_delta[child, 2],
-                        compact_tree_body_delta[child, 3],
-                        compact_tree_body_delta[child, 4],
-                        compact_tree_body_delta[child, 5],
+                        propagation_tree_body_delta[child, 0],
+                        propagation_tree_body_delta[child, 1],
+                        propagation_tree_body_delta[child, 2],
+                        propagation_tree_body_delta[child, 3],
+                        propagation_tree_body_delta[child, 4],
+                        propagation_tree_body_delta[child, 5],
                     )
                     child_delta = translate_twist_between_parallel_frames(parent_delta, edge)
 
                 for row in range(6):
-                    compact_tree_Ia[child, row, col] = child_delta[row]
-                    compact_body_response[child, row, col] = child_delta[row]
+                    propagation_tree_Ia[child, row, col] = child_delta[row]
+                    propagation_body_response[child, row, col] = child_delta[row]
         else:
             gdof = dof_start
-            inv_d = compact_tree_D_inv[joint, 0, 0]
+            inv_d = propagation_tree_D_inv[joint, 0, 0]
             for col in range(6):
                 basis = wp.spatial_vector()
                 if col == 0:
@@ -5693,14 +5693,14 @@ def compute_compact_tree_body_response_revolute_for_size(
                 else:
                     basis = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
 
-                s_dot_f = compact_joint_S_flat[gdof, col]
+                s_dot_f = propagation_joint_S_flat[gdof, col]
                 p_child = wp.spatial_vector(
-                    basis[0] - compact_tree_U[gdof, 0] * inv_d * s_dot_f,
-                    basis[1] - compact_tree_U[gdof, 1] * inv_d * s_dot_f,
-                    basis[2] - compact_tree_U[gdof, 2] * inv_d * s_dot_f,
-                    basis[3] - compact_tree_U[gdof, 3] * inv_d * s_dot_f,
-                    basis[4] - compact_tree_U[gdof, 4] * inv_d * s_dot_f,
-                    basis[5] - compact_tree_U[gdof, 5] * inv_d * s_dot_f,
+                    basis[0] - propagation_tree_U[gdof, 0] * inv_d * s_dot_f,
+                    basis[1] - propagation_tree_U[gdof, 1] * inv_d * s_dot_f,
+                    basis[2] - propagation_tree_U[gdof, 2] * inv_d * s_dot_f,
+                    basis[3] - propagation_tree_U[gdof, 3] * inv_d * s_dot_f,
+                    basis[4] - propagation_tree_U[gdof, 4] * inv_d * s_dot_f,
+                    basis[5] - propagation_tree_U[gdof, 5] * inv_d * s_dot_f,
                 )
 
                 parent_delta_child = wp.spatial_vector()
@@ -5709,45 +5709,45 @@ def compute_compact_tree_body_response_revolute_for_size(
                     for row in range(6):
                         value = float(0.0)
                         for p_col in range(6):
-                            value += compact_tree_Ia[parent, row, p_col] * p_parent[p_col]
-                        compact_tree_body_delta[child, row] = value
+                            value += propagation_tree_Ia[parent, row, p_col] * p_parent[p_col]
+                        propagation_tree_body_delta[child, row] = value
                     parent_delta_parent = wp.spatial_vector(
-                        compact_tree_body_delta[child, 0],
-                        compact_tree_body_delta[child, 1],
-                        compact_tree_body_delta[child, 2],
-                        compact_tree_body_delta[child, 3],
-                        compact_tree_body_delta[child, 4],
-                        compact_tree_body_delta[child, 5],
+                        propagation_tree_body_delta[child, 0],
+                        propagation_tree_body_delta[child, 1],
+                        propagation_tree_body_delta[child, 2],
+                        propagation_tree_body_delta[child, 3],
+                        propagation_tree_body_delta[child, 4],
+                        propagation_tree_body_delta[child, 5],
                     )
                     parent_delta_child = translate_twist_between_parallel_frames(parent_delta_parent, edge)
 
                 parent_dot = float(0.0)
                 for row in range(6):
-                    parent_dot += compact_tree_U[gdof, row] * parent_delta_child[row]
+                    parent_dot += propagation_tree_U[gdof, row] * parent_delta_child[row]
                 qdd = inv_d * (s_dot_f - parent_dot)
 
                 for row in range(6):
-                    value = parent_delta_child[row] + compact_joint_S_flat[gdof, row] * qdd
-                    compact_tree_Ia[child, row, col] = value
-                    compact_body_response[child, row, col] = value
+                    value = parent_delta_child[row] + propagation_joint_S_flat[gdof, row] * qdd
+                    propagation_tree_Ia[child, row, col] = value
+                    propagation_body_response[child, row, col] = value
 
 @wp.kernel
-def refresh_compact_tree_body_qd_for_size(
+def refresh_propagation_tree_body_qd_for_size(
     group_to_art: wp.array[int],
     articulation_start: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
-    compact_joint_S_flat: wp.array2d[float],
-    compact_body_com_rel: wp.array2d[float],
+    propagation_joint_S_flat: wp.array2d[float],
+    propagation_body_com_rel: wp.array2d[float],
     v_out: wp.array[float],
     # scratch
-    compact_tree_body_delta: wp.array2d[float],
+    propagation_tree_body_delta: wp.array2d[float],
     # outputs
-    compact_body_qd: wp.array2d[float],
+    propagation_body_qd: wp.array2d[float],
 ):
-    """Refresh compact live COM velocities from generalized velocity by a tree pass."""
+    """Refresh propagation live COM velocities from generalized velocity by a tree pass."""
     group_idx = wp.tid()
     art = group_to_art[group_idx]
     joint_start = articulation_start[art]
@@ -5761,22 +5761,22 @@ def refresh_compact_tree_body_qd_for_size(
         parent_delta_child = wp.spatial_vector()
         if parent >= 0:
             parent_delta_parent = wp.spatial_vector(
-                compact_tree_body_delta[parent, 0],
-                compact_tree_body_delta[parent, 1],
-                compact_tree_body_delta[parent, 2],
-                compact_tree_body_delta[parent, 3],
-                compact_tree_body_delta[parent, 4],
-                compact_tree_body_delta[parent, 5],
+                propagation_tree_body_delta[parent, 0],
+                propagation_tree_body_delta[parent, 1],
+                propagation_tree_body_delta[parent, 2],
+                propagation_tree_body_delta[parent, 3],
+                propagation_tree_body_delta[parent, 4],
+                propagation_tree_body_delta[parent, 5],
             )
             child_rel = wp.vec3(
-                compact_body_com_rel[child, 0],
-                compact_body_com_rel[child, 1],
-                compact_body_com_rel[child, 2],
+                propagation_body_com_rel[child, 0],
+                propagation_body_com_rel[child, 1],
+                propagation_body_com_rel[child, 2],
             )
             parent_rel = wp.vec3(
-                compact_body_com_rel[parent, 0],
-                compact_body_com_rel[parent, 1],
-                compact_body_com_rel[parent, 2],
+                propagation_body_com_rel[parent, 0],
+                propagation_body_com_rel[parent, 1],
+                propagation_body_com_rel[parent, 2],
             )
             parent_delta_child = translate_twist_between_parallel_frames(parent_delta_parent, child_rel - parent_rel)
 
@@ -5784,23 +5784,23 @@ def refresh_compact_tree_body_qd_for_size(
             value = parent_delta_child[r]
             for a in range(dof_count):
                 gdof = dof_start + a
-                value += compact_joint_S_flat[gdof, r] * v_out[gdof]
-            compact_tree_body_delta[child, r] = value
-            compact_body_qd[child, r] = value
+                value += propagation_joint_S_flat[gdof, r] * v_out[gdof]
+            propagation_tree_body_delta[child, r] = value
+            propagation_body_qd[child, r] = value
 
 
 @wp.kernel
-def flush_compact_free_body_qd_to_vout(
+def flush_propagation_free_body_qd_to_vout(
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
     articulation_root_dof_start: wp.array[int],
     articulation_root_com_offset: wp.array[wp.vec3],
     # in/out
-    compact_body_qd: wp.array2d[float],
-    compact_body_impulses: wp.array2d[float],
+    propagation_body_qd: wp.array2d[float],
+    propagation_body_impulses: wp.array2d[float],
     v_out: wp.array[float],
 ):
-    """Write compact live free-rigid velocities to v_out after compact GS."""
+    """Write propagation live free-rigid velocities to v_out after propagation GS."""
     body = wp.tid()
     art = body_to_articulation[body]
     if art < 0:
@@ -5809,8 +5809,8 @@ def flush_compact_free_body_qd_to_vout(
         return
 
     dof_start = articulation_root_dof_start[art]
-    v_com = wp.vec3(compact_body_qd[body, 0], compact_body_qd[body, 1], compact_body_qd[body, 2])
-    w = wp.vec3(compact_body_qd[body, 3], compact_body_qd[body, 4], compact_body_qd[body, 5])
+    v_com = wp.vec3(propagation_body_qd[body, 0], propagation_body_qd[body, 1], propagation_body_qd[body, 2])
+    w = wp.vec3(propagation_body_qd[body, 3], propagation_body_qd[body, 4], propagation_body_qd[body, 5])
     com_offset = articulation_root_com_offset[art]
     v_local = v_com - wp.cross(w, com_offset)
 
@@ -5822,20 +5822,20 @@ def flush_compact_free_body_qd_to_vout(
     v_out[dof_start + 5] = w[2]
 
     for r in range(6):
-        compact_body_impulses[body, r] = 0.0
+        propagation_body_impulses[body, r] = 0.0
 
 
 @wp.kernel
-def refresh_compact_free_body_qd_from_vout(
+def refresh_propagation_free_body_qd_from_vout(
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
     articulation_root_dof_start: wp.array[int],
     articulation_root_com_offset: wp.array[wp.vec3],
     v_out: wp.array[float],
     # out
-    compact_body_qd: wp.array2d[float],
+    propagation_body_qd: wp.array2d[float],
 ):
-    """Refresh compact live COM velocities for free-rigid bodies from v_out."""
+    """Refresh propagation live COM velocities for free-rigid bodies from v_out."""
     body = wp.tid()
     art = body_to_articulation[body]
     if art < 0:
@@ -5849,36 +5849,36 @@ def refresh_compact_free_body_qd_from_vout(
     com_offset = articulation_root_com_offset[art]
     v_com = v_local + wp.cross(w, com_offset)
 
-    compact_body_qd[body, 0] = v_com[0]
-    compact_body_qd[body, 1] = v_com[1]
-    compact_body_qd[body, 2] = v_com[2]
-    compact_body_qd[body, 3] = w[0]
-    compact_body_qd[body, 4] = w[1]
-    compact_body_qd[body, 5] = w[2]
+    propagation_body_qd[body, 0] = v_com[0]
+    propagation_body_qd[body, 1] = v_com[1]
+    propagation_body_qd[body, 2] = v_com[2]
+    propagation_body_qd[body, 3] = w[0]
+    propagation_body_qd[body, 4] = w[1]
+    propagation_body_qd[body, 5] = w[2]
 
 
 @wp.kernel
-def flush_compact_active_free_body_qd_to_vout(
-    compact_body_count: wp.array[int],
-    compact_body_list: wp.array2d[int],
-    max_compact_bodies: int,
+def flush_propagation_active_free_body_qd_to_vout(
+    propagation_body_count: wp.array[int],
+    propagation_body_list: wp.array2d[int],
+    max_propagation_bodies: int,
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
     articulation_root_dof_start: wp.array[int],
     articulation_root_com_offset: wp.array[wp.vec3],
     # in/out
-    compact_body_qd: wp.array2d[float],
-    compact_body_impulses: wp.array2d[float],
+    propagation_body_qd: wp.array2d[float],
+    propagation_body_impulses: wp.array2d[float],
     v_out: wp.array[float],
 ):
-    """Write compact live free-rigid velocities for touched compact bodies."""
+    """Write propagation live free-rigid velocities for touched propagation bodies."""
     tid = wp.tid()
-    world = tid // max_compact_bodies
-    local_body = tid - world * max_compact_bodies
-    if local_body >= compact_body_count[world]:
+    world = tid // max_propagation_bodies
+    local_body = tid - world * max_propagation_bodies
+    if local_body >= propagation_body_count[world]:
         return
 
-    body = compact_body_list[world, local_body]
+    body = propagation_body_list[world, local_body]
     if body < 0:
         return
 
@@ -5889,8 +5889,8 @@ def flush_compact_active_free_body_qd_to_vout(
         return
 
     dof_start = articulation_root_dof_start[art]
-    v_com = wp.vec3(compact_body_qd[body, 0], compact_body_qd[body, 1], compact_body_qd[body, 2])
-    w = wp.vec3(compact_body_qd[body, 3], compact_body_qd[body, 4], compact_body_qd[body, 5])
+    v_com = wp.vec3(propagation_body_qd[body, 0], propagation_body_qd[body, 1], propagation_body_qd[body, 2])
+    w = wp.vec3(propagation_body_qd[body, 3], propagation_body_qd[body, 4], propagation_body_qd[body, 5])
     com_offset = articulation_root_com_offset[art]
     v_local = v_com - wp.cross(w, com_offset)
 
@@ -5902,32 +5902,32 @@ def flush_compact_active_free_body_qd_to_vout(
     v_out[dof_start + 5] = w[2]
 
     for r in range(6):
-        compact_body_impulses[body, r] = 0.0
+        propagation_body_impulses[body, r] = 0.0
 
 
 @wp.kernel
-def propagate_compact_tree_impulses_for_size(
+def propagate_tree_impulses_for_size(
     group_to_art: wp.array[int],
     articulation_start: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
-    compact_joint_S_flat: wp.array2d[float],
-    compact_body_com_rel: wp.array2d[float],
-    compact_tree_U: wp.array2d[float],
-    compact_tree_D_inv: wp.array3d[float],
-    compact_body_impulses: wp.array2d[float],
+    propagation_joint_S_flat: wp.array2d[float],
+    propagation_body_com_rel: wp.array2d[float],
+    propagation_tree_U: wp.array2d[float],
+    propagation_tree_D_inv: wp.array3d[float],
+    propagation_body_impulses: wp.array2d[float],
     # scratch
-    compact_tree_pA: wp.array2d[float],
-    compact_tree_u: wp.array[float],
-    compact_tree_qdd: wp.array[float],
-    compact_tree_body_delta: wp.array2d[float],
+    propagation_tree_pA: wp.array2d[float],
+    propagation_tree_u: wp.array[float],
+    propagation_tree_qdd: wp.array[float],
+    propagation_tree_body_delta: wp.array2d[float],
     # in/out
-    compact_body_qd: wp.array2d[float],
+    propagation_body_qd: wp.array2d[float],
     v_out: wp.array[float],
 ):
-    """Propagate deferred compact body impulses through the articulation tree."""
+    """Propagate deferred propagation body impulses through the articulation tree."""
     group_idx = wp.tid()
     art = group_to_art[group_idx]
     joint_start = articulation_start[art]
@@ -5937,33 +5937,33 @@ def propagate_compact_tree_impulses_for_size(
     for joint in range(joint_start, joint_end):
         body = joint_child[joint]
         for r in range(6):
-            compact_tree_pA[body, r] = 0.0
-            compact_tree_body_delta[body, r] = 0.0
+            propagation_tree_pA[body, r] = 0.0
+            propagation_tree_body_delta[body, r] = 0.0
         dof_start = joint_qd_start[joint]
         dof_end = joint_qd_start[joint + 1]
         for dof in range(dof_start, dof_end):
-            compact_tree_u[dof] = 0.0
-            compact_tree_qdd[dof] = 0.0
+            propagation_tree_u[dof] = 0.0
+            propagation_tree_qdd[dof] = 0.0
 
         force = wp.vec3(
-            compact_body_impulses[body, 0],
-            compact_body_impulses[body, 1],
-            compact_body_impulses[body, 2],
+            propagation_body_impulses[body, 0],
+            propagation_body_impulses[body, 1],
+            propagation_body_impulses[body, 2],
         )
         torque_com = wp.vec3(
-            compact_body_impulses[body, 3],
-            compact_body_impulses[body, 4],
-            compact_body_impulses[body, 5],
+            propagation_body_impulses[body, 3],
+            propagation_body_impulses[body, 4],
+            propagation_body_impulses[body, 5],
         )
         if wp.length_sq(force) + wp.length_sq(torque_com) > 0.0:
             has_impulse = int(1)
 
-        compact_tree_pA[body, 0] = -force[0]
-        compact_tree_pA[body, 1] = -force[1]
-        compact_tree_pA[body, 2] = -force[2]
-        compact_tree_pA[body, 3] = -torque_com[0]
-        compact_tree_pA[body, 4] = -torque_com[1]
-        compact_tree_pA[body, 5] = -torque_com[2]
+        propagation_tree_pA[body, 0] = -force[0]
+        propagation_tree_pA[body, 1] = -force[1]
+        propagation_tree_pA[body, 2] = -force[2]
+        propagation_tree_pA[body, 3] = -torque_com[0]
+        propagation_tree_pA[body, 4] = -torque_com[1]
+        propagation_tree_pA[body, 5] = -torque_com[2]
 
     if has_impulse != 0:
         for offset in range(joint_end - joint_start):
@@ -5977,44 +5977,44 @@ def propagate_compact_tree_impulses_for_size(
                 gdof = dof_start + a
                 value = float(0.0)
                 for r in range(6):
-                    value -= compact_joint_S_flat[gdof, r] * compact_tree_pA[child, r]
-                compact_tree_u[gdof] = value
+                    value -= propagation_joint_S_flat[gdof, r] * propagation_tree_pA[child, r]
+                propagation_tree_u[gdof] = value
 
             if parent >= 0:
-                p0 = compact_tree_pA[child, 0]
-                p1 = compact_tree_pA[child, 1]
-                p2 = compact_tree_pA[child, 2]
-                p3 = compact_tree_pA[child, 3]
-                p4 = compact_tree_pA[child, 4]
-                p5 = compact_tree_pA[child, 5]
+                p0 = propagation_tree_pA[child, 0]
+                p1 = propagation_tree_pA[child, 1]
+                p2 = propagation_tree_pA[child, 2]
+                p3 = propagation_tree_pA[child, 3]
+                p4 = propagation_tree_pA[child, 4]
+                p5 = propagation_tree_pA[child, 5]
                 for a in range(dof_count):
                     gdof_a = dof_start + a
                     coeff = float(0.0)
                     for b in range(dof_count):
                         gdof_b = dof_start + b
-                        coeff += compact_tree_D_inv[joint, a, b] * compact_tree_u[gdof_b]
-                    p0 += compact_tree_U[gdof_a, 0] * coeff
-                    p1 += compact_tree_U[gdof_a, 1] * coeff
-                    p2 += compact_tree_U[gdof_a, 2] * coeff
-                    p3 += compact_tree_U[gdof_a, 3] * coeff
-                    p4 += compact_tree_U[gdof_a, 4] * coeff
-                    p5 += compact_tree_U[gdof_a, 5] * coeff
+                        coeff += propagation_tree_D_inv[joint, a, b] * propagation_tree_u[gdof_b]
+                    p0 += propagation_tree_U[gdof_a, 0] * coeff
+                    p1 += propagation_tree_U[gdof_a, 1] * coeff
+                    p2 += propagation_tree_U[gdof_a, 2] * coeff
+                    p3 += propagation_tree_U[gdof_a, 3] * coeff
+                    p4 += propagation_tree_U[gdof_a, 4] * coeff
+                    p5 += propagation_tree_U[gdof_a, 5] * coeff
 
                 child_rel = wp.vec3(
-                    compact_body_com_rel[child, 0],
-                    compact_body_com_rel[child, 1],
-                    compact_body_com_rel[child, 2],
+                    propagation_body_com_rel[child, 0],
+                    propagation_body_com_rel[child, 1],
+                    propagation_body_com_rel[child, 2],
                 )
                 parent_rel = wp.vec3(
-                    compact_body_com_rel[parent, 0],
-                    compact_body_com_rel[parent, 1],
-                    compact_body_com_rel[parent, 2],
+                    propagation_body_com_rel[parent, 0],
+                    propagation_body_com_rel[parent, 1],
+                    propagation_body_com_rel[parent, 2],
                 )
                 child_minus_parent = child_rel - parent_rel
                 propagated_child = wp.spatial_vector(p0, p1, p2, p3, p4, p5)
                 propagated_parent = translate_wrench_between_parallel_frames(propagated_child, child_minus_parent)
                 for r in range(6):
-                    compact_tree_pA[parent, r] = compact_tree_pA[parent, r] + propagated_parent[r]
+                    propagation_tree_pA[parent, r] = propagation_tree_pA[parent, r] + propagated_parent[r]
 
         for joint in range(joint_start, joint_end):
             child = joint_child[joint]
@@ -6024,22 +6024,22 @@ def propagate_compact_tree_impulses_for_size(
             parent_delta_child = wp.spatial_vector()
             if parent >= 0:
                 parent_delta_parent = wp.spatial_vector(
-                    compact_tree_body_delta[parent, 0],
-                    compact_tree_body_delta[parent, 1],
-                    compact_tree_body_delta[parent, 2],
-                    compact_tree_body_delta[parent, 3],
-                    compact_tree_body_delta[parent, 4],
-                    compact_tree_body_delta[parent, 5],
+                    propagation_tree_body_delta[parent, 0],
+                    propagation_tree_body_delta[parent, 1],
+                    propagation_tree_body_delta[parent, 2],
+                    propagation_tree_body_delta[parent, 3],
+                    propagation_tree_body_delta[parent, 4],
+                    propagation_tree_body_delta[parent, 5],
                 )
                 child_rel = wp.vec3(
-                    compact_body_com_rel[child, 0],
-                    compact_body_com_rel[child, 1],
-                    compact_body_com_rel[child, 2],
+                    propagation_body_com_rel[child, 0],
+                    propagation_body_com_rel[child, 1],
+                    propagation_body_com_rel[child, 2],
                 )
                 parent_rel = wp.vec3(
-                    compact_body_com_rel[parent, 0],
-                    compact_body_com_rel[parent, 1],
-                    compact_body_com_rel[parent, 2],
+                    propagation_body_com_rel[parent, 0],
+                    propagation_body_com_rel[parent, 1],
+                    propagation_body_com_rel[parent, 2],
                 )
                 parent_delta_child = translate_twist_between_parallel_frames(parent_delta_parent, child_rel - parent_rel)
 
@@ -6051,17 +6051,17 @@ def propagate_compact_tree_impulses_for_size(
                     parent_term = float(0.0)
                     if parent >= 0:
                         for r in range(6):
-                            parent_term += compact_tree_U[gdof_b, r] * parent_delta_child[r]
-                    qdd += compact_tree_D_inv[joint, a, b] * (compact_tree_u[gdof_b] - parent_term)
-                compact_tree_qdd[gdof_a] = qdd
+                            parent_term += propagation_tree_U[gdof_b, r] * parent_delta_child[r]
+                    qdd += propagation_tree_D_inv[joint, a, b] * (propagation_tree_u[gdof_b] - parent_term)
+                propagation_tree_qdd[gdof_a] = qdd
                 v_out[gdof_a] = v_out[gdof_a] + qdd
 
             for r in range(6):
                 value = parent_delta_child[r]
                 for a in range(dof_count):
                     gdof = dof_start + a
-                    value += compact_joint_S_flat[gdof, r] * compact_tree_qdd[gdof]
-                compact_tree_body_delta[child, r] = value
+                    value += propagation_joint_S_flat[gdof, r] * propagation_tree_qdd[gdof]
+                propagation_tree_body_delta[child, r] = value
 
     # Recompute full live body velocities from updated generalized velocities
     # and clear the deferred body impulse buffer for the next GS iteration.
@@ -6073,22 +6073,22 @@ def propagate_compact_tree_impulses_for_size(
         parent_delta_child = wp.spatial_vector()
         if parent >= 0:
             parent_delta_parent = wp.spatial_vector(
-                compact_tree_body_delta[parent, 0],
-                compact_tree_body_delta[parent, 1],
-                compact_tree_body_delta[parent, 2],
-                compact_tree_body_delta[parent, 3],
-                compact_tree_body_delta[parent, 4],
-                compact_tree_body_delta[parent, 5],
+                propagation_tree_body_delta[parent, 0],
+                propagation_tree_body_delta[parent, 1],
+                propagation_tree_body_delta[parent, 2],
+                propagation_tree_body_delta[parent, 3],
+                propagation_tree_body_delta[parent, 4],
+                propagation_tree_body_delta[parent, 5],
             )
             child_rel = wp.vec3(
-                compact_body_com_rel[child, 0],
-                compact_body_com_rel[child, 1],
-                compact_body_com_rel[child, 2],
+                propagation_body_com_rel[child, 0],
+                propagation_body_com_rel[child, 1],
+                propagation_body_com_rel[child, 2],
             )
             parent_rel = wp.vec3(
-                compact_body_com_rel[parent, 0],
-                compact_body_com_rel[parent, 1],
-                compact_body_com_rel[parent, 2],
+                propagation_body_com_rel[parent, 0],
+                propagation_body_com_rel[parent, 1],
+                propagation_body_com_rel[parent, 2],
             )
             parent_delta_child = translate_twist_between_parallel_frames(parent_delta_parent, child_rel - parent_rel)
 
@@ -6096,15 +6096,15 @@ def propagate_compact_tree_impulses_for_size(
             value = parent_delta_child[r]
             for a in range(dof_count):
                 gdof = dof_start + a
-                value += compact_joint_S_flat[gdof, r] * v_out[gdof]
-            compact_tree_body_delta[child, r] = value
-            compact_body_qd[child, r] = value
+                value += propagation_joint_S_flat[gdof, r] * v_out[gdof]
+            propagation_tree_body_delta[child, r] = value
+            propagation_body_qd[child, r] = value
         for r in range(6):
-            compact_body_impulses[child, r] = 0.0
+            propagation_body_impulses[child, r] = 0.0
 
 
 @wp.kernel
-def propagate_compact_body_impulses_for_size(
+def propagate_body_impulses_for_size(
     L_group: wp.array3d[float],
     group_to_art: wp.array[int],
     articulation_start: wp.array[int],
@@ -6112,14 +6112,14 @@ def propagate_compact_body_impulses_for_size(
     art_dof_start: wp.array[int],
     n_dofs: int,
     max_dofs: int,
-    compact_body_B: wp.array3d[float],
-    compact_body_impulses: wp.array2d[float],
+    propagation_body_B: wp.array3d[float],
+    propagation_body_impulses: wp.array2d[float],
     # in/out
-    compact_qd_delta: wp.array[float],
-    compact_body_qd: wp.array2d[float],
+    propagation_qd_delta: wp.array[float],
+    propagation_body_qd: wp.array2d[float],
     v_out: wp.array[float],
 ):
-    """Propagate compact body impulses through one articulation Cholesky solve."""
+    """Propagate propagation body impulses through one articulation Cholesky solve."""
     group_idx = wp.tid()
     art = group_to_art[group_idx]
     dof_start = art_dof_start[art]
@@ -6134,34 +6134,34 @@ def propagate_compact_body_impulses_for_size(
         for joint in range(joint_start, joint_end):
             body = joint_child[joint]
             for basis in range(6):
-                val += compact_body_B[body, basis, i] * compact_body_impulses[body, basis]
+                val += propagation_body_B[body, basis, i] * propagation_body_impulses[body, basis]
         for k in range(i):
-            val -= L_group[group_idx, i, k] * compact_qd_delta[dof_start + k]
+            val -= L_group[group_idx, i, k] * propagation_qd_delta[dof_start + k]
 
         L_ii = L_group[group_idx, i, i]
         if L_ii != 0.0:
-            compact_qd_delta[dof_start + i] = val / L_ii
+            propagation_qd_delta[dof_start + i] = val / L_ii
         else:
-            compact_qd_delta[dof_start + i] = 0.0
+            propagation_qd_delta[dof_start + i] = 0.0
 
     # Backward substitution: L^T * qd_delta = z.
     for i_rev in range(n_dofs):
         i = n_dofs - 1 - i_rev
         if i >= max_dofs:
             continue
-        val = compact_qd_delta[dof_start + i]
+        val = propagation_qd_delta[dof_start + i]
         for k in range(i + 1, n_dofs):
-            val -= L_group[group_idx, k, i] * compact_qd_delta[dof_start + k]
+            val -= L_group[group_idx, k, i] * propagation_qd_delta[dof_start + k]
 
         L_ii = L_group[group_idx, i, i]
         if L_ii != 0.0:
-            compact_qd_delta[dof_start + i] = val / L_ii
+            propagation_qd_delta[dof_start + i] = val / L_ii
         else:
-            compact_qd_delta[dof_start + i] = 0.0
+            propagation_qd_delta[dof_start + i] = 0.0
 
     for i in range(n_dofs):
         if i < max_dofs:
-            v_out[dof_start + i] = v_out[dof_start + i] + compact_qd_delta[dof_start + i]
+            v_out[dof_start + i] = v_out[dof_start + i] + propagation_qd_delta[dof_start + i]
 
     # Clear body impulses for this articulation and refresh live body velocities
     # from the propagated generalized velocity.
@@ -6171,78 +6171,78 @@ def propagate_compact_body_impulses_for_size(
             value = float(0.0)
             for d in range(n_dofs):
                 if d < max_dofs:
-                    value += compact_body_B[body, basis, d] * v_out[dof_start + d]
-            compact_body_qd[body, basis] = value
-            compact_body_impulses[body, basis] = 0.0
+                    value += propagation_body_B[body, basis, d] * v_out[dof_start + d]
+            propagation_body_qd[body, basis] = value
+            propagation_body_impulses[body, basis] = 0.0
 
 
 @wp.kernel
-def pgs_solve_compact_contact_loop(
-    compact_constraint_count: wp.array[int],
-    compact_body_a: wp.array2d[int],
-    compact_body_b: wp.array2d[int],
-    compact_MiJt_a: wp.array3d[float],
-    compact_MiJt_b: wp.array3d[float],
-    compact_J_a: wp.array3d[float],
-    compact_J_b: wp.array3d[float],
-    compact_eff_mass_inv: wp.array2d[float],
-    compact_rhs: wp.array2d[float],
-    compact_row_type: wp.array2d[int],
-    compact_row_parent: wp.array2d[int],
-    compact_row_mu: wp.array2d[float],
-    compact_max_constraints: int,
+def pgs_solve_propagation_contact_loop(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_MiJt_a: wp.array3d[float],
+    propagation_MiJt_b: wp.array3d[float],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_eff_mass_inv: wp.array2d[float],
+    propagation_rhs: wp.array2d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
+    propagation_max_constraints: int,
     iterations: int,
     omega: float,
     friction_start_iteration: int,
     iteration_offset: int,
     # in/out
-    compact_impulses: wp.array2d[float],
-    compact_body_qd: wp.array2d[float],
-    compact_body_impulses: wp.array2d[float],
+    propagation_impulses: wp.array2d[float],
+    propagation_body_qd: wp.array2d[float],
+    propagation_body_impulses: wp.array2d[float],
 ):
-    """Serial per-world compact contact GS over fixed-size body-space rows."""
+    """Serial per-world propagation contact GS over fixed-size body-space rows."""
     world = wp.tid()
-    m_count = compact_constraint_count[world]
+    m_count = propagation_constraint_count[world]
     if m_count == 0:
         return
-    if m_count > compact_max_constraints:
-        m_count = compact_max_constraints
+    if m_count > propagation_max_constraints:
+        m_count = propagation_max_constraints
 
     for it in range(iterations):
         global_iter = iteration_offset + it
         for i in range(m_count):
-            row_type = compact_row_type[world, i]
+            row_type = propagation_row_type[world, i]
             if row_type == PGS_CONSTRAINT_TYPE_FRICTION and global_iter < friction_start_iteration:
-                compact_impulses[world, i] = 0.0
+                propagation_impulses[world, i] = 0.0
                 continue
 
-            eff_inv = compact_eff_mass_inv[world, i]
+            eff_inv = propagation_eff_mass_inv[world, i]
             if eff_inv <= 0.0:
                 continue
 
-            ba = compact_body_a[world, i]
-            bb = compact_body_b[world, i]
+            ba = propagation_body_a[world, i]
+            bb = propagation_body_b[world, i]
 
             jv = float(0.0)
             if ba >= 0:
                 for k in range(6):
-                    jv += compact_J_a[world, i, k] * compact_body_qd[ba, k]
+                    jv += propagation_J_a[world, i, k] * propagation_body_qd[ba, k]
             if bb >= 0:
                 for k in range(6):
-                    jv += compact_J_b[world, i, k] * compact_body_qd[bb, k]
+                    jv += propagation_J_b[world, i, k] * propagation_body_qd[bb, k]
 
-            residual = jv + compact_rhs[world, i]
+            residual = jv + propagation_rhs[world, i]
             delta = -residual * eff_inv
-            old_impulse = compact_impulses[world, i]
+            old_impulse = propagation_impulses[world, i]
             new_impulse = old_impulse + omega * delta
 
             if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
                 if new_impulse < 0.0:
                     new_impulse = 0.0
             elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-                parent_idx = compact_row_parent[world, i]
-                lambda_n = compact_impulses[world, parent_idx]
-                mu_val = compact_row_mu[world, i]
+                parent_idx = propagation_row_parent[world, i]
+                lambda_n = propagation_impulses[world, parent_idx]
+                mu_val = propagation_row_mu[world, i]
                 radius = wp.max(mu_val * lambda_n, 0.0)
 
                 if radius <= 0.0:
@@ -6251,51 +6251,51 @@ def pgs_solve_compact_contact_loop(
                     sib = parent_idx + 1
                     if i == parent_idx + 1:
                         sib = parent_idx + 2
-                    compact_impulses[world, i] = new_impulse
+                    propagation_impulses[world, i] = new_impulse
                     a = new_impulse
-                    b = compact_impulses[world, sib]
+                    b = propagation_impulses[world, sib]
                     mag = wp.sqrt(a * a + b * b)
                     if mag > radius:
                         scale = radius / mag
                         new_impulse = a * scale
                         sib_new = b * scale
                         sib_delta = sib_new - b
-                        compact_impulses[world, sib] = sib_new
+                        propagation_impulses[world, sib] = sib_new
 
-                        sib_ba = compact_body_a[world, sib]
-                        sib_bb = compact_body_b[world, sib]
+                        sib_ba = propagation_body_a[world, sib]
+                        sib_bb = propagation_body_b[world, sib]
                         if sib_ba >= 0:
                             for k in range(6):
-                                compact_body_qd[sib_ba, k] = (
-                                    compact_body_qd[sib_ba, k] + compact_MiJt_a[world, sib, k] * sib_delta
+                                propagation_body_qd[sib_ba, k] = (
+                                    propagation_body_qd[sib_ba, k] + propagation_MiJt_a[world, sib, k] * sib_delta
                                 )
-                                compact_body_impulses[sib_ba, k] = (
-                                    compact_body_impulses[sib_ba, k] + compact_J_a[world, sib, k] * sib_delta
+                                propagation_body_impulses[sib_ba, k] = (
+                                    propagation_body_impulses[sib_ba, k] + propagation_J_a[world, sib, k] * sib_delta
                                 )
                         if sib_bb >= 0:
                             for k in range(6):
-                                compact_body_qd[sib_bb, k] = (
-                                    compact_body_qd[sib_bb, k] + compact_MiJt_b[world, sib, k] * sib_delta
+                                propagation_body_qd[sib_bb, k] = (
+                                    propagation_body_qd[sib_bb, k] + propagation_MiJt_b[world, sib, k] * sib_delta
                                 )
-                                compact_body_impulses[sib_bb, k] = (
-                                    compact_body_impulses[sib_bb, k] + compact_J_b[world, sib, k] * sib_delta
+                                propagation_body_impulses[sib_bb, k] = (
+                                    propagation_body_impulses[sib_bb, k] + propagation_J_b[world, sib, k] * sib_delta
                                 )
 
             delta_impulse = new_impulse - old_impulse
-            compact_impulses[world, i] = new_impulse
+            propagation_impulses[world, i] = new_impulse
 
             if delta_impulse != 0.0:
                 if ba >= 0:
                     for k in range(6):
-                        compact_body_qd[ba, k] = compact_body_qd[ba, k] + compact_MiJt_a[world, i, k] * delta_impulse
-                        compact_body_impulses[ba, k] = (
-                            compact_body_impulses[ba, k] + compact_J_a[world, i, k] * delta_impulse
+                        propagation_body_qd[ba, k] = propagation_body_qd[ba, k] + propagation_MiJt_a[world, i, k] * delta_impulse
+                        propagation_body_impulses[ba, k] = (
+                            propagation_body_impulses[ba, k] + propagation_J_a[world, i, k] * delta_impulse
                         )
                 if bb >= 0:
                     for k in range(6):
-                        compact_body_qd[bb, k] = compact_body_qd[bb, k] + compact_MiJt_b[world, i, k] * delta_impulse
-                        compact_body_impulses[bb, k] = (
-                            compact_body_impulses[bb, k] + compact_J_b[world, i, k] * delta_impulse
+                        propagation_body_qd[bb, k] = propagation_body_qd[bb, k] + propagation_MiJt_b[world, i, k] * delta_impulse
+                        propagation_body_impulses[bb, k] = (
+                            propagation_body_impulses[bb, k] + propagation_J_b[world, i, k] * delta_impulse
                         )
 
 
@@ -7319,10 +7319,10 @@ def build_mf_body_map(
     mf_local_body_a: wp.array2d[int],
     mf_local_body_b: wp.array2d[int],
 ):
-    """Build per-world compact body table and local body index mapping.
+    """Build per-world local body table and local body index mapping.
 
     Scans all MF constraint body indices, builds a unique body list per world,
-    and maps each constraint's body indices to local (compact) indices.
+    and maps each constraint's body indices to local indices.
     """
     world = wp.tid()
     m = mf_constraint_count[world]
@@ -8085,20 +8085,20 @@ def pgs_convergence_diagnostic_velocity(
     mf_dof_a: wp.array2d[int],
     mf_dof_b: wp.array2d[int],
     mf_max_constraints: int,
-    # Compact articulated body-space constraints
-    compact_constraint_count: wp.array[int],
-    compact_rhs: wp.array2d[float],
-    compact_impulses: wp.array2d[float],
-    prev_compact_impulses: wp.array2d[float],
-    compact_row_type: wp.array2d[int],
-    compact_row_parent: wp.array2d[int],
-    compact_row_mu: wp.array2d[float],
-    compact_J_a: wp.array3d[float],
-    compact_J_b: wp.array3d[float],
-    compact_body_a: wp.array2d[int],
-    compact_body_b: wp.array2d[int],
-    compact_body_qd: wp.array2d[float],
-    compact_max_constraints: int,
+    # Propagation articulated body-space constraints
+    propagation_constraint_count: wp.array[int],
+    propagation_rhs: wp.array2d[float],
+    propagation_impulses: wp.array2d[float],
+    prev_propagation_impulses: wp.array2d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_body_qd: wp.array2d[float],
+    propagation_max_constraints: int,
     # Velocity
     v_out: wp.array[float],
     # Output: [worlds, 4]
@@ -8116,7 +8116,7 @@ def pgs_convergence_diagnostic_velocity(
 
     m_dense = constraint_count[world]
     m_mf = mf_constraint_count[world]
-    m_compact = compact_constraint_count[world]
+    m_propagation = propagation_constraint_count[world]
     w_dof_start = world_dof_start[world]
 
     max_dl = float(0.0)
@@ -8204,43 +8204,43 @@ def pgs_convergence_diagnostic_velocity(
                 if t_mag < radius * 0.999:
                     tang_res += residual * residual
 
-    # --- Compact articulated body-space constraints ---
-    for i in range(m_compact):
-        lam = compact_impulses[world, i]
-        prev_lam = prev_compact_impulses[world, i]
+    # --- Propagation articulated body-space constraints ---
+    for i in range(m_propagation):
+        lam = propagation_impulses[world, i]
+        prev_lam = prev_propagation_impulses[world, i]
         dl = wp.abs(lam - prev_lam)
         if dl > max_dl:
             max_dl = dl
 
-        ba = compact_body_a[world, i]
-        bb = compact_body_b[world, i]
+        ba = propagation_body_a[world, i]
+        bb = propagation_body_b[world, i]
         jv = float(0.0)
         if ba >= 0:
             for k in range(6):
-                jv += compact_J_a[world, i, k] * compact_body_qd[ba, k]
+                jv += propagation_J_a[world, i, k] * propagation_body_qd[ba, k]
         if bb >= 0:
             for k in range(6):
-                jv += compact_J_b[world, i, k] * compact_body_qd[bb, k]
-        residual = jv + compact_rhs[world, i]
+                jv += propagation_J_b[world, i, k] * propagation_body_qd[bb, k]
+        residual = jv + propagation_rhs[world, i]
 
-        rt = compact_row_type[world, i]
+        rt = propagation_row_type[world, i]
         if rt == PGS_CONSTRAINT_TYPE_CONTACT:
             comp_gap += lam * residual
             fb_val = wp.sqrt(lam * lam + residual * residual) - lam - residual
             fb_merit += fb_val * fb_val
         elif rt == PGS_CONSTRAINT_TYPE_FRICTION:
-            parent_idx = compact_row_parent[world, i]
-            lambda_n = compact_impulses[world, parent_idx]
-            mu = compact_row_mu[world, i]
+            parent_idx = propagation_row_parent[world, i]
+            lambda_n = propagation_impulses[world, parent_idx]
+            mu = propagation_row_mu[world, i]
             radius = mu * lambda_n
             if radius > 0.0:
                 if i == parent_idx + 1:
                     sib = parent_idx + 2
                 else:
                     sib = parent_idx + 1
-                if sib < compact_max_constraints and sib < m_compact:
-                    lam_t1 = compact_impulses[world, i]
-                    lam_t2 = compact_impulses[world, sib]
+                if sib < propagation_max_constraints and sib < m_propagation:
+                    lam_t1 = propagation_impulses[world, i]
+                    lam_t2 = propagation_impulses[world, sib]
                     t_mag = wp.sqrt(lam_t1 * lam_t1 + lam_t2 * lam_t2)
                     if t_mag < radius * 0.999:
                         tang_res += residual * residual
@@ -8283,20 +8283,20 @@ def pgs_ncp_residuals_diagnostic_velocity(
     mf_dof_a: wp.array2d[int],
     mf_dof_b: wp.array2d[int],
     mf_max_constraints: int,
-    # Compact articulated body-space constraints
-    compact_constraint_count: wp.array[int],
-    compact_rhs: wp.array2d[float],
-    compact_impulses: wp.array2d[float],
-    compact_row_type: wp.array2d[int],
-    compact_row_parent: wp.array2d[int],
-    compact_row_mu: wp.array2d[float],
-    compact_row_phi: wp.array2d[float],
-    compact_J_a: wp.array3d[float],
-    compact_J_b: wp.array3d[float],
-    compact_body_a: wp.array2d[int],
-    compact_body_b: wp.array2d[int],
-    compact_body_qd: wp.array2d[float],
-    compact_max_constraints: int,
+    # Propagation articulated body-space constraints
+    propagation_constraint_count: wp.array[int],
+    propagation_rhs: wp.array2d[float],
+    propagation_impulses: wp.array2d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
+    propagation_row_phi: wp.array2d[float],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_body_qd: wp.array2d[float],
+    propagation_max_constraints: int,
     # Velocity
     v_out: wp.array[float],
     # Output: [worlds, 6]
@@ -8351,7 +8351,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
 
     m_dense = constraint_count[world]
     m_mf = mf_constraint_count[world]
-    m_compact = compact_constraint_count[world]
+    m_propagation = propagation_constraint_count[world]
     w_dof_start = world_dof_start[world]
 
     r_compl = float(0.0)
@@ -8532,23 +8532,23 @@ def pgs_ncp_residuals_diagnostic_velocity(
             if dir_err > r_mdp_dir:
                 r_mdp_dir = dir_err
 
-    # ---- Compact articulated body-space constraints ----
-    for i in range(m_compact):
-        rt = compact_row_type[world, i]
+    # ---- Propagation articulated body-space constraints ----
+    for i in range(m_propagation):
+        rt = propagation_row_type[world, i]
         if rt != PGS_CONSTRAINT_TYPE_CONTACT:
             continue
 
-        ba = compact_body_a[world, i]
-        bb = compact_body_b[world, i]
+        ba = propagation_body_a[world, i]
+        bb = propagation_body_b[world, i]
         u_n = float(0.0)
         if ba >= 0:
             for k in range(6):
-                u_n += compact_J_a[world, i, k] * compact_body_qd[ba, k]
+                u_n += propagation_J_a[world, i, k] * propagation_body_qd[ba, k]
         if bb >= 0:
             for k in range(6):
-                u_n += compact_J_b[world, i, k] * compact_body_qd[bb, k]
-        b_n = compact_rhs[world, i]
-        ln = compact_impulses[world, i]
+                u_n += propagation_J_b[world, i, k] * propagation_body_qd[bb, k]
+        b_n = propagation_rhs[world, i]
+        ln = propagation_impulses[world, i]
 
         ubn = u_n + b_n
         if ln < ubn:
@@ -8558,7 +8558,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
         if compl > r_compl:
             r_compl = compl
 
-        neg_phi = -compact_row_phi[world, i]
+        neg_phi = -propagation_row_phi[world, i]
         if neg_phi > r_gap:
             r_gap = neg_phi
 
@@ -8569,33 +8569,33 @@ def pgs_ncp_residuals_diagnostic_velocity(
         mu = float(0.0)
 
         i1 = i + 1
-        if i1 < compact_max_constraints and i1 < m_compact:
-            if compact_row_type[world, i1] == PGS_CONSTRAINT_TYPE_FRICTION and compact_row_parent[world, i1] == i:
-                lt1 = compact_impulses[world, i1]
-                mu = compact_row_mu[world, i1]
-                ba1 = compact_body_a[world, i1]
-                bb1 = compact_body_b[world, i1]
+        if i1 < propagation_max_constraints and i1 < m_propagation:
+            if propagation_row_type[world, i1] == PGS_CONSTRAINT_TYPE_FRICTION and propagation_row_parent[world, i1] == i:
+                lt1 = propagation_impulses[world, i1]
+                mu = propagation_row_mu[world, i1]
+                ba1 = propagation_body_a[world, i1]
+                bb1 = propagation_body_b[world, i1]
                 if ba1 >= 0:
                     for k in range(6):
-                        u_t1 += compact_J_a[world, i1, k] * compact_body_qd[ba1, k]
+                        u_t1 += propagation_J_a[world, i1, k] * propagation_body_qd[ba1, k]
                 if bb1 >= 0:
                     for k in range(6):
-                        u_t1 += compact_J_b[world, i1, k] * compact_body_qd[bb1, k]
+                        u_t1 += propagation_J_b[world, i1, k] * propagation_body_qd[bb1, k]
 
         i2 = i + 2
-        if i2 < compact_max_constraints and i2 < m_compact:
-            if compact_row_type[world, i2] == PGS_CONSTRAINT_TYPE_FRICTION and compact_row_parent[world, i2] == i:
-                lt2 = compact_impulses[world, i2]
+        if i2 < propagation_max_constraints and i2 < m_propagation:
+            if propagation_row_type[world, i2] == PGS_CONSTRAINT_TYPE_FRICTION and propagation_row_parent[world, i2] == i:
+                lt2 = propagation_impulses[world, i2]
                 if mu == 0.0:
-                    mu = compact_row_mu[world, i2]
-                ba2 = compact_body_a[world, i2]
-                bb2 = compact_body_b[world, i2]
+                    mu = propagation_row_mu[world, i2]
+                ba2 = propagation_body_a[world, i2]
+                bb2 = propagation_body_b[world, i2]
                 if ba2 >= 0:
                     for k in range(6):
-                        u_t2 += compact_J_a[world, i2, k] * compact_body_qd[ba2, k]
+                        u_t2 += propagation_J_a[world, i2, k] * propagation_body_qd[ba2, k]
                 if bb2 >= 0:
                     for k in range(6):
-                        u_t2 += compact_J_b[world, i2, k] * compact_body_qd[bb2, k]
+                        u_t2 += propagation_J_b[world, i2, k] * propagation_body_qd[bb2, k]
 
         tang_mag = wp.sqrt(lt1 * lt1 + lt2 * lt2)
         cone = tang_mag - mu * ln

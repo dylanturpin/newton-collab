@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Frozen-contact accuracy probe for compact articulated contact rows.
+"""Frozen-contact accuracy probe for articulated contact propagation rows.
 
 This intentionally measures one fixed contact problem.  Contacts are generated
 once from the initial state, then reused for every solver path and iteration
@@ -46,7 +46,7 @@ import newton  # noqa: E402
 from newton.solvers import SolverFeatherPGS  # noqa: E402
 
 
-PATHS = ("mf_immediate", "compact_tree")
+PATHS = ("mf_immediate", "propagation")
 CONVERGENCE_KEYS = (
     "max_delta_lambda",
     "complementarity_gap",
@@ -77,7 +77,7 @@ class AccuracyResult:
     joint_dof_count: int
     dense_rows_total: int
     mf_rows_total: int
-    compact_rows_total: int
+    propagation_rows_total: int
     final_max_delta_lambda: float
     final_complementarity_gap: float
     final_tangent_residual: float
@@ -121,14 +121,11 @@ def _case_label(case: BenchCase) -> str:
     return f"A={case.articulations},L={case.links},boxes={case.contacts_per_articulation}"
 
 
-def _solver_capacities(case: BenchCase, path: str, compact_max_constraints: int | None) -> tuple[int, int, int]:
+def _solver_capacities(case: BenchCase) -> tuple[int, int]:
     row_capacity = _planned_row_capacity(case)
     dense_capacity = row_capacity
     mf_capacity = 16
-    compact_capacity = compact_max_constraints if compact_max_constraints is not None else row_capacity
-    if path == "compact_tree":
-        dense_capacity = 16
-    return dense_capacity, mf_capacity, compact_capacity
+    return dense_capacity, mf_capacity
 
 
 def _make_solver(
@@ -140,16 +137,14 @@ def _make_solver(
     pgs_velocity_iterations: int,
     enable_contact_friction: bool,
     contact_friction_position_iterations: int,
-    compact_max_constraints: int | None,
-    compact_warp_propagation: bool,
     pgs_debug: bool,
 ) -> SolverFeatherPGS:
-    dense_capacity, mf_capacity, compact_capacity = _solver_capacities(case, path, compact_max_constraints)
-    response_mode = "compact_tree" if path == "compact_tree" else "immediate"
+    dense_capacity, mf_capacity = _solver_capacities(case)
+    response_mode = "propagation" if path == "propagation" else "immediate"
     return SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
-        articulated_dense_response_mode=response_mode,
+        articulated_contact_response=response_mode,
         hinv_jt_kernel="par_row",
         pgs_iterations=pgs_iterations,
         pgs_velocity_iterations=pgs_velocity_iterations,
@@ -157,10 +152,6 @@ def _make_solver(
         contact_friction_position_iterations=contact_friction_position_iterations,
         dense_max_constraints=dense_capacity,
         mf_max_constraints=mf_capacity,
-        compact_max_constraints=compact_capacity,
-        compact_fast_body_map=True,
-        compact_shared_row_solver=False,
-        compact_warp_propagation=compact_warp_propagation if path == "compact_tree" else False,
         pgs_warmstart=False,
         mf_warmstart=False,
         pgs_debug=pgs_debug,
@@ -188,9 +179,9 @@ def _run_one_step(
 def _count_rows(solver: SolverFeatherPGS) -> tuple[int, int, int]:
     dense = int(np.sum(solver.constraint_count.numpy()))
     mf = int(np.sum(solver.mf_constraint_count.numpy()))
-    compact_count_array = getattr(solver, "compact_constraint_count", None)
-    compact = 0 if compact_count_array is None else int(np.sum(compact_count_array.numpy()))
-    return dense, mf, compact
+    propagation_count_array = getattr(solver, "propagation_constraint_count", None)
+    propagation = 0 if propagation_count_array is None else int(np.sum(propagation_count_array.numpy()))
+    return dense, mf, propagation
 
 
 def _last_debug_metrics(solver: SolverFeatherPGS) -> tuple[dict[str, float], dict[str, float]]:
@@ -260,8 +251,6 @@ def _run_accuracy_case(args: argparse.Namespace, case: BenchCase) -> list[Accura
             pgs_velocity_iterations=args.pgs_velocity_iterations,
             enable_contact_friction=not args.no_friction,
             contact_friction_position_iterations=args.contact_friction_position_iterations,
-            compact_max_constraints=args.compact_max_constraints,
-            compact_warp_propagation=args.compact_warp_propagation,
             pgs_debug=False,
         )
         reference_states[path] = _run_one_step(model, solver, contacts, initial, args.dt)
@@ -278,12 +267,10 @@ def _run_accuracy_case(args: argparse.Namespace, case: BenchCase) -> list[Accura
                 pgs_velocity_iterations=args.pgs_velocity_iterations,
                 enable_contact_friction=not args.no_friction,
                 contact_friction_position_iterations=args.contact_friction_position_iterations,
-                compact_max_constraints=args.compact_max_constraints,
-                compact_warp_propagation=args.compact_warp_propagation,
                 pgs_debug=True,
             )
             final_state = _run_one_step(model, solver, contacts, initial, args.dt)
-            dense_rows, mf_rows, compact_rows = _count_rows(solver)
+            dense_rows, mf_rows, propagation_rows = _count_rows(solver)
             convergence, ncp = _last_debug_metrics(solver)
             states[(path, iterations)] = final_state
             partial[(path, iterations)] = {
@@ -299,7 +286,7 @@ def _run_accuracy_case(args: argparse.Namespace, case: BenchCase) -> list[Accura
                 "joint_dof_count": model.joint_dof_count,
                 "dense_rows_total": dense_rows,
                 "mf_rows_total": mf_rows,
-                "compact_rows_total": compact_rows,
+                "propagation_rows_total": propagation_rows,
                 "final_max_delta_lambda": convergence["max_delta_lambda"],
                 "final_complementarity_gap": convergence["complementarity_gap"],
                 "final_tangent_residual": convergence["tangent_residual"],
@@ -319,7 +306,7 @@ def _run_accuracy_case(args: argparse.Namespace, case: BenchCase) -> list[Accura
         mf_state = states[("mf_immediate", iterations)]
         for path in PATHS:
             row = dict(partial[(path, iterations)])
-            if path == "compact_tree":
+            if path == "propagation":
                 row.update(_state_delta("same_iter_vs_mf", states[(path, iterations)], mf_state))
             results.append(AccuracyResult(**row))
     return results
@@ -348,7 +335,7 @@ def write_outputs(out_dir: Path, rows: list[AccuracyResult]) -> None:
         "",
         "Contacts are generated once and reused for every path. Metrics therefore measure the fixed PGS problem, not long-horizon trajectory divergence.",
         "",
-        "| case | path | iters | rows dense/mf/compact | final r_compl | final r_cone | final tangent | self-ref qd Linf | MF-ref qd Linf | same-iter MF qd Linf |",
+        "| case | path | iters | rows dense/mf/propagation | final r_compl | final r_cone | final tangent | self-ref qd Linf | MF-ref qd Linf | same-iter MF qd Linf |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
@@ -359,7 +346,7 @@ def write_outputs(out_dir: Path, rows: list[AccuracyResult]) -> None:
                     row.label,
                     row.path,
                     str(row.pgs_iterations),
-                    f"{row.dense_rows_total}/{row.mf_rows_total}/{row.compact_rows_total}",
+                    f"{row.dense_rows_total}/{row.mf_rows_total}/{row.propagation_rows_total}",
                     f"{row.final_r_compl:.6g}",
                     f"{row.final_r_cone:.6g}",
                     f"{row.final_tangent_residual:.6g}",
@@ -388,8 +375,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-friction-position-iterations", type=int, default=-1)
     parser.add_argument("--dt", type=float, default=1.0 / 240.0)
     parser.add_argument("--no-friction", action="store_true")
-    parser.add_argument("--compact-warp-propagation", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--compact-max-constraints", type=int, default=None)
     return parser.parse_args()
 
 

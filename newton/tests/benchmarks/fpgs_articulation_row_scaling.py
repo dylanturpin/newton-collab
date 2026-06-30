@@ -5,7 +5,7 @@
 
 This benchmark intentionally uses the public SolverFeatherPGS.step path only.
 The only compared modes are the current matrix-free articulated response
-("immediate") and the compact tree articulated-contact response. There are
+("immediate") and articulated contact propagation. There are
 no private generated-kernel calls and no reduced row-solver substitutes here.
 """
 
@@ -39,7 +39,7 @@ import newton  # noqa: E402
 from newton.solvers import SolverFeatherPGS  # noqa: E402
 
 
-COMPACT_PATHS = ("compact_tree", "compact_cholesky")
+PROPAGATION_PATHS = ("propagation", "propagation-fused")
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,7 @@ class RunResult:
     label: str
     case_kind: str
     path: str
-    compact_active: bool
+    propagation_active: bool
     requested_world_count: int
     free_pairs: int
     articulations: int
@@ -72,13 +72,13 @@ class RunResult:
     joint_dof_count: int
     dense_row_capacity: int
     mf_row_capacity: int
-    compact_row_capacity: int
+    propagation_row_capacity: int
     dense_rows_total: int
     dense_rows_max_world: int
     mf_rows_total: int
     mf_rows_max_world: int
-    compact_rows_total: int
-    compact_rows_max_world: int
+    propagation_rows_total: int
+    propagation_rows_max_world: int
     rigid_contacts: int
     ms_per_step: float
     peak_gpu_mem_bytes: int
@@ -344,20 +344,20 @@ def _row_solver_bytes(solver: SolverFeatherPGS) -> int:
         "mf_MiJt_b",
         "mf_dof_a",
         "mf_dof_b",
-        "compact_rhs",
-        "compact_rhs_unbiased",
-        "compact_impulses",
-        "compact_eff_mass_inv",
-        "compact_row_type",
-        "compact_row_parent",
-        "compact_row_mu",
-        "compact_phi",
-        "compact_J_a",
-        "compact_J_b",
-        "compact_MiJt_a",
-        "compact_MiJt_b",
-        "compact_body_a",
-        "compact_body_b",
+        "propagation_rhs",
+        "propagation_rhs_unbiased",
+        "propagation_impulses",
+        "propagation_eff_mass_inv",
+        "propagation_row_type",
+        "propagation_row_parent",
+        "propagation_row_mu",
+        "propagation_phi",
+        "propagation_J_a",
+        "propagation_J_b",
+        "propagation_MiJt_a",
+        "propagation_MiJt_b",
+        "propagation_body_a",
+        "propagation_body_b",
         "world_deferred_dof_mask",
     )
     return sum(_array_nbytes(getattr(solver, name, None)) for name in names)
@@ -369,17 +369,17 @@ def _propagation_extra_bytes(solver: SolverFeatherPGS) -> int:
         "_deferred_dense_delta_impulses",
         "_deferred_dense_tau",
         "_deferred_dense_qd_delta",
-        "compact_body_response",
-        "compact_body_qd",
-        "compact_body_impulses",
-        "compact_tree_Ia",
-        "compact_tree_U",
-        "compact_tree_D_chol",
-        "compact_tree_D_inv",
-        "compact_tree_pA",
-        "compact_tree_u",
-        "compact_tree_qdd",
-        "compact_tree_body_delta",
+        "propagation_body_response",
+        "propagation_body_qd",
+        "propagation_body_impulses",
+        "propagation_tree_Ia",
+        "propagation_tree_U",
+        "propagation_tree_D_chol",
+        "propagation_tree_D_inv",
+        "propagation_tree_pA",
+        "propagation_tree_u",
+        "propagation_tree_qdd",
+        "propagation_tree_body_delta",
     )
     return sum(_array_nbytes(getattr(solver, name, None)) for name in names)
 
@@ -527,10 +527,6 @@ def _run_case_path(
     pgs_velocity_iterations: int,
     enable_contact_friction: bool,
     contact_friction_position_iterations: int,
-    compact_fast_body_map: bool,
-    compact_shared_row_solver: bool,
-    compact_warp_propagation: bool,
-    compact_max_constraints_override: int | None,
     model: newton.Model | None = None,
     initial: dict[str, np.ndarray] | None = None,
     contacts: newton.Contacts | None = None,
@@ -541,30 +537,21 @@ def _run_case_path(
     row_capacity = _planned_row_capacity(case)
     dense_capacity = row_capacity
     mf_capacity = row_capacity
-    compact_capacity = row_capacity
-    if compact_max_constraints_override is not None:
-        compact_capacity = compact_max_constraints_override
+    propagation_capacity = row_capacity
     if case.case_kind == "articulated_free":
         # These scenes intentionally contain articulated/free contacts but no
         # free/free contact pairs. Keep MF capacity at a small internal margin
         # for both paths so the comparison focuses on dense D-wide contact rows
-        # versus compact contact rows.
+        # versus propagation contact rows.
         mf_capacity = 16
-    if path in ("compact_cholesky", "compact_tree") and case.case_kind == "articulated_free":
-        # Compact articulated contacts do not need D-wide dense contact rows.
-        # Keep a small dense capacity for non-contact rows such as drives or
-        # joint limits while the compact capacity scales with requested contacts.
-        dense_capacity = 16
-    response_mode = "immediate"
-    if path in ("compact_cholesky", "compact_tree"):
-        response_mode = path
+    response_mode = path if path in PROPAGATION_PATHS else "immediate"
     peak_gpu_mem_bytes = _gpu_used_bytes()
     process_gpu_mem_baseline_bytes, process_gpu_mem_source = _current_process_gpu_mem_bytes()
     process_peak_gpu_mem_bytes = process_gpu_mem_baseline_bytes
     solver = SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
-        articulated_dense_response_mode=response_mode,
+        articulated_contact_response=response_mode,
         hinv_jt_kernel="par_row",
         pgs_iterations=pgs_iterations,
         pgs_velocity_iterations=pgs_velocity_iterations,
@@ -572,10 +559,6 @@ def _run_case_path(
         contact_friction_position_iterations=contact_friction_position_iterations,
         dense_max_constraints=dense_capacity,
         mf_max_constraints=mf_capacity,
-        compact_max_constraints=compact_capacity,
-        compact_fast_body_map=compact_fast_body_map,
-        compact_shared_row_solver=compact_shared_row_solver if path == "compact_tree" else False,
-        compact_warp_propagation=compact_warp_propagation if path == "compact_tree" else False,
         pgs_warmstart=False,
         mf_warmstart=False,
     )
@@ -603,15 +586,15 @@ def _run_case_path(
 
     dense_counts = solver.constraint_count.numpy().astype(np.int64, copy=False)
     mf_counts = solver.mf_constraint_count.numpy().astype(np.int64, copy=False)
-    compact_count_array = getattr(solver, "compact_constraint_count", None)
-    if compact_count_array is None:
-        compact_counts = np.zeros_like(dense_counts)
+    propagation_count_array = getattr(solver, "propagation_constraint_count", None)
+    if propagation_count_array is None:
+        propagation_counts = np.zeros_like(dense_counts)
     else:
-        compact_counts = compact_count_array.numpy().astype(np.int64, copy=False)
+        propagation_counts = propagation_count_array.numpy().astype(np.int64, copy=False)
     rigid_contacts = int(contacts.rigid_contact_count.numpy()[0])
-    compact_active = bool(
-        solver.articulated_dense_response_mode in ("compact_cholesky", "compact_tree")
-        and np.sum(compact_counts) > 0
+    propagation_active = bool(
+        solver.articulated_contact_response in PROPAGATION_PATHS
+        and np.sum(propagation_counts) > 0
     )
 
     result = RunResult(
@@ -619,7 +602,7 @@ def _run_case_path(
         label=case.label,
         case_kind=case.case_kind,
         path=path,
-        compact_active=compact_active,
+        propagation_active=propagation_active,
         requested_world_count=case.world_count,
         free_pairs=case.free_pairs,
         articulations=case.articulations,
@@ -630,13 +613,13 @@ def _run_case_path(
         joint_dof_count=model.joint_dof_count,
         dense_row_capacity=dense_capacity,
         mf_row_capacity=mf_capacity,
-        compact_row_capacity=compact_capacity,
+        propagation_row_capacity=propagation_capacity,
         dense_rows_total=int(np.sum(dense_counts)),
         dense_rows_max_world=int(np.max(dense_counts)) if dense_counts.size else 0,
         mf_rows_total=int(np.sum(mf_counts)),
         mf_rows_max_world=int(np.max(mf_counts)) if mf_counts.size else 0,
-        compact_rows_total=int(np.sum(compact_counts)),
-        compact_rows_max_world=int(np.max(compact_counts)) if compact_counts.size else 0,
+        propagation_rows_total=int(np.sum(propagation_counts)),
+        propagation_rows_max_world=int(np.max(propagation_counts)) if propagation_counts.size else 0,
         rigid_contacts=rigid_contacts,
         ms_per_step=float(ms_per_step),
         peak_gpu_mem_bytes=peak_gpu_mem_bytes,
@@ -841,7 +824,7 @@ def _add_error_columns(results: list[RunResult], final_states: dict[tuple[str, s
             # Free/free controls execute the same existing MF kernel in both
             # modes. At large contact counts that kernel is order-sensitive, so
             # state deltas across separate runs are reproducibility noise rather
-            # than compact-method error.
+            # than propagation-method error.
             result.joint_q_rel_l2 = None
             result.joint_qd_rel_l2 = None
             result.joint_qd_abs_l2 = None
@@ -913,8 +896,8 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
     lines.append("")
     lines.append("This report uses real `SolverFeatherPGS.step` runs only. Compared paths:")
     lines.append("- `mf_immediate`: current production matrix-free path.")
-    lines.append("- `compact_tree`: fixed-size articulated contact rows plus tree response/propagation.")
-    lines.append("- `compact_cholesky`: fixed-size contact rows with a dense Cholesky response oracle for diagnostics.")
+    lines.append("- `propagation`: fixed-size articulated contact rows plus tree response/propagation.")
+    lines.append("- `propagation-fused`: same response model with the fused propagation kernel where supported.")
     lines.append("")
     lines.append(
         f"Config: preset `{args.preset}`, repeats {args.repeats}, warmups {args.warmups}, "
@@ -922,24 +905,19 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
         f"contact friction {'off' if args.no_friction else 'on'}, "
         f"contact_friction_position_iterations={args.contact_friction_position_iterations}, "
         f"`hinv_jt_kernel=par_row`, "
-        f"compact_fast_body_map={args.compact_fast_body_map}, "
-        f"compact_shared_row_solver={args.compact_shared_row_solver}, "
-        f"compact_warp_propagation={args.compact_warp_propagation}, "
-        f"compact_max_constraints={args.compact_max_constraints}, "
-        f"compact_path={args.compact_path}, "
         f"joint_armature={args.joint_armature}."
     )
     lines.append("")
     lines.append(
-        "`dense_row_capacity`/`mf_row_capacity`/`compact_row_capacity` are configured capacities. "
-        "`dense_rows_total`/`mf_rows_total`/`compact_rows_total` are produced by the real contact/row setup. "
+        "`dense_row_capacity`/`mf_row_capacity`/`propagation_row_capacity` are configured capacities. "
+        "`dense_rows_total`/`mf_rows_total`/`propagation_rows_total` are produced by the real contact/row setup. "
         "`process peak GPU MB` is current-process CUDA memory around solver allocation and stepping, "
         "including all benchmark-owned CUDA buffers visible to NVML. "
         "`legacy device peak GPU MB` is total device memory in use and can include unrelated processes. "
         "Contacts are generated once per case and reused for both solver paths so path comparisons see identical contact arrays."
     )
     lines.append(
-        "State-error columns are omitted for free/free controls because compact rows are inactive there and both rows execute "
+        "State-error columns are omitted for free/free controls because propagation rows are inactive there and both rows execute "
         "the same order-sensitive MF kernel; articulated/free rows report error against `mf_immediate`."
     )
     if args.preset == "stress":
@@ -957,7 +935,7 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
         lines.append(f"## {sweep}")
         lines.append("")
         lines.append(
-            "| case | path | D | cap dense/mf/compact | rows dense/mf/compact | contacts | ms/step | process peak GPU MB | legacy device peak GPU MB | qd rel L2 | qd abs Linf | state Linf |"
+            "| case | path | D | cap dense/mf/propagation | rows dense/mf/propagation | contacts | ms/step | process peak GPU MB | legacy device peak GPU MB | qd rel L2 | qd abs Linf | state Linf |"
         )
         lines.append(
             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
@@ -972,8 +950,8 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
                         result.label,
                         result.path,
                         str(result.joint_dof_count),
-                        f"{result.dense_row_capacity}/{result.mf_row_capacity}/{result.compact_row_capacity}",
-                        f"{result.dense_rows_total}/{result.mf_rows_total}/{result.compact_rows_total}",
+                        f"{result.dense_row_capacity}/{result.mf_row_capacity}/{result.propagation_row_capacity}",
+                        f"{result.dense_rows_total}/{result.mf_rows_total}/{result.propagation_rows_total}",
                         str(result.rigid_contacts),
                         _fmt(result.ms_per_step),
                         _fmt(
@@ -1056,28 +1034,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-friction-position-iterations", type=int, default=-1)
     parser.add_argument("--joint-armature", type=float, default=0.0)
     parser.add_argument(
-        "--compact-path",
-        choices=COMPACT_PATHS,
-        default="compact_tree",
-        help="Compact path to compare against mf_immediate.",
-    )
-    parser.add_argument(
         "--path",
         action="append",
-        choices=("mf_immediate", *COMPACT_PATHS),
+        choices=("mf_immediate", *PROPAGATION_PATHS),
         default=None,
-        help="Run only selected path(s). Defaults to mf_immediate plus --compact-path.",
+        help="Run only selected path(s). Defaults to mf_immediate plus propagation.",
     )
     parser.add_argument("--no-friction", action="store_true")
-    parser.add_argument("--compact-fast-body-map", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--compact-shared-row-solver", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--compact-warp-propagation", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument(
-        "--compact-max-constraints",
-        type=int,
-        default=None,
-        help="Override compact_max_constraints for capacity-sensitivity profiling.",
-    )
     parser.add_argument(
         "--case",
         action="append",
@@ -1128,7 +1091,7 @@ def main() -> None:
 
     results: list[RunResult] = []
     final_states: dict[tuple[str, str, str], dict[str, np.ndarray]] = {}
-    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", args.compact_path)
+    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", "propagation")
     for case in cases:
         model, initial, contacts = _prepare_case_run(case, args.device)
         for path_name in paths:
@@ -1143,10 +1106,6 @@ def main() -> None:
                 pgs_velocity_iterations=args.pgs_velocity_iterations,
                 enable_contact_friction=not args.no_friction,
                 contact_friction_position_iterations=args.contact_friction_position_iterations,
-                compact_fast_body_map=args.compact_fast_body_map,
-                compact_shared_row_solver=args.compact_shared_row_solver,
-                compact_warp_propagation=args.compact_warp_propagation,
-                compact_max_constraints_override=args.compact_max_constraints,
                 model=model,
                 initial=initial,
                 contacts=contacts,
