@@ -17,12 +17,17 @@ import json
 import math
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import warp as wp
+
+try:
+    import torch
+except Exception:  # pragma: no cover - optional benchmark instrumentation
+    torch = None
 
 _NEWTON_REPO = Path(__file__).resolve().parents[3]
 if str(_NEWTON_REPO) not in sys.path:
@@ -32,7 +37,7 @@ import newton  # noqa: E402
 from newton.solvers import SolverFeatherPGS  # noqa: E402
 
 
-PATHS = ("mf_immediate", "compact_tree")
+COMPACT_PATHS = ("compact_tree", "compact_cholesky")
 
 
 @dataclass(frozen=True)
@@ -40,10 +45,12 @@ class BenchCase:
     sweep: str
     label: str
     case_kind: str
+    world_count: int = 1
     free_pairs: int = 0
     articulations: int = 0
     links: int = 0
     contacts_per_articulation: int = 0
+    joint_armature: float = 0.0
 
 
 @dataclass
@@ -53,6 +60,7 @@ class RunResult:
     case_kind: str
     path: str
     compact_active: bool
+    requested_world_count: int
     free_pairs: int
     articulations: int
     links: int
@@ -71,12 +79,17 @@ class RunResult:
     compact_rows_max_world: int
     rigid_contacts: int
     ms_per_step: float
+    peak_gpu_mem_bytes: int
     row_solver_mib: float
     propagation_extra_mib: float
     joint_q_rel_l2: float | None = None
     joint_qd_rel_l2: float | None = None
+    joint_qd_abs_l2: float | None = None
+    joint_qd_abs_linf: float | None = None
     body_q_rel_l2: float | None = None
     body_qd_rel_l2: float | None = None
+    body_qd_abs_l2: float | None = None
+    body_qd_abs_linf: float | None = None
     state_linf: float | None = None
 
 
@@ -118,6 +131,32 @@ def _selected_contact_links(num_links: int, count: int) -> list[int]:
     return out
 
 
+def _max_contact_slots_per_link(num_links: int, count: int) -> int:
+    if num_links <= 0 or count <= 0:
+        return 0
+    return int(math.ceil(count / num_links))
+
+
+def _contact_link_slots(num_links: int, count: int) -> list[tuple[int, float]]:
+    if count <= num_links:
+        return [(link_idx, 0.0) for link_idx in _selected_contact_links(num_links, count)]
+
+    slots_by_link = [[] for _ in range(num_links)]
+    for contact_idx in range(count):
+        slots_by_link[contact_idx % num_links].append(contact_idx // num_links)
+
+    out: list[tuple[int, float]] = []
+    slot_spacing = 0.09
+    for link_idx, slots in enumerate(slots_by_link):
+        n_slots = len(slots)
+        if n_slots == 0:
+            continue
+        for slot_idx in range(n_slots):
+            y_offset = 0.0 if n_slots == 1 else (slot_idx - 0.5 * (n_slots - 1)) * slot_spacing
+            out.append((link_idx, y_offset))
+    return out
+
+
 def _configure_shape_defaults(builder: newton.ModelBuilder) -> None:
     builder.default_shape_cfg.density = 1000.0
     builder.default_shape_cfg.ke = 1.0e5
@@ -128,7 +167,7 @@ def _configure_shape_defaults(builder: newton.ModelBuilder) -> None:
     builder.default_shape_cfg.gap = 0.0
 
 
-def _build_free_free_model(case: BenchCase, device: str) -> newton.Model:
+def _build_free_free_builder(case: BenchCase) -> tuple[newton.ModelBuilder, tuple[float, float, float]]:
     builder = newton.ModelBuilder(gravity=0.0)
     _configure_shape_defaults(builder)
 
@@ -144,17 +183,39 @@ def _build_free_free_model(case: BenchCase, device: str) -> newton.Model:
         builder.add_shape_box(lower, hx=hx, hy=hy, hz=hz)
         builder.add_shape_box(upper, hx=hx, hy=hy, hz=hz)
 
+    return builder, (max(case.free_pairs, 1) * spacing + 0.5, 0.0, 0.0)
+
+
+def _replicate_or_finalize(
+    template: newton.ModelBuilder,
+    world_count: int,
+    spacing: tuple[float, float, float],
+    device: str,
+) -> newton.Model:
+    if world_count <= 1:
+        return template.finalize(device=device)
+    builder = newton.ModelBuilder(gravity=0.0)
+    builder.replicate(template, world_count, spacing=spacing)
     return builder.finalize(device=device)
 
 
-def _build_articulated_free_model(case: BenchCase, device: str) -> newton.Model:
+def _build_free_free_model(case: BenchCase, device: str) -> newton.Model:
+    template, spacing = _build_free_free_builder(case)
+    return _replicate_or_finalize(template, case.world_count, spacing, device)
+
+
+def _build_articulated_free_builder(case: BenchCase) -> tuple[newton.ModelBuilder, tuple[float, float, float]]:
     builder = newton.ModelBuilder(gravity=0.0)
     _configure_shape_defaults(builder)
 
+    cube_h = 0.04
+    contact_slot_spacing = 0.09
+    max_slots_per_link = _max_contact_slots_per_link(case.links, case.contacts_per_articulation)
     link_hx = 0.15
     link_hy = 0.06
+    if max_slots_per_link > 2:
+        link_hy = max(link_hy, 0.5 * (max_slots_per_link - 1) * contact_slot_spacing + cube_h + 0.01)
     link_hz = 0.045
-    cube_h = 0.04
     penetration = 0.012
     art_spacing_y = 0.55
     base_z = 0.5
@@ -182,20 +243,27 @@ def _build_articulated_free_model(case: BenchCase, device: str) -> newton.Model:
                     axis=wp.vec3(0.0, 1.0, 0.0),
                     parent_xform=parent_xform,
                     child_xform=wp.transform(wp.vec3(-link_hx, 0.0, 0.0), wp.quat_identity()),
+                    armature=case.joint_armature,
                 )
             )
             parent = link
 
         builder.add_articulation(joints)
 
-        for link_idx in _selected_contact_links(case.links, case.contacts_per_articulation):
+        for link_idx, y_offset in _contact_link_slots(case.links, case.contacts_per_articulation):
             x = float(origin[0]) + (2.0 * link_idx + 1.0) * link_hx
-            y = float(origin[1])
+            y = float(origin[1]) + y_offset
             z = base_z + link_hz + cube_h - penetration
             cube = builder.add_body(xform=wp.transform(wp.vec3(x, y, z), wp.quat_identity()))
             builder.add_shape_box(cube, hx=cube_h, hy=cube_h, hz=cube_h)
 
-    return builder.finalize(device=device)
+    world_spacing_y = max(case.articulations + 2, 1) * art_spacing_y
+    return builder, (0.0, world_spacing_y, 0.0)
+
+
+def _build_articulated_free_model(case: BenchCase, device: str) -> newton.Model:
+    template, spacing = _build_articulated_free_builder(case)
+    return _replicate_or_finalize(template, case.world_count, spacing, device)
 
 
 def _build_model(case: BenchCase, device: str) -> newton.Model:
@@ -310,12 +378,29 @@ def _propagation_extra_bytes(solver: SolverFeatherPGS) -> int:
     return sum(_array_nbytes(getattr(solver, name, None)) for name in names)
 
 
+def _gpu_used_bytes() -> int:
+    if torch is None or not torch.cuda.is_available():
+        return 0
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    return int(total_bytes - free_bytes)
+
+
 def _finite_rel_l2(value: np.ndarray, reference: np.ndarray) -> float:
     diff = np.asarray(value, dtype=np.float64).reshape(-1) - np.asarray(reference, dtype=np.float64).reshape(-1)
     denom = np.linalg.norm(np.asarray(reference, dtype=np.float64).reshape(-1))
     if denom == 0.0:
         denom = 1.0
     return float(np.linalg.norm(diff) / denom)
+
+
+def _abs_l2(value: np.ndarray, reference: np.ndarray) -> float:
+    diff = np.asarray(value, dtype=np.float64).reshape(-1) - np.asarray(reference, dtype=np.float64).reshape(-1)
+    return float(np.linalg.norm(diff))
+
+
+def _abs_linf(value: np.ndarray, reference: np.ndarray) -> float:
+    diff = np.asarray(value, dtype=np.float64).reshape(-1) - np.asarray(reference, dtype=np.float64).reshape(-1)
+    return float(np.max(np.abs(diff))) if diff.size else 0.0
 
 
 def _state_linf(value: dict[str, np.ndarray], reference: dict[str, np.ndarray]) -> float:
@@ -335,10 +420,11 @@ def _run_step_loop(
     repeats: int,
     warmups: int,
     dt: float,
-) -> tuple[float, dict[str, np.ndarray]]:
+) -> tuple[float, dict[str, np.ndarray], int]:
     state_in = model.state()
     state_out = model.state()
     control = model.control()
+    peak_gpu_mem_bytes = _gpu_used_bytes()
 
     for _ in range(warmups):
         _restore_state(model, state_in, initial)
@@ -346,7 +432,9 @@ def _run_step_loop(
         state_in.clear_forces()
         state_out.clear_forces()
         solver.step(state_in, state_out, control, contacts, dt)
+        peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, _gpu_used_bytes())
     wp.synchronize()
+    peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, _gpu_used_bytes())
 
     start = time.perf_counter()
     for _ in range(repeats):
@@ -355,10 +443,12 @@ def _run_step_loop(
         state_in.clear_forces()
         state_out.clear_forces()
         solver.step(state_in, state_out, control, contacts, dt)
+        peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, _gpu_used_bytes())
     wp.synchronize()
+    peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, _gpu_used_bytes())
 
     elapsed = time.perf_counter() - start
-    return (elapsed * 1000.0 / repeats), _snapshot_state(state_out)
+    return (elapsed * 1000.0 / repeats), _snapshot_state(state_out), peak_gpu_mem_bytes
 
 
 def _prepare_case_run(case: BenchCase, device: str) -> tuple[newton.Model, dict[str, np.ndarray], newton.Contacts]:
@@ -384,6 +474,7 @@ def _run_case_path(
     pgs_iterations: int,
     pgs_velocity_iterations: int,
     enable_contact_friction: bool,
+    contact_friction_position_iterations: int,
     compact_fast_body_map: bool,
     compact_existing_row_phases: str,
     compact_shared_row_solver: bool,
@@ -408,19 +499,24 @@ def _run_case_path(
         # for both paths so the comparison focuses on dense D-wide contact rows
         # versus compact contact rows.
         mf_capacity = 16
-    if path == "compact_tree" and case.case_kind == "articulated_free":
+    if path in ("compact_cholesky", "compact_tree") and case.case_kind == "articulated_free":
         # Compact articulated contacts do not need D-wide dense contact rows.
         # Keep a small dense capacity for non-contact rows such as drives or
         # joint limits while the compact capacity scales with requested contacts.
         dense_capacity = 16
+    response_mode = "immediate"
+    if path in ("compact_cholesky", "compact_tree"):
+        response_mode = path
+    peak_gpu_mem_bytes = _gpu_used_bytes()
     solver = SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
-        articulated_dense_response_mode="immediate" if path == "mf_immediate" else "compact_tree",
+        articulated_dense_response_mode=response_mode,
         hinv_jt_kernel="par_row",
         pgs_iterations=pgs_iterations,
         pgs_velocity_iterations=pgs_velocity_iterations,
         enable_contact_friction=enable_contact_friction,
+        contact_friction_position_iterations=contact_friction_position_iterations,
         dense_max_constraints=dense_capacity,
         mf_max_constraints=mf_capacity,
         compact_max_constraints=compact_capacity,
@@ -431,7 +527,9 @@ def _run_case_path(
         pgs_warmstart=False,
         mf_warmstart=False,
     )
-    ms_per_step, final_state = _run_step_loop(
+    wp.synchronize()
+    peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, _gpu_used_bytes())
+    ms_per_step, final_state, loop_peak_gpu_mem_bytes = _run_step_loop(
         model,
         solver,
         contacts,
@@ -440,6 +538,7 @@ def _run_case_path(
         warmups=warmups,
         dt=dt,
     )
+    peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, loop_peak_gpu_mem_bytes)
 
     dense_counts = solver.constraint_count.numpy().astype(np.int64, copy=False)
     mf_counts = solver.mf_constraint_count.numpy().astype(np.int64, copy=False)
@@ -449,7 +548,10 @@ def _run_case_path(
     else:
         compact_counts = compact_count_array.numpy().astype(np.int64, copy=False)
     rigid_contacts = int(contacts.rigid_contact_count.numpy()[0])
-    compact_active = bool(solver.articulated_dense_response_mode == "compact_tree" and np.sum(compact_counts) > 0)
+    compact_active = bool(
+        solver.articulated_dense_response_mode in ("compact_cholesky", "compact_tree")
+        and np.sum(compact_counts) > 0
+    )
 
     result = RunResult(
         sweep=case.sweep,
@@ -457,6 +559,7 @@ def _run_case_path(
         case_kind=case.case_kind,
         path=path,
         compact_active=compact_active,
+        requested_world_count=case.world_count,
         free_pairs=case.free_pairs,
         articulations=case.articulations,
         links=case.links,
@@ -475,6 +578,7 @@ def _run_case_path(
         compact_rows_max_world=int(np.max(compact_counts)) if compact_counts.size else 0,
         rigid_contacts=rigid_contacts,
         ms_per_step=float(ms_per_step),
+        peak_gpu_mem_bytes=peak_gpu_mem_bytes,
         row_solver_mib=_row_solver_bytes(solver) / (1024.0 * 1024.0),
         propagation_extra_mib=_propagation_extra_bytes(solver) / (1024.0 * 1024.0),
     )
@@ -600,6 +704,69 @@ def _cases_for_preset(preset: str) -> list[BenchCase]:
                 )
             )
         return cases
+    if preset == "env_scale":
+        world_counts = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+        a16_l16_c64 = [
+            BenchCase(
+                "env_count",
+                f"envs={world_count}",
+                "articulated_free",
+                world_count=world_count,
+                articulations=16,
+                links=16,
+                contacts_per_articulation=1,
+            )
+            for world_count in world_counts
+        ]
+        a2_l16_c256 = [
+            BenchCase(
+                "env_count_a2_l16_c256",
+                f"envs={world_count}",
+                "articulated_free",
+                world_count=world_count,
+                articulations=2,
+                links=16,
+                contacts_per_articulation=32,
+            )
+            for world_count in world_counts
+        ]
+        a16_l4_c256 = [
+            BenchCase(
+                "env_count_a16_l4_c256",
+                f"envs={world_count}",
+                "articulated_free",
+                world_count=world_count,
+                articulations=16,
+                links=4,
+                contacts_per_articulation=4,
+            )
+            for world_count in world_counts
+        ]
+        a2_l4_c64 = [
+            BenchCase(
+                "env_count_a2_l4_c64",
+                f"envs={world_count}",
+                "articulated_free",
+                world_count=world_count,
+                articulations=2,
+                links=4,
+                contacts_per_articulation=8,
+            )
+            for world_count in world_counts
+        ]
+        a1_l4_c256 = [
+            BenchCase(
+                "env_count_a1_l4_c256",
+                f"envs={world_count}",
+                "articulated_free",
+                world_count=world_count,
+                articulations=1,
+                links=4,
+                contacts_per_articulation=64,
+            )
+            for world_count in world_counts
+        ]
+        return a16_l16_c64 + a2_l16_c256 + a16_l4_c256 + a2_l4_c64 + a1_l4_c256
     raise ValueError(f"unknown preset {preset!r}")
 
 
@@ -612,32 +779,55 @@ def _add_error_columns(results: list[RunResult], final_states: dict[tuple[str, s
             # than compact-method error.
             result.joint_q_rel_l2 = None
             result.joint_qd_rel_l2 = None
+            result.joint_qd_abs_l2 = None
+            result.joint_qd_abs_linf = None
             result.body_q_rel_l2 = None
             result.body_qd_rel_l2 = None
+            result.body_qd_abs_l2 = None
+            result.body_qd_abs_linf = None
             result.state_linf = None
             continue
 
         key = (result.sweep, result.label, result.case_kind)
-        current = final_states[(key[0], key[1], "mf_immediate")]
+        current = final_states.get((key[0], key[1], "mf_immediate"))
+        if current is None:
+            result.joint_q_rel_l2 = None
+            result.joint_qd_rel_l2 = None
+            result.joint_qd_abs_l2 = None
+            result.joint_qd_abs_linf = None
+            result.body_q_rel_l2 = None
+            result.body_qd_rel_l2 = None
+            result.body_qd_abs_l2 = None
+            result.body_qd_abs_linf = None
+            result.state_linf = None
+            continue
         value = final_states[(key[0], key[1], result.path)]
         if result.path == "mf_immediate":
             result.joint_q_rel_l2 = 0.0
             result.joint_qd_rel_l2 = 0.0
+            result.joint_qd_abs_l2 = 0.0
+            result.joint_qd_abs_linf = 0.0
             result.body_q_rel_l2 = 0.0
             result.body_qd_rel_l2 = 0.0
+            result.body_qd_abs_l2 = 0.0
+            result.body_qd_abs_linf = 0.0
             result.state_linf = 0.0
         else:
             result.joint_q_rel_l2 = _finite_rel_l2(value["joint_q"], current["joint_q"])
             result.joint_qd_rel_l2 = _finite_rel_l2(value["joint_qd"], current["joint_qd"])
+            result.joint_qd_abs_l2 = _abs_l2(value["joint_qd"], current["joint_qd"])
+            result.joint_qd_abs_linf = _abs_linf(value["joint_qd"], current["joint_qd"])
             result.body_q_rel_l2 = _finite_rel_l2(value["body_q"], current["body_q"])
             result.body_qd_rel_l2 = _finite_rel_l2(value["body_qd"], current["body_qd"])
+            result.body_qd_abs_l2 = _abs_l2(value["body_qd"], current["body_qd"])
+            result.body_qd_abs_linf = _abs_linf(value["body_qd"], current["body_qd"])
             result.state_linf = _state_linf(value, current)
 
 
 def _write_csv(path: Path, results: list[RunResult]) -> None:
     rows = [asdict(result) for result in results]
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -659,22 +849,27 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
     lines.append("This report uses real `SolverFeatherPGS.step` runs only. Compared paths:")
     lines.append("- `mf_immediate`: current production matrix-free path.")
     lines.append("- `compact_tree`: fixed-size articulated contact rows plus tree response/propagation.")
+    lines.append("- `compact_cholesky`: fixed-size contact rows with a dense Cholesky response oracle for diagnostics.")
     lines.append("")
     lines.append(
         f"Config: preset `{args.preset}`, repeats {args.repeats}, warmups {args.warmups}, "
         f"dt {args.dt}, PGS iterations {args.pgs_iterations}, velocity iterations {args.pgs_velocity_iterations}, "
-        f"contact friction {'off' if args.no_friction else 'on'}, `hinv_jt_kernel=par_row`, "
+        f"contact friction {'off' if args.no_friction else 'on'}, "
+        f"contact_friction_position_iterations={args.contact_friction_position_iterations}, "
+        f"`hinv_jt_kernel=par_row`, "
         f"compact_fast_body_map={args.compact_fast_body_map}, "
         f"compact_existing_row_phases={args.compact_existing_row_phases}, "
         f"compact_shared_row_solver={args.compact_shared_row_solver}, "
         f"compact_warp_propagation={args.compact_warp_propagation}, "
-        f"compact_max_constraints={args.compact_max_constraints}."
+        f"compact_max_constraints={args.compact_max_constraints}, "
+        f"compact_path={args.compact_path}, "
+        f"joint_armature={args.joint_armature}."
     )
     lines.append("")
     lines.append(
         "`dense_row_capacity`/`mf_row_capacity`/`compact_row_capacity` are configured capacities. "
         "`dense_rows_total`/`mf_rows_total`/`compact_rows_total` are produced by the real contact/row setup. "
-        "`propagation MiB` is compact body response and tree propagation scratch, separate from row arrays. "
+        "`peak GPU MB` is total CUDA memory in use around solver allocation and stepping. "
         "Contacts are generated once per case and reused for both solver paths so path comparisons see identical contact arrays."
     )
     lines.append(
@@ -696,7 +891,7 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
         lines.append(f"## {sweep}")
         lines.append("")
         lines.append(
-            "| case | path | D | cap dense/mf/compact | rows dense/mf/compact | contacts | ms/step | row MiB | propagation MiB | qd rel L2 | state Linf |"
+            "| case | path | D | cap dense/mf/compact | rows dense/mf/compact | contacts | ms/step | peak GPU MB | qd rel L2 | qd abs Linf | state Linf |"
         )
         lines.append(
             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
@@ -715,9 +910,9 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
                         f"{result.dense_rows_total}/{result.mf_rows_total}/{result.compact_rows_total}",
                         str(result.rigid_contacts),
                         _fmt(result.ms_per_step),
-                        _fmt(result.row_solver_mib),
-                        _fmt(result.propagation_extra_mib),
+                        _fmt(result.peak_gpu_mem_bytes / 1.0e6 if result.peak_gpu_mem_bytes else None),
                         _fmt(result.joint_qd_rel_l2),
+                        _fmt(result.joint_qd_abs_linf),
                         _fmt(result.state_linf),
                     ]
                 )
@@ -741,17 +936,29 @@ def _write_plot(path: Path, results: list[RunResult]) -> None:
         labels = list(dict.fromkeys(result.label for result in sweep_results))
         x = np.arange(len(labels))
         width = 0.35
-        for path_idx, path_name in enumerate(PATHS):
-            path_results = [result for result in sweep_results if result.path == path_name]
-            values = [result.ms_per_step for result in path_results]
-            axes[row_idx][0].bar(x + (path_idx - 0.5) * width, values, width=width, label=path_name)
-            mem = [result.row_solver_mib + result.propagation_extra_mib for result in path_results]
-            axes[row_idx][1].bar(x + (path_idx - 0.5) * width, mem, width=width, label=path_name)
+        paths = list(dict.fromkeys(result.path for result in sweep_results))
+        width = min(0.8 / max(len(paths), 1), 0.35)
+        for path_idx, path_name in enumerate(paths):
+            path_results = {
+                result.label: result for result in sweep_results if result.path == path_name
+            }
+            values = [
+                path_results[label].ms_per_step if label in path_results else math.nan for label in labels
+            ]
+            offset = (path_idx - 0.5 * (len(paths) - 1)) * width
+            axes[row_idx][0].bar(x + offset, values, width=width, label=path_name)
+            mem = [
+                path_results[label].peak_gpu_mem_bytes / 1.0e6
+                if label in path_results and path_results[label].peak_gpu_mem_bytes
+                else math.nan
+                for label in labels
+            ]
+            axes[row_idx][1].bar(x + offset, mem, width=width, label=path_name)
 
         axes[row_idx][0].set_title(f"{sweep}: time")
         axes[row_idx][0].set_ylabel("ms / step")
-        axes[row_idx][1].set_title(f"{sweep}: row + propagation scratch")
-        axes[row_idx][1].set_ylabel("MiB")
+        axes[row_idx][1].set_title(f"{sweep}: total GPU memory")
+        axes[row_idx][1].set_ylabel("MB")
         for axis in axes[row_idx]:
             axis.set_xticks(x)
             axis.set_xticklabels(labels, rotation=30, ha="right")
@@ -765,7 +972,7 @@ def _write_plot(path: Path, results: list[RunResult]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--preset", choices=("smoke", "default", "stress"), default="default")
+    parser.add_argument("--preset", choices=("smoke", "default", "stress", "env_scale"), default="default")
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--repeats", type=int, default=None)
@@ -773,6 +980,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dt", type=float, default=1.0 / 240.0)
     parser.add_argument("--pgs-iterations", type=int, default=None)
     parser.add_argument("--pgs-velocity-iterations", type=int, default=0)
+    parser.add_argument("--contact-friction-position-iterations", type=int, default=-1)
+    parser.add_argument("--joint-armature", type=float, default=0.0)
+    parser.add_argument(
+        "--compact-path",
+        choices=COMPACT_PATHS,
+        default="compact_tree",
+        help="Compact path to compare against mf_immediate.",
+    )
+    parser.add_argument(
+        "--path",
+        action="append",
+        choices=("mf_immediate", *COMPACT_PATHS),
+        default=None,
+        help="Run only selected path(s). Defaults to mf_immediate plus --compact-path.",
+    )
     parser.add_argument("--no-friction", action="store_true")
     parser.add_argument("--compact-fast-body-map", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -812,14 +1034,21 @@ def main() -> None:
     if args.out_dir is None:
         args.out_dir = Path("artifacts/fpgs_articulation_row_scaling") / args.preset
     if args.repeats is None:
-        args.repeats = 1 if args.preset == "smoke" else 4 if args.preset == "stress" else 8
+        args.repeats = 1 if args.preset == "smoke" else 2 if args.preset == "env_scale" else 4 if args.preset == "stress" else 8
     if args.warmups is None:
-        args.warmups = 1 if args.preset == "smoke" else 2
+        args.warmups = 1 if args.preset in ("smoke", "env_scale") else 2
     if args.pgs_iterations is None:
         args.pgs_iterations = 2 if args.preset == "smoke" else 8
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cases = _cases_for_preset(args.preset)
+    if args.joint_armature != 0.0:
+        cases = [
+            replace(case, joint_armature=args.joint_armature)
+            if case.case_kind == "articulated_free"
+            else case
+            for case in cases
+        ]
     if args.case:
         requested = set(args.case)
         cases = [
@@ -832,9 +1061,10 @@ def main() -> None:
 
     results: list[RunResult] = []
     final_states: dict[tuple[str, str, str], dict[str, np.ndarray]] = {}
+    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", args.compact_path)
     for case in cases:
         model, initial, contacts = _prepare_case_run(case, args.device)
-        for path_name in PATHS:
+        for path_name in paths:
             result, final_state = _run_case_path(
                 case,
                 path_name,
@@ -845,6 +1075,7 @@ def main() -> None:
                 pgs_iterations=args.pgs_iterations,
                 pgs_velocity_iterations=args.pgs_velocity_iterations,
                 enable_contact_friction=not args.no_friction,
+                contact_friction_position_iterations=args.contact_friction_position_iterations,
                 compact_fast_body_map=args.compact_fast_body_map,
                 compact_existing_row_phases=args.compact_existing_row_phases,
                 compact_shared_row_solver=args.compact_shared_row_solver,

@@ -130,6 +130,7 @@ from .kernels import (
     propagate_compact_tree_impulses_for_size,
     rhs_accum_world_par_art,
     refresh_compact_body_qd_from_vout,
+    refresh_compact_free_body_qd_from_vout,
     refresh_compact_tree_body_qd_for_size,
     scatter_qdd_from_groups,
     snapshot_mf_prev_slots,
@@ -174,6 +175,7 @@ _FPGS_COMPACT_FULL_FUSED_MAX_ARTS_PER_WORLD = int(
 )
 _FPGS_COMPACT_FULL_FUSED_MAX_SIZE = int(os.environ.get("FEATHER_PGS_COMPACT_FULL_FUSED_MAX_SIZE", "16"))
 _FPGS_COMPACT_FULL_FUSED_PROP_WARPS = int(os.environ.get("FEATHER_PGS_COMPACT_FULL_FUSED_PROP_WARPS", "0"))
+_HINV_JT_TILED_AUTO_SHARED_LIMIT_BYTES = 96 * 1024
 
 
 @wp.kernel
@@ -1006,6 +1008,7 @@ class SolverFeatherPGS(SolverBase):
             self._compact_tree_single_dof_by_size = {int(size): True for size in self.size_groups}
             self._compact_tree_has_non_free_by_size = {int(size): False for size in self.size_groups}
             self._compact_tree_requires_body_map = False
+        self._setup_world_size_grouping(model)
 
     def _compute_articulation_indices(self, model):
         # calculate total size and offsets of Jacobian and mass matrices for entire system
@@ -1202,6 +1205,39 @@ class SolverFeatherPGS(SolverBase):
         self._max_arts_per_world = int(np.max(world_art_counts)) if len(world_art_counts) > 0 else 0
         self._is_multi_articulation = self._max_arts_per_world > 1
 
+    def _setup_world_size_grouping(self, model):
+        self.world_group_art_start = {}
+        self.world_group_to_art = {}
+        if (
+            not model.articulation_count
+            or self.art_to_world is None
+            or self.art_size is None
+            or self.is_free_rigid is None
+        ):
+            return
+
+        device = model.device
+        art_to_world_np = self.art_to_world.numpy().astype(np.int32, copy=False)
+        art_size_np = self.art_size.numpy().astype(np.int32, copy=False)
+        is_free_rigid_np = self.is_free_rigid.numpy().astype(np.int32, copy=False)
+        world_count = max(int(self.world_count), 0)
+        for size in self.size_groups:
+            per_world: list[list[int]] = [[] for _ in range(world_count)]
+            for art in np.where((art_size_np == int(size)) & (is_free_rigid_np == 0))[0]:
+                world = int(art_to_world_np[int(art)])
+                if 0 <= world < world_count:
+                    per_world[world].append(int(art))
+
+            starts = np.zeros(world_count + 1, dtype=np.int32)
+            flat: list[int] = []
+            for world, arts in enumerate(per_world):
+                starts[world] = len(flat)
+                flat.extend(arts)
+            starts[world_count] = len(flat)
+            flat_np = np.asarray(flat, dtype=np.int32)
+            self.world_group_art_start[int(size)] = wp.array(starts, dtype=wp.int32, device=device)
+            self.world_group_to_art[int(size)] = wp.array(flat_np, dtype=wp.int32, device=device)
+
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:
             self.body_to_joint = None
@@ -1349,7 +1385,10 @@ class SolverFeatherPGS(SolverBase):
                 self._deferred_dense_tau = None
                 self._deferred_dense_qd_delta = None
             self._compact_tau = None
-            self._compact_qd_delta = None
+            if self.articulated_dense_response_mode == "compact_cholesky" and self._has_non_free_articulations:
+                self._compact_qd_delta = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+            else:
+                self._compact_qd_delta = None
             # The stage-3 snapshots stay unconditional (small: one dof-vector
             # each): the rsl_rl NaN-anomaly dumper reads them in default
             # configs, where _debug_buffers_enabled is False.
@@ -2169,12 +2208,20 @@ class SolverFeatherPGS(SolverBase):
             (worlds, compact_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
 
-        # Older compact diagnostics used D-wide B and qd-response buffers here.
-        # The production compact tree path must not allocate body_count * 6 * D
+        # The benchmarked compact_tree path must not allocate body_count * 6 * D
         # storage, because that is the scaling problem this route is intended to
-        # remove.
-        self.compact_body_B = None
-        self.compact_body_qd_response = None
+        # remove. The compact_cholesky diagnostic mode keeps these buffers as an
+        # MF-equivalence diagnostic for the fixed-size body-space row formulation.
+        if self.articulated_dense_response_mode == "compact_cholesky":
+            self.compact_body_B = wp.zeros(
+                (body_count, 6, max_dofs), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+            self.compact_body_qd_response = wp.zeros(
+                (body_count, 6, max_dofs), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+        else:
+            self.compact_body_B = None
+            self.compact_body_qd_response = None
         self.compact_body_response = wp.zeros(
             (body_count, 6, 6), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
@@ -2253,6 +2300,20 @@ class SolverFeatherPGS(SolverBase):
                 R_np[group_idx, :dof_count] = armature_np[dof_start : dof_start + dof_count]
 
             self.R_by_size[size] = wp.array(R_np, dtype=wp.float32, device=model.device)
+
+    def _use_tiled_hinv_jt(self, size: int) -> bool:
+        if self.hinv_jt_kernel == "par_row" or self.dense_max_constraints <= 0:
+            return False
+        if self.hinv_jt_kernel == "tiled":
+            return True
+        if size <= self.small_dof_threshold:
+            return False
+        # H^-1 J^T tiles materialize roughly Jt/Z plus L in shared memory:
+        # 2 * D * rows + D^2 float32 values. Large row capacities can exceed
+        # per-block shared memory even for moderate DOF counts, so auto must
+        # account for both dimensions.
+        estimated_bytes = 8 * int(size) * int(self.dense_max_constraints) + 4 * int(size) * int(size)
+        return estimated_bytes <= _HINV_JT_TILED_AUTO_SHARED_LIMIT_BYTES
 
     def _init_tiled_kernels(self, model):
         """Resolve size-specialized Warp kernels once for this solver shape."""
@@ -2355,10 +2416,11 @@ class SolverFeatherPGS(SolverBase):
                 fused_size = getattr(self, "_compact_full_fused_size", None)
                 if fused_size is not None:
                     n_fused_arts = max(int(getattr(self, "_compact_full_fused_arts_per_world", 0)), 1)
-                    prop_warps = n_fused_arts
                     if _FPGS_COMPACT_FULL_FUSED_PROP_WARPS > 0:
-                        prop_warps = min(prop_warps, _FPGS_COMPACT_FULL_FUSED_PROP_WARPS)
-                    fused_warps = min(max(prop_warps + 1, 2), 32)
+                        prop_warps = min(n_fused_arts, _FPGS_COMPACT_FULL_FUSED_PROP_WARPS)
+                        fused_warps = min(max(prop_warps + 1, 2), 32)
+                    else:
+                        fused_warps = 1
                     self._compact_full_fused_block_dim = 32 * fused_warps
                     self._pgs_solve_compact_full_fused_kernel = _get_pgs_solve_compact_full_fused_kernel(
                         self.compact_max_constraints,
@@ -2696,6 +2758,29 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 device=self.model.device,
             )
+        self._refresh_compact_free_body_qd_from_vout()
+
+    def _refresh_compact_free_body_qd_from_vout(self) -> None:
+        if (
+            not self._compact_contacts_enabled()
+            or self.compact_body_qd is None
+            or not self._has_free_rigid_bodies
+            or self.is_free_rigid is None
+        ):
+            return
+        wp.launch(
+            refresh_compact_free_body_qd_from_vout,
+            dim=self.model.body_count,
+            inputs=[
+                self.body_to_articulation,
+                self.is_free_rigid,
+                self.articulation_root_dof_start,
+                self.articulation_root_com_offset,
+                self.v_out,
+            ],
+            outputs=[self.compact_body_qd],
+            device=self.model.device,
+        )
 
     def _compact_pgs_setup(self, state: State, state_aug: State, dt: float) -> None:
         if not self._compact_contacts_enabled():
@@ -2737,6 +2822,122 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[self.compact_joint_S_flat],
                 device=self.model.device,
             )
+
+        if self.articulated_dense_response_mode == "compact_cholesky":
+            if self.compact_body_B is None or self.compact_body_qd_response is None:
+                raise RuntimeError("compact_cholesky requires dense compact body response buffers")
+            self.compact_body_B.zero_()
+            self.compact_body_qd_response.zero_()
+            for size in self.size_groups:
+                n_arts = self.n_arts_by_size[size]
+                if n_arts <= 0 or size <= 0:
+                    continue
+                wp.launch(
+                    compute_compact_active_body_B_for_size,
+                    dim=int(self.world_count * self.max_compact_bodies * 6),
+                    inputs=[
+                        self.compact_body_count,
+                        self.compact_body_list,
+                        self.body_to_articulation,
+                        self.body_to_joint,
+                        state.body_q,
+                        self.model.body_com,
+                        self.art_size,
+                        self.articulation_dof_start,
+                        self.articulation_origin,
+                        self.model.joint_ancestor,
+                        self.model.joint_qd_start,
+                        state_aug.joint_S_s,
+                        size,
+                        self.max_compact_bodies,
+                        self.compact_response_max_dofs,
+                    ],
+                    outputs=[self.compact_body_B],
+                    device=self.model.device,
+                )
+                wp.launch(
+                    solve_compact_active_body_response_for_size,
+                    dim=int(self.world_count * self.max_compact_bodies * 6),
+                    inputs=[
+                        self.L_by_size[size],
+                        self.compact_body_count,
+                        self.compact_body_list,
+                        self.body_to_articulation,
+                        self.art_size,
+                        self.art_group_idx,
+                        size,
+                        self.max_compact_bodies,
+                        self.compact_response_max_dofs,
+                        self.compact_body_B,
+                    ],
+                    outputs=[self.compact_body_qd_response],
+                    device=self.model.device,
+                )
+                wp.launch(
+                    assemble_compact_active_body_response_for_size,
+                    dim=int(self.world_count * self.max_compact_bodies),
+                    inputs=[
+                        self.compact_body_count,
+                        self.compact_body_list,
+                        self.body_to_articulation,
+                        self.art_size,
+                        size,
+                        self.max_compact_bodies,
+                        self.compact_response_max_dofs,
+                        self.compact_body_B,
+                        self.compact_body_qd_response,
+                    ],
+                    outputs=[self.compact_body_response],
+                    device=self.model.device,
+                )
+            wp.launch(
+                refresh_compact_body_qd_from_vout,
+                dim=int(self.model.body_count * 6),
+                inputs=[
+                    self.body_to_articulation,
+                    self.art_size,
+                    self.articulation_dof_start,
+                    self.compact_response_max_dofs,
+                    self.compact_body_B,
+                    self.v_out,
+                ],
+                outputs=[self.compact_body_qd],
+                device=self.model.device,
+            )
+            self._refresh_compact_free_body_qd_from_vout()
+            self.compact_rhs.zero_()
+            self.compact_eff_mass_inv.zero_()
+            self.compact_MiJt_a.zero_()
+            self.compact_MiJt_b.zero_()
+            wp.launch(
+                compute_compact_effective_mass_and_rhs,
+                dim=self.world_count * self.compact_max_constraints,
+                inputs=[
+                    self.compact_constraint_count,
+                    self.compact_body_a,
+                    self.compact_body_b,
+                    self.compact_J_a,
+                    self.compact_J_b,
+                    self.compact_body_response,
+                    self.compact_phi,
+                    self.compact_row_type,
+                    self.rigid_body_max_depenetration_velocity,
+                    self.pgs_cfm,
+                    self.pgs_beta,
+                    self.dense_contact_compliance,
+                    self.speculative_dense_contact_compliance,
+                    dt,
+                    self.compact_max_constraints,
+                ],
+                outputs=[
+                    self.compact_eff_mass_inv,
+                    self.compact_MiJt_a,
+                    self.compact_MiJt_b,
+                    self.compact_rhs,
+                ],
+                device=self.model.device,
+            )
+            return
 
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
@@ -2846,6 +3047,7 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 device=self.model.device,
             )
+        self._refresh_compact_free_body_qd_from_vout()
 
         self.compact_rhs.zero_()
         self.compact_eff_mass_inv.zero_()
@@ -2912,6 +3114,37 @@ class SolverFeatherPGS(SolverBase):
 
     def _propagate_compact_response(self) -> None:
         if not self._compact_contacts_enabled():
+            return
+
+        if self.articulated_dense_response_mode == "compact_cholesky":
+            if self.compact_body_B is None or self._compact_qd_delta is None:
+                raise RuntimeError("compact_cholesky propagation requires dense compact response buffers")
+            self._compact_qd_delta.zero_()
+            for size in self.size_groups:
+                n_arts = self.n_arts_by_size[size]
+                if n_arts <= 0 or size <= 0:
+                    continue
+                wp.launch(
+                    propagate_compact_body_impulses_for_size,
+                    dim=n_arts,
+                    inputs=[
+                        self.L_by_size[size],
+                        self.group_to_art[size],
+                        self.model.articulation_start,
+                        self.model.joint_child,
+                        self.articulation_dof_start,
+                        size,
+                        self.compact_response_max_dofs,
+                        self.compact_body_B,
+                        self.compact_body_impulses,
+                    ],
+                    outputs=[
+                        self._compact_qd_delta,
+                        self.compact_body_qd,
+                        self.v_out,
+                    ],
+                    device=self.model.device,
+                )
             return
 
         for size in self.size_groups:
@@ -3042,9 +3275,8 @@ class SolverFeatherPGS(SolverBase):
                 self.is_free_rigid,
                 self.articulation_root_dof_start,
                 self.articulation_root_com_offset,
-                self.group_to_art[fused_size],
-                self.art_to_world,
-                n_arts,
+                self.world_group_art_start[int(fused_size)],
+                self.world_group_to_art[int(fused_size)],
                 self.model.articulation_start,
                 self.model.joint_parent,
                 self.model.joint_child,
@@ -3068,7 +3300,7 @@ class SolverFeatherPGS(SolverBase):
                 self.compact_body_impulses,
                 self.v_out,
             ],
-            block_dim=max(int(self._compact_full_fused_block_dim), 64),
+            block_dim=max(int(self._compact_full_fused_block_dim), 32),
             device=self.model.device,
         )
         return True
@@ -3201,11 +3433,11 @@ class SolverFeatherPGS(SolverBase):
         launch_existing_phases = self.compact_existing_row_phases != "skip"
 
         if not launch_existing_phases and self._launch_compact_full_fused_iterations(
-            rhs=compact_rhs,
-            iterations=iterations,
-            omega=omega,
-            friction_start_iteration=friction_start_iteration,
-            iteration_offset=iteration_offset,
+                rhs=compact_rhs,
+                iterations=iterations,
+                omega=omega,
+                friction_start_iteration=friction_start_iteration,
+                iteration_offset=iteration_offset,
         ):
             return
 
@@ -3268,8 +3500,18 @@ class SolverFeatherPGS(SolverBase):
         else:
             for local_iter in range(iterations):
                 global_iter = iteration_offset + local_iter
-                launch_existing(0, global_iter)
+                # A single legacy phase-0 launch solved dense/MF rows and the
+                # velocity-limit tail before compact rows existed. Once
+                # articulated contacts move to the compact phase, running that
+                # whole legacy phase first leaves velocity-limit rows blind to
+                # compact contact impulses until the next iteration. Use the
+                # existing three-pass contact schedule so compact contacts are
+                # visible to the same-iteration velocity-limit pass while dense
+                # and free/free contact rows remain covered.
+                launch_existing(3, global_iter)  # dense drive/position-limit rows
+                launch_existing(4, global_iter)  # dense/MF contact/friction rows
                 launch_compact(global_iter)
+                launch_existing(5, global_iter)  # dense/MF velocity-limit rows
 
     def _launch_matrix_free_gs_solve_deferred_cholesky(
         self,
@@ -3517,9 +3759,7 @@ class SolverFeatherPGS(SolverBase):
 
         for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
             with ctx:
-                use_tiled = (self.hinv_jt_kernel == "tiled") or (
-                    self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold
-                )
+                use_tiled = self._use_tiled_hinv_jt(size)
                 if use_tiled:
                     self._stage4_hinv_jt_tiled(size)
                 else:
@@ -3702,9 +3942,7 @@ class SolverFeatherPGS(SolverBase):
             with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                     with ctx:
-                        use_tiled = (self.hinv_jt_kernel == "tiled") or (
-                            self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold
-                        )
+                        use_tiled = self._use_tiled_hinv_jt(size)
                         if use_tiled:
                             self._stage4_hinv_jt_tiled(size)
                         else:
@@ -3757,11 +3995,7 @@ class SolverFeatherPGS(SolverBase):
             fused_ok = (
                 self._is_one_art_per_world
                 and self.hinv_jt_kernel != "par_row"
-                and all(
-                    (self.hinv_jt_kernel == "tiled")
-                    or (self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold)
-                    for size in self.size_groups
-                )
+                and all(self._use_tiled_hinv_jt(size) for size in self.size_groups)
             )
 
             if fused_ok:
@@ -3773,9 +4007,7 @@ class SolverFeatherPGS(SolverBase):
 
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                     with ctx:
-                        use_tiled = (self.hinv_jt_kernel == "tiled") or (
-                            self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold
-                        )
+                        use_tiled = self._use_tiled_hinv_jt(size)
                         if use_tiled:
                             self._stage4_hinv_jt_tiled(size)
                         else:
@@ -8436,6 +8668,7 @@ def _get_pgs_solve_compact_full_fused_kernel(
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int warp_count = blockDim.x >> 5;
+    const int prop_warp_start = (warp_count > 1) ? 1 : 0;
     const int prop_warps = (warp_count > 1) ? (warp_count - 1) : 1;
     const unsigned mask = 0xffffffffu;
     int m = compact_constraint_count.data[world];
@@ -8552,12 +8785,13 @@ def _get_pgs_solve_compact_full_fused_kernel(
 
         __syncthreads();
 
-        if (warp > 0) {{
-            for (int group_idx = warp - 1; group_idx < n_arts; group_idx += prop_warps) {{
-                const int art = group_to_art.data[group_idx];
-                if (art_to_world.data[art] != world) {{
-                    continue;
-                }}
+        if (warp >= prop_warp_start) {{
+            const int prop_warp = warp - prop_warp_start;
+            const int world_art_begin = world_group_art_start.data[world];
+            const int world_art_end = world_group_art_start.data[world + 1];
+            const int world_art_count = world_art_end - world_art_begin;
+            for (int group_idx = prop_warp; group_idx < world_art_count; group_idx += prop_warps) {{
+                const int art = world_group_to_art.data[world_art_begin + group_idx];
                 const int joint_start = articulation_start.data[art];
                 const int joint_end = articulation_start.data[art + 1];
 
@@ -8805,9 +9039,8 @@ def _get_pgs_solve_compact_full_fused_kernel(
         is_free_rigid: wp.array[int],
         articulation_root_dof_start: wp.array[int],
         articulation_root_com_offset: wp.array[wp.vec3],
-        group_to_art: wp.array[int],
-        art_to_world: wp.array[int],
-        n_arts: int,
+        world_group_art_start: wp.array[int],
+        world_group_to_art: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
@@ -8850,9 +9083,8 @@ def _get_pgs_solve_compact_full_fused_kernel(
         is_free_rigid: wp.array[int],
         articulation_root_dof_start: wp.array[int],
         articulation_root_com_offset: wp.array[wp.vec3],
-        group_to_art: wp.array[int],
-        art_to_world: wp.array[int],
-        n_arts: int,
+        world_group_art_start: wp.array[int],
+        world_group_to_art: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
@@ -8896,9 +9128,8 @@ def _get_pgs_solve_compact_full_fused_kernel(
             is_free_rigid,
             articulation_root_dof_start,
             articulation_root_com_offset,
-            group_to_art,
-            art_to_world,
-            n_arts,
+            world_group_art_start,
+            world_group_to_art,
             articulation_start,
             joint_parent,
             joint_child,

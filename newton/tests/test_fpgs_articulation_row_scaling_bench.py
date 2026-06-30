@@ -200,6 +200,52 @@ def test_fpgs_compact_debug_residuals_include_compact_rows():
     assert np.max(convergence[:, 0]) > 0.0
 
 
+def test_fpgs_articulation_accuracy_probe_smoke(tmp_path):
+    wp.init()
+    if not wp.get_device("cuda:0").is_cuda:
+        pytest.skip("CUDA is required for the FPGS accuracy probe")
+
+    script = Path(__file__).parent / "benchmarks" / "fpgs_articulation_accuracy_probe.py"
+    out_dir = tmp_path / "fpgs_articulation_accuracy_probe"
+    subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--links",
+            "4",
+            "--contacts-per-articulation",
+            "1",
+            "--iterations",
+            "1,2",
+            "--reference-iterations",
+            "4",
+            "--out-dir",
+            str(out_dir),
+        ],
+        check=True,
+    )
+
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    results = json.loads((out_dir / "accuracy_probe.json").read_text(encoding="utf-8"))
+    assert "Contacts are generated once" in summary
+    assert {row["path"] for row in results} == {"mf_immediate", "compact_tree"}
+    assert {row["pgs_iterations"] for row in results} == {1, 2}
+
+    compact_rows = [row for row in results if row["path"] == "compact_tree"]
+    assert compact_rows
+    for row in results:
+        assert np.isfinite(row["final_r_compl"])
+        assert np.isfinite(row["self_ref_joint_qd_abs_linf"])
+        assert np.isfinite(row["mf_ref_joint_qd_abs_linf"])
+        assert row["self_ref_joint_qd_abs_linf"] >= 0.0
+        assert row["mf_ref_joint_qd_abs_linf"] >= 0.0
+    for row in compact_rows:
+        assert row["dense_rows_total"] == 0
+        assert row["compact_rows_total"] > 0
+        assert np.isfinite(row["same_iter_vs_mf_joint_qd_abs_linf"])
+        assert row["same_iter_vs_mf_joint_qd_abs_linf"] >= 0.0
+
+
 def test_fpgs_articulation_row_scaling_stress_case_coverage():
     script = Path(__file__).parent / "benchmarks" / "fpgs_articulation_row_scaling.py"
     spec = importlib.util.spec_from_file_location("fpgs_articulation_row_scaling", script)

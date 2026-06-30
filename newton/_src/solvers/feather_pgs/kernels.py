@@ -5826,6 +5826,38 @@ def flush_compact_free_body_qd_to_vout(
 
 
 @wp.kernel
+def refresh_compact_free_body_qd_from_vout(
+    body_to_articulation: wp.array[int],
+    is_free_rigid: wp.array[int],
+    articulation_root_dof_start: wp.array[int],
+    articulation_root_com_offset: wp.array[wp.vec3],
+    v_out: wp.array[float],
+    # out
+    compact_body_qd: wp.array2d[float],
+):
+    """Refresh compact live COM velocities for free-rigid bodies from v_out."""
+    body = wp.tid()
+    art = body_to_articulation[body]
+    if art < 0:
+        return
+    if is_free_rigid[art] == 0:
+        return
+
+    dof_start = articulation_root_dof_start[art]
+    v_local = wp.vec3(v_out[dof_start + 0], v_out[dof_start + 1], v_out[dof_start + 2])
+    w = wp.vec3(v_out[dof_start + 3], v_out[dof_start + 4], v_out[dof_start + 5])
+    com_offset = articulation_root_com_offset[art]
+    v_com = v_local + wp.cross(w, com_offset)
+
+    compact_body_qd[body, 0] = v_com[0]
+    compact_body_qd[body, 1] = v_com[1]
+    compact_body_qd[body, 2] = v_com[2]
+    compact_body_qd[body, 3] = w[0]
+    compact_body_qd[body, 4] = w[1]
+    compact_body_qd[body, 5] = w[2]
+
+
+@wp.kernel
 def flush_compact_active_free_body_qd_to_vout(
     compact_body_count: wp.array[int],
     compact_body_list: wp.array2d[int],

@@ -149,13 +149,16 @@ def _make_solver(
     dense_capacity = row_capacity
     mf_capacity = 16
     compact_capacity = row_capacity
-    if path == "compact_tree":
+    if path in ("compact_cholesky", "compact_tree"):
         dense_capacity = 16
+    mode = "immediate"
+    if path in ("compact_cholesky", "compact_tree"):
+        mode = path
 
     return SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
-        articulated_dense_response_mode="immediate" if path == "mf_immediate" else "compact_tree",
+        articulated_dense_response_mode=mode,
         cholesky_kernel=cholesky_kernel,
         trisolve_kernel=trisolve_kernel,
         hinv_jt_kernel=hinv_jt_kernel,
@@ -568,6 +571,7 @@ def _diagnose_case(
     abs_tol: float,
     rel_tol: float,
     worst_limit: int,
+    compact_path: str,
 ) -> list[OperatorDiagnosticResult]:
     model, initial, contacts = _prepare_case_run(case, device)
     old_solver = _make_solver(
@@ -583,7 +587,7 @@ def _diagnose_case(
     compact_solver = _make_solver(
         model,
         case,
-        "compact_tree",
+        compact_path,
         enable_contact_friction=enable_contact_friction,
         compact_warp_propagation=compact_warp_propagation,
         cholesky_kernel=cholesky_kernel,
@@ -798,6 +802,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-sources", type=int, default=0, help="0 means all source columns")
     parser.add_argument("--abs-tol", type=float, default=1.0e-4)
     parser.add_argument("--rel-tol", type=float, default=1.0e-3)
+    parser.add_argument("--joint-armature", type=float, default=0.0)
+    parser.add_argument("--compact-path", choices=("compact_tree", "compact_cholesky"), default="compact_tree")
     parser.add_argument("--worst-limit", type=int, default=8)
     parser.add_argument("--no-friction", action="store_true")
     parser.add_argument("--compact-warp-propagation", action=argparse.BooleanOptionalAction, default=True)
@@ -826,11 +832,12 @@ def main() -> None:
     for links, contact_count in zip(args.links, contacts, strict=True):
         case = BenchCase(
             sweep="operator_diagnostic",
-            label=f"L={links},boxes={contact_count}",
+            label=f"L={links},boxes={contact_count},armature={args.joint_armature:g}",
             case_kind="articulated_free",
             articulations=1,
             links=links,
             contacts_per_articulation=contact_count,
+            joint_armature=args.joint_armature,
         )
         results.extend(
             _diagnose_case(
@@ -846,6 +853,7 @@ def main() -> None:
                 abs_tol=args.abs_tol,
                 rel_tol=args.rel_tol,
                 worst_limit=args.worst_limit,
+                compact_path=args.compact_path,
             )
         )
 
