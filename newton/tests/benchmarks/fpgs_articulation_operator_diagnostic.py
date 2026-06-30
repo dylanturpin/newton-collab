@@ -169,7 +169,6 @@ def _make_solver(
         mf_max_constraints=mf_capacity,
         compact_max_constraints=compact_capacity,
         compact_fast_body_map=True,
-        compact_existing_row_phases="skip" if path == "compact_tree" else "auto",
         compact_shared_row_solver=False,
         compact_warp_propagation=compact_warp_propagation if path == "compact_tree" else False,
         pgs_warmstart=False,

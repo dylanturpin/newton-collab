@@ -528,7 +528,6 @@ def _run_case_path(
     enable_contact_friction: bool,
     contact_friction_position_iterations: int,
     compact_fast_body_map: bool,
-    compact_existing_row_phases: str,
     compact_shared_row_solver: bool,
     compact_warp_propagation: bool,
     compact_max_constraints_override: int | None,
@@ -575,7 +574,6 @@ def _run_case_path(
         mf_max_constraints=mf_capacity,
         compact_max_constraints=compact_capacity,
         compact_fast_body_map=compact_fast_body_map,
-        compact_existing_row_phases=compact_existing_row_phases if path == "compact_tree" else "auto",
         compact_shared_row_solver=compact_shared_row_solver if path == "compact_tree" else False,
         compact_warp_propagation=compact_warp_propagation if path == "compact_tree" else False,
         pgs_warmstart=False,
@@ -925,7 +923,6 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
         f"contact_friction_position_iterations={args.contact_friction_position_iterations}, "
         f"`hinv_jt_kernel=par_row`, "
         f"compact_fast_body_map={args.compact_fast_body_map}, "
-        f"compact_existing_row_phases={args.compact_existing_row_phases}, "
         f"compact_shared_row_solver={args.compact_shared_row_solver}, "
         f"compact_warp_propagation={args.compact_warp_propagation}, "
         f"compact_max_constraints={args.compact_max_constraints}, "
@@ -1073,12 +1070,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-friction", action="store_true")
     parser.add_argument("--compact-fast-body-map", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument(
-        "--compact-existing-row-phases",
-        choices=("auto", "always", "skip"),
-        default="skip",
-        help="Temporary compact-tree profiling control. Use 'skip' only for known compact-only scenes.",
-    )
     parser.add_argument("--compact-shared-row-solver", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compact-warp-propagation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -1153,7 +1144,6 @@ def main() -> None:
                 enable_contact_friction=not args.no_friction,
                 contact_friction_position_iterations=args.contact_friction_position_iterations,
                 compact_fast_body_map=args.compact_fast_body_map,
-                compact_existing_row_phases=args.compact_existing_row_phases,
                 compact_shared_row_solver=args.compact_shared_row_solver,
                 compact_warp_propagation=args.compact_warp_propagation,
                 compact_max_constraints_override=args.compact_max_constraints,

@@ -141,7 +141,6 @@ def _make_solver(
     enable_contact_friction: bool,
     contact_friction_position_iterations: int,
     compact_max_constraints: int | None,
-    compact_existing_row_phases: str,
     compact_warp_propagation: bool,
     pgs_debug: bool,
 ) -> SolverFeatherPGS:
@@ -160,7 +159,6 @@ def _make_solver(
         mf_max_constraints=mf_capacity,
         compact_max_constraints=compact_capacity,
         compact_fast_body_map=True,
-        compact_existing_row_phases=compact_existing_row_phases if path == "compact_tree" else "auto",
         compact_shared_row_solver=False,
         compact_warp_propagation=compact_warp_propagation if path == "compact_tree" else False,
         pgs_warmstart=False,
@@ -263,7 +261,6 @@ def _run_accuracy_case(args: argparse.Namespace, case: BenchCase) -> list[Accura
             enable_contact_friction=not args.no_friction,
             contact_friction_position_iterations=args.contact_friction_position_iterations,
             compact_max_constraints=args.compact_max_constraints,
-            compact_existing_row_phases=args.compact_existing_row_phases,
             compact_warp_propagation=args.compact_warp_propagation,
             pgs_debug=False,
         )
@@ -282,7 +279,6 @@ def _run_accuracy_case(args: argparse.Namespace, case: BenchCase) -> list[Accura
                 enable_contact_friction=not args.no_friction,
                 contact_friction_position_iterations=args.contact_friction_position_iterations,
                 compact_max_constraints=args.compact_max_constraints,
-                compact_existing_row_phases=args.compact_existing_row_phases,
                 compact_warp_propagation=args.compact_warp_propagation,
                 pgs_debug=True,
             )
@@ -392,12 +388,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-friction-position-iterations", type=int, default=-1)
     parser.add_argument("--dt", type=float, default=1.0 / 240.0)
     parser.add_argument("--no-friction", action="store_true")
-    parser.add_argument(
-        "--compact-existing-row-phases",
-        choices=("auto", "always", "skip"),
-        default="skip",
-        help="Use 'skip' only for this compact-only synthetic scene.",
-    )
     parser.add_argument("--compact-warp-propagation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compact-max-constraints", type=int, default=None)
     return parser.parse_args()

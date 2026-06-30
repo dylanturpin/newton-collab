@@ -336,7 +336,6 @@ class SolverFeatherPGS(SolverBase):
         mf_max_constraints: int = 512,
         compact_max_constraints: int | None = None,
         compact_fast_body_map: bool | None = None,
-        compact_existing_row_phases: Literal["auto", "always", "skip"] = "auto",
         compact_shared_row_solver: bool = False,
         compact_warp_propagation: bool | None = None,
         # Kernel selection per operation
@@ -613,12 +612,6 @@ class SolverFeatherPGS(SolverBase):
         self.compact_fast_body_map = (
             _FPGS_COMPACT_FAST_BODY_MAP if compact_fast_body_map is None else bool(compact_fast_body_map)
         )
-        if compact_existing_row_phases not in ("auto", "always", "skip"):
-            raise ValueError(
-                "compact_existing_row_phases must be 'auto', 'always', or 'skip', "
-                f"got {compact_existing_row_phases!r}"
-            )
-        self.compact_existing_row_phases = compact_existing_row_phases
         self.compact_shared_row_solver = bool(compact_shared_row_solver)
         self.compact_warp_propagation = (
             _FPGS_COMPACT_WARP_PROPAGATION
@@ -3436,20 +3429,8 @@ class SolverFeatherPGS(SolverBase):
             raise RuntimeError("Compact tree solve requested while articulated_dense_response_mode is not compact")
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
-        launch_existing_phases = self.compact_existing_row_phases != "skip"
-
-        if not launch_existing_phases and self._launch_compact_full_fused_iterations(
-                rhs=compact_rhs,
-                iterations=iterations,
-                omega=omega,
-                friction_start_iteration=friction_start_iteration,
-                iteration_offset=iteration_offset,
-        ):
-            return
 
         def launch_existing(row_phase: int, global_iter: int) -> None:
-            if not launch_existing_phases:
-                return
             self._launch_matrix_free_gs_solve(
                 dense_rhs=dense_rhs,
                 mf_meta=mf_meta,
@@ -3462,8 +3443,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
         def launch_compact(global_iter: int) -> None:
-            if launch_existing_phases:
-                self._refresh_compact_body_qd_from_vout()
+            self._refresh_compact_body_qd_from_vout()
             if self._launch_compact_full_fused_iterations(
                 rhs=compact_rhs,
                 iterations=1,
@@ -3485,17 +3465,16 @@ class SolverFeatherPGS(SolverBase):
                 global_iter = iteration_offset + local_iter
                 launch_existing(1, global_iter)
                 launch_compact(global_iter)
-            if launch_existing_phases:
-                self._launch_matrix_free_gs_solve(
-                    dense_rhs=dense_rhs,
-                    mf_meta=mf_meta,
-                    iterations=iterations,
-                    omega=omega,
-                    friction_start_iteration=friction_start_iteration,
-                    iteration_offset=iteration_offset,
-                    freeze_drive_rows=freeze_drive_rows,
-                    row_phase_override=2,
-                )
+            self._launch_matrix_free_gs_solve(
+                dense_rhs=dense_rhs,
+                mf_meta=mf_meta,
+                iterations=iterations,
+                omega=omega,
+                friction_start_iteration=friction_start_iteration,
+                iteration_offset=iteration_offset,
+                freeze_drive_rows=freeze_drive_rows,
+                row_phase_override=2,
+            )
         elif self.pgs_schedule == "physx_grasp":
             for local_iter in range(iterations):
                 global_iter = iteration_offset + local_iter

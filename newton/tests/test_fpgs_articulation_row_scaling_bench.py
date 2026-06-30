@@ -172,7 +172,6 @@ def test_fpgs_compact_debug_residuals_include_compact_rows():
         mf_max_constraints=16,
         compact_max_constraints=16,
         compact_fast_body_map=True,
-        compact_existing_row_phases="auto",
         compact_warp_propagation=True,
         pgs_warmstart=False,
         mf_warmstart=False,
