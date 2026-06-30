@@ -15,6 +15,8 @@ import argparse
 import csv
 import json
 import math
+import os
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, replace
@@ -80,6 +82,10 @@ class RunResult:
     rigid_contacts: int
     ms_per_step: float
     peak_gpu_mem_bytes: int
+    process_gpu_mem_baseline_bytes: int
+    process_peak_gpu_mem_bytes: int
+    process_gpu_mem_delta_bytes: int
+    process_gpu_mem_source: str
     row_solver_mib: float
     propagation_extra_mib: float
     joint_q_rel_l2: float | None = None
@@ -385,6 +391,52 @@ def _gpu_used_bytes() -> int:
     return int(total_bytes - free_bytes)
 
 
+def _current_process_gpu_mem_bytes() -> tuple[int, str]:
+    """Return current-process GPU memory via NVML/nvidia-smi.
+
+    torch.cuda.mem_get_info() is device-wide, and torch.cuda.memory_allocated()
+    only sees PyTorch's caching allocator. This benchmark also allocates through
+    Warp/Newton, so use NVML's per-process accounting when available.
+    """
+
+    pid = os.getpid()
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0, ""
+
+    if completed.returncode != 0:
+        return 0, ""
+
+    mib = 0
+    for line in completed.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            row_pid = int(parts[0])
+            row_mib = int(float(parts[1]))
+        except ValueError:
+            continue
+        if row_pid == pid:
+            mib += row_mib
+
+    if mib <= 0:
+        return 0, ""
+    return mib * 1024 * 1024, "nvidia-smi"
+
+
 def _finite_rel_l2(value: np.ndarray, reference: np.ndarray) -> float:
     diff = np.asarray(value, dtype=np.float64).reshape(-1) - np.asarray(reference, dtype=np.float64).reshape(-1)
     denom = np.linalg.norm(np.asarray(reference, dtype=np.float64).reshape(-1))
@@ -508,6 +560,8 @@ def _run_case_path(
     if path in ("compact_cholesky", "compact_tree"):
         response_mode = path
     peak_gpu_mem_bytes = _gpu_used_bytes()
+    process_gpu_mem_baseline_bytes, process_gpu_mem_source = _current_process_gpu_mem_bytes()
+    process_peak_gpu_mem_bytes = process_gpu_mem_baseline_bytes
     solver = SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
@@ -529,6 +583,10 @@ def _run_case_path(
     )
     wp.synchronize()
     peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, _gpu_used_bytes())
+    current_process_bytes, current_process_source = _current_process_gpu_mem_bytes()
+    if current_process_source:
+        process_gpu_mem_source = current_process_source
+    process_peak_gpu_mem_bytes = max(process_peak_gpu_mem_bytes, current_process_bytes)
     ms_per_step, final_state, loop_peak_gpu_mem_bytes = _run_step_loop(
         model,
         solver,
@@ -539,6 +597,11 @@ def _run_case_path(
         dt=dt,
     )
     peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, loop_peak_gpu_mem_bytes)
+    current_process_bytes, current_process_source = _current_process_gpu_mem_bytes()
+    if current_process_source:
+        process_gpu_mem_source = current_process_source
+    process_peak_gpu_mem_bytes = max(process_peak_gpu_mem_bytes, current_process_bytes)
+    process_gpu_mem_delta_bytes = max(0, process_peak_gpu_mem_bytes - process_gpu_mem_baseline_bytes)
 
     dense_counts = solver.constraint_count.numpy().astype(np.int64, copy=False)
     mf_counts = solver.mf_constraint_count.numpy().astype(np.int64, copy=False)
@@ -579,6 +642,10 @@ def _run_case_path(
         rigid_contacts=rigid_contacts,
         ms_per_step=float(ms_per_step),
         peak_gpu_mem_bytes=peak_gpu_mem_bytes,
+        process_gpu_mem_baseline_bytes=process_gpu_mem_baseline_bytes,
+        process_peak_gpu_mem_bytes=process_peak_gpu_mem_bytes,
+        process_gpu_mem_delta_bytes=process_gpu_mem_delta_bytes,
+        process_gpu_mem_source=process_gpu_mem_source,
         row_solver_mib=_row_solver_bytes(solver) / (1024.0 * 1024.0),
         propagation_extra_mib=_propagation_extra_bytes(solver) / (1024.0 * 1024.0),
     )
@@ -869,7 +936,9 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
     lines.append(
         "`dense_row_capacity`/`mf_row_capacity`/`compact_row_capacity` are configured capacities. "
         "`dense_rows_total`/`mf_rows_total`/`compact_rows_total` are produced by the real contact/row setup. "
-        "`peak GPU MB` is total CUDA memory in use around solver allocation and stepping. "
+        "`process peak GPU MB` is current-process CUDA memory around solver allocation and stepping, "
+        "including all benchmark-owned CUDA buffers visible to NVML. "
+        "`legacy device peak GPU MB` is total device memory in use and can include unrelated processes. "
         "Contacts are generated once per case and reused for both solver paths so path comparisons see identical contact arrays."
     )
     lines.append(
@@ -891,10 +960,10 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
         lines.append(f"## {sweep}")
         lines.append("")
         lines.append(
-            "| case | path | D | cap dense/mf/compact | rows dense/mf/compact | contacts | ms/step | peak GPU MB | qd rel L2 | qd abs Linf | state Linf |"
+            "| case | path | D | cap dense/mf/compact | rows dense/mf/compact | contacts | ms/step | process peak GPU MB | legacy device peak GPU MB | qd rel L2 | qd abs Linf | state Linf |"
         )
         lines.append(
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
         )
         for result in results:
             if result.sweep != sweep:
@@ -910,6 +979,11 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
                         f"{result.dense_rows_total}/{result.mf_rows_total}/{result.compact_rows_total}",
                         str(result.rigid_contacts),
                         _fmt(result.ms_per_step),
+                        _fmt(
+                            result.process_peak_gpu_mem_bytes / 1.0e6
+                            if result.process_peak_gpu_mem_bytes
+                            else None
+                        ),
                         _fmt(result.peak_gpu_mem_bytes / 1.0e6 if result.peak_gpu_mem_bytes else None),
                         _fmt(result.joint_qd_rel_l2),
                         _fmt(result.joint_qd_abs_linf),
@@ -947,17 +1021,19 @@ def _write_plot(path: Path, results: list[RunResult]) -> None:
             ]
             offset = (path_idx - 0.5 * (len(paths) - 1)) * width
             axes[row_idx][0].bar(x + offset, values, width=width, label=path_name)
-            mem = [
-                path_results[label].peak_gpu_mem_bytes / 1.0e6
-                if label in path_results and path_results[label].peak_gpu_mem_bytes
-                else math.nan
-                for label in labels
-            ]
+            mem = []
+            for label in labels:
+                if label not in path_results:
+                    mem.append(math.nan)
+                    continue
+                result = path_results[label]
+                bytes_value = result.process_peak_gpu_mem_bytes or result.peak_gpu_mem_bytes
+                mem.append(bytes_value / 1.0e6 if bytes_value else math.nan)
             axes[row_idx][1].bar(x + offset, mem, width=width, label=path_name)
 
         axes[row_idx][0].set_title(f"{sweep}: time")
         axes[row_idx][0].set_ylabel("ms / step")
-        axes[row_idx][1].set_title(f"{sweep}: total GPU memory")
+        axes[row_idx][1].set_title(f"{sweep}: process total GPU memory")
         axes[row_idx][1].set_ylabel("MB")
         for axis in axes[row_idx]:
             axis.set_xticks(x)

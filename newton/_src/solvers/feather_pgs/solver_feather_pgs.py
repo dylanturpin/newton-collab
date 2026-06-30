@@ -749,7 +749,13 @@ class SolverFeatherPGS(SolverBase):
             # :meth:`_allocate_buffers`.
             pass
         self.mf_max_constraints = mf_max_constraints
-        self.compact_max_constraints = int(mf_max_constraints if compact_max_constraints is None else compact_max_constraints)
+        # Compact articulated-contact rows replace the old D-wide dense
+        # articulated rows, not ordinary free/free MF rows. Default the compact
+        # capacity to dense capacity so mixed scenes with many free bodies do
+        # not allocate compact rows at the much larger MF contact cap.
+        self.compact_max_constraints = int(
+            dense_max_constraints if compact_max_constraints is None else compact_max_constraints
+        )
         if self.compact_max_constraints < 1:
             raise ValueError("compact_max_constraints must be positive")
         self._double_buffer = double_buffer
