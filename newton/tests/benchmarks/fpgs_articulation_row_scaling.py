@@ -611,9 +611,9 @@ def _run_case_path(
         world_count=model.world_count,
         body_count=model.body_count,
         joint_dof_count=model.joint_dof_count,
-        dense_row_capacity=dense_capacity,
-        mf_row_capacity=mf_capacity,
-        propagation_row_capacity=propagation_capacity,
+        dense_row_capacity=int(solver.dense_max_constraints),
+        mf_row_capacity=int(solver.mf_max_constraints),
+        propagation_row_capacity=int(getattr(solver, "propagation_max_constraints", propagation_capacity)),
         dense_rows_total=int(np.sum(dense_counts)),
         dense_rows_max_world=int(np.max(dense_counts)) if dense_counts.size else 0,
         mf_rows_total=int(np.sum(mf_counts)),
@@ -909,7 +909,7 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
     )
     lines.append("")
     lines.append(
-        "`dense_row_capacity`/`mf_row_capacity`/`propagation_row_capacity` are configured capacities. "
+        "`dense_row_capacity`/`mf_row_capacity`/`propagation_row_capacity` are the effective solver capacities. "
         "`dense_rows_total`/`mf_rows_total`/`propagation_rows_total` are produced by the real contact/row setup. "
         "`process peak GPU MB` is current-process CUDA memory around solver allocation and stepping, "
         "including all benchmark-owned CUDA buffers visible to NVML. "
