@@ -74,6 +74,7 @@ from .kernels import (
     compute_propagation_effective_mass_and_rhs,
     compute_propagation_rhs_bias,
     compute_delta_and_accumulate,
+    copy_free_rigid_propagation_body_response,
     compute_mf_body_Hinv,
     compute_mf_effective_mass_and_rhs,
     compute_mf_rhs_bias,
@@ -144,9 +145,6 @@ _FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture
 _FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in {"1", "true", "yes", "on"}
 _FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", "20"))
 _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUNT", "1")), 0)
-_PROPAGATION_FUSED_MAX_ARTS_PER_WORLD = 16
-_PROPAGATION_FUSED_MAX_SIZE = 16
-_PROPAGATION_FUSED_PROP_WARPS = 0
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
 _HINV_JT_TILED_AUTO_SHARED_LIMIT_BYTES = 96 * 1024
 
@@ -437,9 +435,10 @@ class SolverFeatherPGS(SolverBase):
                 ``"propagation"`` routes contacts touching non-free articulations to fixed-size
                 body-space rows, computes body response from the articulation tree, and propagates
                 deferred body impulses through the tree once per PGS iteration.
-                ``"propagation-fused"`` uses the same response model and enables the fused
-                propagation kernel for supported single-DOF articulation groups. Defaults to
-                ``"immediate"``.
+                ``"propagation-fused"`` uses the same response model and runs a fused full-iteration
+                kernel for supported homogeneous non-free articulation groups; unsupported cases raise
+                :class:`NotImplementedError` instead of falling back to split propagation.
+                Defaults to ``"immediate"``.
             pgs_schedule (str, optional): Matrix-free row ordering. ``"interleaved"`` preserves the
                 legacy per-iteration dense+matrix-free sweep. ``"contact_then_internal"`` runs all
                 contact/friction sweeps first, then all internal articulation sweeps (drive, joint
@@ -766,8 +765,6 @@ class SolverFeatherPGS(SolverBase):
         # _stage1_crba call; gates the per-step H memsets (see _stage1_crba).
         self._mass_update_global_flag = True
         self._last_step_dt = None
-        self._propagation_full_fused_arts_per_world = 0
-
         self._compute_articulation_metadata(model)
         self.dense_max_constraints = self._select_dense_row_capacity(model)
         self._propagation_full_fused_size = self._select_propagation_full_fused_size()
@@ -919,42 +916,27 @@ class SolverFeatherPGS(SolverBase):
         if not self.propagation_full_fused_iterations or not self._propagation_contacts_enabled():
             return None
 
+        if self.pgs_schedule == "contact_then_internal":
+            raise NotImplementedError(
+                "articulated_contact_response='propagation-fused' does not support "
+                "pgs_schedule='contact_then_internal'; use 'propagation' for that schedule"
+            )
+
         candidates: list[int] = []
         for size in self.size_groups:
             size_i = int(size)
             if size_i <= 0 or self.n_arts_by_size.get(size, 0) <= 0:
                 continue
-            if not self._propagation_tree_has_non_free_by_size.get(size_i, True):
-                continue
-            if not self._propagation_tree_single_dof_by_size.get(size_i, False):
-                return None
-            if _PROPAGATION_FUSED_MAX_SIZE > 0 and size_i > _PROPAGATION_FUSED_MAX_SIZE:
-                return None
-            arts_per_world = self._propagation_non_free_arts_per_world(size_i)
-            if (
-                _PROPAGATION_FUSED_MAX_ARTS_PER_WORLD > 0
-                and arts_per_world > _PROPAGATION_FUSED_MAX_ARTS_PER_WORLD
-            ):
-                return None
-            self._propagation_full_fused_arts_per_world = max(arts_per_world, 1)
-            candidates.append(size_i)
+            if self._propagation_tree_has_non_free_by_size.get(size_i, False):
+                candidates.append(size_i)
 
         if len(candidates) != 1:
-            return None
+            raise NotImplementedError(
+                "articulated_contact_response='propagation-fused' requires exactly one "
+                f"non-free articulation DOF-size group; found {candidates}. "
+                "Use articulated_contact_response='propagation' for heterogeneous models."
+            )
         return candidates[0]
-
-    def _propagation_non_free_arts_per_world(self, size: int) -> int:
-        if self.art_to_world is None or self.is_free_rigid is None or self.art_size is None:
-            return int(self.n_arts_by_size.get(size, 0))
-        art_size_np = self.art_size.numpy()
-        art_to_world_np = self.art_to_world.numpy()
-        is_free_rigid_np = self.is_free_rigid.numpy()
-        counts = np.zeros(max(int(self.world_count), 1), dtype=np.int32)
-        for art_idx in np.where((art_size_np == size) & (is_free_rigid_np == 0))[0]:
-            world_idx = int(art_to_world_np[int(art_idx)])
-            if 0 <= world_idx < counts.size:
-                counts[world_idx] += 1
-        return int(np.max(counts)) if counts.size else 0
 
     def _compute_articulation_metadata(self, model):
         self._compute_articulation_indices(model)
@@ -2455,9 +2437,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
         self._pgs_solve_propagation_kernel = None
-        self._pgs_solve_propagation_full_fused_kernel = None
         self._pgs_solve_propagation_full_iteration_kernel = None
-        self._propagation_full_fused_block_dim = 0
         if (
             model.device.is_cuda
             and self._propagation_contacts_enabled()
@@ -2467,20 +2447,7 @@ class SolverFeatherPGS(SolverBase):
                 self.propagation_max_constraints, device_arch
             )
             fused_size = getattr(self, "_propagation_full_fused_size", None)
-            if fused_size is not None:
-                n_fused_arts = max(int(getattr(self, "_propagation_full_fused_arts_per_world", 0)), 1)
-                if _PROPAGATION_FUSED_PROP_WARPS > 0:
-                    prop_warps = min(n_fused_arts, _PROPAGATION_FUSED_PROP_WARPS)
-                    fused_warps = min(max(prop_warps + 1, 2), 32)
-                else:
-                    fused_warps = 1
-                self._propagation_full_fused_block_dim = 32 * fused_warps
-                self._pgs_solve_propagation_full_fused_kernel = _get_pgs_solve_propagation_full_fused_kernel(
-                    self.propagation_max_constraints,
-                    self.max_propagation_bodies,
-                    int(fused_size),
-                    device_arch,
-                )
+            if self.propagation_full_fused_iterations and fused_size is not None:
                 if (
                     self.friction_mode == "current"
                     and self.dense_max_constraints > 0
@@ -2497,6 +2464,11 @@ class SolverFeatherPGS(SolverBase):
                             int(fused_size),
                             device_arch,
                         )
+                    )
+                else:
+                    raise NotImplementedError(
+                        "articulated_contact_response='propagation-fused' requires current friction mode "
+                        "and positive dense, MF, and propagation capacities"
                     )
 
         self._propagate_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
@@ -3013,8 +2985,21 @@ class SolverFeatherPGS(SolverBase):
                     ],
                     outputs=[
                         self.propagation_tree_body_delta,
-                        self.propagation_body_qd,
+                    self.propagation_body_qd,
+                ],
+                device=self.model.device,
+            )
+        if self._has_free_rigid_bodies and self.is_free_rigid is not None:
+            with self._sync_timed("prop_setup_free_response"):
+                wp.launch(
+                    copy_free_rigid_propagation_body_response,
+                    dim=self.model.body_count,
+                    inputs=[
+                        self.is_free_rigid,
+                        self.body_to_articulation,
+                        self.mf_body_Hinv,
                     ],
+                    outputs=[self.propagation_body_response],
                     device=self.model.device,
                 )
         with self._sync_timed("prop_setup_refresh_free_qd"):
@@ -3176,77 +3161,6 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _launch_propagation_full_fused_iterations(
-        self,
-        *,
-        rhs: wp.array,
-        iterations: int,
-        omega: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
-    ) -> bool:
-        kernel = getattr(self, "_pgs_solve_propagation_full_fused_kernel", None)
-        fused_size = getattr(self, "_propagation_full_fused_size", None)
-        if kernel is None or fused_size is None or iterations <= 0:
-            return False
-
-        n_arts = int(self.n_arts_by_size.get(fused_size, 0))
-        if n_arts <= 0:
-            return False
-
-        wp.launch_tiled(
-            kernel,
-            dim=[self.world_count],
-            inputs=[
-                self.propagation_constraint_count,
-                self.propagation_body_count,
-                self.propagation_body_list,
-                self.max_propagation_bodies,
-                self.propagation_body_a,
-                self.propagation_body_b,
-                self.propagation_MiJt_a,
-                self.propagation_MiJt_b,
-                self.propagation_J_a,
-                self.propagation_J_b,
-                self.propagation_eff_mass_inv,
-                rhs,
-                self.propagation_row_type,
-                self.propagation_row_parent,
-                self.propagation_row_mu,
-                self.body_to_articulation,
-                self.is_free_rigid,
-                self.articulation_root_dof_start,
-                self.articulation_root_com_offset,
-                self.world_group_art_start[int(fused_size)],
-                self.world_group_to_art[int(fused_size)],
-                self.model.articulation_start,
-                self.model.joint_parent,
-                self.model.joint_child,
-                self.model.joint_qd_start,
-                self.propagation_joint_S_flat,
-                self.propagation_body_com_rel,
-                self.propagation_tree_U,
-                self.propagation_tree_D_inv,
-                iterations,
-                omega,
-                int(friction_start_iteration),
-                int(iteration_offset),
-            ],
-            outputs=[
-                self.propagation_impulses,
-                self.propagation_tree_pA,
-                self.propagation_tree_u,
-                self.propagation_tree_qdd,
-                self.propagation_tree_body_delta,
-                self.propagation_body_qd,
-                self.propagation_body_impulses,
-                self.v_out,
-            ],
-            block_dim=max(int(self._propagation_full_fused_block_dim), 32),
-            device=self.model.device,
-        )
-        return True
-
     def _launch_propagation_full_iteration_fused_solve(
         self,
         *,
@@ -3258,19 +3172,24 @@ class SolverFeatherPGS(SolverBase):
         friction_start_iteration: int,
         iteration_offset: int,
         freeze_drive_rows: bool,
-    ) -> bool:
+    ) -> None:
+        if iterations <= 0:
+            return
+        if not self.propagation_full_fused_iterations:
+            raise RuntimeError("Full fused propagation launch requested for a non-fused propagation mode")
+        if self.pgs_schedule == "contact_then_internal":
+            raise NotImplementedError(
+                "articulated_contact_response='propagation-fused' does not support "
+                "pgs_schedule='contact_then_internal'"
+            )
+
         kernel = getattr(self, "_pgs_solve_propagation_full_iteration_kernel", None)
         fused_size = getattr(self, "_propagation_full_fused_size", None)
-        if kernel is None or fused_size is None or iterations <= 0:
-            return False
-        if self.pgs_schedule == "contact_then_internal":
-            return False
-        if self.friction_mode != "current":
-            return False
-
-        n_arts = int(self.n_arts_by_size.get(fused_size, 0))
-        if n_arts <= 0:
-            return False
+        if kernel is None or fused_size is None:
+            raise NotImplementedError(
+                "articulated_contact_response='propagation-fused' was requested, but no fused "
+                "full-iteration kernel is available for this model and device"
+            )
 
         with self._sync_timed(f"prop_full_iteration_iters{iterations}"):
             wp.launch_tiled(
@@ -3324,6 +3243,7 @@ class SolverFeatherPGS(SolverBase):
                     self.model.joint_parent,
                     self.model.joint_child,
                     self.model.joint_qd_start,
+                    self.model.joint_dof_dim,
                     self.propagation_joint_S_flat,
                     self.propagation_body_com_rel,
                     self.propagation_tree_U,
@@ -3347,7 +3267,6 @@ class SolverFeatherPGS(SolverBase):
                 block_dim=32,
                 device=self.model.device,
             )
-        return True
 
     def _propagation_pgs_solve_one_iteration(
         self,
@@ -3440,17 +3359,17 @@ class SolverFeatherPGS(SolverBase):
             raise RuntimeError("Propagation solve requested while articulated_contact_response is 'immediate'")
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
-
-        if self._launch_propagation_full_iteration_fused_solve(
-            dense_rhs=dense_rhs,
-            propagation_rhs=propagation_rhs,
-            mf_meta=mf_meta,
-            iterations=iterations,
-            omega=omega,
-            friction_start_iteration=friction_start_iteration,
-            iteration_offset=iteration_offset,
-            freeze_drive_rows=freeze_drive_rows,
-        ):
+        if self.propagation_full_fused_iterations:
+            self._launch_propagation_full_iteration_fused_solve(
+                dense_rhs=dense_rhs,
+                propagation_rhs=propagation_rhs,
+                mf_meta=mf_meta,
+                iterations=iterations,
+                omega=omega,
+                friction_start_iteration=friction_start_iteration,
+                iteration_offset=iteration_offset,
+                freeze_drive_rows=freeze_drive_rows,
+            )
             return
 
         def launch_existing(row_phase: int, global_iter: int) -> None:
@@ -3470,16 +3389,6 @@ class SolverFeatherPGS(SolverBase):
         def launch_propagation(global_iter: int) -> None:
             with self._sync_timed("prop_refresh_qd"):
                 self._refresh_propagation_body_qd_from_vout()
-            with self._sync_timed("prop_full_fused_iter"):
-                fused_launched = self._launch_propagation_full_fused_iterations(
-                    rhs=propagation_rhs,
-                    iterations=1,
-                    omega=omega,
-                    friction_start_iteration=friction_start_iteration,
-                    iteration_offset=global_iter,
-                )
-            if fused_launched:
-                return
             with self._sync_timed("prop_row_solve_iter"):
                 self._propagation_pgs_solve_one_iteration(
                     rhs=propagation_rhs,
@@ -5569,7 +5478,7 @@ class SolverFeatherPGS(SolverBase):
                     outputs=[self.propagation_constraint_count],
                     device=model.device,
                 )
-                if self._propagation_tree_requires_body_map or self._propagation_full_fused_size is not None:
+                if self._propagation_tree_requires_body_map or self.propagation_full_fused_iterations:
                     wp.launch(
                         build_propagation_body_map,
                         dim=self.world_count * self.propagation_max_constraints,
@@ -8778,38 +8687,60 @@ def _get_pgs_solve_propagation_full_fused_kernel(
                         const int parent = joint_parent.data[joint];
                         const int dof_start = joint_qd_start.data[joint];
                         const int dof_end = joint_qd_start.data[joint + 1];
-                        const int has_dof = (dof_start < dof_end);
-                        const int gdof = dof_start;
+                        int dof_count = joint_dof_dim.data[joint * 2] + joint_dof_dim.data[joint * 2 + 1];
+                        const int qd_span = dof_end - dof_start;
+                        if (dof_count > qd_span) dof_count = qd_span;
+                        if (dof_count > 6) dof_count = 6;
+                        if (dof_count < 0) dof_count = 0;
 
-                        float u = 0.0f;
-                        if (has_dof && lane < 6) {{
-                            u = -propagation_joint_S_flat.data[gdof * 6 + lane] * propagation_tree_pA.data[child * 6 + lane];
+                        for (int a = 0; a < dof_count; ++a) {{
+                            const int gdof = dof_start + a;
+                            float u = 0.0f;
+                            if (lane < 6) {{
+                                u = -propagation_joint_S_flat.data[gdof * 6 + lane]
+                                    * propagation_tree_pA.data[child * 6 + lane];
+                            }}
+                            for (int shfl = 16; shfl > 0; shfl >>= 1) {{
+                                u += __shfl_down_sync(mask, u, shfl);
+                            }}
+                            u = __shfl_sync(mask, u, 0);
+                            if (lane == 0) {{
+                                propagation_tree_u.data[gdof] = u;
+                            }}
                         }}
-                        for (int shfl = 16; shfl > 0; shfl >>= 1) {{
-                            u += __shfl_down_sync(mask, u, shfl);
-                        }}
-                        u = __shfl_sync(mask, u, 0);
-                        if (has_dof && lane == 0) {{
-                            propagation_tree_u.data[gdof] = u;
-                        }}
+                        __syncwarp(mask);
 
                         if (parent >= 0 && lane < 6) {{
                             float propagated = propagation_tree_pA.data[child * 6 + lane];
-                            if (has_dof) {{
-                                const float inv_d = propagation_tree_D_inv.data[joint * 36];
-                                propagated += propagation_tree_U.data[gdof * 6 + lane] * inv_d * u;
+                            for (int a = 0; a < dof_count; ++a) {{
+                                const int gdof_a = dof_start + a;
+                                float coeff = 0.0f;
+                                for (int b = 0; b < dof_count; ++b) {{
+                                    const int gdof_b = dof_start + b;
+                                    coeff += propagation_tree_D_inv.data[joint * 36 + a * 6 + b]
+                                        * propagation_tree_u.data[gdof_b];
+                                }}
+                                propagated += propagation_tree_U.data[gdof_a * 6 + lane] * coeff;
                             }}
                             const float ex = propagation_body_com_rel.data[child * 3 + 0] - propagation_body_com_rel.data[parent * 3 + 0];
                             const float ey = propagation_body_com_rel.data[child * 3 + 1] - propagation_body_com_rel.data[parent * 3 + 1];
                             const float ez = propagation_body_com_rel.data[child * 3 + 2] - propagation_body_com_rel.data[parent * 3 + 2];
                             if (lane >= 3) {{
-                                const float inv_d = has_dof ? propagation_tree_D_inv.data[joint * 36] : 0.0f;
-                                const float px = propagation_tree_pA.data[child * 6 + 0]
-                                    + (has_dof ? propagation_tree_U.data[gdof * 6 + 0] * inv_d * u : 0.0f);
-                                const float py = propagation_tree_pA.data[child * 6 + 1]
-                                    + (has_dof ? propagation_tree_U.data[gdof * 6 + 1] * inv_d * u : 0.0f);
-                                const float pz = propagation_tree_pA.data[child * 6 + 2]
-                                    + (has_dof ? propagation_tree_U.data[gdof * 6 + 2] * inv_d * u : 0.0f);
+                                float px = propagation_tree_pA.data[child * 6 + 0];
+                                float py = propagation_tree_pA.data[child * 6 + 1];
+                                float pz = propagation_tree_pA.data[child * 6 + 2];
+                                for (int a = 0; a < dof_count; ++a) {{
+                                    const int gdof_a = dof_start + a;
+                                    float coeff = 0.0f;
+                                    for (int b = 0; b < dof_count; ++b) {{
+                                        const int gdof_b = dof_start + b;
+                                        coeff += propagation_tree_D_inv.data[joint * 36 + a * 6 + b]
+                                            * propagation_tree_u.data[gdof_b];
+                                    }}
+                                    px += propagation_tree_U.data[gdof_a * 6 + 0] * coeff;
+                                    py += propagation_tree_U.data[gdof_a * 6 + 1] * coeff;
+                                    pz += propagation_tree_U.data[gdof_a * 6 + 2] * coeff;
+                                }}
                                 if (lane == 3) propagated += ey * pz - ez * py;
                                 else if (lane == 4) propagated += ez * px - ex * pz;
                                 else propagated += ex * py - ey * px;
@@ -8824,8 +8755,11 @@ def _get_pgs_solve_propagation_full_fused_kernel(
                         const int parent = joint_parent.data[joint];
                         const int dof_start = joint_qd_start.data[joint];
                         const int dof_end = joint_qd_start.data[joint + 1];
-                        const int has_dof = (dof_start < dof_end);
-                        const int gdof = dof_start;
+                        int dof_count = joint_dof_dim.data[joint * 2] + joint_dof_dim.data[joint * 2 + 1];
+                        const int qd_span = dof_end - dof_start;
+                        if (dof_count > qd_span) dof_count = qd_span;
+                        if (dof_count > 6) dof_count = 6;
+                        if (dof_count < 0) dof_count = 0;
 
                         float parent_delta = 0.0f;
                         if (parent >= 0 && lane < 6) {{
@@ -8841,28 +8775,35 @@ def _get_pgs_solve_propagation_full_fused_kernel(
                             else if (lane == 2) parent_delta += wx * ey - wy * ex;
                         }}
 
-                        float qdd = 0.0f;
-                        if (has_dof) {{
-                            float parent_term = 0.0f;
-                            if (parent >= 0 && lane < 6) {{
-                                parent_term = propagation_tree_U.data[gdof * 6 + lane] * parent_delta;
+                        for (int a = 0; a < dof_count; ++a) {{
+                            const int gdof_a = dof_start + a;
+                            float qdd = 0.0f;
+                            for (int b = 0; b < dof_count; ++b) {{
+                                const int gdof_b = dof_start + b;
+                                float parent_term = 0.0f;
+                                if (parent >= 0 && lane < 6) {{
+                                    parent_term = propagation_tree_U.data[gdof_b * 6 + lane] * parent_delta;
+                                }}
+                                for (int shfl = 16; shfl > 0; shfl >>= 1) {{
+                                    parent_term += __shfl_down_sync(mask, parent_term, shfl);
+                                }}
+                                parent_term = __shfl_sync(mask, parent_term, 0);
+                                qdd += propagation_tree_D_inv.data[joint * 36 + a * 6 + b]
+                                    * (propagation_tree_u.data[gdof_b] - parent_term);
                             }}
-                            for (int shfl = 16; shfl > 0; shfl >>= 1) {{
-                                parent_term += __shfl_down_sync(mask, parent_term, shfl);
-                            }}
-                            parent_term = __shfl_sync(mask, parent_term, 0);
-                            qdd = propagation_tree_D_inv.data[joint * 36] * (propagation_tree_u.data[gdof] - parent_term);
                             if (lane == 0) {{
-                                propagation_tree_qdd.data[gdof] = qdd;
-                                v_out.data[gdof] += qdd;
+                                propagation_tree_qdd.data[gdof_a] = qdd;
+                                v_out.data[gdof_a] += qdd;
                             }}
-                            qdd = __shfl_sync(mask, qdd, 0);
                         }}
+                        __syncwarp(mask);
 
                         if (lane < 6) {{
                             float value = parent_delta;
-                            if (has_dof) {{
-                                value += propagation_joint_S_flat.data[gdof * 6 + lane] * qdd;
+                            for (int a = 0; a < dof_count; ++a) {{
+                                const int gdof = dof_start + a;
+                                value += propagation_joint_S_flat.data[gdof * 6 + lane]
+                                    * propagation_tree_qdd.data[gdof];
                             }}
                             propagation_tree_body_delta.data[child * 6 + lane] = value;
                         }}
@@ -8875,8 +8816,11 @@ def _get_pgs_solve_propagation_full_fused_kernel(
                     const int parent = joint_parent.data[joint];
                     const int dof_start = joint_qd_start.data[joint];
                     const int dof_end = joint_qd_start.data[joint + 1];
-                    const int has_dof = (dof_start < dof_end);
-                    const int gdof = dof_start;
+                    int dof_count = joint_dof_dim.data[joint * 2] + joint_dof_dim.data[joint * 2 + 1];
+                    const int qd_span = dof_end - dof_start;
+                    if (dof_count > qd_span) dof_count = qd_span;
+                    if (dof_count > 6) dof_count = 6;
+                    if (dof_count < 0) dof_count = 0;
 
                     if (lane < 6) {{
                         float value = 0.0f;
@@ -8892,7 +8836,8 @@ def _get_pgs_solve_propagation_full_fused_kernel(
                             else if (lane == 1) value += wz * ex - wx * ez;
                             else if (lane == 2) value += wx * ey - wy * ex;
                         }}
-                        if (has_dof) {{
+                        for (int a = 0; a < dof_count; ++a) {{
+                            const int gdof = dof_start + a;
                             value += propagation_joint_S_flat.data[gdof * 6 + lane] * v_out.data[gdof];
                         }}
                         propagation_tree_body_delta.data[child * 6 + lane] = value;
@@ -8974,6 +8919,7 @@ def _get_pgs_solve_propagation_full_fused_kernel(
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
         joint_qd_start: wp.array[int],
+        joint_dof_dim: wp.array2d[int],
         propagation_joint_S_flat: wp.array2d[float],
         propagation_body_com_rel: wp.array2d[float],
         propagation_tree_U: wp.array2d[float],
@@ -9018,6 +8964,7 @@ def _get_pgs_solve_propagation_full_fused_kernel(
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
         joint_qd_start: wp.array[int],
+        joint_dof_dim: wp.array2d[int],
         propagation_joint_S_flat: wp.array2d[float],
         propagation_body_com_rel: wp.array2d[float],
         propagation_tree_U: wp.array2d[float],
@@ -9063,6 +9010,7 @@ def _get_pgs_solve_propagation_full_fused_kernel(
             joint_parent,
             joint_child,
             joint_qd_start,
+            joint_dof_dim,
             propagation_joint_S_flat,
             propagation_body_com_rel,
             propagation_tree_U,
@@ -9379,8 +9327,11 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                         const int parent = joint_parent.data[joint];
                         const int dof_start = joint_qd_start.data[joint];
                         const int dof_end = joint_qd_start.data[joint + 1];
-                        const int has_dof = (dof_start < dof_end);
-                        const int gdof = dof_start;
+                        int dof_count = joint_dof_dim.data[joint * 2] + joint_dof_dim.data[joint * 2 + 1];
+                        const int qd_span = dof_end - dof_start;
+                        if (dof_count > qd_span) dof_count = qd_span;
+                        if (dof_count > 6) dof_count = 6;
+                        if (dof_count < 0) dof_count = 0;
 
                         if (lane < 6) {
                             float value = 0.0f;
@@ -9399,7 +9350,8 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                                 else if (lane == 1) value += wz * ex - wx * ez;
                                 else if (lane == 2) value += wx * ey - wy * ex;
                             }
-                            if (has_dof) {
+                            for (int a = 0; a < dof_count; ++a) {
+                                const int gdof = dof_start + a;
                                 const int local_dof = gdof - w_dof_start;
                                 if (local_dof >= 0 && local_dof < __D__) {
                                     value += propagation_joint_S_flat.data[gdof * 6 + lane] * s_v[local_dof];
@@ -9599,27 +9551,40 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                             const int parent = joint_parent.data[joint];
                             const int dof_start = joint_qd_start.data[joint];
                             const int dof_end = joint_qd_start.data[joint + 1];
-                            const int has_dof = (dof_start < dof_end);
-                            const int gdof = dof_start;
+                            int dof_count = joint_dof_dim.data[joint * 2] + joint_dof_dim.data[joint * 2 + 1];
+                            const int qd_span = dof_end - dof_start;
+                            if (dof_count > qd_span) dof_count = qd_span;
+                            if (dof_count > 6) dof_count = 6;
+                            if (dof_count < 0) dof_count = 0;
 
-                            float u = 0.0f;
-                            if (has_dof && lane < 6) {
-                                u = -propagation_joint_S_flat.data[gdof * 6 + lane]
-                                    * propagation_tree_pA.data[child * 6 + lane];
+                            for (int a = 0; a < dof_count; ++a) {
+                                const int gdof = dof_start + a;
+                                float u = 0.0f;
+                                if (lane < 6) {
+                                    u = -propagation_joint_S_flat.data[gdof * 6 + lane]
+                                        * propagation_tree_pA.data[child * 6 + lane];
+                                }
+                                for (int shfl = 16; shfl > 0; shfl >>= 1) {
+                                    u += __shfl_down_sync(MASK, u, shfl);
+                                }
+                                u = __shfl_sync(MASK, u, 0);
+                                if (lane == 0) {
+                                    propagation_tree_u.data[gdof] = u;
+                                }
                             }
-                            for (int shfl = 16; shfl > 0; shfl >>= 1) {
-                                u += __shfl_down_sync(MASK, u, shfl);
-                            }
-                            u = __shfl_sync(MASK, u, 0);
-                            if (has_dof && lane == 0) {
-                                propagation_tree_u.data[gdof] = u;
-                            }
+                            __syncwarp(MASK);
 
                             if (parent >= 0 && lane < 6) {
                                 float propagated = propagation_tree_pA.data[child * 6 + lane];
-                                if (has_dof) {
-                                    const float inv_d = propagation_tree_D_inv.data[joint * 36];
-                                    propagated += propagation_tree_U.data[gdof * 6 + lane] * inv_d * u;
+                                for (int a = 0; a < dof_count; ++a) {
+                                    const int gdof_a = dof_start + a;
+                                    float coeff = 0.0f;
+                                    for (int b = 0; b < dof_count; ++b) {
+                                        const int gdof_b = dof_start + b;
+                                        coeff += propagation_tree_D_inv.data[joint * 36 + a * 6 + b]
+                                            * propagation_tree_u.data[gdof_b];
+                                    }
+                                    propagated += propagation_tree_U.data[gdof_a * 6 + lane] * coeff;
                                 }
                                 const float ex = propagation_body_com_rel.data[child * 3 + 0]
                                     - propagation_body_com_rel.data[parent * 3 + 0];
@@ -9628,13 +9593,21 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                                 const float ez = propagation_body_com_rel.data[child * 3 + 2]
                                     - propagation_body_com_rel.data[parent * 3 + 2];
                                 if (lane >= 3) {
-                                    const float inv_d = has_dof ? propagation_tree_D_inv.data[joint * 36] : 0.0f;
-                                    const float px = propagation_tree_pA.data[child * 6 + 0]
-                                        + (has_dof ? propagation_tree_U.data[gdof * 6 + 0] * inv_d * u : 0.0f);
-                                    const float py = propagation_tree_pA.data[child * 6 + 1]
-                                        + (has_dof ? propagation_tree_U.data[gdof * 6 + 1] * inv_d * u : 0.0f);
-                                    const float pz = propagation_tree_pA.data[child * 6 + 2]
-                                        + (has_dof ? propagation_tree_U.data[gdof * 6 + 2] * inv_d * u : 0.0f);
+                                    float px = propagation_tree_pA.data[child * 6 + 0];
+                                    float py = propagation_tree_pA.data[child * 6 + 1];
+                                    float pz = propagation_tree_pA.data[child * 6 + 2];
+                                    for (int a = 0; a < dof_count; ++a) {
+                                        const int gdof_a = dof_start + a;
+                                        float coeff = 0.0f;
+                                        for (int b = 0; b < dof_count; ++b) {
+                                            const int gdof_b = dof_start + b;
+                                            coeff += propagation_tree_D_inv.data[joint * 36 + a * 6 + b]
+                                                * propagation_tree_u.data[gdof_b];
+                                        }
+                                        px += propagation_tree_U.data[gdof_a * 6 + 0] * coeff;
+                                        py += propagation_tree_U.data[gdof_a * 6 + 1] * coeff;
+                                        pz += propagation_tree_U.data[gdof_a * 6 + 2] * coeff;
+                                    }
                                     if (lane == 3) propagated += ey * pz - ez * py;
                                     else if (lane == 4) propagated += ez * px - ex * pz;
                                     else propagated += ex * py - ey * px;
@@ -9649,8 +9622,11 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                             const int parent = joint_parent.data[joint];
                             const int dof_start = joint_qd_start.data[joint];
                             const int dof_end = joint_qd_start.data[joint + 1];
-                            const int has_dof = (dof_start < dof_end);
-                            const int gdof = dof_start;
+                            int dof_count = joint_dof_dim.data[joint * 2] + joint_dof_dim.data[joint * 2 + 1];
+                            const int qd_span = dof_end - dof_start;
+                            if (dof_count > qd_span) dof_count = qd_span;
+                            if (dof_count > 6) dof_count = 6;
+                            if (dof_count < 0) dof_count = 0;
 
                             float parent_delta = 0.0f;
                             if (parent >= 0 && lane < 6) {
@@ -9669,32 +9645,38 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                                 else if (lane == 2) parent_delta += wx * ey - wy * ex;
                             }
 
-                            float qdd = 0.0f;
-                            if (has_dof) {
-                                float parent_term = 0.0f;
-                                if (parent >= 0 && lane < 6) {
-                                    parent_term = propagation_tree_U.data[gdof * 6 + lane] * parent_delta;
+                            for (int a = 0; a < dof_count; ++a) {
+                                const int gdof_a = dof_start + a;
+                                float qdd = 0.0f;
+                                for (int b = 0; b < dof_count; ++b) {
+                                    const int gdof_b = dof_start + b;
+                                    float parent_term = 0.0f;
+                                    if (parent >= 0 && lane < 6) {
+                                        parent_term = propagation_tree_U.data[gdof_b * 6 + lane] * parent_delta;
+                                    }
+                                    for (int shfl = 16; shfl > 0; shfl >>= 1) {
+                                        parent_term += __shfl_down_sync(MASK, parent_term, shfl);
+                                    }
+                                    parent_term = __shfl_sync(MASK, parent_term, 0);
+                                    qdd += propagation_tree_D_inv.data[joint * 36 + a * 6 + b]
+                                        * (propagation_tree_u.data[gdof_b] - parent_term);
                                 }
-                                for (int shfl = 16; shfl > 0; shfl >>= 1) {
-                                    parent_term += __shfl_down_sync(MASK, parent_term, shfl);
-                                }
-                                parent_term = __shfl_sync(MASK, parent_term, 0);
-                                qdd = propagation_tree_D_inv.data[joint * 36]
-                                    * (propagation_tree_u.data[gdof] - parent_term);
                                 if (lane == 0) {
-                                    propagation_tree_qdd.data[gdof] = qdd;
-                                    const int local_dof = gdof - w_dof_start;
+                                    propagation_tree_qdd.data[gdof_a] = qdd;
+                                    const int local_dof = gdof_a - w_dof_start;
                                     if (local_dof >= 0 && local_dof < __D__) {
                                         s_v[local_dof] += qdd;
                                     }
                                 }
-                                qdd = __shfl_sync(MASK, qdd, 0);
                             }
+                            __syncwarp(MASK);
 
                             if (lane < 6) {
                                 float value = parent_delta;
-                                if (has_dof) {
-                                    value += propagation_joint_S_flat.data[gdof * 6 + lane] * qdd;
+                                for (int a = 0; a < dof_count; ++a) {
+                                    const int gdof = dof_start + a;
+                                    value += propagation_joint_S_flat.data[gdof * 6 + lane]
+                                        * propagation_tree_qdd.data[gdof];
                                 }
                                 propagation_tree_body_delta.data[child * 6 + lane] = value;
                             }
@@ -9811,6 +9793,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
         joint_qd_start: wp.array[int],
+        joint_dof_dim: wp.array2d[int],
         propagation_joint_S_flat: wp.array2d[float],
         propagation_body_com_rel: wp.array2d[float],
         propagation_tree_U: wp.array2d[float],
@@ -9878,6 +9861,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
         joint_qd_start: wp.array[int],
+        joint_dof_dim: wp.array2d[int],
         propagation_joint_S_flat: wp.array2d[float],
         propagation_body_com_rel: wp.array2d[float],
         propagation_tree_U: wp.array2d[float],
@@ -9946,6 +9930,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
             joint_parent,
             joint_child,
             joint_qd_start,
+            joint_dof_dim,
             propagation_joint_S_flat,
             propagation_body_com_rel,
             propagation_tree_U,
@@ -9972,246 +9957,6 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     pgs_solve_propagation_full_iteration_template.__name__ = name
     pgs_solve_propagation_full_iteration_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_full_iteration_template)
-
-
-@cache
-def _get_pgs_solve_propagation_contact_shared_kernel(
-    propagation_max_constraints: int, max_propagation_bodies: int, device_arch: str
-) -> "wp.Kernel":
-    """Build a one-warp propagation GS kernel with live propagation body state in shared memory."""
-    M = propagation_max_constraints
-    B = max(max_propagation_bodies, 1)
-    contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
-    friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
-
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    const int lane = threadIdx.x & 31;
-    int m = propagation_constraint_count.data[world];
-    if (m > {M}) m = {M};
-    if (m <= 0) return;
-
-    int n_bodies = propagation_body_count.data[world];
-    if (n_bodies > {B}) n_bodies = {B};
-
-    const int world_base = world * {M};
-    const int body_base = world * {B};
-
-    __shared__ float s_body_qd[{B * 6}];
-    __shared__ float s_body_impulses[{B * 6}];
-
-    for (int idx = lane; idx < n_bodies * 6; idx += 32) {{
-        const int local_body = idx / 6;
-        const int k = idx - local_body * 6;
-        const int body = propagation_body_list.data[body_base + local_body];
-        float qd = 0.0f;
-        if (body >= 0) qd = propagation_body_qd.data[body * 6 + k];
-        s_body_qd[idx] = qd;
-        s_body_impulses[idx] = 0.0f;
-    }}
-    __syncwarp();
-
-    for (int it = 0; it < iterations; ++it) {{
-        const int global_iter = iteration_offset + it;
-        for (int i = 0; i < m; ++i) {{
-            const int off = world_base + i;
-            const int row_type = propagation_row_type.data[off];
-            if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
-                if (lane == 0) propagation_impulses.data[off] = 0.0f;
-                __syncwarp();
-                continue;
-            }}
-
-            const float eff_inv = propagation_eff_mass_inv.data[off];
-            if (eff_inv <= 0.0f) {{
-                __syncwarp();
-                continue;
-            }}
-
-            const int ba = propagation_body_a.data[off];
-            const int bb = propagation_body_b.data[off];
-            int la = -1;
-            int lb = -1;
-            if (ba >= 0) la = propagation_body_local_slot.data[ba];
-            if (bb >= 0) lb = propagation_body_local_slot.data[bb];
-
-            float partial = 0.0f;
-            if (lane < 6 && la >= 0 && la < n_bodies) {{
-                partial = propagation_J_a.data[off * 6 + lane] * s_body_qd[la * 6 + lane];
-            }} else if (lane >= 6 && lane < 12 && lb >= 0 && lb < n_bodies) {{
-                const int k = lane - 6;
-                partial = propagation_J_b.data[off * 6 + k] * s_body_qd[lb * 6 + k];
-            }}
-            for (int offset = 16; offset > 0; offset >>= 1) {{
-                partial += __shfl_down_sync(0xffffffff, partial, offset);
-            }}
-
-            float delta_impulse = 0.0f;
-            int sib = -1;
-            float sib_delta = 0.0f;
-            if (lane == 0) {{
-                const float residual = partial + propagation_rhs.data[off];
-                const float old_impulse = propagation_impulses.data[off];
-                float new_impulse = old_impulse + omega * (-residual * eff_inv);
-
-                if (row_type == {contact_type}) {{
-                    if (new_impulse < 0.0f) new_impulse = 0.0f;
-                }} else if (row_type == {friction_type}) {{
-                    const int parent_idx = propagation_row_parent.data[off];
-                    const float lambda_n = propagation_impulses.data[world_base + parent_idx];
-                    const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
-                    if (radius <= 0.0f) {{
-                        new_impulse = 0.0f;
-                    }} else {{
-                        sib = parent_idx + 1;
-                        if (i == parent_idx + 1) sib = parent_idx + 2;
-                        propagation_impulses.data[off] = new_impulse;
-                        const int sib_off = world_base + sib;
-                        const float other = propagation_impulses.data[sib_off];
-                        const float mag = sqrtf(new_impulse * new_impulse + other * other);
-                        if (mag > radius) {{
-                            const float scale = radius / mag;
-                            new_impulse *= scale;
-                            const float sib_new = other * scale;
-                            sib_delta = sib_new - other;
-                            propagation_impulses.data[sib_off] = sib_new;
-                        }}
-                    }}
-                }}
-
-                delta_impulse = new_impulse - old_impulse;
-                propagation_impulses.data[off] = new_impulse;
-            }}
-
-            sib = __shfl_sync(0xffffffff, sib, 0);
-            sib_delta = __shfl_sync(0xffffffff, sib_delta, 0);
-            if (sib_delta != 0.0f) {{
-                const int sib_off = world_base + sib;
-                const int sib_ba = propagation_body_a.data[sib_off];
-                const int sib_bb = propagation_body_b.data[sib_off];
-                int sib_la = -1;
-                int sib_lb = -1;
-                if (sib_ba >= 0) sib_la = propagation_body_local_slot.data[sib_ba];
-                if (sib_bb >= 0) sib_lb = propagation_body_local_slot.data[sib_bb];
-                if (lane < 6 && sib_la >= 0 && sib_la < n_bodies) {{
-                    s_body_qd[sib_la * 6 + lane] += propagation_MiJt_a.data[sib_off * 6 + lane] * sib_delta;
-                    s_body_impulses[sib_la * 6 + lane] += propagation_J_a.data[sib_off * 6 + lane] * sib_delta;
-                }} else if (lane >= 6 && lane < 12 && sib_lb >= 0 && sib_lb < n_bodies) {{
-                    const int k = lane - 6;
-                    s_body_qd[sib_lb * 6 + k] += propagation_MiJt_b.data[sib_off * 6 + k] * sib_delta;
-                    s_body_impulses[sib_lb * 6 + k] += propagation_J_b.data[sib_off * 6 + k] * sib_delta;
-                }}
-            }}
-
-            delta_impulse = __shfl_sync(0xffffffff, delta_impulse, 0);
-            if (delta_impulse != 0.0f) {{
-                if (lane < 6 && la >= 0 && la < n_bodies) {{
-                    s_body_qd[la * 6 + lane] += propagation_MiJt_a.data[off * 6 + lane] * delta_impulse;
-                    s_body_impulses[la * 6 + lane] += propagation_J_a.data[off * 6 + lane] * delta_impulse;
-                }} else if (lane >= 6 && lane < 12 && lb >= 0 && lb < n_bodies) {{
-                    const int k = lane - 6;
-                    s_body_qd[lb * 6 + k] += propagation_MiJt_b.data[off * 6 + k] * delta_impulse;
-                    s_body_impulses[lb * 6 + k] += propagation_J_b.data[off * 6 + k] * delta_impulse;
-                }}
-            }}
-            __syncwarp();
-        }}
-    }}
-
-    for (int idx = lane; idx < n_bodies * 6; idx += 32) {{
-        const int local_body = idx / 6;
-        const int k = idx - local_body * 6;
-        const int body = propagation_body_list.data[body_base + local_body];
-        if (body >= 0) {{
-            propagation_body_qd.data[body * 6 + k] = s_body_qd[idx];
-            propagation_body_impulses.data[body * 6 + k] = s_body_impulses[idx];
-        }}
-    }}
-#endif
-"""
-
-    @wp.func_native(snippet)
-    def pgs_solve_propagation_shared_native(
-        world: int,
-        propagation_constraint_count: wp.array[int],
-        propagation_body_count: wp.array[int],
-        propagation_body_list: wp.array2d[int],
-        propagation_body_local_slot: wp.array[int],
-        propagation_body_a: wp.array2d[int],
-        propagation_body_b: wp.array2d[int],
-        propagation_MiJt_a: wp.array3d[float],
-        propagation_MiJt_b: wp.array3d[float],
-        propagation_J_a: wp.array3d[float],
-        propagation_J_b: wp.array3d[float],
-        propagation_eff_mass_inv: wp.array2d[float],
-        propagation_rhs: wp.array2d[float],
-        propagation_row_type: wp.array2d[int],
-        propagation_row_parent: wp.array2d[int],
-        propagation_row_mu: wp.array2d[float],
-        iterations: int,
-        omega: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        propagation_impulses: wp.array2d[float],
-        propagation_body_qd: wp.array2d[float],
-        propagation_body_impulses: wp.array2d[float],
-    ): ...
-
-    def pgs_solve_propagation_shared_template(
-        propagation_constraint_count: wp.array[int],
-        propagation_body_count: wp.array[int],
-        propagation_body_list: wp.array2d[int],
-        propagation_body_local_slot: wp.array[int],
-        propagation_body_a: wp.array2d[int],
-        propagation_body_b: wp.array2d[int],
-        propagation_MiJt_a: wp.array3d[float],
-        propagation_MiJt_b: wp.array3d[float],
-        propagation_J_a: wp.array3d[float],
-        propagation_J_b: wp.array3d[float],
-        propagation_eff_mass_inv: wp.array2d[float],
-        propagation_rhs: wp.array2d[float],
-        propagation_row_type: wp.array2d[int],
-        propagation_row_parent: wp.array2d[int],
-        propagation_row_mu: wp.array2d[float],
-        iterations: int,
-        omega: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        propagation_impulses: wp.array2d[float],
-        propagation_body_qd: wp.array2d[float],
-        propagation_body_impulses: wp.array2d[float],
-    ):
-        world, _lane = wp.tid()
-        pgs_solve_propagation_shared_native(
-            world,
-            propagation_constraint_count,
-            propagation_body_count,
-            propagation_body_list,
-            propagation_body_local_slot,
-            propagation_body_a,
-            propagation_body_b,
-            propagation_MiJt_a,
-            propagation_MiJt_b,
-            propagation_J_a,
-            propagation_J_b,
-            propagation_eff_mass_inv,
-            propagation_rhs,
-            propagation_row_type,
-            propagation_row_parent,
-            propagation_row_mu,
-            iterations,
-            omega,
-            friction_start_iteration,
-            iteration_offset,
-            propagation_impulses,
-            propagation_body_qd,
-            propagation_body_impulses,
-        )
-
-    name = f"pgs_solve_propagation_contact_shared_{propagation_max_constraints}_{B}"
-    pgs_solve_propagation_shared_template.__name__ = name
-    pgs_solve_propagation_shared_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_shared_template)
 
 
 @cache

@@ -2688,7 +2688,10 @@ def allocate_world_contact_slots(
     if propagation_articulated_contacts != 0 and is_mf == 0:
         a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
         b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
-        if a_non_free or b_non_free:
+        # Same-articulation two-link contacts need cross response terms between
+        # the two touched links. Keep those on the dense generalized-row path.
+        same_non_free_articulation = a_non_free and b_non_free and art_a == art_b
+        if (a_non_free or b_non_free) and not same_non_free_articulation:
             is_propagation = 1
 
     friction_anchor_rank = int(0)
@@ -4388,6 +4391,34 @@ def compute_mf_body_Hinv(
         return
 
     mf_body_Hinv[b] = spatial_matrix_block_inverse(body_I_s[b])
+
+
+@wp.kernel
+def copy_free_rigid_propagation_body_response(
+    is_free_rigid: wp.array[int],
+    body_to_articulation: wp.array[int],
+    mf_body_Hinv: wp.array[wp.spatial_matrix],
+    # outputs
+    propagation_body_response: wp.array3d[float],
+):
+    """Seed propagation's 6D body response for free rigid bodies.
+
+    Propagation rows use ``propagation_body_response`` for both contact sides.
+    Non-free articulated links are filled by the tree-response setup. Free rigid
+    bodies do not run that tree solve, so copy the same inverse spatial inertia
+    used by the existing free/free MF path.
+    """
+    body = wp.tid()
+    art = body_to_articulation[body]
+    if art < 0:
+        return
+    if is_free_rigid[art] == 0:
+        return
+
+    Hinv = mf_body_Hinv[body]
+    for r in range(6):
+        for c in range(6):
+            propagation_body_response[body, r, c] = Hinv[r, c]
 
 
 @wp.kernel

@@ -753,7 +753,7 @@ def _cases_for_preset(preset: str) -> list[BenchCase]:
             )
         return cases
     if preset == "env_scale":
-        world_counts = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+        world_counts = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
         a16_l16_c64 = [
             BenchCase(
                 "env_count",
@@ -1038,7 +1038,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         choices=("mf_immediate", *PROPAGATION_PATHS),
         default=None,
-        help="Run only selected path(s). Defaults to mf_immediate plus propagation.",
+        help="Run only selected path(s). Defaults to mf_immediate, propagation, and propagation-fused.",
     )
     parser.add_argument("--no-friction", action="store_true")
     parser.add_argument(
@@ -1091,7 +1091,7 @@ def main() -> None:
 
     results: list[RunResult] = []
     final_states: dict[tuple[str, str, str], dict[str, np.ndarray]] = {}
-    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", "propagation")
+    paths = tuple(dict.fromkeys(args.path)) if args.path else ("mf_immediate", "propagation", "propagation-fused")
     for case in cases:
         model, initial, contacts = _prepare_case_run(case, args.device)
         for path_name in paths:

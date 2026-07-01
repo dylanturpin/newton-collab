@@ -11,6 +11,160 @@ import numpy as np
 import pytest
 import warp as wp
 
+import newton
+from newton.solvers import SolverFeatherPGS
+
+
+def _build_d6_articulated_free_contact_model(device: str):
+    builder = newton.ModelBuilder(gravity=0.0)
+    cfg = newton.ModelBuilder.JointDofConfig
+
+    link = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), mass=1.0)
+    builder.add_shape_box(link, hx=0.12, hy=0.08, hz=0.06)
+    joint = builder.add_joint_d6(
+        parent=-1,
+        child=link,
+        linear_axes=[cfg(axis=newton.Axis.X), cfg(axis=newton.Axis.Y), cfg(axis=newton.Axis.Z)],
+        angular_axes=[cfg(axis=newton.Axis.X), cfg(axis=newton.Axis.Y), cfg(axis=newton.Axis.Z)],
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+        child_xform=wp.transform_identity(),
+    )
+    builder.add_articulation([joint])
+
+    cube = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.588), wp.quat_identity()), mass=1.0)
+    builder.add_shape_box(cube, hx=0.05, hy=0.05, hz=0.04)
+    return builder.finalize(device=device)
+
+
+def _step_d6_contact_case(model, contacts, mode: str) -> tuple[np.ndarray, tuple[int, int, int], int | None]:
+    state_in = model.state()
+    state_out = model.state()
+    control = model.control()
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+    state_in.clear_forces()
+    state_out.clear_forces()
+
+    solver = SolverFeatherPGS(
+        model,
+        pgs_mode="matrix_free",
+        articulated_contact_response=mode,
+        hinv_jt_kernel="par_row",
+        pgs_iterations=2,
+        pgs_velocity_iterations=0,
+        enable_contact_friction=True,
+        dense_max_constraints=32,
+        mf_max_constraints=32,
+        pgs_warmstart=False,
+        mf_warmstart=False,
+    )
+    solver.step(state_in, state_out, control, contacts, 1.0 / 120.0)
+    wp.synchronize()
+
+    propagation_count = getattr(solver, "propagation_constraint_count", None)
+    rows = (
+        int(np.sum(solver.constraint_count.numpy())),
+        int(np.sum(solver.mf_constraint_count.numpy())),
+        int(np.sum(propagation_count.numpy())) if propagation_count is not None else 0,
+    )
+    return state_out.joint_qd.numpy().copy(), rows, getattr(solver, "_propagation_full_fused_size", None)
+
+
+def test_fpgs_propagation_fused_supports_multi_dof_contact_rows():
+    wp.init()
+    if not wp.get_device("cuda:0").is_cuda:
+        pytest.skip("CUDA is required for propagation-fused multi-DOF contact rows")
+
+    model = _build_d6_articulated_free_contact_model("cuda:0")
+    assert model.joint_dof_dim.numpy().tolist() == [[3, 3], [3, 3]]
+
+    initial = model.state()
+    newton.eval_fk(model, initial.joint_q, initial.joint_qd, initial)
+    contacts = model.contacts()
+    model.collide(initial, contacts)
+    wp.synchronize()
+    assert int(contacts.rigid_contact_count.numpy()[0]) > 0
+
+    qd_immediate, rows_immediate, fused_immediate = _step_d6_contact_case(model, contacts, "immediate")
+    qd_propagation, rows_propagation, fused_propagation = _step_d6_contact_case(model, contacts, "propagation")
+    qd_fused, rows_fused, fused_size = _step_d6_contact_case(model, contacts, "propagation-fused")
+
+    assert rows_immediate[0] > 0
+    assert rows_immediate[2] == 0
+    assert fused_immediate is None
+
+    assert rows_propagation[0] == 0
+    assert rows_propagation[2] > 0
+    assert fused_propagation is None
+
+    assert rows_fused[0] == 0
+    assert rows_fused[2] == rows_propagation[2]
+    assert fused_size == 6
+
+    np.testing.assert_allclose(qd_propagation, qd_immediate, rtol=1.0e-5, atol=1.0e-5)
+    np.testing.assert_allclose(qd_fused, qd_immediate, rtol=1.0e-5, atol=1.0e-5)
+
+
+def test_fpgs_propagation_mixed_size_free_body_response():
+    wp.init()
+    if not wp.get_device("cuda:0").is_cuda:
+        pytest.skip("CUDA is required for propagation articulated/free contact rows")
+
+    script = Path(__file__).parent / "benchmarks" / "fpgs_articulation_row_scaling.py"
+    spec = importlib.util.spec_from_file_location("fpgs_articulation_row_scaling", script)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    case = module.BenchCase(
+        "mixed_size_response",
+        "L=4,boxes=1",
+        "articulated_free",
+        articulations=1,
+        links=4,
+        contacts_per_articulation=1,
+    )
+    model, initial, contacts = module._prepare_case_run(case, "cuda:0")
+
+    state_in = model.state()
+    state_out = model.state()
+    module._restore_state(model, state_in, initial)
+    module._restore_state(model, state_out, initial)
+    state_in.clear_forces()
+    state_out.clear_forces()
+
+    solver = module.SolverFeatherPGS(
+        model,
+        pgs_mode="matrix_free",
+        articulated_contact_response="propagation",
+        hinv_jt_kernel="par_row",
+        pgs_iterations=2,
+        pgs_velocity_iterations=0,
+        enable_contact_friction=True,
+        dense_max_constraints=32,
+        mf_max_constraints=16,
+        pgs_warmstart=False,
+        mf_warmstart=False,
+    )
+    solver.step(state_in, state_out, model.control(), contacts, 1.0 / 120.0)
+    wp.synchronize()
+
+    row_count = int(solver.propagation_constraint_count.numpy()[0])
+    assert row_count > 0
+
+    body_to_art = solver.body_to_articulation.numpy()
+    is_free = solver.is_free_rigid.numpy()
+    body_b = solver.propagation_body_b.numpy()[0, :row_count]
+    free_bodies = [int(body) for body in body_b if body >= 0 and is_free[body_to_art[int(body)]] != 0]
+    assert free_bodies
+
+    response = solver.propagation_body_response.numpy()
+    mijt_b = solver.propagation_MiJt_b.numpy()[0, :row_count]
+    assert max(float(np.linalg.norm(response[body])) for body in free_bodies) > 0.0
+    assert float(np.linalg.norm(mijt_b)) > 0.0
+
 
 def test_fpgs_articulation_row_scaling_benchmark_smoke(tmp_path):
     wp.init()
@@ -36,7 +190,7 @@ def test_fpgs_articulation_row_scaling_benchmark_smoke(tmp_path):
     assert (out_dir / "results.csv").is_file()
     results = json.loads((out_dir / "results.json").read_text(encoding="utf-8"))
     paths = {row["path"] for row in results}
-    assert paths == {"mf_immediate", "propagation"}
+    assert paths == {"mf_immediate", "propagation", "propagation-fused"}
     assert not (
         paths
         & {
