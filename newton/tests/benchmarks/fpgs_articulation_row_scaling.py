@@ -863,6 +863,30 @@ def _cases_for_preset(preset: str) -> list[BenchCase]:
             )
             for world_count in world_counts
         ]
+        a2_l4_c16 = [
+            BenchCase(
+                "env_count_a2_l4_c16",
+                f"envs={world_count}",
+                "articulated_free",
+                world_count=world_count,
+                articulations=2,
+                links=4,
+                contacts_per_articulation=2,
+            )
+            for world_count in world_counts
+        ]
+        a2_l16_c32 = [
+            BenchCase(
+                "env_count_a2_l16_c32",
+                f"envs={world_count}",
+                "articulated_free",
+                world_count=world_count,
+                articulations=2,
+                links=16,
+                contacts_per_articulation=4,
+            )
+            for world_count in world_counts
+        ]
         a1_l4_c256 = [
             BenchCase(
                 "env_count_a1_l4_c256",
@@ -875,7 +899,7 @@ def _cases_for_preset(preset: str) -> list[BenchCase]:
             )
             for world_count in world_counts
         ]
-        return a16_l16_c64 + a2_l16_c256 + a16_l4_c256 + a2_l4_c64 + a1_l4_c256
+        return a16_l16_c64 + a2_l16_c256 + a16_l4_c256 + a2_l4_c64 + a1_l4_c256 + a2_l4_c16 + a2_l16_c32
     raise ValueError(f"unknown preset {preset!r}")
 
 
