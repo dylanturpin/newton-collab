@@ -2418,12 +2418,19 @@ class SolverFeatherPGS(SolverBase):
             and getattr(self, "max_world_dofs", 0) > 0
             and self.mf_max_constraints > 0
         ):
+            # shared_metadata=False streams the nine read-only per-row metadata
+            # arrays from global/L2 instead of shared memory. Measured on RTX
+            # 5080: occupancy rises from floor(smem/(10*M_D*4B)) to the
+            # register/stream limit, cutting the GS kernel 10% at D=104 and
+            # 58% at D=388/M_D=1024 where shared capacity pinned it to two
+            # worlds per SM. Values are unchanged, only the storage class.
             self._pgs_solve_mf_gs_kernel = _get_pgs_solve_mf_gs_kernel(
                 self.dense_max_constraints,
                 self.mf_max_constraints,
                 self.max_world_dofs,
                 device_arch,
                 friction_mode=self.friction_mode,
+                shared_metadata=False,
             )
 
         self._pgs_solve_mf_kernel = None
@@ -10260,6 +10267,7 @@ def _get_pgs_solve_mf_gs_kernel(
     device_arch: str,
     friction_mode: str = "current",
     software_pipeline: bool = True,
+    shared_metadata: bool = True,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -11512,6 +11520,27 @@ def _get_pgs_solve_mf_gs_kernel(
     # s_v (the world velocity), not lambda, so each row needs only its own impulse (+ a
     # friction parent's). Aliasing mf_impulses via a volatile pointer keeps the existing
     # __syncwarp cross-lane visibility (warp lanes share L1) and updates impulses in place.
+    if not shared_metadata:
+        # Shared-memory diet: the nine read-only per-row metadata arrays are
+        # ~9/11ths of this kernel's shared footprint and pin occupancy to
+        # floor(smem_per_sm / (10*M_D*4B)). Stream them from global/L2 instead;
+        # values are identical, only the storage class changes.
+        meta_map = {
+            "s_rhs_dense": ("float", "rhs_bias"),
+            "s_diag_dense": ("float", "world_diag"),
+            "s_rtype_dense": ("int", "world_row_type"),
+            "s_parent_dense": ("int", "world_row_parent"),
+            "s_mu_dense": ("float", "world_row_mu"),
+            "s_drive_target_dense": ("float", "world_drive_target_vel_bias"),
+            "s_drive_vel_mul_dense": ("float", "world_drive_vel_multiplier"),
+            "s_drive_imp_mul_dense": ("float", "world_drive_impulse_multiplier"),
+            "s_drive_max_imp_dense": ("float", "world_drive_max_impulse"),
+        }
+        for sname, (ctype, gname) in meta_map.items():
+            snippet = re.sub(rf"    __shared__ {ctype}\s+{sname}\[{M_D}\];\n", "", snippet)
+            snippet = re.sub(rf"\s*{sname}\[i\] = {gname}\.data\[off_dense \+ i\];", "", snippet, count=1)
+            snippet = re.sub(rf"{sname}\[([^\]]*)\]", rf"{gname}.data[off_dense + (\1)]", snippet)
+
     # Value-preserving -> bit-identical; cuts smem so occupancy stops scaling with the mf
     # capacity. Opt-in via FEATHER_PGS_MFGS_STREAM_LAMBDA=1 (default off = resident smem).
     if os.environ.get("FEATHER_PGS_MFGS_STREAM_LAMBDA", "").strip().lower() in ("1", "true", "yes", "on"):
@@ -11637,6 +11666,8 @@ def _get_pgs_solve_mf_gs_kernel(
     name = f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
     if not software_pipeline:
         name += "_nopipe"
+    if not shared_metadata:
+        name += "_gmeta"
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
