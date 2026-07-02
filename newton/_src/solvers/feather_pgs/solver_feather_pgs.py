@@ -3071,11 +3071,11 @@ class SolverFeatherPGS(SolverBase):
         with self._sync_timed("prop_setup_refresh_free_qd"):
             self._refresh_propagation_free_body_qd_from_vout()
 
-        with self._sync_timed("prop_setup_zero_rows"):
-            self.propagation_rhs.zero_()
-            self.propagation_eff_mass_inv.zero_()
-            self.propagation_MiJt_a.zero_()
-            self.propagation_MiJt_b.zero_()
+        # No zeroing of the propagation row buffers: every consumer (row solve,
+        # fused kernel, debug diagnostics, penetration telemetry) is bounded by
+        # propagation_constraint_count, and compute_propagation_effective_mass
+        # rewrites all active rows each step, so stale entries past the count
+        # are never read.
         with self._sync_timed("prop_setup_effective_mass_rhs"):
             wp.launch(
                 compute_propagation_effective_mass_and_rhs,
@@ -8401,44 +8401,89 @@ def _get_pgs_solve_propagation_contact_kernel(
     if (m > {M}) m = {M};
     const int world_base = world * {M};
 
+    // Software pipeline: the only cross-row dependency in the GS chain is
+    // propagation_body_qd; every other per-row operand (scalars and the
+    // per-lane J/MiJt pair) is prefetched one row ahead so its load latency
+    // overlaps the previous row's compute and shuffles.
+    int pf_type = 0;
+    float pf_eff = 0.0f;
+    float pf_rhs = 0.0f;
+    int pf_ba = -1;
+    int pf_bb = -1;
+    float pf_J = 0.0f;
+    float pf_MiJt = 0.0f;
+
     for (int it = 0; it < iterations; ++it) {{
         const int global_iter = iteration_offset + it;
+        if (m > 0) {{
+            const int off0 = world_base;
+            pf_type = propagation_row_type.data[off0];
+            pf_eff = propagation_eff_mass_inv.data[off0];
+            pf_rhs = propagation_rhs.data[off0];
+            pf_ba = propagation_body_a.data[off0];
+            pf_bb = propagation_body_b.data[off0];
+            if (lane < 6) {{
+                pf_J = propagation_J_a.data[off0 * 6 + lane];
+                pf_MiJt = propagation_MiJt_a.data[off0 * 6 + lane];
+            }} else if (lane < 12) {{
+                pf_J = propagation_J_b.data[off0 * 6 + lane - 6];
+                pf_MiJt = propagation_MiJt_b.data[off0 * 6 + lane - 6];
+            }}
+        }}
         for (int i = 0; i < m; ++i) {{
             const int off = world_base + i;
-            const int row_type = propagation_row_type.data[off];
+            const int row_type = pf_type;
+            const float eff_inv = pf_eff;
+            const float row_rhs = pf_rhs;
+            const int ba = pf_ba;
+            const int bb = pf_bb;
+            const float my_J = pf_J;
+            const float my_MiJt = pf_MiJt;
+
+            if (i + 1 < m) {{
+                const int off_n = off + 1;
+                pf_type = propagation_row_type.data[off_n];
+                pf_eff = propagation_eff_mass_inv.data[off_n];
+                pf_rhs = propagation_rhs.data[off_n];
+                pf_ba = propagation_body_a.data[off_n];
+                pf_bb = propagation_body_b.data[off_n];
+                if (lane < 6) {{
+                    pf_J = propagation_J_a.data[off_n * 6 + lane];
+                    pf_MiJt = propagation_MiJt_a.data[off_n * 6 + lane];
+                }} else if (lane < 12) {{
+                    pf_J = propagation_J_b.data[off_n * 6 + lane - 6];
+                    pf_MiJt = propagation_MiJt_b.data[off_n * 6 + lane - 6];
+                }}
+            }}
+
             if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
                 if (lane == 0) propagation_impulses.data[off] = 0.0f;
                 __syncwarp();
                 continue;
             }}
 
-            const float eff_inv = propagation_eff_mass_inv.data[off];
             if (eff_inv <= 0.0f) {{
                 __syncwarp();
                 continue;
             }}
 
-            const int ba = propagation_body_a.data[off];
-            const int bb = propagation_body_b.data[off];
             int active_body = -1;
             int active_k = -1;
             float active_J = 0.0f;
             float active_MiJt = 0.0f;
             float partial = 0.0f;
             if (lane < 6 && ba >= 0) {{
-                const int elem = off * 6 + lane;
                 active_body = ba;
                 active_k = lane;
-                active_J = propagation_J_a.data[elem];
-                active_MiJt = propagation_MiJt_a.data[elem];
+                active_J = my_J;
+                active_MiJt = my_MiJt;
                 partial = active_J * propagation_body_qd.data[ba * 6 + lane];
             }} else if (lane >= 6 && lane < 12 && bb >= 0) {{
                 const int k = lane - 6;
-                const int elem = off * 6 + k;
                 active_body = bb;
                 active_k = k;
-                active_J = propagation_J_b.data[elem];
-                active_MiJt = propagation_MiJt_b.data[elem];
+                active_J = my_J;
+                active_MiJt = my_MiJt;
                 partial = active_J * propagation_body_qd.data[bb * 6 + k];
             }}
             for (int offset = 16; offset > 0; offset >>= 1) {{
@@ -8449,7 +8494,7 @@ def _get_pgs_solve_propagation_contact_kernel(
             int sib = -1;
             float sib_delta = 0.0f;
             if (lane == 0) {{
-                const float residual = partial + propagation_rhs.data[off];
+                const float residual = partial + row_rhs;
                 const float old_impulse = propagation_impulses.data[off];
                 float new_impulse = old_impulse + omega * (-residual * eff_inv);
 
