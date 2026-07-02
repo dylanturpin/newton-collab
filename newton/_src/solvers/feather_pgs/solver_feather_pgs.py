@@ -2434,9 +2434,16 @@ class SolverFeatherPGS(SolverBase):
 
         self._pgs_solve_propagation_kernel = None
         self._pgs_solve_propagation_full_iteration_kernel = None
+        # Two one-warp worlds per 64-thread block: the row-solve kernel uses no
+        # per-world shared memory, so 32-thread blocks are capped by the
+        # hardware block-slot limit at 24 warps/SM while 64-thread blocks reach
+        # the full 48, doubling resident serial GS chains at large env counts.
+        self._propagation_gs_worlds_per_block = 2
         if model.device.is_cuda and self._propagation_contacts_enabled() and self.propagation_max_constraints > 0:
             self._pgs_solve_propagation_kernel = _get_pgs_solve_propagation_contact_kernel(
-                self.propagation_max_constraints, device_arch
+                self.propagation_max_constraints,
+                device_arch,
+                worlds_per_block=self._propagation_gs_worlds_per_block,
             )
             fused_size = getattr(self, "_propagation_full_fused_size", None)
             if self.propagation_full_fused_iterations and fused_size is not None:
@@ -3318,10 +3325,12 @@ class SolverFeatherPGS(SolverBase):
             return
         propagation_kernel = getattr(self, "_pgs_solve_propagation_kernel", None)
         if propagation_kernel is not None:
+            wpb = self._propagation_gs_worlds_per_block
             wp.launch_tiled(
                 propagation_kernel,
-                dim=[self.world_count],
+                dim=[(self.world_count + wpb - 1) // wpb],
                 inputs=[
+                    self.world_count,
                     self.propagation_constraint_count,
                     self.propagation_body_a,
                     self.propagation_body_b,
@@ -3344,7 +3353,7 @@ class SolverFeatherPGS(SolverBase):
                     self.propagation_body_qd,
                     self.propagation_body_impulses,
                 ],
-                block_dim=32,
+                block_dim=32 * wpb,
                 device=self.model.device,
             )
         else:
@@ -8348,15 +8357,27 @@ def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.K
 
 
 @cache
-def _get_pgs_solve_propagation_contact_kernel(propagation_max_constraints: int, device_arch: str) -> "wp.Kernel":
-    """Build a one-warp propagation contact GS kernel for fixed-size body rows."""
+def _get_pgs_solve_propagation_contact_kernel(
+    propagation_max_constraints: int, device_arch: str, worlds_per_block: int = 1
+) -> "wp.Kernel":
+    """Build a one-warp propagation contact GS kernel for fixed-size body rows.
+
+    ``worlds_per_block`` packs several one-warp worlds into one thread block.
+    The kernel uses no per-world shared memory, so a 32-thread block is
+    capped by the hardware block-slot limit at 24 warps/SM; packing two
+    worlds per 64-thread block reaches the full 48 warps/SM, doubling the
+    number of concurrently resident serial GS chains.
+    """
     M = propagation_max_constraints
+    W = max(int(worlds_per_block), 1)
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const int lane = threadIdx.x & 31;
+    const int world = tile * {W} + (threadIdx.x >> 5);
+    if (world >= world_count) return;
     int m = propagation_constraint_count.data[world];
     if (m > {M}) m = {M};
     const int world_base = world * {M};
@@ -8472,7 +8493,8 @@ def _get_pgs_solve_propagation_contact_kernel(propagation_max_constraints: int, 
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_native(
-        world: int,
+        tile: int,
+        world_count: int,
         propagation_constraint_count: wp.array[int],
         propagation_body_a: wp.array2d[int],
         propagation_body_b: wp.array2d[int],
@@ -8495,6 +8517,7 @@ def _get_pgs_solve_propagation_contact_kernel(propagation_max_constraints: int, 
     ): ...
 
     def pgs_solve_propagation_template(
+        world_count: int,
         propagation_constraint_count: wp.array[int],
         propagation_body_a: wp.array2d[int],
         propagation_body_b: wp.array2d[int],
@@ -8515,9 +8538,10 @@ def _get_pgs_solve_propagation_contact_kernel(propagation_max_constraints: int, 
         propagation_body_qd: wp.array2d[float],
         propagation_body_impulses: wp.array2d[float],
     ):
-        world, _lane = wp.tid()
+        tile, _lane = wp.tid()
         pgs_solve_propagation_native(
-            world,
+            tile,
+            world_count,
             propagation_constraint_count,
             propagation_body_a,
             propagation_body_b,
@@ -8539,7 +8563,7 @@ def _get_pgs_solve_propagation_contact_kernel(propagation_max_constraints: int, 
             propagation_body_impulses,
         )
 
-    name = f"pgs_solve_propagation_contact_{propagation_max_constraints}"
+    name = f"pgs_solve_propagation_contact_{propagation_max_constraints}_w{W}"
     pgs_solve_propagation_template.__name__ = name
     pgs_solve_propagation_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_template)
