@@ -2591,6 +2591,7 @@ def allocate_world_contact_slots(
     contact_path: wp.array[int],
     mf_slot_counter: wp.array[int],
     propagation_slot_counter: wp.array[int],
+    dense_contact_world_flag: wp.array[int],
 ):
     """
     Phase 1 of multi-articulation contact building.
@@ -2755,6 +2756,9 @@ def allocate_world_contact_slots(
         contact_art_a[c] = art_a
         contact_art_b[c] = art_b
         contact_path[c] = 0
+        # Dense contact rows write articulated generalized velocities during
+        # split GS phases; propagation tree refresh keys off this per world.
+        dense_contact_world_flag[world] = 1
 
 
 @wp.func
@@ -5762,9 +5766,13 @@ def compute_propagation_tree_body_response_revolute_for_size(
                     propagation_tree_Ia[child, row, col] = value
                     propagation_body_response[child, row, col] = value
 
+
 @wp.kernel
 def refresh_propagation_tree_body_qd_for_size(
     group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    dense_contact_world_flag: wp.array[int],
+    force_refresh: int,
     articulation_start: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
@@ -5778,9 +5786,21 @@ def refresh_propagation_tree_body_qd_for_size(
     # outputs
     propagation_body_qd: wp.array2d[float],
 ):
-    """Refresh propagation live COM velocities from generalized velocity by a tree pass."""
+    """Refresh propagation live COM velocities from generalized velocity by a tree pass.
+
+    ``propagate_tree_impulses_for_size`` already leaves ``propagation_body_qd``
+    consistent with ``v_out``. Between propagation iterations the tree
+    generalized velocities only change when a dense GS phase ran rows for this
+    world, so when ``force_refresh`` is 0 the pass is skipped for worlds with
+    no dense contact rows (drive/limit/velocity-limit phases force refresh
+    through ``force_refresh`` instead).
+    """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
+    if force_refresh == 0:
+        world = art_to_world[art]
+        if world >= 0 and dense_contact_world_flag[world] == 0:
+            return
     joint_start = articulation_start[art]
     joint_end = articulation_start[art + 1]
 
@@ -6072,7 +6092,9 @@ def propagate_tree_impulses_for_size(
                     propagation_body_com_rel[parent, 1],
                     propagation_body_com_rel[parent, 2],
                 )
-                parent_delta_child = translate_twist_between_parallel_frames(parent_delta_parent, child_rel - parent_rel)
+                parent_delta_child = translate_twist_between_parallel_frames(
+                    parent_delta_parent, child_rel - parent_rel
+                )
 
             for a in range(dof_count):
                 gdof_a = dof_start + a
@@ -6096,42 +6118,47 @@ def propagate_tree_impulses_for_size(
 
     # Recompute full live body velocities from updated generalized velocities
     # and clear the deferred body impulse buffer for the next GS iteration.
-    for joint in range(joint_start, joint_end):
-        child = joint_child[joint]
-        parent = joint_parent[joint]
-        dof_start = joint_qd_start[joint]
-        dof_count = joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
-        parent_delta_child = wp.spatial_vector()
-        if parent >= 0:
-            parent_delta_parent = wp.spatial_vector(
-                propagation_tree_body_delta[parent, 0],
-                propagation_tree_body_delta[parent, 1],
-                propagation_tree_body_delta[parent, 2],
-                propagation_tree_body_delta[parent, 3],
-                propagation_tree_body_delta[parent, 4],
-                propagation_tree_body_delta[parent, 5],
-            )
-            child_rel = wp.vec3(
-                propagation_body_com_rel[child, 0],
-                propagation_body_com_rel[child, 1],
-                propagation_body_com_rel[child, 2],
-            )
-            parent_rel = wp.vec3(
-                propagation_body_com_rel[parent, 0],
-                propagation_body_com_rel[parent, 1],
-                propagation_body_com_rel[parent, 2],
-            )
-            parent_delta_child = translate_twist_between_parallel_frames(parent_delta_parent, child_rel - parent_rel)
+    # With no deferred impulses, v_out and propagation_body_qd are both
+    # untouched since the previous consistent recompute, so skip the pass.
+    if has_impulse != 0:
+        for joint in range(joint_start, joint_end):
+            child = joint_child[joint]
+            parent = joint_parent[joint]
+            dof_start = joint_qd_start[joint]
+            dof_count = joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
+            parent_delta_child = wp.spatial_vector()
+            if parent >= 0:
+                parent_delta_parent = wp.spatial_vector(
+                    propagation_tree_body_delta[parent, 0],
+                    propagation_tree_body_delta[parent, 1],
+                    propagation_tree_body_delta[parent, 2],
+                    propagation_tree_body_delta[parent, 3],
+                    propagation_tree_body_delta[parent, 4],
+                    propagation_tree_body_delta[parent, 5],
+                )
+                child_rel = wp.vec3(
+                    propagation_body_com_rel[child, 0],
+                    propagation_body_com_rel[child, 1],
+                    propagation_body_com_rel[child, 2],
+                )
+                parent_rel = wp.vec3(
+                    propagation_body_com_rel[parent, 0],
+                    propagation_body_com_rel[parent, 1],
+                    propagation_body_com_rel[parent, 2],
+                )
+                parent_delta_child = translate_twist_between_parallel_frames(
+                    parent_delta_parent, child_rel - parent_rel
+                )
 
-        for r in range(6):
-            value = parent_delta_child[r]
-            for a in range(dof_count):
-                gdof = dof_start + a
-                value += propagation_joint_S_flat[gdof, r] * v_out[gdof]
-            propagation_tree_body_delta[child, r] = value
-            propagation_body_qd[child, r] = value
-        for r in range(6):
-            propagation_body_impulses[child, r] = 0.0
+            for r in range(6):
+                value = parent_delta_child[r]
+                for a in range(dof_count):
+                    gdof = dof_start + a
+                    value += propagation_joint_S_flat[gdof, r] * v_out[gdof]
+                propagation_tree_body_delta[child, r] = value
+                propagation_body_qd[child, r] = value
+            for r in range(6):
+                propagation_body_impulses[child, r] = 0.0
 
 
 @wp.kernel
@@ -6318,13 +6345,17 @@ def pgs_solve_propagation_contact_loop(
             if delta_impulse != 0.0:
                 if ba >= 0:
                     for k in range(6):
-                        propagation_body_qd[ba, k] = propagation_body_qd[ba, k] + propagation_MiJt_a[world, i, k] * delta_impulse
+                        propagation_body_qd[ba, k] = (
+                            propagation_body_qd[ba, k] + propagation_MiJt_a[world, i, k] * delta_impulse
+                        )
                         propagation_body_impulses[ba, k] = (
                             propagation_body_impulses[ba, k] + propagation_J_a[world, i, k] * delta_impulse
                         )
                 if bb >= 0:
                     for k in range(6):
-                        propagation_body_qd[bb, k] = propagation_body_qd[bb, k] + propagation_MiJt_b[world, i, k] * delta_impulse
+                        propagation_body_qd[bb, k] = (
+                            propagation_body_qd[bb, k] + propagation_MiJt_b[world, i, k] * delta_impulse
+                        )
                         propagation_body_impulses[bb, k] = (
                             propagation_body_impulses[bb, k] + propagation_J_b[world, i, k] * delta_impulse
                         )
@@ -8069,11 +8100,7 @@ def accumulate_deferred_dense_tau_from_J_world(
     c = (tid // max_world_dofs) % max_constraints
     world = tid // (max_world_dofs * max_constraints)
 
-    if (
-        d >= world_dof_count[world]
-        or c >= world_constraint_count[world]
-        or world_deferred_dof_mask[world, d] == 0
-    ):
+    if d >= world_dof_count[world] or c >= world_constraint_count[world] or world_deferred_dof_mask[world, d] == 0:
         return
 
     delta = world_delta_impulses[world, c]
@@ -8601,7 +8628,10 @@ def pgs_ncp_residuals_diagnostic_velocity(
 
         i1 = i + 1
         if i1 < propagation_max_constraints and i1 < m_propagation:
-            if propagation_row_type[world, i1] == PGS_CONSTRAINT_TYPE_FRICTION and propagation_row_parent[world, i1] == i:
+            if (
+                propagation_row_type[world, i1] == PGS_CONSTRAINT_TYPE_FRICTION
+                and propagation_row_parent[world, i1] == i
+            ):
                 lt1 = propagation_impulses[world, i1]
                 mu = propagation_row_mu[world, i1]
                 ba1 = propagation_body_a[world, i1]
@@ -8615,7 +8645,10 @@ def pgs_ncp_residuals_diagnostic_velocity(
 
         i2 = i + 2
         if i2 < propagation_max_constraints and i2 < m_propagation:
-            if propagation_row_type[world, i2] == PGS_CONSTRAINT_TYPE_FRICTION and propagation_row_parent[world, i2] == i:
+            if (
+                propagation_row_type[world, i2] == PGS_CONSTRAINT_TYPE_FRICTION
+                and propagation_row_parent[world, i2] == i
+            ):
                 lt2 = propagation_impulses[world, i2]
                 if mu == 0.0:
                     mu = propagation_row_mu[world, i2]
