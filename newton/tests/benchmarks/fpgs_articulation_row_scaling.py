@@ -38,7 +38,6 @@ if str(_NEWTON_REPO) not in sys.path:
 import newton  # noqa: E402
 from newton.solvers import SolverFeatherPGS  # noqa: E402
 
-
 PROPAGATION_PATHS = ("propagation", "propagation-fused")
 
 
@@ -53,6 +52,7 @@ class BenchCase:
     links: int = 0
     contacts_per_articulation: int = 0
     joint_armature: float = 0.0
+    spawn_penetration: float = 0.012
 
 
 @dataclass
@@ -183,9 +183,7 @@ def _build_free_free_builder(case: BenchCase) -> tuple[newton.ModelBuilder, tupl
     for i in range(case.free_pairs):
         x = i * spacing
         lower = builder.add_body(xform=wp.transform(wp.vec3(x, 0.0, 0.5), wp.quat_identity()))
-        upper = builder.add_body(
-            xform=wp.transform(wp.vec3(x, 0.0, 0.5 + 2.0 * hz - penetration), wp.quat_identity())
-        )
+        upper = builder.add_body(xform=wp.transform(wp.vec3(x, 0.0, 0.5 + 2.0 * hz - penetration), wp.quat_identity()))
         builder.add_shape_box(lower, hx=hx, hy=hy, hz=hz)
         builder.add_shape_box(upper, hx=hx, hy=hy, hz=hz)
 
@@ -222,7 +220,7 @@ def _build_articulated_free_builder(case: BenchCase) -> tuple[newton.ModelBuilde
     if max_slots_per_link > 2:
         link_hy = max(link_hy, 0.5 * (max_slots_per_link - 1) * contact_slot_spacing + cube_h + 0.01)
     link_hz = 0.045
-    penetration = 0.012
+    penetration = case.spawn_penetration
     art_spacing_y = 0.55
     base_z = 0.5
 
@@ -593,8 +591,7 @@ def _run_case_path(
         propagation_counts = propagation_count_array.numpy().astype(np.int64, copy=False)
     rigid_contacts = int(contacts.rigid_contact_count.numpy()[0])
     propagation_active = bool(
-        solver.articulated_contact_response in PROPAGATION_PATHS
-        and np.sum(propagation_counts) > 0
+        solver.articulated_contact_response in PROPAGATION_PATHS and np.sum(propagation_counts) > 0
     )
 
     result = RunResult(
@@ -653,10 +650,28 @@ def _cases_for_preset(preset: str) -> list[BenchCase]:
                 links=4,
                 contacts_per_articulation=2,
             ),
-            BenchCase("chain_depth", "L=2,boxes=2", "articulated_free", articulations=1, links=2, contacts_per_articulation=2),
-            BenchCase("chain_depth", "L=4,boxes=4", "articulated_free", articulations=1, links=4, contacts_per_articulation=4),
-            BenchCase("articulation_count", "A=1,L=4", "articulated_free", articulations=1, links=4, contacts_per_articulation=1),
-            BenchCase("articulation_count", "A=2,L=4", "articulated_free", articulations=2, links=4, contacts_per_articulation=1),
+            BenchCase(
+                "chain_depth", "L=2,boxes=2", "articulated_free", articulations=1, links=2, contacts_per_articulation=2
+            ),
+            BenchCase(
+                "chain_depth", "L=4,boxes=4", "articulated_free", articulations=1, links=4, contacts_per_articulation=4
+            ),
+            BenchCase(
+                "articulation_count",
+                "A=1,L=4",
+                "articulated_free",
+                articulations=1,
+                links=4,
+                contacts_per_articulation=1,
+            ),
+            BenchCase(
+                "articulation_count",
+                "A=2,L=4",
+                "articulated_free",
+                articulations=2,
+                links=4,
+                contacts_per_articulation=1,
+            ),
         ]
     if preset == "default":
         return [
@@ -687,14 +702,60 @@ def _cases_for_preset(preset: str) -> list[BenchCase]:
                 links=64,
                 contacts_per_articulation=32,
             ),
-            BenchCase("chain_depth", "L=2,boxes=2", "articulated_free", articulations=1, links=2, contacts_per_articulation=2),
-            BenchCase("chain_depth", "L=8,boxes=8", "articulated_free", articulations=1, links=8, contacts_per_articulation=8),
-            BenchCase("chain_depth", "L=32,boxes=32", "articulated_free", articulations=1, links=32, contacts_per_articulation=32),
-            BenchCase("chain_depth", "L=64,boxes=64", "articulated_free", articulations=1, links=64, contacts_per_articulation=64),
-            BenchCase("articulation_count", "A=1,L=16", "articulated_free", articulations=1, links=16, contacts_per_articulation=1),
-            BenchCase("articulation_count", "A=2,L=16", "articulated_free", articulations=2, links=16, contacts_per_articulation=1),
-            BenchCase("articulation_count", "A=16,L=16", "articulated_free", articulations=16, links=16, contacts_per_articulation=1),
-            BenchCase("articulation_count", "A=64,L=16", "articulated_free", articulations=64, links=16, contacts_per_articulation=1),
+            BenchCase(
+                "chain_depth", "L=2,boxes=2", "articulated_free", articulations=1, links=2, contacts_per_articulation=2
+            ),
+            BenchCase(
+                "chain_depth", "L=8,boxes=8", "articulated_free", articulations=1, links=8, contacts_per_articulation=8
+            ),
+            BenchCase(
+                "chain_depth",
+                "L=32,boxes=32",
+                "articulated_free",
+                articulations=1,
+                links=32,
+                contacts_per_articulation=32,
+            ),
+            BenchCase(
+                "chain_depth",
+                "L=64,boxes=64",
+                "articulated_free",
+                articulations=1,
+                links=64,
+                contacts_per_articulation=64,
+            ),
+            BenchCase(
+                "articulation_count",
+                "A=1,L=16",
+                "articulated_free",
+                articulations=1,
+                links=16,
+                contacts_per_articulation=1,
+            ),
+            BenchCase(
+                "articulation_count",
+                "A=2,L=16",
+                "articulated_free",
+                articulations=2,
+                links=16,
+                contacts_per_articulation=1,
+            ),
+            BenchCase(
+                "articulation_count",
+                "A=16,L=16",
+                "articulated_free",
+                articulations=16,
+                links=16,
+                contacts_per_articulation=1,
+            ),
+            BenchCase(
+                "articulation_count",
+                "A=64,L=16",
+                "articulated_free",
+                articulations=64,
+                links=16,
+                contacts_per_articulation=1,
+            ),
         ]
     if preset == "stress":
         cases: list[BenchCase] = []
@@ -818,7 +879,9 @@ def _cases_for_preset(preset: str) -> list[BenchCase]:
     raise ValueError(f"unknown preset {preset!r}")
 
 
-def _add_error_columns(results: list[RunResult], final_states: dict[tuple[str, str, str], dict[str, np.ndarray]]) -> None:
+def _add_error_columns(
+    results: list[RunResult], final_states: dict[tuple[str, str, str], dict[str, np.ndarray]]
+) -> None:
     for result in results:
         if result.case_kind == "free_free":
             # Free/free controls execute the same existing MF kernel in both
@@ -937,9 +1000,7 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
         lines.append(
             "| case | path | D | cap dense/mf/propagation | rows dense/mf/propagation | contacts | ms/step | process peak GPU MB | legacy device peak GPU MB | qd rel L2 | qd abs Linf | state Linf |"
         )
-        lines.append(
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
-        )
+        lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
         for result in results:
             if result.sweep != sweep:
                 continue
@@ -954,11 +1015,7 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
                         f"{result.dense_rows_total}/{result.mf_rows_total}/{result.propagation_rows_total}",
                         str(result.rigid_contacts),
                         _fmt(result.ms_per_step),
-                        _fmt(
-                            result.process_peak_gpu_mem_bytes / 1.0e6
-                            if result.process_peak_gpu_mem_bytes
-                            else None
-                        ),
+                        _fmt(result.process_peak_gpu_mem_bytes / 1.0e6 if result.process_peak_gpu_mem_bytes else None),
                         _fmt(result.peak_gpu_mem_bytes / 1.0e6 if result.peak_gpu_mem_bytes else None),
                         _fmt(result.joint_qd_rel_l2),
                         _fmt(result.joint_qd_abs_linf),
@@ -988,12 +1045,8 @@ def _write_plot(path: Path, results: list[RunResult]) -> None:
         paths = list(dict.fromkeys(result.path for result in sweep_results))
         width = min(0.8 / max(len(paths), 1), 0.35)
         for path_idx, path_name in enumerate(paths):
-            path_results = {
-                result.label: result for result in sweep_results if result.path == path_name
-            }
-            values = [
-                path_results[label].ms_per_step if label in path_results else math.nan for label in labels
-            ]
+            path_results = {result.label: result for result in sweep_results if result.path == path_name}
+            values = [path_results[label].ms_per_step if label in path_results else math.nan for label in labels]
             offset = (path_idx - 0.5 * (len(paths) - 1)) * width
             axes[row_idx][0].bar(x + offset, values, width=width, label=path_name)
             mem = []
@@ -1064,7 +1117,9 @@ def main() -> None:
     if args.out_dir is None:
         args.out_dir = Path("artifacts/fpgs_articulation_row_scaling") / args.preset
     if args.repeats is None:
-        args.repeats = 1 if args.preset == "smoke" else 2 if args.preset == "env_scale" else 4 if args.preset == "stress" else 8
+        args.repeats = (
+            1 if args.preset == "smoke" else 2 if args.preset == "env_scale" else 4 if args.preset == "stress" else 8
+        )
     if args.warmups is None:
         args.warmups = 1 if args.preset in ("smoke", "env_scale") else 2
     if args.pgs_iterations is None:
@@ -1074,18 +1129,12 @@ def main() -> None:
     cases = _cases_for_preset(args.preset)
     if args.joint_armature != 0.0:
         cases = [
-            replace(case, joint_armature=args.joint_armature)
-            if case.case_kind == "articulated_free"
-            else case
+            replace(case, joint_armature=args.joint_armature) if case.case_kind == "articulated_free" else case
             for case in cases
         ]
     if args.case:
         requested = set(args.case)
-        cases = [
-            case
-            for case in cases
-            if case.label in requested or f"{case.sweep}|{case.label}" in requested
-        ]
+        cases = [case for case in cases if case.label in requested or f"{case.sweep}|{case.label}" in requested]
         if not cases:
             raise ValueError(f"--case filters did not match any {args.preset!r} cases: {sorted(requested)}")
 
