@@ -2439,6 +2439,9 @@ class SolverFeatherPGS(SolverBase):
         # hardware block-slot limit at 24 warps/SM while 64-thread blocks reach
         # the full 48, doubling resident serial GS chains at large env counts.
         self._propagation_gs_worlds_per_block = 2
+        # See the fused-kernel construction below: packing hurts the fused
+        # kernel, so it keeps one world per block.
+        self._propagation_fused_worlds_per_block = 1
         if model.device.is_cuda and self._propagation_contacts_enabled() and self.propagation_max_constraints > 0:
             self._pgs_solve_propagation_kernel = _get_pgs_solve_propagation_contact_kernel(
                 self.propagation_max_constraints,
@@ -2453,6 +2456,12 @@ class SolverFeatherPGS(SolverBase):
                     and self.mf_max_constraints > 0
                     and self.max_world_dofs > 0
                 ):
+                    # Measured on RTX 5080: packing two worlds per block makes the
+                    # fused kernel ~20% slower despite higher occupancy (28 vs 24
+                    # worlds/SM). Unlike the split row solve, the fused kernel
+                    # re-reads its per-world rows every iteration, so it is bound
+                    # by cache reuse rather than latency hiding, and extra
+                    # resident worlds dilute L1/L2. Keep one world per block.
                     self._pgs_solve_propagation_full_iteration_kernel = (
                         _get_pgs_solve_propagation_full_iteration_kernel(
                             self.dense_max_constraints,
@@ -2462,6 +2471,7 @@ class SolverFeatherPGS(SolverBase):
                             self.max_propagation_bodies,
                             int(fused_size),
                             device_arch,
+                            worlds_per_block=self._propagation_fused_worlds_per_block,
                         )
                     )
                 else:
@@ -3236,11 +3246,13 @@ class SolverFeatherPGS(SolverBase):
                 "full-iteration kernel is available for this model and device"
             )
 
+        wpb = self._propagation_fused_worlds_per_block
         with self._sync_timed(f"prop_full_iteration_iters{iterations}"):
             wp.launch_tiled(
                 kernel,
-                dim=[self.world_count],
+                dim=[(self.world_count + wpb - 1) // wpb],
                 inputs=[
+                    self.world_count,
                     self.constraint_count,
                     self.world_dof_start,
                     dense_rhs,
@@ -3309,7 +3321,7 @@ class SolverFeatherPGS(SolverBase):
                     self.propagation_body_impulses,
                     self.v_out,
                 ],
-                block_dim=32,
+                block_dim=32 * wpb,
                 device=self.model.device,
             )
 
@@ -8578,6 +8590,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     max_propagation_bodies: int,
     target_size: int,
     device_arch: str,
+    worlds_per_block: int = 1,
 ) -> "wp.Kernel":
     """Build a block-per-world kernel that fuses the whole propagation GS iteration.
 
@@ -8600,6 +8613,9 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xffffffffu;
     const int lane = threadIdx.x & 31;
+    const int _slot = threadIdx.x >> 5;
+    const int world = tile * __W__ + _slot;
+    if (world >= world_count) return;
 
     int m_dense = world_constraint_count.data[world];
     int m_mf = mf_constraint_count.data[world];
@@ -8616,18 +8632,36 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     const int mf6_base = world * __M_MF__ * 6;
     const int prop_world_base = world * __M_PROP__;
 
-    __shared__ float s_v[__D__];
-    __shared__ float s_lam_dense[__M_D__];
-    __shared__ float s_rhs_dense[__M_D__];
-    __shared__ float s_diag_dense[__M_D__];
-    __shared__ int s_rtype_dense[__M_D__];
-    __shared__ int s_parent_dense[__M_D__];
-    __shared__ float s_mu_dense[__M_D__];
-    __shared__ float s_drive_target_dense[__M_D__];
-    __shared__ float s_drive_vel_mul_dense[__M_D__];
-    __shared__ float s_drive_imp_mul_dense[__M_D__];
-    __shared__ float s_drive_max_imp_dense[__M_D__];
-    __shared__ float s_lam_mf[__M_MF__];
+    // One slot of every shared array per packed world; the reference bindings
+    // keep the original names so the kernel body is world-count agnostic.
+    __shared__ float _sh_v[__W__][__D__];
+    __shared__ float _sh_lam_dense[__W__][__M_D__];
+    __shared__ float _sh_rhs_dense[__W__][__M_D__];
+    __shared__ float _sh_diag_dense[__W__][__M_D__];
+    __shared__ int _sh_rtype_dense[__W__][__M_D__];
+    __shared__ int _sh_parent_dense[__W__][__M_D__];
+    __shared__ float _sh_mu_dense[__W__][__M_D__];
+    __shared__ float _sh_drive_target_dense[__W__][__M_D__];
+    __shared__ float _sh_drive_vel_mul_dense[__W__][__M_D__];
+    __shared__ float _sh_drive_imp_mul_dense[__W__][__M_D__];
+    __shared__ float _sh_drive_max_imp_dense[__W__][__M_D__];
+    __shared__ float _sh_lam_mf[__W__][__M_MF__];
+    typedef float _arr_d_t[__D__];
+    typedef float _arr_md_f_t[__M_D__];
+    typedef int _arr_md_i_t[__M_D__];
+    typedef float _arr_mf_t[__M_MF__];
+    _arr_d_t& s_v = _sh_v[_slot];
+    _arr_md_f_t& s_lam_dense = _sh_lam_dense[_slot];
+    _arr_md_f_t& s_rhs_dense = _sh_rhs_dense[_slot];
+    _arr_md_f_t& s_diag_dense = _sh_diag_dense[_slot];
+    _arr_md_i_t& s_rtype_dense = _sh_rtype_dense[_slot];
+    _arr_md_i_t& s_parent_dense = _sh_parent_dense[_slot];
+    _arr_md_f_t& s_mu_dense = _sh_mu_dense[_slot];
+    _arr_md_f_t& s_drive_target_dense = _sh_drive_target_dense[_slot];
+    _arr_md_f_t& s_drive_vel_mul_dense = _sh_drive_vel_mul_dense[_slot];
+    _arr_md_f_t& s_drive_imp_mul_dense = _sh_drive_imp_mul_dense[_slot];
+    _arr_md_f_t& s_drive_max_imp_dense = _sh_drive_max_imp_dense[_slot];
+    _arr_mf_t& s_lam_mf = _sh_lam_mf[_slot];
 
     for (int d = lane; d < __D__; d += 32) {
         s_v[d] = v_out.data[w_dof_start + d];
@@ -9271,6 +9305,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         "__D__": str(D),
         "__M_PROP__": str(M_PROP),
         "__B_PROP__": str(B_PROP),
+        "__W__": str(max(int(worlds_per_block), 1)),
         "__CONTACT_TYPE__": str(contact_type),
         "__FRICTION_TYPE__": str(friction_type),
     }
@@ -9279,7 +9314,8 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_full_iteration_native(
-        world: int,
+        tile: int,
+        world_count: int,
         world_constraint_count: wp.array[int],
         world_dof_start: wp.array[int],
         rhs_bias: wp.array2d[float],
@@ -9348,6 +9384,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     ): ...
 
     def pgs_solve_propagation_full_iteration_template(
+        world_count: int,
         world_constraint_count: wp.array[int],
         world_dof_start: wp.array[int],
         rhs_bias: wp.array2d[float],
@@ -9414,9 +9451,10 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         propagation_body_impulses: wp.array2d[float],
         v_out: wp.array[float],
     ):
-        world, _lane = wp.tid()
+        tile, _lane = wp.tid()
         pgs_solve_propagation_full_iteration_native(
-            world,
+            tile,
+            world_count,
             world_constraint_count,
             world_dof_start,
             rhs_bias,
@@ -9484,7 +9522,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
             v_out,
         )
 
-    name = f"pgs_solve_propagation_full_iteration_{M_D}_{M_MF}_{D}_{M_PROP}_{B_PROP}_{target_size}"
+    name = f"pgs_solve_propagation_full_iteration_{M_D}_{M_MF}_{D}_{M_PROP}_{B_PROP}_{target_size}_w{max(int(worlds_per_block), 1)}"
     pgs_solve_propagation_full_iteration_template.__name__ = name
     pgs_solve_propagation_full_iteration_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_full_iteration_template)
@@ -10221,6 +10259,7 @@ def _get_pgs_solve_mf_gs_kernel(
     max_world_dofs: int,
     device_arch: str,
     friction_mode: str = "current",
+    software_pipeline: bool = True,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -10294,6 +10333,29 @@ def _get_pgs_solve_mf_gs_kernel(
                 s_v[{d_expr}] += cur_dY_{k} * delta_impulse;
             }}""")
     dense_v_update_code = "\n".join(dense_v_update_parts)
+
+    if not software_pipeline:
+        # Direct-load variant: no double-buffer registers, J/Y read at use.
+        dense_pipe_decl = ""
+        dense_prefetch_init_code = ";"
+        dense_prefetch_next_code = ";"
+        dense_consume_code = f"const int cur_jy_base = jy_world_base + i * {D};"
+        dot_parts = []
+        upd_parts = []
+        for k in range(ELEMS_PER_LANE):
+            d_expr = f"lane + {k * 32}" if k > 0 else "lane"
+            dot_parts.append(f"""
+            if ({d_expr} < {D}) {{
+                my_sum += J_world.data[cur_jy_base + {d_expr}] * s_v[{d_expr}];
+            }}""")
+            upd_parts.append(f"""
+            if ({d_expr} < {D} &&
+                (defer_dense_response == 0 ||
+                 world_deferred_dof_mask.data[deferred_mask_base + {d_expr}] == 0)) {{
+                s_v[{d_expr}] += Y_world.data[cur_jy_base + {d_expr}] * delta_impulse;
+            }}""")
+        dense_dot_code = "\n".join(["float my_sum = 0.0f;", *dot_parts])
+        dense_v_update_code = "\n".join(upd_parts)
 
     # Dense sibling v update — NOT pipelined (random sib index)
     dense_sib_v_parts = []
@@ -11573,6 +11635,8 @@ def _get_pgs_solve_mf_gs_kernel(
         )
 
     name = f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
+    if not software_pipeline:
+        name += "_nopipe"
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
