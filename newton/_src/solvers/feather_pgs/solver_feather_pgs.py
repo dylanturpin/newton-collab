@@ -11221,8 +11221,12 @@ def _get_pgs_solve_mf_gs_kernel(
         s_drive_imp_mul_dense[i] = world_drive_impulse_multiplier.data[off_dense + i];
         s_drive_max_imp_dense[i] = world_drive_max_impulse.data[off_dense + i];
     }}
-    for (int i = lane; i < m_mf; i += 32) {{
-        s_lam_mf[i] = mf_impulses.data[off_mf + i];
+    if (row_phase != 3) {{
+        // Phase 3 (drive/position-limit rows) touches no MF rows in either
+        // MF section; skip staging the impulses entirely.
+        for (int i = lane; i < m_mf; i += 32) {{
+            s_lam_mf[i] = mf_impulses.data[off_mf + i];
+        }}
     }}
     for (int d = lane; d < {D}; d += 32) {{
         s_v[d] = v_out.data[w_dof_start + d];
@@ -11345,6 +11349,11 @@ def _get_pgs_solve_mf_gs_kernel(
         }}
 
         // ── Phase 2: MF constraints (6-DOF per body, software-pipelined) ──
+        // MF contact/friction rows only exist in phases 0/1/4. The guard sits
+        // OUTSIDE the loop: phase-3/5 launches previously prefetch-scanned
+        // every MF row (meta + J/MiJt) only to discard it, which dominated
+        // split-propagation scheduling cost on free-object-heavy scenes.
+        if (row_phase == 0 || row_phase == 1 || row_phase == 4) {{
 
         // Pipeline registers: prefetch next constraint's global data
         int4 pre_meta;
@@ -11385,8 +11394,6 @@ def _get_pgs_solve_mf_gs_kernel(
                     pre_MiJtb = mf_MiJt_b.data[next_mf6 + lane - 6];
                 }}
             }}
-
-            if (row_phase == 2 || row_phase == 3 || row_phase == 5) continue;
 
             // Process constraint i
             int packed_dofs = meta.x;
@@ -11454,6 +11461,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 }}
             }}
             __syncwarp();
+        }}
         }}
 
         // ── Final velocity-limit phase ──
@@ -11553,8 +11561,10 @@ def _get_pgs_solve_mf_gs_kernel(
     for (int i = lane; i < m_dense; i += 32) {{
         world_impulses.data[off_dense + i] = s_lam_dense[i];
     }}
-    for (int i = lane; i < m_mf; i += 32) {{
-        mf_impulses.data[off_mf + i] = s_lam_mf[i];
+    if (row_phase != 3) {{
+        for (int i = lane; i < m_mf; i += 32) {{
+            mf_impulses.data[off_mf + i] = s_lam_mf[i];
+        }}
     }}
 #endif
 """
