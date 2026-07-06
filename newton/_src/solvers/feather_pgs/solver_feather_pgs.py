@@ -1632,6 +1632,9 @@ class SolverFeatherPGS(SolverBase):
         # Set by allocate_world_contact_slots when a world received dense
         # contact rows this step; gates the propagation tree qd refresh.
         self.dense_contact_world_flag = wp.zeros((self.world_count,), dtype=wp.int32, device=device)
+        # First MF slot past the contact/friction rows (start of the
+        # velocity-limit tail); snapshotted from mf_slot_counter each step.
+        self.mf_contact_rows_end = wp.zeros((self.world_count,), dtype=wp.int32, device=device)
         self.contact_path = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self._debug_position_rigid_contact_count = (
             wp.zeros((1,), dtype=wp.int32, device=device) if self._debug_buffers_enabled else None
@@ -2732,6 +2735,7 @@ class SolverFeatherPGS(SolverBase):
                         self.drive_impulse_multiplier,
                         self.drive_max_impulse,
                         self.mf_constraint_count,
+                        self.mf_contact_rows_end,
                         mf_meta,
                         self.mf_impulses,
                         self.mf_J_a,
@@ -3275,6 +3279,7 @@ class SolverFeatherPGS(SolverBase):
                     self.drive_impulse_multiplier,
                     self.drive_max_impulse,
                     self.mf_constraint_count,
+                    self.mf_contact_rows_end,
                     mf_meta,
                     self.mf_impulses,
                     self.mf_J_a,
@@ -5633,6 +5638,13 @@ class SolverFeatherPGS(SolverBase):
         # last MF slots; the fused PGS kernel also solves row_type=4 in a
         # final phase so articulated and rigid velocity-limit rows are both
         # visited after drive/contact/friction/position-limit rows.
+        if mf_active:
+            # Contact/friction rows all precede velocity-limit rows in the MF
+            # slot space (the classifier completes before the vlim allocation
+            # below). Record the partition boundary so the GS kernels can loop
+            # only the contact prefix in contact phases and only the vlim tail
+            # in velocity-limit phases instead of scanning all rows.
+            wp.copy(self.mf_contact_rows_end, self.mf_slot_counter)
         if mf_active and self.rigid_velocity_limit_slot is not None:
             # Dummy when no articulation metadata exists; the kernel only
             # reads it for free-rigid roots, which then cannot occur.
@@ -8675,6 +8687,8 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     if (m_dense > __M_D__) m_dense = __M_D__;
     if (m_mf > __M_MF__) m_mf = __M_MF__;
     if (m_prop > __M_PROP__) m_prop = __M_PROP__;
+    int mf_contact_end = mf_contact_rows_end.data[world];
+    if (mf_contact_end > m_mf) mf_contact_end = m_mf;
 
     const int w_dof_start = world_dof_start.data[world];
     const int off_dense = world * __M_D__;
@@ -8834,8 +8848,31 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
             }
 
             if (row_phase != 3) {
-                for (int i = 0; i < m_mf; ++i) {
-                    const int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);
+                // phase 4 visits the contact prefix, phase 5 the vlim tail.
+                // Software pipeline: meta and each lane's J value are
+                // prefetched one row ahead (same double-buffer as the split
+                // GS kernel), so their load latency overlaps the previous
+                // row's shuffles and impulse update.
+                const int mf_lo = (row_phase == 5) ? mf_contact_end : 0;
+                const int mf_hi = (row_phase == 4) ? mf_contact_end : m_mf;
+                int4 pf_meta;
+                float pf_Ja = 0.0f, pf_Jb = 0.0f;
+                if (mf_lo < mf_hi) {
+                    pf_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + mf_lo * 4]);
+                    const int mf6_0 = mf6_base + mf_lo * 6;
+                    if (lane < 6) pf_Ja = mf_J_a.data[mf6_0 + lane];
+                    if (lane >= 6 && lane < 12) pf_Jb = mf_J_b.data[mf6_0 + lane - 6];
+                }
+                for (int i = mf_lo; i < mf_hi; ++i) {
+                    const int4 meta = pf_meta;
+                    const float cur_Ja = pf_Ja;
+                    const float cur_Jb = pf_Jb;
+                    if (i + 1 < mf_hi) {
+                        pf_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i + 1) * 4]);
+                        const int mf6_n = mf6_base + (i + 1) * 6;
+                        if (lane < 6) pf_Ja = mf_J_a.data[mf6_n + lane];
+                        if (lane >= 6 && lane < 12) pf_Jb = mf_J_b.data[mf6_n + lane - 6];
+                    }
                     const int packed_dofs = meta.x;
                     const int dof_a = packed_dofs >> 16;
                     const int dof_b = (packed_dofs << 16) >> 16;
@@ -8858,11 +8895,11 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     const int row_mf6 = mf6_base + i * 6;
                     float my_sum = 0.0f;
                     if (lane < 6 && dof_a >= 0) {
-                        my_sum = mf_J_a.data[row_mf6 + lane] * s_v[dof_a + lane];
+                        my_sum = cur_Ja * s_v[dof_a + lane];
                     }
                     if (lane >= 6 && lane < 12 && dof_b >= 0) {
                         const int k = lane - 6;
-                        my_sum = mf_J_b.data[row_mf6 + k] * s_v[dof_b + k];
+                        my_sum = cur_Jb * s_v[dof_b + k];
                     }
                     for (int shfl = 16; shfl > 0; shfl >>= 1) {
                         my_sum += __shfl_down_sync(MASK, my_sum, shfl);
@@ -9383,6 +9420,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         world_drive_impulse_multiplier: wp.array2d[float],
         world_drive_max_impulse: wp.array2d[float],
         mf_constraint_count: wp.array[int],
+        mf_contact_rows_end: wp.array[int],
         mf_meta: wp.array2d[int],
         mf_impulses: wp.array2d[float],
         mf_J_a: wp.array3d[float],
@@ -9452,6 +9490,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         world_drive_impulse_multiplier: wp.array2d[float],
         world_drive_max_impulse: wp.array2d[float],
         mf_constraint_count: wp.array[int],
+        mf_contact_rows_end: wp.array[int],
         mf_meta: wp.array2d[int],
         mf_impulses: wp.array2d[float],
         mf_J_a: wp.array3d[float],
@@ -9522,6 +9561,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
             world_drive_impulse_multiplier,
             world_drive_max_impulse,
             mf_constraint_count,
+            mf_contact_rows_end,
             mf_meta,
             mf_impulses,
             mf_J_a,
@@ -11181,6 +11221,8 @@ def _get_pgs_solve_mf_gs_kernel(
     if (m_dense == 0 && m_mf == 0) return;
     if (m_dense > {M_D}) m_dense = {M_D};
     if (m_mf > {M_MF}) m_mf = {M_MF};
+    int mf_contact_end = mf_contact_rows_end.data[world];
+    if (mf_contact_end > m_mf) mf_contact_end = m_mf;
 
     int w_dof_start = world_dof_start.data[world];
     int off_dense = world * {M_D};
@@ -11360,8 +11402,8 @@ def _get_pgs_solve_mf_gs_kernel(
         float pre_Ja = 0.0f, pre_Jb = 0.0f;
         float pre_MiJta = 0.0f, pre_MiJtb = 0.0f;
 
-        // Prefetch constraint 0
-        if (m_mf > 0) {{
+        // Prefetch constraint 0 (contact/friction rows occupy [0, mf_contact_end))
+        if (mf_contact_end > 0) {{
             pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta]);
             if (lane < 6) {{
                 pre_Ja = mf_J_a.data[mf6_base + lane];
@@ -11373,7 +11415,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
         }}
 
-        for (int i = 0; i < m_mf; i++) {{
+        for (int i = 0; i < mf_contact_end; i++) {{
             // Consume prefetched data for constraint i
             int4 meta = pre_meta;
             float cur_Ja = pre_Ja;
@@ -11382,7 +11424,7 @@ def _get_pgs_solve_mf_gs_kernel(
             float cur_MiJtb = pre_MiJtb;
 
             // Prefetch constraint i+1 (loads issued now, complete during compute)
-            if (i + 1 < m_mf) {{
+            if (i + 1 < mf_contact_end) {{
                 int next_mf6 = mf6_base + (i + 1) * 6;
                 pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + (i + 1) * 4]);
                 if (lane < 6) {{
@@ -11506,7 +11548,7 @@ def _get_pgs_solve_mf_gs_kernel(
         }}
 
         if (row_phase == 0 || row_phase == 2 || row_phase == 5) {{
-            for (int i = 0; i < m_mf; i++) {{
+            for (int i = mf_contact_end; i < m_mf; i++) {{
                 int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);
                 int packed_tp = meta.w;
                 int mf_rt = packed_tp & 0xFFFF;
@@ -11626,6 +11668,7 @@ def _get_pgs_solve_mf_gs_kernel(
         world_drive_max_impulse: wp.array2d[float],
         # MF
         mf_constraint_count: wp.array[int],
+        mf_contact_rows_end: wp.array[int],
         mf_meta: wp.array2d[int],
         mf_impulses: wp.array2d[float],
         mf_J_a: wp.array3d[float],
@@ -11664,6 +11707,7 @@ def _get_pgs_solve_mf_gs_kernel(
         world_drive_max_impulse: wp.array2d[float],
         # MF
         mf_constraint_count: wp.array[int],
+        mf_contact_rows_end: wp.array[int],
         mf_meta: wp.array2d[int],
         mf_impulses: wp.array2d[float],
         mf_J_a: wp.array3d[float],
@@ -11701,6 +11745,7 @@ def _get_pgs_solve_mf_gs_kernel(
             world_drive_impulse_multiplier,
             world_drive_max_impulse,
             mf_constraint_count,
+            mf_contact_rows_end,
             mf_meta,
             mf_impulses,
             mf_J_a,
