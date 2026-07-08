@@ -299,6 +299,7 @@ class SolverFeatherPGS(SolverBase):
         mf_warmstart_decay: float = 1.0,
         pgs_mode: str = "split",
         articulated_contact_response: Literal["immediate", "propagation", "propagation-fused"] = "immediate",
+        propagation_same_articulation_rows: bool = False,
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
         mf_max_constraints: int = 512,
@@ -577,6 +578,17 @@ class SolverFeatherPGS(SolverBase):
             )
         self.articulated_contact_response = articulated_contact_response
         self.propagation_full_fused_iterations = articulated_contact_response == "propagation-fused"
+        if propagation_same_articulation_rows and articulated_contact_response == "immediate":
+            raise ValueError(
+                "propagation_same_articulation_rows requires articulated_contact_response "
+                "'propagation' or 'propagation-fused'"
+            )
+        if propagation_same_articulation_rows and articulated_contact_response == "propagation-fused":
+            raise NotImplementedError(
+                "propagation_same_articulation_rows is not supported on the fused path yet; "
+                "use articulated_contact_response='propagation'"
+            )
+        self.propagation_same_articulation_rows = bool(propagation_same_articulation_rows)
         self.pgs_warmstart = pgs_warmstart
         if self.pgs_warmstart and self.contact_friction_position_iterations >= 0:
             raise NotImplementedError(
@@ -5269,6 +5281,7 @@ class SolverFeatherPGS(SolverBase):
                     is_free_rigid,
                     has_free_rigid_flag,
                     propagation_flag,
+                    1 if self.propagation_same_articulation_rows else 0,
                     max_constraints,
                     self.mf_max_constraints,
                     self.propagation_max_constraints,

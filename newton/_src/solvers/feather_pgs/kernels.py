@@ -2576,6 +2576,7 @@ def allocate_world_contact_slots(
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
     propagation_articulated_contacts: int,
+    propagation_same_articulation: int,
     max_constraints: int,
     mf_max_constraints: int,
     propagation_max_constraints: int,
@@ -2690,10 +2691,13 @@ def allocate_world_contact_slots(
         a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
         b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
         # Same-articulation two-link contacts need cross response terms between
-        # the two touched links. Keep those on the dense generalized-row path.
+        # the two touched links. They route to propagation rows only when the
+        # cross-response path is enabled; otherwise they stay on the dense
+        # generalized-row path.
         same_non_free_articulation = a_non_free and b_non_free and art_a == art_b
-        if (a_non_free or b_non_free) and not same_non_free_articulation:
-            is_propagation = 1
+        if a_non_free or b_non_free:
+            if propagation_same_articulation != 0 or not same_non_free_articulation:
+                is_propagation = 1
 
     friction_anchor_rank = int(0)
     if contact_friction_anchor_limit > 0:
