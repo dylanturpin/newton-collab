@@ -120,6 +120,7 @@ from .kernels import (
     prepare_world_impulses,
     prescale_joint_velocity_limits,
     propagate_tree_impulses_for_size,
+    refine_same_articulation_propagation_rows,
     refresh_propagation_free_body_qd_from_vout,
     refresh_propagation_tree_body_qd_for_size,
     rhs_accum_world_par_art,
@@ -439,6 +440,12 @@ class SolverFeatherPGS(SolverBase):
                 kernel for supported homogeneous non-free articulation groups; unsupported cases raise
                 :class:`NotImplementedError` instead of falling back to split propagation.
                 Defaults to ``"immediate"``.
+            propagation_same_articulation_rows (bool, optional): Route contacts between two
+                links of the same articulation to propagation rows instead of dense generalized
+                rows. Their effective mass is recomputed with exact cross operational-space
+                response by propagating each row's combined test impulse through the articulated
+                body factorization. Requires ``articulated_contact_response="propagation"``.
+                Defaults to False (dense routing, prior behavior).
             pgs_schedule (str, optional): Matrix-free row ordering. ``"interleaved"`` preserves the
                 legacy per-iteration dense+matrix-free sweep. ``"contact_then_internal"`` runs all
                 contact/friction sweeps first, then all internal articulation sweeps (drive, joint
@@ -3121,6 +3128,52 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 device=self.model.device,
             )
+
+        if self.propagation_same_articulation_rows:
+            # Rows whose two bodies are links of one articulation get their
+            # MiJt/effective mass recomputed with exact cross response terms.
+            with self._sync_timed("prop_setup_same_art_rows"):
+                wp.launch(
+                    refine_same_articulation_propagation_rows,
+                    dim=self.model.articulation_count,
+                    inputs=[
+                        self.is_free_rigid,
+                        self.art_to_world,
+                        self.body_to_articulation,
+                        self.model.articulation_start,
+                        self.model.joint_parent,
+                        self.model.joint_child,
+                        self.model.joint_qd_start,
+                        self.model.joint_dof_dim,
+                        self.propagation_joint_S_flat,
+                        self.propagation_body_com_rel,
+                        self.propagation_tree_U,
+                        self.propagation_tree_D_inv,
+                        self.propagation_body_local_slot,
+                        self.propagation_constraint_count,
+                        self.propagation_body_a,
+                        self.propagation_body_b,
+                        self.propagation_J_a,
+                        self.propagation_J_b,
+                        self.propagation_phi,
+                        self.propagation_row_type,
+                        self.pgs_cfm,
+                        self.dense_contact_compliance,
+                        self.speculative_dense_contact_compliance,
+                        dt,
+                        self.propagation_max_constraints,
+                        self.propagation_tree_pA,
+                        self.propagation_tree_u,
+                        self.propagation_tree_qdd,
+                        self.propagation_tree_body_delta,
+                    ],
+                    outputs=[
+                        self.propagation_eff_mass_inv,
+                        self.propagation_MiJt_a,
+                        self.propagation_MiJt_b,
+                    ],
+                    device=self.model.device,
+                )
 
     def _compute_propagation_rhs_bias(
         self,

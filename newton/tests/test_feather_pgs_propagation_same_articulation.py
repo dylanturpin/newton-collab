@@ -263,18 +263,25 @@ class TestPropagationSameArticulation(unittest.TestCase):
                 f"{y_got} vs {y_ref}",
             )
 
+        checked = 0
         for contact in sorted(dense_rows):
             row = prop_rows[contact]
             g = X[body_a[row]].T @ J_a[row] + X[body_b[row]].T @ J_b[row]
             ref = float(g @ np.linalg.solve(H, g))
             got = prop_diag[row]
-            self.assertGreater(ref, 0.0)
+            if ref < 1.0e-6:
+                # Kinematically locked direction: true W_kk is zero, both
+                # sides must be at float noise level.
+                self.assertLess(abs(got), 1.0e-6)
+                continue
+            checked += 1
             rel = abs(got - ref) / ref
             self.assertLess(
                 rel, 1.0e-3,
                 f"contact {contact}: propagation W_kk {got:.6e} vs reference {ref:.6e} "
                 f"(rel {rel:.3e}) — cross response term missing or wrong",
             )
+        self.assertGreater(checked, 0, "no non-degenerate same-articulation rows were checked")
 
 
 if __name__ == "__main__":
