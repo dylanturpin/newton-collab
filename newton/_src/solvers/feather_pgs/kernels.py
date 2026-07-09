@@ -8922,8 +8922,13 @@ def pgs_ncp_residuals_diagnostic_velocity(
 # serial tail bucket (color PROPAGATION_COLOR_TAIL) processed by a per-world
 # ordered sweep — measured and reported, never silent.
 
-PROPAGATION_MAX_COLORS = 64
-PROPAGATION_COLOR_TAIL = 64
+PROPAGATION_MAX_COLORS = 256
+PROPAGATION_COLOR_TAIL = 256
+# round-tagged ticket key: (round << 23) | (0x7FFFFF - flat_row_id).
+# atomic_max prefers the current round over stale rounds (bigger high bits)
+# and the smallest row id within a round (bigger low bits), so tickets never
+# need re-initialization between rounds. Flat row ids must stay < 2^23.
+PROPAGATION_COLOR_ROW_ID_LIMIT = 1 << 23
 
 
 @wp.kernel(enable_backward=False)
@@ -8933,6 +8938,7 @@ def color_propagation_propose(
     propagation_body_b: wp.array2d[int],
     propagation_max_constraints: int,
     row_color: wp.array[int],
+    round_index: int,
     # out
     body_ticket: wp.array[int],
 ):
@@ -8943,12 +8949,13 @@ def color_propagation_propose(
         return
     if row_color[r] != -1:
         return
+    key = (round_index << 23) | (0x7FFFFF - r)
     ba = propagation_body_a[world, slot]
     bb = propagation_body_b[world, slot]
     if ba >= 0:
-        wp.atomic_min(body_ticket, ba, r)
+        wp.atomic_max(body_ticket, ba, key)
     if bb >= 0:
-        wp.atomic_min(body_ticket, bb, r)
+        wp.atomic_max(body_ticket, bb, key)
 
 
 @wp.kernel(enable_backward=False)
@@ -8958,10 +8965,9 @@ def color_propagation_commit(
     propagation_body_b: wp.array2d[int],
     propagation_max_constraints: int,
     body_ticket: wp.array[int],
+    round_index: int,
     # in/out
     row_color: wp.array[int],
-    body_mask_lo: wp.array[int],
-    body_mask_hi: wp.array[int],
 ):
     r = wp.tid()
     world = r // propagation_max_constraints
@@ -8970,48 +8976,15 @@ def color_propagation_commit(
         return
     if row_color[r] != -1:
         return
+    key = (round_index << 23) | (0x7FFFFF - r)
     ba = propagation_body_a[world, slot]
     bb = propagation_body_b[world, slot]
-    if ba >= 0 and body_ticket[ba] != r:
+    if ba >= 0 and body_ticket[ba] != key:
         return
-    if bb >= 0 and body_ticket[bb] != r:
+    if bb >= 0 and body_ticket[bb] != key:
         return
-
-    m_lo = int(0)
-    m_hi = int(0)
-    if ba >= 0:
-        m_lo = m_lo | body_mask_lo[ba]
-        m_hi = m_hi | body_mask_hi[ba]
-    if bb >= 0:
-        m_lo = m_lo | body_mask_lo[bb]
-        m_hi = m_hi | body_mask_hi[bb]
-
-    cand = int(PROPAGATION_COLOR_TAIL)
-    for c in range(32):
-        if ((m_lo >> c) & 1) == 0:
-            cand = c
-            break
-    if cand == PROPAGATION_COLOR_TAIL:
-        for c in range(32):
-            if ((m_hi >> c) & 1) == 0:
-                cand = 32 + c
-                break
-
-    row_color[r] = cand
-    if cand < 32:
-        bit = 1 << cand
-        # winner-per-body uniqueness (min ticket on every touched body) makes
-        # these single-writer this round; no atomics needed
-        if ba >= 0:
-            body_mask_lo[ba] = body_mask_lo[ba] | bit
-        if bb >= 0:
-            body_mask_lo[bb] = body_mask_lo[bb] | bit
-    elif cand < PROPAGATION_MAX_COLORS:
-        bit = 1 << (cand - 32)
-        if ba >= 0:
-            body_mask_hi[ba] = body_mask_hi[ba] | bit
-        if bb >= 0:
-            body_mask_hi[bb] = body_mask_hi[bb] | bit
+    # color = zero-based commit round; chromatic count tracks max body degree
+    row_color[r] = round_index - 1
 
 
 @wp.kernel(enable_backward=False)
@@ -9342,3 +9315,57 @@ def pgs_solve_propagation_colored_tail(
             propagation_body_qd,
             propagation_body_impulses,
         )
+
+
+@wp.kernel(enable_backward=False)
+def color_propagation_world_histogram(
+    propagation_constraint_count: wp.array[int],
+    propagation_max_constraints: int,
+    row_color: wp.array[int],
+    n_entries: int,
+    # out
+    world_color_counts: wp.array[int],
+):
+    r = wp.tid()
+    world = r // propagation_max_constraints
+    slot = r - world * propagation_max_constraints
+    if slot >= propagation_constraint_count[world]:
+        return
+    wp.atomic_add(world_color_counts, world * n_entries + row_color[r], 1)
+
+
+@wp.kernel(enable_backward=False)
+def color_propagation_world_scan(
+    world_color_counts: wp.array[int],
+    n_entries: int,
+    # out
+    world_color_offsets: wp.array[int],
+):
+    world = wp.tid()
+    base = world * n_entries
+    acc = int(0)
+    for c in range(n_entries):
+        world_color_offsets[base + c] = acc
+        acc += world_color_counts[base + c]
+
+
+@wp.kernel(enable_backward=False)
+def color_propagation_world_scatter(
+    propagation_constraint_count: wp.array[int],
+    propagation_max_constraints: int,
+    row_color: wp.array[int],
+    world_color_offsets: wp.array[int],
+    n_entries: int,
+    # in/out
+    world_color_cursor: wp.array[int],
+    # out
+    world_row_order: wp.array[int],
+):
+    r = wp.tid()
+    world = r // propagation_max_constraints
+    slot = r - world * propagation_max_constraints
+    if slot >= propagation_constraint_count[world]:
+        return
+    c = row_color[r]
+    idx = wp.atomic_add(world_color_cursor, world * n_entries + c, 1)
+    world_row_order[world * propagation_max_constraints + world_color_offsets[world * n_entries + c] + idx] = slot
