@@ -66,6 +66,7 @@ from .kernels import (
     build_propagation_contact_rows,
     cholesky_loop,
     clamp_augmented_joint_u0,
+    collect_propagation_units,
     color_propagation_assign_tail,
     color_propagation_commit,
     color_propagation_count_uncolored,
@@ -1678,6 +1679,7 @@ class SolverFeatherPGS(SolverBase):
         self._max_contacts_alloc = max_contacts
         self.contact_world = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_slot = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.contact_slots_needed = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
@@ -2357,6 +2359,11 @@ class SolverFeatherPGS(SolverBase):
             else:
                 self.color_world_offsets = wp.zeros((worlds * n_entries,), dtype=wp.int32, device=device)
                 self.color_world_row_order = wp.zeros((total_rows,), dtype=wp.int32, device=device)
+                self.color_unit_contact = wp.zeros((total_rows,), dtype=wp.int32, device=device)
+                self.color_unit_body_a = wp.zeros((total_rows,), dtype=wp.int32, device=device)
+                self.color_unit_body_b = wp.zeros((total_rows,), dtype=wp.int32, device=device)
+                self.color_unit_len = wp.zeros((total_rows,), dtype=wp.int32, device=device)
+                self.color_world_unit_cursor = wp.zeros((worlds,), dtype=wp.int32, device=device)
 
     def _allocate_debug_buffers(self, model):
         """Allocate buffers for PGS convergence diagnostics."""
@@ -2536,6 +2543,12 @@ class SolverFeatherPGS(SolverBase):
             and self.propagation_max_constraints > 0
         ):
             self._pgs_solve_propagation_colored_block_kernel = _get_pgs_solve_propagation_colored_block_kernel(
+                self.propagation_max_constraints,
+                PROPAGATION_COLOR_TAIL + 2,
+                self._propagation_colored_block_dim,
+                device_arch,
+            )
+            self._color_propagation_prebuild_kernel = _get_color_propagation_prebuild_kernel(
                 self.propagation_max_constraints,
                 PROPAGATION_COLOR_TAIL + 2,
                 self._propagation_colored_block_dim,
@@ -3277,7 +3290,11 @@ class SolverFeatherPGS(SolverBase):
         n_entries = PROPAGATION_COLOR_TAIL + 2
 
         if self.propagation_colored_layout == "block":
-            # one launch does everything per world: rounds, tail, counting sort
+            # v4: coloring already ran pre-build (contact_slot rewritten in
+            # color order; offsets and unit starts written there). Nothing to
+            # do per-step here.
+            return
+        if False:
             wp.launch_tiled(
                 self._color_propagation_block_kernel,
                 dim=[self.world_count],
@@ -5685,6 +5702,7 @@ class SolverFeatherPGS(SolverBase):
                     mf_slot_counter,
                     propagation_slot_counter,
                     self.dense_contact_world_flag,
+                    self.contact_slots_needed,
                 ],
                 device=model.device,
             )
@@ -5914,6 +5932,57 @@ class SolverFeatherPGS(SolverBase):
                         self.mf_row_mu,
                         self.mf_phi,
                     ],
+                    device=model.device,
+                )
+
+            if (
+                propagation_active
+                and self._propagation_colored
+                and self.propagation_colored_layout == "block"
+            ):
+                # v4 pre-build coloring: gather propagation contacts into
+                # per-world unit lists, color them, and rewrite contact_slot
+                # in color-sorted order so the row builder below writes every
+                # color segment into contiguous row memory.
+                self.color_world_unit_cursor.zero_()
+                wp.launch(
+                    collect_propagation_units,
+                    dim=contacts.rigid_contact_max,
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        self.contact_path,
+                        self.contact_world,
+                        contacts.rigid_contact_shape0,
+                        contacts.rigid_contact_shape1,
+                        model.shape_body,
+                        self.contact_slots_needed,
+                        self.propagation_max_constraints,
+                    ],
+                    outputs=[
+                        self.color_world_unit_cursor,
+                        self.color_unit_contact,
+                        self.color_unit_body_a,
+                        self.color_unit_body_b,
+                        self.color_unit_len,
+                    ],
+                    device=model.device,
+                )
+                wp.launch_tiled(
+                    self._color_propagation_prebuild_kernel,
+                    dim=[self.world_count],
+                    inputs=[
+                        self.world_count,
+                        self.color_world_unit_cursor,
+                        self.color_unit_contact,
+                        self.color_unit_body_a,
+                        self.color_unit_body_b,
+                        self.color_unit_len,
+                        self.color_body_ticket,
+                        self.contact_slot,
+                        self.color_world_row_order,
+                        self.color_world_offsets,
+                    ],
+                    block_dim=self._propagation_colored_block_dim,
                     device=model.device,
                 )
 
@@ -8787,6 +8856,193 @@ def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.K
 
 
 @cache
+def _get_color_propagation_prebuild_kernel(
+    propagation_max_constraints: int, n_color_entries: int, block_dim: int, device_arch: str
+) -> "wp.Kernel":
+    """Build the pre-build contact-unit coloring kernel (v4 layout).
+
+    Runs after contact classification and BEFORE row build: each block colors
+    its world's propagation contacts (round-tagged ticket bidding over a
+    compacted worklist, keys on global contact index for determinism of the
+    coloring), counting-sorts units by color, and rewrites ``contact_slot``
+    so the row builder writes every unit's rows at a color-ordered slot.
+    Color segments therefore occupy contiguous row memory and the colored
+    solve kernel's payload reads are sequential — no post-build permutation,
+    no staging copies. Also emits the unit-start order and per-color unit
+    offsets the solve kernel consumes.
+    """
+    M = propagation_max_constraints
+    NE = n_color_entries
+    B = int(block_dim)
+    cap = NE - 2  # color cap; index NE-2 is the tail bucket
+
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int world = tile;
+    if (world >= world_count) return;
+    int n_units = world_unit_cursor.data[world];
+    if (n_units > {M}) n_units = {M};
+    const int t = threadIdx.x;
+    if (n_units == 0) {{
+        for (int c = t; c < {NE}; c += {B}) world_color_offsets.data[world * {NE} + c] = 0;
+        return;
+    }}
+    const int world_base = world * {M};
+
+    __shared__ int s_n_work;
+    __shared__ int s_next_work;
+    __shared__ int s_counts[{NE}];
+    __shared__ int s_offsets[{NE}];
+    __shared__ short s_unit_color[{M}];
+    __shared__ short s_work[{M}];
+    __shared__ short s_work_next[{M}];
+    __shared__ short s_sorted[{M}];
+
+    if (t == 0) {{
+        s_n_work = n_units;
+        s_next_work = 0;
+    }}
+    for (int u = t; u < n_units; u += {B}) {{
+        s_unit_color[u] = -1;
+        s_work[u] = (short)u;
+        const int ba = unit_body_a.data[world_base + u];
+        const int bb = unit_body_b.data[world_base + u];
+        if (ba >= 0) body_ticket.data[ba] = 0;
+        if (bb >= 0) body_ticket.data[bb] = 0;
+    }}
+    __syncthreads();
+
+    for (int round_idx = 1; round_idx <= {cap}; ++round_idx) {{
+        const int n_work = s_n_work;
+        if (n_work == 0) break;
+        for (int w = t; w < n_work; w += {B}) {{
+            const int u = (int)s_work[w];
+            // key on the global contact index: deterministic coloring
+            // independent of the atomic list-build order
+            const int key = (round_idx << 23) | (0x7FFFFF - (unit_contact.data[world_base + u] & 0x7FFFFF));
+            const int ba = unit_body_a.data[world_base + u];
+            const int bb = unit_body_b.data[world_base + u];
+            if (ba >= 0) atomicMax(&body_ticket.data[ba], key);
+            if (bb >= 0) atomicMax(&body_ticket.data[bb], key);
+        }}
+        __syncthreads();
+        for (int w = t; w < n_work; w += {B}) {{
+            const int u = (int)s_work[w];
+            const int key = (round_idx << 23) | (0x7FFFFF - (unit_contact.data[world_base + u] & 0x7FFFFF));
+            const int ba = unit_body_a.data[world_base + u];
+            const int bb = unit_body_b.data[world_base + u];
+            if ((ba < 0 || body_ticket.data[ba] == key) && (bb < 0 || body_ticket.data[bb] == key)) {{
+                s_unit_color[u] = (short)(round_idx - 1);
+            }} else {{
+                const int idx = atomicAdd(&s_next_work, 1);
+                s_work_next[idx] = (short)u;
+            }}
+        }}
+        __syncthreads();
+        const int n_remaining = s_next_work;
+        __syncthreads();
+        if (t == 0) {{
+            s_n_work = n_remaining;
+            s_next_work = 0;
+        }}
+        for (int w = t; w < n_remaining; w += {B}) s_work[w] = s_work_next[w];
+        __syncthreads();
+    }}
+
+    for (int u = t; u < n_units; u += {B}) {{
+        if (s_unit_color[u] == -1) s_unit_color[u] = {cap};
+    }}
+
+    // counting sort of units by color
+    for (int c = t; c < {NE}; c += {B}) s_counts[c] = 0;
+    __syncthreads();
+    for (int u = t; u < n_units; u += {B}) {{
+        atomicAdd(&s_counts[(int)s_unit_color[u]], 1);
+    }}
+    __syncthreads();
+    if (t == 0) {{
+        int acc = 0;
+        for (int c = 0; c < {NE}; ++c) {{
+            s_offsets[c] = acc;
+            acc += s_counts[c];
+        }}
+    }}
+    __syncthreads();
+    for (int c = t; c < {NE}; c += {B}) {{
+        world_color_offsets.data[world * {NE} + c] = s_offsets[c];
+        s_counts[c] = 0;  // reuse as scatter cursor
+    }}
+    __syncthreads();
+    for (int u = t; u < n_units; u += {B}) {{
+        const int c = (int)s_unit_color[u];
+        const int idx = atomicAdd(&s_counts[c], 1);
+        s_sorted[s_offsets[c] + idx] = (short)u;
+    }}
+    __syncthreads();
+
+    // serial slot prefix in color order: rows of consecutive units are
+    // adjacent, so every color segment is contiguous row memory
+    if (t == 0) {{
+        int row_acc = 0;
+        for (int pos = 0; pos < n_units; ++pos) {{
+            const int u = (int)s_sorted[pos];
+            world_row_order.data[world_base + pos] = row_acc;
+            contact_slot.data[unit_contact.data[world_base + u]] = row_acc;
+            row_acc += unit_len.data[world_base + u];
+        }}
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def color_propagation_prebuild_native(
+        tile: int,
+        world_count: int,
+        world_unit_cursor: wp.array[int],
+        unit_contact: wp.array[int],
+        unit_body_a: wp.array[int],
+        unit_body_b: wp.array[int],
+        unit_len: wp.array[int],
+        body_ticket: wp.array[int],
+        contact_slot: wp.array[int],
+        world_row_order: wp.array[int],
+        world_color_offsets: wp.array[int],
+    ): ...
+
+    def color_propagation_prebuild_template(
+        world_count: int,
+        world_unit_cursor: wp.array[int],
+        unit_contact: wp.array[int],
+        unit_body_a: wp.array[int],
+        unit_body_b: wp.array[int],
+        unit_len: wp.array[int],
+        body_ticket: wp.array[int],
+        contact_slot: wp.array[int],
+        world_row_order: wp.array[int],
+        world_color_offsets: wp.array[int],
+    ):
+        tile, _t = wp.tid()
+        color_propagation_prebuild_native(
+            tile,
+            world_count,
+            world_unit_cursor,
+            unit_contact,
+            unit_body_a,
+            unit_body_b,
+            unit_len,
+            body_ticket,
+            contact_slot,
+            world_row_order,
+            world_color_offsets,
+        )
+
+    name = f"color_propagation_prebuild_{M}_{NE}_bd{B}"
+    color_propagation_prebuild_template.__name__ = name
+    color_propagation_prebuild_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(color_propagation_prebuild_template)
+
+
+@cache
 def _get_color_propagation_block_kernel(
     propagation_max_constraints: int, n_color_entries: int, block_dim: int, device_arch: str
 ) -> "wp.Kernel":
@@ -9000,18 +9256,32 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     propagation_impulses.data[off] = 0.0f;
                     continue;
                 }}
-                const float eff_inv = propagation_eff_mass_inv.data[off];
+                const float eff_inv = __ldg(&propagation_eff_mass_inv.data[off]);
                 if (eff_inv <= 0.0f) continue;
-                const int ba = propagation_body_a.data[off];
-                const int bb = propagation_body_b.data[off];
+                const int ba = __ldg(&propagation_body_a.data[off]);
+                const int bb = __ldg(&propagation_body_b.data[off]);
                 float jv = 0.0f;
                 if (ba >= 0) {{
-                    for (int k = 0; k < 6; ++k) jv += propagation_J_a.data[off * 6 + k] * propagation_body_qd.data[ba * 6 + k];
+                    const float2* J2 = (const float2*)(propagation_J_a.data + (size_t)off * 6);
+                    const float2* v2 = (const float2*)(propagation_body_qd.data + (size_t)ba * 6);
+                    #pragma unroll
+                    for (int k = 0; k < 3; ++k) {{
+                        const float2 j = __ldg(&J2[k]);
+                        const float2 v = v2[k];
+                        jv += j.x * v.x + j.y * v.y;
+                    }}
                 }}
                 if (bb >= 0) {{
-                    for (int k = 0; k < 6; ++k) jv += propagation_J_b.data[off * 6 + k] * propagation_body_qd.data[bb * 6 + k];
+                    const float2* J2 = (const float2*)(propagation_J_b.data + (size_t)off * 6);
+                    const float2* v2 = (const float2*)(propagation_body_qd.data + (size_t)bb * 6);
+                    #pragma unroll
+                    for (int k = 0; k < 3; ++k) {{
+                        const float2 j = __ldg(&J2[k]);
+                        const float2 v = v2[k];
+                        jv += j.x * v.x + j.y * v.y;
+                    }}
                 }}
-                const float residual = jv + propagation_rhs.data[off];
+                const float residual = jv + __ldg(&propagation_rhs.data[off]);
                 const float old_impulse = propagation_impulses.data[off];
                 float new_impulse = old_impulse + omega * (-residual * eff_inv);
                 if (row_type == {contact_type}) {{
@@ -9056,15 +9326,37 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                 propagation_impulses.data[off] = new_impulse;
                 if (delta_impulse != 0.0f) {{
                     if (ba >= 0) {{
-                        for (int k = 0; k < 6; ++k) {{
-                            propagation_body_qd.data[ba * 6 + k] += propagation_MiJt_a.data[off * 6 + k] * delta_impulse;
-                            propagation_body_impulses.data[ba * 6 + k] += propagation_J_a.data[off * 6 + k] * delta_impulse;
+                        const float2* M2 = (const float2*)(propagation_MiJt_a.data + (size_t)off * 6);
+                        const float2* J2 = (const float2*)(propagation_J_a.data + (size_t)off * 6);
+                        float2* qd2 = (float2*)(propagation_body_qd.data + (size_t)ba * 6);
+                        float2* pi2 = (float2*)(propagation_body_impulses.data + (size_t)ba * 6);
+                        #pragma unroll
+                        for (int k = 0; k < 3; ++k) {{
+                            const float2 mi = __ldg(&M2[k]);
+                            const float2 jj = __ldg(&J2[k]);
+                            float2 q = qd2[k];
+                            float2 pIm = pi2[k];
+                            q.x += mi.x * delta_impulse; q.y += mi.y * delta_impulse;
+                            pIm.x += jj.x * delta_impulse; pIm.y += jj.y * delta_impulse;
+                            qd2[k] = q;
+                            pi2[k] = pIm;
                         }}
                     }}
                     if (bb >= 0) {{
-                        for (int k = 0; k < 6; ++k) {{
-                            propagation_body_qd.data[bb * 6 + k] += propagation_MiJt_b.data[off * 6 + k] * delta_impulse;
-                            propagation_body_impulses.data[bb * 6 + k] += propagation_J_b.data[off * 6 + k] * delta_impulse;
+                        const float2* M2 = (const float2*)(propagation_MiJt_b.data + (size_t)off * 6);
+                        const float2* J2 = (const float2*)(propagation_J_b.data + (size_t)off * 6);
+                        float2* qd2 = (float2*)(propagation_body_qd.data + (size_t)bb * 6);
+                        float2* pi2 = (float2*)(propagation_body_impulses.data + (size_t)bb * 6);
+                        #pragma unroll
+                        for (int k = 0; k < 3; ++k) {{
+                            const float2 mi = __ldg(&M2[k]);
+                            const float2 jj = __ldg(&J2[k]);
+                            float2 q = qd2[k];
+                            float2 pIm = pi2[k];
+                            q.x += mi.x * delta_impulse; q.y += mi.y * delta_impulse;
+                            pIm.x += jj.x * delta_impulse; pIm.y += jj.y * delta_impulse;
+                            qd2[k] = q;
+                            pi2[k] = pIm;
                         }}
                     }}
                 }}

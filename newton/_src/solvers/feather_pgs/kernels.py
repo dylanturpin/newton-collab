@@ -2593,6 +2593,7 @@ def allocate_world_contact_slots(
     mf_slot_counter: wp.array[int],
     propagation_slot_counter: wp.array[int],
     dense_contact_world_flag: wp.array[int],
+    contact_slots_needed: wp.array[int],
 ):
     """
     Phase 1 of multi-articulation contact building.
@@ -2717,6 +2718,7 @@ def allocate_world_contact_slots(
     add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
     if add_friction and (contact_friction_anchor_limit == 0 or friction_anchor_rank < contact_friction_anchor_limit):
         slots_needed = 3
+    contact_slots_needed[c] = slots_needed
 
     if is_mf != 0:
         # Matrix-free path
@@ -9369,3 +9371,46 @@ def color_propagation_world_scatter(
     c = row_color[r]
     idx = wp.atomic_add(world_color_cursor, world * n_entries + c, 1)
     world_row_order[world * propagation_max_constraints + world_color_offsets[world * n_entries + c] + idx] = slot
+
+
+@wp.kernel(enable_backward=False)
+def collect_propagation_units(
+    contact_count: wp.array[int],
+    contact_path: wp.array[int],
+    contact_world: wp.array[int],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    shape_body: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    propagation_max_constraints: int,
+    # in/out
+    world_unit_cursor: wp.array[int],
+    # out
+    unit_contact: wp.array[int],
+    unit_body_a: wp.array[int],
+    unit_body_b: wp.array[int],
+    unit_len: wp.array[int],
+):
+    """Gather propagation-path contacts into per-world unit lists for pre-build coloring."""
+    c = wp.tid()
+    if c >= contact_count[0]:
+        return
+    if contact_path[c] != 2:
+        return
+    world = contact_world[c]
+    idx = wp.atomic_add(world_unit_cursor, world, 1)
+    if idx >= propagation_max_constraints:
+        return
+    base = world * propagation_max_constraints
+    body_a = -1
+    body_b = -1
+    sa = contact_shape0[c]
+    sb = contact_shape1[c]
+    if sa >= 0:
+        body_a = shape_body[sa]
+    if sb >= 0:
+        body_b = shape_body[sb]
+    unit_contact[base + idx] = c
+    unit_body_a[base + idx] = body_a
+    unit_body_b[base + idx] = body_b
+    unit_len[base + idx] = contact_slots_needed[c]
