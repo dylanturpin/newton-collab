@@ -8898,3 +8898,447 @@ def pgs_ncp_residuals_diagnostic_velocity(
     metrics[world, 3] = r_ds_compl
     metrics[world, 4] = r_ds_dual
     metrics[world, 5] = r_mdp_dir
+
+
+# ---------------------------------------------------------------------------
+# Graph coloring for propagation rows (articulated_contact_response=
+# "propagation-colored").
+#
+# Two propagation rows conflict iff they share a dynamic body (their velocity
+# writes and deferred-impulse accumulations overlap). Rows of one color are
+# body-disjoint, so a color can be solved by one flat thread-per-row launch
+# across all worlds with plain (non-atomic) body writes; colors run
+# sequentially, giving a Gauss-Seidel ordering permutation of the serial
+# per-world sweep. The friction-cone sibling write stays single-writer under
+# coloring because a row's siblings share its bodies and therefore can never
+# share its color.
+#
+# Coloring is a deterministic parallel greedy (PhysX-style): per round, every
+# uncolored row bids for its bodies with an atomic-min ticket (flat row id);
+# a row that wins the ticket on both of its dynamic bodies commits to the
+# lowest color bit free in both bodies' masks. Winner-per-body uniqueness
+# makes the mask update single-writer, and min-ticket makes the whole
+# coloring deterministic. Rows still uncolored after the round cap go to a
+# serial tail bucket (color PROPAGATION_COLOR_TAIL) processed by a per-world
+# ordered sweep — measured and reported, never silent.
+
+PROPAGATION_MAX_COLORS = 64
+PROPAGATION_COLOR_TAIL = 64
+
+
+@wp.kernel(enable_backward=False)
+def color_propagation_propose(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_max_constraints: int,
+    row_color: wp.array[int],
+    # out
+    body_ticket: wp.array[int],
+):
+    r = wp.tid()
+    world = r // propagation_max_constraints
+    slot = r - world * propagation_max_constraints
+    if slot >= propagation_constraint_count[world]:
+        return
+    if row_color[r] != -1:
+        return
+    ba = propagation_body_a[world, slot]
+    bb = propagation_body_b[world, slot]
+    if ba >= 0:
+        wp.atomic_min(body_ticket, ba, r)
+    if bb >= 0:
+        wp.atomic_min(body_ticket, bb, r)
+
+
+@wp.kernel(enable_backward=False)
+def color_propagation_commit(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_max_constraints: int,
+    body_ticket: wp.array[int],
+    # in/out
+    row_color: wp.array[int],
+    body_mask_lo: wp.array[int],
+    body_mask_hi: wp.array[int],
+):
+    r = wp.tid()
+    world = r // propagation_max_constraints
+    slot = r - world * propagation_max_constraints
+    if slot >= propagation_constraint_count[world]:
+        return
+    if row_color[r] != -1:
+        return
+    ba = propagation_body_a[world, slot]
+    bb = propagation_body_b[world, slot]
+    if ba >= 0 and body_ticket[ba] != r:
+        return
+    if bb >= 0 and body_ticket[bb] != r:
+        return
+
+    m_lo = int(0)
+    m_hi = int(0)
+    if ba >= 0:
+        m_lo = m_lo | body_mask_lo[ba]
+        m_hi = m_hi | body_mask_hi[ba]
+    if bb >= 0:
+        m_lo = m_lo | body_mask_lo[bb]
+        m_hi = m_hi | body_mask_hi[bb]
+
+    cand = int(PROPAGATION_COLOR_TAIL)
+    for c in range(32):
+        if ((m_lo >> c) & 1) == 0:
+            cand = c
+            break
+    if cand == PROPAGATION_COLOR_TAIL:
+        for c in range(32):
+            if ((m_hi >> c) & 1) == 0:
+                cand = 32 + c
+                break
+
+    row_color[r] = cand
+    if cand < 32:
+        bit = 1 << cand
+        # winner-per-body uniqueness (min ticket on every touched body) makes
+        # these single-writer this round; no atomics needed
+        if ba >= 0:
+            body_mask_lo[ba] = body_mask_lo[ba] | bit
+        if bb >= 0:
+            body_mask_lo[bb] = body_mask_lo[bb] | bit
+    elif cand < PROPAGATION_MAX_COLORS:
+        bit = 1 << (cand - 32)
+        if ba >= 0:
+            body_mask_hi[ba] = body_mask_hi[ba] | bit
+        if bb >= 0:
+            body_mask_hi[bb] = body_mask_hi[bb] | bit
+
+
+@wp.kernel(enable_backward=False)
+def color_propagation_count_uncolored(
+    propagation_constraint_count: wp.array[int],
+    propagation_max_constraints: int,
+    row_color: wp.array[int],
+    # out
+    uncolored: wp.array[int],
+):
+    r = wp.tid()
+    world = r // propagation_max_constraints
+    slot = r - world * propagation_max_constraints
+    if slot >= propagation_constraint_count[world]:
+        return
+    if row_color[r] == -1:
+        wp.atomic_add(uncolored, 0, 1)
+
+
+@wp.kernel(enable_backward=False)
+def color_propagation_assign_tail(
+    propagation_constraint_count: wp.array[int],
+    propagation_max_constraints: int,
+    # in/out
+    row_color: wp.array[int],
+):
+    r = wp.tid()
+    world = r // propagation_max_constraints
+    slot = r - world * propagation_max_constraints
+    if slot >= propagation_constraint_count[world]:
+        return
+    if row_color[r] == -1:
+        row_color[r] = PROPAGATION_COLOR_TAIL
+
+
+@wp.kernel(enable_backward=False)
+def color_propagation_histogram(
+    propagation_constraint_count: wp.array[int],
+    propagation_max_constraints: int,
+    row_color: wp.array[int],
+    # out
+    color_counts: wp.array[int],
+):
+    r = wp.tid()
+    world = r // propagation_max_constraints
+    slot = r - world * propagation_max_constraints
+    if slot >= propagation_constraint_count[world]:
+        return
+    wp.atomic_add(color_counts, row_color[r], 1)
+
+
+@wp.kernel(enable_backward=False)
+def color_propagation_scan_offsets(
+    color_counts: wp.array[int],
+    n_entries: int,
+    # out
+    color_offsets: wp.array[int],
+):
+    # single-thread exclusive scan over <= 65 entries
+    acc = int(0)
+    for c in range(n_entries):
+        color_offsets[c] = acc
+        acc += color_counts[c]
+
+
+@wp.kernel(enable_backward=False)
+def color_propagation_scatter(
+    propagation_constraint_count: wp.array[int],
+    propagation_max_constraints: int,
+    row_color: wp.array[int],
+    color_offsets: wp.array[int],
+    # in/out
+    color_cursor: wp.array[int],
+    # out
+    color_row_list: wp.array[int],
+):
+    r = wp.tid()
+    world = r // propagation_max_constraints
+    slot = r - world * propagation_max_constraints
+    if slot >= propagation_constraint_count[world]:
+        return
+    c = row_color[r]
+    idx = wp.atomic_add(color_cursor, c, 1)
+    color_row_list[color_offsets[c] + idx] = r
+
+
+@wp.func
+def _propagation_apply_row_delta(
+    world: int,
+    row: int,
+    ba: int,
+    bb: int,
+    delta_impulse: float,
+    propagation_MiJt_a: wp.array3d(dtype=float),
+    propagation_MiJt_b: wp.array3d(dtype=float),
+    propagation_J_a: wp.array3d(dtype=float),
+    propagation_J_b: wp.array3d(dtype=float),
+    propagation_body_qd: wp.array2d(dtype=float),
+    propagation_body_impulses: wp.array2d(dtype=float),
+):
+    if ba >= 0:
+        for k in range(6):
+            propagation_body_qd[ba, k] = propagation_body_qd[ba, k] + propagation_MiJt_a[world, row, k] * delta_impulse
+            propagation_body_impulses[ba, k] = (
+                propagation_body_impulses[ba, k] + propagation_J_a[world, row, k] * delta_impulse
+            )
+    if bb >= 0:
+        for k in range(6):
+            propagation_body_qd[bb, k] = propagation_body_qd[bb, k] + propagation_MiJt_b[world, row, k] * delta_impulse
+            propagation_body_impulses[bb, k] = (
+                propagation_body_impulses[bb, k] + propagation_J_b[world, row, k] * delta_impulse
+            )
+
+
+@wp.func
+def _propagation_solve_row(
+    world: int,
+    i: int,
+    global_iter: int,
+    friction_start_iteration: int,
+    omega: float,
+    propagation_body_a: wp.array2d(dtype=int),
+    propagation_body_b: wp.array2d(dtype=int),
+    propagation_MiJt_a: wp.array3d(dtype=float),
+    propagation_MiJt_b: wp.array3d(dtype=float),
+    propagation_J_a: wp.array3d(dtype=float),
+    propagation_J_b: wp.array3d(dtype=float),
+    propagation_eff_mass_inv: wp.array2d(dtype=float),
+    propagation_rhs: wp.array2d(dtype=float),
+    propagation_row_type: wp.array2d(dtype=int),
+    propagation_row_parent: wp.array2d(dtype=int),
+    propagation_row_mu: wp.array2d(dtype=float),
+    propagation_impulses: wp.array2d(dtype=float),
+    propagation_body_qd: wp.array2d(dtype=float),
+    propagation_body_impulses: wp.array2d(dtype=float),
+):
+    """One row update — the exact body of the serial per-world loop."""
+    row_type = propagation_row_type[world, i]
+    if row_type == PGS_CONSTRAINT_TYPE_FRICTION and global_iter < friction_start_iteration:
+        propagation_impulses[world, i] = 0.0
+        return
+
+    eff_inv = propagation_eff_mass_inv[world, i]
+    if eff_inv <= 0.0:
+        return
+
+    ba = propagation_body_a[world, i]
+    bb = propagation_body_b[world, i]
+
+    jv = float(0.0)
+    if ba >= 0:
+        for k in range(6):
+            jv += propagation_J_a[world, i, k] * propagation_body_qd[ba, k]
+    if bb >= 0:
+        for k in range(6):
+            jv += propagation_J_b[world, i, k] * propagation_body_qd[bb, k]
+
+    residual = jv + propagation_rhs[world, i]
+    delta = -residual * eff_inv
+    old_impulse = propagation_impulses[world, i]
+    new_impulse = old_impulse + omega * delta
+
+    if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        if new_impulse < 0.0:
+            new_impulse = 0.0
+    elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+        parent_idx = propagation_row_parent[world, i]
+        lambda_n = propagation_impulses[world, parent_idx]
+        mu_val = propagation_row_mu[world, i]
+        radius = wp.max(mu_val * lambda_n, 0.0)
+
+        if radius <= 0.0:
+            new_impulse = 0.0
+        else:
+            sib = parent_idx + 1
+            if i == parent_idx + 1:
+                sib = parent_idx + 2
+            propagation_impulses[world, i] = new_impulse
+            a = new_impulse
+            b = propagation_impulses[world, sib]
+            mag = wp.sqrt(a * a + b * b)
+            if mag > radius:
+                scale = radius / mag
+                new_impulse = a * scale
+                sib_new = b * scale
+                sib_delta = sib_new - b
+                propagation_impulses[world, sib] = sib_new
+                sib_ba = propagation_body_a[world, sib]
+                sib_bb = propagation_body_b[world, sib]
+                _propagation_apply_row_delta(
+                    world,
+                    sib,
+                    sib_ba,
+                    sib_bb,
+                    sib_delta,
+                    propagation_MiJt_a,
+                    propagation_MiJt_b,
+                    propagation_J_a,
+                    propagation_J_b,
+                    propagation_body_qd,
+                    propagation_body_impulses,
+                )
+
+    delta_impulse = new_impulse - old_impulse
+    propagation_impulses[world, i] = new_impulse
+
+    if delta_impulse != 0.0:
+        _propagation_apply_row_delta(
+            world,
+            i,
+            ba,
+            bb,
+            delta_impulse,
+            propagation_MiJt_a,
+            propagation_MiJt_b,
+            propagation_J_a,
+            propagation_J_b,
+            propagation_body_qd,
+            propagation_body_impulses,
+        )
+
+
+@wp.kernel(enable_backward=False)
+def pgs_solve_propagation_colored_batch(
+    color_row_list: wp.array[int],
+    seg_start: int,
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_MiJt_a: wp.array3d[float],
+    propagation_MiJt_b: wp.array3d[float],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_eff_mass_inv: wp.array2d[float],
+    propagation_rhs: wp.array2d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
+    propagation_max_constraints: int,
+    omega: float,
+    friction_start_iteration: int,
+    global_iter: int,
+    # in/out
+    propagation_impulses: wp.array2d[float],
+    propagation_body_qd: wp.array2d[float],
+    propagation_body_impulses: wp.array2d[float],
+):
+    """Solve every row of one color: flat across worlds, body-disjoint by construction."""
+    t = wp.tid()
+    r = color_row_list[seg_start + t]
+    world = r // propagation_max_constraints
+    slot = r - world * propagation_max_constraints
+    _propagation_solve_row(
+        world,
+        slot,
+        global_iter,
+        friction_start_iteration,
+        omega,
+        propagation_body_a,
+        propagation_body_b,
+        propagation_MiJt_a,
+        propagation_MiJt_b,
+        propagation_J_a,
+        propagation_J_b,
+        propagation_eff_mass_inv,
+        propagation_rhs,
+        propagation_row_type,
+        propagation_row_parent,
+        propagation_row_mu,
+        propagation_impulses,
+        propagation_body_qd,
+        propagation_body_impulses,
+    )
+
+
+@wp.kernel(enable_backward=False)
+def pgs_solve_propagation_colored_tail(
+    propagation_constraint_count: wp.array[int],
+    row_color: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_MiJt_a: wp.array3d[float],
+    propagation_MiJt_b: wp.array3d[float],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_eff_mass_inv: wp.array2d[float],
+    propagation_rhs: wp.array2d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
+    propagation_max_constraints: int,
+    omega: float,
+    friction_start_iteration: int,
+    global_iter: int,
+    # in/out
+    propagation_impulses: wp.array2d[float],
+    propagation_body_qd: wp.array2d[float],
+    propagation_body_impulses: wp.array2d[float],
+):
+    """Ordered per-world sweep over tail-bucket rows (color overflow), exact GS semantics."""
+    world = wp.tid()
+    m_count = propagation_constraint_count[world]
+    if m_count == 0:
+        return
+    if m_count > propagation_max_constraints:
+        m_count = propagation_max_constraints
+    base = world * propagation_max_constraints
+    for i in range(m_count):
+        if row_color[base + i] != PROPAGATION_COLOR_TAIL:
+            continue
+        _propagation_solve_row(
+            world,
+            i,
+            global_iter,
+            friction_start_iteration,
+            omega,
+            propagation_body_a,
+            propagation_body_b,
+            propagation_MiJt_a,
+            propagation_MiJt_b,
+            propagation_J_a,
+            propagation_J_b,
+            propagation_eff_mass_inv,
+            propagation_rhs,
+            propagation_row_type,
+            propagation_row_parent,
+            propagation_row_mu,
+            propagation_impulses,
+            propagation_body_qd,
+            propagation_body_impulses,
+        )

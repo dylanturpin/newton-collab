@@ -66,6 +66,13 @@ from .kernels import (
     build_propagation_contact_rows,
     cholesky_loop,
     clamp_augmented_joint_u0,
+    color_propagation_assign_tail,
+    color_propagation_commit,
+    color_propagation_count_uncolored,
+    color_propagation_histogram,
+    color_propagation_propose,
+    color_propagation_scan_offsets,
+    color_propagation_scatter,
     clamp_free_root_velocity_limits,
     compute_com_transforms,
     compute_composite_inertia,
@@ -111,6 +118,9 @@ from .kernels import (
     pgs_ncp_residuals_diagnostic_velocity,
     pgs_solve_loop,
     pgs_solve_mf_loop,
+    PROPAGATION_COLOR_TAIL,
+    pgs_solve_propagation_colored_batch,
+    pgs_solve_propagation_colored_tail,
     pgs_solve_propagation_contact_loop,
     populate_joint_limit_J_for_size,
     populate_joint_velocity_limit_J_for_size,
@@ -299,7 +309,9 @@ class SolverFeatherPGS(SolverBase):
         mf_warmstart: bool = False,
         mf_warmstart_decay: float = 1.0,
         pgs_mode: str = "split",
-        articulated_contact_response: Literal["immediate", "propagation", "propagation-fused"] = "immediate",
+        articulated_contact_response: Literal[
+            "immediate", "propagation", "propagation-fused", "propagation-colored"
+        ] = "immediate",
         propagation_same_articulation_rows: bool = False,
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
@@ -439,6 +451,11 @@ class SolverFeatherPGS(SolverBase):
                 ``"propagation-fused"`` uses the same response model and runs a fused full-iteration
                 kernel for supported homogeneous non-free articulation groups; unsupported cases raise
                 :class:`NotImplementedError` instead of falling back to split propagation.
+                ``"propagation-colored"`` uses the propagation response model but replaces the
+                serial per-world row sweep with graph-colored batches: rows are colored per step
+                so no two rows of a color share a body, and each color solves as one flat
+                thread-per-row launch across all worlds (colors sequential, tree sweep per
+                iteration unchanged). Color-overflow rows run in an ordered serial tail bucket.
                 Defaults to ``"immediate"``.
             propagation_same_articulation_rows (bool, optional): Route contacts between two
                 links of the same articulation to propagation rows instead of dense generalized
@@ -578,13 +595,19 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(f"pgs_velocity_drive_mode must be 'active' or 'freeze', got {pgs_velocity_drive_mode!r}")
         self.pgs_velocity_drive_mode = pgs_velocity_drive_mode
         self._requested_dense_max_constraints = int(dense_max_constraints)
-        if articulated_contact_response not in ("immediate", "propagation", "propagation-fused"):
+        if articulated_contact_response not in (
+            "immediate",
+            "propagation",
+            "propagation-fused",
+            "propagation-colored",
+        ):
             raise ValueError(
-                "articulated_contact_response must be 'immediate', 'propagation', or "
-                f"'propagation-fused', got {articulated_contact_response!r}"
+                "articulated_contact_response must be 'immediate', 'propagation', "
+                f"'propagation-fused', or 'propagation-colored', got {articulated_contact_response!r}"
             )
         self.articulated_contact_response = articulated_contact_response
         self.propagation_full_fused_iterations = articulated_contact_response == "propagation-fused"
+        self._propagation_colored = articulated_contact_response == "propagation-colored"
         if propagation_same_articulation_rows and articulated_contact_response == "immediate":
             raise ValueError(
                 "propagation_same_articulation_rows requires articulated_contact_response "
@@ -898,7 +921,7 @@ class SolverFeatherPGS(SolverBase):
     def _propagation_contacts_enabled(self) -> bool:
         return (
             self.pgs_mode == "matrix_free"
-            and self.articulated_contact_response in ("propagation", "propagation-fused")
+            and self.articulated_contact_response in ("propagation", "propagation-fused", "propagation-colored")
             and self._has_non_free_articulations
         )
 
@@ -2302,6 +2325,22 @@ class SolverFeatherPGS(SolverBase):
         self.propagation_tree_qdd = wp.zeros((joint_dof_count,), dtype=wp.float32, device=device)
         self.propagation_tree_body_delta = wp.zeros((body_count, 6), dtype=wp.float32, device=device)
 
+        if self._propagation_colored:
+            total_rows = worlds * propagation_max_c
+            n_entries = PROPAGATION_COLOR_TAIL + 1
+            self.color_row_color = wp.full((total_rows,), -1, dtype=wp.int32, device=device)
+            self.color_body_ticket = wp.zeros((body_count,), dtype=wp.int32, device=device)
+            self.color_body_mask_lo = wp.zeros((body_count,), dtype=wp.int32, device=device)
+            self.color_body_mask_hi = wp.zeros((body_count,), dtype=wp.int32, device=device)
+            self.color_row_list = wp.zeros((total_rows,), dtype=wp.int32, device=device)
+            self.color_counts = wp.zeros((n_entries,), dtype=wp.int32, device=device)
+            self.color_offsets = wp.zeros((n_entries,), dtype=wp.int32, device=device)
+            self.color_cursor = wp.zeros((n_entries,), dtype=wp.int32, device=device)
+            self.color_uncolored = wp.zeros((1,), dtype=wp.int32, device=device)
+            self._color_segments = []
+            self._color_tail_rows = 0
+            self._color_stats = {}
+
     def _allocate_debug_buffers(self, model):
         """Allocate buffers for PGS convergence diagnostics."""
         if not self.pgs_debug:
@@ -2471,7 +2510,12 @@ class SolverFeatherPGS(SolverBase):
         # See the fused-kernel construction below: packing hurts the fused
         # kernel, so it keeps one world per block.
         self._propagation_fused_worlds_per_block = 1
-        if model.device.is_cuda and self._propagation_contacts_enabled() and self.propagation_max_constraints > 0:
+        if (
+            model.device.is_cuda
+            and self._propagation_contacts_enabled()
+            and self.propagation_max_constraints > 0
+            and not self._propagation_colored
+        ):
             self._pgs_solve_propagation_kernel = _get_pgs_solve_propagation_contact_kernel(
                 self.propagation_max_constraints,
                 device_arch,
@@ -3175,6 +3219,197 @@ class SolverFeatherPGS(SolverBase):
                     device=self.model.device,
                 )
 
+        if self._propagation_colored:
+            with self._sync_timed("prop_coloring"):
+                self._color_propagation_rows()
+
+    def _color_propagation_rows(self) -> None:
+        """Color propagation rows so body-disjoint rows can solve in parallel.
+
+        Deterministic parallel greedy: rounds of min-ticket bidding per body;
+        a row commits to the lowest color free in both bodies' masks only when
+        it wins the ticket on every dynamic body it touches. Uncolored rows
+        after the round cap fall into a serial tail bucket. One small D2H copy
+        per step fetches the color segment table for exact launch dims.
+        """
+        cap = int(self.propagation_max_constraints)
+        total_rows = self.world_count * cap
+        device = self.model.device
+        n_entries = PROPAGATION_COLOR_TAIL + 1
+
+        self.color_row_color.fill_(-1)
+        self.color_body_mask_lo.zero_()
+        self.color_body_mask_hi.zero_()
+
+        rounds = 0
+        max_rounds = PROPAGATION_COLOR_TAIL
+        check_every = 8
+        while rounds < max_rounds:
+            for _ in range(check_every):
+                self.color_body_ticket.fill_(total_rows)
+                wp.launch(
+                    color_propagation_propose,
+                    dim=total_rows,
+                    inputs=[
+                        self.propagation_constraint_count,
+                        self.propagation_body_a,
+                        self.propagation_body_b,
+                        cap,
+                        self.color_row_color,
+                    ],
+                    outputs=[self.color_body_ticket],
+                    device=device,
+                )
+                wp.launch(
+                    color_propagation_commit,
+                    dim=total_rows,
+                    inputs=[
+                        self.propagation_constraint_count,
+                        self.propagation_body_a,
+                        self.propagation_body_b,
+                        cap,
+                        self.color_body_ticket,
+                    ],
+                    outputs=[
+                        self.color_row_color,
+                        self.color_body_mask_lo,
+                        self.color_body_mask_hi,
+                    ],
+                    device=device,
+                )
+                rounds += 1
+            self.color_uncolored.zero_()
+            wp.launch(
+                color_propagation_count_uncolored,
+                dim=total_rows,
+                inputs=[self.propagation_constraint_count, cap, self.color_row_color],
+                outputs=[self.color_uncolored],
+                device=device,
+            )
+            if int(self.color_uncolored.numpy()[0]) == 0:
+                break
+
+        wp.launch(
+            color_propagation_assign_tail,
+            dim=total_rows,
+            inputs=[self.propagation_constraint_count, cap],
+            outputs=[self.color_row_color],
+            device=device,
+        )
+
+        self.color_counts.zero_()
+        wp.launch(
+            color_propagation_histogram,
+            dim=total_rows,
+            inputs=[self.propagation_constraint_count, cap, self.color_row_color],
+            outputs=[self.color_counts],
+            device=device,
+        )
+        wp.launch(
+            color_propagation_scan_offsets,
+            dim=1,
+            inputs=[self.color_counts, n_entries],
+            outputs=[self.color_offsets],
+            device=device,
+        )
+        self.color_cursor.zero_()
+        wp.launch(
+            color_propagation_scatter,
+            dim=total_rows,
+            inputs=[
+                self.propagation_constraint_count,
+                cap,
+                self.color_row_color,
+                self.color_offsets,
+            ],
+            outputs=[self.color_cursor, self.color_row_list],
+            device=device,
+        )
+
+        counts = self.color_counts.numpy()
+        offsets = self.color_offsets.numpy()
+        self._color_segments = [
+            (int(offsets[c]), int(counts[c])) for c in range(PROPAGATION_COLOR_TAIL) if counts[c] > 0
+        ]
+        self._color_tail_rows = int(counts[PROPAGATION_COLOR_TAIL])
+        self._color_stats = {
+            "colors_used": len(self._color_segments),
+            "tail_rows": self._color_tail_rows,
+            "rounds": rounds,
+            "total_rows": int(counts.sum()),
+            "max_color_rows": int(counts[: PROPAGATION_COLOR_TAIL].max()) if len(self._color_segments) else 0,
+        }
+
+    def _propagation_pgs_solve_colored_iteration(
+        self,
+        *,
+        rhs: wp.array,
+        omega: float,
+        friction_start_iteration: int,
+        iteration_offset: int,
+    ) -> None:
+        device = self.model.device
+        for seg_start, seg_count in self._color_segments:
+            wp.launch(
+                pgs_solve_propagation_colored_batch,
+                dim=seg_count,
+                inputs=[
+                    self.color_row_list,
+                    seg_start,
+                    self.propagation_body_a,
+                    self.propagation_body_b,
+                    self.propagation_MiJt_a,
+                    self.propagation_MiJt_b,
+                    self.propagation_J_a,
+                    self.propagation_J_b,
+                    self.propagation_eff_mass_inv,
+                    rhs,
+                    self.propagation_row_type,
+                    self.propagation_row_parent,
+                    self.propagation_row_mu,
+                    self.propagation_max_constraints,
+                    omega,
+                    int(friction_start_iteration),
+                    int(iteration_offset),
+                ],
+                outputs=[
+                    self.propagation_impulses,
+                    self.propagation_body_qd,
+                    self.propagation_body_impulses,
+                ],
+                device=device,
+            )
+        if self._color_tail_rows > 0:
+            wp.launch(
+                pgs_solve_propagation_colored_tail,
+                dim=self.world_count,
+                inputs=[
+                    self.propagation_constraint_count,
+                    self.color_row_color,
+                    self.propagation_body_a,
+                    self.propagation_body_b,
+                    self.propagation_MiJt_a,
+                    self.propagation_MiJt_b,
+                    self.propagation_J_a,
+                    self.propagation_J_b,
+                    self.propagation_eff_mass_inv,
+                    rhs,
+                    self.propagation_row_type,
+                    self.propagation_row_parent,
+                    self.propagation_row_mu,
+                    self.propagation_max_constraints,
+                    omega,
+                    int(friction_start_iteration),
+                    int(iteration_offset),
+                ],
+                outputs=[
+                    self.propagation_impulses,
+                    self.propagation_body_qd,
+                    self.propagation_body_impulses,
+                ],
+                device=device,
+            )
+
     def _compute_propagation_rhs_bias(
         self,
         dt: float,
@@ -3411,6 +3646,15 @@ class SolverFeatherPGS(SolverBase):
         iteration_offset: int,
     ) -> None:
         if not self._propagation_contacts_enabled():
+            return
+        if self._propagation_colored:
+            self._propagation_pgs_solve_colored_iteration(
+                rhs=rhs,
+                omega=omega,
+                friction_start_iteration=friction_start_iteration,
+                iteration_offset=iteration_offset,
+            )
+            self._propagate_response()
             return
         propagation_kernel = getattr(self, "_pgs_solve_propagation_kernel", None)
         if propagation_kernel is not None:
