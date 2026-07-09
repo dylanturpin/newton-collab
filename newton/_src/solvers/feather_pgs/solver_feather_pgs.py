@@ -3286,7 +3286,7 @@ class SolverFeatherPGS(SolverBase):
                     self.propagation_constraint_count,
                     self.propagation_body_a,
                     self.propagation_body_b,
-                    self.color_row_color,
+                    self.propagation_row_type,
                     self.color_body_ticket,
                     self.color_world_row_order,
                     self.color_world_offsets,
@@ -8790,20 +8790,22 @@ def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.K
 def _get_color_propagation_block_kernel(
     propagation_max_constraints: int, n_color_entries: int, block_dim: int, device_arch: str
 ) -> "wp.Kernel":
-    """Build the one-launch per-world coloring + counting-sort kernel.
+    """Build the one-launch per-world contact-unit coloring kernel.
 
-    Conflicts are intra-world (bodies belong to one world), so each block
-    colors its own world to completion: round-tagged ticket bidding with
-    ``__syncthreads()`` between propose/commit phases, tail assignment at the
-    round cap, then an in-shared-memory counting sort producing the
-    color-sorted row order and per-color offsets the solve kernel consumes.
-    No host round-count sync, no separate memsets - tickets and colors are
-    initialized in-kernel.
+    Colors *contact units* (a non-friction row plus its trailing friction
+    rows) rather than individual rows: unit rows share both bodies, so unit
+    coloring is conflict-equivalent while cutting rounds by the unit size
+    (color count tracks max per-body CONTACT degree). Each block colors its
+    own world: a thread-0 serial pass identifies unit starts, then
+    round-tagged ticket bidding over a compacted uncolored-unit worklist,
+    then an in-shared-memory counting sort emits unit start slots in color
+    order plus per-color unit offsets. No host syncs, no memsets.
     """
     M = propagation_max_constraints
     NE = n_color_entries
     B = int(block_dim)
     cap = NE - 2  # color cap; index NE-2 is the tail bucket
+    friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -8818,66 +8820,90 @@ def _get_color_propagation_block_kernel(
     }}
     const int world_base = world * {M};
 
-    __shared__ int s_uncolored;
+    __shared__ int s_n_units;
+    __shared__ int s_n_work;
+    __shared__ int s_next_work;
     __shared__ int s_counts[{NE}];
     __shared__ int s_offsets[{NE}];
+    __shared__ short s_unit_start[{M}];
+    __shared__ short s_unit_color[{M}];
+    __shared__ short s_work[{M}];
+    __shared__ short s_work_next[{M}];
 
-    // init colors and tickets in-kernel (only this block touches this world's bodies)
-    for (int i = t; i < m; i += {B}) {{
-        row_color.data[world_base + i] = -1;
-        const int ba = propagation_body_a.data[world_base + i];
-        const int bb = propagation_body_b.data[world_base + i];
+    // unit starts in slot order (deterministic serial pass; ~m iterations)
+    if (t == 0) {{
+        int n = 0;
+        for (int i = 0; i < m; ++i) {{
+            if (propagation_row_type.data[world_base + i] != {friction_type}) {{
+                s_unit_start[n] = (short)i;
+                ++n;
+            }}
+        }}
+        s_n_units = n;
+        s_n_work = n;
+        s_next_work = 0;
+    }}
+    __syncthreads();
+    const int n_units = s_n_units;
+
+    for (int u = t; u < n_units; u += {B}) {{
+        s_unit_color[u] = -1;
+        s_work[u] = (short)u;
+        const int slot = (int)s_unit_start[u];
+        const int ba = propagation_body_a.data[world_base + slot];
+        const int bb = propagation_body_b.data[world_base + slot];
         if (ba >= 0) body_ticket.data[ba] = 0;
         if (bb >= 0) body_ticket.data[bb] = 0;
     }}
     __syncthreads();
 
-    if (t == 0) s_uncolored = 0;
-    __syncthreads();
     for (int round_idx = 1; round_idx <= {cap}; ++round_idx) {{
-        for (int i = t; i < m; i += {B}) {{
-            const int off = world_base + i;
-            if (row_color.data[off] != -1) continue;
-            const int key = (round_idx << 23) | (0x7FFFFF - i);
-            const int ba = propagation_body_a.data[off];
-            const int bb = propagation_body_b.data[off];
+        const int n_work = s_n_work;
+        if (n_work == 0) break;
+        for (int w = t; w < n_work; w += {B}) {{
+            const int u = (int)s_work[w];
+            const int slot = (int)s_unit_start[u];
+            const int key = (round_idx << 23) | (0x7FFFFF - u);
+            const int ba = propagation_body_a.data[world_base + slot];
+            const int bb = propagation_body_b.data[world_base + slot];
             if (ba >= 0) atomicMax(&body_ticket.data[ba], key);
             if (bb >= 0) atomicMax(&body_ticket.data[bb], key);
         }}
         __syncthreads();
-        for (int i = t; i < m; i += {B}) {{
-            const int off = world_base + i;
-            if (row_color.data[off] != -1) continue;
-            const int key = (round_idx << 23) | (0x7FFFFF - i);
-            const int ba = propagation_body_a.data[off];
-            const int bb = propagation_body_b.data[off];
+        for (int w = t; w < n_work; w += {B}) {{
+            const int u = (int)s_work[w];
+            const int slot = (int)s_unit_start[u];
+            const int key = (round_idx << 23) | (0x7FFFFF - u);
+            const int ba = propagation_body_a.data[world_base + slot];
+            const int bb = propagation_body_b.data[world_base + slot];
             if ((ba < 0 || body_ticket.data[ba] == key) && (bb < 0 || body_ticket.data[bb] == key)) {{
-                row_color.data[off] = round_idx - 1;
+                s_unit_color[u] = (short)(round_idx - 1);
             }} else {{
-                s_uncolored = 1;
+                const int idx = atomicAdd(&s_next_work, 1);
+                s_work_next[idx] = (short)u;
             }}
         }}
         __syncthreads();
-        // read-then-barrier-then-reset: every thread must consume the flag
-        // before thread 0 may clear it for the next round, or a slow thread
-        // can observe the cleared value and break to a mismatched barrier
-        const int round_done = (s_uncolored == 0) ? 1 : 0;
+        const int n_remaining = s_next_work;
         __syncthreads();
-        if (round_done) break;
-        if (t == 0) s_uncolored = 0;
+        if (t == 0) {{
+            s_n_work = n_remaining;
+            s_next_work = 0;
+        }}
+        for (int w = t; w < n_remaining; w += {B}) s_work[w] = s_work_next[w];
         __syncthreads();
     }}
 
     // tail bucket for anything past the round cap
-    for (int i = t; i < m; i += {B}) {{
-        if (row_color.data[world_base + i] == -1) row_color.data[world_base + i] = {cap};
+    for (int u = t; u < n_units; u += {B}) {{
+        if (s_unit_color[u] == -1) s_unit_color[u] = {cap};
     }}
 
-    // in-block counting sort by color
+    // in-block counting sort of units by color
     for (int c = t; c < {NE}; c += {B}) s_counts[c] = 0;
     __syncthreads();
-    for (int i = t; i < m; i += {B}) {{
-        atomicAdd(&s_counts[row_color.data[world_base + i]], 1);
+    for (int u = t; u < n_units; u += {B}) {{
+        atomicAdd(&s_counts[(int)s_unit_color[u]], 1);
     }}
     __syncthreads();
     if (t == 0) {{
@@ -8893,10 +8919,10 @@ def _get_color_propagation_block_kernel(
         s_counts[c] = 0;  // reuse as scatter cursor
     }}
     __syncthreads();
-    for (int i = t; i < m; i += {B}) {{
-        const int c = row_color.data[world_base + i];
+    for (int u = t; u < n_units; u += {B}) {{
+        const int c = (int)s_unit_color[u];
         const int idx = atomicAdd(&s_counts[c], 1);
-        world_row_order.data[world_base + s_offsets[c] + idx] = i;
+        world_row_order.data[world_base + s_offsets[c] + idx] = (int)s_unit_start[u];
     }}
 #endif
 """
@@ -8908,7 +8934,7 @@ def _get_color_propagation_block_kernel(
         propagation_constraint_count: wp.array[int],
         propagation_body_a: wp.array2d[int],
         propagation_body_b: wp.array2d[int],
-        row_color: wp.array[int],
+        propagation_row_type: wp.array2d[int],
         body_ticket: wp.array[int],
         world_row_order: wp.array[int],
         world_color_offsets: wp.array[int],
@@ -8919,7 +8945,7 @@ def _get_color_propagation_block_kernel(
         propagation_constraint_count: wp.array[int],
         propagation_body_a: wp.array2d[int],
         propagation_body_b: wp.array2d[int],
-        row_color: wp.array[int],
+        propagation_row_type: wp.array2d[int],
         body_ticket: wp.array[int],
         world_row_order: wp.array[int],
         world_color_offsets: wp.array[int],
@@ -8931,13 +8957,13 @@ def _get_color_propagation_block_kernel(
             propagation_constraint_count,
             propagation_body_a,
             propagation_body_b,
-            row_color,
+            propagation_row_type,
             body_ticket,
             world_row_order,
             world_color_offsets,
         )
 
-    name = f"color_propagation_block_{M}_{NE}_bd{B}"
+    name = f"color_propagation_block_units_{M}_{NE}_bd{B}"
     color_propagation_block_template.__name__ = name
     color_propagation_block_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(color_propagation_block_template)
@@ -8947,16 +8973,15 @@ def _get_color_propagation_block_kernel(
 def _get_pgs_solve_propagation_colored_block_kernel(
     propagation_max_constraints: int, n_color_entries: int, block_dim: int, device_arch: str
 ) -> "wp.Kernel":
-    """Build the block-local colored propagation row solver.
+    """Build the block-local colored propagation solver over contact units.
 
-    One thread block per world. Rows are pre-sorted by color per world
-    (``world_row_order`` + ``world_color_offsets``); the block sweeps colors
-    sequentially with ``__syncthreads()`` barriers and solves each color's
-    rows thread-parallel (rows of one color share no body, so plain global
-    writes are race-free). The tail segment (color-cap overflow) runs
-    ordered on thread 0. One launch per PGS iteration regardless of the
-    number of colors — this is the PhysX-style alternative to launching one
-    global batch per color.
+    One thread block per world sweeps unit colors sequentially with
+    ``__syncthreads()`` barriers; within a color each thread owns one
+    contact unit (start slot from ``world_row_order``) and solves its rows
+    in slot order — the unit's rows share bodies, so in-thread ordering is
+    exact Gauss-Seidel, while units of one color share no body and write
+    race-free. The tail segment (color-cap overflow) runs ordered on
+    thread 0. One launch per PGS iteration regardless of color count.
     """
     M = propagation_max_constraints
     NE = n_color_entries
@@ -8964,9 +8989,13 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
 
-    row_solve_body = f"""
+    unit_solve_body = f"""
+            for (int rr = 0; ; ++rr) {{
+                const int slot = start_slot + rr;
+                if (slot >= m) break;
                 const int off = world_base + slot;
                 const int row_type = propagation_row_type.data[off];
+                if (rr > 0 && row_type != {friction_type}) break;
                 if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
                     propagation_impulses.data[off] = 0.0f;
                     continue;
@@ -9039,6 +9068,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                         }}
                     }}
                 }}
+            }}
 """
 
     snippet = f"""
@@ -9051,21 +9081,22 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     const int world_base = world * {M};
     const int t = threadIdx.x;
     const int off_base = world * {NE};
+    const int n_units = world_color_offsets.data[off_base + {NE} - 1];
 
     int seg_start = 0;
-    for (int c = 0; c + 1 < {NE} && seg_start < m; ++c) {{
+    for (int c = 0; c + 1 < {NE} && seg_start < n_units; ++c) {{
         const int seg_end = world_color_offsets.data[off_base + c + 1];
         if (c + 2 < {NE}) {{
-            // rows of one color share no body: thread-parallel, plain writes
-            for (int i = seg_start + t; i < seg_end; i += {B}) {{
-                const int slot = world_row_order.data[world_base + i];
-{row_solve_body}
+            // units of one color share no body: thread-parallel, plain writes
+            for (int w = seg_start + t; w < seg_end; w += {B}) {{
+                const int start_slot = world_row_order.data[world_base + w];
+{unit_solve_body}
             }}
         }} else if (t == 0) {{
             // tail bucket (color-cap overflow): ordered serial sweep
-            for (int i = seg_start; i < seg_end; ++i) {{
-                const int slot = world_row_order.data[world_base + i];
-{row_solve_body}
+            for (int w = seg_start; w < seg_end; ++w) {{
+                const int start_slot = world_row_order.data[world_base + w];
+{unit_solve_body}
             }}
         }}
         __syncthreads();
@@ -9149,10 +9180,11 @@ def _get_pgs_solve_propagation_colored_block_kernel(
             propagation_body_impulses,
         )
 
-    name = f"pgs_solve_propagation_colored_block_{M}_{NE}_bd{B}"
+    name = f"pgs_solve_propagation_colored_units_{M}_{NE}_bd{B}"
     pgs_solve_propagation_colored_block_template.__name__ = name
     pgs_solve_propagation_colored_block_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_colored_block_template)
+
 
 
 def _get_pgs_solve_propagation_contact_kernel(
