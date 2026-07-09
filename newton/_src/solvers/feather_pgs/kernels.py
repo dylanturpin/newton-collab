@@ -3874,6 +3874,10 @@ def build_propagation_contact_rows(
     contact_friction_anchor_limit: int,
     contact_friction_scale: float,
     contact_shared_anchor: int,
+    unit_order: wp.array[int],
+    world_unit_count: wp.array[int],
+    unit_capacity: int,
+    use_unit_order: int,
     # outputs
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
@@ -3884,8 +3888,21 @@ def build_propagation_contact_rows(
     propagation_row_mu: wp.array2d[float],
     propagation_phi: wp.array2d[float],
 ):
-    """Build fixed-size body-space rows for contacts touching non-free articulations."""
-    c = wp.tid()
+    """Build fixed-size body-space rows for contacts touching non-free articulations.
+
+    With ``use_unit_order`` the launch runs over color-sorted unit positions
+    (worlds x capacity) instead of raw contact indices, so row WRITES land
+    sequentially in the color-ordered slot layout (reads scatter instead,
+    avoiding the write-allocate round trip on the row arrays).
+    """
+    tid = wp.tid()
+    c = tid
+    if use_unit_order != 0:
+        w = tid // unit_capacity
+        pos = tid - w * unit_capacity
+        if pos >= world_unit_count[w]:
+            return
+        c = unit_order[tid]
     total_contacts = contact_count[0]
     if c >= total_contacts:
         return
