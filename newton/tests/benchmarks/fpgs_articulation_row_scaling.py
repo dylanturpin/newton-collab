@@ -38,7 +38,7 @@ if str(_NEWTON_REPO) not in sys.path:
 import newton  # noqa: E402
 from newton.solvers import SolverFeatherPGS  # noqa: E402
 
-PROPAGATION_PATHS = ("propagation", "propagation-fused")
+PROPAGATION_PATHS = ("propagation", "propagation-fused", "propagation-colored")
 
 
 @dataclass(frozen=True)

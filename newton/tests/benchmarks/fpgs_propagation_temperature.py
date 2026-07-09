@@ -61,7 +61,7 @@ from fpgs_articulation_row_scaling import (
 import newton
 from newton.solvers import SolverFeatherPGS
 
-MODES = ("mf_immediate", "propagation", "propagation-fused")
+MODES = ("mf_immediate", "propagation", "propagation-fused", "propagation-colored")
 CONTACT_ROW_TYPE = 0
 
 
