@@ -2357,9 +2357,12 @@ class SolverFeatherPGS(SolverBase):
 
         if self._propagation_colored:
             total_rows = worlds * propagation_max_c
-            if total_rows >= PROPAGATION_COLOR_ROW_ID_LIMIT:
+            if self.propagation_colored_layout == "global" and total_rows >= PROPAGATION_COLOR_ROW_ID_LIMIT:
+                # the global layout's ticket keys embed the flat row id; the
+                # block/warp layouts key on per-world indices and have no
+                # such limit
                 raise ValueError(
-                    "propagation-colored: world_count * propagation_max_constraints "
+                    "propagation-colored (global layout): world_count * propagation_max_constraints "
                     f"({total_rows}) exceeds the flat row-id limit ({PROPAGATION_COLOR_ROW_ID_LIMIT})"
                 )
             n_entries = PROPAGATION_COLOR_TAIL + 2
