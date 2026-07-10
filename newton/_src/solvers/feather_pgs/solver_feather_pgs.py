@@ -319,6 +319,7 @@ class SolverFeatherPGS(SolverBase):
         ] = "immediate",
         propagation_colored_layout: Literal["block", "global"] = "block",
         propagation_same_articulation_rows: bool = False,
+        propagation_free_free_rows: bool = False,
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
         mf_max_constraints: int = 512,
@@ -463,6 +464,14 @@ class SolverFeatherPGS(SolverBase):
                 thread-per-row launch across all worlds (colors sequential, tree sweep per
                 iteration unchanged). Color-overflow rows run in an ordered serial tail bucket.
                 Defaults to ``"immediate"``.
+            propagation_free_free_rows (bool, optional): Route free/free and free/ground
+                contact rows to the propagation row family instead of the matrix-free
+                family. The row math is identical (free bodies use their spatial inverse
+                inertia response); the point is scheduling: with
+                ``articulated_contact_response="propagation-colored"`` the pile rows then
+                run through the colored solve path. Velocity-limit rows stay on the
+                matrix-free family. Requires ``articulated_contact_response="propagation"``
+                or ``"propagation-colored"``. Defaults to False.
             propagation_same_articulation_rows (bool, optional): Route contacts between two
                 links of the same articulation to propagation rows instead of dense generalized
                 rows. Their effective mass is recomputed with exact cross operational-space
@@ -630,6 +639,15 @@ class SolverFeatherPGS(SolverBase):
                 "use articulated_contact_response='propagation'"
             )
         self.propagation_same_articulation_rows = bool(propagation_same_articulation_rows)
+        if propagation_free_free_rows and articulated_contact_response not in (
+            "propagation",
+            "propagation-colored",
+        ):
+            raise NotImplementedError(
+                "propagation_free_free_rows requires articulated_contact_response "
+                "'propagation' or 'propagation-colored'"
+            )
+        self.propagation_free_free_rows = bool(propagation_free_free_rows)
         self.pgs_warmstart = pgs_warmstart
         if self.pgs_warmstart and self.contact_friction_position_iterations >= 0:
             raise NotImplementedError(
@@ -5744,6 +5762,7 @@ class SolverFeatherPGS(SolverBase):
                     has_free_rigid_flag,
                     propagation_flag,
                     1 if self.propagation_same_articulation_rows else 0,
+                    1 if self.propagation_free_free_rows else 0,
                     max_constraints,
                     self.mf_max_constraints,
                     self.propagation_max_constraints,

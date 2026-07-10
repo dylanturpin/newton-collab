@@ -2577,6 +2577,7 @@ def allocate_world_contact_slots(
     has_free_rigid: int,
     propagation_articulated_contacts: int,
     propagation_same_articulation: int,
+    propagation_free_free: int,
     max_constraints: int,
     mf_max_constraints: int,
     propagation_max_constraints: int,
@@ -2688,7 +2689,15 @@ def allocate_world_contact_slots(
         b_is_free_or_ground = (art_b < 0) or (is_free_rigid[art_b] != 0)
         if a_is_free_or_ground and b_is_free_or_ground:
             is_mf = 1
-    if propagation_articulated_contacts != 0 and is_mf == 0:
+    if propagation_free_free != 0 and is_mf == 1:
+        # Opt-in: route free/free (and free/ground) contact rows to the
+        # propagation family. The row math is identical (free bodies use the
+        # plain spatial inverse inertia response seeded by
+        # copy_free_rigid_propagation_body_response); this puts pile rows on
+        # the colored solve path. Velocity-limit rows stay on the MF family.
+        is_mf = 0
+        is_propagation = 1
+    if propagation_articulated_contacts != 0 and is_mf == 0 and is_propagation == 0:
         a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
         b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
         # Same-articulation two-link contacts need cross response terms between
