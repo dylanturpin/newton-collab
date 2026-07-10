@@ -67,16 +67,6 @@ from .kernels import (
     cholesky_loop,
     clamp_augmented_joint_u0,
     collect_propagation_units,
-    color_propagation_assign_tail,
-    color_propagation_commit,
-    color_propagation_count_uncolored,
-    color_propagation_histogram,
-    color_propagation_propose,
-    color_propagation_scan_offsets,
-    color_propagation_scatter,
-    color_propagation_world_histogram,
-    color_propagation_world_scan,
-    color_propagation_world_scatter,
     clamp_free_root_velocity_limits,
     compute_com_transforms,
     compute_composite_inertia,
@@ -122,10 +112,7 @@ from .kernels import (
     pgs_ncp_residuals_diagnostic_velocity,
     pgs_solve_loop,
     pgs_solve_mf_loop,
-    PROPAGATION_COLOR_ROW_ID_LIMIT,
     PROPAGATION_COLOR_TAIL,
-    pgs_solve_propagation_colored_batch,
-    pgs_solve_propagation_colored_tail,
     pgs_solve_propagation_contact_loop,
     populate_joint_limit_J_for_size,
     populate_joint_velocity_limit_J_for_size,
@@ -317,7 +304,6 @@ class SolverFeatherPGS(SolverBase):
         articulated_contact_response: Literal[
             "immediate", "propagation", "propagation-fused", "propagation-colored"
         ] = "immediate",
-        propagation_colored_layout: Literal["block", "global"] = "block",
         propagation_same_articulation_rows: bool = False,
         propagation_free_free_rows: bool = False,
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
@@ -623,11 +609,6 @@ class SolverFeatherPGS(SolverBase):
         self.articulated_contact_response = articulated_contact_response
         self.propagation_full_fused_iterations = articulated_contact_response == "propagation-fused"
         self._propagation_colored = articulated_contact_response == "propagation-colored"
-        if propagation_colored_layout not in ("block", "global"):
-            raise ValueError(
-                f"propagation_colored_layout must be 'block' or 'global', got {propagation_colored_layout!r}"
-            )
-        self.propagation_colored_layout = propagation_colored_layout
         if propagation_same_articulation_rows and articulated_contact_response == "immediate":
             raise ValueError(
                 "propagation_same_articulation_rows requires articulated_contact_response "
@@ -2357,35 +2338,16 @@ class SolverFeatherPGS(SolverBase):
 
         if self._propagation_colored:
             total_rows = worlds * propagation_max_c
-            if self.propagation_colored_layout == "global" and total_rows >= PROPAGATION_COLOR_ROW_ID_LIMIT:
-                # the global layout's ticket keys embed the flat row id; the
-                # block/warp layouts key on per-world indices and have no
-                # such limit
-                raise ValueError(
-                    "propagation-colored (global layout): world_count * propagation_max_constraints "
-                    f"({total_rows}) exceeds the flat row-id limit ({PROPAGATION_COLOR_ROW_ID_LIMIT})"
-                )
             n_entries = PROPAGATION_COLOR_TAIL + 2
-            self.color_row_color = wp.full((total_rows,), -1, dtype=wp.int32, device=device)
             self.color_body_ticket = wp.zeros((body_count,), dtype=wp.int32, device=device)
-            self.color_uncolored = wp.zeros((1,), dtype=wp.int32, device=device)
-            self._color_segments = []
-            self._color_tail_rows = 0
-            self._color_stats = {}
-            if self.propagation_colored_layout == "global":
-                self.color_row_list = wp.zeros((total_rows,), dtype=wp.int32, device=device)
-                self.color_counts = wp.zeros((n_entries,), dtype=wp.int32, device=device)
-                self.color_offsets = wp.zeros((n_entries,), dtype=wp.int32, device=device)
-                self.color_cursor = wp.zeros((n_entries,), dtype=wp.int32, device=device)
-            else:
-                self.color_world_offsets = wp.zeros((worlds * n_entries,), dtype=wp.int32, device=device)
-                self.color_world_row_order = wp.zeros((total_rows,), dtype=wp.int32, device=device)
-                self.color_unit_contact = wp.zeros((total_rows,), dtype=wp.int32, device=device)
-                self.color_unit_body_a = wp.zeros((total_rows,), dtype=wp.int32, device=device)
-                self.color_unit_body_b = wp.zeros((total_rows,), dtype=wp.int32, device=device)
-                self.color_unit_len = wp.zeros((total_rows,), dtype=wp.int32, device=device)
-                self.color_unit_sorted = wp.zeros((total_rows,), dtype=wp.int32, device=device)
-                self.color_world_unit_cursor = wp.zeros((worlds,), dtype=wp.int32, device=device)
+            self.color_world_offsets = wp.zeros((worlds * n_entries,), dtype=wp.int32, device=device)
+            self.color_world_row_order = wp.zeros((total_rows,), dtype=wp.int32, device=device)
+            self.color_unit_contact = wp.zeros((total_rows,), dtype=wp.int32, device=device)
+            self.color_unit_body_a = wp.zeros((total_rows,), dtype=wp.int32, device=device)
+            self.color_unit_body_b = wp.zeros((total_rows,), dtype=wp.int32, device=device)
+            self.color_unit_len = wp.zeros((total_rows,), dtype=wp.int32, device=device)
+            self.color_unit_sorted = wp.zeros((total_rows,), dtype=wp.int32, device=device)
+            self.color_world_unit_cursor = wp.zeros((worlds,), dtype=wp.int32, device=device)
 
     def _allocate_debug_buffers(self, model):
         """Allocate buffers for PGS convergence diagnostics."""
@@ -2561,7 +2523,6 @@ class SolverFeatherPGS(SolverBase):
         if (
             model.device.is_cuda
             and self._propagation_colored
-            and self.propagation_colored_layout == "block"
             and self.propagation_max_constraints > 0
         ):
             self._pgs_solve_propagation_colored_block_kernel = _get_pgs_solve_propagation_colored_block_kernel(
@@ -2589,12 +2550,6 @@ class SolverFeatherPGS(SolverBase):
                     )
                 )
             self._color_propagation_prebuild_kernel = _get_color_propagation_prebuild_kernel(
-                self.propagation_max_constraints,
-                PROPAGATION_COLOR_TAIL + 2,
-                self._propagation_colored_block_dim,
-                device_arch,
-            )
-            self._color_propagation_block_kernel = _get_color_propagation_block_kernel(
                 self.propagation_max_constraints,
                 PROPAGATION_COLOR_TAIL + 2,
                 self._propagation_colored_block_dim,
@@ -3309,149 +3264,6 @@ class SolverFeatherPGS(SolverBase):
                     device=self.model.device,
                 )
 
-        if self._propagation_colored:
-            with self._sync_timed("prop_coloring"):
-                self._color_propagation_rows()
-
-    def _color_propagation_rows(self) -> None:
-        """Color propagation rows so body-disjoint rows can solve in parallel.
-
-        Deterministic parallel greedy: each round, every uncolored row bids
-        for its bodies with a round-tagged atomic-max ticket; a row that wins
-        every dynamic body it touches commits to color = round-1. Colors
-        therefore track max body degree directly (no packing masks, no hard
-        64-color cap). Tickets never need re-initialization between rounds
-        because the round tag dominates the key comparison. Rows uncolored
-        after the round cap fall into the tail bucket.
-        """
-        cap = int(self.propagation_max_constraints)
-        total_rows = self.world_count * cap
-        device = self.model.device
-        n_entries = PROPAGATION_COLOR_TAIL + 2
-
-        if self.propagation_colored_layout == "block":
-            # v4: coloring already ran pre-build (contact_slot rewritten in
-            # color order; offsets and unit starts written there). Nothing to
-            # do per-step here.
-            return
-        if False:
-            wp.launch_tiled(
-                self._color_propagation_block_kernel,
-                dim=[self.world_count],
-                inputs=[
-                    self.world_count,
-                    self.propagation_constraint_count,
-                    self.propagation_body_a,
-                    self.propagation_body_b,
-                    self.propagation_row_type,
-                    self.color_body_ticket,
-                    self.color_world_row_order,
-                    self.color_world_offsets,
-                ],
-                block_dim=self._propagation_colored_block_dim,
-                device=device,
-            )
-            return
-
-        self.color_row_color.fill_(-1)
-        self.color_body_ticket.zero_()
-
-        rounds = 0
-        max_rounds = PROPAGATION_COLOR_TAIL
-        check_every = 16
-        while rounds < max_rounds:
-            for _ in range(min(check_every, max_rounds - rounds)):
-                rounds += 1
-                wp.launch(
-                    color_propagation_propose,
-                    dim=total_rows,
-                    inputs=[
-                        self.propagation_constraint_count,
-                        self.propagation_body_a,
-                        self.propagation_body_b,
-                        cap,
-                        self.color_row_color,
-                        rounds,
-                    ],
-                    outputs=[self.color_body_ticket],
-                    device=device,
-                )
-                wp.launch(
-                    color_propagation_commit,
-                    dim=total_rows,
-                    inputs=[
-                        self.propagation_constraint_count,
-                        self.propagation_body_a,
-                        self.propagation_body_b,
-                        cap,
-                        self.color_body_ticket,
-                        rounds,
-                    ],
-                    outputs=[self.color_row_color],
-                    device=device,
-                )
-            self.color_uncolored.zero_()
-            wp.launch(
-                color_propagation_count_uncolored,
-                dim=total_rows,
-                inputs=[self.propagation_constraint_count, cap, self.color_row_color],
-                outputs=[self.color_uncolored],
-                device=device,
-            )
-            if int(self.color_uncolored.numpy()[0]) == 0:
-                break
-
-        wp.launch(
-            color_propagation_assign_tail,
-            dim=total_rows,
-            inputs=[self.propagation_constraint_count, cap],
-            outputs=[self.color_row_color],
-            device=device,
-        )
-
-
-        self.color_counts.zero_()
-        wp.launch(
-            color_propagation_histogram,
-            dim=total_rows,
-            inputs=[self.propagation_constraint_count, cap, self.color_row_color],
-            outputs=[self.color_counts],
-            device=device,
-        )
-        wp.launch(
-            color_propagation_scan_offsets,
-            dim=1,
-            inputs=[self.color_counts, n_entries],
-            outputs=[self.color_offsets],
-            device=device,
-        )
-        self.color_cursor.zero_()
-        wp.launch(
-            color_propagation_scatter,
-            dim=total_rows,
-            inputs=[
-                self.propagation_constraint_count,
-                cap,
-                self.color_row_color,
-                self.color_offsets,
-            ],
-            outputs=[self.color_cursor, self.color_row_list],
-            device=device,
-        )
-
-        counts = self.color_counts.numpy()
-        offsets = self.color_offsets.numpy()
-        self._color_segments = [
-            (int(offsets[c]), int(counts[c])) for c in range(PROPAGATION_COLOR_TAIL) if counts[c] > 0
-        ]
-        self._color_tail_rows = int(counts[PROPAGATION_COLOR_TAIL])
-        self._color_stats = {
-            "colors_used": len(self._color_segments),
-            "tail_rows": self._color_tail_rows,
-            "rounds": rounds,
-            "total_rows": int(counts.sum()),
-            "max_color_rows": int(counts[: PROPAGATION_COLOR_TAIL].max()) if len(self._color_segments) else 0,
-        }
 
     def _propagation_pgs_solve_colored_iteration(
         self,
@@ -3462,7 +3274,7 @@ class SolverFeatherPGS(SolverBase):
         iteration_offset: int,
     ) -> None:
         device = self.model.device
-        if self.propagation_colored_layout == "block" and self._pgs_solve_propagation_colored_warp_kernel is not None:
+        if self._pgs_solve_propagation_colored_warp_kernel is not None:
             wpb = self._propagation_colored_worlds_per_block
             wp.launch_tiled(
                 self._pgs_solve_propagation_colored_warp_kernel,
@@ -3499,7 +3311,8 @@ class SolverFeatherPGS(SolverBase):
                 device=device,
             )
             return
-        if self.propagation_colored_layout == "block":
+        # staging-budget fallback: block-per-world kernel, same inputs
+        if True:
             wp.launch_tiled(
                 self._pgs_solve_propagation_colored_block_kernel,
                 dim=[self.world_count],
@@ -3535,66 +3348,6 @@ class SolverFeatherPGS(SolverBase):
                 device=device,
             )
             return
-        for seg_start, seg_count in self._color_segments:
-            wp.launch(
-                pgs_solve_propagation_colored_batch,
-                dim=seg_count,
-                inputs=[
-                    self.color_row_list,
-                    seg_start,
-                    self.propagation_body_a,
-                    self.propagation_body_b,
-                    self.propagation_MiJt_a,
-                    self.propagation_MiJt_b,
-                    self.propagation_J_a,
-                    self.propagation_J_b,
-                    self.propagation_eff_mass_inv,
-                    rhs,
-                    self.propagation_row_type,
-                    self.propagation_row_parent,
-                    self.propagation_row_mu,
-                    self.propagation_max_constraints,
-                    omega,
-                    int(friction_start_iteration),
-                    int(iteration_offset),
-                ],
-                outputs=[
-                    self.propagation_impulses,
-                    self.propagation_body_qd,
-                    self.propagation_body_impulses,
-                ],
-                device=device,
-            )
-        if self._color_tail_rows > 0:
-            wp.launch(
-                pgs_solve_propagation_colored_tail,
-                dim=self.world_count,
-                inputs=[
-                    self.propagation_constraint_count,
-                    self.color_row_color,
-                    self.propagation_body_a,
-                    self.propagation_body_b,
-                    self.propagation_MiJt_a,
-                    self.propagation_MiJt_b,
-                    self.propagation_J_a,
-                    self.propagation_J_b,
-                    self.propagation_eff_mass_inv,
-                    rhs,
-                    self.propagation_row_type,
-                    self.propagation_row_parent,
-                    self.propagation_row_mu,
-                    self.propagation_max_constraints,
-                    omega,
-                    int(friction_start_iteration),
-                    int(iteration_offset),
-                ],
-                outputs=[
-                    self.propagation_impulses,
-                    self.propagation_body_qd,
-                    self.propagation_body_impulses,
-                ],
-                device=device,
-            )
 
     def _compute_propagation_rhs_bias(
         self,
@@ -6019,7 +5772,6 @@ class SolverFeatherPGS(SolverBase):
             if (
                 propagation_active
                 and self._propagation_colored
-                and self.propagation_colored_layout == "block"
             ):
                 # v4 pre-build coloring: gather propagation contacts into
                 # per-world unit lists, color them, and rewrite contact_slot
@@ -6069,7 +5821,7 @@ class SolverFeatherPGS(SolverBase):
                 )
 
             if propagation_active:
-                colored_ordered_build = self._propagation_colored and self.propagation_colored_layout == "block"
+                colored_ordered_build = self._propagation_colored
                 if colored_ordered_build:
                     builder_unit_order = self.color_unit_sorted
                     builder_unit_count = self.color_world_unit_cursor
@@ -6135,7 +5887,7 @@ class SolverFeatherPGS(SolverBase):
                 if (
                     self._propagation_tree_requires_body_map
                     or self.propagation_full_fused_iterations
-                    or (self._propagation_colored and self.propagation_colored_layout == "block")
+                    or self._propagation_colored
                 ):
                     wp.launch(
                         build_propagation_body_map,
@@ -8954,6 +8706,198 @@ def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.K
     pack_mf_meta_template.__name__ = name
     pack_mf_meta_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pack_mf_meta_template)
+
+
+@cache
+def _get_color_propagation_prebuild_kernel(
+    propagation_max_constraints: int, n_color_entries: int, block_dim: int, device_arch: str
+) -> "wp.Kernel":
+    """Build the pre-build contact-unit coloring kernel (v4 layout).
+
+    Runs after contact classification and BEFORE row build: each block colors
+    its world's propagation contacts (round-tagged ticket bidding over a
+    compacted worklist, keys on global contact index for determinism of the
+    coloring), counting-sorts units by color, and rewrites ``contact_slot``
+    so the row builder writes every unit's rows at a color-ordered slot.
+    Color segments therefore occupy contiguous row memory and the colored
+    solve kernel's payload reads are sequential — no post-build permutation,
+    no staging copies. Also emits the unit-start order and per-color unit
+    offsets the solve kernel consumes.
+    """
+    M = propagation_max_constraints
+    NE = n_color_entries
+    B = int(block_dim)
+    cap = NE - 2  # color cap; index NE-2 is the tail bucket
+
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int world = tile;
+    if (world >= world_count) return;
+    int n_units = world_unit_cursor.data[world];
+    if (n_units > {M}) n_units = {M};
+    const int t = threadIdx.x;
+    if (n_units == 0) {{
+        for (int c = t; c < {NE}; c += {B}) world_color_offsets.data[world * {NE} + c] = 0;
+        return;
+    }}
+    const int world_base = world * {M};
+
+    __shared__ int s_n_work;
+    __shared__ int s_next_work;
+    __shared__ int s_counts[{NE}];
+    __shared__ int s_offsets[{NE}];
+    __shared__ short s_unit_color[{M}];
+    __shared__ short s_work[{M}];
+    __shared__ short s_work_next[{M}];
+    __shared__ short s_sorted[{M}];
+
+    if (t == 0) {{
+        s_n_work = n_units;
+        s_next_work = 0;
+    }}
+    for (int u = t; u < n_units; u += {B}) {{
+        s_unit_color[u] = -1;
+        s_work[u] = (short)u;
+        const int ba = unit_body_a.data[world_base + u];
+        const int bb = unit_body_b.data[world_base + u];
+        if (ba >= 0) body_ticket.data[ba] = 0;
+        if (bb >= 0) body_ticket.data[bb] = 0;
+    }}
+    __syncthreads();
+
+    for (int round_idx = 1; round_idx <= {cap}; ++round_idx) {{
+        const int n_work = s_n_work;
+        if (n_work == 0) break;
+        for (int w = t; w < n_work; w += {B}) {{
+            const int u = (int)s_work[w];
+            // key on the global contact index: deterministic coloring
+            // independent of the atomic list-build order
+            const int key = (round_idx << 23) | (0x7FFFFF - (unit_contact.data[world_base + u] & 0x7FFFFF));
+            const int ba = unit_body_a.data[world_base + u];
+            const int bb = unit_body_b.data[world_base + u];
+            if (ba >= 0) atomicMax(&body_ticket.data[ba], key);
+            if (bb >= 0) atomicMax(&body_ticket.data[bb], key);
+        }}
+        __syncthreads();
+        for (int w = t; w < n_work; w += {B}) {{
+            const int u = (int)s_work[w];
+            const int key = (round_idx << 23) | (0x7FFFFF - (unit_contact.data[world_base + u] & 0x7FFFFF));
+            const int ba = unit_body_a.data[world_base + u];
+            const int bb = unit_body_b.data[world_base + u];
+            if ((ba < 0 || body_ticket.data[ba] == key) && (bb < 0 || body_ticket.data[bb] == key)) {{
+                s_unit_color[u] = (short)(round_idx - 1);
+            }} else {{
+                const int idx = atomicAdd(&s_next_work, 1);
+                s_work_next[idx] = (short)u;
+            }}
+        }}
+        __syncthreads();
+        const int n_remaining = s_next_work;
+        __syncthreads();
+        if (t == 0) {{
+            s_n_work = n_remaining;
+            s_next_work = 0;
+        }}
+        for (int w = t; w < n_remaining; w += {B}) s_work[w] = s_work_next[w];
+        __syncthreads();
+    }}
+
+    for (int u = t; u < n_units; u += {B}) {{
+        if (s_unit_color[u] == -1) s_unit_color[u] = {cap};
+    }}
+
+    // counting sort of units by color
+    for (int c = t; c < {NE}; c += {B}) s_counts[c] = 0;
+    __syncthreads();
+    for (int u = t; u < n_units; u += {B}) {{
+        atomicAdd(&s_counts[(int)s_unit_color[u]], 1);
+    }}
+    __syncthreads();
+    if (t == 0) {{
+        int acc = 0;
+        for (int c = 0; c < {NE}; ++c) {{
+            s_offsets[c] = acc;
+            acc += s_counts[c];
+        }}
+    }}
+    __syncthreads();
+    for (int c = t; c < {NE}; c += {B}) {{
+        world_color_offsets.data[world * {NE} + c] = s_offsets[c];
+        s_counts[c] = 0;  // reuse as scatter cursor
+    }}
+    __syncthreads();
+    for (int u = t; u < n_units; u += {B}) {{
+        const int c = (int)s_unit_color[u];
+        const int idx = atomicAdd(&s_counts[c], 1);
+        s_sorted[s_offsets[c] + idx] = (short)u;
+    }}
+    __syncthreads();
+
+    // serial slot prefix in color order: rows of consecutive units are
+    // adjacent, so every color segment is contiguous row memory
+    if (t == 0) {{
+        int row_acc = 0;
+        for (int pos = 0; pos < n_units; ++pos) {{
+            const int u = (int)s_sorted[pos];
+            const int cid = unit_contact.data[world_base + u];
+            world_row_order.data[world_base + pos] = row_acc;
+            unit_sorted_contact.data[world_base + pos] = cid;
+            contact_slot.data[cid] = row_acc;
+            row_acc += unit_len.data[world_base + u];
+        }}
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def color_propagation_prebuild_native(
+        tile: int,
+        world_count: int,
+        world_unit_cursor: wp.array[int],
+        unit_contact: wp.array[int],
+        unit_body_a: wp.array[int],
+        unit_body_b: wp.array[int],
+        unit_len: wp.array[int],
+        body_ticket: wp.array[int],
+        contact_slot: wp.array[int],
+        world_row_order: wp.array[int],
+        world_color_offsets: wp.array[int],
+        unit_sorted_contact: wp.array[int],
+    ): ...
+
+    def color_propagation_prebuild_template(
+        world_count: int,
+        world_unit_cursor: wp.array[int],
+        unit_contact: wp.array[int],
+        unit_body_a: wp.array[int],
+        unit_body_b: wp.array[int],
+        unit_len: wp.array[int],
+        body_ticket: wp.array[int],
+        contact_slot: wp.array[int],
+        world_row_order: wp.array[int],
+        world_color_offsets: wp.array[int],
+        unit_sorted_contact: wp.array[int],
+    ):
+        tile, _t = wp.tid()
+        color_propagation_prebuild_native(
+            tile,
+            world_count,
+            world_unit_cursor,
+            unit_contact,
+            unit_body_a,
+            unit_body_b,
+            unit_len,
+            body_ticket,
+            contact_slot,
+            world_row_order,
+            world_color_offsets,
+            unit_sorted_contact,
+        )
+
+    name = f"color_propagation_prebuild_{M}_{NE}_bd{B}"
+    color_propagation_prebuild_template.__name__ = name
+    color_propagation_prebuild_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(color_propagation_prebuild_template)
 
 
 @cache
