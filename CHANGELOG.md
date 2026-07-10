@@ -36,6 +36,7 @@
 ### Fixed
 
 - Fix `import newton` failing when `warp.fem` is unavailable (e.g. the `omni.warp.core` build shipped in Omniverse Kit) by guarding the eager `SolverImplicitMPM` import in `newton._src.solvers`; the symbol is set to `None` when the MPM solver cannot be imported.
+- Fix `SolverFeatherPGS` producing NaNs when `dense_max_constraints` exceeds the per-block shared-memory limit (about 224 rows for a 35-DOF articulation on sm_86): the tiled `H^-1 J^T` kernel sized its shared memory to `dense_max_constraints` and silently over-subscribed, leaving its output as garbage. The kernel is now compiled at a fixed width and launched once per row-chunk (new `hinv_jt_chunk_size` parameter, default 128), so `dense_max_constraints` can exceed the limit without over-subscribing.
 - Fix `eval_fk()` overwriting VBD-simulated `JointType.CABLE` body poses.
 - Fix `SolverXPBD` `body_parent_f` reporting to include `Control.joint_f` contributions and accumulate multiple inbound joint contributions, matching the `SolverMuJoCo` and `SolverFeatherstone` convention.
 - Fix MJCF `xyaxes` parsing to treat the second vector as Y and derive Z from X cross Y.

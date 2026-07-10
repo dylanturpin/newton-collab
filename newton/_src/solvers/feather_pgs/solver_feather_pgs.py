@@ -275,6 +275,7 @@ class SolverFeatherPGS(SolverBase):
         # Streaming kernel chunk sizes (None = auto-select)
         delassus_chunk_size: int | None = None,
         pgs_chunk_size: int | None = None,
+        hinv_jt_chunk_size: int | None = None,
         # Auto selection threshold
         small_dof_threshold: int = 12,
         # Parallelism options
@@ -437,6 +438,13 @@ class SolverFeatherPGS(SolverBase):
                 for the streaming PGS kernel. Controls how many block-rows of the Delassus matrix are
                 preloaded into shared memory at once. 1 = current streaming behavior (one block-row
                 at a time). None defaults to 1. Defaults to None.
+            hinv_jt_chunk_size (int, optional): Fixed tile width (in constraint rows) for the tiled
+                ``H^{-1} J^T`` kernel. The kernel is compiled at ``min(dense_max_constraints,
+                hinv_jt_chunk_size)`` and launched once per row-chunk, so its shared-memory footprint is
+                bounded by this width rather than scaling with :paramref:`dense_max_constraints`. This
+                lets ``dense_max_constraints`` exceed the per-block shared-memory limit (~224 rows for a
+                35-DOF articulation on sm_86) without over-subscribing. ``None`` uses 128, which fits every
+                supported size on sm_80+. Defaults to None.
             small_dof_threshold (int, optional): DOF threshold for "auto" kernel selection. Defaults to 12.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
@@ -671,6 +679,7 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_kernel = pgs_kernel
         self.delassus_chunk_size = delassus_chunk_size
         self.pgs_chunk_size = pgs_chunk_size if pgs_chunk_size is not None else 1
+        self.hinv_jt_chunk_size = hinv_jt_chunk_size if hinv_jt_chunk_size is not None else 128
         self.small_dof_threshold = small_dof_threshold
         self.use_parallel_streams = use_parallel_streams
 
@@ -1736,6 +1745,13 @@ class SolverFeatherPGS(SolverBase):
     def _init_tiled_kernels(self, model):
         """Resolve size-specialized Warp kernels once for this solver shape."""
         device_arch = model.device.arch
+        # Fixed tile width for the tiled H^{-1} J^T kernel. The kernel is launched once per row-chunk
+        # (see :meth:`_stage4_hinv_jt_tiled`), so its shared-memory footprint is bounded by this width
+        # instead of scaling with ``dense_max_constraints``. When ``dense_max_constraints`` fits, this is
+        # ``dense_max_constraints`` and the launch is a single full-width tile (unchanged behavior).
+        self._hinv_jt_tiled_width = (
+            min(self.dense_max_constraints, self.hinv_jt_chunk_size) if self.dense_max_constraints > 0 else 0
+        )
         self._cholesky_kernels_by_size = {}
         self._triangular_solve_kernels_by_size = {}
         self._hinv_jt_kernels_by_size = {}
@@ -1762,7 +1778,7 @@ class SolverFeatherPGS(SolverBase):
                 continue
 
             self._hinv_jt_kernels_by_size[size] = _get_hinv_jt_kernel(
-                size, self.dense_max_constraints, device_arch, self.tile_threads
+                size, self._hinv_jt_tiled_width, device_arch, self.tile_threads
             )
             self._hinv_jt_fused_kernels_by_size[size] = _get_hinv_jt_fused_kernel(
                 size, self.dense_max_constraints, device_arch, self.tile_threads
@@ -2332,6 +2348,10 @@ class SolverFeatherPGS(SolverBase):
             fused_ok = (
                 self._is_one_art_per_world
                 and self.hinv_jt_kernel != "par_row"
+                # The fused kernel still builds a full [M x M] Delassus tile, so it cannot be chunked like
+                # _stage4_hinv_jt_tiled. Only take it when the full width fits shared memory; otherwise fall
+                # through to the chunked non-fused hinv_jt + streaming Delassus path.
+                and self.dense_max_constraints <= self._hinv_jt_tiled_width
                 and all(
                     (self.hinv_jt_kernel == "tiled")
                     or (self.hinv_jt_kernel == "auto" and size > self.small_dof_threshold)
@@ -4038,20 +4058,31 @@ class SolverFeatherPGS(SolverBase):
         hinv_jt_kernel = self._hinv_jt_kernels_by_size[size]
         if hinv_jt_kernel is None:
             raise RuntimeError(f"H^-1 J^T tiled kernel is unavailable for DOF size {size}")
-        wp.launch_tiled(
-            hinv_jt_kernel,
-            dim=[n_arts],
-            inputs=[
-                self.L_by_size[size],
-                self.J_by_size[size],
-                self.group_to_art[size],
-                self.art_to_world,
-                self.constraint_count,
-            ],
-            outputs=[self.Y_by_size[size]],
-            block_dim=self.tile_threads,
-            device=model.device,
-        )
+        # The kernel is compiled at a fixed width ``ceff`` <= dense_max_constraints, so launch it once per
+        # row-chunk, slicing J/Y along the constraint axis. Each row is an independent triangular solve, so
+        # chunking is exact. The last chunk's offset is clamped to M - ceff to keep every launch exactly
+        # ``ceff`` wide; overlapping rows recompute to identical values. When ceff == M (dense fits) this is
+        # a single full-width launch, unchanged from the non-chunked behavior.
+        ceff = self._hinv_jt_tiled_width
+        m = self.dense_max_constraints
+        j_group = self.J_by_size[size]
+        y_group = self.Y_by_size[size]
+        offsets = sorted({min(off, m - ceff) for off in range(0, m, ceff)})
+        for off in offsets:
+            wp.launch_tiled(
+                hinv_jt_kernel,
+                dim=[n_arts],
+                inputs=[
+                    self.L_by_size[size],
+                    j_group[:, off : off + ceff, :],
+                    self.group_to_art[size],
+                    self.art_to_world,
+                    self.constraint_count,
+                ],
+                outputs=[y_group[:, off : off + ceff, :]],
+                block_dim=self.tile_threads,
+                device=model.device,
+            )
 
     def _stage4_hinv_jt_tiled_fused(self, size: int):
         model = self.model
