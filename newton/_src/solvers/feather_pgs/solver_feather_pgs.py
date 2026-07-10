@@ -2550,6 +2550,23 @@ class SolverFeatherPGS(SolverBase):
                 int(getattr(self, "max_propagation_bodies", 0)),
                 device_arch,
             )
+            self._pgs_solve_propagation_colored_warp_kernel = None
+            mb = int(getattr(self, "max_propagation_bodies", 0))
+            lanes = int(os.environ.get("FEATHER_PGS_COLORED_LANES", "1"))
+            wpb = int(os.environ.get("FEATHER_PGS_COLORED_WPB", "2"))
+            self._propagation_colored_worlds_per_block = wpb
+            # per-warp staging: 48B/body/world; keep total static shared under ~44KB
+            if lanes in (1, 2, 4, 8, 16, 32) and wpb >= 1 and mb * wpb * 48 <= 45056:
+                self._pgs_solve_propagation_colored_warp_kernel = (
+                    _get_pgs_solve_propagation_colored_warp_kernel(
+                        self.propagation_max_constraints,
+                        PROPAGATION_COLOR_TAIL + 2,
+                        mb,
+                        lanes,
+                        wpb,
+                        device_arch,
+                    )
+                )
             self._color_propagation_prebuild_kernel = _get_color_propagation_prebuild_kernel(
                 self.propagation_max_constraints,
                 PROPAGATION_COLOR_TAIL + 2,
@@ -3424,6 +3441,43 @@ class SolverFeatherPGS(SolverBase):
         iteration_offset: int,
     ) -> None:
         device = self.model.device
+        if self.propagation_colored_layout == "block" and self._pgs_solve_propagation_colored_warp_kernel is not None:
+            wpb = self._propagation_colored_worlds_per_block
+            wp.launch_tiled(
+                self._pgs_solve_propagation_colored_warp_kernel,
+                dim=[(self.world_count + wpb - 1) // wpb],
+                inputs=[
+                    self.world_count,
+                    self.propagation_constraint_count,
+                    self.propagation_body_a,
+                    self.propagation_body_b,
+                    self.propagation_MiJt_a,
+                    self.propagation_MiJt_b,
+                    self.propagation_J_a,
+                    self.propagation_J_b,
+                    self.propagation_eff_mass_inv,
+                    rhs,
+                    self.propagation_row_type,
+                    self.propagation_row_parent,
+                    self.propagation_row_mu,
+                    self.color_world_row_order,
+                    self.color_world_offsets,
+                    self.propagation_body_list,
+                    self.propagation_body_count,
+                    self.propagation_body_local_slot,
+                    omega,
+                    int(friction_start_iteration),
+                    int(iteration_offset),
+                ],
+                outputs=[
+                    self.propagation_impulses,
+                    self.propagation_body_qd,
+                    self.propagation_body_impulses,
+                ],
+                block_dim=32 * wpb,
+                device=device,
+            )
+            return
         if self.propagation_colored_layout == "block":
             wp.launch_tiled(
                 self._pgs_solve_propagation_colored_block_kernel,
@@ -9253,6 +9307,357 @@ def _get_color_propagation_block_kernel(
     color_propagation_block_template.__name__ = name
     color_propagation_block_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(color_propagation_block_template)
+
+
+@cache
+def _get_pgs_solve_propagation_colored_warp_kernel(
+    propagation_max_constraints: int,
+    n_color_entries: int,
+    max_propagation_bodies: int,
+    lanes_per_unit: int,
+    worlds_per_block: int,
+    device_arch: str,
+) -> "wp.Kernel":
+    """Build the warp-per-world colored solver with sub-warp unit cooperation.
+
+    Each warp owns one world (``worlds_per_block`` warps per block), so color
+    barriers are ``__syncwarp()`` — worlds pack into blocks past the
+    block-slot occupancy limit without any cross-warp barrier divergence.
+    Within a warp, groups of ``lanes_per_unit`` (R, power of two) lanes
+    cooperate on one contact unit per color segment: lanes stride the 12-wide
+    Jacobian dot (shuffle-reduced within the group), the group leader runs
+    the scalar impulse/cone update, and lanes fan out the body writes. Body
+    velocity and deferred impulse live in per-warp shared-memory staging.
+    Row solve order and results match the serial semantics (group branches
+    are row-uniform); only float summation order inside a row's dot differs.
+    """
+    M = propagation_max_constraints
+    NE = n_color_entries
+    MB = max(int(max_propagation_bodies), 1)
+    R = int(lanes_per_unit)
+    W = int(worlds_per_block)
+    assert R in (1, 2, 4, 8, 16, 32)
+    contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
+    friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
+    if R == 32:
+        gmask = "0xffffffffu"
+    else:
+        gmask = f"((((1u << {R}) - 1u)) << (grp * {R}))"
+
+    coop_body = f"""
+            for (int rr = 0; ; ++rr) {{
+                const int slot = start_slot + rr;
+                if (slot >= m) break;
+                const int off = world_base + slot;
+                const int row_type = __ldg(&propagation_row_type.data[off]);
+                if (rr > 0 && row_type != {friction_type}) break;
+                if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
+                    if (gl == 0) propagation_impulses.data[off] = 0.0f;
+                    continue;
+                }}
+                const float eff_inv = __ldg(&propagation_eff_mass_inv.data[off]);
+                if (eff_inv <= 0.0f) continue;
+                const int ba = __ldg(&propagation_body_a.data[off]);
+                const int bb = __ldg(&propagation_body_b.data[off]);
+                const int la = (ba >= 0) ? __ldg(&propagation_body_local_slot.data[ba]) : -1;
+                const int lb = (bb >= 0) ? __ldg(&propagation_body_local_slot.data[bb]) : -1;
+
+                float partial = 0.0f;
+                for (int k = gl; k < 12; k += {R}) {{
+                    if (k < 6) {{
+                        if (la >= 0) partial += __ldg(&propagation_J_a.data[off * 6 + k]) * s_qd[la * 6 + k];
+                    }} else {{
+                        if (lb >= 0) partial += __ldg(&propagation_J_b.data[off * 6 + k - 6]) * s_qd[lb * 6 + k - 6];
+                    }}
+                }}
+                for (int o = {R} / 2; o > 0; o >>= 1) partial += __shfl_down_sync({gmask}, partial, o, {R});
+
+                float delta_impulse = 0.0f;
+                float sib_delta = 0.0f;
+                int sib = -1;
+                if (gl == 0) {{
+                    const float residual = partial + __ldg(&propagation_rhs.data[off]);
+                    const float old_impulse = propagation_impulses.data[off];
+                    float new_impulse = old_impulse + omega * (-residual * eff_inv);
+                    if (row_type == {contact_type}) {{
+                        if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    }} else if (row_type == {friction_type}) {{
+                        const int parent_idx = propagation_row_parent.data[off];
+                        const float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                        const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
+                        if (radius <= 0.0f) {{
+                            new_impulse = 0.0f;
+                        }} else {{
+                            sib = parent_idx + 1;
+                            if (slot == parent_idx + 1) sib = parent_idx + 2;
+                            propagation_impulses.data[off] = new_impulse;
+                            const int sib_off = world_base + sib;
+                            const float other = propagation_impulses.data[sib_off];
+                            const float mag = sqrtf(new_impulse * new_impulse + other * other);
+                            if (mag > radius) {{
+                                const float scale = radius / mag;
+                                new_impulse *= scale;
+                                const float sib_new = other * scale;
+                                sib_delta = sib_new - other;
+                                propagation_impulses.data[sib_off] = sib_new;
+                            }} else {{
+                                sib = -1;
+                            }}
+                        }}
+                    }}
+                    delta_impulse = new_impulse - old_impulse;
+                    propagation_impulses.data[off] = new_impulse;
+                }}
+                delta_impulse = __shfl_sync({gmask}, delta_impulse, 0, {R});
+                sib_delta = __shfl_sync({gmask}, sib_delta, 0, {R});
+                sib = __shfl_sync({gmask}, sib, 0, {R});
+
+                if (sib >= 0 && sib_delta != 0.0f) {{
+                    const int sib_off = world_base + sib;
+                    for (int e = gl; e < 6; e += {R}) {{
+                        if (la >= 0) {{
+                            s_qd[la * 6 + e] += __ldg(&propagation_MiJt_a.data[sib_off * 6 + e]) * sib_delta;
+                            s_imp[la * 6 + e] += __ldg(&propagation_J_a.data[sib_off * 6 + e]) * sib_delta;
+                        }}
+                        if (lb >= 0) {{
+                            s_qd[lb * 6 + e] += __ldg(&propagation_MiJt_b.data[sib_off * 6 + e]) * sib_delta;
+                            s_imp[lb * 6 + e] += __ldg(&propagation_J_b.data[sib_off * 6 + e]) * sib_delta;
+                        }}
+                    }}
+                }}
+                if (delta_impulse != 0.0f) {{
+                    for (int e = gl; e < 6; e += {R}) {{
+                        if (la >= 0) {{
+                            s_qd[la * 6 + e] += __ldg(&propagation_MiJt_a.data[off * 6 + e]) * delta_impulse;
+                            s_imp[la * 6 + e] += __ldg(&propagation_J_a.data[off * 6 + e]) * delta_impulse;
+                        }}
+                        if (lb >= 0) {{
+                            s_qd[lb * 6 + e] += __ldg(&propagation_MiJt_b.data[off * 6 + e]) * delta_impulse;
+                            s_imp[lb * 6 + e] += __ldg(&propagation_J_b.data[off * 6 + e]) * delta_impulse;
+                        }}
+                    }}
+                }}
+            }}
+"""
+
+    tail_body = f"""
+            for (int rr = 0; ; ++rr) {{
+                const int slot = start_slot + rr;
+                if (slot >= m) break;
+                const int off = world_base + slot;
+                const int row_type = propagation_row_type.data[off];
+                if (rr > 0 && row_type != {friction_type}) break;
+                if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
+                    propagation_impulses.data[off] = 0.0f;
+                    continue;
+                }}
+                const float eff_inv = propagation_eff_mass_inv.data[off];
+                if (eff_inv <= 0.0f) continue;
+                const int ba = propagation_body_a.data[off];
+                const int bb = propagation_body_b.data[off];
+                const int la = (ba >= 0) ? propagation_body_local_slot.data[ba] : -1;
+                const int lb = (bb >= 0) ? propagation_body_local_slot.data[bb] : -1;
+                float jv = 0.0f;
+                if (la >= 0) for (int k = 0; k < 6; ++k) jv += propagation_J_a.data[off * 6 + k] * s_qd[la * 6 + k];
+                if (lb >= 0) for (int k = 0; k < 6; ++k) jv += propagation_J_b.data[off * 6 + k] * s_qd[lb * 6 + k];
+                const float residual = jv + propagation_rhs.data[off];
+                const float old_impulse = propagation_impulses.data[off];
+                float new_impulse = old_impulse + omega * (-residual * eff_inv);
+                if (row_type == {contact_type}) {{
+                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                }} else if (row_type == {friction_type}) {{
+                    const int parent_idx = propagation_row_parent.data[off];
+                    const float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
+                    if (radius <= 0.0f) {{
+                        new_impulse = 0.0f;
+                    }} else {{
+                        int sib = parent_idx + 1;
+                        if (slot == parent_idx + 1) sib = parent_idx + 2;
+                        propagation_impulses.data[off] = new_impulse;
+                        const int sib_off = world_base + sib;
+                        const float other = propagation_impulses.data[sib_off];
+                        const float mag = sqrtf(new_impulse * new_impulse + other * other);
+                        if (mag > radius) {{
+                            const float scale = radius / mag;
+                            new_impulse *= scale;
+                            const float sib_new = other * scale;
+                            const float sib_delta = sib_new - other;
+                            propagation_impulses.data[sib_off] = sib_new;
+                            for (int e = 0; e < 6; ++e) {{
+                                if (la >= 0) {{
+                                    s_qd[la * 6 + e] += propagation_MiJt_a.data[sib_off * 6 + e] * sib_delta;
+                                    s_imp[la * 6 + e] += propagation_J_a.data[sib_off * 6 + e] * sib_delta;
+                                }}
+                                if (lb >= 0) {{
+                                    s_qd[lb * 6 + e] += propagation_MiJt_b.data[sib_off * 6 + e] * sib_delta;
+                                    s_imp[lb * 6 + e] += propagation_J_b.data[sib_off * 6 + e] * sib_delta;
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+                const float delta_impulse = new_impulse - old_impulse;
+                propagation_impulses.data[off] = new_impulse;
+                if (delta_impulse != 0.0f) {{
+                    for (int e = 0; e < 6; ++e) {{
+                        if (la >= 0) {{
+                            s_qd[la * 6 + e] += propagation_MiJt_a.data[off * 6 + e] * delta_impulse;
+                            s_imp[la * 6 + e] += propagation_J_a.data[off * 6 + e] * delta_impulse;
+                        }}
+                        if (lb >= 0) {{
+                            s_qd[lb * 6 + e] += propagation_MiJt_b.data[off * 6 + e] * delta_impulse;
+                            s_imp[lb * 6 + e] += propagation_J_b.data[off * 6 + e] * delta_impulse;
+                        }}
+                    }}
+                }}
+            }}
+"""
+
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int t = threadIdx.x;
+    const int warp_id = t >> 5;
+    const int lane = t & 31;
+    const int world = tile * {W} + warp_id;
+    if (world >= world_count) return;
+    int m = propagation_constraint_count.data[world];
+    if (m > {M}) m = {M};
+    if (m == 0) return;
+    const int world_base = world * {M};
+    const int off_base = world * {NE};
+    const int n_units = world_color_offsets.data[off_base + {NE} - 1];
+
+    __shared__ float s_qd_all[{W} * {MB} * 6];
+    __shared__ float s_imp_all[{W} * {MB} * 6];
+    float* s_qd = s_qd_all + warp_id * {MB} * 6;
+    float* s_imp = s_imp_all + warp_id * {MB} * 6;
+    const int n_bodies = propagation_body_count.data[world];
+    for (int i = lane; i < n_bodies * 6; i += 32) {{
+        const int g = propagation_body_list.data[world * {MB} + i / 6];
+        s_qd[i] = propagation_body_qd.data[g * 6 + i % 6];
+        s_imp[i] = propagation_body_impulses.data[g * 6 + i % 6];
+    }}
+    __syncwarp();
+
+    const int grp = lane / {R};
+    const int gl = lane - grp * {R};
+
+    int seg_start = 0;
+    for (int c = 0; c + 1 < {NE} && seg_start < n_units; ++c) {{
+        const int seg_end = world_color_offsets.data[off_base + c + 1];
+        if (c + 2 < {NE}) {{
+            for (int w = seg_start + grp; w < seg_end; w += (32 / {R})) {{
+                const int start_slot = world_row_order.data[world_base + w];
+{coop_body}
+            }}
+        }} else if (lane == 0) {{
+            for (int w = seg_start; w < seg_end; ++w) {{
+                const int start_slot = world_row_order.data[world_base + w];
+{tail_body}
+            }}
+        }}
+        __syncwarp();
+        seg_start = seg_end;
+    }}
+
+    __syncwarp();
+    for (int i = lane; i < n_bodies * 6; i += 32) {{
+        const int g = propagation_body_list.data[world * {MB} + i / 6];
+        propagation_body_qd.data[g * 6 + i % 6] = s_qd[i];
+        propagation_body_impulses.data[g * 6 + i % 6] = s_imp[i];
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def pgs_solve_propagation_colored_warp_native(
+        tile: int,
+        world_count: int,
+        propagation_constraint_count: wp.array[int],
+        propagation_body_a: wp.array2d[int],
+        propagation_body_b: wp.array2d[int],
+        propagation_MiJt_a: wp.array3d[float],
+        propagation_MiJt_b: wp.array3d[float],
+        propagation_J_a: wp.array3d[float],
+        propagation_J_b: wp.array3d[float],
+        propagation_eff_mass_inv: wp.array2d[float],
+        propagation_rhs: wp.array2d[float],
+        propagation_row_type: wp.array2d[int],
+        propagation_row_parent: wp.array2d[int],
+        propagation_row_mu: wp.array2d[float],
+        world_row_order: wp.array[int],
+        world_color_offsets: wp.array[int],
+        propagation_body_list: wp.array2d[int],
+        propagation_body_count: wp.array[int],
+        propagation_body_local_slot: wp.array[int],
+        omega: float,
+        friction_start_iteration: int,
+        global_iter: int,
+        propagation_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        propagation_body_impulses: wp.array2d[float],
+    ): ...
+
+    def pgs_solve_propagation_colored_warp_template(
+        world_count: int,
+        propagation_constraint_count: wp.array[int],
+        propagation_body_a: wp.array2d[int],
+        propagation_body_b: wp.array2d[int],
+        propagation_MiJt_a: wp.array3d[float],
+        propagation_MiJt_b: wp.array3d[float],
+        propagation_J_a: wp.array3d[float],
+        propagation_J_b: wp.array3d[float],
+        propagation_eff_mass_inv: wp.array2d[float],
+        propagation_rhs: wp.array2d[float],
+        propagation_row_type: wp.array2d[int],
+        propagation_row_parent: wp.array2d[int],
+        propagation_row_mu: wp.array2d[float],
+        world_row_order: wp.array[int],
+        world_color_offsets: wp.array[int],
+        propagation_body_list: wp.array2d[int],
+        propagation_body_count: wp.array[int],
+        propagation_body_local_slot: wp.array[int],
+        omega: float,
+        friction_start_iteration: int,
+        global_iter: int,
+        propagation_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        propagation_body_impulses: wp.array2d[float],
+    ):
+        tile, _t = wp.tid()
+        pgs_solve_propagation_colored_warp_native(
+            tile,
+            world_count,
+            propagation_constraint_count,
+            propagation_body_a,
+            propagation_body_b,
+            propagation_MiJt_a,
+            propagation_MiJt_b,
+            propagation_J_a,
+            propagation_J_b,
+            propagation_eff_mass_inv,
+            propagation_rhs,
+            propagation_row_type,
+            propagation_row_parent,
+            propagation_row_mu,
+            world_row_order,
+            world_color_offsets,
+            propagation_body_list,
+            propagation_body_count,
+            propagation_body_local_slot,
+            omega,
+            friction_start_iteration,
+            global_iter,
+            propagation_impulses,
+            propagation_body_qd,
+            propagation_body_impulses,
+        )
+
+    name = f"pgs_solve_propagation_colored_warp_{M}_{NE}_r{R}_w{W}_mb{MB}"
+    pgs_solve_propagation_colored_warp_template.__name__ = name
+    pgs_solve_propagation_colored_warp_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_colored_warp_template)
 
 
 @cache
