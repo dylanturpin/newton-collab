@@ -16,12 +16,18 @@ Public inverse-kinematics API for defining objectives and solving IK problems.
    :nosignatures:
 
    IKJacobianType
+   IKLinearSolver
    IKObjective
    IKObjectiveJointLimit
+   IKObjectiveJointReference
    IKObjectivePosition
    IKObjectiveRotation
+   IKObjectiveSmoothness
+   IKObjectiveTemporal
+   IKObjectiveVelocityLimit
    IKOptimizer
    IKOptimizerLBFGS
    IKOptimizerLM
    IKSampler
    IKSolver
+   IKSolverTrajectory
