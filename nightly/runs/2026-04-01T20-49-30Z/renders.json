@@ -1,0 +1,170 @@
+[
+  {
+    "fps": 60,
+    "frames": 300,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_tag": "rtx-pro-6000-blackwell-server-edition",
+    "height": 1080,
+    "job_id": "g1_flat_renders__0001",
+    "label": "FeatherPGS (split), 2 substeps",
+    "path": "renders/g1_flat_renders__0001/g1_flat.mp4",
+    "run_id": "2026-04-01T20-49-30Z",
+    "run_timestamp": "2026-04-01T20:49:22.096767Z",
+    "scenario": "g1_flat",
+    "series": "g1_flat_render",
+    "solver": "fpgs_split",
+    "substeps": 2,
+    "tags": [
+      "g1_flat_render"
+    ],
+    "task_id": "g1_flat_renders",
+    "width": 1920
+  },
+  {
+    "fps": 60,
+    "frames": 300,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_tag": "rtx-pro-6000-blackwell-server-edition",
+    "height": 1080,
+    "job_id": "g1_flat_renders__0002",
+    "label": "FeatherPGS (split), 4 substeps",
+    "path": "renders/g1_flat_renders__0002/g1_flat.mp4",
+    "run_id": "2026-04-01T20-49-30Z",
+    "run_timestamp": "2026-04-01T20:49:22.096767Z",
+    "scenario": "g1_flat",
+    "series": "g1_flat_render",
+    "solver": "fpgs_split",
+    "substeps": 4,
+    "tags": [
+      "g1_flat_render"
+    ],
+    "task_id": "g1_flat_renders",
+    "width": 1920
+  },
+  {
+    "fps": 60,
+    "frames": 300,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_tag": "rtx-pro-6000-blackwell-server-edition",
+    "height": 1080,
+    "job_id": "g1_flat_renders__0003",
+    "label": "MJWarp, 2 substeps",
+    "path": "renders/g1_flat_renders__0003/g1_flat.mp4",
+    "run_id": "2026-04-01T20-49-30Z",
+    "run_timestamp": "2026-04-01T20:49:22.096767Z",
+    "scenario": "g1_flat",
+    "series": "g1_flat_render",
+    "solver": "mujoco",
+    "substeps": 2,
+    "tags": [
+      "g1_flat_render"
+    ],
+    "task_id": "g1_flat_renders",
+    "width": 1920
+  },
+  {
+    "fps": 60,
+    "frames": 300,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_tag": "rtx-pro-6000-blackwell-server-edition",
+    "height": 1080,
+    "job_id": "g1_flat_renders__0004",
+    "label": "MJWarp, 4 substeps",
+    "path": "renders/g1_flat_renders__0004/g1_flat.mp4",
+    "run_id": "2026-04-01T20-49-30Z",
+    "run_timestamp": "2026-04-01T20:49:22.096767Z",
+    "scenario": "g1_flat",
+    "series": "g1_flat_render",
+    "solver": "mujoco",
+    "substeps": 4,
+    "tags": [
+      "g1_flat_render"
+    ],
+    "task_id": "g1_flat_renders",
+    "width": 1920
+  },
+  {
+    "fps": 60,
+    "frames": 300,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_tag": "rtx-pro-6000-blackwell-server-edition",
+    "height": 1080,
+    "job_id": "h1_tabletop_renders__0001",
+    "label": "FeatherPGS (matrix-free), 4 substeps",
+    "path": "renders/h1_tabletop_renders__0001/h1_tabletop.mp4",
+    "run_id": "2026-04-01T20-49-30Z",
+    "run_timestamp": "2026-04-01T20:49:22.096767Z",
+    "scenario": "h1_tabletop",
+    "series": "h1_tabletop_render",
+    "solver": "fpgs_matrix_free",
+    "substeps": 4,
+    "tags": [
+      "h1_tabletop_render"
+    ],
+    "task_id": "h1_tabletop_renders",
+    "width": 1920
+  },
+  {
+    "fps": 60,
+    "frames": 300,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_tag": "rtx-pro-6000-blackwell-server-edition",
+    "height": 1080,
+    "job_id": "h1_tabletop_renders__0002",
+    "label": "FeatherPGS (matrix-free), 8 substeps",
+    "path": "renders/h1_tabletop_renders__0002/h1_tabletop.mp4",
+    "run_id": "2026-04-01T20-49-30Z",
+    "run_timestamp": "2026-04-01T20:49:22.096767Z",
+    "scenario": "h1_tabletop",
+    "series": "h1_tabletop_render",
+    "solver": "fpgs_matrix_free",
+    "substeps": 8,
+    "tags": [
+      "h1_tabletop_render"
+    ],
+    "task_id": "h1_tabletop_renders",
+    "width": 1920
+  },
+  {
+    "fps": 60,
+    "frames": 300,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_tag": "rtx-pro-6000-blackwell-server-edition",
+    "height": 1080,
+    "job_id": "h1_tabletop_renders__0003",
+    "label": "MJWarp, 4 substeps",
+    "path": "renders/h1_tabletop_renders__0003/h1_tabletop.mp4",
+    "run_id": "2026-04-01T20-49-30Z",
+    "run_timestamp": "2026-04-01T20:49:22.096767Z",
+    "scenario": "h1_tabletop",
+    "series": "h1_tabletop_render",
+    "solver": "mujoco",
+    "substeps": 4,
+    "tags": [
+      "h1_tabletop_render"
+    ],
+    "task_id": "h1_tabletop_renders",
+    "width": 1920
+  },
+  {
+    "fps": 60,
+    "frames": 300,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_tag": "rtx-pro-6000-blackwell-server-edition",
+    "height": 1080,
+    "job_id": "h1_tabletop_renders__0004",
+    "label": "MJWarp, 8 substeps",
+    "path": "renders/h1_tabletop_renders__0004/h1_tabletop.mp4",
+    "run_id": "2026-04-01T20-49-30Z",
+    "run_timestamp": "2026-04-01T20:49:22.096767Z",
+    "scenario": "h1_tabletop",
+    "series": "h1_tabletop_render",
+    "solver": "mujoco",
+    "substeps": 8,
+    "tags": [
+      "h1_tabletop_render"
+    ],
+    "task_id": "h1_tabletop_renders",
+    "width": 1920
+  }
+]

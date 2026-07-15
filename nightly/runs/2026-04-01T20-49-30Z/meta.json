@@ -1,0 +1,24 @@
+{
+  "commit": "53b31880",
+  "commit_short": "53b3188",
+  "execution_mode": "slurm",
+  "failed_jobs": 0,
+  "failed_point_count": 0,
+  "failed_tasks": 0,
+  "gpu": "NVIDIA B200",
+  "gpu_memory_total_gb": 178.3533935546875,
+  "gpu_tag": "b200",
+  "plan_run_mode": "full",
+  "platform": "Linux",
+  "point_count": 74,
+  "python_version": "3.12.3",
+  "render_count": 0,
+  "run_dir": "runs/2026-04-01T20-49-30Z",
+  "run_id": "2026-04-01T20-49-30Z",
+  "scenarios": [
+    "g1_flat",
+    "h1_tabletop"
+  ],
+  "status": "completed",
+  "timestamp": "2026-04-01T20:49:22.096767Z"
+}
