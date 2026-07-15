@@ -3507,7 +3507,7 @@ class SolverMuJoCo(SolverBase):
                 self.mj_model.qpos0[:] = self.mjw_model.qpos0.numpy()[0]
                 self.mj_model.qpos_spring[:] = self.mjw_model.qpos_spring.numpy()[0]
             if need_length_range or need_const_fixed or need_const_0:
-                self._mujoco.mj_setConst(self.mj_model, self.mj_data)
+                self._set_const_0_with_physical_meaninertia()
             # Must be called last — mj_setConst/set_const_0 computes CONNECT anchor2
             # without accounting for Newton's dof_ref, so we overwrite with the
             # correctly computed values.
@@ -3530,7 +3530,7 @@ class SolverMuJoCo(SolverBase):
                     if need_const_fixed:
                         self._mujoco_warp.set_const_fixed(self.mjw_model, self.mjw_data)
                     if need_const_0:
-                        self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+                        self._set_const_0_with_physical_meaninertia()
                     # Must be called last — mj_setConst/set_const_0 computes CONNECT anchor2
                     # without accounting for Newton's dof_ref, so we overwrite with the
                     # correctly computed values.
@@ -5843,6 +5843,16 @@ class SolverMuJoCo(SolverBase):
 
             # so far we have only defined the first world,
             # now complete the data from the Newton model
+            #
+            # Note: this also corrects the initial ``stat.meaninertia``. The MJCF
+            # spec bakes the kinematic locking armature (``_KINEMATIC_ARMATURE``)
+            # into the joint armature fields, so ``spec.compile()`` (and the
+            # ``put_model`` copy into ``mjw_model``) computes a polluted
+            # meaninertia, which MuJoCo uses to scale solver convergence
+            # tolerances. ``SolverNotifyFlags.ALL`` sets ``need_const_0``, so
+            # ``notify_model_changed`` invokes
+            # ``_set_const_0_with_physical_meaninertia`` and the initial
+            # tolerances are derived from physical armature.
             self.notify_model_changed(SolverNotifyFlags.ALL)
 
     def _expand_model_fields(self, mj_model: MjWarpModel, nworld: int):
@@ -6098,7 +6108,40 @@ class SolverMuJoCo(SolverBase):
             device=self.model.device,
         )
 
-    def _update_body_properties(self):
+    def _set_const_0_with_physical_meaninertia(self) -> None:
+        """Recompute constants without counting kinematic locking armature in solver statistics."""
+        has_kinematic_bodies = bool(np.any((self.model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0))
+        if not has_kinematic_bodies:
+            if self.use_mujoco_cpu:
+                self._mujoco.mj_setConst(self.mj_model, self.mj_data)
+            else:
+                self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+            return
+
+        # Subtracting the locking armature in float32 would lose the physical inertia.
+        self._update_body_properties(apply_kinematic_armature=False)
+        if self.use_mujoco_cpu:
+            actuator_biasprm = self.mj_model.actuator_biasprm.copy()
+            self.mj_model.dof_armature[:] = self.mjw_model.dof_armature.numpy()[0]
+            self._mujoco.mj_setConst(self.mj_model, self.mj_data)
+            physical_meaninertia = float(self.mj_model.stat.meaninertia)
+
+            self._update_body_properties()
+            self.mj_model.actuator_biasprm[:] = actuator_biasprm
+            self.mj_model.dof_armature[:] = self.mjw_model.dof_armature.numpy()[0]
+            self._mujoco.mj_setConst(self.mj_model, self.mj_data)
+            self.mj_model.stat.meaninertia = physical_meaninertia
+        else:
+            actuator_biasprm = wp.clone(self.mjw_model.actuator_biasprm)
+            self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+            physical_meaninertia = wp.clone(self.mjw_model.stat.meaninertia)
+
+            self._update_body_properties()
+            wp.copy(self.mjw_model.actuator_biasprm, actuator_biasprm)
+            self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+            wp.copy(self.mjw_model.stat.meaninertia, physical_meaninertia)
+
+    def _update_body_properties(self, apply_kinematic_armature: bool = True):
         """Update body-property dependent MuJoCo DOF parameters.
 
         This currently applies kinematic body flags by rewriting MuJoCo
@@ -6121,6 +6164,7 @@ class SolverMuJoCo(SolverBase):
                 self.model.body_flags,
                 self.model.joint_armature,
                 self._KINEMATIC_ARMATURE,
+                apply_kinematic_armature,
             ],
             outputs=[self.mjw_model.dof_armature],
             device=self.model.device,

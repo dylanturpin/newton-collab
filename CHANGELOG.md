@@ -41,6 +41,7 @@
 - Fix MJCF `xyaxes` parsing to treat the second vector as Y and derive Z from X cross Y.
 - Fix `SolverMuJoCo` rejecting box and other geoms whose `add_geom` parameters were Warp/NumPy arrays or 32-bit collision masks, by coercing sequence and scalar values to native Python types and wrapping `contype`/`conaffinity` into signed int32 range.
 - Fix mesh-convex and heightfield-convex contacts missing when shapes are separated by margin but still within the contact envelope.
+- Fix `SolverMuJoCo` convergence tolerance scaling for models with kinematic bodies.
 - Fix `SolverMuJoCo` returning `State.joint_qd` in world frame for root `FREE` joints with non-identity `parent_xform`, violating the documented parent-frame contract and corrupting derived `body_qd`.
 - Fix `example_softbody_gift` emitting spurious non-manifold edge warnings caused by mismatched 5-tet diagonals across adjacent cubes in the soft body mesh.
 - Fix `basic_conveyor` example emitting a spurious inertia validation warning at finalize.
