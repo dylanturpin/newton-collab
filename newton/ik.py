@@ -5,26 +5,38 @@
 
 from ._src.sim.ik import (
     IKJacobianType,
+    IKLinearSolver,
     IKObjective,
     IKObjectiveJointLimit,
+    IKObjectiveJointReference,
     IKObjectivePosition,
     IKObjectiveRotation,
+    IKObjectiveSmoothness,
+    IKObjectiveTemporal,
+    IKObjectiveVelocityLimit,
     IKOptimizer,
     IKOptimizerLBFGS,
     IKOptimizerLM,
     IKSampler,
     IKSolver,
+    IKSolverTrajectory,
 )
 
 __all__ = [
     "IKJacobianType",
+    "IKLinearSolver",
     "IKObjective",
     "IKObjectiveJointLimit",
+    "IKObjectiveJointReference",
     "IKObjectivePosition",
     "IKObjectiveRotation",
+    "IKObjectiveSmoothness",
+    "IKObjectiveTemporal",
+    "IKObjectiveVelocityLimit",
     "IKOptimizer",
     "IKOptimizerLBFGS",
     "IKOptimizerLM",
     "IKSampler",
     "IKSolver",
+    "IKSolverTrajectory",
 ]

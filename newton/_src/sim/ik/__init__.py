@@ -8,16 +8,29 @@ from .ik_lbfgs_optimizer import IKOptimizerLBFGS
 from .ik_lm_optimizer import IKOptimizerLM
 from .ik_objectives import IKObjective, IKObjectiveJointLimit, IKObjectivePosition, IKObjectiveRotation
 from .ik_solver import IKOptimizer, IKSampler, IKSolver
+from .ik_trajectory_objectives import (
+    IKObjectiveJointReference,
+    IKObjectiveSmoothness,
+    IKObjectiveTemporal,
+    IKObjectiveVelocityLimit,
+)
+from .ik_trajectory_solver import IKLinearSolver, IKSolverTrajectory
 
 __all__ = [
     "IKJacobianType",
+    "IKLinearSolver",
     "IKObjective",
     "IKObjectiveJointLimit",
+    "IKObjectiveJointReference",
     "IKObjectivePosition",
     "IKObjectiveRotation",
+    "IKObjectiveSmoothness",
+    "IKObjectiveTemporal",
+    "IKObjectiveVelocityLimit",
     "IKOptimizer",
     "IKOptimizerLBFGS",
     "IKOptimizerLM",
     "IKSampler",
     "IKSolver",
+    "IKSolverTrajectory",
 ]

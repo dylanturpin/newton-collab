@@ -701,6 +701,8 @@ add_example_test(TestIKExamples, name="ik.example_ik_h1", devices=test_devices, 
 
 add_example_test(TestIKExamples, name="ik.example_ik_custom", devices=cuda_test_devices, use_viewer=True)
 
+add_example_test(TestIKExamples, name="ik.example_ik_trajectory", devices=test_devices, use_viewer=True)
+
 add_example_test(
     TestIKExamples,
     name="ik.example_ik_cube_stacking",
