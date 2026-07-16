@@ -945,6 +945,18 @@ def _motion_subspace_rows(
             qd_start,
             S_s_out,
         )
+        # jcalc anchors the free-joint angular columns at the child COM, but
+        # the solver's retraction (jcalc_integrate) rotates about the joint
+        # frame's origin — the world origin for a root joint, the parent
+        # anchor otherwise (cf. _stencil_free_lever_coeffs). Rewrite the
+        # linear parts so downstream point Jacobians dp = v + omega x p
+        # match the tangent convention.
+        anchor = wp.transform_get_translation(X_wpj)
+        for k in range(3):
+            S = S_s_out[qd_start + 3 + k]
+            omega = wp.vec3(S[3], S[4], S[5])
+            v = wp.cross(anchor, omega)
+            S_s_out[qd_start + 3 + k] = wp.spatial_vector(v[0], v[1], v[2], S[3], S[4], S[5])
     else:
         jcalc_motion_subspace(
             t,

@@ -245,9 +245,37 @@ def test_gravity_torque_reduces_torque(test, device):
         test.assertLess(tau_grav, 0.7 * tau_base)
 
 
-def _standalone_apparent_gravity(model, n_frames, device, dt, weight=1.0):
+def _perturb_root_free_tangent(q, dof, eps, coord0=0):
+    """Root-free-joint tangent step matching the retraction: the position
+    pivots about the joint-frame origin (p += eps * e_a x p) and the
+    orientation quaternion is left-multiplied."""
+    qp = q.copy()
+    if dof < 3:
+        qp[coord0 + dof] += eps
+        return qp
+    axis = np.zeros(3)
+    axis[dof - 3] = 1.0
+    p = q[coord0 : coord0 + 3]
+    qp[coord0 : coord0 + 3] = p + eps * np.cross(axis, p)
+    x1, y1, z1 = np.sin(eps / 2) * axis
+    w1 = np.cos(eps / 2)
+    x2, y2, z2, w2 = q[coord0 + 3 : coord0 + 7]
+    qp[coord0 + 3 : coord0 + 7] = [
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    ]
+    return qp
+
+
+def _standalone_apparent_gravity(model, n_frames, device, dt, weight=1.0, link=None, offset=None):
     obj = ik.IKObjectiveApparentGravity(
-        model, EE_LINK, wp.vec3(EE_OFFSET[0], EE_OFFSET[1], EE_OFFSET[2]), dt=dt, weight=weight
+        model,
+        EE_LINK if link is None else link,
+        wp.vec3(EE_OFFSET[0], EE_OFFSET[1], EE_OFFSET[2]) if offset is None else offset,
+        dt=dt,
+        weight=weight,
     )
     obj.set_batch_layout(model.joint_dof_count, 0, n_frames)
     obj.bind_device(device)
@@ -317,6 +345,108 @@ def test_apparent_gravity_static_tilt(test, device):
             test.assertAlmostEqual(res[0, k], np.dot(world_axis, up), places=3)
 
 
+def test_gravity_torque_free_descendant(test, device):
+    """Payload attached by a free joint below the arm: the actuated rows'
+    coupling columns to the payload tangents must match finite differences
+    (regression: they used to be reported as zero)."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(up_axis="Z", gravity=-9.81)
+        link = builder.add_link(mass=1.0)
+        builder.add_shape_capsule(link, radius=0.04, half_height=0.25, cfg=newton.ModelBuilder.ShapeConfig(density=0.0))
+        j0 = builder.add_joint_revolute(
+            -1,
+            link,
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(-0.25, 0.0, 0.0), wp.quat_identity()),
+            axis=wp.vec3(0.0, 1.0, 0.0),
+        )
+        payload = builder.add_link(mass=0.8)
+        builder.add_shape_box(payload, hx=0.06, hy=0.05, hz=0.04, cfg=newton.ModelBuilder.ShapeConfig(density=0.0))
+        j1 = builder.add_joint_free(
+            payload,
+            parent=link,
+            parent_xform=wp.transform(wp.vec3(0.3, 0.0, 0.0), wp.quat_identity()),
+        )
+        builder.add_articulation([j0, j1])
+        model = builder.finalize(device=device)
+        n_dofs = model.joint_dof_count  # 1 revolute + 6 free
+
+        rng = np.random.default_rng(31)
+        n_rows = 2
+        q_np = np.zeros((n_rows, model.joint_coord_count), dtype=np.float64)
+        q_np[:, 0] = rng.uniform(-1.0, 1.0, size=n_rows)
+        q_np[:, 1:4] = rng.uniform(-0.2, 0.2, size=(n_rows, 3))
+        quat = rng.normal(size=(n_rows, 4))
+        quat /= np.linalg.norm(quat, axis=1, keepdims=True)
+        q_np[:, 4:8] = quat
+
+        obj = _standalone_objective(model, n_rows, n_rows, device)
+        joint_q = wp.array(q_np.astype(np.float32), dtype=wp.float32, device=device)
+        obj.compute_coeffs(joint_q)
+        coeffs = obj.coeffs.numpy()[:, 0]
+
+        eps = 1e-4
+        fd = np.zeros((n_rows, n_dofs, n_dofs))
+        for dof in range(n_dofs):
+            if dof == 0:
+                qp = q_np.copy()
+                qp[:, 0] += eps
+                qm = q_np.copy()
+                qm[:, 0] -= eps
+            else:
+                qp = np.stack([_perturb_root_free_tangent(q_np[t], dof - 1, eps, coord0=1) for t in range(n_rows)])
+                qm = np.stack([_perturb_root_free_tangent(q_np[t], dof - 1, -eps, coord0=1) for t in range(n_rows)])
+            fd[:, :, dof] = (
+                _objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)
+            ) / (2 * eps)
+        # only the actuated (revolute) row is nonzero; free rows are unweighted
+        assert_np_equal(coeffs[:, 0, :], fd[:, 0, :].astype(np.float32), tol=5e-3 * max(np.abs(fd).max(), 1.0))
+        # the payload-orientation coupling must actually be present
+        test.assertGreater(np.abs(coeffs[:, 0, 4:]).max(), 0.1)
+
+
+def test_apparent_gravity_free_joint_coeffs(test, device):
+    """Floating-base waiter blocks must match the retraction's tangent convention
+    (regression: jcalc's COM-anchored free-joint columns are re-anchored)."""
+    with wp.ScopedDevice(device):
+        model = _build_free_plus_revolute(device)
+        n_dofs = model.joint_dof_count
+        n_frames = 4
+        rng = np.random.default_rng(29)
+        # base well away from the origin so a convention mismatch is visible
+        q_np = np.zeros((n_frames, model.joint_coord_count), dtype=np.float64)
+        q_np[:, 0:3] = np.array([1.6, -0.9, 0.7]) + rng.uniform(-0.2, 0.2, size=(n_frames, 3))
+        quat = rng.normal(size=(n_frames, 4))
+        quat /= np.linalg.norm(quat, axis=1, keepdims=True)
+        q_np[:, 3:7] = quat
+        q_np[:, 7] = rng.uniform(-1.0, 1.0, size=n_frames)
+
+        obj = _standalone_apparent_gravity(model, n_frames, device, dt=DT, link=1, offset=EE_OFFSET)
+        joint_q = wp.array(q_np.astype(np.float32), dtype=wp.float32, device=device)
+        obj.compute_coeffs(joint_q)
+        coeffs = obj.coeffs.numpy()
+
+        eps = 1e-4
+        scale = max(np.abs(coeffs).max(), 1.0)
+        for m in range(n_frames):
+            for dof in range(n_dofs):
+                qp = q_np.copy()
+                qm = q_np.copy()
+                if dof < 6:
+                    qp[m] = _perturb_root_free_tangent(q_np[m], dof, eps)
+                    qm[m] = _perturb_root_free_tangent(q_np[m], dof, -eps)
+                else:
+                    qp[m, 7] += eps
+                    qm[m, 7] -= eps
+                fd = (_objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)) / (
+                    2 * eps
+                )
+                for t in range(n_frames):
+                    j = m - t
+                    analytic = coeffs[t, j, :2, dof] if 0 <= j <= 2 else np.zeros(2)
+                    assert_np_equal(analytic, fd[t, :2], tol=5e-3 * scale)
+
+
 def test_apparent_gravity_balances(test, device):
     """A fast dash with the objective carries far less tangential apparent force."""
     with wp.ScopedDevice(device):
@@ -367,8 +497,20 @@ class TestIKTrajectoryDynamics(unittest.TestCase):
 
 add_function_test(
     TestIKTrajectoryDynamics,
+    "test_gravity_torque_free_descendant",
+    test_gravity_torque_free_descendant,
+    devices=devices,
+)
+add_function_test(
+    TestIKTrajectoryDynamics,
     "test_apparent_gravity_coeffs_match_fd",
     test_apparent_gravity_coeffs_match_fd,
+    devices=devices,
+)
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_apparent_gravity_free_joint_coeffs",
+    test_apparent_gravity_free_joint_coeffs,
     devices=devices,
 )
 add_function_test(
