@@ -705,6 +705,14 @@ add_example_test(TestIKExamples, name="ik.example_ik_trajectory", devices=test_d
 
 add_example_test(
     TestIKExamples,
+    name="ik.example_ik_waiter",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 300},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestIKExamples,
     name="ik.example_ik_cube_stacking",
     test_options_cuda={"world-count": 16, "num-frames": 2000},
     devices=cuda_test_devices,
