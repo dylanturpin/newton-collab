@@ -863,10 +863,12 @@ class SolverFeatherPGS(SolverBase):
             wm_device = self.constraint_count.device
             self._row_watermark_dense = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_mf = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_watermark_propagation = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_contact = wp.zeros(1, dtype=wp.int32, device=wm_device)
         else:
             self._row_watermark_dense = None
             self._row_watermark_mf = None
+            self._row_watermark_propagation = None
             self._row_watermark_contact = None
 
         self._debug_projected_root = os.getenv("IL_NEWTON_FPGS_PROJECTED_ROOT", "").lower() in {
@@ -1425,6 +1427,15 @@ class SolverFeatherPGS(SolverBase):
         self._has_mixed_contacts = self._has_free_rigid_bodies and self._n_free_rigid < model.articulation_count
         self._has_non_free_articulations = n_free < model.articulation_count
         self.is_free_rigid = wp.array(is_free_rigid_np, dtype=wp.int32, device=model.device)
+        if self.propagation_free_free_rows and not self._has_non_free_articulations:
+            import warnings
+
+            warnings.warn(
+                "propagation_free_free_rows is set but the model has no non-free "
+                "articulations, so the propagation row family is not allocated. "
+                "Free/free contact rows stay on the MF family (routing disabled).",
+                stacklevel=2,
+            )
 
     def _compute_world_dof_mapping(self, model):
         """Compute per-world DOF start and max DOF count for consolidated J/Y arrays."""
@@ -4640,6 +4651,14 @@ class SolverFeatherPGS(SolverBase):
                     inputs=[mf_counts, self._row_watermark_mf],
                     device=mf_counts.device,
                 )
+            prop_counts = getattr(self, "propagation_constraint_count", None)
+            if prop_counts is not None and prop_counts.shape[0] > 0:
+                wp.launch(
+                    _accumulate_row_watermark,
+                    dim=prop_counts.shape[0],
+                    inputs=[prop_counts, self._row_watermark_propagation],
+                    device=prop_counts.device,
+                )
             if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
                 contact_counts = contacts.rigid_contact_count
                 wp.launch(
@@ -4668,11 +4687,15 @@ class SolverFeatherPGS(SolverBase):
             return {
                 "dense_high_water": 0,
                 "mf_high_water": 0,
+                "propagation_high_water": 0,
                 "contact_high_water": 0,
             }
         return {
             "dense_high_water": int(self._row_watermark_dense.numpy()[0]),
             "mf_high_water": int(self._row_watermark_mf.numpy()[0]),
+            "propagation_high_water": int(self._row_watermark_propagation.numpy()[0])
+            if self._row_watermark_propagation is not None
+            else 0,
             "contact_high_water": int(self._row_watermark_contact.numpy()[0]),
         }
 
@@ -5538,7 +5561,12 @@ class SolverFeatherPGS(SolverBase):
                     has_free_rigid_flag,
                     propagation_flag,
                     1 if self.propagation_same_articulation_rows else 0,
-                    1 if self.propagation_free_free_rows else 0,
+                    # Free-free routing requires the propagation family to be
+                    # allocated; without this gate, scenes with no non-free
+                    # articulations route contact rows into the dummy slot
+                    # counter and silently drop them (bodies fall through the
+                    # ground).
+                    1 if (self.propagation_free_free_rows and propagation_active) else 0,
                     max_constraints,
                     self.mf_max_constraints,
                     self.propagation_max_constraints,
