@@ -10,11 +10,13 @@ from .ik_objectives import IKObjective, IKObjectiveJointLimit, IKObjectivePositi
 from .ik_solver import IKOptimizer, IKSampler, IKSolver
 from .ik_trajectory_objectives import (
     IKObjectiveApparentGravity,
+    IKObjectiveFootSkate,
     IKObjectiveGravityTorque,
     IKObjectiveJointReference,
     IKObjectiveSmoothness,
     IKObjectiveTemporal,
     IKObjectiveVelocityLimit,
+    IKObjectiveWorldPlane,
 )
 from .ik_trajectory_solver import IKLinearSolver, IKSolverTrajectory
 
@@ -23,6 +25,7 @@ __all__ = [
     "IKLinearSolver",
     "IKObjective",
     "IKObjectiveApparentGravity",
+    "IKObjectiveFootSkate",
     "IKObjectiveGravityTorque",
     "IKObjectiveJointLimit",
     "IKObjectiveJointReference",
@@ -31,6 +34,7 @@ __all__ = [
     "IKObjectiveSmoothness",
     "IKObjectiveTemporal",
     "IKObjectiveVelocityLimit",
+    "IKObjectiveWorldPlane",
     "IKOptimizer",
     "IKOptimizerLBFGS",
     "IKOptimizerLM",

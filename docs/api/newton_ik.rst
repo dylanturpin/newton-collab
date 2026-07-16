@@ -19,6 +19,7 @@ Public inverse-kinematics API for defining objectives and solving IK problems.
    IKLinearSolver
    IKObjective
    IKObjectiveApparentGravity
+   IKObjectiveFootSkate
    IKObjectiveGravityTorque
    IKObjectiveJointLimit
    IKObjectiveJointReference
@@ -27,6 +28,7 @@ Public inverse-kinematics API for defining objectives and solving IK problems.
    IKObjectiveSmoothness
    IKObjectiveTemporal
    IKObjectiveVelocityLimit
+   IKObjectiveWorldPlane
    IKOptimizer
    IKOptimizerLBFGS
    IKOptimizerLM

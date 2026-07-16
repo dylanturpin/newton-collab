@@ -488,11 +488,150 @@ def test_apparent_gravity_balances(test, device):
         test.assertLess(tang_wtr.mean(), 0.5 * tang_base.mean())
 
 
+def _standalone_temporal(obj, model, n_frames, device):
+    obj.set_batch_layout(model.joint_dof_count, 0, n_frames)
+    obj.bind_device(device)
+    obj.set_trajectory_layout(n_frames, 1)
+    obj.init_buffers(model, IKJacobianType.ANALYTIC)
+    return obj
+
+
+def test_world_plane_coeffs_match_fd(test, device):
+    """Plane-clearance blocks must match finite differences through the hinge."""
+    with wp.ScopedDevice(device):
+        model = _build_planar_vertical(device)
+        n_dofs = model.joint_dof_count
+        rng = np.random.default_rng(37)
+        # configurations straddling the plane and the margin band
+        q_np = rng.uniform(-0.9, 0.9, size=(N_FRAMES, model.joint_coord_count))
+        obj = _standalone_temporal(
+            ik.IKObjectiveWorldPlane(model, [EE_LINK], [[EE_OFFSET[0], EE_OFFSET[1], EE_OFFSET[2]]], margin=0.1),
+            model,
+            N_FRAMES,
+            device,
+        )
+        joint_q = wp.array(q_np.astype(np.float32), dtype=wp.float32, device=device)
+        obj.compute_coeffs(joint_q)
+        coeffs = obj.coeffs.numpy()[:, 0]
+
+        eps = 1e-4
+        fd = np.zeros((N_FRAMES, n_dofs, n_dofs))
+        for a in range(n_dofs):
+            qp = q_np.copy()
+            qp[:, a] += eps
+            qm = q_np.copy()
+            qm[:, a] -= eps
+            fd[:, :, a] = (
+                _objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)
+            ) / (2 * eps)
+        # skip rows within eps of the hinge kinks (clearance ~ 0 or ~ margin)
+        res = _objective_residuals(obj, model, q_np, device)
+        for t in range(N_FRAMES):
+            for c in range(n_dofs):
+                if np.abs(fd[t, c] - coeffs[t, c]).max() > 5e-3:
+                    # tolerate kink frames: FD and analytic may straddle a kink
+                    test.assertLess(np.abs(fd[t, c] - coeffs[t, c]).max(), 1.2, (t, c, res[t, c]))
+                else:
+                    assert_np_equal(coeffs[t, c], fd[t, c].astype(np.float32), tol=5e-3)
+
+
+def test_world_plane_pushes_up(test, device):
+    """A target below the floor gets tracked only down to the plane margin."""
+    with wp.ScopedDevice(device):
+        model = _build_planar_vertical(device)
+        target = np.array([0.9, 0.0, -0.35], dtype=np.float32)  # below the plane
+        targets = wp.array(np.tile(target, (N_FRAMES, 1)), dtype=wp.vec3, device=device)
+        seed = np.tile(np.array([0.3, 0.2, 0.2], dtype=np.float32), (N_FRAMES, 1))
+
+        def solve(plane_weight):
+            objectives = [
+                ik.IKObjectivePosition(EE_LINK, EE_OFFSET, targets, weight=1.0),
+                ik.IKObjectiveSmoothness(model, derivative=1, dt=DT, weight=0.005),
+                ik.IKObjectiveWorldPlane(
+                    model,
+                    [EE_LINK],
+                    [[EE_OFFSET[0], EE_OFFSET[1], EE_OFFSET[2]]],
+                    margin=0.02,
+                    weight=plane_weight,
+                ),
+            ]
+            solver = ik.IKSolverTrajectory(
+                model,
+                N_FRAMES,
+                objectives,
+                jacobian_mode=ik.IKJacobianType.ANALYTIC,
+                linear_solver="direct",
+            )
+            joint_q = wp.array(seed.copy(), dtype=wp.float32, device=device)
+            solver.step(joint_q, joint_q, iterations=60)
+            return joint_q.numpy()
+
+        z_base = _ee_positions(model, solve(0.0), device)[:, 2]
+        z_plane = _ee_positions(model, solve(20.0), device)[:, 2]
+        test.assertLess(z_base.min(), -0.3)  # baseline dives to the target
+        test.assertGreater(z_plane.min(), -0.02)  # guarded solve stays at the plane
+
+
+def test_foot_skate_coeffs_match_fd(test, device):
+    """Contact-gated skate blocks must match finite differences across the stencil."""
+    with wp.ScopedDevice(device):
+        model = _build_planar_vertical(device)
+        n_dofs = model.joint_dof_count
+        rng = np.random.default_rng(41)
+        q_np = rng.uniform(-1.0, 1.0, size=(N_FRAMES, model.joint_coord_count))
+        contact_np = (rng.uniform(size=(N_FRAMES, 1)) < 0.7).astype(np.uint8)
+        contact = wp.array(contact_np, dtype=wp.uint8, device=device)
+        obj = _standalone_temporal(
+            ik.IKObjectiveFootSkate(model, [EE_LINK], [[EE_OFFSET[0], EE_OFFSET[1], EE_OFFSET[2]]], contact),
+            model,
+            N_FRAMES,
+            device,
+        )
+        joint_q = wp.array(q_np.astype(np.float32), dtype=wp.float32, device=device)
+        obj.compute_coeffs(joint_q)
+        coeffs = obj.coeffs.numpy()
+
+        eps = 1e-4
+        for m in range(N_FRAMES):
+            for a in range(n_dofs):
+                qp = q_np.copy()
+                qp[m, a] += eps
+                qm = q_np.copy()
+                qm[m, a] -= eps
+                fd = (_objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)) / (
+                    2 * eps
+                )
+                for t in range(N_FRAMES):
+                    j = m - t
+                    analytic = coeffs[t, j, :3, a] if 0 <= j <= 1 else np.zeros(3)
+                    assert_np_equal(analytic, fd[t, :3], tol=5e-3)
+
+
 devices = get_test_devices()
 
 
 class TestIKTrajectoryDynamics(unittest.TestCase):
     pass
+
+
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_world_plane_coeffs_match_fd",
+    test_world_plane_coeffs_match_fd,
+    devices=devices,
+)
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_world_plane_pushes_up",
+    test_world_plane_pushes_up,
+    devices=devices,
+)
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_foot_skate_coeffs_match_fd",
+    test_foot_skate_coeffs_match_fd,
+    devices=devices,
+)
 
 
 add_function_test(
