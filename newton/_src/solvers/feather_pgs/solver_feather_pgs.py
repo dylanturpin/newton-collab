@@ -305,7 +305,6 @@ class SolverFeatherPGS(SolverBase):
             "immediate", "propagation", "propagation-fused", "propagation-colored"
         ] = "immediate",
         propagation_same_articulation_rows: bool = False,
-        propagation_free_free_rows: bool = False,
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
         mf_max_constraints: int = 512,
@@ -451,14 +450,13 @@ class SolverFeatherPGS(SolverBase):
                 thread-per-row launch across all worlds (colors sequential, tree sweep per
                 iteration unchanged). Color-overflow rows run in an ordered serial tail bucket.
                 Defaults to ``"immediate"``.
-            propagation_free_free_rows (bool, optional): Route free/free and free/ground
-                contact rows to the propagation row family instead of the matrix-free
-                family. The row math is identical (free bodies use their spatial inverse
-                inertia response); the point is scheduling: with
-                ``articulated_contact_response="propagation-colored"`` the pile rows then
-                run through the colored solve path. Velocity-limit rows stay on the
-                matrix-free family. Requires ``articulated_contact_response="propagation"``
-                or ``"propagation-colored"``. Defaults to False.
+                Contact-row placement is intrinsic to the mode: ``"propagation"`` and
+                ``"propagation-colored"`` place every contact row (free/free and
+                free/ground included) on the propagation family — the row math is
+                identical for free bodies (spatial inverse inertia response), only the
+                scheduling changes — while ``"propagation-fused"`` keeps free/free rows
+                on the matrix-free family (its measured-best configuration).
+                Velocity-limit rows stay on the matrix-free family in all modes.
             propagation_same_articulation_rows (bool, optional): Route contacts between two
                 links of the same articulation to propagation rows instead of dense generalized
                 rows. Their effective mass is recomputed with exact cross operational-space
@@ -628,15 +626,14 @@ class SolverFeatherPGS(SolverBase):
                 "use articulated_contact_response='propagation'"
             )
         self.propagation_same_articulation_rows = bool(propagation_same_articulation_rows)
-        if propagation_free_free_rows and articulated_contact_response not in (
+        # Contact-row placement is intrinsic to the mode: the serial and colored
+        # propagation modes place every contact row (free/free and free/ground
+        # included) on the propagation family; the fused mode keeps free/free
+        # rows on the matrix-free family (its measured-best configuration).
+        self._route_free_free_contacts = articulated_contact_response in (
             "propagation",
             "propagation-colored",
-        ):
-            raise NotImplementedError(
-                "propagation_free_free_rows requires articulated_contact_response "
-                "'propagation' or 'propagation-colored'"
-            )
-        self.propagation_free_free_rows = bool(propagation_free_free_rows)
+        )
         self.pgs_warmstart = pgs_warmstart
         if self.pgs_warmstart and self.contact_friction_position_iterations >= 0:
             raise NotImplementedError(
@@ -940,11 +937,13 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _propagation_contacts_enabled(self) -> bool:
-        return (
-            self.pgs_mode == "matrix_free"
-            and self.articulated_contact_response in ("propagation", "propagation-fused", "propagation-colored")
-            and self._has_non_free_articulations
-        )
+        if self.pgs_mode != "matrix_free":
+            return False
+        if self.articulated_contact_response not in ("propagation", "propagation-fused", "propagation-colored"):
+            return False
+        if self._has_non_free_articulations:
+            return True
+        return self._route_free_free_contacts and self._has_free_rigid_bodies
 
     def _split_matrix_free_row_phase_may_have_work(self, row_phase: int) -> bool:
         """Return false only when a split GS phase cannot contain rows.
@@ -1427,15 +1426,6 @@ class SolverFeatherPGS(SolverBase):
         self._has_mixed_contacts = self._has_free_rigid_bodies and self._n_free_rigid < model.articulation_count
         self._has_non_free_articulations = n_free < model.articulation_count
         self.is_free_rigid = wp.array(is_free_rigid_np, dtype=wp.int32, device=model.device)
-        if self.propagation_free_free_rows and not self._has_non_free_articulations:
-            import warnings
-
-            warnings.warn(
-                "propagation_free_free_rows is set but the model has no non-free "
-                "articulations, so the propagation row family is not allocated. "
-                "Free/free contact rows stay on the MF family (routing disabled).",
-                stacklevel=2,
-            )
 
     def _compute_world_dof_mapping(self, model):
         """Compute per-world DOF start and max DOF count for consolidated J/Y arrays."""
@@ -5566,7 +5556,7 @@ class SolverFeatherPGS(SolverBase):
                     # articulations route contact rows into the dummy slot
                     # counter and silently drop them (bodies fall through the
                     # ground).
-                    1 if (self.propagation_free_free_rows and propagation_active) else 0,
+                    1 if (self._route_free_free_contacts and propagation_active) else 0,
                     max_constraints,
                     self.mf_max_constraints,
                     self.propagation_max_constraints,
