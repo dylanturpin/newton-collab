@@ -268,7 +268,7 @@ class Example:
         q[ARM_COORDS + 3 : ARM_COORDS + 7] = [0.0, 0.0, 0.0, 1.0]
         self.state_0.joint_q.assign(q)
         qd = self.state_0.joint_qd.numpy()
-        qd[ARM_COORDS - 2 : ARM_COORDS + 4] = 0.0
+        qd[ARM_COORDS : ARM_COORDS + 6] = 0.0  # the ball's six free-joint DoFs
         self.state_0.joint_qd.assign(qd)
         newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
 
