@@ -43,6 +43,23 @@ def _quat_rotate_np(q, v):
     return v + q[3] * uv + np.cross(xyz, uv)
 
 
+@wp.kernel(enable_backward=False)
+def _interp_targets(
+    q_prev: wp.array[wp.float32],  # (arm coords,) plan frame f
+    q_curr: wp.array[wp.float32],  # (arm coords,) plan frame f + 1
+    alpha: float,
+    inv_dt: float,
+    # outputs
+    joint_target_q: wp.array[wp.float32],
+    joint_target_qd: wp.array[wp.float32],
+):
+    """Write interpolated PD targets (with velocity feedforward) on device,
+    so the whole sim frame is CUDA-graph capturable."""
+    i = wp.tid()
+    joint_target_q[i] = (1.0 - alpha) * q_prev[i] + alpha * q_curr[i]
+    joint_target_qd[i] = (q_curr[i] - q_prev[i]) * inv_dt
+
+
 class Example:
     def __init__(self, viewer, args):
         self.fps = 30
@@ -56,7 +73,8 @@ class Example:
         # drift; keep a padded tail that is solved but never executed
         self.play_end = self.n_frames - 16
         self.control_substeps = 4  # control rate 120 Hz
-        self.sim_substeps = 12  # physics 1440 Hz
+        self.sim_substeps = 8  # physics 960 Hz
+        self.replan_interval = 8  # frames between re-solves while dragging
         self.waiter_enabled = True
         self._replan_needed = True
 
@@ -99,7 +117,7 @@ class Example:
             integrator="implicitfast",
             cone="elliptic",
             impratio=100.0,
-            iterations=20,
+            iterations=10,
             nconmax=256,
         )
         self.state_0 = self.model.state()
@@ -168,12 +186,39 @@ class Example:
         self.state_0.joint_q.assign(q0)
         newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
         # joint targets use the DoF layout; the FR3's arm coords equal its DoFs
-        self._target_q_np = np.zeros(self.model.joint_dof_count, dtype=np.float32)
-        self._target_qd_np = np.zeros(self.model.joint_dof_count, dtype=np.float32)
-        self._target_q_np[:ARM_COORDS] = q0[:ARM_COORDS]
-        self.control.joint_target_q.assign(self._target_q_np)
+        target_seed = np.zeros(self.model.joint_dof_count, dtype=np.float32)
+        target_seed[:ARM_COORDS] = q0[:ARM_COORDS]
+        self.control.joint_target_q.assign(target_seed)
+
+        # device-side plan interpolation buffers (updated per frame with two
+        # small device-to-device row copies; the sim graph reads them)
+        n_coords = self.ik_model.joint_coord_count
+        self._plan_flat = self.plan_q.flatten()
+        self._q_prev = wp.zeros(n_coords, dtype=wp.float32)
+        self._q_curr = wp.zeros(n_coords, dtype=wp.float32)
+        wp.copy(self._q_prev, self._plan_flat, count=n_coords)
+        wp.copy(self._q_curr, self._plan_flat, count=n_coords)
 
         self.play_frame = 0
+        self._frames_since_replan = 10**9
+
+        # warm up the MuJoCo step (JIT + lazy allocs), then capture one full
+        # sim frame (48 solver steps + target interpolation) as a CUDA graph
+        self.sim_graph = None
+        self._ik_graphs = {}
+        if wp.get_device().is_cuda:
+            self._sim_frame()
+            with wp.ScopedCapture() as capture:
+                self._sim_frame()
+            self.sim_graph = capture.graph
+            # rewind the warm-up frame so the demo starts from rest
+            self.state_0.joint_q.assign(q0)
+            self.state_0.joint_qd.zero_()
+            newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
+
+        # warm the LM kernels uncaptured, then plan (captures the mode's graph)
+        self.traj_solver.step(self.plan_q, self.plan_q, iterations=2)
+        self.plan_q.assign(np.tile(self.home_q, (n, 1)).astype(np.float32))
         self._replan()
 
     # ----------------------------------------------------------------------
@@ -243,11 +288,23 @@ class Example:
 
         seed = np.tile(q_now, (n, 1)).astype(np.float32)
         self.plan_q.assign(seed)
-        self.traj_solver.step(self.plan_q, self.plan_q, iterations=96)
-        self._plan_np = self.plan_q.numpy()
-        self._plan_qd = np.zeros_like(self._plan_np)
-        self._plan_qd[1:] = (self._plan_np[1:] - self._plan_np[:-1]) / self.frame_dt
+        self._solve_plan()
         self.play_frame = 0
+        self._frames_since_replan = 0
+
+    def _solve_plan(self):
+        """Run the LM solve, replayed as a CUDA graph (one per objective mode,
+        captured lazily on first use; objective weights are baked in)."""
+        if self.sim_graph is None:  # CPU fallback / capture unavailable
+            self.traj_solver.step(self.plan_q, self.plan_q, iterations=48)
+            return
+        graph = self._ik_graphs.get(self.waiter_enabled)
+        if graph is None:
+            with wp.ScopedCapture() as capture:
+                self.traj_solver.step(self.plan_q, self.plan_q, iterations=48)
+            graph = capture.graph
+            self._ik_graphs[self.waiter_enabled] = graph
+        wp.capture_launch(graph)
 
     # ----------------------------------------------------------------------
     def gui(self, imgui):
@@ -285,28 +342,46 @@ class Example:
             self._user_moved_goal = True
             self._last_goal = goal_now
             self._replan_needed = True
-        if self._replan_needed:
+        # throttle re-solves so a continuous drag replans a few times per
+        # second instead of every frame
+        if self._replan_needed and self._frames_since_replan >= self.replan_interval:
             self._replan_needed = False
             self._replan()
 
-        # follow the current plan through the PD-controlled simulation
+        # follow the current plan through the PD-controlled simulation:
+        # two row copies feed the captured sim frame's on-device interpolation
         f = min(self.play_frame, self.play_end)
         f_next = min(f + 1, self.play_end)
-        sim_dt = self.frame_dt / (self.control_substeps * self.sim_substeps)
-        for s in range(self.control_substeps):
-            alpha = (s + 1) / self.control_substeps
-            self._target_q_np[:ARM_COORDS] = (1 - alpha) * self._plan_np[f] + alpha * self._plan_np[f_next]
-            self._target_qd_np[:ARM_COORDS] = self._plan_qd[f_next]
-            self.control.joint_target_q.assign(self._target_q_np)
-            self.control.joint_target_qd.assign(self._target_qd_np)
-            for _ in range(self.sim_substeps):
-                self.state_0.clear_forces()
-                self.model.collide(self.state_0, self.contacts)
-                self.solver.step(self.state_0, self.state_1, self.control, self.contacts, sim_dt)
-                self.state_0, self.state_1 = self.state_1, self.state_0
+        n_coords = self.ik_model.joint_coord_count
+        wp.copy(self._q_prev, self._plan_flat, src_offset=f * n_coords, count=n_coords)
+        wp.copy(self._q_curr, self._plan_flat, src_offset=f_next * n_coords, count=n_coords)
+        if self.sim_graph is not None:
+            wp.capture_launch(self.sim_graph)
+        else:
+            self._sim_frame()
 
         self.play_frame = min(self.play_frame + 1, self.play_end)
+        self._frames_since_replan += 1
         self.sim_time += self.frame_dt
+
+    def _sim_frame(self):
+        """One render frame of simulation; fully on-device (graph-capturable).
+        MuJoCo generates its own contacts, so no collision pipeline call is
+        needed, and the substep count is even so the state ping-pong returns
+        to the original buffers."""
+        sim_dt = self.frame_dt / (self.control_substeps * self.sim_substeps)
+        for s in range(self.control_substeps):
+            alpha = float(s + 1) / self.control_substeps
+            wp.launch(
+                _interp_targets,
+                dim=ARM_COORDS,
+                inputs=[self._q_prev, self._q_curr, alpha, 1.0 / self.frame_dt],
+                outputs=[self.control.joint_target_q, self.control.joint_target_qd],
+            )
+            for _ in range(self.sim_substeps):
+                self.state_0.clear_forces()
+                self.solver.step(self.state_0, self.state_1, self.control, self.contacts, sim_dt)
+                self.state_0, self.state_1 = self.state_1, self.state_0
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
