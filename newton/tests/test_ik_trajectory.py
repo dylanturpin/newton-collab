@@ -280,6 +280,31 @@ def test_trajectory_cg_matches_direct(test, device):
         assert_np_equal(q_cg, q_direct, tol=1e-4)
 
 
+def test_trajectory_spike_matches_direct(test, device):
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        targets_np = _arc_targets(N_FRAMES)
+
+        def solve(linear_solver, **kwargs):
+            solver = ik.IKSolverTrajectory(
+                model,
+                N_FRAMES,
+                _make_arc_tracking_objectives(model, targets_np),
+                jacobian_mode=ik.IKJacobianType.ANALYTIC,
+                linear_solver=linear_solver,
+                lambda_initial=1e-3,
+                **kwargs,
+            )
+            joint_q = wp.zeros((N_FRAMES, model.joint_coord_count), dtype=wp.float32)
+            solver.step(joint_q, joint_q, iterations=20)
+            return joint_q.numpy()
+
+        q_direct = solve("direct")
+        for n_parts in (2, 4):
+            q_spike = solve("spike", spike_partitions=n_parts)
+            assert_np_equal(q_spike, q_direct, tol=1e-4)
+
+
 # ----------------------------------------------------------------------------
 # 4.  Fixed frames stay at their seed values
 # ----------------------------------------------------------------------------
@@ -611,6 +636,9 @@ add_function_test(
     devices,
 )
 add_function_test(TestIKTrajectory, "test_trajectory_cg_matches_direct", test_trajectory_cg_matches_direct, devices)
+add_function_test(
+    TestIKTrajectory, "test_trajectory_spike_matches_direct", test_trajectory_spike_matches_direct, devices
+)
 add_function_test(TestIKTrajectory, "test_trajectory_fixed_frames", test_trajectory_fixed_frames, devices)
 add_function_test(TestIKTrajectory, "test_trajectory_velocity_limit", test_trajectory_velocity_limit, devices)
 add_function_test(
