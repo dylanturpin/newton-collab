@@ -245,11 +245,144 @@ def test_gravity_torque_reduces_torque(test, device):
         test.assertLess(tau_grav, 0.7 * tau_base)
 
 
+def _standalone_apparent_gravity(model, n_frames, device, dt, weight=1.0):
+    obj = ik.IKObjectiveApparentGravity(
+        model, EE_LINK, wp.vec3(EE_OFFSET[0], EE_OFFSET[1], EE_OFFSET[2]), dt=dt, weight=weight
+    )
+    obj.set_batch_layout(model.joint_dof_count, 0, n_frames)
+    obj.bind_device(device)
+    obj.set_trajectory_layout(n_frames, 1)
+    obj.init_buffers(model, IKJacobianType.ANALYTIC)
+    return obj
+
+
+def test_apparent_gravity_coeffs_match_fd(test, device):
+    """Waiter-objective blocks must match the full finite-difference Jacobian."""
+    with wp.ScopedDevice(device):
+        model = _build_planar_vertical(device)
+        n_dofs = model.joint_dof_count
+        rng = np.random.default_rng(23)
+        q_np = rng.uniform(-1.0, 1.0, size=(N_FRAMES, model.joint_coord_count))
+        obj = _standalone_apparent_gravity(model, N_FRAMES, device, dt=DT)
+
+        res = _objective_residuals(obj, model, q_np, device)
+        test.assertEqual(np.abs(res[N_FRAMES - 2 :, :]).max(), 0.0)
+        test.assertEqual(np.abs(res[:, 2:]).max(), 0.0)
+
+        joint_q = wp.array(q_np.astype(np.float32), dtype=wp.float32, device=device)
+        obj.compute_coeffs(joint_q)
+        coeffs = obj.coeffs.numpy()
+
+        eps = 1e-4
+        scale = max(np.abs(coeffs).max(), 1.0)
+        for m in range(N_FRAMES):
+            for a in range(n_dofs):
+                qp = q_np.copy()
+                qp[m, a] += eps
+                qm = q_np.copy()
+                qm[m, a] -= eps
+                fd = (_objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)) / (
+                    2 * eps
+                )
+                for t in range(N_FRAMES):
+                    j = m - t
+                    analytic = coeffs[t, j, :2, a] if 0 <= j <= 2 else np.zeros(2)
+                    # fp32 FD noise on accelerations scales with the coeff magnitude
+                    assert_np_equal(analytic, fd[t, :2], tol=5e-3 * scale)
+
+
+def test_apparent_gravity_static_tilt(test, device):
+    """At rest the residual is the plate's tangential gravity component."""
+    with wp.ScopedDevice(device):
+        model = _build_planar_vertical(device)
+        obj = _standalone_apparent_gravity(model, N_FRAMES, device, dt=DT)
+        q_np = np.tile(np.array([0.3, -0.5, 0.4], dtype=np.float64), (N_FRAMES, 1))
+        res = _objective_residuals(obj, model, q_np, device)
+
+        joint_q = wp.array(q_np.astype(np.float32), dtype=wp.float32, device=device)
+        joint_qd = wp.zeros((N_FRAMES, model.joint_dof_count), dtype=wp.float32, device=device)
+        body_q = wp.zeros((N_FRAMES, model.body_count), dtype=wp.transform, device=device)
+        body_qd = wp.zeros((N_FRAMES, model.body_count), dtype=wp.spatial_vector, device=device)
+        eval_fk_batched(model, joint_q, joint_qd, body_q, body_qd)
+        quat = body_q.numpy()[0, EE_LINK][3:7]
+
+        def rotate(q, v):
+            x, y, z, w = q
+            uv = 2.0 * np.cross([x, y, z], v)
+            return v + w * uv + np.cross([x, y, z], uv)
+
+        up = np.array([0.0, 0.0, 9.81])
+        for k, axis in enumerate((obj._tangent_u, obj._tangent_v)):
+            world_axis = rotate(quat, np.array([axis[0], axis[1], axis[2]]))
+            test.assertAlmostEqual(res[0, k], np.dot(world_axis, up), places=3)
+
+
+def test_apparent_gravity_balances(test, device):
+    """A fast dash with the objective carries far less tangential apparent force."""
+    with wp.ScopedDevice(device):
+        model = _build_planar_vertical(device)
+        dt = DT
+        # fast vertical-plane dash: down 0.5 m and back within ~0.6 s
+        s = np.concatenate([np.linspace(0, 1, N_FRAMES // 2), np.linspace(1, 0, N_FRAMES - N_FRAMES // 2)])
+        targets_np = np.stack(
+            [0.9 - 0.25 * s, np.zeros_like(s), 0.6 * s - 0.2],
+            axis=1,
+        ).astype(np.float32)
+        targets = wp.array(targets_np, dtype=wp.vec3, device=device)
+        seed = np.tile(np.array([0.3, 0.4, 0.4], dtype=np.float32), (N_FRAMES, 1))
+
+        def solve(weight):
+            objectives = [
+                ik.IKObjectivePosition(EE_LINK, EE_OFFSET, targets, weight=2.0),
+                ik.IKObjectiveSmoothness(model, derivative=2, dt=dt, weight=0.001),
+                ik.IKObjectiveApparentGravity(
+                    model, EE_LINK, wp.vec3(EE_OFFSET[0], EE_OFFSET[1], EE_OFFSET[2]), dt=dt, weight=weight
+                ),
+            ]
+            solver = ik.IKSolverTrajectory(
+                model,
+                N_FRAMES,
+                objectives,
+                jacobian_mode=ik.IKJacobianType.ANALYTIC,
+                linear_solver="direct",
+            )
+            joint_q = wp.array(seed.copy(), dtype=wp.float32, device=device)
+            solver.step(joint_q, joint_q, iterations=60)
+            return joint_q.numpy()
+
+        eval_obj = _standalone_apparent_gravity(model, N_FRAMES, device, dt=dt)
+        res_base = _objective_residuals(eval_obj, model, solve(0.0), device)
+        res_wtr = _objective_residuals(eval_obj, model, solve(0.05), device)
+        tang_base = np.linalg.norm(res_base[: N_FRAMES - 2, :2], axis=1)
+        tang_wtr = np.linalg.norm(res_wtr[: N_FRAMES - 2, :2], axis=1)
+        test.assertLess(tang_wtr.mean(), 0.5 * tang_base.mean())
+
+
 devices = get_test_devices()
 
 
 class TestIKTrajectoryDynamics(unittest.TestCase):
     pass
+
+
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_apparent_gravity_coeffs_match_fd",
+    test_apparent_gravity_coeffs_match_fd,
+    devices=devices,
+)
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_apparent_gravity_static_tilt",
+    test_apparent_gravity_static_tilt,
+    devices=devices,
+)
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_apparent_gravity_balances",
+    test_apparent_gravity_balances,
+    devices=devices,
+)
 
 
 add_function_test(

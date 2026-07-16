@@ -1051,6 +1051,313 @@ def _gravity_torque_coeffs(
     coeffs[row, 0, c, a] = -s * wp.dot(gravity, wp.cross(w_ancestor, u_descendant))
 
 
+@wp.func
+def _link_point(body_q: wp.array2d[wp.transform], row: int, link: int, offset: wp.vec3) -> wp.vec3:
+    tf = body_q[row, link]
+    rot = wp.quat(tf[3], tf[4], tf[5], tf[6])
+    return wp.vec3(tf[0], tf[1], tf[2]) + wp.quat_rotate(rot, offset)
+
+
+@wp.func
+def _link_axis(body_q: wp.array2d[wp.transform], row: int, link: int, axis: wp.vec3) -> wp.vec3:
+    tf = body_q[row, link]
+    rot = wp.quat(tf[3], tf[4], tf[5], tf[6])
+    return wp.quat_rotate(rot, axis)
+
+
+@wp.kernel(enable_backward=False)
+def _apparent_gravity_scratch(
+    body_q: wp.array2d[wp.transform],  # (n_rows, n_bodies)
+    n_frames: int,
+    link_index: int,
+    link_offset: wp.vec3,
+    tangent_u: wp.vec3,  # link-local plate tangent axes
+    tangent_v: wp.vec3,
+    gravity: wp.vec3,
+    inv_dt2: float,
+    # outputs
+    f_app: wp.array[wp.vec3],  # (n_rows,) apparent specific force a_ee - g
+    t_u: wp.array[wp.vec3],  # (n_rows,) world tangent axes at frame t + 1
+    t_v: wp.array[wp.vec3],
+):
+    row = wp.tid()
+    t = row % n_frames
+    if t + 2 >= n_frames:
+        return
+    p0 = _link_point(body_q, row, link_index, link_offset)
+    p1 = _link_point(body_q, row + 1, link_index, link_offset)
+    p2 = _link_point(body_q, row + 2, link_index, link_offset)
+    a_ee = (p0 - 2.0 * p1 + p2) * inv_dt2
+    f_app[row] = a_ee - gravity
+    t_u[row] = _link_axis(body_q, row + 1, link_index, tangent_u)
+    t_v[row] = _link_axis(body_q, row + 1, link_index, tangent_v)
+
+
+@wp.kernel(enable_backward=False)
+def _apparent_gravity_residuals(
+    f_app: wp.array[wp.vec3],  # (n_rows,)
+    t_u: wp.array[wp.vec3],
+    t_v: wp.array[wp.vec3],
+    n_frames: int,
+    weight: float,
+    start_idx: int,
+    # outputs
+    residuals: wp.array2d[wp.float32],
+):
+    row = wp.tid()
+    t = row % n_frames
+    if t + 2 >= n_frames:
+        return
+    residuals[row, start_idx + 0] = weight * wp.dot(t_u[row], f_app[row])
+    residuals[row, start_idx + 1] = weight * wp.dot(t_v[row], f_app[row])
+
+
+@wp.kernel(enable_backward=False)
+def _apparent_gravity_coeffs(
+    body_q: wp.array2d[wp.transform],  # (n_rows, n_bodies)
+    joint_S_s: wp.array2d[wp.spatial_vector],  # (n_rows, n_dofs)
+    f_app: wp.array[wp.vec3],
+    t_u: wp.array[wp.vec3],
+    t_v: wp.array[wp.vec3],
+    affects_dof: wp.array[wp.uint8],  # (n_dofs,)
+    n_frames: int,
+    link_index: int,
+    link_offset: wp.vec3,
+    weight: float,
+    inv_dt2: float,
+    # outputs
+    coeffs: wp.array4d[wp.float32],  # (n_rows, 3, n_dofs, n_dofs), zeroed by caller
+):
+    """Waiter-objective Jacobian blocks.
+
+    Row k of frame t couples to tangent coordinate ``a`` of frames
+    ``t + j`` through the acceleration stencil ``s = (1, -2, 1)/dt^2``
+    projected on the plate tangent axis, plus (at ``j = 1``, where the
+    tangent axes are evaluated) the plate-tilt term
+    ``(omega_a x t_k) . f_app``.
+    """
+    row, dof = wp.tid()
+    t = row % n_frames
+    if t + 2 >= n_frames:
+        return
+    if affects_dof[dof] == 0:
+        return
+
+    for j in range(3):
+        rj = row + j
+        s_j = wp.where(j == 1, -2.0, 1.0) * inv_dt2
+        p = _link_point(body_q, rj, link_index, link_offset)
+        S = joint_S_s[rj, dof]
+        v = wp.vec3(S[0], S[1], S[2])
+        omega = wp.vec3(S[3], S[4], S[5])
+        dp = v + wp.cross(omega, p)
+        c_u = s_j * wp.dot(t_u[row], dp)
+        c_v = s_j * wp.dot(t_v[row], dp)
+        if j == 1:
+            c_u += wp.dot(wp.cross(omega, t_u[row]), f_app[row])
+            c_v += wp.dot(wp.cross(omega, t_v[row]), f_app[row])
+        coeffs[row, j, 0, dof] = weight * c_u
+        coeffs[row, j, 1, dof] = weight * c_v
+
+
+class IKObjectiveApparentGravity(IKObjectiveTemporal):
+    """Keep apparent gravity aligned with a carried surface's normal.
+
+    The "waiter" objective: for a plate (tray, glass, ball support) rigidly
+    carried by ``link_index``, an object resting on it stays put when the
+    apparent specific force ``f = a_ee - g`` [m/s²] felt in the plate frame
+    points along the plate normal. Residual rows 0 and 1 of frame ``t`` are
+    the two plate-tangential components ``weight * t_k . f`` with the
+    end-effector acceleration ``a_ee`` taken as the forward second
+    difference of frames ``t .. t + 2`` and the tangent axes ``t_k``
+    evaluated at frame ``t + 1``. The remaining ``joint_dof_count - 2``
+    rows stay zero (the banded assembly requires temporal residual blocks
+    of that size).
+
+    Minimizing it makes the solver both smooth the carried point's
+    acceleration and bank the plate into the residual acceleration — the
+    same strategy a waiter uses with a loaded tray. It penalizes sliding
+    (tangential force) only; it does not enforce a unilateral contact
+    (``f . n > 0``) or a friction cone.
+
+    Args:
+        model: Shared articulation model.
+        link_index: Link carrying the surface.
+        link_offset: Surface reference point in the link frame [m].
+        plate_axis: Surface normal in the link frame (need not be unit).
+        dt: Time step between consecutive frames [s].
+        weight: Scalar multiplier applied to the residual rows.
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        link_index: int,
+        link_offset: wp.vec3,
+        plate_axis: wp.vec3 = wp.vec3(0.0, 0.0, 1.0),
+        dt: float = 1.0,
+        weight: float = 1.0,
+    ) -> None:
+        super().__init__(model)
+        if dt <= 0.0:
+            raise ValueError("dt must be positive")
+        self.link_index = link_index
+        self.link_offset = link_offset
+        self.dt = dt
+        self.weight = weight
+
+        axis = np.array([plate_axis[0], plate_axis[1], plate_axis[2]], dtype=np.float64)
+        norm = np.linalg.norm(axis)
+        if norm < 1e-9:
+            raise ValueError("plate_axis must be non-zero")
+        axis /= norm
+        helper = np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        u = np.cross(axis, helper)
+        u /= np.linalg.norm(u)
+        v = np.cross(axis, u)
+        self._tangent_u = wp.vec3(*u)
+        self._tangent_v = wp.vec3(*v)
+
+        self._affects_dof = None
+        self._gravity = None
+        self._f_app = None
+        self._t_u = None
+        self._t_v = None
+        self._joint_S_s = None
+        self._body_q_fk = None
+        self._body_qd_fk = None
+        self._qd_zero = None
+
+    def stencil_width(self) -> int:
+        """Return 2: the acceleration stencil couples frames ``t .. t + 2``."""
+        return 2
+
+    def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
+        super().init_buffers(model, jacobian_mode)
+        n_bodies = model.body_count
+
+        # per-DoF mask of ancestors of the carrying link
+        joint_qd_start_np = model.joint_qd_start.numpy()
+        joint_parent_np = model.joint_parent.numpy()
+        joint_child_np = model.joint_child.numpy()
+        body_to_joint = np.full(n_bodies, -1, dtype=np.int32)
+        for j in range(model.joint_count):
+            child = joint_child_np[j]
+            if child != -1:
+                body_to_joint[child] = j
+        affects = np.zeros(self.n_dofs, dtype=np.uint8)
+        body = self.link_index
+        while body != -1:
+            j = body_to_joint[body]
+            if j == -1:
+                break
+            affects[joint_qd_start_np[j] : joint_qd_start_np[j + 1]] = 1
+            body = joint_parent_np[j]
+        self._affects_dof = wp.array(affects, dtype=wp.uint8, device=self.device)
+
+        self._gravity = wp.vec3(*model.gravity.numpy()[0])
+        self._f_app = wp.zeros(self.n_batch, dtype=wp.vec3, device=self.device)
+        self._t_u = wp.zeros(self.n_batch, dtype=wp.vec3, device=self.device)
+        self._t_v = wp.zeros(self.n_batch, dtype=wp.vec3, device=self.device)
+        self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
+        self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
+        self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
+        self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
+
+    def _compute_scratch(self, body_q: wp.array2d[wp.transform], n_rows: int) -> None:
+        wp.launch(
+            _apparent_gravity_scratch,
+            dim=[n_rows],
+            inputs=[
+                body_q,
+                self.n_frames,
+                self.link_index,
+                self.link_offset,
+                self._tangent_u,
+                self._tangent_v,
+                self._gravity,
+                1.0 / self.dt**2,
+            ],
+            outputs=[self._f_app, self._t_u, self._t_v],
+            device=self.device,
+        )
+
+    def compute_residuals(
+        self,
+        body_q: wp.array2d[wp.transform],
+        joint_q: wp.array2d[wp.float32],
+        model: Model,
+        residuals: wp.array2d[wp.float32],
+        start_idx: int,
+        problem_idx: wp.array[wp.int32],
+    ) -> None:
+        """Write weighted tangential apparent-gravity components into the buffer.
+
+        Args:
+            body_q: Batched body transforms, shape [n_rows, body_count].
+            joint_q: Batched joint coordinates, shape [n_rows, joint_coord_count].
+            model: Shared articulation model.
+            residuals: Global residual buffer, shape [n_rows, total_residual_count].
+            start_idx: First residual row reserved for this objective.
+            problem_idx: Present for interface compatibility; frames are
+                addressed through the trajectory layout instead.
+        """
+        self._require_trajectory_layout()
+        n_rows = joint_q.shape[0]
+        self._compute_scratch(body_q, n_rows)
+        wp.launch(
+            _apparent_gravity_residuals,
+            dim=[n_rows],
+            inputs=[self._f_app, self._t_u, self._t_v, self.n_frames, self.weight, start_idx],
+            outputs=[residuals],
+            device=self.device,
+        )
+
+    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
+        eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
+        model = self.model
+        wp.launch(
+            _motion_subspace_rows,
+            dim=[self.n_batch, model.joint_count],
+            inputs=[
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                joint_q,
+                model.joint_axis,
+                model.joint_dof_dim,
+                self._body_q_fk,
+                model.body_com,
+                model.joint_X_p,
+            ],
+            outputs=[self._joint_S_s],
+            device=self.device,
+        )
+        self._compute_scratch(self._body_q_fk, self.n_batch)
+        self.coeffs.zero_()
+        wp.launch(
+            _apparent_gravity_coeffs,
+            dim=[self.n_batch, self.n_dofs],
+            inputs=[
+                self._body_q_fk,
+                self._joint_S_s,
+                self._f_app,
+                self._t_u,
+                self._t_v,
+                self._affects_dof,
+                self.n_frames,
+                self.link_index,
+                self.link_offset,
+                self.weight,
+                1.0 / self.dt**2,
+            ],
+            outputs=[self.coeffs],
+            device=self.device,
+        )
+
+
 class IKObjectiveGravityTorque(IKObjectiveTemporal):
     """Penalize the static gravity-compensation torque at every frame.
 

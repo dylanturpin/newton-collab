@@ -9,6 +9,7 @@ from .ik_lm_optimizer import IKOptimizerLM
 from .ik_objectives import IKObjective, IKObjectiveJointLimit, IKObjectivePosition, IKObjectiveRotation
 from .ik_solver import IKOptimizer, IKSampler, IKSolver
 from .ik_trajectory_objectives import (
+    IKObjectiveApparentGravity,
     IKObjectiveGravityTorque,
     IKObjectiveJointReference,
     IKObjectiveSmoothness,
@@ -21,6 +22,7 @@ __all__ = [
     "IKJacobianType",
     "IKLinearSolver",
     "IKObjective",
+    "IKObjectiveApparentGravity",
     "IKObjectiveGravityTorque",
     "IKObjectiveJointLimit",
     "IKObjectiveJointReference",

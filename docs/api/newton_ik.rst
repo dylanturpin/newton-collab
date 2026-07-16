@@ -18,6 +18,7 @@ Public inverse-kinematics API for defining objectives and solving IK problems.
    IKJacobianType
    IKLinearSolver
    IKObjective
+   IKObjectiveApparentGravity
    IKObjectiveGravityTorque
    IKObjectiveJointLimit
    IKObjectiveJointReference
