@@ -20,9 +20,10 @@ import math
 import numpy as np
 import warp as wp
 
+from ..articulation import jcalc_motion_subspace
 from ..enums import JointType
 from ..model import Model
-from .ik_common import IKJacobianType
+from .ik_common import IKJacobianType, eval_fk_batched
 from .ik_objectives import IKObjective
 
 
@@ -888,6 +889,372 @@ class IKObjectiveJointReference(IKObjectiveTemporal):
                 self.model.joint_type,
                 self.model.joint_q_start,
                 self.model.joint_qd_start,
+            ],
+            outputs=[self.coeffs],
+            device=self.device,
+        )
+
+
+@wp.kernel(enable_backward=False)
+def _motion_subspace_rows(
+    joint_type: wp.array[wp.int32],
+    joint_parent: wp.array[wp.int32],
+    joint_child: wp.array[wp.int32],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_q: wp.array2d[wp.float32],  # (n_rows, n_coords)
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[wp.int32],
+    body_q: wp.array2d[wp.transform],  # (n_rows, n_bodies)
+    body_com: wp.array[wp.vec3],
+    joint_X_p: wp.array[wp.transform],
+    # outputs
+    joint_S_s: wp.array2d[wp.spatial_vector],  # (n_rows, n_dofs)
+):
+    """Batched world-frame motion subspace, layout ``(v_origin[0:3], omega[3:6])``."""
+    row, joint_idx = wp.tid()
+
+    t = joint_type[joint_idx]
+    parent = joint_parent[joint_idx]
+    child = joint_child[joint_idx]
+    q_start = joint_q_start[joint_idx]
+    qd_start = joint_qd_start[joint_idx]
+
+    X_pj = joint_X_p[joint_idx]
+    X_wpj = X_pj
+    if parent >= 0:
+        X_wpj = body_q[row, parent] * X_pj
+
+    lin_axis_count = joint_dof_dim[joint_idx, 0]
+    ang_axis_count = joint_dof_dim[joint_idx, 1]
+
+    joint_q_1d = joint_q[row]
+    S_s_out = joint_S_s[row]
+
+    if t == JointType.FREE or t == JointType.DISTANCE:
+        jcalc_motion_subspace(
+            t,
+            joint_axis,
+            joint_q_1d,
+            lin_axis_count,
+            ang_axis_count,
+            X_wpj,
+            body_q[row, child],
+            body_com[child],
+            q_start,
+            qd_start,
+            S_s_out,
+        )
+    else:
+        jcalc_motion_subspace(
+            t,
+            joint_axis,
+            joint_q_1d,
+            lin_axis_count,
+            ang_axis_count,
+            X_wpj,
+            wp.transform_identity(),
+            wp.vec3(),
+            q_start,
+            qd_start,
+            S_s_out,
+        )
+
+
+@wp.kernel(enable_backward=False)
+def _world_com_scratch(
+    body_q: wp.array2d[wp.transform],  # (n_rows, n_bodies)
+    body_com: wp.array[wp.vec3],
+    # outputs
+    com_w: wp.array2d[wp.vec3],  # (n_rows, n_bodies)
+):
+    row, body = wp.tid()
+    com_w[row, body] = wp.transform_point(body_q[row, body], body_com[body])
+
+
+@wp.kernel(enable_backward=False)
+def _gravity_torque_u(
+    com_w: wp.array2d[wp.vec3],  # (n_rows, n_bodies)
+    body_mass: wp.array[wp.float32],
+    joint_S_s: wp.array2d[wp.spatial_vector],  # (n_rows, n_dofs)
+    subtree_body: wp.array2d[wp.uint8],  # (n_dofs, n_bodies)
+    n_bodies: int,
+    # outputs
+    u: wp.array2d[wp.vec3],  # (n_rows, n_dofs)
+):
+    """Subtree gravity moment direction ``u_d = M_d v_d + omega_d x P_d``.
+
+    ``M_d`` / ``P_d`` are the total mass and mass-weighted world COM of the
+    bodies moved by DoF ``d``, and ``(v_d, omega_d)`` its world motion
+    subspace at the origin, so ``tau_g[d] = -g . u_d``.
+    """
+    row, dof = wp.tid()
+    S = joint_S_s[row, dof]
+    v = wp.vec3(S[0], S[1], S[2])
+    w = wp.vec3(S[3], S[4], S[5])
+    m_sum = float(0.0)
+    p_sum = wp.vec3(0.0)
+    for b in range(n_bodies):
+        if subtree_body[dof, b] != 0:
+            m = body_mass[b]
+            m_sum += m
+            p_sum += m * com_w[row, b]
+    u[row, dof] = m_sum * v + wp.cross(w, p_sum)
+
+
+@wp.kernel(enable_backward=False)
+def _gravity_torque_residuals(
+    u: wp.array2d[wp.vec3],  # (n_rows, n_dofs)
+    gravity: wp.vec3,
+    dof_scale: wp.array[wp.float32],  # (n_dofs,)
+    start_idx: int,
+    # outputs
+    residuals: wp.array2d[wp.float32],
+):
+    row, dof = wp.tid()
+    s = dof_scale[dof]
+    if s == 0.0:
+        return
+    residuals[row, start_idx + dof] = -s * wp.dot(gravity, u[row, dof])
+
+
+@wp.kernel(enable_backward=False)
+def _gravity_torque_coeffs(
+    u: wp.array2d[wp.vec3],  # (n_rows, n_dofs)
+    joint_S_s: wp.array2d[wp.spatial_vector],  # (n_rows, n_dofs)
+    dof_ancestor: wp.array2d[wp.uint8],  # (n_dofs, n_dofs); [d, a] = a ancestor-or-self of d
+    gravity: wp.vec3,
+    dof_scale: wp.array[wp.float32],  # (n_dofs,)
+    # outputs
+    coeffs: wp.array4d[wp.float32],  # (n_rows, 1, n_dofs, n_dofs), zeroed by caller
+):
+    """Gravity-torque Jacobian ``d tau_g[c] / d u_a = -g . (omega_ancestor x u_descendant)``.
+
+    Rigid transport gives ``d u_descendant / d q_ancestor = omega_ancestor x u_descendant`` for any
+    ancestor/descendant DoF pair on one chain (exact for revolute, prismatic,
+    and free-joint tangents; Gauss-Newton-approximate between rotational DoFs
+    that share one ball or D6 joint). Unrelated DoF pairs are zero.
+    """
+    row, c, a = wp.tid()
+    s = dof_scale[c]
+    if s == 0.0:
+        return
+    if dof_ancestor[c, a] != 0:
+        S_ancestor = joint_S_s[row, a]
+        u_descendant = u[row, c]
+    elif dof_ancestor[a, c] != 0:
+        S_ancestor = joint_S_s[row, c]
+        u_descendant = u[row, a]
+    else:
+        return
+    w_ancestor = wp.vec3(S_ancestor[3], S_ancestor[4], S_ancestor[5])
+    coeffs[row, 0, c, a] = -s * wp.dot(gravity, wp.cross(w_ancestor, u_descendant))
+
+
+class IKObjectiveGravityTorque(IKObjectiveTemporal):
+    """Penalize the static gravity-compensation torque at every frame.
+
+    Residual row ``t`` of DoF ``d`` is
+    ``weight * dof_weights[d] * tau_g,d(q_t)`` [N or N·m], where
+    ``tau_g(q) = dU/dq`` is the joint force that holds the articulation
+    static under gravity (the ``gravity_force`` convention of
+    :func:`~newton.eval_inverse_dynamics`). Minimizing it steers redundant
+    DoFs toward gravity-friendly postures — e.g. an elbow hanging below the
+    wrist instead of winging sideways — which is most visible with a heavy
+    payload attached to the end effector.
+
+    DoFs of free and distance joints are unactuated and always contribute
+    zero residual rows; their coefficient columns (how base motion changes
+    the actuated torques) are still reported exactly. Gravity is read from
+    world 0 of the model.
+
+    Args:
+        model: Shared articulation model.
+        weight: Scalar multiplier applied to the residual rows.
+        dof_weights: Optional per-DoF multipliers, shape [joint_dof_count].
+            Read once when the owning solver initializes the objective.
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        weight: float = 1.0,
+        dof_weights: wp.array[wp.float32] | None = None,
+    ) -> None:
+        super().__init__(model)
+        self.weight = weight
+        self.dof_weights = dof_weights
+        self._dof_scale = None
+        self._subtree_body = None
+        self._dof_ancestor = None
+        self._gravity = None
+        self._joint_S_s = None
+        self._com_w = None
+        self._u = None
+        self._body_q_fk = None
+        self._body_qd_fk = None
+        self._qd_zero = None
+
+    def stencil_width(self) -> int:
+        """Return 0: each residual row only involves its own frame."""
+        return 0
+
+    def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
+        super().init_buffers(model, jacobian_mode)
+        n_bodies = model.body_count
+        n_joints = model.joint_count
+
+        joint_qd_start_np = model.joint_qd_start.numpy()
+        joint_parent_np = model.joint_parent.numpy()
+        joint_child_np = model.joint_child.numpy()
+        joint_type_np = model.joint_type.numpy()
+
+        body_to_joint = np.full(n_bodies, -1, dtype=np.int32)
+        for j in range(n_joints):
+            child = joint_child_np[j]
+            if child != -1:
+                body_to_joint[child] = j
+
+        dof_to_joint = np.full(self.n_dofs, -1, dtype=np.int32)
+        for j in range(n_joints):
+            dof_to_joint[joint_qd_start_np[j] : joint_qd_start_np[j + 1]] = j
+
+        # subtree_body[d, b] = 1 iff DoF d's joint lies on the chain from the
+        # root to body b (i.e. moving d moves b)
+        subtree_body = np.zeros((self.n_dofs, n_bodies), dtype=np.uint8)
+        joint_ancestor = np.zeros((n_joints, n_joints), dtype=np.uint8)
+        for b in range(n_bodies):
+            body = b
+            while body != -1:
+                j = body_to_joint[body]
+                if j == -1:
+                    break
+                subtree_body[joint_qd_start_np[j] : joint_qd_start_np[j + 1], b] = 1
+                if body_to_joint[b] != -1:
+                    joint_ancestor[body_to_joint[b], j] = 1
+                body = joint_parent_np[j]
+
+        # dof_ancestor[c, a] = 1 iff a is ancestor-or-self of c; DoFs of one
+        # joint are ordered (earlier axes carry later ones, cf. jcalc FK)
+        dof_ancestor = np.zeros((self.n_dofs, self.n_dofs), dtype=np.uint8)
+        for c in range(self.n_dofs):
+            jc = dof_to_joint[c]
+            if jc == -1:
+                continue
+            for a in range(self.n_dofs):
+                ja = dof_to_joint[a]
+                if ja == -1:
+                    continue
+                if jc == ja:
+                    dof_ancestor[c, a] = 1 if a <= c else 0
+                elif joint_ancestor[jc, ja]:
+                    dof_ancestor[c, a] = 1
+
+        dof_scale = np.full(self.n_dofs, self.weight, dtype=np.float32)
+        for j in range(n_joints):
+            if joint_type_np[j] in (int(JointType.FREE), int(JointType.DISTANCE)):
+                dof_scale[joint_qd_start_np[j] : joint_qd_start_np[j + 1]] = 0.0
+        if self.dof_weights is not None:
+            dof_scale *= self.dof_weights.numpy().astype(np.float32)
+
+        self._subtree_body = wp.array(subtree_body, dtype=wp.uint8, device=self.device)
+        self._dof_ancestor = wp.array(dof_ancestor, dtype=wp.uint8, device=self.device)
+        self._dof_scale = wp.array(dof_scale, dtype=wp.float32, device=self.device)
+        self._gravity = wp.vec3(*model.gravity.numpy()[0])
+
+        self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
+        self._com_w = wp.zeros((self.n_batch, n_bodies), dtype=wp.vec3, device=self.device)
+        self._u = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.vec3, device=self.device)
+        self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
+        self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
+        self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
+
+    def _compute_u(self, body_q: wp.array2d[wp.transform], joint_q: wp.array2d[wp.float32]) -> None:
+        n_rows = joint_q.shape[0]
+        model = self.model
+        wp.launch(
+            _world_com_scratch,
+            dim=[n_rows, model.body_count],
+            inputs=[body_q, model.body_com],
+            outputs=[self._com_w],
+            device=self.device,
+        )
+        wp.launch(
+            _motion_subspace_rows,
+            dim=[n_rows, model.joint_count],
+            inputs=[
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                joint_q,
+                model.joint_axis,
+                model.joint_dof_dim,
+                body_q,
+                model.body_com,
+                model.joint_X_p,
+            ],
+            outputs=[self._joint_S_s],
+            device=self.device,
+        )
+        wp.launch(
+            _gravity_torque_u,
+            dim=[n_rows, self.n_dofs],
+            inputs=[
+                self._com_w,
+                model.body_mass,
+                self._joint_S_s,
+                self._subtree_body,
+                model.body_count,
+            ],
+            outputs=[self._u],
+            device=self.device,
+        )
+
+    def compute_residuals(
+        self,
+        body_q: wp.array2d[wp.transform],
+        joint_q: wp.array2d[wp.float32],
+        model: Model,
+        residuals: wp.array2d[wp.float32],
+        start_idx: int,
+        problem_idx: wp.array[wp.int32],
+    ) -> None:
+        """Write weighted gravity-compensation torques into the global buffer.
+
+        Args:
+            body_q: Batched body transforms, shape [n_rows, body_count].
+            joint_q: Batched joint coordinates, shape [n_rows, joint_coord_count].
+            model: Shared articulation model.
+            residuals: Global residual buffer, shape [n_rows, total_residual_count].
+            start_idx: First residual row reserved for this objective.
+            problem_idx: Present for interface compatibility; frames are
+                addressed through the trajectory layout instead.
+        """
+        self._require_trajectory_layout()
+        self._compute_u(body_q, joint_q)
+        wp.launch(
+            _gravity_torque_residuals,
+            dim=[joint_q.shape[0], self.n_dofs],
+            inputs=[self._u, self._gravity, self._dof_scale, start_idx],
+            outputs=[residuals],
+            device=self.device,
+        )
+
+    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
+        eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
+        self._compute_u(self._body_q_fk, joint_q)
+        self.coeffs.zero_()
+        wp.launch(
+            _gravity_torque_coeffs,
+            dim=[self.n_batch, self.n_dofs, self.n_dofs],
+            inputs=[
+                self._u,
+                self._joint_S_s,
+                self._dof_ancestor,
+                self._gravity,
+                self._dof_scale,
             ],
             outputs=[self.coeffs],
             device=self.device,
