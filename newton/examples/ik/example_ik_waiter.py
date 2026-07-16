@@ -337,9 +337,14 @@ class Example:
             self._last_goal = np.array(goal)
             self._replan_needed = True
 
-        goal_now = np.array([*wp.transform_get_translation(self.goal_tf)])
-        if np.linalg.norm(goal_now - self._last_goal) > 5e-3:
+        # grabbing the gizmo (mouse down on any handle, no motion needed)
+        # permanently hands control to the user and ends the scripted demo
+        if not self._user_moved_goal and bool(getattr(self.viewer, "gizmo_is_using", False)):
             self._user_moved_goal = True
+            self._script.clear()
+
+        goal_now = np.array([*wp.transform_get_translation(self.goal_tf)])
+        if np.linalg.norm(goal_now - self._last_goal) > 1e-6:
             self._last_goal = goal_now
             self._replan_needed = True
         # throttle re-solves so a continuous drag replans a few times per
