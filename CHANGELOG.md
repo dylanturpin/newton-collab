@@ -482,6 +482,11 @@
   - Stop forwarding CoACD/V-HACD-only keyword arguments to the convex-hull fallback when the decomposition backend fails or is unavailable.
   - Ignore incompatible non-mesh entries in explicit `shape_indices`; process `GeoType.MESH` and `GeoType.CONVEX_MESH` entries.
   - Replace failed remeshing results with the documented bounding-box approximation instead of leaving the original mesh in place.
+- Fix Style3D solver divergence caused by isolated vertices.
+- Fix IK convergence for floating-base robots far from the world origin: root free-joint tangents are now body-centered (the angular tangent rotates about the base's own anchor instead of the world origin) and the analytic Jacobian columns of the per-frame and trajectory IK solvers match the retraction pivot exactly. Previously the effector Jacobian error grew with the base's distance from the origin, making Levenberg-Marquardt reject every step a few meters out.
+- Fix USD joint `physics:collisionEnabled` import so joints with two explicit bodies honor authored collision behavior; joints to world continue to allow body/world collisions, and articulation-wide self-collision filtering remains additive.
+- Fix `ViewerFile.is_running()` to return `False` after `ViewerFile.close()` so headless recording loops can terminate like interactive viewers. (#3094)
+- Fix `ModelBuilder.approximate_meshes()` forwarding CoACD/V-HACD keyword arguments to the convex-hull fallback when the decomposition backend fails or is not installed, which broke the fallback and left the original mesh in place.
 - Raise an error when `SolverVBD(rigid_contact_history=True)` would allocate or grow contact-history buffers during CUDA graph capture; construct `CollisionPipeline` before `SolverVBD`, or run one uncaptured solver step before capture.
 - Fix `SensorTiledCamera.utils.convert_ray_depth_to_forward_depth()` to preserve the clear-depth sentinel for zero-direction rays and non-positive depths.
 - Fix `SolverMuJoCo` placing articulations whose root is a fully-locked D6 joint (e.g. imported from a generic USD `PhysicsJoint`) at the first world's root pose in every world; such roots now become mocap bodies like fixed-joint roots. (#3499; fixes #3430)
