@@ -688,11 +688,69 @@ def test_position_rotation_set_equivalence(test, device):
         assert_np_equal(q_fused, q_individual, tol=1e-5)
 
 
+def test_self_collision_coeffs_match_fd(test, device):
+    """Capsule-pair separation blocks must match finite differences."""
+    with wp.ScopedDevice(device):
+        model = _build_planar_vertical(device)
+        n_dofs = model.joint_dof_count
+        rng = np.random.default_rng(53)
+        # capsules on links 0 and 2 of the chain; poses that bring them close.
+        # the mechanism is planar, so offset the capsules in y to keep the
+        # closest distance bounded away from the crossing degeneracy where the
+        # separation normal is undefined
+        pairs = [[0, 2]]
+        ends = [[[-0.2, 0.04, 0.0], [0.2, 0.04, 0.0], [-0.2, -0.04, 0.0], [0.2, -0.04, 0.0]]]
+        radii = [[0.05, 0.05]]
+        # half the frames fold the chain back on itself (joints 2 and 3 near
+        # pi) so link 2's capsule approaches link 0's; jitter avoids exactly
+        # parallel segments where the closest point is degenerate
+        q_np = rng.uniform(-0.5, 0.5, size=(N_FRAMES, model.joint_coord_count))
+        fold = N_FRAMES // 2
+        q_np[:fold, 1] = np.pi - rng.uniform(0.15, 0.5, size=fold)
+        q_np[:fold, 2] = np.pi - rng.uniform(0.15, 0.5, size=fold)
+        obj = _standalone_temporal(
+            ik.IKObjectiveSelfCollision(model, pairs, ends, radii, margin=0.15),
+            model,
+            N_FRAMES,
+            device,
+        )
+        res = _objective_residuals(obj, model, q_np, device)
+        test.assertGreater(np.abs(res[:, 0]).max(), 0.0)  # some frames must activate
+
+        joint_q = wp.array(q_np.astype(np.float32), dtype=wp.float32, device=device)
+        obj.compute_coeffs(joint_q)
+        coeffs = obj.coeffs.numpy()[:, 0]
+
+        eps = 1e-4
+        fd = np.zeros((N_FRAMES, n_dofs, n_dofs))
+        for a in range(n_dofs):
+            qp = q_np.copy()
+            qp[:, a] += eps
+            qm = q_np.copy()
+            qm[:, a] -= eps
+            fd[:, :, a] = (
+                _objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)
+            ) / (2 * eps)
+        # exact away from hinge kinks / degenerate parallel segments; allow
+        # a small number of kink-straddling entries
+        diff = np.abs(coeffs - fd)
+        test.assertLess(np.median(diff[np.abs(fd) > 1e-6]) if (np.abs(fd) > 1e-6).any() else 0.0, 5e-3)
+        test.assertLess((diff > 5e-2).mean(), 0.05)
+
+
 devices = get_test_devices()
 
 
 class TestIKTrajectoryDynamics(unittest.TestCase):
     pass
+
+
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_self_collision_coeffs_match_fd",
+    test_self_collision_coeffs_match_fd,
+    devices=devices,
+)
 
 
 add_function_test(

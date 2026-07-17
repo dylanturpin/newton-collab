@@ -1206,11 +1206,13 @@ class IKObjectiveApparentGravity(IKObjectiveTemporal):
         model: Model,
         link_index: int,
         link_offset: wp.vec3,
-        plate_axis: wp.vec3 = wp.vec3(0.0, 0.0, 1.0),
+        plate_axis: wp.vec3 | None = None,
         dt: float = 1.0,
         weight: float = 1.0,
     ) -> None:
         super().__init__(model)
+        if plate_axis is None:
+            plate_axis = wp.vec3(0.0, 0.0, 1.0)
         if dt <= 0.0:
             raise ValueError("dt must be positive")
         self.link_index = link_index
@@ -1470,12 +1472,14 @@ class IKObjectiveWorldPlane(IKObjectiveTemporal):
         model: Model,
         link_indices,
         link_offsets,
-        plane_normal: wp.vec3 = wp.vec3(0.0, 0.0, 1.0),
+        plane_normal: wp.vec3 | None = None,
         plane_offset: float = 0.0,
         margin: float = 0.02,
         weight: float = 1.0,
     ) -> None:
         super().__init__(model)
+        if plane_normal is None:
+            plane_normal = wp.vec3(0.0, 0.0, 1.0)
         self._links_np = np.asarray(link_indices, dtype=np.int32)
         self._offsets_np = np.asarray(link_offsets, dtype=np.float32).reshape(-1, 3)
         if self._links_np.shape[0] != self._offsets_np.shape[0]:
@@ -2019,6 +2023,284 @@ class IKObjectiveFootContact(IKObjectiveTemporal):
                 self._affects,
                 self._links,
                 self._offsets,
+                self.weight,
+            ],
+            outputs=[self.coeffs],
+            device=self.device,
+        )
+
+
+@wp.func
+def _segment_closest_params(p1: wp.vec3, q1: wp.vec3, p2: wp.vec3, q2: wp.vec3):
+    """Closest-point parameters (s, t) between segments [p1,q1] and [p2,q2]."""
+    d1 = q1 - p1
+    d2 = q2 - p2
+    r = p1 - p2
+    a = wp.dot(d1, d1)
+    e = wp.dot(d2, d2)
+    f = wp.dot(d2, r)
+    c = wp.dot(d1, r)
+    b = wp.dot(d1, d2)
+    denom = a * e - b * b
+    s = float(0.0)
+    if denom > 1e-12:
+        s = wp.clamp((b * f - c * e) / denom, 0.0, 1.0)
+    t = float(0.0)
+    if e > 1e-12:
+        t = wp.clamp((b * s + f) / e, 0.0, 1.0)
+        # recompute s for the clamped t
+        s = wp.clamp((b * t - c) / wp.max(a, 1e-12), 0.0, 1.0)
+    return s, t
+
+
+@wp.kernel(enable_backward=False)
+def _self_collision_scratch(
+    body_q: wp.array2d[wp.transform],  # (n_rows, n_bodies)
+    pair_link: wp.array2d[wp.int32],  # (n_pairs, 2)
+    pair_ends: wp.array2d[wp.vec3],  # (n_pairs, 4): a0, a1, b0, b1 (local)
+    pair_radii: wp.array2d[wp.float32],  # (n_pairs, 2)
+    margin: float,
+    weight: float,
+    start_idx: int,
+    write_residuals: int,
+    # outputs
+    close_a: wp.array2d[wp.vec3],  # (n_rows, n_pairs) world closest point on A
+    close_b: wp.array2d[wp.vec3],
+    grads: wp.array2d[wp.float32],  # (n_rows, n_pairs) d hinge / d dist
+    residuals: wp.array2d[wp.float32],
+):
+    row, k = wp.tid()
+    tf_a = body_q[row, pair_link[k, 0]]
+    tf_b = body_q[row, pair_link[k, 1]]
+    a0 = wp.transform_point(tf_a, pair_ends[k, 0])
+    a1 = wp.transform_point(tf_a, pair_ends[k, 1])
+    b0 = wp.transform_point(tf_b, pair_ends[k, 2])
+    b1 = wp.transform_point(tf_b, pair_ends[k, 3])
+    s, t = _segment_closest_params(a0, a1, b0, b1)
+    ca = a0 + s * (a1 - a0)
+    cb = b0 + t * (b1 - b0)
+    close_a[row, k] = ca
+    close_b[row, k] = cb
+    dist = wp.length(ca - cb) - pair_radii[k, 0] - pair_radii[k, 1]
+    grads[row, k] = _colldist_hinge_grad(dist, margin)
+    if write_residuals != 0:
+        residuals[row, start_idx + k] = weight * _colldist_hinge(dist, margin)
+
+
+@wp.kernel(enable_backward=False)
+def _self_collision_coeffs(
+    close_a: wp.array2d[wp.vec3],
+    close_b: wp.array2d[wp.vec3],
+    grads: wp.array2d[wp.float32],
+    joint_S_s: wp.array2d[wp.spatial_vector],  # (n_rows, n_dofs)
+    affects_a: wp.array2d[wp.uint8],  # (n_pairs, n_dofs)
+    affects_b: wp.array2d[wp.uint8],
+    weight: float,
+    # outputs
+    coeffs: wp.array4d[wp.float32],  # (n_rows, 1, n_dofs, n_dofs), zeroed by caller
+):
+    row, k, dof = wp.tid()
+    g = grads[row, k]
+    if g == 0.0:
+        return
+    aff_a = affects_a[k, dof]
+    aff_b = affects_b[k, dof]
+    if aff_a == 0 and aff_b == 0:
+        return
+    ca = close_a[row, k]
+    cb = close_b[row, k]
+    n = ca - cb
+    ln = wp.length(n)
+    # crossing centerlines: distance is locally flat and the normal is
+    # undefined, so skip rather than emit a garbage direction
+    if ln < 1e-4:
+        return
+    n = n / ln
+    S = joint_S_s[row, dof]
+    v = wp.vec3(S[0], S[1], S[2])
+    omega = wp.vec3(S[3], S[4], S[5])
+    d = float(0.0)
+    if aff_a != 0:
+        d += wp.dot(n, v + wp.cross(omega, ca))
+    if aff_b != 0:
+        d -= wp.dot(n, v + wp.cross(omega, cb))
+    coeffs[row, 0, k, dof] = weight * g * d
+
+
+class IKObjectiveSelfCollision(IKObjectiveTemporal):
+    """Keep capsule pairs on the robot from interpenetrating.
+
+    Each guarded pair is two capsules attached to different links; the
+    residual is the smoothed one-sided penalty of :class:`IKObjectiveWorldPlane`
+    applied to their signed separation (segment-segment distance minus the
+    radii). The Gauss-Newton block uses the closest-point normal and treats
+    the closest points as fixed on their links per iteration (the standard
+    collision-Jacobian approximation, also used by PyRoKi). ``n_pairs`` may
+    not exceed ``joint_dof_count``.
+
+    Args:
+        model: Shared articulation model.
+        pair_links: Link index pairs, shape [n_pairs, 2].
+        pair_endpoints: Capsule segment endpoints in each link's frame [m],
+            shape [n_pairs, 4] of vec3: (a0, a1, b0, b1).
+        pair_radii: Capsule radii [m], shape [n_pairs, 2].
+        margin: Separation below which the penalty activates [m].
+        weight: Scalar multiplier applied to the residual rows.
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        pair_links,
+        pair_endpoints,
+        pair_radii,
+        margin: float = 0.02,
+        weight: float = 1.0,
+    ) -> None:
+        super().__init__(model)
+        self._pairs_np = np.asarray(pair_links, dtype=np.int32).reshape(-1, 2)
+        self._ends_np = np.asarray(pair_endpoints, dtype=np.float32).reshape(-1, 4, 3)
+        self._radii_np = np.asarray(pair_radii, dtype=np.float32).reshape(-1, 2)
+        n_pairs = self._pairs_np.shape[0]
+        if self._ends_np.shape[0] != n_pairs or self._radii_np.shape[0] != n_pairs:
+            raise ValueError("pair_links, pair_endpoints, and pair_radii must have equal length")
+        if n_pairs > model.joint_dof_count:
+            raise ValueError("n_pairs may not exceed joint_dof_count")
+        self.margin = margin
+        self.weight = weight
+        self._pairs = None
+        self._ends = None
+        self._radii = None
+        self._affects_a = None
+        self._affects_b = None
+        self._close_a = None
+        self._close_b = None
+        self._grads = None
+        self._joint_S_s = None
+        self._body_q_fk = None
+        self._body_qd_fk = None
+        self._qd_zero = None
+
+    def stencil_width(self) -> int:
+        """Return 0: each residual row only involves its own frame."""
+        return 0
+
+    def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
+        super().init_buffers(model, jacobian_mode)
+        n_bodies = model.body_count
+        n_pairs = self._pairs_np.shape[0]
+        self._pairs = wp.array2d(self._pairs_np, dtype=wp.int32, device=self.device)
+        self._ends = wp.array2d(self._ends_np, dtype=wp.vec3, device=self.device)
+        self._radii = wp.array2d(self._radii_np, dtype=wp.float32, device=self.device)
+
+        joint_qd_start_np = model.joint_qd_start.numpy()
+        joint_parent_np = model.joint_parent.numpy()
+        joint_child_np = model.joint_child.numpy()
+        body_to_joint = np.full(n_bodies, -1, dtype=np.int32)
+        for j in range(model.joint_count):
+            child = joint_child_np[j]
+            if child != -1:
+                body_to_joint[child] = j
+
+        def mask_for(links):
+            m = np.zeros((n_pairs, self.n_dofs), dtype=np.uint8)
+            for k, link in enumerate(links):
+                body = int(link)
+                while body != -1:
+                    j = body_to_joint[body]
+                    if j == -1:
+                        break
+                    m[k, joint_qd_start_np[j] : joint_qd_start_np[j + 1]] = 1
+                    body = joint_parent_np[j]
+            return m
+
+        self._affects_a = wp.array(mask_for(self._pairs_np[:, 0]), dtype=wp.uint8, device=self.device)
+        self._affects_b = wp.array(mask_for(self._pairs_np[:, 1]), dtype=wp.uint8, device=self.device)
+
+        self._close_a = wp.zeros((self.n_batch, n_pairs), dtype=wp.vec3, device=self.device)
+        self._close_b = wp.zeros((self.n_batch, n_pairs), dtype=wp.vec3, device=self.device)
+        self._grads = wp.zeros((self.n_batch, n_pairs), dtype=wp.float32, device=self.device)
+        self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
+        self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
+        self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
+        self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
+        self._dummy = wp.zeros((self.n_batch, 1), dtype=wp.float32, device=self.device)
+
+    def _scratch(self, body_q, n_rows, residuals, start_idx, write_residuals):
+        wp.launch(
+            _self_collision_scratch,
+            dim=[n_rows, self._pairs_np.shape[0]],
+            inputs=[
+                body_q,
+                self._pairs,
+                self._ends,
+                self._radii,
+                self.margin,
+                self.weight,
+                start_idx,
+                write_residuals,
+            ],
+            outputs=[self._close_a, self._close_b, self._grads, residuals],
+            device=self.device,
+        )
+
+    def compute_residuals(
+        self,
+        body_q: wp.array2d[wp.transform],
+        joint_q: wp.array2d[wp.float32],
+        model: Model,
+        residuals: wp.array2d[wp.float32],
+        start_idx: int,
+        problem_idx: wp.array[wp.int32],
+    ) -> None:
+        """Write weighted capsule-separation penalties into the buffer.
+
+        Args:
+            body_q: Batched body transforms, shape [n_rows, body_count].
+            joint_q: Batched joint coordinates, shape [n_rows, joint_coord_count].
+            model: Shared articulation model.
+            residuals: Global residual buffer, shape [n_rows, total_residual_count].
+            start_idx: First residual row reserved for this objective.
+            problem_idx: Present for interface compatibility.
+        """
+        self._require_trajectory_layout()
+        self._scratch(body_q, joint_q.shape[0], residuals, start_idx, 1)
+
+    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
+        eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
+        model = self.model
+        wp.launch(
+            _motion_subspace_rows,
+            dim=[self.n_batch, model.joint_count],
+            inputs=[
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                joint_q,
+                model.joint_axis,
+                model.joint_dof_dim,
+                self._body_q_fk,
+                model.body_com,
+                model.joint_X_p,
+            ],
+            outputs=[self._joint_S_s],
+            device=self.device,
+        )
+        # residuals are not rewritten here (write_residuals = 0)
+        self._scratch(self._body_q_fk, self.n_batch, self._dummy, 0, 0)
+        self.coeffs.zero_()
+        wp.launch(
+            _self_collision_coeffs,
+            dim=[self.n_batch, self._pairs_np.shape[0], self.n_dofs],
+            inputs=[
+                self._close_a,
+                self._close_b,
+                self._grads,
+                self._joint_S_s,
+                self._affects_a,
+                self._affects_b,
                 self.weight,
             ],
             outputs=[self.coeffs],

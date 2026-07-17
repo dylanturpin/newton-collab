@@ -28,6 +28,7 @@ Public inverse-kinematics API for defining objectives and solving IK problems.
    IKObjectivePositionSet
    IKObjectiveRotation
    IKObjectiveRotationSet
+   IKObjectiveSelfCollision
    IKObjectiveSmoothness
    IKObjectiveTemporal
    IKObjectiveVelocityLimit
