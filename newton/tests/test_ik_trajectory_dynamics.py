@@ -636,6 +636,138 @@ def test_free_joint_far_from_origin_converges(test, device):
         test.assertLess(err.mean(), 0.02, f"mean EE error {err.mean() * 1e3:.1f} mm")
 
 
+def test_world_plane_capsule_coeffs_match_fd(test, device):
+    """Capsule-clearance blocks must match finite differences through the hinge.
+
+    The comparison is strict (5e-3) away from true endpoint ties, so a kernel
+    differentiating through the wrong endpoint fails: its error is
+    ``weight * |g| * |omega x (p0 - p1)|``, far above the tolerance. The test
+    asserts its own coverage — at least one active sample per endpoint and one
+    in the quadratic taper band — via crafted configurations appended to the
+    random ones (a pure random draw covers only deep, end1-active samples).
+    Also covers the degenerate sphere case (``end0 == end1``, permanently on
+    the tie branch, which is exact rather than exempt because both endpoints
+    coincide).
+    """
+    with wp.ScopedDevice(device):
+        model = _build_planar_vertical(device)
+        n_dofs = model.joint_dof_count
+        margin = 0.1
+        radius = 0.05
+        ends = [[[0.05, 0.0, 0.0], [0.25, 0.0, 0.0]], [[0.25, 0.0, 0.0], [0.25, 0.0, 0.0]]]
+        rng = np.random.default_rng(59)
+        # random configurations straddling the plane, plus crafted rows:
+        # end0-active deep, end1-active deep, and a taper-band sample
+        q_np = np.concatenate(
+            [
+                rng.uniform(-0.9, 0.9, size=(N_FRAMES, model.joint_coord_count)),
+                np.array(
+                    [
+                        [0.580, -0.980, 0.099],  # end0 active, shallow penetration
+                        [0.300, 0.953, 0.662],  # end1 active, deep penetration
+                        [0.009, -0.389, 0.784],  # taper band, end1 active
+                        [0.503, -0.731, -0.871],  # taper band, end0 active
+                    ]
+                ),
+            ]
+        )
+        n_rows = q_np.shape[0]
+        obj = _standalone_temporal(
+            ik.IKObjectiveWorldPlaneCapsule(model, [EE_LINK, 1], ends, [radius, 0.08], margin=margin),
+            model,
+            n_rows,
+            device,
+        )
+        res = _objective_residuals(obj, model, q_np, device)
+        test.assertGreater(np.abs(res[:, :2]).max(), 0.0)  # some frames must activate
+
+        # endpoint plane distances of the two-endpoint capsule, from FK
+        joint_q = wp.array(q_np.astype(np.float32), dtype=wp.float32, device=device)
+        joint_qd = wp.zeros((n_rows, model.joint_dof_count), dtype=wp.float32, device=device)
+        body_q = wp.zeros((n_rows, model.body_count), dtype=wp.transform, device=device)
+        body_qd = wp.zeros((n_rows, model.body_count), dtype=wp.spatial_vector, device=device)
+        eval_fk_batched(model, joint_q, joint_qd, body_q, body_qd)
+        bq = body_q.numpy()
+        c_ends = np.zeros((n_rows, 2))
+        for j in range(2):
+            off = np.array(ends[0][j])
+            for t in range(n_rows):
+                x, y, z, w = bq[t, EE_LINK][3:7]
+                uv = 2.0 * np.cross([x, y, z], off)
+                c_ends[t, j] = (bq[t, EE_LINK][:3] + off + w * uv + np.cross([x, y, z], uv))[2]
+        clearance = c_ends.min(axis=1) - radius
+        active = clearance < margin
+        # coverage: both endpoints must be the active one somewhere, and the
+        # quadratic taper band must be sampled (else wrong-endpoint or wrong-
+        # branch kernels pass unnoticed)
+        test.assertTrue((active & (c_ends[:, 0] < c_ends[:, 1] - 1e-3)).any(), "no end0-active sample")
+        test.assertTrue((active & (c_ends[:, 1] < c_ends[:, 0] - 1e-3)).any(), "no end1-active sample")
+        test.assertTrue(((clearance > 0.005) & (clearance < margin - 0.005)).any(), "no taper-band sample")
+
+        obj.compute_coeffs(joint_q)
+        coeffs = obj.coeffs.numpy()[:, 0]
+
+        eps = 1e-4
+        fd = np.zeros((n_rows, n_dofs, n_dofs))
+        for a in range(n_dofs):
+            qp = q_np.copy()
+            qp[:, a] += eps
+            qm = q_np.copy()
+            qm[:, a] -= eps
+            fd[:, :, a] = (
+                _objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)
+            ) / (2 * eps)
+        # strict everywhere except genuine endpoint near-ties of the
+        # two-endpoint capsule, where FD straddles the min switch
+        tie = np.abs(c_ends[:, 0] - c_ends[:, 1]) < 1e-3
+        for t in range(n_rows):
+            for c in range(n_dofs):
+                if c == 0 and tie[t]:
+                    continue
+                assert_np_equal(coeffs[t, c], fd[t, c].astype(np.float32), tol=5e-3)
+
+
+def test_world_plane_capsule_holds_surface(test, device):
+    """A target below the floor gets tracked only down to the capsule surface."""
+    with wp.ScopedDevice(device):
+        model = _build_planar_vertical(device)
+        target = np.array([0.9, 0.0, -0.35], dtype=np.float32)  # below the plane
+        targets = wp.array(np.tile(target, (N_FRAMES, 1)), dtype=wp.vec3, device=device)
+        seed = np.tile(np.array([0.3, 0.2, 0.2], dtype=np.float32), (N_FRAMES, 1))
+        radius = 0.05
+
+        def solve(capsule_weight):
+            objectives = [
+                ik.IKObjectivePosition(EE_LINK, EE_OFFSET, targets, weight=1.0),
+                ik.IKObjectiveSmoothness(model, derivative=1, dt=DT, weight=0.005),
+                ik.IKObjectiveWorldPlaneCapsule(
+                    model,
+                    [EE_LINK],
+                    [[[0.05, 0.0, 0.0], [EE_OFFSET[0], EE_OFFSET[1], EE_OFFSET[2]]]],
+                    [radius],
+                    margin=0.02,
+                    weight=capsule_weight,
+                ),
+            ]
+            solver = ik.IKSolverTrajectory(
+                model,
+                N_FRAMES,
+                objectives,
+                jacobian_mode=ik.IKJacobianType.ANALYTIC,
+                linear_solver="direct",
+            )
+            joint_q = wp.array(seed.copy(), dtype=wp.float32, device=device)
+            solver.step(joint_q, joint_q, iterations=60)
+            return joint_q.numpy()
+
+        z_base = _ee_positions(model, solve(0.0), device)[:, 2]
+        z_caps = _ee_positions(model, solve(20.0), device)[:, 2]
+        test.assertLess(z_base.min(), -0.3)  # baseline dives to the target
+        # guarded solve keeps the capsule SURFACE near the plane: the endpoint
+        # center stays a radius above it (minus the soft-penalty slack)
+        test.assertGreater(z_caps.min(), radius - 0.03)
+
+
 def test_foot_skate_coeffs_match_fd(test, device):
     """Contact-gated skate blocks must match finite differences across the stencil."""
     with wp.ScopedDevice(device):
@@ -847,6 +979,18 @@ add_function_test(
     TestIKTrajectoryDynamics,
     "test_free_joint_far_from_origin_converges",
     test_free_joint_far_from_origin_converges,
+    devices=devices,
+)
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_world_plane_capsule_coeffs_match_fd",
+    test_world_plane_capsule_coeffs_match_fd,
+    devices=devices,
+)
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_world_plane_capsule_holds_surface",
+    test_world_plane_capsule_holds_surface,
     devices=devices,
 )
 add_function_test(
