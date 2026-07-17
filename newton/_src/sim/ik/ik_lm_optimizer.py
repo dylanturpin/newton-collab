@@ -782,6 +782,43 @@ class IKOptimizerLM:
             q_out_row = joint_q_out[row]
             qd_out_row = joint_qd_out[row]
 
+            # Body-centered retraction for root free/distance joints: the
+            # linear tangent translates the joint anchor directly and the
+            # angular tangent rotates about it, so tangent lever arms stay
+            # body-sized wherever the base sits in the world.
+            # (jcalc_integrate pivots root rotations about the world origin;
+            # far from it the |p|-scale lever arms stall LM in fp32. The
+            # motion-subspace kernels re-anchor their free-joint columns to
+            # this same pivot — the two must always match.)
+            if (t == JointType.FREE or t == JointType.DISTANCE) and parent < 0:
+                v_lin = wp.vec3(
+                    qd_row[dof_start + 0] + delta_row[dof_start + 0] * dt,
+                    qd_row[dof_start + 1] + delta_row[dof_start + 1] * dt,
+                    qd_row[dof_start + 2] + delta_row[dof_start + 2] * dt,
+                )
+                omega = wp.vec3(
+                    qd_row[dof_start + 3] + delta_row[dof_start + 3] * dt,
+                    qd_row[dof_start + 4] + delta_row[dof_start + 4] * dt,
+                    qd_row[dof_start + 5] + delta_row[dof_start + 5] * dt,
+                )
+                r = wp.quat(
+                    q_row[coord_start + 3],
+                    q_row[coord_start + 4],
+                    q_row[coord_start + 5],
+                    q_row[coord_start + 6],
+                )
+                r_new = wp.normalize(r + wp.quat(omega, 0.0) * r * (0.5 * dt))
+                q_out_row[coord_start + 0] = q_row[coord_start + 0] + v_lin[0] * dt
+                q_out_row[coord_start + 1] = q_row[coord_start + 1] + v_lin[1] * dt
+                q_out_row[coord_start + 2] = q_row[coord_start + 2] + v_lin[2] * dt
+                q_out_row[coord_start + 3] = r_new[0]
+                q_out_row[coord_start + 4] = r_new[1]
+                q_out_row[coord_start + 5] = r_new[2]
+                q_out_row[coord_start + 6] = r_new[3]
+                for k in range(6):
+                    qd_out_row[dof_start + k] = qd_row[dof_start + k] + delta_row[dof_start + k] * dt
+                return
+
             # Treat `delta_row` as acceleration with dt=1:
             #   qd_new = 0 + delta           (qd ← delta)
             #   q_new  = q + qd_new * dt     (q ← q + delta)
@@ -851,6 +888,22 @@ class IKOptimizerLM:
                     qd_start,
                     S_s_out,
                 )
+                # jcalc anchors the angular columns at the child COM, but the
+                # retraction (_integrate_dq_dof) pivots root joints about
+                # their own anchor position and non-root free joints about
+                # the parent anchor origin (jcalc_integrate). Rewrite the
+                # linear parts so point Jacobians dp = v + omega x p match
+                # the retraction; the mismatch grows with the body's world
+                # distance and stalls LM on far-from-origin problems.
+                anchor = wp.transform_get_translation(X_wpj)
+                if parent < 0:
+                    p_j = wp.vec3(joint_q_1d[q_start + 0], joint_q_1d[q_start + 1], joint_q_1d[q_start + 2])
+                    anchor = wp.transform_point(X_wpj, p_j)
+                for k in range(3):
+                    S = S_s_out[qd_start + 3 + k]
+                    omega_k = wp.vec3(S[3], S[4], S[5])
+                    v_k = wp.cross(anchor, omega_k)
+                    S_s_out[qd_start + 3 + k] = wp.spatial_vector(v_k[0], v_k[1], v_k[2], S[3], S[4], S[5])
             else:
                 jcalc_motion_subspace(
                     type,

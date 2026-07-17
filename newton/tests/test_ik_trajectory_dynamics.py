@@ -245,18 +245,22 @@ def test_gravity_torque_reduces_torque(test, device):
         test.assertLess(tau_grav, 0.7 * tau_base)
 
 
-def _perturb_root_free_tangent(q, dof, eps, coord0=0):
-    """Root-free-joint tangent step matching the retraction: the position
-    pivots about the joint-frame origin (p += eps * e_a x p) and the
-    orientation quaternion is left-multiplied."""
+def _perturb_free_tangent(q, dof, eps, coord0=0, origin_pivot=False):
+    """Free-joint tangent step matching the retraction. Root joints are
+    body-centered: the angular tangent rotates about the joint's own anchor,
+    leaving the position coordinates unchanged. Non-root joints
+    (``origin_pivot=True``) keep jcalc_integrate's pivot about the parent
+    anchor origin (``p += eps * e_a x p`` in anchor coordinates). The
+    orientation quaternion is left-multiplied either way."""
     qp = q.copy()
     if dof < 3:
         qp[coord0 + dof] += eps
         return qp
     axis = np.zeros(3)
     axis[dof - 3] = 1.0
-    p = q[coord0 : coord0 + 3]
-    qp[coord0 : coord0 + 3] = p + eps * np.cross(axis, p)
+    if origin_pivot:
+        p = q[coord0 : coord0 + 3]
+        qp[coord0 : coord0 + 3] = p + eps * np.cross(axis, p)
     x1, y1, z1 = np.sin(eps / 2) * axis
     w1 = np.cos(eps / 2)
     x2, y2, z2, w2 = q[coord0 + 3 : coord0 + 7]
@@ -394,8 +398,12 @@ def test_gravity_torque_free_descendant(test, device):
                 qm = q_np.copy()
                 qm[:, 0] -= eps
             else:
-                qp = np.stack([_perturb_root_free_tangent(q_np[t], dof - 1, eps, coord0=1) for t in range(n_rows)])
-                qm = np.stack([_perturb_root_free_tangent(q_np[t], dof - 1, -eps, coord0=1) for t in range(n_rows)])
+                qp = np.stack(
+                    [_perturb_free_tangent(q_np[t], dof - 1, eps, coord0=1, origin_pivot=True) for t in range(n_rows)]
+                )
+                qm = np.stack(
+                    [_perturb_free_tangent(q_np[t], dof - 1, -eps, coord0=1, origin_pivot=True) for t in range(n_rows)]
+                )
             fd[:, :, dof] = (
                 _objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)
             ) / (2 * eps)
@@ -433,8 +441,8 @@ def test_apparent_gravity_free_joint_coeffs(test, device):
                 qp = q_np.copy()
                 qm = q_np.copy()
                 if dof < 6:
-                    qp[m] = _perturb_root_free_tangent(q_np[m], dof, eps)
-                    qm[m] = _perturb_root_free_tangent(q_np[m], dof, -eps)
+                    qp[m] = _perturb_free_tangent(q_np[m], dof, eps)
+                    qm[m] = _perturb_free_tangent(q_np[m], dof, -eps)
                 else:
                     qp[m, 7] += eps
                     qm[m, 7] -= eps
@@ -570,6 +578,62 @@ def test_world_plane_pushes_up(test, device):
         z_plane = _ee_positions(model, solve(20.0), device)[:, 2]
         test.assertLess(z_base.min(), -0.3)  # baseline dives to the target
         test.assertGreater(z_plane.min(), -0.02)  # guarded solve stays at the plane
+
+
+def test_free_joint_far_from_origin_converges(test, device):
+    """Trajectory IK on a floating base must converge far from the world origin.
+
+    Regression test for the free-joint tangent convention: with origin-pivot
+    angular tangents (and COM-anchored effector columns), the Jacobian error
+    grows with the base's distance from the origin, so LM rejects every step
+    on targets a few meters out and the solve returns the seed. Body-centered
+    tangents keep the lever arms body-sized regardless of world position.
+    """
+    with wp.ScopedDevice(device):
+        model = _build_free_plus_revolute(device)
+        # targets ~4.6 m from the origin (the jump_on_box regime): EE sweeps
+        # a small arc so the base must translate AND rotate to track it
+        s = np.linspace(0.0, 1.0, N_FRAMES)
+        targets_np = np.stack(
+            [4.0 + 0.1 * s, 0.05 * np.sin(2.0 * np.pi * s), 2.5 + 0.1 * s],
+            axis=1,
+        ).astype(np.float32)
+        targets = wp.array(targets_np, dtype=wp.vec3, device=device)
+        objectives = [
+            ik.IKObjectivePosition(1, wp.vec3(0.25, 0.0, 0.0), targets, weight=1.0),
+            ik.IKObjectiveSmoothness(model, derivative=1, dt=DT, weight=0.001),
+        ]
+        solver = ik.IKSolverTrajectory(
+            model,
+            N_FRAMES,
+            objectives,
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+            linear_solver="direct",
+        )
+        # plain constant seed: identity orientation, base near the targets but
+        # offset enough that the solve needs real base motion
+        seed = np.zeros((N_FRAMES, model.joint_coord_count), dtype=np.float32)
+        seed[:, 0:3] = (3.6, 0.3, 2.2)
+        seed[:, 6] = 1.0  # qw
+        seed[:, 7] = 0.3
+        joint_q = wp.array(seed.copy(), dtype=wp.float32, device=device)
+        solver.step(joint_q, joint_q, iterations=100)
+
+        q = joint_q.numpy()
+        ee = np.zeros((N_FRAMES, 3))
+        joint_q_wp = wp.array(q, dtype=wp.float32, device=device)
+        joint_qd = wp.zeros((N_FRAMES, model.joint_dof_count), dtype=wp.float32, device=device)
+        body_q = wp.zeros((N_FRAMES, model.body_count), dtype=wp.transform, device=device)
+        body_qd = wp.zeros((N_FRAMES, model.body_count), dtype=wp.spatial_vector, device=device)
+        eval_fk_batched(model, joint_q_wp, joint_qd, body_q, body_qd)
+        bq = body_q.numpy()
+        off = np.array([0.25, 0.0, 0.0])
+        for t in range(N_FRAMES):
+            x, y, z, w = bq[t, 1][3:7]
+            uv = 2.0 * np.cross([x, y, z], off)
+            ee[t] = bq[t, 1][:3] + off + w * uv + np.cross([x, y, z], uv)
+        err = np.linalg.norm(ee - targets_np, axis=1)
+        test.assertLess(err.mean(), 0.02, f"mean EE error {err.mean() * 1e3:.1f} mm")
 
 
 def test_foot_skate_coeffs_match_fd(test, device):
@@ -777,6 +841,12 @@ add_function_test(
     TestIKTrajectoryDynamics,
     "test_world_plane_pushes_up",
     test_world_plane_pushes_up,
+    devices=devices,
+)
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_free_joint_far_from_origin_converges",
+    test_free_joint_far_from_origin_converges,
     devices=devices,
 )
 add_function_test(
