@@ -1825,6 +1825,207 @@ class IKObjectiveFootSkate(IKObjectiveTemporal):
         )
 
 
+@wp.kernel(enable_backward=False)
+def _foot_contact_residuals(
+    body_q: wp.array2d[wp.transform],  # (n_rows, n_bodies)
+    contact: wp.array2d[wp.uint8],  # (n_rows, n_points)
+    targets: wp.array2d[wp.vec3],  # (n_rows, n_points)
+    link_index: wp.array[wp.int32],
+    link_offset: wp.array[wp.vec3],
+    weight: float,
+    start_idx: int,
+    # outputs
+    residuals: wp.array2d[wp.float32],
+):
+    row, k = wp.tid()
+    if contact[row, k] == 0:
+        return
+    p = _link_point(body_q, row, link_index[k], link_offset[k])
+    d = p - targets[row, k]
+    residuals[row, start_idx + 3 * k + 0] = weight * d[0]
+    residuals[row, start_idx + 3 * k + 1] = weight * d[1]
+    residuals[row, start_idx + 3 * k + 2] = weight * d[2]
+
+
+@wp.kernel(enable_backward=False)
+def _foot_contact_coeffs(
+    body_q: wp.array2d[wp.transform],  # (n_rows, n_bodies)
+    joint_S_s: wp.array2d[wp.spatial_vector],  # (n_rows, n_dofs)
+    contact: wp.array2d[wp.uint8],
+    affects: wp.array2d[wp.uint8],  # (n_points, n_dofs)
+    link_index: wp.array[wp.int32],
+    link_offset: wp.array[wp.vec3],
+    weight: float,
+    # outputs
+    coeffs: wp.array4d[wp.float32],  # (n_rows, 1, n_dofs, n_dofs), zeroed by caller
+):
+    row, k, dof = wp.tid()
+    if contact[row, k] == 0 or affects[k, dof] == 0:
+        return
+    p = _link_point(body_q, row, link_index[k], link_offset[k])
+    S = joint_S_s[row, dof]
+    dp = wp.vec3(S[0], S[1], S[2]) + wp.cross(wp.vec3(S[3], S[4], S[5]), p)
+    coeffs[row, 0, 3 * k + 0, dof] = weight * dp[0]
+    coeffs[row, 0, 3 * k + 1, dof] = weight * dp[1]
+    coeffs[row, 0, 3 * k + 2, dof] = weight * dp[2]
+
+
+class IKObjectiveFootContact(IKObjectiveTemporal):
+    """Pin contact points to per-frame anchor targets while in contact.
+
+    For each guarded point ``k`` with contact labels ``c_t``, residual rows
+    of frame ``t`` are ``weight * (p_k(q_t) - target_{t,k})`` [m] whenever
+    ``c_t`` is set — PyRoKi's floor-contact cost. Typical anchors are the
+    source foot targets projected onto the ground plane, which pins stance
+    feet the way soma-retargeter's feet-stabilizer post-pass does, but
+    inside the joint solve. Rows beyond ``3 * n_points`` stay zero;
+    ``3 * n_points`` must not exceed ``joint_dof_count``.
+
+    Args:
+        model: Shared articulation model.
+        link_indices: Links carrying the contact points.
+        link_offsets: Contact point in each link's frame [m].
+        contact: Per-frame contact labels, shape
+            [n_trajectories * n_frames, n_points], nonzero = in contact.
+        targets: Per-frame anchor positions [m], shape
+            [n_trajectories * n_frames, n_points].
+        weight: Scalar multiplier applied to the residual rows.
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        link_indices,
+        link_offsets,
+        contact: wp.array2d[wp.uint8],
+        targets: wp.array2d[wp.vec3],
+        weight: float = 1.0,
+    ) -> None:
+        super().__init__(model)
+        self._links_np = np.asarray(link_indices, dtype=np.int32)
+        self._offsets_np = np.asarray(link_offsets, dtype=np.float32).reshape(-1, 3)
+        if self._links_np.shape[0] != self._offsets_np.shape[0]:
+            raise ValueError("link_indices and link_offsets must have equal length")
+        if 3 * self._links_np.shape[0] > model.joint_dof_count:
+            raise ValueError("3 * n_points may not exceed joint_dof_count")
+        self.contact = contact
+        self.targets = targets
+        self.weight = weight
+        self._links = None
+        self._offsets = None
+        self._affects = None
+        self._joint_S_s = None
+        self._body_q_fk = None
+        self._body_qd_fk = None
+        self._qd_zero = None
+
+    def stencil_width(self) -> int:
+        """Return 0: each residual row only involves its own frame."""
+        return 0
+
+    def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
+        super().init_buffers(model, jacobian_mode)
+        n_points = len(self._links_np)
+        if self.contact.shape != (self.n_batch, n_points):
+            raise ValueError(f"contact has shape {self.contact.shape}, expected {(self.n_batch, n_points)}")
+        if self.targets.shape != (self.n_batch, n_points):
+            raise ValueError(f"targets has shape {self.targets.shape}, expected {(self.n_batch, n_points)}")
+        n_bodies = model.body_count
+        self._links = wp.array(self._links_np, dtype=wp.int32, device=self.device)
+        self._offsets = wp.array(self._offsets_np, dtype=wp.vec3, device=self.device)
+
+        joint_qd_start_np = model.joint_qd_start.numpy()
+        joint_parent_np = model.joint_parent.numpy()
+        joint_child_np = model.joint_child.numpy()
+        body_to_joint = np.full(n_bodies, -1, dtype=np.int32)
+        for j in range(model.joint_count):
+            child = joint_child_np[j]
+            if child != -1:
+                body_to_joint[child] = j
+        affects = np.zeros((n_points, self.n_dofs), dtype=np.uint8)
+        for k, link in enumerate(self._links_np):
+            body = int(link)
+            while body != -1:
+                j = body_to_joint[body]
+                if j == -1:
+                    break
+                affects[k, joint_qd_start_np[j] : joint_qd_start_np[j + 1]] = 1
+                body = joint_parent_np[j]
+        self._affects = wp.array(affects, dtype=wp.uint8, device=self.device)
+
+        self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
+        self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
+        self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
+        self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
+
+    def compute_residuals(
+        self,
+        body_q: wp.array2d[wp.transform],
+        joint_q: wp.array2d[wp.float32],
+        model: Model,
+        residuals: wp.array2d[wp.float32],
+        start_idx: int,
+        problem_idx: wp.array[wp.int32],
+    ) -> None:
+        """Write contact-gated anchor deviations into the global buffer.
+
+        Args:
+            body_q: Batched body transforms, shape [n_rows, body_count].
+            joint_q: Batched joint coordinates, shape [n_rows, joint_coord_count].
+            model: Shared articulation model.
+            residuals: Global residual buffer, shape [n_rows, total_residual_count].
+            start_idx: First residual row reserved for this objective.
+            problem_idx: Present for interface compatibility.
+        """
+        self._require_trajectory_layout()
+        wp.launch(
+            _foot_contact_residuals,
+            dim=[joint_q.shape[0], len(self._links_np)],
+            inputs=[body_q, self.contact, self.targets, self._links, self._offsets, self.weight, start_idx],
+            outputs=[residuals],
+            device=self.device,
+        )
+
+    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
+        eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
+        model = self.model
+        wp.launch(
+            _motion_subspace_rows,
+            dim=[self.n_batch, model.joint_count],
+            inputs=[
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                joint_q,
+                model.joint_axis,
+                model.joint_dof_dim,
+                self._body_q_fk,
+                model.body_com,
+                model.joint_X_p,
+            ],
+            outputs=[self._joint_S_s],
+            device=self.device,
+        )
+        self.coeffs.zero_()
+        wp.launch(
+            _foot_contact_coeffs,
+            dim=[self.n_batch, len(self._links_np), self.n_dofs],
+            inputs=[
+                self._body_q_fk,
+                self._joint_S_s,
+                self.contact,
+                self._affects,
+                self._links,
+                self._offsets,
+                self.weight,
+            ],
+            outputs=[self.coeffs],
+            device=self.device,
+        )
+
+
 class IKObjectiveGravityTorque(IKObjectiveTemporal):
     """Penalize the static gravity-compensation torque at every frame.
 

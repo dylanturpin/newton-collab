@@ -607,11 +607,106 @@ def test_foot_skate_coeffs_match_fd(test, device):
                     assert_np_equal(analytic, fd[t, :3], tol=5e-3)
 
 
+def test_foot_contact_coeffs_match_fd(test, device):
+    """Contact-gated anchor-pin blocks must match finite differences."""
+    with wp.ScopedDevice(device):
+        model = _build_planar_vertical(device)
+        n_dofs = model.joint_dof_count
+        rng = np.random.default_rng(43)
+        q_np = rng.uniform(-1.0, 1.0, size=(N_FRAMES, model.joint_coord_count))
+        contact = wp.array((rng.uniform(size=(N_FRAMES, 1)) < 0.7).astype(np.uint8), dtype=wp.uint8, device=device)
+        anchors = wp.array(rng.uniform(-1, 1, size=(N_FRAMES, 1, 3)).astype(np.float32), dtype=wp.vec3, device=device)
+        obj = _standalone_temporal(
+            ik.IKObjectiveFootContact(model, [EE_LINK], [[EE_OFFSET[0], EE_OFFSET[1], EE_OFFSET[2]]], contact, anchors),
+            model,
+            N_FRAMES,
+            device,
+        )
+        joint_q = wp.array(q_np.astype(np.float32), dtype=wp.float32, device=device)
+        obj.compute_coeffs(joint_q)
+        coeffs = obj.coeffs.numpy()[:, 0]
+
+        eps = 1e-4
+        fd = np.zeros((N_FRAMES, n_dofs, n_dofs))
+        for a in range(n_dofs):
+            qp = q_np.copy()
+            qp[:, a] += eps
+            qm = q_np.copy()
+            qm[:, a] -= eps
+            fd[:, :, a] = (
+                _objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)
+            ) / (2 * eps)
+        assert_np_equal(coeffs, fd.astype(np.float32), tol=5e-3)
+
+
+def test_position_rotation_set_equivalence(test, device):
+    """Fused set objectives must reproduce the per-effector solve exactly."""
+    with wp.ScopedDevice(device):
+        model = _build_planar_vertical(device)
+        rng = np.random.default_rng(47)
+        links = [1, 2]
+        offsets = [[0.25, 0.0, 0.0], [0.25, 0.0, 0.0]]
+        weights = [2.0, 1.0]
+        rot_weights = [0.5, 0.3]
+        pos_np = rng.uniform(-0.8, 0.8, size=(N_FRAMES, 2, 3)).astype(np.float32)
+        quat_np = rng.normal(size=(N_FRAMES, 2, 4)).astype(np.float32)
+        quat_np /= np.linalg.norm(quat_np, axis=-1, keepdims=True)
+        seed = np.tile(np.array([0.3, 0.4, 0.4], dtype=np.float32), (N_FRAMES, 1))
+
+        def solve(objectives):
+            solver = ik.IKSolverTrajectory(
+                model,
+                N_FRAMES,
+                objectives,
+                jacobian_mode=ik.IKJacobianType.ANALYTIC,
+                linear_solver="direct",
+            )
+            joint_q = wp.array(seed.copy(), dtype=wp.float32, device=device)
+            solver.step(joint_q, joint_q, iterations=20)
+            return joint_q.numpy()
+
+        individual = []
+        for e in range(2):
+            individual.append(
+                ik.IKObjectivePosition(
+                    links[e], wp.vec3(*offsets[e]), wp.array(pos_np[:, e].copy(), dtype=wp.vec3), weight=weights[e]
+                )
+            )
+        for e in range(2):
+            individual.append(
+                ik.IKObjectiveRotation(
+                    links[e], wp.quat_identity(), wp.array(quat_np[:, e].copy(), dtype=wp.vec4), weight=rot_weights[e]
+                )
+            )
+        q_individual = solve(individual)
+
+        fused = [
+            ik.IKObjectivePositionSet(links, offsets, wp.array(pos_np, dtype=wp.vec3), weights),
+            ik.IKObjectiveRotationSet(links, wp.array(quat_np, dtype=wp.vec4), rot_weights),
+        ]
+        q_fused = solve(fused)
+        assert_np_equal(q_fused, q_individual, tol=1e-5)
+
+
 devices = get_test_devices()
 
 
 class TestIKTrajectoryDynamics(unittest.TestCase):
     pass
+
+
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_foot_contact_coeffs_match_fd",
+    test_foot_contact_coeffs_match_fd,
+    devices=devices,
+)
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_position_rotation_set_equivalence",
+    test_position_rotation_set_equivalence,
+    devices=devices,
+)
 
 
 add_function_test(
