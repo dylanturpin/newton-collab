@@ -1116,3 +1116,335 @@ class IKObjectiveRotation(IKObjective):
             outputs=[jacobian],
             device=self.device,
         )
+
+
+@wp.kernel
+def _pos_set_residuals(
+    body_q: wp.array2d[wp.transform],  # (n_batch, n_bodies)
+    target_pos: wp.array2d[wp.vec3],  # (n_problems, n_effectors)
+    link_index: wp.array[wp.int32],  # (n_effectors,)
+    link_offset: wp.array[wp.vec3],
+    weights: wp.array[wp.float32],
+    start_idx: int,
+    problem_idx_map: wp.array[wp.int32],
+    # outputs
+    residuals: wp.array2d[wp.float32],
+):
+    row, e = wp.tid()
+    base = problem_idx_map[row]
+    tf = body_q[row, link_index[e]]
+    rot = wp.quat(tf[3], tf[4], tf[5], tf[6])
+    pos = wp.vec3(tf[0], tf[1], tf[2]) + wp.quat_rotate(rot, link_offset[e])
+    r = weights[e] * (target_pos[base, e] - pos)
+    residuals[row, start_idx + 3 * e + 0] = r[0]
+    residuals[row, start_idx + 3 * e + 1] = r[1]
+    residuals[row, start_idx + 3 * e + 2] = r[2]
+
+
+@wp.kernel
+def _pos_set_jac_analytic(
+    body_q: wp.array2d[wp.transform],  # (n_batch, n_bodies)
+    joint_S_s: wp.array2d[wp.spatial_vector],  # (n_batch, n_dofs)
+    affects: wp.array2d[wp.uint8],  # (n_effectors, n_dofs)
+    link_index: wp.array[wp.int32],
+    link_offset: wp.array[wp.vec3],
+    weights: wp.array[wp.float32],
+    start_idx: int,
+    # outputs
+    jacobian: wp.array3d[wp.float32],  # (n_batch, n_residuals, n_dofs)
+):
+    row, e, dof = wp.tid()
+    if affects[e, dof] == 0:
+        return
+    tf = body_q[row, link_index[e]]
+    rot = wp.quat(tf[3], tf[4], tf[5], tf[6])
+    pos = wp.vec3(tf[0], tf[1], tf[2]) + wp.quat_rotate(rot, link_offset[e])
+    S = joint_S_s[row, dof]
+    v = wp.vec3(S[0], S[1], S[2]) + wp.cross(wp.vec3(S[3], S[4], S[5]), pos)
+    w = weights[e]
+    jacobian[row, start_idx + 3 * e + 0, dof] = -w * v[0]
+    jacobian[row, start_idx + 3 * e + 1, dof] = -w * v[1]
+    jacobian[row, start_idx + 3 * e + 2, dof] = -w * v[2]
+
+
+@wp.kernel
+def _rot_set_residuals(
+    body_q: wp.array2d[wp.transform],  # (n_batch, n_bodies)
+    target_rot: wp.array2d[wp.vec4],  # (n_problems, n_effectors)
+    link_index: wp.array[wp.int32],
+    weights: wp.array[wp.float32],
+    start_idx: int,
+    problem_idx_map: wp.array[wp.int32],
+    # outputs
+    residuals: wp.array2d[wp.float32],
+):
+    row, e = wp.tid()
+    base = problem_idx_map[row]
+    tf = body_q[row, link_index[e]]
+    actual = wp.quat(tf[3], tf[4], tf[5], tf[6])
+    tv = target_rot[base, e]
+    target = wp.quat(tv[0], tv[1], tv[2], tv[3])
+    q_err = actual * wp.quat_inverse(target)
+    if wp.dot(actual, target) < 0.0:
+        q_err = -q_err
+    v_norm = wp.sqrt(q_err[0] * q_err[0] + q_err[1] * q_err[1] + q_err[2] * q_err[2])
+    angle = 2.0 * wp.atan2(v_norm, q_err[3])
+    aa = wp.vec3(2.0 * q_err[0], 2.0 * q_err[1], 2.0 * q_err[2])
+    if v_norm > 1e-8:
+        aa = wp.vec3(q_err[0] / v_norm * angle, q_err[1] / v_norm * angle, q_err[2] / v_norm * angle)
+    w = weights[e]
+    residuals[row, start_idx + 3 * e + 0] = w * aa[0]
+    residuals[row, start_idx + 3 * e + 1] = w * aa[1]
+    residuals[row, start_idx + 3 * e + 2] = w * aa[2]
+
+
+@wp.kernel
+def _rot_set_jac_analytic(
+    joint_S_s: wp.array2d[wp.spatial_vector],  # (n_batch, n_dofs)
+    affects: wp.array2d[wp.uint8],  # (n_effectors, n_dofs)
+    weights: wp.array[wp.float32],
+    start_idx: int,
+    # outputs
+    jacobian: wp.array3d[wp.float32],
+):
+    row, e, dof = wp.tid()
+    if affects[e, dof] == 0:
+        return
+    S = joint_S_s[row, dof]
+    w = weights[e]
+    jacobian[row, start_idx + 3 * e + 0, dof] = w * S[3]
+    jacobian[row, start_idx + 3 * e + 1, dof] = w * S[4]
+    jacobian[row, start_idx + 3 * e + 2, dof] = w * S[5]
+
+
+def _ancestor_mask(model: Model, link_indices) -> np.ndarray:
+    """(n_effectors, n_dofs) mask of DoFs on the chain to each link."""
+    joint_qd_start_np = model.joint_qd_start.numpy()
+    joint_parent_np = model.joint_parent.numpy()
+    joint_child_np = model.joint_child.numpy()
+    body_to_joint = np.full(model.body_count, -1, dtype=np.int32)
+    for j in range(model.joint_count):
+        child = joint_child_np[j]
+        if child != -1:
+            body_to_joint[child] = j
+    n_dofs = int(joint_qd_start_np[-1])
+    mask = np.zeros((len(link_indices), n_dofs), dtype=np.uint8)
+    for k, link in enumerate(link_indices):
+        body = int(link)
+        while body != -1:
+            j = body_to_joint[body]
+            if j == -1:
+                break
+            mask[k, joint_qd_start_np[j] : joint_qd_start_np[j + 1]] = 1
+            body = joint_parent_np[j]
+    return mask
+
+
+class IKObjectivePositionSet(IKObjective):
+    """Match the world positions of several link points with one objective.
+
+    Functionally equivalent to a list of :class:`IKObjectivePosition`
+    instances (one per effector), but evaluates all residual and Jacobian
+    rows in two kernel launches instead of two per effector — with many
+    effectors (e.g. humanoid retargeting) the per-iteration assembly cost
+    drops substantially. Analytic Jacobians only.
+
+    Args:
+        link_indices: Body index per effector.
+        link_offsets: Effector point in each link's frame [m].
+        target_positions: Targets [m], shape [problem_count, n_effectors].
+        weights: Per-effector multipliers, shape [n_effectors].
+    """
+
+    def __init__(
+        self,
+        link_indices,
+        link_offsets,
+        target_positions: wp.array2d[wp.vec3],
+        weights,
+    ) -> None:
+        super().__init__()
+        self._links_np = np.asarray(link_indices, dtype=np.int32)
+        self._offsets_np = np.asarray(link_offsets, dtype=np.float32).reshape(-1, 3)
+        self._weights_np = np.asarray(weights, dtype=np.float32)
+        self.target_positions = target_positions
+        self._links = None
+        self._offsets = None
+        self._weights = None
+        self._affects = None
+
+    def residual_dim(self) -> int:
+        """Return three residual rows per effector."""
+        return 3 * len(self._links_np)
+
+    def supports_analytic(self) -> bool:
+        """Return ``True``; only the analytic Jacobian path is implemented."""
+        return True
+
+    def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
+        """Allocate device buffers and the per-effector ancestor masks.
+
+        Args:
+            model: Shared articulation model.
+            jacobian_mode: Jacobian backend selected for this objective;
+                only :attr:`IKJacobianType.ANALYTIC` is supported.
+        """
+        self._require_batch_layout()
+        if jacobian_mode != IKJacobianType.ANALYTIC:
+            raise ValueError(
+                "IKObjectivePositionSet supports analytic Jacobians only (use jacobian_mode=ANALYTIC or MIXED)"
+            )
+        self._links = wp.array(self._links_np, dtype=wp.int32, device=self.device)
+        self._offsets = wp.array(self._offsets_np, dtype=wp.vec3, device=self.device)
+        self._weights = wp.array(self._weights_np, dtype=wp.float32, device=self.device)
+        self._affects = wp.array(_ancestor_mask(model, self._links_np), dtype=wp.uint8, device=self.device)
+
+    def compute_residuals(
+        self,
+        body_q: wp.array2d[wp.transform],
+        joint_q: wp.array2d[wp.float32],
+        model: Model,
+        residuals: wp.array2d[wp.float32],
+        start_idx: int,
+        problem_idx: wp.array[wp.int32],
+    ) -> None:
+        """Write all effectors' weighted position residuals into the buffer.
+
+        Args:
+            body_q: Batched body transforms, shape [n_batch, body_count].
+            joint_q: Batched joint coordinates, shape [n_batch, joint_coord_count].
+            model: Shared articulation model.
+            residuals: Global residual buffer, shape [n_batch, total_residual_count].
+            start_idx: First residual row reserved for this objective.
+            problem_idx: Batch-row to base-problem map for target lookups.
+        """
+        wp.launch(
+            _pos_set_residuals,
+            dim=[body_q.shape[0], len(self._links_np)],
+            inputs=[body_q, self.target_positions, self._links, self._offsets, self._weights, start_idx, problem_idx],
+            outputs=[residuals],
+            device=self.device,
+        )
+
+    def compute_jacobian_analytic(self, body_q, joint_q, model, jacobian, joint_S_s, start_idx) -> None:
+        """Write all effectors' analytic Jacobian rows.
+
+        Args:
+            body_q: Batched body transforms, shape [n_batch, body_count].
+            joint_q: Batched joint coordinates. Unused.
+            model: Shared articulation model.
+            jacobian: Global Jacobian buffer,
+                shape [n_batch, total_residual_count, joint_dof_count].
+            joint_S_s: Batched motion-subspace columns,
+                shape [n_batch, joint_dof_count].
+            start_idx: First residual row reserved for this objective.
+        """
+        wp.launch(
+            _pos_set_jac_analytic,
+            dim=[body_q.shape[0], len(self._links_np), model.joint_dof_count],
+            inputs=[body_q, joint_S_s, self._affects, self._links, self._offsets, self._weights, start_idx],
+            outputs=[jacobian],
+            device=self.device,
+        )
+
+
+class IKObjectiveRotationSet(IKObjective):
+    """Match the world orientations of several links with one objective.
+
+    The fused counterpart of a list of :class:`IKObjectiveRotation`
+    instances (short-arc axis-angle residuals; identity link offsets).
+    Analytic Jacobians only.
+
+    Args:
+        link_indices: Body index per effector.
+        target_rotations: Target quaternions in ``(x, y, z, w)`` order,
+            shape [problem_count, n_effectors].
+        weights: Per-effector multipliers, shape [n_effectors].
+    """
+
+    def __init__(
+        self,
+        link_indices,
+        target_rotations: wp.array2d[wp.vec4],
+        weights,
+    ) -> None:
+        super().__init__()
+        self._links_np = np.asarray(link_indices, dtype=np.int32)
+        self._weights_np = np.asarray(weights, dtype=np.float32)
+        self.target_rotations = target_rotations
+        self._links = None
+        self._weights = None
+        self._affects = None
+
+    def residual_dim(self) -> int:
+        """Return three residual rows per effector."""
+        return 3 * len(self._links_np)
+
+    def supports_analytic(self) -> bool:
+        """Return ``True``; only the analytic Jacobian path is implemented."""
+        return True
+
+    def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
+        """Allocate device buffers and the per-effector ancestor masks.
+
+        Args:
+            model: Shared articulation model.
+            jacobian_mode: Jacobian backend selected for this objective;
+                only :attr:`IKJacobianType.ANALYTIC` is supported.
+        """
+        self._require_batch_layout()
+        if jacobian_mode != IKJacobianType.ANALYTIC:
+            raise ValueError(
+                "IKObjectiveRotationSet supports analytic Jacobians only (use jacobian_mode=ANALYTIC or MIXED)"
+            )
+        self._links = wp.array(self._links_np, dtype=wp.int32, device=self.device)
+        self._weights = wp.array(self._weights_np, dtype=wp.float32, device=self.device)
+        self._affects = wp.array(_ancestor_mask(model, self._links_np), dtype=wp.uint8, device=self.device)
+
+    def compute_residuals(
+        self,
+        body_q: wp.array2d[wp.transform],
+        joint_q: wp.array2d[wp.float32],
+        model: Model,
+        residuals: wp.array2d[wp.float32],
+        start_idx: int,
+        problem_idx: wp.array[wp.int32],
+    ) -> None:
+        """Write all effectors' weighted rotation residuals into the buffer.
+
+        Args:
+            body_q: Batched body transforms, shape [n_batch, body_count].
+            joint_q: Batched joint coordinates, shape [n_batch, joint_coord_count].
+            model: Shared articulation model.
+            residuals: Global residual buffer, shape [n_batch, total_residual_count].
+            start_idx: First residual row reserved for this objective.
+            problem_idx: Batch-row to base-problem map for target lookups.
+        """
+        wp.launch(
+            _rot_set_residuals,
+            dim=[body_q.shape[0], len(self._links_np)],
+            inputs=[body_q, self.target_rotations, self._links, self._weights, start_idx, problem_idx],
+            outputs=[residuals],
+            device=self.device,
+        )
+
+    def compute_jacobian_analytic(self, body_q, joint_q, model, jacobian, joint_S_s, start_idx) -> None:
+        """Write all effectors' analytic rotation Jacobian rows.
+
+        Args:
+            body_q: Batched body transforms. Unused.
+            joint_q: Batched joint coordinates. Unused.
+            model: Shared articulation model.
+            jacobian: Global Jacobian buffer,
+                shape [n_batch, total_residual_count, joint_dof_count].
+            joint_S_s: Batched motion-subspace columns,
+                shape [n_batch, joint_dof_count].
+            start_idx: First residual row reserved for this objective.
+        """
+        wp.launch(
+            _rot_set_jac_analytic,
+            dim=[joint_S_s.shape[0], len(self._links_np), model.joint_dof_count],
+            inputs=[joint_S_s, self._affects, self._weights, start_idx],
+            outputs=[jacobian],
+            device=self.device,
+        )
