@@ -33,6 +33,7 @@ Public inverse-kinematics API for defining objectives and solving IK problems.
    IKObjectiveTemporal
    IKObjectiveVelocityLimit
    IKObjectiveWorldPlane
+   IKObjectiveWorldPlaneCapsule
    IKOptimizer
    IKOptimizerLBFGS
    IKOptimizerLM

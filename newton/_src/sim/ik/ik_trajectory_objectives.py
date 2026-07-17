@@ -1635,6 +1635,258 @@ class IKObjectiveWorldPlane(IKObjectiveTemporal):
 
 
 @wp.kernel(enable_backward=False)
+def _world_plane_capsule_residuals(
+    body_q: wp.array2d[wp.transform],  # (n_rows, n_bodies)
+    link_index: wp.array[wp.int32],  # (n_capsules,)
+    end0: wp.array[wp.vec3],
+    end1: wp.array[wp.vec3],
+    radius: wp.array[wp.float32],
+    plane_normal: wp.vec3,
+    plane_offset: float,
+    margin: float,
+    weight: float,
+    start_idx: int,
+    # outputs
+    residuals: wp.array2d[wp.float32],
+):
+    row, k = wp.tid()
+    link = link_index[k]
+    c0 = wp.dot(plane_normal, _link_point(body_q, row, link, end0[k])) - plane_offset
+    c1 = wp.dot(plane_normal, _link_point(body_q, row, link, end1[k])) - plane_offset
+    clearance = wp.min(c0, c1) - radius[k]
+    residuals[row, start_idx + k] = weight * _colldist_hinge(clearance, margin)
+
+
+@wp.kernel(enable_backward=False)
+def _world_plane_capsule_coeffs(
+    body_q: wp.array2d[wp.transform],  # (n_rows, n_bodies)
+    joint_S_s: wp.array2d[wp.spatial_vector],  # (n_rows, n_dofs)
+    affects: wp.array2d[wp.uint8],  # (n_capsules, n_dofs)
+    link_index: wp.array[wp.int32],
+    end0: wp.array[wp.vec3],
+    end1: wp.array[wp.vec3],
+    radius: wp.array[wp.float32],
+    plane_normal: wp.vec3,
+    plane_offset: float,
+    margin: float,
+    weight: float,
+    # outputs
+    coeffs: wp.array4d[wp.float32],  # (n_rows, 1, n_dofs, n_dofs), zeroed by caller
+):
+    row, k, dof = wp.tid()
+    if affects[k, dof] == 0:
+        return
+    link = link_index[k]
+    p0 = _link_point(body_q, row, link, end0[k])
+    p1 = _link_point(body_q, row, link, end1[k])
+    c0 = wp.dot(plane_normal, p0) - plane_offset
+    c1 = wp.dot(plane_normal, p1) - plane_offset
+    # the min over endpoints differentiates through the lower one; at exact
+    # ties take end 0 (a valid subgradient — unlike crossing capsule pairs the
+    # clearance is not locally flat there, so any choice makes progress)
+    p = p0
+    c = c0
+    if c1 < c0:
+        p = p1
+        c = c1
+    g = _colldist_hinge_grad(c - radius[k], margin)
+    if g == 0.0:
+        return
+    S = joint_S_s[row, dof]
+    dp = wp.vec3(S[0], S[1], S[2]) + wp.cross(wp.vec3(S[3], S[4], S[5]), p)
+    coeffs[row, 0, k, dof] = weight * g * wp.dot(plane_normal, dp)
+
+
+class IKObjectiveWorldPlaneCapsule(IKObjectiveTemporal):
+    """Keep link-attached capsules on the positive side of a world plane.
+
+    Each guarded capsule is a segment ``(end0, end1)`` with a surface
+    ``radius``, rigidly attached to one link. The residual for capsule ``k``
+    at frame ``t`` is the smoothed one-sided penalty of
+    :class:`IKObjectiveWorldPlane` applied to the capsule's signed surface
+    clearance ``min(n . p_end0 - d, n . p_end1 - d) - radius`` [m] — for a
+    plane, the closest point of a capsule is always at one of the endpoint
+    hemispheres. The Gauss-Newton block differentiates through the active
+    (lower) endpoint. Setting ``end0 == end1`` guards a sphere.
+
+    Compared to guarding sampled surface points, capsules bound the whole
+    limb segment surface — retargeted floor work (crawls, push-ups) where
+    thigh or forearm surfaces graze the ground is the motivating case.
+
+    The remaining ``joint_dof_count - n_capsules`` temporal residual rows
+    stay zero; ``n_capsules`` must not exceed ``joint_dof_count``.
+
+    Args:
+        model: Shared articulation model.
+        link_indices: Links carrying the guarded capsules.
+        capsule_ends: Segment endpoints in each link's frame [m],
+            shape [n_capsules, 2] of vec3: (end0, end1).
+        capsule_radii: Capsule surface radii [m], shape [n_capsules].
+        plane_normal: World plane normal (need not be unit; normalized).
+        plane_offset: Plane offset ``d`` such that the plane is
+            ``n . p = d`` [m].
+        margin: Surface clearance below which the penalty activates [m].
+        weight: Scalar multiplier applied to the residual rows.
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        link_indices,
+        capsule_ends,
+        capsule_radii,
+        plane_normal: wp.vec3 | None = None,
+        plane_offset: float = 0.0,
+        margin: float = 0.02,
+        weight: float = 1.0,
+    ) -> None:
+        super().__init__(model)
+        if plane_normal is None:
+            plane_normal = wp.vec3(0.0, 0.0, 1.0)
+        self._links_np = np.asarray(link_indices, dtype=np.int32)
+        self._ends_np = np.asarray(capsule_ends, dtype=np.float32).reshape(-1, 2, 3)
+        self._radii_np = np.asarray(capsule_radii, dtype=np.float32).reshape(-1)
+        n_capsules = self._links_np.shape[0]
+        if self._ends_np.shape[0] != n_capsules or self._radii_np.shape[0] != n_capsules:
+            raise ValueError("link_indices, capsule_ends, and capsule_radii must have equal length")
+        if n_capsules > model.joint_dof_count:
+            raise ValueError("n_capsules may not exceed joint_dof_count")
+        n = np.asarray([plane_normal[0], plane_normal[1], plane_normal[2]], dtype=np.float64)
+        n /= np.linalg.norm(n)
+        self._normal = wp.vec3(*n)
+        self.plane_offset = plane_offset
+        self.margin = margin
+        self.weight = weight
+        self._links = None
+        self._end0 = None
+        self._end1 = None
+        self._radii = None
+        self._affects = None
+        self._joint_S_s = None
+        self._body_q_fk = None
+        self._body_qd_fk = None
+        self._qd_zero = None
+
+    def stencil_width(self) -> int:
+        """Return 0: each residual row only involves its own frame."""
+        return 0
+
+    def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
+        super().init_buffers(model, jacobian_mode)
+        n_bodies = model.body_count
+        self._links = wp.array(self._links_np, dtype=wp.int32, device=self.device)
+        self._end0 = wp.array(np.ascontiguousarray(self._ends_np[:, 0]), dtype=wp.vec3, device=self.device)
+        self._end1 = wp.array(np.ascontiguousarray(self._ends_np[:, 1]), dtype=wp.vec3, device=self.device)
+        self._radii = wp.array(self._radii_np, dtype=wp.float32, device=self.device)
+
+        joint_qd_start_np = model.joint_qd_start.numpy()
+        joint_parent_np = model.joint_parent.numpy()
+        joint_child_np = model.joint_child.numpy()
+        body_to_joint = np.full(n_bodies, -1, dtype=np.int32)
+        for j in range(model.joint_count):
+            child = joint_child_np[j]
+            if child != -1:
+                body_to_joint[child] = j
+        affects = np.zeros((len(self._links_np), self.n_dofs), dtype=np.uint8)
+        for k, link in enumerate(self._links_np):
+            body = int(link)
+            while body != -1:
+                j = body_to_joint[body]
+                if j == -1:
+                    break
+                affects[k, joint_qd_start_np[j] : joint_qd_start_np[j + 1]] = 1
+                body = joint_parent_np[j]
+        self._affects = wp.array(affects, dtype=wp.uint8, device=self.device)
+
+        self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
+        self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
+        self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
+        self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
+
+    def compute_residuals(
+        self,
+        body_q: wp.array2d[wp.transform],
+        joint_q: wp.array2d[wp.float32],
+        model: Model,
+        residuals: wp.array2d[wp.float32],
+        start_idx: int,
+        problem_idx: wp.array[wp.int32],
+    ) -> None:
+        """Write weighted capsule-clearance penalties into the global buffer.
+
+        Args:
+            body_q: Batched body transforms, shape [n_rows, body_count].
+            joint_q: Batched joint coordinates, shape [n_rows, joint_coord_count].
+            model: Shared articulation model.
+            residuals: Global residual buffer, shape [n_rows, total_residual_count].
+            start_idx: First residual row reserved for this objective.
+            problem_idx: Present for interface compatibility.
+        """
+        self._require_trajectory_layout()
+        wp.launch(
+            _world_plane_capsule_residuals,
+            dim=[joint_q.shape[0], len(self._links_np)],
+            inputs=[
+                body_q,
+                self._links,
+                self._end0,
+                self._end1,
+                self._radii,
+                self._normal,
+                self.plane_offset,
+                self.margin,
+                self.weight,
+                start_idx,
+            ],
+            outputs=[residuals],
+            device=self.device,
+        )
+
+    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
+        eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
+        model = self.model
+        wp.launch(
+            _motion_subspace_rows,
+            dim=[self.n_batch, model.joint_count],
+            inputs=[
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                joint_q,
+                model.joint_axis,
+                model.joint_dof_dim,
+                self._body_q_fk,
+                model.body_com,
+                model.joint_X_p,
+            ],
+            outputs=[self._joint_S_s],
+            device=self.device,
+        )
+        self.coeffs.zero_()
+        wp.launch(
+            _world_plane_capsule_coeffs,
+            dim=[self.n_batch, len(self._links_np), self.n_dofs],
+            inputs=[
+                self._body_q_fk,
+                self._joint_S_s,
+                self._affects,
+                self._links,
+                self._end0,
+                self._end1,
+                self._radii,
+                self._normal,
+                self.plane_offset,
+                self.margin,
+                self.weight,
+            ],
+            outputs=[self.coeffs],
+            device=self.device,
+        )
+
+
+@wp.kernel(enable_backward=False)
 def _foot_skate_residuals(
     body_q: wp.array2d[wp.transform],  # (n_rows, n_bodies)
     contact: wp.array2d[wp.uint8],  # (n_rows, n_points)

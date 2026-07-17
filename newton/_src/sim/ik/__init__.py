@@ -26,6 +26,7 @@ from .ik_trajectory_objectives import (
     IKObjectiveTemporal,
     IKObjectiveVelocityLimit,
     IKObjectiveWorldPlane,
+    IKObjectiveWorldPlaneCapsule,
 )
 from .ik_trajectory_solver import IKLinearSolver, IKSolverTrajectory
 
@@ -48,6 +49,7 @@ __all__ = [
     "IKObjectiveTemporal",
     "IKObjectiveVelocityLimit",
     "IKObjectiveWorldPlane",
+    "IKObjectiveWorldPlaneCapsule",
     "IKOptimizer",
     "IKOptimizerLBFGS",
     "IKOptimizerLM",
