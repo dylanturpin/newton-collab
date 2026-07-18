@@ -81,6 +81,7 @@ def test_particle_particle_friction_uses_relative_velocity(test, device):
     solver = newton.solvers.SolverXPBD(
         model=model,
         iterations=20,
+        enable_restitution=True,
     )
 
     state0 = model.state()
@@ -158,7 +159,7 @@ def test_optional_control_and_contacts(test, device):
     builder.add_ground_plane()
 
     model = builder.finalize(device=device)
-    solver = newton.solvers.SolverXPBD(model)
+    solver = newton.solvers.SolverXPBD(model, enable_restitution=True)
     state_in = model.state()
     state_out = model.state()
 
@@ -216,7 +217,7 @@ def test_particle_particle_friction_with_relative_motion(test, device):
         model.particle_mu = mu
         model.particle_cohesion = 0.0
 
-        solver = newton.solvers.SolverXPBD(model=model, iterations=30)
+        solver = newton.solvers.SolverXPBD(model=model, iterations=30, enable_restitution=True)
 
         state0 = model.state()
         state1 = model.state()
@@ -262,7 +263,7 @@ def test_xpbd_particle_particle_contact_nan_guard(test, device):
     model.particle_mu = 1.0
     model.particle_cohesion = 0.0
 
-    solver = newton.solvers.SolverXPBD(model=model, iterations=1)
+    solver = newton.solvers.SolverXPBD(model=model, iterations=1, enable_restitution=True)
     state0 = model.state()
     state1 = model.state()
     contacts = model.contacts()
@@ -296,7 +297,7 @@ def test_xpbd_particle_particle_tiny_separation_contact_remains_active(test, dev
     model.particle_mu = 1.0
     model.particle_cohesion = 0.0
 
-    solver = newton.solvers.SolverXPBD(model=model, iterations=1)
+    solver = newton.solvers.SolverXPBD(model=model, iterations=1, enable_restitution=True)
     state0 = model.state()
     state1 = model.state()
     contacts = model.contacts()
@@ -840,7 +841,7 @@ def test_articulation_contact_drift(test, device):
     builder.add_ground_plane()
 
     model = builder.finalize(device=device)
-    solver = newton.solvers.SolverXPBD(model)
+    solver = newton.solvers.SolverXPBD(model, enable_restitution=True)
 
     state_0 = model.state()
     state_1 = model.state()
@@ -957,7 +958,7 @@ def test_xpbd_contact_force_static_equilibrium(test, device):
     model = builder.finalize(device=device)
     model.request_contact_attributes("force")
 
-    solver = newton.solvers.SolverXPBD(model, iterations=32, rigid_contact_con_weighting=True)
+    solver = newton.solvers.SolverXPBD(model, iterations=32, rigid_contact_con_weighting=True, enable_restitution=True)
     state_in = model.state()
     state_out = model.state()
     control = model.control()
@@ -1095,7 +1096,7 @@ def test_xpbd_contact_force_zero_when_no_contact(test, device):
     model = builder.finalize(device=device)
     model.request_contact_attributes("force")
 
-    solver = newton.solvers.SolverXPBD(model, iterations=2)
+    solver = newton.solvers.SolverXPBD(model, iterations=2, enable_restitution=True)
     state_in = model.state()
     state_out = model.state()
     control = model.control()
@@ -1131,7 +1132,7 @@ def test_xpbd_contact_force_zero_when_not_touching(test, device):
     model.set_gravity(wp.vec3(0.0, 0.0, 0.0))
     model.request_contact_attributes("force")
 
-    solver = newton.solvers.SolverXPBD(model, iterations=2)
+    solver = newton.solvers.SolverXPBD(model, iterations=2, enable_restitution=True)
     state_in = model.state()
     state_out = model.state()
     control = model.control()
@@ -1164,7 +1165,7 @@ def test_xpbd_update_contacts_requires_force_attribute(test, device):
     builder.add_shape_sphere(body=body, radius=0.25)
     model = builder.finalize(device=device)
 
-    solver = newton.solvers.SolverXPBD(model, iterations=2)
+    solver = newton.solvers.SolverXPBD(model, iterations=2, enable_restitution=True)
     state_in = model.state()
     state_out = model.state()
     control = model.control()
@@ -1238,7 +1239,7 @@ def _run_single_body_steady_state(test, device, joint_kind: str, parent_kinemati
     builder, child_link = _build_single_body_pendulum(joint_kind, parent_kinematic, gravity)
     model = builder.finalize(device=device)
 
-    solver = newton.solvers.SolverXPBD(model, iterations=8)
+    solver = newton.solvers.SolverXPBD(model, iterations=8, enable_restitution=True)
     state_in = model.state()
     state_out = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
@@ -1362,7 +1363,7 @@ def test_xpbd_parent_force_chain_weight_propagation(test, device):
     builder.add_articulation([joint0, joint1])
     model = builder.finalize(device=device)
 
-    solver = newton.solvers.SolverXPBD(model, iterations=32)
+    solver = newton.solvers.SolverXPBD(model, iterations=32, enable_restitution=True)
     state_in = model.state()
     state_out = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
@@ -1419,7 +1420,7 @@ def test_xpbd_parent_force_not_allocated(test, device):
     builder.add_articulation([joint])
     model = builder.finalize(device=device)
 
-    solver = newton.solvers.SolverXPBD(model, iterations=2)
+    solver = newton.solvers.SolverXPBD(model, iterations=2, enable_restitution=True)
     state_in = model.state()
     state_out = model.state()
 
@@ -1447,7 +1448,7 @@ def test_xpbd_parent_force_zero_for_free_body(test, device):
     builder.add_articulation([joint])
     model = builder.finalize(device=device)
 
-    solver = newton.solvers.SolverXPBD(model, iterations=2)
+    solver = newton.solvers.SolverXPBD(model, iterations=2, enable_restitution=True)
     state_in = model.state()
     state_out = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
@@ -1512,7 +1513,7 @@ def test_xpbd_parent_f_centripetal_zero_g(test, device):
         joint_linear_compliance=0.0,
         joint_angular_compliance=0.0,
         angular_damping=0.0,
-        enable_restitution=False,
+        enable_restitution=True,
     )
 
     state_in = model.state()
@@ -1602,7 +1603,7 @@ def test_xpbd_parent_f_consistent_across_solvers(test, device):
     dt = 5e-3
     results = {}
     for name, make_solver in [
-        ("xpbd", lambda m: newton.solvers.SolverXPBD(m, iterations=8)),
+        ("xpbd", lambda m: newton.solvers.SolverXPBD(m, iterations=8, enable_restitution=True)),
         ("mujoco", lambda m: newton.solvers.SolverMuJoCo(m, use_mujoco_cpu=False)),
         ("featherstone", newton.solvers.SolverFeatherstone),
     ]:
@@ -1696,7 +1697,7 @@ def _newton_second_law_on_child(joint_kind, ic, *, dt, iters, device):
         joint_linear_compliance=0.0,
         joint_angular_compliance=0.0,
         angular_damping=0.0,
-        enable_restitution=False,
+        enable_restitution=True,
     )
     state_in = model.state()
     state_out = model.state()

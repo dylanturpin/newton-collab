@@ -100,7 +100,7 @@ class Example:
             self.solver = newton.solvers.SolverVBD(self.model, iterations=4)
             self.contacts = self.model.contacts()
         elif self.solver_type == "xpbd":
-            self.solver = newton.solvers.SolverXPBD(self.model, iterations=10)
+            self.solver = newton.solvers.SolverXPBD(self.model, iterations=10, enable_restitution=True)
             self.contacts = self.model.contacts()
         elif self.solver_type == "mujoco":
             self.solver = newton.solvers.SolverMuJoCo(

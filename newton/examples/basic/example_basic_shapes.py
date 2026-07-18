@@ -108,7 +108,7 @@ class Example:
                 iterations=10,
             )
         else:
-            self.solver = newton.solvers.SolverXPBD(self.model, iterations=10)
+            self.solver = newton.solvers.SolverXPBD(self.model, iterations=10, enable_restitution=True)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

@@ -220,6 +220,7 @@ class Example:
                 self.model,
                 iterations=10,
                 rigid_contact_relaxation=self.xpbd_contact_relaxation,
+                enable_restitution=True,
             )
         elif self.solver_type == "mujoco":
             num_per_world = self.rigid_contact_max // self.world_count
