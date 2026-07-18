@@ -8,6 +8,7 @@ from .ik_lbfgs_optimizer import IKOptimizerLBFGS
 from .ik_lm_optimizer import IKOptimizerLM
 from .ik_objectives import (
     IKObjective,
+    IKObjectiveAxisAlignment,
     IKObjectiveJointLimit,
     IKObjectivePosition,
     IKObjectivePositionSet,
@@ -35,6 +36,7 @@ __all__ = [
     "IKLinearSolver",
     "IKObjective",
     "IKObjectiveApparentGravity",
+    "IKObjectiveAxisAlignment",
     "IKObjectiveFootContact",
     "IKObjectiveFootSkate",
     "IKObjectiveGravityTorque",

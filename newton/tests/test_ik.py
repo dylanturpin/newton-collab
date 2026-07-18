@@ -517,6 +517,56 @@ def test_rotation_jacobian_compare(test, device):
 
 
 # ----------------------------------------------------------------------------
+# 2b'.  Axis-alignment Jacobian
+# ----------------------------------------------------------------------------
+
+
+def _axis_objective_builder(model, n_problems):
+    angles = [math.pi / 5 + prob * math.pi / 7 for prob in range(n_problems)]
+    axes = [[math.cos(a), math.sin(a), 0.0] for a in angles]
+    axis_obj = ik.IKObjectiveAxisAlignment(
+        link_index=1,
+        link_axis=wp.vec3(1.0, 0.0, 0.0),
+        target_axes=wp.array(axes, dtype=wp.vec3),
+    )
+    return [axis_obj]
+
+
+def test_axis_alignment_jacobian_compare(test, device):
+    _jacobian_compare(test, device, _axis_objective_builder)
+
+
+def test_axis_alignment_converges(test, device):
+    """The link axis aligns with per-problem targets from a misaligned seed."""
+    with wp.ScopedDevice(device):
+        n_problems = 3
+        model = _build_two_link_planar(device)
+        angles = [0.4 + 0.5 * prob for prob in range(n_problems)]
+        axes_np = np.array([[math.cos(a), math.sin(a), 0.0] for a in angles], dtype=np.float32)
+        axis_obj = ik.IKObjectiveAxisAlignment(
+            link_index=1,
+            link_axis=wp.vec3(1.0, 0.0, 0.0),
+            target_axes=wp.array(axes_np, dtype=wp.vec3),
+        )
+        solver = ik.IKSolver(model, n_problems, [axis_obj], jacobian_mode=ik.IKJacobianType.ANALYTIC)
+        joint_q = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32)
+        solver.step(joint_q, joint_q, iterations=32, step_size=1.0)
+        body_q = wp.zeros((n_problems, model.body_count), dtype=wp.transform)
+        body_qd = wp.zeros((n_problems, model.body_count), dtype=wp.spatial_vector)
+        eval_fk_batched(
+            model, joint_q, wp.zeros((n_problems, model.joint_dof_count), dtype=wp.float32), body_q, body_qd
+        )
+        bq = body_q.numpy()
+        for prob in range(n_problems):
+            x, y, z, w = bq[prob, 1][3:7]
+            ax = np.array([1.0, 0.0, 0.0])
+            uv = 2.0 * np.cross([x, y, z], ax)
+            a_world = ax + w * uv + np.cross([x, y, z], uv)
+            cos_err = float(np.dot(a_world, axes_np[prob]))
+            test.assertGreater(cos_err, 0.999, f"problem {prob} misaligned (cos {cos_err:.4f})")
+
+
+# ----------------------------------------------------------------------------
 # 2c.  Joint-limit Jacobian
 # ----------------------------------------------------------------------------
 
@@ -596,6 +646,10 @@ add_function_test(TestIKModes, "test_convergence_mixed_d6", test_convergence_mix
 # Jacobian equality
 add_function_test(TestIKModes, "test_position_jacobian_compare", test_position_jacobian_compare, devices)
 add_function_test(TestIKModes, "test_rotation_jacobian_compare", test_rotation_jacobian_compare, cuda_devices)
+add_function_test(
+    TestIKModes, "test_axis_alignment_jacobian_compare", test_axis_alignment_jacobian_compare, cuda_devices
+)
+add_function_test(TestIKModes, "test_axis_alignment_converges", test_axis_alignment_converges, devices)
 add_function_test(TestIKModes, "test_joint_limit_jacobian_compare", test_joint_limit_jacobian_compare, devices)
 add_function_test(TestIKModes, "test_d6_jacobian_compare", test_d6_jacobian_compare, cuda_devices)
 
