@@ -486,11 +486,11 @@ def test_trajectory_free_joint(test, device):
 def test_trajectory_free_joint_world_offset(test, device):
     """Temporal objectives must stay well-posed for floating bases away from
     the world origin: free-joint residuals are plain position differences
-    (origin-invariant) and the ``[p]x`` lever-arm coupling of the retraction
-    is carried exactly in the coefficient blocks. Regression test for a
-    diagonal-only formulation that degraded within a couple of meters of the
-    origin. (Very large offsets still converge, but with a slow conditioning
-    tail — the free-joint tangent convention pivots about the world origin.)"""
+    (origin-invariant) and root free-joint tangents are body-centered, so
+    the position rows carry no angular coupling and convergence does not
+    depend on where the trajectory sits in the world (cf.
+    test_ik_trajectory_dynamics.test_free_joint_far_from_origin_converges
+    for the far-origin regression)."""
     with wp.ScopedDevice(device):
         model = _build_free_plus_revolute(device)
         offset = np.array([10.0, -6.0, 0.0], dtype=np.float32)
