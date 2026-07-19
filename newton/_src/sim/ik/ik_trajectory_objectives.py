@@ -413,6 +413,10 @@ class IKObjectiveTemporal(IKObjective):
     them.
     """
 
+    uses_fk = False
+    """Whether :meth:`compute_coeffs` consumes body transforms and
+    motion-subspace rows (shared by the owning solver when available)."""
+
     def __init__(self, model: Model) -> None:
         super().__init__()
         self.model = model
@@ -420,6 +424,12 @@ class IKObjectiveTemporal(IKObjective):
         self.n_frames = None
         self.n_trajectories = None
         self.coeffs = None
+        # private FK buffers, allocated on first standalone compute_coeffs
+        # (the owning solver shares its own instead, cf. _fk_context)
+        self._body_q_fk = None
+        self._body_qd_fk = None
+        self._qd_zero = None
+        self._joint_S_s = None
 
     def set_trajectory_layout(self, n_frames: int, n_trajectories: int) -> None:
         """Register the frame layout of the owning trajectory solver.
@@ -480,7 +490,61 @@ class IKObjectiveTemporal(IKObjective):
     def compute_jacobian_analytic(self, body_q, joint_q, model, jacobian, joint_S_s, start_idx) -> None:
         """No-op: temporal Jacobians are reported via :meth:`compute_coeffs`."""
 
-    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
+    def _ensure_fk_buffers(self) -> None:
+        if self._body_q_fk is None:
+            n_bodies = self.model.body_count
+            self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
+            self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
+            self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
+
+    def _fk_context(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        body_q: wp.array2d[wp.transform] | None,
+        joint_S_s: wp.array2d[wp.spatial_vector] | None,
+    ) -> tuple[wp.array2d[wp.transform], wp.array2d[wp.spatial_vector]]:
+        """Resolve the FK inputs of :meth:`compute_coeffs`.
+
+        When the owning solver passes both its already-evaluated body
+        transforms and world motion-subspace rows, they are used directly;
+        otherwise (standalone use) both are computed here from ``joint_q``
+        into private buffers, allocated on first use — call once before any
+        CUDA graph capture.
+        """
+        if body_q is not None and joint_S_s is not None:
+            return body_q, joint_S_s
+        model = self.model
+        self._ensure_fk_buffers()
+        if self._joint_S_s is None:
+            self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
+        eval_fk_batched(model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
+        wp.launch(
+            _motion_subspace_rows,
+            dim=[self.n_batch, model.joint_count],
+            inputs=[
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                joint_q,
+                model.joint_axis,
+                model.joint_dof_dim,
+                self._body_q_fk,
+                model.body_com,
+                model.joint_X_p,
+            ],
+            outputs=[self._joint_S_s],
+            device=self.device,
+        )
+        return self._body_q_fk, self._joint_S_s
+
+    def compute_coeffs(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        body_q: wp.array2d[wp.transform] | None = None,
+        joint_S_s: wp.array2d[wp.spatial_vector] | None = None,
+    ) -> None:
         """Write the stencil-coefficient blocks at the given configuration.
 
         After this call, ``self.coeffs[row, j, c, a]`` must equal the partial
@@ -493,6 +557,11 @@ class IKObjectiveTemporal(IKObjective):
 
         Args:
             joint_q: Batched joint coordinates, shape [n_rows, joint_coord_count].
+            body_q: Optional solver-evaluated body transforms at ``joint_q``,
+                shape [n_rows, body_count]. Passed together with
+                ``joint_S_s`` to skip this objective's own FK pass.
+            joint_S_s: Optional world motion-subspace rows matching
+                ``body_q``, shape [n_rows, joint_dof_count].
         """
         raise NotImplementedError
 
@@ -635,12 +704,18 @@ class IKObjectiveSmoothness(IKObjectiveTemporal):
             device=self.device,
         )
 
-    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
+    def compute_coeffs(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        body_q: wp.array2d[wp.transform] | None = None,
+        joint_S_s: wp.array2d[wp.spatial_vector] | None = None,
+    ) -> None:
         """Rewrite the free-joint lever blocks at the given configuration.
 
         The diagonal blocks are constant and were written by
         :meth:`init_buffers`; the lever blocks have fixed sparsity, so they
-        are overwritten in place without clearing the buffer.
+        are overwritten in place without clearing the buffer. The shared FK
+        arguments are unused: this objective works in joint space.
         """
         if not self._needs_free_lever:
             return
@@ -761,7 +836,14 @@ class IKObjectiveVelocityLimit(IKObjectiveTemporal):
             device=self.device,
         )
 
-    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
+    def compute_coeffs(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        body_q: wp.array2d[wp.transform] | None = None,
+        joint_S_s: wp.array2d[wp.spatial_vector] | None = None,
+    ) -> None:
+        """Write the active velocity-limit blocks; the shared FK arguments
+        are unused, this objective works in joint space."""
         self._compute_velocity(joint_q, self.model)
         self.coeffs.zero_()
         wp.launch(
@@ -925,12 +1007,18 @@ class IKObjectiveJointReference(IKObjectiveTemporal):
             device=self.device,
         )
 
-    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
+    def compute_coeffs(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        body_q: wp.array2d[wp.transform] | None = None,
+        joint_S_s: wp.array2d[wp.spatial_vector] | None = None,
+    ) -> None:
         """Rewrite the free-joint lever blocks at the given configuration.
 
         The diagonal blocks are constant and were written by
         :meth:`init_buffers`; the lever blocks have fixed sparsity, so they
-        are overwritten in place without clearing the buffer.
+        are overwritten in place without clearing the buffer. The shared FK
+        arguments are unused: this objective works in joint space.
         """
         if not self._needs_free_lever:
             return
@@ -1265,6 +1353,8 @@ class IKObjectiveApparentGravity(IKObjectiveTemporal):
         weight: Scalar multiplier applied to the residual rows.
     """
 
+    uses_fk = True
+
     def __init__(
         self,
         model: Model,
@@ -1301,10 +1391,6 @@ class IKObjectiveApparentGravity(IKObjectiveTemporal):
         self._f_app = None
         self._t_u = None
         self._t_v = None
-        self._joint_S_s = None
-        self._body_q_fk = None
-        self._body_qd_fk = None
-        self._qd_zero = None
 
     def stencil_width(self) -> int:
         """Return 2: the acceleration stencil couples frames ``t .. t + 2``."""
@@ -1341,10 +1427,6 @@ class IKObjectiveApparentGravity(IKObjectiveTemporal):
         self._f_app = wp.zeros(self.n_batch, dtype=wp.vec3, device=self.device)
         self._t_u = wp.zeros(self.n_batch, dtype=wp.vec3, device=self.device)
         self._t_v = wp.zeros(self.n_batch, dtype=wp.vec3, device=self.device)
-        self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
-        self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
-        self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
-        self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
 
     def _compute_scratch(self, body_q: wp.array2d[wp.transform], n_rows: int) -> None:
         wp.launch(
@@ -1395,36 +1477,21 @@ class IKObjectiveApparentGravity(IKObjectiveTemporal):
             device=self.device,
         )
 
-    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
-        eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
-        model = self.model
-        wp.launch(
-            _motion_subspace_rows,
-            dim=[self.n_batch, model.joint_count],
-            inputs=[
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                joint_q,
-                model.joint_axis,
-                model.joint_dof_dim,
-                self._body_q_fk,
-                model.body_com,
-                model.joint_X_p,
-            ],
-            outputs=[self._joint_S_s],
-            device=self.device,
-        )
-        self._compute_scratch(self._body_q_fk, self.n_batch)
+    def compute_coeffs(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        body_q: wp.array2d[wp.transform] | None = None,
+        joint_S_s: wp.array2d[wp.spatial_vector] | None = None,
+    ) -> None:
+        body_q, joint_S_s = self._fk_context(joint_q, body_q, joint_S_s)
+        self._compute_scratch(body_q, self.n_batch)
         self.coeffs.zero_()
         wp.launch(
             _apparent_gravity_coeffs,
             dim=[self.n_batch, self.n_dofs],
             inputs=[
-                self._body_q_fk,
-                self._joint_S_s,
+                body_q,
+                joint_S_s,
                 self._f_app,
                 self._t_u,
                 self._t_v,
@@ -1535,6 +1602,8 @@ class IKObjectiveWorldPlane(IKObjectiveTemporal):
         weight: Scalar multiplier applied to the residual rows.
     """
 
+    uses_fk = True
+
     def __init__(
         self,
         model: Model,
@@ -1563,10 +1632,6 @@ class IKObjectiveWorldPlane(IKObjectiveTemporal):
         self._links = None
         self._offsets = None
         self._affects = None
-        self._joint_S_s = None
-        self._body_q_fk = None
-        self._body_qd_fk = None
-        self._qd_zero = None
 
     def stencil_width(self) -> int:
         """Return 0: each residual row only involves its own frame."""
@@ -1600,11 +1665,6 @@ class IKObjectiveWorldPlane(IKObjectiveTemporal):
                 affects[k, joint_qd_start_np[j] : joint_qd_start_np[j + 1]] = 1
                 body = joint_parent_np[j]
         self._affects = wp.array(affects, dtype=wp.uint8, device=self.device)
-
-        self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
-        self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
-        self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
-        self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
 
     def compute_residuals(
         self,
@@ -1643,35 +1703,20 @@ class IKObjectiveWorldPlane(IKObjectiveTemporal):
             device=self.device,
         )
 
-    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
-        eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
-        model = self.model
-        wp.launch(
-            _motion_subspace_rows,
-            dim=[self.n_batch, model.joint_count],
-            inputs=[
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                joint_q,
-                model.joint_axis,
-                model.joint_dof_dim,
-                self._body_q_fk,
-                model.body_com,
-                model.joint_X_p,
-            ],
-            outputs=[self._joint_S_s],
-            device=self.device,
-        )
+    def compute_coeffs(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        body_q: wp.array2d[wp.transform] | None = None,
+        joint_S_s: wp.array2d[wp.spatial_vector] | None = None,
+    ) -> None:
+        body_q, joint_S_s = self._fk_context(joint_q, body_q, joint_S_s)
         self.coeffs.zero_()
         wp.launch(
             _world_plane_coeffs,
             dim=[self.n_batch, len(self._links_np), self.n_dofs],
             inputs=[
-                self._body_q_fk,
-                self._joint_S_s,
+                body_q,
+                joint_S_s,
                 self._affects,
                 self._links,
                 self._offsets,
@@ -1780,6 +1825,8 @@ class IKObjectiveWorldPlaneCapsule(IKObjectiveTemporal):
         weight: Scalar multiplier applied to the residual rows.
     """
 
+    uses_fk = True
+
     def __init__(
         self,
         model: Model,
@@ -1813,10 +1860,6 @@ class IKObjectiveWorldPlaneCapsule(IKObjectiveTemporal):
         self._end1 = None
         self._radii = None
         self._affects = None
-        self._joint_S_s = None
-        self._body_q_fk = None
-        self._body_qd_fk = None
-        self._qd_zero = None
 
     def stencil_width(self) -> int:
         """Return 0: each residual row only involves its own frame."""
@@ -1852,11 +1895,6 @@ class IKObjectiveWorldPlaneCapsule(IKObjectiveTemporal):
                 affects[k, joint_qd_start_np[j] : joint_qd_start_np[j + 1]] = 1
                 body = joint_parent_np[j]
         self._affects = wp.array(affects, dtype=wp.uint8, device=self.device)
-
-        self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
-        self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
-        self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
-        self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
 
     def compute_residuals(
         self,
@@ -1897,35 +1935,20 @@ class IKObjectiveWorldPlaneCapsule(IKObjectiveTemporal):
             device=self.device,
         )
 
-    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
-        eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
-        model = self.model
-        wp.launch(
-            _motion_subspace_rows,
-            dim=[self.n_batch, model.joint_count],
-            inputs=[
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                joint_q,
-                model.joint_axis,
-                model.joint_dof_dim,
-                self._body_q_fk,
-                model.body_com,
-                model.joint_X_p,
-            ],
-            outputs=[self._joint_S_s],
-            device=self.device,
-        )
+    def compute_coeffs(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        body_q: wp.array2d[wp.transform] | None = None,
+        joint_S_s: wp.array2d[wp.spatial_vector] | None = None,
+    ) -> None:
+        body_q, joint_S_s = self._fk_context(joint_q, body_q, joint_S_s)
         self.coeffs.zero_()
         wp.launch(
             _world_plane_capsule_coeffs,
             dim=[self.n_batch, len(self._links_np), self.n_dofs],
             inputs=[
-                self._body_q_fk,
-                self._joint_S_s,
+                body_q,
+                joint_S_s,
                 self._affects,
                 self._links,
                 self._end0,
@@ -2019,6 +2042,8 @@ class IKObjectiveFootSkate(IKObjectiveTemporal):
         weight: Scalar multiplier applied to the residual rows.
     """
 
+    uses_fk = True
+
     def __init__(
         self,
         model: Model,
@@ -2039,10 +2064,6 @@ class IKObjectiveFootSkate(IKObjectiveTemporal):
         self._links = None
         self._offsets = None
         self._affects = None
-        self._joint_S_s = None
-        self._body_q_fk = None
-        self._body_qd_fk = None
-        self._qd_zero = None
 
     def stencil_width(self) -> int:
         """Return 1: each residual row couples frames ``t`` and ``t + 1``."""
@@ -2078,11 +2099,6 @@ class IKObjectiveFootSkate(IKObjectiveTemporal):
                 affects[k, joint_qd_start_np[j] : joint_qd_start_np[j + 1]] = 1
                 body = joint_parent_np[j]
         self._affects = wp.array(affects, dtype=wp.uint8, device=self.device)
-
-        self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
-        self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
-        self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
-        self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
 
     def compute_residuals(
         self,
@@ -2120,35 +2136,20 @@ class IKObjectiveFootSkate(IKObjectiveTemporal):
             device=self.device,
         )
 
-    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
-        eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
-        model = self.model
-        wp.launch(
-            _motion_subspace_rows,
-            dim=[self.n_batch, model.joint_count],
-            inputs=[
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                joint_q,
-                model.joint_axis,
-                model.joint_dof_dim,
-                self._body_q_fk,
-                model.body_com,
-                model.joint_X_p,
-            ],
-            outputs=[self._joint_S_s],
-            device=self.device,
-        )
+    def compute_coeffs(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        body_q: wp.array2d[wp.transform] | None = None,
+        joint_S_s: wp.array2d[wp.spatial_vector] | None = None,
+    ) -> None:
+        body_q, joint_S_s = self._fk_context(joint_q, body_q, joint_S_s)
         self.coeffs.zero_()
         wp.launch(
             _foot_skate_coeffs,
             dim=[self.n_batch, len(self._links_np), self.n_dofs],
             inputs=[
-                self._body_q_fk,
-                self._joint_S_s,
+                body_q,
+                joint_S_s,
                 self.contact,
                 self._affects,
                 self._links,
@@ -2228,6 +2229,8 @@ class IKObjectiveFootContact(IKObjectiveTemporal):
         weight: Scalar multiplier applied to the residual rows.
     """
 
+    uses_fk = True
+
     def __init__(
         self,
         model: Model,
@@ -2250,10 +2253,6 @@ class IKObjectiveFootContact(IKObjectiveTemporal):
         self._links = None
         self._offsets = None
         self._affects = None
-        self._joint_S_s = None
-        self._body_q_fk = None
-        self._body_qd_fk = None
-        self._qd_zero = None
 
     def stencil_width(self) -> int:
         """Return 0: each residual row only involves its own frame."""
@@ -2293,11 +2292,6 @@ class IKObjectiveFootContact(IKObjectiveTemporal):
                 body = joint_parent_np[j]
         self._affects = wp.array(affects, dtype=wp.uint8, device=self.device)
 
-        self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
-        self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
-        self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
-        self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
-
     def compute_residuals(
         self,
         body_q: wp.array2d[wp.transform],
@@ -2326,35 +2320,20 @@ class IKObjectiveFootContact(IKObjectiveTemporal):
             device=self.device,
         )
 
-    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
-        eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
-        model = self.model
-        wp.launch(
-            _motion_subspace_rows,
-            dim=[self.n_batch, model.joint_count],
-            inputs=[
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                joint_q,
-                model.joint_axis,
-                model.joint_dof_dim,
-                self._body_q_fk,
-                model.body_com,
-                model.joint_X_p,
-            ],
-            outputs=[self._joint_S_s],
-            device=self.device,
-        )
+    def compute_coeffs(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        body_q: wp.array2d[wp.transform] | None = None,
+        joint_S_s: wp.array2d[wp.spatial_vector] | None = None,
+    ) -> None:
+        body_q, joint_S_s = self._fk_context(joint_q, body_q, joint_S_s)
         self.coeffs.zero_()
         wp.launch(
             _foot_contact_coeffs,
             dim=[self.n_batch, len(self._links_np), self.n_dofs],
             inputs=[
-                self._body_q_fk,
-                self._joint_S_s,
+                body_q,
+                joint_S_s,
                 self.contact,
                 self._affects,
                 self._links,
@@ -2484,6 +2463,8 @@ class IKObjectiveSelfCollision(IKObjectiveTemporal):
         weight: Scalar multiplier applied to the residual rows.
     """
 
+    uses_fk = True
+
     def __init__(
         self,
         model: Model,
@@ -2512,10 +2493,6 @@ class IKObjectiveSelfCollision(IKObjectiveTemporal):
         self._close_a = None
         self._close_b = None
         self._grads = None
-        self._joint_S_s = None
-        self._body_q_fk = None
-        self._body_qd_fk = None
-        self._qd_zero = None
 
     def stencil_width(self) -> int:
         """Return 0: each residual row only involves its own frame."""
@@ -2560,10 +2537,6 @@ class IKObjectiveSelfCollision(IKObjectiveTemporal):
         self._close_a = wp.zeros((self.n_batch, n_pairs), dtype=wp.vec3, device=self.device)
         self._close_b = wp.zeros((self.n_batch, n_pairs), dtype=wp.vec3, device=self.device)
         self._grads = wp.zeros((self.n_batch, n_pairs), dtype=wp.float32, device=self.device)
-        self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
-        self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
-        self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
-        self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
         self._dummy = wp.zeros((self.n_batch, 1), dtype=wp.float32, device=self.device)
 
     def _scratch(self, body_q, n_rows, residuals, start_idx, write_residuals):
@@ -2606,30 +2579,15 @@ class IKObjectiveSelfCollision(IKObjectiveTemporal):
         self._require_trajectory_layout()
         self._scratch(body_q, joint_q.shape[0], residuals, start_idx, 1)
 
-    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
-        eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
-        model = self.model
-        wp.launch(
-            _motion_subspace_rows,
-            dim=[self.n_batch, model.joint_count],
-            inputs=[
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                joint_q,
-                model.joint_axis,
-                model.joint_dof_dim,
-                self._body_q_fk,
-                model.body_com,
-                model.joint_X_p,
-            ],
-            outputs=[self._joint_S_s],
-            device=self.device,
-        )
+    def compute_coeffs(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        body_q: wp.array2d[wp.transform] | None = None,
+        joint_S_s: wp.array2d[wp.spatial_vector] | None = None,
+    ) -> None:
+        body_q, joint_S_s = self._fk_context(joint_q, body_q, joint_S_s)
         # residuals are not rewritten here (write_residuals = 0)
-        self._scratch(self._body_q_fk, self.n_batch, self._dummy, 0, 0)
+        self._scratch(body_q, self.n_batch, self._dummy, 0, 0)
         self.coeffs.zero_()
         wp.launch(
             _self_collision_coeffs,
@@ -2638,7 +2596,7 @@ class IKObjectiveSelfCollision(IKObjectiveTemporal):
                 self._close_a,
                 self._close_b,
                 self._grads,
-                self._joint_S_s,
+                joint_S_s,
                 self._affects_a,
                 self._affects_b,
                 self.weight,
@@ -2672,6 +2630,8 @@ class IKObjectiveGravityTorque(IKObjectiveTemporal):
             Read once when the owning solver initializes the objective.
     """
 
+    uses_fk = True
+
     def __init__(
         self,
         model: Model,
@@ -2685,12 +2645,8 @@ class IKObjectiveGravityTorque(IKObjectiveTemporal):
         self._subtree_body = None
         self._dof_ancestor = None
         self._gravity = None
-        self._joint_S_s = None
         self._com_w = None
         self._u = None
-        self._body_q_fk = None
-        self._body_qd_fk = None
-        self._qd_zero = None
 
     def stencil_width(self) -> int:
         """Return 0: each residual row only involves its own frame."""
@@ -2762,9 +2718,6 @@ class IKObjectiveGravityTorque(IKObjectiveTemporal):
         self._joint_S_s = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.spatial_vector, device=self.device)
         self._com_w = wp.zeros((self.n_batch, n_bodies), dtype=wp.vec3, device=self.device)
         self._u = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.vec3, device=self.device)
-        self._body_q_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.transform, device=self.device)
-        self._body_qd_fk = wp.zeros((self.n_batch, n_bodies), dtype=wp.spatial_vector, device=self.device)
-        self._qd_zero = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, device=self.device)
 
     def _compute_u(self, body_q: wp.array2d[wp.transform], joint_q: wp.array2d[wp.float32]) -> None:
         n_rows = joint_q.shape[0]
@@ -2839,9 +2792,19 @@ class IKObjectiveGravityTorque(IKObjectiveTemporal):
             device=self.device,
         )
 
-    def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
-        eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
-        self._compute_u(self._body_q_fk, joint_q)
+    def compute_coeffs(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        body_q: wp.array2d[wp.transform] | None = None,
+        joint_S_s: wp.array2d[wp.spatial_vector] | None = None,
+    ) -> None:
+        # a shared joint_S_s is ignored: _compute_u regenerates the rows into
+        # this objective's own buffer, which compute_residuals also consumes
+        if body_q is None:
+            self._ensure_fk_buffers()
+            eval_fk_batched(self.model, joint_q, self._qd_zero, self._body_q_fk, self._body_qd_fk)
+            body_q = self._body_q_fk
+        self._compute_u(body_q, joint_q)
         self.coeffs.zero_()
         wp.launch(
             _gravity_torque_coeffs,

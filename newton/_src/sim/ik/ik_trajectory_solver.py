@@ -597,6 +597,7 @@ class IKSolverTrajectory(IKOptimizerLM):
         self.cg_tol = cg_tol
 
         self.temporal_objectives = [o for o in objectives if isinstance(o, IKObjectiveTemporal)]
+        self._temporal_uses_fk = any(o.uses_fk for o in self.temporal_objectives)
         self.band_width = max((o.stencil_width() for o in self.temporal_objectives), default=0)
         self.kb = max(self.band_width, 1)
         self.n_superblocks = (n_frames + self.kb - 1) // self.kb
@@ -698,6 +699,14 @@ class IKSolverTrajectory(IKOptimizerLM):
         n_traj = self.n_trajectories
         n_super = self.n_superblocks
         m = self.kb * n_dofs
+
+        # pure-AUTODIFF solves compute no per-frame motion subspace; FK-using
+        # temporal objectives then share this buffer instead (cf. _step)
+        self._temporal_S_s = (
+            wp.zeros((n_rows, n_dofs), dtype=wp.spatial_vector, device=device)
+            if self._temporal_uses_fk and self.jacobian_mode == IKJacobianType.AUTODIFF
+            else None
+        )
 
         self.jtj = wp.zeros((n_rows, n_dofs, n_dofs), dtype=wp.float32, device=device)
         self.grad3 = wp.zeros((n_rows, n_dofs, 1), dtype=wp.float32, device=device)
@@ -935,11 +944,26 @@ class IKSolverTrajectory(IKOptimizerLM):
             self.jtj.zero_()
             self.grad3.zero_()
 
-        # banded coupling and gradient of the temporal objectives
+        # banded coupling and gradient of the temporal objectives; body_q is
+        # fresh at joint_q here in every mode (_residuals_analytic above, or
+        # the Jacobian tape's FK), so FK-using objectives share it along with
+        # the motion-subspace rows instead of re-evaluating their own
+        shared_S_s = None
+        if self._temporal_uses_fk:
+            if self.joint_S_s is not None:
+                # recomputed from body_q by _jacobian_analytic this iteration
+                shared_S_s = self.joint_S_s
+            else:
+                self._compute_motion_subspace(
+                    joint_q_in=joint_q,
+                    body_q=self.body_q,
+                    joint_S_s_out=self._temporal_S_s,
+                )
+                shared_S_s = self._temporal_S_s
         self.band.zero_()
         for obj, offset in zip(self.objectives, self.residual_offsets, strict=False):
             if isinstance(obj, IKObjectiveTemporal):
-                obj.compute_coeffs(joint_q)
+                obj.compute_coeffs(joint_q, body_q=self.body_q, joint_S_s=shared_S_s)
                 n_coeff_rows = obj.coeffs.shape[2]
                 wp.launch(
                     _accumulate_temporal_band,
