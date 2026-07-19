@@ -214,6 +214,16 @@ def _accumulate_temporal_grad(
 
 
 @wp.kernel
+def _gather_perframe_residuals(
+    residuals: wp.array2d[wp.float32],  # (n_rows, n_residuals)
+    # outputs
+    residuals_3d: wp.array3d[wp.float32],  # (n_rows, n_perframe, 1)
+):
+    row, i = wp.tid()
+    residuals_3d[row, i, 0] = residuals[row, i]
+
+
+@wp.kernel
 def _gather_block_diag(
     jtj: wp.array3d[wp.float32],  # (n_rows, n_dofs, n_dofs)
     band: wp.array4d[wp.float32],  # (n_rows, band_count, n_dofs, n_dofs)
@@ -539,10 +549,11 @@ class IKSolverTrajectory(IKOptimizerLM):
     ) -> IKSolverTrajectory:
         n_dofs = model.joint_dof_count
         n_residuals = sum(o.residual_dim() for o in objectives)
+        n_perframe = sum(o.residual_dim() for o in objectives if not isinstance(o, IKObjectiveTemporal))
         band_width = max((o.stencil_width() for o in objectives if isinstance(o, IKObjectiveTemporal)), default=0)
         kb = max(band_width, 1)
         arch = model.device.arch
-        key = (n_dofs, n_residuals, kb, arch)
+        key = (n_dofs, n_residuals, n_perframe, kb, arch)
 
         spec_cls = cls._cache.get(key)
         if spec_cls is None:
@@ -589,6 +600,10 @@ class IKSolverTrajectory(IKOptimizerLM):
         self.band_width = max((o.stencil_width() for o in self.temporal_objectives), default=0)
         self.kb = max(self.band_width, 1)
         self.n_superblocks = (n_frames + self.kb - 1) // self.kb
+        # temporal objectives report Jacobians through their stencil
+        # coefficients, so the dense per-frame Jacobian and its J^T J tile
+        # kernel only carry the per-frame objectives' rows
+        self.n_perframe_residuals = sum(o.residual_dim() for o in objectives if not isinstance(o, IKObjectiveTemporal))
 
         if self.linear_solver is IKLinearSolver.SPIKE:
             self._plan_spike_partitions(spike_partitions)
@@ -651,6 +666,28 @@ class IKSolverTrajectory(IKOptimizerLM):
         for obj in self.temporal_objectives:
             obj.set_trajectory_layout(self.n_frames, self.n_trajectories)
         super()._init_objectives()
+
+    def _build_residual_offsets(self) -> None:
+        # per-frame objectives first so their rows form the leading
+        # contiguous block consumed by the J^T J tile kernel; temporal rows
+        # follow (their Jacobians live in the banded coefficients instead)
+        offsets: list[int] = []
+        offset = 0
+        for obj in self.objectives:
+            if not isinstance(obj, IKObjectiveTemporal):
+                offsets.append(offset)
+                offset += obj.residual_dim()
+            else:
+                offsets.append(-1)
+        for i, obj in enumerate(self.objectives):
+            if isinstance(obj, IKObjectiveTemporal):
+                offsets[i] = offset
+                offset += obj.residual_dim()
+        self.residual_offsets = offsets
+
+    def _jacobian_row_count(self) -> int:
+        # at least one row so the buffers stay valid for temporal-only stacks
+        return max(1, self.n_perframe_residuals)
 
     def _alloc_solver_buffers(self, grad: bool) -> None:
         super()._alloc_solver_buffers(grad)
@@ -879,15 +916,24 @@ class IKSolverTrajectory(IKOptimizerLM):
         )
         self._reduce_costs_traj(self.costs, self.costs_traj)
 
-        # dense per-frame Jacobian of the per-frame objectives
+        # dense per-frame Jacobian of the per-frame objectives (also refreshes
+        # FK state for the AUTODIFF/MIXED modes)
         self._jacobian_at(ctx_curr)
 
-        residuals_flat = ctx_curr.residuals.flatten()
-        residuals_3d_flat = self.residuals_3d.flatten()
-        wp.copy(residuals_3d_flat, residuals_flat)
-
-        # block-diagonal J^T J and gradient of the per-frame objectives
-        self._jtj_grad_tiled(ctx_curr.jacobian_out, self.residuals_3d, self.jtj, self.grad3)
+        # block-diagonal J^T J and gradient of the per-frame objectives,
+        # whose residual rows lead the buffer (cf. _build_residual_offsets)
+        if self.n_perframe_residuals > 0:
+            wp.launch(
+                _gather_perframe_residuals,
+                dim=[self.n_batch, self.n_perframe_residuals],
+                inputs=[ctx_curr.residuals],
+                outputs=[self.residuals_3d],
+                device=self.device,
+            )
+            self._jtj_grad_tiled(ctx_curr.jacobian_out, self.residuals_3d, self.jtj, self.grad3)
+        else:
+            self.jtj.zero_()
+            self.grad3.zero_()
 
         # banded coupling and gradient of the temporal objectives
         self.band.zero_()
@@ -1233,9 +1279,9 @@ class IKSolverTrajectory(IKOptimizerLM):
         raise NotImplementedError("This method should be overridden by specialized solver")
 
     @classmethod
-    def _build_specialized(cls, key: tuple[int, int, int, str]) -> type[IKSolverTrajectory]:
+    def _build_specialized(cls, key: tuple[int, int, int, int, str]) -> type[IKSolverTrajectory]:
         """Build a specialized subclass with tiled kernels for the given dimensions."""
-        n_dofs, n_residuals, kb, arch = key
+        n_dofs, n_residuals, n_perframe, kb, arch = key
 
         base_key = (n_dofs, n_residuals, arch)
         base_cls = IKOptimizerLM._cache.get(base_key)
@@ -1244,7 +1290,9 @@ class IKSolverTrajectory(IKOptimizerLM):
             IKOptimizerLM._cache[base_key] = base_cls
 
         DOF = wp.constant(n_dofs)
-        RES = wp.constant(n_residuals)
+        # the tile J^T J only sees the per-frame objectives' residual rows;
+        # temporal rows enter through the banded stencil coefficients
+        RES = wp.constant(max(1, n_perframe))
         MB = wp.constant(kb * n_dofs)
 
         def _jtj_grad_template(
@@ -1265,7 +1313,7 @@ class IKSolverTrajectory(IKOptimizerLM):
             wp.tile_matmul(Jt, r, g)
             wp.tile_store(grad_out[row], g)
 
-        _jtj_grad_template.__name__ = f"_trajik_jtj_grad_{n_dofs}_{n_residuals}"
+        _jtj_grad_template.__name__ = f"_trajik_jtj_grad_{n_dofs}_{n_perframe}"
         _jtj_grad_kernel = wp.kernel(enable_backward=False, module="unique")(_jtj_grad_template)
 
         def _thomas_template(
@@ -1604,7 +1652,7 @@ class IKSolverTrajectory(IKOptimizerLM):
                     device=self.device,
                 )
 
-        _Specialized.__name__ = f"IKTraj_{n_dofs}x{n_residuals}_k{kb}"
+        _Specialized.__name__ = f"IKTraj_{n_dofs}x{n_residuals}pf{n_perframe}_k{kb}"
         _Specialized._integrate_dq_dof = staticmethod(base_cls._integrate_dq_dof)
         _Specialized._compute_motion_subspace_2d = staticmethod(base_cls._compute_motion_subspace_2d)
         _Specialized._fk_two_pass = staticmethod(base_cls._fk_two_pass)
