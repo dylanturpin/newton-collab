@@ -235,9 +235,10 @@ class IKOptimizerLM:
         self.residuals_proposed = wp.zeros(
             (self.n_batch, self.n_residuals), dtype=wp.float32, requires_grad=grad, device=device
         )
-        self.residuals_3d = wp.zeros((self.n_batch, self.n_residuals, 1), dtype=wp.float32, device=device)
+        jac_rows = self._jacobian_row_count()
+        self.residuals_3d = wp.zeros((self.n_batch, jac_rows, 1), dtype=wp.float32, device=device)
 
-        self.jacobian = wp.zeros((self.n_batch, self.n_residuals, self.n_dofs), dtype=wp.float32, device=device)
+        self.jacobian = wp.zeros((self.n_batch, jac_rows, self.n_dofs), dtype=wp.float32, device=device)
         self.dq_dof = wp.zeros((self.n_batch, self.n_dofs), dtype=wp.float32, requires_grad=grad, device=device)
 
         self.joint_q_proposed = wp.zeros(
@@ -258,6 +259,10 @@ class IKOptimizerLM:
             if self.jacobian_mode != IKJacobianType.AUTODIFF and self.has_analytic_objective
             else None
         )
+
+    def _jacobian_row_count(self) -> int:
+        """Rows of the dense Jacobian; all residual rows for per-frame LM."""
+        return self.n_residuals
 
     def _build_residual_offsets(self) -> None:
         offsets: list[int] = []
