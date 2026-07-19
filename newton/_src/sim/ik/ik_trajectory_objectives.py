@@ -245,6 +245,16 @@ def _stencil_free_lever_coeffs(
                 coeffs[row, j, dof0 + a, dof0 + 3 + b] = -c * s_row * _skew_entry(p, a, b)
 
 
+def _has_nonroot_free_joint(model: Model) -> bool:
+    """Whether any FREE/DISTANCE joint has a parent (root joints use
+    body-centered tangents and carry no lever coupling, cf.
+    ``_stencil_free_lever_coeffs``)."""
+    jt = model.joint_type.numpy()
+    jp = model.joint_parent.numpy()
+    free = (jt == JointType.FREE) | (jt == JointType.DISTANCE)
+    return bool((free & (jp >= 0)).any())
+
+
 @wp.kernel(enable_backward=False)
 def _reference_residuals(
     joint_q: wp.array2d[wp.float32],  # (n_rows, n_coords)
@@ -546,6 +556,24 @@ class IKObjectiveSmoothness(IKObjectiveTemporal):
         else:
             self._dof_weights = wp.ones(self.n_dofs, dtype=wp.float32, device=self.device)
         self._frame_weights = wp.empty(0, dtype=wp.float32, device=self.device)
+        # the diagonal blocks are configuration-independent (weights are read
+        # here, once): only the non-root free-joint lever blocks vary with
+        # joint_q and are rewritten by compute_coeffs
+        wp.launch(
+            _stencil_diag_coeffs,
+            dim=[self.n_batch, self.n_dofs],
+            inputs=[
+                self.n_frames,
+                self.derivative,
+                self._jac_coeffs,
+                self._scale,
+                self._dof_weights,
+                self._frame_weights,
+            ],
+            outputs=[self.coeffs],
+            device=self.device,
+        )
+        self._needs_free_lever = _has_nonroot_free_joint(model)
 
     @property
     def _scale(self) -> float:
@@ -608,21 +636,14 @@ class IKObjectiveSmoothness(IKObjectiveTemporal):
         )
 
     def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
-        self.coeffs.zero_()
-        wp.launch(
-            _stencil_diag_coeffs,
-            dim=[self.n_batch, self.n_dofs],
-            inputs=[
-                self.n_frames,
-                self.derivative,
-                self._jac_coeffs,
-                self._scale,
-                self._dof_weights,
-                self._frame_weights,
-            ],
-            outputs=[self.coeffs],
-            device=self.device,
-        )
+        """Rewrite the free-joint lever blocks at the given configuration.
+
+        The diagonal blocks are constant and were written by
+        :meth:`init_buffers`; the lever blocks have fixed sparsity, so they
+        are overwritten in place without clearing the buffer.
+        """
+        if not self._needs_free_lever:
+            return
         wp.launch(
             _stencil_free_lever_coeffs,
             dim=[self.n_batch, self.model.joint_count],
@@ -831,6 +852,24 @@ class IKObjectiveJointReference(IKObjectiveTemporal):
             self._frame_weights = self.frame_weights
         else:
             self._frame_weights = wp.empty(0, dtype=wp.float32, device=self.device)
+        # the diagonal blocks are configuration-independent (weights are read
+        # here, once): only the non-root free-joint lever blocks vary with
+        # joint_q and are rewritten by compute_coeffs
+        wp.launch(
+            _stencil_diag_coeffs,
+            dim=[self.n_batch, self.n_dofs],
+            inputs=[
+                self.n_frames,
+                0,
+                self._unit_jac,
+                self.weight,
+                self._dof_weights,
+                self._frame_weights,
+            ],
+            outputs=[self.coeffs],
+            device=self.device,
+        )
+        self._needs_free_lever = _has_nonroot_free_joint(model)
 
     def compute_residuals(
         self,
@@ -887,21 +926,14 @@ class IKObjectiveJointReference(IKObjectiveTemporal):
         )
 
     def compute_coeffs(self, joint_q: wp.array2d[wp.float32]) -> None:
-        self.coeffs.zero_()
-        wp.launch(
-            _stencil_diag_coeffs,
-            dim=[self.n_batch, self.n_dofs],
-            inputs=[
-                self.n_frames,
-                0,
-                self._unit_jac,
-                self.weight,
-                self._dof_weights,
-                self._frame_weights,
-            ],
-            outputs=[self.coeffs],
-            device=self.device,
-        )
+        """Rewrite the free-joint lever blocks at the given configuration.
+
+        The diagonal blocks are constant and were written by
+        :meth:`init_buffers`; the lever blocks have fixed sparsity, so they
+        are overwritten in place without clearing the buffer.
+        """
+        if not self._needs_free_lever:
+            return
         wp.launch(
             _stencil_free_lever_coeffs,
             dim=[self.n_batch, self.model.joint_count],
