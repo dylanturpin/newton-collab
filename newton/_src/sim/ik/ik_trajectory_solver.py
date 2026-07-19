@@ -70,7 +70,7 @@ class IKLinearSolver(str, Enum):
 
     The interior factorization carries three simultaneous right-hand sides,
     so it reaches the tile shared-memory limit at smaller superblock sizes
-    than :attr:`DIRECT` (roughly ``k * n_dofs <= 24–32`` fp32); larger
+    than :attr:`DIRECT` (roughly ``k * n_dofs <= 24-32`` fp32); larger
     problems should use :attr:`DIRECT` or :attr:`CG`.
     """
 
