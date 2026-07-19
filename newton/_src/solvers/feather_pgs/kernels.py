@@ -16,7 +16,7 @@
 import warp as wp
 
 from ...math.spatial import transform_twist
-from ...sim import JointType
+from ...sim import BodyFlags, JointType
 from ...sim.articulation import (
     compute_2d_rotational_dofs,
     compute_3d_rotational_dofs,
@@ -63,15 +63,18 @@ _FPGS_COULOMB_NEWTON_NEWTON_ITERS = 50
 
 
 @wp.kernel
-def copy_int_array_masked(
+def commit_mass_updates(
     src: wp.array[int],
     mask: wp.array[int],
+    mass_update_requested: wp.array[int],
     # outputs
     dst: wp.array[int],
 ):
     tid = wp.tid()
     if mask[tid] != 0:
         dst[tid] = src[tid]
+    if tid == 0:
+        mass_update_requested[0] = 0
 
 
 @wp.kernel
@@ -217,6 +220,7 @@ def convert_root_free_qd_local_to_world(
 def clamp_free_root_velocity_limits(
     articulation_start: wp.array[int],
     joint_child: wp.array[int],
+    body_flags: wp.array[wp.int32],
     articulation_root_is_free: wp.array[int],
     articulation_root_dof_start: wp.array[int],
     rigid_body_max_linear_velocity: wp.array[float],
@@ -232,6 +236,8 @@ def clamp_free_root_velocity_limits(
     root_joint = articulation_start[art]
     root_body = joint_child[root_joint]
     if root_body < 0:
+        return
+    if (body_flags[root_body] & BodyFlags.KINEMATIC) != 0:
         return
 
     ds = articulation_root_dof_start[art]
@@ -261,9 +267,11 @@ def clamp_free_root_velocity_limits(
 def prescale_joint_velocity_limits(
     articulation_start: wp.array[int],
     joint_type: wp.array[int],
+    joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     joint_velocity_limit: wp.array[float],
+    body_flags: wp.array[wp.int32],
     # in/out
     joint_qd: wp.array[float],
 ):
@@ -279,6 +287,8 @@ def prescale_joint_velocity_limits(
 
     ratio = float(1.0)
     for j in range(joint_start, joint_end):
+        if (body_flags[joint_child[j]] & BodyFlags.KINEMATIC) != 0:
+            continue
         jtype = joint_type[j]
         if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
             continue
@@ -301,6 +311,8 @@ def prescale_joint_velocity_limits(
         return
 
     for j in range(joint_start, joint_end):
+        if (body_flags[joint_child[j]] & BodyFlags.KINEMATIC) != 0:
+            continue
         jtype = joint_type[j]
         if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
             continue
@@ -1078,6 +1090,7 @@ def eval_rigid_tau(
     joint_S_s: wp.array[wp.spatial_vector],
     body_fb_s: wp.array[wp.spatial_vector],
     body_f_ext: wp.array[wp.spatial_vector],
+    body_flags: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     articulation_origin: wp.array[wp.vec3],
@@ -1113,7 +1126,9 @@ def eval_rigid_tau(
         f_t_s = body_ft_s[child]
 
         # external wrench is provided at COM in world frame; shift torque to origin
-        f_ext_com = body_f_ext[child]
+        f_ext_com = wp.spatial_vector()
+        if (body_flags[child] & BodyFlags.KINEMATIC) == 0:
+            f_ext_com = body_f_ext[child]
         f_ext_f = wp.spatial_bottom(f_ext_com)
         f_ext_t = wp.spatial_top(f_ext_com)
 
@@ -1332,6 +1347,7 @@ def integrate_generalized_joints(
     joint_child: wp.array[int],
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     body_com: wp.array[wp.vec3],
     joint_q: wp.array[float],
@@ -1351,6 +1367,13 @@ def integrate_generalized_joints(
     child = joint_child[index]
     coord_start = joint_q_start[index]
     dof_start = joint_qd_start[index]
+    if kinematic_joint_mask[index] != 0:
+        for coord in range(coord_start, joint_q_start[index + 1]):
+            joint_q_new[coord] = joint_q[coord]
+        for dof in range(dof_start, joint_qd_start[index + 1]):
+            joint_qd_new[dof] = joint_qd[dof]
+        return
+
     lin_axis_count = joint_dof_dim[index, 0]
     ang_axis_count = joint_dof_dim[index, 1]
 
@@ -1376,25 +1399,35 @@ def integrate_generalized_joints(
 @wp.kernel
 def compute_velocity_predictor(
     joint_qd: wp.array[float],
-    joint_qdd: wp.array[float],
+    kinematic_dof_mask: wp.array[int],
     dt: float,
+    # in/out
+    joint_qdd: wp.array[float],
     # outputs
     v_hat: wp.array[float],
 ):
     tid = wp.tid()
+    if kinematic_dof_mask[tid] != 0:
+        joint_qdd[tid] = 0.0
     v_hat[tid] = joint_qd[tid] + joint_qdd[tid] * dt
 
 
 @wp.kernel
 def update_qdd_from_velocity(
     joint_qd: wp.array[float],
-    v_new: wp.array[float],
+    kinematic_dof_mask: wp.array[int],
     inv_dt: float,
-    # outputs
+    # in/out
+    v_new: wp.array[float],
+    # output
     joint_qdd: wp.array[float],
 ):
     tid = wp.tid()
-    joint_qdd[tid] = (v_new[tid] - joint_qd[tid]) * inv_dt
+    if kinematic_dof_mask[tid] != 0:
+        v_new[tid] = joint_qd[tid]
+        joint_qdd[tid] = 0.0
+    else:
+        joint_qdd[tid] = (v_new[tid] - joint_qd[tid]) * inv_dt
 
 
 @wp.func
@@ -2126,12 +2159,13 @@ def detect_limit_count_changes(
 def build_mass_update_mask(
     global_flag: int,
     limit_change_mask: wp.array[int],
+    mass_update_requested: wp.array[int],
     # outputs
     mass_update_mask: wp.array[int],
 ):
     tid = wp.tid()
     flag = 1 if global_flag != 0 else 0
-    if limit_change_mask[tid] != 0:
+    if limit_change_mask[tid] != 0 or mass_update_requested[0] != 0:
         flag = 1
     mass_update_mask[tid] = flag
 
@@ -2535,6 +2569,8 @@ def allocate_world_contact_slots(
     shape_body: wp.array[int],
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
+    art_size: wp.array[int],
+    body_flags: wp.array[wp.int32],
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
     max_constraints: int,
@@ -2586,6 +2622,15 @@ def allocate_world_contact_slots(
     if body_b >= 0:
         art_b = body_to_articulation[body_b]
 
+    a_has_dofs = art_a >= 0 and art_size[art_a] > 0
+    b_has_dofs = art_b >= 0 and art_size[art_b] > 0
+    a_can_respond = a_has_dofs and (body_flags[body_a] & BodyFlags.KINEMATIC) == 0
+    b_can_respond = b_has_dofs and (body_flags[body_b] & BodyFlags.KINEMATIC) == 0
+    if not a_can_respond and not b_can_respond:
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
+
     # Determine world (both bodies must be in same world, or one is ground)
     world = -1
     if art_a >= 0:
@@ -2634,9 +2679,9 @@ def allocate_world_contact_slots(
     # Classify: MF path if both sides are free rigid or ground
     is_mf = 0
     if has_free_rigid != 0:
-        a_is_free_or_ground = (art_a < 0) or (is_free_rigid[art_a] != 0)
-        b_is_free_or_ground = (art_b < 0) or (is_free_rigid[art_b] != 0)
-        if a_is_free_or_ground and b_is_free_or_ground:
+        a_is_mf_compatible = not a_has_dofs or is_free_rigid[art_a] != 0
+        b_is_mf_compatible = not b_has_dofs or is_free_rigid[art_b] != 0
+        if a_is_mf_compatible and b_is_mf_compatible:
             is_mf = 1
 
     friction_anchor_rank = int(0)
@@ -3591,6 +3636,7 @@ def build_mf_contact_rows(
     contact_path: wp.array[int],
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
+    art_size: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
@@ -3644,6 +3690,16 @@ def build_mf_contact_rows(
         body_a = shape_body[shape_a]
     if shape_b >= 0:
         body_b = shape_body[shape_b]
+
+    # Zero-DOF articulations contribute collision geometry but own no
+    # generalized response. Treat them like ground after using their body
+    # transforms to reconstruct the contact points below.
+    response_body_a = -1
+    response_body_b = -1
+    if body_a >= 0 and contact_art_a[c] >= 0 and art_size[contact_art_a[c]] > 0:
+        response_body_a = body_a
+    if body_b >= 0 and contact_art_b[c] >= 0 and art_size[contact_art_b[c]] > 0:
+        response_body_b = body_b
 
     thickness_a = contact_thickness0[c]
     thickness_b = contact_thickness1[c]
@@ -3724,7 +3780,7 @@ def build_mf_contact_rows(
 
         # Body A Jacobian in articulation-local frame: J = [d, r_a x d], where
         # r_a is the contact point relative to articulation A's fixed origin.
-        if body_a >= 0:
+        if response_body_a >= 0:
             art_a = contact_art_a[c]
             origin_a = articulation_origin[art_a]
             point_a_row_world = point_a_world
@@ -3740,7 +3796,7 @@ def build_mf_contact_rows(
             mf_J_a[world, row_idx, 5] = ang_a[2]
 
         # Body B Jacobian in articulation-local frame (opposite sign).
-        if body_b >= 0:
+        if response_body_b >= 0:
             art_b = contact_art_b[c]
             origin_b = articulation_origin[art_b]
             point_b_row_world = point_b_world
@@ -3755,8 +3811,8 @@ def build_mf_contact_rows(
             mf_J_b[world, row_idx, 4] = -ang_b[1]
             mf_J_b[world, row_idx, 5] = -ang_b[2]
 
-        mf_body_a[world, row_idx] = body_a
-        mf_body_b[world, row_idx] = body_b
+        mf_body_a[world, row_idx] = response_body_a
+        mf_body_b[world, row_idx] = response_body_b
 
         if row_offset == 0:
             mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
@@ -3872,6 +3928,7 @@ def allocate_rigid_velocity_limit_slots(
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
     is_free_rigid: wp.array[int],
+    body_flags: wp.array[wp.int32],
     rigid_body_max_linear_velocity: wp.array[float],
     rigid_body_max_angular_velocity: wp.array[float],
     articulation_root_dof_start: wp.array[int],
@@ -3911,6 +3968,8 @@ def allocate_rigid_velocity_limit_slots(
     if art < 0:
         return
     if is_free_rigid[art] == 0:
+        return
+    if (body_flags[body] & BodyFlags.KINEMATIC) != 0:
         return
 
     world = art_to_world[art]
@@ -4126,6 +4185,7 @@ def compute_mf_body_Hinv(
     body_I_s: wp.array[wp.spatial_matrix],
     is_free_rigid: wp.array[int],
     body_to_articulation: wp.array[int],
+    body_flags: wp.array[wp.int32],
     # outputs
     mf_body_Hinv: wp.array[wp.spatial_matrix],
 ):
@@ -4139,6 +4199,9 @@ def compute_mf_body_Hinv(
     if art < 0:
         return
     if is_free_rigid[art] == 0:
+        return
+    if (body_flags[b] & BodyFlags.KINEMATIC) != 0:
+        mf_body_Hinv[b] = wp.spatial_matrix(0.0)
         return
 
     mf_body_Hinv[b] = spatial_matrix_block_inverse(body_I_s[b])
