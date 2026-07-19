@@ -359,7 +359,7 @@ def _fill_bsr_values(
     # outputs
     values: wp.array3d[wp.float32],  # (nnz, n_dofs, n_dofs)
 ):
-    row, s = wp.tid()
+    row, s, a = wp.tid()
     t = row % n_frames
     p = row // n_frames
     tc = t + s - band_width
@@ -371,29 +371,27 @@ def _fill_bsr_values(
         return
 
     if s == band_width:  # diagonal block
-        for a in range(n_dofs):
-            for b in range(n_dofs):
-                val = float(0.0)
-                if fixed_mask[t] != 0:
-                    val = 1.0 if a == b else 0.0
-                else:
-                    val = jtj[row, a, b] + band[row, 0, a, b]
-                    if a == b:
-                        val += lambda_traj[p]
-                values[idx, a, b] = val
+        for b in range(n_dofs):
+            val = float(0.0)
+            if fixed_mask[t] != 0:
+                val = 1.0 if a == b else 0.0
+            else:
+                val = jtj[row, a, b] + band[row, 0, a, b]
+                if a == b:
+                    val += lambda_traj[p]
+            values[idx, a, b] = val
     else:
         d = s - band_width
         active = fixed_mask[t] == 0 and fixed_mask[tc] == 0
-        for a in range(n_dofs):
-            for b in range(n_dofs):
-                val = float(0.0)
-                if active:
-                    # band stores H(f, f + d); read the transpose below the diagonal
-                    if d > 0:
-                        val = band[row, d, a, b]
-                    else:
-                        val = band[col, -d, b, a]
-                values[idx, a, b] = val
+        for b in range(n_dofs):
+            val = float(0.0)
+            if active:
+                # band stores H(f, f + d); read the transpose below the diagonal
+                if d > 0:
+                    val = band[row, d, a, b]
+                else:
+                    val = band[col, -d, b, a]
+            values[idx, a, b] = val
 
 
 @wp.kernel
@@ -1147,7 +1145,7 @@ class IKSolverTrajectory(IKOptimizerLM):
         n_dofs = self.n_dofs
         wp.launch(
             _fill_bsr_values,
-            dim=[self.n_batch, 2 * self.band_width + 1],
+            dim=[self.n_batch, 2 * self.band_width + 1, n_dofs],
             inputs=[
                 self.jtj,
                 self.band,
