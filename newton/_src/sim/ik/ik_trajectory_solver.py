@@ -167,10 +167,10 @@ def _update_trajectory_scalars(
 
 @wp.kernel
 def _accumulate_temporal_band(
-    coeffs: wp.array4d[wp.float32],  # (n_rows, width + 1, n_dofs, n_dofs)
+    coeffs: wp.array4d[wp.float32],  # (n_rows, width + 1, n_coeff_rows, n_dofs)
     width: int,
     n_frames: int,
-    n_dofs: int,
+    n_coeff_rows: int,
     # outputs
     band: wp.array4d[wp.float32],  # (n_rows, band_count, n_dofs, n_dofs)
 ):
@@ -184,19 +184,19 @@ def _accumulate_temporal_band(
         for i in range(width - d + 1):
             if i <= t:
                 rs = row - i
-                for c in range(n_dofs):
+                for c in range(n_coeff_rows):
                     acc += coeffs[rs, i, c, a] * coeffs[rs, i + d, c, b]
         band[row, d, a, b] += acc
 
 
 @wp.kernel
 def _accumulate_temporal_grad(
-    coeffs: wp.array4d[wp.float32],  # (n_rows, width + 1, n_dofs, n_dofs)
+    coeffs: wp.array4d[wp.float32],  # (n_rows, width + 1, n_coeff_rows, n_dofs)
     residuals: wp.array2d[wp.float32],  # (n_rows, n_residuals)
     start_idx: int,
     width: int,
     n_frames: int,
-    n_dofs: int,
+    n_coeff_rows: int,
     # outputs
     grad: wp.array2d[wp.float32],  # (n_rows, n_dofs)
 ):
@@ -208,7 +208,7 @@ def _accumulate_temporal_grad(
     for j in range(width + 1):
         if j <= t:
             rs = row - j
-            for c in range(n_dofs):
+            for c in range(n_coeff_rows):
                 gacc += coeffs[rs, j, c, a] * residuals[rs, start_idx + c]
     grad[row, a] += gacc
 
@@ -940,10 +940,11 @@ class IKSolverTrajectory(IKOptimizerLM):
         for obj, offset in zip(self.objectives, self.residual_offsets, strict=False):
             if isinstance(obj, IKObjectiveTemporal):
                 obj.compute_coeffs(joint_q)
+                n_coeff_rows = obj.coeffs.shape[2]
                 wp.launch(
                     _accumulate_temporal_band,
                     dim=[self.n_batch, self.n_dofs, self.n_dofs],
-                    inputs=[obj.coeffs, obj.stencil_width(), self.n_frames, self.n_dofs],
+                    inputs=[obj.coeffs, obj.stencil_width(), self.n_frames, n_coeff_rows],
                     outputs=[self.band],
                     device=self.device,
                 )
@@ -956,7 +957,7 @@ class IKSolverTrajectory(IKOptimizerLM):
                         offset,
                         obj.stencil_width(),
                         self.n_frames,
-                        self.n_dofs,
+                        n_coeff_rows,
                     ],
                     outputs=[self.grad],
                     device=self.device,

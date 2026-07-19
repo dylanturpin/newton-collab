@@ -433,6 +433,17 @@ class IKObjectiveTemporal(IKObjective):
         """Return one residual row per joint DoF."""
         return self.n_dofs
 
+    def coeff_row_count(self) -> int:
+        """Return the number of leading residual rows carrying coefficients.
+
+        The stencil-coefficient buffer only stores this many rows of the
+        objective's residual block; the remaining rows up to
+        :meth:`residual_dim` stay identically zero and are skipped by the
+        band accumulation. Objectives with sparse residual rows (contact
+        points, capsule guards, ...) override this with their active count.
+        """
+        return self.n_dofs
+
     def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
         """Allocate the stencil-coefficient buffer.
 
@@ -444,7 +455,7 @@ class IKObjectiveTemporal(IKObjective):
         self._require_batch_layout()
         self._require_trajectory_layout()
         self.coeffs = wp.zeros(
-            (self.n_batch, self.stencil_width() + 1, self.n_dofs, self.n_dofs),
+            (self.n_batch, self.stencil_width() + 1, self.coeff_row_count(), self.n_dofs),
             dtype=wp.float32,
             device=self.device,
         )
@@ -1267,6 +1278,10 @@ class IKObjectiveApparentGravity(IKObjectiveTemporal):
         """Return 2: the acceleration stencil couples frames ``t .. t + 2``."""
         return 2
 
+    def coeff_row_count(self) -> int:
+        """Return 2: only the two plate-tangential rows carry coefficients."""
+        return 2
+
     def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
         super().init_buffers(model, jacobian_mode)
         n_bodies = model.body_count
@@ -1525,6 +1540,10 @@ class IKObjectiveWorldPlane(IKObjectiveTemporal):
         """Return 0: each residual row only involves its own frame."""
         return 0
 
+    def coeff_row_count(self) -> int:
+        """Return the number of guarded points; only their rows are populated."""
+        return len(self._links_np)
+
     def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
         super().init_buffers(model, jacobian_mode)
         n_bodies = model.body_count
@@ -1771,6 +1790,10 @@ class IKObjectiveWorldPlaneCapsule(IKObjectiveTemporal):
         """Return 0: each residual row only involves its own frame."""
         return 0
 
+    def coeff_row_count(self) -> int:
+        """Return the number of guarded capsules; only their rows are populated."""
+        return len(self._links_np)
+
     def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
         super().init_buffers(model, jacobian_mode)
         n_bodies = model.body_count
@@ -1993,6 +2016,10 @@ class IKObjectiveFootSkate(IKObjectiveTemporal):
         """Return 1: each residual row couples frames ``t`` and ``t + 1``."""
         return 1
 
+    def coeff_row_count(self) -> int:
+        """Return three rows per tracked contact point."""
+        return 3 * len(self._links_np)
+
     def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
         super().init_buffers(model, jacobian_mode)
         if self.contact.shape != (self.n_batch, len(self._links_np)):
@@ -2199,6 +2226,10 @@ class IKObjectiveFootContact(IKObjectiveTemporal):
     def stencil_width(self) -> int:
         """Return 0: each residual row only involves its own frame."""
         return 0
+
+    def coeff_row_count(self) -> int:
+        """Return three rows per anchored link."""
+        return 3 * len(self._links_np)
 
     def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
         super().init_buffers(model, jacobian_mode)
@@ -2457,6 +2488,10 @@ class IKObjectiveSelfCollision(IKObjectiveTemporal):
     def stencil_width(self) -> int:
         """Return 0: each residual row only involves its own frame."""
         return 0
+
+    def coeff_row_count(self) -> int:
+        """Return the number of capsule pairs; only their rows are populated."""
+        return len(self._pairs_np)
 
     def init_buffers(self, model: Model, jacobian_mode: IKJacobianType) -> None:
         super().init_buffers(model, jacobian_mode)

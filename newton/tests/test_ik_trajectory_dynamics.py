@@ -532,10 +532,13 @@ def test_world_plane_coeffs_match_fd(test, device):
             fd[:, :, a] = (
                 _objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)
             ) / (2 * eps)
+        # rows past the guarded points are padding and must stay dead
+        n_active = coeffs.shape[1]
+        test.assertEqual(np.abs(fd[:, n_active:]).max(initial=0.0), 0.0)
         # skip rows within eps of the hinge kinks (clearance ~ 0 or ~ margin)
         res = _objective_residuals(obj, model, q_np, device)
         for t in range(N_FRAMES):
-            for c in range(n_dofs):
+            for c in range(n_active):
                 if np.abs(fd[t, c] - coeffs[t, c]).max() > 5e-3:
                     # tolerate kink frames: FD and analytic may straddle a kink
                     test.assertLess(np.abs(fd[t, c] - coeffs[t, c]).max(), 1.2, (t, c, res[t, c]))
@@ -717,11 +720,14 @@ def test_world_plane_capsule_coeffs_match_fd(test, device):
             fd[:, :, a] = (
                 _objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)
             ) / (2 * eps)
+        # rows past the guarded capsules are padding and must stay dead
+        n_active = coeffs.shape[1]
+        test.assertEqual(np.abs(fd[:, n_active:]).max(initial=0.0), 0.0)
         # strict everywhere except genuine endpoint near-ties of the
         # two-endpoint capsule, where FD straddles the min switch
         tie = np.abs(c_ends[:, 0] - c_ends[:, 1]) < 1e-3
         for t in range(n_rows):
-            for c in range(n_dofs):
+            for c in range(n_active):
                 if c == 0 and tie[t]:
                     continue
                 assert_np_equal(coeffs[t, c], fd[t, c].astype(np.float32), tol=5e-3)
@@ -832,7 +838,9 @@ def test_foot_contact_coeffs_match_fd(test, device):
             fd[:, :, a] = (
                 _objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)
             ) / (2 * eps)
-        assert_np_equal(coeffs, fd.astype(np.float32), tol=5e-3)
+        # rows past the anchored links are padding and must stay dead
+        test.assertEqual(np.abs(fd[:, coeffs.shape[1] :]).max(initial=0.0), 0.0)
+        assert_np_equal(coeffs, fd[:, : coeffs.shape[1]].astype(np.float32), tol=5e-3)
 
 
 def test_position_rotation_set_equivalence(test, device):
@@ -927,6 +935,9 @@ def test_self_collision_coeffs_match_fd(test, device):
             fd[:, :, a] = (
                 _objective_residuals(obj, model, qp, device) - _objective_residuals(obj, model, qm, device)
             ) / (2 * eps)
+        # rows past the capsule pairs are padding and must stay dead
+        test.assertEqual(np.abs(fd[:, coeffs.shape[1] :]).max(initial=0.0), 0.0)
+        fd = fd[:, : coeffs.shape[1]]
         # exact away from hinge kinks / degenerate parallel segments; allow
         # a small number of kink-straddling entries
         diff = np.abs(coeffs - fd)
