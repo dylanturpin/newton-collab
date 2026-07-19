@@ -75,18 +75,37 @@ class IKLinearSolver(str, Enum):
     """
 
 
+# Per-trajectory reductions run in two stages so long horizons do not
+# serialize on one thread per trajectory (dominant at small batch sizes).
 @wp.kernel
-def _reduce_costs_trajectory(
+def _reduce_costs_partial(
     costs_rows: wp.array[wp.float32],  # (n_rows,)
     n_frames: int,
+    chunk: int,
     # outputs
-    costs_traj: wp.array[wp.float32],  # (n_trajectories,)
+    partials: wp.array2d[wp.float32],  # (n_trajectories, n_chunks)
+):
+    p, c = wp.tid()
+    start = c * chunk
+    end = wp.min(start + chunk, n_frames)
+    acc = float(0.0)
+    for t in range(start, end):
+        acc += costs_rows[p * n_frames + t]
+    partials[p, c] = acc
+
+
+@wp.kernel
+def _reduce_partials(
+    partials: wp.array2d[wp.float32],  # (n_trajectories, n_chunks)
+    n_chunks: int,
+    # outputs
+    out: wp.array[wp.float32],  # (n_trajectories,)
 ):
     p = wp.tid()
     acc = float(0.0)
-    for t in range(n_frames):
-        acc += costs_rows[p * n_frames + t]
-    costs_traj[p] = acc
+    for c in range(n_chunks):
+        acc += partials[p, c]
+    out[p] = acc
 
 
 @wp.kernel
@@ -303,24 +322,27 @@ def _scatter_delta(
 
 
 @wp.kernel
-def _pred_reduction_trajectory(
+def _pred_reduction_partial(
     dq_dof: wp.array2d[wp.float32],  # (n_rows, n_dofs)
     grad: wp.array2d[wp.float32],  # (n_rows, n_dofs)
     lambda_traj: wp.array[wp.float32],  # (n_trajectories,)
     n_frames: int,
     n_dofs: int,
+    chunk: int,
     # outputs
-    pred: wp.array[wp.float32],  # (n_trajectories,)
+    partials: wp.array2d[wp.float32],  # (n_trajectories, n_chunks)
 ):
-    p = wp.tid()
+    p, c = wp.tid()
     lam = lambda_traj[p]
+    start = c * chunk
+    end = wp.min(start + chunk, n_frames)
     acc = float(0.0)
-    for t in range(n_frames):
+    for t in range(start, end):
         row = p * n_frames + t
         for d in range(n_dofs):
             dq = dq_dof[row, d]
             acc += dq * (lam * dq - grad[row, d])
-    pred[p] = 0.5 * acc
+    partials[p, c] = 0.5 * acc
 
 
 @wp.kernel
@@ -648,6 +670,12 @@ class IKSolverTrajectory(IKOptimizerLM):
         self.band = wp.zeros((n_rows, self.band_width + 1, n_dofs, n_dofs), dtype=wp.float32, device=device)
         self.fixed_mask = wp.array(self._fixed_mask_np, dtype=wp.uint8, device=device)
 
+        # two-stage per-trajectory reduction: chunk count capped so both
+        # stages stay parallel at million-frame horizons
+        self._red_chunk = max(16, -(-self.n_frames // 4096))
+        self._red_n_chunks = -(-self.n_frames // self._red_chunk)
+        self._traj_partials = wp.zeros((n_traj, self._red_n_chunks), dtype=wp.float32, device=device)
+
         self.costs_traj = wp.zeros(n_traj, dtype=wp.float32, device=device)
         self.costs_traj_proposed = wp.zeros(n_traj, dtype=wp.float32, device=device)
         self.lambda_traj = wp.zeros(n_traj, dtype=wp.float32, device=device)
@@ -778,6 +806,22 @@ class IKSolverTrajectory(IKOptimizerLM):
     # solve
     # ------------------------------------------------------------------
 
+    def _reduce_costs_traj(self, costs_rows: wp.array[wp.float32], out: wp.array[wp.float32]) -> None:
+        wp.launch(
+            _reduce_costs_partial,
+            dim=[self.n_trajectories, self._red_n_chunks],
+            inputs=[costs_rows, self.n_frames, self._red_chunk],
+            outputs=[self._traj_partials],
+            device=self.device,
+        )
+        wp.launch(
+            _reduce_partials,
+            dim=self.n_trajectories,
+            inputs=[self._traj_partials, self._red_n_chunks],
+            outputs=[out],
+            device=self.device,
+        )
+
     def step(
         self,
         joint_q_in: wp.array2d[wp.float32],
@@ -835,13 +879,7 @@ class IKSolverTrajectory(IKOptimizerLM):
             outputs=[self.costs],
             device=self.device,
         )
-        wp.launch(
-            _reduce_costs_trajectory,
-            dim=self.n_trajectories,
-            inputs=[self.costs, self.n_frames],
-            outputs=[self.costs_traj],
-            device=self.device,
-        )
+        self._reduce_costs_traj(self.costs, self.costs_traj)
 
         # dense per-frame Jacobian of the per-frame objectives
         self._jacobian_at(ctx_curr)
@@ -888,9 +926,16 @@ class IKSolverTrajectory(IKOptimizerLM):
             self._solve_cg()
 
         wp.launch(
-            _pred_reduction_trajectory,
+            _pred_reduction_partial,
+            dim=[self.n_trajectories, self._red_n_chunks],
+            inputs=[self.dq_dof, self.grad, self.lambda_traj, self.n_frames, self.n_dofs, self._red_chunk],
+            outputs=[self._traj_partials],
+            device=self.device,
+        )
+        wp.launch(
+            _reduce_partials,
             dim=self.n_trajectories,
-            inputs=[self.dq_dof, self.grad, self.lambda_traj, self.n_frames, self.n_dofs],
+            inputs=[self._traj_partials, self._red_n_chunks],
             outputs=[self.pred_reduction_traj],
             device=self.device,
         )
@@ -916,13 +961,7 @@ class IKSolverTrajectory(IKOptimizerLM):
             outputs=[self.costs_proposed],
             device=self.device,
         )
-        wp.launch(
-            _reduce_costs_trajectory,
-            dim=self.n_trajectories,
-            inputs=[self.costs_proposed, self.n_frames],
-            outputs=[self.costs_traj_proposed],
-            device=self.device,
-        )
+        self._reduce_costs_traj(self.costs_proposed, self.costs_traj_proposed)
 
         wp.launch(
             _accept_reject_trajectory,
@@ -1167,13 +1206,7 @@ class IKSolverTrajectory(IKOptimizerLM):
             Costs for each trajectory, shape [n_problems].
         """
         super().compute_costs(joint_q)
-        wp.launch(
-            _reduce_costs_trajectory,
-            dim=self.n_trajectories,
-            inputs=[self.costs, self.n_frames],
-            outputs=[self.costs_traj],
-            device=self.device,
-        )
+        self._reduce_costs_traj(self.costs, self.costs_traj)
         return self.costs_traj
 
     def reset(self) -> None:
