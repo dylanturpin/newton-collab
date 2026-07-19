@@ -44,6 +44,8 @@
 
 ### Fixed
 
+- Fix `SolverFeatherPGS` matrix-free contact response for moving kinematic free roots and automatically select H-inverse tiles that fit device shared memory.
+
 - Fix `SolverFeatherPGS.reset()` retaining dense and matrix-free warm-start impulses for reset worlds.
 - Fix `SolverFeatherPGS` treating kinematic bodies as dynamic, retaining stale body-flag state after model changes, routing zero-DOF kinematic roots through numerical solve paths, allocating contact rows between immovable bodies, and selecting CUDA-only kernels on CPU.
 - Fix USD joint `physics:collisionEnabled` import so joints with two explicit bodies honor authored collision behavior; joints to world continue to allow body/world collisions, and articulation-wide self-collision filtering remains additive.
