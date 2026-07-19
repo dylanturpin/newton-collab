@@ -13,6 +13,7 @@ import warp as wp
 import newton
 import newton.ik as ik
 from newton._src.sim.ik.ik_common import IKJacobianType, eval_fk_batched
+from newton._src.sim.ik.ik_trajectory_objectives import _motion_subspace_rows
 from newton.tests.unittest_utils import add_function_test, assert_np_equal, get_test_devices
 
 # Shared dimensions: keep identical across tests so the specialized tile
@@ -945,11 +946,66 @@ def test_self_collision_coeffs_match_fd(test, device):
         test.assertLess((diff > 5e-2).mean(), 0.05)
 
 
+def test_shared_fk_context_parity(test, device):
+    """Coefficients from solver-shared FK inputs must equal the standalone path."""
+    with wp.ScopedDevice(device):
+        model = _build_planar_vertical(device)
+        rng = np.random.default_rng(59)
+        q_np = rng.uniform(-0.9, 0.9, size=(N_FRAMES, model.joint_coord_count))
+        obj = _standalone_temporal(
+            ik.IKObjectiveWorldPlaneCapsule(
+                model, [EE_LINK], [[[-0.1, 0.0, 0.0], [0.1, 0.0, 0.0]]], [0.05], margin=0.1
+            ),
+            model,
+            N_FRAMES,
+            device,
+        )
+        joint_q = wp.array(q_np.astype(np.float32), dtype=wp.float32, device=device)
+        obj.compute_coeffs(joint_q)
+        own = obj.coeffs.numpy().copy()
+
+        # externally evaluated FK + motion subspace, as the solver would share
+        joint_qd = wp.zeros((N_FRAMES, model.joint_dof_count), dtype=wp.float32, device=device)
+        body_q = wp.zeros((N_FRAMES, model.body_count), dtype=wp.transform, device=device)
+        body_qd = wp.zeros((N_FRAMES, model.body_count), dtype=wp.spatial_vector, device=device)
+        eval_fk_batched(model, joint_q, joint_qd, body_q, body_qd)
+        joint_S_s = wp.zeros((N_FRAMES, model.joint_dof_count), dtype=wp.spatial_vector, device=device)
+        wp.launch(
+            _motion_subspace_rows,
+            dim=[N_FRAMES, model.joint_count],
+            inputs=[
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                joint_q,
+                model.joint_axis,
+                model.joint_dof_dim,
+                body_q,
+                model.body_com,
+                model.joint_X_p,
+            ],
+            outputs=[joint_S_s],
+            device=device,
+        )
+        obj.compute_coeffs(joint_q, body_q=body_q, joint_S_s=joint_S_s)
+        assert_np_equal(obj.coeffs.numpy(), own, tol=1e-7)
+
+
 devices = get_test_devices()
 
 
 class TestIKTrajectoryDynamics(unittest.TestCase):
     pass
+
+
+add_function_test(
+    TestIKTrajectoryDynamics,
+    "test_shared_fk_context_parity",
+    test_shared_fk_context_parity,
+    devices=devices,
+)
 
 
 add_function_test(
