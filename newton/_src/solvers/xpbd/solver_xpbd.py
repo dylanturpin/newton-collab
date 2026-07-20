@@ -30,7 +30,6 @@ from .kernels import (
     # solve_simple_body_joints,
     solve_springs,
     solve_tetrahedra,
-    update_body_velocities,
 )
 
 
@@ -43,6 +42,10 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
     After constructing :class:`Model`, :class:`State`, and :class:`Control` (optional) objects, this time-integrator
     may be used to advance the simulation state forward in time.
+
+    Rigid-body velocities use Newton's public ``(v_com_world, omega_world)`` convention throughout integration and
+    constraint projection. Enabling restitution adds velocity-level contact constraints without changing that
+    integration path for other bodies.
 
     Limitations:
         **Momentum conservation** -- When ``rigid_contact_con_weighting`` is
@@ -111,6 +114,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         joint_linear_compliance: float = 0.0,
         joint_angular_compliance: float = 0.0,
         rigid_contact_relaxation: float = 0.8,
+        rigid_contact_restitution_iterations: int = 16,
         rigid_contact_con_weighting: bool = True,
         angular_damping: float = 0.0,
         enable_restitution: bool = False,
@@ -133,6 +137,8 @@ class SolverXPBD(SolverBase, CouplingInterface):
             joint_angular_compliance: Compliance shared by angular joint constraints [rad/(N·m)]. Defaults to 0.0.
             rigid_contact_relaxation: Relaxation factor applied to rigid contact constraint corrections
                 [dimensionless]. Defaults to 0.8.
+            rigid_contact_restitution_iterations: Number of contact-weighted Jacobi iterations for rigid-body
+                restitution. Defaults to 16.
             rigid_contact_con_weighting: Whether to divide each rigid body's contact correction by its number of
                 active contacts. Defaults to ``True``.
             angular_damping: Rigid-body angular velocity damping coefficient [1/s]. Defaults to 0.0.
@@ -164,11 +170,17 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self.joint_angular_compliance = joint_angular_compliance
 
         self.rigid_contact_relaxation = rigid_contact_relaxation
+        if rigid_contact_restitution_iterations < 1:
+            raise ValueError("rigid_contact_restitution_iterations must be at least 1")
+        self.rigid_contact_restitution_iterations = rigid_contact_restitution_iterations
         self.rigid_contact_con_weighting = rigid_contact_con_weighting
 
         self.angular_damping = angular_damping
 
         self.enable_restitution = enable_restitution
+        self._rigid_restitution_enabled = False
+        if enable_restitution:
+            self._refresh_rigid_restitution_enabled()
         if not enable_restitution:
             # stacklevel=3 skips the deprecate_nonkeyword_arguments wrapper
             warnings.warn(
@@ -179,8 +191,6 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 DeprecationWarning,
                 stacklevel=3,
             )
-
-        self.compute_body_velocity_from_position_delta = False
 
         self._init_kinematic_state()
 
@@ -197,9 +207,8 @@ class SolverXPBD(SolverBase, CouplingInterface):
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached body data after model properties change.
 
-        Effective inverse masses and inertia tensors are refreshed when
-        :attr:`~newton.ModelFlags.BODY_PROPERTIES` or
-        :attr:`~newton.ModelFlags.BODY_INERTIAL_PROPERTIES` is set. Other flags are ignored.
+        Effective inverse masses and inertia tensors are refreshed for body-property changes. The cached restitution
+        state is refreshed for shape-property changes. Other flags are ignored.
 
         Args:
             flags: Bitmask of :class:`~newton.ModelFlags` or custom ``int`` bits indicating which model properties
@@ -208,6 +217,14 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self._apply_module_options()
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES):
             self._refresh_kinematic_state()
+        if self.enable_restitution and flags & ModelFlags.SHAPE_PROPERTIES:
+            self._refresh_rigid_restitution_enabled()
+
+    def _refresh_rigid_restitution_enabled(self) -> None:
+        restitution = self.model.shape_material_restitution
+        self._rigid_restitution_enabled = bool(
+            restitution is not None and restitution.size > 0 and (restitution.numpy() > 0.0).any()
+        )
 
     @override
     def coupling_supports_inertial_property_refresh(self) -> bool:
@@ -370,11 +387,13 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
         body_q = None
         body_qd = None
-        body_q_init = None
-        body_qd_init = None
+        body_q_pre_solve = None
+        body_qd_pre_solve = None
         body_deltas = None
 
         rigid_contact_inv_weight = None
+        restitution_contact_active = None
+        restitution_contact_inv_weight = None
 
         contact_impulse = None
         contact_impulse_iter = None
@@ -382,7 +401,9 @@ class SolverXPBD(SolverBase, CouplingInterface):
         if contacts:
             if self.rigid_contact_con_weighting:
                 rigid_contact_inv_weight = wp.zeros(model.body_count, dtype=float, device=model.device)
-            rigid_contact_inv_weight_init = None
+            if self.enable_restitution and self._rigid_restitution_enabled and model.body_count:
+                restitution_contact_active = wp.zeros(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
+                restitution_contact_inv_weight = wp.zeros(model.body_count, dtype=float, device=model.device)
 
             if contacts.force is not None:
                 contact_impulse = wp.zeros(contacts.rigid_contact_max, dtype=wp.spatial_vector, device=model.device)
@@ -405,11 +426,11 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 particle_qd = state_out.particle_qd
 
                 self.particle_q_init = wp.clone(state_in.particle_q)
-                if self.enable_restitution:
-                    self.particle_qd_init = wp.clone(state_in.particle_qd)
                 particle_deltas = wp.empty_like(state_out.particle_qd)
 
                 self.integrate_particles(model, state_in, state_out, dt)
+                if self.enable_restitution:
+                    self.particle_qd_init = wp.clone(state_out.particle_qd)
 
                 # Build/update the particle hash grid for particle-particle contact queries
                 if model.particle_count > 1 and model.particle_grid is not None:
@@ -421,10 +442,6 @@ class SolverXPBD(SolverBase, CouplingInterface):
             if model.body_count:
                 body_q = state_out.body_q
                 body_qd = state_out.body_qd
-
-                if self.compute_body_velocity_from_position_delta or self.enable_restitution:
-                    body_q_init = wp.clone(state_in.body_q)
-                    body_qd_init = wp.clone(state_in.body_qd)
 
                 body_deltas = wp.empty_like(state_out.body_qd)
 
@@ -468,6 +485,10 @@ class SolverXPBD(SolverBase, CouplingInterface):
                     state_in.body_f = body_f_tmp
                     self.integrate_bodies(model, state_in, state_out, dt, self.angular_damping)
                     state_in.body_f = body_f_prev
+
+                if self.enable_restitution:
+                    body_q_pre_solve = wp.clone(state_out.body_q)
+                    body_qd_pre_solve = wp.clone(state_out.body_qd)
 
             spring_constraint_lambdas = None
             if model.spring_count:
@@ -650,6 +671,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                 model.shape_material_mu,
                                 model.shape_material_mu_torsional,
                                 model.shape_material_mu_rolling,
+                                model.shape_material_restitution,
                                 self.rigid_contact_relaxation,
                                 dt,
                             ],
@@ -657,6 +679,8 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                 body_deltas,
                                 rigid_contact_inv_weight,
                                 contact_impulse_iter,
+                                restitution_contact_active,
+                                restitution_contact_inv_weight,
                             ],
                             device=model.device,
                         )
@@ -685,13 +709,6 @@ class SolverXPBD(SolverBase, CouplingInterface):
                         #     print("body_deltas:", body_deltas.numpy().flatten())
 
                         # print(rigid_active_contact_distance.numpy().flatten())
-
-                        if self.enable_restitution and i == 0:
-                            # remember contact constraint weighting from the first iteration
-                            if self.rigid_contact_con_weighting:
-                                rigid_contact_inv_weight_init = wp.clone(rigid_contact_inv_weight)
-                            else:
-                                rigid_contact_inv_weight_init = None
 
                         body_q, body_qd = self._apply_body_deltas(
                             model, state_in, state_out, body_deltas, dt, rigid_contact_inv_weight
@@ -775,24 +792,12 @@ class SolverXPBD(SolverBase, CouplingInterface):
                     state_out.body_q.assign(body_q)
                     state_out.body_qd.assign(body_qd)
 
-            # Update body velocities from position changes. Grad-enabled steps
-            # write into a cloned buffer so restitution can use corrected
-            # impact velocities without mutating a recorded array in place.
+            # Rigid integration and every positional correction update all
+            # bodies' public COM-referenced velocities incrementally. Velocity
+            # constraints consume that same convention without selecting a
+            # different integration path when restitution is enabled.
             body_qd_for_restitution = state_out.body_qd
-            if (self.compute_body_velocity_from_position_delta or self.enable_restitution) and model.body_count:
-                body_qd_from_position_delta = wp.clone(state_out.body_qd) if requires_grad else state_out.body_qd
-                wp.launch(
-                    kernel=update_body_velocities,
-                    dim=model.body_count,
-                    inputs=[state_out.body_q, body_q_init, model.body_com, dt],
-                    outputs=[body_qd_from_position_delta],
-                    device=model.device,
-                )
-                body_qd_for_restitution = body_qd_from_position_delta
-                if requires_grad:
-                    state_out.body_qd = body_qd_from_position_delta
 
-            # Restitution requires corrected velocities from update_body_velocities above.
             if self.enable_restitution and contacts is not None:
                 if model.particle_count:
                     # Grad-enabled steps write into a cloned buffer to avoid
@@ -809,9 +814,9 @@ class SolverXPBD(SolverBase, CouplingInterface):
                             model.particle_radius,
                             model.particle_flags,
                             body_q,
-                            body_q_init,
+                            body_q_pre_solve,
                             body_qd_for_restitution,
-                            body_qd_init,
+                            body_qd_pre_solve,
                             model.body_com,
                             model.shape_body,
                             model.particle_adhesion,
@@ -830,56 +835,52 @@ class SolverXPBD(SolverBase, CouplingInterface):
                     if requires_grad:
                         state_out.particle_qd = particle_qd_with_restitution
 
-                if model.body_count:
-                    if requires_grad:
-                        body_deltas = wp.zeros_like(body_deltas)
-                    else:
-                        body_deltas.zero_()
+                if model.body_count and self._rigid_restitution_enabled:
+                    body_qd_with_restitution = body_qd_for_restitution
+                    for _ in range(self.rigid_contact_restitution_iterations):
+                        if requires_grad:
+                            body_deltas = wp.zeros_like(body_deltas)
+                        else:
+                            body_deltas.zero_()
 
-                    wp.launch(
-                        kernel=apply_rigid_restitution,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[
-                            state_out.body_q,
-                            body_qd_for_restitution,
-                            body_q_init,
-                            body_qd_init,
-                            model.body_com,
-                            self.body_inv_mass_effective,
-                            self.body_inv_inertia_effective,
-                            model.body_world,
-                            model.shape_body,
-                            contacts.rigid_contact_count,
-                            contacts.rigid_contact_normal,
-                            contacts.rigid_contact_shape0,
-                            contacts.rigid_contact_shape1,
-                            model.shape_material_restitution,
-                            contacts.rigid_contact_point0,
-                            contacts.rigid_contact_point1,
-                            contacts.rigid_contact_offset0,
-                            contacts.rigid_contact_offset1,
-                            contacts.rigid_contact_margin0,
-                            contacts.rigid_contact_margin1,
-                            rigid_contact_inv_weight_init,
-                            model.gravity,
-                            dt,
-                        ],
-                        outputs=[
-                            body_deltas,
-                        ],
-                        device=model.device,
-                    )
+                        wp.launch(
+                            kernel=apply_rigid_restitution,
+                            dim=contacts.rigid_contact_max,
+                            inputs=[
+                                body_qd_with_restitution,
+                                body_q_pre_solve,
+                                body_qd_pre_solve,
+                                model.body_com,
+                                self.body_inv_mass_effective,
+                                self.body_inv_inertia_effective,
+                                model.body_world,
+                                model.shape_body,
+                                contacts.rigid_contact_count,
+                                restitution_contact_active,
+                                contacts.rigid_contact_normal,
+                                contacts.rigid_contact_shape0,
+                                contacts.rigid_contact_shape1,
+                                model.shape_material_restitution,
+                                contacts.rigid_contact_point0,
+                                contacts.rigid_contact_point1,
+                                contacts.rigid_contact_offset0,
+                                contacts.rigid_contact_offset1,
+                                model.gravity,
+                                dt,
+                            ],
+                            outputs=[body_deltas],
+                            device=model.device,
+                        )
 
-                    body_qd_with_restitution = wp.clone(body_qd_for_restitution) if requires_grad else state_out.body_qd
-                    wp.launch(
-                        kernel=apply_body_delta_velocities,
-                        dim=model.body_count,
-                        inputs=[
-                            body_deltas,
-                        ],
-                        outputs=[body_qd_with_restitution],
-                        device=model.device,
-                    )
+                        next_body_qd = wp.clone(body_qd_with_restitution) if requires_grad else body_qd_with_restitution
+                        wp.launch(
+                            kernel=apply_body_delta_velocities,
+                            dim=model.body_count,
+                            inputs=[body_deltas, restitution_contact_inv_weight],
+                            outputs=[next_body_qd],
+                            device=model.device,
+                        )
+                        body_qd_with_restitution = next_body_qd
                     if requires_grad:
                         state_out.body_qd = body_qd_with_restitution
 
