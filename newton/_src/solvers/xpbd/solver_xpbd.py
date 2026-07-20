@@ -114,7 +114,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         joint_linear_compliance: float = 0.0,
         joint_angular_compliance: float = 0.0,
         rigid_contact_relaxation: float = 0.8,
-        rigid_contact_restitution_iterations: int = 16,
+        rigid_contact_restitution_iterations: int = 2,
         rigid_contact_con_weighting: bool = True,
         angular_damping: float = 0.0,
         enable_restitution: bool = False,
@@ -138,7 +138,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
             rigid_contact_relaxation: Relaxation factor applied to rigid contact constraint corrections
                 [dimensionless]. Defaults to 0.8.
             rigid_contact_restitution_iterations: Number of contact-weighted Jacobi iterations for rigid-body
-                restitution. Defaults to 16.
+                restitution. Defaults to 2.
             rigid_contact_con_weighting: Whether to divide each rigid body's contact correction by its number of
                 active contacts. Defaults to ``True``.
             angular_damping: Rigid-body angular velocity damping coefficient [1/s]. Defaults to 0.0.
