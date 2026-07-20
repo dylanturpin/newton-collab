@@ -603,10 +603,22 @@ class ArticulationView:
         if articulation_count == 0:
             raise KeyError(f"No articulations matching pattern '{pattern}'")
 
-        if not all_equal(counts_per_world):
-            raise ValueError("Varying articulation counts per world are not supported")
+        # Worlds without matches are excluded from the view: the view spans only the
+        # subset of worlds that contain matched articulations (e.g. scenes where an
+        # articulation type exists in some worlds but not others). The view's world
+        # axis enumerates the matched worlds in ascending world order; the mapping
+        # back to model worlds is kept in ``world_indices``.
+        world_indices = [world_id for world_id in range(world_count) if counts_per_world[world_id] > 0]
+        if not all_equal([counts_per_world[world_id] for world_id in world_indices]):
+            raise ValueError("Varying articulation counts per matched world are not supported")
+        if len(world_indices) < world_count:
+            articulation_ids = [articulation_ids[world_id] for world_id in world_indices]
+            world_count = len(world_indices)
 
-        count_per_world = counts_per_world[0]
+        self.world_indices = world_indices
+        self.model_world_count = model.world_count
+
+        count_per_world = len(articulation_ids[0])
 
         # use the first articulation as a "template"
         arti_0 = articulation_ids[0][0]
@@ -667,6 +679,8 @@ class ArticulationView:
         joint_coord_starts = list_of_lists(world_count)
         joint_coord_counts = list_of_lists(world_count)
         root_joint_types = list_of_lists(world_count)
+        joint_type_seqs = list_of_lists(world_count)
+        joint_dof_dists = list_of_lists(world_count)
         link_starts = list_of_lists(world_count)
         link_counts = list_of_lists(world_count)
         shape_starts = list_of_lists(world_count)
@@ -693,6 +707,16 @@ class ArticulationView:
                 joint_coord_counts[world_id].append(joint_coord_end - joint_coord_start)
                 # root joint types
                 root_joint_types[world_id].append(int(model_joint_type[joint_start]))
+                # full joint-type sequence and per-joint dof distribution: equal totals
+                # can still hide structurally different articulations that would then
+                # silently alias each other's data through the strided layout
+                joint_type_seqs[world_id].append(model_joint_type[joint_start:joint_end].tobytes())
+                joint_dof_dists[world_id].append(
+                    (
+                        model_joint_qd_start[joint_start + 1 : joint_end + 1]
+                        - model_joint_qd_start[joint_start:joint_end]
+                    ).tobytes()
+                )
                 # links and shapes
                 link_ids = []
                 for j in range(joint_start, joint_end):
@@ -722,6 +746,14 @@ class ArticulationView:
             and all_equal(shape_counts)
         ):
             raise ValueError("Articulations are not identical")
+
+        # make sure the matched articulations share the template's structure, not
+        # just its totals (different robots with equal counts must be rejected)
+        if not (all_equal(joint_type_seqs) and all_equal(joint_dof_dists)):
+            raise ValueError(
+                f"Articulations matched by pattern '{pattern}' have identical counts but different"
+                " joint types or per-joint DOF layouts; such articulations cannot share one view."
+            )
 
         self.root_joint_type = root_joint_types[0][0]
         # fixed base means that all linear and angular degrees of freedom are locked at the root

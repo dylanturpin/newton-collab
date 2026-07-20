@@ -73,6 +73,7 @@ from .kernels import (
     eval_mujoco_coupling_effective_mass_block_kernel,
     eval_mujoco_coupling_effective_mass_kernel,
     eval_mujoco_coupling_gravity_acceleration_kernel,
+    gather_world_mask_kernel,
     recompute_jnt_eq_anchor1_kernel,
     repeat_array_kernel,
     reset_joint_state_kernel,
@@ -3291,6 +3292,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         model: Model,
         *,
         separate_worlds: bool | None = None,
+        worlds: list[int] | None = None,
         njmax: int | None = None,
         nconmax: int | None = None,
         iterations: int | None = None,
@@ -3331,6 +3333,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         Args:
             model: The model to be simulated.
             separate_worlds: If True, each Newton world is mapped to a separate MuJoCo world. Defaults to `not use_mujoco_cpu`.
+            worlds: Optional subset of Newton world indices this solver instance simulates.
+                All listed worlds must have identical structure (entity counts and types);
+                the first listed world is the conversion template. Worlds not listed are
+                ignored entirely — their state is neither read nor written, so several
+                solver instances with disjoint subsets can share one heterogeneous model.
+                ``None`` (default) simulates every world and requires a fully homogeneous
+                model. Requires ``separate_worlds=True`` semantics (GPU backend).
             njmax: Maximum number of constraints per world. If None, a default value is estimated from the initial state. Note that the larger of the user-provided value or the default value is used.
             nconmax: Number of contact points per world. If None, a default value is estimated from the initial state. Note that the larger of the user-provided value or the default value is used.
             iterations: Number of solver iterations. If None, uses model custom attribute or MuJoCo's default (100).
@@ -3555,6 +3564,17 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     )
         if separate_worlds is None:
             separate_worlds = not use_mujoco_cpu and model.world_count > 1
+
+        # Resolve the world subset this solver instance owns and precompute the
+        # per-world flat-array offsets every mapping table and sync kernel uses.
+        # For the default full set on a homogeneous model these offsets are the
+        # classic ``world * entities_per_world`` values.
+        if worlds is not None:
+            if use_mujoco_cpu:
+                raise ValueError("SolverMuJoCo: the 'worlds' subset option requires the GPU (mujoco_warp) backend.")
+            if not separate_worlds:
+                raise ValueError("SolverMuJoCo: the 'worlds' subset option requires separate_worlds=True.")
+        self._compute_world_layout(model, worlds, separate_worlds)
         # Buffers for the fast-path contact conversion optimisation.
         # See _convert_contacts_to_mjwarp / convert_newton_contacts_to_mjwarp_kernel.
         # Initialised before _convert_to_mjc because notify_model_changed (called
@@ -3728,21 +3748,37 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 f"world_mask has length {world_mask.shape[0]}, expected {world_count} (one entry per world)."
             )
 
+        # Subset solvers receive a model-sized mask; gather it down to this
+        # solver's active worlds so the per-local-world kernels see local rows.
+        if world_mask is not None and self.nworld_local != world_count:
+            if self._local_world_mask is None:
+                self._local_world_mask = wp.zeros(self.nworld_local, dtype=wp.bool, device=self.model.device)
+            wp.launch(
+                gather_world_mask_kernel,
+                dim=self.nworld_local,
+                inputs=[world_mask, self._active_worlds_wp],
+                outputs=[self._local_world_mask],
+                device=self.model.device,
+            )
+            world_mask = self._local_world_mask
+
         # Reset joint coordinates/velocities to model defaults for the selected
         # worlds. body_q/body_qd are FK outputs and intentionally not touched.
         flags_value = int(StateFlags.ALL if flags is None else flags)
         reset_q = bool(flags_value & StateFlags.JOINT_Q) and state.joint_q is not None
         reset_qd = bool(flags_value & StateFlags.JOINT_QD) and state.joint_qd is not None
         if reset_q or reset_qd:
-            coords_per_world = self.model.joint_coord_count // world_count
-            dofs_per_world = self.model.joint_dof_count // world_count
+            coords_per_world = int(self._world_counts_np["coord"][0])
+            dofs_per_world = int(self._world_counts_np["dof"][0])
             joint_dim = max(coords_per_world if reset_q else 0, dofs_per_world if reset_qd else 0)
             if joint_dim > 0:
                 wp.launch(
                     reset_joint_state_kernel,
-                    dim=(world_count, joint_dim),
+                    dim=(self.nworld_local, joint_dim),
                     inputs=[
                         world_mask,
+                        self.world_coord_start,
+                        self.world_dof_start,
                         coords_per_world,
                         dofs_per_world,
                         self.model.joint_q,
@@ -3833,10 +3869,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         wp.launch(
             eval_mujoco_coupling_gravity_acceleration_kernel,
+    gather_world_mask_kernel,
             dim=out_body_acceleration.shape[0],
             inputs=[
                 self.model.gravity,
                 self.model.body_world,
+                self.model_world_to_mjc_world,
                 self.mjc_body_to_newton,
                 body_gravcomp,
             ],
@@ -3875,6 +3913,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.model.body_mass,
                 self.model.particle_mass,
                 self.model.body_world,
+                self.model_world_to_mjc_world,
                 self.mjc_body_to_newton,
                 self.mjw_model.body_invweight0,
             ],
@@ -3926,6 +3965,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.model.body_inertia,
                 self.model.particle_mass,
                 self.model.body_world,
+                self.model_world_to_mjc_world,
                 self.mjc_body_to_newton,
                 self.mjw_model.body_invweight0,
             ],
@@ -3938,11 +3978,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if self.newton_shape_to_mjc_geom is None:
             self._create_inverse_shape_mapping()
 
-        # The kernel only produces valid output for tid < naconmax (the full
-        # path clamps count and rejects cid >= naconmax).  Launching more
-        # threads than naconmax wastes GPU resources, so cap the grid size.
+        # Scan the whole Newton contact buffer: world-subset solvers own a sparse
+        # subset of it, so owned contacts can sit at any index. Capacity is
+        # enforced per owned contact inside the kernel (cid >= naconmax rejected).
         naconmax = self.mjw_data.naconmax
-        launch_dim = min(contacts.rigid_contact_max, naconmax)
+        launch_dim = contacts.rigid_contact_max
 
         # Lazy-allocate the tid_to_cid buffer; reallocate if launch_dim grew
         # (e.g. a different Contacts object with a larger rigid_contact_max).
@@ -3979,7 +4019,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # contacts; the fast path restores the count from last_nacon_count.
         self.mjw_data.nacon.zero_()
 
-        bodies_per_world = self.model.body_count // self.model.world_count
         mujoco_attrs = getattr(model, "mujoco", None)
         shape_mjc_solref_mode = getattr(mujoco_attrs, "solref_mode", None) if mujoco_attrs is not None else None
         wp.launch(
@@ -4019,7 +4058,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 contacts.rigid_contact_damping,
                 contacts.rigid_contact_friction,
                 model.shape_margin,
-                bodies_per_world,
+                self.newton_body_to_mjc_world,
                 self.newton_shape_to_mjc_geom,
                 # Mujoco warp contacts
                 self.mjw_data.naconmax,
@@ -4060,6 +4099,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             dim=1,
             inputs=[
                 self.mjw_data.nacon,
+                naconmax,
                 self._last_nacon_count,
                 contacts.contact_generation,
                 self._last_contact_generation,
@@ -4277,6 +4317,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         Create the inverse shape mapping (Newton shape -> MuJoCo [world, geom]).
         This is lazily created only when use_mujoco_contacts=False.
         """
+        if getattr(self, "newton_shape_to_mjc_geom", None) is not None:
+            # already built body-consistently at conversion time
+            return
         nworld = self.mjc_geom_to_newton_shape.shape[0]
         ngeom = self.mjc_geom_to_newton_shape.shape[1]
 
@@ -4319,23 +4362,19 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             qfrc = wp.zeros((1, len(mj_data.qfrc_applied)), dtype=wp.float32, device=model.device)
             xfrc = wp.zeros((1, len(mj_data.xfrc_applied)), dtype=wp.spatial_vector, device=model.device)
             nworld = 1
-        joints_per_world = (
-            model.joint_count // model.world_count if single_world_template else model.joint_count // nworld
-        )
+        joints_per_world = int(self._world_counts_np["joint"][0])
         if control is not None:
             # Use instance arrays (built during MuJoCo model construction)
             if self.mjc_actuator_ctrl_source is not None and self.mjc_actuator_to_newton_idx is not None:
                 nu = self.mjc_actuator_ctrl_source.shape[0]
-                dofs_per_world = model.joint_dof_count // nworld if nworld > 0 else model.joint_dof_count
-                target_q_total = control.joint_target_q.shape[0] if control.joint_target_q is not None else 0
-                target_q_per_world = target_q_total // nworld if nworld > 0 else target_q_total
-                coords_per_world = model.joint_coord_count // nworld if nworld > 0 else model.joint_coord_count
 
                 # Get mujoco.ctrl (None if not available - won't be accessed if no CTRL_DIRECT actuators)
                 mujoco_ctrl_ns = getattr(control, "mujoco", None)
                 mujoco_ctrl = getattr(mujoco_ctrl_ns, "ctrl", None) if mujoco_ctrl_ns is not None else None
-                ctrls_per_world = mujoco_ctrl.shape[0] // nworld if mujoco_ctrl is not None and nworld > 0 else 0
 
+                world_target_q_start = (
+                    self.world_coord_start if model.use_coord_layout_targets else self.world_dof_start
+                )
                 wp.launch(
                     apply_mjc_control_kernel,
                     dim=(nworld, nu),
@@ -4350,11 +4389,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         control.joint_target_qd,
                         state.joint_q,
                         mujoco_ctrl,
-                        target_q_per_world,
-                        coords_per_world,
-                        dofs_per_world,
-                        ctrls_per_world,
-                        joints_per_world,
+                        world_target_q_start,
+                        self.world_coord_start,
+                        self.world_dof_start,
+                        self.world_actuator_start,
+                        self.world_joint_start,
                         model.use_coord_layout_targets,
                     ],
                     outputs=[
@@ -4375,7 +4414,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     model.joint_qd_start,
                     model.joint_dof_dim,
                     model.joint_X_c,
-                    joints_per_world,
+                    self.world_joint_start,
                     self.mj_qd_start,
                 ],
                 outputs=[
@@ -4434,8 +4473,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             # we have an MjData object from Mujoco
             effective_coord_count = model.joint_coord_count - self._total_loop_joint_coords
             single_world_template = len(mj_data.qpos) < effective_coord_count
+            # Per-template coord count (heterogeneous/subset-of-worlds safe); loop-joint
+            # coords are tracked globally, so subtract them conservatively.
             expected_qpos = (
-                effective_coord_count // model.world_count if single_world_template else effective_coord_count
+                max(int(self._world_counts_np["coord"][0]) - self._total_loop_joint_coords, 0)
+                if single_world_template
+                else effective_coord_count
             )
             assert len(mj_data.qpos) >= expected_qpos, (
                 f"MuJoCo qpos size ({len(mj_data.qpos)}) < expected joint coords ({expected_qpos})"
@@ -4449,9 +4492,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         else:
             joint_q = state.joint_q
             joint_qd = state.joint_qd
-        joints_per_world = (
-            model.joint_count // model.world_count if single_world_template else model.joint_count // nworld
-        )
+        joints_per_world = int(self._world_counts_np["joint"][0])
         mujoco_attrs = getattr(model, "mujoco", None)
         dof_ref = getattr(mujoco_attrs, "dof_ref", None) if mujoco_attrs is not None else None
         wp.launch(
@@ -4460,7 +4501,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             inputs=[
                 joint_q,
                 joint_qd,
-                joints_per_world,
+                self.world_joint_start,
                 model.joint_type,
                 model.joint_q_start,
                 model.joint_qd_start,
@@ -4512,9 +4553,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             qpos = wp.array([mj_data.qpos], dtype=wp.float32, device=model.device)
             qvel = wp.array([mj_data.qvel], dtype=wp.float32, device=model.device)
             nworld = 1
-        joints_per_world = (
-            model.joint_count // model.world_count if single_world_template else model.joint_count // nworld
-        )
+        joints_per_world = int(self._world_counts_np["joint"][0])
         mujoco_attrs = getattr(model, "mujoco", None)
         dof_ref = getattr(mujoco_attrs, "dof_ref", None) if mujoco_attrs is not None else None
         wp.launch(
@@ -4523,7 +4562,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             inputs=[
                 qpos,
                 qvel,
-                joints_per_world,
+                self.world_joint_start,
                 model.joint_type,
                 model.joint_q_start,
                 model.joint_qd_start,
@@ -4543,7 +4582,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=model.device,
         )
 
-        eval_fk(model, state.joint_q, state.joint_qd, state)
+        # Subset solvers only update kinematics for the worlds they own; the
+        # full-set solver keeps the cheaper unmasked call.
+        eval_fk(model, state.joint_q, state.joint_qd, state, mask=self.active_articulation_mask)
 
         # Update rigid force fields on state.
         if state.body_qdd is not None or state.body_parent_f is not None:
@@ -4581,7 +4622,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 inputs=[
                     mjw_qfrc,
                     mjw_qpos,
-                    joints_per_world,
+                    self.world_joint_start,
                     model.joint_type,
                     model.joint_q_start,
                     model.joint_qd_start,
@@ -4745,6 +4786,200 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=self.model.device,
         )
         contacts.n_contacts = mj_data.nacon
+
+    def _compute_world_layout(self, model: Model, worlds: list[int] | None, separate_worlds: bool = True) -> None:
+        """Resolve the active world subset and per-world flat-array offsets.
+
+        For every entity kind, builds an ``int32`` device array holding the flat
+        index of each active world's first entity. For the default full world
+        set on a homogeneous model these are the classic
+        ``world * entities_per_world`` offsets; for world subsets over
+        heterogeneous models they are gathered from the model's per-entity
+        world-assignment arrays. Every mapping table and state-sync kernel
+        indexes Newton's flat arrays through these offsets.
+
+        When ``separate_worlds`` is False the solver maps the whole model to a
+        single MuJoCo world: all offsets are zero, counts are the model totals,
+        and every model world maps to local world 0.
+        """
+        world_count = max(model.world_count, 1)
+        device = model.device
+
+        if not separate_worlds:
+            self.active_worlds = np.zeros(1, dtype=np.int32)
+            self.nworld_local = 1
+            zeros = np.zeros(1, dtype=np.int32)
+            mujoco_attrs = getattr(model, "mujoco", None)
+            self._world_starts_np = {kind: zeros for kind in
+                ("body", "joint", "dof", "coord", "shape", "eq", "tendon", "actuator", "pair", "mimic")}
+            self._world_counts_np = {
+                "body": np.array([model.body_count], dtype=np.int32),
+                "joint": np.array([model.joint_count], dtype=np.int32),
+                "dof": np.array([model.joint_dof_count], dtype=np.int32),
+                "coord": np.array([model.joint_coord_count], dtype=np.int32),
+                "shape": np.array([model.shape_count], dtype=np.int32),
+                "eq": np.array([getattr(mujoco_attrs, "equality_constraint_count", 0) if mujoco_attrs else 0], dtype=np.int32),
+                "tendon": zeros,
+                "actuator": zeros,
+                "pair": zeros,
+                "mimic": np.array([model.constraint_mimic_count], dtype=np.int32),
+            }
+            zero_wp = wp.zeros(1, dtype=wp.int32, device=device)
+            self.world_body_start = zero_wp
+            self.world_joint_start = zero_wp
+            self.world_dof_start = zero_wp
+            self.world_coord_start = zero_wp
+            self.world_shape_start = zero_wp
+            self.world_eq_start = zero_wp
+            self.world_tendon_start = zero_wp
+            self.world_actuator_start = zero_wp
+            self.world_pair_start = zero_wp
+            self.world_mimic_start = zero_wp
+            self._model_world_to_mjc_world_np = np.zeros(world_count, dtype=np.int32)
+            self.model_world_to_mjc_world = wp.zeros(world_count, dtype=wp.int32, device=device)
+            self.newton_body_to_mjc_world = wp.zeros(max(model.body_count, 1), dtype=wp.int32, device=device)
+            self.active_articulation_mask = None
+            self._active_worlds_wp = wp.zeros(1, dtype=wp.int32, device=device)
+            self._local_world_mask = None
+            return
+
+        if worlds is None:
+            active = np.arange(world_count, dtype=np.int32)
+        else:
+            active = np.asarray(worlds, dtype=np.int32)
+            if active.ndim != 1 or len(active) == 0:
+                raise ValueError("SolverMuJoCo: 'worlds' must be a non-empty 1D sequence of world indices.")
+            if len(active) > 1 and np.any(np.diff(active) <= 0):
+                raise ValueError("SolverMuJoCo: 'worlds' must be strictly ascending and free of duplicates.")
+            if int(active[0]) < 0 or int(active[-1]) >= world_count:
+                raise ValueError(f"SolverMuJoCo: 'worlds' entries must be in [0, {world_count}).")
+        self.active_worlds = active
+        self.nworld_local = int(len(active))
+
+        device = model.device
+
+        world_to_local = np.full(world_count, -1, dtype=np.int32)
+        world_to_local[active] = np.arange(len(active), dtype=np.int32)
+        self._model_world_to_mjc_world_np = world_to_local
+        self.model_world_to_mjc_world = wp.array(world_to_local, dtype=wp.int32, device=device)
+
+        def starts_and_counts(world_arr: np.ndarray, kind: str) -> tuple[np.ndarray, np.ndarray]:
+            starts = np.zeros(len(active), dtype=np.int32)
+            counts = np.zeros(len(active), dtype=np.int32)
+            for i, w in enumerate(active):
+                idx = np.flatnonzero(world_arr == w)
+                counts[i] = len(idx)
+                if len(idx):
+                    if int(idx[-1]) - int(idx[0]) + 1 != len(idx):
+                        raise ValueError(
+                            f"SolverMuJoCo: {kind} entities of world {int(w)} are not contiguous in the"
+                            " model's flat arrays; world-major layout is required."
+                        )
+                    starts[i] = idx[0]
+            return starts, counts
+
+        body_world_np = model.body_world.numpy()
+        joint_world_np = model.joint_world.numpy()
+        shape_world_np = model.shape_world.numpy()
+
+        body_starts, body_counts = starts_and_counts(body_world_np, "body")
+        joint_starts, joint_counts = starts_and_counts(joint_world_np, "joint")
+        shape_starts, shape_counts = starts_and_counts(shape_world_np, "shape")
+
+        # DOF/coordinate offsets derive from each world's first joint.
+        joint_q_start_np = model.joint_q_start.numpy()
+        joint_qd_start_np = model.joint_qd_start.numpy()
+        dof_starts = np.zeros(len(active), dtype=np.int32)
+        dof_counts = np.zeros(len(active), dtype=np.int32)
+        coord_starts = np.zeros(len(active), dtype=np.int32)
+        coord_counts = np.zeros(len(active), dtype=np.int32)
+        for i in range(len(active)):
+            if joint_counts[i]:
+                j0, j1 = int(joint_starts[i]), int(joint_starts[i]) + int(joint_counts[i])
+                dof_starts[i] = joint_qd_start_np[j0]
+                dof_counts[i] = joint_qd_start_np[j1] - joint_qd_start_np[j0]
+                coord_starts[i] = joint_q_start_np[j0]
+                coord_counts[i] = joint_q_start_np[j1] - joint_q_start_np[j0]
+
+        def optional_world_arr(container, name: str) -> np.ndarray | None:
+            arr = getattr(container, name, None)
+            if arr is None or (hasattr(arr, "shape") and len(arr) == 0):
+                return None
+            return arr.numpy()
+
+        mujoco_attrs = getattr(model, "mujoco", None)
+        eq_world_np = optional_world_arr(mujoco_attrs, "equality_constraint_world") if mujoco_attrs else None
+        tendon_world_np = optional_world_arr(mujoco_attrs, "tendon_world") if mujoco_attrs else None
+        actuator_world_np = optional_world_arr(mujoco_attrs, "actuator_world") if mujoco_attrs else None
+        pair_world_np = optional_world_arr(mujoco_attrs, "pair_world") if mujoco_attrs else None
+        mimic_world_np = optional_world_arr(model, "constraint_mimic_world")
+
+        empty = np.zeros(len(active), dtype=np.int32)
+        eq_starts, eq_counts = starts_and_counts(eq_world_np, "equality constraint") if eq_world_np is not None else (empty, empty)
+        tendon_starts, tendon_counts = (
+            starts_and_counts(tendon_world_np, "tendon") if tendon_world_np is not None else (empty, empty)
+        )
+        actuator_starts, actuator_counts = (
+            starts_and_counts(actuator_world_np, "actuator") if actuator_world_np is not None else (empty, empty)
+        )
+        pair_starts, pair_counts = (
+            starts_and_counts(pair_world_np, "pair") if pair_world_np is not None else (empty, empty)
+        )
+        mimic_starts, mimic_counts = (
+            starts_and_counts(mimic_world_np, "mimic constraint") if mimic_world_np is not None else (empty, empty)
+        )
+
+        self._world_starts_np = {
+            "body": body_starts,
+            "joint": joint_starts,
+            "dof": dof_starts,
+            "coord": coord_starts,
+            "shape": shape_starts,
+            "eq": eq_starts,
+            "tendon": tendon_starts,
+            "actuator": actuator_starts,
+            "pair": pair_starts,
+            "mimic": mimic_starts,
+        }
+        self._world_counts_np = {
+            "body": body_counts,
+            "joint": joint_counts,
+            "dof": dof_counts,
+            "coord": coord_counts,
+            "shape": shape_counts,
+            "eq": eq_counts,
+            "tendon": tendon_counts,
+            "actuator": actuator_counts,
+            "pair": pair_counts,
+            "mimic": mimic_counts,
+        }
+        self.world_body_start = wp.array(body_starts, dtype=wp.int32, device=device)
+        self.world_joint_start = wp.array(joint_starts, dtype=wp.int32, device=device)
+        self.world_dof_start = wp.array(dof_starts, dtype=wp.int32, device=device)
+        self.world_coord_start = wp.array(coord_starts, dtype=wp.int32, device=device)
+        self.world_shape_start = wp.array(shape_starts, dtype=wp.int32, device=device)
+        self.world_eq_start = wp.array(eq_starts, dtype=wp.int32, device=device)
+        self.world_tendon_start = wp.array(tendon_starts, dtype=wp.int32, device=device)
+        self.world_actuator_start = wp.array(actuator_starts, dtype=wp.int32, device=device)
+        self.world_pair_start = wp.array(pair_starts, dtype=wp.int32, device=device)
+        self.world_mimic_start = wp.array(mimic_starts, dtype=wp.int32, device=device)
+
+        # Newton body -> local MuJoCo world row (-1: static or not owned by this solver).
+        clipped = np.clip(body_world_np, 0, world_count - 1)
+        newton_body_to_mjc_world = np.where(body_world_np >= 0, world_to_local[clipped], -1).astype(np.int32)
+        self.newton_body_to_mjc_world = wp.array(newton_body_to_mjc_world, dtype=wp.int32, device=device)
+
+        # Articulation mask restricting FK to the worlds this solver owns.
+        # None (all articulations) for the full world set.
+        if len(active) == world_count:
+            self.active_articulation_mask = None
+        else:
+            articulation_world_np = model.articulation_world.numpy()
+            mask = np.isin(articulation_world_np, active)
+            self.active_articulation_mask = wp.array(mask, dtype=wp.bool, device=device)
+
+        self._active_worlds_wp = wp.array(active, dtype=wp.int32, device=device)
+        self._local_world_mask = None
 
     def _convert_to_mjc(
         self,
@@ -5183,11 +5418,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         joint_names = {}
 
         if separate_worlds:
-            # determine which shapes, bodies and joints belong to the first world
-            # based on the body world indices: we pick objects from the first world and global shapes
-            non_negatives = body_world[body_world >= 0]
-            if len(non_negatives) > 0:
-                first_world = np.min(non_negatives)
+            # determine which shapes, bodies and joints belong to the template world
+            # (the first ACTIVE world of this solver instance) plus global shapes
+            template_candidates = self.active_worlds[np.isin(self.active_worlds, body_world)]
+            if len(template_candidates) > 0:
+                first_world = int(template_candidates[0])
             else:
                 first_world = -1
             selected_shapes = np.where((shape_world == first_world) | (shape_world < 0))[0].astype(np.int32)
@@ -5313,9 +5548,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         for j in joints_loop:
             loop_coord_count += int(joint_q_start_np[j + 1]) - int(joint_q_start_np[j])
             loop_dof_count += int(joint_qd_start_np[j + 1]) - int(joint_qd_start_np[j])
+        self._template_loop_joint_coords = loop_coord_count
+        self._template_loop_joint_dofs = loop_dof_count
         if separate_worlds:
-            self._total_loop_joint_coords = loop_coord_count * model.world_count
-            self._total_loop_joint_dofs = loop_dof_count * model.world_count
+            self._total_loop_joint_coords = loop_coord_count * self.nworld_local
+            self._total_loop_joint_dofs = loop_dof_count * self.nworld_local
         else:
             self._total_loop_joint_coords = loop_coord_count
             self._total_loop_joint_dofs = loop_dof_count
@@ -5655,14 +5892,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # add static geoms attached to the worldbody
         add_geoms(-1)
 
-        # Maps from Newton joint index (per-world/template) to MuJoCo DOF start index (per-world/template)
-        # Only populated for template joints; in kernels, use joint_in_world to index
-        joint_mjc_dof_start = np.full(len(selected_joints), -1, dtype=np.int32)
-        joint_mjc_qpos_start = np.full(len(selected_joints), -1, dtype=np.int32)
+        # Maps from Newton joint index to MuJoCo DOF start index. Indexed by GLOBAL
+        # Newton joint id; only the template world's entries are populated.
+        joint_mjc_dof_start = np.full(model.joint_count, -1, dtype=np.int32)
+        joint_mjc_qpos_start = np.full(model.joint_count, -1, dtype=np.int32)
 
-        # Maps from Newton DOF index to MuJoCo joint index (first world only)
+        # Maps from GLOBAL Newton DOF index to MuJoCo joint index (template world only)
         # Needed because jnt_solimp/jnt_solref are per-joint (not per-DOF) in MuJoCo
-        dof_to_mjc_joint = np.full(model.joint_dof_count // model.world_count, -1, dtype=np.int32)
+        dof_to_mjc_joint = np.full(model.joint_dof_count, -1, dtype=np.int32)
 
         # This is needed for CTRL_DIRECT actuators targeting joints within combined Newton joints.
         mjc_joint_names: list[str] = []
@@ -6486,7 +6723,41 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             site_mapping,
         )
 
-        # Convert actuator mapping lists to warp arrays
+        # Convert actuator mapping lists to warp arrays. The spec-building code
+        # records GLOBAL template-world indices; the control kernel expects
+        # template-LOCAL offsets (it adds the per-world start tables), so
+        # normalize here, honoring the sign encodings.
+        coord_tmpl_start = int(self._world_starts_np["coord"][0])
+        dof_tmpl_start = int(self._world_starts_np["dof"][0])
+        target_tmpl_start = coord_tmpl_start if model.use_coord_layout_targets else dof_tmpl_start
+        actuator_tmpl_start = int(self._world_starts_np["actuator"][0])
+        normalized_newton_idx: list[int] = []
+        normalized_target_q_idx: list[int] = []
+        for row, (source, idx, tq_idx, axis_idx) in enumerate(
+            zip(
+                mjc_actuator_ctrl_source_list,
+                mjc_actuator_to_newton_idx_list,
+                mjc_actuator_to_target_q_idx_list,
+                mjc_actuator_to_target_q_axis_idx_list,
+            )
+        ):
+            if source == 0:  # JOINT_TARGET: idx is a dof encoding
+                if idx >= 0:
+                    idx = idx - dof_tmpl_start
+                elif idx <= -2:
+                    idx = -((-(idx + 2) - dof_tmpl_start) + 2)
+                if tq_idx >= 0:
+                    if axis_idx >= 0 and mjc_actuator_to_newton_idx_list[row] <= -2:
+                        # Ball velocity rows read the current quaternion: always coord space.
+                        tq_idx = tq_idx - coord_tmpl_start
+                    else:
+                        tq_idx = tq_idx - target_tmpl_start
+            else:  # CTRL_DIRECT: idx is a mujoco:actuator entity index
+                if idx >= 0:
+                    idx = idx - actuator_tmpl_start
+            normalized_newton_idx.append(idx)
+            normalized_target_q_idx.append(tq_idx)
+
         if mjc_actuator_ctrl_source_list:
             self.mjc_actuator_ctrl_source = wp.array(
                 np.array(mjc_actuator_ctrl_source_list, dtype=np.int32),
@@ -6494,12 +6765,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 device=model.device,
             )
             self.mjc_actuator_to_newton_idx = wp.array(
-                np.array(mjc_actuator_to_newton_idx_list, dtype=np.int32),
+                np.array(normalized_newton_idx, dtype=np.int32),
                 dtype=wp.int32,
                 device=model.device,
             )
             self.mjc_actuator_to_newton_target_q_idx = wp.array(
-                np.array(mjc_actuator_to_target_q_idx_list, dtype=np.int32),
+                np.array(normalized_target_q_idx, dtype=np.int32),
                 dtype=wp.int32,
                 device=model.device,
             )
@@ -6595,9 +6866,19 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mjw_model.mesh_pos = wp.array(self.mj_model.mesh_pos, dtype=wp.vec3)
 
             # Determine nworld for mapping dimensions
-            nworld = model.world_count if separate_worlds else 1
+            nworld = self.nworld_local if separate_worlds else 1
 
             # --- Create unified mappings: MuJoCo[world, entity] -> Newton[entity] ---
+            # Local world w (a row of this solver's MuJoCo data) covers Newton world
+            # self.active_worlds[w]; per-kind flat offsets come from the world-start
+            # tables computed in _compute_world_layout. Template-relative indices are
+            # obtained by subtracting the template world's start (active world 0).
+            body_starts_np = self._world_starts_np["body"]
+            joint_starts_np = self._world_starts_np["joint"]
+            dof_starts_np = self._world_starts_np["dof"]
+            body_tmpl_start = int(body_starts_np[0])
+            joint_tmpl_start = int(joint_starts_np[0])
+            dof_tmpl_start = int(dof_starts_np[0])
 
             # Build geom -> shape mapping
             # geom_to_shape_idx maps from MuJoCo geom index to absolute Newton shape index.
@@ -6627,41 +6908,98 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             geom_is_static_wp = wp.array(geom_is_static_np, dtype=bool)
 
             # Create mjc_geom_to_newton_shape: MuJoCo[world, geom] -> Newton shape
-            self.mjc_geom_to_newton_shape = wp.full((nworld, self.mj_model.ngeom), -1, dtype=wp.int32)
+            if not self._use_mujoco_contacts:
+                # Worlds may diverge in collision-shape census in this mode
+                # (the validator relaxes shape homogeneity), so positional
+                # matching against the template is invalid. Match shapes to
+                # template geoms within each body instead: injected contacts
+                # derive body attribution and material from the geom, so a
+                # shape must always resolve to a geom on its own body. Member
+                # shapes beyond a body's template geom count borrow the
+                # body's last template geom (correct body, approximate
+                # material); shapes on bodies without any template geom
+                # cannot be injected into MuJoCo and are dropped.
+                shape_body_np = model.shape_body.numpy()
+                shape_flags_np = model.shape_flags.numpy()
+                shape_starts_np = self._world_starts_np["shape"]
+                shape_counts_np = self._world_counts_np["shape"]
+                geom_map_np = np.full((nworld, self.mj_model.ngeom), -1, dtype=np.int32)
+                inverse_np = np.full(model.shape_count, -1, dtype=np.int32)
 
-            if self.mjw_model.geom_pos.size:
-                wp.launch(
-                    update_shape_mappings_kernel,
-                    dim=(nworld, self.mj_model.ngeom),
-                    inputs=[
-                        geom_to_shape_idx_wp,
-                        geom_is_static_wp,
-                        self._shapes_per_world,
-                        first_env_shape_base,
-                    ],
-                    outputs=[
-                        self.mjc_geom_to_newton_shape,
-                    ],
-                    device=model.device,
-                )
+                geoms_by_body: dict[int, list[int]] = {}
+                for geom_idx, abs_shape_idx in sorted(geom_to_shape_idx.items(), key=lambda item: item[1]):
+                    if shape_world[abs_shape_idx] < 0:
+                        # static shapes are shared by every world
+                        geom_map_np[:, geom_idx] = abs_shape_idx
+                        inverse_np[abs_shape_idx] = geom_idx
+                    else:
+                        local_body = int(shape_body_np[abs_shape_idx]) - body_tmpl_start
+                        geoms_by_body.setdefault(local_body, []).append(geom_idx)
+
+                dropped_shapes = 0
+                for w in range(nworld):
+                    shapes_by_body: dict[int, list[int]] = {}
+                    body_base = int(body_starts_np[w])
+                    for s in range(int(shape_starts_np[w]), int(shape_starts_np[w] + shape_counts_np[w])):
+                        # only colliding shapes produce Newton contacts; visual
+                        # shapes and sites never query the geom map
+                        if not shape_flags_np[s] & int(ShapeFlags.COLLIDE_SHAPES):
+                            continue
+                        shapes_by_body.setdefault(int(shape_body_np[s]) - body_base, []).append(s)
+                    for local_body, members in shapes_by_body.items():
+                        geoms = geoms_by_body.get(local_body, [])
+                        if not geoms:
+                            dropped_shapes += len(members)
+                            continue
+                        for rank, s in enumerate(members):
+                            inverse_np[s] = geoms[rank] if rank < len(geoms) else geoms[-1]
+                            if rank < len(geoms):
+                                geom_map_np[w, geoms[rank]] = s
+                if dropped_shapes:
+                    warnings.warn(
+                        f"SolverMuJoCo: {dropped_shapes} shape(s) sit on bodies without any"
+                        " template-world shape; their Newton contacts cannot be injected into"
+                        " MuJoCo and are dropped for this solver.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                self.mjc_geom_to_newton_shape = wp.array(geom_map_np, dtype=wp.int32, device=model.device)
+                self.newton_shape_to_mjc_geom = wp.array(inverse_np, dtype=wp.int32, device=model.device)
+            else:
+                self.mjc_geom_to_newton_shape = wp.full((nworld, self.mj_model.ngeom), -1, dtype=wp.int32)
+
+                if self.mjw_model.geom_pos.size:
+                    wp.launch(
+                        update_shape_mappings_kernel,
+                        dim=(nworld, self.mj_model.ngeom),
+                        inputs=[
+                            geom_to_shape_idx_wp,
+                            geom_is_static_wp,
+                            self.world_shape_start,
+                        ],
+                        outputs=[
+                            self.mjc_geom_to_newton_shape,
+                        ],
+                        device=model.device,
+                    )
 
             # Create mjc_body_to_newton: MuJoCo[world, body] -> Newton body
             # body_mapping is {newton_body_id: mjc_body_id}, we need to invert it
-            # and expand to 2D for all worlds
+            # and expand to 2D for all active worlds
             nbody = self.mj_model.nbody
-            bodies_per_world = model.body_count // model.world_count
+            bodies_per_world = int(self._world_counts_np["body"][0])
             mjc_body_to_newton_np = np.full((nworld, nbody), -1, dtype=np.int32)
             for newton_body, mjc_body in body_mapping.items():
                 if newton_body >= 0:  # Skip world body (-1 -> 0)
-                    newton_body_in_world = newton_body % bodies_per_world
+                    newton_body_in_world = newton_body - body_tmpl_start
                     for w in range(nworld):
-                        mjc_body_to_newton_np[w, mjc_body] = w * bodies_per_world + newton_body_in_world
+                        mjc_body_to_newton_np[w, mjc_body] = body_starts_np[w] + newton_body_in_world
             self.mjc_body_to_newton = wp.array(mjc_body_to_newton_np, dtype=wp.int32)
 
             # Common variables for mapping creation
             njnt = self.mj_model.njnt
-            joints_per_world = model.joint_count // model.world_count
-            dofs_per_world = model.joint_dof_count // model.world_count
+            joints_per_world = int(self._world_counts_np["joint"][0])
+            dofs_per_world = int(self._world_counts_np["dof"][0])
 
             # Map each Newton body to the qd_start of its free/DISTANCE joint (or -1).
             # Use selected_joints as the template and tile offsets across worlds.
@@ -6684,12 +7022,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             free_mask = np.isin(template_joint_types, (JointType.FREE, JointType.DISTANCE))
             body_free_qd_start_np = np.full(model.body_count, -1, dtype=np.int32)
             if np.any(free_mask):
-                template_children = joint_child_np[selected_joints] % bodies_per_world
-                template_qd_start = joint_qd_start_np[selected_joints] % dofs_per_world
+                template_children = joint_child_np[selected_joints] - body_tmpl_start
+                template_qd_start = joint_qd_start_np[selected_joints] - dof_tmpl_start
                 child_free = template_children[free_mask]
                 qd_start_free = template_qd_start[free_mask]
-                world_body_offsets = (np.arange(model.world_count, dtype=np.int32) * bodies_per_world)[:, None]
-                world_qd_offsets = (np.arange(model.world_count, dtype=np.int32) * dofs_per_world)[:, None]
+                world_body_offsets = body_starts_np.astype(np.int32)[:, None]
+                world_qd_offsets = dof_starts_np.astype(np.int32)[:, None]
                 body_indices = (child_free[None, :] + world_body_offsets).ravel()
                 qd_starts = (qd_start_free[None, :] + world_qd_offsets).ravel()
                 body_free_qd_start_np[body_indices] = qd_starts
@@ -6711,11 +7049,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     newton_body = mjc_body_to_newton_np[0, mjc_body]
                     if newton_body < 0:
                         continue
-                    newton_body_template = newton_body % bodies_per_world
                     for j in range(joints_per_world):
-                        if joint_child_np[j] == newton_body_template:
+                        if joint_child_np[joint_tmpl_start + j] == newton_body:
                             for w in range(nworld):
-                                mjc_mocap_to_newton_jnt_np[w, mocap_idx] = w * joints_per_world + j
+                                mjc_mocap_to_newton_jnt_np[w, mocap_idx] = joint_starts_np[w] + j
                             break
                 self.mjc_mocap_to_newton_jnt = wp.array(mjc_mocap_to_newton_jnt_np, dtype=wp.int32)
             else:
@@ -6725,17 +7062,17 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             # selected_joints[idx] is the Newton template joint index
             mjc_jnt_to_newton_jnt_np = np.full((nworld, njnt), -1, dtype=np.int32)
             # Invert dof_to_mjc_joint to get mjc_jnt -> template_dof, then find the joint
-            for template_dof, mjc_jnt in enumerate(dof_to_mjc_joint):
+            for global_dof, mjc_jnt in enumerate(dof_to_mjc_joint):
                 if mjc_jnt >= 0:
                     # Find which Newton template joint contains this DOF
                     # This is the first DOF of the joint, so we can search for it
                     for _ji, j in enumerate(selected_joints):
-                        j_dof_start = joint_qd_start[j] % dofs_per_world
+                        j_dof_start = joint_qd_start[j]
                         j_lin_count, j_ang_count = joint_dof_dim[j]
                         j_dof_end = j_dof_start + j_lin_count + j_ang_count
-                        if j_dof_start <= template_dof < j_dof_end:
+                        if j_dof_start <= global_dof < j_dof_end:
                             for w in range(nworld):
-                                mjc_jnt_to_newton_jnt_np[w, mjc_jnt] = w * joints_per_world + j
+                                mjc_jnt_to_newton_jnt_np[w, mjc_jnt] = joint_starts_np[w] + (j - joint_tmpl_start)
                             break
             self.mjc_jnt_to_newton_jnt = wp.array(mjc_jnt_to_newton_jnt_np, dtype=wp.int32)
 
@@ -6743,10 +7080,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             # joint_mjc_dof_start[template_joint] -> mjc_dof_start
             # dof_to_mjc_joint[template_dof] -> mjc_joint
             mjc_jnt_to_newton_dof_np = np.full((nworld, njnt), -1, dtype=np.int32)
-            for template_dof, mjc_jnt in enumerate(dof_to_mjc_joint):
+            for global_dof, mjc_jnt in enumerate(dof_to_mjc_joint):
                 if mjc_jnt >= 0:
                     for w in range(nworld):
-                        mjc_jnt_to_newton_dof_np[w, mjc_jnt] = w * dofs_per_world + template_dof
+                        mjc_jnt_to_newton_dof_np[w, mjc_jnt] = dof_starts_np[w] + (global_dof - dof_tmpl_start)
             self.mjc_jnt_to_newton_dof = wp.array(mjc_jnt_to_newton_dof_np, dtype=wp.int32)
 
             # Create mjc_dof_to_newton_dof: MuJoCo[world, dof] -> Newton DOF
@@ -6760,25 +7097,26 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     total_dofs = lin_count + ang_count
                     for d in range(total_dofs):
                         mjc_dof = mjc_dof_start + d
-                        template_newton_dof = (newton_dof_start % dofs_per_world) + d
+                        template_newton_dof = (newton_dof_start - dof_tmpl_start) + d
                         for w in range(nworld):
-                            mjc_dof_to_newton_dof_np[w, mjc_dof] = w * dofs_per_world + template_newton_dof
+                            mjc_dof_to_newton_dof_np[w, mjc_dof] = dof_starts_np[w] + template_newton_dof
             self.mjc_dof_to_newton_dof = wp.array(mjc_dof_to_newton_dof_np, dtype=wp.int32)
 
             # Create mjc_eq_to_newton_eq: MuJoCo[world, eq] -> Newton equality constraint
             # selected_constraints[idx] is the Newton template constraint index
             neq = self.mj_model.neq
-            eq_constraints_per_world = model.mujoco.equality_constraint_count // model.world_count
+            eq_starts_np = self._world_starts_np["eq"]
+            eq_tmpl_start = int(eq_starts_np[0])
             mjc_eq_to_newton_eq_np = np.full((nworld, neq), -1, dtype=np.int32)
             mjc_eq_to_newton_jnt_np = np.full((nworld, neq), -1, dtype=np.int32)
             for mjc_eq, newton_eq in mjc_eq_to_newton_eq_dict.items():
-                template_eq = newton_eq % eq_constraints_per_world if eq_constraints_per_world > 0 else newton_eq
+                template_eq = newton_eq - eq_tmpl_start
                 for w in range(nworld):
-                    mjc_eq_to_newton_eq_np[w, mjc_eq] = w * eq_constraints_per_world + template_eq
+                    mjc_eq_to_newton_eq_np[w, mjc_eq] = eq_starts_np[w] + template_eq
             for mjc_eq, newton_jnt in mjc_eq_to_newton_jnt.items():
-                template_jnt = newton_jnt % joints_per_world if joints_per_world > 0 else newton_jnt
+                template_jnt = newton_jnt - joint_tmpl_start
                 for w in range(nworld):
-                    mjc_eq_to_newton_jnt_np[w, mjc_eq] = w * joints_per_world + template_jnt
+                    mjc_eq_to_newton_jnt_np[w, mjc_eq] = joint_starts_np[w] + template_jnt
             self.mjc_eq_to_newton_eq = wp.array(mjc_eq_to_newton_eq_np, dtype=wp.int32)
             self.mjc_eq_to_newton_jnt = wp.array(mjc_eq_to_newton_jnt_np, dtype=wp.int32)
 
@@ -6802,41 +7140,29 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             )
 
             # Create mjc_eq_to_newton_mimic: MuJoCo[world, eq] -> Newton mimic constraint
-            mimic_per_world = (
-                model.constraint_mimic_count // model.world_count
-                if model.world_count > 0
-                else model.constraint_mimic_count
-            )
+            mimic_starts_np = self._world_starts_np["mimic"]
+            mimic_tmpl_start = int(mimic_starts_np[0])
             mjc_eq_to_newton_mimic_np = np.full((nworld, neq), -1, dtype=np.int32)
             for mjc_eq, newton_mimic in mjc_eq_to_newton_mimic_dict.items():
-                template_mimic = newton_mimic % mimic_per_world if mimic_per_world > 0 else newton_mimic
+                template_mimic = newton_mimic - mimic_tmpl_start
                 for w in range(nworld):
-                    mjc_eq_to_newton_mimic_np[w, mjc_eq] = w * mimic_per_world + template_mimic
+                    mjc_eq_to_newton_mimic_np[w, mjc_eq] = mimic_starts_np[w] + template_mimic
             self.mjc_eq_to_newton_mimic = wp.array(mjc_eq_to_newton_mimic_np, dtype=wp.int32)
 
             # Create mjc_tendon_to_newton_tendon: MuJoCo[world, tendon] -> Newton tendon
             # selected_tendons[idx] is the Newton template tendon index
             ntendon = self.mj_model.ntendon
             if ntendon > 0:
-                # Get tendon count per world from custom attributes
-                mujoco_attrs = getattr(model, "mujoco", None)
-                tendon_world = getattr(mujoco_attrs, "tendon_world", None) if mujoco_attrs else None
-                if tendon_world is not None:
-                    total_tendons = len(tendon_world)
-                    tendons_per_world = total_tendons // model.world_count if model.world_count > 0 else total_tendons
-                else:
-                    tendons_per_world = ntendon
+                tendon_starts_np = self._world_starts_np["tendon"]
+                tendon_tmpl_start = int(tendon_starts_np[0])
                 mjc_tendon_to_newton_tendon_np = np.full((nworld, ntendon), -1, dtype=np.int32)
                 for mjc_tendon, newton_tendon in enumerate(selected_tendons):
-                    template_tendon = newton_tendon % tendons_per_world if tendons_per_world > 0 else newton_tendon
+                    template_tendon = newton_tendon - tendon_tmpl_start
                     for w in range(nworld):
-                        mjc_tendon_to_newton_tendon_np[w, mjc_tendon] = w * tendons_per_world + template_tendon
+                        mjc_tendon_to_newton_tendon_np[w, mjc_tendon] = tendon_starts_np[w] + template_tendon
                 self.mjc_tendon_to_newton_tendon = wp.array(mjc_tendon_to_newton_tendon_np, dtype=wp.int32)
 
-            if separate_worlds:
-                nworld = model.world_count
-            else:
-                nworld = 1
+            nworld = self.nworld_local if separate_worlds else 1
 
             # TODO find better heuristics to determine nconmax and njmax
             if disable_contacts:
@@ -7080,7 +7406,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             overridden_options = set()
 
         mujoco_attrs = getattr(self.model, "mujoco", None)
-        nworld = self.model.world_count
+        nworld = self.nworld_local
 
         # Helper to get WORLD frequency option array or None
         def get_option(name: str):
@@ -7120,6 +7446,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             update_solver_options_kernel,
             dim=nworld,
             inputs=[
+                self._active_worlds_wp,
                 newton_impratio,
                 newton_tolerance,
                 newton_ls_tolerance,
@@ -7260,7 +7587,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if self.mjc_actuator_ctrl_source is not None and self.mjc_actuator_to_newton_idx is not None:
             nu = self.mjc_actuator_ctrl_source.shape[0]
             nworld = self.mjw_model.actuator_biasprm.shape[0]
-            dofs_per_world = self.model.joint_dof_count // nworld if nworld > 0 else self.model.joint_dof_count
 
             wp.launch(
                 update_axis_properties_kernel,
@@ -7271,7 +7597,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     self.model.joint_target_ke,
                     self.model.joint_target_kd,
                     self.model.joint_target_mode,
-                    dofs_per_world,
+                    self.world_dof_start,
                 ],
                 outputs=[
                     self.mjw_model.actuator_biasprm,
@@ -7346,14 +7672,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # so qpos0 must be correct before calling it.
         dof_ref = getattr(mujoco_attrs, "dof_ref", None) if mujoco_attrs is not None else None
         dof_springref = getattr(mujoco_attrs, "dof_springref", None) if mujoco_attrs is not None else None
-        joints_per_world = self.model.joint_count // nworld
-        bodies_per_world = self.model.body_count // nworld
+        joints_per_world = int(self._world_counts_np["joint"][0])
         wp.launch(
             sync_qpos0_kernel,
             dim=(nworld, joints_per_world),
             inputs=[
-                joints_per_world,
-                bodies_per_world,
+                self.world_joint_start,
+                self.world_body_start,
                 self.model.joint_type,
                 self.model.joint_q_start,
                 self.model.joint_qd_start,
@@ -8087,21 +8412,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             attr is not None
             for attr in [pair_solref, pair_solreffriction, pair_solimp, pair_margin, pair_gap, pair_friction]
         ):
-            # Compute pairs_per_world from Newton custom attributes
-            pair_world_attr = getattr(mujoco_attrs, "pair_world", None)
-            if pair_world_attr is not None:
-                total_pairs = len(pair_world_attr)
-                pairs_per_world = total_pairs // self.model.world_count
-            else:
-                pairs_per_world = npair
-
             world_count = self.mjw_data.nworld
 
             wp.launch(
                 update_pair_properties_kernel,
                 dim=(world_count, npair),
                 inputs=[
-                    pairs_per_world,
+                    self.world_pair_start,
                     pair_solref,
                     pair_solreffriction,
                     pair_solimp,
@@ -8346,7 +8663,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             return
 
         nworld = self.mjw_model.actuator_biasprm.shape[0]
-        actuators_per_world = actuator_gainprm.shape[0] // nworld if nworld > 0 else actuator_gainprm.shape[0]
 
         wp.launch(
             update_ctrl_direct_actuator_properties_kernel,
@@ -8362,7 +8678,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 actuator_actrange,
                 actuator_gear,
                 actuator_cranklength,
-                actuators_per_world,
+                self.world_actuator_start,
             ],
             outputs=[
                 self.mjw_model.actuator_gainprm,
@@ -8448,82 +8764,79 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if world_count <= 1:
             return
 
-        # --- Check entity count homogeneity ---
-        # Count entities per world (excluding global shapes)
-        non_global_shapes = shape_world[shape_world >= 0]
+        # --- Check entity count homogeneity across ACTIVE worlds ---
+        # A solver instance only simulates its active world subset; only those
+        # worlds must be structurally identical.
+        active = self.active_worlds
+        if len(active) <= 1:
+            return
 
-        for entity_name, world_arr in [
-            ("bodies", body_world),
-            ("joints", joint_world),
-            ("shapes", non_global_shapes),
-            ("equality constraints", eq_constraint_world),
-            ("mimic constraints", mimic_world),
-        ]:
-            # Use bincount for O(n) counting instead of O(n * world_count) loop
-            if len(world_arr) == 0:
-                continue
-            counts = np.bincount(world_arr.astype(np.int64), minlength=world_count)
-            # Vectorized check: all counts must equal the first
+        # Shape census only matters when MuJoCo runs its own collision
+        # pipeline; with Newton-pipeline contacts the geom maps are built
+        # body-consistently and worlds may diverge in collision shells.
+        entity_rows = [
+            ("bodies", self._world_counts_np["body"]),
+            ("joints", self._world_counts_np["joint"]),
+            ("equality constraints", self._world_counts_np["eq"]),
+            ("mimic constraints", self._world_counts_np["mimic"]),
+        ]
+        if self._use_mujoco_contacts:
+            entity_rows.insert(2, ("shapes", self._world_counts_np["shape"]))
+        for entity_name, counts in entity_rows:
             if not np.all(counts == counts[0]):
-                # Find first mismatch for error message (only on failure path)
-                expected = counts[0]
-                mismatched = np.where(counts != expected)[0]
-                w = mismatched[0]
+                mismatched = np.where(counts != counts[0])[0]
+                i = mismatched[0]
                 raise ValueError(
                     f"SolverMuJoCo requires homogeneous worlds. "
-                    f"World 0 has {expected} {entity_name}, but world {w} has {counts[w]}."
+                    f"World {int(active[0])} has {counts[0]} {entity_name}, "
+                    f"but world {int(active[i])} has {counts[i]}."
+                    + (
+                        " Pass disjoint 'worlds' subsets of structurally identical worlds to run a"
+                        " heterogeneous model with multiple solver instances."
+                        if len(active) == world_count
+                        else ""
+                    )
                 )
 
-        # --- Check type matching across worlds (vectorized) ---
-        # Load type arrays lazily - only when needed for validation
-        joints_per_world = model.joint_count // world_count
-        if joints_per_world > 0:
-            joint_type = model.joint_type.numpy()
-            joint_types_2d = joint_type.reshape(world_count, joints_per_world)
-            # Vectorized mismatch check: compare all rows to first row
-            mismatches = joint_types_2d != joint_types_2d[0]
-            if np.any(mismatches):
-                # Find first mismatch position using vectorized operations
-                j = np.argmax(np.any(mismatches, axis=0))
-                types = joint_types_2d[:, j]
-                raise ValueError(
-                    f"SolverMuJoCo requires homogeneous worlds. "
-                    f"Joint types mismatch at position {j}: world 0 has type {types[0]}, "
-                    f"but other worlds have types {types[1:].tolist()}."
-                )
+        # --- Check type matching across active worlds ---
+        def check_types(type_arr: np.ndarray, kind: str, starts: np.ndarray, counts: np.ndarray) -> None:
+            if counts[0] == 0:
+                return
+            template = type_arr[starts[0] : starts[0] + counts[0]]
+            for i in range(1, len(active)):
+                other = type_arr[starts[i] : starts[i] + counts[i]]
+                mismatches = other != template
+                if np.any(mismatches):
+                    j = int(np.argmax(mismatches))
+                    raise ValueError(
+                        f"SolverMuJoCo requires homogeneous worlds. "
+                        f"{kind} types mismatch at position {j}: world {int(active[0])} has type "
+                        f"{template[j]}, but world {int(active[i])} has type {other[j]}."
+                    )
 
-        # Only check non-global shapes
-        shapes_per_world = len(non_global_shapes) // world_count if world_count > 0 else 0
-        if shapes_per_world > 0:
-            shape_type = model.shape_type.numpy()
-            # Get shape types for non-global shapes only
-            non_global_shape_types = shape_type[shape_world >= 0]
-            shape_types_2d = non_global_shape_types.reshape(world_count, shapes_per_world)
-            # Vectorized mismatch check
-            mismatches = shape_types_2d != shape_types_2d[0]
-            if np.any(mismatches):
-                s = np.argmax(np.any(mismatches, axis=0))
-                types = shape_types_2d[:, s]
-                raise ValueError(
-                    f"SolverMuJoCo requires homogeneous worlds. "
-                    f"Shape types mismatch at position {s}: world 0 has type {types[0]}, "
-                    f"but other worlds have types {types[1:].tolist()}."
-                )
+        if self._world_counts_np["joint"][0] > 0:
+            check_types(
+                model.joint_type.numpy(),
+                "Joint",
+                self._world_starts_np["joint"],
+                self._world_counts_np["joint"],
+            )
 
-        constraints_per_world = (model.mujoco.equality_constraint_count // world_count) if world_count > 0 else 0
-        if constraints_per_world > 0:
-            eq_constraint_type = model.mujoco.equality_constraint_type.numpy()
-            constraint_types_2d = eq_constraint_type.reshape(world_count, constraints_per_world)
-            # Vectorized mismatch check
-            mismatches = constraint_types_2d != constraint_types_2d[0]
-            if np.any(mismatches):
-                c = np.argmax(np.any(mismatches, axis=0))
-                types = constraint_types_2d[:, c]
-                raise ValueError(
-                    f"SolverMuJoCo requires homogeneous worlds. "
-                    f"Equality constraint types mismatch at position {c}: world 0 has type {types[0]}, "
-                    f"but other worlds have types {types[1:].tolist()}."
-                )
+        if self._use_mujoco_contacts and self._world_counts_np["shape"][0] > 0:
+            check_types(
+                model.shape_type.numpy(),
+                "Shape",
+                self._world_starts_np["shape"],
+                self._world_counts_np["shape"],
+            )
+
+        if self._world_counts_np["eq"][0] > 0:
+            check_types(
+                model.mujoco.equality_constraint_type.numpy(),
+                "Equality constraint",
+                self._world_starts_np["eq"],
+                self._world_counts_np["eq"],
+            )
 
     def render_mujoco_viewer(
         self,

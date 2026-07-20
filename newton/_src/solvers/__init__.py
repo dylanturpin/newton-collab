@@ -5,7 +5,7 @@ from .featherstone import SolverFeatherstone
 from .flags import SolverNotifyFlags
 from .implicit_mpm import SolverImplicitMPM
 from .kamino import SolverKamino
-from .mujoco import SolverMuJoCo
+from .mujoco import SolverMuJoCo, SolverMuJoCoGroup, audit_group_value_transport, compute_structural_world_groups
 from .semi_implicit import SolverSemiImplicit
 from .solver import SolverBase
 from .style3d.solver_style3d import SolverStyle3D
@@ -18,6 +18,7 @@ __all__ = [
     "SolverImplicitMPM",
     "SolverKamino",
     "SolverMuJoCo",
+    "SolverMuJoCoGroup",
     "SolverNotifyFlags",
     "SolverSemiImplicit",
     "SolverStyle3D",

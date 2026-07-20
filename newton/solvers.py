@@ -24,12 +24,14 @@ from ._src.solvers import (
     SolverImplicitMPM,
     SolverKamino,
     SolverMuJoCo,
+    SolverMuJoCoGroup,
     SolverSemiImplicit,
     SolverStyle3D,
     SolverVBD,
     SolverXPBD,
     style3d,
 )
+from ._src.solvers.mujoco import audit_group_value_transport, compute_structural_world_groups
 from ._src.solvers import coupled as _coupled
 
 # solver flags
@@ -53,6 +55,9 @@ __all__ = [
     "SolverImplicitMPM",
     "SolverKamino",
     "SolverMuJoCo",
+    "SolverMuJoCoGroup",
+    "audit_group_value_transport",
+    "compute_structural_world_groups",
     "SolverNotifyFlags",
     "SolverSemiImplicit",
     "SolverStyle3D",
