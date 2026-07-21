@@ -39,5 +39,6 @@ Public inverse-kinematics API for defining objectives and solving IK problems.
    IKOptimizerLBFGS
    IKOptimizerLM
    IKSampler
+   IKSharedMemoryError
    IKSolver
    IKSolverTrajectory

@@ -42,8 +42,10 @@ class IKLinearSolver(str, Enum):
     DIRECT = "direct"
     """Batched block-tridiagonal Cholesky (block Thomas algorithm).
 
-    Exact solve, sequential over frames inside a single kernel, parallel
-    across trajectories. Preferred for moderate horizon lengths and larger
+    Exact solve, sequential over frames inside each trajectory's CUDA
+    block, parallel across trajectories. The factorization streams through
+    global workspaces so at most three superblock tiles live in shared
+    memory at once. Preferred for moderate horizon lengths and larger
     trajectory batches.
     """
 
@@ -68,10 +70,24 @@ class IKLinearSolver(str, Enum):
     Schur-complement reduction used here preserves symmetric positive
     definiteness so every factorization stays a Cholesky.
 
-    The interior factorization carries three simultaneous right-hand sides,
-    so it reaches the tile shared-memory limit at smaller superblock sizes
-    than :attr:`DIRECT` (roughly ``k * n_dofs <= 24-32`` fp32); larger
-    problems should use :attr:`DIRECT` or :attr:`CG`.
+    The factorization streams through global workspaces in several lean
+    passes, so its largest kernel holds five superblock tiles in CUDA
+    shared memory (``5 * (k * n_dofs)^2`` fp32); problems whose
+    factorization kernels exceed the device's shared-memory limit raise
+    :class:`~newton.ik.IKSharedMemoryError` at construction and should use
+    :attr:`CG`.
+    """
+
+
+class IKSharedMemoryError(RuntimeError):
+    """Specialized tile kernels exceed the CUDA device's shared-memory limit.
+
+    Raised at construction by :class:`~newton.ik.IKSolverTrajectory` when the
+    :attr:`IKLinearSolver.DIRECT` or :attr:`IKLinearSolver.SPIKE` backend is
+    selected but a factorization kernel's dynamic shared-memory footprint —
+    proportional to the squared superblock size ``(k * n_dofs)^2`` set by the
+    objective stack's temporal stencil width — does not fit the device. Catch
+    it to fall back to :attr:`IKLinearSolver.CG`.
     """
 
 
@@ -655,6 +671,41 @@ def _spike_recover(
     x_bar[p, g, a] = acc
 
 
+@wp.kernel
+def _refine_residual_f64(
+    d_bar: wp.array4d[wp.float32],  # (n_traj, n_super, m, m)
+    l_bar: wp.array4d[wp.float32],  # (n_traj, n_super, m, m), block (g, g - 1)
+    b_bar: wp.array3d[wp.float32],  # (n_traj, n_super, m)
+    x_bar: wp.array3d[wp.float32],  # (n_traj, n_super, m)
+    n_super: int,
+    m: int,
+    # outputs
+    r_bar: wp.array3d[wp.float32],  # (n_traj, n_super, m)
+):
+    """Banded residual r = b - A x accumulated in float64 (iterative refinement)."""
+    p, g, a = wp.tid()
+    acc = wp.float64(b_bar[p, g, a])
+    for c in range(m):
+        acc -= wp.float64(d_bar[p, g, a, c]) * wp.float64(x_bar[p, g, c])
+    if g > 0:
+        for c in range(m):
+            acc -= wp.float64(l_bar[p, g, a, c]) * wp.float64(x_bar[p, g - 1, c])
+    if g < n_super - 1:
+        for c in range(m):
+            acc -= wp.float64(l_bar[p, g + 1, c, a]) * wp.float64(x_bar[p, g + 1, c])
+    r_bar[p, g, a] = wp.float32(acc)
+
+
+@wp.kernel
+def _add_refine_delta(
+    dx_bar: wp.array3d[wp.float32],  # (n_traj, n_super, m)
+    # outputs
+    x_bar: wp.array3d[wp.float32],  # (n_traj, n_super, m)
+):
+    p, g, a = wp.tid()
+    x_bar[p, g, a] += dx_bar[p, g, a]
+
+
 class IKSolverTrajectory(IKOptimizerLM):
     """Levenberg-Marquardt trajectory IK with a block-banded global solve.
 
@@ -694,6 +745,14 @@ class IKSolverTrajectory(IKOptimizerLM):
         spike_partitions: Number of parallel partitions of the frame chain
             (SPIKE backend only). ``None`` picks roughly one partition per
             16 superblocks, clamped to a valid range.
+        refine_iterations: Number of float64-residual iterative-refinement
+            passes applied after each linear solve, reusing the stored
+            factors (DIRECT and SPIKE backends only; forced to ``0`` for
+            CG, which does not factorize). Typically one pass drives the
+            fp32 solution of an IK-shaped system to its correctly rounded
+            value (near-flat spectra can need two), and the refined fixed
+            point is independent of the backend choice (bitwise); ``0``
+            keeps the raw fp32 factorization result.
     """
 
     TILE_M_SUPER = None
@@ -741,6 +800,7 @@ class IKSolverTrajectory(IKOptimizerLM):
         cg_iterations: int = 64,
         cg_tol: float = 1e-6,
         spike_partitions: int | None = None,
+        refine_iterations: int = 0,
     ) -> None:
         if isinstance(jacobian_mode, str):
             jacobian_mode = IKJacobianType(jacobian_mode)
@@ -750,12 +810,15 @@ class IKSolverTrajectory(IKOptimizerLM):
             raise ValueError("n_frames must be >= 2")
         if n_problems < 1:
             raise ValueError("n_problems must be >= 1")
+        if refine_iterations < 0:
+            raise ValueError("refine_iterations must be >= 0")
 
         self.n_frames = n_frames
         self.n_trajectories = n_problems
         self.linear_solver = linear_solver
         self.cg_iterations = cg_iterations
         self.cg_tol = cg_tol
+        self.refine_iterations = refine_iterations if linear_solver is not IKLinearSolver.CG else 0
 
         self.temporal_objectives = [o for o in objectives if isinstance(o, IKObjectiveTemporal)]
         self._temporal_uses_fk = any(o.uses_fk for o in self.temporal_objectives)
@@ -892,14 +955,21 @@ class IKSolverTrajectory(IKOptimizerLM):
             self.l_bar = wp.zeros((n_traj, n_super, m, m), dtype=wp.float32, device=device)
             self.b_bar = wp.zeros((n_traj, n_super, m), dtype=wp.float32, device=device)
             self.x_bar = wp.zeros((n_traj, n_super, m), dtype=wp.float32, device=device)
+            if self.refine_iterations > 0:
+                self._ref_r_bar = wp.zeros((n_traj, n_super, m), dtype=wp.float32, device=device)
+                self._ref_dx_bar = wp.zeros((n_traj, n_super, m), dtype=wp.float32, device=device)
         if self.linear_solver is IKLinearSolver.DIRECT:
             self._chol_ws = wp.zeros((n_traj, n_super, m, m), dtype=wp.float32, device=device)
             self._coupling_ws = wp.zeros((n_traj, n_super, m, m), dtype=wp.float32, device=device)
-            self._fwd_ws = wp.zeros((n_traj, n_super, m), dtype=wp.float32, device=device)
+            # the factorization/substitution kernels walk one partition per
+            # block; the whole chain is a single partition here
+            self._thomas_istart = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
+            self._thomas_ilen = wp.array(np.array([n_super], dtype=np.int32), dtype=wp.int32, device=device)
         elif self.linear_solver is IKLinearSolver.SPIKE:
             self._alloc_spike_buffers()
         else:
             self._alloc_cg_buffers()
+        self._check_tile_shared_memory()
 
     def _alloc_spike_buffers(self) -> None:
         device = self.device
@@ -930,7 +1000,8 @@ class IKSolverTrajectory(IKOptimizerLM):
         self._sp_x_sep = wp.zeros((n_traj, n_sep, m), dtype=wp.float32, device=device)
         self._sp_chol_sep = wp.zeros((n_traj, n_sep, m, m), dtype=wp.float32, device=device)
         self._sp_coup_sep = wp.zeros((n_traj, n_sep, m, m), dtype=wp.float32, device=device)
-        self._sp_fwd_sep = wp.zeros((n_traj, n_sep, m), dtype=wp.float32, device=device)
+        self._sp_sep_istart = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
+        self._sp_sep_ilen = wp.array(np.array([n_sep], dtype=np.int32), dtype=wp.int32, device=device)
 
     def _alloc_cg_buffers(self) -> None:
         device = self.device
@@ -1284,20 +1355,57 @@ class IKSolverTrajectory(IKOptimizerLM):
             device=self.device,
         )
 
-    def _solve_direct(self) -> None:
-        n_dofs = self.n_dofs
-        self._gather_banded()
+    def _refine_step(self, substitute) -> None:
+        """One float64-residual refinement pass; `substitute` solves A dx = r."""
+        m = self.kb * self.n_dofs
+        wp.launch(
+            _refine_residual_f64,
+            dim=[self.n_trajectories, self.n_superblocks, m],
+            inputs=[self.d_bar, self.l_bar, self.b_bar, self.x_bar, self.n_superblocks, m],
+            outputs=[self._ref_r_bar],
+            device=self.device,
+        )
+        substitute()
+        wp.launch(
+            _add_refine_delta,
+            dim=[self.n_trajectories, self.n_superblocks, m],
+            inputs=[self._ref_dx_bar],
+            outputs=[self.x_bar],
+            device=self.device,
+        )
 
+    def _direct_factor_solve(self) -> None:
+        """Solve the gathered banded system into ``x_bar`` (DIRECT backend)."""
         self._block_thomas_solve(
             self.d_bar,
             self.l_bar,
             self.b_bar,
-            self.n_superblocks,
+            self._thomas_istart,
+            self._thomas_ilen,
             self.x_bar,
             self._chol_ws,
             self._coupling_ws,
-            self._fwd_ws,
         )
+
+        def substitute():
+            self._banded_substitute(
+                self._ref_r_bar,
+                self._thomas_istart,
+                self._thomas_ilen,
+                1,
+                self._chol_ws,
+                self._coupling_ws,
+                self._ref_dx_bar,
+                self.n_trajectories,
+            )
+
+        for _ in range(self.refine_iterations):
+            self._refine_step(substitute)
+
+    def _solve_direct(self) -> None:
+        n_dofs = self.n_dofs
+        self._gather_banded()
+        self._direct_factor_solve()
 
         wp.launch(
             _scatter_delta,
@@ -1307,12 +1415,10 @@ class IKSolverTrajectory(IKOptimizerLM):
             device=self.device,
         )
 
-    def _solve_spike(self) -> None:
-        n_dofs = self.n_dofs
-        m = self.kb * n_dofs
+    def _spike_factor_solve(self) -> None:
+        """Solve the gathered banded system into ``x_bar`` (SPIKE backend)."""
+        m = self.kb * self.n_dofs
         n_parts = self._spike_n_parts
-
-        self._gather_banded()
 
         # factor every interior in parallel; solve for the local rhs and the
         # left/right spike columns in one pass
@@ -1347,36 +1453,81 @@ class IKSolverTrajectory(IKOptimizerLM):
         )
 
         # the reduced system is block-tridiagonal with the same block size:
-        # reuse the sequential Thomas kernel (n_parts - 1 blocks, cheap)
+        # reuse the sequential Thomas kernels (n_parts - 1 blocks, cheap)
         self._block_thomas_solve(
             self._sp_d_sep,
             self._sp_l_sep,
             self._sp_b_sep,
-            n_parts - 1,
+            self._sp_sep_istart,
+            self._sp_sep_ilen,
             self._sp_x_sep,
             self._sp_chol_sep,
             self._sp_coup_sep,
-            self._sp_fwd_sep,
         )
 
         # recover the interiors in parallel from the separator solution
-        wp.launch(
-            _spike_recover,
-            dim=[self.n_trajectories, self.n_superblocks, m],
-            inputs=[
-                self._sp_y,
-                self._sp_u,
-                self._sp_v,
-                self._sp_x_sep,
-                self._sp_kind,
-                self._sp_idx,
-                self._sp_loc,
+        def recover(x_out):
+            wp.launch(
+                _spike_recover,
+                dim=[self.n_trajectories, self.n_superblocks, m],
+                inputs=[
+                    self._sp_y,
+                    self._sp_u,
+                    self._sp_v,
+                    self._sp_x_sep,
+                    self._sp_kind,
+                    self._sp_idx,
+                    self._sp_loc,
+                    n_parts,
+                    m,
+                ],
+                outputs=[x_out],
+                device=self.device,
+            )
+
+        recover(self.x_bar)
+
+        def substitute():
+            # interior substitution of the residual, then the same Schur
+            # rhs/reduced-solve/recovery chain as the primary solve
+            self._banded_substitute(
+                self._ref_r_bar,
+                self._sp_istart,
+                self._sp_ilen,
                 n_parts,
-                m,
-            ],
-            outputs=[self.x_bar],
-            device=self.device,
-        )
+                self._sp_chol,
+                self._sp_coup,
+                self._sp_y,
+                self.n_trajectories * n_parts,
+            )
+            self._spike_schur_rhs(
+                self._ref_r_bar,
+                self.l_bar,
+                self._sp_istart,
+                self._sp_ilen,
+                n_parts,
+                self._sp_y,
+                self._sp_b_sep,
+            )
+            self._banded_substitute(
+                self._sp_b_sep,
+                self._sp_sep_istart,
+                self._sp_sep_ilen,
+                1,
+                self._sp_chol_sep,
+                self._sp_coup_sep,
+                self._sp_x_sep,
+                self.n_trajectories,
+            )
+            recover(self._ref_dx_bar)
+
+        for _ in range(self.refine_iterations):
+            self._refine_step(substitute)
+
+    def _solve_spike(self) -> None:
+        n_dofs = self.n_dofs
+        self._gather_banded()
+        self._spike_factor_solve()
 
         wp.launch(
             _scatter_delta,
@@ -1465,7 +1616,10 @@ class IKSolverTrajectory(IKOptimizerLM):
     def _jtj_grad_tiled(self, jacobian, residuals_3d, jtj_out, grad_out) -> None:
         raise NotImplementedError("This method should be overridden by specialized solver")
 
-    def _block_thomas_solve(self, d_bar, l_bar, b_bar, n_super, x_bar, chol_ws, coupling_ws, fwd_ws) -> None:
+    def _block_thomas_solve(self, d_bar, l_bar, b_bar, istart, ilen, x_bar, chol_ws, coupling_ws) -> None:
+        raise NotImplementedError("This method should be overridden by specialized solver")
+
+    def _banded_substitute(self, rhs, istart, ilen, n_parts, chol_ws, coupling_ws, out, dim) -> None:
         raise NotImplementedError("This method should be overridden by specialized solver")
 
     def _spike_interior_solve(self, d_bar, l_bar, b_bar, istart, ilen, n_parts, y, u, v, chol, coup) -> None:
@@ -1474,8 +1628,69 @@ class IKSolverTrajectory(IKOptimizerLM):
     def _spike_schur_assemble(self, d_bar, l_bar, b_bar, istart, ilen, n_parts, y, u, v, d_sep, l_sep, b_sep) -> None:
         raise NotImplementedError("This method should be overridden by specialized solver")
 
+    def _spike_schur_rhs(self, rhs, l_bar, istart, ilen, n_parts, y, b_sep) -> None:
+        raise NotImplementedError("This method should be overridden by specialized solver")
+
     def _invert_diag_blocks(self, values, diag_idx, identity, minv) -> None:
         raise NotImplementedError("This method should be overridden by specialized solver")
+
+    def _solver_tile_kernels(self) -> list:
+        raise NotImplementedError("This method should be overridden by specialized solver")
+
+    def _check_tile_shared_memory(self) -> None:
+        """Raise :class:`IKSharedMemoryError` if a tile kernel cannot fit the device.
+
+        Warp sizes a tile kernel's dynamic shared memory from its owner-tile
+        expression sites at compile time, so the footprint is known before any
+        launch; checking here turns a launch-time CUDA error inside the first
+        :meth:`step` into a typed construction-time error. When warp's
+        per-kernel footprint is unavailable, the check degrades to the
+        compile-free analytic three-tile lower bound.
+        """
+        device = self.device
+        if not device.is_cuda:
+            return
+        limit = device.max_shared_memory_per_block
+        kernels = self._solver_tile_kernels()
+        if not kernels:
+            return
+        # cheap lower bound before compiling anything: every factorization
+        # kernel keeps at least three owner MBxMB fp32 tiles live
+        m = self.kb * self.n_dofs
+        min_bytes = 3 * m * m * 4
+        if min_bytes > limit:
+            objectives = ", ".join(type(o).__name__ for o in self.objectives)
+            raise IKSharedMemoryError(
+                f"linear_solver='{self.linear_solver.value}' needs at least {min_bytes} B of dynamic "
+                f"shared memory per block, but device {device.alias} allows {limit} B. "
+                f"The superblock size k * n_dofs = {self.kb} * {self.n_dofs} = {m} "
+                f"set by the objective stack [{objectives}] is too large for this device; "
+                f"use linear_solver='cg' instead."
+            )
+        for kernel in kernels:
+            # TODO: replace this reach into warp's module metadata with a
+            # supported "will this kernel launch" query once warp provides
+            # one (https://github.com/NVIDIA/warp/issues/1699); until then,
+            # degrade to the analytic bound above whenever the metadata is
+            # unavailable.
+            module_exec = kernel.module.load(device, block_dim=int(self.THOMAS_THREADS))
+            if module_exec is None:
+                # warp returns None for a previously failed build rather
+                # than raising again
+                continue
+            smem_meta = module_exec.meta.get(kernel.get_mangled_name() + "_cuda_kernel_forward_smem_bytes")
+            if smem_meta is None:
+                continue
+            smem = int(smem_meta)
+            if smem > limit:
+                objectives = ", ".join(type(o).__name__ for o in self.objectives)
+                raise IKSharedMemoryError(
+                    f"linear_solver='{self.linear_solver.value}' needs {smem} B of dynamic shared memory "
+                    f"per block in kernel '{kernel.key}', but device {device.alias} allows {limit} B. "
+                    f"The superblock size k * n_dofs = {self.kb} * {self.n_dofs} = {self.kb * self.n_dofs} "
+                    f"set by the objective stack [{objectives}] is too large for this device; "
+                    f"use linear_solver='cg' instead."
+                )
 
     @classmethod
     def _build_specialized(cls, key: tuple[int, int, int, int, str]) -> type[IKSolverTrajectory]:
@@ -1515,72 +1730,18 @@ class IKSolverTrajectory(IKOptimizerLM):
         _jtj_grad_template.__name__ = f"_trajik_jtj_grad_{n_dofs}_{n_perframe}"
         _jtj_grad_kernel = wp.kernel(enable_backward=False, module="unique")(_jtj_grad_template)
 
-        def _thomas_template(
-            d_bar: wp.array4d[wp.float32],  # (n_traj, n_super, m, m)
-            l_bar: wp.array4d[wp.float32],  # (n_traj, n_super, m, m), block (g, g - 1)
-            b_bar: wp.array3d[wp.float32],  # (n_traj, n_super, m)
-            n_super: int,
-            # outputs
-            x_bar: wp.array3d[wp.float32],  # (n_traj, n_super, m)
-            chol_ws: wp.array4d[wp.float32],  # Cholesky factors workspace
-            coupling_ws: wp.array4d[wp.float32],  # coupling factors workspace
-            fwd_ws: wp.array3d[wp.float32],  # forward-substitution workspace
-        ):
-            p = wp.tid()
+        # The factorization/substitution kernels below keep at most five
+        # owner MBxMB tiles live per kernel: warp charges dynamic shared
+        # memory for every owner-tile expression site in a kernel (there is
+        # no live-range reuse), so the fused single-kernel forms exceed the
+        # shared-memory limit of consumer devices already at MB ~ 48 (e.g.
+        # 219,056 B at MB = 70 vs the 101,376 B sm_89 ceiling). In-place
+        # tile Cholesky/triangular solves, subtract-accumulate GEMMs
+        # (alpha=-1, beta=1), transpose views, and splitting program phases
+        # into separate streaming kernels over the global workspaces keep
+        # each kernel inside the ceiling without changing the math.
 
-            # forward factorization + forward substitution
-            Dt = wp.tile_load(d_bar[p, 0], shape=(MB, MB))
-            Ct = wp.tile_cholesky(Dt)
-            wp.tile_store(chol_ws[p, 0], Ct)
-            bt = wp.tile_load(b_bar[p, 0], shape=MB)
-            yt = wp.tile_lower_solve(Ct, bt)
-            wp.tile_store(fwd_ws[p, 0], yt)
-
-            for t in range(1, n_super):
-                Cprev = wp.tile_load(chol_ws[p, t - 1], shape=(MB, MB))
-                Lt = wp.tile_load(l_bar[p, t], shape=(MB, MB))
-                # W = L C^-T from C W^T = L^T
-                WtT = wp.tile_lower_solve(Cprev, wp.tile_transpose(Lt))
-                Wt = wp.tile_transpose(WtT)
-                wp.tile_store(coupling_ws[p, t], Wt)
-
-                Dt = wp.tile_load(d_bar[p, t], shape=(MB, MB))
-                WWt = wp.tile_zeros(shape=(MB, MB), dtype=wp.float32)
-                wp.tile_matmul(Wt, wp.tile_transpose(Wt), WWt)
-                S = wp.tile_map(wp.sub, Dt, WWt)
-                Ct = wp.tile_cholesky(S)
-                wp.tile_store(chol_ws[p, t], Ct)
-
-                yprev = wp.tile_load(fwd_ws[p, t - 1], shape=MB)
-                bt = wp.tile_load(b_bar[p, t], shape=MB)
-                Wy = wp.tile_zeros(shape=(MB, 1), dtype=wp.float32)
-                wp.tile_matmul(Wt, wp.tile_reshape(yprev, shape=(MB, 1)), Wy)
-                rhs = wp.tile_map(wp.sub, bt, wp.tile_reshape(Wy, shape=(MB,)))
-                yt = wp.tile_lower_solve(Ct, rhs)
-                wp.tile_store(fwd_ws[p, t], yt)
-
-            # back substitution
-            Clast = wp.tile_load(chol_ws[p, n_super - 1], shape=(MB, MB))
-            ylast = wp.tile_load(fwd_ws[p, n_super - 1], shape=MB)
-            xt = wp.tile_upper_solve(wp.tile_transpose(Clast), ylast)
-            wp.tile_store(x_bar[p, n_super - 1], xt)
-
-            for i in range(1, n_super):
-                t = n_super - 1 - i
-                Ct = wp.tile_load(chol_ws[p, t], shape=(MB, MB))
-                Wnext = wp.tile_load(coupling_ws[p, t + 1], shape=(MB, MB))
-                xnext = wp.tile_load(x_bar[p, t + 1], shape=MB)
-                yt = wp.tile_load(fwd_ws[p, t], shape=MB)
-                Wx = wp.tile_zeros(shape=(MB, 1), dtype=wp.float32)
-                wp.tile_matmul(wp.tile_transpose(Wnext), wp.tile_reshape(xnext, shape=(MB, 1)), Wx)
-                rhs = wp.tile_map(wp.sub, yt, wp.tile_reshape(Wx, shape=(MB,)))
-                xt = wp.tile_upper_solve(wp.tile_transpose(Ct), rhs)
-                wp.tile_store(x_bar[p, t], xt)
-
-        _thomas_template.__name__ = f"_trajik_block_thomas_{n_dofs}_{kb}"
-        _thomas_kernel = wp.kernel(enable_backward=False, module="unique")(_thomas_template)
-
-        def _spike_interior_template(
+        def _fwd_factor_template(
             d_bar: wp.array4d[wp.float32],  # (n_traj, n_super, m, m)
             l_bar: wp.array4d[wp.float32],  # (n_traj, n_super, m, m), block (g, g - 1)
             b_bar: wp.array3d[wp.float32],  # (n_traj, n_super, m)
@@ -1588,149 +1749,213 @@ class IKSolverTrajectory(IKOptimizerLM):
             ilen: wp.array[wp.int32],  # (n_parts,)
             n_parts: int,
             # outputs
-            y_int: wp.array3d[wp.float32],  # (n_traj * n_parts, l_max, m)
-            u_int: wp.array4d[wp.float32],  # (n_traj * n_parts, l_max, m, m)
-            v_int: wp.array4d[wp.float32],  # (n_traj * n_parts, l_max, m, m)
-            chol_ws: wp.array4d[wp.float32],
-            coup_ws: wp.array4d[wp.float32],
+            chol_ws: wp.array4d[wp.float32],  # (n_traj * n_parts, l_max, m, m)
+            coup_ws: wp.array4d[wp.float32],  # W_t = E_t L_{t-1}^{-T}
+            fwd_ws: wp.array3d[wp.float32],  # (n_traj * n_parts, l_max, m)
         ):
-            tid = wp.tid()
-            p = tid // n_parts
-            part = tid - p * n_parts
-            row = tid
+            """Streamed block-Cholesky factorization + forward substitution
+            over one partition [s, s + len) of one trajectory's chain."""
+            row = wp.tid()
+            p = row // n_parts
+            part = row - p * n_parts
             s = istart[part]
             length = ilen[part]
 
-            # ----- forward factorization + forward substitution -----
-            Dt = wp.tile_load(d_bar[p, s], shape=(MB, MB))
-            Ct = wp.tile_cholesky(Dt)
-            wp.tile_store(chol_ws[row, 0], Ct)
-
-            bt = wp.tile_load(b_bar[p, s], shape=MB)
-            yt = wp.tile_lower_solve(Ct, bt)
-            wp.tile_store(y_int[row, 0], yt)
-
-            # Branchless masking: the gather kernels write zero blocks at
-            # l_bar[p, 0], so loading row 0 yields a zero rhs; the clamped
-            # out-of-range spike of the last partition is never read.
-            n_super = l_bar.shape[1]
-            v_row = wp.min(s + length, n_super - 1)
-
-            # left spike rhs: coupling of the interior's first row to the
-            # separator on its left (block (s, s - 1) = l_bar[s]; zero for
-            # the first partition since l_bar[p, 0] is zero)
-            Ru = wp.tile_load(l_bar[p, s], shape=(MB, MB))
-            Ut = wp.tile_lower_solve(Ct, Ru)
-            wp.tile_store(u_int[row, 0], Ut)
-
-            # right spike rhs: coupling of the interior's last row to the
-            # separator on its right (block (s+L-1, s+L) = l_bar[s+L]^T);
-            # nonzero only on the interior's last row
-            # same expression form as the loop body so the tile layouts of
-            # the reassigned variables agree across iterations
-            rv0 = wp.where(length == 1, v_row, 0)
-            Rv = wp.tile_transpose(wp.tile_load(l_bar[p, rv0], shape=(MB, MB)))
-            WV = wp.tile_zeros(shape=(MB, MB), dtype=wp.float32)
-            Vt = wp.tile_lower_solve(Ct, wp.tile_map(wp.sub, Rv, WV))
-            wp.tile_store(v_int[row, 0], Vt)
-
+            A = wp.tile_load(d_bar[p, s], shape=(MB, MB))
+            wp.tile_cholesky_inplace(A)
+            wp.tile_store(chol_ws[row, 0], A)
+            y0 = wp.tile_load(b_bar[p, s], shape=MB)
+            wp.tile_lower_solve_inplace(A, y0)
+            wp.tile_store(fwd_ws[row, 0], y0)
             for t in range(1, length):
-                Cprev = wp.tile_load(chol_ws[row, t - 1], shape=(MB, MB))
-                Lt = wp.tile_load(l_bar[p, s + t], shape=(MB, MB))
-                WtT = wp.tile_lower_solve(Cprev, wp.tile_transpose(Lt))
-                Wt = wp.tile_transpose(WtT)
-                wp.tile_store(coup_ws[row, t], Wt)
-
-                Dt = wp.tile_load(d_bar[p, s + t], shape=(MB, MB))
-                WWt = wp.tile_zeros(shape=(MB, MB), dtype=wp.float32)
-                wp.tile_matmul(Wt, wp.tile_transpose(Wt), WWt)
-                St = wp.tile_map(wp.sub, Dt, WWt)
-                Ct = wp.tile_cholesky(St)
-                wp.tile_store(chol_ws[row, t], Ct)
-
-                yprev = wp.tile_load(y_int[row, t - 1], shape=MB)
+                # W^T = L_{t-1}^{-1} E^T solved in place into the transposed
+                # view of E; E's storage then holds W
+                E = wp.tile_load(l_bar[p, s + t], shape=(MB, MB))
+                ET = wp.tile_transpose(E)
+                wp.tile_lower_solve_inplace(A, ET)
+                wp.tile_store(coup_ws[row, t], E)
+                # S_t = D_t - W W^T
+                A = wp.tile_load(d_bar[p, s + t], shape=(MB, MB))
+                wp.tile_matmul(E, ET, A, alpha=-1.0, beta=1.0)
+                wp.tile_cholesky_inplace(A)
+                wp.tile_store(chol_ws[row, t], A)
+                # y_t = L_t^{-1} (b_t - W y_{t-1})
+                yp = wp.tile_load(fwd_ws[row, t - 1], shape=MB)
                 bt = wp.tile_load(b_bar[p, s + t], shape=MB)
-                Wy = wp.tile_zeros(shape=(MB, 1), dtype=wp.float32)
-                wp.tile_matmul(Wt, wp.tile_reshape(yprev, shape=(MB, 1)), Wy)
-                rhs = wp.tile_map(wp.sub, bt, wp.tile_reshape(Wy, shape=(MB,)))
-                yt = wp.tile_lower_solve(Ct, rhs)
-                wp.tile_store(y_int[row, t], yt)
+                wp.tile_matmul(
+                    E, wp.tile_reshape(yp, shape=(MB, 1)), wp.tile_reshape(bt, shape=(MB, 1)), alpha=-1.0, beta=1.0
+                )
+                wp.tile_lower_solve_inplace(A, bt)
+                wp.tile_store(fwd_ws[row, t], bt)
 
-                # left spike: zero rhs past the first row
-                Uprev = wp.tile_load(u_int[row, t - 1], shape=(MB, MB))
-                WU = wp.tile_zeros(shape=(MB, MB), dtype=wp.float32)
-                wp.tile_matmul(Wt, Uprev, WU)
-                Ut = wp.tile_lower_solve(Ct, wp.tile_map(wp.neg, WU))
-                wp.tile_store(u_int[row, t], Ut)
-
-                # right spike: rhs only on the last row (fwd stays zero
-                # before, so the recursion term W V_prev vanishes there)
-                rvt = wp.where(t == length - 1, v_row, 0)
-                Rv = wp.tile_transpose(wp.tile_load(l_bar[p, rvt], shape=(MB, MB)))
-                Vprev = wp.tile_load(v_int[row, t - 1], shape=(MB, MB))
-                WV2 = wp.tile_zeros(shape=(MB, MB), dtype=wp.float32)
-                wp.tile_matmul(Wt, Vprev, WV2)
-                Vt = wp.tile_lower_solve(Ct, wp.tile_map(wp.sub, Rv, WV2))
-                wp.tile_store(v_int[row, t], Vt)
-
-            # ----- back substitution (in place over the forward values) -----
-            Clast = wp.tile_load(chol_ws[row, length - 1], shape=(MB, MB))
-            ylast = wp.tile_load(y_int[row, length - 1], shape=MB)
-            xt = wp.tile_upper_solve(wp.tile_transpose(Clast), ylast)
-            wp.tile_store(y_int[row, length - 1], xt)
-            Ulast = wp.tile_load(u_int[row, length - 1], shape=(MB, MB))
-            Ux = wp.tile_upper_solve(wp.tile_transpose(Clast), Ulast)
-            wp.tile_store(u_int[row, length - 1], Ux)
-            Vlast = wp.tile_load(v_int[row, length - 1], shape=(MB, MB))
-            Vx = wp.tile_upper_solve(wp.tile_transpose(Clast), Vlast)
-            wp.tile_store(v_int[row, length - 1], Vx)
-
-            for i in range(1, length):
-                t = length - 1 - i
-                Ct = wp.tile_load(chol_ws[row, t], shape=(MB, MB))
-                Wnext = wp.tile_load(coup_ws[row, t + 1], shape=(MB, MB))
-                WnT = wp.tile_transpose(Wnext)
-
-                ynext = wp.tile_load(y_int[row, t + 1], shape=MB)
-                yfwd = wp.tile_load(y_int[row, t], shape=MB)
-                Wx = wp.tile_zeros(shape=(MB, 1), dtype=wp.float32)
-                wp.tile_matmul(WnT, wp.tile_reshape(ynext, shape=(MB, 1)), Wx)
-                rhs = wp.tile_map(wp.sub, yfwd, wp.tile_reshape(Wx, shape=(MB,)))
-                xt = wp.tile_upper_solve(wp.tile_transpose(Ct), rhs)
-                wp.tile_store(y_int[row, t], xt)
-
-                Unext = wp.tile_load(u_int[row, t + 1], shape=(MB, MB))
-                Ufwd = wp.tile_load(u_int[row, t], shape=(MB, MB))
-                WUm = wp.tile_zeros(shape=(MB, MB), dtype=wp.float32)
-                wp.tile_matmul(WnT, Unext, WUm)
-                Ux = wp.tile_upper_solve(wp.tile_transpose(Ct), wp.tile_map(wp.sub, Ufwd, WUm))
-                wp.tile_store(u_int[row, t], Ux)
-
-                Vnext = wp.tile_load(v_int[row, t + 1], shape=(MB, MB))
-                Vfwd = wp.tile_load(v_int[row, t], shape=(MB, MB))
-                WVm = wp.tile_zeros(shape=(MB, MB), dtype=wp.float32)
-                wp.tile_matmul(WnT, Vnext, WVm)
-                Vx = wp.tile_upper_solve(wp.tile_transpose(Ct), wp.tile_map(wp.sub, Vfwd, WVm))
-                wp.tile_store(v_int[row, t], Vx)
-
-        _spike_interior_template.__name__ = f"_trajik_spike_interior_{n_dofs}_{kb}"
-        _spike_interior_kernel = wp.kernel(enable_backward=False, module="unique")(_spike_interior_template)
-
-        def _spike_schur_template(
-            d_bar: wp.array4d[wp.float32],
-            l_bar: wp.array4d[wp.float32],
-            b_bar: wp.array3d[wp.float32],
+        def _fwd_subst_template(
+            rhs: wp.array3d[wp.float32],  # (n_traj, n_chain, m), indexed at s + t
             istart: wp.array[wp.int32],
             ilen: wp.array[wp.int32],
             n_parts: int,
-            y_int: wp.array3d[wp.float32],
+            chol_ws: wp.array4d[wp.float32],
+            coup_ws: wp.array4d[wp.float32],
+            # outputs
+            fwd_ws: wp.array3d[wp.float32],
+        ):
+            """Forward substitution only, on the stored factors (refinement)."""
+            row = wp.tid()
+            p = row // n_parts
+            part = row - p * n_parts
+            s = istart[part]
+            length = ilen[part]
+            for t in range(length):
+                bt = wp.tile_load(rhs[p, s + t], shape=MB)
+                if t > 0:
+                    E = wp.tile_load(coup_ws[row, t], shape=(MB, MB))
+                    yp = wp.tile_load(fwd_ws[row, t - 1], shape=MB)
+                    wp.tile_matmul(
+                        E, wp.tile_reshape(yp, shape=(MB, 1)), wp.tile_reshape(bt, shape=(MB, 1)), alpha=-1.0, beta=1.0
+                    )
+                A = wp.tile_load(chol_ws[row, t], shape=(MB, MB))
+                wp.tile_lower_solve_inplace(A, bt)
+                wp.tile_store(fwd_ws[row, t], bt)
+
+        def _bwd_subst_template(
+            istart: wp.array[wp.int32],
+            ilen: wp.array[wp.int32],
+            n_parts: int,
+            chol_ws: wp.array4d[wp.float32],
+            coup_ws: wp.array4d[wp.float32],
+            # outputs (in place)
+            y_ws: wp.array3d[wp.float32],
+        ):
+            """Backward substitution in place over the forward values."""
+            row = wp.tid()
+            part = row - (row // n_parts) * n_parts
+            length = ilen[part]
+            for i in range(length):
+                t = length - 1 - i
+                yt = wp.tile_load(y_ws[row, t], shape=MB)
+                if t < length - 1:
+                    E = wp.tile_load(coup_ws[row, t + 1], shape=(MB, MB))
+                    xn = wp.tile_load(y_ws[row, t + 1], shape=MB)
+                    wp.tile_matmul(
+                        wp.tile_transpose(E),
+                        wp.tile_reshape(xn, shape=(MB, 1)),
+                        wp.tile_reshape(yt, shape=(MB, 1)),
+                        alpha=-1.0,
+                        beta=1.0,
+                    )
+                A = wp.tile_load(chol_ws[row, t], shape=(MB, MB))
+                wp.tile_upper_solve_inplace(wp.tile_transpose(A), yt)
+                wp.tile_store(y_ws[row, t], yt)
+
+        _fwd_factor_template.__name__ = f"_trajik_thomas_fwd_{n_dofs}_{kb}"
+        _fwd_factor_kernel = wp.kernel(enable_backward=False, module="unique")(_fwd_factor_template)
+        _fwd_subst_template.__name__ = f"_trajik_thomas_fwd_subst_{n_dofs}_{kb}"
+        _fwd_subst_kernel = wp.kernel(enable_backward=False, module="unique")(_fwd_subst_template)
+        _bwd_subst_template.__name__ = f"_trajik_thomas_bwd_{n_dofs}_{kb}"
+        _bwd_subst_kernel = wp.kernel(enable_backward=False, module="unique")(_bwd_subst_template)
+
+        def _u_fwd_template(
+            l_bar: wp.array4d[wp.float32],
+            istart: wp.array[wp.int32],
+            ilen: wp.array[wp.int32],
+            n_parts: int,
+            chol_ws: wp.array4d[wp.float32],
+            coup_ws: wp.array4d[wp.float32],
+            # outputs
+            u_int: wp.array4d[wp.float32],
+        ):
+            """Left-spike forward recurrence U_0 = L_0^{-1} Ru,
+            U_t = -L_t^{-1} (W_t U_{t-1}); Ru = l_bar[p, s] is the coupling of
+            the interior's first row to the separator on its left (a zero
+            block for the first partition, since l_bar[p, 0] is zero)."""
+            row = wp.tid()
+            p = row // n_parts
+            part = row - p * n_parts
+            s = istart[part]
+            length = ilen[part]
+            # loop-carried spike tile: T holds U_{t-1} entering each iteration
+            T = wp.tile_load(l_bar[p, s], shape=(MB, MB))
+            A = wp.tile_load(chol_ws[row, 0], shape=(MB, MB))
+            wp.tile_lower_solve_inplace(A, T)
+            wp.tile_store(u_int[row, 0], T)
+            for t in range(1, length):
+                W = wp.tile_load(coup_ws[row, t], shape=(MB, MB))
+                T = wp.tile_matmul(W, T, alpha=-1.0)
+                A = wp.tile_load(chol_ws[row, t], shape=(MB, MB))
+                wp.tile_lower_solve_inplace(A, T)
+                wp.tile_store(u_int[row, t], T)
+
+        def _v_last_template(
+            l_bar: wp.array4d[wp.float32],
+            istart: wp.array[wp.int32],
+            ilen: wp.array[wp.int32],
+            n_parts: int,
+            n_super: int,
+            chol_ws: wp.array4d[wp.float32],
+            # outputs
+            v_int: wp.array4d[wp.float32],
+        ):
+            """Right-spike forward values are structurally zero below the last
+            interior row (V_prev = 0 propagates exact zeros through the
+            recurrence); only V[len-1] = L_{len-1}^{-1} Rv is nonzero, with
+            Rv = l_bar[p, s + len]^T the coupling of the interior's last row
+            to the separator on its right. The caller zeroes v_int before
+            this kernel; the clamped out-of-range spike of the last
+            partition is never read."""
+            row = wp.tid()
+            p = row // n_parts
+            part = row - p * n_parts
+            s = istart[part]
+            length = ilen[part]
+            v_row = wp.min(s + length, n_super - 1)
+            Rv = wp.tile_load(l_bar[p, v_row], shape=(MB, MB))
+            A = wp.tile_load(chol_ws[row, length - 1], shape=(MB, MB))
+            T = wp.tile_lower_solve(A, wp.tile_transpose(Rv))
+            wp.tile_store(v_int[row, length - 1], T)
+
+        def _spike_bwd_template(
+            istart: wp.array[wp.int32],
+            ilen: wp.array[wp.int32],
+            n_parts: int,
+            chol_ws: wp.array4d[wp.float32],
+            coup_ws: wp.array4d[wp.float32],
+            # outputs (in place)
+            s_int: wp.array4d[wp.float32],
+        ):
+            """Backward substitution in place over spike forward values
+            (matrix right-hand side; used for both U and V)."""
+            row = wp.tid()
+            part = row - (row // n_parts) * n_parts
+            length = ilen[part]
+            for i in range(length):
+                t = length - 1 - i
+                T = wp.tile_load(s_int[row, t], shape=(MB, MB))
+                if t < length - 1:
+                    E = wp.tile_load(coup_ws[row, t + 1], shape=(MB, MB))
+                    Xn = wp.tile_load(s_int[row, t + 1], shape=(MB, MB))
+                    wp.tile_matmul(wp.tile_transpose(E), Xn, T, alpha=-1.0, beta=1.0)
+                A = wp.tile_load(chol_ws[row, t], shape=(MB, MB))
+                wp.tile_upper_solve_inplace(wp.tile_transpose(A), T)
+                wp.tile_store(s_int[row, t], T)
+
+        _u_fwd_template.__name__ = f"_trajik_spike_u_fwd_{n_dofs}_{kb}"
+        _u_fwd_kernel = wp.kernel(enable_backward=False, module="unique")(_u_fwd_template)
+        _v_last_template.__name__ = f"_trajik_spike_v_last_{n_dofs}_{kb}"
+        _v_last_kernel = wp.kernel(enable_backward=False, module="unique")(_v_last_template)
+        _spike_bwd_template.__name__ = f"_trajik_spike_bwd_{n_dofs}_{kb}"
+        _spike_bwd_kernel = wp.kernel(enable_backward=False, module="unique")(_spike_bwd_template)
+
+        def _schur_diag_template(
+            d_bar: wp.array4d[wp.float32],
+            l_bar: wp.array4d[wp.float32],
+            istart: wp.array[wp.int32],
+            ilen: wp.array[wp.int32],
+            n_parts: int,
             u_int: wp.array4d[wp.float32],
             v_int: wp.array4d[wp.float32],
             # outputs
             d_sep: wp.array4d[wp.float32],  # (n_traj, n_parts - 1, m, m)
-            l_sep: wp.array4d[wp.float32],
-            b_sep: wp.array3d[wp.float32],
         ):
+            """Schur diagonal S_j = D_s - CL V_j[last] - CR^T U_{j+1}[first]."""
             tid = wp.tid()
             n_sep = n_parts - 1
             p = tid // n_sep
@@ -1738,41 +1963,77 @@ class IKSolverTrajectory(IKOptimizerLM):
             s = istart[j] + ilen[j]  # global index of separator j
             last = ilen[j] - 1
 
-            CL = wp.tile_load(l_bar[p, s], shape=(MB, MB))  # block (s, s - 1)
-            CRt = wp.tile_transpose(wp.tile_load(l_bar[p, s + 1], shape=(MB, MB)))  # block (s, s + 1)
+            A = wp.tile_load(d_bar[p, s], shape=(MB, MB))
+            B = wp.tile_load(l_bar[p, s], shape=(MB, MB))  # CL = block (s, s - 1)
+            C = wp.tile_load(v_int[p * n_parts + j, last], shape=(MB, MB))
+            wp.tile_matmul(B, C, A, alpha=-1.0, beta=1.0)
+            B = wp.tile_load(l_bar[p, s + 1], shape=(MB, MB))  # CR = block (s + 1, s)
+            C = wp.tile_load(u_int[p * n_parts + j + 1, 0], shape=(MB, MB))
+            wp.tile_matmul(wp.tile_transpose(B), C, A, alpha=-1.0, beta=1.0)
+            wp.tile_store(d_sep[p, j], A)
 
-            # S_j = D_s - CL V_j[last] - CR^T U_{j+1}[first]
-            Dt = wp.tile_load(d_bar[p, s], shape=(MB, MB))
-            Vl = wp.tile_load(v_int[p * n_parts + j, last], shape=(MB, MB))
-            Uf = wp.tile_load(u_int[p * n_parts + j + 1, 0], shape=(MB, MB))
-            T1 = wp.tile_zeros(shape=(MB, MB), dtype=wp.float32)
-            wp.tile_matmul(CL, Vl, T1)
-            T2 = wp.tile_zeros(shape=(MB, MB), dtype=wp.float32)
-            wp.tile_matmul(CRt, Uf, T2)
-            St = wp.tile_map(wp.sub, wp.tile_map(wp.sub, Dt, T1), T2)
-            wp.tile_store(d_sep[p, j], St)
+        def _schur_lower_template(
+            l_bar: wp.array4d[wp.float32],
+            istart: wp.array[wp.int32],
+            ilen: wp.array[wp.int32],
+            n_parts: int,
+            u_int: wp.array4d[wp.float32],
+            # outputs
+            l_sep: wp.array4d[wp.float32],
+        ):
+            """Schur sub-diagonal -CL U_j[last] (never read for j = 0: U_0 is
+            exactly zero because l_bar[p, 0] is zero)."""
+            tid = wp.tid()
+            n_sep = n_parts - 1
+            p = tid // n_sep
+            j = tid - p * n_sep
+            s = istart[j] + ilen[j]
+            last = ilen[j] - 1
+            B = wp.tile_load(l_bar[p, s], shape=(MB, MB))
+            C = wp.tile_load(u_int[p * n_parts + j, last], shape=(MB, MB))
+            T = wp.tile_matmul(B, C, alpha=-1.0)
+            wp.tile_store(l_sep[p, j], T)
 
-            # sub-diagonal of the reduced system: -CL U_j[last] (never read for j = 0)
-            Ul = wp.tile_load(u_int[p * n_parts + j, last], shape=(MB, MB))
-            T3 = wp.tile_zeros(shape=(MB, MB), dtype=wp.float32)
-            wp.tile_matmul(CL, Ul, T3)
-            wp.tile_store(l_sep[p, j], wp.tile_map(wp.neg, T3))
-
-            # rhs: b_s - CL y_j[last] - CR^T y_{j+1}[first]
+        def _schur_rhs_template(
+            rhs: wp.array3d[wp.float32],
+            l_bar: wp.array4d[wp.float32],
+            istart: wp.array[wp.int32],
+            ilen: wp.array[wp.int32],
+            n_parts: int,
+            y_int: wp.array3d[wp.float32],
+            # outputs
+            b_sep: wp.array3d[wp.float32],
+        ):
+            """Schur right-hand side b_s - CL y_j[last] - CR^T y_{j+1}[first]."""
+            tid = wp.tid()
+            n_sep = n_parts - 1
+            p = tid // n_sep
+            j = tid - p * n_sep
+            s = istart[j] + ilen[j]
+            last = ilen[j] - 1
+            bt = wp.tile_load(rhs[p, s], shape=MB)
+            B = wp.tile_load(l_bar[p, s], shape=(MB, MB))
             yl = wp.tile_load(y_int[p * n_parts + j, last], shape=MB)
-            yr = wp.tile_load(y_int[p * n_parts + j + 1, 0], shape=MB)
-            t4 = wp.tile_zeros(shape=(MB, 1), dtype=wp.float32)
-            wp.tile_matmul(CL, wp.tile_reshape(yl, shape=(MB, 1)), t4)
-            t5 = wp.tile_zeros(shape=(MB, 1), dtype=wp.float32)
-            wp.tile_matmul(CRt, wp.tile_reshape(yr, shape=(MB, 1)), t5)
-            bs = wp.tile_load(b_bar[p, s], shape=MB)
-            res = wp.tile_map(
-                wp.sub, wp.tile_map(wp.sub, bs, wp.tile_reshape(t4, shape=(MB,))), wp.tile_reshape(t5, shape=(MB,))
+            wp.tile_matmul(
+                B, wp.tile_reshape(yl, shape=(MB, 1)), wp.tile_reshape(bt, shape=(MB, 1)), alpha=-1.0, beta=1.0
             )
-            wp.tile_store(b_sep[p, j], res)
+            B = wp.tile_load(l_bar[p, s + 1], shape=(MB, MB))
+            yr = wp.tile_load(y_int[p * n_parts + j + 1, 0], shape=MB)
+            wp.tile_matmul(
+                wp.tile_transpose(B),
+                wp.tile_reshape(yr, shape=(MB, 1)),
+                wp.tile_reshape(bt, shape=(MB, 1)),
+                alpha=-1.0,
+                beta=1.0,
+            )
+            wp.tile_store(b_sep[p, j], bt)
 
-        _spike_schur_template.__name__ = f"_trajik_spike_schur_{n_dofs}_{kb}"
-        _spike_schur_kernel = wp.kernel(enable_backward=False, module="unique")(_spike_schur_template)
+        _schur_diag_template.__name__ = f"_trajik_schur_diag_{n_dofs}_{kb}"
+        _schur_diag_kernel = wp.kernel(enable_backward=False, module="unique")(_schur_diag_template)
+        _schur_lower_template.__name__ = f"_trajik_schur_lower_{n_dofs}_{kb}"
+        _schur_lower_kernel = wp.kernel(enable_backward=False, module="unique")(_schur_lower_template)
+        _schur_rhs_template.__name__ = f"_trajik_schur_rhs_{n_dofs}_{kb}"
+        _schur_rhs_kernel = wp.kernel(enable_backward=False, module="unique")(_schur_rhs_template)
 
         def _inv_diag_template(
             values: wp.array3d[wp.float32],  # (nnz, n_dofs, n_dofs)
@@ -1797,7 +2058,11 @@ class IKSolverTrajectory(IKOptimizerLM):
             TILE_N_RESIDUALS = wp.constant(n_residuals)
             TILE_M_SUPER = wp.constant(kb * n_dofs)
             TILE_THREADS = wp.constant(32)
-            THOMAS_THREADS = wp.constant(64)
+            # block size of the factorization/substitution kernels; measured
+            # fastest of {64, 128, 256} at production size (MB = 70, sm_89)
+            # for both the single-trajectory SPIKE and batched DIRECT shapes
+            # (e.g. 16 x 3,991 frames: 436 -> 263 ms/solve vs 64 threads)
+            THOMAS_THREADS = wp.constant(256)
 
             def _jtj_grad_tiled(self, jacobian, residuals_3d, jtj_out, grad_out) -> None:
                 wp.launch_tiled(
@@ -1809,37 +2074,142 @@ class IKSolverTrajectory(IKOptimizerLM):
                     device=self.device,
                 )
 
-            def _block_thomas_solve(self, d_bar, l_bar, b_bar, n_super, x_bar, chol_ws, coupling_ws, fwd_ws) -> None:
+            def _block_thomas_solve(self, d_bar, l_bar, b_bar, istart, ilen, x_bar, chol_ws, coupling_ws) -> None:
+                # forward pass writes its values into x_bar; the backward
+                # pass then solves in place
                 wp.launch_tiled(
-                    _thomas_kernel,
+                    _fwd_factor_kernel,
                     dim=[self.n_trajectories],
-                    inputs=[d_bar, l_bar, b_bar, n_super],
-                    outputs=[x_bar, chol_ws, coupling_ws, fwd_ws],
+                    inputs=[d_bar, l_bar, b_bar, istart, ilen, 1],
+                    outputs=[chol_ws, coupling_ws, x_bar],
+                    block_dim=self.THOMAS_THREADS,
+                    device=self.device,
+                )
+                wp.launch_tiled(
+                    _bwd_subst_kernel,
+                    dim=[self.n_trajectories],
+                    inputs=[istart, ilen, 1, chol_ws, coupling_ws],
+                    outputs=[x_bar],
+                    block_dim=self.THOMAS_THREADS,
+                    device=self.device,
+                )
+
+            def _banded_substitute(self, rhs, istart, ilen, n_parts, chol_ws, coupling_ws, out, dim) -> None:
+                wp.launch_tiled(
+                    _fwd_subst_kernel,
+                    dim=[dim],
+                    inputs=[rhs, istart, ilen, n_parts, chol_ws, coupling_ws],
+                    outputs=[out],
+                    block_dim=self.THOMAS_THREADS,
+                    device=self.device,
+                )
+                wp.launch_tiled(
+                    _bwd_subst_kernel,
+                    dim=[dim],
+                    inputs=[istart, ilen, n_parts, chol_ws, coupling_ws],
+                    outputs=[out],
                     block_dim=self.THOMAS_THREADS,
                     device=self.device,
                 )
 
             def _spike_interior_solve(self, d_bar, l_bar, b_bar, istart, ilen, n_parts, y, u, v, chol, coup) -> None:
+                rows = self.n_trajectories * n_parts
+                # the lean right-spike kernel writes only the structurally
+                # nonzero last interior row
+                v.zero_()
                 wp.launch_tiled(
-                    _spike_interior_kernel,
-                    dim=[self.n_trajectories * n_parts],
+                    _fwd_factor_kernel,
+                    dim=[rows],
                     inputs=[d_bar, l_bar, b_bar, istart, ilen, n_parts],
-                    outputs=[y, u, v, chol, coup],
+                    outputs=[chol, coup, y],
                     block_dim=self.THOMAS_THREADS,
                     device=self.device,
                 )
+                wp.launch_tiled(
+                    _u_fwd_kernel,
+                    dim=[rows],
+                    inputs=[l_bar, istart, ilen, n_parts, chol, coup],
+                    outputs=[u],
+                    block_dim=self.THOMAS_THREADS,
+                    device=self.device,
+                )
+                wp.launch_tiled(
+                    _v_last_kernel,
+                    dim=[rows],
+                    inputs=[l_bar, istart, ilen, n_parts, int(l_bar.shape[1]), chol],
+                    outputs=[v],
+                    block_dim=self.THOMAS_THREADS,
+                    device=self.device,
+                )
+                wp.launch_tiled(
+                    _bwd_subst_kernel,
+                    dim=[rows],
+                    inputs=[istart, ilen, n_parts, chol, coup],
+                    outputs=[y],
+                    block_dim=self.THOMAS_THREADS,
+                    device=self.device,
+                )
+                for spike in (u, v):
+                    wp.launch_tiled(
+                        _spike_bwd_kernel,
+                        dim=[rows],
+                        inputs=[istart, ilen, n_parts, chol, coup],
+                        outputs=[spike],
+                        block_dim=self.THOMAS_THREADS,
+                        device=self.device,
+                    )
 
             def _spike_schur_assemble(
                 self, d_bar, l_bar, b_bar, istart, ilen, n_parts, y, u, v, d_sep, l_sep, b_sep
             ) -> None:
+                n_sep_rows = self.n_trajectories * (n_parts - 1)
                 wp.launch_tiled(
-                    _spike_schur_kernel,
-                    dim=[self.n_trajectories * (n_parts - 1)],
-                    inputs=[d_bar, l_bar, b_bar, istart, ilen, n_parts, y, u, v],
-                    outputs=[d_sep, l_sep, b_sep],
+                    _schur_diag_kernel,
+                    dim=[n_sep_rows],
+                    inputs=[d_bar, l_bar, istart, ilen, n_parts, u, v],
+                    outputs=[d_sep],
                     block_dim=self.THOMAS_THREADS,
                     device=self.device,
                 )
+                wp.launch_tiled(
+                    _schur_lower_kernel,
+                    dim=[n_sep_rows],
+                    inputs=[l_bar, istart, ilen, n_parts, u],
+                    outputs=[l_sep],
+                    block_dim=self.THOMAS_THREADS,
+                    device=self.device,
+                )
+                self._spike_schur_rhs(b_bar, l_bar, istart, ilen, n_parts, y, b_sep)
+
+            def _spike_schur_rhs(self, rhs, l_bar, istart, ilen, n_parts, y, b_sep) -> None:
+                wp.launch_tiled(
+                    _schur_rhs_kernel,
+                    dim=[self.n_trajectories * (n_parts - 1)],
+                    inputs=[rhs, l_bar, istart, ilen, n_parts, y],
+                    outputs=[b_sep],
+                    block_dim=self.THOMAS_THREADS,
+                    device=self.device,
+                )
+
+            def _solver_tile_kernels(self) -> list:
+                if self.linear_solver is IKLinearSolver.DIRECT:
+                    kernels = [_fwd_factor_kernel, _bwd_subst_kernel]
+                elif self.linear_solver is IKLinearSolver.SPIKE:
+                    kernels = [
+                        _fwd_factor_kernel,
+                        _bwd_subst_kernel,
+                        _u_fwd_kernel,
+                        _v_last_kernel,
+                        _spike_bwd_kernel,
+                        _schur_diag_kernel,
+                        _schur_lower_kernel,
+                        _schur_rhs_kernel,
+                    ]
+                else:
+                    return []
+                if self.refine_iterations > 0:
+                    kernels.append(_fwd_subst_kernel)
+                return kernels
 
             def _invert_diag_blocks(self, values, diag_idx, identity, minv) -> None:
                 wp.launch_tiled(
