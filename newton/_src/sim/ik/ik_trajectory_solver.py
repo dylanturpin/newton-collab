@@ -462,6 +462,167 @@ def _block_jacobi_apply(
     z[i] = alpha * acc + beta * y[i]
 
 
+_CG_DOT_TILE = 512
+# length above which warp's single-batch dot path abandons the serial-lane
+# reduction for its tiled tree; _SegmentedTiledDot applies the same policy to
+# the batched path (warp's batched kernel stays serial at every length)
+_CG_SERIAL_DOT_MAX_LENGTH = 128 * _CG_DOT_TILE
+
+
+@wp.kernel
+def _batch_dot_partials(
+    a: wp.array2d[wp.float32],
+    b: wp.array2d[wp.float32],
+    batch_offsets: wp.array[wp.int32],
+    blocks_per_batch: int,
+    # outputs
+    partials: wp.array2d[wp.float32],  # (n_columns, batch_count * blocks_per_batch)
+):
+    col, block, lane = wp.tid()
+    batch_id = block // blocks_per_batch
+    i = batch_offsets[batch_id] + (block - batch_id * blocks_per_batch) * wp.block_dim() + lane
+    acc = float(0.0)
+    if i < batch_offsets[batch_id + 1]:
+        acc = a[col, i] * b[col, i]
+    partial = wp.tile_sum(wp.tile(acc))
+    wp.tile_store(partials[col], partial, offset=block)
+
+
+@wp.kernel
+def _batch_dot_combine(
+    partials: wp.array2d[wp.float32],  # (n_columns, batch_count * blocks_per_batch)
+    blocks_per_batch: int,
+    # outputs
+    result: wp.array2d[wp.float32],  # (n_columns, batch_count)
+):
+    col, batch_id, lane = wp.tid()
+    acc = float(0.0)
+    for j in range(batch_id * blocks_per_batch + lane, (batch_id + 1) * blocks_per_batch, wp.block_dim()):
+        acc += partials[col, j]
+    total = wp.tile_sum(wp.tile(acc))
+    wp.tile_store(result[col], total, offset=batch_id)
+
+
+class _SegmentedTiledDot:
+    """Per-trajectory CG dot products with a segmented tile-tree reduction.
+
+    Drop-in for warp CG's use of the ``compute``/``col``/``cols`` interface
+    of its internal ``TiledDot``, restricted to flat fp32 scalar arrays (no
+    vector-dtype handling) over a uniform per-subproblem block grid.
+
+    warp's batched path (``batch_count > 1``) reduces each subproblem with a
+    single block whose lanes accumulate their strided share serially in the
+    payload dtype — ``subproblem_length / block_dim`` fp32 additions per
+    lane. The O(n) rounding growth this injects into every CG scalar (rho,
+    the step denominator ``p . Ap``, the stopping-test residual norms)
+    stalls convergence of long trajectory chains at iteration budgets that
+    are ample for the same trajectory solved alone (warp reduces single
+    batches longer than ``_CG_SERIAL_DOT_MAX_LENGTH`` with a tiled tree).
+    Here every 512-entry block reduces through ``wp.tile_sum`` and one
+    further tile reduction per subproblem combines the block partials,
+    keeping the accumulation depth logarithmic.
+
+    Parity envelope: for subproblems up to ``_CG_DOT_TILE**2`` (512 * 512 =
+    262,144) scalar dofs this reduction has the same shape as warp's
+    single-batch bounded tree — block indexing is relative to each
+    subproblem's own offset — so batched CG solves stay bitwise-equal to
+    the equivalent single-trajectory solves. Above that, the combine stage
+    folds partials serially per lane: accuracy stays tree-like, but bitwise
+    parity with the single-batch path ends. The reduction order is fixed
+    (no atomics), so results are deterministic run to run.
+
+    Args:
+        batch_offsets: Scalar-dof prefix offsets, shape ``[batch_count + 1]``,
+            partitioning the flat dof vector into per-subproblem segments.
+        batch_length: Maximum per-subproblem scalar length. The block grid
+            is uniform across subproblems, so every segment must satisfy
+            ``batch_offsets[i + 1] - batch_offsets[i] <= batch_length``.
+        device: Device on which to allocate scratch memory and launch
+            kernels.
+        max_column_count: Maximum number of simultaneous dot products (CG
+            computes two at once).
+    """
+
+    def __init__(
+        self,
+        batch_offsets: wp.array[wp.int32],
+        batch_length: int,
+        device,
+        max_column_count: int = 2,
+    ):
+        self.batch_count = batch_offsets.shape[0] - 1
+        self._batch_offsets = batch_offsets
+        self._device = device
+        self._blocks_per_batch = -(-batch_length // _CG_DOT_TILE)
+        self._partials = wp.zeros(
+            (max_column_count, self.batch_count * self._blocks_per_batch),
+            dtype=wp.float32,
+            device=device,
+        )
+        self._output = wp.zeros((max_column_count, self.batch_count), dtype=wp.float32, device=device)
+
+    def compute(self, a: wp.array, b: wp.array, col_offset: int = 0) -> wp.array:
+        if a.ndim == 1:
+            a = a.reshape((1, -1))
+        if b.ndim == 1:
+            b = b.reshape((1, -1))
+        column_count = a.shape[0]
+        out = self._output[col_offset : col_offset + column_count]
+        wp.launch(
+            _batch_dot_partials,
+            dim=(column_count, self.batch_count * self._blocks_per_batch, _CG_DOT_TILE),
+            inputs=[a, b, self._batch_offsets, self._blocks_per_batch],
+            outputs=[self._partials],
+            block_dim=_CG_DOT_TILE,
+            device=self._device,
+        )
+        wp.launch(
+            _batch_dot_combine,
+            dim=(column_count, self.batch_count, _CG_DOT_TILE),
+            inputs=[self._partials, self._blocks_per_batch],
+            outputs=[out],
+            block_dim=_CG_DOT_TILE,
+            device=self._device,
+        )
+        return out
+
+    def col(self, col: int = 0) -> wp.array:
+        return self._output[col][: self.batch_count]
+
+    def cols(self, count: int, start: int = 0) -> wp.array:
+        return self._output[start : start + count, : self.batch_count]
+
+
+def _swap_cg_tiled_dot(cg_state, batch_offsets: wp.array[wp.int32], batch_length: int, device) -> None:
+    """Replace a warp CG state's dot reduction with :class:`_SegmentedTiledDot`.
+
+    warp exposes no public hook for the CG dot reduction, so the swap writes
+    the private ``_tiled_dot`` attribute. The attribute is validated first:
+    a plain assignment would silently create a dead attribute if warp renamed
+    it, reverting the fix while tests stay green. The check is duck-typed
+    because warp does not export ``TiledDot`` from ``warp.optim.linear``.
+
+    Args:
+        cg_state: warp CG solver state created with ``run=False``.
+        batch_offsets: Scalar-dof prefix offsets, shape ``[batch_count + 1]``.
+        batch_length: Maximum per-subproblem scalar length.
+        device: Device on which to allocate scratch memory and launch
+            kernels.
+
+    Raises:
+        RuntimeError: If the CG state does not carry a ``_tiled_dot`` with
+            the expected ``_CG_DOT_TILE``-lane tile size.
+    """
+    if not hasattr(cg_state, "_tiled_dot") or getattr(cg_state._tiled_dot, "tile_size", None) != _CG_DOT_TILE:
+        raise RuntimeError(
+            f"warp's CG solver state does not expose a _tiled_dot attribute with tile_size {_CG_DOT_TILE}; "
+            "its internals have changed and the segmented batched-dot replacement (_SegmentedTiledDot) "
+            "can no longer be installed safely. Re-validate the replacement against this warp version, "
+            "or remove it if warp's batched dot reduction no longer accumulates serially."
+        )
+    cg_state._tiled_dot = _SegmentedTiledDot(batch_offsets, batch_length, device)
+
+
 @wp.kernel
 def _spike_recover(
     y_int: wp.array3d[wp.float32],  # (n_traj * n_parts, l_max, m)
@@ -845,6 +1006,19 @@ class IKSolverTrajectory(IKOptimizerLM):
                 check_every=0,
                 run=False,
             )
+
+        # warp's batched dot kernel accumulates each subproblem serially per
+        # lane at every length, which under-converges CG on long trajectory
+        # chains (see _SegmentedTiledDot); swap in the segmented tree above
+        # the same threshold at which warp's single-batch path switches to
+        # its tree, so shorter multi-trajectory solves keep warp's reduction
+        # (and stay bitwise-equal to their single-trajectory counterparts).
+        # CPU is deliberately left on warp's reduction: its batched dot is a
+        # single serial lane per subproblem — the same O(n) issue in
+        # principle — but unmeasured there and outside this fix's scope.
+        # TODO: drop once warp's TiledDot batches with a multi-block tree.
+        if self.n_trajectories > 1 and device.is_cuda and n_frames * n_dofs > _CG_SERIAL_DOT_MAX_LENGTH:
+            _swap_cg_tiled_dot(self._cg_state, self._batch_offsets, n_frames * n_dofs, device)
 
     # ------------------------------------------------------------------
     # solve
