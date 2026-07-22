@@ -2846,6 +2846,7 @@ class SolverFeatherPGS(SolverBase):
                     inputs=[
                         self.constraint_count,
                         self.world_dof_start,
+                        self.world_dof_count,
                         self.world_deferred_dof_mask,
                         dense_rhs,
                         self.diag,
@@ -12932,6 +12933,7 @@ def _get_pgs_solve_mf_gs_kernel(
     if (mf_contact_end > m_mf) mf_contact_end = m_mf;
 
     int w_dof_start = world_dof_start.data[world];
+    int w_ndof = world_dof_count.data[world];
     int off_dense = world * {M_D};
     int off_mf = world * {M_MF};
     int off_meta = off_mf * 4;
@@ -12978,7 +12980,7 @@ def _get_pgs_solve_mf_gs_kernel(
         }}
     }}
     for (int d = lane; d < {D}; d += 32) {{
-        s_v[d] = v_out.data[w_dof_start + d];
+        s_v[d] = (d < w_ndof) ? v_out.data[w_dof_start + d] : 0.0f;
     }}
     __syncwarp();
 
@@ -13304,7 +13306,7 @@ def _get_pgs_solve_mf_gs_kernel(
     // ═══════════════════════════════════════════════════════
     // STORE PHASE
     // ═══════════════════════════════════════════════════════
-    for (int d = lane; d < {D}; d += 32) {{
+    for (int d = lane; d < w_ndof; d += 32) {{
         v_out.data[w_dof_start + d] = s_v[d];
     }}
     for (int i = lane; i < m_dense; i += 32) {{
@@ -13360,6 +13362,7 @@ def _get_pgs_solve_mf_gs_kernel(
         # Dense
         world_constraint_count: wp.array[int],
         world_dof_start: wp.array[int],
+        world_dof_count: wp.array[int],
         world_deferred_dof_mask: wp.array2d[int],
         rhs_bias: wp.array2d[float],
         world_diag: wp.array2d[float],
@@ -13399,6 +13402,7 @@ def _get_pgs_solve_mf_gs_kernel(
         # Dense
         world_constraint_count: wp.array[int],
         world_dof_start: wp.array[int],
+        world_dof_count: wp.array[int],
         world_deferred_dof_mask: wp.array2d[int],
         rhs_bias: wp.array2d[float],
         world_diag: wp.array2d[float],
@@ -13438,6 +13442,7 @@ def _get_pgs_solve_mf_gs_kernel(
             world,
             world_constraint_count,
             world_dof_start,
+            world_dof_count,
             world_deferred_dof_mask,
             rhs_bias,
             world_diag,
