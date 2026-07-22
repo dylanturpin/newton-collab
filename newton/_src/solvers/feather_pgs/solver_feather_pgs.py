@@ -151,7 +151,6 @@ _FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in 
 _FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", "20"))
 _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUNT", "1")), 0)
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
-_HINV_JT_TILED_AUTO_SHARED_LIMIT_BYTES = 96 * 1024
 
 
 @wp.kernel
@@ -534,7 +533,6 @@ class SolverFeatherPGS(SolverBase):
         # Streaming kernel chunk sizes (None = auto-select)
         delassus_chunk_size: int | None = None,
         pgs_chunk_size: int | None = None,
-        hinv_jt_chunk_size: int | None = None,
         # Auto selection threshold
         small_dof_threshold: int = 12,
         # Parallelism options
@@ -731,13 +729,6 @@ class SolverFeatherPGS(SolverBase):
                 for the streaming PGS kernel. Controls how many block-rows of the Delassus matrix are
                 preloaded into shared memory at once. 1 = current streaming behavior (one block-row
                 at a time). None defaults to 1. Defaults to None.
-            hinv_jt_chunk_size (int, optional): Fixed tile width (in constraint rows) for the tiled
-                ``H^{-1} J^T`` kernel. The kernel is compiled at ``min(dense_max_constraints,
-                hinv_jt_chunk_size)`` and launched once per row-chunk, so its shared-memory footprint is
-                bounded by this width rather than scaling with :paramref:`dense_max_constraints`. This
-                lets ``dense_max_constraints`` exceed the per-block shared-memory limit (~224 rows for a
-                35-DOF articulation on sm_86) without over-subscribing. ``None`` uses 128, which fits every
-                supported size on sm_80+. Defaults to None.
             small_dof_threshold (int, optional): DOF threshold for "auto" kernel selection. Defaults to 12.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
@@ -1051,7 +1042,6 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_kernel = pgs_kernel
         self.delassus_chunk_size = delassus_chunk_size
         self.pgs_chunk_size = pgs_chunk_size if pgs_chunk_size is not None else 1
-        self.hinv_jt_chunk_size = hinv_jt_chunk_size if hinv_jt_chunk_size is not None else 128
         self.small_dof_threshold = small_dof_threshold
         self.use_parallel_streams = use_parallel_streams
 
@@ -2856,30 +2846,9 @@ class SolverFeatherPGS(SolverBase):
 
             self.R_by_size[size].assign(R_np)
 
-    def _use_tiled_hinv_jt(self, size: int) -> bool:
-        if self.hinv_jt_kernel == "par_row" or self.dense_max_constraints <= 0:
-            return False
-        if self.hinv_jt_kernel == "tiled":
-            return True
-        if size <= self.small_dof_threshold:
-            return False
-        # H^-1 J^T tiles materialize roughly Jt/Z plus L in shared memory:
-        # 2 * D * rows + D^2 float32 values. Large row capacities can exceed
-        # per-block shared memory even for moderate DOF counts, so auto must
-        # account for both dimensions.
-        estimated_bytes = 8 * int(size) * int(self._hinv_jt_tiled_width) + 4 * int(size) * int(size)
-        return estimated_bytes <= _HINV_JT_TILED_AUTO_SHARED_LIMIT_BYTES
-
     def _init_tiled_kernels(self, model):
         """Resolve size-specialized Warp kernels once for this solver shape."""
         device_arch = model.device.arch
-        # Fixed tile width for the tiled H^{-1} J^T kernel. The kernel is launched once per row-chunk
-        # (see :meth:`_stage4_hinv_jt_tiled`), so its shared-memory footprint is bounded by this width
-        # instead of scaling with ``dense_max_constraints``. When ``dense_max_constraints`` fits, this is
-        # ``dense_max_constraints`` and the launch is a single full-width tile (unchanged behavior).
-        self._hinv_jt_tiled_width = (
-            min(self.dense_max_constraints, self.hinv_jt_chunk_size) if self.dense_max_constraints > 0 else 0
-        )
         self._cholesky_kernels_by_size = {}
         self._triangular_solve_kernels_by_size = {}
         self._hinv_jt_kernels_by_size = {}
