@@ -3958,8 +3958,15 @@ def parse_usd(
                     cmp_mass, cmp_i_diag, cmp_com, cmp_principal_axes = rigid_body_api.ComputeMassProperties(
                         _get_collision_mass_information
                     )
+                    if cmp_mass < 0.0:
+                        # Genuine mass-computer failure (colliders not discoverable,
+                        # e.g. shapes created by schema resolvers are not real USD
+                        # prims). Distinct from the blocked-attrs workaround above,
+                        # where real colliders exist and the accumulated-property
+                        # fallback must preserve upstream's mass-precedence scaling
+                        # rather than trigger the PhysX small-sphere inertia.
+                        mass_compute_failed = True
                 if cmp_mass < 0.0 or not math.isfinite(cmp_mass):
-                    mass_compute_failed = True
                     # ComputeMassProperties failed to discover colliders (e.g. shapes
                     # created by schema resolvers are not real USD prims) or aggregated
                     # non-finite authored values. Fall back to builder-accumulated mass
