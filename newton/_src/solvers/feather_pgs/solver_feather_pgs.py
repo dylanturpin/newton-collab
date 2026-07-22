@@ -1384,7 +1384,11 @@ class SolverFeatherPGS(SolverBase):
             joint_dof_dim = model.joint_dof_dim.numpy()
             joint_dof_count = np.sum(joint_dof_dim, axis=1)
             articulation_start = model.articulation_start.numpy()
-            art_size_np = self.art_size.numpy()
+            # Solve-size membership follows the response mapping (art_size was
+            # renamed to the plan's response_dof_count by the response
+            # execution redesign; identical for propagation-reachable configs
+            # because prescribed elision is gated to the immediate path).
+            art_size_np = self._model_plan.response_dof_count
             is_free_rigid_np = (
                 self.is_free_rigid.numpy()
                 if self.is_free_rigid is not None
@@ -1738,14 +1742,14 @@ class SolverFeatherPGS(SolverBase):
         if (
             not model.articulation_count
             or self.art_to_world is None
-            or self.art_size is None
+            or self._model_plan is None
             or self.is_free_rigid is None
         ):
             return
 
         device = model.device
         art_to_world_np = self.art_to_world.numpy().astype(np.int32, copy=False)
-        art_size_np = self.art_size.numpy().astype(np.int32, copy=False)
+        art_size_np = self._model_plan.response_dof_count.astype(np.int32, copy=False)
         is_free_rigid_np = self.is_free_rigid.numpy().astype(np.int32, copy=False)
         world_count = max(int(self.world_count), 0)
         for size in self.size_groups:
