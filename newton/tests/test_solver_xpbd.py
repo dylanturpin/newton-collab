@@ -633,7 +633,11 @@ def test_rigid_restitution_elastic_no_explosion(test, device):
     builder.add_shape_cylinder(body=body, radius=0.1, half_height=hz, cfg=cfg)
     model = builder.finalize(device=device)
 
-    solver = newton.solvers.SolverXPBD(model, enable_restitution=True)
+    # Contact-weighted Jacobi restitution converges per-manifold; the flat
+    # cylinder face needs ~32 iterations to recover >=80% of the release
+    # height. The solver default (2) trades that convergence for speed and
+    # leaves multi-contact rebound heavily damped, so pin the count here.
+    solver = newton.solvers.SolverXPBD(model, enable_restitution=True, rigid_contact_restitution_iterations=32)
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
