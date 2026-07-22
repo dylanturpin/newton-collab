@@ -25,7 +25,7 @@ import numpy as np
 import warp as wp
 
 from ...core.types import override
-from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State
+from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk
 from ...sim.enums import BodyFlags, JointType
 from ..semi_implicit.kernels_contact import (
@@ -125,6 +125,7 @@ from .kernels import (
     refine_same_articulation_propagation_rows,
     refresh_propagation_free_body_qd_from_vout,
     refresh_propagation_tree_body_qd_for_size,
+    reset_world_warmstart_buffers,
     rhs_accum_world_par_art,
     scatter_qdd_from_groups,
     snapshot_mf_prev_slots,
@@ -962,6 +963,48 @@ class SolverFeatherPGS(SolverBase):
             self._update_kinematic_state()
             self._scatter_armature_to_groups(self.model)
             self._mass_update_requested.fill_(1)
+
+    @override
+    def reset(
+        self,
+        state: State,
+        world_mask: wp.array | None = None,
+        flags: StateFlags | int | None = None,
+    ) -> None:
+        """Clear persistent warm-start state for reset worlds.
+
+        The authored simulation state is preserved. Only solver-owned dense
+        and matrix-free impulse history is cleared.
+
+        Args:
+            state: Simulation state, which is left unchanged.
+            world_mask: Optional per-world reset mask. ``None`` resets every world.
+            flags: State flags, which do not affect solver-owned impulse history.
+        """
+        del state, flags
+        if world_mask is not None and world_mask.shape[0] != self.world_count:
+            raise ValueError(
+                f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per world)."
+            )
+        if self.world_count == 0:
+            return
+
+        prev_mf_impulses = self._ws_prev_mf_impulses
+        if not self.pgs_warmstart and prev_mf_impulses is None:
+            return
+
+        dense_impulses = self.impulses if self.pgs_warmstart else self._dummy_contact_impulses
+        if prev_mf_impulses is None:
+            prev_mf_impulses = self._dummy_contact_impulses
+        prev_mf_row_type = self._ws_prev_mf_row_type
+        if prev_mf_row_type is None:
+            prev_mf_row_type = self._dummy_contact_row_type
+        wp.launch(
+            reset_world_warmstart_buffers,
+            dim=self.world_count,
+            inputs=[world_mask, dense_impulses, prev_mf_impulses, prev_mf_row_type],
+            device=self.model.device,
+        )
 
     @staticmethod
     def _parse_projected_root_worlds(value: str) -> set[int] | None:

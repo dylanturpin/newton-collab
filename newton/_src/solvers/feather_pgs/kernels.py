@@ -3627,6 +3627,29 @@ def prepare_world_impulses(
             world_impulses[world, i] = 0.0
 
 
+@wp.kernel
+def reset_world_warmstart_buffers(
+    world_mask: wp.array[wp.bool],
+    dense_impulses: wp.array2d[float],
+    prev_mf_impulses: wp.array2d[float],
+    prev_mf_row_type: wp.array2d[int],
+):
+    """Clear persistent warm-start state for selected worlds."""
+    world = wp.tid()
+    if world_mask and not world_mask[world]:
+        return
+
+    if world < dense_impulses.shape[0]:
+        for row in range(dense_impulses.shape[1]):
+            dense_impulses[world, row] = 0.0
+    if world < prev_mf_impulses.shape[0]:
+        for row in range(prev_mf_impulses.shape[1]):
+            prev_mf_impulses[world, row] = 0.0
+    if world < prev_mf_row_type.shape[0]:
+        for row in range(prev_mf_row_type.shape[1]):
+            prev_mf_row_type[world, row] = -1
+
+
 # =============================================================================
 # Fully Matrix-Free PGS Kernels (velocity-space Jacobi)
 # =============================================================================
