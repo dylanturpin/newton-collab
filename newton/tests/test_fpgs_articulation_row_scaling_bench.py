@@ -5,6 +5,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import unittest
 from pathlib import Path
 
 import numpy as np
@@ -72,7 +73,7 @@ def _step_d6_contact_case(model, contacts, mode: str) -> tuple[np.ndarray, tuple
 def test_fpgs_propagation_fused_supports_multi_dof_contact_rows():
     wp.init()
     if not wp.get_device("cuda:0").is_cuda:
-        self.skipTest("CUDA is required for propagation-fused multi-DOF contact rows")
+        raise unittest.SkipTest("CUDA is required for propagation-fused multi-DOF contact rows")
 
     model = _build_d6_articulated_free_contact_model("cuda:0")
     assert model.joint_dof_dim.numpy().tolist() == [[3, 3], [3, 3]]
@@ -107,7 +108,7 @@ def test_fpgs_propagation_fused_supports_multi_dof_contact_rows():
 def test_fpgs_propagation_mixed_size_free_body_response():
     wp.init()
     if not wp.get_device("cuda:0").is_cuda:
-        self.skipTest("CUDA is required for propagation articulated/free contact rows")
+        raise unittest.SkipTest("CUDA is required for propagation articulated/free contact rows")
 
     script = Path(__file__).parent / "benchmarks" / "fpgs_articulation_row_scaling.py"
     spec = importlib.util.spec_from_file_location("fpgs_articulation_row_scaling", script)
@@ -168,7 +169,7 @@ def test_fpgs_propagation_mixed_size_free_body_response():
 def test_fpgs_articulation_row_scaling_benchmark_smoke(tmp_path):
     wp.init()
     if not wp.get_device("cuda:0").is_cuda:
-        self.skipTest("CUDA is required for the FPGS production scaling benchmark")
+        raise unittest.SkipTest("CUDA is required for the FPGS production scaling benchmark")
 
     script = Path(__file__).parent / "benchmarks" / "fpgs_articulation_row_scaling.py"
     out_dir = tmp_path / "fpgs_articulation_row_scaling"
@@ -250,7 +251,7 @@ def test_fpgs_articulation_row_scaling_benchmark_smoke(tmp_path):
 def test_fpgs_articulation_operator_diagnostic_smoke(tmp_path):
     wp.init()
     if not wp.get_device("cuda:0").is_cuda:
-        self.skipTest("CUDA is required for the FPGS operator diagnostic")
+        raise unittest.SkipTest("CUDA is required for the FPGS operator diagnostic")
 
     script = Path(__file__).parent / "benchmarks" / "fpgs_articulation_operator_diagnostic.py"
     out_dir = tmp_path / "fpgs_articulation_operator_diagnostic"
@@ -293,7 +294,7 @@ def test_fpgs_articulation_operator_diagnostic_smoke(tmp_path):
 def test_fpgs_propagation_debug_residuals_include_propagation_rows():
     wp.init()
     if not wp.get_device("cuda:0").is_cuda:
-        self.skipTest("CUDA is required for propagation PGS debug diagnostics")
+        raise unittest.SkipTest("CUDA is required for propagation PGS debug diagnostics")
 
     script = Path(__file__).parent / "benchmarks" / "fpgs_articulation_row_scaling.py"
     spec = importlib.util.spec_from_file_location("fpgs_articulation_row_scaling", script)
@@ -350,7 +351,7 @@ def test_fpgs_propagation_debug_residuals_include_propagation_rows():
 def test_fpgs_articulation_accuracy_probe_smoke(tmp_path):
     wp.init()
     if not wp.get_device("cuda:0").is_cuda:
-        self.skipTest("CUDA is required for the FPGS accuracy probe")
+        raise unittest.SkipTest("CUDA is required for the FPGS accuracy probe")
 
     script = Path(__file__).parent / "benchmarks" / "fpgs_articulation_accuracy_probe.py"
     out_dir = tmp_path / "fpgs_articulation_accuracy_probe"
