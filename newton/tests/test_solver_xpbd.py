@@ -814,6 +814,56 @@ def test_particle_shape_restitution_runs_with_requires_grad(test, device):
         )
 
 
+def test_rigid_restitution_elastic_box_on_plane(test, device):
+    """Restore the #1289 geometry: a restitution=1.0 box (4-corner manifold) on a
+    ground plane must rebound within elastic bounds. The 4-corner manifold is the
+    slowest-converging case for contact-weighted Jacobi restitution, so pin the
+    iteration count high enough to converge within a substep."""
+    hz = 0.05
+    drop_z = 0.3
+
+    builder = newton.ModelBuilder()
+    cfg = newton.ModelBuilder.ShapeConfig(density=500.0, restitution=1.0, mu=0.0)
+    builder.add_ground_plane(cfg=cfg)
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, drop_z), wp.quat_identity()))
+    builder.add_shape_box(body=body, hx=0.1, hy=0.1, hz=hz, cfg=cfg)
+    model = builder.finalize(device=device)
+
+    solver = newton.solvers.SolverXPBD(model, enable_restitution=True, rigid_contact_restitution_iterations=32)
+    state_0 = model.state()
+    state_1 = model.state()
+    contacts = model.contacts()
+
+    fps, substeps = 60, 16
+    dt = 1.0 / fps / substeps
+    n_frames = 50
+
+    z_history = []
+    for _ in range(n_frames):
+        for _ in range(substeps):
+            state_0.clear_forces()
+            model.collide(state_0, contacts)
+            solver.step(state_0, state_1, None, contacts, dt)
+            state_0, state_1 = state_1, state_0
+        z = float(state_0.body_q.numpy()[body, 2])
+        test.assertTrue(np.isfinite(z), f"Body Z is not finite: {z}")
+        z_history.append(z)
+
+    max_z = max(z_history)
+    test.assertLess(max_z, 1.05 * drop_z, f"Elastic box gained energy: peak {max_z:.4f} m")
+
+    contact_idx = next((i for i, z in enumerate(z_history) if z < hz * 1.5), None)
+    test.assertIsNotNone(contact_idx, "Box never contacted the ground.")
+    post_impact = z_history[contact_idx:]
+    z_min = min(post_impact)
+    peak_after = max(post_impact[post_impact.index(z_min) :])
+    test.assertGreater(
+        peak_after,
+        0.8 * drop_z,
+        f"Box should recover >=80% of release height (z_min={z_min:.4f}, peak={peak_after:.4f}).",
+    )
+
+
 def test_rigid_restitution_skips_inactive_contact(test, device):
     """Rigid restitution must ignore contacts inactive in the positional solve."""
     body_q = wp.array([wp.transform_identity()], dtype=wp.transform, device=device)
@@ -1987,6 +2037,14 @@ add_function_test(
     TestSolverXPBD,
     "test_rigid_restitution_uses_integrated_velocity",
     test_rigid_restitution_uses_integrated_velocity,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_rigid_restitution_elastic_box_on_plane",
+    test_rigid_restitution_elastic_box_on_plane,
     devices=devices,
     check_output=False,
 )
