@@ -25,9 +25,9 @@ import numpy as np
 import warp as wp
 
 from ...core.types import override
-from ...sim import Contacts, Control, Model, ModelBuilder, State
+from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State
 from ...sim.articulation import eval_fk
-from ...sim.enums import JointType
+from ...sim.enums import BodyFlags, JointType
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
@@ -68,6 +68,7 @@ from .kernels import (
     clamp_augmented_joint_u0,
     collect_propagation_units,
     clamp_free_root_velocity_limits,
+    commit_mass_updates,
     compute_com_transforms,
     compute_composite_inertia,
     compute_contact_linear_force_from_impulses,
@@ -88,7 +89,6 @@ from .kernels import (
     convert_root_free_qd_local_to_world,
     convert_root_free_qd_world_to_local,
     copy_free_rigid_propagation_body_response,
-    copy_int_array_masked,
     crba_fill_par_dof,
     delassus_par_row_col,
     detect_limit_count_changes,
@@ -433,7 +433,8 @@ class SolverFeatherPGS(SolverBase):
             pgs_mode (str, optional): PGS mode. "dense" builds the full Delassus matrix C = J*H^{-1}*J^T
                 and solves in impulse space (Gauss-Seidel) for all contacts. "split" uses the dense
                 path for articulated bodies and a cheaper matrix-free PGS path for free rigid body
-                contacts. "matrix_free" skips C entirely, recomputes J*v each iteration, and uses only
+                contacts. "matrix_free" is CUDA-only; CPU construction raises :class:`NotImplementedError`.
+                It skips C entirely, recomputes J*v each iteration, and uses only
                 the diagonal for preconditioning — O(max_constraints) memory instead of
                 O(max_constraints^2). Defaults to "split". Passing ``pgs_mode="dense"``
                 with a heterogeneous multi-world model (worlds whose per-world DOF
@@ -504,7 +505,8 @@ class SolverFeatherPGS(SolverBase):
                 (C = J * H^{-1} * J^T). "tiled" uses a streaming CUDA kernel that chunks shared memory
                 and scales to any constraint count. "par_row_col" launches one thread per matrix element.
                 "auto" selects "tiled" when DOFs exceed the threshold. Defaults to "auto".
-            pgs_kernel (str, optional): "loop", "tiled_row", or "tiled_contact" for PGS solve. Defaults to "tiled_row".
+            pgs_kernel (str, optional): "loop", "tiled_row", or "tiled_contact" for PGS solve. CPU models
+                use the scalar kernel suite regardless of these selectors. Defaults to "tiled_row".
             delassus_chunk_size (int, optional): Chunk size (in constraint rows) for the streaming Delassus
                 kernel. Controls how many rows of J and Y are loaded into shared memory at once.
                 None selects automatically based on shared memory heuristics. Defaults to None.
@@ -673,6 +675,10 @@ class SolverFeatherPGS(SolverBase):
                 f"articulated_contact_response={articulated_contact_response!r} currently requires "
                 "pgs_mode='matrix_free'"
             )
+        if model.device.is_cpu and self.pgs_mode == "matrix_free":
+            raise NotImplementedError(
+                "SolverFeatherPGS pgs_mode='matrix_free' requires CUDA; use pgs_mode='dense' or 'split' on CPU."
+            )
         if pgs_schedule not in ("interleaved", "contact_then_internal", "physx_grasp"):
             raise ValueError(
                 f"pgs_schedule must be 'interleaved', 'contact_then_internal', or 'physx_grasp', got {pgs_schedule!r}"
@@ -769,6 +775,7 @@ class SolverFeatherPGS(SolverBase):
         # per world per iteration. Populated only when ``pgs_debug`` is
         # ``True`` and ``pgs_mode == "matrix_free"``.
         self._pgs_ncp_residual_log: list[np.ndarray] = []
+
         valid_cholesky = {"tiled", "loop", "auto"}
         if cholesky_kernel not in valid_cholesky:
             raise ValueError(f"cholesky_kernel must be one of {sorted(valid_cholesky)}")
@@ -788,6 +795,16 @@ class SolverFeatherPGS(SolverBase):
         valid_pgs = {"loop", "tiled_row", "tiled_contact", "streaming"}
         if pgs_kernel not in valid_pgs:
             raise ValueError(f"pgs_kernel must be one of {sorted(valid_pgs)}")
+
+        # Native tiled kernels are CUDA-only. Resolve the complete scalar
+        # suite here so CPU callers cannot accidentally launch silent no-op
+        # native bodies through otherwise valid public selectors.
+        if model.device.is_cpu:
+            cholesky_kernel = "loop"
+            trisolve_kernel = "loop"
+            hinv_jt_kernel = "par_row"
+            delassus_kernel = "par_row_col"
+            pgs_kernel = "loop"
 
         # Effort-limit clamp is always actuator-only: the explicit-PD drive bucket
         # (``aug_row_u0``) is clamped to ``+/- joint_effort_limit`` before it
@@ -823,10 +840,15 @@ class SolverFeatherPGS(SolverBase):
 
         self._step = 0
         self._force_mass_update = False
+        self._mass_update_requested = wp.zeros(1, dtype=wp.int32, device=model.device)
         # Host mirror of the global mass-update flag evaluated by the last
         # _stage1_crba call; gates the per-step H memsets (see _stage1_crba).
         self._mass_update_global_flag = True
         self._last_step_dt = None
+
+        self._kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
+        self._kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
+        self._update_kinematic_state()
         self._compute_articulation_metadata(model)
         self._validate_heterogeneous_world_support(model)
         self.dense_max_constraints = self._select_dense_row_capacity(model)
@@ -907,6 +929,39 @@ class SolverFeatherPGS(SolverBase):
             )
 
         self._init_double_buffer_stream()
+
+    def _update_kinematic_state(self) -> None:
+        """Refresh cached kinematic flags and effective joint armature."""
+        model = self.model
+        self._joint_armature_effective = model.joint_armature.numpy().copy()
+        joint_mask = np.zeros(model.joint_count, dtype=np.int32)
+        dof_mask = np.zeros(model.joint_dof_count, dtype=np.int32)
+
+        if model.body_count and model.joint_count:
+            kinematic_bodies = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
+            joint_child = model.joint_child.numpy()
+            joint_qd_start = model.joint_qd_start.numpy()
+            for joint in range(model.joint_count):
+                if not kinematic_bodies[joint_child[joint]]:
+                    continue
+                joint_mask[joint] = 1
+                dof_start = joint_qd_start[joint]
+                dof_end = joint_qd_start[joint + 1]
+                if dof_end <= dof_start:
+                    continue
+                dof_mask[dof_start:dof_end] = 1
+                self._joint_armature_effective[dof_start:dof_end] = 1.0e10
+
+        self._kinematic_joint_mask.assign(joint_mask)
+        self._kinematic_dof_mask.assign(dof_mask)
+
+    @override
+    def notify_model_changed(self, flags: ModelFlags | int) -> None:
+        """Refresh cached dynamics data after body flags or joint armature change."""
+        if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
+            self._update_kinematic_state()
+            self._scatter_armature_to_groups(self.model)
+            self._mass_update_requested.fill_(1)
 
     @staticmethod
     def _parse_projected_root_worlds(value: str) -> set[int] | None:
@@ -1009,7 +1064,6 @@ class SolverFeatherPGS(SolverBase):
         self._compute_root_free_metadata(model)
         self._setup_size_grouping(model)
         self._setup_world_mapping(model)
-        self._is_one_art_per_world = self.world_count == model.articulation_count
         self._is_homogeneous = (len(self.size_groups) == 1) if self.size_groups else True
         self._build_body_maps(model)
         self._classify_free_rigid_bodies(model)
@@ -1331,21 +1385,23 @@ class SolverFeatherPGS(SolverBase):
             last_dof = joint_qd_start[last_joint]
             articulation_dof_counts[art_idx] = last_dof - first_dof
 
-        # Determine unique sizes (sorted descending for largest first)
-        unique_sizes = sorted(set(articulation_dof_counts), reverse=True)
-        self.size_groups = unique_sizes
-        self.n_arts_by_size = {size: int(np.sum(articulation_dof_counts == size)) for size in unique_sizes}
+        # Numerical solve groups contain only articulations with active DOFs.
+        solve_sizes = sorted({int(size) for size in articulation_dof_counts if size > 0}, reverse=True)
+        self.size_groups = solve_sizes
+        self.n_arts_by_size = {size: int(np.sum(articulation_dof_counts == size)) for size in solve_sizes}
 
         # Build indirection arrays
         art_size_np = articulation_dof_counts.copy()
-        art_group_idx_np = np.zeros(model.articulation_count, dtype=np.int32)
-        group_to_art_np = {size: np.zeros(self.n_arts_by_size[size], dtype=np.int32) for size in unique_sizes}
+        art_group_idx_np = np.full(model.articulation_count, -1, dtype=np.int32)
+        group_to_art_np = {size: np.zeros(self.n_arts_by_size[size], dtype=np.int32) for size in solve_sizes}
 
         # Track current index within each size group
-        size_counters = dict.fromkeys(unique_sizes, 0)
+        size_counters = dict.fromkeys(solve_sizes, 0)
 
         for art_idx in range(model.articulation_count):
             size = articulation_dof_counts[art_idx]
+            if size == 0:
+                continue
             group_idx = size_counters[size]
 
             art_group_idx_np[art_idx] = group_idx
@@ -1357,7 +1413,7 @@ class SolverFeatherPGS(SolverBase):
         self.art_size = wp.array(art_size_np, dtype=wp.int32, device=device)
         self.art_group_idx = wp.array(art_group_idx_np, dtype=wp.int32, device=device)
         self.group_to_art = {
-            size: wp.array(group_to_art_np[size], dtype=wp.int32, device=device) for size in unique_sizes
+            size: wp.array(group_to_art_np[size], dtype=wp.int32, device=device) for size in solve_sizes
         }
 
     def _setup_world_mapping(self, model):
@@ -1371,6 +1427,7 @@ class SolverFeatherPGS(SolverBase):
             self.world_art_start = None
             self._is_multi_articulation = False
             self._max_arts_per_world = 0
+            self._is_one_solve_art_per_world = False
             return
 
         device = model.device
@@ -1399,6 +1456,14 @@ class SolverFeatherPGS(SolverBase):
         world_art_start_np[1:] = np.cumsum(world_art_counts)
 
         self.world_art_start = wp.array(world_art_start_np, dtype=wp.int32, device=device)
+
+        # Numerical fast paths are defined by positive-DOF solve participants,
+        # not by fixed articulations that only contribute collision geometry.
+        art_size_np = self.art_size.numpy()
+        world_solve_art_counts = np.zeros(self.world_count, dtype=np.int32)
+        for art_idx, world_idx in enumerate(art_to_world_np):
+            world_solve_art_counts[world_idx] += int(art_size_np[art_idx] > 0)
+        self._is_one_solve_art_per_world = bool(np.all(world_solve_art_counts == 1))
 
         # Detect if we have multiple articulations per world
         self._max_arts_per_world = int(np.max(world_art_counts)) if len(world_art_counts) > 0 else 0
@@ -1495,8 +1560,17 @@ class SolverFeatherPGS(SolverBase):
         n_free = int(np.sum(is_free_rigid_np))
         self._has_free_rigid_bodies = n_free > 0
         self._n_free_rigid = n_free
-        self._has_mixed_contacts = self._has_free_rigid_bodies and self._n_free_rigid < model.articulation_count
-        self._has_non_free_articulations = n_free < model.articulation_count
+
+        solve_mask = self.art_size.numpy() > 0
+        free_mask = is_free_rigid_np != 0
+        art_to_world_np = self.art_to_world.numpy()
+        free_worlds = set(art_to_world_np[solve_mask & free_mask])
+        nonfree_worlds = set(art_to_world_np[solve_mask & ~free_mask])
+        self._has_mixed_contacts = bool(free_worlds & nonfree_worlds)
+        # Solve-mask-aware: zero-DOF (kinematic-only) articulations are excluded
+        # from the solve size groups, so they must not count as non-free
+        # articulations when gating propagation-family buffer allocation.
+        self._has_non_free_articulations = bool(np.any(solve_mask & ~free_mask))
         self.is_free_rigid = wp.array(is_free_rigid_np, dtype=wp.int32, device=model.device)
 
     def _compute_world_dof_mapping(self, model):
@@ -2470,7 +2544,7 @@ class SolverFeatherPGS(SolverBase):
         if not self.size_groups:
             return
 
-        armature_np = model.joint_armature.numpy()
+        armature_np = self._joint_armature_effective
         art_dof_start_np = self.articulation_dof_start.numpy()
         art_H_rows_np = self.articulation_H_rows.numpy()
 
@@ -2486,7 +2560,7 @@ class SolverFeatherPGS(SolverBase):
                 dof_count = art_H_rows_np[art_idx]
                 R_np[group_idx, :dof_count] = armature_np[dof_start : dof_start + dof_count]
 
-            self.R_by_size[size] = wp.array(R_np, dtype=wp.float32, device=model.device)
+            self.R_by_size[size].assign(R_np)
 
     def _use_tiled_hinv_jt(self, size: int) -> bool:
         if self.hinv_jt_kernel == "par_row" or self.dense_max_constraints <= 0:
@@ -2519,14 +2593,6 @@ class SolverFeatherPGS(SolverBase):
         self._delassus_kernels_by_size = {}
 
         for size in self.size_groups:
-            if size <= 0:
-                self._cholesky_kernels_by_size[size] = None
-                self._triangular_solve_kernels_by_size[size] = None
-                self._hinv_jt_kernels_by_size[size] = None
-                self._hinv_jt_fused_kernels_by_size[size] = None
-                self._delassus_kernels_by_size[size] = None
-                continue
-
             self._cholesky_kernels_by_size[size] = _get_cholesky_kernel(size, device_arch, self.tile_threads)
             self._triangular_solve_kernels_by_size[size] = _get_triangular_solve_kernel(
                 size, device_arch, self.tile_threads
@@ -4264,7 +4330,7 @@ class SolverFeatherPGS(SolverBase):
 
         else:
             fused_ok = (
-                self._is_one_art_per_world
+                self._is_one_solve_art_per_world
                 and self.hinv_jt_kernel != "par_row"
                 # The fused kernel still builds a full [M x M] Delassus tile, so it cannot be chunked like
                 # _stage4_hinv_jt_tiled. Only take it when the full width fits shared memory; otherwise fall
@@ -5035,9 +5101,11 @@ class SolverFeatherPGS(SolverBase):
                 inputs=[
                     model.articulation_start,
                     model.joint_type,
+                    model.joint_child,
                     model.joint_qd_start,
                     model.joint_dof_dim,
                     model.joint_velocity_limit,
+                    model.body_flags,
                 ],
                 outputs=[self.qd_work],
                 device=model.device,
@@ -5136,6 +5204,7 @@ class SolverFeatherPGS(SolverBase):
                     state_aug.joint_S_s,
                     state_aug.body_f_s,
                     body_f,
+                    model.body_flags,
                     state_in.body_q,
                     model.body_com,
                     self.articulation_origin,
@@ -5284,6 +5353,7 @@ class SolverFeatherPGS(SolverBase):
             inputs=[
                 global_flag,
                 self.limit_change_mask,
+                self._mass_update_requested,
             ],
             outputs=[self.mass_update_mask],
             device=model.device,
@@ -5357,9 +5427,9 @@ class SolverFeatherPGS(SolverBase):
             )
 
         wp.launch(
-            copy_int_array_masked,
+            commit_mass_updates,
             dim=model.articulation_count,
-            inputs=[self.aug_limit_counts, self.mass_update_mask],
+            inputs=[self.aug_limit_counts, self.mass_update_mask, self._mass_update_requested],
             outputs=[self.aug_prev_limit_counts],
             device=model.device,
         )
@@ -5475,10 +5545,10 @@ class SolverFeatherPGS(SolverBase):
             dim=model.joint_dof_count,
             inputs=[
                 self.qd_work,
-                state_aug.joint_qdd,
+                self._kinematic_dof_mask,
                 dt,
             ],
-            outputs=[self.v_hat],
+            outputs=[state_aug.joint_qdd, self.v_hat],
             device=model.device,
         )
 
@@ -5620,6 +5690,8 @@ class SolverFeatherPGS(SolverBase):
                     model.shape_body,
                     self.body_to_articulation,
                     self.art_to_world,
+                    self.art_size,
+                    model.body_flags,
                     is_free_rigid,
                     has_free_rigid_flag,
                     propagation_flag,
@@ -5855,6 +5927,7 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_path,
                         self.contact_art_a,
                         self.contact_art_b,
+                        self.art_size,
                         self.articulation_origin,
                         model.shape_body,
                         state_in.body_q,
@@ -6092,6 +6165,7 @@ class SolverFeatherPGS(SolverBase):
                     self.body_to_articulation,
                     self.art_to_world,
                     is_free_rigid,
+                    model.body_flags,
                     self.rigid_body_max_linear_velocity,
                     self.rigid_body_max_angular_velocity,
                     root_dof_start,
@@ -6696,6 +6770,7 @@ class SolverFeatherPGS(SolverBase):
             inputs=[
                 self.model.articulation_start,
                 self.model.joint_child,
+                self.model.body_flags,
                 self.articulation_root_is_free,
                 self.articulation_root_dof_start,
                 self.rigid_body_max_linear_velocity,
@@ -7139,6 +7214,7 @@ class SolverFeatherPGS(SolverBase):
                 state_aug.body_I_s,
                 self.is_free_rigid,
                 self.body_to_articulation,
+                model.body_flags,
             ],
             outputs=[self.mf_body_Hinv],
             device=model.device,
@@ -7318,8 +7394,8 @@ class SolverFeatherPGS(SolverBase):
         wp.launch(
             update_qdd_from_velocity,
             dim=model.joint_dof_count,
-            inputs=[state_in.joint_qd, self.v_out, 1.0 / dt],
-            outputs=[state_aug.joint_qdd],
+            inputs=[state_in.joint_qd, self._kinematic_dof_mask, 1.0 / dt],
+            outputs=[self.v_out, state_aug.joint_qdd],
             device=model.device,
         )
 
@@ -7336,6 +7412,7 @@ class SolverFeatherPGS(SolverBase):
                     model.joint_child,
                     model.joint_q_start,
                     model.joint_qd_start,
+                    self._kinematic_joint_mask,
                     model.joint_dof_dim,
                     model.body_com,
                     state_in.joint_q,
@@ -7382,8 +7459,8 @@ class SolverFeatherPGS(SolverBase):
             wp.launch(
                 update_qdd_from_velocity,
                 dim=model.joint_dof_count,
-                inputs=[state_in.joint_qd, self.qd_work, 1.0 / dt],
-                outputs=[state_aug.joint_qdd],
+                inputs=[state_in.joint_qd, self._kinematic_dof_mask, 1.0 / dt],
+                outputs=[self.qd_work, state_aug.joint_qdd],
                 device=model.device,
             )
             wp.launch(
@@ -7395,6 +7472,7 @@ class SolverFeatherPGS(SolverBase):
                     model.joint_child,
                     model.joint_q_start,
                     model.joint_qd_start,
+                    self._kinematic_joint_mask,
                     model.joint_dof_dim,
                     model.body_com,
                     state_in.joint_q,
@@ -7428,14 +7506,14 @@ class SolverFeatherPGS(SolverBase):
                     device=model.device,
                 )
 
-            wp.copy(state_out.joint_qd, self.v_out)
             wp.launch(
                 update_qdd_from_velocity,
                 dim=model.joint_dof_count,
-                inputs=[state_in.joint_qd, self.v_out, 1.0 / dt],
-                outputs=[state_aug.joint_qdd],
+                inputs=[state_in.joint_qd, self._kinematic_dof_mask, 1.0 / dt],
+                outputs=[self.v_out, state_aug.joint_qdd],
                 device=model.device,
             )
+            wp.copy(state_out.joint_qd, self.v_out)
             eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
 
 

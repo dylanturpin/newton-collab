@@ -658,6 +658,8 @@ def test_kinematic_runtime_toggle(
     builder.color()
     model = builder.finalize(device=device)
     solver = solver_fn(model)
+    if isinstance(solver, newton.solvers.SolverFeatherPGS):
+        solver.update_mass_matrix_interval = 100
     collision_pipeline, contacts = _create_contacts(model, solver)
 
     state_0, state_1 = model.state(), model.state()
@@ -718,6 +720,11 @@ def test_kinematic_runtime_toggle(
 devices = get_test_devices()
 solvers = {
     "featherstone": lambda model: newton.solvers.SolverFeatherstone(model, angular_damping=0.0),
+    "feather_pgs_dense": lambda model: newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, pgs_mode="dense"),
+    "feather_pgs_split": lambda model: newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, pgs_mode="split"),
+    "feather_pgs_matrix_free": lambda model: newton.solvers.SolverFeatherPGS(
+        model, angular_damping=0.0, pgs_mode="matrix_free"
+    ),
     "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, iterations=5, angular_damping=0.0),
@@ -729,6 +736,8 @@ for device in devices:
         if device.is_cuda and solver_name == "mujoco_cpu":
             continue
         if device.is_cpu and solver_name == "mujoco_warp":
+            continue
+        if device.is_cpu and solver_name == "feather_pgs_matrix_free":
             continue
 
         add_function_test(

@@ -41,6 +41,7 @@
 ### Changed
 
 - `SolverFeatherPGS` now raises `ValueError` at construction when a heterogeneous multi-world model (worlds whose per-world DOF counts differ) is combined with `pgs_mode="dense"` or any propagation-family `articulated_contact_response` (`"propagation"`, `"propagation-fused"`, `"propagation-colored"`): the dense path produces deterministic wrong trajectories and the propagation full-iteration kernel silently corrupts velocities across world boundaries on such models. Heterogeneous models remain supported with `pgs_mode="matrix_free"` or `pgs_mode="split"` under the default `articulated_contact_response="immediate"`.
+- Require CUDA for `SolverFeatherPGS(pgs_mode="matrix_free")`; use `pgs_mode="dense"` or `pgs_mode="split"` when constructing the solver on CPU.
 - Remove the `cbor2` `<6` dependency ceiling after updating recorder deserialization to accept mapping-like decoded containers
 - Require Warp 1.14 and configure Warp logging through `warp.config.log_level`; use Newton's `--quiet` flag or `--warp-config log_level=...` instead of legacy `verbose` or `quiet` config keys
 - Auto-scale `ViewerGL` contact arrows, joint axes, and COM markers by `Viewer.scene_scale`; to approximate the previous fixed sizes after `set_model()`, set `viewer.renderer.arrow_length_scale = 0.1 / viewer.scene_scale`, `viewer.renderer.joint_scale = 0.1 / viewer.scene_scale`, and `viewer.renderer.com_scale = 0.1 / viewer.scene_scale`.
@@ -77,6 +78,7 @@
 
 - Fix `import newton` failing when `warp.fem` is unavailable (e.g. the `omni.warp.core` build shipped in Omniverse Kit) by guarding the eager `SolverImplicitMPM` import in `newton._src.solvers`; the symbol is set to `None` when the MPM solver cannot be imported.
 - Fix `SolverFeatherPGS` producing NaNs when `dense_max_constraints` exceeds the per-block shared-memory limit (about 224 rows for a 35-DOF articulation on sm_86): the tiled `H^-1 J^T` kernel sized its shared memory to `dense_max_constraints` and silently over-subscribed, leaving its output as garbage. The kernel is now compiled at a fixed width and launched once per row-chunk (new `hinv_jt_chunk_size` parameter, default 128), so `dense_max_constraints` can exceed the limit without over-subscribing.
+- Fix `SolverFeatherPGS` treating kinematic bodies as dynamic, retaining stale body-flag state after model changes, routing zero-DOF kinematic roots through numerical solve paths, allocating contact rows between immovable bodies, and selecting CUDA-only kernels on CPU.
 - Fix `eval_fk()` overwriting VBD-simulated `JointType.CABLE` body poses.
 - Fix `SolverXPBD` `body_parent_f` reporting to include `Control.joint_f` contributions and accumulate multiple inbound joint contributions, matching the `SolverMuJoCo` and `SolverFeatherstone` convention.
 - Fix MJCF `xyaxes` parsing to treat the second vector as Y and derive Z from X cross Y.
