@@ -147,6 +147,22 @@ def _accumulate_row_watermark(
     wp.atomic_max(watermark, 0, counts[tid])
 
 
+@wp.kernel
+def _accumulate_dropped_rows(
+    counts: wp.array(dtype=wp.int32),
+    cap: int,
+    dropped: wp.array(dtype=wp.int32),
+):
+    # Per-world overflow (raw slot demand minus capacity) summed into a single
+    # cumulative scalar — the total number of constraint rows discarded by the
+    # cap over the whole run. Read-only on ``counts``; writes only the separate
+    # ``dropped`` buffer, so this is numerics-neutral like the watermark.
+    tid = wp.tid()
+    over = counts[tid] - cap
+    if over > 0:
+        wp.atomic_add(dropped, 0, over)
+
+
 class SolverFeatherPGS(SolverBase):
     """A semi-implicit integrator using symplectic Euler that operates
     on reduced (also called generalized) coordinates to simulate articulated rigid body dynamics
@@ -188,6 +204,19 @@ class SolverFeatherPGS(SolverBase):
             solver.step(state_in, state_out, control, contacts, dt)
             state_in, state_out = state_out, state_in
 
+    """
+
+    joint_qd_public_convention: bool = True
+    """FeatherPGS stores free-joint ``joint_qd`` in Newton's PUBLIC convention (child-body
+    COM linear velocity + world angular velocity), matching :func:`newton.eval_fk`.
+
+    This differs from the vanilla Featherstone solver's INTERNAL free-joint convention (a
+    world-origin-referenced spatial twist), which requires
+    ``eval_fk_with_velocity_conversion`` instead. Integration layers that refresh maximal
+    body state from joint state (e.g. after reset writes) must dispatch on this attribute:
+    using the Featherstone-internal helper on public-convention ``joint_qd`` mis-references
+    the base twist by the articulation origin, injecting ``omega x p`` of phantom COM
+    velocity into ``State.body_qd`` (grows with the env grid radius).
     """
 
     @classmethod
@@ -726,10 +755,22 @@ class SolverFeatherPGS(SolverBase):
             self._row_watermark_dense = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_mf = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_contact = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            # Unclamped-demand watermarks + cumulative dropped-row counters. The
+            # slot counters hold the raw pre-clamp demand (the finalize kernels
+            # clamp them into the constraint counts), so demand - cap is exactly
+            # the rows discarded that step.
+            self._row_watermark_dense_demand = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_watermark_mf_demand = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_dropped_dense = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_dropped_mf = wp.zeros(1, dtype=wp.int32, device=wm_device)
         else:
             self._row_watermark_dense = None
             self._row_watermark_mf = None
             self._row_watermark_contact = None
+            self._row_watermark_dense_demand = None
+            self._row_watermark_mf_demand = None
+            self._row_dropped_dense = None
+            self._row_dropped_mf = None
 
         self._debug_projected_root = os.getenv("IL_NEWTON_FPGS_PROJECTED_ROOT", "").lower() in {
             "1",
@@ -2722,6 +2763,35 @@ class SolverFeatherPGS(SolverBase):
                     inputs=[contact_counts, self._row_watermark_contact],
                     device=contact_counts.device,
                 )
+            # raw (pre-clamp) demand + dropped rows, from the un-finalized slot counters
+            slot_counts = getattr(self, "slot_counter", None)
+            if slot_counts is not None and slot_counts.shape[0] > 0:
+                wp.launch(
+                    _accumulate_row_watermark,
+                    dim=slot_counts.shape[0],
+                    inputs=[slot_counts, self._row_watermark_dense_demand],
+                    device=slot_counts.device,
+                )
+                wp.launch(
+                    _accumulate_dropped_rows,
+                    dim=slot_counts.shape[0],
+                    inputs=[slot_counts, int(self.dense_max_constraints), self._row_dropped_dense],
+                    device=slot_counts.device,
+                )
+            mf_slots = getattr(self, "mf_slot_counter", None)
+            if mf_slots is not None and mf_slots.shape[0] > 0:
+                wp.launch(
+                    _accumulate_row_watermark,
+                    dim=mf_slots.shape[0],
+                    inputs=[mf_slots, self._row_watermark_mf_demand],
+                    device=mf_slots.device,
+                )
+                wp.launch(
+                    _accumulate_dropped_rows,
+                    dim=mf_slots.shape[0],
+                    inputs=[mf_slots, int(self.mf_max_constraints), self._row_dropped_mf],
+                    device=mf_slots.device,
+                )
 
         self._step += 1
         return state_out
@@ -2743,11 +2813,19 @@ class SolverFeatherPGS(SolverBase):
                 "dense_high_water": 0,
                 "mf_high_water": 0,
                 "contact_high_water": 0,
+                "dense_demand_high_water": 0,
+                "mf_demand_high_water": 0,
+                "dense_rows_dropped": 0,
+                "mf_rows_dropped": 0,
             }
         return {
             "dense_high_water": int(self._row_watermark_dense.numpy()[0]),
             "mf_high_water": int(self._row_watermark_mf.numpy()[0]),
             "contact_high_water": int(self._row_watermark_contact.numpy()[0]),
+            "dense_demand_high_water": int(self._row_watermark_dense_demand.numpy()[0]),
+            "mf_demand_high_water": int(self._row_watermark_mf_demand.numpy()[0]),
+            "dense_rows_dropped": int(self._row_dropped_dense.numpy()[0]),
+            "mf_rows_dropped": int(self._row_dropped_mf.numpy()[0]),
         }
 
     @override
