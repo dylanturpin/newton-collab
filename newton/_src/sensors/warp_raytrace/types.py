@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import warp as wp
 
+from ...utils.color import ColorSpace
+
 
 class RenderLightType(enum.IntEnum):
     """Light types supported by the Warp raytracer."""
@@ -55,10 +57,25 @@ class RenderConfig:
     """Enable ambient lighting for the scene."""
 
     enable_particles: bool = True
-    """Enable particle rendering."""
+    """Enable standalone particle rendering.
+
+    Particles referenced by rendered triangle or tetrahedral deformable topology
+    are rendered by the triangle mesh path and are not emitted as particle
+    spheres.
+    """
 
     enable_backface_culling: bool = True
     """Cull back-facing triangles."""
+
+    enable_fast_math: bool = True
+    """Compile render kernels with CUDA fast math."""
+
+    output_color_space: ColorSpace = ColorSpace.SRGB
+    """Color space for packed color and albedo outputs.
+
+    Use ``ColorSpace.SRGB`` for display-encoded bytes or
+    ``ColorSpace.LINEAR`` for linear RGB bytes.
+    """
 
     render_order: int = RenderOrder.PIXEL_PRIORITY
     """Render traversal order (see :class:`RenderOrder`)."""

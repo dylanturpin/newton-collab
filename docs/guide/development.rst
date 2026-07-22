@@ -174,42 +174,6 @@ Pass ``--help`` to either run method below to see all available flags.
             # run tests
             python -m newton.tests
             
-Most tests run when the ``dev`` extras are installed. The tests using PyTorch
-to run inference on an RL policy are skipped if the ``torch`` dependency is
-not installed. In order to run these tests, include the ``torch-cu12`` or
-``torch-cu13`` extras matching your NVIDIA driver's CUDA support:
-
-.. tab-set::
-    :sync-group: env
-
-    .. tab-item:: uv
-        :sync: uv
-
-        .. code-block:: console
-
-            # install development extras and run tests
-            uv run --extra dev --extra torch-cu12 -m newton.tests
-
-    .. tab-item:: venv
-        :sync: venv
-
-        .. code-block:: console
-
-            # install both dev and torch-cu12 extras (need to pull from PyTorch CUDA 12.8 wheel index)
-            python -m pip install --extra-index-url https://download.pytorch.org/whl/cu128 -e ".[dev,torch-cu12]"
-            # run tests
-            python -m newton.tests
-
-.. note::
-
-    The ``torch-cu12`` extra requires PyTorch built against CUDA 12.8. If your
-    driver only supports CUDA 12.4 or 12.5 (check with ``nvidia-smi``), install
-    PyTorch 2.6.0 manually instead of using the ``torch-cu12`` extra:
-
-    .. code-block:: console
-
-        pip install torch==2.6.0 --extra-index-url https://download.pytorch.org/whl/cu124
-
 Specific Newton examples can be tested in isolation via the ``-k`` argument:
 
 .. tab-set::
@@ -562,6 +526,54 @@ After running the script, rebuild the documentation to verify the result (see
     attributes) are included. If a new class or function in ``newton/_src/`` should
     be visible to users, re-export it through the appropriate public module first.
 
+.. _experimental-features:
+
+Experimental features
+^^^^^^^^^^^^^^^^^^^^^
+
+Mark user-facing experimental API with the ``.. experimental::`` directive in
+the public docstring or concept page where users encounter it. The directive is
+the user-facing compatibility marker; do not add a separate policy page or
+inline prose block for the same status.
+
+With no body, the directive renders Newton's standard notice:
+
+.. experimental::
+
+.. code-block:: rst
+
+    .. experimental::
+
+Use this form for an entire module, class, method, or function when the full
+feature is experimental.
+
+For experimental behavior inside an otherwise stable API, add custom content that
+names the exact scope:
+
+.. code-block:: rst
+
+    Args:
+        contact_matching: Frame-to-frame contact matching mode.
+
+            .. experimental::
+
+                The ``"sticky"`` mode may change without prior notice.
+
+When adding or changing experimental public API:
+
+- keep the marker in the public docs or docstring, not just in comments;
+- keep status tables and summaries concise; use plain text such as
+  ``experimental`` instead of linking every status label to the marker;
+- describe any relevant limitations in the concept docs;
+- run ``uv run python docs/generate_api.py`` when public API symbols change.
+
+Use a domain-local experimental namespace only for a cohesive new subsystem
+that can reasonably live behind an opt-in import path, for example
+``newton.solvers.experimental.<feature>``. Do not move existing public classes
+such as solver backends into an experimental namespace just to communicate
+implementation maturity. Mark the specific class, behavior, option, or concept
+instead.
+
 Testing documentation code snippets
 -----------------------------------
 
@@ -786,6 +798,43 @@ The benchmarks discovered by airspeed velocity are in the ``asv/benchmarks`` dir
 benchmark code from the ``asv/benchmarks`` directory against the code state of the ``main`` branch. Note that
 the benchmark definitions themselves are not checked out from different branches—only the code being
 benchmarked is.
+
+Simulation benchmark metrics
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The nightly robot and policy simulation benchmarks publish several metrics from one cached benchmark run. This
+includes the batched MuJoCo and Kamino KPI workloads, the non-policy DR Legs workload, the pretrained Anymal
+workload, and the XPBD quadruped workload. Companion ``FastMetrics*`` classes reuse the exact factories, scenes,
+solvers, and frame counts of existing aggregate benchmarks. Rendering, IK, inverse dynamics, CPU-backend
+regression, material/contact microbenchmarks, and startup benchmarks are not experience-collection workloads and
+are outside this metric set.
+
+Let ``F`` be the number of measured frames across all samples, ``S`` the number of physics substeps per frame,
+``W`` the world count, ``dt`` the physics timestep in seconds, ``T`` the synchronized complete-step wall time in
+seconds, and ``T_physics`` the workload's synchronized internal physics time. The reported metrics are:
+
+* mean world-step time: ``1000 * T_physics / (F * S * W)`` in ``ms/world-step`` for workloads with an internal
+  timer and ``1000 * T / (F * S * W)`` otherwise;
+* simulation throughput: ``F * S * W / T`` in ``world-steps/s``;
+* real-time factor: ``F * S * W * dt / T``;
+* p95 step time: the 95th percentile of synchronized complete-step times in ``ms/frame``; and
+* steady-state GPU memory in ``MiB``; and
+* mean and maximum MuJoCo solver iteration counts across worlds at the final frame of each measured sample.
+
+The existing KPI mean world-step series keeps its ``track_simulate`` name and definition, and existing
+``time_simulate`` aggregate series remain unchanged. ``world_count`` remains an ASV parameter where applicable,
+while ``sim_dt`` and ``sim_substeps`` are also recorded as tracked values so dashboard results retain the
+configuration needed to interpret throughput and real-time factor. The existing KPI mean series continues to use
+each workload's internal physics timer. Throughput, real-time factor, and p95 metrics time and synchronize the
+complete ``step()`` operation, including any policy or control work it performs.
+
+GPU memory is the decrease in ``Device.free_memory`` between a baseline immediately before the first finalized
+workload is created and a measurement after initialization, CUDA graph capture, and the first complete measured
+sample, while that sample's workload is still live. This device-level delta includes allocations from Warp,
+PyTorch, solver support, and CUDA graphs. Because the measurement is device-wide, runners must provide exclusive
+GPU access during the measurement interval. The remaining samples do not affect this measurement. A benchmark
+fails instead of publishing metrics if its final simulation state is invalid, has non-normalized body rotations,
+or exceeds the workload's body-speed bounds.
 
 Benchmarks can also be run against a range of commits using the ``commit1..commit2`` syntax.
 This is useful for comparing performance across several recent changes:
