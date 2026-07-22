@@ -435,7 +435,9 @@ class SolverFeatherPGS(SolverBase):
                 path for articulated bodies and a cheaper matrix-free PGS path for free rigid body
                 contacts. "matrix_free" skips C entirely, recomputes J*v each iteration, and uses only
                 the diagonal for preconditioning — O(max_constraints) memory instead of
-                O(max_constraints^2). Defaults to "split".
+                O(max_constraints^2). Defaults to "split". Passing ``pgs_mode="dense"``
+                with a heterogeneous multi-world model (worlds whose per-world DOF
+                counts differ) raises ``ValueError``; use "matrix_free" or "split".
             articulated_contact_response (str, optional): Contact response for articulated rows
                 under ``pgs_mode="matrix_free"``. ``"immediate"`` is the existing D-wide row path.
                 ``"propagation"`` routes contacts touching non-free articulations to fixed-size
@@ -457,6 +459,9 @@ class SolverFeatherPGS(SolverBase):
                 scheduling changes — while ``"propagation-fused"`` keeps free/free rows
                 on the matrix-free family (its measured-best configuration).
                 Velocity-limit rows stay on the matrix-free family in all modes.
+                Passing any propagation-family value with a heterogeneous multi-world
+                model (worlds whose per-world DOF counts differ) raises ``ValueError``;
+                use ``"immediate"`` (or ``pgs_mode="split"``) for such models.
             propagation_same_articulation_rows (bool, optional): Route contacts between two
                 links of the same articulation to propagation rows instead of dense generalized
                 rows. Their effective mass is recomputed with exact cross operational-space
@@ -823,6 +828,7 @@ class SolverFeatherPGS(SolverBase):
         self._mass_update_global_flag = True
         self._last_step_dt = None
         self._compute_articulation_metadata(model)
+        self._validate_heterogeneous_world_support(model)
         self.dense_max_constraints = self._select_dense_row_capacity(model)
         self._propagation_full_fused_size = self._select_propagation_full_fused_size()
 
@@ -1041,6 +1047,72 @@ class SolverFeatherPGS(SolverBase):
             self._propagation_tree_has_non_free_by_size = {int(size): False for size in self.size_groups}
             self._propagation_tree_requires_body_map = False
         self._setup_world_size_grouping(model)
+
+    def _detect_heterogeneous_world_dofs(self, model) -> "np.ndarray | None":
+        """Return the distinct per-world DOF counts when worlds are heterogeneous.
+
+        Mirrors the per-world DOF-span computation in
+        :meth:`_compute_world_dof_mapping`, but only considers worlds that
+        contain at least one articulation (worlds without articulations do not
+        participate in per-world DOF windows). Returns ``None`` when the model
+        is homogeneous, including the trivial cases (no joints, no
+        articulations, or at most one populated world).
+        """
+        if not model.joint_count or not model.articulation_count or self.art_to_world is None:
+            return None
+        art_to_world_np = self.art_to_world.numpy()
+        art_dof_start_np = self.articulation_dof_start.numpy()
+        art_H_rows_np = self.articulation_H_rows.numpy()
+
+        world_dof_start_np = np.full(self.world_count, np.iinfo(np.int64).max, dtype=np.int64)
+        world_dof_end_np = np.full(self.world_count, np.iinfo(np.int64).min, dtype=np.int64)
+        for art_idx in range(model.articulation_count):
+            w = art_to_world_np[art_idx]
+            ds = int(art_dof_start_np[art_idx])
+            de = ds + int(art_H_rows_np[art_idx])
+            world_dof_start_np[w] = min(world_dof_start_np[w], ds)
+            world_dof_end_np[w] = max(world_dof_end_np[w], de)
+
+        populated = world_dof_end_np != np.iinfo(np.int64).min
+        counts = np.unique(world_dof_end_np[populated] - world_dof_start_np[populated])
+        if len(counts) <= 1:
+            return None
+        return counts
+
+    def _validate_heterogeneous_world_support(self, model) -> None:
+        """Reject solver configurations known to be unsafe on heterogeneous worlds.
+
+        Heterogeneous multi-world models (worlds whose per-world DOF counts
+        differ) are only supported on the ``pgs_mode="matrix_free"`` and
+        ``pgs_mode="split"`` paths with the default
+        ``articulated_contact_response="immediate"``. The dense path produces
+        deterministic wrong trajectories on such models, and the
+        propagation-family contact responses still use fixed-width per-world
+        velocity windows that silently corrupt velocities across world
+        boundaries.
+        """
+        hetero_counts = self._detect_heterogeneous_world_dofs(model)
+        if hetero_counts is None:
+            return
+        counts_str = ", ".join(str(int(c)) for c in hetero_counts)
+        if self.pgs_mode == "dense":
+            raise ValueError(
+                "pgs_mode='dense' does not support heterogeneous multi-world models "
+                f"(found per-world DOF counts [{counts_str}]): the dense path is known to "
+                "produce deterministic wrong trajectories when worlds have differing DOF "
+                "counts. Use pgs_mode='matrix_free' or pgs_mode='split' (both with the "
+                "default articulated_contact_response='immediate') instead."
+            )
+        if self.articulated_contact_response != "immediate":
+            raise ValueError(
+                f"articulated_contact_response={self.articulated_contact_response!r} does not "
+                "support heterogeneous multi-world models "
+                f"(found per-world DOF counts [{counts_str}]): the propagation-family contact "
+                "response uses fixed-width per-world velocity windows that silently corrupt "
+                "velocities across world boundaries when worlds have differing DOF counts. "
+                "Use articulated_contact_response='immediate' with pgs_mode='matrix_free', "
+                "or pgs_mode='split', instead."
+            )
 
     def _select_dense_row_capacity(self, model) -> int:
         requested = int(self._requested_dense_max_constraints)

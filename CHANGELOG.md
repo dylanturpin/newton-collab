@@ -18,6 +18,7 @@
 
 ### Changed
 
+- `SolverFeatherPGS` now raises `ValueError` at construction when a heterogeneous multi-world model (worlds whose per-world DOF counts differ) is combined with `pgs_mode="dense"` or any propagation-family `articulated_contact_response` (`"propagation"`, `"propagation-fused"`, `"propagation-colored"`): the dense path produces deterministic wrong trajectories and the propagation full-iteration kernel silently corrupts velocities across world boundaries on such models. Heterogeneous models remain supported with `pgs_mode="matrix_free"` or `pgs_mode="split"` under the default `articulated_contact_response="immediate"`.
 - Remove the `cbor2` `<6` dependency ceiling after updating recorder deserialization to accept mapping-like decoded containers
 - Require Warp 1.14 and configure Warp logging through `warp.config.log_level`; use Newton's `--quiet` flag or `--warp-config log_level=...` instead of legacy `verbose` or `quiet` config keys
 - Auto-scale `ViewerGL` contact arrows, joint axes, and COM markers by `Viewer.scene_scale`; to approximate the previous fixed sizes after `set_model()`, set `viewer.renderer.arrow_length_scale = 0.1 / viewer.scene_scale`, `viewer.renderer.joint_scale = 0.1 / viewer.scene_scale`, and `viewer.renderer.com_scale = 0.1 / viewer.scene_scale`.
