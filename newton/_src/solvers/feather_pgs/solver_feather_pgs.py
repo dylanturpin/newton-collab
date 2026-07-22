@@ -869,6 +869,12 @@ class SolverFeatherPGS(SolverBase):
         self._dummy_mf_slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=model.device)
         self._dummy_contact_count = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_contact_row_type = wp.zeros((1, 1), dtype=wp.int32, device=model.device)
+        # Dedicated row-type sink for reset(): reset_world_warmstart_buffers
+        # writes -1 into its prev_mf_row_type argument, which would violate the
+        # all-zeros invariant of the shared _dummy_contact_row_type buffer that
+        # other launch sites rely on. Allocated up front so reset() stays
+        # allocation-free (CUDA-graph-capturable).
+        self._reset_dummy_mf_row_type = wp.zeros((1, 1), dtype=wp.int32, device=model.device)
         self._dummy_contact_row_parent = wp.full((1, 1), -1, dtype=wp.int32, device=model.device)
         # Persistent dummy for the mf_slot_counter output of
         # allocate_world_contact_slots when the MF path is inactive (the
@@ -998,7 +1004,15 @@ class SolverFeatherPGS(SolverBase):
             prev_mf_impulses = self._dummy_contact_impulses
         prev_mf_row_type = self._ws_prev_mf_row_type
         if prev_mf_row_type is None:
-            prev_mf_row_type = self._dummy_contact_row_type
+            # Use the dedicated reset sink, not _dummy_contact_row_type: the
+            # kernel writes -1 into this buffer and the shared dummy must stay
+            # all zeros for its other consumers.
+            prev_mf_row_type = self._reset_dummy_mf_row_type
+        # _ws_prev_slot_sorted is intentionally NOT cleared here:
+        # gather_mf_warmstart only seeds impulses from prev slots whose
+        # prev_mf_row_type marks a contact row, so the row_type = -1 sentinel
+        # written below (together with the zeroed impulses) neutralizes any
+        # stale prev-slot mapping for reset worlds.
         wp.launch(
             reset_world_warmstart_buffers,
             dim=self.world_count,
