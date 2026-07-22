@@ -31,6 +31,7 @@ PGS_CONSTRAINT_TYPE_JOINT_LIMIT = 3
 # appendix). Finite limits create two unilateral rows every step: one lower
 # bound row and one upper bound row. No Baumgarte / ERP bias.
 PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT = 4
+PGS_CONSTRAINT_TYPE_COUNT = 5
 
 # Numeric IDs for the ``friction_mode`` argument passed to the matrix-free
 # PGS solver kernels.  Mirrors the Python-side string enum on
@@ -2115,7 +2116,7 @@ def populate_physx_drive_J_for_size(
 def compute_physx_pgs_drive_desc(
     world_constraint_count: wp.array[int],
     max_constraints: int,
-    world_dof_start: wp.array[int],
+    world_dof_indices: wp.array2d[int],
     max_world_dofs: int,
     world_row_type: wp.array2d[int],
     world_diag: wp.array2d[float],
@@ -2162,9 +2163,10 @@ def compute_physx_pgs_drive_desc(
         drive_bias_coeff = stiffness * x * dt
         position_delta = float(0.0)
         if position_delta_scale != 0.0:
-            dof_start = world_dof_start[world]
             for d in range(max_world_dofs):
-                position_delta += world_J[world, i, d] * position_delta_velocity[dof_start + d]
+                global_dof = world_dof_indices[world, d]
+                if global_dof >= 0:
+                    position_delta += world_J[world, i, d] * position_delta_velocity[global_dof]
             position_delta = position_delta_scale * dt * position_delta
 
         world_drive_target_vel_bias[world, i] = x * b + drive_bias_coeff * (
@@ -2607,7 +2609,7 @@ def allocate_world_contact_slots(
     shape_body: wp.array[int],
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
-    art_size: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
     body_flags: wp.array[wp.int32],
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
@@ -2667,8 +2669,8 @@ def allocate_world_contact_slots(
     if body_b >= 0:
         art_b = body_to_articulation[body_b]
 
-    a_has_dofs = art_a >= 0 and art_size[art_a] > 0
-    b_has_dofs = art_b >= 0 and art_size[art_b] > 0
+    a_has_dofs = art_a >= 0 and articulation_response_dof_count[art_a] > 0
+    b_has_dofs = art_b >= 0 and articulation_response_dof_count[art_b] > 0
     a_can_respond = a_has_dofs and (body_flags[body_a] & BodyFlags.KINEMATIC) == 0
     b_can_respond = b_has_dofs and (body_flags[body_b] & BodyFlags.KINEMATIC) == 0
     if not a_can_respond and not b_can_respond:
@@ -2865,6 +2867,65 @@ def accumulate_jacobian_row_world(
         curr_joint = joint_ancestor[curr_joint]
 
 
+@wp.func
+def prescribed_contact_velocity(
+    body: int,
+    art: int,
+    sign: float,
+    point_world: wp.vec3,
+    direction: wp.vec3,
+    prescribed_articulation: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    body_v_s: wp.array[wp.spatial_vector],
+):
+    """Return one prescribed articulation's signed contact-point velocity."""
+    value = float(0.0)
+    if body >= 0 and art >= 0 and prescribed_articulation[art] != 0:
+        twist = body_v_s[body]
+        linear = wp.spatial_top(twist)
+        angular = wp.spatial_bottom(twist)
+        point_velocity = linear + wp.cross(angular, point_world - articulation_origin[art])
+        value = sign * wp.dot(direction, point_velocity)
+    return value
+
+
+@wp.func
+def prescribed_relative_contact_target(
+    body_a: int,
+    art_a: int,
+    body_b: int,
+    art_b: int,
+    point_a_world: wp.vec3,
+    point_b_world: wp.vec3,
+    direction: wp.vec3,
+    prescribed_articulation: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    body_v_s: wp.array[wp.spatial_vector],
+):
+    """Return the target velocity induced by prescribed contact motion."""
+    known_jv = prescribed_contact_velocity(
+        body_a,
+        art_a,
+        1.0,
+        point_a_world,
+        direction,
+        prescribed_articulation,
+        articulation_origin,
+        body_v_s,
+    )
+    known_jv += prescribed_contact_velocity(
+        body_b,
+        art_b,
+        -1.0,
+        point_b_world,
+        direction,
+        prescribed_articulation,
+        articulation_origin,
+        body_v_s,
+    )
+    return -known_jv
+
+
 @wp.kernel
 def populate_world_J_for_size(
     contact_count: wp.array[int],
@@ -2881,7 +2942,7 @@ def populate_world_J_for_size(
     contact_art_b: wp.array[int],
     contact_path: wp.array[int],
     target_size: int,
-    art_size: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
     art_group_idx: wp.array[int],
     art_dof_start: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
@@ -2891,6 +2952,8 @@ def populate_world_J_for_size(
     joint_S_s: wp.array[wp.spatial_vector],
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
+    body_v_s: wp.array[wp.spatial_vector],
+    prescribed_articulation: wp.array[int],
     shape_transform: wp.array[wp.transform],
     shape_material_mu: wp.array[float],
     enable_friction: int,
@@ -3012,9 +3075,56 @@ def populate_world_J_for_size(
     if contact_friction_anchor_limit > 0 and friction_anchor_rank >= contact_friction_anchor_limit:
         will_add_friction = False
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
+    target_point_a_normal = point_a_world
+    target_point_b_normal = point_b_world
+    if contact_shared_anchor != 0:
+        target_point_a_normal = contact_anchor_world
+        target_point_b_normal = contact_anchor_world
+    target_point_a_friction = point_a_world
+    target_point_b_friction = point_b_world
+    if contact_shared_anchor != 0 or contact_friction_shared_anchor != 0:
+        target_point_a_friction = contact_anchor_world
+        target_point_b_friction = contact_anchor_world
+
+    normal_target = prescribed_relative_contact_target(
+        body_a,
+        art_a,
+        body_b,
+        art_b,
+        target_point_a_normal,
+        target_point_b_normal,
+        normal,
+        prescribed_articulation,
+        articulation_origin,
+        body_v_s,
+    )
+    friction0_target = prescribed_relative_contact_target(
+        body_a,
+        art_a,
+        body_b,
+        art_b,
+        target_point_a_friction,
+        target_point_b_friction,
+        t0,
+        prescribed_articulation,
+        articulation_origin,
+        body_v_s,
+    )
+    friction1_target = prescribed_relative_contact_target(
+        body_a,
+        art_a,
+        body_b,
+        art_b,
+        target_point_a_friction,
+        target_point_b_friction,
+        t1,
+        prescribed_articulation,
+        articulation_origin,
+        body_v_s,
+    )
 
     # Handle articulation A if it matches target size
-    if art_a >= 0 and art_size[art_a] == target_size:
+    if art_a >= 0 and articulation_response_dof_count[art_a] == target_size:
         group_idx_a = art_group_idx[art_a]
         dof_start_a = art_dof_start[art_a]
         origin_a = articulation_origin[art_a]
@@ -3082,7 +3192,7 @@ def populate_world_J_for_size(
             )
 
     # Handle articulation B if it matches target size
-    if art_b >= 0 and art_size[art_b] == target_size:
+    if art_b >= 0 and articulation_response_dof_count[art_b] == target_size:
         group_idx_b = art_group_idx[art_b]
         dof_start_b = art_dof_start[art_b]
         origin_b = articulation_origin[art_b]
@@ -3149,7 +3259,7 @@ def populate_world_J_for_size(
 
     # Set row metadata (only once per contact, from whichever articulation runs first)
     # Use art_a preferentially to avoid double-writes
-    if art_a >= 0 and art_size[art_a] == target_size:
+    if art_a >= 0 and articulation_response_dof_count[art_a] == target_size:
         # Normal contact row
         world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
         world_row_parent[world, slot] = -1
@@ -3157,7 +3267,7 @@ def populate_world_J_for_size(
         world_row_beta[world, slot] = pgs_beta
         world_row_cfm[world, slot] = pgs_cfm
         world_phi[world, slot] = phi
-        world_target_velocity[world, slot] = 0.0
+        world_target_velocity[world, slot] = normal_target
 
         if will_add_friction:
             # Friction row 1
@@ -3167,7 +3277,7 @@ def populate_world_J_for_size(
             world_row_beta[world, slot + 1] = 0.0
             world_row_cfm[world, slot + 1] = pgs_cfm
             world_phi[world, slot + 1] = 0.0
-            world_target_velocity[world, slot + 1] = 0.0
+            world_target_velocity[world, slot + 1] = friction0_target
 
             # Friction row 2
             world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_FRICTION
@@ -3176,9 +3286,9 @@ def populate_world_J_for_size(
             world_row_beta[world, slot + 2] = 0.0
             world_row_cfm[world, slot + 2] = pgs_cfm
             world_phi[world, slot + 2] = 0.0
-            world_target_velocity[world, slot + 2] = 0.0
+            world_target_velocity[world, slot + 2] = friction1_target
 
-    elif art_b >= 0 and art_size[art_b] == target_size:
+    elif art_b >= 0 and articulation_response_dof_count[art_b] == target_size:
         # Only write metadata from art_b if art_a didn't match this size
         world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
         world_row_parent[world, slot] = -1
@@ -3186,7 +3296,7 @@ def populate_world_J_for_size(
         world_row_beta[world, slot] = pgs_beta
         world_row_cfm[world, slot] = pgs_cfm
         world_phi[world, slot] = phi
-        world_target_velocity[world, slot] = 0.0
+        world_target_velocity[world, slot] = normal_target
 
         if will_add_friction:
             world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_FRICTION
@@ -3195,7 +3305,7 @@ def populate_world_J_for_size(
             world_row_beta[world, slot + 1] = 0.0
             world_row_cfm[world, slot + 1] = pgs_cfm
             world_phi[world, slot + 1] = 0.0
-            world_target_velocity[world, slot + 1] = 0.0
+            world_target_velocity[world, slot + 1] = friction0_target
 
             world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 2] = slot
@@ -3203,7 +3313,7 @@ def populate_world_J_for_size(
             world_row_beta[world, slot + 2] = 0.0
             world_row_cfm[world, slot + 2] = pgs_cfm
             world_phi[world, slot + 2] = 0.0
-            world_target_velocity[world, slot + 2] = 0.0
+            world_target_velocity[world, slot + 2] = friction1_target
 
 
 @wp.kernel
@@ -3576,8 +3686,6 @@ def rhs_accum_world_par_art(
     world_constraint_count: wp.array[int],
     max_constraints: int,
     art_to_world: wp.array[int],
-    art_size: wp.array[int],
-    art_group_idx: wp.array[int],
     art_dof_start: wp.array[int],
     v_hat: wp.array[float],
     group_to_art: wp.array[int],
@@ -3692,9 +3800,8 @@ def diag_from_JY_par_art(
 def gather_JY_to_world(
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
-    art_dof_start: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
     world_constraint_count: wp.array[int],
-    world_dof_start: wp.array[int],
     J_group: wp.array3d[float],
     Y_group: wp.array3d[float],
     n_dofs: int,
@@ -3719,9 +3826,7 @@ def gather_JY_to_world(
     world = art_to_world[art]
     if c >= world_constraint_count[world]:
         return
-    dof_start = art_dof_start[art]
-    w_dof_start = world_dof_start[world]
-    local_d = (dof_start - w_dof_start) + d
+    local_d = articulation_world_dof_offset[art] + d
     # Write unconditionally (including zeros) so J_world/Y_world don't need pre-zeroing
     J_world[world, c, local_d] = J_group[idx, c, d]
     Y_world[world, c, local_d] = Y_group[idx, c, d]
@@ -3747,10 +3852,13 @@ def build_mf_contact_rows(
     contact_path: wp.array[int],
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
-    art_size: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
+    body_v_s: wp.array[wp.spatial_vector],
+    prescribed_articulation: wp.array[int],
+    has_target_velocity: int,
     shape_material_mu: wp.array[float],
     enable_friction: int,
     contact_friction_gap_threshold: float,
@@ -3768,6 +3876,7 @@ def build_mf_contact_rows(
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
     mf_phi: wp.array2d[float],
+    mf_target_velocity: wp.array2d[float],
 ):
     """Build MF constraint rows for contacts between free rigid bodies / ground.
 
@@ -3807,9 +3916,9 @@ def build_mf_contact_rows(
     # transforms to reconstruct the contact points below.
     response_body_a = -1
     response_body_b = -1
-    if body_a >= 0 and contact_art_a[c] >= 0 and art_size[contact_art_a[c]] > 0:
+    if body_a >= 0 and contact_art_a[c] >= 0 and articulation_response_dof_count[contact_art_a[c]] > 0:
         response_body_a = body_a
-    if body_b >= 0 and contact_art_b[c] >= 0 and art_size[contact_art_b[c]] > 0:
+    if body_b >= 0 and contact_art_b[c] >= 0 and articulation_response_dof_count[contact_art_b[c]] > 0:
         response_body_b = body_b
 
     thickness_a = contact_thickness0[c]
@@ -3889,14 +3998,17 @@ def build_mf_contact_rows(
         else:
             d = t1
 
+        point_a_row_world = point_a_world
+        point_b_row_world = point_b_world
+        if contact_shared_anchor != 0 or (row_offset > 0 and contact_friction_shared_anchor != 0):
+            point_a_row_world = contact_anchor_world
+            point_b_row_world = contact_anchor_world
+
         # Body A Jacobian in articulation-local frame: J = [d, r_a x d], where
         # r_a is the contact point relative to articulation A's fixed origin.
         if response_body_a >= 0:
             art_a = contact_art_a[c]
             origin_a = articulation_origin[art_a]
-            point_a_row_world = point_a_world
-            if contact_shared_anchor != 0 or (row_offset > 0 and contact_friction_shared_anchor != 0):
-                point_a_row_world = contact_anchor_world
             r_a = point_a_row_world - origin_a
             ang_a = wp.cross(r_a, d)
             mf_J_a[world, row_idx, 0] = d[0]
@@ -3910,9 +4022,6 @@ def build_mf_contact_rows(
         if response_body_b >= 0:
             art_b = contact_art_b[c]
             origin_b = articulation_origin[art_b]
-            point_b_row_world = point_b_world
-            if contact_shared_anchor != 0 or (row_offset > 0 and contact_friction_shared_anchor != 0):
-                point_b_row_world = contact_anchor_world
             r_b = point_b_row_world - origin_b
             ang_b = wp.cross(r_b, d)
             mf_J_b[world, row_idx, 0] = -d[0]
@@ -3937,6 +4046,19 @@ def build_mf_contact_rows(
             mf_row_mu[world, row_idx] = mu
         else:
             mf_row_mu[world, row_idx] = friction_mu
+        if has_target_velocity != 0:
+            mf_target_velocity[world, row_idx] = prescribed_relative_contact_target(
+                body_a,
+                contact_art_a[c],
+                body_b,
+                contact_art_b[c],
+                point_a_row_world,
+                point_b_row_world,
+                d,
+                prescribed_articulation,
+                articulation_origin,
+                body_v_s,
+            )
 
 
 @wp.kernel
@@ -4233,6 +4355,7 @@ def snapshot_mf_prev_slots(
 
 @wp.kernel
 def allocate_rigid_velocity_limit_slots(
+    free_rigid_body_indices: wp.array[int],
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
     is_free_rigid: wp.array[int],
@@ -4265,8 +4388,9 @@ def allocate_rigid_velocity_limit_slots(
     the default allocation and slot ordering match the historical behavior
     exactly.
     """
-    body = wp.tid()
-    base = 12 * body
+    candidate = wp.tid()
+    body = free_rigid_body_indices[candidate]
+    base = 12 * candidate
 
     for row in range(12):
         rigid_velocity_limit_slot[base + row] = -1
@@ -4319,6 +4443,7 @@ def allocate_rigid_velocity_limit_slots(
 
 @wp.kernel
 def populate_rigid_velocity_limit_rows(
+    free_rigid_body_indices: wp.array[int],
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
     is_free_rigid: wp.array[int],
@@ -4337,7 +4462,8 @@ def populate_rigid_velocity_limit_rows(
     mf_phi: wp.array2d[float],
 ):
     """Populate MF rows for rigid-body linear/angular velocity limits."""
-    body = wp.tid()
+    candidate = wp.tid()
+    body = free_rigid_body_indices[candidate]
     art = body_to_articulation[body]
     if art < 0:
         return
@@ -4350,7 +4476,7 @@ def populate_rigid_velocity_limit_rows(
 
     lin_limit = rigid_body_max_linear_velocity[body]
     ang_limit = rigid_body_max_angular_velocity[body]
-    base = 12 * body
+    base = 12 * candidate
 
     for axis in range(6):
         limit = lin_limit
@@ -4490,6 +4616,7 @@ def spatial_matrix_block_inverse(M: wp.spatial_matrix):
 
 @wp.kernel
 def compute_mf_body_Hinv(
+    free_rigid_body_indices: wp.array[int],
     body_I_s: wp.array[wp.spatial_matrix],
     is_free_rigid: wp.array[int],
     body_to_articulation: wp.array[int],
@@ -4502,7 +4629,7 @@ def compute_mf_body_Hinv(
     For root free joints, H = body_I_s in articulation-local coordinates.
     This remains a full 6x6 matrix for bodies with non-zero CoM offsets.
     """
-    b = wp.tid()
+    b = free_rigid_body_indices[wp.tid()]
     art = body_to_articulation[b]
     if art < 0:
         return
@@ -4553,6 +4680,8 @@ def compute_mf_effective_mass_and_rhs(
     mf_body_Hinv: wp.array[wp.spatial_matrix],
     mf_phi: wp.array2d[float],
     mf_row_type: wp.array2d[int],
+    mf_target_velocity: wp.array2d[float],
+    has_target_velocity: int,
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_cfm: float,
     pgs_beta: float,
@@ -4657,6 +4786,8 @@ def compute_mf_effective_mass_and_rhs(
     elif rtype == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         bias = mf_phi[world, i]
 
+    if has_target_velocity != 0:
+        bias -= mf_target_velocity[world, i]
     mf_rhs[world, i] = bias
 
 
@@ -4667,6 +4798,8 @@ def compute_mf_rhs_bias(
     mf_body_b: wp.array2d[int],
     mf_phi: wp.array2d[float],
     mf_row_type: wp.array2d[int],
+    mf_target_velocity: wp.array2d[float],
+    has_target_velocity: int,
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_beta: float,
     dt: float,
@@ -4706,6 +4839,8 @@ def compute_mf_rhs_bias(
     elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         bias = mf_phi[world, i]
 
+    if has_target_velocity != 0:
+        bias -= mf_target_velocity[world, i]
     mf_rhs[world, i] = bias
 
 
@@ -7760,8 +7895,7 @@ def compute_mf_world_dof_offsets(
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
     body_to_articulation: wp.array[int],
-    art_dof_start: wp.array[int],
-    world_dof_start: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
     mf_max_constraints: int,
     # outputs
     mf_dof_a: wp.array2d[int],
@@ -7769,24 +7903,23 @@ def compute_mf_world_dof_offsets(
 ):
     """Compute world-relative DOF offsets for each MF contact body.
 
-    For each MF constraint, stores the articulation DOF start minus the
-    world DOF start for body A and B.  The two-phase GS kernel uses
-    these offsets to index into the shared velocity vector.
+    For each MF constraint, stores the articulation's compact response
+    offset. The two-phase GS kernel uses these offsets to index its shared
+    velocity vector.
     """
     tid = wp.tid()
     world = tid // mf_max_constraints
     c = tid % mf_max_constraints
     if c >= mf_constraint_count[world]:
         return
-    w_dof = world_dof_start[world]
     ba = mf_body_a[world, c]
     bb = mf_body_b[world, c]
     if ba >= 0:
-        mf_dof_a[world, c] = art_dof_start[body_to_articulation[ba]] - w_dof
+        mf_dof_a[world, c] = articulation_world_dof_offset[body_to_articulation[ba]]
     else:
         mf_dof_a[world, c] = -1
     if bb >= 0:
-        mf_dof_b[world, c] = art_dof_start[body_to_articulation[bb]] - w_dof
+        mf_dof_b[world, c] = articulation_world_dof_offset[body_to_articulation[bb]]
     else:
         mf_dof_b[world, c] = -1
 
@@ -8431,6 +8564,20 @@ def accumulate_deferred_dense_tau_from_J_world(
     wp.atomic_add(deferred_tau, dof, J_world[world, c, d] * delta)
 
 
+@wp.func
+def world_response_velocity(
+    v_out: wp.array[float],
+    world_dof_indices: wp.array2d[int],
+    world: int,
+    local_dof: int,
+) -> float:
+    """Read a compact response velocity, returning zero for padding."""
+    global_dof = world_dof_indices[world, local_dof]
+    if global_dof >= 0:
+        return v_out[global_dof]
+    return 0.0
+
+
 # =============================================================================
 # PGS Convergence Diagnostic Kernel (velocity-space mode)
 # =============================================================================
@@ -8440,7 +8587,7 @@ def accumulate_deferred_dense_tau_from_J_world(
 def pgs_convergence_diagnostic_velocity(
     # Dense constraints
     constraint_count: wp.array[int],
-    world_dof_start: wp.array[int],
+    world_dof_indices: wp.array2d[int],
     rhs: wp.array2d[float],
     impulses: wp.array2d[float],
     prev_impulses: wp.array2d[float],
@@ -8495,7 +8642,6 @@ def pgs_convergence_diagnostic_velocity(
     m_dense = constraint_count[world]
     m_mf = mf_constraint_count[world]
     m_propagation = propagation_constraint_count[world]
-    w_dof_start = world_dof_start[world]
 
     max_dl = float(0.0)
     comp_gap = float(0.0)
@@ -8513,7 +8659,7 @@ def pgs_convergence_diagnostic_velocity(
         # Compute residual: r_i = J_i * v + bias_i
         jv = float(0.0)
         for d in range(max_world_dofs):
-            jv += J_world[world, i, d] * v_out[w_dof_start + d]
+            jv += J_world[world, i, d] * world_response_velocity(v_out, world_dof_indices, world, d)
         residual = jv + rhs[world, i]
 
         rt = row_type[world, i]
@@ -8555,10 +8701,10 @@ def pgs_convergence_diagnostic_velocity(
         jv = float(0.0)
         if dof_a >= 0:
             for k in range(6):
-                jv += mf_J_a[world, i, k] * v_out[dof_a + k]
+                jv += mf_J_a[world, i, k] * world_response_velocity(v_out, world_dof_indices, world, dof_a + k)
         if dof_b >= 0:
             for k in range(6):
-                jv += mf_J_b[world, i, k] * v_out[dof_b + k]
+                jv += mf_J_b[world, i, k] * world_response_velocity(v_out, world_dof_indices, world, dof_b + k)
         residual = jv + mf_rhs[world, i]
 
         rt = mf_row_type[world, i]
@@ -8638,7 +8784,7 @@ def pgs_convergence_diagnostic_velocity(
 def pgs_ncp_residuals_diagnostic_velocity(
     # Dense constraints
     constraint_count: wp.array[int],
-    world_dof_start: wp.array[int],
+    world_dof_indices: wp.array2d[int],
     rhs: wp.array2d[float],
     impulses: wp.array2d[float],
     row_type: wp.array2d[int],
@@ -8730,7 +8876,6 @@ def pgs_ncp_residuals_diagnostic_velocity(
     m_dense = constraint_count[world]
     m_mf = mf_constraint_count[world]
     m_propagation = propagation_constraint_count[world]
-    w_dof_start = world_dof_start[world]
 
     r_compl = float(0.0)
     r_cone = float(0.0)
@@ -8751,7 +8896,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
         # Normal row velocity (bias-free): u_n = J_n * v
         u_n = float(0.0)
         for d in range(max_world_dofs):
-            u_n += J_world[world, i, d] * v_out[w_dof_start + d]
+            u_n += J_world[world, i, d] * world_response_velocity(v_out, world_dof_indices, world, d)
         b_n = rhs[world, i]
         ln = impulses[world, i]
 
@@ -8782,7 +8927,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
                 lt1 = impulses[world, i1]
                 mu = row_mu[world, i1]
                 for d in range(max_world_dofs):
-                    u_t1 += J_world[world, i1, d] * v_out[w_dof_start + d]
+                    u_t1 += J_world[world, i1, d] * world_response_velocity(v_out, world_dof_indices, world, d)
 
         i2 = i + 2
         if i2 < max_constraints and i2 < m_dense:
@@ -8791,7 +8936,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
                 if mu == 0.0:
                     mu = row_mu[world, i2]
                 for d in range(max_world_dofs):
-                    u_t2 += J_world[world, i2, d] * v_out[w_dof_start + d]
+                    u_t2 += J_world[world, i2, d] * world_response_velocity(v_out, world_dof_indices, world, d)
 
         # r_cone
         tang_mag = wp.sqrt(lt1 * lt1 + lt2 * lt2)
@@ -8831,10 +8976,10 @@ def pgs_ncp_residuals_diagnostic_velocity(
         u_n = float(0.0)
         if dof_a >= 0:
             for k in range(6):
-                u_n += mf_J_a[world, i, k] * v_out[dof_a + k]
+                u_n += mf_J_a[world, i, k] * world_response_velocity(v_out, world_dof_indices, world, dof_a + k)
         if dof_b >= 0:
             for k in range(6):
-                u_n += mf_J_b[world, i, k] * v_out[dof_b + k]
+                u_n += mf_J_b[world, i, k] * world_response_velocity(v_out, world_dof_indices, world, dof_b + k)
         b_n = mf_rhs[world, i]
         ln = mf_impulses[world, i]
 
@@ -8865,10 +9010,14 @@ def pgs_ncp_residuals_diagnostic_velocity(
                 dof_b1 = mf_dof_b[world, i1]
                 if dof_a1 >= 0:
                     for k in range(6):
-                        u_t1 += mf_J_a[world, i1, k] * v_out[dof_a1 + k]
+                        u_t1 += mf_J_a[world, i1, k] * world_response_velocity(
+                            v_out, world_dof_indices, world, dof_a1 + k
+                        )
                 if dof_b1 >= 0:
                     for k in range(6):
-                        u_t1 += mf_J_b[world, i1, k] * v_out[dof_b1 + k]
+                        u_t1 += mf_J_b[world, i1, k] * world_response_velocity(
+                            v_out, world_dof_indices, world, dof_b1 + k
+                        )
 
         i2 = i + 2
         if i2 < mf_max_constraints and i2 < m_mf:
@@ -8880,10 +9029,14 @@ def pgs_ncp_residuals_diagnostic_velocity(
                 dof_b2 = mf_dof_b[world, i2]
                 if dof_a2 >= 0:
                     for k in range(6):
-                        u_t2 += mf_J_a[world, i2, k] * v_out[dof_a2 + k]
+                        u_t2 += mf_J_a[world, i2, k] * world_response_velocity(
+                            v_out, world_dof_indices, world, dof_a2 + k
+                        )
                 if dof_b2 >= 0:
                     for k in range(6):
-                        u_t2 += mf_J_b[world, i2, k] * v_out[dof_b2 + k]
+                        u_t2 += mf_J_b[world, i2, k] * world_response_velocity(
+                            v_out, world_dof_indices, world, dof_b2 + k
+                        )
 
         tang_mag = wp.sqrt(lt1 * lt1 + lt2 * lt2)
         cone = tang_mag - mu * ln
