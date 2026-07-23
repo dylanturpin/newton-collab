@@ -12,19 +12,22 @@ from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
 from . import kernels
 from .kernels import (
+    RESTITUTION_MANIFOLD_MAX_CONTACTS,
     accumulate_weighted_contact_impulse,
     apply_body_delta_velocities,
     apply_body_deltas,
     apply_joint_forces,
     apply_particle_deltas,
     apply_particle_shape_restitution,
-    apply_rigid_restitution,
+    apply_restitution_deltas,
     bending_constraint,
+    build_restitution_manifolds,
     convert_contact_impulse_to_force,
     convert_joint_impulse_to_parent_f,
     copy_kinematic_body_state_kernel,
     solve_body_contact_positions,
     solve_body_joints,
+    solve_manifold_restitution,
     solve_particle_particle_contacts,
     solve_particle_shape_contacts,
     # solve_simple_body_joints,
@@ -173,6 +176,9 @@ class SolverXPBD(SolverBase, CouplingInterface):
         if rigid_contact_restitution_iterations < 1:
             raise ValueError("rigid_contact_restitution_iterations must be at least 1")
         self.rigid_contact_restitution_iterations = rigid_contact_restitution_iterations
+        # Gauss-Seidel sweeps inside the per-manifold restitution solve
+        # (prototype knob, see kernels.solve_manifold_restitution).
+        self._restitution_manifold_inner_iterations = 8
         self.rigid_contact_con_weighting = rigid_contact_con_weighting
 
         self.angular_damping = angular_damping
@@ -394,6 +400,13 @@ class SolverXPBD(SolverBase, CouplingInterface):
         rigid_contact_inv_weight = None
         restitution_contact_active = None
         restitution_contact_inv_weight = None
+        restitution_manifold_key = None
+        restitution_manifold_size = None
+        restitution_manifold_contact = None
+        restitution_body_manifold_count = None
+        restitution_contact_n_K = None
+        restitution_contact_axn_lo_target = None
+        restitution_contact_axn_hi_sigma = None
 
         contact_impulse = None
         contact_impulse_iter = None
@@ -404,6 +417,24 @@ class SolverXPBD(SolverBase, CouplingInterface):
             if self.enable_restitution and self._rigid_restitution_enabled and model.body_count:
                 restitution_contact_active = wp.zeros(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
                 restitution_contact_inv_weight = wp.zeros(model.body_count, dtype=float, device=model.device)
+                # manifold hash table (one slot may host every contact, so
+                # capacity == contact capacity guarantees insertion succeeds)
+                restitution_manifold_key = wp.zeros(contacts.rigid_contact_max, dtype=wp.int64, device=model.device)
+                restitution_manifold_size = wp.zeros(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
+                restitution_manifold_contact = wp.empty(
+                    contacts.rigid_contact_max * RESTITUTION_MANIFOLD_MAX_CONTACTS,
+                    dtype=wp.int32,
+                    device=model.device,
+                )
+                restitution_body_manifold_count = wp.zeros(model.body_count, dtype=float, device=model.device)
+                # per-contact solve records cached by setup_restitution_contacts
+                restitution_contact_n_K = wp.empty(contacts.rigid_contact_max, dtype=wp.vec4, device=model.device)
+                restitution_contact_axn_lo_target = wp.empty(
+                    contacts.rigid_contact_max, dtype=wp.vec4, device=model.device
+                )
+                restitution_contact_axn_hi_sigma = wp.empty(
+                    contacts.rigid_contact_max, dtype=wp.vec4, device=model.device
+                )
 
             if contacts.force is not None:
                 contact_impulse = wp.zeros(contacts.rigid_contact_max, dtype=wp.spatial_vector, device=model.device)
@@ -836,51 +867,98 @@ class SolverXPBD(SolverBase, CouplingInterface):
                         state_out.particle_qd = particle_qd_with_restitution
 
                 if model.body_count and self._rigid_restitution_enabled:
+                    # Group contacts that can fire restitution into manifolds
+                    # (canonical body pairs) and cache their solve records.
+                    # The collision pipeline interleaves contacts across
+                    # pairs, so contacts are not pair-contiguous; a fixed-size
+                    # hash table built with atomics keeps this graph-capture
+                    # safe.
+                    wp.launch(
+                        kernel=build_restitution_manifolds,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[
+                            body_q_pre_solve,
+                            body_qd_pre_solve,
+                            model.body_com,
+                            self.body_inv_mass_effective,
+                            self.body_inv_inertia_effective,
+                            model.body_world,
+                            model.shape_body,
+                            contacts.rigid_contact_count,
+                            restitution_contact_active,
+                            contacts.rigid_contact_normal,
+                            contacts.rigid_contact_shape0,
+                            contacts.rigid_contact_shape1,
+                            model.shape_material_restitution,
+                            contacts.rigid_contact_point0,
+                            contacts.rigid_contact_point1,
+                            contacts.rigid_contact_offset0,
+                            contacts.rigid_contact_offset1,
+                            model.gravity,
+                            dt,
+                            model.body_count,
+                        ],
+                        outputs=[
+                            restitution_manifold_key,
+                            restitution_manifold_size,
+                            restitution_manifold_contact,
+                            restitution_contact_n_K,
+                            restitution_contact_axn_lo_target,
+                            restitution_contact_axn_hi_sigma,
+                        ],
+                        device=model.device,
+                    )
+
                     body_qd_with_restitution = body_qd_for_restitution
+                    if not requires_grad:
+                        # apply_restitution_deltas consumes and clears the
+                        # accumulators, so they only need zeroing once
+                        body_deltas.zero_()
+                        restitution_body_manifold_count.zero_()
                     for _ in range(self.rigid_contact_restitution_iterations):
                         if requires_grad:
                             body_deltas = wp.zeros_like(body_deltas)
-                        else:
-                            body_deltas.zero_()
+                            restitution_body_manifold_count.zero_()
 
                         wp.launch(
-                            kernel=apply_rigid_restitution,
+                            kernel=solve_manifold_restitution,
                             dim=contacts.rigid_contact_max,
                             inputs=[
                                 body_qd_with_restitution,
                                 body_q_pre_solve,
-                                body_qd_pre_solve,
-                                model.body_com,
                                 self.body_inv_mass_effective,
                                 self.body_inv_inertia_effective,
-                                model.body_world,
-                                model.shape_body,
-                                contacts.rigid_contact_count,
-                                restitution_contact_active,
-                                contacts.rigid_contact_normal,
-                                contacts.rigid_contact_shape0,
-                                contacts.rigid_contact_shape1,
-                                model.shape_material_restitution,
-                                contacts.rigid_contact_point0,
-                                contacts.rigid_contact_point1,
-                                contacts.rigid_contact_offset0,
-                                contacts.rigid_contact_offset1,
-                                model.gravity,
-                                dt,
+                                restitution_manifold_key,
+                                restitution_manifold_size,
+                                restitution_manifold_contact,
+                                model.body_count,
+                                restitution_contact_n_K,
+                                restitution_contact_axn_lo_target,
+                                restitution_contact_axn_hi_sigma,
+                                self._restitution_manifold_inner_iterations,
                             ],
-                            outputs=[body_deltas],
+                            outputs=[body_deltas, restitution_body_manifold_count],
                             device=model.device,
                         )
 
-                        next_body_qd = wp.clone(body_qd_with_restitution) if requires_grad else body_qd_with_restitution
-                        wp.launch(
-                            kernel=apply_body_delta_velocities,
-                            dim=model.body_count,
-                            inputs=[body_deltas, restitution_contact_inv_weight],
-                            outputs=[next_body_qd],
-                            device=model.device,
-                        )
-                        body_qd_with_restitution = next_body_qd
+                        if requires_grad:
+                            next_body_qd = wp.clone(body_qd_with_restitution)
+                            wp.launch(
+                                kernel=apply_body_delta_velocities,
+                                dim=model.body_count,
+                                inputs=[body_deltas, restitution_body_manifold_count],
+                                outputs=[next_body_qd],
+                                device=model.device,
+                            )
+                            body_qd_with_restitution = next_body_qd
+                        else:
+                            wp.launch(
+                                kernel=apply_restitution_deltas,
+                                dim=model.body_count,
+                                inputs=[body_deltas, restitution_body_manifold_count],
+                                outputs=[body_qd_with_restitution],
+                                device=model.device,
+                            )
                     if requires_grad:
                         state_out.body_qd = body_qd_with_restitution
 
