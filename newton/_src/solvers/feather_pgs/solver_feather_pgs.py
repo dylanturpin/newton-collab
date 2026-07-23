@@ -13812,8 +13812,15 @@ def _get_pgs_solve_mf_gs_kernel(
         # ~9/11ths of this kernel's shared footprint and pin occupancy to
         # floor(smem_per_sm / (10*M_D*4B)). Stream them from global/L2 instead;
         # values are identical, only the storage class changes.
-        # s_meta_dense stays resident: it is packed at load time from two
-        # global arrays, so there is no single global stream to alias it to.
+        # s_meta_dense cannot alias a single global stream (it is packed at
+        # load time from two arrays), so its reads are rewritten back to the
+        # source arrays below. Keeping the packed array resident costs 4*M_D
+        # bytes of static shared memory per block; at M_D=1024 that is +4 KiB
+        # (e.g. 22.9 -> 27.0 KiB with M_MF=4096, D=604), dropping occupancy
+        # from 4 to 3 blocks/SM on 100-KiB-smem parts (sm_86/89/120) and
+        # regressing dense-contact scenes by the lost concurrency. Replay of a
+        # captured launch confirms the streamed variant is bitwise-identical
+        # in v_out, impulses, and mf_impulses.
         meta_map = {
             "s_rhs_dense": ("float", "rhs_bias"),
             "s_diag_dense": ("float", "world_diag"),
@@ -13827,6 +13834,42 @@ def _get_pgs_solve_mf_gs_kernel(
             snippet = re.sub(rf"    __shared__ {ctype}\s+{sname}\[{M_D}\];\n", "", snippet)
             snippet = re.sub(rf"\s*{sname}\[i\] = {gname}\.data\[off_dense \+ i\];", "", snippet, count=1)
             snippet = re.sub(rf"{sname}\[([^\]]*)\]", rf"{gname}.data[off_dense + (\1)]", snippet)
+
+        # Stream the packed dense-row metadata: drop the resident array and
+        # its load-time packing, and read row type/parent straight from their
+        # global source arrays (identical values, S2-era storage classes).
+        snippet = re.sub(
+            r"\s*// Low 3 bits[^\n]*\n\s*__shared__ int   s_meta_dense\[\d+\];\n",
+            "\n",
+            snippet,
+        )
+        snippet = re.sub(
+            r"\s*int row_type = world_row_type\.data\[off_dense \+ i\];"
+            r"\s*int row_parent = world_row_parent\.data\[off_dense \+ i\];"
+            r"\s*s_meta_dense\[i\] = [^\n]*\n",
+            "\n",
+            snippet,
+        )
+        snippet = re.sub(
+            r"int parent_idx = \(s_meta_dense\[i\] >> \d+\) - 1;",
+            "int parent_idx = world_row_parent.data[off_dense + i];",
+            snippet,
+        )
+        snippet = re.sub(
+            r"int row_type = s_meta_dense\[i\] & \d+;",
+            "int row_type = world_row_type.data[off_dense + i];",
+            snippet,
+        )
+        snippet = re.sub(
+            r"\(s_meta_dense\[i\] & \d+\)",
+            "(world_row_type.data[off_dense + i])",
+            snippet,
+        )
+        if "s_meta_dense" in snippet:
+            raise RuntimeError(
+                "MF-GS shared-memory diet failed to stream s_meta_dense; "
+                "the generated snippet still references the resident array"
+            )
 
     # Value-preserving -> bit-identical; cuts smem so occupancy stops scaling with the mf
     # capacity. Opt-in via FEATHER_PGS_MFGS_STREAM_LAMBDA=1 (default off = resident smem).
