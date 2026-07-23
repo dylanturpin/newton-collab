@@ -432,7 +432,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                     dtype=wp.int32,
                     device=model.device,
                 )
-                restitution_manifold_head = wp.full(contacts.rigid_contact_max, -1, dtype=wp.int32, device=model.device)
+                restitution_manifold_head = wp.zeros(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
                 restitution_manifold_total = wp.zeros(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
                 restitution_contact_next = wp.empty(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
                 restitution_contact_pos_depth = wp.empty(contacts.rigid_contact_max, dtype=wp.vec4, device=model.device)
@@ -930,6 +930,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                         inputs=[
                             restitution_manifold_key,
                             restitution_manifold_head,
+                            restitution_manifold_total,
                             restitution_contact_next,
                             restitution_contact_pos_depth,
                             restitution_contact_n_K,

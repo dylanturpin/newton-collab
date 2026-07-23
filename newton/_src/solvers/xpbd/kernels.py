@@ -2885,7 +2885,8 @@ def build_restitution_manifolds(
         prev = wp.atomic_cas(manifold_key, slot, wp.int64(0), key)
         if prev == wp.int64(0) or prev == key:
             wp.atomic_add(manifold_total, slot, 1)
-            contact_next[tid] = wp.atomic_exch(manifold_head, slot, tid)
+            # heads store index+1 so a zeroed table means empty (memset-cheap reset)
+            contact_next[tid] = wp.atomic_exch(manifold_head, slot, tid + 1) - 1
             return
         slot += 1
         if slot == table_size:
@@ -2896,6 +2897,7 @@ def build_restitution_manifolds(
 def select_manifold_contacts(
     manifold_key: wp.array[wp.int64],
     manifold_head: wp.array[wp.int32],
+    manifold_total: wp.array[wp.int32],
     contact_next: wp.array[wp.int32],
     contact_pos_depth: wp.array[wp.vec4],
     contact_n_K: wp.array[wp.vec4],
@@ -2927,8 +2929,21 @@ def select_manifold_contacts(
 
     if manifold_key[tid] == wp.int64(0):
         return
-    head = manifold_head[tid]
+    head = manifold_head[tid] - 1
     if head < 0:
+        return
+
+    # fast path: within-cap manifolds keep every contact; chain order is
+    # irrelevant because the solve kernel sorts its indices canonically
+    total = manifold_total[tid]
+    if total <= _restitution_manifold_max:
+        n_all = wp.int32(0)
+        c = head
+        while c >= 0:
+            manifold_contact[tid * _restitution_manifold_max + n_all] = c
+            n_all += 1
+            c = contact_next[c]
+        manifold_size[tid] = n_all
         return
 
     # pass 1: anchor = deepest contact (tie -> lower index)
