@@ -25,6 +25,7 @@ from .kernels import (
     convert_contact_impulse_to_force,
     convert_joint_impulse_to_parent_f,
     copy_kinematic_body_state_kernel,
+    select_manifold_contacts,
     solve_body_contact_positions,
     solve_body_joints,
     solve_manifold_restitution,
@@ -403,6 +404,11 @@ class SolverXPBD(SolverBase, CouplingInterface):
         restitution_manifold_key = None
         restitution_manifold_size = None
         restitution_manifold_contact = None
+        restitution_manifold_head = None
+        restitution_manifold_total = None
+        restitution_contact_next = None
+        restitution_contact_pos_depth = None
+        restitution_contact_sel_score = None
         restitution_body_manifold_count = None
         restitution_contact_n_K = None
         restitution_contact_axn_lo_target = None
@@ -426,6 +432,11 @@ class SolverXPBD(SolverBase, CouplingInterface):
                     dtype=wp.int32,
                     device=model.device,
                 )
+                restitution_manifold_head = wp.full(contacts.rigid_contact_max, -1, dtype=wp.int32, device=model.device)
+                restitution_manifold_total = wp.zeros(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
+                restitution_contact_next = wp.empty(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
+                restitution_contact_pos_depth = wp.empty(contacts.rigid_contact_max, dtype=wp.vec4, device=model.device)
+                restitution_contact_sel_score = wp.empty(contacts.rigid_contact_max, dtype=float, device=model.device)
                 restitution_body_manifold_count = wp.zeros(model.body_count, dtype=float, device=model.device)
                 # per-contact solve records cached by setup_restitution_contacts
                 restitution_contact_n_K = wp.empty(contacts.rigid_contact_max, dtype=wp.vec4, device=model.device)
@@ -900,11 +911,33 @@ class SolverXPBD(SolverBase, CouplingInterface):
                         ],
                         outputs=[
                             restitution_manifold_key,
-                            restitution_manifold_size,
-                            restitution_manifold_contact,
+                            restitution_manifold_head,
+                            restitution_manifold_total,
+                            restitution_contact_next,
                             restitution_contact_n_K,
                             restitution_contact_axn_lo_target,
                             restitution_contact_axn_hi_sigma,
+                            restitution_contact_pos_depth,
+                        ],
+                        device=model.device,
+                    )
+
+                    # Reduce each manifold chain to its bounded best-K subset
+                    # (deterministic; see kernels.select_manifold_contacts).
+                    wp.launch(
+                        kernel=select_manifold_contacts,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[
+                            restitution_manifold_key,
+                            restitution_manifold_head,
+                            restitution_contact_next,
+                            restitution_contact_pos_depth,
+                            restitution_contact_n_K,
+                        ],
+                        outputs=[
+                            restitution_manifold_contact,
+                            restitution_manifold_size,
+                            restitution_contact_sel_score,
                         ],
                         device=model.device,
                     )

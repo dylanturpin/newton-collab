@@ -2697,9 +2697,12 @@ def apply_rigid_restitution(
         wp.atomic_add(deltas, body_b, wp.spatial_vector(n * m_inv_b * dv_b, dq))
 
 
-# Maximum number of contacts processed per restitution manifold. Contacts
-# beyond the cap are skipped by the manifold solve (large mesh manifolds).
-RESTITUTION_MANIFOLD_MAX_CONTACTS = 8
+# Maximum number of contacts the restitution solve keeps per manifold.
+# Manifolds larger than the cap are reduced to a bounded best-K subset by
+# select_manifold_contacts (deepest anchor + greedy position/normal spread),
+# which is lossless in practice because the velocity-level rigid solve has
+# rank <= 6 per body pair. Single cap, no size bucketing.
+RESTITUTION_MANIFOLD_MAX_CONTACTS = 12
 
 _restitution_manifold_max = wp.constant(RESTITUTION_MANIFOLD_MAX_CONTACTS)
 _restitution_vecNf = wp.types.vector(length=RESTITUTION_MANIFOLD_MAX_CONTACTS, dtype=wp.float32)
@@ -2730,11 +2733,13 @@ def build_restitution_manifolds(
     body_count: int,
     # outputs
     manifold_key: wp.array[wp.int64],
-    manifold_size: wp.array[wp.int32],
-    manifold_contact: wp.array[wp.int32],
+    manifold_head: wp.array[wp.int32],
+    manifold_total: wp.array[wp.int32],
+    contact_next: wp.array[wp.int32],
     contact_n_K: wp.array[wp.vec4],
     contact_axn_lo_target: wp.array[wp.vec4],
     contact_axn_hi_sigma: wp.array[wp.vec4],
+    contact_pos_depth: wp.array[wp.vec4],
 ):
     """Group contacts that can fire restitution into per-body-pair manifolds.
 
@@ -2743,8 +2748,10 @@ def build_restitution_manifolds(
     (pre-solve) approach velocity passes the impact threshold inserts its
     canonical body-pair key (``(lo+1)*(body_count+1) + hi+1 >= 1``; 0 means an
     empty slot) into an open-addressing hash table via ``atomic_cas`` and
-    appends its contact index to the slot's fixed-capacity list. Fixed-size
-    table, no host sync: CUDA-graph-capture safe.
+    pushes its contact index onto the slot's uncapped linked chain
+    (``manifold_head``/``contact_next``); :func:`select_manifold_contacts`
+    later reduces each chain to a bounded best-K subset. Fixed-size table, no
+    host sync: CUDA-graph-capture safe.
 
     Alongside, packed per-contact records consumed by
     :func:`solve_manifold_restitution` are cached:
@@ -2755,6 +2762,9 @@ def build_restitution_manifolds(
       target ``-e * rel_vel_old``.
     * ``contact_axn_hi_sigma``: ``r_hi x n`` (world) and the normal sign
       ``sigma`` for the lower-indexed body (-1 when it is the shape0 side).
+    * ``contact_pos_depth``: world mid-surface contact point and the
+      pre-solve penetration depth (larger = deeper), consumed by the
+      best-K selection.
 
     Everything derives from pre-solve state, so the grouping and records are
     valid for all restitution iterations of the current substep.
@@ -2860,6 +2870,12 @@ def build_restitution_manifolds(
     contact_n_K[tid] = wp.vec4(n[0], n[1], n[2], inv_mass)
     contact_axn_lo_target[tid] = wp.vec4(axn_lo[0], axn_lo[1], axn_lo[2], -restitution * rel_vel_old)
     contact_axn_hi_sigma[tid] = wp.vec4(axn_hi[0], axn_hi[1], axn_hi[2], sigma)
+    bx_lo = contact_surface_point(X_lo, p_lo, o_lo)
+    bx_hi = contact_surface_point(X_hi, p_hi, o_hi)
+    p_mid = 0.5 * (bx_lo + bx_hi)
+    # pre-solve penetration depth along the A->B normal (larger = deeper)
+    depth = sigma * wp.dot(n, bx_hi - bx_lo)
+    contact_pos_depth[tid] = wp.vec4(p_mid[0], p_mid[1], p_mid[2], depth)
 
     key = wp.int64(lo + 1) * wp.int64(body_count + 1) + wp.int64(hi + 1)
     table_size = manifold_key.shape[0]
@@ -2868,13 +2884,128 @@ def build_restitution_manifolds(
     for _attempt in range(table_size):
         prev = wp.atomic_cas(manifold_key, slot, wp.int64(0), key)
         if prev == wp.int64(0) or prev == key:
-            count = wp.atomic_add(manifold_size, slot, 1)
-            if count < _restitution_manifold_max:
-                manifold_contact[slot * _restitution_manifold_max + count] = tid
+            wp.atomic_add(manifold_total, slot, 1)
+            contact_next[tid] = wp.atomic_exch(manifold_head, slot, tid)
             return
         slot += 1
         if slot == table_size:
             slot = 0
+
+
+@wp.kernel
+def select_manifold_contacts(
+    manifold_key: wp.array[wp.int64],
+    manifold_head: wp.array[wp.int32],
+    contact_next: wp.array[wp.int32],
+    contact_pos_depth: wp.array[wp.vec4],
+    contact_n_K: wp.array[wp.vec4],
+    # outputs
+    manifold_contact: wp.array[wp.int32],
+    manifold_size: wp.array[wp.int32],
+    contact_sel_score: wp.array[float],
+):
+    """Reduce each manifold chain to a bounded best-K contact subset.
+
+    One thread per occupied hash slot. The deepest contact anchors the
+    selection (ties break to the lower contact index); the remaining picks
+    greedily maximize the minimum distance to the already-selected set in a
+    combined metric ``|dp|^2 + w |dn|^2`` with ``w`` the squared patch radius
+    about the anchor, approximating coverage of the contact Jacobian rows
+    (position spread spans the torque rows, normal spread the force rows).
+    Farthest-point selection with a per-contact running score
+    (``contact_sel_score``; each contact belongs to exactly one manifold, so
+    the scratch is race-free): O(K * N) chain walks. Every argmax breaks ties
+    to the lower contact index, so the result is independent of chain
+    (atomic append) order — deterministic. Manifolds with at most
+    ``RESTITUTION_MANIFOLD_MAX_CONTACTS`` contacts keep every distinct
+    contact (exact duplicates in position and normal add no span and are
+    dropped). The
+    velocity-level rigid solve is rank <= 6 per body pair, so a spread-K
+    subset preserves the reachable impulse space.
+    """
+    tid = wp.tid()
+
+    if manifold_key[tid] == wp.int64(0):
+        return
+    head = manifold_head[tid]
+    if head < 0:
+        return
+
+    # pass 1: anchor = deepest contact (tie -> lower index)
+    anchor = wp.int32(-1)
+    best_depth = float(-1.0e30)
+    c = head
+    while c >= 0:
+        depth = contact_pos_depth[c][3]
+        if depth > best_depth or (depth == best_depth and (anchor < 0 or c < anchor)):
+            best_depth = depth
+            anchor = c
+        c = contact_next[c]
+
+    # pass 2: squared patch radius about the anchor -> normal-term weight,
+    # and initialize per-contact scores as distance-to-anchor
+    d_a = contact_pos_depth[anchor]
+    p_anchor = wp.vec3(d_a[0], d_a[1], d_a[2])
+    d_an = contact_n_K[anchor]
+    n_anchor = wp.vec3(d_an[0], d_an[1], d_an[2])
+    r2 = float(0.0)
+    c = head
+    while c >= 0:
+        d_c = contact_pos_depth[c]
+        p_c = wp.vec3(d_c[0], d_c[1], d_c[2])
+        r2 = wp.max(r2, wp.length_sq(p_c - p_anchor))
+        c = contact_next[c]
+    w = wp.max(r2, 1.0e-12)
+    c = head
+    while c >= 0:
+        if c == anchor:
+            contact_sel_score[c] = -1.0  # selected sentinel
+        else:
+            d_c = contact_pos_depth[c]
+            p_c = wp.vec3(d_c[0], d_c[1], d_c[2])
+            d_cn = contact_n_K[c]
+            n_c = wp.vec3(d_cn[0], d_cn[1], d_cn[2])
+            contact_sel_score[c] = wp.length_sq(p_c - p_anchor) + w * wp.length_sq(n_c - n_anchor)
+        c = contact_next[c]
+
+    sel = _restitution_vecNi()
+    sel[0] = anchor
+    n_sel = wp.int32(1)
+    for _pick in range(_restitution_manifold_max - 1):
+        # argmax of running min-distance score (tie -> lower index)
+        best = wp.int32(-1)
+        best_score = float(0.0)
+        c = head
+        while c >= 0:
+            sc = contact_sel_score[c]
+            if sc > best_score or (sc == best_score and sc > 0.0 and (best < 0 or c < best)):
+                best_score = sc
+                best = c
+            c = contact_next[c]
+        if best < 0:
+            break  # nothing left that adds span (or chain exhausted)
+        sel[n_sel] = best
+        n_sel += 1
+        contact_sel_score[best] = -1.0
+        # relax remaining scores against the new pick
+        d_b = contact_pos_depth[best]
+        p_b = wp.vec3(d_b[0], d_b[1], d_b[2])
+        d_bn = contact_n_K[best]
+        n_b = wp.vec3(d_bn[0], d_bn[1], d_bn[2])
+        c = head
+        while c >= 0:
+            if contact_sel_score[c] > 0.0:
+                d_c = contact_pos_depth[c]
+                p_c = wp.vec3(d_c[0], d_c[1], d_c[2])
+                d_cn = contact_n_K[c]
+                n_c = wp.vec3(d_cn[0], d_cn[1], d_cn[2])
+                cand = wp.length_sq(p_c - p_b) + w * wp.length_sq(n_c - n_b)
+                contact_sel_score[c] = wp.min(contact_sel_score[c], cand)
+            c = contact_next[c]
+
+    for j in range(n_sel):
+        manifold_contact[tid * _restitution_manifold_max + j] = sel[j]
+    manifold_size[tid] = n_sel
 
 
 @wp.func
