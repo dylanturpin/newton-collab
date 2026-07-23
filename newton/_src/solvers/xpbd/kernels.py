@@ -2919,9 +2919,10 @@ def select_manifold_contacts(
     the scratch is race-free): O(K * N) chain walks. Every argmax breaks ties
     to the lower contact index, so the result is independent of chain
     (atomic append) order — deterministic. Manifolds with at most
-    ``RESTITUTION_MANIFOLD_MAX_CONTACTS`` contacts keep every distinct
-    contact (exact duplicates in position and normal add no span and are
-    dropped). The
+    ``RESTITUTION_MANIFOLD_MAX_CONTACTS`` contacts keep every contact
+    unchanged (fast path). Over-cap manifolds drop exact duplicates in
+    position and normal — their max-min score is exactly zero, so they are
+    never picked and the selected size can be below the cap. The
     velocity-level rigid solve is rank <= 6 per body pair, so a spread-K
     subset preserves the reachable impulse space.
     """
@@ -2956,6 +2957,9 @@ def select_manifold_contacts(
             best_depth = depth
             anchor = c
         c = contact_next[c]
+
+    if anchor < 0:
+        return
 
     # pass 2: squared patch radius about the anchor -> normal-term weight,
     # and initialize per-contact scores as distance-to-anchor
@@ -3052,7 +3056,7 @@ def solve_manifold_restitution(
     One thread per occupied hash-table slot (canonical body pair) iterates the
     manifold's contacts Gauss-Seidel style against local working copies of the
     two bodies' velocities, using the per-contact records cached by
-    :func:`setup_restitution_contacts` and an accumulated non-negativity clamp
+    :func:`build_restitution_manifolds` and an accumulated non-negativity clamp
     on each contact impulse (PGS). The manifold's net velocity change is
     written to ``deltas`` with atomics and averaged per body by the caller
     over manifolds that fired (``body_manifold_count``). Restitution targets

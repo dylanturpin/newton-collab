@@ -438,7 +438,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 restitution_contact_pos_depth = wp.empty(contacts.rigid_contact_max, dtype=wp.vec4, device=model.device)
                 restitution_contact_sel_score = wp.empty(contacts.rigid_contact_max, dtype=float, device=model.device)
                 restitution_body_manifold_count = wp.zeros(model.body_count, dtype=float, device=model.device)
-                # per-contact solve records cached by setup_restitution_contacts
+                # per-contact solve records cached by build_restitution_manifolds
                 restitution_contact_n_K = wp.empty(contacts.rigid_contact_max, dtype=wp.vec4, device=model.device)
                 restitution_contact_axn_lo_target = wp.empty(
                     contacts.rigid_contact_max, dtype=wp.vec4, device=model.device
