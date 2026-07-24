@@ -633,11 +633,7 @@ def test_rigid_restitution_elastic_no_explosion(test, device):
     builder.add_shape_cylinder(body=body, radius=0.1, half_height=hz, cfg=cfg)
     model = builder.finalize(device=device)
 
-    # Contact-weighted Jacobi restitution converges per-manifold; the flat
-    # cylinder face needs ~32 iterations to recover >=80% of the release
-    # height. The solver default (2) trades that convergence for speed and
-    # leaves multi-contact rebound heavily damped, so pin the count here.
-    solver = newton.solvers.SolverXPBD(model, enable_restitution=True, rigid_contact_restitution_iterations=32)
+    solver = newton.solvers.SolverXPBD(model, enable_restitution=True)
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
@@ -816,9 +812,9 @@ def test_particle_shape_restitution_runs_with_requires_grad(test, device):
 
 def test_rigid_restitution_elastic_box_on_plane(test, device):
     """Restore the #1289 geometry: a restitution=1.0 box (4-corner manifold) on a
-    ground plane must rebound within elastic bounds. The 4-corner manifold is the
-    slowest-converging case for contact-weighted Jacobi restitution, so pin the
-    iteration count high enough to converge within a substep."""
+    ground plane must rebound within elastic bounds. The 4-corner manifold was the
+    slowest-converging case for the previous contact-weighted Jacobi restitution;
+    the per-manifold solve converges it at the default iteration count."""
     hz = 0.05
     drop_z = 0.3
 
@@ -829,7 +825,7 @@ def test_rigid_restitution_elastic_box_on_plane(test, device):
     builder.add_shape_box(body=body, hx=0.1, hy=0.1, hz=hz, cfg=cfg)
     model = builder.finalize(device=device)
 
-    solver = newton.solvers.SolverXPBD(model, enable_restitution=True, rigid_contact_restitution_iterations=32)
+    solver = newton.solvers.SolverXPBD(model, enable_restitution=True)
     state_0 = model.state()
     state_1 = model.state()
     contacts = model.contacts()
