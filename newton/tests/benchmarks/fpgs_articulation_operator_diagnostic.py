@@ -383,7 +383,12 @@ def _nonfree_world_dof_mask_and_condition(solver: SolverFeatherPGS, world: int) 
 
     art_to_world = solver.art_to_world.numpy().astype(np.int32, copy=False)
     art_dof_start = solver.articulation_dof_start.numpy().astype(np.int32, copy=False)
-    art_size = solver.art_size.numpy().astype(np.int32, copy=False)
+    # PR #13 renamed the per-articulation solve-size array (art_size ->
+    # articulation_response_dof_count, sourced from the model plan); read the
+    # plan's response_dof_count like the surviving solver-side consumers
+    # (801d8dd0). Identical to the old art_size here because prescribed-response
+    # elision is gated to the immediate path.
+    art_size = solver._model_plan.response_dof_count.astype(np.int32, copy=False)
 
     condition_values: list[float] = []
     for art in range(solver.model.articulation_count):
