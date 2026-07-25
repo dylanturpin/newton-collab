@@ -997,7 +997,371 @@ def test_trajectory_graph_capture(test, device):
 
 
 # ----------------------------------------------------------------------------
-# 11.  Test-class registration per device
+# 11.  Ragged trajectory batches (per-trajectory frame counts)
+# ----------------------------------------------------------------------------
+
+# under the default SPIKE partition law these lengths plan 4/2/2 partitions,
+# exercising unequal per-trajectory partition counts and inert partition rows
+_RAGGED_LENGTHS = [64, 40, 33]
+
+
+def _ragged_arc_targets(lengths: list[int], n_max: int, pad_with_edge: bool = True) -> np.ndarray:
+    """Stacked arc targets padded per trajectory to ``n_max`` rows."""
+    out = np.zeros((len(lengths) * n_max, 3), dtype=np.float32)
+    for p, length in enumerate(lengths):
+        a = _arc_targets(length)
+        out[p * n_max : p * n_max + length] = a
+        out[p * n_max + length : (p + 1) * n_max] = a[-1] if pad_with_edge else 0.0
+    return out
+
+
+def _solve_ragged_arc(model, lengths, n_max, linear_solver, seed_np=None, iterations=20, **kwargs):
+    """Solve a ragged batch of arc-tracking problems; returns (q, costs)."""
+    solver = ik.IKSolverTrajectory(
+        model,
+        n_max,
+        _make_arc_tracking_objectives(model, _ragged_arc_targets(lengths, n_max)),
+        n_problems=len(lengths),
+        jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        linear_solver=linear_solver,
+        frame_counts=lengths,
+        lambda_initial=1e-3,
+        **kwargs,
+    )
+    if seed_np is None:
+        seed_np = np.zeros((len(lengths) * n_max, model.joint_coord_count), dtype=np.float32)
+    joint_q = wp.array(seed_np, dtype=wp.float32)
+    solver.step(joint_q, joint_q, iterations=iterations)
+    return joint_q.numpy().reshape(len(lengths), n_max, -1), solver.trajectory_costs.numpy().copy(), solver
+
+
+def _solve_singleton_arc(model, length, linear_solver, iterations=20, **kwargs):
+    solver = ik.IKSolverTrajectory(
+        model,
+        length,
+        _make_arc_tracking_objectives(model, _arc_targets(length)),
+        n_problems=1,
+        jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        linear_solver=linear_solver,
+        lambda_initial=1e-3,
+        **kwargs,
+    )
+    joint_q = wp.zeros((length, model.joint_coord_count), dtype=wp.float32)
+    solver.step(joint_q, joint_q, iterations=iterations)
+    return joint_q.numpy(), solver.trajectory_costs.numpy().copy()
+
+
+def test_trajectory_ragged_matches_singleton_exact(test, device):
+    """THE ragged-batching invariant: on the exact tile backends every member
+    of a ragged batch must solve BITWISE identically to its own unpadded
+    single-trajectory solve — each trajectory's chain is planned and reduced
+    exactly as it would be standalone, its costs exclude pad rows, and pad
+    rows are inert. Covers direct and spike at refine 0 and 1; the spike plan
+    carries unequal per-trajectory partition counts."""
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        n_max = max(_RAGGED_LENGTHS)
+
+        for backend in ("direct", "spike"):
+            for refine in (0, 1):
+                q_ragged, costs_ragged, solver = _solve_ragged_arc(
+                    model, _RAGGED_LENGTHS, n_max, backend, refine_iterations=refine
+                )
+                if backend == "spike":
+                    # the default law must plan each member like its singleton
+                    test.assertEqual(solver.spike_partition_counts, (4, 2, 2))
+                for p, length in enumerate(_RAGGED_LENGTHS):
+                    q_single, costs_single = _solve_singleton_arc(model, length, backend, refine_iterations=refine)
+                    assert_np_equal(q_ragged[p, :length], q_single)
+                    assert_np_equal(costs_ragged[p : p + 1], costs_single)
+
+
+def test_trajectory_ragged_cg_matches_singleton(test, device):
+    """The CG backend treats ragged tails as inert identity rows: members
+    match their singleton solves to solver tolerance (reduction shapes differ
+    with the batch layout, so bitwise equality is not expected), and the
+    ragged solve itself is bitwise deterministic run to run."""
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        n_max = max(_RAGGED_LENGTHS)
+        q_ragged, _, _ = _solve_ragged_arc(model, _RAGGED_LENGTHS, n_max, "cg")
+        q_rerun, _, _ = _solve_ragged_arc(model, _RAGGED_LENGTHS, n_max, "cg")
+        assert_np_equal(q_rerun, q_ragged)
+        for p, length in enumerate(_RAGGED_LENGTHS):
+            q_single, _ = _solve_singleton_arc(model, length, "cg")
+            assert_np_equal(q_ragged[p, :length], q_single, tol=1e-5)
+
+
+def test_trajectory_ragged_full_counts_matches_none(test, device):
+    """``frame_counts=[n_frames] * n_problems`` must be bitwise identical to
+    the default uniform path (the ragged clamps are inert at full length)."""
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        targets_np = np.tile(_arc_targets(N_FRAMES), (3, 1))
+
+        def solve(frame_counts):
+            solver = ik.IKSolverTrajectory(
+                model,
+                N_FRAMES,
+                _make_arc_tracking_objectives(model, targets_np),
+                n_problems=3,
+                jacobian_mode=ik.IKJacobianType.ANALYTIC,
+                linear_solver="direct",
+                frame_counts=frame_counts,
+                lambda_initial=1e-3,
+            )
+            joint_q = wp.zeros((3 * N_FRAMES, model.joint_coord_count), dtype=wp.float32)
+            solver.step(joint_q, joint_q, iterations=20)
+            return joint_q.numpy()
+
+        assert_np_equal(solve([N_FRAMES] * 3), solve(None))
+
+
+def test_trajectory_ragged_pad_rows_inert(test, device):
+    """Rows past a trajectory's frame count must not influence any real row:
+    two solves whose pad rows hold different finite values (edge-replicated
+    vs. constant-garbage seeds and targets) agree bitwise on every real row,
+    and pad rows receive a zero update (revolute coordinates unchanged)."""
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        n_max = max(_RAGGED_LENGTHS)
+        n_coords = model.joint_coord_count
+
+        seed_a = np.zeros((len(_RAGGED_LENGTHS) * n_max, n_coords), dtype=np.float32)
+        seed_b = seed_a.copy()
+        for p, length in enumerate(_RAGGED_LENGTHS):
+            seed_b[p * n_max + length : (p + 1) * n_max] = 0.37  # finite garbage
+
+        solver = ik.IKSolverTrajectory(
+            model,
+            n_max,
+            _make_arc_tracking_objectives(model, _ragged_arc_targets(_RAGGED_LENGTHS, n_max, pad_with_edge=False)),
+            n_problems=len(_RAGGED_LENGTHS),
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+            linear_solver="spike",
+            frame_counts=_RAGGED_LENGTHS,
+            lambda_initial=1e-3,
+            refine_iterations=1,
+        )
+
+        def solve(seed_np):
+            joint_q = wp.array(seed_np, dtype=wp.float32)
+            solver.reset()
+            solver.step(joint_q, joint_q, iterations=20)
+            return joint_q.numpy().reshape(len(_RAGGED_LENGTHS), n_max, -1)
+
+        q_a = solve(seed_a)
+        q_b = solve(seed_b)
+        for p, length in enumerate(_RAGGED_LENGTHS):
+            assert_np_equal(q_a[p, :length], q_b[p, :length])
+            # zero update on pad rows: they keep their seed values
+            assert_np_equal(q_b[p, length:], np.full((n_max - length, n_coords), 0.37, dtype=np.float32))
+        # ... and the edge-padded run of the invariant test matches too
+        q_edge, _, _ = _solve_ragged_arc(model, _RAGGED_LENGTHS, n_max, "spike", refine_iterations=1)
+        for p, length in enumerate(_RAGGED_LENGTHS):
+            assert_np_equal(q_a[p, :length], q_edge[p, :length])
+
+
+def test_trajectory_ragged_free_joint_kb2_matches_singleton(test, device):
+    """The invariant on the quaternion tangent path with an acceleration
+    stencil (kb = 2) and ODD member lengths, so every member ends in a
+    partially filled trailing superblock; an explicit spike_partitions
+    request clamps per trajectory (3/3/2 partitions here)."""
+    lengths = [12, 9, 7]
+    n_max = max(lengths)
+    with wp.ScopedDevice(device):
+        model = _build_free_plus_revolute(device)
+        n_coords = model.joint_coord_count
+
+        def targets_for(length):
+            xs = np.linspace(0.0, 0.8, length)
+            return np.stack([1.5 + xs, 0.3 * xs, np.zeros(length)], axis=1).astype(np.float32)
+
+        def objectives_for(targets_np):
+            return [
+                ik.IKObjectivePosition(
+                    link_index=EE_LINK,
+                    link_offset=EE_OFFSET,
+                    target_positions=wp.array(targets_np, dtype=wp.vec3),
+                ),
+                ik.IKObjectiveSmoothness(model, derivative=1, dt=DT, weight=0.02),
+                ik.IKObjectiveSmoothness(model, derivative=2, dt=DT, weight=0.002),
+            ]
+
+        def seed_rows(n_rows):
+            seed = np.zeros((n_rows, n_coords), dtype=np.float32)
+            seed[:, 6] = 1.0
+            return seed
+
+        for backend, kwargs in (("direct", {}), ("spike", {"spike_partitions": 3})):
+            stacked = np.zeros((len(lengths) * n_max, 3), dtype=np.float32)
+            for p, length in enumerate(lengths):
+                t = targets_for(length)
+                stacked[p * n_max : p * n_max + length] = t
+                stacked[p * n_max + length : (p + 1) * n_max] = t[-1]
+            solver = ik.IKSolverTrajectory(
+                model,
+                n_max,
+                objectives_for(stacked),
+                n_problems=len(lengths),
+                jacobian_mode=ik.IKJacobianType.ANALYTIC,
+                linear_solver=backend,
+                frame_counts=lengths,
+                lambda_initial=1e-2,
+                refine_iterations=1,
+                **kwargs,
+            )
+            if backend == "spike":
+                test.assertEqual(solver.spike_partition_counts, (3, 3, 2))
+            joint_q = wp.array(seed_rows(len(lengths) * n_max), dtype=wp.float32)
+            solver.step(joint_q, joint_q, iterations=15)
+            q_ragged = joint_q.numpy().reshape(len(lengths), n_max, -1)
+
+            for p, length in enumerate(lengths):
+                single = ik.IKSolverTrajectory(
+                    model,
+                    length,
+                    objectives_for(targets_for(length)),
+                    n_problems=1,
+                    jacobian_mode=ik.IKJacobianType.ANALYTIC,
+                    linear_solver=backend,
+                    lambda_initial=1e-2,
+                    refine_iterations=1,
+                    **kwargs,
+                )
+                q_single = wp.array(seed_rows(length), dtype=wp.float32)
+                single.step(q_single, q_single, iterations=15)
+                assert_np_equal(q_ragged[p, :length], q_single.numpy())
+
+
+def test_trajectory_ragged_validation(test, device):
+    """frame_counts validation: entry count, range, and the spike minimum
+    superblock requirement apply per trajectory."""
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        targets_np = np.tile(_arc_targets(N_FRAMES), (2, 1))
+
+        def build(frame_counts, linear_solver="direct"):
+            return ik.IKSolverTrajectory(
+                model,
+                N_FRAMES,
+                _make_arc_tracking_objectives(model, targets_np),
+                n_problems=2,
+                jacobian_mode=ik.IKJacobianType.ANALYTIC,
+                linear_solver=linear_solver,
+                frame_counts=frame_counts,
+            )
+
+        with test.assertRaises(ValueError):
+            build([N_FRAMES])  # wrong entry count
+        with test.assertRaises(ValueError):
+            build([N_FRAMES, 1])  # below the 2-frame minimum
+        with test.assertRaises(ValueError):
+            build([N_FRAMES, N_FRAMES + 1])  # above n_frames
+        with test.assertRaises(ValueError):
+            build([N_FRAMES, 2], linear_solver="spike")  # < 3 superblocks
+
+
+def test_trajectory_ragged_autodiff_matches_singleton(test, device):
+    """The ragged==singleton invariant under the default AUTODIFF Jacobian
+    mode: the tape-based per-frame Jacobian evaluates row by row (pad rows
+    included, masked out downstream like every per-frame row), so the
+    direct-backend solve must match the unpadded singleton bitwise, exactly
+    as in the ANALYTIC case."""
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        n_max = max(_RAGGED_LENGTHS)
+        n_probs = len(_RAGGED_LENGTHS)
+
+        solver = ik.IKSolverTrajectory(
+            model,
+            n_max,
+            _make_arc_tracking_objectives(model, _ragged_arc_targets(_RAGGED_LENGTHS, n_max)),
+            n_problems=n_probs,
+            jacobian_mode=ik.IKJacobianType.AUTODIFF,
+            linear_solver="direct",
+            frame_counts=_RAGGED_LENGTHS,
+            lambda_initial=1e-3,
+        )
+        joint_q = wp.zeros((n_probs * n_max, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
+        solver.step(joint_q, joint_q, iterations=20)
+        q_ragged = joint_q.numpy().reshape(n_probs, n_max, -1)
+
+        for p, length in enumerate(_RAGGED_LENGTHS):
+            single = ik.IKSolverTrajectory(
+                model,
+                length,
+                _make_arc_tracking_objectives(model, _arc_targets(length)),
+                n_problems=1,
+                jacobian_mode=ik.IKJacobianType.AUTODIFF,
+                linear_solver="direct",
+                lambda_initial=1e-3,
+            )
+            q_single = wp.zeros((length, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
+            single.step(q_single, q_single, iterations=20)
+            assert_np_equal(q_ragged[p, :length], q_single.numpy())
+
+
+def test_trajectory_ragged_fixed_frames(test, device):
+    """fixed_frames indices at or past a trajectory's frame count are inert
+    for that trajectory: pinning the batch's last row (a real frame only for
+    the longest member) must pin exactly that member's last frame — every
+    member still solves bitwise like its own singleton with the in-range
+    subset of the fixed indices."""
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        n_max = max(_RAGGED_LENGTHS)
+        q_ragged, _, _ = _solve_ragged_arc(model, _RAGGED_LENGTHS, n_max, "direct", fixed_frames=[0, n_max - 1])
+        for p, length in enumerate(_RAGGED_LENGTHS):
+            fixed = [0, length - 1] if length == n_max else [0]
+            q_single, _ = _solve_singleton_arc(model, length, "direct", fixed_frames=fixed)
+            assert_np_equal(q_ragged[p, :length], q_single)
+
+
+def test_trajectory_ragged_graph_capture(test, device):
+    """A ragged solve must capture and replay in a CUDA graph: all ragged
+    control flow is host-constant at plan time (the shared lengths array and
+    the per-trajectory partition tables), so a captured step replays the
+    eager ragged solve bitwise. Uses spike + refinement — the most
+    ragged-specific kernel set."""
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        n_max = max(_RAGGED_LENGTHS)
+        n_probs = len(_RAGGED_LENGTHS)
+
+        solver = ik.IKSolverTrajectory(
+            model,
+            n_max,
+            _make_arc_tracking_objectives(model, _ragged_arc_targets(_RAGGED_LENGTHS, n_max)),
+            n_problems=n_probs,
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+            linear_solver="spike",
+            frame_counts=_RAGGED_LENGTHS,
+            lambda_initial=1e-3,
+            refine_iterations=1,
+        )
+
+        joint_q = wp.zeros((n_probs * n_max, model.joint_coord_count), dtype=wp.float32)
+        # warm up so all modules are loaded before capture; this eager solve
+        # is also the bitwise reference for the replay
+        solver.reset()
+        solver.step(joint_q, joint_q, iterations=20)
+        q_eager = joint_q.numpy().reshape(n_probs, n_max, -1)
+
+        joint_q.zero_()
+        solver.reset()
+        with wp.ScopedCapture() as capture:
+            solver.step(joint_q, joint_q, iterations=20)
+        wp.capture_launch(capture.graph)
+        q_replay = joint_q.numpy().reshape(n_probs, n_max, -1)
+
+        assert_np_equal(q_replay, q_eager)
+        costs = solver.compute_trajectory_costs(joint_q).numpy()
+        test.assertTrue(np.all(np.isfinite(costs)), "trajectory costs not finite after graph replay")
+
+
+# ----------------------------------------------------------------------------
+# 12.  Test-class registration per device
 # ----------------------------------------------------------------------------
 
 devices = get_test_devices()
@@ -1077,6 +1441,60 @@ add_function_test(
     cuda_devices,
 )
 add_function_test(TestIKTrajectory, "test_trajectory_graph_capture", test_trajectory_graph_capture, cuda_devices)
+add_function_test(
+    TestIKTrajectory,
+    "test_trajectory_ragged_matches_singleton_exact",
+    test_trajectory_ragged_matches_singleton_exact,
+    devices,
+)
+add_function_test(
+    TestIKTrajectory,
+    "test_trajectory_ragged_cg_matches_singleton",
+    test_trajectory_ragged_cg_matches_singleton,
+    devices,
+)
+add_function_test(
+    TestIKTrajectory,
+    "test_trajectory_ragged_full_counts_matches_none",
+    test_trajectory_ragged_full_counts_matches_none,
+    devices,
+)
+add_function_test(
+    TestIKTrajectory,
+    "test_trajectory_ragged_pad_rows_inert",
+    test_trajectory_ragged_pad_rows_inert,
+    devices,
+)
+add_function_test(
+    TestIKTrajectory,
+    "test_trajectory_ragged_free_joint_kb2_matches_singleton",
+    test_trajectory_ragged_free_joint_kb2_matches_singleton,
+    devices,
+)
+add_function_test(
+    TestIKTrajectory,
+    "test_trajectory_ragged_validation",
+    test_trajectory_ragged_validation,
+    devices,
+)
+add_function_test(
+    TestIKTrajectory,
+    "test_trajectory_ragged_autodiff_matches_singleton",
+    test_trajectory_ragged_autodiff_matches_singleton,
+    devices,
+)
+add_function_test(
+    TestIKTrajectory,
+    "test_trajectory_ragged_fixed_frames",
+    test_trajectory_ragged_fixed_frames,
+    devices,
+)
+add_function_test(
+    TestIKTrajectory,
+    "test_trajectory_ragged_graph_capture",
+    test_trajectory_ragged_graph_capture,
+    cuda_devices,
+)
 
 
 if __name__ == "__main__":

@@ -106,6 +106,7 @@ def _accumulate_joint_tangent_diff(
 def _stencil_diff_residuals(
     joint_q: wp.array2d[wp.float32],  # (n_rows, n_coords)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     width: int,
     diff_coeffs: wp.array[wp.float32],  # (width,)
     start_idx: int,
@@ -118,7 +119,7 @@ def _stencil_diff_residuals(
 ):
     row, joint_idx = wp.tid()
     t = row % n_frames
-    if t + width >= n_frames:
+    if t + width >= lengths[row // n_frames]:
         return
 
     for i in range(width):
@@ -141,6 +142,7 @@ def _stencil_diff_residuals(
 @wp.kernel(enable_backward=False)
 def _scale_residual_rows(
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     width: int,
     scale: float,
     dof_weights: wp.array[wp.float32],  # (n_dofs,)
@@ -152,7 +154,7 @@ def _scale_residual_rows(
 ):
     row, dof = wp.tid()
     t = row % n_frames
-    if t + width >= n_frames:
+    if t + width >= lengths[row // n_frames]:
         return
     s = scale * dof_weights[dof]
     if frame_weights.shape[0] > 0:
@@ -163,6 +165,7 @@ def _scale_residual_rows(
 @wp.kernel(enable_backward=False)
 def _stencil_diag_coeffs(
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     width: int,
     jac_coeffs: wp.array[wp.float32],  # (width + 1,)
     scale: float,
@@ -173,7 +176,7 @@ def _stencil_diag_coeffs(
 ):
     row, dof = wp.tid()
     t = row % n_frames
-    if t + width >= n_frames:
+    if t + width >= lengths[row // n_frames]:
         return
     s = scale * dof_weights[dof]
     if frame_weights.shape[0] > 0:
@@ -196,6 +199,7 @@ def _skew_entry(p: wp.vec3, a: int, b: int) -> float:
 def _stencil_free_lever_coeffs(
     joint_q: wp.array2d[wp.float32],  # (n_rows, n_coords)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     width: int,
     jac_coeffs: wp.array[wp.float32],  # (width + 1,)
     scale: float,
@@ -225,7 +229,7 @@ def _stencil_free_lever_coeffs(
     if joint_parent[joint_idx] < 0:
         return
     t = row % n_frames
-    if t + width >= n_frames:
+    if t + width >= lengths[row // n_frames]:
         return
 
     coord0 = joint_q_start[joint_idx]
@@ -286,6 +290,7 @@ def _reference_residuals(
 def _velocity_scratch(
     joint_q: wp.array2d[wp.float32],  # (n_rows, n_coords)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     inv_dt: float,
     joint_type: wp.array[wp.int32],
     joint_q_start: wp.array[wp.int32],
@@ -296,7 +301,7 @@ def _velocity_scratch(
 ):
     row, joint_idx = wp.tid()
     t = row % n_frames
-    if t + 1 >= n_frames:
+    if t + 1 >= lengths[row // n_frames]:
         return
     _accumulate_joint_tangent_diff(
         joint_idx,
@@ -317,6 +322,7 @@ def _velocity_limit_residuals(
     velocity: wp.array2d[wp.float32],  # (n_rows, n_dofs)
     velocity_limits: wp.array[wp.float32],  # (n_dofs,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     weight: float,
     start_idx: int,
     # outputs
@@ -324,7 +330,7 @@ def _velocity_limit_residuals(
 ):
     row, dof = wp.tid()
     t = row % n_frames
-    if t + 1 >= n_frames:
+    if t + 1 >= lengths[row // n_frames]:
         return
     v = velocity[row, dof]
     viol = wp.abs(v) - velocity_limits[dof]
@@ -336,6 +342,7 @@ def _velocity_limit_coeffs(
     velocity: wp.array2d[wp.float32],  # (n_rows, n_dofs)
     velocity_limits: wp.array[wp.float32],  # (n_dofs,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     weight: float,
     inv_dt: float,
     # outputs
@@ -343,7 +350,7 @@ def _velocity_limit_coeffs(
 ):
     row, dof = wp.tid()
     t = row % n_frames
-    if t + 1 >= n_frames:
+    if t + 1 >= lengths[row // n_frames]:
         return
     v = velocity[row, dof]
     if wp.abs(v) > velocity_limits[dof]:
@@ -358,6 +365,7 @@ def _velocity_limit_free_lever_coeffs(
     velocity: wp.array2d[wp.float32],  # (n_rows, n_dofs)
     velocity_limits: wp.array[wp.float32],  # (n_dofs,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     weight: float,
     inv_dt: float,
     joint_type: wp.array[wp.int32],
@@ -375,7 +383,7 @@ def _velocity_limit_free_lever_coeffs(
     if joint_parent[joint_idx] < 0:
         return
     t = row % n_frames
-    if t + 1 >= n_frames:
+    if t + 1 >= lengths[row // n_frames]:
         return
 
     coord0 = joint_q_start[joint_idx]
@@ -423,6 +431,7 @@ class IKObjectiveTemporal(IKObjective):
         self.n_dofs = model.joint_dof_count
         self.n_frames = None
         self.n_trajectories = None
+        self.frame_counts = None
         self.coeffs = None
         # private FK buffers, allocated on first standalone compute_coeffs
         # (the owning solver shares its own instead, cf. _fk_context)
@@ -431,15 +440,28 @@ class IKObjectiveTemporal(IKObjective):
         self._qd_zero = None
         self._joint_S_s = None
 
-    def set_trajectory_layout(self, n_frames: int, n_trajectories: int) -> None:
+    def set_trajectory_layout(
+        self,
+        n_frames: int,
+        n_trajectories: int,
+        frame_counts: wp.array[wp.int32] | None = None,
+    ) -> None:
         """Register the frame layout of the owning trajectory solver.
 
         Args:
-            n_frames: Number of frames per trajectory.
+            n_frames: Number of frames per trajectory (the longest trajectory
+                when ``frame_counts`` is given).
             n_trajectories: Number of trajectories optimized together.
+            frame_counts: Per-trajectory frame counts, shape
+                [n_trajectories]. Residual rows whose stencil crosses their
+                own trajectory's last frame are truncated exactly as at the
+                uniform end. ``None`` treats every trajectory as ``n_frames``
+                long (an equivalent array is allocated in
+                :meth:`init_buffers`).
         """
         self.n_frames = n_frames
         self.n_trajectories = n_trajectories
+        self.frame_counts = frame_counts
 
     def _require_trajectory_layout(self) -> None:
         if self.n_frames is None:
@@ -474,6 +496,12 @@ class IKObjectiveTemporal(IKObjective):
         """
         self._require_batch_layout()
         self._require_trajectory_layout()
+        if self.frame_counts is None:
+            self.frame_counts = wp.array(
+                np.full(self.n_trajectories, self.n_frames, dtype=np.int32),
+                dtype=wp.int32,
+                device=self.device,
+            )
         self.coeffs = wp.zeros(
             (self.n_batch, self.stencil_width() + 1, self.coeff_row_count(), self.n_dofs),
             dtype=wp.float32,
@@ -633,6 +661,7 @@ class IKObjectiveSmoothness(IKObjectiveTemporal):
             dim=[self.n_batch, self.n_dofs],
             inputs=[
                 self.n_frames,
+                self.frame_counts,
                 self.derivative,
                 self._jac_coeffs,
                 self._scale,
@@ -677,6 +706,7 @@ class IKObjectiveSmoothness(IKObjectiveTemporal):
             inputs=[
                 joint_q,
                 self.n_frames,
+                self.frame_counts,
                 self.derivative,
                 self._diff_coeffs,
                 start_idx,
@@ -693,6 +723,7 @@ class IKObjectiveSmoothness(IKObjectiveTemporal):
             dim=[n_rows, self.n_dofs],
             inputs=[
                 self.n_frames,
+                self.frame_counts,
                 self.derivative,
                 self._scale,
                 self._dof_weights,
@@ -725,6 +756,7 @@ class IKObjectiveSmoothness(IKObjectiveTemporal):
             inputs=[
                 joint_q,
                 self.n_frames,
+                self.frame_counts,
                 self.derivative,
                 self._jac_coeffs,
                 self._scale,
@@ -789,6 +821,7 @@ class IKObjectiveVelocityLimit(IKObjectiveTemporal):
             inputs=[
                 joint_q,
                 self.n_frames,
+                self.frame_counts,
                 1.0 / self.dt,
                 model.joint_type,
                 model.joint_q_start,
@@ -829,6 +862,7 @@ class IKObjectiveVelocityLimit(IKObjectiveTemporal):
                 self._velocity,
                 self.velocity_limits,
                 self.n_frames,
+                self.frame_counts,
                 self.weight,
                 start_idx,
             ],
@@ -853,6 +887,7 @@ class IKObjectiveVelocityLimit(IKObjectiveTemporal):
                 self._velocity,
                 self.velocity_limits,
                 self.n_frames,
+                self.frame_counts,
                 self.weight,
                 1.0 / self.dt,
             ],
@@ -867,6 +902,7 @@ class IKObjectiveVelocityLimit(IKObjectiveTemporal):
                 self._velocity,
                 self.velocity_limits,
                 self.n_frames,
+                self.frame_counts,
                 self.weight,
                 1.0 / self.dt,
                 self.model.joint_type,
@@ -942,6 +978,7 @@ class IKObjectiveJointReference(IKObjectiveTemporal):
             dim=[self.n_batch, self.n_dofs],
             inputs=[
                 self.n_frames,
+                self.frame_counts,
                 0,
                 self._unit_jac,
                 self.weight,
@@ -996,6 +1033,7 @@ class IKObjectiveJointReference(IKObjectiveTemporal):
             dim=[n_rows, self.n_dofs],
             inputs=[
                 self.n_frames,
+                self.frame_counts,
                 0,
                 self.weight,
                 self._dof_weights,
@@ -1028,6 +1066,7 @@ class IKObjectiveJointReference(IKObjectiveTemporal):
             inputs=[
                 joint_q,
                 self.n_frames,
+                self.frame_counts,
                 0,
                 self._unit_jac,
                 self.weight,
@@ -1233,6 +1272,7 @@ def _link_axis(body_q: wp.array2d[wp.transform], row: int, link: int, axis: wp.v
 def _apparent_gravity_scratch(
     body_q: wp.array2d[wp.transform],  # (n_rows, n_bodies)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     link_index: int,
     link_offset: wp.vec3,
     tangent_u: wp.vec3,  # link-local plate tangent axes
@@ -1246,7 +1286,7 @@ def _apparent_gravity_scratch(
 ):
     row = wp.tid()
     t = row % n_frames
-    if t + 2 >= n_frames:
+    if t + 2 >= lengths[row // n_frames]:
         return
     p0 = _link_point(body_q, row, link_index, link_offset)
     p1 = _link_point(body_q, row + 1, link_index, link_offset)
@@ -1263,6 +1303,7 @@ def _apparent_gravity_residuals(
     t_u: wp.array[wp.vec3],
     t_v: wp.array[wp.vec3],
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     weight: float,
     start_idx: int,
     # outputs
@@ -1270,7 +1311,7 @@ def _apparent_gravity_residuals(
 ):
     row = wp.tid()
     t = row % n_frames
-    if t + 2 >= n_frames:
+    if t + 2 >= lengths[row // n_frames]:
         return
     residuals[row, start_idx + 0] = weight * wp.dot(t_u[row], f_app[row])
     residuals[row, start_idx + 1] = weight * wp.dot(t_v[row], f_app[row])
@@ -1285,6 +1326,7 @@ def _apparent_gravity_coeffs(
     t_v: wp.array[wp.vec3],
     affects_dof: wp.array[wp.uint8],  # (n_dofs,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     link_index: int,
     link_offset: wp.vec3,
     weight: float,
@@ -1302,7 +1344,7 @@ def _apparent_gravity_coeffs(
     """
     row, dof = wp.tid()
     t = row % n_frames
-    if t + 2 >= n_frames:
+    if t + 2 >= lengths[row // n_frames]:
         return
     if affects_dof[dof] == 0:
         return
@@ -1435,6 +1477,7 @@ class IKObjectiveApparentGravity(IKObjectiveTemporal):
             inputs=[
                 body_q,
                 self.n_frames,
+                self.frame_counts,
                 self.link_index,
                 self.link_offset,
                 self._tangent_u,
@@ -1472,7 +1515,7 @@ class IKObjectiveApparentGravity(IKObjectiveTemporal):
         wp.launch(
             _apparent_gravity_residuals,
             dim=[n_rows],
-            inputs=[self._f_app, self._t_u, self._t_v, self.n_frames, self.weight, start_idx],
+            inputs=[self._f_app, self._t_u, self._t_v, self.n_frames, self.frame_counts, self.weight, start_idx],
             outputs=[residuals],
             device=self.device,
         )
@@ -1497,6 +1540,7 @@ class IKObjectiveApparentGravity(IKObjectiveTemporal):
                 self._t_v,
                 self._affects_dof,
                 self.n_frames,
+                self.frame_counts,
                 self.link_index,
                 self.link_offset,
                 self.weight,
@@ -1971,6 +2015,7 @@ def _foot_skate_residuals(
     link_index: wp.array[wp.int32],
     link_offset: wp.array[wp.vec3],
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     weight: float,
     start_idx: int,
     # outputs
@@ -1978,7 +2023,7 @@ def _foot_skate_residuals(
 ):
     row, k = wp.tid()
     t = row % n_frames
-    if t + 1 >= n_frames:
+    if t + 1 >= lengths[row // n_frames]:
         return
     if contact[row, k] == 0 or contact[row + 1, k] == 0:
         return
@@ -1999,13 +2044,14 @@ def _foot_skate_coeffs(
     link_index: wp.array[wp.int32],
     link_offset: wp.array[wp.vec3],
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     weight: float,
     # outputs
     coeffs: wp.array4d[wp.float32],  # (n_rows, 2, n_dofs, n_dofs), zeroed by caller
 ):
     row, k, dof = wp.tid()
     t = row % n_frames
-    if t + 1 >= n_frames:
+    if t + 1 >= lengths[row // n_frames]:
         return
     if contact[row, k] == 0 or contact[row + 1, k] == 0:
         return
@@ -2129,6 +2175,7 @@ class IKObjectiveFootSkate(IKObjectiveTemporal):
                 self._links,
                 self._offsets,
                 self.n_frames,
+                self.frame_counts,
                 self.weight,
                 start_idx,
             ],
@@ -2155,6 +2202,7 @@ class IKObjectiveFootSkate(IKObjectiveTemporal):
                 self._links,
                 self._offsets,
                 self.n_frames,
+                self.frame_counts,
                 self.weight,
             ],
             outputs=[self.coeffs],

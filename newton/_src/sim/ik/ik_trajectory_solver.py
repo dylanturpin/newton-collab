@@ -93,17 +93,21 @@ class IKSharedMemoryError(RuntimeError):
 
 # Per-trajectory reductions run in two stages so long horizons do not
 # serialize on one thread per trajectory (dominant at small batch sizes).
+# Rows past a trajectory's frame count (ragged tails, cf. ``frame_counts``)
+# are excluded: chunks past the end contribute exact zeros, so the reduction
+# matches the trajectory's standalone solve bit for bit.
 @wp.kernel
 def _reduce_costs_partial(
     costs_rows: wp.array[wp.float32],  # (n_rows,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     chunk: int,
     # outputs
     partials: wp.array2d[wp.float32],  # (n_trajectories, n_chunks)
 ):
     p, c = wp.tid()
     start = c * chunk
-    end = wp.min(start + chunk, n_frames)
+    end = wp.min(start + chunk, lengths[p])
     acc = float(0.0)
     for t in range(start, end):
         acc += costs_rows[p * n_frames + t]
@@ -246,6 +250,7 @@ def _gather_block_diag(
     lambda_traj: wp.array[wp.float32],  # (n_trajectories,)
     fixed_mask: wp.array[wp.uint8],  # (n_frames,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     kb: int,
     n_dofs: int,
     band_count: int,
@@ -259,8 +264,9 @@ def _gather_block_diag(
     db = b % n_dofs
 
     val = float(0.0)
-    if fa >= n_frames or fb >= n_frames:
-        # identity padding for the partial trailing superblock
+    if fa >= lengths[p] or fb >= lengths[p]:
+        # identity padding for the partial trailing superblock and for
+        # rows past this trajectory's frame count (ragged tails)
         val = 1.0 if a == b else 0.0
     elif fixed_mask[fa] != 0 or fixed_mask[fb] != 0:
         val = 1.0 if a == b else 0.0
@@ -288,6 +294,7 @@ def _gather_block_offdiag(
     band: wp.array4d[wp.float32],  # (n_rows, band_count, n_dofs, n_dofs)
     fixed_mask: wp.array[wp.uint8],  # (n_frames,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     kb: int,
     n_dofs: int,
     band_count: int,
@@ -301,7 +308,8 @@ def _gather_block_offdiag(
         fb = (g - 1) * kb + b // n_dofs
         da = a % n_dofs
         db = b % n_dofs
-        if fa < n_frames and fixed_mask[fa] == 0 and fixed_mask[fb] == 0:
+        # fa > fb always, so fa < lengths[p] bounds both frames
+        if fa < lengths[p] and fixed_mask[fa] == 0 and fixed_mask[fb] == 0:
             d = fa - fb  # always > 0: read the transpose of H(fb, fb + d)
             if d < band_count:
                 val = band[p * n_frames + fb, d, db, da]
@@ -313,6 +321,7 @@ def _gather_rhs(
     grad: wp.array2d[wp.float32],  # (n_rows, n_dofs)
     fixed_mask: wp.array[wp.uint8],  # (n_frames,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     kb: int,
     n_dofs: int,
     # outputs
@@ -321,7 +330,7 @@ def _gather_rhs(
     p, g, a = wp.tid()
     fa = g * kb + a // n_dofs
     val = float(0.0)
-    if fa < n_frames and fixed_mask[fa] == 0:
+    if fa < lengths[p] and fixed_mask[fa] == 0:
         val = -grad[p * n_frames + fa, a % n_dofs]
     b_bar[p, g, a] = val
 
@@ -331,6 +340,7 @@ def _scatter_delta(
     x_bar: wp.array3d[wp.float32],  # (n_trajectories, n_super, m)
     fixed_mask: wp.array[wp.uint8],  # (n_frames,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     kb: int,
     n_dofs: int,
     # outputs
@@ -338,10 +348,10 @@ def _scatter_delta(
 ):
     row, dof = wp.tid()
     t = row % n_frames
-    if fixed_mask[t] != 0:
+    p = row // n_frames
+    if t >= lengths[p] or fixed_mask[t] != 0:
         dq_dof[row, dof] = 0.0
         return
-    p = row // n_frames
     g = t // kb
     a = (t % kb) * n_dofs + dof
     dq_dof[row, dof] = x_bar[p, g, a]
@@ -353,6 +363,7 @@ def _pred_reduction_partial(
     grad: wp.array2d[wp.float32],  # (n_rows, n_dofs)
     lambda_traj: wp.array[wp.float32],  # (n_trajectories,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     n_dofs: int,
     chunk: int,
     # outputs
@@ -361,7 +372,7 @@ def _pred_reduction_partial(
     p, c = wp.tid()
     lam = lambda_traj[p]
     start = c * chunk
-    end = wp.min(start + chunk, n_frames)
+    end = wp.min(start + chunk, lengths[p])
     acc = float(0.0)
     for t in range(start, end):
         row = p * n_frames + t
@@ -378,6 +389,7 @@ def _fill_bsr_values(
     lambda_traj: wp.array[wp.float32],  # (n_trajectories,)
     fixed_mask: wp.array[wp.uint8],  # (n_frames,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     n_dofs: int,
     band_width: int,
     bsr_offsets: wp.array[wp.int32],
@@ -399,7 +411,8 @@ def _fill_bsr_values(
     if s == band_width:  # diagonal block
         for b in range(n_dofs):
             val = float(0.0)
-            if fixed_mask[t] != 0:
+            if t >= lengths[p] or fixed_mask[t] != 0:
+                # ragged-tail rows are inert identity rows (zero rhs below)
                 val = 1.0 if a == b else 0.0
             else:
                 val = jtj[row, a, b] + band[row, 0, a, b]
@@ -408,7 +421,7 @@ def _fill_bsr_values(
             values[idx, a, b] = val
     else:
         d = s - band_width
-        active = fixed_mask[t] == 0 and fixed_mask[tc] == 0
+        active = t < lengths[p] and tc < lengths[p] and fixed_mask[t] == 0 and fixed_mask[tc] == 0
         for b in range(n_dofs):
             val = float(0.0)
             if active:
@@ -425,13 +438,15 @@ def _gather_rhs_flat(
     grad: wp.array2d[wp.float32],  # (n_rows, n_dofs)
     fixed_mask: wp.array[wp.uint8],  # (n_frames,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     n_dofs: int,
     # outputs
     rhs: wp.array[wp.float32],  # (n_rows * n_dofs,)
 ):
     row, dof = wp.tid()
+    t = row % n_frames
     val = float(0.0)
-    if fixed_mask[row % n_frames] == 0:
+    if t < lengths[row // n_frames] and fixed_mask[t] == 0:
         val = -grad[row, dof]
     rhs[row * n_dofs + dof] = val
 
@@ -440,11 +455,13 @@ def _gather_rhs_flat(
 def _mask_fixed_delta(
     fixed_mask: wp.array[wp.uint8],  # (n_frames,)
     n_frames: int,
+    lengths: wp.array[wp.int32],  # (n_trajectories,)
     # outputs
     dq_dof: wp.array2d[wp.float32],
 ):
     row, dof = wp.tid()
-    if fixed_mask[row % n_frames] != 0:
+    t = row % n_frames
+    if t >= lengths[row // n_frames] or fixed_mask[t] != 0:
         dq_dof[row, dof] = 0.0
 
 
@@ -645,27 +662,34 @@ def _spike_recover(
     u_int: wp.array4d[wp.float32],  # (n_traj * n_parts, l_max, m, m)
     v_int: wp.array4d[wp.float32],  # (n_traj * n_parts, l_max, m, m)
     x_sep: wp.array3d[wp.float32],  # (n_traj, n_parts - 1, m)
-    g_kind: wp.array[wp.int32],  # (n_super,) 0 = interior, 1 = separator
-    g_idx: wp.array[wp.int32],  # (n_super,) partition / separator index
-    g_loc: wp.array[wp.int32],  # (n_super,) local offset within the partition
+    g_kind: wp.array2d[wp.int32],  # (n_traj, n_super) 0 = interior, 1 = separator, 2 = ragged pad
+    g_idx: wp.array2d[wp.int32],  # (n_traj, n_super) partition / separator index
+    g_loc: wp.array2d[wp.int32],  # (n_traj, n_super) local offset within the partition
+    parts: wp.array[wp.int32],  # (n_traj,) partitions per trajectory
     n_parts: int,
     m: int,
     # outputs
     x_bar: wp.array3d[wp.float32],  # (n_traj, n_super, m)
 ):
     p, g, a = wp.tid()
-    if g_kind[g] == 1:
-        x_bar[p, g, a] = x_sep[p, g_idx[g], a]
+    kind = g_kind[p, g]
+    if kind == 2:
+        # superblock past this trajectory's chain: exact zero keeps the
+        # refinement residual of the padded tail identically zero
+        x_bar[p, g, a] = 0.0
         return
-    part = g_idx[g]
-    loc = g_loc[g]
+    if kind == 1:
+        x_bar[p, g, a] = x_sep[p, g_idx[p, g], a]
+        return
+    part = g_idx[p, g]
+    loc = g_loc[p, g]
     row = p * n_parts + part
     acc = y_int[row, loc, a]
     # x_interior = y - U x_sep_left - V x_sep_right
     if part > 0:
         for c in range(m):
             acc -= u_int[row, loc, a, c] * x_sep[p, part - 1, c]
-    if part < n_parts - 1:
+    if part < parts[p] - 1:
         for c in range(m):
             acc -= v_int[row, loc, a, c] * x_sep[p, part, c]
     x_bar[p, g, a] = acc
@@ -709,20 +733,41 @@ def _add_refine_delta(
 class IKSolverTrajectory(IKOptimizerLM):
     """Levenberg-Marquardt trajectory IK with a block-banded global solve.
 
-    The solver optimizes ``n_problems`` trajectories of ``n_frames`` frames
-    each. Evaluation rows are laid out frame-major: row ``p * n_frames + t``
-    holds frame ``t`` of trajectory ``p``. Per-frame objectives size their
-    target arrays by ``n_problems * n_frames`` (one target per frame);
-    temporal objectives couple consecutive frames and define the bandwidth
-    of the Gauss-Newton system.
+    The solver optimizes ``n_problems`` trajectories of up to ``n_frames``
+    frames each. Evaluation rows are laid out frame-major: row
+    ``p * n_frames + t`` holds frame ``t`` of trajectory ``p``. Per-frame
+    objectives size their target arrays by ``n_problems * n_frames`` (one
+    target per frame); temporal objectives couple consecutive frames and
+    define the bandwidth of the Gauss-Newton system.
 
     Damping and step acceptance are per trajectory: a trajectory accepts or
     rejects the joint update of all of its frames atomically, based on the
     total cost across frames.
 
+    Trajectories of unequal length share one solver through
+    ``frame_counts``: trajectory ``p`` occupies rows
+    ``p * n_frames + [0, frame_counts[p])`` and its temporal stencils,
+    costs, and linear system stop exactly at its own last frame. Rows past
+    a trajectory's frame count are inert: they contribute nothing to any
+    cost or coupling, and real rows are bitwise independent of their
+    content. Pad rows should hold valid configurations — repeating the
+    last real frame is the recommended (and tested) pattern. Non-quaternion
+    pad coordinates receive an exact zero update; quaternion pad
+    coordinates pass through the same renormalization as real rows when
+    their trajectory accepts a step, so an all-zero pad quaternion becomes
+    the identity (warp's normalize is eps-guarded), a non-unit one is
+    rescaled to unit length, and a unit one may drift by an ulp. On the
+    DIRECT and SPIKE backends each trajectory's chain is factorized with
+    the same partitioning and reduction order as a standalone solve of its own
+    length, so a batched trajectory's solution is bitwise equal to its
+    unpadded single-trajectory solve (for horizons below ~65k frames,
+    where the two-stage cost-reduction chunking coincides); the CG backend
+    matches to solver tolerance.
+
     Args:
         model: Shared articulation model.
-        n_frames: Number of frames per trajectory.
+        n_frames: Number of frames per trajectory (the longest trajectory
+            when ``frame_counts`` is given).
         objectives: Ordered IK objectives; per-frame and temporal objectives
             may be mixed freely.
         n_problems: Number of trajectories optimized together.
@@ -732,7 +777,11 @@ class IKSolverTrajectory(IKOptimizerLM):
             equations.
         fixed_frames: Frame indices whose configurations are held fixed at
             their seed values (in every trajectory), e.g. ``[0]`` to anchor
-            the start of the trajectory.
+            the start of the trajectory. Indices at or past a trajectory's
+            ``frame_counts`` entry are inert for that trajectory.
+        frame_counts: Number of frames of each trajectory, shape
+            [n_problems], each in ``[2, n_frames]``. ``None`` solves every
+            trajectory at the full ``n_frames``.
         lambda_initial: Initial LM damping factor for each trajectory.
         lambda_factor: LM damping update factor.
         lambda_min: Minimum LM damping value.
@@ -792,6 +841,7 @@ class IKSolverTrajectory(IKOptimizerLM):
         jacobian_mode: IKJacobianType | str = IKJacobianType.AUTODIFF,
         linear_solver: IKLinearSolver | str = IKLinearSolver.DIRECT,
         fixed_frames: Sequence[int] | None = None,
+        frame_counts: Sequence[int] | None = None,
         lambda_initial: float = 0.1,
         lambda_factor: float = 2.0,
         lambda_min: float = 1e-5,
@@ -813,7 +863,18 @@ class IKSolverTrajectory(IKOptimizerLM):
         if refine_iterations < 0:
             raise ValueError("refine_iterations must be >= 0")
 
+        if frame_counts is not None:
+            counts = tuple(int(c) for c in frame_counts)
+            if len(counts) != n_problems:
+                raise ValueError(f"frame_counts must have n_problems = {n_problems} entries, got {len(counts)}")
+            for p, count in enumerate(counts):
+                if not 2 <= count <= n_frames:
+                    raise ValueError(f"frame_counts[{p}] = {count} outside [2, n_frames = {n_frames}]")
+        else:
+            counts = (n_frames,) * n_problems
+
         self.n_frames = n_frames
+        self.frame_counts = counts
         self.n_trajectories = n_problems
         self.linear_solver = linear_solver
         self.cg_iterations = cg_iterations
@@ -858,38 +919,79 @@ class IKSolverTrajectory(IKOptimizerLM):
     # ------------------------------------------------------------------
 
     def _plan_spike_partitions(self, spike_partitions: int | None) -> None:
-        """Split the superblock chain into interiors separated by interface blocks."""
-        n_super = self.n_superblocks
-        if n_super < 3:
-            raise ValueError("the spike backend requires at least 3 superblocks; use the direct backend")
-        n_parts = spike_partitions if spike_partitions is not None else max(2, min(64, n_super // 16))
-        n_parts = max(2, min(n_parts, (n_super + 1) // 2))
+        """Split each trajectory's superblock chain into interiors separated by
+        interface blocks.
 
-        base, rem = divmod(n_super - (n_parts - 1), n_parts)
-        lens = [base + (1 if i < rem else 0) for i in range(n_parts)]
-        starts = []
-        kind = np.zeros(n_super, dtype=np.int32)  # 0 = interior, 1 = separator
-        idx = np.zeros(n_super, dtype=np.int32)
-        loc = np.zeros(n_super, dtype=np.int32)
-        g = 0
-        for i, length in enumerate(lens):
-            starts.append(g)
-            for t in range(length):
-                kind[g], idx[g], loc[g] = 0, i, t
-                g += 1
-            if i < n_parts - 1:
-                kind[g], idx[g], loc[g] = 1, i, 0
-                g += 1
+        Every trajectory is planned independently from its own frame count
+        with the same law a standalone solve of that length would use, so a
+        batched trajectory's factorization runs the identical partitioning
+        and reduction order as its single-trajectory solve (the bitwise
+        batching invariant). Trajectories with fewer partitions than the
+        widest member leave trailing partition rows with ``ilen == 0``,
+        which the factorization kernels skip; their reduced (Schur) chains
+        keep per-trajectory separator counts.
+        """
+        kb = self.kb
+        n_traj = self.n_trajectories
+        plans: list[tuple[int, int, list[int]]] = []
+        for count in self.frame_counts:
+            n_super = (count + kb - 1) // kb
+            if n_super < 3:
+                raise ValueError(
+                    "the spike backend requires at least 3 superblocks per trajectory; use the direct backend"
+                )
+            n_parts = spike_partitions if spike_partitions is not None else max(2, min(64, n_super // 16))
+            n_parts = max(2, min(n_parts, (n_super + 1) // 2))
+            base, rem = divmod(n_super - (n_parts - 1), n_parts)
+            lens = [base + (1 if i < rem else 0) for i in range(n_parts)]
+            plans.append((n_super, n_parts, lens))
 
-        self._spike_n_parts = n_parts
-        self._spike_l_max = max(lens)
-        self._spike_istart_np = np.array(starts, dtype=np.int32)
-        self._spike_ilen_np = np.array(lens, dtype=np.int32)
+        n_parts_max = max(plan[1] for plan in plans)
+        n_super_max = self.n_superblocks
+        istart = np.zeros((n_traj, n_parts_max), dtype=np.int32)
+        ilen = np.zeros((n_traj, n_parts_max), dtype=np.int32)
+        # 0 = interior, 1 = separator, 2 = pad superblock past the chain
+        kind = np.full((n_traj, n_super_max), 2, dtype=np.int32)
+        idx = np.zeros((n_traj, n_super_max), dtype=np.int32)
+        loc = np.zeros((n_traj, n_super_max), dtype=np.int32)
+        parts = np.zeros(n_traj, dtype=np.int32)
+        for p, (_n_super, n_parts, lens) in enumerate(plans):
+            parts[p] = n_parts
+            g = 0
+            for i, length in enumerate(lens):
+                istart[p, i] = g
+                ilen[p, i] = length
+                for t in range(length):
+                    kind[p, g], idx[p, g], loc[p, g] = 0, i, t
+                    g += 1
+                if i < n_parts - 1:
+                    kind[p, g], idx[p, g], loc[p, g] = 1, i, 0
+                    g += 1
+
+        self._spike_n_parts = n_parts_max
+        self._spike_l_max = max(max(plan[2]) for plan in plans)
+        self._spike_parts_np = parts
+        self._spike_istart_np = istart.reshape(-1)
+        self._spike_ilen_np = ilen.reshape(-1)
         self._spike_kind_np, self._spike_idx_np, self._spike_loc_np = kind, idx, loc
+
+    @property
+    def spike_partition_counts(self) -> tuple[int, ...] | None:
+        """Per-trajectory SPIKE partition counts, length ``n_problems``.
+
+        Each trajectory is planned from its own frame count with the same
+        partition law a standalone solve of that length would use, so this
+        is the observable record of the per-trajectory reduction order
+        behind the bitwise batching invariant. ``None`` unless
+        ``linear_solver`` is :attr:`IKLinearSolver.SPIKE`.
+        """
+        if self.linear_solver is not IKLinearSolver.SPIKE:
+            return None
+        return tuple(int(n) for n in self._spike_parts_np)
 
     def _init_objectives(self) -> None:
         for obj in self.temporal_objectives:
-            obj.set_trajectory_layout(self.n_frames, self.n_trajectories)
+            obj.set_trajectory_layout(self.n_frames, self.n_trajectories, frame_counts=self._lengths)
         super()._init_objectives()
 
     def _build_residual_offsets(self) -> None:
@@ -937,6 +1039,9 @@ class IKSolverTrajectory(IKOptimizerLM):
         self.grad = self.grad3.reshape((n_rows, n_dofs))
         self.band = wp.zeros((n_rows, self.band_width + 1, n_dofs, n_dofs), dtype=wp.float32, device=device)
         self.fixed_mask = wp.array(self._fixed_mask_np, dtype=wp.uint8, device=device)
+        # one shared per-trajectory frame-count array drives every ragged
+        # clamp; the uniform case simply holds n_frames everywhere
+        self._lengths = wp.array(np.array(self.frame_counts, dtype=np.int32), dtype=wp.int32, device=device)
 
         # two-stage per-trajectory reduction: chunk count capped so both
         # stages stay parallel at million-frame horizons
@@ -962,9 +1067,13 @@ class IKSolverTrajectory(IKOptimizerLM):
             self._chol_ws = wp.zeros((n_traj, n_super, m, m), dtype=wp.float32, device=device)
             self._coupling_ws = wp.zeros((n_traj, n_super, m, m), dtype=wp.float32, device=device)
             # the factorization/substitution kernels walk one partition per
-            # block; the whole chain is a single partition here
-            self._thomas_istart = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
-            self._thomas_ilen = wp.array(np.array([n_super], dtype=np.int32), dtype=wp.int32, device=device)
+            # block, one row per trajectory; each trajectory's chain is a
+            # single partition of its own superblock count, so ragged tails
+            # are never factorized
+            kb = self.kb
+            n_super_traj = np.array([(c + kb - 1) // kb for c in self.frame_counts], dtype=np.int32)
+            self._thomas_istart = wp.array(np.zeros(n_traj, dtype=np.int32), dtype=wp.int32, device=device)
+            self._thomas_ilen = wp.array(n_super_traj, dtype=wp.int32, device=device)
         elif self.linear_solver is IKLinearSolver.SPIKE:
             self._alloc_spike_buffers()
         else:
@@ -985,6 +1094,7 @@ class IKSolverTrajectory(IKOptimizerLM):
         self._sp_kind = wp.array(self._spike_kind_np, dtype=wp.int32, device=device)
         self._sp_idx = wp.array(self._spike_idx_np, dtype=wp.int32, device=device)
         self._sp_loc = wp.array(self._spike_loc_np, dtype=wp.int32, device=device)
+        self._sp_parts = wp.array(self._spike_parts_np, dtype=wp.int32, device=device)
 
         # per-interior local solution and the two spike columns
         self._sp_y = wp.zeros((rows, l_max, m), dtype=wp.float32, device=device)
@@ -1000,8 +1110,9 @@ class IKSolverTrajectory(IKOptimizerLM):
         self._sp_x_sep = wp.zeros((n_traj, n_sep, m), dtype=wp.float32, device=device)
         self._sp_chol_sep = wp.zeros((n_traj, n_sep, m, m), dtype=wp.float32, device=device)
         self._sp_coup_sep = wp.zeros((n_traj, n_sep, m, m), dtype=wp.float32, device=device)
-        self._sp_sep_istart = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
-        self._sp_sep_ilen = wp.array(np.array([n_sep], dtype=np.int32), dtype=wp.int32, device=device)
+        # per-trajectory reduced chains: n_parts_p - 1 separators each
+        self._sp_sep_istart = wp.array(np.zeros(n_traj, dtype=np.int32), dtype=wp.int32, device=device)
+        self._sp_sep_ilen = wp.array((self._spike_parts_np - 1).astype(np.int32), dtype=wp.int32, device=device)
 
     def _alloc_cg_buffers(self) -> None:
         device = self.device
@@ -1099,7 +1210,7 @@ class IKSolverTrajectory(IKOptimizerLM):
         wp.launch(
             _reduce_costs_partial,
             dim=[self.n_trajectories, self._red_n_chunks],
-            inputs=[costs_rows, self.n_frames, self._red_chunk],
+            inputs=[costs_rows, self.n_frames, self._lengths, self._red_chunk],
             outputs=[self._traj_partials],
             device=self.device,
         )
@@ -1242,7 +1353,15 @@ class IKSolverTrajectory(IKOptimizerLM):
         wp.launch(
             _pred_reduction_partial,
             dim=[self.n_trajectories, self._red_n_chunks],
-            inputs=[self.dq_dof, self.grad, self.lambda_traj, self.n_frames, self.n_dofs, self._red_chunk],
+            inputs=[
+                self.dq_dof,
+                self.grad,
+                self.lambda_traj,
+                self.n_frames,
+                self._lengths,
+                self.n_dofs,
+                self._red_chunk,
+            ],
             outputs=[self._traj_partials],
             device=self.device,
         )
@@ -1326,6 +1445,7 @@ class IKSolverTrajectory(IKOptimizerLM):
                 self.lambda_traj,
                 self.fixed_mask,
                 self.n_frames,
+                self._lengths,
                 self.kb,
                 n_dofs,
                 self.band_width + 1,
@@ -1340,6 +1460,7 @@ class IKSolverTrajectory(IKOptimizerLM):
                 self.band,
                 self.fixed_mask,
                 self.n_frames,
+                self._lengths,
                 self.kb,
                 n_dofs,
                 self.band_width + 1,
@@ -1350,7 +1471,7 @@ class IKSolverTrajectory(IKOptimizerLM):
         wp.launch(
             _gather_rhs,
             dim=[self.n_trajectories, self.n_superblocks, m],
-            inputs=[self.grad, self.fixed_mask, self.n_frames, self.kb, n_dofs],
+            inputs=[self.grad, self.fixed_mask, self.n_frames, self._lengths, self.kb, n_dofs],
             outputs=[self.b_bar],
             device=self.device,
         )
@@ -1410,7 +1531,7 @@ class IKSolverTrajectory(IKOptimizerLM):
         wp.launch(
             _scatter_delta,
             dim=[self.n_batch, n_dofs],
-            inputs=[self.x_bar, self.fixed_mask, self.n_frames, self.kb, n_dofs],
+            inputs=[self.x_bar, self.fixed_mask, self.n_frames, self._lengths, self.kb, n_dofs],
             outputs=[self.dq_dof],
             device=self.device,
         )
@@ -1478,6 +1599,7 @@ class IKSolverTrajectory(IKOptimizerLM):
                     self._sp_kind,
                     self._sp_idx,
                     self._sp_loc,
+                    self._sp_parts,
                     n_parts,
                     m,
                 ],
@@ -1532,7 +1654,7 @@ class IKSolverTrajectory(IKOptimizerLM):
         wp.launch(
             _scatter_delta,
             dim=[self.n_batch, n_dofs],
-            inputs=[self.x_bar, self.fixed_mask, self.n_frames, self.kb, n_dofs],
+            inputs=[self.x_bar, self.fixed_mask, self.n_frames, self._lengths, self.kb, n_dofs],
             outputs=[self.dq_dof],
             device=self.device,
         )
@@ -1548,6 +1670,7 @@ class IKSolverTrajectory(IKOptimizerLM):
                 self.lambda_traj,
                 self.fixed_mask,
                 self.n_frames,
+                self._lengths,
                 n_dofs,
                 self.band_width,
                 self._hessian.offsets,
@@ -1559,7 +1682,7 @@ class IKSolverTrajectory(IKOptimizerLM):
         wp.launch(
             _gather_rhs_flat,
             dim=[self.n_batch, n_dofs],
-            inputs=[self.grad, self.fixed_mask, self.n_frames, n_dofs],
+            inputs=[self.grad, self.fixed_mask, self.n_frames, self._lengths, n_dofs],
             outputs=[self._cg_rhs],
             device=self.device,
         )
@@ -1575,7 +1698,7 @@ class IKSolverTrajectory(IKOptimizerLM):
         wp.launch(
             _mask_fixed_delta,
             dim=[self.n_batch, n_dofs],
-            inputs=[self.fixed_mask, self.n_frames],
+            inputs=[self.fixed_mask, self.n_frames, self._lengths],
             outputs=[self.dq_dof],
             device=self.device,
         )
@@ -1745,8 +1868,8 @@ class IKSolverTrajectory(IKOptimizerLM):
             d_bar: wp.array4d[wp.float32],  # (n_traj, n_super, m, m)
             l_bar: wp.array4d[wp.float32],  # (n_traj, n_super, m, m), block (g, g - 1)
             b_bar: wp.array3d[wp.float32],  # (n_traj, n_super, m)
-            istart: wp.array[wp.int32],  # (n_parts,)
-            ilen: wp.array[wp.int32],  # (n_parts,)
+            istart: wp.array[wp.int32],  # (n_traj * n_parts,)
+            ilen: wp.array[wp.int32],  # (n_traj * n_parts,)
             n_parts: int,
             # outputs
             chol_ws: wp.array4d[wp.float32],  # (n_traj * n_parts, l_max, m, m)
@@ -1754,12 +1877,16 @@ class IKSolverTrajectory(IKOptimizerLM):
             fwd_ws: wp.array3d[wp.float32],  # (n_traj * n_parts, l_max, m)
         ):
             """Streamed block-Cholesky factorization + forward substitution
-            over one partition [s, s + len) of one trajectory's chain."""
+            over one partition [s, s + len) of one trajectory's chain. The
+            partition tables are per row (trajectory-major), so trajectories
+            of unequal length carry their own plans; rows whose trajectory
+            has fewer partitions are inert (ilen == 0)."""
             row = wp.tid()
             p = row // n_parts
-            part = row - p * n_parts
-            s = istart[part]
-            length = ilen[part]
+            s = istart[row]
+            length = ilen[row]
+            if length == 0:
+                return
 
             A = wp.tile_load(d_bar[p, s], shape=(MB, MB))
             wp.tile_cholesky_inplace(A)
@@ -1790,8 +1917,8 @@ class IKSolverTrajectory(IKOptimizerLM):
 
         def _fwd_subst_template(
             rhs: wp.array3d[wp.float32],  # (n_traj, n_chain, m), indexed at s + t
-            istart: wp.array[wp.int32],
-            ilen: wp.array[wp.int32],
+            istart: wp.array[wp.int32],  # (n_traj * n_parts,)
+            ilen: wp.array[wp.int32],  # (n_traj * n_parts,)
             n_parts: int,
             chol_ws: wp.array4d[wp.float32],
             coup_ws: wp.array4d[wp.float32],
@@ -1801,9 +1928,8 @@ class IKSolverTrajectory(IKOptimizerLM):
             """Forward substitution only, on the stored factors (refinement)."""
             row = wp.tid()
             p = row // n_parts
-            part = row - p * n_parts
-            s = istart[part]
-            length = ilen[part]
+            s = istart[row]
+            length = ilen[row]
             for t in range(length):
                 bt = wp.tile_load(rhs[p, s + t], shape=MB)
                 if t > 0:
@@ -1817,8 +1943,8 @@ class IKSolverTrajectory(IKOptimizerLM):
                 wp.tile_store(fwd_ws[row, t], bt)
 
         def _bwd_subst_template(
-            istart: wp.array[wp.int32],
-            ilen: wp.array[wp.int32],
+            istart: wp.array[wp.int32],  # (n_traj * n_parts,)
+            ilen: wp.array[wp.int32],  # (n_traj * n_parts,)
             n_parts: int,
             chol_ws: wp.array4d[wp.float32],
             coup_ws: wp.array4d[wp.float32],
@@ -1827,8 +1953,7 @@ class IKSolverTrajectory(IKOptimizerLM):
         ):
             """Backward substitution in place over the forward values."""
             row = wp.tid()
-            part = row - (row // n_parts) * n_parts
-            length = ilen[part]
+            length = ilen[row]
             for i in range(length):
                 t = length - 1 - i
                 yt = wp.tile_load(y_ws[row, t], shape=MB)
@@ -1855,8 +1980,8 @@ class IKSolverTrajectory(IKOptimizerLM):
 
         def _u_fwd_template(
             l_bar: wp.array4d[wp.float32],
-            istart: wp.array[wp.int32],
-            ilen: wp.array[wp.int32],
+            istart: wp.array[wp.int32],  # (n_traj * n_parts,)
+            ilen: wp.array[wp.int32],  # (n_traj * n_parts,)
             n_parts: int,
             chol_ws: wp.array4d[wp.float32],
             coup_ws: wp.array4d[wp.float32],
@@ -1869,9 +1994,10 @@ class IKSolverTrajectory(IKOptimizerLM):
             block for the first partition, since l_bar[p, 0] is zero)."""
             row = wp.tid()
             p = row // n_parts
-            part = row - p * n_parts
-            s = istart[part]
-            length = ilen[part]
+            s = istart[row]
+            length = ilen[row]
+            if length == 0:
+                return
             # loop-carried spike tile: T holds U_{t-1} entering each iteration
             T = wp.tile_load(l_bar[p, s], shape=(MB, MB))
             A = wp.tile_load(chol_ws[row, 0], shape=(MB, MB))
@@ -1886,8 +2012,8 @@ class IKSolverTrajectory(IKOptimizerLM):
 
         def _v_last_template(
             l_bar: wp.array4d[wp.float32],
-            istart: wp.array[wp.int32],
-            ilen: wp.array[wp.int32],
+            istart: wp.array[wp.int32],  # (n_traj * n_parts,)
+            ilen: wp.array[wp.int32],  # (n_traj * n_parts,)
             n_parts: int,
             n_super: int,
             chol_ws: wp.array4d[wp.float32],
@@ -1900,12 +2026,14 @@ class IKSolverTrajectory(IKOptimizerLM):
             Rv = l_bar[p, s + len]^T the coupling of the interior's last row
             to the separator on its right. The caller zeroes v_int before
             this kernel; the clamped out-of-range spike of the last
-            partition is never read."""
+            partition is never read (for a ragged trajectory the clamp lands
+            on a zero pad coupling block, equally never read)."""
             row = wp.tid()
             p = row // n_parts
-            part = row - p * n_parts
-            s = istart[part]
-            length = ilen[part]
+            s = istart[row]
+            length = ilen[row]
+            if length == 0:
+                return
             v_row = wp.min(s + length, n_super - 1)
             Rv = wp.tile_load(l_bar[p, v_row], shape=(MB, MB))
             A = wp.tile_load(chol_ws[row, length - 1], shape=(MB, MB))
@@ -1913,8 +2041,8 @@ class IKSolverTrajectory(IKOptimizerLM):
             wp.tile_store(v_int[row, length - 1], T)
 
         def _spike_bwd_template(
-            istart: wp.array[wp.int32],
-            ilen: wp.array[wp.int32],
+            istart: wp.array[wp.int32],  # (n_traj * n_parts,)
+            ilen: wp.array[wp.int32],  # (n_traj * n_parts,)
             n_parts: int,
             chol_ws: wp.array4d[wp.float32],
             coup_ws: wp.array4d[wp.float32],
@@ -1924,8 +2052,7 @@ class IKSolverTrajectory(IKOptimizerLM):
             """Backward substitution in place over spike forward values
             (matrix right-hand side; used for both U and V)."""
             row = wp.tid()
-            part = row - (row // n_parts) * n_parts
-            length = ilen[part]
+            length = ilen[row]
             for i in range(length):
                 t = length - 1 - i
                 T = wp.tile_load(s_int[row, t], shape=(MB, MB))
@@ -1947,35 +2074,42 @@ class IKSolverTrajectory(IKOptimizerLM):
         def _schur_diag_template(
             d_bar: wp.array4d[wp.float32],
             l_bar: wp.array4d[wp.float32],
-            istart: wp.array[wp.int32],
-            ilen: wp.array[wp.int32],
+            istart: wp.array[wp.int32],  # (n_traj * n_parts,)
+            ilen: wp.array[wp.int32],  # (n_traj * n_parts,)
+            parts: wp.array[wp.int32],  # (n_traj,)
             n_parts: int,
             u_int: wp.array4d[wp.float32],
             v_int: wp.array4d[wp.float32],
             # outputs
             d_sep: wp.array4d[wp.float32],  # (n_traj, n_parts - 1, m, m)
         ):
-            """Schur diagonal S_j = D_s - CL V_j[last] - CR^T U_{j+1}[first]."""
+            """Schur diagonal S_j = D_s - CL V_j[last] - CR^T U_{j+1}[first].
+            Separator slots past a trajectory's own count are skipped; the
+            per-trajectory reduced Thomas chain never reads them."""
             tid = wp.tid()
             n_sep = n_parts - 1
             p = tid // n_sep
             j = tid - p * n_sep
-            s = istart[j] + ilen[j]  # global index of separator j
-            last = ilen[j] - 1
+            if j >= parts[p] - 1:
+                return
+            row = p * n_parts + j
+            s = istart[row] + ilen[row]  # global index of separator j
+            last = ilen[row] - 1
 
             A = wp.tile_load(d_bar[p, s], shape=(MB, MB))
             B = wp.tile_load(l_bar[p, s], shape=(MB, MB))  # CL = block (s, s - 1)
-            C = wp.tile_load(v_int[p * n_parts + j, last], shape=(MB, MB))
+            C = wp.tile_load(v_int[row, last], shape=(MB, MB))
             wp.tile_matmul(B, C, A, alpha=-1.0, beta=1.0)
             B = wp.tile_load(l_bar[p, s + 1], shape=(MB, MB))  # CR = block (s + 1, s)
-            C = wp.tile_load(u_int[p * n_parts + j + 1, 0], shape=(MB, MB))
+            C = wp.tile_load(u_int[row + 1, 0], shape=(MB, MB))
             wp.tile_matmul(wp.tile_transpose(B), C, A, alpha=-1.0, beta=1.0)
             wp.tile_store(d_sep[p, j], A)
 
         def _schur_lower_template(
             l_bar: wp.array4d[wp.float32],
-            istart: wp.array[wp.int32],
-            ilen: wp.array[wp.int32],
+            istart: wp.array[wp.int32],  # (n_traj * n_parts,)
+            ilen: wp.array[wp.int32],  # (n_traj * n_parts,)
+            parts: wp.array[wp.int32],  # (n_traj,)
             n_parts: int,
             u_int: wp.array4d[wp.float32],
             # outputs
@@ -1987,18 +2121,22 @@ class IKSolverTrajectory(IKOptimizerLM):
             n_sep = n_parts - 1
             p = tid // n_sep
             j = tid - p * n_sep
-            s = istart[j] + ilen[j]
-            last = ilen[j] - 1
+            if j >= parts[p] - 1:
+                return
+            row = p * n_parts + j
+            s = istart[row] + ilen[row]
+            last = ilen[row] - 1
             B = wp.tile_load(l_bar[p, s], shape=(MB, MB))
-            C = wp.tile_load(u_int[p * n_parts + j, last], shape=(MB, MB))
+            C = wp.tile_load(u_int[row, last], shape=(MB, MB))
             T = wp.tile_matmul(B, C, alpha=-1.0)
             wp.tile_store(l_sep[p, j], T)
 
         def _schur_rhs_template(
             rhs: wp.array3d[wp.float32],
             l_bar: wp.array4d[wp.float32],
-            istart: wp.array[wp.int32],
-            ilen: wp.array[wp.int32],
+            istart: wp.array[wp.int32],  # (n_traj * n_parts,)
+            ilen: wp.array[wp.int32],  # (n_traj * n_parts,)
+            parts: wp.array[wp.int32],  # (n_traj,)
             n_parts: int,
             y_int: wp.array3d[wp.float32],
             # outputs
@@ -2009,16 +2147,19 @@ class IKSolverTrajectory(IKOptimizerLM):
             n_sep = n_parts - 1
             p = tid // n_sep
             j = tid - p * n_sep
-            s = istart[j] + ilen[j]
-            last = ilen[j] - 1
+            if j >= parts[p] - 1:
+                return
+            row = p * n_parts + j
+            s = istart[row] + ilen[row]
+            last = ilen[row] - 1
             bt = wp.tile_load(rhs[p, s], shape=MB)
             B = wp.tile_load(l_bar[p, s], shape=(MB, MB))
-            yl = wp.tile_load(y_int[p * n_parts + j, last], shape=MB)
+            yl = wp.tile_load(y_int[row, last], shape=MB)
             wp.tile_matmul(
                 B, wp.tile_reshape(yl, shape=(MB, 1)), wp.tile_reshape(bt, shape=(MB, 1)), alpha=-1.0, beta=1.0
             )
             B = wp.tile_load(l_bar[p, s + 1], shape=(MB, MB))
-            yr = wp.tile_load(y_int[p * n_parts + j + 1, 0], shape=MB)
+            yr = wp.tile_load(y_int[row + 1, 0], shape=MB)
             wp.tile_matmul(
                 wp.tile_transpose(B),
                 wp.tile_reshape(yr, shape=(MB, 1)),
@@ -2166,7 +2307,7 @@ class IKSolverTrajectory(IKOptimizerLM):
                 wp.launch_tiled(
                     _schur_diag_kernel,
                     dim=[n_sep_rows],
-                    inputs=[d_bar, l_bar, istart, ilen, n_parts, u, v],
+                    inputs=[d_bar, l_bar, istart, ilen, self._sp_parts, n_parts, u, v],
                     outputs=[d_sep],
                     block_dim=self.THOMAS_THREADS,
                     device=self.device,
@@ -2174,7 +2315,7 @@ class IKSolverTrajectory(IKOptimizerLM):
                 wp.launch_tiled(
                     _schur_lower_kernel,
                     dim=[n_sep_rows],
-                    inputs=[l_bar, istart, ilen, n_parts, u],
+                    inputs=[l_bar, istart, ilen, self._sp_parts, n_parts, u],
                     outputs=[l_sep],
                     block_dim=self.THOMAS_THREADS,
                     device=self.device,
@@ -2185,7 +2326,7 @@ class IKSolverTrajectory(IKOptimizerLM):
                 wp.launch_tiled(
                     _schur_rhs_kernel,
                     dim=[self.n_trajectories * (n_parts - 1)],
-                    inputs=[rhs, l_bar, istart, ilen, n_parts, y],
+                    inputs=[rhs, l_bar, istart, ilen, self._sp_parts, n_parts, y],
                     outputs=[b_sep],
                     block_dim=self.THOMAS_THREADS,
                     device=self.device,
