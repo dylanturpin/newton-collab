@@ -29,7 +29,7 @@ from .ik_trajectory_objectives import (
     IKObjectiveWorldPlane,
     IKObjectiveWorldPlaneCapsule,
 )
-from .ik_trajectory_solver import IKLinearSolver, IKSolverTrajectory
+from .ik_trajectory_solver import IKLinearSolver, IKSharedMemoryError, IKSolverTrajectory
 
 __all__ = [
     "IKJacobianType",
@@ -56,6 +56,7 @@ __all__ = [
     "IKOptimizerLBFGS",
     "IKOptimizerLM",
     "IKSampler",
+    "IKSharedMemoryError",
     "IKSolver",
     "IKSolverTrajectory",
 ]

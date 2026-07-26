@@ -28,6 +28,7 @@ from ._src.sim.ik import (
     IKOptimizerLBFGS,
     IKOptimizerLM,
     IKSampler,
+    IKSharedMemoryError,
     IKSolver,
     IKSolverTrajectory,
 )
@@ -57,6 +58,7 @@ __all__ = [
     "IKOptimizerLBFGS",
     "IKOptimizerLM",
     "IKSampler",
+    "IKSharedMemoryError",
     "IKSolver",
     "IKSolverTrajectory",
 ]
