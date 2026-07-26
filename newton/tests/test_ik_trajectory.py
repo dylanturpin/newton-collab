@@ -11,6 +11,12 @@ import warp as wp
 import newton
 import newton.ik as ik
 from newton._src.sim.ik.ik_common import eval_fk_batched
+from newton._src.sim.ik.ik_trajectory_solver import (
+    _CG_DOT_TILE,
+    _CG_SERIAL_DOT_MAX_LENGTH,
+    _SegmentedTiledDot,
+    _swap_cg_tiled_dot,
+)
 from newton.tests.unittest_utils import (
     add_function_test,
     assert_np_equal,
@@ -430,6 +436,145 @@ def test_trajectory_batched_matches_single(test, device):
             assert_np_equal(q_batched[prob], q_single[0], tol=1e-6)
 
 
+def test_trajectory_cg_batched_long_horizon(test, device):
+    """Multi-trajectory CG solves above the segmented-dot length threshold must
+    engage the tree reduction (warp's batched dot accumulates serially per lane
+    and under-converges long chains), stay bitwise-equal to the equivalent
+    single-trajectory solve, and be bitwise deterministic run to run. The
+    per-trajectory length sits inside the reduction's parity envelope
+    (<= 512 * 512 scalar dofs), where the segmented tree has the same shape as
+    warp's single-batch bounded tree, so batched == single holds exactly; with
+    warp's serial batched reduction instead, most coordinates drift by up to
+    ~1e-6 here, so the bitwise assertion discriminates the reduction
+    numerically. The full convergence failure needs a production-scale
+    articulation; this guards the reduction path itself."""
+    # 2 dofs per frame: just above the serial-dot length threshold, and a
+    # multiple of the reduction tile so both copies' windows stay aligned
+    n_frames = _CG_SERIAL_DOT_MAX_LENGTH // 2 + 1024
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        targets_np = _arc_targets(n_frames)
+
+        def solve(n_problems):
+            solver = ik.IKSolverTrajectory(
+                model,
+                n_frames,
+                _make_arc_tracking_objectives(model, np.tile(targets_np, (n_problems, 1))),
+                n_problems=n_problems,
+                jacobian_mode=ik.IKJacobianType.ANALYTIC,
+                linear_solver="cg",
+                lambda_initial=1e-3,
+            )
+            if n_problems > 1:
+                test.assertIsInstance(solver._cg_state._tiled_dot, _SegmentedTiledDot)
+            joint_q = wp.zeros((n_problems * n_frames, model.joint_coord_count), dtype=wp.float32)
+            solver.step(joint_q, joint_q, iterations=10)
+            return joint_q.numpy().reshape(n_problems, n_frames, -1)
+
+        q_single = solve(1)
+        q_batched = solve(2)
+        q_batched_rerun = solve(2)
+
+        # fixed reduction order: bitwise identical across runs
+        assert_np_equal(q_batched_rerun, q_batched)
+        # inside the parity envelope every copy matches the single-trajectory
+        # solve bitwise (fails with warp's serial batched reduction)
+        for prob in range(2):
+            assert_np_equal(q_batched[prob], q_single[0])
+
+
+def test_trajectory_segmented_dot(test, device):
+    """_SegmentedTiledDot must match an fp64 reference within a tree-level
+    error bound across batch shapes, reduce every segment independently of its
+    offset (identical segment data gives bitwise-identical per-segment
+    results, equal to a singleton instance's), be bitwise deterministic across
+    repeated computes, and honor the two-column ``compute``/``col`` interface
+    CG uses (``col_offset=1`` for the ``p . Ap`` column)."""
+    rng = np.random.default_rng(1234)
+    # above the engagement threshold, with a partially filled tail block
+    length = _CG_SERIAL_DOT_MAX_LENGTH + 3 * _CG_DOT_TILE + 13
+    with wp.ScopedDevice(device):
+        for batch_count in (2, 3, 4):
+            offsets_np = np.arange(batch_count + 1, dtype=np.int32) * length
+            offsets = wp.array(offsets_np, dtype=wp.int32)
+
+            # accuracy vs fp64: a . a keeps the reference away from zero so
+            # the relative bound is meaningful (a . b with independent signs
+            # cancels toward zero and has no scale-free relative error)
+            a_np = rng.standard_normal(batch_count * length).astype(np.float32)
+            a = wp.array(a_np, dtype=wp.float32)
+            dot = _SegmentedTiledDot(offsets, length, device)
+            out = dot.compute(a, a).numpy()[0]
+            ref = np.array(
+                [np.dot(seg.astype(np.float64), seg.astype(np.float64)) for seg in np.split(a_np, batch_count)]
+            )
+            rel_err = np.abs(out - ref) / ref
+            # observed tree-level error is ~1e-7 for this size; 1e-6 leaves headroom
+            test.assertLess(rel_err.max(), 1e-6)
+
+            # determinism: repeated computes are bitwise identical
+            assert_np_equal(dot.compute(a, a).numpy()[0], out)
+
+        # offset independence: identical data in every segment reduces to
+        # bitwise-identical results, equal to a singleton instance's result
+        seg_np = rng.standard_normal(length).astype(np.float32)
+        seg = wp.array(seg_np, dtype=wp.float32)
+        tiled = wp.array(np.tile(seg_np, 3), dtype=wp.float32)
+        offsets3 = wp.array(np.arange(4, dtype=np.int32) * length, dtype=wp.int32)
+        offsets1 = wp.array(np.array([0, length], dtype=np.int32), dtype=wp.int32)
+        out3 = _SegmentedTiledDot(offsets3, length, device).compute(tiled, tiled).numpy()[0]
+        out1 = _SegmentedTiledDot(offsets1, length, device).compute(seg, seg).numpy()[0]
+        assert_np_equal(out3, np.full(3, out1[0], dtype=np.float32))
+
+        # two-column interface as CG drives it: a two-column compute fills
+        # cols 0-1 with per-column dots, then a col_offset=1 compute
+        # overwrites col 1 (the p . Ap slot) and leaves col 0 untouched
+        seg64, b_np = seg_np.astype(np.float64), rng.standard_normal(length).astype(np.float32)
+        b, b64 = wp.array(b_np, dtype=wp.float32), b_np.astype(np.float64)
+        dot = _SegmentedTiledDot(offsets1, length, device)
+        two_col = wp.array(np.stack([seg_np, b_np]), dtype=wp.float32)
+        dot.compute(two_col, two_col)
+        col0, col1 = dot.col(0).numpy()[0], dot.col(1).numpy()[0]
+        test.assertLess(abs(col0 - np.dot(seg64, seg64)), 1e-6 * np.dot(seg64, seg64))
+        test.assertLess(abs(col1 - np.dot(b64, b64)), 1e-6 * np.dot(b64, b64))
+        dot.compute(seg, b, col_offset=1)
+        test.assertEqual(dot.col(0).numpy()[0], col0)  # col 0 untouched
+        # mixed dot cancels toward zero, so bound its error by the scale
+        # sum(|seg_i * b_i|) instead of the reference value
+        scale = np.dot(np.abs(seg64), np.abs(b64))
+        test.assertLess(abs(dot.col(1).numpy()[0] - np.dot(seg64, b64)), 1e-6 * scale)
+
+
+def test_trajectory_cg_dot_swap_guard(test, device):
+    """The dot-reduction swap must fail loudly at solver construction if warp's
+    CG state stops exposing a compatible ``_tiled_dot`` (a plain assignment
+    would silently create a dead attribute and revert the fix while tests stay
+    green)."""
+    device = wp.get_device(device)
+    offsets = wp.array(np.array([0, 4], dtype=np.int32), dtype=wp.int32, device=device)
+
+    class _FakeState:
+        pass
+
+    state = _FakeState()
+    # attribute renamed/removed by a warp internals change
+    with test.assertRaises(RuntimeError):
+        _swap_cg_tiled_dot(state, offsets, 4, device)
+
+    # attribute present but with an unexpected tile size
+    class _FakeDot:
+        tile_size = 256
+
+    state._tiled_dot = _FakeDot()
+    with test.assertRaises(RuntimeError):
+        _swap_cg_tiled_dot(state, offsets, 4, device)
+
+    # compatible attribute: the swap installs the segmented reduction
+    _FakeDot.tile_size = _CG_DOT_TILE
+    _swap_cg_tiled_dot(state, offsets, 4, device)
+    test.assertIsInstance(state._tiled_dot, _SegmentedTiledDot)
+
+
 # ----------------------------------------------------------------------------
 # 7.  Free-joint trajectory (quaternion tangent path)
 # ----------------------------------------------------------------------------
@@ -643,6 +788,16 @@ add_function_test(TestIKTrajectory, "test_trajectory_fixed_frames", test_traject
 add_function_test(TestIKTrajectory, "test_trajectory_velocity_limit", test_trajectory_velocity_limit, devices)
 add_function_test(
     TestIKTrajectory, "test_trajectory_batched_matches_single", test_trajectory_batched_matches_single, devices
+)
+add_function_test(
+    TestIKTrajectory,
+    "test_trajectory_cg_batched_long_horizon",
+    test_trajectory_cg_batched_long_horizon,
+    cuda_devices,
+)
+add_function_test(TestIKTrajectory, "test_trajectory_segmented_dot", test_trajectory_segmented_dot, cuda_devices)
+add_function_test(
+    TestIKTrajectory, "test_trajectory_cg_dot_swap_guard", test_trajectory_cg_dot_swap_guard, cuda_devices
 )
 add_function_test(TestIKTrajectory, "test_trajectory_free_joint", test_trajectory_free_joint, devices)
 add_function_test(
