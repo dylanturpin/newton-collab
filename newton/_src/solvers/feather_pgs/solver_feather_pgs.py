@@ -3171,6 +3171,7 @@ class SolverFeatherPGS(SolverBase):
         self._propagate_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         self._factor_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         self._response_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
+        self._refresh_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         self._propagation_joint_parent_slot = None
         if model.device.is_cuda and self._propagation_contacts_enabled():
             self._propagation_joint_parent_slot = self._build_propagation_joint_parent_slot(model)
@@ -3192,6 +3193,7 @@ class SolverFeatherPGS(SolverBase):
                 self._factor_tree_warp_kernels_by_size[size_i] = None
                 self._response_tree_warp_kernels_by_size[size_i] = None
                 self._propagate_tree_warp_kernels_by_size[size_i] = None
+                self._refresh_tree_warp_kernels_by_size[size_i] = None
                 if eligible:
                     # A group that is fully single-DOF takes the plain revolute
                     # variants; otherwise every articulation in it has the
@@ -3208,6 +3210,9 @@ class SolverFeatherPGS(SolverBase):
                     )
                     self._propagate_tree_warp_kernels_by_size[size_i] = _get_propagate_tree_impulses_revolute_kernel(
                         size_i, group_max_joints[size_i], device_arch, has_free_root=has_free_root
+                    )
+                    self._refresh_tree_warp_kernels_by_size[size_i] = _get_refresh_propagation_tree_body_qd_warp_kernel(
+                        size_i, group_max_joints[size_i], device_arch
                     )
 
     def _build_propagation_joint_parent_slot(self, model) -> wp.array:
@@ -3492,9 +3497,15 @@ class SolverFeatherPGS(SolverBase):
                 continue
             if not self._propagation_tree_has_non_free_by_size.get(int(size), True):
                 continue
-            wp.launch(
-                refresh_propagation_tree_body_qd_for_size,
-                dim=n_arts,
+            self._launch_refresh_propagation_tree_body_qd(size, n_arts, force=force)
+        self._refresh_propagation_free_body_qd_from_vout()
+
+    def _launch_refresh_propagation_tree_body_qd(self, size: int, n_arts: int, *, force: bool) -> None:
+        refresh_kernel = getattr(self, "_refresh_tree_warp_kernels_by_size", {}).get(int(size))
+        if refresh_kernel is not None:
+            wp.launch_tiled(
+                refresh_kernel,
+                dim=[n_arts],
                 inputs=[
                     self.group_to_art[size],
                     self.art_to_world,
@@ -3504,18 +3515,39 @@ class SolverFeatherPGS(SolverBase):
                     self.model.joint_parent,
                     self.model.joint_child,
                     self.model.joint_qd_start,
-                    self.model.joint_dof_dim,
+                    self._propagation_joint_parent_slot,
                     self.propagation_joint_S_flat,
                     self.propagation_body_com_rel,
                     self.v_out,
                 ],
-                outputs=[
-                    self.propagation_tree_body_delta,
-                    self.propagation_body_qd,
-                ],
+                outputs=[self.propagation_body_qd],
+                block_dim=32,
                 device=self.model.device,
             )
-        self._refresh_propagation_free_body_qd_from_vout()
+            return
+        wp.launch(
+            refresh_propagation_tree_body_qd_for_size,
+            dim=n_arts,
+            inputs=[
+                self.group_to_art[size],
+                self.art_to_world,
+                self.dense_contact_world_flag,
+                int(force),
+                self.model.articulation_start,
+                self.model.joint_parent,
+                self.model.joint_child,
+                self.model.joint_qd_start,
+                self.model.joint_dof_dim,
+                self.propagation_joint_S_flat,
+                self.propagation_body_com_rel,
+                self.v_out,
+            ],
+            outputs=[
+                self.propagation_tree_body_delta,
+                self.propagation_body_qd,
+            ],
+            device=self.model.device,
+        )
 
     def _refresh_propagation_free_body_qd_from_vout(self) -> None:
         if (
@@ -3735,29 +3767,7 @@ class SolverFeatherPGS(SolverBase):
                         device=self.model.device,
                     )
             with self._sync_timed(f"prop_setup_refresh_tree_qd_size{int(size)}"):
-                wp.launch(
-                    refresh_propagation_tree_body_qd_for_size,
-                    dim=n_arts,
-                    inputs=[
-                        self.group_to_art[size],
-                        self.art_to_world,
-                        self.dense_contact_world_flag,
-                        1,
-                        self.model.articulation_start,
-                        self.model.joint_parent,
-                        self.model.joint_child,
-                        self.model.joint_qd_start,
-                        self.model.joint_dof_dim,
-                        self.propagation_joint_S_flat,
-                        self.propagation_body_com_rel,
-                        self.v_out,
-                    ],
-                    outputs=[
-                        self.propagation_tree_body_delta,
-                        self.propagation_body_qd,
-                    ],
-                    device=self.model.device,
-                )
+                self._launch_refresh_propagation_tree_body_qd(size, n_arts, force=True)
         if self._has_free_rigid_bodies and self.is_free_rigid is not None:
             with self._sync_timed("prop_setup_free_response"):
                 wp.launch(
@@ -12942,6 +12952,160 @@ def _get_propagate_tree_impulses_revolute_kernel(
     propagate_tree_impulses_revolute_template.__name__ = name
     propagate_tree_impulses_revolute_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(propagate_tree_impulses_revolute_template)
+
+
+@cache
+def _get_refresh_propagation_tree_body_qd_warp_kernel(size: int, max_joints: int, device_arch: str) -> "wp.Kernel":
+    """Build a one-warp variant of ``refresh_propagation_tree_body_qd_for_size``.
+
+    The refresh is a single root-to-leaf pass: each link's live COM twist is
+    its parent's twist translated to the link COM plus the inbound joint's
+    S * v contribution. Per-joint S * v terms (generic over dof_count, so a
+    multi-DOF free root needs no special casing), COM edges, and topology are
+    preloaded into shared memory with lane-parallel strided loads; the serial
+    parent chain then runs on-chip with six lanes per link. The parent twist
+    lives in shared memory only — the serial kernel's
+    ``propagation_tree_body_delta`` global scratch is not written (no other
+    kernel consumes it without re-initializing it first).
+
+    Registered only for size groups whose articulations have the single-DOF
+    or free-root shape: those checks also guarantee the topological joint
+    order (parents before children) and in-articulation parents that
+    ``joint_parent_slot`` indexing relies on.
+    """
+    joints_cap = max(int(max_joints), 1)
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int lane = threadIdx.x & 31;
+    const unsigned mask = 0xffffffffu;
+    const int art = group_to_art.data[group_idx];
+    if (force_refresh == 0) {{
+        const int world = art_to_world.data[art];
+        if (world >= 0 && dense_contact_world_flag.data[world] == 0) {{
+            return;
+        }}
+    }}
+    const int joint_start = articulation_start.data[art];
+    const int joint_end = articulation_start.data[art + 1];
+    const int n_joints = joint_end - joint_start;
+
+    __shared__ float s_bd[{joints_cap} * 6];
+    __shared__ float s_Sv[{joints_cap} * 6];
+    __shared__ float s_e[{joints_cap} * 3];
+    __shared__ int s_child[{joints_cap}];
+    __shared__ int s_pslot[{joints_cap}];
+
+    for (int j = lane; j < n_joints; j += 32) {{
+        s_child[j] = joint_child.data[joint_start + j];
+        s_pslot[j] = joint_parent_slot.data[joint_start + j];
+    }}
+    __syncwarp(mask);
+    for (int idx = lane; idx < n_joints * 6; idx += 32) {{
+        const int j = idx / 6;
+        const int comp = idx - j * 6;
+        const int joint = joint_start + j;
+        const int dof_start = joint_qd_start.data[joint];
+        const int dof_end = joint_qd_start.data[joint + 1];
+        float value = 0.0f;
+        for (int dof = dof_start; dof < dof_end; ++dof) {{
+            value += propagation_joint_S_flat.data[dof * 6 + comp] * v_out.data[dof];
+        }}
+        s_Sv[idx] = value;
+    }}
+    for (int idx = lane; idx < n_joints * 3; idx += 32) {{
+        const int j = idx / 3;
+        const int comp = idx - j * 3;
+        float e = 0.0f;
+        if (s_pslot[j] >= 0) {{
+            const int parent = joint_parent.data[joint_start + j];
+            e = propagation_body_com_rel.data[s_child[j] * 3 + comp]
+                - propagation_body_com_rel.data[parent * 3 + comp];
+        }}
+        s_e[idx] = e;
+    }}
+    __syncwarp(mask);
+
+    for (int j = 0; j < n_joints; ++j) {{
+        if (lane < 6) {{
+            float value = s_Sv[j * 6 + lane];
+            const int pslot = s_pslot[j];
+            if (pslot >= 0) {{
+                value += s_bd[pslot * 6 + lane];
+                if (lane < 3) {{
+                    const float ex = s_e[j * 3 + 0];
+                    const float ey = s_e[j * 3 + 1];
+                    const float ez = s_e[j * 3 + 2];
+                    const float wx = s_bd[pslot * 6 + 3];
+                    const float wy = s_bd[pslot * 6 + 4];
+                    const float wz = s_bd[pslot * 6 + 5];
+                    if (lane == 0) value += wy * ez - wz * ey;
+                    else if (lane == 1) value += wz * ex - wx * ez;
+                    else value += wx * ey - wy * ex;
+                }}
+            }}
+            s_bd[j * 6 + lane] = value;
+            propagation_body_qd.data[s_child[j] * 6 + lane] = value;
+        }}
+        __syncwarp(mask);
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def refresh_propagation_tree_body_qd_warp_native(
+        group_idx: int,
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        dense_contact_world_flag: wp.array[int],
+        force_refresh: int,
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_parent_slot: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        v_out: wp.array[float],
+        propagation_body_qd: wp.array2d[float],
+    ): ...
+
+    def refresh_propagation_tree_body_qd_warp_template(
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        dense_contact_world_flag: wp.array[int],
+        force_refresh: int,
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_parent_slot: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        v_out: wp.array[float],
+        propagation_body_qd: wp.array2d[float],
+    ):
+        group_idx, _lane = wp.tid()
+        refresh_propagation_tree_body_qd_warp_native(
+            group_idx,
+            group_to_art,
+            art_to_world,
+            dense_contact_world_flag,
+            force_refresh,
+            articulation_start,
+            joint_parent,
+            joint_child,
+            joint_qd_start,
+            joint_parent_slot,
+            propagation_joint_S_flat,
+            propagation_body_com_rel,
+            v_out,
+            propagation_body_qd,
+        )
+
+    name = f"refresh_propagation_tree_body_qd_warp_{size}_j{joints_cap}"
+    refresh_propagation_tree_body_qd_warp_template.__name__ = name
+    refresh_propagation_tree_body_qd_warp_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(refresh_propagation_tree_body_qd_warp_template)
 
 
 @cache
