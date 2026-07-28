@@ -33,6 +33,8 @@ def _allocated_joint_velocity_slots(qd: float, *, fraction: float, qdot_max: flo
             wp.array([qdot_max], dtype=wp.float32, device=device),
             wp.array([qd], dtype=wp.float32, device=device),
             fraction,
+            wp.array([-1], dtype=wp.int32, device=device),  # drive_slot (unused: skip_driven=0)
+            0,  # skip_driven
             wp.array([0], dtype=wp.int32, device=device),
             8,
         ],

@@ -273,6 +273,8 @@ def prescale_joint_velocity_limits(
     joint_dof_dim: wp.array2d[int],
     joint_velocity_limit: wp.array[float],
     body_flags: wp.array[wp.int32],
+    drive_slot: wp.array[int],
+    skip_driven: int,
     # in/out
     joint_qd: wp.array[float],
 ):
@@ -281,6 +283,16 @@ def prescale_joint_velocity_limits(
     PhysX computes a single ratio per articulation from maxJointVelocity and
     applies that ratio to all articulation DOFs before building link velocities.
     This is separate from the velocity-limit constraint rows solved later.
+
+    ``skip_driven != 0`` (the ``fuse_joint_velocity_limits`` path) excludes
+    DOFs with a PhysX drive row (``drive_slot[dof] >= 0``) from both the
+    ratio computation and the scaling: those DOFs are clamped in-solve by the
+    fused drive-row velocity clamp instead. ``drive_slot`` holds the previous
+    step's allocation at this point in the step (it is initialized to -1, so
+    the very first step prescales exactly as before); the driven-DOF set is
+    derived from ``joint_target_ke/kd > 0`` and is stable across steps.
+    When ``skip_driven == 0``, ``drive_slot`` is never read (a 1-element
+    dummy is safe).
     """
     art = wp.tid()
     joint_start = articulation_start[art]
@@ -301,6 +313,9 @@ def prescale_joint_velocity_limits(
 
         for axis in range(axis_count):
             dof = qd_start + axis
+            if skip_driven != 0:
+                if drive_slot[dof] >= 0:
+                    continue
             limit = joint_velocity_limit[dof]
             qd_abs = wp.abs(joint_qd[dof])
             if limit > 0.0 and wp.isfinite(limit) and qd_abs > 0.0:
@@ -325,6 +340,9 @@ def prescale_joint_velocity_limits(
 
         for axis in range(axis_count):
             dof = qd_start + axis
+            if skip_driven != 0:
+                if drive_slot[dof] >= 0:
+                    continue
             joint_qd[dof] = joint_qd[dof] * ratio
 
 
@@ -2047,6 +2065,8 @@ def populate_physx_drive_J_for_size(
     joint_q: wp.array[float],
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
+    joint_velocity_limit: wp.array[float],
+    fuse_vel_limits: int,
     art_to_world: wp.array[int],
     drive_slot: wp.array[int],
     group_to_art: wp.array[int],
@@ -2063,8 +2083,19 @@ def populate_physx_drive_J_for_size(
     world_drive_damping: wp.array2d[float],
     world_drive_geom_error: wp.array2d[float],
     world_drive_max_force: wp.array2d[float],
+    world_drive_vel_limit: wp.array2d[float],
 ):
-    """Populate PhysX-style drive rows and row data for one articulation size group."""
+    """Populate PhysX-style drive rows and row data for one articulation size group.
+
+    ``fuse_vel_limits != 0`` (the ``fuse_joint_velocity_limits`` path)
+    additionally records the DOF's joint velocity limit per drive row in
+    ``world_drive_vel_limit`` so the MF-GS drive-row visit can apply the
+    PhysX-style stateless velocity clamp in place of dedicated
+    velocity-limit rows. Non-positive / non-finite limits are stored as
+    ``+inf`` so the fused clamp is a no-op for unlimited DOFs. When
+    ``fuse_vel_limits == 0`` neither ``joint_velocity_limit`` nor
+    ``world_drive_vel_limit`` is touched (1-element dummies are safe).
+    """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
     world = art_to_world[art]
@@ -2110,6 +2141,11 @@ def populate_physx_drive_J_for_size(
             world_drive_damping[world, slot] = damping
             world_drive_geom_error[world, slot] = target_pos - q
             world_drive_max_force[world, slot] = joint_effort_limit[dof]
+            if fuse_vel_limits != 0:
+                qdot_max = joint_velocity_limit[dof]
+                if qdot_max <= 0.0 or not wp.isfinite(qdot_max):
+                    qdot_max = float(wp.inf)
+                world_drive_vel_limit[world, slot] = qdot_max
 
 
 @wp.kernel
@@ -2402,6 +2438,8 @@ def allocate_joint_velocity_limit_slots(
     joint_velocity_limit: wp.array[float],
     joint_qd: wp.array[float],
     velocity_limit_activation_fraction: float,
+    drive_slot: wp.array[int],
+    skip_driven: int,
     art_to_world: wp.array[int],
     max_constraints: int,
     # outputs
@@ -2435,6 +2473,14 @@ def allocate_joint_velocity_limit_slots(
     always-allocate behavior. Because the gate samples the pre-solve
     velocity, a DOF that crosses the threshold during a step is clamped one
     step late.
+
+    ``skip_driven != 0`` (the ``fuse_joint_velocity_limits`` path) skips DOFs
+    with a PhysX drive row (``drive_slot[dof] >= 0``): their velocity limit is
+    enforced as a stateless clamp fused into the drive-row visit instead of a
+    dedicated row pair, matching PhysX's per-DOF ``PxClamp`` in the drive
+    constraint. DOFs with a velocity limit but no drive row keep their
+    dedicated rows. When ``skip_driven == 0``, ``drive_slot`` is never read
+    (a 1-element dummy is safe).
 
     Outputs two entries per DOF in ``velocity_limit_slot`` (world-constraint
     row, or -1) and ``velocity_limit_sign`` (+1 / -1).
@@ -2475,6 +2521,11 @@ def allocate_joint_velocity_limit_slots(
             # the stored limit is non-positive (treated as "unlimited").
             if qdot_max <= 0.0:
                 continue
+
+            # Fused path: driven DOFs are clamped inside the drive-row visit.
+            if skip_driven != 0:
+                if drive_slot[dof] >= 0:
+                    continue
 
             # Proximity gate: only reserve the row pair when the DOF speed is
             # within ``fraction * qdot_max`` of the box edge. The fraction==0
@@ -2531,6 +2582,11 @@ def populate_joint_velocity_limit_J_for_size(
     The target velocity is ``-qdot_max`` for both sides of the box: combined
     with the sign flip on ``J``, this encodes the bilateral projection as
     two unilateral ``J*v >= target_vel`` rows with ``lambda >= 0``.
+
+    DOFs skipped by :func:`allocate_joint_velocity_limit_slots` (activation
+    gate, or driven DOFs under ``fuse_joint_velocity_limits``) carry
+    ``velocity_limit_slot == -1`` and are skipped here through the same
+    per-row slot check; this kernel needs no separate skip flag.
     """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
