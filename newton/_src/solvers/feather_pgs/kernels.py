@@ -5960,6 +5960,7 @@ def compute_propagation_tree_body_response_for_size(
     propagation_body_count: wp.array[int],
     propagation_body_list: wp.array2d[int],
     body_to_articulation: wp.array[int],
+    body_to_joint: wp.array[int],
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
     articulation_start: wp.array[int],
@@ -5996,8 +5997,35 @@ def compute_propagation_tree_body_response_for_size(
         if body_to_articulation[target_body] != art:
             continue
 
+        # Root-path restriction: a unit wrench at target_body couples only to
+        # the joints on target's root path. Off-path pA/u/qdd stay zero in the
+        # backward pass, and body deltas flow root->leaf, so off-path qdd can
+        # never feed the delta read back at target_body. Walking just the path
+        # is exact and turns each basis solve from O(joints) into O(depth).
+        # The walk is capped at the articulation's joint count: a well-formed
+        # tree exits via wparent < 0 first, and the cap keeps a malformed or
+        # cyclic model from hanging the GPU in an unbounded loop.
+        path_len = int(0)
+        walk = body_to_joint[target_body]
+        for _cap in range(joint_end - joint_start):
+            if walk < 0:
+                break
+            path_len += 1
+            wparent = joint_parent[walk]
+            if wparent >= 0:
+                walk = body_to_joint[wparent]
+            else:
+                walk = int(-1)
+
         for basis in range(6):
-            for joint in range(joint_start, joint_end):
+            walk = body_to_joint[target_body]
+            for _k in range(path_len):
+                joint = walk
+                wparent = joint_parent[joint]
+                if wparent >= 0:
+                    walk = body_to_joint[wparent]
+                else:
+                    walk = int(-1)
                 body = joint_child[joint]
                 for r in range(6):
                     propagation_tree_pA[body, r] = 0.0
@@ -6030,8 +6058,15 @@ def compute_propagation_tree_body_response_for_size(
             propagation_tree_pA[target_body, 4] = -torque_com[1]
             propagation_tree_pA[target_body, 5] = -torque_com[2]
 
-            for offset in range(joint_end - joint_start):
-                joint = joint_end - 1 - offset
+            # Backward sweep, target -> root along the path (children first).
+            walk = body_to_joint[target_body]
+            for _k in range(path_len):
+                joint = walk
+                wparent = joint_parent[joint]
+                if wparent >= 0:
+                    walk = body_to_joint[wparent]
+                else:
+                    walk = int(-1)
                 child = joint_child[joint]
                 parent = joint_parent[joint]
                 dof_start = joint_qd_start[joint]
@@ -6080,7 +6115,13 @@ def compute_propagation_tree_body_response_for_size(
                     for r in range(6):
                         propagation_tree_pA[parent, r] = propagation_tree_pA[parent, r] + propagated_parent[r]
 
-            for joint in range(joint_start, joint_end):
+            # Forward sweep, root -> target along the path (parents first):
+            # level i visits the (path_len-1-i)-th ancestor of target_body.
+            for level in range(path_len):
+                joint = body_to_joint[target_body]
+                steps = path_len - 1 - level
+                for _s in range(steps):
+                    joint = body_to_joint[joint_parent[joint]]
                 child = joint_child[joint]
                 parent = joint_parent[joint]
                 dof_start = joint_qd_start[joint]

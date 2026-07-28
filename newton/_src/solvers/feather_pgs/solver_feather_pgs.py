@@ -3580,6 +3580,7 @@ class SolverFeatherPGS(SolverBase):
                             self.propagation_body_count,
                             self.propagation_body_list,
                             self.body_to_articulation,
+                            self.body_to_joint,
                             self.group_to_art[size],
                             self.art_to_world,
                             self.model.articulation_start,
