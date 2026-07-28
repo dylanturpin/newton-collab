@@ -3228,6 +3228,7 @@ class SolverFeatherPGS(SolverBase):
                 os.makedirs(_FPGS_CAPTURE_DIR, exist_ok=True)
                 _arrs = {
                     "constraint_count": self.constraint_count,
+                    "dense_phase_bounds": self.dense_phase_bounds,
                     "world_dof_indices": self.world_dof_indices,
                     "dense_rhs": dense_rhs,
                     "diag": self.diag,
@@ -3285,6 +3286,7 @@ class SolverFeatherPGS(SolverBase):
                     dim=[self.world_count],
                     inputs=[
                         self.constraint_count,
+                        self.dense_phase_bounds,
                         self.world_dof_indices,
                         self.world_deferred_dof_mask,
                         dense_rhs,
@@ -3961,6 +3963,7 @@ class SolverFeatherPGS(SolverBase):
                 inputs=[
                     self.world_count,
                     self.constraint_count,
+                    self.dense_phase_bounds,
                     self.world_dof_start,
                     dense_rhs,
                     self.diag,
@@ -10831,7 +10834,23 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         for (int phase_stage = 0; phase_stage < 3; ++phase_stage) {
             const int row_phase = (phase_stage == 0) ? 3 : ((phase_stage == 1) ? 4 : 5);
 
-            for (int i = 0; i < m_dense; ++i) {
+            // The dense slot layout is [drive][joint-limit][joint-vel-limit]
+            // [contact/friction], so each phase stage scans only its own
+            // contiguous row range (absolute indexing into the shared arrays,
+            // which are loaded/stored once for the full [0, m_dense) span);
+            // the per-row type filters below remain as a safety net.
+            int dense_lo = 0;
+            int dense_hi = m_dense;
+            if (row_phase == 3) {
+                dense_hi = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+            } else if (row_phase == 5) {
+                dense_lo = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+                dense_hi = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
+            } else {
+                dense_lo = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
+            }
+
+            for (int i = dense_lo; i < dense_hi; ++i) {
                 const int row_type = s_rtype_dense[i];
                 if (row_phase == 3 && row_type != 1 && row_type != 3) continue;
                 if (row_phase == 4 && row_type != 0 && row_type != 2) continue;
@@ -11481,6 +11500,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         tile: int,
         world_count: int,
         world_constraint_count: wp.array[int],
+        dense_phase_bounds: wp.array2d[int],
         world_dof_start: wp.array[int],
         rhs_bias: wp.array2d[float],
         world_diag: wp.array2d[float],
@@ -11551,6 +11571,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     def pgs_solve_propagation_full_iteration_template(
         world_count: int,
         world_constraint_count: wp.array[int],
+        dense_phase_bounds: wp.array2d[int],
         world_dof_start: wp.array[int],
         rhs_bias: wp.array2d[float],
         world_diag: wp.array2d[float],
@@ -11622,6 +11643,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
             tile,
             world_count,
             world_constraint_count,
+            dense_phase_bounds,
             world_dof_start,
             rhs_bias,
             world_diag,
@@ -12460,14 +12482,14 @@ def _get_pgs_solve_mf_gs_kernel(
     # Pipeline register declarations
     dense_pipe_decl = "\n".join([f"        float pre_dJ_{k} = 0.0f, pre_dY_{k} = 0.0f;" for k in range(ELEMS_PER_LANE)])
 
-    # Initial prefetch (constraint 0)
-    dense_prefetch_init_parts = []
+    # Initial prefetch (constraint dense_lo, the first row of this phase's range)
+    dense_prefetch_init_parts = [f"            const int init_jy_base = jy_world_base + dense_lo * {D};"]
     for k in range(ELEMS_PER_LANE):
         d_expr = f"lane + {k * 32}" if k > 0 else "lane"
         dense_prefetch_init_parts.append(f"""
             if ({d_expr} < {D}) {{
-                pre_dJ_{k} = J_world.data[jy_world_base + {d_expr}];
-                pre_dY_{k} = Y_world.data[jy_world_base + {d_expr}];
+                pre_dJ_{k} = J_world.data[init_jy_base + {d_expr}];
+                pre_dY_{k} = Y_world.data[init_jy_base + {d_expr}];
             }}""")
     dense_prefetch_init_code = "\n".join(dense_prefetch_init_parts)
 
@@ -13384,6 +13406,25 @@ def _get_pgs_solve_mf_gs_kernel(
     int mf_contact_end = mf_contact_rows_end.data[world];
     if (mf_contact_end > m_mf) mf_contact_end = m_mf;
 
+    // The dense slot layout is [drive][joint-limit][joint-vel-limit]
+    // [contact/friction], so each PhysX-grasp row phase owns one contiguous
+    // dense row range and only needs to load/scan/store that range:
+    //   row_phase 3: [0, bounds[0])          drive + position-limit rows
+    //   row_phase 5: [bounds[0], bounds[1])  joint velocity-limit rows
+    //   row_phase 4: [bounds[1], m_dense)    contact + friction rows
+    // Other phases scan every dense row. Shared arrays keep absolute
+    // indexing and the per-row type filters below remain as a safety net.
+    int dense_lo = 0;
+    int dense_hi = m_dense;
+    if (row_phase == 3) {{
+        dense_hi = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+    }} else if (row_phase == 5) {{
+        dense_lo = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+        dense_hi = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
+    }} else if (row_phase == 4) {{
+        dense_lo = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
+    }}
+
     int dof_map_base = world * {D};
     int off_dense = world * {M_D};
     int off_mf = world * {M_MF};
@@ -13408,7 +13449,7 @@ def _get_pgs_solve_mf_gs_kernel(
     // ═══════════════════════════════════════════════════════
     // LOAD PHASE
     // ═══════════════════════════════════════════════════════
-    for (int i = lane; i < m_dense; i += 32) {{
+    for (int i = dense_lo + lane; i < dense_hi; i += 32) {{
         s_lam_dense[i] = world_impulses.data[off_dense + i];
         s_rhs_dense[i] = rhs_bias.data[off_dense + i];
         s_diag_dense[i] = world_diag.data[off_dense + i];
@@ -13442,17 +13483,17 @@ def _get_pgs_solve_mf_gs_kernel(
 
         // ── Phase 1: Dense constraints (D-DOF warp-parallel, software-pipelined) ──
 
-        // Prefetch constraint 0
-        if (m_dense > 0) {{
+        // Prefetch the first constraint of this phase's dense range
+        if (dense_hi > dense_lo) {{
             {dense_prefetch_init_code}
         }}
 
-        for (int i = 0; i < m_dense; i++) {{
+        for (int i = dense_lo; i < dense_hi; i++) {{
             // Consume prefetched J/Y for constraint i
             {dense_consume_code}
 
             // Prefetch constraint i+1
-            if (i + 1 < m_dense) {{
+            if (i + 1 < dense_hi) {{
                 int next_jy_base = jy_world_base + (i + 1) * {D};
                 {dense_prefetch_next_code}
             }}
@@ -13715,7 +13756,7 @@ def _get_pgs_solve_mf_gs_kernel(
         int global_dof = world_dof_indices.data[dof_map_base + d];
         if (global_dof >= 0) v_out.data[global_dof] = s_v[d];
     }}
-    for (int i = lane; i < m_dense; i += 32) {{
+    for (int i = dense_lo + lane; i < dense_hi; i += 32) {{
         world_impulses.data[off_dense + i] = s_lam_dense[i];
     }}
     if (row_phase != 3) {{
@@ -13810,6 +13851,7 @@ def _get_pgs_solve_mf_gs_kernel(
         world: int,
         # Dense
         world_constraint_count: wp.array[int],
+        dense_phase_bounds: wp.array2d[int],
         world_dof_indices: wp.array2d[int],
         world_deferred_dof_mask: wp.array2d[int],
         rhs_bias: wp.array2d[float],
@@ -13849,6 +13891,7 @@ def _get_pgs_solve_mf_gs_kernel(
     def pgs_solve_mf_gs_template(
         # Dense
         world_constraint_count: wp.array[int],
+        dense_phase_bounds: wp.array2d[int],
         world_dof_indices: wp.array2d[int],
         world_deferred_dof_mask: wp.array2d[int],
         rhs_bias: wp.array2d[float],
@@ -13888,6 +13931,7 @@ def _get_pgs_solve_mf_gs_kernel(
         pgs_solve_mf_gs_native(
             world,
             world_constraint_count,
+            dense_phase_bounds,
             world_dof_indices,
             world_deferred_dof_mask,
             rhs_bias,

@@ -3348,7 +3348,7 @@ def snapshot_dense_phase_bound(
     world_slot_counter: wp.array[int],
     bound_index: int,
     # outputs
-    dense_phase_bounds: wp.array2d(dtype=wp.int32),
+    dense_phase_bounds: wp.array2d[int],
 ):
     """Record the current dense slot watermark for one row-family boundary.
 
