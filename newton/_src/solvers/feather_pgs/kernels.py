@@ -3344,6 +3344,26 @@ def finalize_world_constraint_counts(
 
 
 @wp.kernel
+def snapshot_dense_phase_bound(
+    world_slot_counter: wp.array[int],
+    bound_index: int,
+    # outputs
+    dense_phase_bounds: wp.array2d(dtype=wp.int32),
+):
+    """Record the current dense slot watermark for one row-family boundary.
+
+    The dense per-world slot layout is [drive][joint-limit][joint-vel-limit]
+    [contact/friction]. Launched right after the joint-limit allocation
+    (``bound_index`` 0) and the joint-velocity-limit allocation
+    (``bound_index`` 1) so the PhysX-grasp GS phases can loop only their own
+    contiguous row range instead of scanning every dense row. The raw counter
+    is stored; consumers clamp against the per-world constraint count.
+    """
+    world = wp.tid()
+    dense_phase_bounds[world, bound_index] = world_slot_counter[world]
+
+
+@wp.kernel
 def clamp_contact_counts(
     constraint_counts: wp.array[int],
     max_constraints: int,
@@ -3723,15 +3743,43 @@ def prepare_world_impulses(
     max_constraints: int,
     warmstart: int,
     world_row_type: wp.array2d[int],
+    dense_phase_bounds: wp.array2d[int],
+    dense_phase_bounds_prev: wp.array2d[int],
     # in/out
     world_impulses: wp.array2d[float],
 ):
-    """Initialize world impulses (zero or warmstart)."""
+    """Initialize world impulses (zero or warmstart).
+
+    Warm-start flicker hazard: the dense slot layout is [drive][joint-limit]
+    [joint-vel-limit][contact/friction] and warm-starting reuses impulses by
+    raw row index. Limit and vel-limit rows are dynamically gated
+    (``joint_limit_activation_gap``, ``velocity_limit_activation_fraction``),
+    so a step-to-step change in their counts shifts every following slot and
+    index-based reuse would hand contacts stale impulses from the wrong rows.
+    When a row-family boundary moved since the previous step, cold-start
+    everything from the first moved boundary onward for that world.
+    """
     world = wp.tid()
     m = world_constraint_count[world]
 
+    cold_start_from = max_constraints
+    if warmstart != 0:
+        b0 = dense_phase_bounds[world, 0]
+        b1 = dense_phase_bounds[world, 1]
+        p0 = dense_phase_bounds_prev[world, 0]
+        p1 = dense_phase_bounds_prev[world, 1]
+        if b0 != p0:
+            cold_start_from = wp.min(b0, p0)
+        elif b1 != p1:
+            cold_start_from = wp.min(b1, p1)
+
     for i in range(max_constraints):
-        if warmstart == 0 or i >= m or world_row_type[world, i] == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+        if (
+            warmstart == 0
+            or i >= m
+            or i >= cold_start_from
+            or world_row_type[world, i] == PGS_CONSTRAINT_TYPE_JOINT_TARGET
+        ):
             world_impulses[world, i] = 0.0
 
 
