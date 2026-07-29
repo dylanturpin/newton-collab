@@ -3331,6 +3331,7 @@ class SolverFeatherPGS(SolverBase):
         # per-iteration tree-walk kernels stay compiled as the exact fallback
         # for worlds whose active-body count overflows the cache.
         self._cached_response_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
+        self._cached_response_block_dim_by_size: dict[int, int] = {}
         self._propagation_cached_gemv_kernel = None
         self._propagation_cached_gemv_worlds_per_block = 2
         self._propagation_cached_response_active = False
@@ -3340,18 +3341,22 @@ class SolverFeatherPGS(SolverBase):
             and self._propagation_cached_response_candidate()
             and self.propagation_cache_max_bodies > 0
         ):
-            # The extraction kernel stages six per-basis tree states in static
-            # shared memory (~97 floats/joint); cap the joint count so the
-            # block stays under the 48KB static shared limit.
-            max_cached_joints = 120
             for size in self.size_groups:
                 size_i = int(size)
                 self._cached_response_tree_warp_kernels_by_size[size_i] = None
                 if self._propagate_tree_warp_kernels_by_size.get(size_i) is None:
                     continue
-                if group_max_joints[size_i] > max_cached_joints:
-                    continue
                 single_dof = self._propagation_tree_single_dof_by_size.get(size_i, False)
+                # One warp per concurrently solved active body, as many as the
+                # per-warp column blocks leave room for in static shared memory.
+                warps = _cached_response_extraction_warps(
+                    group_max_joints[size_i],
+                    self.propagation_cache_max_bodies,
+                    has_free_root=not single_dof,
+                )
+                if warps <= 0:
+                    continue
+                self._cached_response_block_dim_by_size[size_i] = 32 * warps
                 self._cached_response_tree_warp_kernels_by_size[size_i] = (
                     _get_propagation_tree_cached_response_kernel(
                         size_i,
@@ -3961,7 +3966,8 @@ class SolverFeatherPGS(SolverBase):
             )
             if cached_kernel is not None:
                 # Extract this pass's cached response matrices (R and B) from
-                # per-basis tree solves against the just-computed
+                # column-batched tree solves (all six basis columns per sweep)
+                # against the just-computed
                 # factorization. Valid for the whole pass (and the velocity
                 # iterations) because U/D_inv are fixed until the next setup.
                 with self._sync_timed(f"prop_setup_cached_response_size{int(size)}"):
@@ -3990,7 +3996,7 @@ class SolverFeatherPGS(SolverBase):
                             self.propagation_cache_R,
                             self.propagation_cache_B,
                         ],
-                        block_dim=192,
+                        block_dim=self._cached_response_block_dim_by_size[int(size)],
                         device=self.model.device,
                     )
             with self._sync_timed(f"prop_setup_refresh_tree_qd_size{int(size)}"):
@@ -13269,6 +13275,25 @@ def _get_propagate_tree_impulses_revolute_kernel(
     return wp.kernel(enable_backward=False, module="unique")(propagate_tree_impulses_revolute_template)
 
 
+def _cached_response_extraction_warps(max_joints: int, cache_max_bodies: int, *, has_free_root: bool) -> int:
+    """Warps per block for the cached-response extraction kernel (0 = unbuildable).
+
+    Each warp batch-solves one active body (all six basis columns at once)
+    and owns a private ``[joints][6 x 6]`` column block in static shared
+    memory (36 floats/joint), on top of the per-block joint metadata
+    (19 words/joint) and the free-root S/D_inv matrices (72 words). Pick the
+    largest warp count that keeps the block within the 48KB static shared
+    limit; warps beyond the cache body capacity could only ever idle.
+    """
+    joints_cap = max(int(max_joints), 1)
+    budget_words = (48 * 1024) // 4
+    fixed_words = 72 if has_free_root else 0
+    for warps in range(min(6, max(int(cache_max_bodies), 1)), 0, -1):
+        if joints_cap * (36 * warps + 19) + fixed_words <= budget_words:
+            return warps
+    return 0
+
+
 @cache
 def _get_propagation_tree_cached_response_kernel(
     size: int,
@@ -13282,16 +13307,20 @@ def _get_propagation_tree_cached_response_kernel(
 ) -> "wp.Kernel":
     """Build the per-pass cached-response extraction kernel for 0/1-DOF trees.
 
-    One block (six warps) per articulation; warp w solves the tree response
-    for unit basis wrench w. For every contact-active body b of the
-    articulation (``propagation_body_list`` slot order) the warp runs the
-    same backward+forward Featherstone pass as
-    ``propagate_tree_impulses_revolute`` seeded with pA = -e_w at b, then:
+    One block per articulation, ``_cached_response_extraction_warps`` warps.
+    Warp w batch-solves the tree response of active slots w, w+W, ... of
+    ``propagation_body_list``: for its body b it runs ONE backward+forward
+    Featherstone sweep pair carrying all six basis columns simultaneously —
+    lanes 0-5 each own one column of a 6-wide pA / body-delta block, so every
+    per-joint operation of ``propagate_tree_impulses_revolute`` (S^T pA,
+    D_inv application, U updates, wrench/twist translation) is applied
+    column-wise: the identical math, six columns per metadata load, with no
+    cross-lane traffic at all (columns are independent by superposition).
 
-    - the forward-pass qdd per DOF is column w of the full joint-space
-      response matrix R_b (written to ``propagation_cache_R``), and
-    - the forward-pass body delta at every OTHER active body a is column w of
-      the pair response block B_ab (written to ``propagation_cache_B``;
+    - the forward-pass qdd stream of column c is column c of the full
+      joint-space response matrix R_b (written to ``propagation_cache_R``),
+    - the forward-pass body delta at every active body a is a column of the
+      pair response block B_ab (written to ``propagation_cache_B``;
       cross-articulation pairs are written as exact zeros so the GEMV can sum
       over all active slots of the world).
 
@@ -13310,66 +13339,83 @@ def _get_propagation_tree_cached_response_kernel(
     MB = max(int(max_prop_bodies), 1)
     C = max(int(cache_max_bodies), 1)
     MAXD = max(int(max_art_dofs), 1)
+    W = _cached_response_extraction_warps(joints_cap, C, has_free_root=has_free_root)
+    if W <= 0:
+        raise ValueError(f"cached-response extraction does not fit shared memory for {joints_cap} joints")
+    BLOCK = 32 * W
     if has_free_root:
         root_decl = """
     __shared__ float s_S_root[36];
-    __shared__ float s_U_root[36];
     __shared__ float s_Dinv_root[36];
-    __shared__ float s_u_root[6 * 6];
-    __shared__ float s_qdd_root[6 * 6];
     const int root_gdof = joint_qd_start.data[joint_start];
     const int root_dc = joint_qd_start.data[joint_start + 1] - root_gdof;
 """
         root_gdof_guard = " && j != 0"
-        root_preload = """
-    for (int idx = t; idx < root_dc * 6; idx += 192) {
+        root_preload = f"""
+    for (int idx = t; idx < root_dc * 6; idx += {BLOCK}) {{
         const int a = idx / 6;
         const int comp = idx - a * 6;
         s_S_root[a * 6 + comp] = propagation_joint_S_flat.data[(root_gdof + a) * 6 + comp];
-        s_U_root[a * 6 + comp] = propagation_tree_U.data[(root_gdof + a) * 6 + comp];
-    }
-    for (int idx = t; idx < root_dc * root_dc; idx += 192) {
+    }}
+    for (int idx = t; idx < root_dc * root_dc; idx += {BLOCK}) {{
         const int a = idx / root_dc;
         const int b = idx - a * root_dc;
         s_Dinv_root[a * 6 + b] = propagation_tree_D_inv.data[joint_start * 36 + a * 6 + b];
-    }
+    }}
 """
         root_backward = """
-            if (j == 0) {
-                if (lane < root_dc) {
-                    float u_root = 0.0f;
-                    for (int r = 0; r < 6; ++r) {
-                        u_root -= s_S_root[lane * 6 + r] * s_pA[r];
+                if (j == 0) {
+                    float ur[6];
+                    #pragma unroll
+                    for (int a = 0; a < 6; ++a) {
+                        float u_root = 0.0f;
+                        if (a < root_dc) {
+                            for (int r = 0; r < 6; ++r) {
+                                u_root -= s_S_root[a * 6 + r] * s_blk[r * 6 + c];
+                            }
+                        }
+                        ur[a] = u_root;
                     }
-                    s_u_root[basis * 6 + lane] = u_root;
+                    // pA[0] is consumed; its rows stage u_root for the
+                    // forward pass (column-local, like the 1-DOF u packing).
+                    #pragma unroll
+                    for (int a = 0; a < 6; ++a) {
+                        if (a < root_dc) {
+                            s_blk[a * 6 + c] = ur[a];
+                        }
+                    }
+                    continue;
                 }
-                __syncwarp(mask);
-                continue;
-            }
 """
         root_forward = f"""
-            if (j == 0) {{
-                if (lane < root_dc) {{
-                    float qdd_root = 0.0f;
-                    for (int b = 0; b < root_dc; ++b) {{
-                        qdd_root += s_Dinv_root[lane * 6 + b] * s_u_root[basis * 6 + b];
+                if (j == 0) {{
+                    float qr[6];
+                    #pragma unroll
+                    for (int a = 0; a < 6; ++a) {{
+                        float qdd_root = 0.0f;
+                        if (a < root_dc) {{
+                            for (int b = 0; b < root_dc; ++b) {{
+                                qdd_root += s_Dinv_root[a * 6 + b] * s_blk[b * 6 + c];
+                            }}
+                            propagation_cache_R.data[
+                                (((world * {C}) + slot) * {MAXD} + (root_gdof + a - art_dof_start)) * 6 + c
+                            ] = qdd_root;
+                        }}
+                        qr[a] = qdd_root;
                     }}
-                    s_qdd_root[basis * 6 + lane] = qdd_root;
-                    propagation_cache_R.data[
-                        (((world * {C}) + slot) * {MAXD} + (root_gdof + lane - art_dof_start)) * 6 + basis
-                    ] = qdd_root;
-                }}
-                __syncwarp(mask);
-                if (lane < 6) {{
-                    float value = 0.0f;
-                    for (int a = 0; a < root_dc; ++a) {{
-                        value += s_S_root[a * 6 + lane] * s_qdd_root[basis * 6 + a];
+                    #pragma unroll
+                    for (int r = 0; r < 6; ++r) {{
+                        float value = 0.0f;
+                        #pragma unroll
+                        for (int a = 0; a < 6; ++a) {{
+                            if (a < root_dc) {{
+                                value += s_S_root[a * 6 + r] * qr[a];
+                            }}
+                        }}
+                        s_blk[r * 6 + c] = value;
                     }}
-                    s_bd[lane] = value;
+                    continue;
                 }}
-                __syncwarp(mask);
-                continue;
-            }}
 """
     else:
         root_decl = ""
@@ -13380,7 +13426,7 @@ def _get_propagation_tree_cached_response_kernel(
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const int t = threadIdx.x;
-    const int basis = t >> 5;
+    const int warp = t >> 5;
     const int lane = t & 31;
     const unsigned mask = 0xffffffffu;
     const int art = group_to_art.data[group_idx];
@@ -13394,9 +13440,13 @@ def _get_propagation_tree_cached_response_kernel(
     const int n_joints = joint_end - joint_start;
     const int art_dof_start = joint_qd_start.data[joint_start];
 
-    __shared__ float s_pA_all[6 * {joints_cap} * 6];
-    __shared__ float s_bd_all[6 * {joints_cap} * 6];
-    __shared__ float s_u_all[6 * {joints_cap}];
+    // Warp w batch-solves active slots w, w+{W}, ...: ONE backward+forward
+    // sweep pair per body carrying all six basis columns, lanes 0-5 each
+    // owning one column. s_blk is the warp's [joint][6 x 6] column block: pA
+    // during the backward sweep, body deltas during the forward sweep (pA is
+    // dead once its u row is extracted, so the forward pass reuses the same
+    // storage; u itself packs into the dead row 0).
+    __shared__ __align__(16) float s_blk_all[{W} * {joints_cap} * 36];
     __shared__ float s_U[{joints_cap} * 6];
     __shared__ float s_S[{joints_cap} * 6];
     __shared__ float s_e[{joints_cap} * 3];
@@ -13405,11 +13455,9 @@ def _get_propagation_tree_cached_response_kernel(
     __shared__ int s_pslot[{joints_cap}];
     __shared__ int s_gdof[{joints_cap}];
 {root_decl}
-    float* s_pA = s_pA_all + basis * {joints_cap} * 6;
-    float* s_bd = s_bd_all + basis * {joints_cap} * 6;
-    float* s_u = s_u_all + basis * {joints_cap};
+    float* s_blk = s_blk_all + warp * {joints_cap} * 36;
 
-    for (int j = t; j < n_joints; j += 192) {{
+    for (int j = t; j < n_joints; j += {BLOCK}) {{
         const int joint = joint_start + j;
         const int child = joint_child.data[joint];
         const int dof_start_j = joint_qd_start.data[joint];
@@ -13420,14 +13468,14 @@ def _get_propagation_tree_cached_response_kernel(
         s_dinv[j] = has_dof ? propagation_tree_D_inv.data[joint * 36] : 0.0f;
     }}
     __syncthreads();
-    for (int idx = t; idx < n_joints * 6; idx += 192) {{
+    for (int idx = t; idx < n_joints * 6; idx += {BLOCK}) {{
         const int j = idx / 6;
         const int comp = idx - j * 6;
         const int gdof = s_gdof[j];
         s_U[idx] = (gdof >= 0) ? propagation_tree_U.data[gdof * 6 + comp] : 0.0f;
         s_S[idx] = (gdof >= 0) ? propagation_joint_S_flat.data[gdof * 6 + comp] : 0.0f;
     }}
-    for (int idx = t; idx < n_joints * 3; idx += 192) {{
+    for (int idx = t; idx < n_joints * 3; idx += {BLOCK}) {{
         const int j = idx / 3;
         const int comp = idx - j * 3;
         float e = 0.0f;
@@ -13441,121 +13489,141 @@ def _get_propagation_tree_cached_response_kernel(
 {root_preload}
     __syncthreads();
 
-    // After the shared preload each warp is independent: warp `basis` owns
-    // its private pA/bd/u slices and its own R/B columns.
-    for (int slot = 0; slot < n_active; ++slot) {{
+    // After the shared preload each warp is independent: it owns its slots'
+    // column block and R/B rows outright, so no block-level sync remains.
+    for (int slot = warp; slot < n_active; slot += {W}) {{
         const int target_body = propagation_body_list.data[world * {MB} + slot];
         if (target_body < 0 || body_to_articulation.data[target_body] != art) continue;
         const int j_target = body_to_joint.data[target_body] - joint_start;
 
-        for (int idx = lane; idx < n_joints * 6; idx += 32) {{
-            s_pA[idx] = 0.0f;
-        }}
-        __syncwarp(mask);
-        if (lane == 0) {{
-            s_pA[j_target * 6 + basis] = -1.0f;
+        // Zero the column block (36 words/joint keeps float4 alignment).
+        for (int idx = lane; idx < n_joints * 9; idx += 32) {{
+            reinterpret_cast<float4*>(s_blk)[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }}
         __syncwarp(mask);
 
-        // Backward sweep, leaf -> root (unit wrench seeded at target_body).
-        for (int offset = 0; offset < n_joints; ++offset) {{
-            const int j = n_joints - 1 - offset;
+        if (lane < 6) {{
+            const int c = lane;
+            // Seed column c with the unit basis wrench: pA = -e_c at b.
+            s_blk[j_target * 36 + c * 6 + c] = -1.0f;
+
+            // Backward sweep, leaf -> root: the tree walk's per-joint math
+            // applied to column c. Every read and write below touches only
+            // column c, so lanes never need to synchronize.
+            for (int offset = 0; offset < n_joints; ++offset) {{
+                const int j = n_joints - 1 - offset;
 {root_backward}
-            const int parent_slot = s_pslot[j];
-            const int has_dof = (s_gdof[j] >= 0);
+                const int parent_slot = s_pslot[j];
+                const int has_dof = (s_gdof[j] >= 0);
+                float* blk_j = s_blk + j * 36;
 
-            float u = 0.0f;
-            if (has_dof && lane < 6) {{
-                u = -s_S[j * 6 + lane] * s_pA[j * 6 + lane];
-            }}
-            for (int shfl = 16; shfl > 0; shfl >>= 1) {{
-                u += __shfl_down_sync(mask, u, shfl);
-            }}
-            u = __shfl_sync(mask, u, 0);
-            if (has_dof && lane == 0) {{
-                s_u[j] = u;
-            }}
+                const float p0 = blk_j[0 * 6 + c];
+                const float p1 = blk_j[1 * 6 + c];
+                const float p2 = blk_j[2 * 6 + c];
+                const float p3 = blk_j[3 * 6 + c];
+                const float p4 = blk_j[4 * 6 + c];
+                const float p5 = blk_j[5 * 6 + c];
 
-            if (parent_slot >= 0 && lane < 6) {{
-                const float inv_du = has_dof ? s_dinv[j] * u : 0.0f;
-                float propagated = s_pA[j * 6 + lane] + s_U[j * 6 + lane] * inv_du;
-                if (lane >= 3) {{
+                float u = 0.0f;
+                if (has_dof) {{
+                    const float* Sj = s_S + j * 6;
+                    u = -(Sj[0] * p0 + Sj[1] * p1 + Sj[2] * p2 + Sj[3] * p3 + Sj[4] * p4 + Sj[5] * p5);
+                }}
+                if (parent_slot >= 0) {{
+                    const float inv_du = has_dof ? s_dinv[j] * u : 0.0f;
+                    const float* Uj = s_U + j * 6;
+                    const float q0 = p0 + Uj[0] * inv_du;
+                    const float q1 = p1 + Uj[1] * inv_du;
+                    const float q2 = p2 + Uj[2] * inv_du;
+                    float q3 = p3 + Uj[3] * inv_du;
+                    float q4 = p4 + Uj[4] * inv_du;
+                    float q5 = p5 + Uj[5] * inv_du;
                     const float ex = s_e[j * 3 + 0];
                     const float ey = s_e[j * 3 + 1];
                     const float ez = s_e[j * 3 + 2];
-                    const float px = s_pA[j * 6 + 0] + s_U[j * 6 + 0] * inv_du;
-                    const float py = s_pA[j * 6 + 1] + s_U[j * 6 + 1] * inv_du;
-                    const float pz = s_pA[j * 6 + 2] + s_U[j * 6 + 2] * inv_du;
-                    if (lane == 3) propagated += ey * pz - ez * py;
-                    else if (lane == 4) propagated += ez * px - ex * pz;
-                    else propagated += ex * py - ey * px;
+                    q3 += ey * q2 - ez * q1;
+                    q4 += ez * q0 - ex * q2;
+                    q5 += ex * q1 - ey * q0;
+                    float* blk_p = s_blk + parent_slot * 36;
+                    blk_p[0 * 6 + c] += q0;
+                    blk_p[1 * 6 + c] += q1;
+                    blk_p[2 * 6 + c] += q2;
+                    blk_p[3 * 6 + c] += q3;
+                    blk_p[4 * 6 + c] += q4;
+                    blk_p[5 * 6 + c] += q5;
                 }}
-                s_pA[parent_slot * 6 + lane] += propagated;
+                if (has_dof) {{
+                    blk_j[c] = u;  // pA[j] is dead; row 0 stages u for the forward pass
+                }}
             }}
-            __syncwarp(mask);
-        }}
 
-        // Forward sweep, root -> leaf: qdd per DOF is R_b's column `basis`,
-        // body deltas land in s_bd for the B extraction below.
-        for (int j = 0; j < n_joints; ++j) {{
+            // Forward sweep, root -> leaf: qdd per DOF is column c of R_b,
+            // the block turns into per-body COM twist deltas.
+            for (int j = 0; j < n_joints; ++j) {{
 {root_forward}
-            const int parent_slot = s_pslot[j];
-            const int gdof = s_gdof[j];
-            const int has_dof = (gdof >= 0);
+                const int parent_slot = s_pslot[j];
+                const int gdof = s_gdof[j];
+                const int has_dof = (gdof >= 0);
+                float* blk_j = s_blk + j * 36;
 
-            float parent_delta = 0.0f;
-            if (parent_slot >= 0 && lane < 6) {{
-                parent_delta = s_bd[parent_slot * 6 + lane];
-                const float ex = s_e[j * 3 + 0];
-                const float ey = s_e[j * 3 + 1];
-                const float ez = s_e[j * 3 + 2];
-                const float wx = s_bd[parent_slot * 6 + 3];
-                const float wy = s_bd[parent_slot * 6 + 4];
-                const float wz = s_bd[parent_slot * 6 + 5];
-                if (lane == 0) parent_delta += wy * ez - wz * ey;
-                else if (lane == 1) parent_delta += wz * ex - wx * ez;
-                else if (lane == 2) parent_delta += wx * ey - wy * ex;
-            }}
+                float d0 = 0.0f;
+                float d1 = 0.0f;
+                float d2 = 0.0f;
+                float d3 = 0.0f;
+                float d4 = 0.0f;
+                float d5 = 0.0f;
+                if (parent_slot >= 0) {{
+                    const float* blk_p = s_blk + parent_slot * 36;
+                    d0 = blk_p[0 * 6 + c];
+                    d1 = blk_p[1 * 6 + c];
+                    d2 = blk_p[2 * 6 + c];
+                    d3 = blk_p[3 * 6 + c];
+                    d4 = blk_p[4 * 6 + c];
+                    d5 = blk_p[5 * 6 + c];
+                    const float ex = s_e[j * 3 + 0];
+                    const float ey = s_e[j * 3 + 1];
+                    const float ez = s_e[j * 3 + 2];
+                    d0 += d4 * ez - d5 * ey;
+                    d1 += d5 * ex - d3 * ez;
+                    d2 += d3 * ey - d4 * ex;
+                }}
 
-            float qdd = 0.0f;
-            if (has_dof) {{
-                float parent_term = 0.0f;
-                if (parent_slot >= 0 && lane < 6) {{
-                    parent_term = s_U[j * 6 + lane] * parent_delta;
-                }}
-                for (int shfl = 16; shfl > 0; shfl >>= 1) {{
-                    parent_term += __shfl_down_sync(mask, parent_term, shfl);
-                }}
-                parent_term = __shfl_sync(mask, parent_term, 0);
-                qdd = s_dinv[j] * (s_u[j] - parent_term);
-                if (lane == 0) {{
+                float qdd = 0.0f;
+                if (has_dof) {{
+                    const float u = blk_j[c];  // staged by the backward sweep
+                    float parent_term = 0.0f;
+                    if (parent_slot >= 0) {{
+                        const float* Uj = s_U + j * 6;
+                        parent_term = Uj[0] * d0 + Uj[1] * d1 + Uj[2] * d2 + Uj[3] * d3 + Uj[4] * d4 + Uj[5] * d5;
+                    }}
+                    qdd = s_dinv[j] * (u - parent_term);
                     propagation_cache_R.data[
-                        (((world * {C}) + slot) * {MAXD} + (gdof - art_dof_start)) * 6 + basis
+                        (((world * {C}) + slot) * {MAXD} + (gdof - art_dof_start)) * 6 + c
                     ] = qdd;
                 }}
-                qdd = __shfl_sync(mask, qdd, 0);
+
+                const float* Sj = s_S + j * 6;
+                blk_j[0 * 6 + c] = d0 + (has_dof ? Sj[0] * qdd : 0.0f);
+                blk_j[1 * 6 + c] = d1 + (has_dof ? Sj[1] * qdd : 0.0f);
+                blk_j[2 * 6 + c] = d2 + (has_dof ? Sj[2] * qdd : 0.0f);
+                blk_j[3 * 6 + c] = d3 + (has_dof ? Sj[3] * qdd : 0.0f);
+                blk_j[4 * 6 + c] = d4 + (has_dof ? Sj[4] * qdd : 0.0f);
+                blk_j[5 * 6 + c] = d5 + (has_dof ? Sj[5] * qdd : 0.0f);
             }}
 
-            if (lane < 6) {{
-                s_bd[j * 6 + lane] = parent_delta + (has_dof ? s_S[j * 6 + lane] * qdd : 0.0f);
-            }}
-            __syncwarp(mask);
-        }}
-
-        // B extraction: body delta at every active slot a. Bodies outside
-        // this articulation get exact zeros (no cross-articulation response),
-        // which also makes the whole column valid for the GEMV's flat sum.
-        for (int a_pos = 0; a_pos < n_active; ++a_pos) {{
-            if (lane < 6) {{
+            // B extraction: body delta at every active slot a. Bodies outside
+            // this articulation get exact zeros (no cross-articulation
+            // response), which also makes the whole column valid for the
+            // GEMV's flat sum.
+            for (int a_pos = 0; a_pos < n_active; ++a_pos) {{
                 const int body_a = propagation_body_list.data[world * {MB} + a_pos];
-                float value = 0.0f;
-                if (body_a >= 0 && body_to_articulation.data[body_a] == art) {{
-                    const int j_a = body_to_joint.data[body_a] - joint_start;
-                    value = s_bd[j_a * 6 + lane];
+                const bool in_art = (body_a >= 0 && body_to_articulation.data[body_a] == art);
+                const float* bd = in_art ? (s_blk + (body_to_joint.data[body_a] - joint_start) * 36) : s_blk;
+                float* out = propagation_cache_B.data + (((world * {C}) + a_pos) * {C} + slot) * 36;
+                #pragma unroll
+                for (int r = 0; r < 6; ++r) {{
+                    out[r * 6 + c] = in_art ? bd[r * 6 + c] : 0.0f;
                 }}
-                propagation_cache_B.data[
-                    (((world * {C}) + a_pos) * {C} + slot) * 36 + lane * 6 + basis
-                ] = value;
             }}
         }}
         __syncwarp(mask);
