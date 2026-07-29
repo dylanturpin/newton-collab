@@ -5543,6 +5543,27 @@ def build_propagation_body_map_slow(
 
 
 @wp.kernel
+def compute_propagation_cache_world_flag(
+    propagation_body_count: wp.array[int],
+    cache_max_bodies: int,
+    # outputs
+    propagation_cache_world_flag: wp.array[int],
+):
+    """Mark worlds whose active propagation bodies fit the response cache.
+
+    Worlds with more active bodies than the cache capacity keep the exact
+    per-iteration tree-walk fallback (flag 0); worlds under the cap take the
+    cached-response GEMV path (flag 1). A zero-body world is trivially
+    "cached": both paths are no-ops there.
+    """
+    world = wp.tid()
+    flag = int(0)
+    if propagation_body_count[world] <= cache_max_bodies:
+        flag = int(1)
+    propagation_cache_world_flag[world] = flag
+
+
+@wp.kernel
 def compute_propagation_body_com_rel(
     body_to_articulation: wp.array[int],
     body_q: wp.array[wp.transform],
@@ -6559,6 +6580,8 @@ def flush_propagation_active_free_body_qd_to_vout(
 @wp.kernel
 def propagate_tree_impulses_for_size(
     group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    propagation_cache_world_flag: wp.array[int],
     articulation_start: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
@@ -6578,9 +6601,20 @@ def propagate_tree_impulses_for_size(
     propagation_body_qd: wp.array2d[float],
     v_out: wp.array[float],
 ):
-    """Propagate deferred propagation body impulses through the articulation tree."""
+    """Propagate deferred propagation body impulses through the articulation tree.
+
+    ``propagation_cache_world_flag`` gates the cached-response fast path: a
+    nonzero flag means this world's deferred impulses were already converted
+    to joint velocities by the precomputed response-matrix GEMV (exactly the
+    same linear map), so this articulation is skipped. Callers with the
+    cached path disabled pass an all-zeros flag, which leaves behavior
+    unchanged.
+    """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
+    world = art_to_world[art]
+    if world >= 0 and propagation_cache_world_flag[world] != 0:
+        return
     joint_start = articulation_start[art]
     joint_end = articulation_start[art + 1]
 
