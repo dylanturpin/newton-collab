@@ -26,6 +26,7 @@ from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, State
 from ...sim.articulation import eval_fk
 from ...sim.enums import JointType
+from ..flags import SolverNotifyFlags
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
@@ -2232,6 +2233,34 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[self.J_world, self.Y_world],
                 device=self.model.device,
             )
+
+    @override
+    def notify_model_changed(self, flags: int) -> None:
+        model = self.model
+        if flags & SolverNotifyFlags.BODY_INERTIAL_PROPERTIES and model.body_count:
+            # Refresh the derived buffers baked from body_com/body_mass/
+            # body_inertia in _allocate_common_buffers.
+            wp.launch(
+                compute_spatial_inertia,
+                model.body_count,
+                inputs=[model.body_inertia, model.body_mass],
+                outputs=[self.body_I_m],
+                device=model.device,
+            )
+            wp.launch(
+                compute_com_transforms,
+                model.body_count,
+                inputs=[model.body_com],
+                outputs=[self.body_X_com],
+                device=model.device,
+            )
+            # H is rebuilt from body_I_s only on masked steps; force a rebuild
+            # and refactor on the next step regardless of
+            # update_mass_matrix_interval. Host-evaluated, so ineffective on
+            # steps replayed from a CUDA graph captured with the flag unset
+            # (a non-issue at the default update_mass_matrix_interval=1, where
+            # every step rebuilds H).
+            self._force_mass_update = True
 
     @override
     def step(
