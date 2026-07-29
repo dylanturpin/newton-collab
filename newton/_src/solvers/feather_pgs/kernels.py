@@ -5564,6 +5564,42 @@ def compute_propagation_cache_world_flag(
 
 
 @wp.kernel
+def snapshot_propagation_cache_qd_base(
+    propagation_cache_world_flag: wp.array[int],
+    propagation_body_count: wp.array[int],
+    propagation_body_list: wp.array2d[int],
+    cache_max_bodies: int,
+    propagation_body_qd: wp.array2d[float],
+    # outputs
+    propagation_cache_qd_base: wp.array3d[float],
+):
+    """Snapshot active bodies' live COM twists before a propagation GS sweep.
+
+    The sweep updates ``propagation_body_qd`` in place with diagonal-response
+    estimates; the cached-response GEMV afterwards must rebuild the exact
+    velocities as (pre-sweep twist) + (response x accumulated impulses), so
+    the consistent pre-sweep value is captured here. Pre-sweep consistency
+    holds because either the forced refresh just recomputed body_qd from
+    v_out, or v_out is unchanged since the previous exact update.
+    """
+    tid = wp.tid()
+    world = tid // cache_max_bodies
+    slot = tid - world * cache_max_bodies
+    if propagation_cache_world_flag[world] == 0:
+        return
+    n = propagation_body_count[world]
+    if n > cache_max_bodies:
+        n = cache_max_bodies
+    if slot >= n:
+        return
+    body = propagation_body_list[world, slot]
+    if body < 0:
+        return
+    for r in range(6):
+        propagation_cache_qd_base[world, slot, r] = propagation_body_qd[body, r]
+
+
+@wp.kernel
 def compute_propagation_body_com_rel(
     body_to_articulation: wp.array[int],
     body_q: wp.array[wp.transform],

@@ -133,6 +133,7 @@ from .kernels import (
     scatter_qdd_from_groups,
     snapshot_dense_phase_bound,
     snapshot_mf_prev_slots,
+    snapshot_propagation_cache_qd_base,
     trisolve_loop,
     update_articulation_origins,
     update_articulation_root_com_offsets,
@@ -3364,6 +3365,13 @@ class SolverFeatherPGS(SolverBase):
                 )
             if any(k is not None for k in self._cached_response_tree_warp_kernels_by_size.values()):
                 self._propagation_cached_response_active = True
+                self._propagation_cached_gemv_kernel = _get_propagation_cached_gemv_kernel(
+                    self.propagation_cache_max_bodies,
+                    self.propagation_response_max_dofs,
+                    self.max_propagation_bodies,
+                    self._propagation_cached_gemv_worlds_per_block,
+                    device_arch,
+                )
                 # Per-articulation static eligibility: only bodies of arts in
                 # groups with an extraction kernel take the GEMV path; free
                 # rigid bodies keep the existing sweep-estimate + flush path
@@ -3380,6 +3388,20 @@ class SolverFeatherPGS(SolverBase):
                         continue
                     art_eligible[(art_size_np == size_i) & (is_free_np == 0)] = 1
                 self.propagation_cache_art_eligible.assign(art_eligible)
+
+    def _propagation_cache_guard_flag(self, size: int) -> wp.array:
+        """Per-world skip flag for a size group's tree-walk propagate launch.
+
+        Groups covered by the cached-response path skip worlds the GEMV
+        already handled (flag 1); all other groups — and the cached path when
+        disabled — get the all-zeros flag, i.e. unconditional tree walk.
+        """
+        if (
+            self._propagation_cached_response_active
+            and self._cached_response_tree_warp_kernels_by_size.get(int(size)) is not None
+        ):
+            return self.propagation_cache_world_flag
+        return self._propagation_cache_flag_zeros
 
     def _build_propagation_joint_parent_slot(self, model) -> wp.array:
         """Per-joint local index of the joint whose child is this joint's parent body.
@@ -4185,9 +4207,50 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
+    def _launch_propagation_cached_gemv(self) -> None:
+        """Apply the cached response matrices to this iteration's impulses.
+
+        Exactly replaces the per-iteration tree walk for worlds with
+        ``propagation_cache_world_flag == 1``: v_out += sum_b R_b · imp_b and
+        propagation_body_qd[a] = qd_base[a] + sum_b B_ab · imp_b for active
+        bodies (superposition over the fixed factorization — the same linear
+        map the tree walk applies), then clears the consumed impulses.
+        """
+        kernel = self._propagation_cached_gemv_kernel
+        if kernel is None:
+            return
+        wpb = self._propagation_cached_gemv_worlds_per_block
+        wp.launch_tiled(
+            kernel,
+            dim=[(self.world_count + wpb - 1) // wpb],
+            inputs=[
+                self.world_count,
+                self.propagation_cache_world_flag,
+                self.propagation_body_count,
+                self.propagation_body_list,
+                self.propagation_cache_art_eligible,
+                self.body_to_articulation,
+                self.model.articulation_start,
+                self.model.joint_qd_start,
+                self.propagation_cache_R,
+                self.propagation_cache_B,
+                self.propagation_cache_qd_base,
+            ],
+            outputs=[
+                self.propagation_body_impulses,
+                self.propagation_body_qd,
+                self.v_out,
+            ],
+            block_dim=32 * wpb,
+            device=self.model.device,
+        )
+
     def _propagate_response(self) -> None:
         if not self._propagation_contacts_enabled():
             return
+
+        if self._propagation_cached_response_active:
+            self._launch_propagation_cached_gemv()
 
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
@@ -4195,7 +4258,7 @@ class SolverFeatherPGS(SolverBase):
                 continue
             if not self._propagation_tree_has_non_free_by_size.get(int(size), True):
                 continue
-            guard_flag = self._propagation_cache_flag_zeros
+            guard_flag = self._propagation_cache_guard_flag(size)
             warp_kernel = getattr(self, "_propagate_tree_warp_kernels_by_size", {}).get(int(size))
             if warp_kernel is not None:
                 wp.launch_tiled(
@@ -4401,6 +4464,25 @@ class SolverFeatherPGS(SolverBase):
     ) -> None:
         if not self._propagation_contacts_enabled():
             return
+        if self._propagation_cached_response_active:
+            # Snapshot the consistent pre-sweep active-body twists: the GS
+            # sweep below overwrites propagation_body_qd with diagonal
+            # estimates, which the cached-response GEMV replaces by the exact
+            # (base + response x impulses) superposition — mirroring how the
+            # tree walk rebuilt body_qd from v_out.
+            wp.launch(
+                snapshot_propagation_cache_qd_base,
+                dim=self.world_count * self.propagation_cache_max_bodies,
+                inputs=[
+                    self.propagation_cache_world_flag,
+                    self.propagation_body_count,
+                    self.propagation_body_list,
+                    self.propagation_cache_max_bodies,
+                    self.propagation_body_qd,
+                ],
+                outputs=[self.propagation_cache_qd_base],
+                device=self.model.device,
+            )
         if self._propagation_colored:
             self._propagation_pgs_solve_colored_iteration(
                 rhs=rhs,
@@ -13553,6 +13635,175 @@ def _get_propagation_tree_cached_response_kernel(
     propagation_tree_cached_response_template.__name__ = name
     propagation_tree_cached_response_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(propagation_tree_cached_response_template)
+
+
+@cache
+def _get_propagation_cached_gemv_kernel(
+    cache_max_bodies: int,
+    max_art_dofs: int,
+    max_prop_bodies: int,
+    worlds_per_block: int,
+    device_arch: str,
+) -> "wp.Kernel":
+    """Build the per-iteration cached-response GEMV kernel (warp per world).
+
+    For worlds on the cached path this applies exactly the linear map the
+    per-iteration tree walk applies to the deferred body impulses:
+
+    - ``v_out[art dofs] += sum_b R_b · imp_b`` (lanes stride the DOFs; bodies
+      of one articulation accumulate sequentially per lane, so no atomics),
+    - ``propagation_body_qd[a] = qd_base[a] + sum_b B_ab · imp_b`` for active
+      bodies a, replacing the GS sweep's in-place diagonal estimates with the
+      exact superposition (this mirrors the tree walk's from-scratch body_qd
+      recompute), and
+    - clears the consumed ``propagation_body_impulses``.
+
+    Only bodies whose articulation is cached-eligible participate
+    (``art_eligible``): free rigid bodies keep the sweep-estimate + flush
+    path (their diagonal response is already exact), and bodies of
+    non-eligible tree groups keep the tree-walk launch, whose per-world guard
+    flag is the all-zeros array for those groups.
+    """
+    C = max(int(cache_max_bodies), 1)
+    MAXD = max(int(max_art_dofs), 1)
+    MB = max(int(max_prop_bodies), 1)
+    W = int(worlds_per_block)
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int t = threadIdx.x;
+    const int warp_id = t >> 5;
+    const int lane = t & 31;
+    const int world = tile * {W} + warp_id;
+    if (world >= world_count) return;
+    if (cache_world_flag.data[world] == 0) return;
+    int n = propagation_body_count.data[world];
+    if (n <= 0) return;
+    if (n > {C}) n = {C};
+
+    __shared__ float s_imp_all[{W} * {C} * 6];
+    __shared__ int s_body_all[{W} * {C}];
+    __shared__ int s_elig_all[{W} * {C}];
+    float* s_imp = s_imp_all + warp_id * {C} * 6;
+    int* s_body = s_body_all + warp_id * {C};
+    int* s_elig = s_elig_all + warp_id * {C};
+
+    for (int i = lane; i < n; i += 32) {{
+        const int body = propagation_body_list.data[world * {MB} + i];
+        s_body[i] = body;
+        int elig = 0;
+        if (body >= 0) {{
+            const int art = body_to_articulation.data[body];
+            if (art >= 0 && art_eligible.data[art] != 0) elig = 1;
+        }}
+        s_elig[i] = elig;
+    }}
+    __syncwarp();
+    for (int i = lane; i < n * 6; i += 32) {{
+        const int body = s_body[i / 6];
+        s_imp[i] = (body >= 0) ? propagation_body_impulses.data[body * 6 + (i - (i / 6) * 6)] : 0.0f;
+    }}
+    __syncwarp();
+
+    // v_out += R_b · imp_b per eligible active body.
+    for (int b = 0; b < n; ++b) {{
+        if (s_elig[b] == 0) continue;
+        float any_imp = fabsf(s_imp[b * 6 + 0]) + fabsf(s_imp[b * 6 + 1]) + fabsf(s_imp[b * 6 + 2])
+            + fabsf(s_imp[b * 6 + 3]) + fabsf(s_imp[b * 6 + 4]) + fabsf(s_imp[b * 6 + 5]);
+        if (any_imp == 0.0f) continue;
+        const int art = body_to_articulation.data[s_body[b]];
+        const int joint_start = articulation_start.data[art];
+        const int joint_end = articulation_start.data[art + 1];
+        const int dof_start = joint_qd_start.data[joint_start];
+        const int dof_count = joint_qd_start.data[joint_end] - dof_start;
+        for (int d = lane; d < dof_count; d += 32) {{
+            const int base = ((world * {C} + b) * {MAXD} + d) * 6;
+            float acc = 0.0f;
+            for (int j2 = 0; j2 < 6; ++j2) {{
+                acc += propagation_cache_R.data[base + j2] * s_imp[b * 6 + j2];
+            }}
+            v_out.data[dof_start + d] += acc;
+        }}
+    }}
+
+    // body_qd[a] = qd_base[a] + sum_b B_ab · imp_b; clear consumed impulses.
+    // Impulse reads all come from the s_imp staging, so the in-loop clear
+    // cannot race the reads.
+    for (int i = lane; i < n * 6; i += 32) {{
+        const int a = i / 6;
+        const int comp = i - a * 6;
+        if (s_elig[a] == 0) continue;
+        float val = propagation_cache_qd_base.data[(world * {C} + a) * 6 + comp];
+        for (int b = 0; b < n; ++b) {{
+            if (s_elig[b] == 0) continue;
+            const int base = (((world * {C} + a) * {C}) + b) * 36 + comp * 6;
+            for (int j2 = 0; j2 < 6; ++j2) {{
+                val += propagation_cache_B.data[base + j2] * s_imp[b * 6 + j2];
+            }}
+        }}
+        propagation_body_qd.data[s_body[a] * 6 + comp] = val;
+        propagation_body_impulses.data[s_body[a] * 6 + comp] = 0.0f;
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def propagation_cached_gemv_native(
+        tile: int,
+        world_count: int,
+        cache_world_flag: wp.array[int],
+        propagation_body_count: wp.array[int],
+        propagation_body_list: wp.array2d[int],
+        art_eligible: wp.array[int],
+        body_to_articulation: wp.array[int],
+        articulation_start: wp.array[int],
+        joint_qd_start: wp.array[int],
+        propagation_cache_R: wp.array4d[float],
+        propagation_cache_B: wp.array4d[float],
+        propagation_cache_qd_base: wp.array3d[float],
+        propagation_body_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        v_out: wp.array[float],
+    ): ...
+
+    def propagation_cached_gemv_template(
+        world_count: int,
+        cache_world_flag: wp.array[int],
+        propagation_body_count: wp.array[int],
+        propagation_body_list: wp.array2d[int],
+        art_eligible: wp.array[int],
+        body_to_articulation: wp.array[int],
+        articulation_start: wp.array[int],
+        joint_qd_start: wp.array[int],
+        propagation_cache_R: wp.array4d[float],
+        propagation_cache_B: wp.array4d[float],
+        propagation_cache_qd_base: wp.array3d[float],
+        propagation_body_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        v_out: wp.array[float],
+    ):
+        tile, _t = wp.tid()
+        propagation_cached_gemv_native(
+            tile,
+            world_count,
+            cache_world_flag,
+            propagation_body_count,
+            propagation_body_list,
+            art_eligible,
+            body_to_articulation,
+            articulation_start,
+            joint_qd_start,
+            propagation_cache_R,
+            propagation_cache_B,
+            propagation_cache_qd_base,
+            propagation_body_impulses,
+            propagation_body_qd,
+            v_out,
+        )
+
+    name = f"propagation_cached_gemv_c{C}_d{MAXD}_w{W}"
+    propagation_cached_gemv_template.__name__ = name
+    propagation_cached_gemv_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(propagation_cached_gemv_template)
 
 
 @cache
