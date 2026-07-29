@@ -95,6 +95,10 @@ def _build_model(device: str, *, base_z: float, contact_sphere: str | None, grou
 
 
 def _make_solver(model: newton.Model, response: str) -> SolverFeatherPGS:
+    # propagation_cached_response=False pins the per-iteration tree-walk
+    # propagation path this file compares (warp vs serial variants). The
+    # cached-response GEMV replacement has its own equivalence gate in
+    # test_feather_pgs_propagation_cached_response.py.
     return SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
@@ -102,6 +106,7 @@ def _make_solver(model: newton.Model, response: str) -> SolverFeatherPGS:
         pgs_iterations=8,
         pgs_warmstart=False,
         mf_warmstart=False,
+        propagation_cached_response=False,
     )
 
 
