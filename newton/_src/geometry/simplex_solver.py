@@ -316,6 +316,7 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
         position_b: wp.vec3,
         extend: float,
         data_provider: Any,
+        max_dist: float = 0.0,
         MAX_ITER: int = 30,
         COLLIDE_EPSILON: float = 1e-4,
     ) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float]:
@@ -336,6 +337,13 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
             position_b: Position of shape B relative to shape A
             extend: Contact offset extension (sum of contact offsets)
             data_provider: Support mapping data provider
+            max_dist: Separation cutoff [m]. When positive, iteration stops as
+                soon as a support plane proves the shapes are separated by more
+                than this distance; the returned distance is then an upper
+                bound on the true distance that still exceeds ``max_dist``, and
+                the witness points are the current (unrefined) simplex estimate.
+                ``0.0`` (default) disables the cutoff and computes the exact
+                closest distance.
             MAX_ITER: Maximum number of GJK iterations (default: 30)
             COLLIDE_EPSILON: Convergence threshold for distance computation (default: 1e-4)
 
@@ -389,6 +397,14 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
             # Check for convergence using Frank-Wolfe duality gap
             # Use BtoA directly (Minkowski difference)
             w_v = w.BtoA
+            # Separation cutoff: the support plane orthogonal to the search
+            # direction lower-bounds the true distance by dot(v, w_v)/|v|.
+            # Once that exceeds max_dist the caller's contact threshold can
+            # never be met, so stop refining; the post-loop exit returns
+            # |v| >= true distance > max_dist, keeping the caller's
+            # distance-vs-threshold test consistent.
+            if max_dist > 0.0 and wp.dot(v, w_v) > max_dist * wp.sqrt(dist_sq):
+                break
             delta_dist = wp.dot(v, v - w_v)
             if delta_dist < COLLIDE_EPSILON * wp.sqrt(dist_sq):
                 break
@@ -532,6 +548,7 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
             relative_position_b,
             combined_margin,
             data_provider,
+            0.0,  # max_dist: exact distance query, no separation cutoff
             MAX_ITER,
             COLLIDE_EPSILON,
         )
