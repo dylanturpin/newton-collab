@@ -299,31 +299,44 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertTrue(np.isfinite(state_1.joint_qd.numpy()).all())
 
     def test_fuse_joint_velocity_limits_validation(self):
+        # fuse_joint_velocity_limits defaults to True but only engages in the
+        # matrix_free + physx_pgs + velocity-limits formulation; anywhere else
+        # it must be silently inert (no error), so the default doesn't
+        # constrain unrelated solver modes.
         model = _build_chain_model(num_links=2, num_worlds=1)
         for kwargs in (
             {},  # neither matrix_free nor velocity limits nor physx drive
             {"pgs_mode": "matrix_free", "drive_mode": "physx_pgs"},  # no velocity limits
         ):
             with self.subTest(kwargs=kwargs):
-                with self.assertRaisesRegex(ValueError, "fuse_joint_velocity_limits"):
-                    SolverFeatherPGS(model, fuse_joint_velocity_limits=True, **kwargs)
+                solver = SolverFeatherPGS(model, fuse_joint_velocity_limits=True, **kwargs)
+                self.assertFalse(solver.fuse_joint_velocity_limits)
         if wp.is_cuda_available():
-            # drive_mode='augmented' with velocity limits enabled is rejected too
+            # drive_mode='augmented' with velocity limits enabled is inert too
             # (matrix_free construction requires CUDA).
-            with self.assertRaisesRegex(ValueError, "fuse_joint_velocity_limits"):
-                SolverFeatherPGS(
-                    model,
-                    pgs_mode="matrix_free",
-                    enable_joint_velocity_limits=True,
-                    drive_mode="augmented",
-                    fuse_joint_velocity_limits=True,
-                )
+            solver = SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                enable_joint_velocity_limits=True,
+                drive_mode="augmented",
+                fuse_joint_velocity_limits=True,
+            )
+            self.assertFalse(solver.fuse_joint_velocity_limits)
+            # The applicable combination engages by default (no kwarg passed).
+            solver = SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                enable_joint_velocity_limits=True,
+                drive_mode="physx_pgs",
+            )
+            self.assertTrue(solver.fuse_joint_velocity_limits)
             # Velocity iterations with frozen drive rows would skip the fused
             # clamp entirely (the clamp rides the drive-row visit and driven
-            # DOFs have no dedicated vel-limit rows); must raise, directing to
+            # DOFs would have no dedicated vel-limit rows); must warn and fall
+            # back to the dedicated rows, directing to
             # pgs_velocity_drive_mode="active".
-            with self.assertRaisesRegex(ValueError, "pgs_velocity_drive_mode"):
-                SolverFeatherPGS(
+            with self.assertWarnsRegex(UserWarning, "pgs_velocity_drive_mode"):
+                solver = SolverFeatherPGS(
                     model,
                     pgs_mode="matrix_free",
                     enable_joint_velocity_limits=True,
@@ -332,9 +345,10 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                     pgs_velocity_iterations=2,
                     pgs_velocity_drive_mode="freeze",
                 )
+            self.assertFalse(solver.fuse_joint_velocity_limits)
             # The "active" drive mode is the documented escape hatch: same
-            # combination with pgs_velocity_drive_mode="active" constructs.
-            SolverFeatherPGS(
+            # combination with pgs_velocity_drive_mode="active" keeps fusion.
+            solver = SolverFeatherPGS(
                 model,
                 pgs_mode="matrix_free",
                 enable_joint_velocity_limits=True,
@@ -343,6 +357,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 pgs_velocity_iterations=2,
                 pgs_velocity_drive_mode="active",
             )
+            self.assertTrue(solver.fuse_joint_velocity_limits)
 
     @unittest.skipUnless(wp.is_cuda_available(), "fused velocity-limit clamp requires CUDA")
     def test_fuse_joint_velocity_limits_clamps_driven_dofs_without_rows(self):
