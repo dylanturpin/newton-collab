@@ -17,6 +17,7 @@ import json
 import os
 import re
 import time
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
@@ -521,7 +522,7 @@ class SolverFeatherPGS(SolverBase):
         joint_limit_activation_gap: float = float("inf"),
         enable_joint_velocity_limits: bool = False,
         velocity_limit_activation_fraction: float = 0.0,
-        fuse_joint_velocity_limits: bool = False,
+        fuse_joint_velocity_limits: bool = True,
         pgs_iterations: int = 12,
         pgs_velocity_iterations: int = 0,
         pgs_beta: float = 0.2,
@@ -652,14 +653,21 @@ class SolverFeatherPGS(SolverBase):
                 drive/position-limit phase (row phase 3) rather than the final velocity-limit
                 phase (row phase 5); this matches PhysX's default ``eBEFORE_STATIC`` drive
                 ordering. The fused clamp also skips driven DOFs in the PhysX-style pre-solve
-                velocity prescale ratio. Only valid together with ``pgs_mode="matrix_free"``,
-                ``enable_joint_velocity_limits=True``, and ``drive_mode="physx_pgs"``; any
-                other combination raises :class:`ValueError`. Because the fused clamp lives
+                velocity prescale ratio. Requires ``model.joint_velocity_limit`` to be
+                allocated; when it is absent the flag is inert (the dedicated-row path
+                skips allocation without that array too, so behavior matches). The fused clamp only applies to the
+                ``pgs_mode="matrix_free"`` + ``enable_joint_velocity_limits=True`` +
+                ``drive_mode="physx_pgs"`` formulation; in any other configuration the flag
+                is inert and velocity limits keep their dedicated rows (no error — this lets
+                the flag default to True without constraining unrelated solver modes).
+                Because the fused clamp lives
                 inside the drive-row visit, combining it with ``pgs_velocity_iterations > 0``
                 requires ``pgs_velocity_drive_mode="active"``: with ``"freeze"`` the frozen
                 drive rows are skipped wholesale during velocity iterations and driven DOFs
                 (which no longer have dedicated vel-limit rows) would silently miss their
-                clamp; that combination raises :class:`ValueError` too. Defaults to False.
+                clamp; that combination downgrades to the dedicated rows with a
+                :class:`UserWarning` (pass ``pgs_velocity_drive_mode="active"`` to keep the
+                fused clamp). Defaults to True.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_velocity_iterations (int, optional): Additional matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
@@ -682,9 +690,10 @@ class SolverFeatherPGS(SolverBase):
                 iterations. ``"freeze"`` keeps PhysX-style drive impulses from the biased position
                 solve and lets only contacts, friction, and limits clean up velocity residuals;
                 ``"active"`` continues updating drive rows during the velocity-only pass.
-                ``"freeze"`` is incompatible with ``fuse_joint_velocity_limits=True`` when
+                ``"freeze"`` disables ``fuse_joint_velocity_limits`` when
                 ``pgs_velocity_iterations > 0`` (the fused clamp rides the drive-row visit,
-                which freeze skips). Defaults to ``"freeze"``.
+                which freeze skips; dedicated rows are used instead, with a warning).
+                Defaults to ``"freeze"``.
             dense_max_constraints (int, optional): Maximum number of dense (articulation) contact constraint
                 rows stored per world. Free rigid body contacts are stored separately, bounded by
                 mf_max_constraints. Defaults to 32.
@@ -970,31 +979,39 @@ class SolverFeatherPGS(SolverBase):
         if drive_mode == "physx_pgs" and self.pgs_mode != "matrix_free":
             raise NotImplementedError("drive_mode='physx_pgs' currently requires pgs_mode='matrix_free'")
         self.drive_mode = drive_mode
-        self.fuse_joint_velocity_limits = bool(fuse_joint_velocity_limits)
-        if self.fuse_joint_velocity_limits and (
-            self.pgs_mode != "matrix_free" or not self.enable_joint_velocity_limits or self.drive_mode != "physx_pgs"
-        ):
-            raise ValueError(
-                "fuse_joint_velocity_limits=True requires pgs_mode='matrix_free', "
-                "enable_joint_velocity_limits=True, and drive_mode='physx_pgs'; got "
-                f"pgs_mode={self.pgs_mode!r}, enable_joint_velocity_limits={self.enable_joint_velocity_limits!r}, "
-                f"drive_mode={self.drive_mode!r}"
-            )
+        # fuse_joint_velocity_limits defaults to True but is an
+        # engage-where-applicable request, not a demand: the fused clamp only
+        # exists in the matrix_free + physx_pgs + velocity-limits formulation
+        # (and needs model.joint_velocity_limit), so any other configuration
+        # keeps its dedicated rows silently instead of erroring.
+        _fuse_applicable = (
+            self.pgs_mode == "matrix_free"
+            and self.enable_joint_velocity_limits
+            and self.drive_mode == "physx_pgs"
+            and getattr(model, "joint_velocity_limit", None) is not None
+        )
         if (
-            self.fuse_joint_velocity_limits
+            fuse_joint_velocity_limits
+            and _fuse_applicable
             and self.pgs_velocity_iterations > 0
             and self.pgs_velocity_drive_mode == "freeze"
         ):
             # The fused clamp is applied inside the drive-row visit; "freeze"
             # skips drive rows wholesale during the velocity-only post-pass, and
-            # driven DOFs no longer have dedicated vel-limit rows, so their
-            # velocity limits would silently go unenforced there.
-            raise ValueError(
-                "fuse_joint_velocity_limits=True with pgs_velocity_iterations > 0 requires "
-                'pgs_velocity_drive_mode="active": the fused velocity-limit clamp runs inside '
-                "the drive-row visit, which pgs_velocity_drive_mode='freeze' skips during "
-                "velocity iterations, leaving driven DOFs unclamped."
+            # driven DOFs would no longer have dedicated vel-limit rows, so
+            # their velocity limits would silently go unenforced there. Fall
+            # back to the dedicated rows (which enforce correctly under freeze)
+            # rather than erroring out of a default-on flag.
+            warnings.warn(
+                "fuse_joint_velocity_limits with pgs_velocity_iterations > 0 and "
+                "pgs_velocity_drive_mode='freeze' would leave driven DOFs unclamped during "
+                "velocity iterations (the fused clamp rides the drive-row visit, which "
+                "'freeze' skips); using dedicated velocity-limit rows instead. Pass "
+                "pgs_velocity_drive_mode='active' to keep the fused clamp.",
+                stacklevel=2,
             )
+            _fuse_applicable = False
+        self.fuse_joint_velocity_limits = bool(fuse_joint_velocity_limits) and _fuse_applicable
         self.rigid_body_max_linear_velocity = getattr(model, "rigid_body_max_linear_velocity", None)
         self.rigid_body_max_angular_velocity = getattr(model, "rigid_body_max_angular_velocity", None)
         self.rigid_body_max_depenetration_velocity = getattr(model, "rigid_body_max_depenetration_velocity", None)
