@@ -35,6 +35,8 @@ newton.utils
    create_straight_cable_points_and_quaternions
    download_asset
    event_scope
+   filter_static_self_collision_pairs
+   find_static_self_collision_filters
    load_texture
    normalize_texture
    plot_graph

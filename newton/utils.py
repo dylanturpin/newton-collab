@@ -86,6 +86,19 @@ __all__ += [
 ]
 
 # ==================================================================================
+# self-collision filtering
+# ==================================================================================
+from ._src.utils.self_collision_filter import (  # noqa: E402
+    filter_static_self_collision_pairs,
+    find_static_self_collision_filters,
+)
+
+__all__ += [
+    "filter_static_self_collision_pairs",
+    "find_static_self_collision_filters",
+]
+
+# ==================================================================================
 # asset management
 # ==================================================================================
 from ._src.utils.download_assets import download_asset  # noqa: E402
