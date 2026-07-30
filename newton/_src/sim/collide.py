@@ -233,11 +233,25 @@ def compute_shape_aabbs(
     geom_scale = scale
 
     if is_infinite_plane:
-        # Bounding sphere fallback for infinite planes
-        radius = shape_collision_radius[shape_id]
-        half_extents = wp.vec3(radius, radius, radius)
-        aabb_lower[shape_id] = pos - half_extents - margin_vec
-        aabb_upper[shape_id] = pos + half_extents + margin_vec
+        # Half-space AABB: unbounded except along world axes the plane normal
+        # aligns with, where the solid side is clamped at the surface. For an
+        # axis-aligned plane this makes AABB overlap equivalent to the exact
+        # half-space proximity test, so shapes far above the ground stop being
+        # broad-phase candidates. Tilted planes keep unbounded extents on
+        # non-aligned axes (conservative, matches the old always-overlap
+        # behavior in the worst case).
+        normal = wp.quat_rotate(orientation, wp.vec3(0.0, 0.0, 1.0))
+        plane_d = wp.dot(normal, pos)
+        HALF_SPACE_EXTENT = 1.0e10
+        lo = wp.vec3(-HALF_SPACE_EXTENT, -HALF_SPACE_EXTENT, -HALF_SPACE_EXTENT)
+        hi = wp.vec3(HALF_SPACE_EXTENT, HALF_SPACE_EXTENT, HALF_SPACE_EXTENT)
+        for i in range(3):
+            if normal[i] >= 0.999999:
+                hi[i] = plane_d + effective_gap
+            elif normal[i] <= -0.999999:
+                lo[i] = -plane_d - effective_gap
+        aabb_lower[shape_id] = lo
+        aabb_upper[shape_id] = hi
     elif has_local_aabb:
         # Pre-computed local AABB transformed to world space.
         # Scale is already baked into shape_collision_aabb by the builder,
