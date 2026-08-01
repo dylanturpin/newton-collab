@@ -1459,7 +1459,9 @@ class SolverFeatherPGS(SolverBase):
                 continue
             if not self._propagation_tree_has_non_free_by_size.get(size_i, True):
                 continue
-            if self._propagation_tree_single_dof_by_size.get(size_i, False) or self._propagation_tree_free_root_by_size.get(size_i, False):
+            if self._propagation_tree_single_dof_by_size.get(
+                size_i, False
+            ) or self._propagation_tree_free_root_by_size.get(size_i, False):
                 return True
         return False
 
@@ -2306,7 +2308,9 @@ class SolverFeatherPGS(SolverBase):
         self._max_contacts_alloc = max_contacts
         self.contact_world = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_slot = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self.contact_slots_needed = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.contact_slots_needed = wp.zeros(
+            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
@@ -3235,11 +3239,7 @@ class SolverFeatherPGS(SolverBase):
         self._propagation_fused_worlds_per_block = 1
         self._pgs_solve_propagation_colored_block_kernel = None
         self._propagation_colored_block_dim = 64
-        if (
-            model.device.is_cuda
-            and self._propagation_colored
-            and self.propagation_max_constraints > 0
-        ):
+        if model.device.is_cuda and self._propagation_colored and self.propagation_max_constraints > 0:
             self._pgs_solve_propagation_colored_block_kernel = _get_pgs_solve_propagation_colored_block_kernel(
                 self.propagation_max_constraints,
                 PROPAGATION_COLOR_TAIL + 2,
@@ -3254,15 +3254,13 @@ class SolverFeatherPGS(SolverBase):
             self._propagation_colored_worlds_per_block = wpb
             # per-warp staging: 48B/body/world; keep total static shared under ~44KB
             if lanes in (1, 2, 4, 8, 16, 32) and wpb >= 1 and mb * wpb * 48 <= 45056:
-                self._pgs_solve_propagation_colored_warp_kernel = (
-                    _get_pgs_solve_propagation_colored_warp_kernel(
-                        self.propagation_max_constraints,
-                        PROPAGATION_COLOR_TAIL + 2,
-                        mb,
-                        lanes,
-                        wpb,
-                        device_arch,
-                    )
+                self._pgs_solve_propagation_colored_warp_kernel = _get_pgs_solve_propagation_colored_warp_kernel(
+                    self.propagation_max_constraints,
+                    PROPAGATION_COLOR_TAIL + 2,
+                    mb,
+                    lanes,
+                    wpb,
+                    device_arch,
                 )
             self._color_propagation_prebuild_kernel = _get_color_propagation_prebuild_kernel(
                 self.propagation_max_constraints,
@@ -3395,16 +3393,14 @@ class SolverFeatherPGS(SolverBase):
                 if warps <= 0:
                     continue
                 self._cached_response_block_dim_by_size[size_i] = 32 * warps
-                self._cached_response_tree_warp_kernels_by_size[size_i] = (
-                    _get_propagation_tree_cached_response_kernel(
-                        size_i,
-                        group_max_joints[size_i],
-                        self.max_propagation_bodies,
-                        self.propagation_cache_max_bodies,
-                        self.propagation_response_max_dofs,
-                        device_arch,
-                        has_free_root=not single_dof,
-                    )
+                self._cached_response_tree_warp_kernels_by_size[size_i] = _get_propagation_tree_cached_response_kernel(
+                    size_i,
+                    group_max_joints[size_i],
+                    self.max_propagation_bodies,
+                    self.propagation_cache_max_bodies,
+                    self.propagation_response_max_dofs,
+                    device_arch,
+                    has_free_root=not single_dof,
                 )
             if any(k is not None for k in self._cached_response_tree_warp_kernels_by_size.values()):
                 self._propagation_cached_response_active = True
@@ -4138,7 +4134,6 @@ class SolverFeatherPGS(SolverBase):
                     ],
                     device=self.model.device,
                 )
-
 
     def _propagation_pgs_solve_colored_iteration(
         self,
@@ -6791,10 +6786,7 @@ class SolverFeatherPGS(SolverBase):
                     device=model.device,
                 )
 
-            if (
-                propagation_active
-                and self._propagation_colored
-            ):
+            if propagation_active and self._propagation_colored:
                 # v4 pre-build coloring: gather propagation contacts into
                 # per-world unit lists, color them, and rewrite contact_slot
                 # in color-sorted order so the row builder below writes every
@@ -10739,7 +10731,6 @@ def _get_pgs_solve_propagation_colored_block_kernel(
             }}
 """
 
-
     unit_solve_body_staged = f"""
             for (int rr = 0; ; ++rr) {{
                 const int slot = start_slot + rr;
@@ -11009,7 +11000,6 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     pgs_solve_propagation_colored_block_template.__name__ = name
     pgs_solve_propagation_colored_block_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_colored_block_template)
-
 
 
 def _get_pgs_solve_propagation_contact_kernel(
