@@ -1470,6 +1470,100 @@ def update_qdd_from_velocity(
         joint_qdd[tid] = (v_new[tid] - joint_qd[tid]) * inv_dt
 
 
+@wp.kernel
+def advance_frozen_row_errors(
+    world_constraint_count: wp.array[int],
+    max_constraints: int,
+    world_dof_indices: wp.array2d[int],
+    max_world_dofs: int,
+    world_row_type: wp.array2d[int],
+    world_J: wp.array3d[float],
+    v_out: wp.array[float],
+    dt: float,
+    # in/out
+    world_phi: wp.array2d[float],
+    world_drive_geom_error: wp.array2d[float],
+):
+    """Advance dense-row position errors by ``dt * J*v`` on a frozen basis.
+
+    Inner-substep (TGS-style) error re-measurement: with the manifold, row
+    Jacobians, and mass factorization frozen for the whole step, the row
+    position error evolves exactly as ``d(phi)/dt = J*qd`` to first order in
+    the frozen J. Contacts and joint limits store phi measured along J
+    (``phi += dt*J*v``); drive rows store ``geom_error = target - q`` with a
+    unit J on the dof (``geom_error -= dt*J*v``). Friction and velocity-limit
+    rows carry no position error.
+    """
+    tid = wp.tid()
+    world = tid // max_constraints
+    i = tid % max_constraints
+    if i >= world_constraint_count[world]:
+        return
+
+    row_type = world_row_type[world, i]
+    is_position_row = row_type == PGS_CONSTRAINT_TYPE_CONTACT or row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+    is_drive_row = row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET
+    if not (is_position_row or is_drive_row):
+        return
+
+    jv = float(0.0)
+    for d in range(max_world_dofs):
+        global_dof = world_dof_indices[world, d]
+        if global_dof >= 0:
+            jv += world_J[world, i, d] * v_out[global_dof]
+
+    if is_position_row:
+        world_phi[world, i] += dt * jv
+    else:
+        world_drive_geom_error[world, i] -= dt * jv
+
+
+@wp.kernel
+def advance_frozen_mf_phi(
+    mf_constraint_count: wp.array[int],
+    mf_max_constraints: int,
+    world_dof_indices: wp.array2d[int],
+    mf_row_type: wp.array2d[int],
+    mf_J_a: wp.array3d[float],
+    mf_J_b: wp.array3d[float],
+    mf_dof_a: wp.array2d[int],
+    mf_dof_b: wp.array2d[int],
+    v_out: wp.array[float],
+    dt: float,
+    # in/out
+    mf_phi: wp.array2d[float],
+):
+    """Advance MF contact-row phi by ``dt * J*v`` on a frozen basis.
+
+    Matrix-free counterpart of :func:`advance_frozen_row_errors` for
+    free-rigid contact rows. Velocity-limit MF rows store a velocity bound in
+    ``mf_phi`` and must not be advanced.
+    """
+    tid = wp.tid()
+    world = tid // mf_max_constraints
+    i = tid % mf_max_constraints
+    if i >= mf_constraint_count[world]:
+        return
+    if mf_row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
+        return
+
+    jv = float(0.0)
+    dof_a = mf_dof_a[world, i]
+    if dof_a >= 0:
+        for k in range(6):
+            global_dof = world_dof_indices[world, dof_a + k]
+            if global_dof >= 0:
+                jv += mf_J_a[world, i, k] * v_out[global_dof]
+    dof_b = mf_dof_b[world, i]
+    if dof_b >= 0:
+        for k in range(6):
+            global_dof = world_dof_indices[world, dof_b + k]
+            if global_dof >= 0:
+                jv += mf_J_b[world, i, k] * v_out[global_dof]
+
+    mf_phi[world, i] += dt * jv
+
+
 @wp.func
 def contact_tangent_basis(n: wp.vec3):
     # pick an arbitrary perpendicular vector and orthonormalize
