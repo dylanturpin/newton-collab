@@ -1217,10 +1217,29 @@ class SolverFeatherPGS(SolverBase):
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
-        """Refresh cached dynamics data after body flags or joint armature change."""
+        """Refresh cached dynamics data after body, joint, or inertial model changes."""
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
             self._update_kinematic_state()
             self._scatter_armature_to_groups()
+            self._mass_update_requested.fill_(1)
+        if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:
+            # Re-derive the buffers baked from body_com/body_mass/body_inertia
+            # in _allocate_common_buffers so runtime CoM/mass randomization
+            # reaches FK and the articulated inertia.
+            wp.launch(
+                compute_spatial_inertia,
+                self.model.body_count,
+                inputs=[self.model.body_inertia, self.model.body_mass],
+                outputs=[self.body_I_m],
+                device=self.model.device,
+            )
+            wp.launch(
+                compute_com_transforms,
+                self.model.body_count,
+                inputs=[self.model.body_com],
+                outputs=[self.body_X_com],
+                device=self.model.device,
+            )
             self._mass_update_requested.fill_(1)
 
     @override
