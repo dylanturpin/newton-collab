@@ -17,7 +17,6 @@ import json
 import os
 import re
 import time
-import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
@@ -638,17 +637,21 @@ class SolverFeatherPGS(SolverBase):
                 NaN. Defaults to ``0.0``.
             fuse_joint_velocity_limits (bool, optional): Enforce joint velocity limits of
                 *driven* DOFs (``drive_slot[dof] >= 0``, i.e. ``joint_target_ke/kd > 0``) as a
-                stateless clamp fused into the PhysX drive-row visit instead of two dedicated
-                dense rows per DOF. This mirrors PhysX's ``PxClamp`` on ``jointV`` inside the
-                per-DOF drive constraint (``DyFeatherstoneArticulation.cpp``): after the drive
-                impulse, if ``|jointV| > maxJointVel`` an extra impulse
-                ``(clamp(jointV) - jointV) * recipResponse`` is applied in the same visit —
-                no accumulated lambda, no relaxation, no Baumgarte. DOFs with a velocity limit
-                but no drive row keep their dedicated fallback rows. Behavior difference vs.
-                the dedicated rows: for driven DOFs the limit is enforced during the
-                drive/position-limit phase (row phase 3) rather than the final velocity-limit
-                phase (row phase 5); this matches PhysX's default ``eBEFORE_STATIC`` drive
-                ordering. The fused clamp also skips driven DOFs in the PhysX-style pre-solve
+                stateless clamp instead of two dedicated dense rows per DOF. This mirrors
+                PhysX's ``PxClamp`` on ``jointV`` (``DyFeatherstoneArticulation.cpp``): if
+                ``|jointV| > maxJointVel`` an extra impulse
+                ``(clamp(jointV) - jointV) * recipResponse`` is applied — no accumulated
+                lambda, no relaxation, no Baumgarte. DOFs with a velocity limit
+                but no drive row keep their dedicated fallback rows. The clamp runs at the
+                end of every PGS iteration, after the contact rows — the position the
+                dedicated velocity-limit rows it replaces own — so the limit keeps the
+                last word of each iteration even when the sweep is under-converged. That
+                is the ordering PhysX documents for gripping scenarios
+                (``PxSceneFlag::eSOLVE_ARTICULATION_CONTACT_LAST`` /
+                ``VelLimit::eAFTER_STATIC_CONSTRAINTS``); clamping inside the drive-row
+                visit instead would let contact impulses landing later in the iteration
+                push driven DOFs past their limits with nothing left to re-clamp them.
+                The fused clamp also skips driven DOFs in the PhysX-style pre-solve
                 velocity prescale ratio. Requires ``model.joint_velocity_limit`` to be
                 allocated; when it is absent the flag is inert (the dedicated-row path
                 skips allocation without that array too, so behavior matches). The flag is
@@ -659,15 +662,10 @@ class SolverFeatherPGS(SolverBase):
                 ``pgs_mode="matrix_free"`` + ``enable_joint_velocity_limits=True`` +
                 ``drive_mode="physx_pgs"`` formulation; in any other configuration the flag
                 is inert and velocity limits keep their dedicated rows (no error — the flag
-                is an engage-where-applicable request, not a demand).
-                Because the fused clamp lives
-                inside the drive-row visit, combining it with ``pgs_velocity_iterations > 0``
-                requires ``pgs_velocity_drive_mode="active"``: with ``"freeze"`` the frozen
-                drive rows are skipped wholesale during velocity iterations and driven DOFs
-                (which no longer have dedicated vel-limit rows) would silently miss their
-                clamp; that combination downgrades to the dedicated rows with a
-                :class:`UserWarning` (pass ``pgs_velocity_drive_mode="active"`` to keep the
-                fused clamp). Defaults to False.
+                is an engage-where-applicable request, not a demand). The clamp pass is
+                independent of the drive-row visit, so it stays active during velocity-only
+                iterations under ``pgs_velocity_drive_mode="freeze"``, exactly like the
+                dedicated rows it replaces. Defaults to False.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_velocity_iterations (int, optional): Additional matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
@@ -690,9 +688,6 @@ class SolverFeatherPGS(SolverBase):
                 iterations. ``"freeze"`` keeps PhysX-style drive impulses from the biased position
                 solve and lets only contacts, friction, and limits clean up velocity residuals;
                 ``"active"`` continues updating drive rows during the velocity-only pass.
-                ``"freeze"`` disables ``fuse_joint_velocity_limits`` when
-                ``pgs_velocity_iterations > 0`` (the fused clamp rides the drive-row visit,
-                which freeze skips; dedicated rows are used instead, with a warning).
                 Defaults to ``"freeze"``.
             dense_max_constraints (int, optional): Maximum number of dense (articulation) contact constraint
                 rows stored per world. Free rigid body contacts are stored separately, bounded by
@@ -969,27 +964,6 @@ class SolverFeatherPGS(SolverBase):
             and not np.isinf(self.velocity_limit_activation_fraction)
             and getattr(model, "joint_velocity_limit", None) is not None
         )
-        if (
-            fuse_joint_velocity_limits
-            and _fuse_applicable
-            and self.pgs_velocity_iterations > 0
-            and self.pgs_velocity_drive_mode == "freeze"
-        ):
-            # The fused clamp is applied inside the drive-row visit; "freeze"
-            # skips drive rows wholesale during the velocity-only post-pass, and
-            # driven DOFs would no longer have dedicated vel-limit rows, so
-            # their velocity limits would silently go unenforced there. Fall
-            # back to the dedicated rows (which enforce correctly under freeze)
-            # rather than erroring out of a default-on flag.
-            warnings.warn(
-                "fuse_joint_velocity_limits with pgs_velocity_iterations > 0 and "
-                "pgs_velocity_drive_mode='freeze' would leave driven DOFs unclamped during "
-                "velocity iterations (the fused clamp rides the drive-row visit, which "
-                "'freeze' skips); using dedicated velocity-limit rows instead. Pass "
-                "pgs_velocity_drive_mode='active' to keep the fused clamp.",
-                stacklevel=2,
-            )
-            _fuse_applicable = False
         self.fuse_joint_velocity_limits = bool(fuse_joint_velocity_limits) and _fuse_applicable
         self.rigid_body_max_linear_velocity = getattr(model, "rigid_body_max_linear_velocity", None)
         self.rigid_body_max_angular_velocity = getattr(model, "rigid_body_max_angular_velocity", None)
@@ -1424,6 +1398,12 @@ class SolverFeatherPGS(SolverBase):
         if row_phase == 5:
             if np.isinf(self.velocity_limit_activation_fraction):
                 return False
+            if self.fuse_joint_velocity_limits:
+                # The fused end-of-iteration clamp revisits the drive-row
+                # prefix during the phase-5 launch, so the phase has work
+                # even when every limited DOF is driven and no dedicated
+                # velocity-limit row was allocated.
+                return True
             has_joint_velocity_rows = (
                 self.enable_joint_velocity_limits and getattr(self, "velocity_limit_slot", None) is not None
             )
@@ -10917,32 +10897,57 @@ def _get_pgs_solve_propagation_contact_kernel(
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_template)
 
 
-# Fused PhysX-style joint velocity clamp (fuse_joint_velocity_limits), shared
-# verbatim by _get_pgs_solve_mf_gs_kernel and
-# _get_pgs_solve_propagation_full_iteration_kernel. Mirrors
-# DyFeatherstoneArticulation.cpp: in the same per-DOF drive visit, right after
-# the drive impulse, deltaF = (PxClamp(jointV, -maxV, maxV) - jointV) *
-# recipResponse. A drive row's Jacobian is e_i, so this row's `jv` IS the
-# DOF's joint velocity and `denom` (= J M^-1 J^T + cfm, with cfm == 0 for
-# drive rows; denom > 0 is guaranteed by the guard above the insertion point)
-# is PhysX's unitResponse: the post-drive joint velocity is
-# jv + delta_impulse * denom, and dividing the overshoot by denom is the
-# recipResponse multiply. The correction is folded ONLY into the applied
-# delta_impulse (the velocity update), never into the persistent drive lambda:
-# PhysX does not accumulate the clamp deltaF, and folding it into lambda would
-# decay it through drive_impulse_multiplier and re-clamp it against maxForce
-# on the next visit. Inserted right after `delta_impulse = new_impulse -
-# old_impulse;` inside the drive-row (row_type == 1) projection.
-_FVL_DRIVE_CLAMP_SNIPPET = """\
-                // Fused stateless velocity clamp: applied to delta_impulse
-                // only, NOT accumulated into the drive lambda (see
-                // _FVL_DRIVE_CLAMP_SNIPPET).
-                float jv_after = jv + delta_impulse * denom;
-                float qdot_max = s_drive_vel_limit_dense[i];
-                if (fabsf(jv_after) > qdot_max) {
-                    float fvl_target = fminf(fmaxf(jv_after, -qdot_max), qdot_max);
-                    delta_impulse += (fvl_target - jv_after) / denom;
+# Fused PhysX-style joint velocity clamp (fuse_joint_velocity_limits) for the
+# propagation full-iteration kernel; _get_pgs_solve_mf_gs_kernel carries the
+# same pass in its own f-string idiom (packed s_meta_dense, deferred-response
+# masking). Mirrors DyFeatherstoneArticulation.cpp:
+# deltaF = (PxClamp(jointV, -maxV, maxV) - jointV) * recipResponse. A drive
+# row's Jacobian is e_i, so its J·v IS the DOF's joint velocity and its diag
+# (= J M^-1 J^T + cfm, with cfm == 0 for drive rows) is PhysX's unitResponse.
+# The pass runs once per iteration AFTER every contact phase — the position
+# the dedicated velocity-limit rows it replaces own — so the limit keeps the
+# last word even when the sweep is under-converged. That is the ordering
+# PhysX documents for gripping scenarios
+# (PxSceneFlag::eSOLVE_ARTICULATION_CONTACT_LAST /
+# VelLimit::eAFTER_STATIC_CONSTRAINTS); clamping inside the drive-row visit
+# instead lets contact impulses landing later in the same iteration push
+# driven DOFs past their limits with nothing left to re-clamp them. The
+# correction is velocity-only, never accumulated into the drive lambda:
+# PhysX does not accumulate the clamp deltaF, and folding it into lambda
+# would decay it through drive_impulse_multiplier and re-clamp it against
+# maxForce on the next visit. Substituted at //FVL_LAST_CLAMP, at the end of
+# the per-iteration phase_stage loop.
+_FVL_LAST_WORD_CLAMP_SNIPPET = """\
+        // Fused stateless velocity clamp on driven DOFs, run after all
+        // contact phases of this iteration (see _FVL_LAST_WORD_CLAMP_SNIPPET).
+        {
+            const int drive_hi_fvl = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+            for (int i = 0; i < drive_hi_fvl; ++i) {
+                if (s_rtype_dense[i] != 1) continue;
+                const float qdot_max_fvl = s_drive_vel_limit_dense[i];
+                const float denom_fvl = s_diag_dense[i];
+                if (denom_fvl <= 0.0f) continue;
+
+                const int row_base_fvl = jy_world_base + i * __D__;
+                float my_sum_fvl = 0.0f;
+                for (int d = lane; d < __D__; d += 32) {
+                    my_sum_fvl += J_world.data[row_base_fvl + d] * s_v[d];
                 }
+                for (int shfl = 16; shfl > 0; shfl >>= 1) {
+                    my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, shfl);
+                }
+                const float jv_fvl = __shfl_sync(MASK, my_sum_fvl, 0);
+
+                if (fabsf(jv_fvl) > qdot_max_fvl) {
+                    const float delta_fvl =
+                        (fminf(fmaxf(jv_fvl, -qdot_max_fvl), qdot_max_fvl) - jv_fvl) / denom_fvl;
+                    for (int d = lane; d < __D__; d += 32) {
+                        s_v[d] += Y_world.data[row_base_fvl + d] * delta_fvl;
+                    }
+                }
+                __syncwarp(MASK);
+            }
+        }
 """
 
 
@@ -10967,8 +10972,9 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     those phases and only writes it back at the end.
 
     ``fuse_vel_limits`` compiles the PhysX-style stateless joint-velocity
-    clamp into the drive-row projection (``_FVL_DRIVE_CLAMP_SNIPPET``, shared
-    with the MF-GS kernel). The ``world_drive_vel_limit`` per-row parameter is
+    clamp as an end-of-iteration pass over the drive-row prefix
+    (``_FVL_LAST_WORD_CLAMP_SNIPPET``; the MF-GS kernel carries the same pass
+    in its own idiom). The ``world_drive_vel_limit`` per-row parameter is
     always present in the signature — launch sites pass the solver's
     ``drive_vel_limit`` array, a (1, 1) dummy when the feature is off — and
     the flag only gates the clamp code emission, so the generated source with
@@ -11127,7 +11133,6 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     if (new_impulse > max_imp) new_impulse = max_imp;
                     if (new_impulse < -max_imp) new_impulse = -max_imp;
                     delta_impulse = new_impulse - old_impulse;
-//FVL_CLAMP
                 } else if (row_type == 4) {
                     if (residual < 0.0f) {
                         delta_impulse = delta;
@@ -11704,6 +11709,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                 }
             }
         }
+//FVL_LAST_CLAMP
     }
 
     for (int d = lane; d < __D__; d += 32) {
@@ -11719,14 +11725,14 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
 """
 
     if fuse_vel_limits:
-        # Fused PhysX-style joint velocity clamp: same shared staging and
-        # drive-visit math as the MF-GS kernel variant; the clamp body is the
-        # shared _FVL_DRIVE_CLAMP_SNIPPET constant.
+        # Fused PhysX-style joint velocity clamp: same shared staging as the
+        # MF-GS kernel variant; the end-of-iteration clamp body is the shared
+        # _FVL_LAST_WORD_CLAMP_SNIPPET constant.
         fvl_subs = {
             "//FVL_SMEM_DECL\n": "    __shared__ float _sh_drive_vel_limit_dense[__W__][__M_D__];\n",
             "//FVL_SMEM_BIND\n": "    _arr_md_f_t& s_drive_vel_limit_dense = _sh_drive_vel_limit_dense[_slot];\n",
             "//FVL_LOAD\n": "        s_drive_vel_limit_dense[i] = world_drive_vel_limit.data[off];\n",
-            "//FVL_CLAMP\n": _FVL_DRIVE_CLAMP_SNIPPET,
+            "//FVL_LAST_CLAMP\n": _FVL_LAST_WORD_CLAMP_SNIPPET,
         }
     else:
         # Strip the whole marker lines so the flag-off source stays
@@ -11735,7 +11741,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
             "//FVL_SMEM_DECL\n": "",
             "//FVL_SMEM_BIND\n": "",
             "//FVL_LOAD\n": "",
-            "//FVL_CLAMP\n": "",
+            "//FVL_LAST_CLAMP\n": "",
         }
     for marker, code in fvl_subs.items():
         assert snippet.count(marker) == 1
@@ -13178,9 +13184,11 @@ def _get_pgs_solve_mf_gs_kernel(
     when those row types cannot be produced by the solver configuration.
 
     ``fuse_vel_limits`` (requires ``has_drive_rows``) compiles the PhysX-style
-    stateless joint-velocity clamp into the drive-row projection
-    (``_FVL_DRIVE_CLAMP_SNIPPET``, shared with the propagation full-iteration
-    kernel). The ``world_drive_vel_limit`` per-row parameter is always present
+    stateless joint-velocity clamp as an end-of-iteration pass over the
+    drive-row prefix (the same pass as ``_FVL_LAST_WORD_CLAMP_SNIPPET`` in the
+    propagation full-iteration kernel, in this kernel's idiom — packed
+    ``s_meta_dense`` metadata and deferred-response masking). The
+    ``world_drive_vel_limit`` per-row parameter is always present
     in the signature — launch sites pass the solver's ``drive_vel_limit``
     array, a (1, 1) dummy when the feature is off — and the flag only gates
     the clamp code emission, so the generated source with the flag off stays
@@ -14059,12 +14067,6 @@ def _get_pgs_solve_mf_gs_kernel(
     __shared__ float s_drive_vel_limit_dense[{M_D}];"""
         drive_loads += """
         s_drive_vel_limit_dense[i] = world_drive_vel_limit.data[off_dense + i];"""
-    # PhysX-style stateless velocity clamp fused into the drive visit; the
-    # shared clamp body and its unit-response derivation live at
-    # _FVL_DRIVE_CLAMP_SNIPPET (also used by the propagation full-iteration
-    # kernel factory). The correction adjusts only the applied delta_impulse;
-    # the persistent drive lambda keeps the drive-only value.
-    drive_vel_limit_clamp = ("\n" + _FVL_DRIVE_CLAMP_SNIPPET.rstrip("\n")) if fuse_vel_limits else ""
     drive_projection = (
         f"""
             if (row_type == 1) {{
@@ -14074,7 +14076,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 float max_imp = s_drive_max_imp_dense[i];
                 if (new_impulse > max_imp) new_impulse = max_imp;
                 if (new_impulse < -max_imp) new_impulse = -max_imp;
-                delta_impulse = new_impulse - old_impulse;{drive_vel_limit_clamp}
+                delta_impulse = new_impulse - old_impulse;
             }}"""
         if has_drive_rows
         else """
@@ -14123,6 +14125,64 @@ def _get_pgs_solve_mf_gs_kernel(
         else ""
     )
 
+    # Fused stateless velocity clamp on driven DOFs: the same PhysX PxClamp /
+    # unitResponse math as _FVL_LAST_WORD_CLAMP_SNIPPET (propagation
+    # full-iteration kernel), in this kernel's idiom (packed s_meta_dense,
+    # deferred-response masking). Runs where the dedicated velocity-limit
+    # rows run — after the contact rows of the same iteration — so the limit
+    # keeps the last word even when the sweep is under-converged (the
+    # ordering PhysX documents for gripping scenarios via
+    # PxSceneFlag::eSOLVE_ARTICULATION_CONTACT_LAST). Velocity-only: the
+    # persistent drive lambda keeps the drive-only value.
+    fused_drive_vel_limit_phase = (
+        f"""
+        if (row_phase == 0 || row_phase == 2 || row_phase == 5) {{
+            int drive_hi_fvl = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+            for (int i = 0; i < drive_hi_fvl; i++) {{
+                if ((s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK}) != {int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)}) continue;
+                float qdot_max_fvl = s_drive_vel_limit_dense[i];
+                float denom_fvl = s_diag_dense[i];
+                if (denom_fvl <= 0.0f) continue;
+
+                float my_sum_fvl = 0.0f;
+                int row_base_fvl = jy_world_base + i * {D};
+                for (int d = lane; d < {D}; d += 32) {{
+                    my_sum_fvl += J_world.data[row_base_fvl + d] * s_v[d];
+                }}
+                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 16);
+                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 8);
+                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 4);
+                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 2);
+                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 1);
+                float jv_fvl = __shfl_sync(MASK, my_sum_fvl, 0);
+
+                if (fabsf(jv_fvl) > qdot_max_fvl) {{
+                    float delta_fvl = (fminf(fmaxf(jv_fvl, -qdot_max_fvl), qdot_max_fvl) - jv_fvl) / denom_fvl;
+                    for (int d = lane; d < {D}; d += 32) {{
+                        if (defer_dense_response == 0 ||
+                            world_deferred_dof_mask.data[deferred_mask_base + d] == 0) {{
+                            s_v[d] += Y_world.data[row_base_fvl + d] * delta_fvl;
+                        }}
+                    }}
+                }}
+                __syncwarp();
+            }}
+        }}"""
+        if fuse_vel_limits
+        else ""
+    )
+
+    # The end-of-iteration fused clamp revisits the drive-row prefix, so a
+    # phase-5 launch (physx_grasp schedule stages only the vel-limit segment)
+    # must extend its dense staging window down to row 0.
+    fused_load_lo_decl = (
+        """
+    int load_lo = (row_phase == 5) ? 0 : dense_lo;"""
+        if fuse_vel_limits
+        else ""
+    )
+    dense_load_start = "load_lo" if fuse_vel_limits else "dense_lo"
+
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
@@ -14153,7 +14213,7 @@ def _get_pgs_solve_mf_gs_kernel(
         dense_hi = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
     }} else if (row_phase == 4) {{
         dense_lo = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
-    }}
+    }}{fused_load_lo_decl}
 
     int dof_map_base = world * {D};
     int off_dense = world * {M_D};
@@ -14179,7 +14239,7 @@ def _get_pgs_solve_mf_gs_kernel(
     // ═══════════════════════════════════════════════════════
     // LOAD PHASE
     // ═══════════════════════════════════════════════════════
-    for (int i = dense_lo + lane; i < dense_hi; i += 32) {{
+    for (int i = {dense_load_start} + lane; i < dense_hi; i += 32) {{
         s_lam_dense[i] = world_impulses.data[off_dense + i];
         s_rhs_dense[i] = rhs_bias.data[off_dense + i];
         s_diag_dense[i] = world_diag.data[off_dense + i];
@@ -14431,6 +14491,7 @@ def _get_pgs_solve_mf_gs_kernel(
         // drive/contact/friction/position-limit rows. Split schedules use
         // row_phase 2/5 as their explicit final velocity-limit pass.
 {dense_velocity_limit_phase}
+{fused_drive_vel_limit_phase}
 
         if (row_phase == 0 || row_phase == 2 || row_phase == 5) {{
             for (int i = mf_contact_end; i < m_mf; i++) {{
