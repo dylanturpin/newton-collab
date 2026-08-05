@@ -92,20 +92,70 @@ def _add_floating_chain(
     builder.add_articulation(joints)
 
 
-def _build_model(device: str, *, chains: tuple[int, ...], spheres: tuple[str, ...]) -> newton.Model:
+def _add_fixed_chain(
+    builder: newton.ModelBuilder, *, n_links: int, base_z: float, base_y: float, spheres: tuple[str, ...]
+) -> None:
+    """A world-anchored all-revolute chain: the fixed-base extraction variant.
+
+    No free root — the first joint is a world-rooted revolute, so every joint
+    is 1-DOF and the articulation takes the cached-response extraction's
+    fixed-base (single-DOF) variant, the default shape of a fixed-base arm.
+    ``spheres`` selects collision spheres on the first ("base"), middle
+    ("mid"), and last ("deep") link; the chain droops under gravity onto the
+    ground plane, so several bodies are simultaneously contact-active and the
+    cross response blocks B_ab carry real impulses.
+    """
+    no_collision = builder.default_shape_cfg.copy()
+    no_collision.has_shape_collision = False
+    no_collision.collision_group = 0
+
+    joints = []
+    prev = -1
+    for i in range(n_links):
+        link = builder.add_link()
+        builder.add_shape_box(link, hx=0.12, hy=0.03, hz=0.03, cfg=no_collision)
+        if "base" in spheres and i == 0:
+            builder.add_shape_sphere(link, radius=0.1)
+        if "deep" in spheres and i == n_links - 1:
+            builder.add_shape_sphere(link, radius=0.1)
+        if "mid" in spheres and i == n_links // 2:
+            builder.add_shape_sphere(link, radius=0.1)
+        parent_xform = (
+            wp.transform(wp.vec3(0.0, base_y, base_z), wp.quat_identity())
+            if prev == -1
+            else wp.transform(wp.vec3(0.12, 0.0, 0.0), wp.quat_identity())
+        )
+        joints.append(
+            builder.add_joint_revolute(
+                parent=prev,
+                child=link,
+                axis=wp.vec3(0.0, 1.0, 0.0),
+                parent_xform=parent_xform,
+                child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
+            )
+        )
+        prev = link
+    builder.add_articulation(joints)
+
+
+def _build_model(
+    device: str, *, chains: tuple[int, ...], spheres: tuple[str, ...], fixed_base: bool = False
+) -> newton.Model:
     """N_WORLDS identical worlds, each holding one chain per entry of ``chains``.
 
     Multiple chain lengths inside one world create several articulation
     DOF-size groups while keeping per-world DOF totals homogeneous (the
     propagation modes reject heterogeneous per-world DOF counts).
+    ``fixed_base`` swaps the floating chains for world-anchored ones.
     """
     scene = newton.ModelBuilder()
+    add_chain = _add_fixed_chain if fixed_base else _add_floating_chain
     for _ in range(N_WORLDS):
         world = newton.ModelBuilder()
         world.default_shape_cfg.density = 1000.0
         world.default_shape_cfg.mu = 0.7
         for k, n_links in enumerate(chains):
-            _add_floating_chain(world, n_links=n_links, base_z=0.105, base_y=0.8 * k, spheres=spheres)
+            add_chain(world, n_links=n_links, base_z=0.105, base_y=0.8 * k, spheres=spheres)
         scene.add_world(world)
     scene.add_ground_plane()
     return scene.finalize(device=device)
@@ -232,6 +282,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
         cls.model_multi = _build_model(cls.device, chains=(6,), spheres=("base", "mid", "deep"))
         cls.model_two_groups = _build_model(cls.device, chains=(6, 3), spheres=("base", "deep"))
         cls.model_single = _build_model(cls.device, chains=(6,), spheres=("base",))
+        cls.model_fixed = _build_model(cls.device, chains=(6,), spheres=("base", "mid", "deep"), fixed_base=True)
 
     def test_cached_path_detected(self):
         solver = _make_solver(self.model_multi, "propagation-colored", cached=True)
@@ -290,6 +341,29 @@ class TestPropagationCachedResponse(unittest.TestCase):
         stats, _, _ = _run_lockstep(self, self.model_single, "propagation", 40)
         self._assert_stats(stats, expect_min_bodies=1)
 
+    def test_lockstep_fixed_base_single_dof(self):
+        """Fixed-base all-revolute chains: the single-DOF extraction variant.
+
+        Every prior lockstep scene is floating-base, which takes the
+        free-root extraction variant; a fixed-base arm — the default shape of
+        every table-mounted robot — takes the other one, so gate it
+        explicitly against the tree walk on the same contact-rich scene.
+        """
+        stats, _, test = _run_lockstep(self, self.model_fixed, "propagation-colored", 40)
+        sizes = [int(s) for s in test.size_groups if test.n_arts_by_size[s] > 0]
+        for size in sizes:
+            # A fully single-DOF group takes the plain fixed-base extraction
+            # variant (the kernel factories receive has_free_root=not
+            # single_dof), even though a 1-DOF world-rooted chain also
+            # satisfies the free-root SHAPE check.
+            self.assertTrue(
+                test._propagation_tree_single_dof_by_size.get(size, False),
+                f"size group {size} did not take the fixed-base single-DOF variant",
+            )
+            self.assertIsNotNone(test._cached_response_tree_warp_kernels_by_size.get(size))
+        self.assertTrue(np.all(test.propagation_cache_world_flag.numpy() == 1))
+        self._assert_stats(stats, expect_min_bodies=2)
+
     def test_overflow_falls_back_to_tree_walk(self):
         """Cache capacity below the active-body count: every world must take
         the device-side tree-walk fallback and match the cached=False run."""
@@ -303,13 +377,20 @@ class TestPropagationCachedResponse(unittest.TestCase):
         self._assert_stats(stats, expect_min_bodies=3)
 
     def test_cached_matrices_match_numpy_reference(self):
+        """Floating-base R/B against the float64 tree-walk mirror."""
+        self._check_cached_matrices_vs_numpy(self.model_multi)
+
+    def test_fixed_base_cached_matrices_match_numpy_reference(self):
+        """Fixed-base (single-DOF variant) R/B against the same mirror."""
+        self._check_cached_matrices_vs_numpy(self.model_fixed)
+
+    def _check_cached_matrices_vs_numpy(self, model):
         """R and B against a float64 mirror of the serial tree-walk algorithm.
 
         R_b column j is the qdd over all articulation DOFs from a unit basis
         wrench j at body b; B_ab column j is the resulting COM twist delta at
         body a. Both fall out of _ref_propagate run at zero initial velocity.
         """
-        model = self.model_multi
         solver = _make_solver(model, "propagation-colored", cached=True)
         state_in, state_out = model.state(), model.state()
         control = model.control()
