@@ -519,7 +519,7 @@ class SolverFeatherPGS(SolverBase):
         joint_limit_activation_gap: float = float("inf"),
         enable_joint_velocity_limits: bool = False,
         velocity_limit_activation_fraction: float = 0.0,
-        fuse_joint_velocity_limits: bool = False,
+        fuse_joint_velocity_limits: bool = True,
         pgs_iterations: int = 12,
         pgs_velocity_iterations: int = 0,
         pgs_beta: float = 0.2,
@@ -662,10 +662,11 @@ class SolverFeatherPGS(SolverBase):
                 ``pgs_mode="matrix_free"`` + ``enable_joint_velocity_limits=True`` +
                 ``drive_mode="physx_pgs"`` formulation; in any other configuration the flag
                 is inert and velocity limits keep their dedicated rows (no error — the flag
-                is an engage-where-applicable request, not a demand). The clamp pass is
+                is an engage-where-applicable request, not a demand, which lets it default
+                to True without constraining unrelated solver modes). The clamp pass is
                 independent of the drive-row visit, so it stays active during velocity-only
                 iterations under ``pgs_velocity_drive_mode="freeze"``, exactly like the
-                dedicated rows it replaces. Defaults to False.
+                dedicated rows it replaces. Defaults to True.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_velocity_iterations (int, optional): Additional matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
