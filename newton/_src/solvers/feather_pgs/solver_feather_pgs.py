@@ -520,7 +520,7 @@ class SolverFeatherPGS(SolverBase):
         joint_limit_activation_gap: float = float("inf"),
         enable_joint_velocity_limits: bool = False,
         velocity_limit_activation_fraction: float = 0.0,
-        fuse_joint_velocity_limits: bool = True,
+        fuse_joint_velocity_limits: bool = False,
         pgs_iterations: int = 12,
         pgs_velocity_iterations: int = 0,
         pgs_beta: float = 0.2,
@@ -651,11 +651,15 @@ class SolverFeatherPGS(SolverBase):
                 ordering. The fused clamp also skips driven DOFs in the PhysX-style pre-solve
                 velocity prescale ratio. Requires ``model.joint_velocity_limit`` to be
                 allocated; when it is absent the flag is inert (the dedicated-row path
-                skips allocation without that array too, so behavior matches). The fused clamp only applies to the
+                skips allocation without that array too, so behavior matches). The flag is
+                also inert when ``velocity_limit_activation_fraction`` is ``inf``: that value
+                is the explicit never-activate kill-switch for velocity limits, and the fused
+                clamp rides the drive-row visit rather than the gated velocity-limit phase,
+                so it must not re-enforce limits the fraction disabled. The fused clamp only applies to the
                 ``pgs_mode="matrix_free"`` + ``enable_joint_velocity_limits=True`` +
                 ``drive_mode="physx_pgs"`` formulation; in any other configuration the flag
-                is inert and velocity limits keep their dedicated rows (no error — this lets
-                the flag default to True without constraining unrelated solver modes).
+                is inert and velocity limits keep their dedicated rows (no error — the flag
+                is an engage-where-applicable request, not a demand).
                 Because the fused clamp lives
                 inside the drive-row visit, combining it with ``pgs_velocity_iterations > 0``
                 requires ``pgs_velocity_drive_mode="active"``: with ``"freeze"`` the frozen
@@ -663,7 +667,7 @@ class SolverFeatherPGS(SolverBase):
                 (which no longer have dedicated vel-limit rows) would silently miss their
                 clamp; that combination downgrades to the dedicated rows with a
                 :class:`UserWarning` (pass ``pgs_velocity_drive_mode="active"`` to keep the
-                fused clamp). Defaults to True.
+                fused clamp). Defaults to False.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_velocity_iterations (int, optional): Additional matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
@@ -950,15 +954,19 @@ class SolverFeatherPGS(SolverBase):
         if drive_mode == "physx_pgs" and self.pgs_mode != "matrix_free":
             raise NotImplementedError("drive_mode='physx_pgs' currently requires pgs_mode='matrix_free'")
         self.drive_mode = drive_mode
-        # fuse_joint_velocity_limits defaults to True but is an
-        # engage-where-applicable request, not a demand: the fused clamp only
-        # exists in the matrix_free + physx_pgs + velocity-limits formulation
-        # (and needs model.joint_velocity_limit), so any other configuration
-        # keeps its dedicated rows silently instead of erroring.
+        # fuse_joint_velocity_limits is an engage-where-applicable request,
+        # not a demand: the fused clamp only exists in the matrix_free +
+        # physx_pgs + velocity-limits formulation (and needs
+        # model.joint_velocity_limit), so any other configuration keeps its
+        # dedicated rows silently instead of erroring. An inf activation
+        # fraction is the explicit never-activate kill-switch for velocity
+        # limits; the fused clamp rides the drive-row visit rather than the
+        # gated velocity-limit phase, so it must stay disengaged there too.
         _fuse_applicable = (
             self.pgs_mode == "matrix_free"
             and self.enable_joint_velocity_limits
             and self.drive_mode == "physx_pgs"
+            and not np.isinf(self.velocity_limit_activation_fraction)
             and getattr(model, "joint_velocity_limit", None) is not None
         )
         if (

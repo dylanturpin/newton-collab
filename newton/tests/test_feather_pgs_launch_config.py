@@ -299,9 +299,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertTrue(np.isfinite(state_1.joint_qd.numpy()).all())
 
     def test_fuse_joint_velocity_limits_validation(self):
-        # fuse_joint_velocity_limits defaults to True but only engages in the
+        # fuse_joint_velocity_limits is opt-in and only engages in the
         # matrix_free + physx_pgs + velocity-limits formulation; anywhere else
-        # it must be silently inert (no error), so the default doesn't
+        # it must be silently inert (no error), so opting in doesn't
         # constrain unrelated solver modes.
         model = _build_chain_model(num_links=2, num_worlds=1)
         for kwargs in (
@@ -322,14 +322,37 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 fuse_joint_velocity_limits=True,
             )
             self.assertFalse(solver.fuse_joint_velocity_limits)
-            # The applicable combination engages by default (no kwarg passed).
+            # The clamp is opt-in: the applicable combination stays on
+            # dedicated rows unless the caller passes the flag explicitly.
             solver = SolverFeatherPGS(
                 model,
                 pgs_mode="matrix_free",
                 enable_joint_velocity_limits=True,
                 drive_mode="physx_pgs",
             )
+            self.assertFalse(solver.fuse_joint_velocity_limits)
+            solver = SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                enable_joint_velocity_limits=True,
+                drive_mode="physx_pgs",
+                fuse_joint_velocity_limits=True,
+            )
             self.assertTrue(solver.fuse_joint_velocity_limits)
+            # velocity_limit_activation_fraction=inf is the explicit
+            # never-activate kill-switch for velocity limits; the fused clamp
+            # rides the drive-row visit (which the inf gate does not cover),
+            # so an explicit opt-in must stay inert rather than re-enforce
+            # limits the fraction disabled.
+            solver = SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                enable_joint_velocity_limits=True,
+                drive_mode="physx_pgs",
+                fuse_joint_velocity_limits=True,
+                velocity_limit_activation_fraction=float("inf"),
+            )
+            self.assertFalse(solver.fuse_joint_velocity_limits)
             # Velocity iterations with frozen drive rows would skip the fused
             # clamp entirely (the clamp rides the drive-row visit and driven
             # DOFs would have no dedicated vel-limit rows); must warn and fall
