@@ -287,7 +287,7 @@ def prescale_joint_velocity_limits(
     ``skip_driven != 0`` (the ``fuse_joint_velocity_limits`` path) excludes
     DOFs with a PhysX drive row (``drive_slot[dof] >= 0``) from both the
     ratio computation and the scaling: those DOFs are clamped in-solve by the
-    fused drive-row velocity clamp instead. ``drive_slot`` holds the previous
+    fused end-of-iteration velocity clamp instead. ``drive_slot`` holds the previous
     step's allocation at this point in the step (it is initialized to -1, so
     the very first step prescales exactly as before); the driven-DOF set is
     derived from ``joint_target_ke/kd > 0`` and is stable across steps.
@@ -2089,9 +2089,9 @@ def populate_physx_drive_J_for_size(
 
     ``fuse_vel_limits != 0`` (the ``fuse_joint_velocity_limits`` path)
     additionally records the DOF's joint velocity limit per drive row in
-    ``world_drive_vel_limit`` so the MF-GS drive-row visit can apply the
-    PhysX-style stateless velocity clamp in place of dedicated
-    velocity-limit rows. Non-positive / non-finite limits are stored as
+    ``world_drive_vel_limit`` so the solve kernels can apply the PhysX-style
+    stateless velocity clamp at the end of each iteration in place of
+    dedicated velocity-limit rows. Non-positive / non-finite limits are stored as
     ``+inf`` so the fused clamp is a no-op for unlimited DOFs. When
     ``fuse_vel_limits == 0`` neither ``joint_velocity_limit`` nor
     ``world_drive_vel_limit`` is touched (1-element dummies are safe).
@@ -2476,9 +2476,9 @@ def allocate_joint_velocity_limit_slots(
 
     ``skip_driven != 0`` (the ``fuse_joint_velocity_limits`` path) skips DOFs
     with a PhysX drive row (``drive_slot[dof] >= 0``): their velocity limit is
-    enforced as a stateless clamp fused into the drive-row visit instead of a
-    dedicated row pair, matching PhysX's per-DOF ``PxClamp`` in the drive
-    constraint. DOFs with a velocity limit but no drive row keep their
+    enforced as a stateless clamp at the end of each solver iteration
+    instead of a dedicated row pair (PhysX ``PxClamp`` math, run after the
+    contact phases like the rows it replaces). DOFs with a velocity limit but no drive row keep their
     dedicated rows. When ``skip_driven == 0``, ``drive_slot`` is never read
     (a 1-element dummy is safe).
 
@@ -2522,7 +2522,7 @@ def allocate_joint_velocity_limit_slots(
             if qdot_max <= 0.0:
                 continue
 
-            # Fused path: driven DOFs are clamped inside the drive-row visit.
+            # Fused path: driven DOFs are clamped at the end of each iteration.
             if skip_driven != 0:
                 if drive_slot[dof] >= 0:
                     continue
