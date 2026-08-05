@@ -161,7 +161,46 @@ def _build_model(
     return scene.finalize(device=device)
 
 
-def _make_solver(model: newton.Model, response: str, *, cached: bool, cache_max_bodies: int = 8) -> SolverFeatherPGS:
+def _build_clutter_model(device: str, *, n_boxes: int) -> newton.Model:
+    """A fixed-base arm plus free-rigid clutter boxes resting on the ground.
+
+    The clutter bodies are contact-active every step but never take the
+    cached GEMV path (free bodies keep the sweep-estimate + flush path), so
+    they must not count against the cache capacity: only the arm's bodies
+    are cache-eligible. Clutter is frictionless spheres: one normal-only
+    ground row per clutter body keeps every clutter row's state fully
+    disjoint, so the lockstep gate's tree-walk determinism precondition
+    survives the atomic (run-varying) row ordering — box corner contacts or
+    friction pairs share a body and reorder its float accumulation between
+    runs.
+    """
+    scene = newton.ModelBuilder()
+    for _ in range(N_WORLDS):
+        world = newton.ModelBuilder()
+        world.default_shape_cfg.density = 1000.0
+        world.default_shape_cfg.mu = 0.7
+        # Anchor low enough that every arm sphere starts pressed into the
+        # ground: a marginal (flickering) tip contact makes the active-body
+        # set differ between the lockstepped solvers.
+        _add_fixed_chain(world, n_links=6, base_z=0.095, base_y=0.0, spheres=("base", "mid", "deep"))
+        clutter_cfg = world.default_shape_cfg.copy()
+        clutter_cfg.mu = 0.0
+        for b in range(n_boxes):
+            ball = world.add_link(
+                xform=wp.transform(
+                    wp.vec3(-0.4 - 0.25 * (b % 3), 0.6 + 0.25 * (b // 3), 0.0995), wp.quat_identity()
+                )
+            )
+            world.add_shape_sphere(ball, radius=0.1, cfg=clutter_cfg)
+            world.add_articulation([world.add_joint_free(parent=-1, child=ball)])
+        scene.add_world(world)
+    scene.add_ground_plane()
+    return scene.finalize(device=device)
+
+
+def _make_solver(
+    model: newton.Model, response: str, *, cached: bool, cache_max_bodies: int = 8, **solver_kwargs
+) -> SolverFeatherPGS:
     return SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
@@ -171,6 +210,7 @@ def _make_solver(model: newton.Model, response: str, *, cached: bool, cache_max_
         mf_warmstart=False,
         propagation_cached_response=cached,
         propagation_cached_response_max_bodies=cache_max_bodies,
+        **solver_kwargs,
     )
 
 
@@ -207,7 +247,7 @@ class _LockstepStats:
         self.total_rows = 0
 
 
-def _run_lockstep(test_case, model, response, n_steps, *, cache_max_bodies: int = 8):
+def _run_lockstep(test_case, model, response, n_steps, *, cache_max_bodies: int = 8, **solver_kwargs):
     """Advance a tree-walk reference trajectory; at every step, run the cached
     solver one step from the identical input state and record output diffs.
 
@@ -215,9 +255,9 @@ def _run_lockstep(test_case, model, response, n_steps, *, cache_max_bodies: int 
     precondition: if the fallback itself were not reproducible from shared
     inputs, the cached-vs-fallback diff would be meaningless.
     """
-    ref = _make_solver(model, response, cached=False, cache_max_bodies=cache_max_bodies)
-    ref2 = _make_solver(model, response, cached=False, cache_max_bodies=cache_max_bodies)
-    test = _make_solver(model, response, cached=True, cache_max_bodies=cache_max_bodies)
+    ref = _make_solver(model, response, cached=False, cache_max_bodies=cache_max_bodies, **solver_kwargs)
+    ref2 = _make_solver(model, response, cached=False, cache_max_bodies=cache_max_bodies, **solver_kwargs)
+    test = _make_solver(model, response, cached=True, cache_max_bodies=cache_max_bodies, **solver_kwargs)
 
     state_in = model.state()
     ref_out = model.state()
@@ -375,6 +415,52 @@ class TestPropagationCachedResponse(unittest.TestCase):
         self.assertTrue(np.all(counts > 2), f"scene must overflow the cap, got counts {counts}")
         self.assertTrue(np.all(flags == 0), f"overflowing worlds must clear the cache flag, got {flags}")
         self._assert_stats(stats, expect_min_bodies=3)
+
+    def test_clutter_does_not_evict_cache(self):
+        """Free-rigid clutter must not count against the cache capacity.
+
+        A fixed-base arm (three contact-active tree bodies) plus two free
+        spheres on the ground against a cache capacity of 4: the TOTAL active
+        count (5) exceeds the cap, but only the arm's bodies are
+        cache-eligible, so every world must stay on the cached GEMV path —
+        and still match the tree walk in lockstep. Before the partitioned
+        capacity gate this scene silently self-disabled the cache. Clutter is
+        kept small because larger free-body counts make the tree-walk
+        REFERENCE itself non-reproducible run-to-run on this branch
+        (reassociation-level, and near the default 32-row cap much larger),
+        which invalidates the lockstep gate's determinism precondition.
+        """
+        model = _build_clutter_model(self.device, n_boxes=2)
+        stats, ref, test = _run_lockstep(
+            self, model, "propagation-colored", 40, cache_max_bodies=4, dense_max_constraints=128
+        )
+        self.assertTrue(test._propagation_cached_response_active)
+        counts = ref.propagation_body_count.numpy()
+        self.assertTrue(np.all(counts > 4), f"scene must overflow the TOTAL active-body count, got {counts}")
+        eligible_counts = test.propagation_cache_body_count.numpy()
+        self.assertTrue(
+            np.all((eligible_counts >= 2) & (eligible_counts <= 4)),
+            f"expected 2..4 eligible arm bodies per world, got {eligible_counts}",
+        )
+        self.assertTrue(
+            np.all(test.propagation_cache_world_flag.numpy() == 1),
+            "clutter must not evict the arm from the cached path",
+        )
+        # Partition invariant: cache-eligible bodies occupy the slot prefix.
+        art_eligible = test.propagation_cache_art_eligible.numpy()
+        body_to_art = test.body_to_articulation.numpy()
+        body_list = test.propagation_body_list.numpy()
+        test_counts = test.propagation_body_count.numpy()
+        for world in range(body_list.shape[0]):
+            n_elig = int(eligible_counts[world])
+            for slot in range(min(int(test_counts[world]), body_list.shape[1])):
+                body = int(body_list[world, slot])
+                self.assertGreaterEqual(body, 0)
+                is_eligible = int(art_eligible[int(body_to_art[body])]) == 1
+                self.assertEqual(
+                    is_eligible, slot < n_elig, f"world {world} slot {slot}: eligible prefix violated"
+                )
+        self._assert_stats(stats, expect_min_bodies=5)
 
     def test_cached_matrices_match_numpy_reference(self):
         """Floating-base R/B against the float64 tree-walk mirror."""

@@ -66,6 +66,7 @@ from .kernels import (
     build_mf_body_map,
     build_mf_contact_rows,
     build_propagation_body_map,
+    build_propagation_body_map_partitioned,
     build_propagation_contact_rows,
     cholesky_loop,
     clamp_augmented_joint_u0,
@@ -752,10 +753,15 @@ class SolverFeatherPGS(SolverBase):
                 per-iteration tree-walk fallback (selected per world on the device, so
                 CUDA-graph capture is unaffected). Defaults to True.
             propagation_cached_response_max_bodies (int, optional): Capacity of the cached
-                response buffers, in contact-active bodies per world. Response matrices are
-                sized (worlds, cap, max_dofs, 6) and (worlds, cap, cap, 36); worlds with
-                more simultaneously contact-active bodies than the cap fall back to the
-                tree walk for that step. Defaults to 8.
+                response buffers, in contact-active CACHE-ELIGIBLE bodies per world —
+                bodies of cacheable articulations. Free-rigid clutter and non-cacheable
+                articulations do not count (they never take the cached GEMV: free bodies
+                keep the sweep-estimate + flush path, other trees the unconditional tree
+                walk), so a robot+clutter scene stays cached as long as the robot's own
+                active bodies fit. Response matrices are sized (worlds, cap, max_dofs, 6)
+                and (worlds, cap, cap, 36); worlds with more simultaneously active
+                eligible bodies than the cap fall back to the tree walk for that step.
+                Defaults to 8.
             pgs_schedule (str, optional): Matrix-free row ordering. ``"interleaved"`` preserves the
                 legacy per-iteration dense+matrix-free sweep. ``"contact_then_internal"`` runs all
                 contact/friction sweeps first, then all internal articulation sweeps (drive, joint
@@ -2895,6 +2901,7 @@ class SolverFeatherPGS(SolverBase):
             self.propagation_tree_body_delta = None
             self.propagation_body_count = None
             self.propagation_body_list = None
+            self.propagation_cache_body_count = None
             self._current_propagation_joint_S_s = None
             self._current_propagation_body_q = None
             self.max_propagation_bodies = 0
@@ -2931,6 +2938,12 @@ class SolverFeatherPGS(SolverBase):
         self.propagation_body_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.propagation_body_list = wp.full(
             (worlds, self.max_propagation_bodies), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        # Length of the cache-eligible slot prefix of propagation_body_list
+        # (== propagation_body_count after pass 1 of the partitioned build);
+        # only written when the cached-response path is active.
+        self.propagation_cache_body_count = wp.zeros(
+            (worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
 
         self.propagation_body_a = wp.zeros(
@@ -3995,7 +4008,10 @@ class SolverFeatherPGS(SolverBase):
                             self.group_to_art[size],
                             self.art_to_world,
                             self.propagation_cache_world_flag,
-                            self.propagation_body_count,
+                            # Eligible prefix length: bounds the slot scan so
+                            # clutter past the prefix is never touched and
+                            # slot-indexed cache writes stay within capacity.
+                            self.propagation_cache_body_count,
                             self.propagation_body_list,
                             self.body_to_articulation,
                             self.body_to_joint,
@@ -4249,7 +4265,10 @@ class SolverFeatherPGS(SolverBase):
             inputs=[
                 self.world_count,
                 self.propagation_cache_world_flag,
-                self.propagation_body_count,
+                # Eligible prefix length: the GEMV consumes exactly the slots
+                # the cache covers; clutter impulses stay for the flush / the
+                # unconditional tree walk.
+                self.propagation_cache_body_count,
                 self.propagation_body_list,
                 self.propagation_cache_art_eligible,
                 self.body_to_articulation,
@@ -4498,7 +4517,7 @@ class SolverFeatherPGS(SolverBase):
                 dim=self.world_count * self.propagation_cache_max_bodies,
                 inputs=[
                     self.propagation_cache_world_flag,
-                    self.propagation_body_count,
+                    self.propagation_cache_body_count,
                     self.propagation_body_list,
                     self.propagation_cache_max_bodies,
                     self.propagation_body_qd,
@@ -6879,11 +6898,44 @@ class SolverFeatherPGS(SolverBase):
                     outputs=[self.propagation_constraint_count],
                     device=model.device,
                 )
-                if (
+                if self._propagation_cached_response_active:
+                    # Partitioned build: cache-eligible bodies claim the slot
+                    # prefix, free-rigid clutter and non-cacheable
+                    # articulations follow. The cache arrays (R/B/qd_base) are
+                    # indexed by slot and bounded by the eligible prefix, so
+                    # clutter neither consumes cache capacity nor evicts the
+                    # robot from the cached path.
+                    for want_eligible in (1, 0):
+                        wp.launch(
+                            build_propagation_body_map_partitioned,
+                            dim=self.world_count * self.propagation_max_constraints,
+                            inputs=[
+                                self.propagation_constraint_count,
+                                self.propagation_body_a,
+                                self.propagation_body_b,
+                                self.propagation_max_constraints,
+                                self.max_propagation_bodies,
+                                self.body_to_articulation,
+                                self.propagation_cache_art_eligible,
+                                want_eligible,
+                                self.propagation_body_seen,
+                            ],
+                            outputs=[
+                                self.propagation_body_list,
+                                self.propagation_body_count,
+                                self.propagation_body_local_slot,
+                            ],
+                            device=model.device,
+                        )
+                        if want_eligible == 1:
+                            # The counter value after pass 1 IS the eligible
+                            # prefix length; pass 2 keeps counting on the same
+                            # array toward the total.
+                            wp.copy(self.propagation_cache_body_count, self.propagation_body_count)
+                elif (
                     self._propagation_tree_requires_body_map
                     or self.propagation_full_fused_iterations
                     or self._propagation_colored
-                    or self._propagation_cached_response_active
                 ):
                     wp.launch(
                         build_propagation_body_map,
@@ -6907,11 +6959,13 @@ class SolverFeatherPGS(SolverBase):
                     # Device-side per-world routing between the cached GEMV
                     # and the tree-walk fallback; recomputed every step so
                     # cache-overflowing worlds stay exact without host sync.
+                    # Gated on the ELIGIBLE prefix length, not the total
+                    # active-body count.
                     wp.launch(
                         compute_propagation_cache_world_flag,
                         dim=self.world_count,
                         inputs=[
-                            self.propagation_body_count,
+                            self.propagation_cache_body_count,
                             self.propagation_cache_max_bodies,
                         ],
                         outputs=[self.propagation_cache_world_flag],
