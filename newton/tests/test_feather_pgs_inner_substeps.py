@@ -74,6 +74,67 @@ def test_inner_substeps_match_true_substeps(test, device):
     test.assertLess(speed_frozen, 0.05, f"stack not at rest: max |body_qd| = {speed_frozen}")
 
 
+def _build_driven_arm(device):
+    """Fixed-base 2-link arm with PD drives and joint limits, i.e. DENSE constraint rows."""
+    builder = newton.ModelBuilder()
+    parent = -1
+    z = 0.5
+    joints = []
+    for i in range(2):
+        link = builder.add_link()
+        builder.add_shape_box(link, hx=0.04, hy=0.04, hz=0.12)
+        joints.append(
+            builder.add_joint_revolute(
+                parent=parent,
+                child=link,
+                axis=newton.ModelBuilder.JointDofConfig(
+                    axis=wp.vec3(0.0, 1.0, 0.0),
+                    target_pos=0.4,
+                    target_ke=40.0,
+                    target_kd=2.0,
+                    limit_lower=-1.0,
+                    limit_upper=1.0,
+                ),
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, z if i == 0 else -0.24), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.12), wp.quat_identity()),
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    return builder.finalize(device=device)
+
+
+def test_inner_substeps_dense_rows_match_true_substeps(test, device):
+    """Verify frozen inner substeps track true substeps on dense drive and joint-limit rows.
+
+    The box-stack case exercises only the matrix-free row family. A bolted articulation
+    puts its drive and joint-limit rows on the dense family, so this covers
+    ``advance_frozen_row_errors`` -- in particular the drive geometric-error sign, which a
+    matrix-free-only scene can never reach.
+    """
+    steps, dt = 120, 0.005
+    kw = dict(SOLVER_KW, drive_mode="physx_pgs", enable_joint_limits=True, pgs_iterations=8)
+
+    def run(solver_kwargs, substeps):
+        model = _build_driven_arm(device)
+        state = _run(model, SolverFeatherPGS(model, **solver_kwargs), steps, dt, substeps=substeps)
+        return state.joint_q.numpy().copy()
+
+    q_true = run(kw, 8)
+    q_frozen = run(dict(kw, pgs_inner_substeps=8), 1)
+    q_one = run(kw, 1)
+
+    test.assertTrue(np.all(np.isfinite(q_true)) and np.all(np.isfinite(q_frozen)), "arm scene diverged")
+    err_frozen = float(np.abs(q_frozen - q_true).max())
+    err_one = float(np.abs(q_one - q_true).max())
+    test.assertLess(
+        err_frozen,
+        0.25 * err_one,
+        f"frozen substeps should track true substeps far better than a single step "
+        f"(frozen {err_frozen:.2e} vs one step {err_one:.2e})",
+    )
+
+
 def test_inner_substeps_validation(test, device):
     """Verify pgs_inner_substeps rejects unsupported solver configurations."""
     model = _build_stack(device, n_boxes=1)
@@ -99,6 +160,12 @@ add_function_test(
     TestFeatherPGSInnerSubsteps,
     "test_inner_substeps_match_true_substeps",
     test_inner_substeps_match_true_substeps,
+    devices=cuda_devices,
+)
+add_function_test(
+    TestFeatherPGSInnerSubsteps,
+    "test_inner_substeps_dense_rows_match_true_substeps",
+    test_inner_substeps_dense_rows_match_true_substeps,
     devices=cuda_devices,
 )
 add_function_test(

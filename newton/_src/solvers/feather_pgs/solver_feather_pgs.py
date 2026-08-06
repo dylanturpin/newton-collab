@@ -906,8 +906,19 @@ class SolverFeatherPGS(SolverBase):
                 raise ValueError("pgs_inner_substeps > 1 requires pgs_mode='matrix_free'")
             if int(pgs_velocity_iterations) > 0:
                 raise ValueError("pgs_inner_substeps > 1 does not support pgs_velocity_iterations yet")
-            if articulated_contact_response == "propagation":
-                raise ValueError("pgs_inner_substeps > 1 does not support propagation contact response yet")
+            if articulated_contact_response != "immediate":
+                # Every non-immediate response routes contacts through the propagation row
+                # family, whose phi the inner loop does not advance.
+                raise ValueError(
+                    "pgs_inner_substeps > 1 requires articulated_contact_response='immediate' "
+                    f"(got {articulated_contact_response!r})"
+                )
+            if mf_warmstart:
+                # The end-of-step snapshot holds an accumulated full-step impulse; it would
+                # seed the next step's first dt/N substep roughly N times too large.
+                raise ValueError("pgs_inner_substeps > 1 does not support mf_warmstart yet")
+            if pgs_debug:
+                raise ValueError("pgs_inner_substeps > 1 does not support pgs_debug")
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
         self.dense_contact_compliance = dense_contact_compliance
@@ -2147,8 +2158,8 @@ class SolverFeatherPGS(SolverBase):
                 # Frozen-basis inner substeps: world-convention velocity copy and
                 # per-substep qdd scratch (state_aug.joint_qdd must keep the free
                 # acceleration for the v_hat predictor between substeps).
-                self._inner_v_world = wp.zeros_like(model.joint_qd)
-                self._inner_qdd = wp.zeros_like(model.joint_qd)
+                self._inner_v_world = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+                self._inner_qdd = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_mf_accum = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_out_snap = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self._deferred_dense_tau = None
@@ -5025,8 +5036,6 @@ class SolverFeatherPGS(SolverBase):
         # true substeps would. dt_full is only used for particle integration.
         dt_full = dt
         if self.pgs_inner_substeps > 1:
-            if self.pgs_debug:
-                raise RuntimeError("pgs_inner_substeps > 1 is incompatible with pgs_debug")
             dt = dt / self.pgs_inner_substeps
 
         # Double-buffer: select buffer set and wait for its memset to finish
@@ -8257,9 +8266,10 @@ class SolverFeatherPGS(SolverBase):
                     outputs=[self._inner_v_world],
                     device=model.device,
                 )
-            # Last substep writes state_aug.joint_qdd (public telemetry, same
-            # meaning as the standard path); earlier substeps must leave it
-            # holding the free acceleration for the v_hat predictor below.
+            # The last substep writes state_aug.joint_qdd. Note this is the FINAL
+            # SUBSTEP's acceleration, (v_final - v_{N-1}) / dt_sub, not the whole-step
+            # average the single-step path reports. Earlier substeps must leave the buffer
+            # holding the step's free acceleration for the v_hat predictor below.
             qdd_out = state_aug.joint_qdd if k == n - 1 else self._inner_qdd
             wp.launch(
                 update_qdd_from_velocity,
@@ -8292,6 +8302,24 @@ class SolverFeatherPGS(SolverBase):
 
             if k == n - 1:
                 break
+
+            # Re-seed the internal (about-origin) velocity track from the state the
+            # integrator produced: jcalc_integrate applies angular_damping while writing
+            # state_out.joint_qd, and continuing from the pre-damping v_out would let the
+            # next substep undo it, applying the damping ~1/N as strongly as one step does.
+            wp.copy(self.v_out, state_out.joint_qd)
+            if self._has_root_free:
+                wp.launch(
+                    convert_root_free_qd_world_to_local,
+                    dim=model.articulation_count,
+                    inputs=[
+                        self.articulation_root_is_free,
+                        self.articulation_root_dof_start,
+                        self.articulation_root_com_offset,
+                    ],
+                    outputs=[self.v_out],
+                    device=model.device,
+                )
 
             # Re-measure row errors on the frozen basis, then rebuild the
             # cheap per-substep problem data: rhs, drive descriptors, v_hat,
@@ -8347,6 +8375,12 @@ class SolverFeatherPGS(SolverBase):
             if mf_active:
                 self._compute_mf_rhs_bias(dt_sub, bias_scale=1.0, output=self.mf_rhs)
             self._stage5_prepare_impulses_world()
+            if mf_active:
+                # v_out restarts from v_hat below, so the matrix-free impulses must restart
+                # with it: the GS kernel applies (lambda_k - lambda_{k-1}), which for a
+                # carried lambda can be net-attractive on a unilateral row and sizes the
+                # friction cone from the accumulated rather than the per-substep normal.
+                self.mf_impulses.zero_()
             self._pack_mf_meta(self.mf_rhs)
             wp.copy(self.v_out, self.v_hat)
 
