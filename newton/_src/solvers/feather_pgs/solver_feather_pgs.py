@@ -680,8 +680,8 @@ class SolverFeatherPGS(SolverBase):
                 With N > 1, one :meth:`step` call builds the problem once (contacts, Jacobians, mass
                 factorization, free acceleration) and then runs N cycles of [``pgs_iterations`` GS
                 iterations, joint integration at dt/N, first-order row-error re-measurement
-                ``phi += dt*J*v``]. Raises the stable Baumgarte correction rate like true substeps at a
-                fraction of their cost; total correction per step is ``1-(1-pgs_beta)^N``. Requires
+                ``phi += dt*J*v``]. Raises the stable Baumgarte correction rate like true substeps while
+                rebuilding the dynamics only once per step; total correction per step is ``1-(1-pgs_beta)^N``. Requires
                 ``pgs_mode='matrix_free'``, ``articulated_contact_response='immediate'``, and no
                 velocity iterations, warm starting or ``pgs_debug``. The saving over true substeps
                 depends on the scene: it is largest when the per-step build (mass matrix, Cholesky,

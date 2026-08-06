@@ -163,6 +163,8 @@ def test_inner_substeps_validation(test, device):
         SolverFeatherPGS(model, pgs_inner_substeps=8, **dict(SOLVER_KW, mf_warmstart=True))
     with test.assertRaises(ValueError):
         SolverFeatherPGS(model, pgs_inner_substeps=8, **dict(SOLVER_KW, pgs_debug=True))
+    with test.assertRaises(ValueError):
+        SolverFeatherPGS(model, pgs_inner_substeps=8, **dict(SOLVER_KW, pgs_warmstart=True))
     # the resolved warm-start flag is what matters: the env var must not bypass the guard
     with mock.patch.dict(os.environ, {"IL_NEWTON_FPGS_MF_WARMSTART": "1"}):
         with test.assertRaises(ValueError):
