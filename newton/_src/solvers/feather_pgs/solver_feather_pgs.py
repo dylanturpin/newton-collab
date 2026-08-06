@@ -130,6 +130,7 @@ from .kernels import (
     reset_world_warmstart_buffers,
     rhs_accum_world_par_art,
     scatter_qdd_from_groups,
+    snapshot_dense_phase_bound,
     snapshot_mf_prev_slots,
     trisolve_loop,
     update_articulation_origins,
@@ -442,6 +443,21 @@ class SolverFeatherPGS(SolverBase):
 
     """
 
+    joint_qd_public_convention: bool = True
+    """Whether free-joint ``joint_qd`` uses Newton's public twist convention.
+
+    FeatherPGS stores free-joint ``joint_qd`` as ``(v_com_world, omega_world)`` [m/s, rad/s],
+    matching :func:`newton.eval_fk`. The vanilla Featherstone solver instead uses an internal
+    world-origin-referenced spatial twist, which requires
+    ``eval_fk_with_velocity_conversion``.
+
+    Integration layers that refresh maximal body state from joint state (for example after
+    reset writes) must dispatch on this attribute. Applying the Featherstone-internal helper
+    to public-convention ``joint_qd`` re-references the free-joint twist to the world origin,
+    adding ``omega x x_com_world`` of phantom linear velocity to :attr:`newton.State.body_qd`
+    that grows with the body's distance from the world origin.
+    """
+
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
         """Register PhysX rigid-body attributes consumed by FeatherPGS."""
@@ -503,6 +519,7 @@ class SolverFeatherPGS(SolverBase):
         joint_limit_activation_gap: float = float("inf"),
         enable_joint_velocity_limits: bool = False,
         velocity_limit_activation_fraction: float = 0.0,
+        fuse_joint_velocity_limits: bool = True,
         pgs_iterations: int = 12,
         pgs_velocity_iterations: int = 0,
         pgs_beta: float = 0.2,
@@ -618,6 +635,38 @@ class SolverFeatherPGS(SolverBase):
                 no-op clamps. Because the gate samples the pre-solve velocity, a DOF crossing the
                 threshold between steps is clamped one step late. Must be non-negative and not
                 NaN. Defaults to ``0.0``.
+            fuse_joint_velocity_limits (bool, optional): Enforce joint velocity limits of
+                *driven* DOFs (``drive_slot[dof] >= 0``, i.e. ``joint_target_ke/kd > 0``) as a
+                stateless clamp instead of two dedicated dense rows per DOF. This mirrors
+                PhysX's ``PxClamp`` on ``jointV`` (``DyFeatherstoneArticulation.cpp``): if
+                ``|jointV| > maxJointVel`` an extra impulse
+                ``(clamp(jointV) - jointV) * recipResponse`` is applied — no accumulated
+                lambda, no relaxation, no Baumgarte. DOFs with a velocity limit
+                but no drive row keep their dedicated fallback rows. The clamp runs at the
+                end of every PGS iteration, after the contact rows — the position the
+                dedicated velocity-limit rows it replaces own — so the limit keeps the
+                last word of each iteration even when the sweep is under-converged. That
+                is the ordering PhysX documents for gripping scenarios
+                (``PxSceneFlag::eSOLVE_ARTICULATION_CONTACT_LAST`` /
+                ``VelLimit::eAFTER_STATIC_CONSTRAINTS``); clamping inside the drive-row
+                visit instead would let contact impulses landing later in the iteration
+                push driven DOFs past their limits with nothing left to re-clamp them.
+                The fused clamp also skips driven DOFs in the PhysX-style pre-solve
+                velocity prescale ratio. Requires ``model.joint_velocity_limit`` to be
+                allocated; when it is absent the flag is inert (the dedicated-row path
+                skips allocation without that array too, so behavior matches). The flag is
+                also inert when ``velocity_limit_activation_fraction`` is ``inf``: that value
+                is the explicit never-activate kill-switch for velocity limits, and the fused
+                clamp rides the drive-row visit rather than the gated velocity-limit phase,
+                so it must not re-enforce limits the fraction disabled. The fused clamp only applies to the
+                ``pgs_mode="matrix_free"`` + ``enable_joint_velocity_limits=True`` +
+                ``drive_mode="physx_pgs"`` formulation; in any other configuration the flag
+                is inert and velocity limits keep their dedicated rows (no error — the flag
+                is an engage-where-applicable request, not a demand, which lets it default
+                to True without constraining unrelated solver modes). The clamp pass is
+                independent of the drive-row visit, so it stays active during velocity-only
+                iterations under ``pgs_velocity_drive_mode="freeze"``, exactly like the
+                dedicated rows it replaces. Defaults to True.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_velocity_iterations (int, optional): Additional matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
@@ -639,8 +688,8 @@ class SolverFeatherPGS(SolverBase):
             pgs_velocity_drive_mode (str, optional): Drive-row treatment during velocity-only post-pass
                 iterations. ``"freeze"`` keeps PhysX-style drive impulses from the biased position
                 solve and lets only contacts, friction, and limits clean up velocity residuals;
-                ``"active"`` continues updating drive rows during the velocity-only pass. Defaults
-                to ``"freeze"``.
+                ``"active"`` continues updating drive rows during the velocity-only pass.
+                Defaults to ``"freeze"``.
             dense_max_constraints (int, optional): Maximum number of dense (articulation) contact constraint
                 rows stored per world. Free rigid body contacts are stored separately, bounded by
                 mf_max_constraints. Defaults to 32.
@@ -901,6 +950,22 @@ class SolverFeatherPGS(SolverBase):
         if drive_mode == "physx_pgs" and self.pgs_mode != "matrix_free":
             raise NotImplementedError("drive_mode='physx_pgs' currently requires pgs_mode='matrix_free'")
         self.drive_mode = drive_mode
+        # fuse_joint_velocity_limits is an engage-where-applicable request,
+        # not a demand: the fused clamp only exists in the matrix_free +
+        # physx_pgs + velocity-limits formulation (and needs
+        # model.joint_velocity_limit), so any other configuration keeps its
+        # dedicated rows silently instead of erroring. An inf activation
+        # fraction is the explicit never-activate kill-switch for velocity
+        # limits; the fused clamp rides the drive-row visit rather than the
+        # gated velocity-limit phase, so it must stay disengaged there too.
+        _fuse_applicable = (
+            self.pgs_mode == "matrix_free"
+            and self.enable_joint_velocity_limits
+            and self.drive_mode == "physx_pgs"
+            and not np.isinf(self.velocity_limit_activation_fraction)
+            and getattr(model, "joint_velocity_limit", None) is not None
+        )
+        self.fuse_joint_velocity_limits = bool(fuse_joint_velocity_limits) and _fuse_applicable
         self.rigid_body_max_linear_velocity = getattr(model, "rigid_body_max_linear_velocity", None)
         self.rigid_body_max_angular_velocity = getattr(model, "rigid_body_max_angular_velocity", None)
         self.rigid_body_max_depenetration_velocity = getattr(model, "rigid_body_max_depenetration_velocity", None)
@@ -1353,6 +1418,12 @@ class SolverFeatherPGS(SolverBase):
         if row_phase == 5:
             if np.isinf(self.velocity_limit_activation_fraction):
                 return False
+            if self.fuse_joint_velocity_limits:
+                # The fused end-of-iteration clamp revisits the drive-row
+                # prefix during the phase-5 launch, so the phase has work
+                # even when every limited DOF is driven and no dedicated
+                # velocity-limit row was allocated.
+                return True
             has_joint_velocity_rows = (
                 self.enable_joint_velocity_limits and getattr(self, "velocity_limit_slot", None) is not None
             )
@@ -1397,12 +1468,15 @@ class SolverFeatherPGS(SolverBase):
         self._build_body_maps(model)
         self._classify_free_rigid_bodies(model)
         self._propagation_tree_single_dof_by_size: dict[int, bool] = {}
+        self._propagation_tree_free_root_by_size: dict[int, bool] = {}
         self._propagation_tree_has_non_free_by_size: dict[int, bool] = {}
         self._propagation_tree_requires_body_map = False
         if model.joint_count:
             joint_dof_dim = model.joint_dof_dim.numpy()
             joint_dof_count = np.sum(joint_dof_dim, axis=1)
             articulation_start = model.articulation_start.numpy()
+            joint_parent_np = model.joint_parent.numpy()
+            joint_child_np = model.joint_child.numpy()
             # Solve-size membership follows the response mapping (art_size was
             # renamed to the plan's response_dof_count by the response
             # execution redesign; identical for propagation-reachable configs
@@ -1415,6 +1489,7 @@ class SolverFeatherPGS(SolverBase):
             )
             for size in self.size_groups:
                 ok = True
+                free_root_ok = True
                 has_non_free = False
                 for art in np.where(art_size_np == size)[0]:
                     if int(is_free_rigid_np[art]) == 0:
@@ -1423,7 +1498,37 @@ class SolverFeatherPGS(SolverBase):
                     joint_end = int(articulation_start[art + 1])
                     if np.any(joint_dof_count[joint_start:joint_end] > 1):
                         ok = False
+                    # Free-root shape: the articulation's first joint is its
+                    # unique world-rooted joint (up to 6 DOFs, e.g. a floating
+                    # base) and every remaining joint is 0/1-DOF with an
+                    # in-articulation parent that precedes it in joint order.
+                    # This verifies at build time (on the host) the ordering
+                    # assumption the free-root warp kernels rely on:
+                    # articulation_start[art] is the root joint with
+                    # joint_parent == -1, and the joint list is topologically
+                    # sorted (parents before children).
+                    if free_root_ok:
+                        counts = joint_dof_count[joint_start:joint_end]
+                        parents = joint_parent_np[joint_start:joint_end]
+                        if (
+                            joint_end <= joint_start
+                            or int(parents[0]) != -1
+                            or int(counts[0]) > 6
+                            or np.any(parents[1:] < 0)
+                            or np.any(counts[1:] > 1)
+                        ):
+                            free_root_ok = False
+                        else:
+                            child_to_slot = {
+                                int(joint_child_np[j]): j - joint_start for j in range(joint_start, joint_end)
+                            }
+                            for j in range(joint_start + 1, joint_end):
+                                pslot = child_to_slot.get(int(joint_parent_np[j]), -1)
+                                if pslot < 0 or pslot >= j - joint_start:
+                                    free_root_ok = False
+                                    break
                 self._propagation_tree_single_dof_by_size[int(size)] = ok
+                self._propagation_tree_free_root_by_size[int(size)] = free_root_ok
                 self._propagation_tree_has_non_free_by_size[int(size)] = has_non_free
                 if not ok:
                     self._propagation_tree_requires_body_map = True
@@ -1431,6 +1536,7 @@ class SolverFeatherPGS(SolverBase):
         else:
             self._propagation_tree_single_dof_joints = True
             self._propagation_tree_single_dof_by_size = {int(size): True for size in self.size_groups}
+            self._propagation_tree_free_root_by_size = {int(size): False for size in self.size_groups}
             self._propagation_tree_has_non_free_by_size = {int(size): False for size in self.size_groups}
             self._propagation_tree_requires_body_map = False
         self._setup_world_size_grouping(model)
@@ -2141,6 +2247,20 @@ class SolverFeatherPGS(SolverBase):
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        # Per-world dense row-family boundaries, snapshotted from slot_counter
+        # each step (allocated once here: per-step allocation is forbidden
+        # under CUDA graph capture). The dense slot layout is
+        # [drive][joint-limit][joint-vel-limit][contact/friction], so:
+        #   [world, 0] = end of the drive + position-limit prefix (row_phase 3)
+        #   [world, 1] = end of the velocity-limit segment (row_phase 5);
+        #   contacts/friction occupy [bounds[world, 1], m_dense) (row_phase 4).
+        self.dense_phase_bounds = wp.zeros((self.world_count, 2), dtype=wp.int32, device=device)
+        # Previous step's family boundaries, consumed by prepare_world_impulses
+        # when pgs_warmstart is on: activation-gated limit/vel-limit rows can
+        # appear/disappear between steps ("flicker"), shifting every following
+        # slot, so index-based warm-starting must cold-start the shifted tail.
+        # Allocated unconditionally (tiny) so graph capture never allocates.
+        self.dense_phase_bounds_prev = wp.zeros((self.world_count, 2), dtype=wp.int32, device=device)
         # Set by allocate_world_contact_slots when a world received dense
         # contact rows this step; gates the propagation tree qd refresh.
         self.dense_contact_world_flag = wp.zeros((self.world_count,), dtype=wp.int32, device=device)
@@ -2245,6 +2365,24 @@ class SolverFeatherPGS(SolverBase):
             )
         else:
             self.drive_slot = None
+
+        # Velocity-limit kernels take a drive_slot input for the fused-clamp
+        # skip; when fusion is off (or there are no drive slots) they receive
+        # this persistent 1-element dummy and never read it (skip_driven == 0).
+        self._vel_limit_skip_driven = 1 if (self.fuse_joint_velocity_limits and self.drive_slot is not None) else 0
+        if self._vel_limit_skip_driven:
+            self._vel_limit_drive_slot_arg = self.drive_slot
+        else:
+            self._vel_limit_drive_slot_arg = wp.full((1,), -1, dtype=wp.int32, device=device)
+        # The drive-row populate kernel only reads joint_velocity_limit when
+        # the fused clamp is enabled; otherwise pass a 1-element dummy so
+        # models without velocity limits stay valid.
+        if self.fuse_joint_velocity_limits:
+            self._drive_vel_limit_src_arg = model.joint_velocity_limit
+            if self._drive_vel_limit_src_arg is None:
+                raise ValueError("fuse_joint_velocity_limits=True requires model.joint_velocity_limit to be allocated")
+        else:
+            self._drive_vel_limit_src_arg = wp.zeros((1,), dtype=wp.float32, device=device)
 
     def _allocate_world_buffers(self, model):
         """Allocate world-level constraint system buffers for multi-articulation support."""
@@ -2406,6 +2544,17 @@ class SolverFeatherPGS(SolverBase):
         self.drive_max_impulse = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
+        # Per-dense-row joint velocity limit for the fused drive-row clamp
+        # (fuse_joint_velocity_limits). Only allocated at full size when the
+        # feature is on; otherwise a (1, 1) dummy keeps the drive populate
+        # kernel signature satisfied without the memory cost (the kernel
+        # never writes it when fuse_vel_limits == 0).
+        if self.fuse_joint_velocity_limits:
+            self.drive_vel_limit = wp.zeros(
+                (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+        else:
+            self.drive_vel_limit = wp.zeros((1, 1), dtype=wp.float32, device=device)
         self._debug_position_drive_target_vel_bias = (
             wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
             if self._debug_buffers_enabled
@@ -2957,6 +3106,7 @@ class SolverFeatherPGS(SolverBase):
                 device_arch,
                 has_drive_rows=self.drive_mode == "physx_pgs",
                 has_dense_velocity_limit_rows=self.enable_joint_velocity_limits,
+                fuse_vel_limits=self.fuse_joint_velocity_limits,
                 friction_mode=self.friction_mode,
                 shared_metadata=False,
             )
@@ -3049,6 +3199,7 @@ class SolverFeatherPGS(SolverBase):
                             int(fused_size),
                             device_arch,
                             worlds_per_block=self._propagation_fused_worlds_per_block,
+                            fuse_vel_limits=self.fuse_joint_velocity_limits,
                         )
                     )
                 else:
@@ -3060,6 +3211,7 @@ class SolverFeatherPGS(SolverBase):
         self._propagate_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         self._factor_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         self._response_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
+        self._refresh_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
         self._propagation_joint_parent_slot = None
         if model.device.is_cuda and self._propagation_contacts_enabled():
             self._propagation_joint_parent_slot = self._build_propagation_joint_parent_slot(model)
@@ -3070,24 +3222,38 @@ class SolverFeatherPGS(SolverBase):
                 joint_counts = articulation_start_np[arts + 1] - articulation_start_np[arts]
                 group_max_joints[int(size)] = int(joint_counts.max()) if joint_counts.size else 0
             for size in self.size_groups:
-                if (
+                size_i = int(size)
+                single_dof = self._propagation_tree_single_dof_by_size.get(size_i, False)
+                free_root = self._propagation_tree_free_root_by_size.get(size_i, False)
+                eligible = (
                     size > 0
-                    and self._propagation_tree_has_non_free_by_size.get(int(size), True)
-                    and self._propagation_tree_single_dof_by_size.get(int(size), False)
-                ):
-                    self._factor_tree_warp_kernels_by_size[int(size)] = _get_factor_propagation_tree_revolute_kernel(
-                        int(size), device_arch
+                    and self._propagation_tree_has_non_free_by_size.get(size_i, True)
+                    and (single_dof or free_root)
+                )
+                self._factor_tree_warp_kernels_by_size[size_i] = None
+                self._response_tree_warp_kernels_by_size[size_i] = None
+                self._propagate_tree_warp_kernels_by_size[size_i] = None
+                self._refresh_tree_warp_kernels_by_size[size_i] = None
+                if eligible:
+                    # A group that is fully single-DOF takes the plain revolute
+                    # variants; otherwise every articulation in it has the
+                    # free-root shape and the kernels compile a multi-DOF root
+                    # special case (has_free_root).
+                    has_free_root = not single_dof
+                    self._factor_tree_warp_kernels_by_size[size_i] = _get_factor_propagation_tree_revolute_kernel(
+                        size_i, device_arch, has_free_root=has_free_root
                     )
-                    self._response_tree_warp_kernels_by_size[int(size)] = (
-                        _get_propagation_tree_body_response_revolute_kernel(int(size), device_arch)
+                    self._response_tree_warp_kernels_by_size[size_i] = (
+                        _get_propagation_tree_body_response_revolute_kernel(
+                            size_i, device_arch, has_free_root=has_free_root
+                        )
                     )
-                    self._propagate_tree_warp_kernels_by_size[int(size)] = _get_propagate_tree_impulses_revolute_kernel(
-                        int(size), group_max_joints[int(size)], device_arch
+                    self._propagate_tree_warp_kernels_by_size[size_i] = _get_propagate_tree_impulses_revolute_kernel(
+                        size_i, group_max_joints[size_i], device_arch, has_free_root=has_free_root
                     )
-                else:
-                    self._factor_tree_warp_kernels_by_size[int(size)] = None
-                    self._response_tree_warp_kernels_by_size[int(size)] = None
-                    self._propagate_tree_warp_kernels_by_size[int(size)] = None
+                    self._refresh_tree_warp_kernels_by_size[size_i] = _get_refresh_propagation_tree_body_qd_warp_kernel(
+                        size_i, group_max_joints[size_i], device_arch
+                    )
 
     def _build_propagation_joint_parent_slot(self, model) -> wp.array:
         """Per-joint local index of the joint whose child is this joint's parent body.
@@ -3232,6 +3398,7 @@ class SolverFeatherPGS(SolverBase):
                 os.makedirs(_FPGS_CAPTURE_DIR, exist_ok=True)
                 _arrs = {
                     "constraint_count": self.constraint_count,
+                    "dense_phase_bounds": self.dense_phase_bounds,
                     "world_dof_indices": self.world_dof_indices,
                     "dense_rhs": dense_rhs,
                     "diag": self.diag,
@@ -3256,6 +3423,8 @@ class SolverFeatherPGS(SolverBase):
                     "world_deferred_dof_mask": self.world_deferred_dof_mask,
                     "v_out": self.v_out,  # RMW: pre-launch snapshot
                 }
+                if self.fuse_joint_velocity_limits:
+                    _arrs["drive_vel_limit"] = self.drive_vel_limit
                 _base = os.path.join(_FPGS_CAPTURE_DIR, f"mfgs_step{self._fpgs_step_n}_phase{row_phase}")
                 # .numpy() is a synchronous D2H copy; no wp.synchronize() (AGENTS.md rule)
                 np.savez(_base + ".npz", **{_k: _v.numpy() for _k, _v in _arrs.items()})
@@ -3268,6 +3437,7 @@ class SolverFeatherPGS(SolverBase):
                             "friction_mode": str(self.friction_mode),
                             "has_drive_rows": self.drive_mode == "physx_pgs",
                             "has_dense_velocity_limit_rows": bool(self.enable_joint_velocity_limits),
+                            "fuse_vel_limits": bool(self.fuse_joint_velocity_limits),
                             "device_arch": int(self.model.device.arch),  # INT warp arch code
                             "world_count": int(self.world_count),
                             "block_dim": 32,
@@ -3289,6 +3459,7 @@ class SolverFeatherPGS(SolverBase):
                     dim=[self.world_count],
                     inputs=[
                         self.constraint_count,
+                        self.dense_phase_bounds,
                         self.world_dof_indices,
                         self.world_deferred_dof_mask,
                         dense_rhs,
@@ -3303,6 +3474,9 @@ class SolverFeatherPGS(SolverBase):
                         self.drive_vel_multiplier,
                         self.drive_impulse_multiplier,
                         self.drive_max_impulse,
+                        # (1, 1) dummy when the fused clamp is off; the kernel
+                        # only reads it when built with fuse_vel_limits.
+                        self.drive_vel_limit,
                         self.mf_constraint_count,
                         self.mf_contact_rows_end,
                         mf_meta,
@@ -3363,9 +3537,15 @@ class SolverFeatherPGS(SolverBase):
                 continue
             if not self._propagation_tree_has_non_free_by_size.get(int(size), True):
                 continue
-            wp.launch(
-                refresh_propagation_tree_body_qd_for_size,
-                dim=n_arts,
+            self._launch_refresh_propagation_tree_body_qd(size, n_arts, force=force)
+        self._refresh_propagation_free_body_qd_from_vout()
+
+    def _launch_refresh_propagation_tree_body_qd(self, size: int, n_arts: int, *, force: bool) -> None:
+        refresh_kernel = getattr(self, "_refresh_tree_warp_kernels_by_size", {}).get(int(size))
+        if refresh_kernel is not None:
+            wp.launch_tiled(
+                refresh_kernel,
+                dim=[n_arts],
                 inputs=[
                     self.group_to_art[size],
                     self.art_to_world,
@@ -3375,18 +3555,39 @@ class SolverFeatherPGS(SolverBase):
                     self.model.joint_parent,
                     self.model.joint_child,
                     self.model.joint_qd_start,
-                    self.model.joint_dof_dim,
+                    self._propagation_joint_parent_slot,
                     self.propagation_joint_S_flat,
                     self.propagation_body_com_rel,
                     self.v_out,
                 ],
-                outputs=[
-                    self.propagation_tree_body_delta,
-                    self.propagation_body_qd,
-                ],
+                outputs=[self.propagation_body_qd],
+                block_dim=32,
                 device=self.model.device,
             )
-        self._refresh_propagation_free_body_qd_from_vout()
+            return
+        wp.launch(
+            refresh_propagation_tree_body_qd_for_size,
+            dim=n_arts,
+            inputs=[
+                self.group_to_art[size],
+                self.art_to_world,
+                self.dense_contact_world_flag,
+                int(force),
+                self.model.articulation_start,
+                self.model.joint_parent,
+                self.model.joint_child,
+                self.model.joint_qd_start,
+                self.model.joint_dof_dim,
+                self.propagation_joint_S_flat,
+                self.propagation_body_com_rel,
+                self.v_out,
+            ],
+            outputs=[
+                self.propagation_tree_body_delta,
+                self.propagation_body_qd,
+            ],
+            device=self.model.device,
+        )
 
     def _refresh_propagation_free_body_qd_from_vout(self) -> None:
         if (
@@ -3524,55 +3725,55 @@ class SolverFeatherPGS(SolverBase):
                         ],
                         device=self.model.device,
                     )
-            if self._propagation_tree_single_dof_by_size.get(int(size), False):
+            response_kernel = getattr(self, "_response_tree_warp_kernels_by_size", {}).get(int(size))
+            if response_kernel is not None:
                 with self._sync_timed(f"prop_setup_response_revolute_size{int(size)}"):
-                    response_kernel = getattr(self, "_response_tree_warp_kernels_by_size", {}).get(int(size))
-                    if response_kernel is not None:
-                        wp.launch_tiled(
-                            response_kernel,
-                            dim=[n_arts],
-                            inputs=[
-                                self.group_to_art[size],
-                                self.model.articulation_start,
-                                self.model.joint_parent,
-                                self.model.joint_child,
-                                self.model.joint_qd_start,
-                                self.propagation_joint_S_flat,
-                                self.propagation_body_com_rel,
-                                self.propagation_tree_U,
-                                self.propagation_tree_D_inv,
-                            ],
-                            outputs=[
-                                self.propagation_tree_Ia,
-                                self.propagation_tree_body_delta,
-                                self.propagation_body_response,
-                            ],
-                            block_dim=32,
-                            device=self.model.device,
-                        )
-                    else:
-                        wp.launch(
-                            compute_propagation_tree_body_response_revolute_for_size,
-                            dim=n_arts,
-                            inputs=[
-                                self.group_to_art[size],
-                                self.model.articulation_start,
-                                self.model.joint_parent,
-                                self.model.joint_child,
-                                self.model.joint_qd_start,
-                                self.model.joint_dof_dim,
-                                self.propagation_joint_S_flat,
-                                self.propagation_body_com_rel,
-                                self.propagation_tree_U,
-                                self.propagation_tree_D_inv,
-                            ],
-                            outputs=[
-                                self.propagation_tree_Ia,
-                                self.propagation_tree_body_delta,
-                                self.propagation_body_response,
-                            ],
-                            device=self.model.device,
-                        )
+                    wp.launch_tiled(
+                        response_kernel,
+                        dim=[n_arts],
+                        inputs=[
+                            self.group_to_art[size],
+                            self.model.articulation_start,
+                            self.model.joint_parent,
+                            self.model.joint_child,
+                            self.model.joint_qd_start,
+                            self.propagation_joint_S_flat,
+                            self.propagation_body_com_rel,
+                            self.propagation_tree_U,
+                            self.propagation_tree_D_inv,
+                        ],
+                        outputs=[
+                            self.propagation_tree_Ia,
+                            self.propagation_tree_body_delta,
+                            self.propagation_body_response,
+                        ],
+                        block_dim=32,
+                        device=self.model.device,
+                    )
+            elif self._propagation_tree_single_dof_by_size.get(int(size), False):
+                with self._sync_timed(f"prop_setup_response_revolute_size{int(size)}"):
+                    wp.launch(
+                        compute_propagation_tree_body_response_revolute_for_size,
+                        dim=n_arts,
+                        inputs=[
+                            self.group_to_art[size],
+                            self.model.articulation_start,
+                            self.model.joint_parent,
+                            self.model.joint_child,
+                            self.model.joint_qd_start,
+                            self.model.joint_dof_dim,
+                            self.propagation_joint_S_flat,
+                            self.propagation_body_com_rel,
+                            self.propagation_tree_U,
+                            self.propagation_tree_D_inv,
+                        ],
+                        outputs=[
+                            self.propagation_tree_Ia,
+                            self.propagation_tree_body_delta,
+                            self.propagation_body_response,
+                        ],
+                        device=self.model.device,
+                    )
             else:
                 with self._sync_timed(f"prop_setup_response_active_size{int(size)}"):
                     wp.launch(
@@ -3582,6 +3783,7 @@ class SolverFeatherPGS(SolverBase):
                             self.propagation_body_count,
                             self.propagation_body_list,
                             self.body_to_articulation,
+                            self.body_to_joint,
                             self.group_to_art[size],
                             self.art_to_world,
                             self.model.articulation_start,
@@ -3605,29 +3807,7 @@ class SolverFeatherPGS(SolverBase):
                         device=self.model.device,
                     )
             with self._sync_timed(f"prop_setup_refresh_tree_qd_size{int(size)}"):
-                wp.launch(
-                    refresh_propagation_tree_body_qd_for_size,
-                    dim=n_arts,
-                    inputs=[
-                        self.group_to_art[size],
-                        self.art_to_world,
-                        self.dense_contact_world_flag,
-                        1,
-                        self.model.articulation_start,
-                        self.model.joint_parent,
-                        self.model.joint_child,
-                        self.model.joint_qd_start,
-                        self.model.joint_dof_dim,
-                        self.propagation_joint_S_flat,
-                        self.propagation_body_com_rel,
-                        self.v_out,
-                    ],
-                    outputs=[
-                        self.propagation_tree_body_delta,
-                        self.propagation_body_qd,
-                    ],
-                    device=self.model.device,
-                )
+                self._launch_refresh_propagation_tree_body_qd(size, n_arts, force=True)
         if self._has_free_rigid_bodies and self.is_free_rigid is not None:
             with self._sync_timed("prop_setup_free_response"):
                 wp.launch(
@@ -3965,6 +4145,7 @@ class SolverFeatherPGS(SolverBase):
                 inputs=[
                     self.world_count,
                     self.constraint_count,
+                    self.dense_phase_bounds,
                     self.world_dof_start,
                     dense_rhs,
                     self.diag,
@@ -3978,6 +4159,9 @@ class SolverFeatherPGS(SolverBase):
                     self.drive_vel_multiplier,
                     self.drive_impulse_multiplier,
                     self.drive_max_impulse,
+                    # (1, 1) dummy when the fused clamp is off; the kernel
+                    # only reads it when built with fuse_vel_limits.
+                    self.drive_vel_limit,
                     self.mf_constraint_count,
                     self.mf_contact_rows_end,
                     mf_meta,
@@ -5398,6 +5582,8 @@ class SolverFeatherPGS(SolverBase):
                     model.joint_dof_dim,
                     model.joint_velocity_limit,
                     model.body_flags,
+                    self._vel_limit_drive_slot_arg,
+                    self._vel_limit_skip_driven,
                 ],
                 outputs=[self.qd_work],
                 device=model.device,
@@ -5939,6 +6125,10 @@ class SolverFeatherPGS(SolverBase):
                         state_in.joint_q,
                         control.joint_target_pos,
                         control.joint_target_vel,
+                        self._drive_vel_limit_src_arg,
+                        # Equals int(fuse_joint_velocity_limits) here: this
+                        # launch is guarded by drive_active (drive_slot set).
+                        self._vel_limit_skip_driven,
                         self.art_to_world,
                         self.drive_slot,
                         self.group_to_art[size],
@@ -5956,6 +6146,178 @@ class SolverFeatherPGS(SolverBase):
                         self.drive_damping,
                         self.drive_geom_error,
                         self.drive_max_force,
+                        self.drive_vel_limit,
+                    ],
+                    device=model.device,
+                )
+
+        # ── Dense row-family layout ──────────────────────────────────────
+        # Slots are handed out in the order [drive][joint-limit]
+        # [joint-velocity-limit][contact/friction] so each PhysX-grasp GS
+        # row phase owns one contiguous dense row range:
+        #   row_phase 3 (drive + position limits): [0, bounds[0])
+        #   row_phase 5 (velocity limits):         [bounds[0], bounds[1])
+        #   row_phase 4 (contacts + friction):     [bounds[1], m_dense)
+        # The two snapshot_dense_phase_bound launches below record the family
+        # boundaries and must stay glued to this allocation sequence
+        # (slot_counter is zeroed at the top of this method).
+
+        # Joint limit constraint slots (limits work with or without contacts)
+        if self.enable_joint_limits and self.limit_slot is not None:
+            wp.launch(
+                allocate_joint_limit_slots,
+                dim=model.articulation_count,
+                inputs=[
+                    model.articulation_start,
+                    self.articulation_dof_start,
+                    self.articulation_H_rows,
+                    model.joint_type,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_limit_lower,
+                    model.joint_limit_upper,
+                    state_in.joint_q,
+                    self.joint_limit_activation_gap,
+                    self.art_to_world,
+                    max_constraints,
+                ],
+                outputs=[
+                    self.limit_slot,
+                    self.limit_sign,
+                    self.slot_counter,
+                ],
+                device=model.device,
+            )
+
+        # Unconditional: the phase-3 boundary must be valid even when drive
+        # and position-limit rows are disabled (it is then just the current
+        # watermark, i.e. the start of the velocity-limit segment).
+        wp.launch(
+            snapshot_dense_phase_bound,
+            dim=self.world_count,
+            inputs=[self.slot_counter, 0],
+            outputs=[self.dense_phase_bounds],
+            device=model.device,
+        )
+
+        # Populate joint limit Jacobian rows (per size group)
+        if self.enable_joint_limits and self.limit_slot is not None:
+            if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
+                for size in self.size_groups:
+                    self.J_by_size[size].zero_()
+                j_buffers_zeroed = True
+            for size in self.size_groups:
+                n_arts = self.n_arts_by_size[size]
+                wp.launch(
+                    populate_joint_limit_J_for_size,
+                    dim=n_arts,
+                    inputs=[
+                        model.articulation_start,
+                        self.articulation_dof_start,
+                        model.joint_type,
+                        model.joint_q_start,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_limit_lower,
+                        model.joint_limit_upper,
+                        state_in.joint_q,
+                        self.art_to_world,
+                        self.limit_slot,
+                        self.limit_sign,
+                        self.group_to_art[size],
+                        self.pgs_beta,
+                        self.pgs_cfm,
+                    ],
+                    outputs=[
+                        self.J_by_size[size],
+                        self.row_type,
+                        self.row_parent,
+                        self.row_mu,
+                        self.row_beta,
+                        self.row_cfm,
+                        self.phi,
+                        self.target_velocity,
+                    ],
+                    device=model.device,
+                )
+
+        # Allocate + populate joint velocity-limit rows (per-DOF clamp on
+        # |qdot_i| against model.joint_velocity_limit). Dense contact rows
+        # are allocated after this block so contact/friction rows form the
+        # trailing per-world slot segment; PhysX's documented row-visit
+        # ordering (vel-limit rows fire after contact, drive, friction, and
+        # positional-limit rows — physx-deep-dive §7) is enforced by the GS
+        # phase schedule, which visits velocity-limit rows in a dedicated
+        # final pass regardless of slot order.
+        if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None:
+            wp.launch(
+                allocate_joint_velocity_limit_slots,
+                dim=model.articulation_count,
+                inputs=[
+                    model.articulation_start,
+                    self.articulation_dof_start,
+                    self.articulation_H_rows,
+                    model.joint_type,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_velocity_limit,
+                    self.v_hat,
+                    self.velocity_limit_activation_fraction,
+                    self._vel_limit_drive_slot_arg,
+                    self._vel_limit_skip_driven,
+                    self.art_to_world,
+                    max_constraints,
+                ],
+                outputs=[
+                    self.velocity_limit_slot,
+                    self.velocity_limit_sign,
+                    self.slot_counter,
+                ],
+                device=model.device,
+            )
+
+        # Unconditional phase-5 boundary snapshot; dense contact rows start here.
+        wp.launch(
+            snapshot_dense_phase_bound,
+            dim=self.world_count,
+            inputs=[self.slot_counter, 1],
+            outputs=[self.dense_phase_bounds],
+            device=model.device,
+        )
+
+        if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None:
+            if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
+                for size in self.size_groups:
+                    self.J_by_size[size].zero_()
+                j_buffers_zeroed = True
+            for size in self.size_groups:
+                n_arts = self.n_arts_by_size[size]
+                wp.launch(
+                    populate_joint_velocity_limit_J_for_size,
+                    dim=n_arts,
+                    inputs=[
+                        model.articulation_start,
+                        self.articulation_dof_start,
+                        model.joint_type,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_velocity_limit,
+                        self.art_to_world,
+                        self.velocity_limit_slot,
+                        self.velocity_limit_sign,
+                        self.group_to_art[size],
+                        self.pgs_cfm,
+                    ],
+                    outputs=[
+                        self.J_by_size[size],
+                        self.row_type,
+                        self.row_parent,
+                        self.row_mu,
+                        self.row_beta,
+                        self.row_cfm,
+                        self.phi,
+                        self.target_velocity,
                     ],
                     device=model.device,
                 )
@@ -6018,34 +6380,6 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-            # Allocate joint limit constraint slots (same counter as contacts)
-            if self.enable_joint_limits and self.limit_slot is not None:
-                wp.launch(
-                    allocate_joint_limit_slots,
-                    dim=model.articulation_count,
-                    inputs=[
-                        model.articulation_start,
-                        self.articulation_dof_start,
-                        self.articulation_H_rows,
-                        model.joint_type,
-                        model.joint_q_start,
-                        model.joint_qd_start,
-                        model.joint_dof_dim,
-                        model.joint_limit_lower,
-                        model.joint_limit_upper,
-                        state_in.joint_q,
-                        self.joint_limit_activation_gap,
-                        self.art_to_world,
-                        max_constraints,
-                    ],
-                    outputs=[
-                        self.limit_slot,
-                        self.limit_sign,
-                        self.slot_counter,
-                    ],
-                    device=model.device,
-                )
-
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self.size_groups:
                     self.J_by_size[size].zero_()
@@ -6105,104 +6439,6 @@ class SolverFeatherPGS(SolverBase):
                     ],
                     device=model.device,
                 )
-
-            # Populate joint limit Jacobian rows (per size group)
-            if self.enable_joint_limits and self.limit_slot is not None:
-                for size in self.size_groups:
-                    n_arts = self.n_arts_by_size[size]
-                    wp.launch(
-                        populate_joint_limit_J_for_size,
-                        dim=n_arts,
-                        inputs=[
-                            model.articulation_start,
-                            self.articulation_dof_start,
-                            model.joint_type,
-                            model.joint_q_start,
-                            model.joint_qd_start,
-                            model.joint_dof_dim,
-                            model.joint_limit_lower,
-                            model.joint_limit_upper,
-                            state_in.joint_q,
-                            self.art_to_world,
-                            self.limit_slot,
-                            self.limit_sign,
-                            self.group_to_art[size],
-                            self.pgs_beta,
-                            self.pgs_cfm,
-                        ],
-                        outputs=[
-                            self.J_by_size[size],
-                            self.row_type,
-                            self.row_parent,
-                            self.row_mu,
-                            self.row_beta,
-                            self.row_cfm,
-                            self.phi,
-                            self.target_velocity,
-                        ],
-                        device=model.device,
-                    )
-
-            # Allocate + populate joint velocity-limit rows (per-DOF clamp on
-            # |qdot_i| against model.joint_velocity_limit). Launched *after*
-            # joint-position-limit allocation so velocity-limit rows occupy
-            # the last per-world slots — matching PhysX's documented
-            # ordering where the vel-limit row fires after contact, drive,
-            # friction, and positional-limit rows (physx-deep-dive §7).
-            if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None:
-                wp.launch(
-                    allocate_joint_velocity_limit_slots,
-                    dim=model.articulation_count,
-                    inputs=[
-                        model.articulation_start,
-                        self.articulation_dof_start,
-                        self.articulation_H_rows,
-                        model.joint_type,
-                        model.joint_qd_start,
-                        model.joint_dof_dim,
-                        model.joint_velocity_limit,
-                        self.v_hat,
-                        self.velocity_limit_activation_fraction,
-                        self.art_to_world,
-                        max_constraints,
-                    ],
-                    outputs=[
-                        self.velocity_limit_slot,
-                        self.velocity_limit_sign,
-                        self.slot_counter,
-                    ],
-                    device=model.device,
-                )
-                for size in self.size_groups:
-                    n_arts = self.n_arts_by_size[size]
-                    wp.launch(
-                        populate_joint_velocity_limit_J_for_size,
-                        dim=n_arts,
-                        inputs=[
-                            model.articulation_start,
-                            self.articulation_dof_start,
-                            model.joint_type,
-                            model.joint_qd_start,
-                            model.joint_dof_dim,
-                            model.joint_velocity_limit,
-                            self.art_to_world,
-                            self.velocity_limit_slot,
-                            self.velocity_limit_sign,
-                            self.group_to_art[size],
-                            self.pgs_cfm,
-                        ],
-                        outputs=[
-                            self.J_by_size[size],
-                            self.row_type,
-                            self.row_parent,
-                            self.row_mu,
-                            self.row_beta,
-                            self.row_cfm,
-                            self.phi,
-                            self.target_velocity,
-                        ],
-                        device=model.device,
-                    )
 
             # Build MF contact rows
             if mf_active:
@@ -6514,151 +6750,6 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-        # Joint limit constraints (outside contact block — limits work with or without contacts)
-        if self.enable_joint_limits and self.limit_slot is not None:
-            has_contacts = (
-                contacts is not None
-                and getattr(contacts, "rigid_contact_count", None) is not None
-                and contacts.rigid_contact_max > 0
-            )
-            if not has_contacts:
-                # Contacts block was skipped — allocate limits and J from scratch
-                wp.launch(
-                    allocate_joint_limit_slots,
-                    dim=model.articulation_count,
-                    inputs=[
-                        model.articulation_start,
-                        self.articulation_dof_start,
-                        self.articulation_H_rows,
-                        model.joint_type,
-                        model.joint_q_start,
-                        model.joint_qd_start,
-                        model.joint_dof_dim,
-                        model.joint_limit_lower,
-                        model.joint_limit_upper,
-                        state_in.joint_q,
-                        self.joint_limit_activation_gap,
-                        self.art_to_world,
-                        max_constraints,
-                    ],
-                    outputs=[
-                        self.limit_slot,
-                        self.limit_sign,
-                        self.slot_counter,
-                    ],
-                    device=model.device,
-                )
-                if self._H_bufs is None and not j_buffers_zeroed:
-                    for size in self.size_groups:
-                        self.J_by_size[size].zero_()
-                    j_buffers_zeroed = True
-                for size in self.size_groups:
-                    n_arts = self.n_arts_by_size[size]
-                    wp.launch(
-                        populate_joint_limit_J_for_size,
-                        dim=n_arts,
-                        inputs=[
-                            model.articulation_start,
-                            self.articulation_dof_start,
-                            model.joint_type,
-                            model.joint_q_start,
-                            model.joint_qd_start,
-                            model.joint_dof_dim,
-                            model.joint_limit_lower,
-                            model.joint_limit_upper,
-                            state_in.joint_q,
-                            self.art_to_world,
-                            self.limit_slot,
-                            self.limit_sign,
-                            self.group_to_art[size],
-                            self.pgs_beta,
-                            self.pgs_cfm,
-                        ],
-                        outputs=[
-                            self.J_by_size[size],
-                            self.row_type,
-                            self.row_parent,
-                            self.row_mu,
-                            self.row_beta,
-                            self.row_cfm,
-                            self.phi,
-                            self.target_velocity,
-                        ],
-                        device=model.device,
-                    )
-
-        # Joint velocity-limit fallback path: activates when there are no
-        # contacts and the position-limit fallback did not already run us
-        # through the velocity-limit dispatch inside the contact block.
-        if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None:
-            has_contacts = (
-                contacts is not None
-                and getattr(contacts, "rigid_contact_count", None) is not None
-                and contacts.rigid_contact_max > 0
-            )
-            if not has_contacts:
-                # If the position-limit fallback above didn't zero J (because
-                # enable_joint_limits is off), we need to zero it here so
-                # prior-frame rows don't leak into the current solve.
-                if not (self.enable_joint_limits and self.limit_slot is not None):
-                    if self._H_bufs is None and not j_buffers_zeroed:
-                        for size in self.size_groups:
-                            self.J_by_size[size].zero_()
-                        j_buffers_zeroed = True
-                wp.launch(
-                    allocate_joint_velocity_limit_slots,
-                    dim=model.articulation_count,
-                    inputs=[
-                        model.articulation_start,
-                        self.articulation_dof_start,
-                        self.articulation_H_rows,
-                        model.joint_type,
-                        model.joint_qd_start,
-                        model.joint_dof_dim,
-                        model.joint_velocity_limit,
-                        self.v_hat,
-                        self.velocity_limit_activation_fraction,
-                        self.art_to_world,
-                        max_constraints,
-                    ],
-                    outputs=[
-                        self.velocity_limit_slot,
-                        self.velocity_limit_sign,
-                        self.slot_counter,
-                    ],
-                    device=model.device,
-                )
-                for size in self.size_groups:
-                    n_arts = self.n_arts_by_size[size]
-                    wp.launch(
-                        populate_joint_velocity_limit_J_for_size,
-                        dim=n_arts,
-                        inputs=[
-                            model.articulation_start,
-                            self.articulation_dof_start,
-                            model.joint_type,
-                            model.joint_qd_start,
-                            model.joint_dof_dim,
-                            model.joint_velocity_limit,
-                            self.art_to_world,
-                            self.velocity_limit_slot,
-                            self.velocity_limit_sign,
-                            self.group_to_art[size],
-                            self.pgs_cfm,
-                        ],
-                        outputs=[
-                            self.J_by_size[size],
-                            self.row_type,
-                            self.row_parent,
-                            self.row_mu,
-                            self.row_beta,
-                            self.row_cfm,
-                            self.phi,
-                            self.target_velocity,
-                        ],
-                        device=model.device,
-                    )
-
         slots_per_contact_dense = 3 if self.enable_contact_friction else 1
         wp.launch(
             finalize_world_constraint_counts,
@@ -6919,10 +7010,22 @@ class SolverFeatherPGS(SolverBase):
         wp.launch(
             prepare_world_impulses,
             dim=self.world_count,
-            inputs=[self.constraint_count, self.dense_max_constraints, warmstart_flag, self.row_type],
+            inputs=[
+                self.constraint_count,
+                self.dense_max_constraints,
+                warmstart_flag,
+                self.row_type,
+                self.dense_phase_bounds,
+                self.dense_phase_bounds_prev,
+            ],
             outputs=[self.impulses],
             device=self.model.device,
         )
+        if self.pgs_warmstart:
+            # Remember this step's row-family boundaries for the flicker check
+            # inside prepare_world_impulses (wp.copy is graph-capture safe).
+            # Skipped entirely when warm-starting is off.
+            wp.copy(self.dense_phase_bounds_prev, self.dense_phase_bounds)
 
     def _dispatch_dense_pgs_solve(
         self,
@@ -10814,6 +10917,60 @@ def _get_pgs_solve_propagation_contact_kernel(
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_template)
 
 
+# Fused PhysX-style joint velocity clamp (fuse_joint_velocity_limits) for the
+# propagation full-iteration kernel; _get_pgs_solve_mf_gs_kernel carries the
+# same pass in its own f-string idiom (packed s_meta_dense, deferred-response
+# masking). Mirrors DyFeatherstoneArticulation.cpp:
+# deltaF = (PxClamp(jointV, -maxV, maxV) - jointV) * recipResponse. A drive
+# row's Jacobian is e_i, so its J·v IS the DOF's joint velocity and its diag
+# (= J M^-1 J^T + cfm, with cfm == 0 for drive rows) is PhysX's unitResponse.
+# The pass runs once per iteration AFTER every contact phase — the position
+# the dedicated velocity-limit rows it replaces own — so the limit keeps the
+# last word even when the sweep is under-converged. That is the ordering
+# PhysX documents for gripping scenarios
+# (PxSceneFlag::eSOLVE_ARTICULATION_CONTACT_LAST /
+# VelLimit::eAFTER_STATIC_CONSTRAINTS); clamping inside the drive-row visit
+# instead lets contact impulses landing later in the same iteration push
+# driven DOFs past their limits with nothing left to re-clamp them. The
+# correction is velocity-only, never accumulated into the drive lambda:
+# PhysX does not accumulate the clamp deltaF, and folding it into lambda
+# would decay it through drive_impulse_multiplier and re-clamp it against
+# maxForce on the next visit. Substituted at //FVL_LAST_CLAMP, at the end of
+# the per-iteration phase_stage loop.
+_FVL_LAST_WORD_CLAMP_SNIPPET = """\
+        // Fused stateless velocity clamp on driven DOFs, run after all
+        // contact phases of this iteration (see _FVL_LAST_WORD_CLAMP_SNIPPET).
+        {
+            const int drive_hi_fvl = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+            for (int i = 0; i < drive_hi_fvl; ++i) {
+                if (s_rtype_dense[i] != 1) continue;
+                const float qdot_max_fvl = s_drive_vel_limit_dense[i];
+                const float denom_fvl = s_diag_dense[i];
+                if (denom_fvl <= 0.0f) continue;
+
+                const int row_base_fvl = jy_world_base + i * __D__;
+                float my_sum_fvl = 0.0f;
+                for (int d = lane; d < __D__; d += 32) {
+                    my_sum_fvl += J_world.data[row_base_fvl + d] * s_v[d];
+                }
+                for (int shfl = 16; shfl > 0; shfl >>= 1) {
+                    my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, shfl);
+                }
+                const float jv_fvl = __shfl_sync(MASK, my_sum_fvl, 0);
+
+                if (fabsf(jv_fvl) > qdot_max_fvl) {
+                    const float delta_fvl =
+                        (fminf(fmaxf(jv_fvl, -qdot_max_fvl), qdot_max_fvl) - jv_fvl) / denom_fvl;
+                    for (int d = lane; d < __D__; d += 32) {
+                        s_v[d] += Y_world.data[row_base_fvl + d] * delta_fvl;
+                    }
+                }
+                __syncwarp(MASK);
+            }
+        }
+"""
+
+
 @cache
 def _get_pgs_solve_propagation_full_iteration_kernel(
     max_constraints: int,
@@ -10824,6 +10981,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     target_size: int,
     device_arch: str,
     worlds_per_block: int = 1,
+    fuse_vel_limits: bool = False,
 ) -> "wp.Kernel":
     """Build a block-per-world kernel that fuses the whole propagation GS iteration.
 
@@ -10832,6 +10990,15 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     propagation body-space contacts plus tree response, then phase 5
     velocity-limit rows. It keeps the world velocity in shared memory across
     those phases and only writes it back at the end.
+
+    ``fuse_vel_limits`` compiles the PhysX-style stateless joint-velocity
+    clamp as an end-of-iteration pass over the drive-row prefix
+    (``_FVL_LAST_WORD_CLAMP_SNIPPET``; the MF-GS kernel carries the same pass
+    in its own idiom). The ``world_drive_vel_limit`` per-row parameter is
+    always present in the signature — launch sites pass the solver's
+    ``drive_vel_limit`` array, a (1, 1) dummy when the feature is off — and
+    the flag only gates the clamp code emission, so the generated source with
+    the flag off stays byte-identical to before the feature existed.
     """
 
     M_D = max_constraints
@@ -10880,6 +11047,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     __shared__ float _sh_drive_vel_mul_dense[__W__][__M_D__];
     __shared__ float _sh_drive_imp_mul_dense[__W__][__M_D__];
     __shared__ float _sh_drive_max_imp_dense[__W__][__M_D__];
+//FVL_SMEM_DECL
     __shared__ float _sh_lam_mf[__W__][__M_MF__];
     typedef float _arr_d_t[__D__];
     typedef float _arr_md_f_t[__M_D__];
@@ -10896,6 +11064,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     _arr_md_f_t& s_drive_vel_mul_dense = _sh_drive_vel_mul_dense[_slot];
     _arr_md_f_t& s_drive_imp_mul_dense = _sh_drive_imp_mul_dense[_slot];
     _arr_md_f_t& s_drive_max_imp_dense = _sh_drive_max_imp_dense[_slot];
+//FVL_SMEM_BIND
     _arr_mf_t& s_lam_mf = _sh_lam_mf[_slot];
 
     for (int d = lane; d < __D__; d += 32) {
@@ -10913,6 +11082,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         s_drive_vel_mul_dense[i] = world_drive_vel_multiplier.data[off];
         s_drive_imp_mul_dense[i] = world_drive_impulse_multiplier.data[off];
         s_drive_max_imp_dense[i] = world_drive_max_impulse.data[off];
+//FVL_LOAD
     }
     for (int i = lane; i < m_mf; i += 32) {
         s_lam_mf[i] = mf_impulses.data[off_mf + i];
@@ -10925,7 +11095,23 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         for (int phase_stage = 0; phase_stage < 3; ++phase_stage) {
             const int row_phase = (phase_stage == 0) ? 3 : ((phase_stage == 1) ? 4 : 5);
 
-            for (int i = 0; i < m_dense; ++i) {
+            // The dense slot layout is [drive][joint-limit][joint-vel-limit]
+            // [contact/friction], so each phase stage scans only its own
+            // contiguous row range (absolute indexing into the shared arrays,
+            // which are loaded/stored once for the full [0, m_dense) span);
+            // the per-row type filters below remain as a safety net.
+            int dense_lo = 0;
+            int dense_hi = m_dense;
+            if (row_phase == 3) {
+                dense_hi = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+            } else if (row_phase == 5) {
+                dense_lo = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+                dense_hi = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
+            } else {
+                dense_lo = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
+            }
+
+            for (int i = dense_lo; i < dense_hi; ++i) {
                 const int row_type = s_rtype_dense[i];
                 if (row_phase == 3 && row_type != 1 && row_type != 3) continue;
                 if (row_phase == 4 && row_type != 0 && row_type != 2) continue;
@@ -11543,6 +11729,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                 }
             }
         }
+//FVL_LAST_CLAMP
     }
 
     for (int d = lane; d < __D__; d += 32) {
@@ -11557,6 +11744,29 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
 #endif
 """
 
+    if fuse_vel_limits:
+        # Fused PhysX-style joint velocity clamp: same shared staging as the
+        # MF-GS kernel variant; the end-of-iteration clamp body is the shared
+        # _FVL_LAST_WORD_CLAMP_SNIPPET constant.
+        fvl_subs = {
+            "//FVL_SMEM_DECL\n": "    __shared__ float _sh_drive_vel_limit_dense[__W__][__M_D__];\n",
+            "//FVL_SMEM_BIND\n": "    _arr_md_f_t& s_drive_vel_limit_dense = _sh_drive_vel_limit_dense[_slot];\n",
+            "//FVL_LOAD\n": "        s_drive_vel_limit_dense[i] = world_drive_vel_limit.data[off];\n",
+            "//FVL_LAST_CLAMP\n": _FVL_LAST_WORD_CLAMP_SNIPPET,
+        }
+    else:
+        # Strip the whole marker lines so the flag-off source stays
+        # byte-identical to before the feature existed.
+        fvl_subs = {
+            "//FVL_SMEM_DECL\n": "",
+            "//FVL_SMEM_BIND\n": "",
+            "//FVL_LOAD\n": "",
+            "//FVL_LAST_CLAMP\n": "",
+        }
+    for marker, code in fvl_subs.items():
+        assert snippet.count(marker) == 1
+        snippet = snippet.replace(marker, code)
+
     replacements = {
         "__M_D__": str(M_D),
         "__M_MF__": str(M_MF),
@@ -11570,11 +11780,17 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     for key, value in replacements.items():
         snippet = snippet.replace(key, value)
 
+    # Fixed signature (has_drive_rows precedent): world_drive_vel_limit is
+    # always a parameter; launch sites pass the solver's drive_vel_limit
+    # array — a (1, 1) dummy when the fused clamp is off — and
+    # fuse_vel_limits only gates the clamp code emission above.
+
     @wp.func_native(snippet)
     def pgs_solve_propagation_full_iteration_native(
         tile: int,
         world_count: int,
         world_constraint_count: wp.array[int],
+        dense_phase_bounds: wp.array2d[int],
         world_dof_start: wp.array[int],
         rhs_bias: wp.array2d[float],
         world_diag: wp.array2d[float],
@@ -11588,6 +11804,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         world_drive_vel_multiplier: wp.array2d[float],
         world_drive_impulse_multiplier: wp.array2d[float],
         world_drive_max_impulse: wp.array2d[float],
+        world_drive_vel_limit: wp.array2d[float],
         mf_constraint_count: wp.array[int],
         mf_contact_rows_end: wp.array[int],
         mf_meta: wp.array2d[int],
@@ -11645,6 +11862,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     def pgs_solve_propagation_full_iteration_template(
         world_count: int,
         world_constraint_count: wp.array[int],
+        dense_phase_bounds: wp.array2d[int],
         world_dof_start: wp.array[int],
         rhs_bias: wp.array2d[float],
         world_diag: wp.array2d[float],
@@ -11658,6 +11876,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         world_drive_vel_multiplier: wp.array2d[float],
         world_drive_impulse_multiplier: wp.array2d[float],
         world_drive_max_impulse: wp.array2d[float],
+        world_drive_vel_limit: wp.array2d[float],
         mf_constraint_count: wp.array[int],
         mf_contact_rows_end: wp.array[int],
         mf_meta: wp.array2d[int],
@@ -11716,6 +11935,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
             tile,
             world_count,
             world_constraint_count,
+            dense_phase_bounds,
             world_dof_start,
             rhs_bias,
             world_diag,
@@ -11729,6 +11949,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
             world_drive_vel_multiplier,
             world_drive_impulse_multiplier,
             world_drive_max_impulse,
+            world_drive_vel_limit,
             mf_constraint_count,
             mf_contact_rows_end,
             mf_meta,
@@ -11784,18 +12005,35 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         )
 
     name = f"pgs_solve_propagation_full_iteration_{M_D}_{M_MF}_{D}_{M_PROP}_{B_PROP}_{target_size}_w{max(int(worlds_per_block), 1)}"
+    if fuse_vel_limits:
+        name += "_fvl"
     pgs_solve_propagation_full_iteration_template.__name__ = name
     pgs_solve_propagation_full_iteration_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_full_iteration_template)
 
 
 @cache
-def _get_factor_propagation_tree_revolute_kernel(size: int, device_arch: str) -> "wp.Kernel":
-    """Build a one-warp propagation tree factor kernel for 0/1-DOF joint trees."""
+def _get_factor_propagation_tree_revolute_kernel(
+    size: int, device_arch: str, *, has_free_root: bool = False
+) -> "wp.Kernel":
+    """Build a one-warp propagation tree factor kernel for 0/1-DOF joint trees.
+
+    ``has_free_root`` compiles a special case for articulations whose FIRST
+    joint is a multi-DOF world-rooted joint (dof_count <= 6, e.g. a floating
+    base) while every remaining joint stays 0/1-DOF. The root joint's U rows,
+    joint-space block D (Cholesky-factored and inverted serially on lane 0 —
+    once per articulation per factor pass), and the U D^-1 U^T reduction of
+    the child's articulated inertia replicate the generic per-DOF math of the
+    serial ``factor_propagation_tree_for_size`` kernel. The root has no
+    parent, so it never reduces into a parent inertia. Eligibility (root
+    joint first, topological joint order) is verified host-side at solver
+    build time.
+    """
     snippet = """
 #if defined(__CUDA_ARCH__)
     const int lane = threadIdx.x & 31;
     const unsigned mask = 0xffffffffu;
+//FREE_ROOT_DECL
     const int art = group_to_art.data[group_idx];
     const int joint_start = articulation_start.data[art];
     const int joint_end = articulation_start.data[art + 1];
@@ -11832,7 +12070,7 @@ def _get_factor_propagation_tree_revolute_kernel(size: int, device_arch: str) ->
         const int dof_end = joint_qd_start.data[joint + 1];
         const int has_dof = (dof_start < dof_end);
         const int gdof = dof_start;
-
+//FREE_ROOT_FACTOR
         float d_part = 0.0f;
         if (has_dof && lane < 6) {
             float u = 0.0f;
@@ -11976,6 +12214,122 @@ def _get_factor_propagation_tree_revolute_kernel(size: int, device_arch: str) ->
 #endif
 """
 
+    if has_free_root:
+        root_decl = """
+    __shared__ float s_D_root[36];
+    __shared__ float s_Dinv_root[36];
+"""
+        root_factor = """
+        if (joint == joint_start) {
+            const int dc = dof_end - dof_start;
+            // U rows for all root DOFs: U_a = Ia(child) S_a.
+            for (int elem = lane; elem < dc * 6; elem += 32) {
+                const int a = elem / 6;
+                const int r = elem - a * 6;
+                float u_val = 0.0f;
+                for (int c = 0; c < 6; ++c) {
+                    u_val += propagation_tree_Ia.data[child * 36 + r * 6 + c]
+                        * propagation_joint_S_flat.data[(dof_start + a) * 6 + c];
+                }
+                propagation_tree_U.data[(dof_start + a) * 6 + r] = u_val;
+            }
+            __syncwarp(mask);
+            // D = S^T U (+ armature and aug-row stiffness on the diagonal).
+            for (int elem = lane; elem < dc * dc; elem += 32) {
+                const int a = elem / dc;
+                const int b = elem - a * dc;
+                float value = 0.0f;
+                for (int r = 0; r < 6; ++r) {
+                    value += propagation_joint_S_flat.data[(dof_start + a) * 6 + r]
+                        * propagation_tree_U.data[(dof_start + b) * 6 + r];
+                }
+                if (a == b) {
+                    value += joint_armature.data[dof_start + a];
+                    const int aug_count = aug_row_counts.data[art];
+                    for (int aug_i = 0; aug_i < aug_count; ++aug_i) {
+                        const int row_index = art * max_dofs + aug_i;
+                        if (aug_row_dof_index.data[row_index] == dof_start + a) {
+                            const float K = aug_row_K.data[row_index];
+                            if (K > 0.0f) {
+                                value += K;
+                            }
+                        }
+                    }
+                }
+                s_D_root[a * 6 + b] = value;
+            }
+            __syncwarp(mask);
+            if (lane == 0) {
+                // In-place Cholesky mirroring the serial kernel: the lower
+                // triangle holds the factor, the upper keeps raw D entries.
+                for (int jj = 0; jj < dc; ++jj) {
+                    float s = s_D_root[jj * 6 + jj];
+                    for (int k = 0; k < jj; ++k) {
+                        const float cjk = s_D_root[jj * 6 + k];
+                        s -= cjk * cjk;
+                    }
+                    if (s <= 1.0e-12f) {
+                        s = 1.0e-12f;
+                    }
+                    s = sqrtf(s);
+                    s_D_root[jj * 6 + jj] = s;
+                    const float inv_s = 1.0f / s;
+                    for (int i = jj + 1; i < dc; ++i) {
+                        float v = s_D_root[i * 6 + jj];
+                        for (int k = 0; k < jj; ++k) {
+                            v -= s_D_root[i * 6 + k] * s_D_root[jj * 6 + k];
+                        }
+                        s_D_root[i * 6 + jj] = v * inv_s;
+                    }
+                }
+                // Invert D column by column via forward/backward solves.
+                for (int col = 0; col < dc; ++col) {
+                    for (int i = 0; i < dc; ++i) {
+                        float v = (i == col) ? 1.0f : 0.0f;
+                        for (int k = 0; k < i; ++k) {
+                            v -= s_D_root[i * 6 + k] * s_Dinv_root[k * 6 + col];
+                        }
+                        s_Dinv_root[i * 6 + col] = v / s_D_root[i * 6 + i];
+                    }
+                    for (int i = dc - 1; i >= 0; --i) {
+                        float v = s_Dinv_root[i * 6 + col];
+                        for (int k = i + 1; k < dc; ++k) {
+                            v -= s_D_root[k * 6 + i] * s_Dinv_root[k * 6 + col];
+                        }
+                        s_Dinv_root[i * 6 + col] = v / s_D_root[i * 6 + i];
+                    }
+                }
+            }
+            __syncwarp(mask);
+            for (int elem = lane; elem < dc * dc; elem += 32) {
+                const int a = elem / dc;
+                const int b = elem - a * dc;
+                propagation_tree_D_chol.data[joint * 36 + a * 6 + b] = s_D_root[a * 6 + b];
+                propagation_tree_D_inv.data[joint * 36 + a * 6 + b] = s_Dinv_root[a * 6 + b];
+            }
+            __syncwarp(mask);
+            // Ia(child) -= U D^-1 U^T; the root has no parent to reduce into.
+            for (int elem = lane; elem < 36; elem += 32) {
+                const int row = elem / 6;
+                const int col = elem - row * 6;
+                float reduced = propagation_tree_Ia.data[child * 36 + elem];
+                for (int a = 0; a < dc; ++a) {
+                    const float U_ar = propagation_tree_U.data[(dof_start + a) * 6 + row];
+                    for (int b = 0; b < dc; ++b) {
+                        reduced -= U_ar * s_Dinv_root[a * 6 + b]
+                            * propagation_tree_U.data[(dof_start + b) * 6 + col];
+                    }
+                }
+                propagation_tree_Ia.data[child * 36 + elem] = reduced;
+            }
+            __syncwarp(mask);
+            continue;
+        }
+"""
+        snippet = snippet.replace("//FREE_ROOT_DECL", root_decl).replace("//FREE_ROOT_FACTOR", root_factor)
+    else:
+        snippet = snippet.replace("//FREE_ROOT_DECL", "").replace("//FREE_ROOT_FACTOR", "")
+
     @wp.func_native(snippet)
     def factor_propagation_tree_revolute_native(
         group_idx: int,
@@ -12043,14 +12397,33 @@ def _get_factor_propagation_tree_revolute_kernel(size: int, device_arch: str) ->
         )
 
     name = f"factor_propagation_tree_revolute_{size}"
+    if has_free_root:
+        name += "_fr"
     factor_propagation_tree_revolute_template.__name__ = name
     factor_propagation_tree_revolute_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(factor_propagation_tree_revolute_template)
 
 
 @cache
-def _get_propagation_tree_body_response_revolute_kernel(size: int, device_arch: str) -> "wp.Kernel":
-    """Build a one-warp body response kernel for 0/1-DOF joint trees."""
+def _get_propagation_tree_body_response_revolute_kernel(
+    size: int, device_arch: str, *, has_free_root: bool = False
+) -> "wp.Kernel":
+    """Build a one-warp body response kernel for 0/1-DOF joint trees.
+
+    Writes the per-link 6x6 COM response for EVERY link of the articulation
+    (overwriting ``propagation_tree_Ia`` in joint order so each link can reuse
+    its parent's already-computed response).
+
+    ``has_free_root`` compiles a special case for articulations whose FIRST
+    joint is a multi-DOF world-rooted joint (dof_count <= 6): the root link's
+    response to a unit test wrench is S D^-1 S^T (no parent recursion), the
+    multi-DOF generalization of the existing 1-DOF root branch. Descendant
+    0/1-DOF links keep the scalar recursion unchanged. The serial fallback
+    for free-root size groups is the path-restricted generic response kernel
+    (``compute_propagation_tree_body_response_for_size``), which fills only
+    contact-active bodies — a subset of what this kernel writes, with equal
+    values.
+    """
     snippet = """
 #if defined(__CUDA_ARCH__)
     const int lane = threadIdx.x & 31;
@@ -12060,6 +12433,7 @@ def _get_propagation_tree_body_response_revolute_kernel(size: int, device_arch: 
     const int joint_end = articulation_start.data[art + 1];
 
     for (int joint = joint_start; joint < joint_end; ++joint) {
+//FREE_ROOT_RESPONSE
         const int child = joint_child.data[joint];
         const int parent = joint_parent.data[joint];
         const int dof_start = joint_qd_start.data[joint];
@@ -12215,6 +12589,36 @@ def _get_propagation_tree_body_response_revolute_kernel(size: int, device_arch: 
 #endif
 """
 
+    if has_free_root:
+        root_response = """
+        if (joint == joint_start) {
+            // Multi-DOF root link: response = S D^-1 S^T (no parent).
+            const int root_dof_start = joint_qd_start.data[joint];
+            const int root_dc = joint_qd_start.data[joint + 1] - root_dof_start;
+            const int root_child = joint_child.data[joint];
+            for (int elem = lane; elem < 36; elem += 32) {
+                const int row = elem / 6;
+                const int col = elem - row * 6;
+                float value = 0.0f;
+                for (int a = 0; a < root_dc; ++a) {
+                    float qdd = 0.0f;
+                    for (int b = 0; b < root_dc; ++b) {
+                        qdd += propagation_tree_D_inv.data[joint * 36 + a * 6 + b]
+                            * propagation_joint_S_flat.data[(root_dof_start + b) * 6 + col];
+                    }
+                    value += propagation_joint_S_flat.data[(root_dof_start + a) * 6 + row] * qdd;
+                }
+                propagation_tree_Ia.data[root_child * 36 + elem] = value;
+                propagation_body_response.data[root_child * 36 + elem] = value;
+            }
+            __syncwarp(mask);
+            continue;
+        }
+"""
+        snippet = snippet.replace("//FREE_ROOT_RESPONSE", root_response)
+    else:
+        snippet = snippet.replace("//FREE_ROOT_RESPONSE", "")
+
     @wp.func_native(snippet)
     def propagation_tree_body_response_revolute_native(
         group_idx: int,
@@ -12264,13 +12668,17 @@ def _get_propagation_tree_body_response_revolute_kernel(size: int, device_arch: 
         )
 
     name = f"propagation_tree_body_response_revolute_{size}"
+    if has_free_root:
+        name += "_fr"
     propagation_tree_body_response_revolute_template.__name__ = name
     propagation_tree_body_response_revolute_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(propagation_tree_body_response_revolute_template)
 
 
 @cache
-def _get_propagate_tree_impulses_revolute_kernel(size: int, max_joints: int, device_arch: str) -> "wp.Kernel":
+def _get_propagate_tree_impulses_revolute_kernel(
+    size: int, max_joints: int, device_arch: str, *, has_free_root: bool = False
+) -> "wp.Kernel":
     """Build a one-warp propagation tree propagation kernel for 0/1-DOF joint trees.
 
     All per-joint metadata (indices, motion subspace, U, D_inv, COM offsets)
@@ -12279,8 +12687,101 @@ def _get_propagate_tree_impulses_revolute_kernel(size: int, max_joints: int, dev
     v_out, propagation_body_qd, and the deferred impulse clear touch global
     memory after the preload. This matters because the passes are dependent
     serial chains whose cost is dominated by memory latency per joint.
+
+    ``has_free_root`` compiles a special case for articulations whose FIRST
+    joint is a multi-DOF world-rooted joint (e.g. a floating base, up to
+    6 DOFs) while every remaining joint stays 0/1-DOF. The root joint gets
+    dedicated shared blocks (S_root/U_root/D_inv_root 6x6, u_root/qdd_root 6)
+    and replicates the generic per-DOF math of the serial
+    ``propagate_tree_impulses_for_size`` kernel; the root has no parent so it
+    never participates in the upward/downward parent propagation. Eligibility
+    (root joint first, topological joint order) is verified host-side at
+    solver build time.
     """
     joints_cap = max(int(max_joints), 1)
+    if has_free_root:
+        root_decl = """
+    __shared__ float s_S_root[36];
+    __shared__ float s_U_root[36];
+    __shared__ float s_Dinv_root[36];
+    __shared__ float s_u_root[6];
+    __shared__ float s_qdd_root[6];
+    const int root_gdof = joint_qd_start.data[joint_start];
+    const int root_dc = joint_qd_start.data[joint_start + 1] - root_gdof;
+"""
+        root_gdof_guard = " && j != 0"
+        root_preload = """
+    for (int idx = lane; idx < root_dc * 6; idx += 32) {
+        const int a = idx / 6;
+        const int comp = idx - a * 6;
+        s_S_root[a * 6 + comp] = propagation_joint_S_flat.data[(root_gdof + a) * 6 + comp];
+        s_U_root[a * 6 + comp] = propagation_tree_U.data[(root_gdof + a) * 6 + comp];
+    }
+    for (int idx = lane; idx < root_dc * root_dc; idx += 32) {
+        const int a = idx / root_dc;
+        const int b = idx - a * root_dc;
+        s_Dinv_root[a * 6 + b] = propagation_tree_D_inv.data[joint_start * 36 + a * 6 + b];
+    }
+"""
+        root_backward = """
+            if (j == 0) {
+                // Multi-DOF root: u_a = -S_a . pA(root); no parent to propagate to.
+                if (lane < root_dc) {
+                    float u_root = 0.0f;
+                    for (int r = 0; r < 6; ++r) {
+                        u_root -= s_S_root[lane * 6 + r] * s_pA[r];
+                    }
+                    s_u_root[lane] = u_root;
+                }
+                __syncwarp(mask);
+                continue;
+            }
+"""
+        root_forward = """
+            if (j == 0) {
+                // Multi-DOF root: qdd = D^-1 u (no parent term), delta = S qdd.
+                if (lane < root_dc) {
+                    float qdd_root = 0.0f;
+                    for (int b = 0; b < root_dc; ++b) {
+                        qdd_root += s_Dinv_root[lane * 6 + b] * s_u_root[b];
+                    }
+                    s_qdd_root[lane] = qdd_root;
+                    v_out.data[root_gdof + lane] += qdd_root;
+                }
+                __syncwarp(mask);
+                if (lane < 6) {
+                    float value = 0.0f;
+                    for (int a = 0; a < root_dc; ++a) {
+                        value += s_S_root[a * 6 + lane] * s_qdd_root[a];
+                    }
+                    s_bd[lane] = value;
+                }
+                __syncwarp(mask);
+                continue;
+            }
+"""
+        root_recompute = """
+            if (j == 0) {
+                if (lane < 6) {
+                    float value = 0.0f;
+                    for (int a = 0; a < root_dc; ++a) {
+                        value += s_S_root[a * 6 + lane] * v_out.data[root_gdof + a];
+                    }
+                    s_pA[lane] = value;
+                    propagation_body_qd.data[s_child[0] * 6 + lane] = value;
+                    propagation_body_impulses.data[s_child[0] * 6 + lane] = 0.0f;
+                }
+                __syncwarp(mask);
+                continue;
+            }
+"""
+    else:
+        root_decl = ""
+        root_gdof_guard = ""
+        root_preload = ""
+        root_backward = ""
+        root_forward = ""
+        root_recompute = ""
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const int lane = threadIdx.x & 31;
@@ -12300,7 +12801,7 @@ def _get_propagate_tree_impulses_revolute_kernel(size: int, max_joints: int, dev
     __shared__ int s_child[{joints_cap}];
     __shared__ int s_pslot[{joints_cap}];
     __shared__ int s_gdof[{joints_cap}];
-
+{root_decl}
     for (int j = lane; j < n_joints; j += 32) {{
         const int joint = joint_start + j;
         const int child = joint_child.data[joint];
@@ -12308,7 +12809,7 @@ def _get_propagate_tree_impulses_revolute_kernel(size: int, max_joints: int, dev
         const int has_dof = (dof_start < joint_qd_start.data[joint + 1]);
         s_child[j] = child;
         s_pslot[j] = joint_parent_slot.data[joint];
-        s_gdof[j] = has_dof ? dof_start : -1;
+        s_gdof[j] = (has_dof{root_gdof_guard}) ? dof_start : -1;
         s_dinv[j] = has_dof ? propagation_tree_D_inv.data[joint * 36] : 0.0f;
         s_u[j] = 0.0f;
     }}
@@ -12337,11 +12838,13 @@ def _get_propagate_tree_impulses_revolute_kernel(size: int, max_joints: int, dev
         }}
         s_e[idx] = e;
     }}
+{root_preload}
     __syncwarp(mask);
 
     if (any_impulse != 0) {{
         for (int offset = 0; offset < n_joints; ++offset) {{
             const int j = n_joints - 1 - offset;
+{root_backward}
             const int parent_slot = s_pslot[j];
             const int has_dof = (s_gdof[j] >= 0);
 
@@ -12377,6 +12880,7 @@ def _get_propagate_tree_impulses_revolute_kernel(size: int, max_joints: int, dev
         }}
 
         for (int j = 0; j < n_joints; ++j) {{
+{root_forward}
             const int parent_slot = s_pslot[j];
             const int gdof = s_gdof[j];
             const int has_dof = (gdof >= 0);
@@ -12425,6 +12929,7 @@ def _get_propagate_tree_impulses_revolute_kernel(size: int, max_joints: int, dev
         // no deferred impulses v_out and propagation_body_qd are untouched
         // since the previous consistent recompute, so the pass is skipped.
         for (int j = 0; j < n_joints; ++j) {{
+{root_recompute}
             const int parent_slot = s_pslot[j];
             const int gdof = s_gdof[j];
             const int child = s_child[j];
@@ -12508,9 +13013,165 @@ def _get_propagate_tree_impulses_revolute_kernel(size: int, max_joints: int, dev
         )
 
     name = f"propagate_tree_impulses_revolute_{size}_j{joints_cap}"
+    if has_free_root:
+        name += "_fr"
     propagate_tree_impulses_revolute_template.__name__ = name
     propagate_tree_impulses_revolute_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(propagate_tree_impulses_revolute_template)
+
+
+@cache
+def _get_refresh_propagation_tree_body_qd_warp_kernel(size: int, max_joints: int, device_arch: str) -> "wp.Kernel":
+    """Build a one-warp variant of ``refresh_propagation_tree_body_qd_for_size``.
+
+    The refresh is a single root-to-leaf pass: each link's live COM twist is
+    its parent's twist translated to the link COM plus the inbound joint's
+    S * v contribution. Per-joint S * v terms (generic over dof_count, so a
+    multi-DOF free root needs no special casing), COM edges, and topology are
+    preloaded into shared memory with lane-parallel strided loads; the serial
+    parent chain then runs on-chip with six lanes per link. The parent twist
+    lives in shared memory only — the serial kernel's
+    ``propagation_tree_body_delta`` global scratch is not written (no other
+    kernel consumes it without re-initializing it first).
+
+    Registered only for size groups whose articulations have the single-DOF
+    or free-root shape: those checks also guarantee the topological joint
+    order (parents before children) and in-articulation parents that
+    ``joint_parent_slot`` indexing relies on.
+    """
+    joints_cap = max(int(max_joints), 1)
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int lane = threadIdx.x & 31;
+    const unsigned mask = 0xffffffffu;
+    const int art = group_to_art.data[group_idx];
+    if (force_refresh == 0) {{
+        const int world = art_to_world.data[art];
+        if (world >= 0 && dense_contact_world_flag.data[world] == 0) {{
+            return;
+        }}
+    }}
+    const int joint_start = articulation_start.data[art];
+    const int joint_end = articulation_start.data[art + 1];
+    const int n_joints = joint_end - joint_start;
+
+    __shared__ float s_bd[{joints_cap} * 6];
+    __shared__ float s_Sv[{joints_cap} * 6];
+    __shared__ float s_e[{joints_cap} * 3];
+    __shared__ int s_child[{joints_cap}];
+    __shared__ int s_pslot[{joints_cap}];
+
+    for (int j = lane; j < n_joints; j += 32) {{
+        s_child[j] = joint_child.data[joint_start + j];
+        s_pslot[j] = joint_parent_slot.data[joint_start + j];
+    }}
+    __syncwarp(mask);
+    for (int idx = lane; idx < n_joints * 6; idx += 32) {{
+        const int j = idx / 6;
+        const int comp = idx - j * 6;
+        const int joint = joint_start + j;
+        const int dof_start = joint_qd_start.data[joint];
+        const int dof_end = joint_qd_start.data[joint + 1];
+        float value = 0.0f;
+        for (int dof = dof_start; dof < dof_end; ++dof) {{
+            value += propagation_joint_S_flat.data[dof * 6 + comp] * v_out.data[dof];
+        }}
+        s_Sv[idx] = value;
+    }}
+    for (int idx = lane; idx < n_joints * 3; idx += 32) {{
+        const int j = idx / 3;
+        const int comp = idx - j * 3;
+        float e = 0.0f;
+        if (s_pslot[j] >= 0) {{
+            const int parent = joint_parent.data[joint_start + j];
+            e = propagation_body_com_rel.data[s_child[j] * 3 + comp]
+                - propagation_body_com_rel.data[parent * 3 + comp];
+        }}
+        s_e[idx] = e;
+    }}
+    __syncwarp(mask);
+
+    for (int j = 0; j < n_joints; ++j) {{
+        if (lane < 6) {{
+            float value = s_Sv[j * 6 + lane];
+            const int pslot = s_pslot[j];
+            if (pslot >= 0) {{
+                value += s_bd[pslot * 6 + lane];
+                if (lane < 3) {{
+                    const float ex = s_e[j * 3 + 0];
+                    const float ey = s_e[j * 3 + 1];
+                    const float ez = s_e[j * 3 + 2];
+                    const float wx = s_bd[pslot * 6 + 3];
+                    const float wy = s_bd[pslot * 6 + 4];
+                    const float wz = s_bd[pslot * 6 + 5];
+                    if (lane == 0) value += wy * ez - wz * ey;
+                    else if (lane == 1) value += wz * ex - wx * ez;
+                    else value += wx * ey - wy * ex;
+                }}
+            }}
+            s_bd[j * 6 + lane] = value;
+            propagation_body_qd.data[s_child[j] * 6 + lane] = value;
+        }}
+        __syncwarp(mask);
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def refresh_propagation_tree_body_qd_warp_native(
+        group_idx: int,
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        dense_contact_world_flag: wp.array[int],
+        force_refresh: int,
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_parent_slot: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        v_out: wp.array[float],
+        propagation_body_qd: wp.array2d[float],
+    ): ...
+
+    def refresh_propagation_tree_body_qd_warp_template(
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        dense_contact_world_flag: wp.array[int],
+        force_refresh: int,
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_parent_slot: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        v_out: wp.array[float],
+        propagation_body_qd: wp.array2d[float],
+    ):
+        group_idx, _lane = wp.tid()
+        refresh_propagation_tree_body_qd_warp_native(
+            group_idx,
+            group_to_art,
+            art_to_world,
+            dense_contact_world_flag,
+            force_refresh,
+            articulation_start,
+            joint_parent,
+            joint_child,
+            joint_qd_start,
+            joint_parent_slot,
+            propagation_joint_S_flat,
+            propagation_body_com_rel,
+            v_out,
+            propagation_body_qd,
+        )
+
+    name = f"refresh_propagation_tree_body_qd_warp_{size}_j{joints_cap}"
+    refresh_propagation_tree_body_qd_warp_template.__name__ = name
+    refresh_propagation_tree_body_qd_warp_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(refresh_propagation_tree_body_qd_warp_template)
 
 
 @cache
@@ -12525,6 +13186,7 @@ def _get_pgs_solve_mf_gs_kernel(
     shared_metadata: bool = True,
     has_drive_rows: bool = True,
     has_dense_velocity_limit_rows: bool = True,
+    fuse_vel_limits: bool = False,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -12540,7 +13202,20 @@ def _get_pgs_solve_mf_gs_kernel(
 
     The generated kernel omits drive state and dense joint-velocity-limit work
     when those row types cannot be produced by the solver configuration.
+
+    ``fuse_vel_limits`` (requires ``has_drive_rows``) compiles the PhysX-style
+    stateless joint-velocity clamp as an end-of-iteration pass over the
+    drive-row prefix (the same pass as ``_FVL_LAST_WORD_CLAMP_SNIPPET`` in the
+    propagation full-iteration kernel, in this kernel's idiom — packed
+    ``s_meta_dense`` metadata and deferred-response masking). The
+    ``world_drive_vel_limit`` per-row parameter is always present
+    in the signature — launch sites pass the solver's ``drive_vel_limit``
+    array, a (1, 1) dummy when the feature is off — and the flag only gates
+    the clamp code emission, so the generated source with the flag off stays
+    byte-identical to before the feature existed.
     """
+    if fuse_vel_limits and not has_drive_rows:
+        raise ValueError("fuse_vel_limits requires has_drive_rows")
     _validate_dense_metadata_encoding(max_constraints)
     M_D = max_constraints
     M_MF = mf_max_constraints
@@ -12554,14 +13229,14 @@ def _get_pgs_solve_mf_gs_kernel(
     # Pipeline register declarations
     dense_pipe_decl = "\n".join([f"        float pre_dJ_{k} = 0.0f, pre_dY_{k} = 0.0f;" for k in range(ELEMS_PER_LANE)])
 
-    # Initial prefetch (constraint 0)
-    dense_prefetch_init_parts = []
+    # Initial prefetch (constraint dense_lo, the first row of this phase's range)
+    dense_prefetch_init_parts = [f"            const int init_jy_base = jy_world_base + dense_lo * {D};"]
     for k in range(ELEMS_PER_LANE):
         d_expr = f"lane + {k * 32}" if k > 0 else "lane"
         dense_prefetch_init_parts.append(f"""
             if ({d_expr} < {D}) {{
-                pre_dJ_{k} = J_world.data[jy_world_base + {d_expr}];
-                pre_dY_{k} = Y_world.data[jy_world_base + {d_expr}];
+                pre_dJ_{k} = J_world.data[init_jy_base + {d_expr}];
+                pre_dY_{k} = Y_world.data[init_jy_base + {d_expr}];
             }}""")
     dense_prefetch_init_code = "\n".join(dense_prefetch_init_parts)
 
@@ -13407,9 +14082,14 @@ def _get_pgs_solve_mf_gs_kernel(
         if has_drive_rows
         else ""
     )
+    if fuse_vel_limits:
+        drive_shared_declarations += f"""
+    __shared__ float s_drive_vel_limit_dense[{M_D}];"""
+        drive_loads += """
+        s_drive_vel_limit_dense[i] = world_drive_vel_limit.data[off_dense + i];"""
     drive_projection = (
-        """
-            if (row_type == 1) {
+        f"""
+            if (row_type == 1) {{
                 new_impulse = old_impulse * s_drive_imp_mul_dense[i]
                     + jv * s_drive_vel_mul_dense[i]
                     + s_drive_target_dense[i];
@@ -13417,7 +14097,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 if (new_impulse > max_imp) new_impulse = max_imp;
                 if (new_impulse < -max_imp) new_impulse = -max_imp;
                 delta_impulse = new_impulse - old_impulse;
-            }"""
+            }}"""
         if has_drive_rows
         else """
             if (row_type == 1) {
@@ -13465,6 +14145,64 @@ def _get_pgs_solve_mf_gs_kernel(
         else ""
     )
 
+    # Fused stateless velocity clamp on driven DOFs: the same PhysX PxClamp /
+    # unitResponse math as _FVL_LAST_WORD_CLAMP_SNIPPET (propagation
+    # full-iteration kernel), in this kernel's idiom (packed s_meta_dense,
+    # deferred-response masking). Runs where the dedicated velocity-limit
+    # rows run — after the contact rows of the same iteration — so the limit
+    # keeps the last word even when the sweep is under-converged (the
+    # ordering PhysX documents for gripping scenarios via
+    # PxSceneFlag::eSOLVE_ARTICULATION_CONTACT_LAST). Velocity-only: the
+    # persistent drive lambda keeps the drive-only value.
+    fused_drive_vel_limit_phase = (
+        f"""
+        if (row_phase == 0 || row_phase == 2 || row_phase == 5) {{
+            int drive_hi_fvl = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+            for (int i = 0; i < drive_hi_fvl; i++) {{
+                if ((s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK}) != {int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)}) continue;
+                float qdot_max_fvl = s_drive_vel_limit_dense[i];
+                float denom_fvl = s_diag_dense[i];
+                if (denom_fvl <= 0.0f) continue;
+
+                float my_sum_fvl = 0.0f;
+                int row_base_fvl = jy_world_base + i * {D};
+                for (int d = lane; d < {D}; d += 32) {{
+                    my_sum_fvl += J_world.data[row_base_fvl + d] * s_v[d];
+                }}
+                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 16);
+                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 8);
+                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 4);
+                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 2);
+                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 1);
+                float jv_fvl = __shfl_sync(MASK, my_sum_fvl, 0);
+
+                if (fabsf(jv_fvl) > qdot_max_fvl) {{
+                    float delta_fvl = (fminf(fmaxf(jv_fvl, -qdot_max_fvl), qdot_max_fvl) - jv_fvl) / denom_fvl;
+                    for (int d = lane; d < {D}; d += 32) {{
+                        if (defer_dense_response == 0 ||
+                            world_deferred_dof_mask.data[deferred_mask_base + d] == 0) {{
+                            s_v[d] += Y_world.data[row_base_fvl + d] * delta_fvl;
+                        }}
+                    }}
+                }}
+                __syncwarp();
+            }}
+        }}"""
+        if fuse_vel_limits
+        else ""
+    )
+
+    # The end-of-iteration fused clamp revisits the drive-row prefix, so a
+    # phase-5 launch (physx_grasp schedule stages only the vel-limit segment)
+    # must extend its dense staging window down to row 0.
+    fused_load_lo_decl = (
+        """
+    int load_lo = (row_phase == 5) ? 0 : dense_lo;"""
+        if fuse_vel_limits
+        else ""
+    )
+    dense_load_start = "load_lo" if fuse_vel_limits else "dense_lo"
+
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
@@ -13477,6 +14215,25 @@ def _get_pgs_solve_mf_gs_kernel(
     if (m_mf > {M_MF}) m_mf = {M_MF};
     int mf_contact_end = mf_contact_rows_end.data[world];
     if (mf_contact_end > m_mf) mf_contact_end = m_mf;
+
+    // The dense slot layout is [drive][joint-limit][joint-vel-limit]
+    // [contact/friction], so each PhysX-grasp row phase owns one contiguous
+    // dense row range and only needs to load/scan/store that range:
+    //   row_phase 3: [0, bounds[0])          drive + position-limit rows
+    //   row_phase 5: [bounds[0], bounds[1])  joint velocity-limit rows
+    //   row_phase 4: [bounds[1], m_dense)    contact + friction rows
+    // Other phases scan every dense row. Shared arrays keep absolute
+    // indexing and the per-row type filters below remain as a safety net.
+    int dense_lo = 0;
+    int dense_hi = m_dense;
+    if (row_phase == 3) {{
+        dense_hi = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+    }} else if (row_phase == 5) {{
+        dense_lo = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+        dense_hi = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
+    }} else if (row_phase == 4) {{
+        dense_lo = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
+    }}{fused_load_lo_decl}
 
     int dof_map_base = world * {D};
     int off_dense = world * {M_D};
@@ -13502,7 +14259,7 @@ def _get_pgs_solve_mf_gs_kernel(
     // ═══════════════════════════════════════════════════════
     // LOAD PHASE
     // ═══════════════════════════════════════════════════════
-    for (int i = lane; i < m_dense; i += 32) {{
+    for (int i = {dense_load_start} + lane; i < dense_hi; i += 32) {{
         s_lam_dense[i] = world_impulses.data[off_dense + i];
         s_rhs_dense[i] = rhs_bias.data[off_dense + i];
         s_diag_dense[i] = world_diag.data[off_dense + i];
@@ -13536,17 +14293,17 @@ def _get_pgs_solve_mf_gs_kernel(
 
         // ── Phase 1: Dense constraints (D-DOF warp-parallel, software-pipelined) ──
 
-        // Prefetch constraint 0
-        if (m_dense > 0) {{
+        // Prefetch the first constraint of this phase's dense range
+        if (dense_hi > dense_lo) {{
             {dense_prefetch_init_code}
         }}
 
-        for (int i = 0; i < m_dense; i++) {{
+        for (int i = dense_lo; i < dense_hi; i++) {{
             // Consume prefetched J/Y for constraint i
             {dense_consume_code}
 
             // Prefetch constraint i+1
-            if (i + 1 < m_dense) {{
+            if (i + 1 < dense_hi) {{
                 int next_jy_base = jy_world_base + (i + 1) * {D};
                 {dense_prefetch_next_code}
             }}
@@ -13754,6 +14511,7 @@ def _get_pgs_solve_mf_gs_kernel(
         // drive/contact/friction/position-limit rows. Split schedules use
         // row_phase 2/5 as their explicit final velocity-limit pass.
 {dense_velocity_limit_phase}
+{fused_drive_vel_limit_phase}
 
         if (row_phase == 0 || row_phase == 2 || row_phase == 5) {{
             for (int i = mf_contact_end; i < m_mf; i++) {{
@@ -13809,7 +14567,7 @@ def _get_pgs_solve_mf_gs_kernel(
         int global_dof = world_dof_indices.data[dof_map_base + d];
         if (global_dof >= 0) v_out.data[global_dof] = s_v[d];
     }}
-    for (int i = lane; i < m_dense; i += 32) {{
+    for (int i = dense_lo + lane; i < dense_hi; i += 32) {{
         world_impulses.data[off_dense + i] = s_lam_dense[i];
     }}
     if (row_phase != 3) {{
@@ -13849,6 +14607,8 @@ def _get_pgs_solve_mf_gs_kernel(
             "s_drive_imp_mul_dense": ("float", "world_drive_impulse_multiplier"),
             "s_drive_max_imp_dense": ("float", "world_drive_max_impulse"),
         }
+        if fuse_vel_limits:
+            meta_map["s_drive_vel_limit_dense"] = ("float", "world_drive_vel_limit")
         for sname, (ctype, gname) in meta_map.items():
             snippet = re.sub(rf"    __shared__ {ctype}\s+{sname}\[{M_D}\];\n", "", snippet)
             snippet = re.sub(rf"\s*{sname}\[i\] = {gname}\.data\[off_dense \+ i\];", "", snippet, count=1)
@@ -13899,11 +14659,17 @@ def _get_pgs_solve_mf_gs_kernel(
         )
         snippet = re.sub(r"s_lam_mf\[([^\]]*)\]", r"g_lam_mf[\1]", snippet)
 
+    # Fixed signature (has_drive_rows precedent): world_drive_vel_limit is
+    # always a parameter; launch sites pass the solver's drive_vel_limit
+    # array — a (1, 1) dummy when the fused clamp is off — and
+    # fuse_vel_limits only gates the clamp code emission above.
+
     @wp.func_native(snippet)
     def pgs_solve_mf_gs_native(
         world: int,
         # Dense
         world_constraint_count: wp.array[int],
+        dense_phase_bounds: wp.array2d[int],
         world_dof_indices: wp.array2d[int],
         world_deferred_dof_mask: wp.array2d[int],
         rhs_bias: wp.array2d[float],
@@ -13918,6 +14684,7 @@ def _get_pgs_solve_mf_gs_kernel(
         world_drive_vel_multiplier: wp.array2d[float],
         world_drive_impulse_multiplier: wp.array2d[float],
         world_drive_max_impulse: wp.array2d[float],
+        world_drive_vel_limit: wp.array2d[float],
         # MF
         mf_constraint_count: wp.array[int],
         mf_contact_rows_end: wp.array[int],
@@ -13943,6 +14710,7 @@ def _get_pgs_solve_mf_gs_kernel(
     def pgs_solve_mf_gs_template(
         # Dense
         world_constraint_count: wp.array[int],
+        dense_phase_bounds: wp.array2d[int],
         world_dof_indices: wp.array2d[int],
         world_deferred_dof_mask: wp.array2d[int],
         rhs_bias: wp.array2d[float],
@@ -13957,6 +14725,7 @@ def _get_pgs_solve_mf_gs_kernel(
         world_drive_vel_multiplier: wp.array2d[float],
         world_drive_impulse_multiplier: wp.array2d[float],
         world_drive_max_impulse: wp.array2d[float],
+        world_drive_vel_limit: wp.array2d[float],
         # MF
         mf_constraint_count: wp.array[int],
         mf_contact_rows_end: wp.array[int],
@@ -13982,6 +14751,7 @@ def _get_pgs_solve_mf_gs_kernel(
         pgs_solve_mf_gs_native(
             world,
             world_constraint_count,
+            dense_phase_bounds,
             world_dof_indices,
             world_deferred_dof_mask,
             rhs_bias,
@@ -13996,6 +14766,7 @@ def _get_pgs_solve_mf_gs_kernel(
             world_drive_vel_multiplier,
             world_drive_impulse_multiplier,
             world_drive_max_impulse,
+            world_drive_vel_limit,
             mf_constraint_count,
             mf_contact_rows_end,
             mf_meta,
@@ -14019,6 +14790,8 @@ def _get_pgs_solve_mf_gs_kernel(
         f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
     )
+    if fuse_vel_limits:
+        name += "_fvl"
     if not software_pipeline:
         name += "_nopipe"
     if not shared_metadata:

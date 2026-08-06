@@ -273,6 +273,8 @@ def prescale_joint_velocity_limits(
     joint_dof_dim: wp.array2d[int],
     joint_velocity_limit: wp.array[float],
     body_flags: wp.array[wp.int32],
+    drive_slot: wp.array[int],
+    skip_driven: int,
     # in/out
     joint_qd: wp.array[float],
 ):
@@ -281,6 +283,16 @@ def prescale_joint_velocity_limits(
     PhysX computes a single ratio per articulation from maxJointVelocity and
     applies that ratio to all articulation DOFs before building link velocities.
     This is separate from the velocity-limit constraint rows solved later.
+
+    ``skip_driven != 0`` (the ``fuse_joint_velocity_limits`` path) excludes
+    DOFs with a PhysX drive row (``drive_slot[dof] >= 0``) from both the
+    ratio computation and the scaling: those DOFs are clamped in-solve by the
+    fused end-of-iteration velocity clamp instead. ``drive_slot`` holds the previous
+    step's allocation at this point in the step (it is initialized to -1, so
+    the very first step prescales exactly as before); the driven-DOF set is
+    derived from ``joint_target_ke/kd > 0`` and is stable across steps.
+    When ``skip_driven == 0``, ``drive_slot`` is never read (a 1-element
+    dummy is safe).
     """
     art = wp.tid()
     joint_start = articulation_start[art]
@@ -301,6 +313,9 @@ def prescale_joint_velocity_limits(
 
         for axis in range(axis_count):
             dof = qd_start + axis
+            if skip_driven != 0:
+                if drive_slot[dof] >= 0:
+                    continue
             limit = joint_velocity_limit[dof]
             qd_abs = wp.abs(joint_qd[dof])
             if limit > 0.0 and wp.isfinite(limit) and qd_abs > 0.0:
@@ -325,6 +340,9 @@ def prescale_joint_velocity_limits(
 
         for axis in range(axis_count):
             dof = qd_start + axis
+            if skip_driven != 0:
+                if drive_slot[dof] >= 0:
+                    continue
             joint_qd[dof] = joint_qd[dof] * ratio
 
 
@@ -2047,6 +2065,8 @@ def populate_physx_drive_J_for_size(
     joint_q: wp.array[float],
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
+    joint_velocity_limit: wp.array[float],
+    fuse_vel_limits: int,
     art_to_world: wp.array[int],
     drive_slot: wp.array[int],
     group_to_art: wp.array[int],
@@ -2063,8 +2083,19 @@ def populate_physx_drive_J_for_size(
     world_drive_damping: wp.array2d[float],
     world_drive_geom_error: wp.array2d[float],
     world_drive_max_force: wp.array2d[float],
+    world_drive_vel_limit: wp.array2d[float],
 ):
-    """Populate PhysX-style drive rows and row data for one articulation size group."""
+    """Populate PhysX-style drive rows and row data for one articulation size group.
+
+    ``fuse_vel_limits != 0`` (the ``fuse_joint_velocity_limits`` path)
+    additionally records the DOF's joint velocity limit per drive row in
+    ``world_drive_vel_limit`` so the solve kernels can apply the PhysX-style
+    stateless velocity clamp at the end of each iteration in place of
+    dedicated velocity-limit rows. Non-positive / non-finite limits are stored as
+    ``+inf`` so the fused clamp is a no-op for unlimited DOFs. When
+    ``fuse_vel_limits == 0`` neither ``joint_velocity_limit`` nor
+    ``world_drive_vel_limit`` is touched (1-element dummies are safe).
+    """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
     world = art_to_world[art]
@@ -2110,6 +2141,11 @@ def populate_physx_drive_J_for_size(
             world_drive_damping[world, slot] = damping
             world_drive_geom_error[world, slot] = target_pos - q
             world_drive_max_force[world, slot] = joint_effort_limit[dof]
+            if fuse_vel_limits != 0:
+                qdot_max = joint_velocity_limit[dof]
+                if qdot_max <= 0.0 or not wp.isfinite(qdot_max):
+                    qdot_max = float(wp.inf)
+                world_drive_vel_limit[world, slot] = qdot_max
 
 
 @wp.kernel
@@ -2402,6 +2438,8 @@ def allocate_joint_velocity_limit_slots(
     joint_velocity_limit: wp.array[float],
     joint_qd: wp.array[float],
     velocity_limit_activation_fraction: float,
+    drive_slot: wp.array[int],
+    skip_driven: int,
     art_to_world: wp.array[int],
     max_constraints: int,
     # outputs
@@ -2435,6 +2473,14 @@ def allocate_joint_velocity_limit_slots(
     always-allocate behavior. Because the gate samples the pre-solve
     velocity, a DOF that crosses the threshold during a step is clamped one
     step late.
+
+    ``skip_driven != 0`` (the ``fuse_joint_velocity_limits`` path) skips DOFs
+    with a PhysX drive row (``drive_slot[dof] >= 0``): their velocity limit is
+    enforced as a stateless clamp at the end of each solver iteration
+    instead of a dedicated row pair (PhysX ``PxClamp`` math, run after the
+    contact phases like the rows it replaces). DOFs with a velocity limit but no drive row keep their
+    dedicated rows. When ``skip_driven == 0``, ``drive_slot`` is never read
+    (a 1-element dummy is safe).
 
     Outputs two entries per DOF in ``velocity_limit_slot`` (world-constraint
     row, or -1) and ``velocity_limit_sign`` (+1 / -1).
@@ -2475,6 +2521,11 @@ def allocate_joint_velocity_limit_slots(
             # the stored limit is non-positive (treated as "unlimited").
             if qdot_max <= 0.0:
                 continue
+
+            # Fused path: driven DOFs are clamped at the end of each iteration.
+            if skip_driven != 0:
+                if drive_slot[dof] >= 0:
+                    continue
 
             # Proximity gate: only reserve the row pair when the DOF speed is
             # within ``fraction * qdot_max`` of the box edge. The fraction==0
@@ -2531,6 +2582,11 @@ def populate_joint_velocity_limit_J_for_size(
     The target velocity is ``-qdot_max`` for both sides of the box: combined
     with the sign flip on ``J``, this encodes the bilateral projection as
     two unilateral ``J*v >= target_vel`` rows with ``lambda >= 0``.
+
+    DOFs skipped by :func:`allocate_joint_velocity_limit_slots` (activation
+    gate, or driven DOFs under ``fuse_joint_velocity_limits``) carry
+    ``velocity_limit_slot == -1`` and are skipped here through the same
+    per-row slot check; this kernel needs no separate skip flag.
     """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
@@ -3344,6 +3400,26 @@ def finalize_world_constraint_counts(
 
 
 @wp.kernel
+def snapshot_dense_phase_bound(
+    world_slot_counter: wp.array[int],
+    bound_index: int,
+    # outputs
+    dense_phase_bounds: wp.array2d[int],
+):
+    """Record the current dense slot watermark for one row-family boundary.
+
+    The dense per-world slot layout is [drive][joint-limit][joint-vel-limit]
+    [contact/friction]. Launched right after the joint-limit allocation
+    (``bound_index`` 0) and the joint-velocity-limit allocation
+    (``bound_index`` 1) so the PhysX-grasp GS phases can loop only their own
+    contiguous row range instead of scanning every dense row. The raw counter
+    is stored; consumers clamp against the per-world constraint count.
+    """
+    world = wp.tid()
+    dense_phase_bounds[world, bound_index] = world_slot_counter[world]
+
+
+@wp.kernel
 def clamp_contact_counts(
     constraint_counts: wp.array[int],
     max_constraints: int,
@@ -3723,15 +3799,43 @@ def prepare_world_impulses(
     max_constraints: int,
     warmstart: int,
     world_row_type: wp.array2d[int],
+    dense_phase_bounds: wp.array2d[int],
+    dense_phase_bounds_prev: wp.array2d[int],
     # in/out
     world_impulses: wp.array2d[float],
 ):
-    """Initialize world impulses (zero or warmstart)."""
+    """Initialize world impulses (zero or warmstart).
+
+    Warm-start flicker hazard: the dense slot layout is [drive][joint-limit]
+    [joint-vel-limit][contact/friction] and warm-starting reuses impulses by
+    raw row index. Limit and vel-limit rows are dynamically gated
+    (``joint_limit_activation_gap``, ``velocity_limit_activation_fraction``),
+    so a step-to-step change in their counts shifts every following slot and
+    index-based reuse would hand contacts stale impulses from the wrong rows.
+    When a row-family boundary moved since the previous step, cold-start
+    everything from the first moved boundary onward for that world.
+    """
     world = wp.tid()
     m = world_constraint_count[world]
 
+    cold_start_from = max_constraints
+    if warmstart != 0:
+        b0 = dense_phase_bounds[world, 0]
+        b1 = dense_phase_bounds[world, 1]
+        p0 = dense_phase_bounds_prev[world, 0]
+        p1 = dense_phase_bounds_prev[world, 1]
+        if b0 != p0:
+            cold_start_from = wp.min(b0, p0)
+        elif b1 != p1:
+            cold_start_from = wp.min(b1, p1)
+
     for i in range(max_constraints):
-        if warmstart == 0 or i >= m or world_row_type[world, i] == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+        if (
+            warmstart == 0
+            or i >= m
+            or i >= cold_start_from
+            or world_row_type[world, i] == PGS_CONSTRAINT_TYPE_JOINT_TARGET
+        ):
             world_impulses[world, i] = 0.0
 
 
@@ -5912,6 +6016,7 @@ def compute_propagation_tree_body_response_for_size(
     propagation_body_count: wp.array[int],
     propagation_body_list: wp.array2d[int],
     body_to_articulation: wp.array[int],
+    body_to_joint: wp.array[int],
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
     articulation_start: wp.array[int],
@@ -5948,8 +6053,35 @@ def compute_propagation_tree_body_response_for_size(
         if body_to_articulation[target_body] != art:
             continue
 
+        # Root-path restriction: a unit wrench at target_body couples only to
+        # the joints on target's root path. Off-path pA/u/qdd stay zero in the
+        # backward pass, and body deltas flow root->leaf, so off-path qdd can
+        # never feed the delta read back at target_body. Walking just the path
+        # is exact and turns each basis solve from O(joints) into O(depth).
+        # The walk is capped at the articulation's joint count: a well-formed
+        # tree exits via wparent < 0 first, and the cap keeps a malformed or
+        # cyclic model from hanging the GPU in an unbounded loop.
+        path_len = int(0)
+        walk = body_to_joint[target_body]
+        for _cap in range(joint_end - joint_start):
+            if walk < 0:
+                break
+            path_len += 1
+            wparent = joint_parent[walk]
+            if wparent >= 0:
+                walk = body_to_joint[wparent]
+            else:
+                walk = int(-1)
+
         for basis in range(6):
-            for joint in range(joint_start, joint_end):
+            walk = body_to_joint[target_body]
+            for _k in range(path_len):
+                joint = walk
+                wparent = joint_parent[joint]
+                if wparent >= 0:
+                    walk = body_to_joint[wparent]
+                else:
+                    walk = int(-1)
                 body = joint_child[joint]
                 for r in range(6):
                     propagation_tree_pA[body, r] = 0.0
@@ -5982,8 +6114,15 @@ def compute_propagation_tree_body_response_for_size(
             propagation_tree_pA[target_body, 4] = -torque_com[1]
             propagation_tree_pA[target_body, 5] = -torque_com[2]
 
-            for offset in range(joint_end - joint_start):
-                joint = joint_end - 1 - offset
+            # Backward sweep, target -> root along the path (children first).
+            walk = body_to_joint[target_body]
+            for _k in range(path_len):
+                joint = walk
+                wparent = joint_parent[joint]
+                if wparent >= 0:
+                    walk = body_to_joint[wparent]
+                else:
+                    walk = int(-1)
                 child = joint_child[joint]
                 parent = joint_parent[joint]
                 dof_start = joint_qd_start[joint]
@@ -6032,7 +6171,13 @@ def compute_propagation_tree_body_response_for_size(
                     for r in range(6):
                         propagation_tree_pA[parent, r] = propagation_tree_pA[parent, r] + propagated_parent[r]
 
-            for joint in range(joint_start, joint_end):
+            # Forward sweep, root -> target along the path (parents first):
+            # level i visits the (path_len-1-i)-th ancestor of target_body.
+            for level in range(path_len):
+                joint = body_to_joint[target_body]
+                steps = path_len - 1 - level
+                for _s in range(steps):
+                    joint = body_to_joint[joint_parent[joint]]
                 child = joint_child[joint]
                 parent = joint_parent[joint]
                 dof_start = joint_qd_start[joint]
