@@ -918,6 +918,11 @@ class SolverFeatherPGS(SolverBase):
                 )
             if pgs_debug:
                 raise ValueError("pgs_inner_substeps > 1 does not support pgs_debug")
+            if pgs_warmstart:
+                # v_out restarts from v_hat every substep, so a carried dense lambda breaks
+                # v = v_hat + M^-1 J^T lambda; resetting it instead discards the warm start
+                # the flag asks for. Reject rather than silently do one or the other.
+                raise ValueError("pgs_inner_substeps > 1 does not support pgs_warmstart")
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
         self.dense_contact_compliance = dense_contact_compliance

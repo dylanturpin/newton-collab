@@ -77,14 +77,18 @@ def test_inner_substeps_match_true_substeps(test, device):
 
 
 def _build_driven_arm(device):
-    """Free-root articulation with a driven joint, dropped on the ground.
+    """Free-root articulation with a driven joint, settling on the ground.
+
+    Starts clear of the ground (a penetrating initial pose ejects at any substep count,
+    which would make the comparison measure an instability rather than tracking fidelity).
+    The drive target sits past the joint limit so the limit rows carry load.
 
     Contacts on an articulated body take the dense row family, so this scene populates
     dense CONTACT rows alongside the drive and joint-limit rows -- the branches a
     free-rigid box stack (which is matrix-free only) can never reach.
     """
     builder = newton.ModelBuilder()
-    base = builder.add_link()
+    base = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.4), wp.quat_identity()))
     builder.add_shape_box(base, hx=0.12, hy=0.12, hz=0.06)
     joints = [builder.add_joint_free(child=base, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.4), wp.quat_identity()))]
     link = builder.add_link()
@@ -95,7 +99,7 @@ def _build_driven_arm(device):
             child=link,
             axis=newton.ModelBuilder.JointDofConfig(
                 axis=wp.vec3(0.0, 1.0, 0.0),
-                target_pos=0.4,
+                target_pos=1.4,
                 target_ke=40.0,
                 target_kd=2.0,
                 limit_lower=-1.0,
@@ -116,8 +120,7 @@ def test_inner_substeps_dense_rows_match_true_substeps(test, device):
     The box-stack case exercises only the matrix-free row family. A bolted articulation
     puts its drive and joint-limit rows on the dense family, so this covers
     ``advance_frozen_row_errors`` -- in particular the drive geometric-error sign, which a
-    matrix-free-only scene can never reach. The drive target is set past the joint limit so
-    the limit rows carry load rather than sitting inactive.
+    matrix-free-only scene can never reach.
     """
     steps, dt = 120, 0.005
     kw = dict(SOLVER_KW, drive_mode="physx_pgs", enable_joint_limits=True, pgs_iterations=8)
