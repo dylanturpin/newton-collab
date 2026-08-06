@@ -682,8 +682,11 @@ class SolverFeatherPGS(SolverBase):
                 iterations, joint integration at dt/N, first-order row-error re-measurement
                 ``phi += dt*J*v``]. Raises the stable Baumgarte correction rate like true substeps at a
                 fraction of their cost; total correction per step is ``1-(1-pgs_beta)^N``. Requires
-                ``pgs_mode='matrix_free'``, no velocity iterations, and no propagation contact response.
-                Defaults to 1 (off).
+                ``pgs_mode='matrix_free'``, ``articulated_contact_response='immediate'``, and no
+                velocity iterations, warm starting or ``pgs_debug``. The saving over true substeps
+                depends on the scene: it is largest when the per-step build (mass matrix, Cholesky,
+                Jacobians) dominates and small when the Gauss-Seidel sweep and contact work dominate,
+                since those still run once per inner substep. Defaults to 1 (off).
             pgs_velocity_iterations (int, optional): Additional matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
                 geometric bias corrects positions first, then final velocity iterations run without Baumgarte bias.
@@ -913,10 +916,6 @@ class SolverFeatherPGS(SolverBase):
                     "pgs_inner_substeps > 1 requires articulated_contact_response='immediate' "
                     f"(got {articulated_contact_response!r})"
                 )
-            if mf_warmstart:
-                # The end-of-step snapshot holds an accumulated full-step impulse; it would
-                # seed the next step's first dt/N substep roughly N times too large.
-                raise ValueError("pgs_inner_substeps > 1 does not support mf_warmstart yet")
             if pgs_debug:
                 raise ValueError("pgs_inner_substeps > 1 does not support pgs_debug")
         self.pgs_beta = pgs_beta
@@ -984,6 +983,12 @@ class SolverFeatherPGS(SolverBase):
         # allocated, so the determinism/bit-identity ladder is unaffected.
         _env_ws = os.getenv("IL_NEWTON_FPGS_MF_WARMSTART", "0").lower() in {"1", "true", "yes", "on"}
         self._mf_warmstart_enabled = bool(mf_warmstart) or _env_ws
+        if self.pgs_inner_substeps > 1 and self._mf_warmstart_enabled:
+            # Guard the RESOLVED flag: IL_NEWTON_FPGS_MF_WARMSTART enables warm starting
+            # independently of the kwarg. The end-of-step snapshot holds an accumulated
+            # full-step impulse, which would seed the next step's first dt/N substep
+            # roughly N times too large.
+            raise ValueError("pgs_inner_substeps > 1 does not support matrix-free warm starting")
         try:
             self._mf_warmstart_decay = float(os.getenv("IL_NEWTON_FPGS_MF_WARMSTART_DECAY", str(mf_warmstart_decay)))
         except (TypeError, ValueError):
@@ -8375,6 +8380,10 @@ class SolverFeatherPGS(SolverBase):
             if mf_active:
                 self._compute_mf_rhs_bias(dt_sub, bias_scale=1.0, output=self.mf_rhs)
             self._stage5_prepare_impulses_world()
+            # prepare_world_impulses retains lambda on contact/limit rows when warm starting
+            # is on, but v_out restarts from v_hat below, so a carried lambda breaks
+            # v = v_hat + M^-1 J^T lambda for the dense family exactly as it did for MF.
+            self.impulses.zero_()
             if mf_active:
                 # v_out restarts from v_hat below, so the matrix-free impulses must restart
                 # with it: the GS kernel applies (lambda_k - lambda_{k-1}), which for a

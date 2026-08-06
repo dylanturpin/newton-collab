@@ -4,7 +4,9 @@
 """Frozen-basis inner substeps (pgs_inner_substeps): physics equivalence to
 true substeps at shared-manifold semantics, and constructor validation."""
 
+import os
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -75,32 +77,36 @@ def test_inner_substeps_match_true_substeps(test, device):
 
 
 def _build_driven_arm(device):
-    """Fixed-base 2-link arm with PD drives and joint limits, i.e. DENSE constraint rows."""
+    """Free-root articulation with a driven joint, dropped on the ground.
+
+    Contacts on an articulated body take the dense row family, so this scene populates
+    dense CONTACT rows alongside the drive and joint-limit rows -- the branches a
+    free-rigid box stack (which is matrix-free only) can never reach.
+    """
     builder = newton.ModelBuilder()
-    parent = -1
-    z = 0.5
-    joints = []
-    for i in range(2):
-        link = builder.add_link()
-        builder.add_shape_box(link, hx=0.04, hy=0.04, hz=0.12)
-        joints.append(
-            builder.add_joint_revolute(
-                parent=parent,
-                child=link,
-                axis=newton.ModelBuilder.JointDofConfig(
-                    axis=wp.vec3(0.0, 1.0, 0.0),
-                    target_pos=0.4,
-                    target_ke=40.0,
-                    target_kd=2.0,
-                    limit_lower=-1.0,
-                    limit_upper=1.0,
-                ),
-                parent_xform=wp.transform(wp.vec3(0.0, 0.0, z if i == 0 else -0.24), wp.quat_identity()),
-                child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.12), wp.quat_identity()),
-            )
+    base = builder.add_link()
+    builder.add_shape_box(base, hx=0.12, hy=0.12, hz=0.06)
+    joints = [builder.add_joint_free(child=base, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.4), wp.quat_identity()))]
+    link = builder.add_link()
+    builder.add_shape_box(link, hx=0.05, hy=0.05, hz=0.12)
+    joints.append(
+        builder.add_joint_revolute(
+            parent=base,
+            child=link,
+            axis=newton.ModelBuilder.JointDofConfig(
+                axis=wp.vec3(0.0, 1.0, 0.0),
+                target_pos=0.4,
+                target_ke=40.0,
+                target_kd=2.0,
+                limit_lower=-1.0,
+                limit_upper=1.0,
+            ),
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.06), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(0.0, 0.0, -0.12), wp.quat_identity()),
         )
-        parent = link
+    )
     builder.add_articulation(joints)
+    builder.add_ground_plane()
     return builder.finalize(device=device)
 
 
@@ -110,7 +116,8 @@ def test_inner_substeps_dense_rows_match_true_substeps(test, device):
     The box-stack case exercises only the matrix-free row family. A bolted articulation
     puts its drive and joint-limit rows on the dense family, so this covers
     ``advance_frozen_row_errors`` -- in particular the drive geometric-error sign, which a
-    matrix-free-only scene can never reach.
+    matrix-free-only scene can never reach. The drive target is set past the joint limit so
+    the limit rows carry load rather than sitting inactive.
     """
     steps, dt = 120, 0.005
     kw = dict(SOLVER_KW, drive_mode="physx_pgs", enable_joint_limits=True, pgs_iterations=8)
@@ -145,6 +152,21 @@ def test_inner_substeps_validation(test, device):
     bad_mode = {**SOLVER_KW, "pgs_mode": "split"}
     with test.assertRaises(ValueError):
         SolverFeatherPGS(model, pgs_inner_substeps=8, **bad_mode)
+    # every non-immediate response routes contacts through propagation rows
+    for response in ("propagation", "propagation-fused", "propagation-colored"):
+        with test.assertRaises(ValueError):
+            SolverFeatherPGS(model, pgs_inner_substeps=8, **dict(SOLVER_KW, articulated_contact_response=response))
+    with test.assertRaises(ValueError):
+        SolverFeatherPGS(model, pgs_inner_substeps=8, **dict(SOLVER_KW, mf_warmstart=True))
+    with test.assertRaises(ValueError):
+        SolverFeatherPGS(model, pgs_inner_substeps=8, **dict(SOLVER_KW, pgs_debug=True))
+    # the resolved warm-start flag is what matters: the env var must not bypass the guard
+    with mock.patch.dict(os.environ, {"IL_NEWTON_FPGS_MF_WARMSTART": "1"}):
+        with test.assertRaises(ValueError):
+            SolverFeatherPGS(model, pgs_inner_substeps=8, **SOLVER_KW)
+    # the supported configuration still constructs (matrix-free mode is CUDA-only)
+    if device.is_cuda:
+        SolverFeatherPGS(model, pgs_inner_substeps=8, **SOLVER_KW)
 
 
 devices = get_test_devices(mode="basic")
