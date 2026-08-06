@@ -85,6 +85,8 @@ def create_solve_convex_multi_contact(support_func: Any, writer_func: Any, post_
             point_b = point_b + normal * half_enlarge
         else:
             # GJK fallback for separated shapes -- no Minkowski inflate; accurate normals/distances.
+            # The separation cutoff stops iterating once the pair is provably
+            # farther than contact_threshold (the write below is rejected then).
             _separated, point_a, point_b, normal, signed_distance = wp.static(solve_gjk.core)(
                 geom_a,
                 geom_b,
@@ -92,6 +94,7 @@ def create_solve_convex_multi_contact(support_func: Any, writer_func: Any, post_
                 relative_position_b,
                 0.0,
                 data_provider,
+                contact_threshold,
             )
 
         if skip_multi_contact or signed_distance > contact_threshold:
@@ -188,6 +191,8 @@ def create_solve_convex_single_contact(support_func: Any, writer_func: Any, post
             point_b = point_b + normal * half_enlarge
         else:
             # GJK fallback for separated shapes -- no Minkowski inflate; accurate normals/distances.
+            # The separation cutoff stops iterating once the pair is provably
+            # farther than contact_threshold (the writer's gap check rejects then).
             _separated, point_a, point_b, normal, signed_distance = wp.static(solve_gjk.core)(
                 geom_a,
                 geom_b,
@@ -195,6 +200,7 @@ def create_solve_convex_single_contact(support_func: Any, writer_func: Any, post
                 relative_position_b,
                 0.0,
                 data_provider,
+                contact_threshold,
             )
 
         # Transform results back to world space (once).
