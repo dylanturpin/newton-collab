@@ -76,21 +76,59 @@ def test_inner_substeps_match_true_substeps(test, device):
     test.assertLess(speed_frozen, 0.05, f"stack not at rest: max |body_qd| = {speed_frozen}")
 
 
+def _build_bolted_arm(device):
+    """Fixed-base 2-link driven arm: dense drive rows dominate the error budget.
+
+    No contacts, so the drive geometric-error advance is the only live term in
+    ``advance_frozen_row_errors`` -- deleting or sign-flipping it is measurable here,
+    where a contact-dominated scene buries it in the frozen-basis contact noise floor.
+    """
+    builder = newton.ModelBuilder()
+    parent = -1
+    z = 0.5
+    joints = []
+    for i in range(2):
+        link = builder.add_link()
+        builder.add_shape_box(link, hx=0.04, hy=0.04, hz=0.12)
+        joints.append(
+            builder.add_joint_revolute(
+                parent=parent,
+                child=link,
+                axis=newton.ModelBuilder.JointDofConfig(
+                    axis=wp.vec3(0.0, 1.0, 0.0),
+                    target_pos=0.4,
+                    target_ke=40.0,
+                    target_kd=2.0,
+                    limit_lower=-1.0,
+                    limit_upper=1.0,
+                ),
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, z if i == 0 else -0.24), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.12), wp.quat_identity()),
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    return builder.finalize(device=device)
+
+
 def _build_driven_arm(device):
-    """Free-root articulation with a driven joint, settling on the ground.
+    """Free-root articulation with a driven joint, dropped onto the ground.
 
     Starts clear of the ground (a penetrating initial pose ejects at any substep count,
     which would make the comparison measure an instability rather than tracking fidelity).
-    The drive target sits past the joint limit so the limit rows carry load.
 
     Contacts on an articulated body take the dense row family, so this scene populates
-    dense CONTACT rows alongside the drive and joint-limit rows -- the branches a
-    free-rigid box stack (which is matrix-free only) can never reach.
+    dense CONTACT rows -- the branch a free-rigid box stack (matrix-free only) and the
+    bolted arm (contact-free) can never reach.
     """
     builder = newton.ModelBuilder()
-    base = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.4), wp.quat_identity()))
+    # Tilt the drop so the base lands edge-first and rocks: a flat symmetric landing
+    # exerts no torque about the revolute axis, leaving the drive and limit dofs
+    # motionless (jv = 0) and their error advances untestable no-ops.
+    tilt = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.05)
+    base = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.4), tilt))
     builder.add_shape_box(base, hx=0.12, hy=0.12, hz=0.06)
-    joints = [builder.add_joint_free(child=base, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.4), wp.quat_identity()))]
+    joints = [builder.add_joint_free(child=base)]
     link = builder.add_link()
     builder.add_shape_box(link, hx=0.05, hy=0.05, hz=0.12)
     joints.append(
@@ -106,7 +144,9 @@ def _build_driven_arm(device):
                 limit_upper=1.0,
             ),
             parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.06), wp.quat_identity()),
-            child_xform=wp.transform(wp.vec3(0.0, 0.0, -0.12), wp.quat_identity()),
+            # off-axis link COM: the ground impact torques the revolute dof, so the
+            # limit and drive rows see real joint velocity during the transient
+            child_xform=wp.transform(wp.vec3(0.08, 0.0, -0.12), wp.quat_identity()),
         )
     )
     builder.add_articulation(joints)
@@ -114,19 +154,73 @@ def _build_driven_arm(device):
     return builder.finalize(device=device)
 
 
-def test_inner_substeps_dense_rows_match_true_substeps(test, device):
-    """Verify frozen inner substeps track true substeps on dense drive and joint-limit rows.
+def _run_recording(model, solver, steps, dt, substeps=1):
+    """Step like :func:`_run` but record ``joint_q`` after every outer step."""
+    state_in, state_out = model.state(), model.state()
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    control = model.control()
+    contacts = model.contacts()
+    trajectory = []
+    for _ in range(steps):
+        model.collide(state_in, contacts)
+        for _ in range(substeps):
+            state_in.clear_forces()
+            solver.step(state_in, state_out, control, contacts, dt / substeps)
+            state_in, state_out = state_out, state_in
+        trajectory.append(state_in.joint_q.numpy().copy())
+    return np.stack(trajectory)
 
-    The box-stack case exercises only the matrix-free row family. A bolted articulation
-    puts its drive and joint-limit rows on the dense family, so this covers
-    ``advance_frozen_row_errors`` -- in particular the drive geometric-error sign, which a
-    matrix-free-only scene can never reach.
+
+def test_inner_substeps_dense_contact_rows_match_true_substeps(test, device):
+    """Verify frozen inner substeps track true substeps on dense CONTACT rows.
+
+    The box-stack case exercises only the matrix-free row family; contacts on an
+    articulated body take the dense family instead. The error is taken over the whole
+    trajectory rather than the settled end state: the ground impact (~0.34 m free fall)
+    is where the contact rows are dynamically loaded and the substep count changes the
+    outcome, while at rest the error advance multiplies near-zero velocities.
+
+    Mutation-verified for the contact-phi advance (sign flip, deletion, half scale all
+    fail this assertion). The drive advance is covered by the bolted-arm case below; the
+    JOINT_LIMIT clause of the position-row gate has no discriminating test -- a
+    statically pinned limit row has jv = 0 (its advance is a genuine no-op), and a scene
+    with dynamic limit engagement lands in the frozen basis's documented weak regime.
     """
     steps, dt = 120, 0.005
     kw = dict(SOLVER_KW, drive_mode="physx_pgs", enable_joint_limits=True, pgs_iterations=8)
 
     def run(solver_kwargs, substeps):
         model = _build_driven_arm(device)
+        return _run_recording(model, SolverFeatherPGS(model, **solver_kwargs), steps, dt, substeps=substeps)
+
+    q_true = run(kw, 8)
+    q_frozen = run(dict(kw, pgs_inner_substeps=8), 1)
+    q_one = run(kw, 1)
+
+    test.assertTrue(np.all(np.isfinite(q_true)) and np.all(np.isfinite(q_frozen)), "arm scene diverged")
+    err_frozen = float(np.abs(q_frozen - q_true).max())
+    err_one = float(np.abs(q_one - q_true).max())
+    test.assertLess(
+        err_frozen,
+        0.25 * err_one,
+        f"frozen substeps should track true substeps far better than a single step "
+        f"(frozen {err_frozen:.2e} vs one step {err_one:.2e})",
+    )
+
+
+def test_inner_substeps_dense_drive_rows_match_true_substeps(test, device):
+    """Verify frozen inner substeps track true substeps on dense drive rows.
+
+    Contact-free bolted arm, so the drive geometric-error advance dominates the error
+    budget. Mutation-verified: deleting or sign-flipping the drive update fails this
+    assertion (it escapes the contact scene's assertion, where the frozen-basis contact
+    noise floor is larger than the whole drive contribution).
+    """
+    steps, dt = 120, 0.005
+    kw = dict(SOLVER_KW, drive_mode="physx_pgs", enable_joint_limits=True, pgs_iterations=8)
+
+    def run(solver_kwargs, substeps):
+        model = _build_bolted_arm(device)
         state = _run(model, SolverFeatherPGS(model, **solver_kwargs), steps, dt, substeps=substeps)
         return state.joint_q.numpy().copy()
 
@@ -191,8 +285,14 @@ add_function_test(
 )
 add_function_test(
     TestFeatherPGSInnerSubsteps,
-    "test_inner_substeps_dense_rows_match_true_substeps",
-    test_inner_substeps_dense_rows_match_true_substeps,
+    "test_inner_substeps_dense_contact_rows_match_true_substeps",
+    test_inner_substeps_dense_contact_rows_match_true_substeps,
+    devices=cuda_devices,
+)
+add_function_test(
+    TestFeatherPGSInnerSubsteps,
+    "test_inner_substeps_dense_drive_rows_match_true_substeps",
+    test_inner_substeps_dense_drive_rows_match_true_substeps,
     devices=cuda_devices,
 )
 add_function_test(
