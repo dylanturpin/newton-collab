@@ -65,6 +65,7 @@ from .kernels import (
     build_mf_body_map,
     build_mf_contact_rows,
     build_propagation_body_map,
+    build_propagation_body_map_partitioned,
     build_propagation_contact_rows,
     cholesky_loop,
     clamp_augmented_joint_u0,
@@ -81,6 +82,7 @@ from .kernels import (
     compute_mf_world_dof_offsets,
     compute_physx_pgs_drive_desc,
     compute_propagation_body_com_rel,
+    compute_propagation_cache_world_flag,
     compute_propagation_effective_mass_and_rhs,
     compute_propagation_rhs_bias,
     compute_propagation_tree_body_response_for_size,
@@ -132,6 +134,7 @@ from .kernels import (
     scatter_qdd_from_groups,
     snapshot_dense_phase_bound,
     snapshot_mf_prev_slots,
+    snapshot_propagation_cache_qd_base,
     trisolve_loop,
     update_articulation_origins,
     update_articulation_root_com_offsets,
@@ -538,6 +541,8 @@ class SolverFeatherPGS(SolverBase):
             "immediate", "propagation", "propagation-fused", "propagation-colored"
         ] = "immediate",
         propagation_same_articulation_rows: bool = False,
+        propagation_cached_response: bool = True,
+        propagation_cached_response_max_bodies: int = 8,
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
         mf_max_constraints: int = 512,
@@ -733,6 +738,30 @@ class SolverFeatherPGS(SolverBase):
                 response by propagating each row's combined test impulse through the articulated
                 body factorization. Requires ``articulated_contact_response="propagation"``.
                 Defaults to False (dense routing, prior behavior).
+            propagation_cached_response (bool, optional): Replace the per-iteration
+                propagation tree walk with cached per-body response matrices. Within one
+                solver pass the tree factorization is fixed, so deferred body impulse ->
+                joint velocity is a fixed linear map; the setup phase precomputes, per
+                contact-active body, its full joint-space response matrix R (D x 6) and
+                the active-pair body response blocks B_ab (6 x 6), and each GS iteration
+                applies them as a small GEMV instead of a full backward+forward
+                Featherstone sweep — identical math up to float reassociation. Applies
+                only on CUDA for non-fused propagation modes and for articulation size
+                groups eligible for the one-warp tree kernels (0/1-DOF joints, optionally
+                a multi-DOF free root); ineligible groups and worlds whose active-body
+                count exceeds ``propagation_cached_response_max_bodies`` keep the exact
+                per-iteration tree-walk fallback (selected per world on the device, so
+                CUDA-graph capture is unaffected). Defaults to True.
+            propagation_cached_response_max_bodies (int, optional): Capacity of the cached
+                response buffers, in contact-active CACHE-ELIGIBLE bodies per world —
+                bodies of cacheable articulations. Free-rigid clutter and non-cacheable
+                articulations do not count (they never take the cached GEMV: free bodies
+                keep the sweep-estimate + flush path, other trees the unconditional tree
+                walk), so a robot+clutter scene stays cached as long as the robot's own
+                active bodies fit. Response matrices are sized (worlds, cap, max_dofs, 6)
+                and (worlds, cap, cap, 36); worlds with more simultaneously active
+                eligible bodies than the cap fall back to the tree walk for that step.
+                Defaults to 8.
             pgs_schedule (str, optional): Matrix-free row ordering. ``"interleaved"`` preserves the
                 legacy per-iteration dense+matrix-free sweep. ``"contact_then_internal"`` runs all
                 contact/friction sweeps first, then all internal articulation sweeps (drive, joint
@@ -890,6 +919,12 @@ class SolverFeatherPGS(SolverBase):
                 "use articulated_contact_response='propagation'"
             )
         self.propagation_same_articulation_rows = bool(propagation_same_articulation_rows)
+        if int(propagation_cached_response_max_bodies) < 1:
+            raise ValueError(
+                f"propagation_cached_response_max_bodies must be >= 1, got {propagation_cached_response_max_bodies}"
+            )
+        self.propagation_cached_response = bool(propagation_cached_response)
+        self.propagation_cached_response_max_bodies = int(propagation_cached_response_max_bodies)
         # Contact-row placement is intrinsic to the mode: the serial and colored
         # propagation modes place every contact row (free/free and free/ground
         # included) on the propagation family; the fused mode keeps free/free
@@ -1399,6 +1434,34 @@ class SolverFeatherPGS(SolverBase):
         if self._has_non_free_articulations:
             return True
         return self._route_free_free_contacts and self._has_free_rigid_bodies
+
+    def _propagation_cached_response_candidate(self) -> bool:
+        """True when the cached-response buffers/kernels may be built at all.
+
+        Host-side prediction used at buffer-allocation time; final activation
+        additionally requires the per-size cached-response kernels to have
+        been built (see ``_propagation_cached_response_active``). The cached
+        path piggybacks on the one-warp tree-kernel eligibility: a size group
+        qualifies when every articulation in it is 0/1-DOF-jointed or has the
+        free-root shape (multi-DOF world-rooted first joint, 0/1-DOF below).
+        """
+        if not self.propagation_cached_response:
+            return False
+        if not self.model.device.is_cuda:
+            return False
+        if not self._propagation_contacts_enabled():
+            return False
+        if self.propagation_full_fused_iterations:
+            return False
+        for size in self.size_groups:
+            size_i = int(size)
+            if size_i <= 0:
+                continue
+            if not self._propagation_tree_has_non_free_by_size.get(size_i, True):
+                continue
+            if self._propagation_tree_single_dof_by_size.get(size_i, False) or self._propagation_tree_free_root_by_size.get(size_i, False):
+                return True
+        return False
 
     def _split_matrix_free_row_phase_may_have_work(self, row_phase: int) -> bool:
         """Return false only when a split GS phase cannot contain rows.
@@ -2846,9 +2909,17 @@ class SolverFeatherPGS(SolverBase):
             self.propagation_tree_body_delta = None
             self.propagation_body_count = None
             self.propagation_body_list = None
+            self.propagation_cache_body_count = None
             self._current_propagation_joint_S_s = None
             self._current_propagation_body_q = None
             self.max_propagation_bodies = 0
+            self.propagation_cache_max_bodies = 0
+            self.propagation_cache_R = None
+            self.propagation_cache_B = None
+            self.propagation_cache_qd_base = None
+            self.propagation_cache_world_flag = None
+            self.propagation_cache_art_eligible = None
+            self._propagation_cache_flag_zeros = None
             return
 
         device = model.device
@@ -2875,6 +2946,12 @@ class SolverFeatherPGS(SolverBase):
         self.propagation_body_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.propagation_body_list = wp.full(
             (worlds, self.max_propagation_bodies), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
+        # Length of the cache-eligible slot prefix of propagation_body_list
+        # (== propagation_body_count after pass 1 of the partitioned build);
+        # only written when the cached-response path is active.
+        self.propagation_cache_body_count = wp.zeros(
+            (worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
 
         self.propagation_body_a = wp.zeros(
@@ -2934,6 +3011,35 @@ class SolverFeatherPGS(SolverBase):
         self.propagation_body_com_rel = wp.zeros((body_count, 3), dtype=wp.float32, device=device)
         self.propagation_body_seen = wp.zeros((body_count,), dtype=wp.int32, device=device)
         self.propagation_body_local_slot = wp.zeros((body_count,), dtype=wp.int32, device=device)
+
+        # ── Cached-response buffers (propagation_cached_response) ───────────
+        # R: per (world, active-body slot) full joint-space response matrix
+        #    (D x 6): column j is the qdd over the body's articulation DOFs
+        #    from a unit basis wrench j at the body's COM.
+        # B: per (world, slot a, slot b) 6x6 body response block: body-a COM
+        #    twist delta per unit basis wrench at body b (zero across
+        #    articulations; B_bb equals propagation_body_response[b]).
+        # qd_base: pre-sweep snapshot of active bodies' live COM twists.
+        # world_flag: per-world device-side gate (1 = cached GEMV path,
+        #    0 = tree-walk fallback), recomputed each step from the active
+        #    body count so overflowing worlds stay exact without any host
+        #    sync (CUDA-graph safe). flag_zeros is the all-zeros guard passed
+        #    to the tree-walk kernels when the cached path is off.
+        self.propagation_cache_max_bodies = 0
+        self.propagation_cache_R = None
+        self.propagation_cache_B = None
+        self.propagation_cache_qd_base = None
+        self.propagation_cache_world_flag = None
+        self.propagation_cache_art_eligible = None
+        self._propagation_cache_flag_zeros = wp.zeros((worlds,), dtype=wp.int32, device=device)
+        if self._propagation_cached_response_candidate():
+            cap = min(self.max_propagation_bodies, self.propagation_cached_response_max_bodies)
+            self.propagation_cache_max_bodies = cap
+            self.propagation_cache_R = wp.zeros((worlds, cap, max_dofs, 6), dtype=wp.float32, device=device)
+            self.propagation_cache_B = wp.zeros((worlds, cap, cap, 36), dtype=wp.float32, device=device)
+            self.propagation_cache_qd_base = wp.zeros((worlds, cap, 6), dtype=wp.float32, device=device)
+            self.propagation_cache_world_flag = wp.zeros((worlds,), dtype=wp.int32, device=device)
+            self.propagation_cache_art_eligible = wp.zeros((model.articulation_count,), dtype=wp.int32, device=device)
         self._current_propagation_joint_S_s = None
         self._current_propagation_body_q = None
         joint_count = max(int(model.joint_count), 1)
@@ -3254,6 +3360,91 @@ class SolverFeatherPGS(SolverBase):
                     self._refresh_tree_warp_kernels_by_size[size_i] = _get_refresh_propagation_tree_body_qd_warp_kernel(
                         size_i, group_max_joints[size_i], device_arch
                     )
+
+        # ── Cached-response kernels (propagation_cached_response) ────────────
+        # Per eligible size group: a setup kernel that extracts the full
+        # joint-space response matrices R and active-pair body response blocks
+        # B from per-basis tree solves (same factorization the tree walk
+        # uses), plus one per-iteration GEMV kernel shared by all groups. The
+        # per-iteration tree-walk kernels stay compiled as the exact fallback
+        # for worlds whose active-body count overflows the cache.
+        self._cached_response_tree_warp_kernels_by_size: dict[int, wp.Kernel | None] = {}
+        self._cached_response_block_dim_by_size: dict[int, int] = {}
+        self._propagation_cached_gemv_kernel = None
+        self._propagation_cached_gemv_worlds_per_block = 2
+        self._propagation_cached_response_active = False
+        if (
+            model.device.is_cuda
+            and self._propagation_contacts_enabled()
+            and self._propagation_cached_response_candidate()
+            and self.propagation_cache_max_bodies > 0
+        ):
+            for size in self.size_groups:
+                size_i = int(size)
+                self._cached_response_tree_warp_kernels_by_size[size_i] = None
+                if self._propagate_tree_warp_kernels_by_size.get(size_i) is None:
+                    continue
+                single_dof = self._propagation_tree_single_dof_by_size.get(size_i, False)
+                # One warp per concurrently solved active body, as many as the
+                # per-warp column blocks leave room for in static shared memory.
+                warps = _cached_response_extraction_warps(
+                    group_max_joints[size_i],
+                    self.propagation_cache_max_bodies,
+                    has_free_root=not single_dof,
+                )
+                if warps <= 0:
+                    continue
+                self._cached_response_block_dim_by_size[size_i] = 32 * warps
+                self._cached_response_tree_warp_kernels_by_size[size_i] = (
+                    _get_propagation_tree_cached_response_kernel(
+                        size_i,
+                        group_max_joints[size_i],
+                        self.max_propagation_bodies,
+                        self.propagation_cache_max_bodies,
+                        self.propagation_response_max_dofs,
+                        device_arch,
+                        has_free_root=not single_dof,
+                    )
+                )
+            if any(k is not None for k in self._cached_response_tree_warp_kernels_by_size.values()):
+                self._propagation_cached_response_active = True
+                self._propagation_cached_gemv_kernel = _get_propagation_cached_gemv_kernel(
+                    self.propagation_cache_max_bodies,
+                    self.propagation_response_max_dofs,
+                    self.max_propagation_bodies,
+                    self._propagation_cached_gemv_worlds_per_block,
+                    device_arch,
+                )
+                # Per-articulation static eligibility: only bodies of arts in
+                # groups with an extraction kernel take the GEMV path; free
+                # rigid bodies keep the existing sweep-estimate + flush path
+                # (their diagonal response is already exact).
+                art_eligible = np.zeros(int(model.articulation_count), dtype=np.int32)
+                art_size_np = self._model_plan.response_dof_count
+                is_free_np = (
+                    self.is_free_rigid.numpy()
+                    if self.is_free_rigid is not None
+                    else np.zeros(int(model.articulation_count), dtype=np.int32)
+                )
+                for size_i, kern in self._cached_response_tree_warp_kernels_by_size.items():
+                    if kern is None:
+                        continue
+                    art_eligible[(art_size_np == size_i) & (is_free_np == 0)] = 1
+                self.propagation_cache_art_eligible.assign(art_eligible)
+
+    def _propagation_cache_guard_flag(self, size: int) -> wp.array:
+        """Per-world skip flag for a size group's tree-walk propagate launch.
+
+        Groups covered by the cached-response path skip worlds the GEMV
+        already handled (flag 1); all other groups — and the cached path when
+        disabled — get the all-zeros flag, i.e. unconditional tree walk.
+        """
+        if (
+            self._propagation_cached_response_active
+            and self._cached_response_tree_warp_kernels_by_size.get(int(size)) is not None
+        ):
+            return self.propagation_cache_world_flag
+        return self._propagation_cache_flag_zeros
 
     def _build_propagation_joint_parent_slot(self, model) -> wp.array:
         """Per-joint local index of the joint whose child is this joint's parent body.
@@ -3806,6 +3997,49 @@ class SolverFeatherPGS(SolverBase):
                         ],
                         device=self.model.device,
                     )
+            cached_kernel = (
+                self._cached_response_tree_warp_kernels_by_size.get(int(size))
+                if self._propagation_cached_response_active
+                else None
+            )
+            if cached_kernel is not None:
+                # Extract this pass's cached response matrices (R and B) from
+                # column-batched tree solves (all six basis columns per sweep)
+                # against the just-computed
+                # factorization. Valid for the whole pass (and the velocity
+                # iterations) because U/D_inv are fixed until the next setup.
+                with self._sync_timed(f"prop_setup_cached_response_size{int(size)}"):
+                    wp.launch_tiled(
+                        cached_kernel,
+                        dim=[n_arts],
+                        inputs=[
+                            self.group_to_art[size],
+                            self.art_to_world,
+                            self.propagation_cache_world_flag,
+                            # Eligible prefix length: bounds the slot scan so
+                            # clutter past the prefix is never touched and
+                            # slot-indexed cache writes stay within capacity.
+                            self.propagation_cache_body_count,
+                            self.propagation_body_list,
+                            self.body_to_articulation,
+                            self.body_to_joint,
+                            self.model.articulation_start,
+                            self.model.joint_parent,
+                            self.model.joint_child,
+                            self.model.joint_qd_start,
+                            self._propagation_joint_parent_slot,
+                            self.propagation_joint_S_flat,
+                            self.propagation_body_com_rel,
+                            self.propagation_tree_U,
+                            self.propagation_tree_D_inv,
+                        ],
+                        outputs=[
+                            self.propagation_cache_R,
+                            self.propagation_cache_B,
+                        ],
+                        block_dim=self._cached_response_block_dim_by_size[int(size)],
+                        device=self.model.device,
+                    )
             with self._sync_timed(f"prop_setup_refresh_tree_qd_size{int(size)}"):
                 self._launch_refresh_propagation_tree_body_qd(size, n_arts, force=True)
         if self._has_free_rigid_bodies and self.is_free_rigid is not None:
@@ -4020,9 +4254,53 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
+    def _launch_propagation_cached_gemv(self) -> None:
+        """Apply the cached response matrices to this iteration's impulses.
+
+        Exactly replaces the per-iteration tree walk for worlds with
+        ``propagation_cache_world_flag == 1``: v_out += sum_b R_b · imp_b and
+        propagation_body_qd[a] = qd_base[a] + sum_b B_ab · imp_b for active
+        bodies (superposition over the fixed factorization — the same linear
+        map the tree walk applies), then clears the consumed impulses.
+        """
+        kernel = self._propagation_cached_gemv_kernel
+        if kernel is None:
+            return
+        wpb = self._propagation_cached_gemv_worlds_per_block
+        wp.launch_tiled(
+            kernel,
+            dim=[(self.world_count + wpb - 1) // wpb],
+            inputs=[
+                self.world_count,
+                self.propagation_cache_world_flag,
+                # Eligible prefix length: the GEMV consumes exactly the slots
+                # the cache covers; clutter impulses stay for the flush / the
+                # unconditional tree walk.
+                self.propagation_cache_body_count,
+                self.propagation_body_list,
+                self.propagation_cache_art_eligible,
+                self.body_to_articulation,
+                self.model.articulation_start,
+                self.model.joint_qd_start,
+                self.propagation_cache_R,
+                self.propagation_cache_B,
+                self.propagation_cache_qd_base,
+            ],
+            outputs=[
+                self.propagation_body_impulses,
+                self.propagation_body_qd,
+                self.v_out,
+            ],
+            block_dim=32 * wpb,
+            device=self.model.device,
+        )
+
     def _propagate_response(self) -> None:
         if not self._propagation_contacts_enabled():
             return
+
+        if self._propagation_cached_response_active:
+            self._launch_propagation_cached_gemv()
 
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
@@ -4030,6 +4308,7 @@ class SolverFeatherPGS(SolverBase):
                 continue
             if not self._propagation_tree_has_non_free_by_size.get(int(size), True):
                 continue
+            guard_flag = self._propagation_cache_guard_flag(size)
             warp_kernel = getattr(self, "_propagate_tree_warp_kernels_by_size", {}).get(int(size))
             if warp_kernel is not None:
                 wp.launch_tiled(
@@ -4037,6 +4316,8 @@ class SolverFeatherPGS(SolverBase):
                     dim=[n_arts],
                     inputs=[
                         self.group_to_art[size],
+                        self.art_to_world,
+                        guard_flag,
                         self.model.articulation_start,
                         self.model.joint_parent,
                         self.model.joint_child,
@@ -4061,6 +4342,8 @@ class SolverFeatherPGS(SolverBase):
                 dim=n_arts,
                 inputs=[
                     self.group_to_art[size],
+                    self.art_to_world,
+                    guard_flag,
                     self.model.articulation_start,
                     self.model.joint_parent,
                     self.model.joint_child,
@@ -4231,6 +4514,25 @@ class SolverFeatherPGS(SolverBase):
     ) -> None:
         if not self._propagation_contacts_enabled():
             return
+        if self._propagation_cached_response_active:
+            # Snapshot the consistent pre-sweep active-body twists: the GS
+            # sweep below overwrites propagation_body_qd with diagonal
+            # estimates, which the cached-response GEMV replaces by the exact
+            # (base + response x impulses) superposition — mirroring how the
+            # tree walk rebuilt body_qd from v_out.
+            wp.launch(
+                snapshot_propagation_cache_qd_base,
+                dim=self.world_count * self.propagation_cache_max_bodies,
+                inputs=[
+                    self.propagation_cache_world_flag,
+                    self.propagation_cache_body_count,
+                    self.propagation_body_list,
+                    self.propagation_cache_max_bodies,
+                    self.propagation_body_qd,
+                ],
+                outputs=[self.propagation_cache_qd_base],
+                device=self.model.device,
+            )
         if self._propagation_colored:
             self._propagation_pgs_solve_colored_iteration(
                 rhs=rhs,
@@ -6604,7 +6906,41 @@ class SolverFeatherPGS(SolverBase):
                     outputs=[self.propagation_constraint_count],
                     device=model.device,
                 )
-                if (
+                if self._propagation_cached_response_active:
+                    # Partitioned build: cache-eligible bodies claim the slot
+                    # prefix, free-rigid clutter and non-cacheable
+                    # articulations follow. The cache arrays (R/B/qd_base) are
+                    # indexed by slot and bounded by the eligible prefix, so
+                    # clutter neither consumes cache capacity nor evicts the
+                    # robot from the cached path.
+                    for want_eligible in (1, 0):
+                        wp.launch(
+                            build_propagation_body_map_partitioned,
+                            dim=self.world_count * self.propagation_max_constraints,
+                            inputs=[
+                                self.propagation_constraint_count,
+                                self.propagation_body_a,
+                                self.propagation_body_b,
+                                self.propagation_max_constraints,
+                                self.max_propagation_bodies,
+                                self.body_to_articulation,
+                                self.propagation_cache_art_eligible,
+                                want_eligible,
+                                self.propagation_body_seen,
+                            ],
+                            outputs=[
+                                self.propagation_body_list,
+                                self.propagation_body_count,
+                                self.propagation_body_local_slot,
+                            ],
+                            device=model.device,
+                        )
+                        if want_eligible == 1:
+                            # The counter value after pass 1 IS the eligible
+                            # prefix length; pass 2 keeps counting on the same
+                            # array toward the total.
+                            wp.copy(self.propagation_cache_body_count, self.propagation_body_count)
+                elif (
                     self._propagation_tree_requires_body_map
                     or self.propagation_full_fused_iterations
                     or self._propagation_colored
@@ -6625,6 +6961,22 @@ class SolverFeatherPGS(SolverBase):
                             self.propagation_body_count,
                             self.propagation_body_local_slot,
                         ],
+                        device=model.device,
+                    )
+                if self._propagation_cached_response_active:
+                    # Device-side per-world routing between the cached GEMV
+                    # and the tree-walk fallback; recomputed every step so
+                    # cache-overflowing worlds stay exact without host sync.
+                    # Gated on the ELIGIBLE prefix length, not the total
+                    # active-body count.
+                    wp.launch(
+                        compute_propagation_cache_world_flag,
+                        dim=self.world_count,
+                        inputs=[
+                            self.propagation_cache_body_count,
+                            self.propagation_cache_max_bodies,
+                        ],
+                        outputs=[self.propagation_cache_world_flag],
                         device=model.device,
                     )
 
@@ -12787,6 +13139,8 @@ def _get_propagate_tree_impulses_revolute_kernel(
     const int lane = threadIdx.x & 31;
     const unsigned mask = 0xffffffffu;
     const int art = group_to_art.data[group_idx];
+    const int guard_world = art_to_world.data[art];
+    if (guard_world >= 0 && cache_world_flag.data[guard_world] != 0) return;
     const int joint_start = articulation_start.data[art];
     const int joint_end = articulation_start.data[art + 1];
     const int n_joints = joint_end - joint_start;
@@ -12965,6 +13319,8 @@ def _get_propagate_tree_impulses_revolute_kernel(
     def propagate_tree_impulses_revolute_native(
         group_idx: int,
         group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        cache_world_flag: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
@@ -12981,6 +13337,8 @@ def _get_propagate_tree_impulses_revolute_kernel(
 
     def propagate_tree_impulses_revolute_template(
         group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        cache_world_flag: wp.array[int],
         articulation_start: wp.array[int],
         joint_parent: wp.array[int],
         joint_child: wp.array[int],
@@ -12998,6 +13356,8 @@ def _get_propagate_tree_impulses_revolute_kernel(
         propagate_tree_impulses_revolute_native(
             group_idx,
             group_to_art,
+            art_to_world,
+            cache_world_flag,
             articulation_start,
             joint_parent,
             joint_child,
@@ -13018,6 +13378,605 @@ def _get_propagate_tree_impulses_revolute_kernel(
     propagate_tree_impulses_revolute_template.__name__ = name
     propagate_tree_impulses_revolute_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(propagate_tree_impulses_revolute_template)
+
+
+def _cached_response_extraction_warps(max_joints: int, cache_max_bodies: int, *, has_free_root: bool) -> int:
+    """Warps per block for the cached-response extraction kernel (0 = unbuildable).
+
+    Each warp batch-solves one active body (all six basis columns at once)
+    and owns a private ``[joints][6 x 6]`` column block in static shared
+    memory (36 floats/joint), on top of the per-block joint metadata
+    (19 words/joint) and the free-root S/D_inv matrices (72 words). Pick the
+    largest warp count that keeps the block within the 48KB static shared
+    limit; warps beyond the cache body capacity could only ever idle.
+    """
+    joints_cap = max(int(max_joints), 1)
+    budget_words = (48 * 1024) // 4
+    fixed_words = 72 if has_free_root else 0
+    for warps in range(min(6, max(int(cache_max_bodies), 1)), 0, -1):
+        if joints_cap * (36 * warps + 19) + fixed_words <= budget_words:
+            return warps
+    return 0
+
+
+@cache
+def _get_propagation_tree_cached_response_kernel(
+    size: int,
+    max_joints: int,
+    max_prop_bodies: int,
+    cache_max_bodies: int,
+    max_art_dofs: int,
+    device_arch: str,
+    *,
+    has_free_root: bool = False,
+) -> "wp.Kernel":
+    """Build the per-pass cached-response extraction kernel for 0/1-DOF trees.
+
+    One block per articulation, ``_cached_response_extraction_warps`` warps.
+    Warp w batch-solves the tree response of active slots w, w+W, ... of
+    ``propagation_body_list``: for its body b it runs ONE backward+forward
+    Featherstone sweep pair carrying all six basis columns simultaneously —
+    lanes 0-5 each own one column of a 6-wide pA / body-delta block, so every
+    per-joint operation of ``propagate_tree_impulses_revolute`` (S^T pA,
+    D_inv application, U updates, wrench/twist translation) is applied
+    column-wise: the identical math, six columns per metadata load, with no
+    cross-lane traffic at all (columns are independent by superposition).
+
+    - the forward-pass qdd stream of column c is column c of the full
+      joint-space response matrix R_b (written to ``propagation_cache_R``),
+    - the forward-pass body delta at every active body a is a column of the
+      pair response block B_ab (written to ``propagation_cache_B``;
+      cross-articulation pairs are written as exact zeros so the GEMV can sum
+      over all active slots of the world).
+
+    The backward pass runs over the full joint list rather than just b's root
+    path: off-path pA seeds are zero so their u and parent propagation
+    contribute exact zeros — identical math, and it keeps the code a
+    line-for-line sibling of the propagate kernel. The forward pass must be
+    full-tree regardless, because subtrees hanging off the path receive
+    parent deltas. Worlds with ``propagation_cache_world_flag == 0``
+    (active-body overflow) are skipped; they keep the tree-walk fallback.
+
+    ``has_free_root`` compiles the same multi-DOF world-rooted first-joint
+    special case as the other ``_fr`` tree kernels.
+    """
+    joints_cap = max(int(max_joints), 1)
+    MB = max(int(max_prop_bodies), 1)
+    C = max(int(cache_max_bodies), 1)
+    MAXD = max(int(max_art_dofs), 1)
+    W = _cached_response_extraction_warps(joints_cap, C, has_free_root=has_free_root)
+    if W <= 0:
+        raise ValueError(f"cached-response extraction does not fit shared memory for {joints_cap} joints")
+    BLOCK = 32 * W
+    if has_free_root:
+        root_decl = """
+    __shared__ float s_S_root[36];
+    __shared__ float s_Dinv_root[36];
+    const int root_gdof = joint_qd_start.data[joint_start];
+    const int root_dc = joint_qd_start.data[joint_start + 1] - root_gdof;
+"""
+        root_gdof_guard = " && j != 0"
+        root_preload = f"""
+    for (int idx = t; idx < root_dc * 6; idx += {BLOCK}) {{
+        const int a = idx / 6;
+        const int comp = idx - a * 6;
+        s_S_root[a * 6 + comp] = propagation_joint_S_flat.data[(root_gdof + a) * 6 + comp];
+    }}
+    for (int idx = t; idx < root_dc * root_dc; idx += {BLOCK}) {{
+        const int a = idx / root_dc;
+        const int b = idx - a * root_dc;
+        s_Dinv_root[a * 6 + b] = propagation_tree_D_inv.data[joint_start * 36 + a * 6 + b];
+    }}
+"""
+        root_backward = """
+                if (j == 0) {
+                    float ur[6];
+                    #pragma unroll
+                    for (int a = 0; a < 6; ++a) {
+                        float u_root = 0.0f;
+                        if (a < root_dc) {
+                            for (int r = 0; r < 6; ++r) {
+                                u_root -= s_S_root[a * 6 + r] * s_blk[r * 6 + c];
+                            }
+                        }
+                        ur[a] = u_root;
+                    }
+                    // pA[0] is consumed; its rows stage u_root for the
+                    // forward pass (column-local, like the 1-DOF u packing).
+                    #pragma unroll
+                    for (int a = 0; a < 6; ++a) {
+                        if (a < root_dc) {
+                            s_blk[a * 6 + c] = ur[a];
+                        }
+                    }
+                    continue;
+                }
+"""
+        root_forward = f"""
+                if (j == 0) {{
+                    float qr[6];
+                    #pragma unroll
+                    for (int a = 0; a < 6; ++a) {{
+                        float qdd_root = 0.0f;
+                        if (a < root_dc) {{
+                            for (int b = 0; b < root_dc; ++b) {{
+                                qdd_root += s_Dinv_root[a * 6 + b] * s_blk[b * 6 + c];
+                            }}
+                            propagation_cache_R.data[
+                                (((world * {C}) + slot) * {MAXD} + (root_gdof + a - art_dof_start)) * 6 + c
+                            ] = qdd_root;
+                        }}
+                        qr[a] = qdd_root;
+                    }}
+                    #pragma unroll
+                    for (int r = 0; r < 6; ++r) {{
+                        float value = 0.0f;
+                        #pragma unroll
+                        for (int a = 0; a < 6; ++a) {{
+                            if (a < root_dc) {{
+                                value += s_S_root[a * 6 + r] * qr[a];
+                            }}
+                        }}
+                        s_blk[r * 6 + c] = value;
+                    }}
+                    continue;
+                }}
+"""
+    else:
+        root_decl = ""
+        root_gdof_guard = ""
+        root_preload = ""
+        root_backward = ""
+        root_forward = ""
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int t = threadIdx.x;
+    const int warp = t >> 5;
+    const int lane = t & 31;
+    const unsigned mask = 0xffffffffu;
+    const int art = group_to_art.data[group_idx];
+    const int world = art_to_world.data[art];
+    if (world < 0 || cache_world_flag.data[world] == 0) return;
+    int n_active = propagation_body_count.data[world];
+    if (n_active <= 0) return;
+    if (n_active > {C}) n_active = {C};
+    const int joint_start = articulation_start.data[art];
+    const int joint_end = articulation_start.data[art + 1];
+    const int n_joints = joint_end - joint_start;
+    const int art_dof_start = joint_qd_start.data[joint_start];
+
+    // Warp w batch-solves active slots w, w+{W}, ...: ONE backward+forward
+    // sweep pair per body carrying all six basis columns, lanes 0-5 each
+    // owning one column. s_blk is the warp's [joint][6 x 6] column block: pA
+    // during the backward sweep, body deltas during the forward sweep (pA is
+    // dead once its u row is extracted, so the forward pass reuses the same
+    // storage; u itself packs into the dead row 0).
+    __shared__ __align__(16) float s_blk_all[{W} * {joints_cap} * 36];
+    __shared__ float s_U[{joints_cap} * 6];
+    __shared__ float s_S[{joints_cap} * 6];
+    __shared__ float s_e[{joints_cap} * 3];
+    __shared__ float s_dinv[{joints_cap}];
+    __shared__ int s_child[{joints_cap}];
+    __shared__ int s_pslot[{joints_cap}];
+    __shared__ int s_gdof[{joints_cap}];
+{root_decl}
+    float* s_blk = s_blk_all + warp * {joints_cap} * 36;
+
+    for (int j = t; j < n_joints; j += {BLOCK}) {{
+        const int joint = joint_start + j;
+        const int child = joint_child.data[joint];
+        const int dof_start_j = joint_qd_start.data[joint];
+        const int has_dof = (dof_start_j < joint_qd_start.data[joint + 1]);
+        s_child[j] = child;
+        s_pslot[j] = joint_parent_slot.data[joint];
+        s_gdof[j] = (has_dof{root_gdof_guard}) ? dof_start_j : -1;
+        s_dinv[j] = has_dof ? propagation_tree_D_inv.data[joint * 36] : 0.0f;
+    }}
+    __syncthreads();
+    for (int idx = t; idx < n_joints * 6; idx += {BLOCK}) {{
+        const int j = idx / 6;
+        const int comp = idx - j * 6;
+        const int gdof = s_gdof[j];
+        s_U[idx] = (gdof >= 0) ? propagation_tree_U.data[gdof * 6 + comp] : 0.0f;
+        s_S[idx] = (gdof >= 0) ? propagation_joint_S_flat.data[gdof * 6 + comp] : 0.0f;
+    }}
+    for (int idx = t; idx < n_joints * 3; idx += {BLOCK}) {{
+        const int j = idx / 3;
+        const int comp = idx - j * 3;
+        float e = 0.0f;
+        if (s_pslot[j] >= 0) {{
+            const int parent = joint_parent.data[joint_start + j];
+            e = propagation_body_com_rel.data[s_child[j] * 3 + comp]
+                - propagation_body_com_rel.data[parent * 3 + comp];
+        }}
+        s_e[idx] = e;
+    }}
+{root_preload}
+    __syncthreads();
+
+    // After the shared preload each warp is independent: it owns its slots'
+    // column block and R/B rows outright, so no block-level sync remains.
+    for (int slot = warp; slot < n_active; slot += {W}) {{
+        const int target_body = propagation_body_list.data[world * {MB} + slot];
+        if (target_body < 0 || body_to_articulation.data[target_body] != art) continue;
+        const int j_target = body_to_joint.data[target_body] - joint_start;
+
+        // Zero the column block (36 words/joint keeps float4 alignment).
+        for (int idx = lane; idx < n_joints * 9; idx += 32) {{
+            reinterpret_cast<float4*>(s_blk)[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }}
+        __syncwarp(mask);
+
+        if (lane < 6) {{
+            const int c = lane;
+            // Seed column c with the unit basis wrench: pA = -e_c at b.
+            s_blk[j_target * 36 + c * 6 + c] = -1.0f;
+
+            // Backward sweep, leaf -> root: the tree walk's per-joint math
+            // applied to column c. Every read and write below touches only
+            // column c, so lanes never need to synchronize.
+            for (int offset = 0; offset < n_joints; ++offset) {{
+                const int j = n_joints - 1 - offset;
+{root_backward}
+                const int parent_slot = s_pslot[j];
+                const int has_dof = (s_gdof[j] >= 0);
+                float* blk_j = s_blk + j * 36;
+
+                const float p0 = blk_j[0 * 6 + c];
+                const float p1 = blk_j[1 * 6 + c];
+                const float p2 = blk_j[2 * 6 + c];
+                const float p3 = blk_j[3 * 6 + c];
+                const float p4 = blk_j[4 * 6 + c];
+                const float p5 = blk_j[5 * 6 + c];
+
+                float u = 0.0f;
+                if (has_dof) {{
+                    const float* Sj = s_S + j * 6;
+                    u = -(Sj[0] * p0 + Sj[1] * p1 + Sj[2] * p2 + Sj[3] * p3 + Sj[4] * p4 + Sj[5] * p5);
+                }}
+                if (parent_slot >= 0) {{
+                    const float inv_du = has_dof ? s_dinv[j] * u : 0.0f;
+                    const float* Uj = s_U + j * 6;
+                    const float q0 = p0 + Uj[0] * inv_du;
+                    const float q1 = p1 + Uj[1] * inv_du;
+                    const float q2 = p2 + Uj[2] * inv_du;
+                    float q3 = p3 + Uj[3] * inv_du;
+                    float q4 = p4 + Uj[4] * inv_du;
+                    float q5 = p5 + Uj[5] * inv_du;
+                    const float ex = s_e[j * 3 + 0];
+                    const float ey = s_e[j * 3 + 1];
+                    const float ez = s_e[j * 3 + 2];
+                    q3 += ey * q2 - ez * q1;
+                    q4 += ez * q0 - ex * q2;
+                    q5 += ex * q1 - ey * q0;
+                    float* blk_p = s_blk + parent_slot * 36;
+                    blk_p[0 * 6 + c] += q0;
+                    blk_p[1 * 6 + c] += q1;
+                    blk_p[2 * 6 + c] += q2;
+                    blk_p[3 * 6 + c] += q3;
+                    blk_p[4 * 6 + c] += q4;
+                    blk_p[5 * 6 + c] += q5;
+                }}
+                if (has_dof) {{
+                    blk_j[c] = u;  // pA[j] is dead; row 0 stages u for the forward pass
+                }}
+            }}
+
+            // Forward sweep, root -> leaf: qdd per DOF is column c of R_b,
+            // the block turns into per-body COM twist deltas.
+            for (int j = 0; j < n_joints; ++j) {{
+{root_forward}
+                const int parent_slot = s_pslot[j];
+                const int gdof = s_gdof[j];
+                const int has_dof = (gdof >= 0);
+                float* blk_j = s_blk + j * 36;
+
+                float d0 = 0.0f;
+                float d1 = 0.0f;
+                float d2 = 0.0f;
+                float d3 = 0.0f;
+                float d4 = 0.0f;
+                float d5 = 0.0f;
+                if (parent_slot >= 0) {{
+                    const float* blk_p = s_blk + parent_slot * 36;
+                    d0 = blk_p[0 * 6 + c];
+                    d1 = blk_p[1 * 6 + c];
+                    d2 = blk_p[2 * 6 + c];
+                    d3 = blk_p[3 * 6 + c];
+                    d4 = blk_p[4 * 6 + c];
+                    d5 = blk_p[5 * 6 + c];
+                    const float ex = s_e[j * 3 + 0];
+                    const float ey = s_e[j * 3 + 1];
+                    const float ez = s_e[j * 3 + 2];
+                    d0 += d4 * ez - d5 * ey;
+                    d1 += d5 * ex - d3 * ez;
+                    d2 += d3 * ey - d4 * ex;
+                }}
+
+                float qdd = 0.0f;
+                if (has_dof) {{
+                    const float u = blk_j[c];  // staged by the backward sweep
+                    float parent_term = 0.0f;
+                    if (parent_slot >= 0) {{
+                        const float* Uj = s_U + j * 6;
+                        parent_term = Uj[0] * d0 + Uj[1] * d1 + Uj[2] * d2 + Uj[3] * d3 + Uj[4] * d4 + Uj[5] * d5;
+                    }}
+                    qdd = s_dinv[j] * (u - parent_term);
+                    propagation_cache_R.data[
+                        (((world * {C}) + slot) * {MAXD} + (gdof - art_dof_start)) * 6 + c
+                    ] = qdd;
+                }}
+
+                const float* Sj = s_S + j * 6;
+                blk_j[0 * 6 + c] = d0 + (has_dof ? Sj[0] * qdd : 0.0f);
+                blk_j[1 * 6 + c] = d1 + (has_dof ? Sj[1] * qdd : 0.0f);
+                blk_j[2 * 6 + c] = d2 + (has_dof ? Sj[2] * qdd : 0.0f);
+                blk_j[3 * 6 + c] = d3 + (has_dof ? Sj[3] * qdd : 0.0f);
+                blk_j[4 * 6 + c] = d4 + (has_dof ? Sj[4] * qdd : 0.0f);
+                blk_j[5 * 6 + c] = d5 + (has_dof ? Sj[5] * qdd : 0.0f);
+            }}
+
+            // B extraction: body delta at every active slot a. Bodies outside
+            // this articulation get exact zeros (no cross-articulation
+            // response), which also makes the whole column valid for the
+            // GEMV's flat sum.
+            for (int a_pos = 0; a_pos < n_active; ++a_pos) {{
+                const int body_a = propagation_body_list.data[world * {MB} + a_pos];
+                const bool in_art = (body_a >= 0 && body_to_articulation.data[body_a] == art);
+                const float* bd = in_art ? (s_blk + (body_to_joint.data[body_a] - joint_start) * 36) : s_blk;
+                float* out = propagation_cache_B.data + (((world * {C}) + a_pos) * {C} + slot) * 36;
+                #pragma unroll
+                for (int r = 0; r < 6; ++r) {{
+                    out[r * 6 + c] = in_art ? bd[r * 6 + c] : 0.0f;
+                }}
+            }}
+        }}
+        __syncwarp(mask);
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def propagation_tree_cached_response_native(
+        group_idx: int,
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        cache_world_flag: wp.array[int],
+        propagation_body_count: wp.array[int],
+        propagation_body_list: wp.array2d[int],
+        body_to_articulation: wp.array[int],
+        body_to_joint: wp.array[int],
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_parent_slot: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        propagation_tree_U: wp.array2d[float],
+        propagation_tree_D_inv: wp.array3d[float],
+        propagation_cache_R: wp.array4d[float],
+        propagation_cache_B: wp.array4d[float],
+    ): ...
+
+    def propagation_tree_cached_response_template(
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        cache_world_flag: wp.array[int],
+        propagation_body_count: wp.array[int],
+        propagation_body_list: wp.array2d[int],
+        body_to_articulation: wp.array[int],
+        body_to_joint: wp.array[int],
+        articulation_start: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_parent_slot: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        propagation_tree_U: wp.array2d[float],
+        propagation_tree_D_inv: wp.array3d[float],
+        propagation_cache_R: wp.array4d[float],
+        propagation_cache_B: wp.array4d[float],
+    ):
+        group_idx, _t = wp.tid()
+        propagation_tree_cached_response_native(
+            group_idx,
+            group_to_art,
+            art_to_world,
+            cache_world_flag,
+            propagation_body_count,
+            propagation_body_list,
+            body_to_articulation,
+            body_to_joint,
+            articulation_start,
+            joint_parent,
+            joint_child,
+            joint_qd_start,
+            joint_parent_slot,
+            propagation_joint_S_flat,
+            propagation_body_com_rel,
+            propagation_tree_U,
+            propagation_tree_D_inv,
+            propagation_cache_R,
+            propagation_cache_B,
+        )
+
+    name = f"propagation_tree_cached_response_{size}_j{joints_cap}_c{C}"
+    if has_free_root:
+        name += "_fr"
+    propagation_tree_cached_response_template.__name__ = name
+    propagation_tree_cached_response_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(propagation_tree_cached_response_template)
+
+
+@cache
+def _get_propagation_cached_gemv_kernel(
+    cache_max_bodies: int,
+    max_art_dofs: int,
+    max_prop_bodies: int,
+    worlds_per_block: int,
+    device_arch: str,
+) -> "wp.Kernel":
+    """Build the per-iteration cached-response GEMV kernel (warp per world).
+
+    For worlds on the cached path this applies exactly the linear map the
+    per-iteration tree walk applies to the deferred body impulses:
+
+    - ``v_out[art dofs] += sum_b R_b · imp_b`` (lanes stride the DOFs; bodies
+      of one articulation accumulate sequentially per lane, so no atomics),
+    - ``propagation_body_qd[a] = qd_base[a] + sum_b B_ab · imp_b`` for active
+      bodies a, replacing the GS sweep's in-place diagonal estimates with the
+      exact superposition (this mirrors the tree walk's from-scratch body_qd
+      recompute), and
+    - clears the consumed ``propagation_body_impulses``.
+
+    Only bodies whose articulation is cached-eligible participate
+    (``art_eligible``): free rigid bodies keep the sweep-estimate + flush
+    path (their diagonal response is already exact), and bodies of
+    non-eligible tree groups keep the tree-walk launch, whose per-world guard
+    flag is the all-zeros array for those groups.
+    """
+    C = max(int(cache_max_bodies), 1)
+    MAXD = max(int(max_art_dofs), 1)
+    MB = max(int(max_prop_bodies), 1)
+    W = int(worlds_per_block)
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int t = threadIdx.x;
+    const int warp_id = t >> 5;
+    const int lane = t & 31;
+    const int world = tile * {W} + warp_id;
+    if (world >= world_count) return;
+    if (cache_world_flag.data[world] == 0) return;
+    int n = propagation_body_count.data[world];
+    if (n <= 0) return;
+    if (n > {C}) n = {C};
+
+    __shared__ float s_imp_all[{W} * {C} * 6];
+    __shared__ int s_body_all[{W} * {C}];
+    __shared__ int s_elig_all[{W} * {C}];
+    float* s_imp = s_imp_all + warp_id * {C} * 6;
+    int* s_body = s_body_all + warp_id * {C};
+    int* s_elig = s_elig_all + warp_id * {C};
+
+    for (int i = lane; i < n; i += 32) {{
+        const int body = propagation_body_list.data[world * {MB} + i];
+        s_body[i] = body;
+        int elig = 0;
+        if (body >= 0) {{
+            const int art = body_to_articulation.data[body];
+            if (art >= 0 && art_eligible.data[art] != 0) elig = 1;
+        }}
+        s_elig[i] = elig;
+    }}
+    __syncwarp();
+    for (int i = lane; i < n * 6; i += 32) {{
+        const int body = s_body[i / 6];
+        s_imp[i] = (body >= 0) ? propagation_body_impulses.data[body * 6 + (i - (i / 6) * 6)] : 0.0f;
+    }}
+    __syncwarp();
+
+    // v_out += R_b · imp_b per eligible active body.
+    for (int b = 0; b < n; ++b) {{
+        if (s_elig[b] == 0) continue;
+        float any_imp = fabsf(s_imp[b * 6 + 0]) + fabsf(s_imp[b * 6 + 1]) + fabsf(s_imp[b * 6 + 2])
+            + fabsf(s_imp[b * 6 + 3]) + fabsf(s_imp[b * 6 + 4]) + fabsf(s_imp[b * 6 + 5]);
+        if (any_imp == 0.0f) continue;
+        const int art = body_to_articulation.data[s_body[b]];
+        const int joint_start = articulation_start.data[art];
+        const int joint_end = articulation_start.data[art + 1];
+        const int dof_start = joint_qd_start.data[joint_start];
+        const int dof_count = joint_qd_start.data[joint_end] - dof_start;
+        for (int d = lane; d < dof_count; d += 32) {{
+            const int base = ((world * {C} + b) * {MAXD} + d) * 6;
+            float acc = 0.0f;
+            for (int j2 = 0; j2 < 6; ++j2) {{
+                acc += propagation_cache_R.data[base + j2] * s_imp[b * 6 + j2];
+            }}
+            v_out.data[dof_start + d] += acc;
+        }}
+    }}
+
+    // body_qd[a] = qd_base[a] + sum_b B_ab · imp_b; clear consumed impulses.
+    // Impulse reads all come from the s_imp staging, so the in-loop clear
+    // cannot race the reads.
+    for (int i = lane; i < n * 6; i += 32) {{
+        const int a = i / 6;
+        const int comp = i - a * 6;
+        if (s_elig[a] == 0) continue;
+        float val = propagation_cache_qd_base.data[(world * {C} + a) * 6 + comp];
+        for (int b = 0; b < n; ++b) {{
+            if (s_elig[b] == 0) continue;
+            const int base = (((world * {C} + a) * {C}) + b) * 36 + comp * 6;
+            for (int j2 = 0; j2 < 6; ++j2) {{
+                val += propagation_cache_B.data[base + j2] * s_imp[b * 6 + j2];
+            }}
+        }}
+        propagation_body_qd.data[s_body[a] * 6 + comp] = val;
+        propagation_body_impulses.data[s_body[a] * 6 + comp] = 0.0f;
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def propagation_cached_gemv_native(
+        tile: int,
+        world_count: int,
+        cache_world_flag: wp.array[int],
+        propagation_body_count: wp.array[int],
+        propagation_body_list: wp.array2d[int],
+        art_eligible: wp.array[int],
+        body_to_articulation: wp.array[int],
+        articulation_start: wp.array[int],
+        joint_qd_start: wp.array[int],
+        propagation_cache_R: wp.array4d[float],
+        propagation_cache_B: wp.array4d[float],
+        propagation_cache_qd_base: wp.array3d[float],
+        propagation_body_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        v_out: wp.array[float],
+    ): ...
+
+    def propagation_cached_gemv_template(
+        world_count: int,
+        cache_world_flag: wp.array[int],
+        propagation_body_count: wp.array[int],
+        propagation_body_list: wp.array2d[int],
+        art_eligible: wp.array[int],
+        body_to_articulation: wp.array[int],
+        articulation_start: wp.array[int],
+        joint_qd_start: wp.array[int],
+        propagation_cache_R: wp.array4d[float],
+        propagation_cache_B: wp.array4d[float],
+        propagation_cache_qd_base: wp.array3d[float],
+        propagation_body_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        v_out: wp.array[float],
+    ):
+        tile, _t = wp.tid()
+        propagation_cached_gemv_native(
+            tile,
+            world_count,
+            cache_world_flag,
+            propagation_body_count,
+            propagation_body_list,
+            art_eligible,
+            body_to_articulation,
+            articulation_start,
+            joint_qd_start,
+            propagation_cache_R,
+            propagation_cache_B,
+            propagation_cache_qd_base,
+            propagation_body_impulses,
+            propagation_body_qd,
+            v_out,
+        )
+
+    name = f"propagation_cached_gemv_c{C}_d{MAXD}_w{W}"
+    propagation_cached_gemv_template.__name__ = name
+    propagation_cached_gemv_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(propagation_cached_gemv_template)
 
 
 @cache

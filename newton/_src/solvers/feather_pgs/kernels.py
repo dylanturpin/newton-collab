@@ -5499,6 +5499,72 @@ def build_propagation_body_map(
 
 
 @wp.kernel
+def build_propagation_body_map_partitioned(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_max_constraints: int,
+    max_propagation_bodies: int,
+    body_to_articulation: wp.array[int],
+    propagation_cache_art_eligible: wp.array[int],
+    want_eligible: int,
+    propagation_body_seen: wp.array[int],
+    # outputs
+    propagation_body_list: wp.array2d[int],
+    propagation_body_count: wp.array[int],
+    propagation_body_local_slot: wp.array[int],
+):
+    """One partition pass of the body-map build.
+
+    Same claim logic as :func:`build_propagation_body_map`, restricted to
+    bodies whose articulation's cache eligibility equals ``want_eligible``.
+    The cached-response path launches this twice — eligible bodies first,
+    everything else second — so cache-eligible bodies occupy a contiguous
+    slot prefix and the capacity gate can ignore free-rigid clutter and
+    non-cacheable articulations (their impulses go through the flush / the
+    unconditional tree walk, never through the cache). The eligibility
+    predicate runs BEFORE the seen-claim so the second pass can still claim
+    the bodies the first pass skipped.
+    """
+    tid = wp.tid()
+    world = tid // propagation_max_constraints
+    i = tid - world * propagation_max_constraints
+    m = propagation_constraint_count[world]
+    if m > propagation_max_constraints:
+        m = propagation_max_constraints
+    if i >= m:
+        return
+
+    ba = propagation_body_a[world, i]
+    if ba >= 0:
+        elig_a = int(0)
+        art_a = body_to_articulation[ba]
+        if art_a >= 0:
+            elig_a = propagation_cache_art_eligible[art_a]
+        if elig_a == want_eligible:
+            old = wp.atomic_add(propagation_body_seen, ba, 1)
+            if old == 0:
+                slot = wp.atomic_add(propagation_body_count, world, 1)
+                if slot < max_propagation_bodies:
+                    propagation_body_list[world, slot] = ba
+                    propagation_body_local_slot[ba] = slot
+
+    bb = propagation_body_b[world, i]
+    if bb >= 0:
+        elig_b = int(0)
+        art_b = body_to_articulation[bb]
+        if art_b >= 0:
+            elig_b = propagation_cache_art_eligible[art_b]
+        if elig_b == want_eligible:
+            old = wp.atomic_add(propagation_body_seen, bb, 1)
+            if old == 0:
+                slot = wp.atomic_add(propagation_body_count, world, 1)
+                if slot < max_propagation_bodies:
+                    propagation_body_list[world, slot] = bb
+                    propagation_body_local_slot[bb] = slot
+
+
+@wp.kernel
 def build_propagation_body_map_slow(
     propagation_constraint_count: wp.array[int],
     propagation_body_a: wp.array2d[int],
@@ -5540,6 +5606,66 @@ def build_propagation_body_map_slow(
                 n_bodies += int(1)
 
     propagation_body_count[world] = n_bodies
+
+
+@wp.kernel
+def compute_propagation_cache_world_flag(
+    propagation_cache_body_count: wp.array[int],
+    cache_max_bodies: int,
+    # outputs
+    propagation_cache_world_flag: wp.array[int],
+):
+    """Mark worlds whose cache-ELIGIBLE active bodies fit the response cache.
+
+    The count input is the length of the eligible slot prefix written by the
+    partitioned body-map build — free-rigid clutter and non-cacheable
+    articulations never take the GEMV path, so they must not evict the robot
+    from the cache. Worlds whose eligible count exceeds the capacity keep the
+    exact per-iteration tree-walk fallback (flag 0); worlds under the cap
+    take the cached-response GEMV path (flag 1). A zero-body world is
+    trivially "cached": both paths are no-ops there.
+    """
+    world = wp.tid()
+    flag = int(0)
+    if propagation_cache_body_count[world] <= cache_max_bodies:
+        flag = int(1)
+    propagation_cache_world_flag[world] = flag
+
+
+@wp.kernel
+def snapshot_propagation_cache_qd_base(
+    propagation_cache_world_flag: wp.array[int],
+    propagation_body_count: wp.array[int],
+    propagation_body_list: wp.array2d[int],
+    cache_max_bodies: int,
+    propagation_body_qd: wp.array2d[float],
+    # outputs
+    propagation_cache_qd_base: wp.array3d[float],
+):
+    """Snapshot active bodies' live COM twists before a propagation GS sweep.
+
+    The sweep updates ``propagation_body_qd`` in place with diagonal-response
+    estimates; the cached-response GEMV afterwards must rebuild the exact
+    velocities as (pre-sweep twist) + (response x accumulated impulses), so
+    the consistent pre-sweep value is captured here. Pre-sweep consistency
+    holds because either the forced refresh just recomputed body_qd from
+    v_out, or v_out is unchanged since the previous exact update.
+    """
+    tid = wp.tid()
+    world = tid // cache_max_bodies
+    slot = tid - world * cache_max_bodies
+    if propagation_cache_world_flag[world] == 0:
+        return
+    n = propagation_body_count[world]
+    if n > cache_max_bodies:
+        n = cache_max_bodies
+    if slot >= n:
+        return
+    body = propagation_body_list[world, slot]
+    if body < 0:
+        return
+    for r in range(6):
+        propagation_cache_qd_base[world, slot, r] = propagation_body_qd[body, r]
 
 
 @wp.kernel
@@ -6559,6 +6685,8 @@ def flush_propagation_active_free_body_qd_to_vout(
 @wp.kernel
 def propagate_tree_impulses_for_size(
     group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    propagation_cache_world_flag: wp.array[int],
     articulation_start: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
@@ -6578,9 +6706,20 @@ def propagate_tree_impulses_for_size(
     propagation_body_qd: wp.array2d[float],
     v_out: wp.array[float],
 ):
-    """Propagate deferred propagation body impulses through the articulation tree."""
+    """Propagate deferred propagation body impulses through the articulation tree.
+
+    ``propagation_cache_world_flag`` gates the cached-response fast path: a
+    nonzero flag means this world's deferred impulses were already converted
+    to joint velocities by the precomputed response-matrix GEMV (exactly the
+    same linear map), so this articulation is skipped. Callers with the
+    cached path disabled pass an all-zeros flag, which leaves behavior
+    unchanged.
+    """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
+    world = art_to_world[art]
+    if world >= 0 and propagation_cache_world_flag[world] != 0:
+        return
     joint_start = articulation_start[art]
     joint_end = articulation_start[art + 1]
 
