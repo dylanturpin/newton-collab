@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import os
+import tempfile
+import warnings
 from typing import Any
 
 import numpy as np
@@ -18,7 +20,7 @@ try:
 except ImportError:
     Gf = Sdf = Usd = UsdGeom = Vt = None
 
-from .viewer import ViewerBase
+from .viewer import _DEFAULT_LAYER_ID, ViewerBase
 
 
 # transforms a cylinder such that it connects the two points pos0, pos1
@@ -80,6 +82,7 @@ class ViewerUSD(ViewerBase):
         up_axis: str = "Z",
         num_frames: int | None = 100,
         scaling: float = 1.0,
+        points_as_spheres: bool = True,
     ):
         """
         Initialize the USD viewer backend for Newton physics simulations.
@@ -90,6 +93,10 @@ class ViewerUSD(ViewerBase):
             up_axis: USD up axis, either 'Y' or 'Z'. Default is 'Z'.
             num_frames: Maximum number of frames to record. Default is 100. If None, recording is unlimited.
             scaling: Uniform scaling applied to the scene root. Default is 1.0.
+            points_as_spheres: When True, :meth:`log_points` renders points as a
+                :class:`~pxr.UsdGeom.PointInstancer` of :class:`~pxr.UsdGeom.Sphere`
+                prototypes scaled by ``radii``, instead of flat
+                :class:`~pxr.UsdGeom.Points` splats. Default is True.
 
         Raises:
             ImportError: If the usd-core package is not installed.
@@ -102,7 +109,9 @@ class ViewerUSD(ViewerBase):
         self.output_path = os.path.abspath(output_path)
         self.fps = fps
         self.up_axis = up_axis
+        self.scaling = scaling
         self.num_frames = num_frames
+        self.points_as_spheres = points_as_spheres
 
         # Create USD stage. If this output path is already registered in the
         # current process, reuse and clear the existing layer instead of
@@ -135,16 +144,83 @@ class ViewerUSD(ViewerBase):
 
         self.stage.SetDefaultPrim(self.root.GetPrim())
 
-        # Track meshes and instancers
-        self._meshes = {}  # mesh_name -> prototype_path
-        self._instancers = {}  # instancer_name -> UsdGeomPointInstancer
-        self._points = {}  # point_name -> UsdGeomPoints
-
         # Track current frame
         self._frame_index = 0
         self._frame_count = 0
 
         self.set_model(None)
+
+    @override
+    def _init_extra_layer_state(self, layer) -> None:
+        super()._init_extra_layer_state(layer)
+        layer._meshes = {}  # mesh_name -> prototype path
+        layer._instance_groups = {}  # instance_name -> group prim for individually referenced meshes
+        layer._instancers = {}  # instancer_name -> UsdGeom.PointInstancer
+        layer._points = {}  # point_name -> UsdGeom.Points
+        layer._texture_materials: dict[str, Any] = {}  # mesh_name -> UsdShade.Material
+
+    def _reset_stage(self):
+        self.stage.GetRootLayer().Clear()
+        self.stage.SetTimeCodesPerSecond(self.fps)
+        self.stage.SetFramesPerSecond(self.fps)
+        self.stage.SetStartTimeCode(0)
+        axis_token = {
+            "X": UsdGeom.Tokens.x,
+            "Y": UsdGeom.Tokens.y,
+            "Z": UsdGeom.Tokens.z,
+        }.get(self.up_axis.strip().upper())
+        UsdGeom.SetStageUpAxis(self.stage, axis_token)
+        UsdGeom.SetStageMetersPerUnit(self.stage, 1.0)
+        self.root = UsdGeom.Xform.Define(self.stage, "/root")
+        self.root.ClearXformOpOrder()
+        s = self.root.AddScaleOp()
+        s.Set(Gf.Vec3d(float(self.scaling), float(self.scaling), float(self.scaling)), 0.0)
+        self.stage.SetDefaultPrim(self.root.GetPrim())
+        self._frame_index = 0
+        self._frame_count = 0
+
+    @staticmethod
+    def _save_texture_atomic(tex_array: np.ndarray, tex_path: str) -> None:
+        """Write a texture image atomically so readers never see a partial PNG."""
+        from PIL import Image
+
+        tex_dir = os.path.dirname(tex_path)
+        base_name = os.path.basename(tex_path)
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(prefix=f".{base_name}.", suffix=".tmp", dir=tex_dir)
+            os.close(fd)
+            Image.fromarray(tex_array).save(tmp_path, format="PNG")
+            os.replace(tmp_path, tex_path)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _remove_active_layer_prims(self):
+        names = set(self._meshes) | set(self._instance_groups) | set(self._instancers) | set(self._points)
+        for name in sorted(names, key=lambda item: self._get_path(item).count("/"), reverse=True):
+            if self._is_layer_owned_path(name):
+                self.stage.RemovePrim(self._get_path(name))
+
+        for mesh_name in list(self._texture_materials):
+            if self._is_layer_owned_path(mesh_name):
+                self.stage.RemovePrim(self._texture_material_path(mesh_name))
+
+    def _has_user_layers(self) -> bool:
+        return any(layer_id != _DEFAULT_LAYER_ID for layer_id in self._layers)
+
+    def clear_model(self):
+        if hasattr(self, "stage") and self.stage is not None:
+            if self._active_layer_id == _DEFAULT_LAYER_ID and not self._has_user_layers():
+                self._reset_stage()
+            else:
+                self._remove_active_layer_prims()
+
+        super().clear_model()
 
     @override
     def begin_frame(self, time: float):
@@ -238,6 +314,8 @@ class ViewerUSD(ViewerBase):
                 is metal.
         """
 
+        name = self._qualify(name)
+
         # Convert warp arrays to numpy
         points_np = points.numpy().astype(np.float32)
         indices_np = indices.numpy().astype(np.uint32)
@@ -264,13 +342,82 @@ class ViewerUSD(ViewerBase):
             mesh_prim.GetNormalsAttr().Set(normals_np, self._frame_index)
             mesh_prim.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
 
-        # Set UVs if provided (simplified for now)
+        # Set UVs if provided
         if uvs is not None:
-            # TODO: Implement UV support for USD meshes
-            pass
+            uvs_np = uvs.numpy().astype(np.float32) if isinstance(uvs, wp.array) else np.asarray(uvs, dtype=np.float32)
+            pv_api = UsdGeom.PrimvarsAPI(mesh_prim)
+            st_pv = pv_api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+            st_pv.Set(uvs_np)
+
+        # Create and bind a textured material only when both texture and UVs are
+        # provided — a UsdUVTexture shader with no "st" primvar would sample
+        # undefined data and produce incorrect results.
+        if texture is not None and uvs is not None and name not in self._texture_materials:
+            self._create_texture_material(name, mesh_prim, texture)
 
         # how to hide the prototype mesh but not the instances in USD?
         mesh_prim.GetVisibilityAttr().Set("inherited" if not hidden else "invisible", self._frame_index)
+
+    def _create_texture_material(self, mesh_name: str, mesh_prim, texture):
+        """Create a UsdPreviewSurface material with a diffuse texture and bind it to *mesh_prim*."""
+        from pxr import Sdf as _Sdf
+        from pxr import UsdShade
+
+        from ..utils.texture import load_texture  # noqa: PLC0415
+
+        # Resolve texture to a file path on disk
+        if isinstance(texture, str):
+            tex_path = os.path.abspath(texture)
+        else:
+            tex_array = load_texture(texture)
+            if tex_array is None:
+                return
+            tex_dir = os.path.dirname(self.output_path)
+            safe_name = mesh_name.replace("/", "_").replace("\\", "_")
+            tex_path = os.path.join(tex_dir, f"_tex_{safe_name}.png")
+            try:
+                self._save_texture_atomic(tex_array, tex_path)
+            except Exception as exc:
+                warnings.warn(
+                    f"ViewerUSD: failed to export texture for mesh '{mesh_name}': {exc}. "
+                    "Mesh will render without texture.",
+                    stacklevel=2,
+                )
+                return
+
+        mat_path = self._texture_material_path(mesh_name)
+        self._ensure_scopes_for_path(self.stage, mat_path)
+
+        material = UsdShade.Material.Define(self.stage, mat_path)
+        surface = UsdShade.Shader.Define(self.stage, f"{mat_path}/PreviewSurface")
+        surface.CreateIdAttr("UsdPreviewSurface")
+        diff_input = surface.CreateInput("diffuseColor", _Sdf.ValueTypeNames.Color3f)
+        surface.CreateInput("roughness", _Sdf.ValueTypeNames.Float).Set(0.5)
+        material.CreateSurfaceOutput().ConnectToSource(surface.ConnectableAPI(), "surface")
+
+        tex_reader = UsdShade.Shader.Define(self.stage, f"{mat_path}/DiffuseTexture")
+        tex_reader.CreateIdAttr("UsdUVTexture")
+        tex_reader.CreateInput("file", _Sdf.ValueTypeNames.Asset).Set(tex_path)
+        tex_reader.CreateInput("sourceColorSpace", _Sdf.ValueTypeNames.Token).Set("auto")
+        tex_reader.CreateInput("wrapS", _Sdf.ValueTypeNames.Token).Set("repeat")
+        tex_reader.CreateInput("wrapT", _Sdf.ValueTypeNames.Token).Set("repeat")
+        tex_reader.CreateOutput("rgb", _Sdf.ValueTypeNames.Float3)
+        diff_input.ConnectToSource(tex_reader.ConnectableAPI(), "rgb")
+
+        st_reader = UsdShade.Shader.Define(self.stage, f"{mat_path}/PrimvarSt")
+        st_reader.CreateIdAttr("UsdPrimvarReader_float2")
+        st_reader.CreateInput("varname", _Sdf.ValueTypeNames.Token).Set("st")
+        st_reader.CreateOutput("result", _Sdf.ValueTypeNames.Float2)
+        tex_reader.CreateInput("st", _Sdf.ValueTypeNames.Float2).ConnectToSource(st_reader.ConnectableAPI(), "result")
+
+        UsdShade.MaterialBindingAPI.Apply(mesh_prim.GetPrim())
+        UsdShade.MaterialBindingAPI(mesh_prim.GetPrim()).Bind(material)
+        self._texture_materials[mesh_name] = material
+
+    @staticmethod
+    def _texture_material_path(mesh_name: str) -> str:
+        safe = mesh_name.replace("/", "_").lstrip("_")
+        return f"/root/Materials/mat_{safe}"
 
     # log a set of instances as individual mesh prims, slower but makes it easier
     # to do post-editing of instance materials etc. default for Newton shapes
@@ -297,12 +444,21 @@ class ViewerUSD(ViewerBase):
             materials: Array of materials.
             hidden: Whether the instances are hidden.
         """
+        name = self._qualify(name)
+        mesh = self._qualify(mesh)
+
         # Get prototype path
         if mesh not in self._meshes:
             msg = f"Mesh prototype '{mesh}' not found for log_instances(). Call log_mesh() first."
             raise RuntimeError(msg)
 
         self._ensure_scopes_for_path(self.stage, self._get_path(name) + "/scope")
+        group_prim = self.stage.GetPrimAtPath(self._get_path(name))
+        if group_prim:
+            self._instance_groups[name] = group_prim
+            UsdGeom.Imageable(group_prim).GetVisibilityAttr().Set(
+                "inherited" if not hidden else "invisible", self._frame_index
+            )
 
         if xforms is not None:
             xforms = xforms.numpy()
@@ -325,8 +481,11 @@ class ViewerUSD(ViewerBase):
                 instance = self.stage.DefinePrim(instance_path)
                 instance.GetReferences().AddInternalReference(self._get_path(mesh))
 
-                UsdGeom.Imageable(instance).GetVisibilityAttr().Set("inherited" if not hidden else "invisible")
                 _usd_add_xform(instance)
+
+            UsdGeom.Imageable(instance).GetVisibilityAttr().Set(
+                "inherited" if not hidden else "invisible", self._frame_index
+            )
 
             # update transform
             if xforms is not None:
@@ -366,6 +525,9 @@ class ViewerUSD(ViewerBase):
         Raises:
             RuntimeError: If the mesh prototype is not found.
         """
+        name = self._qualify(name)
+        mesh = self._qualify(mesh)
+
         # Get prototype path
         if mesh not in self._meshes:
             msg = f"Mesh prototype '{mesh}' not found for log_instances(). Call log_mesh() first."
@@ -437,6 +599,8 @@ class ViewerUSD(ViewerBase):
                 indices = Vt.IntArray(range(num_instances))
                 displayColor.SetIndices(indices, self._frame_index)
 
+        instancer.GetVisibilityAttr().Set("inherited", self._frame_index)
+
     # Abstract methods that need basic implementations
     @override
     def log_lines(
@@ -458,6 +622,8 @@ class ViewerUSD(ViewerBase):
             width: The width of the lines.
             hidden: Whether the lines are hidden.
         """
+
+        name = self._qualify(name)
 
         if name not in self._instancers:
             self._ensure_scopes_for_path(self.stage, self._get_path(name))
@@ -530,7 +696,11 @@ class ViewerUSD(ViewerBase):
         colors: (wp.array[wp.vec3] | wp.array[wp.float32] | tuple[float, float, float] | list[float] | None) = None,
         hidden: bool = False,
     ):
-        """Log points as a USD `Points` primitive.
+        """Log points as a USD primitive.
+
+        By default, each point is an instance of a ``UsdGeom.Sphere`` prototype
+        under a ``UsdGeom.PointInstancer``. Set ``points_as_spheres=False`` to
+        write flat ``UsdGeom.Points`` splats instead.
 
         Args:
             name: Unique name for the point primitive.
@@ -540,9 +710,19 @@ class ViewerUSD(ViewerBase):
             hidden: Whether the point primitive is hidden.
 
         Returns:
-            Sdf.Path of the created/updated points primitive.
+            ``Sdf.Path`` of the created/updated primitive.
         """
+        name = self._qualify(name)
+
         if points is None:
+            path = self._get_path(name)
+            if self.points_as_spheres:
+                instancer = UsdGeom.PointInstancer.Get(self.stage, path)
+            else:
+                instancer = UsdGeom.Points.Get(self.stage, path)
+            if instancer:
+                instancer.GetVisibilityAttr().Set("invisible", self._frame_index)
+                return instancer.GetPath()
             return
 
         num_points = len(points)
@@ -558,13 +738,55 @@ class ViewerUSD(ViewerBase):
         colors, color_interp = self._normalize_point_colors(colors, num_points)
 
         path = self._get_path(name)
+
+        if self.points_as_spheres:
+            if name not in self._instancers:
+                self._ensure_scopes_for_path(self.stage, path)
+                instancer = UsdGeom.PointInstancer.Define(self.stage, path)
+                sphere = UsdGeom.Sphere.Define(self.stage, instancer.GetPath().AppendChild("sphere"))
+                sphere.GetRadiusAttr().Set(1.0)
+                instancer.CreatePrototypesRel().SetTargets((sphere.GetPath(),))
+                if colors is not None:
+                    UsdGeom.PrimvarsAPI(instancer).CreatePrimvar(
+                        "displayColor", Sdf.ValueTypeNames.Color3fArray, color_interp, 1
+                    )
+                self._instancers[name] = instancer
+
+            instancer = self._instancers[name]
+
+            # Proto indices must be updated every frame: particle count can vary due to stream compaction.
+            instancer.GetProtoIndicesAttr().Set(Vt.IntArray([0] * num_points), self._frame_index)
+            instancer.GetPositionsAttr().Set(points.numpy(), self._frame_index)
+
+            # PointInstancer scales are vec3; broadcast scalar or per-point radius to (N, 3).
+            if np.isscalar(radii):
+                scales = np.full((num_points, 3), radii, dtype=np.float32)
+            else:
+                r = radii.numpy() if isinstance(radii, wp.array) else np.array(radii, dtype=np.float32)
+                scales = np.stack([r, r, r], axis=1)
+            instancer.GetScalesAttr().Set(scales, self._frame_index)
+
+            if colors is not None:
+                primvar = UsdGeom.PrimvarsAPI(instancer).GetPrimvar("displayColor")
+                if not primvar:
+                    primvar = UsdGeom.PrimvarsAPI(instancer).CreatePrimvar(
+                        "displayColor", Sdf.ValueTypeNames.Color3fArray, color_interp, 1
+                    )
+                primvar.Set(colors, self._frame_index)
+
+            instancer.GetVisibilityAttr().Set("inherited" if not hidden else "invisible", self._frame_index)
+            return instancer.GetPath()
+
         instancer = UsdGeom.Points.Get(self.stage, path)
         if not instancer:
             self._ensure_scopes_for_path(self.stage, path)
             instancer = UsdGeom.Points.Define(self.stage, path)
+            self._points[name] = instancer
 
             UsdGeom.Primvar(instancer.GetWidthsAttr()).SetInterpolation(radius_interp)
             UsdGeom.Primvar(instancer.GetDisplayColorAttr()).SetInterpolation(color_interp)
+        else:
+            self._points[name] = instancer
 
         instancer.GetPointsAttr().Set(points.numpy(), self._frame_index)
 
@@ -662,25 +884,25 @@ class ViewerUSD(ViewerBase):
     def _normalize_point_colors(self, colors, num_points):
         """Normalize point colors and return (values, interpolation token)."""
         if colors is None:
-            return None, "constant"
+            return None, UsdGeom.Tokens.constant
 
         if isinstance(colors, wp.array):
             colors = colors.numpy()
 
         if self._is_single_rgb_triplet(colors):
             colors_arr = np.asarray(colors, dtype=np.float32)
-            return colors_arr.reshape(1, 3), "constant"
+            return colors_arr.reshape(1, 3), UsdGeom.Tokens.constant
 
         if isinstance(colors, np.ndarray):
-            return colors, "vertex"
+            return colors, UsdGeom.Tokens.vertex
 
         if isinstance(colors, list | tuple):
             # Keep list/tuple inputs as-is for existing valid per-point color inputs.
             if len(colors) == num_points:
-                return colors, "vertex"
-            return np.asarray(colors), "vertex"
+                return colors, UsdGeom.Tokens.vertex
+            return np.asarray(colors), UsdGeom.Tokens.vertex
 
-        return np.asarray(colors), "vertex"
+        return np.asarray(colors), UsdGeom.Tokens.vertex
 
     @staticmethod
     def _ensure_scopes_for_path(stage: Usd.Stage, prim_path_str: str):

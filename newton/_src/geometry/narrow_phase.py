@@ -33,6 +33,7 @@ from ..geometry.collision_primitive import (
 )
 from ..geometry.contact_data import SHAPE_PAIR_HFIELD_BIT, ContactData, contact_passes_gap_check, make_contact_sort_key
 from ..geometry.contact_reduction_global import (
+    HASHTABLE_WARN_LOAD_PERCENT,
     GlobalContactReducer,
     create_export_reduced_contacts_kernel,
     mesh_triangle_contacts_to_reducer_kernel,
@@ -160,6 +161,8 @@ def create_narrow_phase_primitive_kernel(writer_func: Any):
         shape_source: wp.array[wp.uint64],
         shape_gap: wp.array[float],
         shape_flags: wp.array[wp.int32],
+        shape_sdf_index: wp.array[wp.int32],
+        shape_edge_range: wp.array[wp.vec2i],
         writer_data: Any,
         total_num_threads: int,
         # Output: pairs that need GJK/MPR processing
@@ -292,11 +295,24 @@ def create_narrow_phase_primitive_kernel(writer_func: Any):
             # =====================================================================
             is_mesh_a = type_a == GeoType.MESH
             is_mesh_b = type_b == GeoType.MESH
+            is_box_a = type_a == GeoType.BOX
+            is_box_b = type_b == GeoType.BOX
             is_plane_a = type_a == GeoType.PLANE
             is_infinite_plane_a = is_plane_a and (scale_a[0] == 0.0 and scale_a[1] == 0.0)
+            has_sdf_edges_a = shape_sdf_index[shape_a] >= 0 and shape_edge_range[shape_a][1] > 0
+            has_sdf_edges_b = shape_sdf_index[shape_b] >= 0 and shape_edge_range[shape_b][1] > 0
 
-            # Mesh-mesh collision
-            if is_mesh_a and is_mesh_b:
+            # Existing mesh-mesh pairs keep their legacy SDF/BVH fallback
+            # behavior. New planar SDF cases require both shapes to have
+            # texture SDF data and edges; otherwise the old routing is cheaper.
+            # Keep box-box on its existing GJK/MPR path even when SDFs are
+            # present. The output buffer must exist for the SDF edge route.
+            if (is_mesh_a and is_mesh_b) or (
+                shape_pairs_mesh_mesh.shape[0] > 0
+                and has_sdf_edges_a
+                and has_sdf_edges_b
+                and not (is_box_a and is_box_b)
+            ):
                 idx = wp.atomic_add(shape_pairs_mesh_mesh_count, 0, 1)
                 if idx < shape_pairs_mesh_mesh.shape[0]:
                     shape_pairs_mesh_mesh[idx] = wp.vec2i(shape_a, shape_b)
@@ -1354,6 +1370,10 @@ def verify_narrow_phase_buffers(
     max_sdf_sdf: int,
     contact_count: wp.array[int],
     max_contacts: int,
+    reduction_ht_active_slots: wp.array[int],
+    reduction_ht_capacity: int,
+    reduction_ht_insert_failures: wp.array[int],
+    reduction_ht_warn_load_percent: int,
 ):
     """Check for buffer overflows in the collision pipeline."""
     if broad_phase_count[0] > max_broad_phase:
@@ -1409,6 +1429,22 @@ def verify_narrow_phase_buffers(
             contact_count[0],
             max_contacts,
         )
+    if reduction_ht_capacity > 0:
+        reduction_ht_active_count = reduction_ht_active_slots[reduction_ht_capacity]
+        if reduction_ht_active_count * 100 >= reduction_ht_capacity * reduction_ht_warn_load_percent:
+            wp.printf(
+                "Warning: Contact reduction hashtable fill ratio exceeded %d%% (%d / %d). "
+                "Increase contact_reduction_hashtable_size_factor or max_triangle_pairs.\n",
+                reduction_ht_warn_load_percent,
+                reduction_ht_active_count,
+                reduction_ht_capacity,
+            )
+        if reduction_ht_insert_failures[0] > 0:
+            wp.printf(
+                "Warning: Contact reduction hashtable insert failures %d. "
+                "Increase contact_reduction_hashtable_size_factor or max_triangle_pairs.\n",
+                reduction_ht_insert_failures[0],
+            )
 
 
 class NarrowPhase:
@@ -1439,6 +1475,7 @@ class NarrowPhase:
         deterministic: bool = False,
         contact_max: int | None = None,
         verify_buffers: bool = True,
+        contact_reduction_hashtable_size_factor: float = 0.25,
     ) -> None:
         """
         Initialize NarrowPhase with pre-allocated buffers.
@@ -1477,13 +1514,19 @@ class NarrowPhase:
                 ``triangle_pairs_count``, ``shape_pairs_mesh_plane_count``,
                 ``shape_pairs_mesh_mesh_count``, ``shape_pairs_sdf_sdf_count``)
                 and the output ``contact_count`` against the capacity of its
-                backing array, printing ``wp.printf`` warnings on overflow.
+                backing array, and checks the global contact reducer hashtable
+                fill/failure counters when reduction is enabled, printing
+                ``wp.printf`` warnings on overflow or critical hashtable load.
                 Users who want a programmatic overflow hook can disable this and
                 read those counters themselves.  Overhead is one extra kernel
                 launch per collision pass (roughly a few µs of launch latency on
                 CUDA; the kernel body is a handful of scalar comparisons on one
                 thread).  Disable in hot loops or CUDA graph capture once buffer
                 sizes are known to be adequate.
+            contact_reduction_hashtable_size_factor: Multiplier applied to
+                ``max_triangle_pairs`` when allocating the global contact
+                reduction hashtable. Increase this if hashtable fill/failure
+                warnings appear. Defaults to ``0.25`` for memory compatibility.
         """
         self.max_candidate_pairs = max_candidate_pairs
         self.max_triangle_pairs = max_triangle_pairs
@@ -1494,7 +1537,6 @@ class NarrowPhase:
         self.deterministic = deterministic
         self.verify_buffers = verify_buffers
         device_obj = wp.get_device(device)
-
         # Contact reduction requires either meshes or heightfields (the
         # mesh/heightfield-triangle path feeds the global reducer, so
         # heightfield-only scenes still benefit from reduction).
@@ -1605,7 +1647,10 @@ class NarrowPhase:
             self.export_reduced_contacts_kernel = create_export_reduced_contacts_kernel(writer_func)
             # Global contact reducer for all mesh contact types
             self.global_contact_reducer = GlobalContactReducer(
-                max_triangle_pairs, device=device, deterministic=deterministic
+                max_triangle_pairs,
+                device=device,
+                deterministic=deterministic,
+                hashtable_size_factor=contact_reduction_hashtable_size_factor,
             )
         else:
             self.export_reduced_contacts_kernel = None
@@ -1671,6 +1716,9 @@ class NarrowPhase:
             num_shapes = shape_aabb_lower.shape[0] if shape_aabb_lower is not None else max_candidate_pairs
             self._empty_edge_indices = wp.zeros(1, dtype=wp.vec2i, device=device)
             self._empty_edge_range = wp.full(max(num_shapes, 1), (-1, 0), dtype=wp.vec2i, device=device)
+            # Indexed by shape id; all-zero means "no watertight bit set" so the
+            # sign method falls back to automatic selection (see resolve_mesh_sign_method).
+            self._empty_mesh_properties = wp.zeros(max(num_shapes, 1), dtype=wp.int32, device=device)
 
             if hydroelastic_sdf is not None:
                 self.shape_pairs_sdf_sdf = wp.zeros(hydroelastic_sdf.max_num_shape_pairs, dtype=wp.vec2i, device=device)
@@ -1739,6 +1787,7 @@ class NarrowPhase:
         shape_data: wp.array[wp.vec4],  # Shape data (scale xyz, margin w)
         shape_transform: wp.array[wp.transform],  # In world space
         shape_source: wp.array[wp.uint64],  # The index into the source array, type define by shape_types
+        shape_mesh_properties: wp.array[wp.int32] | None = None,  # Per-shape mesh property bitfield
         shape_sdf_index: wp.array[wp.int32],  # Per-shape index into texture_sdf_data (-1 for none)
         shape_gap: wp.array[wp.float32],  # per-shape contact gap (detection threshold)
         shape_collision_radius: wp.array[wp.float32],  # per-shape collision radius for AABB fallback
@@ -1768,6 +1817,7 @@ class NarrowPhase:
             shape_data: Array of vec4 containing scale (xyz) and margin (w) for each shape
             shape_transform: Array of world-space transforms for each shape
             shape_source: Array of source pointers (mesh IDs, etc.) for each shape
+            shape_mesh_properties: Per-shape mesh property bitfield.
             shape_sdf_index: Per-shape SDF table index (-1 for shapes without SDF)
             texture_sdf_data: Compact array of TextureSDFData structs
             shape_gap: Array of per-shape contact gaps (detection threshold) for each shape
@@ -1783,6 +1833,10 @@ class NarrowPhase:
         """
         if device is None:
             device = self.device if self.device is not None else candidate_pair.device
+        if shape_mesh_properties is None:
+            shape_mesh_properties = self._empty_mesh_properties
+        if shape_edge_range is None:
+            shape_edge_range = self._empty_edge_range
 
         # Clear all counters with a single kernel launch (consolidated counter array)
         self._counter_array.zero_()
@@ -1802,6 +1856,8 @@ class NarrowPhase:
                 shape_source,
                 shape_gap,
                 shape_flags,
+                shape_sdf_index,
+                shape_edge_range,
                 writer_data,
                 self.total_num_threads,
             ],
@@ -2017,9 +2073,6 @@ class NarrowPhase:
                 texture_sdf_data = wp.zeros(0, dtype=TextureSDFData, device=device)
             if mesh_edge_indices is None:
                 mesh_edge_indices = self._empty_edge_indices
-            if shape_edge_range is None:
-                shape_edge_range = self._empty_edge_range
-
             if self.mesh_mesh_contacts_kernel is not None:
                 if self.reduce_contacts and self.mesh_mesh_block_offsets is not None:
                     # Mesh-mesh contacts → buffer + inline hashtable registration
@@ -2046,6 +2099,7 @@ class NarrowPhase:
                             shape_source,
                             texture_sdf_data,
                             shape_sdf_index,
+                            shape_mesh_properties,
                             shape_gap,
                             shape_collision_aabb_lower,
                             shape_collision_aabb_upper,
@@ -2076,6 +2130,7 @@ class NarrowPhase:
                             shape_source,
                             texture_sdf_data,
                             shape_sdf_index,
+                            shape_mesh_properties,
                             shape_gap,
                             shape_collision_aabb_lower,
                             shape_collision_aabb_upper,
@@ -2138,6 +2193,15 @@ class NarrowPhase:
 
         # Verify no collision pipeline buffers overflowed
         if self.verify_buffers:
+            if self.global_contact_reducer is not None:
+                reduction_ht_active_slots = self.global_contact_reducer.hashtable.active_slots
+                reduction_ht_capacity = self.global_contact_reducer.hashtable.capacity
+                reduction_ht_insert_failures = self.global_contact_reducer.ht_insert_failures
+            else:
+                reduction_ht_active_slots = self.gjk_candidate_pairs_count
+                reduction_ht_capacity = 0
+                reduction_ht_insert_failures = self.gjk_candidate_pairs_count
+
             wp.launch(
                 kernel=verify_narrow_phase_buffers,
                 dim=[1],
@@ -2158,6 +2222,10 @@ class NarrowPhase:
                     self.shape_pairs_sdf_sdf.shape[0] if self.shape_pairs_sdf_sdf is not None else 0,
                     writer_data.contact_count,
                     writer_data.contact_max,
+                    reduction_ht_active_slots,
+                    reduction_ht_capacity,
+                    reduction_ht_insert_failures,
+                    HASHTABLE_WARN_LOAD_PERCENT,
                 ],
                 device=device,
                 record_tape=False,
@@ -2172,6 +2240,7 @@ class NarrowPhase:
         shape_data: wp.array[wp.vec4],  # Shape data (scale xyz, margin w)
         shape_transform: wp.array[wp.transform],  # In world space
         shape_source: wp.array[wp.uint64],  # The index into the source array, type define by shape_types
+        shape_mesh_properties: wp.array[wp.int32] | None = None,  # Per-shape mesh property bitfield
         shape_sdf_index: wp.array[wp.int32] | None = None,  # Per-shape index into texture_sdf_data (-1 for none)
         texture_sdf_data: wp.array[TextureSDFData] | None = None,  # Compact texture SDF data table
         shape_gap: wp.array[wp.float32],  # per-shape contact gap (detection threshold)
@@ -2202,6 +2271,7 @@ class NarrowPhase:
             shape_data: Array of vec4 containing scale (xyz) and margin (w) for each shape
             shape_transform: Array of world-space transforms for each shape
             shape_source: Array of source pointers (mesh IDs, etc.) for each shape
+            shape_mesh_properties: Per-shape mesh property bitfield.
             shape_sdf_index: Per-shape SDF table index (-1 for shapes without SDF)
             texture_sdf_data: Compact array of TextureSDFData structs
             shape_gap: Array of per-shape contact gaps (detection threshold) for each shape
@@ -2287,6 +2357,7 @@ class NarrowPhase:
             shape_data=shape_data,
             shape_transform=shape_transform,
             shape_source=shape_source,
+            shape_mesh_properties=shape_mesh_properties,
             shape_sdf_index=shape_sdf_index,
             texture_sdf_data=texture_sdf_data,
             shape_gap=shape_gap,
