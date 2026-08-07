@@ -6,7 +6,7 @@ import unittest
 import warp as wp
 
 import newton
-from newton._src.sim.enums import JointType
+from newton._src.sim.enums import BodyFlags, JointType
 from newton._src.solvers.feather_pgs.kernels import (
     allocate_joint_velocity_limit_slots,
     allocate_rigid_velocity_limit_slots,
@@ -33,6 +33,8 @@ def _allocated_joint_velocity_slots(qd: float, *, fraction: float, qdot_max: flo
             wp.array([qdot_max], dtype=wp.float32, device=device),
             wp.array([qd], dtype=wp.float32, device=device),
             fraction,
+            wp.array([-1], dtype=wp.int32, device=device),  # drive_slot (unused: skip_driven=0)
+            0,  # skip_driven
             wp.array([0], dtype=wp.int32, device=device),
             8,
         ],
@@ -58,7 +60,9 @@ def _allocated_rigid_velocity_slots(qd6, *, fraction: float, lin_limit: float = 
         inputs=[
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
             wp.array([1], dtype=wp.int32, device=device),
+            wp.array([int(BodyFlags.DYNAMIC)], dtype=wp.int32, device=device),
             wp.array([lin_limit], dtype=wp.float32, device=device),
             wp.array([ang_limit], dtype=wp.float32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
