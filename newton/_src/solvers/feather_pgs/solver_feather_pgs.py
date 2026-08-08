@@ -90,8 +90,6 @@ from .kernels import (
     compute_spatial_inertia,
     compute_velocity_predictor,
     compute_world_contact_bias,
-    convert_root_free_qd_local_to_world,
-    convert_root_free_qd_world_to_local,
     copy_free_rigid_propagation_body_response,
     crba_fill_par_dof,
     delassus_par_row_col,
@@ -137,7 +135,6 @@ from .kernels import (
     snapshot_propagation_cache_qd_base,
     trisolve_loop,
     update_articulation_origins,
-    update_articulation_root_com_offsets,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
     vector_add_inplace,
@@ -828,8 +825,7 @@ class SolverFeatherPGS(SolverBase):
                 the only supported value. ``"net"`` is rejected with ``ValueError``.
             serial_kernel_block_dim (int, optional): CUDA block size for the serial
                 one-thread-per-articulation kernels (``eval_rigid_fk``, ``eval_rigid_id``,
-                ``eval_rigid_tau``, ``update_articulation_origins``,
-                ``update_articulation_root_com_offsets``). These kernels have no
+                ``eval_rigid_tau``, ``update_articulation_origins``). These kernels have no
                 cross-thread reductions, so changing this value is bit-identical; it only
                 changes occupancy/grid shape. Must be a positive multiple of 32.
                 Defaults to 256 (the Warp default).
@@ -5844,34 +5840,9 @@ class SolverFeatherPGS(SolverBase):
             block_dim=self.serial_kernel_block_dim,
             device=model.device,
         )
-        wp.launch(
-            update_articulation_root_com_offsets,
-            dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                model.joint_child,
-                state_in.body_q,
-                model.body_com,
-            ],
-            outputs=[self.articulation_root_com_offset],
-            block_dim=self.serial_kernel_block_dim,
-            device=model.device,
-        )
         # evaluate joint inertias, motion vectors, and forces
         state_aug.body_f_s.zero_()
         wp.copy(self.qd_work, state_in.joint_qd)
-        if self._has_root_free:
-            wp.launch(
-                convert_root_free_qd_world_to_local,
-                dim=model.articulation_count,
-                inputs=[
-                    self.articulation_root_is_free,
-                    self.articulation_root_dof_start,
-                    self.articulation_root_com_offset,
-                ],
-                outputs=[self.qd_work],
-                device=model.device,
-            )
         if self.enable_joint_velocity_limits:
             wp.launch(
                 prescale_joint_velocity_limits,
@@ -8129,18 +8100,6 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage6_update_qdd(self, state_in: State, state_aug: State, dt: float):
         model = self.model
-        if self._has_root_free:
-            wp.launch(
-                convert_root_free_qd_local_to_world,
-                dim=model.articulation_count,
-                inputs=[
-                    self.articulation_root_is_free,
-                    self.articulation_root_dof_start,
-                    self.articulation_root_com_offset,
-                ],
-                outputs=[self.v_out],
-                device=model.device,
-            )
         wp.launch(
             update_qdd_from_velocity,
             dim=model.joint_dof_count,
@@ -8193,18 +8152,6 @@ class SolverFeatherPGS(SolverBase):
 
         if model.joint_count:
             wp.copy(self.qd_work, velocity_internal)
-            if self._has_root_free:
-                wp.launch(
-                    convert_root_free_qd_local_to_world,
-                    dim=model.articulation_count,
-                    inputs=[
-                        self.articulation_root_is_free,
-                        self.articulation_root_dof_start,
-                        self.articulation_root_com_offset,
-                    ],
-                    outputs=[self.qd_work],
-                    device=model.device,
-                )
 
             wp.launch(
                 update_qdd_from_velocity,
@@ -8243,18 +8190,6 @@ class SolverFeatherPGS(SolverBase):
         model = self.model
 
         if model.joint_count:
-            if self._has_root_free:
-                wp.launch(
-                    convert_root_free_qd_local_to_world,
-                    dim=model.articulation_count,
-                    inputs=[
-                        self.articulation_root_is_free,
-                        self.articulation_root_dof_start,
-                        self.articulation_root_com_offset,
-                    ],
-                    outputs=[self.v_out],
-                    device=model.device,
-                )
 
             wp.launch(
                 update_qdd_from_velocity,
