@@ -1046,11 +1046,18 @@ def compute_link_velocity(
     I_s = transform_spatial_inertia(X_sm_local, I_m)
 
     coriolis = spatial_cross_dual(v_s, I_s * v_s)
-    if parent < 0 and (type == JointType.FREE or type == JointType.DISTANCE):
-        # Root free bodies use a world-aligned frame centered at the root COM.
-        # In that convention the linear inertial wrench is m*a_com; the
-        # omega x (m*v_com) term from body-frame spatial algebra is spurious.
-        coriolis = wp.spatial_vector(wp.vec3(), wp.spatial_bottom(coriolis))
+    # The articulation frame is world-aligned and centered at O, a material point of the root body,
+    # so body-frame spatial algebra carries an excess wrench per link: a force m*(omega x v_O) at
+    # that link's COM. What remains after subtracting it is exactly the reference-point bias the
+    # frame requires, M*omega x (omega x c) and omega x (I_O omega), with c the offset from O to the
+    # articulation's composite COM. The correction belongs to the frame, not to any one link: gating
+    # it on the root alone leaves every other link in the uncorrected convention, and the two halves
+    # of the sum no longer describe the same frame. A single-link articulation puts O on the COM, so
+    # v_O is v_com and r_com is zero and this reduces to zeroing the linear part, as before.
+    omega_s = wp.spatial_bottom(v_s)
+    v_origin = wp.spatial_top(v_s)
+    excess_f = m * wp.cross(omega_s, v_origin)
+    coriolis = coriolis - wp.spatial_vector(excess_f, wp.cross(r_com, excess_f))
 
     f_b_s = I_s * a_s + coriolis
 
