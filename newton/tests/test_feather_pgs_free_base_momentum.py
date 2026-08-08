@@ -3,19 +3,21 @@
 
 """Momentum conservation for a rotating floating-base articulation.
 
-FeatherPGS writes the free-base equations about ``articulation_origin``, a material point of the
-root body. When the articulation's composite centre of mass sits away from that point, the frame
-requires a reference-point bias wrench; the body-frame spatial algebra in ``compute_link_velocity``
-supplies it only after its per-link excess term is subtracted.
+FeatherPGS solves the free base in a world-aligned frame centred on a material point of the root
+body. Three things have to agree about that point, and they did not:
 
-Gating that subtraction on the root link alone leaves every other link in the uncorrected
-convention, and the articulation then creates linear momentum whenever its base rotates. A
-single-link articulation puts the origin on the composite centre of mass, so the excess vanishes
-identically and the defect is invisible there -- these tests therefore pair a multi-link case with
-the single-link case that must stay exact.
+* the root link's linear inertial wrench was zeroed, discarding the term that carries the
+  reference point as the body rotates;
+* the free-base linear coordinate was integrated without its ``omega x v`` transport term;
+* the public-to-internal shift moved the coordinate to the root body's *origin* while the frame
+  sits on the root body's *centre of mass*.
+
+Each partially compensated the others, so any one of them in isolation looked defensible. Together
+they made every rotating multi-link articulation create linear momentum from nothing.
 
 With no gravity, no contacts and no external wrench, the centre-of-mass velocity of a free
-articulation is exactly constant, so any measured drift is spurious.
+articulation is exactly constant, so any measured drift is spurious. :class:`SolverFeatherstone`
+solves the same dynamics without those three deviations and is used here as the reference.
 """
 
 import unittest
@@ -42,13 +44,17 @@ def _link_inertia(mass, radius=0.05, height=0.20):
     return wp.mat33(i_xy, 0.0, 0.0, 0.0, i_xy, 0.0, 0.0, 0.0, i_z)
 
 
-def _build_welded_pair(device):
-    """Two links welded by a fixed joint: composite COM sits ``LINK_HALF`` above the root COM."""
+def _build_welded_pair(device, root_com_z=0.0):
+    """Two links welded by a fixed joint: composite COM sits ``LINK_HALF`` above the root COM.
+
+    ``root_com_z`` offsets the root link's own centre of mass from its origin, which is the case
+    every real robot link has and no bare primitive does.
+    """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     root = builder.add_link(
         xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
         mass=LINK_MASS,
-        com=wp.vec3(0.0, 0.0, 0.0),
+        com=wp.vec3(0.0, 0.0, root_com_z),
         inertia=_link_inertia(LINK_MASS),
     )
     upper = builder.add_link(
@@ -87,6 +93,37 @@ def _build_equivalent_single(device):
     )
     joint = builder.add_joint_free(parent=-1, child=body)
     builder.add_articulation([joint])
+    return builder.finalize(device=device)
+
+
+def _build_serial_chain(device, depth=2):
+    """Free root followed by ``depth`` revolute links in series, axes transverse to the spin."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    prev = builder.add_link(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+        mass=LINK_MASS,
+        com=wp.vec3(0.0, 0.0, 0.0),
+        inertia=_link_inertia(LINK_MASS),
+    )
+    joints = [builder.add_joint_free(parent=-1, child=prev)]
+    for level in range(depth):
+        link = builder.add_link(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 2.0 * LINK_HALF * (level + 1)), wp.quat_identity()),
+            mass=LINK_MASS,
+            com=wp.vec3(0.0, 0.0, 0.0),
+            inertia=_link_inertia(LINK_MASS),
+        )
+        joints.append(
+            builder.add_joint_revolute(
+                parent=prev,
+                child=link,
+                axis=wp.vec3(0.0, 1.0, 0.0),
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 2.0 * LINK_HALF), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+            )
+        )
+        prev = link
+    builder.add_articulation(joints)
     return builder.finalize(device=device)
 
 
@@ -171,6 +208,42 @@ class TestFeatherPgsFreeBaseMomentum(unittest.TestCase):
             DT = original
         self.assertGreater(coarse, 0.0)
         self.assertLess(fine, 0.65 * coarse)
+
+
+    def test_offset_root_com_conserves_com_velocity(self):
+        """A root link whose own COM is offset from its origin conserves momentum too.
+
+        This exercises the public-to-internal free-base shift, which is an identity only when the
+        frame origin and the coordinate refer to the same point. It is a no-op for a bare primitive
+        and the dominant error term for a real robot link.
+        """
+        model = _build_welded_pair(wp.get_device(), root_com_z=-0.076)
+        self.assertLess(_spin_free_articulation(model), 0.5)
+
+    def test_matches_featherstone_reference(self):
+        """FeatherPGS tracks SolverFeatherstone on chains deep enough to expose the free base.
+
+        Featherstone solves the same dynamics without FeatherPGS's frame re-centring machinery, so
+        it is an independent reference. A depth-2 serial chain is the shallowest case that
+        distinguishes a correct free-base bias from one that merely looks right on a welded pair.
+        """
+        from newton.solvers import SolverFeatherstone
+
+        model = _build_serial_chain(wp.get_device(), depth=2)
+        trajectories = []
+        for solver_cls in (SolverFeatherstone, SolverFeatherPGS):
+            state_0, state_1 = model.state(), model.state()
+            joint_qd = state_0.joint_qd.numpy()
+            joint_qd[3:6] = OMEGA
+            state_0.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+            solver = solver_cls(model, angular_damping=0.0)
+            control = model.control()
+            for _ in range(20):
+                solver.step(state_0, state_1, control, None, DT)
+                state_0, state_1 = state_1, state_0
+            trajectories.append(state_0.body_qd.numpy().astype(np.float64).copy())
+        self.assertLess(float(np.abs(trajectories[0] - trajectories[1]).max()), 1e-4)
 
 
 if __name__ == "__main__":

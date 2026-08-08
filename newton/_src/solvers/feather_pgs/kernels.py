@@ -158,12 +158,12 @@ def update_articulation_root_com_offsets(
         articulation_root_com_offset[art] = wp.vec3()
         return
 
-    root_body = joint_child[start]
-    if root_body >= 0:
-        rot = wp.transform_get_rotation(body_q[root_body])
-        articulation_root_com_offset[art] = wp.quat_rotate(rot, body_com[root_body])
-    else:
-        articulation_root_com_offset[art] = wp.vec3()
+    # The solve frame is already centred on the root body's COM (see update_articulation_origins),
+    # so the free joint's linear coordinate IS the velocity of that point: the public->internal
+    # shift is the identity, and the convert_root_free_qd_* kernels are no-ops. Shifting to the root
+    # body's ORIGIN instead injects -(omega x c_root), which vanishes only when the root link's COM
+    # coincides with its origin -- true of a bare primitive, false for any real robot link.
+    articulation_root_com_offset[art] = wp.vec3()
 
 
 @wp.kernel
@@ -745,9 +745,14 @@ def jcalc_integrate(
         v_com = wp.vec3(joint_qd[dof_start + 0], joint_qd[dof_start + 1], joint_qd[dof_start + 2])
         w_s = wp.vec3(joint_qd[dof_start + 3], joint_qd[dof_start + 4], joint_qd[dof_start + 5])
 
-        # symplectic Euler
+        # symplectic Euler. joint_qdd's linear rows give the acceleration of the articulation-frame
+        # origin, a point fixed in the root body, so its velocity also changes by transport as the
+        # body rotates: that is the omega x v term. SolverFeatherstone performs the same conversion
+        # explicitly (a_com = a + alpha x x_com + omega x v_com); omitting it leaves the free base
+        # short by a term proportional to the spin.
+        w_prev = w_s
         w_s = w_s + m_s * dt
-        v_com = v_com + a_s * dt
+        v_com = v_com + (a_s + wp.cross(w_prev, v_com)) * dt
         w_s_integrate = w_s
 
         p_s = wp.vec3(joint_q[coord_start + 0], joint_q[coord_start + 1], joint_q[coord_start + 2])
@@ -1045,19 +1050,11 @@ def compute_link_velocity(
     # body forces
     I_s = transform_spatial_inertia(X_sm_local, I_m)
 
+    # The root's linear inertial wrench is NOT spurious: the solve frame is centred on a material
+    # point of the root body, so that point accelerates as the body rotates and the term is what
+    # carries it. SolverFeatherstone keeps it and conserves momentum; zeroing it here leaked
+    # momentum on every rotating multi-link articulation.
     coriolis = spatial_cross_dual(v_s, I_s * v_s)
-    # The articulation frame is world-aligned and centered at O, a material point of the root body,
-    # so body-frame spatial algebra carries an excess wrench per link: a force m*(omega x v_O) at
-    # that link's COM. What remains after subtracting it is exactly the reference-point bias the
-    # frame requires, M*omega x (omega x c) and omega x (I_O omega), with c the offset from O to the
-    # articulation's composite COM. The correction belongs to the frame, not to any one link: gating
-    # it on the root alone leaves every other link in the uncorrected convention, and the two halves
-    # of the sum no longer describe the same frame. A single-link articulation puts O on the COM, so
-    # v_O is v_com and r_com is zero and this reduces to zeroing the linear part, as before.
-    omega_s = wp.spatial_bottom(v_s)
-    v_origin = wp.spatial_top(v_s)
-    excess_f = m * wp.cross(omega_s, v_origin)
-    coriolis = coriolis - wp.spatial_vector(excess_f, wp.cross(r_com, excess_f))
 
     f_b_s = I_s * a_s + coriolis
 
