@@ -4,7 +4,7 @@
 
 ### Added
 
-- Add `SolverXPBD.rigid_contact_restitution_iterations` to configure rigid restitution convergence; defaults to 2 contact-weighted Jacobi iterations, must be at least 1.
+- Add `SolverXPBD.rigid_contact_restitution_iterations` to configure rigid restitution convergence; defaults to 2 outer iterations, must be at least 1.
 - Add `forward_depth_image` output support to `SensorTiledCamera.update()` and `SensorTiledCamera.utils.create_forward_depth_image_output()` for native forward-depth rendering without post-processing `depth_image`.
 
 ### Changed
@@ -12,6 +12,7 @@
 - Compile tiled camera render kernels with CUDA fast math by default for faster rendering; set `SensorTiledCamera.render_config.enable_fast_math = False` for bit-exact, IEEE-precise output.
 - Optimize raycast/raytrace queries by restructuring ray-shape intersection into local-space primitives and compile specialized depth/shadow variants that skip unused surface-normal work (mesh shadows also use any-hit queries).
 - Change `SolverXPBD` rigid restitution to velocity-level contact constraints decoupled from body integration: enabling restitution no longer switches bodies to position-delta velocity integration, and contact-free trajectories match the restitution-disabled path. Flat multi-contact impacts rebound lower at the default of 2 restitution iterations; raise `SolverXPBD.rigid_contact_restitution_iterations` (~16-32) and re-test if elastic rebound heights regress.
+- Change `SolverXPBD` rigid restitution to a per-manifold Gauss-Seidel solve with bounded best-K contact reduction (12 contacts per body pair): flat multi-contact impacts now rebound correctly at the default `rigid_contact_restitution_iterations` count, so scenes that raised it to compensate can return to the default and should re-test elastic rebound heights.
 - Speed up `ModelBuilder.replicate()` for large world counts by merging all copies in one pass; it no longer calls `add_world()` or `add_builder()` per copy, so `ModelBuilder` subclass overrides of those methods are not invoked during replication.
 
 ### Deprecated
