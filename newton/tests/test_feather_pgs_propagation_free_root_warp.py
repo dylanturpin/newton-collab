@@ -414,12 +414,20 @@ class TestPropagationFreeRootWarp(unittest.TestCase):
                             results["serial2"][key],
                             err_msg=f"serial trajectory not reproducible for {key}; scene invalidates the gate",
                         )
+                    # The warp and serial paths differ only by float reassociation, but 40 steps of
+                    # contact dynamics amplify that seed chaotically: measured joint_qd diffs are
+                    # ~5e-7 at 10 steps, 1e-5..4e-5 at 20 and 4e-5..1.2e-4 at 40, with the 40-step
+                    # value swinging by 3x across GPU architectures (8.1e-5 on sm_120 vs 1.2e-4 on
+                    # sm_86 at the same commit) and across physically equivalent trajectory changes.
+                    # The gate is set ~4x above the observed band to stay deterministic per
+                    # hardware; structural kernel bugs produce diffs of 1e-2 or more and still trip
+                    # it comfortably.
                     for key in ("joint_q", "joint_qd", "propagation_body_qd"):
                         diff = float(np.max(np.abs(results["warp"][key] - results["serial"][key])))
                         self.assertLessEqual(
                             diff,
-                            1e-4,
-                            f"{key} max abs diff {diff:.3e} exceeds 1e-4",
+                            5e-4,
+                            f"{key} max abs diff {diff:.3e} exceeds 5e-4",
                         )
 
 
