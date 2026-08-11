@@ -57,25 +57,38 @@ from .hashtable import HashTable, hashtable_find_or_insert
 BODY_PAIR_REDUCTION_SLOTS = NUM_SPATIAL_DIRECTIONS + 1
 
 
-@wp.func
-def _make_group_key(group_a: int, group_b: int, bin_id: int, cell_hash: int) -> wp.uint64:
-    """Pack (group_a, group_b, normal bin, spatial cell) into a 63-bit key.
+# Bit budget of the 63-bit group key. Group ids are asserted against this at
+# pipeline construction: aliasing two groups could evict a patch's deepest
+# contact, which would break the strict keep-deepest guarantee.
+GROUP_ID_BITS = 21
+MAX_GROUP_ID = (1 << GROUP_ID_BITS) - 1
+# Cell coordinates are packed EXACTLY as two signed 8-bit values (+/-127 cells
+# from the origin on the bin's face plane); positions beyond that range clamp
+# to the border cell, which merges only the far periphery (beyond ~32 m at the
+# default cell size) and only ever over-competes -- the deepest of the merged
+# region is still kept.
+CELL_COORD_MAX = 127
 
-    Layout: ``[62:43] group_a (20b) | [42:23] group_b (20b) | [22:18] bin (5b) |
-    [17:0] cell hash (18b)``.  Group ids beyond 20 bits or a cell hash collision
-    merge two groups' slot competition -- a graceful degradation (fewer kept
-    points, never a dropped deepest), not a correctness loss.
+
+@wp.func
+def _make_group_key(group_a: int, group_b: int, bin_id: int, cx: int, cy: int) -> wp.uint64:
+    """Pack (group_a, group_b, normal bin, exact spatial cell) into 63 bits.
+
+    Layout: ``[62:42] group_a (21b) | [41:21] group_b (21b) | [20:16] bin (5b)
+    | [15:8] cx (8b) | [7:0] cy (8b)``.  All fields are exact within their
+    asserted/clamped ranges, so two distinct groups can never alias.
     """
+    ux = wp.uint64(wp.clamp(cx, -CELL_COORD_MAX, CELL_COORD_MAX) + CELL_COORD_MAX)
+    uy = wp.uint64(wp.clamp(cy, -CELL_COORD_MAX, CELL_COORD_MAX) + CELL_COORD_MAX)
     return (
-        ((wp.uint64(group_a) & wp.uint64(0xFFFFF)) << wp.uint64(43))
-        | ((wp.uint64(group_b) & wp.uint64(0xFFFFF)) << wp.uint64(23))
-        | ((wp.uint64(bin_id) & wp.uint64(0x1F)) << wp.uint64(18))
-        | (wp.uint64(cell_hash) & wp.uint64(0x3FFFF))
+        (wp.uint64(group_a) << wp.uint64(42))
+        | (wp.uint64(group_b) << wp.uint64(21))
+        | ((wp.uint64(bin_id) & wp.uint64(0x1F)) << wp.uint64(16))
+        | (ux << wp.uint64(8))
+        | uy
     )
 
 
-# Inverse of contact_reduction.float_flip (http://stereopsis.com/radix.html):
-# recover the float whose flipped bit pattern is ``i``.
 @wp.func_native("""
 uint32_t mask = ((i >> 31) - 1u) | 0x80000000u;
 uint32_t r = i ^ mask;
@@ -145,11 +158,7 @@ def _contact_group_key(
     pos_2d = project_point_to_plane(bin_id, center)
     cx = wp.int32(wp.floor(pos_2d[0] / cell_size))
     cy = wp.int32(wp.floor(pos_2d[1] / cell_size))
-    # fold the two cell coordinates into 18 bits (Knuth multiplicative mix)
-    cell_hash = wp.int32(
-        (wp.uint32(cx) * wp.uint32(2654435761) ^ wp.uint32(cy) * wp.uint32(40503)) & wp.uint32(0x3FFFF)
-    )
-    key = _make_group_key(ga, gb, bin_id, cell_hash)
+    key = _make_group_key(ga, gb, bin_id, cx, cy)
     return key, gap, center, bin_id
 
 
@@ -280,6 +289,22 @@ def _insert_spatial_kernel(
 
 
 @wp.kernel(enable_backward=False)
+def _clear_active_values_kernel(
+    ht_active_slots: wp.array[wp.int32],
+    ht_capacity: int,
+    # outputs
+    ht_values: wp.array[wp.uint64],
+):
+    """Zero the value slots of every active hashtable entry from the last step."""
+    t = wp.tid()
+    if t >= ht_active_slots[ht_capacity]:
+        return
+    entry_idx = ht_active_slots[t]
+    for slot in range(wp.static(BODY_PAIR_REDUCTION_SLOTS)):
+        ht_values[slot * ht_capacity + entry_idx] = wp.uint64(0)
+
+
+@wp.kernel(enable_backward=False)
 def _export_keep_flags_kernel(
     ht_active_slots: wp.array[wp.int32],
     ht_values: wp.array[wp.uint64],
@@ -394,14 +419,18 @@ class BodyPairContactReducer:
         device: Warp device.
     """
 
-    def __init__(self, rigid_contact_max: int, depth_window: float, cell_size: float, device):
+    def __init__(
+        self, rigid_contact_max: int, depth_window: float, cell_size: float, device, hashtable_factor: float = 0.25
+    ):
         self.rigid_contact_max = rigid_contact_max
         self.depth_window = float(depth_window)
         self.cell_size = float(cell_size)
         self.device = device
-        # One entry per (body pair, bin) actually touched; the contact count is
-        # a hard upper bound on distinct keys per step.
-        self.hashtable = HashTable(max(1024, rigid_contact_max), device=device)
+        # One entry per (body pair, bin, cell) actually touched -- far fewer
+        # than contacts. Undersizing is safe: on a full table the insert
+        # kernels keep the contact unconditionally (fail open), so the factor
+        # trades memory for reduction coverage, never for dropped contacts.
+        self.hashtable = HashTable(max(1024, int(rigid_contact_max * hashtable_factor)), device=device)
         self.ht_values = wp.zeros(BODY_PAIR_REDUCTION_SLOTS * self.hashtable.capacity, dtype=wp.uint64, device=device)
         self.keep_flags = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
         self.keep_scan = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
@@ -436,7 +465,18 @@ class BodyPairContactReducer:
         n = self.rigid_contact_max
 
         self.keep_flags.zero_()
-        self.ht_values.zero_()
+        # Clear only the previously-active entries' value slots, then their
+        # keys (order matters: the value clear reads the active list that the
+        # key clear resets). Zeroing the full slot array instead costs a
+        # ~100 MB memset per collide at large env counts.
+        wp.launch(
+            _clear_active_values_kernel,
+            dim=self.hashtable.capacity,
+            inputs=[self.hashtable.active_slots, self.hashtable.capacity],
+            outputs=[self.ht_values],
+            device=self.device,
+            record_tape=False,
+        )
         self.hashtable.clear_active()
 
         geom_inputs = [

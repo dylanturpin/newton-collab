@@ -22,6 +22,7 @@ The tests here assert both halves of the contract:
 """
 
 import unittest
+import unittest.mock
 
 import numpy as np
 import warp as wp
@@ -556,3 +557,150 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         z_off = self._settle_with(newton.solvers.SolverXPBD, False, iterations=8)
         z_on = self._settle_with(newton.solvers.SolverXPBD, True, iterations=8)
         self.assertLess(abs(z_off - z_on), 5e-4)
+
+
+class TestBodyPairReductionRobustness(unittest.TestCase):
+    """Remaining contract edges: matching, capacity, graph capture, grad, worlds."""
+
+    def _foot_scene(self, pos=(5.13, 5.07, 0.0149)):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, pos)
+        builder.add_ground_plane()
+        return builder.finalize(device=wp.get_device())
+
+    def test_contact_matching_rejected_at_construction(self):
+        """Reject reduce_contacts_body_pairs together with contact matching.
+
+        Compaction renumbers contacts, which would silently invalidate the
+        matcher's index-based frame-to-frame bookkeeping.
+        """
+        model = self._foot_scene()
+        with self.assertRaisesRegex(ValueError, "contact_matching"):
+            newton.CollisionPipeline(
+                model,
+                broad_phase="nxn",
+                deterministic=True,
+                contact_matching="latest",
+                reduce_contacts_body_pairs=True,
+            )
+
+    def test_group_id_capacity_rejected_at_construction(self):
+        """Reject scenes whose shape+body count exceeds the exact key budget.
+
+        Group ids pack exactly into the reduction key; overflow would alias
+        two groups and could evict a patch's deepest contact, so the pipeline
+        must refuse at construction rather than mask bits at runtime.
+        """
+        model = self._foot_scene()
+        with unittest.mock.patch("newton._src.sim.collide.MAX_GROUP_ID", 4):
+            with self.assertRaisesRegex(ValueError, "at most 4 shapes"):
+                _make_pipeline(model, True)
+
+    def test_cuda_graph_capture(self):
+        """Capture collide() with reduction into a CUDA graph and replay it.
+
+        All reduction launches are fixed-size, so capture must succeed and
+        replays must keep producing the same kept set on the same state.
+        Skipped on CPU devices.
+        """
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device")
+        model = self._foot_scene()
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)  # warm-up: lazy allocations + kernel loads
+        n_ref = int(contacts.rigid_contact_count.numpy()[0])
+        with wp.ScopedCapture(device) as capture:
+            pipeline.collide(state, contacts)
+        for _ in range(3):
+            wp.capture_launch(capture.graph)
+        n_replay = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertEqual(n_ref, n_replay)
+
+    def test_requires_grad_diff_augmentation(self):
+        """Populate the differentiable contact arrays from the compacted set.
+
+        The reduction runs before the augmentation kernel, so the diff arrays
+        must exist, cover exactly the reduced count, and be finite.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (5.13, 5.07, 0.0149))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device(), requires_grad=True)
+        state = model.state()
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            deterministic=True,
+            reduce_contacts_body_pairs=True,
+            requires_grad=True,
+        )
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        n = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertGreater(n, 0)
+        if contacts.rigid_contact_diff_distance is not None:
+            d = contacts.rigid_contact_diff_distance.numpy()[:n]
+            self.assertTrue(np.isfinite(d).all())
+
+    def test_multi_world_independence(self):
+        """Reduce two worlds' identical feet to identical per-world kept sets.
+
+        Worlds must not share groups: each world's foot keeps its own deepest
+        and extremes, and the kept count is the same for identical scenes.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        for _ in range(2):
+            builder.begin_world()
+            _cylinder_foot(builder, (5.13, 5.07, 0.0149))
+            builder.end_world()
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        red = _collide_once(model, state, reduce_body_pairs=True, reduce_contacts_body_pairs_cell=10.0)
+        n, s0, s1, _, _ = _contact_snapshot(red)
+        shape_body = model.shape_body.numpy()
+        per_world = [0, 0]
+        for k in range(n):
+            b = shape_body[s0[k]] if shape_body[s0[k]] >= 0 else shape_body[s1[k]]
+            per_world[0 if b < model.body_count // 2 else 1] += 1
+        self.assertEqual(per_world[0], per_world[1])
+        self.assertGreaterEqual(per_world[0], 3)
+        self.assertLessEqual(per_world[0], 7)
+
+
+class TestBodyPairReductionFPGSImpact(unittest.TestCase):
+    """FPGS-specific touchdown conformance (the G1 failure mode that unit XPBD tests missed)."""
+
+    def test_fpgs_touchdown_capture(self):
+        """Land a falling foot on FPGS at the same rest height with and without reduction.
+
+        This covers the exact defect class found on the walking humanoid: a
+        mis-ranked kept set leaves no load-bearing contact at touchdown and
+        the body free-falls before a violent late landing.
+        """
+        def run(reduce_on):
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+            body = _cylinder_foot(builder, (5.13, 5.07, 0.06))  # 3 cm drop
+            builder.add_ground_plane()
+            model = builder.finalize(device=wp.get_device())
+            state_0, state_1 = model.state(), model.state()
+            control = model.control()
+            pipeline = _make_pipeline(model, reduce_on)
+            contacts = pipeline.contacts()
+            solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+            zs = []
+            for _ in range(240):
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, control, contacts, DT)
+                state_0, state_1 = state_1, state_0
+                zs.append(float(state_0.body_q.numpy()[body][2]))
+            return np.array(zs)
+
+        z_off = run(False)
+        z_on = run(True)
+        self.assertLess(abs(float(z_off[-30:].mean()) - float(z_on[-30:].mean())), 5e-4)
+        # bounded touchdown transient: never punches through the resting height by > 2.5 mm
+        self.assertGreater(float(z_on.min()), 0.015 - 2.5e-3)

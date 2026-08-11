@@ -15,7 +15,7 @@ from ..geometry.collision_core import compute_tight_aabb_from_support
 from ..geometry.contact_data import ContactData, make_contact_sort_key
 from ..geometry.contact_match import ContactMatcher
 from ..geometry.contact_reduction import MAX_CONTACTS_PER_PAIR, NUM_NORMAL_BINS
-from ..geometry.contact_reduction_body_pairs import BodyPairContactReducer
+from ..geometry.contact_reduction_body_pairs import MAX_GROUP_ID, BodyPairContactReducer
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import ShapeFlags
@@ -1376,6 +1376,13 @@ class CollisionPipeline:
                 # deterministic sort makes those indices canonical, so require
                 # it rather than silently produce run-to-run-different kept sets.
                 raise ValueError("reduce_contacts_body_pairs requires deterministic=True")
+            if model.shape_count + model.body_count > MAX_GROUP_ID:
+                # Group ids must pack exactly into the reduction key: aliasing two
+                # groups could evict a patch's deepest contact.
+                raise ValueError(
+                    f"reduce_contacts_body_pairs supports at most {MAX_GROUP_ID} shapes + bodies, "
+                    f"got {model.shape_count + model.body_count}"
+                )
             self._body_pair_reducer = BodyPairContactReducer(
                 rigid_contact_max,
                 reduce_contacts_body_pairs_depth_window,
