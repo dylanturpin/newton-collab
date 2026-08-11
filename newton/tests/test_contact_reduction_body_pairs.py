@@ -413,22 +413,42 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
                 sdf_hydroelastic_config=HydroelasticSDF.Config(),
             )
 
-    def test_nondeterministic_rejected_at_construction(self):
-        """Reject reduce_contacts_body_pairs without deterministic sorting.
+    def test_set_deterministic_without_sort(self):
+        """Produce the same kept set with the deterministic sorter disabled.
 
-        Winner selection tie-breaks on contact indices; without the canonical
-        sort those are GPU-scheduling-dependent, so the kept set would differ
-        run to run. The pipeline must demand determinism instead of silently
-        degrading.
+        Winner selection packs (score, content fingerprint) and contacts
+        self-identify as winners, so the kept SET is a pure function of the
+        physical state -- no sorting required. Compare kept sets as
+        order-independent multisets across repeated collides of one state.
         """
         model = self._foot_model()
-        with self.assertRaisesRegex(ValueError, "deterministic"):
-            newton.CollisionPipeline(
-                model,
-                broad_phase="nxn",
-                deterministic=False,
-                reduce_contacts_body_pairs=True,
-            )
+        state = model.state()
+
+        def kept_set(contacts):
+            n = int(contacts.rigid_contact_count.numpy()[0])
+            s0 = contacts.rigid_contact_shape0.numpy()[:n]
+            s1 = contacts.rigid_contact_shape1.numpy()[:n]
+            p0 = np.round(contacts.rigid_contact_point0.numpy()[:n], 6)
+            rows = sorted(map(tuple, np.column_stack([s0, s1, p0[:, 0], p0[:, 1], p0[:, 2]]).tolist()))
+            return rows
+
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            deterministic=False,
+            reduce_contacts_body_pairs=True,
+        )
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        first = kept_set(contacts)
+        for _ in range(3):
+            pipeline.collide(state, contacts)
+            self.assertEqual(kept_set(contacts), first)
+        # and it matches the sorted pipeline's kept set
+        sorted_pipe = _make_pipeline(model, True)
+        sorted_contacts = sorted_pipe.contacts()
+        sorted_pipe.collide(state, sorted_contacts)
+        self.assertEqual(kept_set(sorted_contacts), first)
 
     def test_unvalidated_solver_rejected_at_step(self):
         """A solver without supports_reduced_contacts refuses a reduced buffer.

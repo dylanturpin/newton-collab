@@ -246,6 +246,36 @@ class ContactSorter:
     # Public API
     # ------------------------------------------------------------------
 
+    def borrow_full_scratch(self) -> dict:
+        """Expose the full-layout scratch buffers for reuse by a sequential stage.
+
+        The buffers are only live INSIDE :meth:`sort_full`; between calls their
+        contents are dead, so a pipeline stage that runs strictly after the sort
+        (and finishes before the next one) may reuse them instead of allocating
+        a second full-size copy of every contact array. The borrower must treat
+        the contents as clobbered by every :meth:`sort_full` call.
+
+        Returns:
+            Mapping from contact field name to the scratch array. The
+            ``stiffness``/``damping``/``friction`` entries are zero-length
+            unless the sorter was built with ``per_contact_shape_properties``.
+        """
+        return {
+            "shape0": self._full_shape0_buf,
+            "shape1": self._full_shape1_buf,
+            "point0": self._full_point0_buf,
+            "point1": self._full_point1_buf,
+            "offset0": self._full_offset0_buf,
+            "offset1": self._full_offset1_buf,
+            "normal": self._full_normal_buf,
+            "margin0": self._full_margin0_buf,
+            "margin1": self._full_margin1_buf,
+            "tids": self._full_tids_buf,
+            "stiffness": self._full_stiffness_buf,
+            "damping": self._full_damping_buf,
+            "friction": self._full_friction_buf,
+        }
+
     def sort_simple(
         self,
         sort_keys: wp.array,

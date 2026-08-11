@@ -1016,9 +1016,11 @@ class CollisionPipeline:
                 primitive colliders, self-collision candidate swarms) by the
                 patch structure instead of the collider decomposition.
                 ``rigid_contact_count`` reflects the reduction.  Not supported
-                together with ``contact_matching``.  For run-to-run
-                reproducible output combine with ``deterministic=True``.
-                Defaults to ``False``.
+                together with ``contact_matching``.  The kept SET is
+                deterministic by construction (winner selection is a pure
+                function of contact content); combine with
+                ``deterministic=True`` if a canonical buffer ORDER is also
+                required.  Defaults to ``False``.
             reduce_contacts_body_pairs_depth_window: Gap band [m] above a
                 group's deepest contact within which contacts compete for the
                 footprint-extreme slots of their normal bin; shallower
@@ -1334,14 +1336,19 @@ class CollisionPipeline:
         self.requires_grad = requires_grad
         self.deterministic = deterministic
         per_contact_props = self.narrow_phase.hydroelastic_sdf is not None
-        if deterministic:
+        if deterministic or reduce_contacts_body_pairs:
+            # The reduction's winner selection tie-breaks on a fingerprint of
+            # the content-derived sort key, so the key array must be populated
+            # even when the sorter itself is not requested.
             with wp.ScopedDevice(device):
                 self._sort_key_array = wp.zeros(rigid_contact_max, dtype=wp.int64, device=device)
+        else:
+            self._sort_key_array = wp.zeros(0, dtype=wp.int64, device=device)
+        if deterministic:
             self._contact_sorter = ContactSorter(
                 rigid_contact_max, per_contact_shape_properties=per_contact_props, device=device
             )
         else:
-            self._sort_key_array = wp.zeros(0, dtype=wp.int64, device=device)
             self._contact_sorter = None
 
         self.contact_matching = contact_matching
@@ -1371,11 +1378,6 @@ class CollisionPipeline:
                 # Hydroelastic contacts carry per-contact area/stiffness data
                 # the compaction does not preserve.
                 raise ValueError("reduce_contacts_body_pairs does not support hydroelastic contacts")
-            if not deterministic:
-                # Winner selection tie-breaks on the contact index; only the
-                # deterministic sort makes those indices canonical, so require
-                # it rather than silently produce run-to-run-different kept sets.
-                raise ValueError("reduce_contacts_body_pairs requires deterministic=True")
             if model.shape_count + model.body_count > MAX_GROUP_ID:
                 # Group ids must pack exactly into the reduction key: aliasing two
                 # groups could evict a patch's deepest contact.
@@ -1388,6 +1390,7 @@ class CollisionPipeline:
                 reduce_contacts_body_pairs_depth_window,
                 reduce_contacts_body_pairs_cell,
                 device,
+                borrowed_scratch=(self._contact_sorter.borrow_full_scratch() if self._contact_sorter else None),
             )
         else:
             self._body_pair_reducer = None
@@ -1772,7 +1775,7 @@ class CollisionPipeline:
         # decomposition. Runs before the differentiable augmentation so the
         # diff arrays are built from the compacted set.
         if self._body_pair_reducer is not None:
-            self._body_pair_reducer.reduce(model, state, contacts)
+            self._body_pair_reducer.reduce(model, state, contacts, self._sort_key_array)
             # Stamp the buffer so consumers can verify support (see
             # SolverBase.supports_reduced_contacts).
             contacts.rigid_contacts_reduced = True
