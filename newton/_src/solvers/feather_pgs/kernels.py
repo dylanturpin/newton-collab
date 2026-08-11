@@ -6495,13 +6495,16 @@ def flush_propagation_free_body_qd_to_vout(
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
     articulation_root_dof_start: wp.array[int],
-    articulation_root_com_offset: wp.array[wp.vec3],
     # in/out
     propagation_body_qd: wp.array2d[float],
     propagation_body_impulses: wp.array2d[float],
     v_out: wp.array[float],
 ):
-    """Write propagation live free-rigid velocities to v_out after propagation GS."""
+    """Write propagation live free-rigid velocities to v_out after propagation GS.
+
+    The generalized linear coordinate and the propagation body velocity both refer to the root
+    body's centre of mass, so the write-back is a plain copy.
+    """
     body = wp.tid()
     art = body_to_articulation[body]
     if art < 0:
@@ -6510,17 +6513,8 @@ def flush_propagation_free_body_qd_to_vout(
         return
 
     dof_start = articulation_root_dof_start[art]
-    v_com = wp.vec3(propagation_body_qd[body, 0], propagation_body_qd[body, 1], propagation_body_qd[body, 2])
-    w = wp.vec3(propagation_body_qd[body, 3], propagation_body_qd[body, 4], propagation_body_qd[body, 5])
-    com_offset = articulation_root_com_offset[art]
-    v_local = v_com - wp.cross(w, com_offset)
-
-    v_out[dof_start + 0] = v_local[0]
-    v_out[dof_start + 1] = v_local[1]
-    v_out[dof_start + 2] = v_local[2]
-    v_out[dof_start + 3] = w[0]
-    v_out[dof_start + 4] = w[1]
-    v_out[dof_start + 5] = w[2]
+    for r in range(6):
+        v_out[dof_start + r] = propagation_body_qd[body, r]
 
     for r in range(6):
         propagation_body_impulses[body, r] = 0.0
@@ -6531,12 +6525,15 @@ def refresh_propagation_free_body_qd_from_vout(
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
     articulation_root_dof_start: wp.array[int],
-    articulation_root_com_offset: wp.array[wp.vec3],
     v_out: wp.array[float],
     # out
     propagation_body_qd: wp.array2d[float],
 ):
-    """Refresh propagation live COM velocities for free-rigid bodies from v_out."""
+    """Refresh propagation live COM velocities for free-rigid bodies from v_out.
+
+    Both sides use the root body's centre of mass as the linear reference point, so the refresh is
+    a plain copy.
+    """
     body = wp.tid()
     art = body_to_articulation[body]
     if art < 0:
@@ -6545,17 +6542,8 @@ def refresh_propagation_free_body_qd_from_vout(
         return
 
     dof_start = articulation_root_dof_start[art]
-    v_local = wp.vec3(v_out[dof_start + 0], v_out[dof_start + 1], v_out[dof_start + 2])
-    w = wp.vec3(v_out[dof_start + 3], v_out[dof_start + 4], v_out[dof_start + 5])
-    com_offset = articulation_root_com_offset[art]
-    v_com = v_local + wp.cross(w, com_offset)
-
-    propagation_body_qd[body, 0] = v_com[0]
-    propagation_body_qd[body, 1] = v_com[1]
-    propagation_body_qd[body, 2] = v_com[2]
-    propagation_body_qd[body, 3] = w[0]
-    propagation_body_qd[body, 4] = w[1]
-    propagation_body_qd[body, 5] = w[2]
+    for r in range(6):
+        propagation_body_qd[body, r] = v_out[dof_start + r]
 
 
 @wp.kernel
@@ -6566,7 +6554,6 @@ def flush_propagation_active_free_body_qd_to_vout(
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
     articulation_root_dof_start: wp.array[int],
-    articulation_root_com_offset: wp.array[wp.vec3],
     # in/out
     propagation_body_qd: wp.array2d[float],
     propagation_body_impulses: wp.array2d[float],
@@ -6590,17 +6577,8 @@ def flush_propagation_active_free_body_qd_to_vout(
         return
 
     dof_start = articulation_root_dof_start[art]
-    v_com = wp.vec3(propagation_body_qd[body, 0], propagation_body_qd[body, 1], propagation_body_qd[body, 2])
-    w = wp.vec3(propagation_body_qd[body, 3], propagation_body_qd[body, 4], propagation_body_qd[body, 5])
-    com_offset = articulation_root_com_offset[art]
-    v_local = v_com - wp.cross(w, com_offset)
-
-    v_out[dof_start + 0] = v_local[0]
-    v_out[dof_start + 1] = v_local[1]
-    v_out[dof_start + 2] = v_local[2]
-    v_out[dof_start + 3] = w[0]
-    v_out[dof_start + 4] = w[1]
-    v_out[dof_start + 5] = w[2]
+    for r in range(6):
+        v_out[dof_start + r] = propagation_body_qd[body, r]
 
     for r in range(6):
         propagation_body_impulses[body, r] = 0.0
