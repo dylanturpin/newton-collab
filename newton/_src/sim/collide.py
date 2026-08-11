@@ -15,6 +15,7 @@ from ..geometry.collision_core import compute_tight_aabb_from_support
 from ..geometry.contact_data import ContactData, make_contact_sort_key
 from ..geometry.contact_match import ContactMatcher
 from ..geometry.contact_reduction import MAX_CONTACTS_PER_PAIR, NUM_NORMAL_BINS
+from ..geometry.contact_reduction_body_pairs import BodyPairContactReducer
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import ShapeFlags
@@ -905,6 +906,8 @@ class CollisionPipeline:
         contact_report: bool = False,
         verify_buffers: bool = True,
         contact_reduction_hashtable_size_factor: float = 0.25,
+        reduce_contacts_body_pairs: bool = False,
+        reduce_contacts_body_pairs_depth_window: float = 3.0e-3,
     ):
         """
         Initialize the CollisionPipeline (expert API).
@@ -1003,6 +1006,26 @@ class CollisionPipeline:
                 ``True``.  Overhead is one extra kernel launch per collision
                 pass; disable in hot loops or CUDA graph capture once buffer
                 sizes are known to be adequate.
+            reduce_contacts_body_pairs: Compact the rigid contacts per body
+                pair and contact-normal bin after the narrow phase: each
+                group keeps its deepest contact plus the spatial extremes of
+                its near-touching footprint, and discards the redundant
+                interior/speculative candidates.  Bounds the registered
+                contact count of multi-shape bodies (a foot built from many
+                primitive colliders, self-collision candidate swarms) by the
+                patch structure instead of the collider decomposition.
+                ``rigid_contact_count`` reflects the reduction.  Not supported
+                together with ``contact_matching``.  For run-to-run
+                reproducible output combine with ``deterministic=True``.
+                Defaults to ``False``.
+            reduce_contacts_body_pairs_depth_window: Gap band [m] above a
+                group's deepest contact within which contacts compete for the
+                footprint-extreme slots of their normal bin; shallower
+                contacts only survive if they are their group's deepest
+                (closest) candidate.  Relative to the group's own deepest gap
+                because witness/margin conventions differ between narrow-phase
+                contact modes, making absolute gaps incomparable.  Defaults to
+                ``3e-3``.
 
         .. experimental::
 
@@ -1330,6 +1353,18 @@ class CollisionPipeline:
             )
         else:
             self._contact_matcher = None
+
+        self.reduce_contacts_body_pairs = bool(reduce_contacts_body_pairs)
+        if self.reduce_contacts_body_pairs:
+            if matching_enabled:
+                # Compaction renumbers contacts, which would invalidate the
+                # matcher's index-based frame-to-frame bookkeeping.
+                raise ValueError("reduce_contacts_body_pairs is not supported together with contact_matching")
+            self._body_pair_reducer = BodyPairContactReducer(
+                rigid_contact_max, reduce_contacts_body_pairs_depth_window, device
+            )
+        else:
+            self._body_pair_reducer = None
 
     @property
     def rigid_contact_max(self) -> int:
@@ -1705,6 +1740,13 @@ class CollisionPipeline:
                 device=self.device,
                 **sticky_offsets,
             )
+
+        # Body-pair contact reduction: compact patch-redundant candidates so
+        # rigid_contact_count reflects the contact structure, not the collider
+        # decomposition. Runs before the differentiable augmentation so the
+        # diff arrays are built from the compacted set.
+        if self._body_pair_reducer is not None:
+            self._body_pair_reducer.reduce(model, state, contacts)
 
         # Differentiable contact augmentation: reconstruct world-space contact
         # quantities through body_q so that gradients flow via wp.Tape.
