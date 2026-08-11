@@ -46,13 +46,32 @@ import warp as wp
 
 from ..sim.contacts import contact_surface_separation
 from .contact_reduction import (
-    NUM_SPATIAL_DIRECTIONS,
     float_flip,
     get_slot,
-    get_spatial_direction_2d,
     project_point_to_plane,
 )
 from .hashtable import HashTable, hashtable_find_or_insert
+
+# Scan directions used to pick footprint extremes on a normal bin's face plane.
+# Deliberately independent of the mesh reducer's own direction count so tuning
+# that path cannot silently change body-pair behaviour.
+#
+# Six is a measured floor, not a value carried over. Each extra direction costs a
+# slot, an atomic per contact, and a kept contact whose row the solver carries,
+# so fewer was tried first: on the randomized primitive piles of the property
+# test, peak body speed against the unreduced run's 95 m/s comes out at 95 with
+# six directions, 199 with four, and diverges outright with five. Fewer
+# directions under-sample a patch's hull and leave a face rocking on too few
+# support points.
+BODY_PAIR_NUM_DIRECTIONS = 6
+
+
+@wp.func
+def _direction_2d(dir_idx: int) -> wp.vec2:
+    """Unit 2D direction at ``dir_idx * 2pi / BODY_PAIR_NUM_DIRECTIONS``."""
+    angle = float(dir_idx) * (2.0 * wp.pi / float(wp.static(BODY_PAIR_NUM_DIRECTIONS)))
+    return wp.vec2(wp.cos(angle), wp.sin(angle))
+
 
 # Value slots per (body pair, normal bin, spatial cell) entry: one spatial
 # extreme per scan direction, plus the group's deepest contact.
@@ -68,8 +87,8 @@ from .hashtable import HashTable, hashtable_find_or_insert
 #   neither kept counts (p50 300 rows either way) nor trajectories on any
 #   scene, because a patch's load-bearing contacts are already its spatial
 #   extremes; it only doubled the slot memory and clearing work.
-DEEPEST_SLOT = NUM_SPATIAL_DIRECTIONS
-BODY_PAIR_REDUCTION_SLOTS = NUM_SPATIAL_DIRECTIONS + 1
+DEEPEST_SLOT = BODY_PAIR_NUM_DIRECTIONS
+BODY_PAIR_REDUCTION_SLOTS = BODY_PAIR_NUM_DIRECTIONS + 1
 
 
 # Bit budget of the 63-bit group key. Group ids are asserted against this at
@@ -320,8 +339,8 @@ def _insert_spatial_kernel(
 
     pos_2d = contact_pos2d[i]
     fp = _key_fingerprint(sort_keys, i)
-    for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-        dir_2d = get_spatial_direction_2d(dir_i)
+    for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
+        dir_2d = _direction_2d(dir_i)
         value = _pack_score(wp.dot(pos_2d, dir_2d), fp)
         slot_idx = dir_i * ht_capacity + entry_idx
         if ht_values[slot_idx] < value:
@@ -379,8 +398,8 @@ def _select_winners_kernel(
     # returns from within a kernel for-loop, so accumulate and flag once.
     won = ht_values[wp.static(DEEPEST_SLOT) * ht_capacity + entry_idx] == _pack_score(-gap, fp)
     pos_2d = contact_pos2d[i]
-    for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-        value = _pack_score(wp.dot(pos_2d, get_spatial_direction_2d(dir_i)), fp)
+    for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
+        value = _pack_score(wp.dot(pos_2d, _direction_2d(dir_i)), fp)
         if ht_values[dir_i * ht_capacity + entry_idx] == value:
             won = True
     if won:
@@ -430,8 +449,8 @@ def _verify_invariant_kernel(
         beaten = True  # I out-rank the recorded winner: the slot missed me
 
     pos_2d = contact_pos2d[i]
-    for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-        dir_2d = get_spatial_direction_2d(dir_i)
+    for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
+        dir_2d = _direction_2d(dir_i)
         value = _pack_score(wp.dot(pos_2d, dir_2d), fp)
         slot_value = ht_values[dir_i * ht_capacity + entry_idx]
         if value == slot_value:
