@@ -908,6 +908,7 @@ class CollisionPipeline:
         contact_reduction_hashtable_size_factor: float = 0.25,
         reduce_contacts_body_pairs: bool = False,
         reduce_contacts_body_pairs_depth_window: float = 3.0e-3,
+        reduce_contacts_body_pairs_cell: float = 0.25,
     ):
         """
         Initialize the CollisionPipeline (expert API).
@@ -1026,6 +1027,12 @@ class CollisionPipeline:
                 because witness/margin conventions differ between narrow-phase
                 contact modes, making absolute gaps incomparable.  Defaults to
                 ``3e-3``.
+            reduce_contacts_body_pairs_cell: Spatial cell edge [m] used to
+                subdivide each body pair + normal bin on the bin's face
+                plane; every cell keeps its own deepest contact and footprint
+                extremes, so same-normal patches farther apart than a cell
+                (a long body across separate regions of one terrain collider)
+                are each fully represented.  Defaults to ``0.25``.
 
         .. experimental::
 
@@ -1360,8 +1367,20 @@ class CollisionPipeline:
                 # Compaction renumbers contacts, which would invalidate the
                 # matcher's index-based frame-to-frame bookkeeping.
                 raise ValueError("reduce_contacts_body_pairs is not supported together with contact_matching")
+            if sdf_hydroelastic_config is not None or self.narrow_phase.hydroelastic_sdf is not None:
+                # Hydroelastic contacts carry per-contact area/stiffness data
+                # the compaction does not preserve.
+                raise ValueError("reduce_contacts_body_pairs does not support hydroelastic contacts")
+            if not deterministic:
+                # Winner selection tie-breaks on the contact index; only the
+                # deterministic sort makes those indices canonical, so require
+                # it rather than silently produce run-to-run-different kept sets.
+                raise ValueError("reduce_contacts_body_pairs requires deterministic=True")
             self._body_pair_reducer = BodyPairContactReducer(
-                rigid_contact_max, reduce_contacts_body_pairs_depth_window, device
+                rigid_contact_max,
+                reduce_contacts_body_pairs_depth_window,
+                reduce_contacts_body_pairs_cell,
+                device,
             )
         else:
             self._body_pair_reducer = None
@@ -1747,6 +1766,9 @@ class CollisionPipeline:
         # diff arrays are built from the compacted set.
         if self._body_pair_reducer is not None:
             self._body_pair_reducer.reduce(model, state, contacts)
+            # Stamp the buffer so consumers can verify support (see
+            # SolverBase.supports_reduced_contacts).
+            contacts.rigid_contacts_reduced = True
 
         # Differentiable contact augmentation: reconstruct world-space contact
         # quantities through body_q so that gradients flow via wp.Tape.

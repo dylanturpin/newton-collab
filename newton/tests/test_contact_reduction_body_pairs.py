@@ -27,6 +27,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.geometry.sdf_hydroelastic import HydroelasticSDF
 
 DT = 1.0 / 240.0
 
@@ -128,11 +129,14 @@ class TestBodyPairReductionCounts(unittest.TestCase):
 
     def _grid_on_plane(self, reduce_body_pairs):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-        _sphere_grid_body(builder, (0.0, 0.0, 0.0095))  # spheres just touching the plane
+        # positive-quadrant placement keeps the whole patch inside ONE spatial cell
+        # (cells are origin-anchored; straddling a boundary benignly over-keeps)
+        _sphere_grid_body(builder, (5.13, 5.07, 0.0095))  # spheres just touching the plane
         builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
         state = model.state()
-        return model, state, _collide_once(model, state, reduce_body_pairs)
+        # one spatial cell: this test asserts the tight single-patch slot bound
+        return model, state, _collide_once(model, state, reduce_body_pairs, reduce_contacts_body_pairs_cell=10.0)
 
     def test_flat_patch_keeps_extremes_and_deepest(self):
         """Reduce a 25-point flat patch to at most 7 while keeping its footprint.
@@ -232,13 +236,14 @@ class TestBodyPairReductionCounts(unittest.TestCase):
         register at most 7 contacts, and the deepest candidate must be kept.
         """
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-        _cylinder_foot(builder, (0.0, 0.0, 0.0149))  # slightly penetrating
+        _cylinder_foot(builder, (5.13, 5.07, 0.0149))  # slightly penetrating, inside one cell
         builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
         state = model.state()
 
         base = _collide_once(model, state, reduce_body_pairs=False)
-        red = _collide_once(model, state, reduce_body_pairs=True)
+        # one spatial cell: the foot spans two default cells, this asserts the per-cell bound
+        red = _collide_once(model, state, reduce_body_pairs=True, reduce_contacts_body_pairs_cell=10.0)
         n_base, *_ = _contact_snapshot(base)
         n_red, *_ = _contact_snapshot(red)
         self.assertGreaterEqual(n_base, 7)
@@ -379,3 +384,175 @@ class TestBodyPairReductionDynamics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBodyPairReductionGuarantees(unittest.TestCase):
+    """Unsupported configurations are rejected at construction or solver start."""
+
+    def _foot_model(self):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (0.0, 0.0, 0.020))
+        builder.add_ground_plane()
+        return builder.finalize(device=wp.get_device())
+
+    def test_hydroelastic_rejected_at_construction(self):
+        """Reject reduce_contacts_body_pairs together with hydroelastic contacts.
+
+        The compaction does not carry the hydroelastic per-contact area and
+        stiffness fields, so the combination must fail at pipeline
+        construction, not corrupt data at runtime.
+        """
+        model = self._foot_model()
+        with self.assertRaisesRegex(ValueError, "hydroelastic"):
+            newton.CollisionPipeline(
+                model,
+                broad_phase="nxn",
+                deterministic=True,
+                reduce_contacts_body_pairs=True,
+                sdf_hydroelastic_config=HydroelasticSDF.Config(),
+            )
+
+    def test_nondeterministic_rejected_at_construction(self):
+        """Reject reduce_contacts_body_pairs without deterministic sorting.
+
+        Winner selection tie-breaks on contact indices; without the canonical
+        sort those are GPU-scheduling-dependent, so the kept set would differ
+        run to run. The pipeline must demand determinism instead of silently
+        degrading.
+        """
+        model = self._foot_model()
+        with self.assertRaisesRegex(ValueError, "deterministic"):
+            newton.CollisionPipeline(
+                model,
+                broad_phase="nxn",
+                deterministic=False,
+                reduce_contacts_body_pairs=True,
+            )
+
+    def test_unvalidated_solver_rejected_at_step(self):
+        """A solver without supports_reduced_contacts refuses a reduced buffer.
+
+        Reduced buffers are stamped; every in-repo solver that has not been
+        conformance-tested calls ``_require_unreduced_contacts`` at the top of
+        ``step`` and must raise rather than consume contacts whose depth
+        convention it might disagree with.
+        """
+        model = self._foot_model()
+        state_0, state_1 = model.state(), model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state_0, contacts)
+        solver = newton.solvers.SolverSemiImplicit(model)
+        with self.assertRaisesRegex(ValueError, "supports_reduced_contacts"):
+            solver.step(state_0, state_1, model.control(), contacts, DT)
+        # the validated solvers accept the same buffer
+        self.assertTrue(newton.solvers.SolverXPBD.supports_reduced_contacts)
+        self.assertTrue(newton.solvers.SolverFeatherPGS.supports_reduced_contacts)
+
+
+class TestBodyPairReductionMultiPatch(unittest.TestCase):
+    """Same-normal patches far apart on ONE shape pair each keep full representation."""
+
+    def _two_cluster_body(self, builder, spread=1.0):
+        """One rigid body with two 4-sphere feet ``spread`` apart on the same plane."""
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0095), wp.quat_identity()), mass=2.0)
+        for end in (-spread / 2.0, spread / 2.0):
+            for i, j in ((0, 0), (1, 0), (0, 1), (1, 1)):
+                builder.add_shape_sphere(
+                    body,
+                    xform=wp.transform(wp.vec3(end + 0.03 * i, 0.03 * j, 0.0), wp.quat_identity()),
+                    radius=0.01,
+                )
+        return body
+
+    def test_both_clusters_fully_kept(self):
+        """Keep deepest + extremes for each cluster, not one shared slot set.
+
+        Both clusters contact the SAME ground shape with the SAME normal --
+        without spatial cells they would compete for a single (pair, bin)
+        entry and one cluster could lose all representation. With cells, each
+        cluster (1 m apart >> 0.25 m cell) must keep at least 3 contacts.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        self._two_cluster_body(builder)
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        red = _collide_once(model, state, reduce_body_pairs=True)
+        n, _s0, _s1, _, _p0 = _contact_snapshot(red)
+        self.assertGreater(n, 0)
+        pts = _world_points0(model, state, red)
+        left = (pts[:, 0] < -0.2).sum()
+        right = (pts[:, 0] > 0.2).sum()
+        self.assertGreaterEqual(int(left), 3, "left cluster under-represented")
+        self.assertGreaterEqual(int(right), 3, "right cluster under-represented")
+
+    def _settle_plank(self, reduce_on):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        body = self._two_cluster_body(builder)
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        pipeline = _make_pipeline(model, reduce_on)
+        contacts = pipeline.contacts()
+        # iterations=16: the redundant unreduced set over-stiffens XPBD per
+        # iteration (see _settle); compare near convergence.
+        solver = newton.solvers.SolverXPBD(model, iterations=16)
+        for _ in range(240):
+            pipeline.collide(state_0, contacts)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, contacts, DT)
+            state_0, state_1 = state_1, state_0
+        return state_0.body_q.numpy()[body]
+
+    def test_plank_settles_level(self):
+        """Settle the two-cluster plank level, at the unreduced rest height.
+
+        If either cluster lost its support points the plank would tilt about
+        the other end. The invariant is against the unreduced pipeline: same
+        rest height (within solver noise) and no pitch, on the same scene.
+        """
+        q_off = self._settle_plank(False)
+        q_on = self._settle_plank(True)
+        self.assertLess(abs(float(q_on[4])), 0.02, "plank tilted -- a cluster lost support")
+        self.assertLess(abs(float(q_on[2]) - float(q_off[2])), 1.5e-3)
+
+
+class TestBodyPairReductionSolverConformance(unittest.TestCase):
+    """Every solver declaring supports_reduced_contacts settles identically on/off."""
+
+    def _settle_with(self, solver_cls, reduce_on, **solver_kwargs):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        body = _cylinder_foot(builder, (0.0, 0.0, 0.020))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        pipeline = _make_pipeline(model, reduce_on)
+        contacts = pipeline.contacts()
+        solver = solver_cls(model, **solver_kwargs)
+        for _ in range(240):
+            pipeline.collide(state_0, contacts)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, contacts, DT)
+            state_0, state_1 = state_1, state_0
+        return float(state_0.body_q.numpy()[body][2])
+
+    def test_feather_pgs_conformance(self):
+        """SolverFeatherPGS rests the multi-cylinder foot at the same height on/off.
+
+        This is the conformance requirement for supports_reduced_contacts:
+        the solver's contact-depth convention must agree with the ranking's
+        canonical contact_surface_separation, or the kept set starves the
+        solver of its load-bearing contacts.
+        """
+        z_off = self._settle_with(newton.solvers.SolverFeatherPGS, False, angular_damping=0.0)
+        z_on = self._settle_with(newton.solvers.SolverFeatherPGS, True, angular_damping=0.0)
+        self.assertLess(abs(z_off - z_on), 5e-4)
+
+    def test_xpbd_conformance(self):
+        """SolverXPBD rests the multi-cylinder foot at the same height on/off."""
+        z_off = self._settle_with(newton.solvers.SolverXPBD, False, iterations=8)
+        z_on = self._settle_with(newton.solvers.SolverXPBD, True, iterations=8)
+        self.assertLess(abs(z_off - z_on), 5e-4)

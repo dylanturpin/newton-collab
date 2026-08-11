@@ -355,6 +355,36 @@ class SolverBase:
         """
         pass
 
+    supports_reduced_contacts: bool = False
+    """Whether this solver is validated against body-pair-reduced contact buffers.
+
+    :class:`newton.CollisionPipeline` with ``reduce_contacts_body_pairs=True``
+    compacts the rigid contacts to each patch's deepest point plus footprint
+    extremes, ranked by :func:`newton._src.sim.contacts.contact_surface_separation`.
+    A solver may only declare support after a conformance test demonstrates it
+    consumes contact depth with that same convention (see
+    ``newton/tests/test_contact_reduction_body_pairs.py``). Solvers that do not
+    declare support must reject reduced buffers via
+    :meth:`_require_unreduced_contacts` at the top of :meth:`step`.
+    """
+
+    def _require_unreduced_contacts(self, contacts: Contacts | None) -> None:
+        """Raise if ``contacts`` was compacted by body-pair reduction.
+
+        Call at the top of :meth:`step` in solvers that have not been
+        conformance-tested against reduced contact buffers.
+        """
+        if (
+            contacts is not None
+            and getattr(contacts, "rigid_contacts_reduced", False)
+            and not type(self).supports_reduced_contacts
+        ):
+            raise ValueError(
+                f"{type(self).__name__} is not validated for body-pair-reduced contacts; "
+                "disable CollisionPipeline(reduce_contacts_body_pairs=True) or use a solver "
+                "with supports_reduced_contacts=True"
+            )
+
     def step(
         self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float
     ) -> None:

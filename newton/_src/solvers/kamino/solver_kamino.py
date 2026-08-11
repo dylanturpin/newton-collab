@@ -825,6 +825,7 @@ class SolverKamino(SolverBase, CouplingInterface):
                 pipeline, or ``None`` to use Kamino's internal collision detector.
             dt: The time step (typically in seconds).
         """
+        self._require_unreduced_contacts(contacts)
         # Interface the input state containers to Kamino's equivalents
         # NOTE: These should produce zero-copy views/references
         # to the arrays of the source Newton containers.

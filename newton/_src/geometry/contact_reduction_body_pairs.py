@@ -50,11 +50,28 @@ from .contact_reduction import (
     get_spatial_direction_2d,
     project_point_to_plane,
 )
-from .contact_reduction_global import make_contact_key, make_contact_value
+from .contact_reduction_global import make_contact_value
 from .hashtable import HashTable, hashtable_find_or_insert
 
-# Value slots per (body pair, normal bin) entry: spatial extremes + one deepest.
+# Value slots per (body pair, normal bin, spatial cell) entry: extremes + one deepest.
 BODY_PAIR_REDUCTION_SLOTS = NUM_SPATIAL_DIRECTIONS + 1
+
+
+@wp.func
+def _make_group_key(group_a: int, group_b: int, bin_id: int, cell_hash: int) -> wp.uint64:
+    """Pack (group_a, group_b, normal bin, spatial cell) into a 63-bit key.
+
+    Layout: ``[62:43] group_a (20b) | [42:23] group_b (20b) | [22:18] bin (5b) |
+    [17:0] cell hash (18b)``.  Group ids beyond 20 bits or a cell hash collision
+    merge two groups' slot competition -- a graceful degradation (fewer kept
+    points, never a dropped deepest), not a correctness loss.
+    """
+    return (
+        ((wp.uint64(group_a) & wp.uint64(0xFFFFF)) << wp.uint64(43))
+        | ((wp.uint64(group_b) & wp.uint64(0xFFFFF)) << wp.uint64(23))
+        | ((wp.uint64(bin_id) & wp.uint64(0x1F)) << wp.uint64(18))
+        | (wp.uint64(cell_hash) & wp.uint64(0x3FFFF))
+    )
 
 
 # Inverse of contact_reduction.float_flip (http://stereopsis.com/radix.html):
@@ -80,6 +97,7 @@ def _contact_group_key(
     body_q: wp.array[wp.transform],
     shape_body: wp.array[wp.int32],
     shape_count: int,
+    cell_size: float,
 ):
     """Compute (key, gap, center, bin_id) for contact ``i``.
 
@@ -91,7 +109,11 @@ def _contact_group_key(
     candidates while discarding the load-bearing contacts.
     The group id is the body for dynamic shapes (all shapes of a body form one
     group) and the shape itself for static geometry (distinct static colliders
-    never merge).
+    never merge).  The key also carries a spatial cell -- the contact's
+    position quantized on the bin's face plane by ``cell_size`` -- so multiple
+    same-normal patches far apart on ONE shape pair (a long body across two
+    regions of a terrain collider) each get their own deepest + extremes
+    instead of competing for a single slot set.
     """
     s0 = contact_shape0[i]
     s1 = contact_shape1[i]
@@ -120,7 +142,14 @@ def _contact_group_key(
     gb = wp.max(g0, g1)
 
     bin_id = get_slot(n)
-    key = make_contact_key(ga, gb, bin_id)
+    pos_2d = project_point_to_plane(bin_id, center)
+    cx = wp.int32(wp.floor(pos_2d[0] / cell_size))
+    cy = wp.int32(wp.floor(pos_2d[1] / cell_size))
+    # fold the two cell coordinates into 18 bits (Knuth multiplicative mix)
+    cell_hash = wp.int32(
+        (wp.uint32(cx) * wp.uint32(2654435761) ^ wp.uint32(cy) * wp.uint32(40503)) & wp.uint32(0x3FFFF)
+    )
+    key = _make_group_key(ga, gb, bin_id, cell_hash)
     return key, gap, center, bin_id
 
 
@@ -137,6 +166,7 @@ def _insert_deepest_kernel(
     body_q: wp.array[wp.transform],
     shape_body: wp.array[wp.int32],
     shape_count: int,
+    cell_size: float,
     ht_keys: wp.array[wp.uint64],
     ht_active_slots: wp.array[wp.int32],
     ht_values: wp.array[wp.uint64],
@@ -167,6 +197,7 @@ def _insert_deepest_kernel(
         body_q,
         shape_body,
         shape_count,
+        cell_size,
     )
     entry_idx = hashtable_find_or_insert(key, ht_keys, ht_active_slots)
     if entry_idx < 0:
@@ -193,6 +224,7 @@ def _insert_spatial_kernel(
     body_q: wp.array[wp.transform],
     shape_body: wp.array[wp.int32],
     shape_count: int,
+    cell_size: float,
     depth_window: float,
     ht_keys: wp.array[wp.uint64],
     ht_active_slots: wp.array[wp.int32],
@@ -224,6 +256,7 @@ def _insert_spatial_kernel(
         body_q,
         shape_body,
         shape_count,
+        cell_size,
     )
     entry_idx = hashtable_find_or_insert(key, ht_keys, ht_active_slots)
     if entry_idx < 0:
@@ -355,12 +388,16 @@ class BodyPairContactReducer:
             which contacts compete for the spatial-extreme (footprint hull)
             slots. Contacts shallower than that only survive if they are their
             group's deepest.
+        cell_size: Spatial cell edge [m] on the normal bin's face plane. Each
+            (body pair, bin, cell) keeps its own deepest + extremes, so
+            same-normal patches farther apart than a cell never compete.
         device: Warp device.
     """
 
-    def __init__(self, rigid_contact_max: int, depth_window: float, device):
+    def __init__(self, rigid_contact_max: int, depth_window: float, cell_size: float, device):
         self.rigid_contact_max = rigid_contact_max
         self.depth_window = float(depth_window)
+        self.cell_size = float(cell_size)
         self.device = device
         # One entry per (body pair, bin) actually touched; the contact count is
         # a hard upper bound on distinct keys per step.
@@ -418,7 +455,7 @@ class BodyPairContactReducer:
         wp.launch(
             _insert_deepest_kernel,
             dim=n,
-            inputs=[*geom_inputs, self.hashtable.keys, self.hashtable.active_slots, self.ht_values],
+            inputs=[*geom_inputs, self.cell_size, self.hashtable.keys, self.hashtable.active_slots, self.ht_values],
             outputs=[self.keep_flags],
             device=self.device,
             record_tape=False,
@@ -428,6 +465,7 @@ class BodyPairContactReducer:
             dim=n,
             inputs=[
                 *geom_inputs,
+                self.cell_size,
                 self.depth_window,
                 self.hashtable.keys,
                 self.hashtable.active_slots,
