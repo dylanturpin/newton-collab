@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import warp as wp
 
+from ..sim.contacts import contact_surface_separation
 from .contact_reduction import (
     NUM_SPATIAL_DIRECTIONS,
     get_slot,
@@ -82,10 +83,15 @@ def _contact_group_key(
 ):
     """Compute (key, gap, center, bin_id) for contact ``i``.
 
-    The gap uses the same witness-point formula as the solvers' contact rows:
-    distance along the normal minus both surface thicknesses.  The group id is
-    the body for dynamic shapes (all shapes of a body form one group) and the
-    shape itself for static geometry (distinct static colliders never merge).
+    The gap is :func:`newton._src.sim.contacts.contact_surface_separation` --
+    the one canonical signed-separation convention the solvers consume
+    (normal points shape0 -> shape1, positive = gap).  Depth must be ranked
+    with exactly that formula: a hand-rolled variant with the opposite point
+    order ranked SHALLOWEST as deepest and made the pass keep hovering
+    candidates while discarding the load-bearing contacts.
+    The group id is the body for dynamic shapes (all shapes of a body form one
+    group) and the shape itself for static geometry (distinct static colliders
+    never merge).
     """
     s0 = contact_shape0[i]
     s1 = contact_shape1[i]
@@ -101,7 +107,7 @@ def _contact_group_key(
         p1_w = wp.transform_point(body_q[b1], p1_w)
 
     n = contact_normal[i]
-    gap = wp.dot(n, p0_w - p1_w) - contact_margin0[i] - contact_margin1[i]
+    gap = contact_surface_separation(p0_w, p1_w, n, contact_margin0[i], contact_margin1[i])
     center = 0.5 * (p0_w + p1_w)
 
     g0 = s0
