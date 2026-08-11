@@ -18,18 +18,19 @@ compacts it **per body pair and normal bin**:
   the body (or the shape itself for static geometry, so distinct static
   colliders never merge) and the bin is a polyhedron face from
   :mod:`contact_reduction`'s normal binning;
-* per group, the deepest contact always survives, and contacts within
-  ``depth_window`` of the group's deepest gap compete for
-  ``NUM_SPATIAL_DIRECTIONS`` spatial-extreme slots (the footprint hull);
+* per group, the deepest contact always survives and every contact competes for
+  one spatial-extreme slot per scan direction on projection alone, so each slot
+  ends up holding that direction's true extreme (see
+  :data:`BODY_PAIR_REDUCTION_SLOTS` for the policies this replaced);
 * everything else -- interior points of the patch and candidates far shallower
   than the load-bearing set -- is discarded, and the ``Contacts`` arrays are
   compacted in place so ``rigid_contact_count`` itself drops.
 
-The depth gate is **relative** to the group's own deepest contact rather than
-an absolute threshold: witness/margin conventions differ between narrow-phase
-contact modes, so absolute gaps are only comparable within a group, and an
-absolute gate was observed to starve loaded patches of support points when a
-pair's convention shifted mid-landing.
+Depth is ranked with the canonical
+:func:`newton._src.sim.contacts.contact_surface_separation`, but only to choose
+each group's single deepest survivor: depth never gates or biases the spatial
+slots.  The policy therefore carries no tunable length scale at all, and no
+classification can leave a patch without footprint support.
 
 Reduction never crosses a normal bin, so multi-patch configurations (a body
 touching floor and wall at once) keep representatives of every patch.  On
@@ -53,7 +54,21 @@ from .contact_reduction import (
 )
 from .hashtable import HashTable, hashtable_find_or_insert
 
-# Value slots per (body pair, normal bin, spatial cell) entry: extremes + one deepest.
+# Value slots per (body pair, normal bin, spatial cell) entry: one spatial
+# extreme per scan direction, plus the group's deepest contact.
+#
+# Every contact competes for every spatial slot on projection alone. Two richer
+# policies were implemented and measured against both a walking humanoid and
+# randomized primitive piles, and neither earned its cost:
+#
+# * gating slot entry on a depth window starves any patch whose gap spread
+#   exceeds the window -- a tilted box face keeps only its deepest corner,
+#   pivots on that point contact and diverges;
+# * adding a second, depth-gated family of slots alongside this one changed
+#   neither kept counts (p50 300 rows either way) nor trajectories on any
+#   scene, because a patch's load-bearing contacts are already its spatial
+#   extremes; it only doubled the slot memory and clearing work.
+DEEPEST_SLOT = NUM_SPATIAL_DIRECTIONS
 BODY_PAIR_REDUCTION_SLOTS = NUM_SPATIAL_DIRECTIONS + 1
 
 
@@ -164,26 +179,48 @@ def _contact_group_key(
 
 @wp.func
 def _pack_score(score: float, fingerprint: wp.uint32) -> wp.uint64:
-    """Pack ``(score, content fingerprint)`` for ``atomic_max`` slot competition.
+    """Pack ``(score, content fingerprint)`` for ``atomic_max`` competition.
+
+    Layout (bit 63 kept zero so the value orders identically read as signed or
+    unsigned)::
+
+        [62:31] float_flip(score)   (32 bits)
+        [30:0]  content fingerprint (31 bits, never zero)
+
+    Every contact of a group competes for every spatial slot on projection
+    alone -- there is no depth gate or depth preference.  Both were tried and
+    both starve patches: a gate drops every contact whose gap spread exceeds
+    the window, and a high-order "near" preference is won outright by the
+    group's deepest contact (trivially near), which then takes all slots.
+    Either way a tilted box face collapses to single-point support and
+    diverges.  Pure projection competition gives each direction slot to that
+    direction's true spatial extreme, so footprint support is preserved by
+    construction and no tuning parameter can remove it.
 
     No buffer index is stored: winners identify THEMSELVES in the selection
-    pass by comparing their own packed value against the slot. Ties on both
-    score and fingerprint mean identical content -- both contacts are kept,
-    which fails open. Because the packed value is a pure function of contact
-    content, the winning SET is invariant to thread scheduling and to buffer
-    order, for any buffer capacity.
-
-    A finite score can never produce the packed value 0 (the empty-slot
-    sentinel): ``float_flip`` maps only ``-inf``-magnitude floats to 0.
+    pass by comparing their own packed value against the slot.  Ties on score
+    and fingerprint mean identical content -- both contacts are kept, which
+    fails open.  Because the value is a pure function of contact content, the
+    winning SET is invariant to thread scheduling, buffer order, and buffer
+    capacity.  The fingerprint is forced nonzero so a real value is never
+    confused with the empty-slot sentinel 0.
     """
-    return (wp.uint64(float_flip(score)) << wp.uint64(32)) | wp.uint64(fingerprint)
+    return (wp.uint64(float_flip(score)) << wp.uint64(31)) | (wp.uint64(fingerprint) & wp.uint64(0x7FFFFFFF))
+
+
+@wp.func
+def _slot_gap(ht_values: wp.array[wp.uint64], ht_capacity: int, entry_idx: int) -> float:
+    """Decode the group's deepest gap from its depth slot."""
+    v = ht_values[wp.static(DEEPEST_SLOT) * ht_capacity + entry_idx]
+    return -float_unflip(wp.uint32((v >> wp.uint64(31)) & wp.uint64(0xFFFFFFFF)))
 
 
 @wp.func
 def _key_fingerprint(sort_keys: wp.array[wp.int64], i: int) -> wp.uint32:
     """Fold the content-derived narrow-phase sort key to a 32-bit fingerprint."""
     k = wp.uint64(sort_keys[i])
-    return wp.uint32((k ^ (k >> wp.uint64(32))) & wp.uint64(0xFFFFFFFF))
+    # bit 0 forced set: a zero fingerprint could collide with the empty-slot sentinel
+    return wp.uint32(((k ^ (k >> wp.uint64(31))) & wp.uint64(0x7FFFFFFF)) | wp.uint64(1))
 
 
 @wp.kernel(enable_backward=False)
@@ -209,6 +246,7 @@ def _insert_deepest_kernel(
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
+    stats: wp.array[wp.int32],
 ):
     """Pass 1: register every contact's depth in its group's deepest slot.
 
@@ -243,13 +281,14 @@ def _insert_deepest_kernel(
     contact_entry[i] = entry_idx
     if entry_idx < 0:
         keep_flags[i] = 1
+        wp.atomic_add(stats, 1, 1)
         return
     contact_gap[i] = gap
     contact_pos2d[i] = project_point_to_plane(bin_id, center)
 
     ht_capacity = ht_keys.shape[0]
     depth_value = _pack_score(-gap, _key_fingerprint(sort_keys, i))
-    slot_idx = wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx
+    slot_idx = wp.static(DEEPEST_SLOT) * ht_capacity + entry_idx
     if ht_values[slot_idx] < depth_value:
         wp.atomic_max(ht_values, slot_idx, depth_value)
 
@@ -261,18 +300,16 @@ def _insert_spatial_kernel(
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
     sort_keys: wp.array[wp.int64],
-    depth_window: float,
     ht_capacity: int,
     # in/out
     ht_values: wp.array[wp.uint64],
 ):
-    """Pass 2: contacts near their group's deepest gap compete for the footprint extremes.
+    """Pass 2: every contact competes for its group's footprint-extreme slots.
 
-    Runs after pass 1 so every group's deepest slot is final, and reads the
-    entry/gap/position cache pass 1 wrote instead of recomputing geometry or
-    re-probing the hashtable.  The gate is relative -- ``gap <= deepest_gap +
-    depth_window`` -- which is invariant to the per-contact-mode
-    witness/margin offsets that make absolute gaps incomparable across groups.
+    Reads the entry/position cache pass 1 wrote instead of recomputing
+    geometry or re-probing the hashtable.  Competition is on spatial
+    projection alone, so each direction slot ends up holding that direction's
+    true extreme contact.
     """
     i = wp.tid()
     if i >= contact_count[0]:
@@ -281,19 +318,11 @@ def _insert_spatial_kernel(
     if entry_idx < 0:
         return
 
-    deepest_value = ht_values[wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx]
-    # high 32 bits hold float_flip(-deepest_gap)
-    deepest_gap = -float_unflip(wp.uint32(deepest_value >> wp.uint64(32)))
-    gap = contact_gap[i]
-    if gap > deepest_gap + depth_window:
-        return
-
     pos_2d = contact_pos2d[i]
     fp = _key_fingerprint(sort_keys, i)
     for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
         dir_2d = get_spatial_direction_2d(dir_i)
-        score = wp.dot(pos_2d, dir_2d)
-        value = _pack_score(score, fp)
+        value = _pack_score(wp.dot(pos_2d, dir_2d), fp)
         slot_idx = dir_i * ht_capacity + entry_idx
         if ht_values[slot_idx] < value:
             wp.atomic_max(ht_values, slot_idx, value)
@@ -322,7 +351,6 @@ def _select_winners_kernel(
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
     sort_keys: wp.array[wp.int64],
-    depth_window: float,
     ht_capacity: int,
     ht_values: wp.array[wp.uint64],
     # outputs
@@ -347,23 +375,76 @@ def _select_winners_kernel(
     fp = _key_fingerprint(sort_keys, i)
     gap = contact_gap[i]
 
-    deepest_slot = wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx
-    deepest_value = ht_values[deepest_slot]
-    if deepest_value == _pack_score(-gap, fp):
+    # NOTE: no early ``return`` inside the loop -- Warp does not reliably honor
+    # returns from within a kernel for-loop, so accumulate and flag once.
+    won = ht_values[wp.static(DEEPEST_SLOT) * ht_capacity + entry_idx] == _pack_score(-gap, fp)
+    pos_2d = contact_pos2d[i]
+    for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
+        value = _pack_score(wp.dot(pos_2d, get_spatial_direction_2d(dir_i)), fp)
+        if ht_values[dir_i * ht_capacity + entry_idx] == value:
+            won = True
+    if won:
         keep_flags[i] = 1
-        return
 
-    deepest_gap = -float_unflip(wp.uint32(deepest_value >> wp.uint64(32)))
-    if gap > deepest_gap + depth_window:
+
+@wp.kernel(enable_backward=False)
+def _verify_invariant_kernel(
+    contact_count: wp.array[wp.int32],
+    contact_entry: wp.array[wp.int32],
+    contact_gap: wp.array[wp.float32],
+    contact_pos2d: wp.array[wp.vec2],
+    sort_keys: wp.array[wp.int64],
+    ht_capacity: int,
+    ht_values: wp.array[wp.uint64],
+    keep_flags: wp.array[wp.int32],
+    # outputs
+    violations: wp.array[wp.int32],
+):
+    """Certificate mode: re-derive the keep/discard decision and count disagreements.
+
+    For every contact, recompute its packed slot values and check the
+    invariant the pass promises: a DISCARDED contact must not beat any final
+    slot winner it was eligible for, and a KEPT registered contact must
+    actually match at least one winner. Any disagreement means a slot race,
+    clearing bug, or ranking regression -- counted, never silent.
+    """
+    i = wp.tid()
+    if i >= contact_count[0]:
         return
+    entry_idx = contact_entry[i]
+    if entry_idx < 0:
+        return  # fail-open contacts are kept by definition
+
+    fp = _key_fingerprint(sort_keys, i)
+    gap = contact_gap[i]
+    kept = keep_flags[i] != 0
+
+    matched = False
+    beaten = False
+
+    deepest_value = ht_values[wp.static(DEEPEST_SLOT) * ht_capacity + entry_idx]
+    my_depth = _pack_score(-gap, fp)
+    if my_depth == deepest_value:
+        matched = True
+    elif my_depth > deepest_value:
+        beaten = True  # I out-rank the recorded winner: the slot missed me
 
     pos_2d = contact_pos2d[i]
     for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
         dir_2d = get_spatial_direction_2d(dir_i)
-        score = wp.dot(pos_2d, dir_2d)
-        if ht_values[dir_i * ht_capacity + entry_idx] == _pack_score(score, fp):
-            keep_flags[i] = 1
-            return
+        value = _pack_score(wp.dot(pos_2d, dir_2d), fp)
+        slot_value = ht_values[dir_i * ht_capacity + entry_idx]
+        if value == slot_value:
+            matched = True
+        elif value > slot_value:
+            beaten = True
+
+    if kept and not matched:
+        wp.atomic_add(violations, 0, 1)  # kept without winning: selection too permissive
+    if (not kept) and matched:
+        wp.atomic_add(violations, 0, 1)  # winner discarded: selection missed it
+    if (not kept) and (not matched) and beaten:
+        wp.atomic_add(violations, 2, 1)  # out-ranks a slot winner: atomic lost an update
 
 
 @wp.kernel(enable_backward=False)
@@ -427,6 +508,66 @@ def _gather_kept_contacts_kernel(
 
 
 @wp.kernel(enable_backward=False)
+def _scatter_back_kernel(
+    contact_count: wp.array[wp.int32],
+    src_point_id: wp.array[wp.int32],
+    src_shape0: wp.array[wp.int32],
+    src_shape1: wp.array[wp.int32],
+    src_point0: wp.array[wp.vec3],
+    src_point1: wp.array[wp.vec3],
+    src_offset0: wp.array[wp.vec3],
+    src_offset1: wp.array[wp.vec3],
+    src_normal: wp.array[wp.vec3],
+    src_margin0: wp.array[wp.float32],
+    src_margin1: wp.array[wp.float32],
+    src_tids: wp.array[wp.int32],
+    has_material: int,
+    src_stiffness: wp.array[wp.float32],
+    src_damping: wp.array[wp.float32],
+    src_friction: wp.array[wp.float32],
+    # outputs
+    dst_point_id: wp.array[wp.int32],
+    dst_shape0: wp.array[wp.int32],
+    dst_shape1: wp.array[wp.int32],
+    dst_point0: wp.array[wp.vec3],
+    dst_point1: wp.array[wp.vec3],
+    dst_offset0: wp.array[wp.vec3],
+    dst_offset1: wp.array[wp.vec3],
+    dst_normal: wp.array[wp.vec3],
+    dst_margin0: wp.array[wp.float32],
+    dst_margin1: wp.array[wp.float32],
+    dst_tids: wp.array[wp.int32],
+    dst_stiffness: wp.array[wp.float32],
+    dst_damping: wp.array[wp.float32],
+    dst_friction: wp.array[wp.float32],
+):
+    """Write the compacted contacts back into the live arrays.
+
+    Runs after ``_write_reduced_count_kernel``, so ``contact_count`` already
+    holds the kept count: only the live range is touched, instead of copying
+    entire capacity-sized arrays back.
+    """
+    i = wp.tid()
+    if i >= contact_count[0]:
+        return
+    dst_point_id[i] = src_point_id[i]
+    dst_shape0[i] = src_shape0[i]
+    dst_shape1[i] = src_shape1[i]
+    dst_point0[i] = src_point0[i]
+    dst_point1[i] = src_point1[i]
+    dst_offset0[i] = src_offset0[i]
+    dst_offset1[i] = src_offset1[i]
+    dst_normal[i] = src_normal[i]
+    dst_margin0[i] = src_margin0[i]
+    dst_margin1[i] = src_margin1[i]
+    dst_tids[i] = src_tids[i]
+    if has_material != 0:
+        dst_stiffness[i] = src_stiffness[i]
+        dst_damping[i] = src_damping[i]
+        dst_friction[i] = src_friction[i]
+
+
+@wp.kernel(enable_backward=False)
 def _write_reduced_count_kernel(
     keep_scan: wp.array[wp.int32],
     # in/out
@@ -446,10 +587,6 @@ class BodyPairContactReducer:
 
     Args:
         rigid_contact_max: Capacity of the ``Contacts`` buffer being reduced.
-        depth_window: Gap band [m] above a group's deepest contact within
-            which contacts compete for the spatial-extreme (footprint hull)
-            slots. Contacts shallower than that only survive if they are their
-            group's deepest.
         cell_size: Spatial cell edge [m] on the normal bin's face plane. Each
             (body pair, bin, cell) keeps its own deepest + extremes, so
             same-normal patches farther apart than a cell never compete.
@@ -459,14 +596,13 @@ class BodyPairContactReducer:
     def __init__(
         self,
         rigid_contact_max: int,
-        depth_window: float,
-        cell_size: float,
+            cell_size: float,
         device,
         hashtable_factor: float = 0.25,
         borrowed_scratch: dict | None = None,
+        verify: bool = False,
     ):
         self.rigid_contact_max = rigid_contact_max
-        self.depth_window = float(depth_window)
         self.cell_size = float(cell_size)
         self.device = device
         # Full-size gather scratch borrowed from the deterministic sorter (see
@@ -475,6 +611,12 @@ class BodyPairContactReducer:
         # scratch footprint. Fields the sorter did not allocate (zero-length
         # material arrays, point_id) are allocated locally on first use.
         self._borrowed_scratch = borrowed_scratch
+        self.verify = bool(verify)
+        # Telemetry counters, read via stats(): [0] invariant violations
+        # (verify mode only), [1] fail-open keeps (hashtable full), never
+        # reset automatically -- whole-run accumulators like the row
+        # watermarks.
+        self._stats = wp.zeros(3, dtype=wp.int32, device=device)
         # One entry per (body pair, bin, cell) actually touched -- far fewer
         # than contacts. Undersizing is safe: on a full table the insert
         # kernels keep the contact unconditionally (fail open), so the factor
@@ -585,7 +727,13 @@ class BodyPairContactReducer:
                 self.hashtable.active_slots,
                 self.ht_values,
             ],
-            outputs=[self.keep_flags, self.contact_entry, self.contact_gap, self.contact_pos2d],
+            outputs=[
+                self.keep_flags,
+                self.contact_entry,
+                self.contact_gap,
+                self.contact_pos2d,
+                self._stats,
+            ],
             device=self.device,
             record_tape=False,
         )
@@ -598,7 +746,6 @@ class BodyPairContactReducer:
                 self.contact_gap,
                 self.contact_pos2d,
                 sort_keys,
-                self.depth_window,
                 self.hashtable.capacity,
                 self.ht_values,
             ],
@@ -614,7 +761,6 @@ class BodyPairContactReducer:
                 self.contact_gap,
                 self.contact_pos2d,
                 sort_keys,
-                self.depth_window,
                 self.hashtable.capacity,
                 self.ht_values,
             ],
@@ -622,9 +768,32 @@ class BodyPairContactReducer:
             device=self.device,
             record_tape=False,
         )
+        if self.verify:
+            wp.launch(
+                _verify_invariant_kernel,
+                dim=n,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    self.contact_entry,
+                    self.contact_gap,
+                        self.contact_pos2d,
+                    sort_keys,
+                        self.hashtable.capacity,
+                    self.ht_values,
+                    self.keep_flags,
+                ],
+                outputs=[self._stats],
+                device=self.device,
+                record_tape=False,
+            )
         wp.utils.array_scan(self.keep_flags, self.keep_scan, True)
 
         has_material = int(has_material)
+        mat_dst = (
+            (contacts.rigid_contact_stiffness, contacts.rigid_contact_damping, contacts.rigid_contact_friction)
+            if has_material
+            else (sc["stiffness"], sc["damping"], sc["friction"])
+        )
         mat_src = (
             (contacts.rigid_contact_stiffness, contacts.rigid_contact_damping, contacts.rigid_contact_friction)
             if has_material
@@ -680,18 +849,60 @@ class BodyPairContactReducer:
             device=self.device,
             record_tape=False,
         )
-        wp.copy(contacts.rigid_contact_point_id, sc["point_id"])
-        wp.copy(contacts.rigid_contact_shape0, sc["shape0"])
-        wp.copy(contacts.rigid_contact_shape1, sc["shape1"])
-        wp.copy(contacts.rigid_contact_point0, sc["point0"])
-        wp.copy(contacts.rigid_contact_point1, sc["point1"])
-        wp.copy(contacts.rigid_contact_offset0, sc["offset0"])
-        wp.copy(contacts.rigid_contact_offset1, sc["offset1"])
-        wp.copy(contacts.rigid_contact_normal, sc["normal"])
-        wp.copy(contacts.rigid_contact_margin0, sc["margin0"])
-        wp.copy(contacts.rigid_contact_margin1, sc["margin1"])
-        wp.copy(contacts.rigid_contact_tids, sc["tids"])
-        if has_material:
-            wp.copy(contacts.rigid_contact_stiffness, sc["stiffness"])
-            wp.copy(contacts.rigid_contact_damping, sc["damping"])
-            wp.copy(contacts.rigid_contact_friction, sc["friction"])
+        wp.launch(
+            _scatter_back_kernel,
+            dim=n,
+            inputs=[
+                contacts.rigid_contact_count,
+                sc["point_id"],
+                sc["shape0"],
+                sc["shape1"],
+                sc["point0"],
+                sc["point1"],
+                sc["offset0"],
+                sc["offset1"],
+                sc["normal"],
+                sc["margin0"],
+                sc["margin1"],
+                sc["tids"],
+                has_material,
+                sc["stiffness"],
+                sc["damping"],
+                sc["friction"],
+            ],
+            outputs=[
+                contacts.rigid_contact_point_id,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_offset0,
+                contacts.rigid_contact_offset1,
+                contacts.rigid_contact_normal,
+                contacts.rigid_contact_margin0,
+                contacts.rigid_contact_margin1,
+                contacts.rigid_contact_tids,
+                mat_dst[0],
+                mat_dst[1],
+                mat_dst[2],
+            ],
+            device=self.device,
+            record_tape=False,
+        )
+
+    def stats(self) -> dict:
+        """Whole-run reduction telemetry (forces a device sync; read outside capture).
+
+        Returns:
+            ``invariant_violations``: disagreements found by the opt-in
+            ``verify`` re-derivation (0 when verify is off).
+            ``fail_open_keeps``: contacts kept unconditionally because the
+            hashtable was full -- sustained non-zero values mean the
+            ``hashtable_factor`` is too small for the scene.
+        """
+        v = self._stats.numpy()
+        return {
+            "invariant_violations": int(v[0]),
+            "fail_open_keeps": int(v[1]),
+            "outranked_discards": int(v[2]),
+        }

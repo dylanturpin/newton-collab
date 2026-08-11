@@ -907,8 +907,8 @@ class CollisionPipeline:
         verify_buffers: bool = True,
         contact_reduction_hashtable_size_factor: float = 0.25,
         reduce_contacts_body_pairs: bool = False,
-        reduce_contacts_body_pairs_depth_window: float = 3.0e-3,
         reduce_contacts_body_pairs_cell: float = 0.25,
+        reduce_contacts_body_pairs_verify: bool = False,
     ):
         """
         Initialize the CollisionPipeline (expert API).
@@ -1021,20 +1021,17 @@ class CollisionPipeline:
                 function of contact content); combine with
                 ``deterministic=True`` if a canonical buffer ORDER is also
                 required.  Defaults to ``False``.
-            reduce_contacts_body_pairs_depth_window: Gap band [m] above a
-                group's deepest contact within which contacts compete for the
-                footprint-extreme slots of their normal bin; shallower
-                contacts only survive if they are their group's deepest
-                (closest) candidate.  Relative to the group's own deepest gap
-                because witness/margin conventions differ between narrow-phase
-                contact modes, making absolute gaps incomparable.  Defaults to
-                ``3e-3``.
             reduce_contacts_body_pairs_cell: Spatial cell edge [m] used to
                 subdivide each body pair + normal bin on the bin's face
                 plane; every cell keeps its own deepest contact and footprint
                 extremes, so same-normal patches farther apart than a cell
                 (a long body across separate regions of one terrain collider)
                 are each fully represented.  Defaults to ``0.25``.
+            reduce_contacts_body_pairs_verify: Launch a certificate kernel each
+                collide that re-derives every keep/discard decision and counts
+                disagreements into a telemetry counter (read via the reducer's
+                ``stats()``).  Debug/CI aid; costs one extra pass over the
+                contacts.  Defaults to ``False``.
 
         .. experimental::
 
@@ -1387,10 +1384,10 @@ class CollisionPipeline:
                 )
             self._body_pair_reducer = BodyPairContactReducer(
                 rigid_contact_max,
-                reduce_contacts_body_pairs_depth_window,
                 reduce_contacts_body_pairs_cell,
                 device,
                 borrowed_scratch=(self._contact_sorter.borrow_full_scratch() if self._contact_sorter else None),
+                verify=reduce_contacts_body_pairs_verify,
             )
         else:
             self._body_pair_reducer = None

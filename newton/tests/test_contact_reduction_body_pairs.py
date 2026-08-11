@@ -724,3 +724,97 @@ class TestBodyPairReductionFPGSImpact(unittest.TestCase):
         self.assertLess(abs(float(z_off[-30:].mean()) - float(z_on[-30:].mean())), 5e-4)
         # bounded touchdown transient: never punches through the resting height by > 2.5 mm
         self.assertGreater(float(z_on.min()), 0.015 - 2.5e-3)
+
+
+class TestBodyPairReductionCertificate(unittest.TestCase):
+    """The verify mode re-derives every keep/discard decision and finds zero disagreements."""
+
+    def test_certificate_zero_violations_settling(self):
+        """Certify the invariant over a full settling trajectory.
+
+        Every collide re-checks: no discarded contact out-ranks a slot winner
+        it was eligible for, and every kept registered contact matches a slot
+        it won. Any nonzero counter is a slot race, clearing bug, or ranking
+        regression.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (5.13, 5.07, 0.020))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_verify=True)
+        contacts = pipeline.contacts()
+        solver = newton.solvers.SolverXPBD(model, iterations=8)
+        for _ in range(240):
+            pipeline.collide(state_0, contacts)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, contacts, DT)
+            state_0, state_1 = state_1, state_0
+        stats = pipeline._body_pair_reducer.stats()
+        self.assertEqual(stats["invariant_violations"], 0)
+        self.assertEqual(stats["fail_open_keeps"], 0)
+
+    def test_property_random_piles(self):
+        """Fuzz the invariant and stability on randomized primitive piles.
+
+        Seeded random mixes of spheres, boxes, capsules, and cylinders are
+        dropped into a pile -- geometry nobody hand-picked. Asserts: the
+        certificate stays clean, the registered count is reduced, nothing
+        blows up, and no body tunnels through the ground.
+        """
+        rng = np.random.default_rng(1234)
+        for trial in range(3):
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+            bodies = []
+            for k in range(10):
+                # spawn strictly non-overlapping (max shape extent is 0.16 m):
+                # interpenetrating spawns make BOTH pipelines ballistic and the
+                # comparison chaotic rather than physical
+                pos = (float(rng.uniform(-0.15, 0.15)), float(rng.uniform(-0.15, 0.15)), 0.10 + 0.18 * k)
+                body = builder.add_body(xform=wp.transform(wp.vec3(*pos), wp.quat_identity()), mass=0.5)
+                bodies.append(body)
+                kind = int(rng.integers(0, 4))
+                if kind == 0:
+                    builder.add_shape_sphere(body, radius=float(rng.uniform(0.02, 0.05)))
+                elif kind == 1:
+                    builder.add_shape_box(
+                        body,
+                        hx=float(rng.uniform(0.02, 0.05)),
+                        hy=float(rng.uniform(0.02, 0.05)),
+                        hz=float(rng.uniform(0.02, 0.05)),
+                    )
+                elif kind == 2:
+                    builder.add_shape_capsule(
+                        body, radius=float(rng.uniform(0.015, 0.03)), half_height=float(rng.uniform(0.02, 0.05))
+                    )
+                else:
+                    builder.add_shape_cylinder(
+                        body, radius=float(rng.uniform(0.02, 0.04)), half_height=float(rng.uniform(0.02, 0.05))
+                    )
+            builder.add_ground_plane()
+            model = builder.finalize(device=wp.get_device())
+            state_0, state_1 = model.state(), model.state()
+            control = model.control()
+            pipe_red = _make_pipeline(model, True, reduce_contacts_body_pairs_verify=True)
+            pipe_raw = newton.CollisionPipeline(model, broad_phase="nxn")
+            c_red, c_raw = pipe_red.contacts(), pipe_raw.contacts()
+            solver = newton.solvers.SolverXPBD(model, iterations=8)
+            raw_more = 0
+            for _ in range(150):
+                pipe_raw.collide(state_0, c_raw)
+                pipe_red.collide(state_0, c_red)
+                raw_more += int(
+                    c_raw.rigid_contact_count.numpy()[0] >= c_red.rigid_contact_count.numpy()[0]
+                )
+                state_0.clear_forces()
+                solver.step(state_0, state_1, control, c_red, DT)
+                state_0, state_1 = state_1, state_0
+            stats = pipe_red._body_pair_reducer.stats()
+            self.assertEqual(stats["invariant_violations"], 0, f"trial {trial}")
+            self.assertEqual(raw_more, 150, f"trial {trial}: reduction increased a count")
+            body_q = state_0.body_q.numpy()
+            qd = state_0.body_qd.numpy()
+            self.assertTrue(np.isfinite(body_q).all() and np.isfinite(qd).all())
+            self.assertLess(float(np.abs(qd).max()), 50.0, f"trial {trial}: pile blew up")
+            self.assertGreater(float(body_q[bodies, 2].min()), -0.06, f"trial {trial}: body tunneled")
