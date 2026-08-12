@@ -806,6 +806,53 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
         self.assertEqual(stats["invariant_violations"], 0)
         self.assertEqual(stats["fail_open_keeps"], 0)
 
+    def test_kept_set_independent_of_previous_step(self):
+        """Reduce a state to the same kept set whether or not a busier step preceded it.
+
+        The pass carries capacity-sized scratch across steps -- keep flags, the
+        per-contact hashtable-entry cache, and the per-entry slot values -- and
+        refreshes only the live range each step, so nothing may depend on how
+        busy the previous step was. Drive one pipeline through a three-foot step
+        and then a one-foot step, and require the one-foot result to match a
+        pipeline that only ever saw that state.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        feet = [_cylinder_foot(builder, (1.5 * k, 0.0, 0.020)) for k in range(3)]
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+
+        state_busy = model.state()
+        state_quiet = model.state()
+        q = state_quiet.body_q.numpy()
+        for b in feet[1:]:
+            q[b][2] += 5.0  # lift two feet clear of the ground
+        state_quiet.body_q.assign(q)
+
+        with_history = _make_pipeline(model, True, reduce_contacts_body_pairs_verify=True)
+        contacts_h = with_history.contacts()
+        with_history.collide(state_busy, contacts_h)
+        n_busy = int(contacts_h.rigid_contact_count.numpy()[0])
+        with_history.collide(state_quiet, contacts_h)
+
+        fresh = _make_pipeline(model, True, reduce_contacts_body_pairs_verify=True)
+        contacts_f = fresh.contacts()
+        fresh.collide(state_quiet, contacts_f)
+
+        n_h, s0_h, s1_h, _nrm_h, p0_h = _contact_snapshot(contacts_h)
+        n_f, s0_f, s1_f, _nrm_f, p0_f = _contact_snapshot(contacts_f)
+        self.assertGreater(n_busy, n_f, "the busy step must really register more contacts")
+        self.assertEqual(n_h, n_f, "kept count depends on the previous step")
+
+        def canonical(s0, s1, p0):
+            rows = [(int(a), int(b), *(round(float(v), 6) for v in p)) for a, b, p in zip(s0, s1, p0, strict=True)]
+            return sorted(rows)
+
+        self.assertEqual(canonical(s0_h, s1_h, p0_h), canonical(s0_f, s1_f, p0_f))
+        for pipe in (with_history, fresh):
+            stats = pipe._body_pair_reducer.stats()
+            self.assertEqual(stats["invariant_violations"], 0)
+            self.assertEqual(stats["outranked_discards"], 0)
+
     def test_property_random_piles(self):
         """Fuzz the invariant and stability on randomized primitive piles.
 

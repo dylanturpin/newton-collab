@@ -1333,10 +1333,7 @@ class CollisionPipeline:
         self.requires_grad = requires_grad
         self.deterministic = deterministic
         per_contact_props = self.narrow_phase.hydroelastic_sdf is not None
-        if deterministic or reduce_contacts_body_pairs:
-            # The reduction's winner selection tie-breaks on a fingerprint of
-            # the content-derived sort key, so the key array must be populated
-            # even when the sorter itself is not requested.
+        if deterministic:
             with wp.ScopedDevice(device):
                 self._sort_key_array = wp.zeros(rigid_contact_max, dtype=wp.int64, device=device)
         else:
@@ -1772,7 +1769,7 @@ class CollisionPipeline:
         # decomposition. Runs before the differentiable augmentation so the
         # diff arrays are built from the compacted set.
         if self._body_pair_reducer is not None:
-            self._body_pair_reducer.reduce(model, state, contacts, self._sort_key_array)
+            self._body_pair_reducer.reduce(model, state, contacts)
             # Stamp the buffer so consumers can verify support (see
             # SolverBase.supports_reduced_contacts).
             contacts.rigid_contacts_reduced = True
