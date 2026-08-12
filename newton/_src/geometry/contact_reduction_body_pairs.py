@@ -6,10 +6,12 @@
 Multi-shape bodies multiply narrow-phase output: a foot approximated by 7
 cylinders emits up to 28 candidate contacts against a plane and up to 49
 against another such foot, while the underlying physics is one flat patch that
-is fully described by its deepest point plus the extremes of its footprint
-(any interior point's force is a convex combination of forces at the hull
-points, so discarding interior points preserves the feasible contact wrench
-exactly).
+is described by its deepest point plus the extremes of its footprint.  An
+interior point's NORMAL force is a convex combination of hull-point normal
+forces, so support and tipping statics are preserved exactly, and translational
+friction capacity (``sum mu*N_i``) is position-independent and preserved too.
+The one wrench component this argument does NOT cover is torsional friction --
+see the known-characteristic note below.
 
 This pass runs after the narrow phase has written the ``Contacts`` buffer and
 compacts it in two kernels over the live contact range -- register, then select:
@@ -49,13 +51,22 @@ touching floor and wall at once) keep representatives of every patch.  On
 hashtable overflow the pass fails open: a contact that cannot be registered is
 kept, never dropped.
 
-**Known characteristic -- torsional patch friction.** Keeping a patch's rim
-extremes lengthens its mean friction lever arm: a spinning multi-collider disc
-stops ~25% sooner reduced than unreduced (adversarial A/B, mu 0.3 and 0.6).
-This is inherent to any patch-thinning that keeps boundary points -- PhysX's
-4-point persistent manifolds carry the same rim bias -- and is bounded and
-smooth, so it is documented rather than patched.  Watch yaw-tracking error when
-validating policies whose feet pivot.
+**Known characteristic -- torsional patch friction.** During twist, friction at
+every contact is saturated at ``mu*N_i``, so the resisting torque is
+``mu * sum(N_i * r_i)`` -- fixed by WHERE the normal load sits, with no
+remaining freedom for the solver to redistribute.  Keeping only rim extremes
+forces the load to the largest lever arms, the maximizer of that sum: a
+spinning multi-collider disc stops ~25% sooner reduced than unreduced
+(adversarial A/B, mu 0.3 and 0.6; FPGS measures 1.34x the uniform-pressure
+torque against a geometric ceiling of 1.5x).  A dense point set approximates
+the uniform-pressure integral only by accident of even loading -- nobody
+reweights in either case -- and no placement of boundary points can match both
+translational capacity (``sum mu*N_i``) and the continuum torsion
+(``2/3 mu*W*R``) simultaneously: the bias is inherent to any reduction that
+keeps a patch's boundary points.  Bounded, smooth, and documented rather than
+patched; the principled fix, if yaw transfer measurably suffers, is an
+explicit per-patch torsion row in the solver, not point placement.  Watch
+yaw-tracking error when validating policies whose feet pivot.
 
 All launches are fixed-size and the pass is CUDA-graph-capture compatible.
 """
