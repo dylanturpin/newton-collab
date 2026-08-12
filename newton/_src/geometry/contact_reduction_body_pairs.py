@@ -51,6 +51,19 @@ touching floor and wall at once) keep representatives of every patch.  On
 hashtable overflow the pass fails open: a contact that cannot be registered is
 kept, never dropped.
 
+**Temporal hysteresis.** Winner selection alone is memoryless, and on curved or
+mesh support (flat analytic planes are immune) the score differences between a
+patch's near-symmetric contacts are curvature-sized, so the argmax reorders
+continuously: the kept set churns every step and a resting multi-collider body
+sustains a bounded rocking limit cycle instead of settling.  With hysteresis
+enabled (the default), each step snapshots the winners, and a contact that held
+a slot keeps a score bonus of the hysteresis margin for that slot -- a
+challenger better by more than the margin still wins immediately, incumbency
+follows the contact's quantized pair-anchored position so it disengages by
+itself under real sliding, and the kept set becomes a function of contact
+geometry plus the previous step's winners.  Set the margin to ``0`` for the
+exact, memoryless behavior.
+
 **Known characteristic -- torsional patch friction.** During twist, friction at
 every contact is saturated at ``mu*N_i``, so the resisting torque is
 ``mu * sum(N_i * r_i)`` -- fixed by WHERE the normal load sits, with no
@@ -77,7 +90,13 @@ import warp as wp
 
 from ..sim.contacts import contact_surface_separation
 from .contact_reduction import float_flip
-from .hashtable import HashTable, hashtable_find_or_insert
+from .hashtable import (
+    _HASHTABLE_EMPTY_KEY_VALUE,
+    HASHTABLE_EMPTY_KEY,
+    HashTable,
+    hashtable_find,
+    hashtable_find_or_insert,
+)
 
 # Normal-binning table PRIVATE to body-pair reduction: the icosahedron from
 # :mod:`contact_reduction`, rotated so a face CENTER points at world +Z and the
@@ -423,6 +442,107 @@ REDUCTION_MAX_THREADS = 262144
 
 
 @wp.func
+def _incumbent_mask(
+    key: wp.uint64,
+    pos_key: wp.uint64,
+    prev_keys: wp.array[wp.uint64],
+    prev_winner_pos: wp.array[wp.uint32],
+) -> int:
+    """Return the bitmask of slots this contact won on the PREVIOUS step.
+
+    Probes the previous step's snapshot with the contact's group key and
+    compares the contact's own position identity against each slot's recorded
+    winner.  Identity is the quantized pair-anchored position, so a persisting
+    near-static contact keeps matching itself across steps, while a contact
+    sliding faster than the 0.5 mm quantum per step naturally stops matching --
+    hysteresis engages exactly where kept-set churn lives (near-degenerate,
+    slowly-varying patches) and disengages under real motion, where fresh
+    extremes must win.
+    """
+    mask = int(0)
+    prev_entry = hashtable_find(key, prev_keys)
+    if prev_entry >= 0:
+        me = wp.uint32(pos_key)
+        for slot in range(wp.static(BODY_PAIR_REDUCTION_SLOTS)):
+            if prev_winner_pos[_slot_index(prev_entry, slot)] == me:
+                mask |= 1 << slot
+    return mask
+
+
+@wp.func
+def _biased_primary(primary: float, hysteresis: float, mask: int, slot: int) -> float:
+    """Add the hysteresis bonus to ``primary`` if this contact holds ``slot``.
+
+    The bonus is added to the raw score BEFORE packing, identically in the
+    register, select, and verify passes, so winner self-identification still
+    works by exact value equality.  A challenger better by more than
+    ``hysteresis`` still wins: the bias resolves only near-degenerate handoffs,
+    which is the churn that keeps multi-collider bodies on curved support from
+    ever coming to rest (winner argmax is otherwise memoryless, and
+    curvature-induced score differences between symmetric contacts reorder
+    continuously).
+    """
+    if (mask >> slot) & 1 != 0:
+        return primary + hysteresis
+    return primary
+
+
+@wp.kernel(enable_backward=False)
+def _clear_prev_snapshot_kernel(
+    ht_capacity: int,
+    num_threads: int,
+    # in/out
+    prev_active_slots: wp.array[wp.int32],
+    prev_keys: wp.array[wp.uint64],
+):
+    """Erase the previous snapshot's keys so stale groups cannot be probed.
+
+    Only the keys need clearing: an entry's winner positions are unreachable
+    once its key is gone, and a re-snapshotted entry overwrites all its slots.
+    """
+    count = prev_active_slots[ht_capacity]
+    t = wp.tid()
+    while t < count:
+        prev_keys[prev_active_slots[t]] = HASHTABLE_EMPTY_KEY
+        t += num_threads
+
+
+@wp.kernel(enable_backward=False)
+def _snapshot_prev_kernel(
+    ht_keys: wp.array[wp.uint64],
+    ht_active_slots: wp.array[wp.int32],
+    ht_values: wp.array[wp.uint64],
+    ht_capacity: int,
+    num_threads: int,
+    # outputs
+    prev_keys: wp.array[wp.uint64],
+    prev_winner_pos: wp.array[wp.uint32],
+    prev_active_slots: wp.array[wp.int32],
+):
+    """Snapshot last step's winners before the live table is cleared.
+
+    Copies each active entry's group key and, per slot, the winner's position
+    identity (the low 31 bits of the packed value; 0 for slots no contact won).
+    Entries keep their table index, so the snapshot is probed with the same
+    hash layout as the live table.  Copying instead of pointer-swapping keeps
+    every kernel argument fixed across steps, which CUDA graph capture
+    requires.
+    """
+    count = ht_active_slots[ht_capacity]
+    t = wp.tid()
+    if t == 0:
+        prev_active_slots[ht_capacity] = count
+    while t < count:
+        entry_idx = ht_active_slots[t]
+        prev_active_slots[t] = entry_idx
+        prev_keys[entry_idx] = ht_keys[entry_idx]
+        for slot in range(wp.static(BODY_PAIR_REDUCTION_SLOTS)):
+            idx = _slot_index(entry_idx, slot)
+            prev_winner_pos[idx] = wp.uint32(ht_values[idx] & wp.uint64(0x7FFFFFFF))
+        t += num_threads
+
+
+@wp.func
 def _register_contact_one(
     i: int,
     contact_shape0: wp.array[wp.int32],
@@ -439,10 +559,14 @@ def _register_contact_one(
     ht_keys: wp.array[wp.uint64],
     ht_active_slots: wp.array[wp.int32],
     ht_values: wp.array[wp.uint64],
+    hysteresis: float,
+    prev_keys: wp.array[wp.uint64],
+    prev_winner_pos: wp.array[wp.uint32],
     keep_flags: wp.array[wp.int32],
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
+    contact_incumbent: wp.array[wp.int32],
     stats: wp.array[wp.int32],
 ):
     """Enter contact ``i`` into every slot of its group: depth and all extremes.
@@ -493,13 +617,19 @@ def _register_contact_one(
     contact_pos2d[i] = pos_2d
 
     pos_key = _pos_key_31(pos_2d)
-    depth_value = _pack_score(-gap, pos_key)
+    mask = int(0)
+    if hysteresis > 0.0:
+        mask = _incumbent_mask(key, pos_key, prev_keys, prev_winner_pos)
+        contact_incumbent[i] = mask
+
+    depth_value = _pack_score(_biased_primary(-gap, hysteresis, mask, wp.static(DEEPEST_SLOT)), pos_key)
     slot_idx = _slot_index(entry_idx, wp.static(DEEPEST_SLOT))
     if ht_values[slot_idx] < depth_value:
         wp.atomic_max(ht_values, slot_idx, depth_value)
 
     for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
-        value = _pack_score(wp.dot(pos_2d, _direction_2d(dir_i)), pos_key)
+        primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), hysteresis, mask, dir_i)
+        value = _pack_score(primary, pos_key)
         dir_slot = _slot_index(entry_idx, dir_i)
         if ht_values[dir_slot] < value:
             wp.atomic_max(ht_values, dir_slot, value)
@@ -522,21 +652,25 @@ def _register_contacts_kernel(
     ht_keys: wp.array[wp.uint64],
     ht_active_slots: wp.array[wp.int32],
     ht_values: wp.array[wp.uint64],
+    hysteresis: float,
+    prev_keys: wp.array[wp.uint64],
+    prev_winner_pos: wp.array[wp.uint32],
     num_threads: int,
     # outputs
     keep_flags: wp.array[wp.int32],
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
+    contact_incumbent: wp.array[wp.int32],
     stats: wp.array[wp.int32],
 ):
     """Pass 1 of 2: enter every contact into all slots of its group.
 
-    Caches each contact's hashtable entry, gap, face-plane position, and content
-    fingerprint so the selection pass neither recomputes geometry nor re-probes
-    the table.  A contact that cannot be registered (hashtable full or detached
-    shape) is kept unconditionally -- reduction must fail open, never drop
-    silently.
+    Caches each contact's hashtable entry, gap, face-plane position, and
+    incumbency mask so the selection pass neither recomputes geometry nor
+    re-probes either table.  A contact that cannot be registered (hashtable
+    full or detached shape) is kept unconditionally -- reduction must fail
+    open, never drop silently.
     """
     count = contact_count[0]
     i = wp.tid()
@@ -557,10 +691,14 @@ def _register_contacts_kernel(
             ht_keys,
             ht_active_slots,
             ht_values,
+            hysteresis,
+            prev_keys,
+            prev_winner_pos,
             keep_flags,
             contact_entry,
             contact_gap,
             contact_pos2d,
+            contact_incumbent,
             stats,
         )
         i += num_threads
@@ -596,6 +734,8 @@ def _select_winner_one(
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
+    contact_incumbent: wp.array[wp.int32],
+    hysteresis: float,
     ht_values: wp.array[wp.uint64],
     keep_flags: wp.array[wp.int32],
 ):
@@ -606,14 +746,18 @@ def _select_winner_one(
 
     gap = contact_gap[i]
     pos_2d = contact_pos2d[i]
+    mask = int(0)
+    if hysteresis > 0.0:
+        mask = contact_incumbent[i]
 
     # NOTE: no early ``return`` inside the loop -- Warp does not reliably honor
     # returns from within a for-loop, so accumulate and flag once.
     pos_key = _pos_key_31(pos_2d)
-    won = ht_values[_slot_index(entry_idx, wp.static(DEEPEST_SLOT))] == _pack_score(-gap, pos_key)
+    depth_primary = _biased_primary(-gap, hysteresis, mask, wp.static(DEEPEST_SLOT))
+    won = ht_values[_slot_index(entry_idx, wp.static(DEEPEST_SLOT))] == _pack_score(depth_primary, pos_key)
     for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
-        value = _pack_score(wp.dot(pos_2d, _direction_2d(dir_i)), pos_key)
-        if ht_values[_slot_index(entry_idx, dir_i)] == value:
+        primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), hysteresis, mask, dir_i)
+        if ht_values[_slot_index(entry_idx, dir_i)] == _pack_score(primary, pos_key):
             won = True
     if won:
         keep_flags[i] = 1
@@ -625,6 +769,8 @@ def _select_winners_kernel(
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
+    contact_incumbent: wp.array[wp.int32],
+    hysteresis: float,
     ht_values: wp.array[wp.uint64],
     num_threads: int,
     # outputs
@@ -634,15 +780,18 @@ def _select_winners_kernel(
 
     Winner self-identification: the packed values carry no buffer index, so a
     contact is kept iff one of the values it submitted equals the slot's final
-    winner. Two contacts with identical content (equal score AND fingerprint)
-    both match and are both kept -- reduction fails open on true ties. The
-    kept set is therefore a pure function of contact content: invariant to
+    winner. Two contacts with identical content (equal biased score AND
+    position identity) both match and are both kept -- reduction fails open on
+    true ties. The kept set is therefore a pure function of contact geometry
+    plus, when hysteresis is enabled, the previous step's winners: invariant to
     thread scheduling, buffer order, and buffer capacity.
     """
     count = contact_count[0]
     i = wp.tid()
     while i < count:
-        _select_winner_one(i, contact_entry, contact_gap, contact_pos2d, ht_values, keep_flags)
+        _select_winner_one(
+            i, contact_entry, contact_gap, contact_pos2d, contact_incumbent, hysteresis, ht_values, keep_flags
+        )
         i += num_threads
 
 
@@ -652,6 +801,8 @@ def _verify_invariant_one(
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
+    contact_incumbent: wp.array[wp.int32],
+    hysteresis: float,
     ht_values: wp.array[wp.uint64],
     keep_flags: wp.array[wp.int32],
     violations: wp.array[wp.int32],
@@ -664,20 +815,24 @@ def _verify_invariant_one(
     gap = contact_gap[i]
     pos_2d = contact_pos2d[i]
     kept = keep_flags[i] != 0
+    mask = int(0)
+    if hysteresis > 0.0:
+        mask = contact_incumbent[i]
 
     matched = False
     beaten = False
 
     pos_key = _pos_key_31(pos_2d)
     deepest_value = ht_values[_slot_index(entry_idx, wp.static(DEEPEST_SLOT))]
-    my_depth = _pack_score(-gap, pos_key)
+    my_depth = _pack_score(_biased_primary(-gap, hysteresis, mask, wp.static(DEEPEST_SLOT)), pos_key)
     if my_depth == deepest_value:
         matched = True
     elif my_depth > deepest_value:
         beaten = True  # I out-rank the recorded winner: the slot missed me
 
     for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
-        value = _pack_score(wp.dot(pos_2d, _direction_2d(dir_i)), pos_key)
+        primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), hysteresis, mask, dir_i)
+        value = _pack_score(primary, pos_key)
         slot_value = ht_values[_slot_index(entry_idx, dir_i)]
         if value == slot_value:
             matched = True
@@ -698,6 +853,8 @@ def _verify_invariant_kernel(
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
+    contact_incumbent: wp.array[wp.int32],
+    hysteresis: float,
     ht_values: wp.array[wp.uint64],
     keep_flags: wp.array[wp.int32],
     num_threads: int,
@@ -715,7 +872,17 @@ def _verify_invariant_kernel(
     count = contact_count[0]
     i = wp.tid()
     while i < count:
-        _verify_invariant_one(i, contact_entry, contact_gap, contact_pos2d, ht_values, keep_flags, violations)
+        _verify_invariant_one(
+            i,
+            contact_entry,
+            contact_gap,
+            contact_pos2d,
+            contact_incumbent,
+            hysteresis,
+            ht_values,
+            keep_flags,
+            violations,
+        )
         i += num_threads
 
 
@@ -967,6 +1134,19 @@ class BodyPairContactReducer:
             (body pair, bin, cell) keeps its own deepest + extremes, so
             same-normal patches farther apart than a cell never compete.
         device: Warp device.
+        hysteresis: Temporal hysteresis margin [m]. A contact that won a slot
+            on the previous step receives this bonus on its raw score for that
+            slot, so near-degenerate winners stop handing off every step -- the
+            churn that keeps multi-collider bodies on curved or mesh support
+            oscillating instead of coming to rest.  A challenger better by more
+            than the margin still wins immediately, and incumbency follows the
+            contact's quantized pair-anchored position, so it disengages by
+            itself once a contact slides faster than 0.5 mm per step.  Also
+            softens two exact guarantees by at most the margin: the depth
+            representative may be a contact within ``hysteresis`` of the true
+            deepest, and a spatial slot may hold a contact within ``hysteresis``
+            of the true extreme.  ``0`` disables the mechanism entirely and
+            restores the exact, memoryless behavior.
     """
 
     def __init__(
@@ -977,10 +1157,14 @@ class BodyPairContactReducer:
         hashtable_factor: float = 0.25,
         borrowed_scratch: dict | None = None,
         verify: bool = False,
+        hysteresis: float = 0.001,
     ):
         self.rigid_contact_max = rigid_contact_max
         self.cell_size = float(cell_size)
         self.device = device
+        self.hysteresis = float(hysteresis)
+        if not self.hysteresis >= 0.0:  # rejects NaN too
+            raise ValueError("hysteresis must be non-negative")
         # Full-size gather scratch borrowed from the deterministic sorter (see
         # ContactSorter.borrow_full_scratch): the two stages run strictly
         # sequentially inside collide(), so sharing halves the pipeline's
@@ -1008,6 +1192,24 @@ class BodyPairContactReducer:
         self.contact_entry = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
         self.contact_gap = wp.zeros(rigid_contact_max, dtype=wp.float32, device=device)
         self.contact_pos2d = wp.zeros(rigid_contact_max, dtype=wp.vec2, device=device)
+        # Previous-step winner snapshot for temporal hysteresis: group keys,
+        # per-slot winner position identities, and the active list needed to
+        # erase the snapshot next step. Rebuilt by copy each reduce (never
+        # pointer-swapped) so every kernel argument stays fixed for CUDA graph
+        # capture. Zero-length when hysteresis is off: the kernels take the
+        # arrays unconditionally but only touch them behind a hysteresis > 0
+        # guard.
+        if self.hysteresis > 0.0:
+            cap = self.hashtable.capacity
+            self.prev_keys = wp.full(cap, _HASHTABLE_EMPTY_KEY_VALUE, dtype=wp.uint64, device=device)
+            self.prev_winner_pos = wp.zeros(BODY_PAIR_REDUCTION_SLOTS * cap, dtype=wp.uint32, device=device)
+            self.prev_active_slots = wp.zeros(cap + 1, dtype=wp.int32, device=device)
+            self.contact_incumbent = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
+        else:
+            self.prev_keys = wp.zeros(0, dtype=wp.uint64, device=device)
+            self.prev_winner_pos = wp.zeros(0, dtype=wp.uint32, device=device)
+            self.prev_active_slots = wp.zeros(0, dtype=wp.int32, device=device)
+            self.contact_incumbent = wp.zeros(0, dtype=wp.int32, device=device)
         self._scratch = None
 
     def _ensure_scratch(self, need_material: bool):
@@ -1062,6 +1264,34 @@ class BodyPairContactReducer:
         self._ensure_scratch(has_material)
         sc = self._scratch
 
+        # Snapshot last step's winners BEFORE anything clears the live table:
+        # erase the old snapshot's keys, then copy the current active entries'
+        # keys and winner position identities across. Both kernels walk only
+        # the (small) active lists.
+        if self.hysteresis > 0.0:
+            wp.launch(
+                _clear_prev_snapshot_kernel,
+                dim=self.entry_stride_threads,
+                inputs=[self.hashtable.capacity, self.entry_stride_threads],
+                outputs=[self.prev_active_slots, self.prev_keys],
+                device=self.device,
+                record_tape=False,
+            )
+            wp.launch(
+                _snapshot_prev_kernel,
+                dim=self.entry_stride_threads,
+                inputs=[
+                    self.hashtable.keys,
+                    self.hashtable.active_slots,
+                    self.ht_values,
+                    self.hashtable.capacity,
+                    self.entry_stride_threads,
+                ],
+                outputs=[self.prev_keys, self.prev_winner_pos, self.prev_active_slots],
+                device=self.device,
+                record_tape=False,
+            )
+
         # keep_flags needs no memset: pass 1 writes every live entry, and
         # positions past the live count are never read (the scan output above
         # the count is unused, and the gather only walks the live range).
@@ -1102,6 +1332,9 @@ class BodyPairContactReducer:
                 self.hashtable.keys,
                 self.hashtable.active_slots,
                 self.ht_values,
+                self.hysteresis,
+                self.prev_keys,
+                self.prev_winner_pos,
                 self.stride_threads,
             ],
             outputs=[
@@ -1109,6 +1342,7 @@ class BodyPairContactReducer:
                 self.contact_entry,
                 self.contact_gap,
                 self.contact_pos2d,
+                self.contact_incumbent,
                 self._stats,
             ],
             device=self.device,
@@ -1122,6 +1356,8 @@ class BodyPairContactReducer:
                 self.contact_entry,
                 self.contact_gap,
                 self.contact_pos2d,
+                self.contact_incumbent,
+                self.hysteresis,
                 self.ht_values,
                 self.stride_threads,
             ],
@@ -1138,6 +1374,8 @@ class BodyPairContactReducer:
                     self.contact_entry,
                     self.contact_gap,
                     self.contact_pos2d,
+                    self.contact_incumbent,
+                    self.hysteresis,
                     self.ht_values,
                     self.keep_flags,
                     self.stride_threads,
@@ -1314,6 +1552,9 @@ class BodyPairContactReducer:
             "slots_per_entry": BODY_PAIR_REDUCTION_SLOTS,
             "hashtable_bytes": self.hashtable.keys.size * 8 + self.hashtable.active_slots.size * 4,
             "slot_value_bytes": self.ht_values.size * 8,
-            "per_contact_cache_bytes": n * (4 + 4 + 4 + 4 + 8),  # flags, scan, entry, gap, pos2d
+            "per_contact_cache_bytes": n * (4 + 4 + 4 + 4 + 8) + self.contact_incumbent.size * 4,
+            "hysteresis_snapshot_bytes": (
+                self.prev_keys.size * 8 + self.prev_winner_pos.size * 4 + self.prev_active_slots.size * 4
+            ),
             "gather_scratch_owned_bytes": owned,
         }

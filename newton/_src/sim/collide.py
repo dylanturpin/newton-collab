@@ -909,6 +909,7 @@ class CollisionPipeline:
         reduce_contacts_body_pairs: bool = False,
         reduce_contacts_body_pairs_cell: float = 0.25,
         reduce_contacts_body_pairs_verify: bool = False,
+        reduce_contacts_body_pairs_hysteresis: float = 0.001,
     ):
         """
         Initialize the CollisionPipeline (expert API).
@@ -1032,6 +1033,17 @@ class CollisionPipeline:
                 disagreements into a telemetry counter (read via the reducer's
                 ``stats()``).  Debug/CI aid; costs one extra pass over the
                 contacts.  Defaults to ``False``.
+            reduce_contacts_body_pairs_hysteresis: Temporal hysteresis margin
+                [m] for the reduction's winner selection: a contact that won a
+                slot on the previous step keeps it unless a challenger beats it
+                by more than this margin.  Without it, winner selection is
+                memoryless and near-degenerate extremes on curved or mesh
+                support hand off every step, so a multi-collider body never
+                comes to rest (a bounded rocking limit cycle).  Flat analytic
+                planes are unaffected either way.  The margin also bounds how
+                far the kept depth/extreme representatives may deviate from the
+                exact argmax winners.  ``0`` disables the mechanism and
+                restores exact memoryless selection.  Defaults to ``0.001``.
 
         .. experimental::
 
@@ -1385,6 +1397,7 @@ class CollisionPipeline:
                 device,
                 borrowed_scratch=(self._contact_sorter.borrow_full_scratch() if self._contact_sorter else None),
                 verify=reduce_contacts_body_pairs_verify,
+                hysteresis=reduce_contacts_body_pairs_hysteresis,
             )
         else:
             self._body_pair_reducer = None

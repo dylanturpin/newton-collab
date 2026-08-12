@@ -855,6 +855,137 @@ class TestBodyPairReductionGroupAssignment(unittest.TestCase):
         self.assertEqual(kept_sets[0], kept_sets[2], "kept set changed under translation")
 
 
+class TestBodyPairReductionHysteresis(unittest.TestCase):
+    """Temporal hysteresis: kept-set continuity without sticky wrong winners."""
+
+    def _curved_rock(self, hysteresis, steps=400):
+        """Sphere-grid plate rocking on a large-radius static sphere.
+
+        Curvature makes the plate's contact scores near-degenerate and
+        continuously varying -- the regime where memoryless winner selection
+        churns the kept set every step and the plate never settles. Returns the
+        mean |angular velocity| over the final quarter of the run.
+        """
+        r_ground = 20.0
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        builder.add_shape_sphere(
+            -1, xform=wp.transform(wp.vec3(0.0, 0.0, -r_ground), wp.quat_identity()), radius=r_ground
+        )
+        body = _sphere_grid_body(builder, (0.0, 0.0, 0.0095), n=4, spacing=0.05)
+        model = builder.finalize(device=wp.get_device())
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_hysteresis=hysteresis)
+        contacts = pipeline.contacts()
+        solver = newton.solvers.SolverXPBD(model, iterations=8)
+        tail = []
+        for k in range(steps):
+            pipeline.collide(state_0, contacts)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, contacts, DT)
+            state_0, state_1 = state_1, state_0
+            if k >= steps * 3 // 4:
+                tail.append(float(np.abs(state_0.body_qd.numpy()[body][:3]).max()))
+        return float(np.mean(tail))
+
+    def test_curved_support_settles(self):
+        """Settle a plate on curved support instead of sustaining a limit cycle.
+
+        With hysteresis off, near-degenerate winner handoffs re-excite the
+        contact set each step and the plate rocks forever; the incumbent bias
+        removes the churn. The off-case is measured in the same test so the
+        assertion is relative, not an absolute magic number.
+        """
+        residual_off = self._curved_rock(hysteresis=0.0)
+        residual_on = self._curved_rock(hysteresis=0.001)
+        self.assertLess(
+            residual_on, 0.5 * residual_off, f"hysteresis did not calm the limit cycle: {residual_on} vs {residual_off}"
+        )
+        self.assertLess(residual_on, 0.02, f"plate still not at rest: {residual_on} rad/s")
+
+    def test_challenger_beyond_margin_wins_immediately(self):
+        """Dethrone an incumbent depth winner as soon as a clearly deeper one exists.
+
+        Hysteresis must only stop near-tie handoffs. A three-cylinder foot
+        whose MIDDLE cylinder sits 2 mm lower is kept only through the depth
+        slot (both end cylinders own every spatial extreme). Establish
+        incumbency, then pitch the body so an end cylinder becomes deeper by
+        several times the 1 mm margin while every contact's in-plane position
+        moves less than the 0.5 mm identity quantum -- incumbency stays attached
+        AND must lose: the middle contact has to vanish from the kept set on
+        the very next collide.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0195), wp.quat_identity()), mass=1.0)
+        for i in range(3):
+            z_local = -0.002 if i == 1 else 0.0
+            builder.add_shape_cylinder(
+                body,
+                xform=wp.transform(wp.vec3((i - 1.0) * 0.05, 0.0, z_local), wp.quat_identity()),
+                radius=0.02,
+                half_height=0.015,
+            )
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)  # establish winners
+        pipeline.collide(state, contacts)  # winners now incumbents
+        pts = _world_points0(model, state, contacts)
+        mid = np.abs(pts[:, 0]) < 0.02
+        self.assertTrue(bool(mid.any()), "middle cylinder should be kept as the depth winner")
+
+        # pitch about y: the -x end cylinder gains ~5 mm of depth over the
+        # middle (>> 1 mm hysteresis), while in-plane positions shift by
+        # 0.05 * (1 - cos 0.1) ~ 0.25 mm (< the 0.5 mm identity quantum)
+        q = state.body_q.numpy()
+        pitch = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.1)
+        q[0][3:7] = [pitch[0], pitch[1], pitch[2], pitch[3]]
+        state.body_q.assign(q)
+        pipeline.collide(state, contacts)
+        pts = _world_points0(model, state, contacts)
+        mid = np.abs(pts[:, 0]) < 0.02
+        self.assertFalse(bool(mid.any()), "beaten incumbent depth winner was kept anyway")
+
+    def test_disabled_hysteresis_is_history_independent(self):
+        """Reduce identically with hysteresis=0 regardless of what ran before.
+
+        The zero setting must restore the exact memoryless behavior: the same
+        state reduced by a pipeline that saw a different previous step and by a
+        fresh pipeline must produce identical kept sets.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        body = _cylinder_foot(builder, (0.0, 0.0, 0.0175))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state_a = model.state()
+        state_b = model.state()
+        q = state_b.body_q.numpy()
+        q[body][0] += 0.01  # a slightly different "previous" step
+        state_b.body_q.assign(q)
+
+        with_history = _make_pipeline(model, True, reduce_contacts_body_pairs_hysteresis=0.0)
+        contacts_h = with_history.contacts()
+        with_history.collide(state_b, contacts_h)
+        with_history.collide(state_a, contacts_h)
+
+        fresh = _make_pipeline(model, True, reduce_contacts_body_pairs_hysteresis=0.0)
+        contacts_f = fresh.contacts()
+        fresh.collide(state_a, contacts_f)
+
+        n_h, s0_h, s1_h, _n1, p0_h = _contact_snapshot(contacts_h)
+        n_f, s0_f, s1_f, _n2, p0_f = _contact_snapshot(contacts_f)
+        self.assertEqual(n_h, n_f)
+        rows_h = sorted(
+            (int(a), int(b), *(round(float(v), 6) for v in p)) for a, b, p in zip(s0_h, s1_h, p0_h, strict=True)
+        )
+        rows_f = sorted(
+            (int(a), int(b), *(round(float(v), 6) for v in p)) for a, b, p in zip(s0_f, s1_f, p0_f, strict=True)
+        )
+        self.assertEqual(rows_h, rows_f)
+
+
 class TestBodyPairReductionCertificate(unittest.TestCase):
     """The verify mode re-derives every keep/discard decision and finds zero disagreements."""
 
