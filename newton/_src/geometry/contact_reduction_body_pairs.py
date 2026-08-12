@@ -123,12 +123,16 @@ def _make_group_key(group_a: int, group_b: int, bin_id: int, cx: int, cy: int) -
     )
 
 
-@wp.func_native("""
-uint32_t mask = ((i >> 31) - 1u) | 0x80000000u;
-uint32_t r = i ^ mask;
-return reinterpret_cast<float&>(r);
-""")
-def float_unflip(i: wp.uint32) -> float: ...
+# Telemetry slots in the reducer's stats array. Whole-run accumulators (never
+# reset), read via BodyPairContactReducer.stats().
+STAT_VIOLATIONS = 0
+STAT_FAIL_OPEN = 1
+STAT_OUTRANKED = 2
+STAT_ENTRY_WATERMARK = 3
+STAT_CELL_CLAMPS = 4
+STAT_CONTACTS_IN = 5
+STAT_CONTACTS_KEPT = 6
+STAT_COUNT = 7
 
 
 @wp.func
@@ -146,7 +150,7 @@ def _contact_group_key(
     shape_count: int,
     cell_size: float,
 ):
-    """Compute (key, gap, center, bin_id) for contact ``i``.
+    """Compute (key, gap, center, bin_id, cell_clamped) for contact ``i``.
 
     The gap is :func:`newton._src.sim.contacts.contact_surface_separation` --
     the one canonical signed-separation convention the solvers consume
@@ -193,7 +197,12 @@ def _contact_group_key(
     cx = wp.int32(wp.floor(pos_2d[0] / cell_size))
     cy = wp.int32(wp.floor(pos_2d[1] / cell_size))
     key = _make_group_key(ga, gb, bin_id, cx, cy)
-    return key, gap, center, bin_id
+    # Report the clamp rather than hide it: clamped cells merge distant regions
+    # of one shape pair, which only over-competes, but a sustained nonzero count
+    # means the scene outgrew the 8-bit cell range and reduction quality on the
+    # periphery is no longer what the cell size promises.
+    clamped = wp.abs(cx) > CELL_COORD_MAX or wp.abs(cy) > CELL_COORD_MAX
+    return key, gap, center, bin_id, clamped
 
 
 @wp.func
@@ -225,13 +234,6 @@ def _pack_score(score: float, fingerprint: wp.uint32) -> wp.uint64:
     confused with the empty-slot sentinel 0.
     """
     return (wp.uint64(float_flip(score)) << wp.uint64(31)) | (wp.uint64(fingerprint) & wp.uint64(0x7FFFFFFF))
-
-
-@wp.func
-def _slot_gap(ht_values: wp.array[wp.uint64], ht_capacity: int, entry_idx: int) -> float:
-    """Decode the group's deepest gap from its depth slot."""
-    v = ht_values[wp.static(DEEPEST_SLOT) * ht_capacity + entry_idx]
-    return -float_unflip(wp.uint32((v >> wp.uint64(31)) & wp.uint64(0xFFFFFFFF)))
 
 
 @wp.func
@@ -282,7 +284,7 @@ def _insert_deepest_kernel(
         contact_entry[i] = -1
         return
 
-    key, gap, center, bin_id = _contact_group_key(
+    key, gap, center, bin_id, cell_clamped = _contact_group_key(
         i,
         contact_shape0,
         contact_shape1,
@@ -296,11 +298,13 @@ def _insert_deepest_kernel(
         shape_count,
         cell_size,
     )
+    if cell_clamped:
+        wp.atomic_add(stats, wp.static(STAT_CELL_CLAMPS), 1)
     entry_idx = hashtable_find_or_insert(key, ht_keys, ht_active_slots)
     contact_entry[i] = entry_idx
     if entry_idx < 0:
         keep_flags[i] = 1
-        wp.atomic_add(stats, 1, 1)
+        wp.atomic_add(stats, wp.static(STAT_FAIL_OPEN), 1)
         return
     contact_gap[i] = gap
     contact_pos2d[i] = project_point_to_plane(bin_id, center)
@@ -459,11 +463,11 @@ def _verify_invariant_kernel(
             beaten = True
 
     if kept and not matched:
-        wp.atomic_add(violations, 0, 1)  # kept without winning: selection too permissive
+        wp.atomic_add(violations, wp.static(STAT_VIOLATIONS), 1)  # kept without winning: too permissive
     if (not kept) and matched:
-        wp.atomic_add(violations, 0, 1)  # winner discarded: selection missed it
+        wp.atomic_add(violations, wp.static(STAT_VIOLATIONS), 1)  # winner discarded: selection missed it
     if (not kept) and (not matched) and beaten:
-        wp.atomic_add(violations, 2, 1)  # out-ranks a slot winner: atomic lost an update
+        wp.atomic_add(violations, wp.static(STAT_OUTRANKED), 1)  # out-ranks a winner: atomic lost an update
 
 
 @wp.kernel(enable_backward=False)
@@ -589,13 +593,26 @@ def _scatter_back_kernel(
 @wp.kernel(enable_backward=False)
 def _write_reduced_count_kernel(
     keep_scan: wp.array[wp.int32],
+    ht_active_slots: wp.array[wp.int32],
+    ht_capacity: int,
     # in/out
     contact_count: wp.array[wp.int32],
+    stats: wp.array[wp.int32],
 ):
-    """Replace the contact count with the number of kept contacts."""
+    """Replace the contact count with the number of kept contacts.
+
+    Also records the watermarks that size the pass: how many contacts arrived,
+    how many survived, and how many hashtable entries the scene actually needed.
+    Occupancy is what says whether ``hashtable_factor`` is generous or one busy
+    step away from failing open.
+    """
     old_count = contact_count[0]
     if old_count > 0:
-        contact_count[0] = keep_scan[old_count - 1]
+        kept = keep_scan[old_count - 1]
+        contact_count[0] = kept
+        wp.atomic_max(stats, wp.static(STAT_CONTACTS_KEPT), kept)
+    wp.atomic_max(stats, wp.static(STAT_CONTACTS_IN), old_count)
+    wp.atomic_max(stats, wp.static(STAT_ENTRY_WATERMARK), ht_active_slots[ht_capacity])
 
 
 class BodyPairContactReducer:
@@ -615,7 +632,7 @@ class BodyPairContactReducer:
     def __init__(
         self,
         rigid_contact_max: int,
-            cell_size: float,
+        cell_size: float,
         device,
         hashtable_factor: float = 0.25,
         borrowed_scratch: dict | None = None,
@@ -631,11 +648,8 @@ class BodyPairContactReducer:
         # material arrays, point_id) are allocated locally on first use.
         self._borrowed_scratch = borrowed_scratch
         self.verify = bool(verify)
-        # Telemetry counters, read via stats(): [0] invariant violations
-        # (verify mode only), [1] fail-open keeps (hashtable full), never
-        # reset automatically -- whole-run accumulators like the row
-        # watermarks.
-        self._stats = wp.zeros(3, dtype=wp.int32, device=device)
+        # Whole-run telemetry accumulators; see stats() for the slot meanings.
+        self._stats = wp.zeros(STAT_COUNT, dtype=wp.int32, device=device)
         # One entry per (body pair, bin, cell) actually touched -- far fewer
         # than contacts. Undersizing is safe: on a full table the insert
         # kernels keep the contact unconditionally (fail open), so the factor
@@ -795,9 +809,9 @@ class BodyPairContactReducer:
                     contacts.rigid_contact_count,
                     self.contact_entry,
                     self.contact_gap,
-                        self.contact_pos2d,
+                    self.contact_pos2d,
                     sort_keys,
-                        self.hashtable.capacity,
+                    self.hashtable.capacity,
                     self.ht_values,
                     self.keep_flags,
                 ],
@@ -863,8 +877,8 @@ class BodyPairContactReducer:
         wp.launch(
             _write_reduced_count_kernel,
             dim=1,
-            inputs=[self.keep_scan],
-            outputs=[contacts.rigid_contact_count],
+            inputs=[self.keep_scan, self.hashtable.active_slots, self.hashtable.capacity],
+            outputs=[contacts.rigid_contact_count, self._stats],
             device=self.device,
             record_tape=False,
         )
@@ -912,16 +926,65 @@ class BodyPairContactReducer:
     def stats(self) -> dict:
         """Whole-run reduction telemetry (forces a device sync; read outside capture).
 
+        Every value is a whole-run accumulator -- a max watermark or a total --
+        never reset between steps, so one read at the end of a run characterizes
+        it. The three sizing watermarks exist so a scene that has outgrown its
+        provisioning says so instead of quietly reducing less well.
+
         Returns:
             ``invariant_violations``: disagreements found by the opt-in
             ``verify`` re-derivation (0 when verify is off).
             ``fail_open_keeps``: contacts kept unconditionally because the
             hashtable was full -- sustained non-zero values mean the
             ``hashtable_factor`` is too small for the scene.
+            ``outranked_discards``: discarded contacts that out-rank their
+            slot's recorded winner (verify mode only); non-zero means an atomic
+            lost an update.
+            ``cell_clamp_events``: contacts whose spatial cell hit the packed
+            +/-127 range; non-zero means distant regions of one shape pair are
+            merging on the periphery.
+            ``max_contacts_in`` / ``max_contacts_kept``: peak live contact count
+            before and after reduction, i.e. the achieved reduction ratio and
+            the capacity the ``Contacts`` buffer actually needs.
+            ``max_hashtable_entries`` / ``hashtable_capacity``: peak distinct
+            (body pair, bin, cell) groups against the table that holds them.
+            ``hashtable_load``: the ratio of those two -- linear probing degrades
+            well past ~0.7, and 1.0 means entries were refused and kept open.
         """
         v = self._stats.numpy()
+        entries = int(v[STAT_ENTRY_WATERMARK])
         return {
-            "invariant_violations": int(v[0]),
-            "fail_open_keeps": int(v[1]),
-            "outranked_discards": int(v[2]),
+            "invariant_violations": int(v[STAT_VIOLATIONS]),
+            "fail_open_keeps": int(v[STAT_FAIL_OPEN]),
+            "outranked_discards": int(v[STAT_OUTRANKED]),
+            "cell_clamp_events": int(v[STAT_CELL_CLAMPS]),
+            "max_contacts_in": int(v[STAT_CONTACTS_IN]),
+            "max_contacts_kept": int(v[STAT_CONTACTS_KEPT]),
+            "max_hashtable_entries": entries,
+            "hashtable_capacity": self.hashtable.capacity,
+            "hashtable_load": entries / self.hashtable.capacity,
+        }
+
+    def describe(self) -> dict:
+        """Static footprint of the pass: buffer bytes by role, and capacities.
+
+        Reported per role rather than as one total so an over-provisioned
+        ``rigid_contact_max`` is distinguishable from the pass's own overhead;
+        ``gather_scratch_owned_bytes`` counts only arrays this pass allocated
+        itself, excluding any borrowed from the deterministic sorter.
+        """
+        n = self.rigid_contact_max
+        owned = 0
+        borrowed_ids = {id(a) for a in (self._borrowed_scratch or {}).values()}
+        for arr in (self._scratch or {}).values():
+            if id(arr) not in borrowed_ids:
+                owned += arr.size * wp.types.type_size_in_bytes(arr.dtype)
+        return {
+            "rigid_contact_max": n,
+            "hashtable_capacity": self.hashtable.capacity,
+            "slots_per_entry": BODY_PAIR_REDUCTION_SLOTS,
+            "hashtable_bytes": self.hashtable.keys.size * 8 + self.hashtable.active_slots.size * 4,
+            "slot_value_bytes": self.ht_values.size * 8,
+            "per_contact_cache_bytes": n * (4 + 4 + 4 + 4 + 8),  # flags, scan, entry, gap, pos2d
+            "gather_scratch_owned_bytes": owned,
         }
