@@ -910,6 +910,7 @@ class CollisionPipeline:
         reduce_contacts_body_pairs_cell: float = 0.25,
         reduce_contacts_body_pairs_verify: bool = False,
         reduce_contacts_body_pairs_hysteresis: float = 0.001,
+        reduce_contacts_body_pairs_hashtable_factor: float = 0.25,
     ):
         """
         Initialize the CollisionPipeline (expert API).
@@ -1044,6 +1045,13 @@ class CollisionPipeline:
                 far the kept depth/extreme representatives may deviate from the
                 exact argmax winners.  ``0`` disables the mechanism and
                 restores exact memoryless selection.  Defaults to ``0.001``.
+            reduce_contacts_body_pairs_hashtable_factor: Hashtable capacity for
+                the reduction's (body pair, bin, cell) groups, as a fraction of
+                ``rigid_contact_max``.  Undersizing cannot drop contacts: if
+                the budget is exceeded the whole frame deterministically keeps
+                the full unreduced set (counted in the reducer's
+                ``fallback_frames`` telemetry).  Raise it if that counter is
+                nonzero.  Defaults to ``0.25``.
 
         .. experimental::
 
@@ -1398,6 +1406,7 @@ class CollisionPipeline:
                 borrowed_scratch=(self._contact_sorter.borrow_full_scratch() if self._contact_sorter else None),
                 verify=reduce_contacts_body_pairs_verify,
                 hysteresis=reduce_contacts_body_pairs_hysteresis,
+                hashtable_factor=reduce_contacts_body_pairs_hashtable_factor,
             )
         else:
             self._body_pair_reducer = None
@@ -1635,6 +1644,24 @@ class CollisionPipeline:
         writer_data.out_stiffness = contacts.rigid_contact_stiffness
         writer_data.out_damping = contacts.rigid_contact_damping
         writer_data.out_friction = contacts.rigid_contact_friction
+        if self._body_pair_reducer is not None:
+            # The reducer's caches, scratch, and launch bounds are sized to the
+            # pipeline's capacity at construction; an external buffer with any
+            # other capacity would let the narrow phase write more contacts
+            # than the reducer's arrays can hold.
+            if contacts.rigid_contact_max != self._rigid_contact_max:
+                raise ValueError(
+                    f"reduce_contacts_body_pairs requires the Contacts buffer capacity "
+                    f"({contacts.rigid_contact_max}) to exactly match the pipeline's "
+                    f"rigid_contact_max ({self._rigid_contact_max}). Use CollisionPipeline.contacts() "
+                    f"or construct the pipeline with a matching rigid_contact_max."
+                )
+            if str(contacts.device) != str(self._body_pair_reducer._stats.device):
+                raise ValueError(
+                    f"reduce_contacts_body_pairs requires the Contacts buffer device "
+                    f"({contacts.device}) to match the pipeline device "
+                    f"({self._body_pair_reducer._stats.device})."
+                )
         if self.deterministic and contacts.rigid_contact_max != self._sort_key_array.shape[0]:
             raise ValueError(
                 f"Contacts buffer capacity ({contacts.rigid_contact_max}) does not match the "
@@ -1781,11 +1808,12 @@ class CollisionPipeline:
         # rigid_contact_count reflects the contact structure, not the collider
         # decomposition. Runs before the differentiable augmentation so the
         # diff arrays are built from the compacted set.
+        # Provenance is assigned on EVERY collide from the pipeline's mode --
+        # never only set on reduction -- so a buffer reused across pipelines
+        # cannot carry a stale marker (see SolverBase.supports_reduced_contacts).
+        contacts.rigid_contacts_reduced = self._body_pair_reducer is not None
         if self._body_pair_reducer is not None:
             self._body_pair_reducer.reduce(model, state, contacts)
-            # Stamp the buffer so consumers can verify support (see
-            # SolverBase.supports_reduced_contacts).
-            contacts.rigid_contacts_reduced = True
 
         # Differentiable contact augmentation: reconstruct world-space contact
         # quantities through body_q so that gradients flow via wp.Tape.

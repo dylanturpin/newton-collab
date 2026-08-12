@@ -30,6 +30,7 @@ import warp as wp
 import newton
 from newton._src.geometry.contact_reduction_body_pairs import _BP_FACE_NORMALS_DATA
 from newton._src.geometry.sdf_hydroelastic import HydroelasticSDF
+from newton._src.sim.contacts import Contacts
 
 DT = 1.0 / 240.0
 
@@ -628,6 +629,132 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         z_off = self._settle_with(newton.solvers.SolverXPBD, False, iterations=8)
         z_on = self._settle_with(newton.solvers.SolverXPBD, True, iterations=8)
         self.assertLess(abs(z_off - z_on), 5e-4)
+
+
+class TestBodyPairReductionSafety(unittest.TestCase):
+    """Resource exhaustion must fail open deterministically, never corrupt memory."""
+
+    def test_narrowphase_overflow_fails_open(self):
+        """Deliver the raw over-capacity counter untouched when the input overflows.
+
+        Newton's narrow phase reserves contact indices before checking capacity,
+        so the raw counter legitimately exceeds ``rigid_contact_max`` on
+        overflow and is NOT a safe array bound. The reduction must detect that
+        on device, do nothing that frame, and leave the counter and contact
+        prefix exactly as an unreduced pipeline would deliver them.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _sphere_grid_body(builder, (0.0, 0.0, 0.0095))  # 25 same-plane contacts
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+
+        counts = {}
+        for reduce_on in (False, True):
+            pipeline = newton.CollisionPipeline(
+                model,
+                broad_phase="nxn",
+                rigid_contact_max=8,  # deliberately far below the ~25 candidates
+                reduce_contacts_body_pairs=reduce_on,
+            )
+            contacts = pipeline.contacts()
+            pipeline.collide(state, contacts)  # must not crash or corrupt memory
+            counts[reduce_on] = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertGreater(counts[False], 8, "scene must actually overflow the buffer")
+        self.assertEqual(counts[True], counts[False], "overflow frame must pass the raw counter through")
+
+    def test_hashtable_saturation_keeps_whole_frame(self):
+        """Keep the entire unreduced set when the group table budget is exceeded.
+
+        Per-contact fail-open would let CUDA scheduling decide which groups get
+        the last table entries -- a scheduling-dependent kept set. Exceeding
+        the budget must instead fall back for the whole frame: every contact
+        kept, which is deterministic, and counted in telemetry.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        rng = np.random.default_rng(9)
+        n_bodies = 1200  # > the 1024 minimum table capacity, one group each
+        for k in range(n_bodies):
+            x, y = (k % 40) * 0.5, (k // 40) * 0.5
+            body = builder.add_body(
+                xform=wp.transform(wp.vec3(x, y, 0.0095 + float(rng.uniform(0, 0.001))), wp.quat_identity()),
+                mass=1.0,
+            )
+            builder.add_shape_sphere(body, radius=0.01)
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+
+        base = newton.CollisionPipeline(model, broad_phase="nxn")
+        contacts_base = base.contacts()
+        base.collide(state, contacts_base)
+        n_base = int(contacts_base.rigid_contact_count.numpy()[0])
+        self.assertGreater(n_base, 1024)
+
+        # a factor small enough to hit the 1024-entry floor: 1200 groups cannot fit
+        pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_hashtable_factor=1e-6)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        n_red = int(contacts.rigid_contact_count.numpy()[0])
+        stats = pipeline._body_pair_reducer.stats()
+        self.assertEqual(n_red, n_base, "saturated frame must keep the whole unreduced set")
+        self.assertGreaterEqual(stats["fallback_frames"], 1)
+
+    def test_mismatched_contacts_buffer_rejected(self):
+        """Refuse an external Contacts buffer whose capacity differs from the pipeline's.
+
+        The reducer's caches and launch bounds are sized to the pipeline's
+        capacity; a larger external buffer would let the narrow phase write
+        beyond them.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (0.0, 0.0, 0.0175))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        oversized = Contacts(
+            rigid_contact_max=pipeline.rigid_contact_max * 2, soft_contact_max=0, device=wp.get_device()
+        )
+        with self.assertRaisesRegex(ValueError, "rigid_contact_max"):
+            pipeline.collide(state, oversized)
+
+    def test_invalid_configuration_rejected(self):
+        """Reject non-finite or non-positive reduction configuration at construction."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (0.0, 0.0, 0.0175))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        for kwargs in (
+            {"reduce_contacts_body_pairs_cell": 0.0},
+            {"reduce_contacts_body_pairs_cell": float("inf")},
+            {"reduce_contacts_body_pairs_cell": float("nan")},
+            {"reduce_contacts_body_pairs_hysteresis": float("inf")},
+            {"reduce_contacts_body_pairs_hysteresis": -1.0},
+            {"reduce_contacts_body_pairs_hashtable_factor": 0.0},
+        ):
+            with self.assertRaises(ValueError, msg=f"accepted invalid {kwargs}"):
+                _make_pipeline(model, True, **kwargs)
+
+    def test_reduced_marker_tracks_pipeline_mode(self):
+        """Assign buffer provenance from the pipeline mode on every collide.
+
+        A sticky marker would make an unsupported solver reject a buffer that
+        was later refilled by an ordinary pipeline.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (0.0, 0.0, 0.0175))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        reduced = _make_pipeline(model, True)
+        plain = newton.CollisionPipeline(model, broad_phase="nxn")
+        contacts = reduced.contacts()
+        self.assertFalse(contacts.rigid_contacts_reduced)
+        reduced.collide(state, contacts)
+        self.assertTrue(contacts.rigid_contacts_reduced)
+        plain.collide(state, contacts)
+        self.assertFalse(contacts.rigid_contacts_reduced, "marker must clear when an ordinary pipeline refills")
 
 
 class TestBodyPairReductionRobustness(unittest.TestCase):

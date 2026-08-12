@@ -395,6 +395,13 @@ class Contacts:
         self.rigid_contact_max = rigid_contact_max
         self.soft_contact_max = soft_contact_max
 
+        self.rigid_contacts_reduced = False
+        """Provenance: whether the pipeline that last wrote this buffer runs
+        body-pair contact reduction.  Assigned on every
+        :meth:`newton.CollisionPipeline.collide` call from the pipeline's mode
+        (never a sticky observation), and checked by solvers that have not
+        been conformance-tested against reduced buffers."""
+
     def clear(self, bump_generation: bool = True):
         """
         Clear contact data, resetting counts and optionally clearing all buffers.

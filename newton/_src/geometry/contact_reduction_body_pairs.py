@@ -86,6 +86,8 @@ All launches are fixed-size and the pass is CUDA-graph-capture compatible.
 
 from __future__ import annotations
 
+import math
+
 import warp as wp
 
 from ..sim.contacts import contact_surface_separation
@@ -94,8 +96,7 @@ from .hashtable import (
     _HASHTABLE_EMPTY_KEY_VALUE,
     HASHTABLE_EMPTY_KEY,
     HashTable,
-    hashtable_find,
-    hashtable_find_or_insert,
+    _hashtable_hash,
 )
 
 # Normal-binning table PRIVATE to body-pair reduction: the icosahedron from
@@ -264,7 +265,102 @@ STAT_ENTRY_WATERMARK = 3
 STAT_CELL_CLAMPS = 4
 STAT_CONTACTS_IN = 5
 STAT_CONTACTS_KEPT = 6
-STAT_COUNT = 7
+STAT_INPUT_OVERFLOWS = 7
+STAT_FALLBACK_FRAMES = 8
+STAT_COUNT = 9
+
+# Per-frame device state, reset by the preparation kernel each reduce.
+FRAME_WORK_COUNT = 0  # validated loop bound for every reducer kernel
+FRAME_INPUT_OVERFLOW = 1  # narrow phase emitted more contacts than capacity
+FRAME_FALLBACK = 2  # hashtable budget exceeded: keep every contact this frame
+FRAME_STATE_COUNT = 3
+
+# Linear-probe budget for the reduction's hashtable accesses. The table is
+# provisioned for load far below saturation (measured 0.08 on the reference
+# scene), where expected probe chains are a handful of slots; a chain this long
+# means the table is effectively saturated for this frame and the pass must
+# fail open as a whole rather than let CUDA scheduling decide which groups get
+# the last entries (a scheduling-dependent kept set) or let probes walk the
+# entire capacity (a quadratic-cost cliff).
+PROBE_BUDGET = 128
+
+
+@wp.func
+def _bp_find_or_insert(
+    key: wp.uint64,
+    keys: wp.array[wp.uint64],
+    active_slots: wp.array[wp.int32],
+) -> int:
+    """``hashtable_find_or_insert`` with the probe budget applied."""
+    capacity = keys.shape[0]
+    capacity_mask = capacity - 1
+    idx = _hashtable_hash(key, capacity_mask)
+
+    for _i in range(wp.static(PROBE_BUDGET)):
+        stored_key = keys[idx]
+        if stored_key == key:
+            return idx
+        if stored_key == HASHTABLE_EMPTY_KEY:
+            old_key = wp.atomic_cas(keys, idx, HASHTABLE_EMPTY_KEY, key)
+            if old_key == HASHTABLE_EMPTY_KEY:
+                active_idx = wp.atomic_add(active_slots, capacity, 1)
+                if active_idx < capacity:
+                    active_slots[active_idx] = idx
+                return idx
+            elif old_key == key:
+                return idx
+        idx = (idx + 1) & capacity_mask
+    return -1
+
+
+@wp.func
+def _bp_find(key: wp.uint64, keys: wp.array[wp.uint64]) -> int:
+    """``hashtable_find`` with the probe budget applied (read-only lookup)."""
+    capacity = keys.shape[0]
+    capacity_mask = capacity - 1
+    idx = _hashtable_hash(key, capacity_mask)
+
+    for _i in range(wp.static(PROBE_BUDGET)):
+        stored_key = keys[idx]
+        if stored_key == key:
+            return idx
+        if stored_key == HASHTABLE_EMPTY_KEY:
+            return -1
+        idx = (idx + 1) & capacity_mask
+    return -1
+
+
+@wp.kernel(enable_backward=False)
+def _prepare_frame_kernel(
+    contact_count: wp.array[wp.int32],
+    reducer_capacity: int,
+    # outputs
+    frame_state: wp.array[wp.int32],
+    stats: wp.array[wp.int32],
+):
+    """Derive this frame's validated work count and reset the per-frame flags.
+
+    Newton's narrow phase reserves contact indices with an atomic add BEFORE
+    checking capacity, so ``rigid_contact_count`` can legitimately exceed
+    ``rigid_contact_max`` on overflow (the excess batches are simply not
+    written).  The raw counter is therefore NOT a safe array bound.  Every
+    reducer kernel loops over the work count derived here instead: on overflow
+    it is zero, the whole pass becomes a no-op, and the counter and the
+    materialized contact prefix reach the solver exactly as an unreduced
+    pipeline would deliver them -- preserving both memory safety and the
+    engine's overflow diagnostics.  Reducing a clamped prefix instead would be
+    wrong: batched reservations can leave unwritten holes where a batch
+    crossed capacity.
+    """
+    raw = contact_count[0]
+    if raw >= 0 and raw <= reducer_capacity:
+        frame_state[wp.static(FRAME_WORK_COUNT)] = raw
+        frame_state[wp.static(FRAME_INPUT_OVERFLOW)] = 0
+    else:
+        frame_state[wp.static(FRAME_WORK_COUNT)] = 0
+        frame_state[wp.static(FRAME_INPUT_OVERFLOW)] = 1
+        wp.atomic_add(stats, wp.static(STAT_INPUT_OVERFLOWS), 1)
+    frame_state[wp.static(FRAME_FALLBACK)] = 0
 
 
 @wp.func
@@ -351,8 +447,15 @@ def _contact_group_key(
     # would place the origin exactly on a cell boundary, so a patch centered
     # under the body -- the common case, e.g. a foot's colliders -- would always
     # straddle up to four cells and get four slot sets instead of one.
-    cx = wp.int32(wp.floor(pos_2d[0] / cell_size + 0.5))
-    cy = wp.int32(wp.floor(pos_2d[1] / cell_size + 0.5))
+    # Clamp in FLOAT before converting: an extreme finite coordinate would
+    # overflow the int32 conversion itself and corrupt both the grouping and
+    # the clamp telemetry. The clamp bound is one cell beyond the packed range
+    # so the out-of-range condition stays observable after conversion.
+    fx = wp.floor(pos_2d[0] / cell_size + 0.5)
+    fy = wp.floor(pos_2d[1] / cell_size + 0.5)
+    bound = float(CELL_COORD_MAX + 1)
+    cx = wp.int32(wp.clamp(fx, -bound, bound))
+    cy = wp.int32(wp.clamp(fy, -bound, bound))
     key = _make_group_key(ga, gb, bin_id, cx, cy)
     # Report the clamp rather than hide it: clamped cells merge distant regions
     # of one shape pair, which only over-competes, but a sustained nonzero count
@@ -372,8 +475,10 @@ def _pos_key_31(pos_2d: wp.vec2) -> wp.uint64:
     beyond the range clamp, which can only merge far-apart duplicates into a
     tie -- and ties are kept, never dropped.
     """
-    qx = wp.clamp(wp.int32(wp.floor(pos_2d[0] * 2000.0)) + 32768, 0, 65535)
-    qy = wp.clamp(wp.int32(wp.floor(pos_2d[1] * 2000.0)) + 8192, 0, 16383)
+    # Clamp in FLOAT before converting so extreme coordinates cannot overflow
+    # the int32 conversion (they would corrupt the identity, not just clamp it).
+    qx = wp.int32(wp.clamp(wp.floor(pos_2d[0] * 2000.0), -32768.0, 32767.0)) + 32768
+    qy = wp.int32(wp.clamp(wp.floor(pos_2d[1] * 2000.0), -8192.0, 8191.0)) + 8192
     return (wp.uint64(qx) << wp.uint64(15)) | (wp.uint64(qy) << wp.uint64(1)) | wp.uint64(1)
 
 
@@ -460,7 +565,7 @@ def _incumbent_mask(
     extremes must win.
     """
     mask = int(0)
-    prev_entry = hashtable_find(key, prev_keys)
+    prev_entry = _bp_find(key, prev_keys)
     if prev_entry >= 0:
         me = wp.uint32(pos_key)
         for slot in range(wp.static(BODY_PAIR_REDUCTION_SLOTS)):
@@ -513,6 +618,7 @@ def _snapshot_prev_kernel(
     ht_active_slots: wp.array[wp.int32],
     ht_values: wp.array[wp.uint64],
     ht_capacity: int,
+    frame_state: wp.array[wp.int32],
     num_threads: int,
     # outputs
     prev_keys: wp.array[wp.uint64],
@@ -529,6 +635,10 @@ def _snapshot_prev_kernel(
     requires.
     """
     count = ht_active_slots[ht_capacity]
+    if frame_state[wp.static(FRAME_FALLBACK)] != 0 or frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0:
+        # The last frame kept everything (or reduced nothing): its slot values
+        # are partial and must not seed incumbency.
+        count = 0
     t = wp.tid()
     if t == 0:
         prev_active_slots[ht_capacity] = count
@@ -562,6 +672,7 @@ def _register_contact_one(
     hysteresis: float,
     prev_keys: wp.array[wp.uint64],
     prev_winner_pos: wp.array[wp.uint32],
+    frame_state: wp.array[wp.int32],
     keep_flags: wp.array[wp.int32],
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
@@ -607,10 +718,14 @@ def _register_contact_one(
     )
     if cell_clamped:
         wp.atomic_add(stats, wp.static(STAT_CELL_CLAMPS), 1)
-    entry_idx = hashtable_find_or_insert(key, ht_keys, ht_active_slots)
+    entry_idx = _bp_find_or_insert(key, ht_keys, ht_active_slots)
     contact_entry[i] = entry_idx
     if entry_idx < 0:
+        # Table budget exhausted. Keeping just THIS contact would make the
+        # kept set depend on which threads claimed the last entries, so the
+        # whole frame falls back to the unreduced set (see the select pass).
         keep_flags[i] = 1
+        frame_state[wp.static(FRAME_FALLBACK)] = 1
         wp.atomic_add(stats, wp.static(STAT_FAIL_OPEN), 1)
         return
     contact_gap[i] = gap
@@ -655,6 +770,7 @@ def _register_contacts_kernel(
     hysteresis: float,
     prev_keys: wp.array[wp.uint64],
     prev_winner_pos: wp.array[wp.uint32],
+    frame_state: wp.array[wp.int32],
     num_threads: int,
     # outputs
     keep_flags: wp.array[wp.int32],
@@ -672,7 +788,7 @@ def _register_contacts_kernel(
     full or detached shape) is kept unconditionally -- reduction must fail
     open, never drop silently.
     """
-    count = contact_count[0]
+    count = frame_state[wp.static(FRAME_WORK_COUNT)]
     i = wp.tid()
     while i < count:
         _register_contact_one(
@@ -694,6 +810,7 @@ def _register_contacts_kernel(
             hysteresis,
             prev_keys,
             prev_winner_pos,
+            frame_state,
             keep_flags,
             contact_entry,
             contact_gap,
@@ -772,6 +889,7 @@ def _select_winners_kernel(
     contact_incumbent: wp.array[wp.int32],
     hysteresis: float,
     ht_values: wp.array[wp.uint64],
+    frame_state: wp.array[wp.int32],
     num_threads: int,
     # outputs
     keep_flags: wp.array[wp.int32],
@@ -786,12 +904,18 @@ def _select_winners_kernel(
     plus, when hysteresis is enabled, the previous step's winners: invariant to
     thread scheduling, buffer order, and buffer capacity.
     """
-    count = contact_count[0]
+    count = frame_state[wp.static(FRAME_WORK_COUNT)]
+    keep_all = frame_state[wp.static(FRAME_FALLBACK)] != 0
     i = wp.tid()
     while i < count:
-        _select_winner_one(
-            i, contact_entry, contact_gap, contact_pos2d, contact_incumbent, hysteresis, ht_values, keep_flags
-        )
+        if keep_all:
+            # Table budget was exceeded somewhere this frame: the only
+            # deterministic result is the whole unreduced set.
+            keep_flags[i] = 1
+        else:
+            _select_winner_one(
+                i, contact_entry, contact_gap, contact_pos2d, contact_incumbent, hysteresis, ht_values, keep_flags
+            )
         i += num_threads
 
 
@@ -857,6 +981,7 @@ def _verify_invariant_kernel(
     hysteresis: float,
     ht_values: wp.array[wp.uint64],
     keep_flags: wp.array[wp.int32],
+    frame_state: wp.array[wp.int32],
     num_threads: int,
     # outputs
     violations: wp.array[wp.int32],
@@ -869,7 +994,9 @@ def _verify_invariant_kernel(
     actually match at least one winner. Any disagreement means a slot race,
     clearing bug, or ranking regression -- counted, never silent.
     """
-    count = contact_count[0]
+    count = frame_state[wp.static(FRAME_WORK_COUNT)]
+    if frame_state[wp.static(FRAME_FALLBACK)] != 0:
+        count = 0  # keep-all frames are trivially consistent; slots are partial
     i = wp.tid()
     while i < count:
         _verify_invariant_one(
@@ -906,6 +1033,7 @@ def _gather_kept_contacts_kernel(
     src_stiffness: wp.array[wp.float32],
     src_damping: wp.array[wp.float32],
     src_friction: wp.array[wp.float32],
+    frame_state: wp.array[wp.int32],
     num_threads: int,
     # outputs
     dst_point_id: wp.array[wp.int32],
@@ -924,7 +1052,7 @@ def _gather_kept_contacts_kernel(
     dst_friction: wp.array[wp.float32],
 ):
     """Stable-compact kept contacts into the scratch arrays."""
-    count = contact_count[0]
+    count = frame_state[wp.static(FRAME_WORK_COUNT)]
     i = wp.tid()
     while i < count:
         if keep_flags[i] != 0:
@@ -1035,6 +1163,7 @@ def _scatter_back_kernel(
     src_stiffness: wp.array[wp.float32],
     src_damping: wp.array[wp.float32],
     src_friction: wp.array[wp.float32],
+    frame_state: wp.array[wp.int32],
     num_threads: int,
     # outputs
     dst_point_id: wp.array[wp.int32],
@@ -1056,9 +1185,13 @@ def _scatter_back_kernel(
 
     Runs after ``_write_reduced_count_kernel``, so ``contact_count`` already
     holds the KEPT count: only that range is touched, instead of copying
-    entire capacity-sized arrays back.
+    entire capacity-sized arrays back.  On an input-overflow frame the counter
+    was deliberately left at its raw (over-capacity) value, so the bound comes
+    from the frame state instead: zero, and nothing is written back.
     """
     count = contact_count[0]
+    if frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0:
+        count = 0
     i = wp.tid()
     while i < count:
         _copy_contact(
@@ -1102,6 +1235,7 @@ def _write_reduced_count_kernel(
     keep_scan: wp.array[wp.int32],
     ht_active_slots: wp.array[wp.int32],
     ht_capacity: int,
+    frame_state: wp.array[wp.int32],
     # in/out
     contact_count: wp.array[wp.int32],
     stats: wp.array[wp.int32],
@@ -1113,13 +1247,19 @@ def _write_reduced_count_kernel(
     Occupancy is what says whether ``hashtable_factor`` is generous or one busy
     step away from failing open.
     """
-    old_count = contact_count[0]
-    if old_count > 0:
-        kept = keep_scan[old_count - 1]
+    wp.atomic_max(stats, wp.static(STAT_CONTACTS_IN), contact_count[0])
+    wp.atomic_max(stats, wp.static(STAT_ENTRY_WATERMARK), ht_active_slots[ht_capacity])
+    if frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0:
+        # Leave the raw counter untouched: the solver receives exactly what an
+        # unreduced pipeline would deliver, and overflow stays observable.
+        return
+    if frame_state[wp.static(FRAME_FALLBACK)] != 0:
+        wp.atomic_add(stats, wp.static(STAT_FALLBACK_FRAMES), 1)
+    work = frame_state[wp.static(FRAME_WORK_COUNT)]
+    if work > 0:
+        kept = keep_scan[work - 1]
         contact_count[0] = kept
         wp.atomic_max(stats, wp.static(STAT_CONTACTS_KEPT), kept)
-    wp.atomic_max(stats, wp.static(STAT_CONTACTS_IN), old_count)
-    wp.atomic_max(stats, wp.static(STAT_ENTRY_WATERMARK), ht_active_slots[ht_capacity])
 
 
 class BodyPairContactReducer:
@@ -1161,10 +1301,15 @@ class BodyPairContactReducer:
     ):
         self.rigid_contact_max = rigid_contact_max
         self.cell_size = float(cell_size)
+        if not (math.isfinite(self.cell_size) and self.cell_size > 0.0):
+            raise ValueError(f"cell_size must be finite and positive, got {cell_size}")
         self.device = device
         self.hysteresis = float(hysteresis)
-        if not self.hysteresis >= 0.0:  # rejects NaN too
-            raise ValueError("hysteresis must be non-negative")
+        if not (math.isfinite(self.hysteresis) and self.hysteresis >= 0.0):
+            raise ValueError(f"hysteresis must be finite and non-negative, got {hysteresis}")
+        hashtable_factor = float(hashtable_factor)
+        if not (math.isfinite(hashtable_factor) and hashtable_factor > 0.0):
+            raise ValueError(f"hashtable_factor must be finite and positive, got {hashtable_factor}")
         # Full-size gather scratch borrowed from the deterministic sorter (see
         # ContactSorter.borrow_full_scratch): the two stages run strictly
         # sequentially inside collide(), so sharing halves the pipeline's
@@ -1174,6 +1319,9 @@ class BodyPairContactReducer:
         self.verify = bool(verify)
         # Whole-run telemetry accumulators; see stats() for the slot meanings.
         self._stats = wp.zeros(STAT_COUNT, dtype=wp.int32, device=device)
+        # Per-frame device state: validated work count + overflow/fallback
+        # flags, reset by the preparation kernel each reduce.
+        self._frame_state = wp.zeros(FRAME_STATE_COUNT, dtype=wp.int32, device=device)
         # One entry per (body pair, bin, cell) actually touched -- far fewer
         # than contacts. Undersizing is safe: on a full table the insert
         # kernels keep the contact unconditionally (fail open), so the factor
@@ -1285,12 +1433,25 @@ class BodyPairContactReducer:
                     self.hashtable.active_slots,
                     self.ht_values,
                     self.hashtable.capacity,
+                    self._frame_state,
                     self.entry_stride_threads,
                 ],
                 outputs=[self.prev_keys, self.prev_winner_pos, self.prev_active_slots],
                 device=self.device,
                 record_tape=False,
             )
+
+        # Derive this frame's validated work count (see the kernel docstring:
+        # the raw narrow-phase counter is NOT a safe array bound on overflow).
+        # Must run after the history snapshot, which reads last frame's flags.
+        wp.launch(
+            _prepare_frame_kernel,
+            dim=1,
+            inputs=[contacts.rigid_contact_count, self.rigid_contact_max],
+            outputs=[self._frame_state, self._stats],
+            device=self.device,
+            record_tape=False,
+        )
 
         # keep_flags needs no memset: pass 1 writes every live entry, and
         # positions past the live count are never read (the scan output above
@@ -1335,6 +1496,7 @@ class BodyPairContactReducer:
                 self.hysteresis,
                 self.prev_keys,
                 self.prev_winner_pos,
+                self._frame_state,
                 self.stride_threads,
             ],
             outputs=[
@@ -1359,6 +1521,7 @@ class BodyPairContactReducer:
                 self.contact_incumbent,
                 self.hysteresis,
                 self.ht_values,
+                self._frame_state,
                 self.stride_threads,
             ],
             outputs=[self.keep_flags],
@@ -1378,6 +1541,7 @@ class BodyPairContactReducer:
                     self.hysteresis,
                     self.ht_values,
                     self.keep_flags,
+                    self._frame_state,
                     self.stride_threads,
                 ],
                 outputs=[self._stats],
@@ -1419,6 +1583,7 @@ class BodyPairContactReducer:
                 mat_src[0],
                 mat_src[1],
                 mat_src[2],
+                self._frame_state,
                 self.stride_threads,
             ],
             outputs=[
@@ -1443,7 +1608,7 @@ class BodyPairContactReducer:
         wp.launch(
             _write_reduced_count_kernel,
             dim=1,
-            inputs=[self.keep_scan, self.hashtable.active_slots, self.hashtable.capacity],
+            inputs=[self.keep_scan, self.hashtable.active_slots, self.hashtable.capacity, self._frame_state],
             outputs=[contacts.rigid_contact_count, self._stats],
             device=self.device,
             record_tape=False,
@@ -1468,6 +1633,7 @@ class BodyPairContactReducer:
                 sc["stiffness"],
                 sc["damping"],
                 sc["friction"],
+                self._frame_state,
                 self.stride_threads,
             ],
             outputs=[
@@ -1530,6 +1696,8 @@ class BodyPairContactReducer:
             "max_hashtable_entries": entries,
             "hashtable_capacity": self.hashtable.capacity,
             "hashtable_load": entries / self.hashtable.capacity,
+            "input_overflow_frames": int(v[STAT_INPUT_OVERFLOWS]),
+            "fallback_frames": int(v[STAT_FALLBACK_FRAMES]),
         }
 
     def describe(self) -> dict:
