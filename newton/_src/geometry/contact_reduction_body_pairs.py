@@ -337,7 +337,7 @@ REDUCTION_MAX_THREADS = 262144
 
 
 @wp.func
-def _insert_deepest_one(
+def _register_contact_one(
     i: int,
     contact_shape0: wp.array[wp.int32],
     contact_shape1: wp.array[wp.int32],
@@ -360,7 +360,13 @@ def _insert_deepest_one(
     contact_fp: wp.array[wp.uint32],
     stats: wp.array[wp.int32],
 ):
-    """Register contact ``i``'s depth in its group's deepest slot.
+    """Enter contact ``i`` into every slot of its group: depth and all extremes.
+
+    Depth and the spatial extremes go in together because they are independent
+    ``atomic_max`` accumulations into disjoint slots of the same entry.  They
+    were two passes only while slot entry was gated on the group's deepest
+    value; once that gate was removed the split cost an extra launch and an
+    extra read of this cache for nothing.
 
     The per-item body lives in a ``wp.func`` so the grid-stride kernel around
     it can bail out of one item without leaving the loop: Warp does not reliably
@@ -408,9 +414,15 @@ def _insert_deepest_one(
     if ht_values[slot_idx] < depth_value:
         wp.atomic_max(ht_values, slot_idx, depth_value)
 
+    for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
+        value = _pack_score(wp.dot(pos_2d, _direction_2d(dir_i)), fp)
+        dir_slot = _slot_index(entry_idx, dir_i)
+        if ht_values[dir_slot] < value:
+            wp.atomic_max(ht_values, dir_slot, value)
+
 
 @wp.kernel(enable_backward=False)
-def _insert_deepest_kernel(
+def _register_contacts_kernel(
     contact_count: wp.array[wp.int32],
     contact_shape0: wp.array[wp.int32],
     contact_shape1: wp.array[wp.int32],
@@ -435,18 +447,18 @@ def _insert_deepest_kernel(
     contact_fp: wp.array[wp.uint32],
     stats: wp.array[wp.int32],
 ):
-    """Pass 1: register every contact's depth in its group's deepest slot.
+    """Pass 1 of 2: enter every contact into all slots of its group.
 
-    Also caches the contact's hashtable entry, gap, face-plane position, and
-    content fingerprint so the later passes never recompute geometry or re-probe
-    the table.  A
-    contact that cannot be registered (hashtable full or detached shape) is
-    kept unconditionally -- reduction must fail open, never drop silently.
+    Caches each contact's hashtable entry, gap, face-plane position, and content
+    fingerprint so the selection pass neither recomputes geometry nor re-probes
+    the table.  A contact that cannot be registered (hashtable full or detached
+    shape) is kept unconditionally -- reduction must fail open, never drop
+    silently.
     """
     count = contact_count[0]
     i = wp.tid()
     while i < count:
-        _insert_deepest_one(
+        _register_contact_one(
             i,
             contact_shape0,
             contact_shape1,
@@ -469,53 +481,6 @@ def _insert_deepest_kernel(
             contact_fp,
             stats,
         )
-        i += num_threads
-
-
-@wp.func
-def _insert_spatial_one(
-    i: int,
-    contact_entry: wp.array[wp.int32],
-    contact_pos2d: wp.array[wp.vec2],
-    contact_fp: wp.array[wp.uint32],
-    ht_values: wp.array[wp.uint64],
-):
-    """Enter contact ``i`` into every footprint-extreme slot of its group."""
-    entry_idx = contact_entry[i]
-    if entry_idx < 0:
-        return
-
-    pos_2d = contact_pos2d[i]
-    fp = contact_fp[i]
-    for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
-        dir_2d = _direction_2d(dir_i)
-        value = _pack_score(wp.dot(pos_2d, dir_2d), fp)
-        slot_idx = _slot_index(entry_idx, dir_i)
-        if ht_values[slot_idx] < value:
-            wp.atomic_max(ht_values, slot_idx, value)
-
-
-@wp.kernel(enable_backward=False)
-def _insert_spatial_kernel(
-    contact_count: wp.array[wp.int32],
-    contact_entry: wp.array[wp.int32],
-    contact_pos2d: wp.array[wp.vec2],
-    contact_fp: wp.array[wp.uint32],
-    num_threads: int,
-    # in/out
-    ht_values: wp.array[wp.uint64],
-):
-    """Pass 2: every contact competes for its group's footprint-extreme slots.
-
-    Reads the entry/position cache pass 1 wrote instead of recomputing
-    geometry or re-probing the hashtable.  Competition is on spatial
-    projection alone, so each direction slot ends up holding that direction's
-    true extreme contact.
-    """
-    count = contact_count[0]
-    i = wp.tid()
-    while i < count:
-        _insert_spatial_one(i, contact_entry, contact_pos2d, contact_fp, ht_values)
         i += num_threads
 
 
@@ -556,7 +521,7 @@ def _select_winner_one(
     """Flag contact ``i`` if one of the values it submitted won its slot."""
     entry_idx = contact_entry[i]
     if entry_idx < 0:
-        return  # keep_flags[i] already set by pass 1 (fail open)
+        return  # keep_flags[i] already set by the register pass (fail open)
 
     fp = contact_fp[i]
     gap = contact_gap[i]
@@ -585,7 +550,7 @@ def _select_winners_kernel(
     # outputs
     keep_flags: wp.array[wp.int32],
 ):
-    """Pass 3: every contact checks whether its own packed value won a slot.
+    """Pass 2 of 2: every contact checks whether its own packed value won a slot.
 
     Winner self-identification: the packed values carry no buffer index, so a
     contact is kept iff one of the values it submitted equals the slot's final
@@ -1055,7 +1020,7 @@ class BodyPairContactReducer:
             model.shape_count,
         ]
         wp.launch(
-            _insert_deepest_kernel,
+            _register_contacts_kernel,
             dim=self.stride_threads,
             inputs=[
                 *geom_inputs,
@@ -1072,20 +1037,6 @@ class BodyPairContactReducer:
                 self.contact_pos2d,
                 self.contact_fp,
                 self._stats,
-            ],
-            device=self.device,
-            record_tape=False,
-        )
-        wp.launch(
-            _insert_spatial_kernel,
-            dim=self.stride_threads,
-            inputs=[
-                contacts.rigid_contact_count,
-                self.contact_entry,
-                self.contact_pos2d,
-                self.contact_fp,
-                self.stride_threads,
-                self.ht_values,
             ],
             device=self.device,
             record_tape=False,

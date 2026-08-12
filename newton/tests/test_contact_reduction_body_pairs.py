@@ -147,8 +147,8 @@ class TestBodyPairReductionCounts(unittest.TestCase):
 
     def _grid_on_plane(self, reduce_body_pairs):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-        # positive-quadrant placement keeps the whole patch inside ONE spatial cell
-        # (cells are origin-anchored; straddling a boundary benignly over-keeps)
+        # off-origin placement is deliberate: cells are measured from the pair's
+        # own reference body, so distance from the world origin must not matter
         _sphere_grid_body(builder, (5.13, 5.07, 0.0095))  # spheres just touching the plane
         builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
