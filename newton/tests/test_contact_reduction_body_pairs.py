@@ -28,6 +28,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.geometry.contact_reduction_body_pairs import _BP_FACE_NORMALS_DATA
 from newton._src.geometry.sdf_hydroelastic import HydroelasticSDF
 
 DT = 1.0 / 240.0
@@ -775,6 +776,83 @@ class TestBodyPairReductionFPGSImpact(unittest.TestCase):
         self.assertLess(abs(float(z_off[-30:].mean()) - float(z_on[-30:].mean())), 5e-4)
         # bounded touchdown transient: never punches through the resting height by > 2.5 mm
         self.assertGreater(float(z_on.min()), 0.015 - 2.5e-3)
+
+
+class TestBodyPairReductionGroupAssignment(unittest.TestCase):
+    """Group assignment must be stable at world axes and under rigid translation."""
+
+    def test_bin_margins_at_world_axes(self):
+        """Keep every world axis well inside a bin, especially the ground normal.
+
+        The shared icosahedron table stores the solid Y-up, which places +Z on a
+        face boundary to within 7e-8 of dot product: any curved or mesh surface
+        in a Z-up world then flickers its patch normals between two bins step to
+        step, and the kept set churns (measured as a permanent rocking limit
+        cycle). The body-pair table is rotated so a face CENTER points at +/-Z;
+        this pins that property plus a sane margin at the horizontal axes.
+        """
+        faces = np.array(_BP_FACE_NORMALS_DATA, dtype=np.float64).reshape(-1, 3)
+        norms = np.linalg.norm(faces, axis=1)
+        self.assertTrue(np.allclose(norms, 1.0, atol=1e-6), "face normals must be unit length")
+
+        def margin(d):
+            dots = np.sort(faces @ np.asarray(d, dtype=np.float64))[::-1]
+            return dots[0] - dots[1]
+
+        for axis in ((0, 0, 1), (0, 0, -1)):
+            self.assertGreater(margin(axis), 0.2, f"ground-normal margin too small at {axis}")
+        for axis in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)):
+            self.assertGreater(margin(axis), 0.05, f"horizontal margin too small at {axis}")
+
+    def test_bin_stable_under_ground_normal_wobble(self):
+        """Assign every normal within 15 degrees of +Z to the same single bin.
+
+        Emulates curved/mesh terrain: patch normals wobble around world-up. If
+        any of them crosses a bin boundary, contacts of one patch regroup
+        between steps and the kept set flickers.
+        """
+        faces = np.array(_BP_FACE_NORMALS_DATA, dtype=np.float64).reshape(-1, 3)
+        rng = np.random.default_rng(5)
+        tilt = np.radians(rng.uniform(0.0, 15.0, size=512))
+        yaw = rng.uniform(0.0, 2.0 * np.pi, size=512)
+        normals = np.stack(
+            [np.sin(tilt) * np.cos(yaw), np.sin(tilt) * np.sin(yaw), np.cos(tilt)],
+            axis=1,
+        )
+        bins = np.argmax(normals @ faces.T, axis=1)
+        self.assertEqual(len(np.unique(bins)), 1, "normals near +Z must all share one bin")
+
+    def test_kept_set_invariant_under_translation(self):
+        """Keep the identical relative contact set after translating the scene.
+
+        Symmetric collider layouts tie in the scan directions constantly (a row
+        of foot cylinders shares a coordinate exactly). The old tie-break hashed
+        contact content, and a static shape's witness point is world-space, so
+        pure translation flipped winners: a foot sliding in a straight line
+        churned its kept set. The geometric tie-break is measured in the
+        pair-anchored face frame and cannot see translation.
+        """
+        offsets = ((0.0, 0.0), (0.37, 0.53), (1.24, -0.86))
+        kept_sets = []
+        for ox, oy in offsets:
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+            body = _cylinder_foot(builder, (ox, oy, 0.0175))
+            builder.add_ground_plane()
+            model = builder.finalize(device=wp.get_device())
+            state = model.state()
+            contacts = _collide_once(model, state, reduce_body_pairs=True)
+            n, s0, s1, _nrm, _p0 = _contact_snapshot(contacts)
+            self.assertGreater(n, 0)
+            # canonicalize in the BODY frame: witness points on the static plane
+            # are stored world-space and legitimately move with the scene, so
+            # compare positions relative to the foot instead.
+            pts = _world_points0(model, state, contacts) - state.body_q.numpy()[body][:3]
+            rows = sorted(
+                (int(a), int(b), *(round(float(v), 5) for v in p)) for a, b, p in zip(s0, s1, pts, strict=True)
+            )
+            kept_sets.append(rows)
+        self.assertEqual(kept_sets[0], kept_sets[1], "kept set changed under translation")
+        self.assertEqual(kept_sets[0], kept_sets[2], "kept set changed under translation")
 
 
 class TestBodyPairReductionCertificate(unittest.TestCase):

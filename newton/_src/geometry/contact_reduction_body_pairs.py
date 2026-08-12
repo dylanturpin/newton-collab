@@ -16,10 +16,11 @@ compacts it in two kernels over the live contact range -- register, then select:
 
 * contacts are grouped by ``(group0, group1, normal bin, spatial cell)`` where
   the group is the body (or the shape itself for static geometry, so distinct
-  static colliders never merge), the bin is a polyhedron face from
-  :mod:`contact_reduction`'s normal binning, and the cell is the contact's
-  position on that face plane quantized relative to the pair's own reference
-  body (see :func:`_contact_group_key`);
+  static colliders never merge), the bin is a face of this module's own
+  Z-aligned icosahedron (see :data:`BP_FACE_NORMALS` for why it is not the
+  shared table), and the cell is the contact's position on that face plane
+  quantized relative to the pair's own reference body (see
+  :func:`_contact_group_key`);
 * every contact enters its group's depth slot and all
   :data:`BODY_PAIR_NUM_DIRECTIONS` spatial-extreme slots, competing on
   projection alone, so each slot ends up holding that direction's true extreme
@@ -48,6 +49,14 @@ touching floor and wall at once) keep representatives of every patch.  On
 hashtable overflow the pass fails open: a contact that cannot be registered is
 kept, never dropped.
 
+**Known characteristic -- torsional patch friction.** Keeping a patch's rim
+extremes lengthens its mean friction lever arm: a spinning multi-collider disc
+stops ~25% sooner reduced than unreduced (adversarial A/B, mu 0.3 and 0.6).
+This is inherent to any patch-thinning that keeps boundary points -- PhysX's
+4-point persistent manifolds carry the same rim bias -- and is bounded and
+smooth, so it is documented rather than patched.  Watch yaw-tracking error when
+validating policies whose feet pivot.
+
 All launches are fixed-size and the pass is CUDA-graph-capture compatible.
 """
 
@@ -56,12 +65,93 @@ from __future__ import annotations
 import warp as wp
 
 from ..sim.contacts import contact_surface_separation
-from .contact_reduction import (
-    float_flip,
-    get_slot,
-    project_point_to_plane,
+from .contact_reduction import float_flip
+from .hashtable import HashTable, hashtable_find_or_insert
+
+# Normal-binning table PRIVATE to body-pair reduction: the icosahedron from
+# :mod:`contact_reduction`, rotated so a face CENTER points at world +Z and the
+# yaw chosen to maximize the minimum bin margin at +/-X and +/-Y.
+#
+# The shared table stores the icosahedron Y-up, which puts +Z on the boundary
+# between two equatorial faces to within 7e-8 of dot product. A flat plane is
+# immune (its normal is bit-identical every step, so the argmax is stable), but
+# on any curved or mesh surface in a Z-up world the patch normals wobble across
+# that boundary, contacts regroup between bins step to step, and the kept set
+# churns: measured 20x angular-velocity noise and a permanent rocking limit
+# cycle that never settles. With this table the margin at +/-Z is 0.2546 -- a
+# ground normal must tilt more than 20 degrees to change bins -- and 0.066 at
+# +/-X/+/-Y (walls, ~4 degrees). Boundaries must exist somewhere on the sphere;
+# they just must not pass through the one direction every scene is built
+# around. Private copy on purpose: the mesh reducer consumes the shared table,
+# and re-orienting that path is out of scope (same reasoning as
+# BODY_PAIR_NUM_DIRECTIONS).
+#
+# Derivation (offline, float64): R0 aligns shared-table face 10 with +Z; yaw
+# 55.75 deg about Z then maximizes min(margin(+/-X), margin(+/-Y)); rows
+# renormalized. The two axis-aligned rows are written exactly.
+# fmt: off
+_BP_FACE_NORMALS_DATA = (
+    -0.57095543,  0.75026579,  0.33333337,
+    -0.64404845,  0.17218052,  0.74535593,
+    -0.86918069, -0.36525859,  0.33333330,
+    -0.93522697, -0.11932883, -0.33333339,
+    -0.75091368,  0.57010308, -0.33333336,
+     0.36427171,  0.86959472, -0.33333337,
+    -0.17291149,  0.64385240, -0.74535609,
+     0.47113684,  0.47167205,  0.74535599,
+     0.11826704,  0.93536185,  0.33333335,
+     0.17291155, -0.64385245,  0.74535603,
+     0.0,         0.0,         1.0,
+    -0.11826707, -0.93536184, -0.33333335,
+    -0.36427169, -0.86959473,  0.33333337,
+     0.0,         0.0,        -1.0,
+    -0.47113677, -0.47167196, -0.74535609,
+     0.93522695,  0.11932898,  0.33333339,
+     0.75091367, -0.57010306,  0.33333340,
+     0.57095545, -0.75026579, -0.33333334,
+     0.64404840, -0.17218051, -0.74535597,
+     0.86918063,  0.36525872, -0.33333332,
 )
-from .hashtable import HASH_MIX_MULTIPLIER, HashTable, hashtable_find_or_insert
+# fmt: on
+BP_NUM_NORMAL_BINS = 20
+_bp_face_normals_mat = wp.types.matrix(shape=(BP_NUM_NORMAL_BINS, 3), dtype=wp.float32)
+BP_FACE_NORMALS = _bp_face_normals_mat(*_BP_FACE_NORMALS_DATA)
+
+
+@wp.func
+def _bp_get_slot(normal: wp.vec3) -> int:
+    """Return the body-pair bin whose face normal best matches ``normal``.
+
+    Full linear scan over the rotated table; the shared reducer's Y-cap pruning
+    does not apply to a rotated orientation, and 20 dot products are noise next
+    to the hashtable probe this feeds.
+    """
+    best_slot = int(0)
+    max_dot = wp.dot(normal, wp.vec3(BP_FACE_NORMALS[0, 0], BP_FACE_NORMALS[0, 1], BP_FACE_NORMALS[0, 2]))
+    for i in range(1, wp.static(BP_NUM_NORMAL_BINS)):
+        d = wp.dot(normal, wp.vec3(BP_FACE_NORMALS[i, 0], BP_FACE_NORMALS[i, 1], BP_FACE_NORMALS[i, 2]))
+        if d > max_dot:
+            max_dot = d
+            best_slot = i
+    return best_slot
+
+
+@wp.func
+def _bp_project_point_to_plane(bin_normal_idx: int, point: wp.vec3) -> wp.vec2:
+    """Project ``point`` onto the local 2D frame of a body-pair bin face."""
+    face_normal = wp.vec3(
+        BP_FACE_NORMALS[bin_normal_idx, 0],
+        BP_FACE_NORMALS[bin_normal_idx, 1],
+        BP_FACE_NORMALS[bin_normal_idx, 2],
+    )
+    if wp.abs(face_normal[1]) < 0.9:
+        ref = wp.vec3(0.0, 1.0, 0.0)
+    else:
+        ref = wp.vec3(1.0, 0.0, 0.0)
+    u = wp.normalize(ref - wp.dot(ref, face_normal) * face_normal)
+    v = wp.cross(face_normal, u)
+    return wp.vec2(wp.dot(point, u), wp.dot(point, v))
+
 
 # Scan directions used to pick footprint extremes on a normal bin's face plane.
 # Deliberately independent of the mesh reducer's own direction count so tuning
@@ -224,8 +314,8 @@ def _contact_group_key(
     elif b1 >= 0:
         ref = wp.transform_get_translation(body_q[b1])
 
-    bin_id = get_slot(n)
-    pos_2d = project_point_to_plane(bin_id, center - ref)
+    bin_id = _bp_get_slot(n)
+    pos_2d = _bp_project_point_to_plane(bin_id, center - ref)
     # Round to nearest, not floor: that puts the reference body's origin at the
     # CENTER of cell 0 rather than on its corner. Flooring relative coordinates
     # would place the origin exactly on a cell boundary, so a patch centered
@@ -243,14 +333,29 @@ def _contact_group_key(
 
 
 @wp.func
-def _pack_score(score: float, fingerprint: wp.uint32) -> wp.uint64:
-    """Pack ``(score, content fingerprint)`` for ``atomic_max`` competition.
+def _pos_key_31(pos_2d: wp.vec2) -> wp.uint64:
+    """Quantize a face-plane position to a 31-bit, never-zero identity key.
+
+    0.5 mm resolution; x covers +/-16.4 m (16 bits), y +/-4.1 m (14 bits),
+    both measured from the pair's reference body, and bit 0 is always set so a
+    real packed value can never equal the empty-slot sentinel 0.  Positions
+    beyond the range clamp, which can only merge far-apart duplicates into a
+    tie -- and ties are kept, never dropped.
+    """
+    qx = wp.clamp(wp.int32(wp.floor(pos_2d[0] * 2000.0)) + 32768, 0, 65535)
+    qy = wp.clamp(wp.int32(wp.floor(pos_2d[1] * 2000.0)) + 8192, 0, 16383)
+    return (wp.uint64(qx) << wp.uint64(15)) | (wp.uint64(qy) << wp.uint64(1)) | wp.uint64(1)
+
+
+@wp.func
+def _pack_score(primary: float, pos_key: wp.uint64) -> wp.uint64:
+    """Pack ``(score, position identity)`` for ``atomic_max`` competition.
 
     Layout (bit 63 kept zero so the value orders identically read as signed or
     unsigned)::
 
-        [62:31] float_flip(score)   (32 bits)
-        [30:0]  content fingerprint (31 bits, never zero)
+        [62:31] float_flip(primary)              (32 bits)
+        [30:0]  quantized face-plane position    (31 bits, never zero)
 
     Every contact of a group competes for every spatial slot on projection
     alone -- there is no depth gate or depth preference.  Both were tried and
@@ -262,65 +367,24 @@ def _pack_score(score: float, fingerprint: wp.uint32) -> wp.uint64:
     direction's true spatial extreme, so footprint support is preserved by
     construction and no tuning parameter can remove it.
 
+    The low bits are the GEOMETRIC tie-break: the contact's own quantized
+    position on the pair-anchored face plane.  Symmetric collider layouts tie
+    on the primary score constantly -- a row of foot cylinders shares a
+    coordinate exactly -- and the previous tie-break, a hash of contact
+    content, flipped winners whenever any input float moved (a static shape's
+    witness point is world-space, so it changes under pure translation),
+    churning the kept set of a body sliding in a straight line.  The position
+    key cannot see translation, and unlike a single scalar it identifies the
+    contact (up to 0.5 mm co-location), so a tie means two physically
+    coincident contacts -- both are kept, and the <= 7-per-group bound holds
+    for all genuinely distinct geometry.
+
     No buffer index is stored: winners identify THEMSELVES in the selection
-    pass by comparing their own packed value against the slot.  Ties on score
-    and fingerprint mean identical content -- both contacts are kept, which
-    fails open.  Because the value is a pure function of contact content, the
-    winning SET is invariant to thread scheduling, buffer order, and buffer
-    capacity.  The fingerprint is forced nonzero so a real value is never
-    confused with the empty-slot sentinel 0.
+    pass by comparing their own packed value against the slot, so the winning
+    SET is a pure function of contact geometry: invariant to thread
+    scheduling, buffer order, buffer capacity, and rigid translation.
     """
-    return (wp.uint64(float_flip(score)) << wp.uint64(31)) | (wp.uint64(fingerprint) & wp.uint64(0x7FFFFFFF))
-
-
-@wp.func
-def _mix_u64(h: wp.uint64, v: wp.uint32) -> wp.uint64:
-    """One MurmurHash3-style mixing round of ``v`` into ``h``."""
-    m = (h ^ wp.uint64(v)) * HASH_MIX_MULTIPLIER
-    return m ^ (m >> wp.uint64(29))
-
-
-@wp.func
-def _contact_fingerprint(
-    i: int,
-    contact_shape0: wp.array[wp.int32],
-    contact_shape1: wp.array[wp.int32],
-    contact_point0: wp.array[wp.vec3],
-    contact_point1: wp.array[wp.vec3],
-    contact_normal: wp.array[wp.vec3],
-) -> wp.uint32:
-    """Hash contact ``i``'s own geometry to a 31-bit, never-zero fingerprint.
-
-    This is the tie-break when two contacts of a group score identically in a
-    scan direction, which is routine rather than exotic: a foot's colliders sit
-    in a row, so several share a coordinate exactly and tie in the direction
-    orthogonal to it.
-
-    Derived from the contact's content -- shape pair, both witness points,
-    normal -- and nothing else.  The narrow phase's sort key was used before and
-    is NOT a content function: its sub-key for multi-contact paths is
-    ``(template << 3) | count_out``, an emission-order counter, so the same
-    physical contact could carry different fingerprints in different runs and
-    ties resolved differently depending on history. That made the kept set
-    depend on emission order, contradicting the invariance this pass documents.
-    Hashing the geometry instead makes the guarantee real, and drops a
-    capacity-sized int64 array plus the writer work that filled it.
-
-    Collisions are safe by construction: two contacts matching on both score and
-    fingerprint are both kept, so a collision costs one redundant contact, never
-    a dropped one.
-    """
-    h = _mix_u64(HASH_MIX_MULTIPLIER, wp.uint32(contact_shape0[i]))
-    h = _mix_u64(h, wp.uint32(contact_shape1[i]))
-    p0 = contact_point0[i]
-    p1 = contact_point1[i]
-    n = contact_normal[i]
-    for k in range(3):
-        h = _mix_u64(h, float_flip(p0[k]))
-        h = _mix_u64(h, float_flip(p1[k]))
-        h = _mix_u64(h, float_flip(n[k]))
-    # bit 0 forced set: a zero fingerprint could collide with the empty-slot sentinel
-    return wp.uint32(((h ^ (h >> wp.uint64(32))) & wp.uint64(0x7FFFFFFF)) | wp.uint64(1))
+    return (wp.uint64(float_flip(primary)) << wp.uint64(31)) | pos_key
 
 
 @wp.func
@@ -368,7 +432,6 @@ def _register_contact_one(
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
-    contact_fp: wp.array[wp.uint32],
     stats: wp.array[wp.int32],
 ):
     """Enter contact ``i`` into every slot of its group: depth and all extremes.
@@ -417,16 +480,15 @@ def _register_contact_one(
         return
     contact_gap[i] = gap
     contact_pos2d[i] = pos_2d
-    fp = _contact_fingerprint(i, contact_shape0, contact_shape1, contact_point0, contact_point1, contact_normal)
-    contact_fp[i] = fp
 
-    depth_value = _pack_score(-gap, fp)
+    pos_key = _pos_key_31(pos_2d)
+    depth_value = _pack_score(-gap, pos_key)
     slot_idx = _slot_index(entry_idx, wp.static(DEEPEST_SLOT))
     if ht_values[slot_idx] < depth_value:
         wp.atomic_max(ht_values, slot_idx, depth_value)
 
     for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
-        value = _pack_score(wp.dot(pos_2d, _direction_2d(dir_i)), fp)
+        value = _pack_score(wp.dot(pos_2d, _direction_2d(dir_i)), pos_key)
         dir_slot = _slot_index(entry_idx, dir_i)
         if ht_values[dir_slot] < value:
             wp.atomic_max(ht_values, dir_slot, value)
@@ -455,7 +517,6 @@ def _register_contacts_kernel(
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
-    contact_fp: wp.array[wp.uint32],
     stats: wp.array[wp.int32],
 ):
     """Pass 1 of 2: enter every contact into all slots of its group.
@@ -489,7 +550,6 @@ def _register_contacts_kernel(
             contact_entry,
             contact_gap,
             contact_pos2d,
-            contact_fp,
             stats,
         )
         i += num_threads
@@ -525,7 +585,6 @@ def _select_winner_one(
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
-    contact_fp: wp.array[wp.uint32],
     ht_values: wp.array[wp.uint64],
     keep_flags: wp.array[wp.int32],
 ):
@@ -534,15 +593,15 @@ def _select_winner_one(
     if entry_idx < 0:
         return  # keep_flags[i] already set by the register pass (fail open)
 
-    fp = contact_fp[i]
     gap = contact_gap[i]
+    pos_2d = contact_pos2d[i]
 
     # NOTE: no early ``return`` inside the loop -- Warp does not reliably honor
     # returns from within a for-loop, so accumulate and flag once.
-    won = ht_values[_slot_index(entry_idx, wp.static(DEEPEST_SLOT))] == _pack_score(-gap, fp)
-    pos_2d = contact_pos2d[i]
+    pos_key = _pos_key_31(pos_2d)
+    won = ht_values[_slot_index(entry_idx, wp.static(DEEPEST_SLOT))] == _pack_score(-gap, pos_key)
     for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
-        value = _pack_score(wp.dot(pos_2d, _direction_2d(dir_i)), fp)
+        value = _pack_score(wp.dot(pos_2d, _direction_2d(dir_i)), pos_key)
         if ht_values[_slot_index(entry_idx, dir_i)] == value:
             won = True
     if won:
@@ -555,7 +614,6 @@ def _select_winners_kernel(
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
-    contact_fp: wp.array[wp.uint32],
     ht_values: wp.array[wp.uint64],
     num_threads: int,
     # outputs
@@ -573,7 +631,7 @@ def _select_winners_kernel(
     count = contact_count[0]
     i = wp.tid()
     while i < count:
-        _select_winner_one(i, contact_entry, contact_gap, contact_pos2d, contact_fp, ht_values, keep_flags)
+        _select_winner_one(i, contact_entry, contact_gap, contact_pos2d, ht_values, keep_flags)
         i += num_threads
 
 
@@ -583,7 +641,6 @@ def _verify_invariant_one(
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
-    contact_fp: wp.array[wp.uint32],
     ht_values: wp.array[wp.uint64],
     keep_flags: wp.array[wp.int32],
     violations: wp.array[wp.int32],
@@ -593,24 +650,23 @@ def _verify_invariant_one(
     if entry_idx < 0:
         return  # fail-open contacts are kept by definition
 
-    fp = contact_fp[i]
     gap = contact_gap[i]
+    pos_2d = contact_pos2d[i]
     kept = keep_flags[i] != 0
 
     matched = False
     beaten = False
 
+    pos_key = _pos_key_31(pos_2d)
     deepest_value = ht_values[_slot_index(entry_idx, wp.static(DEEPEST_SLOT))]
-    my_depth = _pack_score(-gap, fp)
+    my_depth = _pack_score(-gap, pos_key)
     if my_depth == deepest_value:
         matched = True
     elif my_depth > deepest_value:
         beaten = True  # I out-rank the recorded winner: the slot missed me
 
-    pos_2d = contact_pos2d[i]
     for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
-        dir_2d = _direction_2d(dir_i)
-        value = _pack_score(wp.dot(pos_2d, dir_2d), fp)
+        value = _pack_score(wp.dot(pos_2d, _direction_2d(dir_i)), pos_key)
         slot_value = ht_values[_slot_index(entry_idx, dir_i)]
         if value == slot_value:
             matched = True
@@ -631,7 +687,6 @@ def _verify_invariant_kernel(
     contact_entry: wp.array[wp.int32],
     contact_gap: wp.array[wp.float32],
     contact_pos2d: wp.array[wp.vec2],
-    contact_fp: wp.array[wp.uint32],
     ht_values: wp.array[wp.uint64],
     keep_flags: wp.array[wp.int32],
     num_threads: int,
@@ -649,9 +704,7 @@ def _verify_invariant_kernel(
     count = contact_count[0]
     i = wp.tid()
     while i < count:
-        _verify_invariant_one(
-            i, contact_entry, contact_gap, contact_pos2d, contact_fp, ht_values, keep_flags, violations
-        )
+        _verify_invariant_one(i, contact_entry, contact_gap, contact_pos2d, ht_values, keep_flags, violations)
         i += num_threads
 
 
@@ -939,12 +992,11 @@ class BodyPairContactReducer:
         self.entry_stride_threads = min(self.hashtable.capacity, REDUCTION_MAX_THREADS)
         self.keep_flags = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
         self.keep_scan = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
-        # pass-1 cache read by passes 2 and 3: hashtable entry, canonical gap,
-        # face-plane position, content fingerprint
+        # pass-1 cache read by the selection pass: hashtable entry, canonical
+        # gap, face-plane position
         self.contact_entry = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
         self.contact_gap = wp.zeros(rigid_contact_max, dtype=wp.float32, device=device)
         self.contact_pos2d = wp.zeros(rigid_contact_max, dtype=wp.vec2, device=device)
-        self.contact_fp = wp.zeros(rigid_contact_max, dtype=wp.uint32, device=device)
         self._scratch = None
 
     def _ensure_scratch(self, need_material: bool):
@@ -1046,7 +1098,6 @@ class BodyPairContactReducer:
                 self.contact_entry,
                 self.contact_gap,
                 self.contact_pos2d,
-                self.contact_fp,
                 self._stats,
             ],
             device=self.device,
@@ -1060,7 +1111,6 @@ class BodyPairContactReducer:
                 self.contact_entry,
                 self.contact_gap,
                 self.contact_pos2d,
-                self.contact_fp,
                 self.ht_values,
                 self.stride_threads,
             ],
@@ -1077,7 +1127,6 @@ class BodyPairContactReducer:
                     self.contact_entry,
                     self.contact_gap,
                     self.contact_pos2d,
-                    self.contact_fp,
                     self.ht_values,
                     self.keep_flags,
                     self.stride_threads,
@@ -1254,6 +1303,6 @@ class BodyPairContactReducer:
             "slots_per_entry": BODY_PAIR_REDUCTION_SLOTS,
             "hashtable_bytes": self.hashtable.keys.size * 8 + self.hashtable.active_slots.size * 4,
             "slot_value_bytes": self.ht_values.size * 8,
-            "per_contact_cache_bytes": n * (4 + 4 + 4 + 4 + 8 + 4),  # flags, scan, entry, gap, pos2d, fp
+            "per_contact_cache_bytes": n * (4 + 4 + 4 + 4 + 8),  # flags, scan, entry, gap, pos2d
             "gather_scratch_owned_bytes": owned,
         }
