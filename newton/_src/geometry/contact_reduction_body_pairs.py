@@ -96,11 +96,12 @@ BODY_PAIR_REDUCTION_SLOTS = BODY_PAIR_NUM_DIRECTIONS + 1
 # contact, which would break the strict keep-deepest guarantee.
 GROUP_ID_BITS = 21
 MAX_GROUP_ID = (1 << GROUP_ID_BITS) - 1
-# Cell coordinates are packed EXACTLY as two signed 8-bit values (+/-127 cells
-# from the origin on the bin's face plane); positions beyond that range clamp
-# to the border cell, which merges only the far periphery (beyond ~32 m at the
-# default cell size) and only ever over-competes -- the deepest of the merged
-# region is still kept.
+# Cell coordinates are packed EXACTLY as two signed 8-bit values, measured from
+# the pair's own reference body (see _contact_group_key), so the range covers a
+# +/-127-cell span ACROSS ONE BODY PAIR -- 32 m at the default cell size, far
+# more than any single pair of colliders spans. Beyond it the coordinate clamps
+# to the border cell, which only ever over-competes (the deepest of the merged
+# region is still kept) and is counted in the clamp telemetry.
 CELL_COORD_MAX = 127
 
 
@@ -150,7 +151,7 @@ def _contact_group_key(
     shape_count: int,
     cell_size: float,
 ):
-    """Compute (key, gap, center, bin_id, cell_clamped) for contact ``i``.
+    """Compute (key, gap, face-plane position, cell_clamped) for contact ``i``.
 
     The gap is :func:`newton._src.sim.contacts.contact_surface_separation` --
     the one canonical signed-separation convention the solvers consume
@@ -165,6 +166,16 @@ def _contact_group_key(
     same-normal patches far apart on ONE shape pair (a long body across two
     regions of a terrain collider) each get their own deepest + extremes
     instead of competing for a single slot set.
+
+    Both the cell and the returned face-plane position are measured from the
+    pair's OWN reference body, not the world origin, because
+    :func:`project_point_to_plane` is a pure linear map and the cell field is
+    only 8 bits per axis: absolute coordinates pin every contact past ~32 m to
+    the border cell, which silently disables the subdivision for all but the
+    envs nearest the origin.  Subtracting a per-group constant cannot change
+    which contact is extreme in a direction, so the shift is free, and it also
+    recovers the float32 precision that large world offsets spend on the
+    exponent.
     """
     s0 = contact_shape0[i]
     s1 = contact_shape1[i]
@@ -192,17 +203,27 @@ def _contact_group_key(
     ga = wp.min(g0, g1)
     gb = wp.max(g0, g1)
 
+    # Cell origin: the pair's lowest-indexed dynamic body, or the world origin
+    # when both sides are static. Chosen from body indices rather than from the
+    # contact's own shape order so the origin is the same for every contact of
+    # the group -- otherwise contacts of one patch would land in different cells.
+    ref = wp.vec3(0.0, 0.0, 0.0)
+    if b0 >= 0 and (b1 < 0 or b0 <= b1):
+        ref = wp.transform_get_translation(body_q[b0])
+    elif b1 >= 0:
+        ref = wp.transform_get_translation(body_q[b1])
+
     bin_id = get_slot(n)
-    pos_2d = project_point_to_plane(bin_id, center)
+    pos_2d = project_point_to_plane(bin_id, center - ref)
     cx = wp.int32(wp.floor(pos_2d[0] / cell_size))
     cy = wp.int32(wp.floor(pos_2d[1] / cell_size))
     key = _make_group_key(ga, gb, bin_id, cx, cy)
     # Report the clamp rather than hide it: clamped cells merge distant regions
     # of one shape pair, which only over-competes, but a sustained nonzero count
-    # means the scene outgrew the 8-bit cell range and reduction quality on the
-    # periphery is no longer what the cell size promises.
+    # means one body pair spans more than +/-127 cells and reduction quality
+    # across it is no longer what the cell size promises.
     clamped = wp.abs(cx) > CELL_COORD_MAX or wp.abs(cy) > CELL_COORD_MAX
-    return key, gap, center, bin_id, clamped
+    return key, gap, pos_2d, clamped
 
 
 @wp.func
@@ -284,7 +305,7 @@ def _insert_deepest_kernel(
         contact_entry[i] = -1
         return
 
-    key, gap, center, bin_id, cell_clamped = _contact_group_key(
+    key, gap, pos_2d, cell_clamped = _contact_group_key(
         i,
         contact_shape0,
         contact_shape1,
@@ -307,7 +328,7 @@ def _insert_deepest_kernel(
         wp.atomic_add(stats, wp.static(STAT_FAIL_OPEN), 1)
         return
     contact_gap[i] = gap
-    contact_pos2d[i] = project_point_to_plane(bin_id, center)
+    contact_pos2d[i] = pos_2d
 
     ht_capacity = ht_keys.shape[0]
     depth_value = _pack_score(-gap, _key_fingerprint(sort_keys, i))

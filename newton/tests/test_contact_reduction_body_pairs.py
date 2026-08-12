@@ -525,6 +525,39 @@ class TestBodyPairReductionMultiPatch(unittest.TestCase):
         self.assertGreaterEqual(int(left), 3, "left cluster under-represented")
         self.assertGreaterEqual(int(right), 3, "right cluster under-represented")
 
+    def test_both_clusters_fully_kept_far_from_origin(self):
+        """Keep both clusters for a body 200 m from the origin, not just near it.
+
+        The spatial cell is packed as two signed 8-bit values. Measured from the
+        world origin those saturate past ~32 m, so both clusters of a distant
+        body land in the same border cell, compete for one slot set, and one
+        loses its support points -- while the identical scene at the origin
+        passes. Anchoring the cell grid at the pair's reference body makes the
+        coordinates relative, so distance from the origin cannot matter.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        body = self._two_cluster_body(builder)
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        q = state.body_q.numpy()
+        q[body][0] += 200.0
+        q[body][1] += 200.0
+        state.body_q.assign(q)
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        pts = _world_points0(model, state, contacts)
+        left = int((pts[:, 0] < 199.8).sum())
+        right = int((pts[:, 0] > 200.2).sum())
+        self.assertGreaterEqual(left, 3, "left cluster under-represented far from origin")
+        self.assertGreaterEqual(right, 3, "right cluster under-represented far from origin")
+        self.assertEqual(
+            pipeline._body_pair_reducer.stats()["cell_clamp_events"],
+            0,
+            "cell coordinates should be relative to the body pair, so nothing clamps",
+        )
+
     def _settle_plank(self, reduce_on):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         body = self._two_cluster_body(builder)
@@ -718,6 +751,7 @@ class TestBodyPairReductionFPGSImpact(unittest.TestCase):
         mis-ranked kept set leaves no load-bearing contact at touchdown and
         the body free-falls before a violent late landing.
         """
+
         def run(reduce_on):
             builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
             body = _cylinder_foot(builder, (5.13, 5.07, 0.06))  # 3 cm drop
@@ -821,9 +855,7 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
             for _ in range(150):
                 pipe_raw.collide(state_0, c_raw)
                 pipe_red.collide(state_0, c_red)
-                raw_more += int(
-                    c_raw.rigid_contact_count.numpy()[0] >= c_red.rigid_contact_count.numpy()[0]
-                )
+                raw_more += int(c_raw.rigid_contact_count.numpy()[0] >= c_red.rigid_contact_count.numpy()[0])
                 state_0.clear_forces()
                 solver.step(state_0, state_1, control, c_red, DT)
                 state_0, state_1 = state_1, state_0
