@@ -12,19 +12,30 @@ points, so discarding interior points preserves the feasible contact wrench
 exactly).
 
 This pass runs after the narrow phase has written the ``Contacts`` buffer and
-compacts it **per body pair and normal bin**:
+compacts it in two kernels over the live contact range -- register, then select:
 
-* contacts are grouped by ``(group0, group1, normal bin)`` where the group is
-  the body (or the shape itself for static geometry, so distinct static
-  colliders never merge) and the bin is a polyhedron face from
-  :mod:`contact_reduction`'s normal binning;
-* per group, the deepest contact always survives and every contact competes for
-  one spatial-extreme slot per scan direction on projection alone, so each slot
-  ends up holding that direction's true extreme (see
-  :data:`BODY_PAIR_REDUCTION_SLOTS` for the policies this replaced);
-* everything else -- interior points of the patch and candidates far shallower
-  than the load-bearing set -- is discarded, and the ``Contacts`` arrays are
-  compacted in place so ``rigid_contact_count`` itself drops.
+* contacts are grouped by ``(group0, group1, normal bin, spatial cell)`` where
+  the group is the body (or the shape itself for static geometry, so distinct
+  static colliders never merge), the bin is a polyhedron face from
+  :mod:`contact_reduction`'s normal binning, and the cell is the contact's
+  position on that face plane quantized relative to the pair's own reference
+  body (see :func:`_contact_group_key`);
+* every contact enters its group's depth slot and all
+  :data:`BODY_PAIR_NUM_DIRECTIONS` spatial-extreme slots, competing on
+  projection alone, so each slot ends up holding that direction's true extreme
+  (see :data:`BODY_PAIR_REDUCTION_SLOTS` for the policies this replaced);
+* each contact then checks whether any value it submitted won its slot, and the
+  survivors are compacted in place so ``rigid_contact_count`` itself drops.
+  Everything else -- interior points of a patch, whose force is a convex
+  combination of the hull points' -- is discarded.
+
+**When this pays.** Only bodies whose collision is decomposed into several
+primitives generate more candidates per pair than the slot budget. On a walking
+G1 (7 cylinders per foot) the pass costs ~4% of the step and returns ~14% of
+throughput. On a scene of single-box bodies there is nothing to discard and it is
+pure overhead -- measured 5% slower on 1024x250 falling cubes. It is opt-in for
+that reason; ``stats()`` reports the achieved ratio, and a ratio near 1.0 means
+this scene does not want it.
 
 Depth is ranked with the canonical
 :func:`newton._src.sim.contacts.contact_surface_separation`, but only to choose
