@@ -1487,8 +1487,25 @@ class CollisionPipeline:
     def body_pair_reduction_stats(self) -> dict:
         """Whole-run telemetry of the body-pair contact reduction.
 
-        Synchronizes the device; do not call during CUDA graph capture.  See
-        the returned keys' documentation on the reducer's ``stats()``.
+        Synchronizes the device; do not call during CUDA graph capture.  All
+        values are int (plus one float ratio), accumulated since construction
+        or the last :meth:`clear_body_pair_reduction_stats`:
+
+        * ``invariant_violations`` / ``outranked_discards`` -- certificate
+          disagreements (verify mode only; any nonzero value is a bug).
+        * ``fail_open_keeps`` -- contacts kept because the group table was
+          full.
+        * ``cell_clamp_events`` -- contacts whose spatial cell hit the packed
+          coordinate range.
+        * ``max_contacts_in`` / ``max_contacts_kept`` -- independent peak
+          watermarks before/after reduction; ``max_contacts_in`` is the
+          minimum observed safe ``rigid_contact_max``.
+        * ``max_hashtable_entries`` / ``hashtable_capacity`` /
+          ``hashtable_load`` (float) -- group-table occupancy.
+        * ``input_overflow_frames`` / ``fallback_frames`` /
+          ``identity_frames`` -- frames that skipped reduction (input
+          overflow), kept everything deterministically (table budget), or
+          provably had nothing to remove.
 
         Raises:
             RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.
@@ -1496,6 +1513,20 @@ class CollisionPipeline:
         if self._body_pair_reducer is None:
             raise RuntimeError("reduce_contacts_body_pairs is not enabled on this pipeline")
         return self._body_pair_reducer.stats()
+
+    def clear_body_pair_reduction_stats(self):
+        """Zero the reduction telemetry accumulators.
+
+        Host-side; call outside CUDA graph capture.  Lets long runs isolate
+        per-phase telemetry (the counters are int32 and otherwise accumulate
+        for the pipeline's lifetime).
+
+        Raises:
+            RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.
+        """
+        if self._body_pair_reducer is None:
+            raise RuntimeError("reduce_contacts_body_pairs is not enabled on this pipeline")
+        self._body_pair_reducer.clear_stats()
 
     def body_pair_reduction_description(self) -> dict:
         """Static buffer footprint of the body-pair contact reduction by role.

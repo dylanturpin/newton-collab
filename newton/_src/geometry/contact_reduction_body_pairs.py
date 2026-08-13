@@ -2087,7 +2087,9 @@ class BodyPairContactReducer:
             ``input_overflow_frames``: frames whose narrow-phase output
             exceeded the buffer capacity; the reduction skipped those frames
             entirely and delivered the raw result (raise
-            ``rigid_contact_max``).
+            ``rigid_contact_max``).  Overflow frames are excluded from the
+            kept watermark: their materialized prefix contains holes, so no
+            meaningful kept count exists for them.
             ``fallback_frames``: frames that deterministically kept the whole
             unreduced set because the group table budget was exceeded (raise
             the hashtable factor).
@@ -2112,8 +2114,21 @@ class BodyPairContactReducer:
             "identity_frames": int(v[STAT_IDENTITY_FRAMES]),
         }
 
+    def clear_stats(self):
+        """Zero the whole-run telemetry accumulators (host-side, outside capture).
+
+        Lets long training runs isolate per-phase telemetry; the counters are
+        int32 and accumulate for the reducer's lifetime otherwise.
+        """
+        self._stats.zero_()
+
     def describe(self) -> dict:
-        """Static footprint of the pass: buffer bytes by role, and capacities.
+        """Currently allocated footprint of the pass: buffer bytes by role.
+
+        Mostly fixed at construction; the per-contact MATERIAL scratch is
+        provisioned on first use by a buffer with per-contact shape
+        properties, so ``gather_scratch_owned_bytes`` can grow once after
+        that first rich-buffer collide.
 
         Reported per role rather than as one total so an over-provisioned
         ``rigid_contact_max`` is distinguishable from the pass's own overhead;
