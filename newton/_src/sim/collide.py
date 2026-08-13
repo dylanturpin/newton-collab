@@ -1024,12 +1024,19 @@ class CollisionPipeline:
                 deterministic: winner selection is a function of contact
                 geometry plus, when
                 ``reduce_contacts_body_pairs_hysteresis`` is nonzero (the
-                default), the previous step's winners; combine with
-                ``deterministic=True`` if a canonical buffer ORDER is also
-                required.  Known fidelity tradeoffs: the footprint hull is
+                default), the previous step's winners -- with two documented
+                qualifications: exactly coincident duplicate contacts are all
+                kept (so duplicated colliders can exceed the per-group slot
+                bound), and near group-table saturation the reduced-vs-
+                fail-open OUTCOME can vary with scheduling (keep
+                ``fallback_frames`` at zero by sizing the table).  Combine
+                with ``deterministic=True`` if a canonical buffer ORDER is
+                also required.  Known fidelity tradeoffs: the footprint hull is
                 sampled by six fixed directions, so support and tipping are
-                preserved to within that sampling (worst-case ~13% of patch
-                radius in an unsampled direction) rather than exactly, and
+                preserved only to scene-dependent sampling tolerances (a
+                densely populated footprint loses at most ~13% of patch
+                radius; a sparse adversarial hull can lose up to 50% in an
+                omitted direction) rather than exactly, and
                 keeping rim extremes strengthens torsional (twist-about-
                 normal) friction -- measured 1.34x the uniform-pressure value
                 on a circular patch; elongated patches can be biased further.

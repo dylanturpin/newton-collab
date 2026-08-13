@@ -12,15 +12,19 @@ is described by its deepest point plus the extremes of its footprint.
 interior point's normal force is a convex combination of hull-point normal
 forces (support/tipping statics preserved) and translational friction capacity
 ``sum mu*N_i`` is position-independent.  But the hull itself is SAMPLED by
-:data:`BODY_PAIR_NUM_DIRECTIONS` fixed scan directions: a footprint with more
-true hull vertices than directions can lose the vertices between them, which
-moves the retained support boundary inward by up to ``1 - cos(pi/N)`` of the
-patch radius in the worst direction (~13% at six directions), and nonzero
+:data:`BODY_PAIR_NUM_DIRECTIONS` fixed scan directions, and the sampling error
+carries NO universal bound: for a densely populated footprint (candidates near
+every direction) the retained support boundary moves inward by at most
+``1 - cos(pi/N)`` of the patch radius (~13% at six directions), but a sparse
+adversarial hull whose omitted vertex is not the deepest can lose up to
+``1 - cos(pi/3)`` = 50% of its support radius in the omitted direction (three
+vertices at -29/30/89 degrees retain ~0.52 of the 30-degree support).  Nonzero
 hysteresis further allows a retained representative to sit within the margin of
 the true winner.  Support, tipping, and translational friction are therefore
-preserved to those tolerances on the scenes the test suite pins -- not exactly
-in general.  Row count and placement also affect iterative-solver compliance,
-so equal capacity does not imply identical realized load distribution.
+preserved only to scene-dependent tolerances pinned by the test suite -- not
+exactly, and not within any shape-independent percentage.  Row count and
+placement also affect iterative-solver compliance, so equal capacity does not
+imply identical realized load distribution.
 
 This pass runs after the narrow phase has written the ``Contacts`` buffer and
 compacts it in two kernels over the live contact range -- register, then select:
@@ -46,8 +50,9 @@ primitives generate more candidates per pair than the slot budget. On a walking
 G1 (7 cylinders per foot) the pass costs ~4% of the step and returns ~14% of
 throughput. On a scene of single-box bodies there is nothing to discard and it is
 pure overhead -- measured 5% slower on 1024x250 falling cubes. It is opt-in for
-that reason; ``stats()`` reports the achieved ratio, and a ratio near 1.0 means
-this scene does not want it.
+that reason; ``stats()`` reports indicative in/kept watermarks and an
+``identity_frames`` counter -- frequent identity frames or watermarks near each
+other mean this scene does not want it.
 
 Depth is ranked with the canonical
 :func:`newton._src.sim.contacts.contact_surface_separation`, but only to choose
@@ -618,8 +623,9 @@ def _pack_score(primary: float, pos_key: wp.uint64) -> wp.uint64:
     group's deepest contact (trivially near), which then takes all slots.
     Either way a tilted box face collapses to single-point support and
     diverges.  Pure projection competition gives each direction slot to that
-    direction's true spatial extreme, so footprint support is preserved by
-    construction and no tuning parameter can remove it.
+    direction's true spatial extreme, so the SAMPLED footprint support cannot
+    be removed by any tuning parameter (the sampling itself is the remaining
+    approximation; see the module docstring).
 
     The low bits are the GEOMETRIC tie-break: the contact's own quantized
     position on the pair-anchored face plane.  Symmetric collider layouts tie
