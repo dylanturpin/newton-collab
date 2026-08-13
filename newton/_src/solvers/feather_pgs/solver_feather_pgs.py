@@ -109,6 +109,7 @@ from .kernels import (
     gather_mf_warmstart,
     gather_tau_to_groups,
     hinv_jt_par_row,
+    apply_free_root_transport_to_predictor,
     integrate_generalized_joints,
     pack_contact_linear_force_as_spatial,
     pgs_convergence_diagnostic_velocity,
@@ -136,6 +137,7 @@ from .kernels import (
     trisolve_loop,
     update_articulation_origins,
     update_body_qd_from_featherstone,
+    remove_free_root_transport_from_qdd,
     update_qdd_from_velocity,
     vector_add_inplace,
 )
@@ -6290,6 +6292,21 @@ class SolverFeatherPGS(SolverBase):
             outputs=[state_aug.joint_qdd, self.v_hat],
             device=model.device,
         )
+        # keep v_hat on jcalc_integrate's free-root convention (omega x v transport)
+        wp.launch(
+            apply_free_root_transport_to_predictor,
+            dim=model.joint_count,
+            inputs=[
+                model.joint_type,
+                model.joint_parent,
+                model.joint_qd_start,
+                self._kinematic_joint_mask,
+                self.qd_work,
+                dt,
+            ],
+            outputs=[self.v_hat],
+            device=model.device,
+        )
 
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
         model = self.model
@@ -8092,6 +8109,20 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.v_out, state_aug.joint_qdd],
             device=model.device,
         )
+        # invert jcalc_integrate's free-root transport so it realizes the solved velocity exactly
+        wp.launch(
+            remove_free_root_transport_from_qdd,
+            dim=model.joint_count,
+            inputs=[
+                model.joint_type,
+                model.joint_parent,
+                model.joint_qd_start,
+                self._kinematic_joint_mask,
+                state_in.joint_qd,
+            ],
+            outputs=[state_aug.joint_qdd],
+            device=model.device,
+        )
 
     def _stage6_integrate(self, state_in: State, state_aug: State, state_out: State, dt: float):
         model = self.model
@@ -8145,6 +8176,20 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[self.qd_work, state_aug.joint_qdd],
                 device=model.device,
             )
+            # invert jcalc_integrate's free-root transport so it realizes the solved velocity exactly
+            wp.launch(
+                remove_free_root_transport_from_qdd,
+                dim=model.joint_count,
+                inputs=[
+                    model.joint_type,
+                    model.joint_parent,
+                    model.joint_qd_start,
+                    self._kinematic_joint_mask,
+                    state_in.joint_qd,
+                ],
+                outputs=[state_aug.joint_qdd],
+                device=model.device,
+            )
             wp.launch(
                 kernel=integrate_generalized_joints,
                 dim=model.joint_count,
@@ -8180,6 +8225,20 @@ class SolverFeatherPGS(SolverBase):
                 dim=model.joint_dof_count,
                 inputs=[state_in.joint_qd, self._kinematic_dof_mask, 1.0 / dt],
                 outputs=[self.v_out, state_aug.joint_qdd],
+                device=model.device,
+            )
+            # invert jcalc_integrate's free-root transport so it realizes the solved velocity exactly
+            wp.launch(
+                remove_free_root_transport_from_qdd,
+                dim=model.joint_count,
+                inputs=[
+                    model.joint_type,
+                    model.joint_parent,
+                    model.joint_qd_start,
+                    self._kinematic_joint_mask,
+                    state_in.joint_qd,
+                ],
+                outputs=[state_aug.joint_qdd],
                 device=model.device,
             )
             wp.copy(state_out.joint_qd, self.v_out)

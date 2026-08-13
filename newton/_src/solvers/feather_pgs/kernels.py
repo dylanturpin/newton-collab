@@ -669,7 +669,10 @@ def jcalc_integrate(
         # origin, a point fixed in the root body, so its velocity also changes by transport as the
         # body rotates: that is the omega x v term. SolverFeatherstone performs the same conversion
         # explicitly (a_com = a + alpha x x_com + omega x v_com); omitting it leaves the free base
-        # short by a term proportional to the spin.
+        # short by a term proportional to the spin. The same term must appear in the velocity
+        # predictor and be removed by the velocity-to-acceleration conversion (see
+        # apply_free_root_transport_to_predictor / remove_free_root_transport_from_qdd), or
+        # constraint rows are built against a velocity this integration never realizes.
         w_prev = w_s
         w_s = w_s + m_s * dt
         v_com = v_com + (a_s + wp.cross(w_prev, v_com)) * dt
@@ -1302,6 +1305,93 @@ def dense_solve(
 ):
     # helper function to include tmp argument for backward pass
     dense_subs(n, L_start, b_start, L, b, x)
+
+
+@wp.func
+def _free_root_transport(
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_qd_start: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    joint_qd: wp.array[float],
+    index: int,
+):
+    """``omega x v`` for a dynamic free/distance ROOT joint, zero for every other joint.
+
+    This is the transport term :func:`jcalc_integrate` adds to the root's linear
+    coordinate; the predictor and the velocity-to-acceleration conversion use it
+    to stay on the integrator's convention.
+    """
+    t = joint_type[index]
+    if t != JointType.FREE and t != JointType.DISTANCE:
+        return wp.vec3()
+    if joint_parent[index] >= 0:
+        return wp.vec3()
+    if kinematic_joint_mask[index] != 0:
+        return wp.vec3()
+    d = joint_qd_start[index]
+    v = wp.vec3(joint_qd[d + 0], joint_qd[d + 1], joint_qd[d + 2])
+    w = wp.vec3(joint_qd[d + 3], joint_qd[d + 4], joint_qd[d + 5])
+    return wp.cross(w, v)
+
+
+@wp.kernel
+def apply_free_root_transport_to_predictor(
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_qd_start: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    joint_qd: wp.array[float],
+    dt: float,
+    # in/out
+    v_hat: wp.array[float],
+):
+    """Lift the free root's velocity predictor onto the integrator's convention.
+
+    ``jcalc_integrate`` realizes ``qd + (qdd + omega x v) * dt`` for the root's
+    linear coordinate. Constraint rows are built against ``v_hat``, so without
+    the same term here every contact, friction, and velocity-limit row sees a
+    COM velocity the integrator never produces, off by ``dt * (omega x v)``.
+    """
+    index = wp.tid()
+    c = _free_root_transport(joint_type, joint_parent, joint_qd_start, kinematic_joint_mask, joint_qd, index)
+    # zero for every non-target joint; writing even a +0 to d+1/d+2 would race
+    # with the joints that own those dofs
+    if wp.length_sq(c) == 0.0:
+        return
+    d = joint_qd_start[index]
+    v_hat[d + 0] = v_hat[d + 0] + c[0] * dt
+    v_hat[d + 1] = v_hat[d + 1] + c[1] * dt
+    v_hat[d + 2] = v_hat[d + 2] + c[2] * dt
+
+
+@wp.kernel
+def remove_free_root_transport_from_qdd(
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_qd_start: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    joint_qd: wp.array[float],
+    # in/out
+    joint_qdd: wp.array[float],
+):
+    """Make ``jcalc_integrate`` reproduce the solved velocity exactly.
+
+    The solver commits to ``v_out``; ``qdd = (v_out - qd) / dt`` alone would let
+    the integrator's transport term push the realized root velocity to
+    ``v_out + dt * (omega x v)``. Subtracting the term here closes the loop, and
+    in the contact-free case recovers the dynamics' own ``qdd`` bit for bit.
+    """
+    index = wp.tid()
+    c = _free_root_transport(joint_type, joint_parent, joint_qd_start, kinematic_joint_mask, joint_qd, index)
+    # zero for every non-target joint; writing even a -0 to d+1/d+2 would race
+    # with the joints that own those dofs
+    if wp.length_sq(c) == 0.0:
+        return
+    d = joint_qd_start[index]
+    joint_qdd[d + 0] = joint_qdd[d + 0] - c[0]
+    joint_qdd[d + 1] = joint_qdd[d + 1] - c[1]
+    joint_qdd[d + 2] = joint_qdd[d + 2] - c[2]
 
 
 @wp.kernel
