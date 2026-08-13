@@ -6,12 +6,21 @@
 Multi-shape bodies multiply narrow-phase output: a foot approximated by 7
 cylinders emits up to 28 candidate contacts against a plane and up to 49
 against another such foot, while the underlying physics is one flat patch that
-is described by its deepest point plus the extremes of its footprint.  An
-interior point's NORMAL force is a convex combination of hull-point normal
-forces, so support and tipping statics are preserved exactly, and translational
-friction capacity (``sum mu*N_i``) is position-independent and preserved too.
-The one wrench component this argument does NOT cover is torsional friction --
-see the known-characteristic note below.
+is described by its deepest point plus the extremes of its footprint.
+
+**Approximation, stated precisely.** For contacts RETAINED at the true hull, an
+interior point's normal force is a convex combination of hull-point normal
+forces (support/tipping statics preserved) and translational friction capacity
+``sum mu*N_i`` is position-independent.  But the hull itself is SAMPLED by
+:data:`BODY_PAIR_NUM_DIRECTIONS` fixed scan directions: a footprint with more
+true hull vertices than directions can lose the vertices between them, which
+moves the retained support boundary inward by up to ``1 - cos(pi/N)`` of the
+patch radius in the worst direction (~13% at six directions), and nonzero
+hysteresis further allows a retained representative to sit within the margin of
+the true winner.  Support, tipping, and translational friction are therefore
+preserved to those tolerances on the scenes the test suite pins -- not exactly
+in general.  Row count and placement also affect iterative-solver compliance,
+so equal capacity does not imply identical realized load distribution.
 
 This pass runs after the narrow phase has written the ``Contacts`` buffer and
 compacts it in two kernels over the live contact range -- register, then select:
@@ -71,7 +80,9 @@ remaining freedom for the solver to redistribute.  Keeping only rim extremes
 forces the load to the largest lever arms, the maximizer of that sum: a
 spinning multi-collider disc stops ~25% sooner reduced than unreduced
 (adversarial A/B, mu 0.3 and 0.6; FPGS measures 1.34x the uniform-pressure
-torque against a geometric ceiling of 1.5x).  A dense point set approximates
+torque, where the rim-loaded limit of a uniform CIRCULAR patch is 1.5x --
+elongated patches concentrate load further and can approach 2x, so the figure
+is scene-dependent, not a universal ceiling).  A dense point set approximates
 the uniform-pressure integral only by accident of even loading -- nobody
 reweights in either case -- and no placement of boundary points can match both
 translational capacity (``sum mu*N_i``) and the continuum torsion
@@ -604,7 +615,13 @@ def _pack_score(primary: float, pos_key: wp.uint64) -> wp.uint64:
     No buffer index is stored: winners identify THEMSELVES in the selection
     pass by comparing their own packed value against the slot, so the winning
     SET is a pure function of contact geometry: invariant to thread
-    scheduling, buffer order, buffer capacity, and rigid translation.
+    scheduling, buffer order, buffer capacity, and rigid translation.  Two
+    qualifications: contacts that are exactly coincident (same position to the
+    0.5 mm quantum) all tie and are all kept, so duplicated colliders can
+    exceed the per-group slot bound; and near the hashtable's probe budget the
+    OUTCOME (reduced vs whole-frame fail-open) can depend on concurrent
+    insertion order even though each outcome's kept set is itself
+    deterministic.  Size the table so ``fallback_frames`` stays zero.
     """
     return (wp.uint64(float_flip(primary)) << wp.uint64(31)) | pos_key
 

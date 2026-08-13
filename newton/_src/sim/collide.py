@@ -1026,13 +1026,15 @@ class CollisionPipeline:
                 ``reduce_contacts_body_pairs_hysteresis`` is nonzero (the
                 default), the previous step's winners; combine with
                 ``deterministic=True`` if a canonical buffer ORDER is also
-                required.  Known fidelity tradeoff: keeping a patch's rim
-                extremes strengthens its torsional (twist-about-normal)
-                friction by up to 1.5x the uniform-pressure value, a bias
-                inherent to any boundary-keeping reduction -- support,
-                tipping, and translational friction are preserved exactly.
-                Validate yaw-heavy motions before enabling in production.
-                Defaults to ``False``.
+                required.  Known fidelity tradeoffs: the footprint hull is
+                sampled by six fixed directions, so support and tipping are
+                preserved to within that sampling (worst-case ~13% of patch
+                radius in an unsampled direction) rather than exactly, and
+                keeping rim extremes strengthens torsional (twist-about-
+                normal) friction -- measured 1.34x the uniform-pressure value
+                on a circular patch; elongated patches can be biased further.
+                Validate tipping- and yaw-heavy motions before enabling in
+                production.  Defaults to ``False``.
             reduce_contacts_body_pairs_cell: Spatial cell edge [m] used to
                 subdivide each body pair + normal bin on the bin's face
                 plane; every cell keeps its own deepest contact and footprint
