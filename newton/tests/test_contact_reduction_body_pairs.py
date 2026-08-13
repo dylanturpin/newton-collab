@@ -697,20 +697,35 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         mode the other tests exercise (matrix-free additionally runs generated
         native CUDA).
         """
-        modes = [("dense", 16)]
+        configs = [("dense", "immediate", 16)]
         if wp.get_device().is_cuda:
-            modes.append(("matrix_free", 8))  # matrix_free is CUDA-only
-        # dense runs 16 iterations: at the default 8 the UNREDUCED redundant
-        # set does not converge (settles 5 mm high; split and the reduced set
-        # both land at the true height) -- redundant near-parallel rows hurt
-        # dense-PGS conditioning, the same effect as the stack-collapse case.
-        # The comparison must be against a converged baseline.
-        for mode, iters in modes:
-            with self.subTest(pgs_mode=mode):
+            # matrix_free (and its propagation response family) is CUDA-only;
+            # the class-wide flag covers every articulated_contact_response
+            # variant, so each one needs its own settle evidence
+            configs += [
+                ("matrix_free", "immediate", 8),
+                ("matrix_free", "propagation", 16),
+                ("matrix_free", "propagation-fused", 8),
+                ("matrix_free", "propagation-colored", 16),
+            ]
+        # dense, propagation, and propagation-colored run 16 iterations: at
+        # the default 8 the UNREDUCED redundant set does not converge (dense
+        # settles 5 mm high, plain/colored propagation 4.8 mm high at 0.01980;
+        # the REDUCED set and split land at the true 0.01500 at every
+        # iteration count) -- redundant near-parallel rows hurt PGS
+        # conditioning, the same effect as the stack-collapse case, and
+        # reduction itself is what removes it.  The comparison must be against
+        # a converged baseline.
+        for mode, response, iters in configs:
+            with self.subTest(pgs_mode=mode, response=response):
                 self._compare(
                     lambda b: _free_jointed_foot(b, (0.0, 0.0, 0.05)),
-                    lambda m, mode=mode, iters=iters: newton.solvers.SolverFeatherPGS(
-                        m, angular_damping=0.0, pgs_mode=mode, pgs_iterations=iters
+                    lambda m, mode=mode, response=response, iters=iters: newton.solvers.SolverFeatherPGS(
+                        m,
+                        angular_damping=0.0,
+                        pgs_mode=mode,
+                        pgs_iterations=iters,
+                        articulated_contact_response=response,
                     ),
                 )
 
@@ -750,55 +765,73 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             return link
 
         # prove the scene actually generates the adversarial topology at some
-        # point of the settle. Note the canonical surface separation of
-        # cylinder-plane witnesses saturates at >= 0 under penetration (the
-        # solvers derive their own depths from body poses at solve time), so
-        # the topology is asserted in gap-band terms: several LOAD-BEARING
+        # point of the settle, in the reducer's OWN competition terms: within
+        # a single reduction group (one contact_entry), several LOAD-BEARING
         # candidates (within 1 mm of the group's deepest) coexist with a far
-        # SHALLOWER candidate (> 5 mm above the deepest) that owns the
-        # face-plane +x endpoint -- the exact shape where spatial extremes are
-        # won by non-load-bearing candidates. Read from the reducer's own
-        # per-candidate caches (canonical gap + face-plane position).
+        # SHALLOWER candidate (> 5 mm above the deepest) that WINS one of the
+        # six real scan-direction slots (0/60/../300 degrees on the face
+        # plane) and SURVIVES a strictly reducing compaction, while the
+        # group's deepest survives too.  Note the canonical surface separation
+        # of cylinder-plane witnesses saturates at >= 0 under penetration (the
+        # solvers derive their own depths from body poses at solve time), so
+        # deep/shallow is a gap-band split, not a signed-depth split; the
+        # dynamic equivalence itself is pinned by the settle comparisons
+        # below.  Hysteresis is disabled on the probe pipeline so slot winners
+        # are exact projections, not incumbency-biased ones.
         probe_builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         probe_body = build(probe_builder)
         probe_builder.add_ground_plane()
         probe_model = probe_builder.finalize(device=wp.get_device())
         ps0, ps1 = probe_model.state(), probe_model.state()
         probe_control = probe_model.control()
-        probe_pipe = _make_pipeline(probe_model, True)
+        probe_pipe = _make_pipeline(probe_model, True, reduce_contacts_body_pairs_hysteresis=0.0)
         probe_contacts = probe_pipe.contacts()
         probe_solver = newton.solvers.SolverXPBD(probe_model, iterations=8)
         red = probe_pipe._body_pair_reducer
         raw_pipe = newton.CollisionPipeline(probe_model, broad_phase="nxn")
         raw_contacts = raw_pipe.contacts()
+        scan_dirs = [
+            (float(np.cos(k * np.pi / 3.0)), float(np.sin(k * np.pi / 3.0)))
+            for k in range(6)  # BODY_PAIR_NUM_DIRECTIONS
+        ]
         topology_seen = False
         _ = probe_body
         for _k in range(60):
             raw_pipe.collide(ps0, raw_contacts)
             n_raw = int(raw_contacts.rigid_contact_count.numpy()[0])
             probe_pipe.collide(ps0, probe_contacts)
-            if n_raw > 2 and not topology_seen:
+            n_red = int(probe_contacts.rigid_contact_count.numpy()[0])
+            if n_raw > 2 and n_red < n_raw and not topology_seen:
                 entries = red.contact_entry.numpy()[:n_raw]
                 gaps = red.contact_gap.numpy()[:n_raw]
                 pos = red.contact_pos2d.numpy()[:n_raw]
-                valid = entries >= 0
-                if valid.sum() > 2:
-                    g0 = float(gaps[valid].min())
-                    deep = valid & (gaps < g0 + 0.001)
-                    shallow = valid & (gaps > g0 + 0.005)
-                    if deep.sum() > 1 and shallow.sum() > 0:
-                        # a shallow candidate owns at least one face-plane
-                        # endpoint (the bin's in-plane basis is not world-axis
-                        # aligned, so check both components, both signs)
-                        for axis in (0, 1):
-                            for sign in (1.0, -1.0):
-                                proj = sign * pos[:, axis]
-                                if float(proj[shallow].max(initial=-1e30)) > float(proj[deep].max(initial=-1e30)):
-                                    topology_seen = True
+                kept = red.keep_flags.numpy()[:n_raw]
+                for e in np.unique(entries[entries >= 0]):
+                    members = np.where(entries == e)[0]
+                    if members.size < 3:
+                        continue
+                    g0 = float(gaps[members].min())
+                    deep = members[gaps[members] < g0 + 0.001]
+                    shallow = members[gaps[members] > g0 + 0.005]
+                    if deep.size < 2 or shallow.size == 0:
+                        continue
+                    deepest = members[int(np.argmin(gaps[members]))]
+                    for dx, dy in scan_dirs:
+                        proj = pos[members, 0] * dx + pos[members, 1] * dy
+                        winner = members[int(np.argmax(proj))]
+                        if winner in shallow and kept[winner] == 1 and kept[deepest] == 1:
+                            topology_seen = True
+                            break
+                    if topology_seen:
+                        break
             ps0.clear_forces()
             probe_solver.step(ps0, ps1, probe_control, probe_contacts, DT)
             ps0, ps1 = ps1, ps0
-        self.assertTrue(topology_seen, "settle never produced deep-band support with a shallower endpoint owner")
+        self.assertTrue(
+            topology_seen,
+            "settle never produced a strictly reduced group whose kept set holds both the deepest "
+            "candidate and a shallow scan-direction slot winner",
+        )
 
         self._compare(build, lambda m: newton.solvers.SolverXPBD(m, iterations=8), tol=1e-3, w_tol=1.8)
         self._compare(
@@ -1356,7 +1389,14 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
 
     @staticmethod
     def _full_rows(contacts):
-        """Sorted per-contact rows over every solver-visible field."""
+        """Sorted per-contact rows over the full rigid-contact record schema.
+
+        Covers shapes, witness points, offsets, normal, margins, point id, and
+        the per-contact material properties when the buffer allocates them.
+        ``rigid_contact_tids`` is deliberately excluded: it records which
+        thread wrote the record (debug provenance, not consumed by solvers)
+        and is not deterministic across launches.
+        """
         n = int(contacts.rigid_contact_count.numpy()[0])
         cols = [
             contacts.rigid_contact_shape0.numpy()[:n],
@@ -1368,7 +1408,12 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
             contacts.rigid_contact_normal.numpy()[:n],
             contacts.rigid_contact_margin0.numpy()[:n],
             contacts.rigid_contact_margin1.numpy()[:n],
+            contacts.rigid_contact_point_id.numpy()[:n],
         ]
+        for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
+            arr = getattr(contacts, name, None)
+            if arr is not None:
+                cols.append(arr.numpy()[:n])
         rows = []
         for k in range(n):
             row = []
@@ -1418,9 +1463,14 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         state.body_q.assign(q)
         state_ref.body_q.assign(q)
         wp.capture_launch(capture.graph)
+        rows_before = self._full_rows(contacts_ref)
         ref.collide(state_ref, contacts_ref)
+        rows_after = self._full_rows(contacts_ref)
+        self.assertNotEqual(
+            rows_before, rows_after, "pitch did not change the reference output; the changing-state leg is vacuous"
+        )
         self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
-        self.assertEqual(self._full_rows(contacts), self._full_rows(contacts_ref))
+        self.assertEqual(self._full_rows(contacts), rows_after)
 
     def test_second_captured_buffer_rejected(self):
         """Refuse to capture a second Contacts buffer on one reducer pipeline.
