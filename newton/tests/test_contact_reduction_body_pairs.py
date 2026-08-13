@@ -1203,7 +1203,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         must refuse at construction rather than mask bits at runtime. Groups
         are material-equivalence classes: five bodies with distinct friction
         coefficients plus the ground are six groups against a patched budget
-        of four.
+        of five (ids are 0-based, so a patched MAX_GROUP_ID of 4 admits five).
         """
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         for k in range(5):
@@ -1212,7 +1212,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
         with unittest.mock.patch("newton._src.sim.collide.MAX_GROUP_ID", 4):
-            with self.assertRaisesRegex(ValueError, "at most 4 reduction groups"):
+            with self.assertRaisesRegex(ValueError, "at most 5 reduction groups"):
                 _make_pipeline(model, True)
 
     def test_cuda_graph_capture(self):
