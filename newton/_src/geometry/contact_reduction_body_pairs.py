@@ -92,7 +92,16 @@ patched; the principled fix, if yaw transfer measurably suffers, is an
 explicit per-patch torsion row in the solver, not point placement.  Watch
 yaw-tracking error when validating policies whose feet pivot.
 
-All launches are fixed-size and the pass is CUDA-graph-capture compatible.
+All launches are fixed-size and the pass is CUDA-graph-capture compatible,
+with two documented lifecycle caveats under graph REPLAY: the automatic
+history reset on a new ``Contacts`` buffer and the ``rigid_contacts_reduced``
+provenance marker are host-side Python and only execute when ``collide()``
+itself runs -- replaying a captured graph repeats neither.  A reducer-enabled
+pipeline must therefore not alternate multiple captured buffers (hysteresis
+history is shared state), and solver provenance checks reflect the last
+Python-level collide, not the last replay.  Per-buffer device-resident
+provenance is the eventual fix; until then capture one buffer per
+reducer-enabled pipeline.
 """
 
 from __future__ import annotations
@@ -1271,8 +1280,8 @@ def _gather_kept_contacts_kernel(
 ):
     """Stable-compact kept contacts into the scratch arrays."""
     count = frame_state[wp.static(FRAME_WORK_COUNT)]
-    if frame_state[wp.static(FRAME_IDENTITY)] != 0:
-        count = 0  # the buffer already contains the result
+    if frame_state[wp.static(FRAME_IDENTITY)] != 0 or frame_state[wp.static(FRAME_FALLBACK)] != 0:
+        count = 0  # the buffer already contains the result (no-op or keep-all)
     i = wp.tid()
     while i < count:
         if keep_flags[i] != 0:
@@ -1410,7 +1419,11 @@ def _scatter_back_kernel(
     from the frame state instead: zero, and nothing is written back.
     """
     count = contact_count[0]
-    if frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0 or frame_state[wp.static(FRAME_IDENTITY)] != 0:
+    if (
+        frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0
+        or frame_state[wp.static(FRAME_IDENTITY)] != 0
+        or frame_state[wp.static(FRAME_FALLBACK)] != 0
+    ):
         count = 0
     i = wp.tid()
     while i < count:
@@ -1475,7 +1488,11 @@ def _write_reduced_count_kernel(
         # observable. Identity: the count is already the kept count.
         return
     if frame_state[wp.static(FRAME_FALLBACK)] != 0:
+        # Keep-all frames deliver the buffer untouched; the counter already
+        # equals the kept count, so only the accounting runs.
         wp.atomic_add(stats, wp.static(STAT_FALLBACK_FRAMES), 1)
+        wp.atomic_max(stats, wp.static(STAT_CONTACTS_KEPT), frame_state[wp.static(FRAME_WORK_COUNT)])
+        return
     work = frame_state[wp.static(FRAME_WORK_COUNT)]
     if work > 0:
         kept = keep_scan[work - 1]
