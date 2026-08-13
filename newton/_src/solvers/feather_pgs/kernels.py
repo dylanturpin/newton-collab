@@ -31,7 +31,19 @@ PGS_CONSTRAINT_TYPE_JOINT_LIMIT = 3
 # appendix). Finite limits create two unilateral rows every step: one lower
 # bound row and one upper bound row. No Baumgarte / ERP bias.
 PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT = 4
-PGS_CONSTRAINT_TYPE_COUNT = 5
+# Mimic (joint coupling) row: the bilateral equality
+# ``q_follower - coef1 * q_leader - coef0 = 0`` between two 1-DoF joints of the
+# same articulation, from ``Model.constraint_mimic_*``. Jacobian has two
+# entries (+1 on the follower DOF, -coef1 on the leader DOF); lambda is
+# unbounded; drift is removed with the standard Baumgarte ``pgs_beta`` bias.
+PGS_CONSTRAINT_TYPE_MIMIC = 5
+# Connect (loop-closure) row: one axis of the bilateral 3-DoF point-coincidence equality
+# ``p_anchor(parent) - p_anchor(child) = 0`` closing a kinematic loop between two links of
+# the same articulation (imported MJCF ``connect`` equalities become trailing BALL loop
+# joints; see ``_FeatherPGSModelPlan.build``). Three rows per closure, world-axis
+# directions, unbounded lambda, Baumgarte drift correction.
+PGS_CONSTRAINT_TYPE_CONNECT = 6
+PGS_CONSTRAINT_TYPE_COUNT = 7
 
 # Numeric IDs for the ``friction_mode`` argument passed to the matrix-free
 # PGS solver kernels.  Mirrors the Python-side string enum on
@@ -556,6 +568,12 @@ def jcalc_tau(
     type: int,
     joint_S_s: wp.array[wp.spatial_vector],
     joint_f: wp.array[float],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_spring_stiffness: wp.array[float],
+    joint_spring_ref: wp.array[float],
+    joint_damping: wp.array[float],
+    coord_start: int,
     dof_start: int,
     lin_axis_count: int,
     ang_axis_count: int,
@@ -591,8 +609,13 @@ def jcalc_tau(
         for i in range(axis_count):
             j = dof_start + i
             S_s = joint_S_s[j]
+            # Passive spring/damping applied explicitly; the drive gains stay on the
+            # implicit augmented path. These joint types have one coordinate per DOF,
+            # so coord_start + i addresses the axis position.
+            passive_f = joint_spring_stiffness[j] * (joint_spring_ref[j] - joint_q[coord_start + i])
+            passive_f -= joint_damping[j] * joint_qd[j]
             # total torque / force on the joint (drive forces handled via augmented mass)
-            tau[j] = -wp.dot(S_s, body_f_s) + joint_f[j]
+            tau[j] = -wp.dot(S_s, body_f_s) + joint_f[j] + passive_f
 
         return
 
@@ -819,6 +842,7 @@ def compute_link_transform(
 @wp.kernel
 def eval_rigid_fk(
     articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
     joint_type: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
@@ -838,7 +862,8 @@ def eval_rigid_fk(
     index = wp.tid()
 
     start = articulation_start[index]
-    end = articulation_start[index + 1]
+    # Tree prefix only: trailing loop-closing joints would overwrite their child's pose.
+    end = articulation_joint_end[index]
 
     for i in range(start, end):
         compute_link_transform(
@@ -1021,6 +1046,7 @@ def compute_link_velocity(
 @wp.kernel
 def eval_rigid_id(
     articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
     joint_type: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
@@ -1046,7 +1072,8 @@ def eval_rigid_id(
     index = wp.tid()
 
     start = articulation_start[index]
-    end = articulation_start[index + 1]
+    # Tree prefix only: trailing loop-closing joints carry no motion subspaces.
+    end = articulation_joint_end[index]
 
     # compute link velocities and coriolis forces
     for i in range(start, end):
@@ -1077,13 +1104,20 @@ def eval_rigid_id(
 @wp.kernel
 def eval_rigid_tau(
     articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
     joint_type: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
     joint_articulation: wp.array[int],
     joint_qd_start: wp.array[int],
+    joint_q_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     joint_f: wp.array[float],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_spring_stiffness: wp.array[float],
+    joint_spring_ref: wp.array[float],
+    joint_damping: wp.array[float],
     joint_S_s: wp.array[wp.spatial_vector],
     body_fb_s: wp.array[wp.spatial_vector],
     body_f_ext: wp.array[wp.spatial_vector],
@@ -1099,7 +1133,8 @@ def eval_rigid_tau(
     index = wp.tid()
 
     start = articulation_start[index]
-    end = articulation_start[index + 1]
+    # Tree prefix only: trailing loop-closing joints are handled as constraint rows.
+    end = articulation_joint_end[index]
     count = end - start
 
     # compute joint forces
@@ -1144,6 +1179,12 @@ def eval_rigid_tau(
             type,
             joint_S_s,
             joint_f,
+            joint_q,
+            joint_qd,
+            joint_spring_stiffness,
+            joint_spring_ref,
+            joint_damping,
+            joint_q_start[i],
             dof_start,
             lin_axis_count,
             ang_axis_count,
@@ -1188,8 +1229,10 @@ def eval_rigid_mass(
 @wp.kernel
 def compute_composite_inertia(
     articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
     mass_update_mask: wp.array[int],
     joint_ancestor: wp.array[int],
+    joint_child: wp.array[int],
     body_I_s: wp.array[wp.spatial_matrix],
     # outputs
     body_I_c: wp.array[wp.spatial_matrix],
@@ -1200,19 +1243,22 @@ def compute_composite_inertia(
         return
 
     start = articulation_start[art_idx]
-    end = articulation_start[art_idx + 1]
+    # Tree prefix only: trailing loop-closing joints carry no link inertia.
+    end = articulation_joint_end[art_idx]
     count = end - start
 
+    # body_I_s/body_I_c are BODY-indexed (see compute_link_velocity); index them through
+    # joint_child. Joint index and child body index only coincide in loop-free models —
+    # a loop joint shifts every later joint index off its body row.
     for i in range(count):
-        idx = start + i
-        body_I_c[idx] = body_I_s[idx]
+        body_I_c[joint_child[start + i]] = body_I_s[joint_child[start + i]]
 
     for i in range(count - 1, -1, -1):
-        child_idx = start + i
-        parent_idx = joint_ancestor[child_idx]
+        joint_i = start + i
+        parent_joint = joint_ancestor[joint_i]
 
-        if parent_idx >= start:
-            body_I_c[parent_idx] += body_I_c[child_idx]
+        if parent_joint >= start:
+            body_I_c[joint_child[parent_joint]] += body_I_c[joint_child[joint_i]]
 
 
 @wp.func
@@ -2453,6 +2499,272 @@ def populate_joint_limit_J_for_size(
                 world_row_cfm[world, slot] = pgs_cfm
                 world_phi[world, slot] = phi
                 world_target_velocity[world, slot] = 0.0
+
+
+# =============================================================================
+# Mimic (Joint Coupling) Constraint Kernels
+# =============================================================================
+# Bilateral equality rows enforcing ``q_follower = coef0 + coef1 * q_leader``
+# between two 1-DoF joints of the same articulation, sourced from
+# ``Model.constraint_mimic_*``. This is the FeatherPGS analogue of PhysX's
+# ``PxArticulationMimicJoint`` (``qA + gearRatio*qB + offset = 0`` with
+# ``gearRatio = -coef1``, ``offset = -coef0``): a joint-space row with two
+# Jacobian entries, an unbounded multiplier, and standard Baumgarte drift
+# correction. See ``reports/vishal/fpgs_mimic_design.md`` in the parent repo.
+#
+# ``coef0``/``coef1``/``enabled`` are read from the model arrays at row-build
+# time, so runtime mutation (NotifyFlags.CONSTRAINT_PROPERTIES) takes effect
+# without solver re-initialization and stays CUDA-graph-safe. The static
+# validity mask (same articulation, 1-DoF joint types, distinct DOFs) is
+# precomputed on the host at solver init.
+
+
+@wp.kernel
+def allocate_mimic_slots(
+    mimic_valid: wp.array[int],
+    mimic_enabled: wp.array[wp.bool],
+    mimic_world: wp.array[int],
+    max_constraints: int,
+    # outputs
+    mimic_slot: wp.array[int],
+    world_slot_counter: wp.array[int],
+):
+    """Allocate one dense constraint slot per enabled, valid mimic constraint.
+
+    Launched with ``dim = constraint_mimic_count``. Disabled or invalid mimics
+    get ``mimic_slot = -1`` and consume no slot.
+    """
+    k = wp.tid()
+    mimic_slot[k] = -1
+    if mimic_valid[k] == 0:
+        return
+    if not mimic_enabled[k]:
+        return
+    slot = wp.atomic_add(world_slot_counter, mimic_world[k], 1)
+    if slot < max_constraints:
+        mimic_slot[k] = slot
+
+
+@wp.kernel
+def populate_mimic_J_for_size(
+    articulation_dof_start: wp.array[int],
+    art_to_world: wp.array[int],
+    group_to_art: wp.array[int],
+    mimic_slot: wp.array[int],
+    mimic_art: wp.array[int],
+    mimic_dof0: wp.array[int],
+    mimic_dof1: wp.array[int],
+    mimic_q0: wp.array[int],
+    mimic_q1: wp.array[int],
+    mimic_coef0: wp.array[float],
+    mimic_coef1: wp.array[float],
+    joint_q: wp.array[float],
+    pgs_beta: float,
+    pgs_cfm: float,
+    # outputs
+    J_group: wp.array3d[float],
+    world_row_type: wp.array2d[int],
+    world_row_parent: wp.array2d[int],
+    world_row_mu: wp.array2d[float],
+    world_row_beta: wp.array2d[float],
+    world_row_cfm: wp.array2d[float],
+    world_phi: wp.array2d[float],
+    world_target_velocity: wp.array2d[float],
+):
+    """Populate Jacobian and metadata for mimic constraint rows.
+
+    Launched once per size group with ``dim = n_arts_of_size``, matching the
+    joint-limit populate kernel. Each thread scans the (small) mimic table and
+    fills the rows belonging to its articulation:
+
+    * Jacobian ``J = e_follower - coef1 * e_leader`` — two entries.
+    * ``phi = q_follower - coef1 * q_leader - coef0`` — the signed violation.
+    """
+    group_idx = wp.tid()
+    art = group_to_art[group_idx]
+    world = art_to_world[art]
+    dof_start = articulation_dof_start[art]
+
+    n_mimic = mimic_art.shape[0]
+    for k in range(n_mimic):
+        if mimic_art[k] != art:
+            continue
+        slot = mimic_slot[k]
+        if slot < 0:
+            continue
+
+        c0 = mimic_coef0[k]
+        c1 = mimic_coef1[k]
+
+        # Jacobian: +1 on the follower DOF, -coef1 on the leader DOF. The two
+        # DOFs are guaranteed distinct by the host-side validity mask.
+        J_group[group_idx, slot, mimic_dof0[k] - dof_start] = 1.0
+        J_group[group_idx, slot, mimic_dof1[k] - dof_start] = -c1
+
+        world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_MIMIC
+        world_row_parent[world, slot] = -1
+        world_row_mu[world, slot] = 0.0
+        world_row_beta[world, slot] = pgs_beta
+        world_row_cfm[world, slot] = pgs_cfm
+        world_phi[world, slot] = joint_q[mimic_q0[k]] - c1 * joint_q[mimic_q1[k]] - c0
+        world_target_velocity[world, slot] = 0.0
+
+
+# =============================================================================
+# Connect (Loop-Closure) Constraint Kernels
+# =============================================================================
+# Three bilateral rows per loop closure enforcing point coincidence of the loop
+# joint's parent/child anchors — the FeatherPGS realization of MJCF ``connect``
+# equalities (design: ``reports/vishal/fpgs_connect_design.md`` in the parent
+# repo). The Jacobian per axis is the anchor-point Jacobian difference of the
+# two bodies, built with the same ancestor walk contact rows use.
+
+
+@wp.kernel
+def allocate_connect_slots(
+    connect_valid: wp.array[int],
+    connect_enabled: wp.array[int],
+    connect_world: wp.array[int],
+    max_constraints: int,
+    # outputs
+    connect_slot: wp.array[int],
+    world_slot_counter: wp.array[int],
+):
+    """Allocate three consecutive dense slots per enabled, valid loop closure.
+
+    Launched with ``dim = n_connect``. If the buffer cannot hold all three rows the
+    closure is dropped whole (``connect_slot = -1``) rather than partially enforced.
+    """
+    k = wp.tid()
+    connect_slot[k] = -1
+    if connect_valid[k] == 0 or connect_enabled[k] == 0:
+        return
+    slot = wp.atomic_add(world_slot_counter, connect_world[k], 3)
+    if slot + 2 < max_constraints:
+        connect_slot[k] = slot
+
+
+@wp.kernel
+def populate_connect_J_for_size(
+    articulation_dof_start: wp.array[int],
+    art_to_world: wp.array[int],
+    group_to_art: wp.array[int],
+    n_dofs: int,
+    connect_slot: wp.array[int],
+    connect_art: wp.array[int],
+    connect_body_p: wp.array[int],
+    connect_body_c: wp.array[int],
+    connect_anchor_p: wp.array[wp.vec3],
+    connect_anchor_c: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    body_to_joint: wp.array[int],
+    body_to_articulation: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    articulation_origin: wp.array[wp.vec3],
+    pgs_beta: float,
+    pgs_cfm: float,
+    # outputs
+    J_group: wp.array3d[float],
+    world_row_type: wp.array2d[int],
+    world_row_parent: wp.array2d[int],
+    world_row_mu: wp.array2d[float],
+    world_row_beta: wp.array2d[float],
+    world_row_cfm: wp.array2d[float],
+    world_phi: wp.array2d[float],
+    world_target_velocity: wp.array2d[float],
+):
+    """Populate Jacobian and metadata for connect (loop-closure) rows.
+
+    Launched once per size group with ``dim = n_arts_of_size``. Each thread scans the
+    (small) closure table and, for closures belonging to its articulation, writes three
+    rows: for world axis ``e_k``, ``phi = (p_A - p_B) . e_k`` and
+    ``J = e_k . (Jpoint(parent, p_A) - Jpoint(child, p_B))`` via the contact ancestor
+    walk. One near-redundant axis on planar linkages is expected; its vanishing Delassus
+    diagonal makes the sweep skip it.
+    """
+    group_idx = wp.tid()
+    art = group_to_art[group_idx]
+    world = art_to_world[art]
+    dof_start = articulation_dof_start[art]
+
+    n_connect = connect_art.shape[0]
+    for k in range(n_connect):
+        if connect_art[k] != art:
+            continue
+        base_slot = connect_slot[k]
+        if base_slot < 0:
+            continue
+
+        body_p = connect_body_p[k]
+        body_c = connect_body_c[k]
+        p_a = wp.transform_point(body_q[body_p], connect_anchor_p[k])
+        p_b = wp.transform_point(body_q[body_c], connect_anchor_c[k])
+        origin = articulation_origin[art]
+        rel_a = p_a - origin
+        rel_b = p_b - origin
+        delta = p_a - p_b
+
+        for axis in range(3):
+            slot = base_slot + axis
+            # The two ancestor walks below ACCUMULATE (shared ancestors partially cancel),
+            # so the row must start from zero regardless of buffer reuse policy.
+            for d in range(n_dofs):
+                J_group[group_idx, slot, d] = 0.0
+            e = wp.vec3(0.0, 0.0, 0.0)
+            e[axis] = 1.0
+
+            # J = e . (Jpoint(parent, p_a) - Jpoint(child, p_b)): ancestor walks with
+            # opposite signs; shared ancestors partially cancel automatically.
+            curr = body_to_joint[body_p]
+            while curr != -1:
+                d0 = joint_qd_start[curr]
+                d1 = joint_qd_start[curr + 1]
+                for d in range(d0, d1):
+                    S = joint_S_s[d]
+                    lin = wp.vec3(S[0], S[1], S[2])
+                    ang = wp.vec3(S[3], S[4], S[5])
+                    J_group[group_idx, slot, d - dof_start] += wp.dot(e, lin + wp.cross(ang, rel_a))
+                curr = joint_ancestor[curr]
+            curr = body_to_joint[body_c]
+            while curr != -1:
+                d0 = joint_qd_start[curr]
+                d1 = joint_qd_start[curr + 1]
+                for d in range(d0, d1):
+                    S = joint_S_s[d]
+                    lin = wp.vec3(S[0], S[1], S[2])
+                    ang = wp.vec3(S[3], S[4], S[5])
+                    J_group[group_idx, slot, d - dof_start] -= wp.dot(e, lin + wp.cross(ang, rel_b))
+                curr = joint_ancestor[curr]
+
+            # Normalize the row: on planar linkages one axis is near-redundant with the
+            # tree, leaving ||J|| ~ 1e-4 — its Delassus diagonal collapses to pure CFM
+            # while H^-1 J^T stays large against small link inertias, and PGS then relaxes
+            # a real velocity effect against a near-zero denominator (measured to NaN in
+            # one sweep). Normalizing keeps the identical constraint with a well-scaled
+            # diagonal; truly degenerate rows are left inert (zero J, zero phi).
+            norm_sq = float(0.0)
+            for d in range(n_dofs):
+                norm_sq += J_group[group_idx, slot, d] * J_group[group_idx, slot, d]
+            phi_axis = delta[axis]
+            if norm_sq > 1.0e-8:
+                inv_norm = 1.0 / wp.sqrt(norm_sq)
+                for d in range(n_dofs):
+                    J_group[group_idx, slot, d] *= inv_norm
+                phi_axis *= inv_norm
+            else:
+                for d in range(n_dofs):
+                    J_group[group_idx, slot, d] = 0.0
+                phi_axis = 0.0
+
+            world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONNECT
+            world_row_parent[world, slot] = -1
+            world_row_mu[world, slot] = 0.0
+            world_row_beta[world, slot] = pgs_beta
+            world_row_cfm[world, slot] = pgs_cfm
+            world_phi[world, slot] = phi_axis
+            world_target_velocity[world, slot] = 0.0
 
 
 # =============================================================================
@@ -3903,6 +4215,11 @@ def compute_world_contact_bias(
             # input, not as a generic constraint target. Their RHS is handled
             # by the per-row drive descriptor in the matrix-free GS kernel.
             rhs = 0.0
+        elif row_type == PGS_CONSTRAINT_TYPE_MIMIC or row_type == PGS_CONSTRAINT_TYPE_CONNECT:
+            # Bilateral equality: Baumgarte-correct the violation from BOTH
+            # sides (contacts/limits only bias on penetration; an equality has
+            # no speculative branch).
+            rhs += bias_scale * beta * phi * inv_dt
         # PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT: no phi-based bias. The
         # constraint is an instantaneous velocity-space projection; the only
         # RHS contribution is ``-target_vel`` (already set above) plus the
@@ -9010,6 +9327,7 @@ def crba_fill_par_dof(
     articulation_dof_start: wp.array[int],
     mass_update_mask: wp.array[int],
     joint_ancestor: wp.array[int],
+    joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     joint_S_s: wp.array[wp.spatial_vector],
@@ -9062,7 +9380,9 @@ def crba_fill_par_dof(
 
     # Compute Force F = I_c[pivot] * S[column]
     S_col = joint_S_s[target_dof_global]
-    I_comp = body_I_c[pivot_joint]
+    # body_I_c is BODY-indexed; joint index only coincides with the child body
+    # index in loop-free models.
+    I_comp = body_I_c[joint_child[pivot_joint]]
     F = I_comp * S_col
 
     # Walk up the tree and project F onto ancestors

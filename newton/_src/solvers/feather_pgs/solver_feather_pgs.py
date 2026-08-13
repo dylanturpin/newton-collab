@@ -17,6 +17,7 @@ import json
 import os
 import re
 import time
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
@@ -53,8 +54,10 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PROPAGATION_COLOR_TAIL,
     add_dense_contact_compliance_to_diag,
+    allocate_connect_slots,
     allocate_joint_limit_slots,
     allocate_joint_velocity_limit_slots,
+    allocate_mimic_slots,
     allocate_physx_drive_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
@@ -121,8 +124,10 @@ from .kernels import (
     pgs_solve_loop,
     pgs_solve_mf_loop,
     pgs_solve_propagation_contact_loop,
+    populate_connect_J_for_size,
     populate_joint_limit_J_for_size,
     populate_joint_velocity_limit_J_for_size,
+    populate_mimic_J_for_size,
     populate_physx_drive_J_for_size,
     populate_rigid_velocity_limit_rows,
     populate_world_J_for_size,
@@ -203,6 +208,7 @@ class _FeatherPGSModelPlan:
     response_free_rigid_body_indices: np.ndarray
     prescribed_articulation: np.ndarray
     response_dof_count: np.ndarray
+    articulation_joint_end: np.ndarray
     world_count: int
 
     @classmethod
@@ -224,6 +230,7 @@ class _FeatherPGSModelPlan:
                 articulation_world = model.articulation_world.numpy().astype(np.int32, copy=True)
                 articulation_world[articulation_world < 0] = 0
 
+        articulation_joint_end = np.zeros(articulation_count, dtype=np.int32)
         if articulation_count and model.joint_count:
             articulation_start = model.articulation_start.numpy()
             joint_parent = model.joint_parent.numpy()
@@ -234,12 +241,37 @@ class _FeatherPGSModelPlan:
             for art in range(articulation_count):
                 first_joint = int(articulation_start[art])
                 last_joint = int(articulation_start[art + 1])
+
+                # Loop-closing joints (a second inbound joint on a body whose tree joint
+                # came earlier — how the MJCF importer closes `connect`/`weld` equalities)
+                # live INSIDE the articulation's joint range but are not part of the
+                # kinematic tree. Excluding them here keeps their DOFs out of the mass
+                # matrix (garbage motion subspaces made H singular -> instant NaN) and out
+                # of the FK walk (they would overwrite their child's tree pose). They are
+                # consumed as CONNECT constraint rows instead.
+                seen_children: set[int] = set()
+                tree_end = first_joint
+                for j in range(first_joint, last_joint):
+                    child = int(joint_child[j])
+                    if child in seen_children:
+                        break  # first loop joint; the rest of the range must be loops too
+                    seen_children.add(child)
+                    tree_end = j + 1
+                for j in range(tree_end, last_joint):
+                    if int(joint_child[j]) not in seen_children:
+                        raise ValueError(
+                            "SolverFeatherPGS: articulation joint range mixes tree joints after "
+                            f"loop joints (articulation {art}, joint {j}). Loop-closing joints "
+                            "must be trailing."
+                        )
+                articulation_joint_end[art] = tree_end
+
                 first_dof = int(joint_qd_start[first_joint])
-                last_dof = int(joint_qd_start[last_joint])
+                last_dof = int(joint_qd_start[tree_end])
                 articulation_dof_start[art] = first_dof
                 articulation_dof_count[art] = last_dof - first_dof
                 if (
-                    last_joint - first_joint == 1
+                    tree_end - first_joint == 1
                     and int(joint_type[first_joint]) == int(JointType.FREE)
                     and int(joint_parent[first_joint]) == -1
                 ):
@@ -281,6 +313,7 @@ class _FeatherPGSModelPlan:
             response_free_rigid_body_indices,
             prescribed,
             response_dof_count,
+            articulation_joint_end,
         )
         for array in arrays:
             array.setflags(write=False)
@@ -539,6 +572,10 @@ class SolverFeatherPGS(SolverBase):
         contact_friction_scale: float = 1.0,
         contact_shared_anchor: bool = False,
         enable_joint_limits: bool = False,
+        enable_mimic_constraints: bool = True,
+        enable_connect_constraints: bool = True,
+        enable_joint_springs: bool = True,
+        enable_joint_passive_damping: bool = True,
         joint_limit_activation_gap: float = float("inf"),
         enable_joint_velocity_limits: bool = False,
         velocity_limit_activation_fraction: float = 0.0,
@@ -636,6 +673,27 @@ class SolverFeatherPGS(SolverBase):
                 constraints. Each active limit side adds one constraint row. Supported with
                 ``pgs_kernel="loop"`` and ``pgs_kernel="tiled_row"``; the ``"tiled_contact"``
                 and ``"streaming"`` PGS kernels are *not* compatible.  Defaults to False.
+            enable_mimic_constraints (bool, optional): Enforce linear joint-coupling (mimic)
+                equality constraints from ``Model.constraint_mimic_*`` as bilateral PGS rows.
+                Disable to reproduce the pre-mimic solver behavior (coupled joints move
+                independently). Defaults to True.
+            enable_connect_constraints (bool, optional): Enforce loop-closing BALL joints
+                (MJCF ``connect`` equalities) as bilateral anchor-coincidence PGS rows.
+                Loop joints are always excluded from the FK/dynamics tree regardless of this
+                flag; disabling only drops the closure rows, so closed linkages fall open
+                (useful for A/B comparison against the pre-connect solver). Defaults to True.
+            enable_joint_springs (bool, optional): Apply passive joint springs
+                (:attr:`~newton.Model.joint_spring_stiffness` /
+                :attr:`~newton.Model.joint_spring_ref`) as an explicit torque
+                ``k * (ref - q)`` on REVOLUTE, PRISMATIC, and D6 DOFs during the
+                inverse-dynamics pass. Springs on BALL or FREE DOFs warn and are ignored.
+                A no-op for models without springs. Defaults to True.
+            enable_joint_passive_damping (bool, optional): Apply passive joint damping
+                (:attr:`~newton.Model.joint_damping`) as an explicit torque ``-c * qd``,
+                matching :class:`SolverFeatherstone` semantics (the drive gains
+                ``joint_target_kd`` are unaffected — they stay on the implicit augmented
+                path). Disable to recover the historical FeatherPGS behavior of ignoring
+                ``joint_damping``. Defaults to True.
             joint_limit_activation_gap (float, optional): Distance from a finite lower or upper
                 position limit at which a joint-limit PGS row becomes active. A lower row is
                 allocated when ``q <= lower + gap``; an upper row is allocated when
@@ -907,6 +965,10 @@ class SolverFeatherPGS(SolverBase):
         if self.contact_friction_anchor_limit < 0:
             raise ValueError("contact_friction_anchor_limit must be non-negative")
         self.enable_joint_limits = enable_joint_limits
+        self.enable_mimic_constraints = bool(enable_mimic_constraints)
+        self.enable_connect_constraints = bool(enable_connect_constraints)
+        self.enable_joint_springs = bool(enable_joint_springs)
+        self.enable_joint_passive_damping = bool(enable_joint_passive_damping)
         try:
             self.joint_limit_activation_gap = float(joint_limit_activation_gap)
         except (TypeError, ValueError) as exc:
@@ -1223,6 +1285,24 @@ class SolverFeatherPGS(SolverBase):
         self._has_prescribed_response = bool(np.any(self._model_plan.prescribed_articulation != 0))
         self._compute_articulation_metadata(model)
         self._validate_heterogeneous_world_support(model)
+        # Loop-closing joints are excluded from the tree (see _FeatherPGSModelPlan.build)
+        # and enforced as CONNECT rows; the propagation-family kernels still iterate full
+        # articulation joint ranges, so gate that mode rather than corrupt silently.
+        self._has_loop_joints = bool(
+            model.articulation_count
+            and np.any(self._model_plan.articulation_joint_end < model.articulation_start.numpy()[1:])
+        )
+        if self._has_loop_joints and self.articulated_contact_response != "immediate":
+            raise ValueError(
+                "SolverFeatherPGS: loop-closing joints (imported connect/weld equalities) are "
+                f"only supported with articulated_contact_response='immediate' "
+                f"(got {self.articulated_contact_response!r})."
+            )
+        # Mimic/connect plans must exist before capacity selection so the row census
+        # counts their rows (see _estimate_dense_internal_rows_per_world).
+        self._build_mimic_plan(model)
+        self._build_connect_plan(model)
+        self._setup_passive_joint_forces(model)
         self.dense_max_constraints = self._select_dense_row_capacity(model)
         self._propagation_full_fused_size = self._select_propagation_full_fused_size()
         # Build the execution plan after dense_max_constraints has been
@@ -1532,7 +1612,9 @@ class SolverFeatherPGS(SolverBase):
         if row_phase == 3:
             has_drive_rows = self.drive_mode == "physx_pgs" and getattr(self, "drive_slot", None) is not None
             has_position_limit_rows = self.enable_joint_limits and getattr(self, "limit_slot", None) is not None
-            return has_drive_rows or has_position_limit_rows
+            has_mimic_rows = getattr(self, "_mimic_count", 0) > 0
+            has_connect_rows = getattr(self, "_connect_count", 0) > 0
+            return has_drive_rows or has_position_limit_rows or has_mimic_rows or has_connect_rows
         if row_phase == 5:
             if np.isinf(self.velocity_limit_activation_fraction):
                 return False
@@ -1741,6 +1823,216 @@ class SolverFeatherPGS(SolverBase):
         ) * _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE
         return min(requested, max(_PROPAGATION_DENSE_INTERNAL_ROW_RESERVE, int(rounded)))
 
+    def _build_mimic_plan(self, model) -> None:
+        """Precompute the static per-mimic lookup tables for the MIMIC row family.
+
+        Resolves ``Model.constraint_mimic_*`` joint indices into articulation / DOF /
+        coordinate indices and validates the supported subset: both joints 1-DoF
+        (REVOLUTE or PRISMATIC), both in the same articulation, distinct DOFs — matching
+        SolverMuJoCo's own restriction. Invalid entries are warned about and masked off;
+        ``coef0``/``coef1``/``enabled`` stay live reads from the model arrays so runtime
+        mutation needs no re-initialization. All buffers are allocated here, once, so the
+        per-step launches are CUDA-graph-safe.
+        """
+        self._mimic_count = 0
+        self.mimic_slot = None
+        n = int(getattr(model, "constraint_mimic_count", 0) or 0)
+        if not self.enable_mimic_constraints:
+            if n > 0:
+                warnings.warn(
+                    f"SolverFeatherPGS: enable_mimic_constraints=False — ignoring {n} mimic "
+                    "constraint(s); coupled joints will move independently.",
+                    stacklevel=2,
+                )
+            self._mimic_world_np = None
+            return
+        if n == 0 or not model.articulation_count or self.art_to_world is None:
+            self._mimic_world_np = None
+            return
+
+        device = model.device
+        j0 = model.constraint_mimic_joint0.numpy().astype(np.int32, copy=False)
+        j1 = model.constraint_mimic_joint1.numpy().astype(np.int32, copy=False)
+        mimic_world = model.constraint_mimic_world.numpy().astype(np.int32, copy=False)
+        articulation_start = model.articulation_start.numpy().astype(np.int64, copy=False)
+        joint_type = model.joint_type.numpy().astype(np.int32, copy=False)
+        joint_qd_start = model.joint_qd_start.numpy().astype(np.int32, copy=False)
+        joint_q_start = model.joint_q_start.numpy().astype(np.int32, copy=False)
+        labels = list(getattr(model, "constraint_mimic_label", []) or [])
+
+        def art_of(j: int) -> int:
+            a = int(np.searchsorted(articulation_start, j, side="right")) - 1
+            if a < 0 or a >= model.articulation_count:
+                return -1
+            if not (articulation_start[a] <= j < articulation_start[a + 1]):
+                return -1
+            return a
+
+        one_dof = (int(JointType.REVOLUTE), int(JointType.PRISMATIC))
+        valid = np.zeros(n, dtype=np.int32)
+        art = np.full(n, -1, dtype=np.int32)
+        for k in range(n):
+            a0, a1 = art_of(int(j0[k])), art_of(int(j1[k]))
+            name = labels[k] if k < len(labels) else f"mimic_{k}"
+            if a0 < 0 or a1 < 0 or a0 != a1:
+                warnings.warn(
+                    f"SolverFeatherPGS: mimic constraint '{name}' spans articulations "
+                    f"({a0} vs {a1}); cross-articulation mimic is unsupported and the "
+                    "constraint is ignored.",
+                    stacklevel=2,
+                )
+                continue
+            if int(joint_type[j0[k]]) not in one_dof or int(joint_type[j1[k]]) not in one_dof:
+                warnings.warn(
+                    f"SolverFeatherPGS: mimic constraint '{name}' references a non-1-DoF "
+                    "joint (only REVOLUTE/PRISMATIC are supported); the constraint is ignored.",
+                    stacklevel=2,
+                )
+                continue
+            if joint_qd_start[j0[k]] == joint_qd_start[j1[k]]:
+                warnings.warn(
+                    f"SolverFeatherPGS: mimic constraint '{name}' couples a DOF to itself; ignored.", stacklevel=2
+                )
+                continue
+            valid[k] = 1
+            art[k] = a0
+
+        self._mimic_valid_np = valid
+        self._mimic_world_np = mimic_world
+        self._mimic_art = wp.array(art, dtype=wp.int32, device=device)
+        self._mimic_valid = wp.array(valid, dtype=wp.int32, device=device)
+        self._mimic_world = wp.array(mimic_world, dtype=wp.int32, device=device)
+        self._mimic_dof0 = wp.array(joint_qd_start[j0], dtype=wp.int32, device=device)
+        self._mimic_dof1 = wp.array(joint_qd_start[j1], dtype=wp.int32, device=device)
+        self._mimic_q0 = wp.array(joint_q_start[j0], dtype=wp.int32, device=device)
+        self._mimic_q1 = wp.array(joint_q_start[j1], dtype=wp.int32, device=device)
+        self.mimic_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
+        self._mimic_count = n
+
+    def _build_connect_plan(self, model) -> None:
+        """Precompute the static per-closure lookup tables for the CONNECT row family.
+
+        Loop-closing joints (BALL joints trailing an articulation's tree prefix — how the
+        MJCF importer realizes ``connect`` equalities) are excluded from FK/ID by
+        :meth:`_FeatherPGSModelPlan.build` and enforced here as three bilateral rows
+        pinning the joint's parent/child anchors together. FIXED (weld) loop joints warn
+        and are ignored for now. All buffers are allocated once (CUDA-graph-safe);
+        ``joint_enabled`` is snapshotted at init.
+        """
+        self._connect_count = 0
+        self.connect_slot = None
+        if not self._has_loop_joints:
+            self._connect_world_np = None
+            return
+        if not self.enable_connect_constraints:
+            warnings.warn(
+                "SolverFeatherPGS: enable_connect_constraints=False — loop-closing joints are "
+                "excluded from the tree but their closure rows are dropped; closed linkages "
+                "will fall open.",
+                stacklevel=2,
+            )
+            self._connect_world_np = None
+            return
+
+        device = model.device
+        articulation_start = model.articulation_start.numpy()
+        joint_end = self._model_plan.articulation_joint_end
+        joint_type = model.joint_type.numpy()
+        joint_parent = model.joint_parent.numpy()
+        joint_child = model.joint_child.numpy()
+        joint_X_p = model.joint_X_p.numpy()
+        joint_X_c = model.joint_X_c.numpy()
+        joint_enabled_arr = getattr(model, "joint_enabled", None)
+        joint_enabled = joint_enabled_arr.numpy() if joint_enabled_arr is not None else None
+        articulation_world = self._model_plan.articulation_world
+
+        art_l, body_p, body_c, anchors_p, anchors_c, world_l, enab = [], [], [], [], [], [], []
+        for art in range(model.articulation_count):
+            for j in range(int(joint_end[art]), int(articulation_start[art + 1])):
+                if int(joint_type[j]) != int(JointType.BALL):
+                    warnings.warn(
+                        f"SolverFeatherPGS: loop joint {j} has unsupported type "
+                        f"{int(joint_type[j])} (only BALL/connect closures are enforced); ignored.",
+                        stacklevel=2,
+                    )
+                    continue
+                art_l.append(art)
+                body_p.append(int(joint_parent[j]))
+                body_c.append(int(joint_child[j]))
+                anchors_p.append(joint_X_p[j][:3])
+                anchors_c.append(joint_X_c[j][:3])
+                world_l.append(int(articulation_world[art]))
+                enab.append(1 if (joint_enabled is None or joint_enabled[j]) else 0)
+
+        n = len(art_l)
+        if n == 0:
+            self._connect_world_np = None
+            return
+        self._connect_world_np = np.asarray(world_l, dtype=np.int32)
+        self._connect_valid_np = np.asarray(enab, dtype=np.int32)
+        self._connect_art = wp.array(np.asarray(art_l, dtype=np.int32), dtype=wp.int32, device=device)
+        self._connect_body_p = wp.array(np.asarray(body_p, dtype=np.int32), dtype=wp.int32, device=device)
+        self._connect_body_c = wp.array(np.asarray(body_c, dtype=np.int32), dtype=wp.int32, device=device)
+        self._connect_anchor_p = wp.array(np.asarray(anchors_p, dtype=np.float32), dtype=wp.vec3, device=device)
+        self._connect_anchor_c = wp.array(np.asarray(anchors_c, dtype=np.float32), dtype=wp.vec3, device=device)
+        self._connect_world = wp.array(self._connect_world_np, dtype=wp.int32, device=device)
+        self._connect_valid = wp.array(np.ones(n, dtype=np.int32), dtype=wp.int32, device=device)
+        self._connect_enabled = wp.array(self._connect_valid_np, dtype=wp.int32, device=device)
+        self.connect_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
+        self._connect_count = n
+
+    def _setup_passive_joint_forces(self, model) -> None:
+        """Select the passive spring/damping arrays applied in the inverse-dynamics pass.
+
+        The toggles resolve here, once, to fixed device arrays (zeros when disabled or
+        absent on the model), so ``eval_rigid_tau`` launches stay CUDA-graph-safe. Springs
+        on unsupported DOF types (BALL / FREE / DISTANCE coordinates) warn and are masked
+        off — only REVOLUTE, PRISMATIC, and D6 DOFs receive the explicit spring torque.
+        """
+        device = model.device
+        n_dofs = int(model.joint_dof_count)
+        zeros = None
+
+        def _zeros():
+            nonlocal zeros
+            if zeros is None:
+                zeros = wp.zeros(n_dofs, dtype=wp.float32, device=device)
+            return zeros
+
+        spring_k = getattr(model, "joint_spring_stiffness", None)
+        spring_ref = getattr(model, "joint_spring_ref", None)
+        if not self.enable_joint_springs or spring_k is None or spring_ref is None:
+            self._passive_spring_stiffness = _zeros()
+            self._passive_spring_ref = _zeros()
+        else:
+            k_np = spring_k.numpy()
+            if np.any(k_np != 0.0) and model.joint_count:
+                # Mask springs on unsupported joint types (kernel applies them per 1-DoF axis).
+                supported = (int(JointType.REVOLUTE), int(JointType.PRISMATIC), int(JointType.D6))
+                joint_type = model.joint_type.numpy()
+                # joint_qd_start is sentinel-closed (length joint_count + 1).
+                dof_counts = np.diff(model.joint_qd_start.numpy())
+                dof_joint = np.repeat(np.arange(model.joint_count), dof_counts)
+                bad = (k_np != 0.0) & ~np.isin(joint_type[dof_joint], supported)
+                if np.any(bad):
+                    warnings.warn(
+                        f"SolverFeatherPGS: passive joint springs on {int(bad.sum())} DOF(s) of "
+                        "unsupported joint types (only REVOLUTE/PRISMATIC/D6 are supported); "
+                        "those springs are ignored.",
+                        stacklevel=2,
+                    )
+                    k_np = k_np.copy()
+                    k_np[bad] = 0.0
+                    spring_k = wp.array(k_np, dtype=wp.float32, device=device)
+            self._passive_spring_stiffness = spring_k
+            self._passive_spring_ref = spring_ref
+
+        damping = getattr(model, "joint_damping", None)
+        if not self.enable_joint_passive_damping or damping is None:
+            self._passive_joint_damping = _zeros()
+        else:
+            self._passive_joint_damping = damping
+
     def _estimate_dense_internal_rows_per_world(self, model) -> int:
         if not model.articulation_count or not model.joint_count or self.art_to_world is None:
             return 0
@@ -1752,11 +2044,24 @@ class SolverFeatherPGS(SolverBase):
             and model.joint_dof_count > 0
             and not np.isinf(self.velocity_limit_activation_fraction)
         )
-        if not (has_drive_rows or has_position_limit_rows or has_velocity_limit_rows):
+        has_mimic_rows = getattr(self, "_mimic_count", 0) > 0
+        has_connect_rows = getattr(self, "_connect_count", 0) > 0
+        if not (
+            has_drive_rows or has_position_limit_rows or has_velocity_limit_rows or has_mimic_rows or has_connect_rows
+        ):
             return 0
 
         art_to_world = self.art_to_world.numpy().astype(np.int32, copy=False)
         per_world = np.zeros(max(int(self.world_count), 1), dtype=np.int64)
+
+        if has_mimic_rows and self._mimic_world_np is not None:
+            valid_worlds = self._mimic_world_np[self._mimic_valid_np != 0]
+            in_range = valid_worlds[(valid_worlds >= 0) & (valid_worlds < per_world.shape[0])]
+            np.add.at(per_world, in_range, 1)
+        if has_connect_rows and self._connect_world_np is not None:
+            valid_worlds = self._connect_world_np[self._connect_valid_np != 0]
+            in_range = valid_worlds[(valid_worlds >= 0) & (valid_worlds < per_world.shape[0])]
+            np.add.at(per_world, in_range, 3)
 
         articulation_start = model.articulation_start.numpy().astype(np.int32, copy=False)
         joint_type = model.joint_type.numpy().astype(np.int32, copy=False)
@@ -1978,6 +2283,11 @@ class SolverFeatherPGS(SolverBase):
         articulation_world = self._model_plan.articulation_world
         self.world_count = self._model_plan.world_count
         self.art_to_world = wp.array(articulation_world, dtype=wp.int32, device=model.device)
+        # Per-articulation end of the kinematic-tree joint prefix: trailing loop-closing
+        # joints (imported `connect`/`weld` equalities) are excluded from FK/ID iteration.
+        self.articulation_joint_end = wp.array(
+            self._model_plan.articulation_joint_end, dtype=wp.int32, device=model.device
+        )
 
         world_art_counts = np.bincount(articulation_world, minlength=self.world_count).astype(np.int32)
         world_art_start = np.zeros(self.world_count + 1, dtype=np.int32)
@@ -2037,9 +2347,13 @@ class SolverFeatherPGS(SolverBase):
         body_to_joint = [-1] * model.body_count
         body_to_articulation = [-1] * model.body_count
 
+        articulation_joint_end = self._model_plan.articulation_joint_end
+
         for articulation in range(model.articulation_count):
             joint_start = articulation_start[articulation]
-            joint_end = articulation_start[articulation + 1]
+            # Tree prefix only: a trailing loop joint must not steal its child's inbound
+            # tree joint, or every ancestor walk from that body follows the loop.
+            joint_end = articulation_joint_end[articulation]
 
             for joint_index in range(joint_start, joint_end):
                 child = joint_child[joint_index]
@@ -5948,6 +6262,7 @@ class SolverFeatherPGS(SolverBase):
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start,
+                self.articulation_joint_end,
                 model.joint_type,
                 model.joint_parent,
                 model.joint_child,
@@ -6005,6 +6320,7 @@ class SolverFeatherPGS(SolverBase):
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start,
+                self.articulation_joint_end,
                 model.joint_type,
                 model.joint_parent,
                 model.joint_child,
@@ -6083,13 +6399,20 @@ class SolverFeatherPGS(SolverBase):
                 dim=model.articulation_count,
                 inputs=[
                     model.articulation_start,
+                    self.articulation_joint_end,
                     model.joint_type,
                     model.joint_parent,
                     model.joint_child,
                     model.joint_articulation,
                     model.joint_qd_start,
+                    model.joint_q_start,
                     model.joint_dof_dim,
                     control.joint_f,
+                    state_in.joint_q,
+                    state_in.joint_qd,
+                    self._passive_spring_stiffness,
+                    self._passive_spring_ref,
+                    self._passive_joint_damping,
                     state_aug.joint_S_s,
                     state_aug.body_f_s,
                     body_f,
@@ -6253,8 +6576,10 @@ class SolverFeatherPGS(SolverBase):
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start,
+                self.articulation_joint_end,
                 self.mass_update_mask,
                 model.joint_ancestor,
+                model.joint_child,
                 state_aug.body_I_s,
             ],
             outputs=[self.body_I_c],
@@ -6284,6 +6609,7 @@ class SolverFeatherPGS(SolverBase):
                     self.articulation_dof_start,
                     self.mass_update_mask,
                     model.joint_ancestor,
+                    model.joint_child,
                     model.joint_qd_start,
                     model.joint_dof_dim,
                     state_aug.joint_S_s,
@@ -6581,15 +6907,133 @@ class SolverFeatherPGS(SolverBase):
                 )
 
         # ── Dense row-family layout ──────────────────────────────────────
-        # Slots are handed out in the order [drive][joint-limit]
+        # Slots are handed out in the order [drive][mimic][joint-limit]
         # [joint-velocity-limit][contact/friction] so each PhysX-grasp GS
         # row phase owns one contiguous dense row range:
-        #   row_phase 3 (drive + position limits): [0, bounds[0])
-        #   row_phase 5 (velocity limits):         [bounds[0], bounds[1])
-        #   row_phase 4 (contacts + friction):     [bounds[1], m_dense)
+        #   row_phase 3 (drive/mimic/position limits): [0, bounds[0])
+        #   row_phase 5 (velocity limits):             [bounds[0], bounds[1])
+        #   row_phase 4 (contacts + friction):         [bounds[1], m_dense)
         # The two snapshot_dense_phase_bound launches below record the family
         # boundaries and must stay glued to this allocation sequence
-        # (slot_counter is zeroed at the top of this method).
+        # (slot_counter is zeroed at the top of this method). Mimic rows sit
+        # between the (static-count) drive family and the (activation-gated,
+        # flickering) limit family so warm-started mimic lambdas keep a stable
+        # slot index across steps.
+
+        # Mimic (joint coupling) equality rows — static count per model.
+        if self._mimic_count > 0:
+            wp.launch(
+                allocate_mimic_slots,
+                dim=self._mimic_count,
+                inputs=[
+                    self._mimic_valid,
+                    model.constraint_mimic_enabled,
+                    self._mimic_world,
+                    max_constraints,
+                ],
+                outputs=[
+                    self.mimic_slot,
+                    self.slot_counter,
+                ],
+                device=model.device,
+            )
+            if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
+                for size in self.size_groups:
+                    self.J_by_size[size].zero_()
+                j_buffers_zeroed = True
+            for size in self.size_groups:
+                n_arts = self.n_arts_by_size[size]
+                wp.launch(
+                    populate_mimic_J_for_size,
+                    dim=n_arts,
+                    inputs=[
+                        self.articulation_dof_start,
+                        self.art_to_world,
+                        self.group_to_art[size],
+                        self.mimic_slot,
+                        self._mimic_art,
+                        self._mimic_dof0,
+                        self._mimic_dof1,
+                        self._mimic_q0,
+                        self._mimic_q1,
+                        model.constraint_mimic_coef0,
+                        model.constraint_mimic_coef1,
+                        state_in.joint_q,
+                        self.pgs_beta,
+                        self.pgs_cfm,
+                    ],
+                    outputs=[
+                        self.J_by_size[size],
+                        self.row_type,
+                        self.row_parent,
+                        self.row_mu,
+                        self.row_beta,
+                        self.row_cfm,
+                        self.phi,
+                        self.target_velocity,
+                    ],
+                    device=model.device,
+                )
+
+        # Connect (loop-closure) equality rows — static count per model.
+        if self._connect_count > 0:
+            wp.launch(
+                allocate_connect_slots,
+                dim=self._connect_count,
+                inputs=[
+                    self._connect_valid,
+                    self._connect_enabled,
+                    self._connect_world,
+                    max_constraints,
+                ],
+                outputs=[
+                    self.connect_slot,
+                    self.slot_counter,
+                ],
+                device=model.device,
+            )
+            if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
+                for size in self.size_groups:
+                    self.J_by_size[size].zero_()
+                j_buffers_zeroed = True
+            for size in self.size_groups:
+                n_arts = self.n_arts_by_size[size]
+                wp.launch(
+                    populate_connect_J_for_size,
+                    dim=n_arts,
+                    inputs=[
+                        self.articulation_dof_start,
+                        self.art_to_world,
+                        self.group_to_art[size],
+                        size,
+                        self.connect_slot,
+                        self._connect_art,
+                        self._connect_body_p,
+                        self._connect_body_c,
+                        self._connect_anchor_p,
+                        self._connect_anchor_c,
+                        state_in.body_q,
+                        self.body_to_joint,
+                        self.body_to_articulation,
+                        model.joint_ancestor,
+                        model.joint_qd_start,
+                        state_aug.joint_S_s,
+                        self.articulation_origin,
+                        self.pgs_beta,
+                        self.pgs_cfm,
+                    ],
+                    outputs=[
+                        self.J_by_size[size],
+                        self.row_type,
+                        self.row_parent,
+                        self.row_mu,
+                        self.row_beta,
+                        self.row_cfm,
+                        self.phi,
+                        self.target_velocity,
+                    ],
+                    device=model.device,
+                )
 
         # Joint limit constraint slots (limits work with or without contacts)
         if self.enable_joint_limits and self.limit_slot is not None:
@@ -11715,7 +12159,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
 
             for (int i = dense_lo; i < dense_hi; ++i) {
                 const int row_type = s_rtype_dense[i];
-                if (row_phase == 3 && row_type != 1 && row_type != 3) continue;
+                if (row_phase == 3 && row_type != 1 && row_type != 3 && row_type != 5 && row_type != 6) continue;
                 if (row_phase == 4 && row_type != 0 && row_type != 2) continue;
                 if (row_phase == 5 && row_type != 4) continue;
                 if (freeze_drive_rows != 0 && row_type == 1) continue;
@@ -15493,8 +15937,8 @@ def _get_pgs_solve_mf_gs_kernel(
             // row_phase 4: PhysX-grasp contact pass, contact/friction rows.
             // row_phase 5: PhysX-grasp final pass, joint velocity-limit rows.
             if (row_phase == 1 && row_type != 0 && row_type != 2) continue;
-            if (row_phase == 2 && row_type != 1 && row_type != 3 && row_type != 4) continue;
-            if (row_phase == 3 && row_type != 1 && row_type != 3) continue;
+            if (row_phase == 2 && row_type != 1 && row_type != 3 && row_type != 4 && row_type != 5 && row_type != 6) continue;
+            if (row_phase == 3 && row_type != 1 && row_type != 3 && row_type != 5 && row_type != 6) continue;
             if (row_phase == 4 && row_type != 0 && row_type != 2) continue;
             if (row_phase == 5 && row_type != 4) continue;
             if ((row_phase == 0 || row_phase == 2) && row_type == 4) continue;
