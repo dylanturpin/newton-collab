@@ -1838,6 +1838,21 @@ class SolverFeatherPGS(SolverBase):
             self.articulation_max_dofs = 0
 
     def _compute_root_free_metadata(self, model):
+        if model.joint_count:
+            joint_type = model.joint_type.numpy()
+            joint_parent = model.joint_parent.numpy()
+            root_mask = ((joint_type == JointType.FREE) | (joint_type == JointType.DISTANCE)) & (joint_parent < 0)
+            free_root_joint_indices = np.flatnonzero(root_mask).astype(np.int32, copy=False)
+            self._free_root_joint_count = int(free_root_joint_indices.size)
+            self._free_root_joint_indices = (
+                wp.array(free_root_joint_indices, dtype=wp.int32, device=model.device)
+                if self._free_root_joint_count
+                else None
+            )
+        else:
+            self._free_root_joint_count = 0
+            self._free_root_joint_indices = None
+
         if not model.articulation_count or not model.joint_count:
             self.articulation_root_is_free = None
             self.articulation_root_dof_start = None
@@ -1845,8 +1860,6 @@ class SolverFeatherPGS(SolverBase):
             return
 
         articulation_start = model.articulation_start.numpy()
-        joint_type = model.joint_type.numpy()
-        joint_parent = model.joint_parent.numpy()
         joint_qd_start = model.joint_qd_start.numpy()
 
         root_is_free = np.zeros(model.articulation_count, dtype=np.int32)
@@ -1991,16 +2004,6 @@ class SolverFeatherPGS(SolverBase):
 
     def _classify_free_rigid_bodies(self, model):
         """Materialize free-rigid execution metadata from the model plan."""
-        # Any dynamic free/distance ROOT joint means the free-root transport
-        # kernels have work; fixed-base models skip those launches entirely.
-        if model.joint_count:
-            joint_type = model.joint_type.numpy()
-            joint_parent = model.joint_parent.numpy()
-            self._has_free_root_joints = bool(
-                (((joint_type == JointType.FREE) | (joint_type == JointType.DISTANCE)) & (joint_parent < 0)).any()
-            )
-        else:
-            self._has_free_root_joints = False
         if not model.articulation_count or not model.joint_count:
             self._has_free_rigid_bodies = False
             self._has_mixed_contacts = False
@@ -6306,16 +6309,16 @@ class SolverFeatherPGS(SolverBase):
             outputs=[state_aug.joint_qdd, self.v_hat],
             device=model.device,
         )
-        # keep v_hat on jcalc_integrate's free-root convention (omega x v
-        # transport); fixed-base models have no eligible joint and skip the launch
-        if not self._has_free_root_joints:
+        # Keep v_hat on jcalc_integrate's free-root convention. The compact
+        # launch excludes every non-root joint; a live device mask handles
+        # runtime kinematic changes without changing graph topology.
+        if not self._free_root_joint_count:
             return
         wp.launch(
             apply_free_root_transport_to_predictor,
-            dim=model.joint_count,
+            dim=self._free_root_joint_count,
             inputs=[
-                model.joint_type,
-                model.joint_parent,
+                self._free_root_joint_indices,
                 model.joint_qd_start,
                 self._kinematic_joint_mask,
                 self.qd_work,
@@ -8123,15 +8126,14 @@ class SolverFeatherPGS(SolverBase):
         Runs after every velocity-to-acceleration conversion; no-op (no
         launch) for fixed-base models.
         """
-        if not self._has_free_root_joints:
+        if not self._free_root_joint_count:
             return
         model = self.model
         wp.launch(
             remove_free_root_transport_from_qdd,
-            dim=model.joint_count,
+            dim=self._free_root_joint_count,
             inputs=[
-                model.joint_type,
-                model.joint_parent,
+                self._free_root_joint_indices,
                 model.joint_qd_start,
                 self._kinematic_joint_mask,
                 state_in.joint_qd,

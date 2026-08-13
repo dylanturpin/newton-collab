@@ -704,8 +704,9 @@ def jcalc_integrate(
             # point whose velocity the coordinate stores, so integrate it
             # directly and place the anchor at x_com - R_new * r_ac.  A
             # force-free COM then stays stationary to roundoff, where the
-            # linearized form (p += (v - w x R_old*r_ac) * dt) leaks
-            # omega * |r_ac| * dt of first-order truncation per step.
+            # linearized form (p += (v - w x R_old*r_ac) * dt) has
+            # O(omega^2 * |r_ac| * dt^2) local error, which accumulates into
+            # first-order global drift.
             # SolverFeatherstone integrates body poses around the COM the
             # same way.
             x_com_new = p_s + wp.quat_rotate(r_s, r_ac) + v_com * dt
@@ -1332,36 +1333,30 @@ def dense_solve(
 
 
 @wp.func
-def _free_root_dof_start(
-    joint_type: wp.array[int],
-    joint_parent: wp.array[int],
+def _active_free_root_dof_start(
+    free_root_joint_indices: wp.array[int],
     joint_qd_start: wp.array[int],
     kinematic_joint_mask: wp.array[int],
-    index: int,
+    root_index: int,
 ):
-    """Dof start of a dynamic free/distance ROOT joint, ``-1`` for every other joint.
+    """DOF start of an active free/distance root, or ``-1`` when kinematic.
 
-    Eligibility is decided from joint metadata alone, never from the numeric
-    value of ``omega x v``: the cross product's forward value can be exactly
-    zero while its derivatives are not (at ``v = 0``, ``d(w x v)/dv != 0``),
-    so an early return keyed on the value would send Warp's autodiff down the
-    empty branch and drop the gradient.  Eligible joints own all six of their
-    dofs, so writing the three linear ones unconditionally races with nobody.
+    Structural eligibility is precomputed once; the device-side kinematic
+    check remains live so model-property notifications and graph replay keep
+    the same launch topology. Eligibility never depends on the numeric value
+    of ``omega x v`` because its forward value can be zero while its derivative
+    is not. Each root owns all six of its DOFs, so writing its three linear
+    entries unconditionally races with nobody.
     """
-    t = joint_type[index]
-    if t != JointType.FREE and t != JointType.DISTANCE:
+    joint = free_root_joint_indices[root_index]
+    if kinematic_joint_mask[joint] != 0:
         return -1
-    if joint_parent[index] >= 0:
-        return -1
-    if kinematic_joint_mask[index] != 0:
-        return -1
-    return joint_qd_start[index]
+    return joint_qd_start[joint]
 
 
 @wp.kernel
 def apply_free_root_transport_to_predictor(
-    joint_type: wp.array[int],
-    joint_parent: wp.array[int],
+    free_root_joint_indices: wp.array[int],
     joint_qd_start: wp.array[int],
     kinematic_joint_mask: wp.array[int],
     joint_qd: wp.array[float],
@@ -1376,8 +1371,8 @@ def apply_free_root_transport_to_predictor(
     the same term here every contact, friction, and velocity-limit row sees a
     COM velocity the integrator never produces, off by ``dt * (omega x v)``.
     """
-    index = wp.tid()
-    d = _free_root_dof_start(joint_type, joint_parent, joint_qd_start, kinematic_joint_mask, index)
+    root_index = wp.tid()
+    d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, root_index)
     if d < 0:
         return
     v = wp.vec3(joint_qd[d + 0], joint_qd[d + 1], joint_qd[d + 2])
@@ -1390,8 +1385,7 @@ def apply_free_root_transport_to_predictor(
 
 @wp.kernel
 def remove_free_root_transport_from_qdd(
-    joint_type: wp.array[int],
-    joint_parent: wp.array[int],
+    free_root_joint_indices: wp.array[int],
     joint_qd_start: wp.array[int],
     kinematic_joint_mask: wp.array[int],
     joint_qd: wp.array[float],
@@ -1405,8 +1399,8 @@ def remove_free_root_transport_from_qdd(
     ``v_out + dt * (omega x v)``. Subtracting the term here closes the loop, and
     in the contact-free case recovers the dynamics' own ``qdd`` bit for bit.
     """
-    index = wp.tid()
-    d = _free_root_dof_start(joint_type, joint_parent, joint_qd_start, kinematic_joint_mask, index)
+    root_index = wp.tid()
+    d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, root_index)
     if d < 0:
         return
     v = wp.vec3(joint_qd[d + 0], joint_qd[d + 1], joint_qd[d + 2])
