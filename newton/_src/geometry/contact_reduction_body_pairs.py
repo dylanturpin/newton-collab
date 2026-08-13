@@ -2035,7 +2035,12 @@ class BodyPairContactReducer:
             "slot_value_bytes": self.ht_values.size * 8,
             "per_contact_cache_bytes": n * (4 + 4 + 4 + 4 + 8) + self.contact_incumbent.size * 4,
             "hysteresis_snapshot_bytes": (
-                self.prev_keys.size * 8 + self.prev_winner_pos.size * 4 + self.prev_active_slots.size * 4
+                self.prev_keys.size * 8
+                + self.prev_winner_pos.size * 4
+                + self.prev_active_slots.size * 4
+                + self.prev_generation.size * 4
+                + self.entry_generation.size * 4
+                + self.history_generation.size * 4
             ),
             "gather_scratch_owned_bytes": owned,
         }
