@@ -420,6 +420,9 @@ class Contacts:
                 generation via another fused kernel (e.g. :func:`compute_shape_aabbs`) can pass
                 ``False`` to avoid an unnecessary double-bump per collision pass.
         """
+        # Provenance resets with the contents: a cleared buffer holds no
+        # reduced contacts, whatever pipeline previously filled it.
+        self.rigid_contacts_reduced = False
         # Clear all counters and (optionally) bump generation in a single kernel launch.
         num_counters = self.contact_counters.shape[0]
         wp.launch(

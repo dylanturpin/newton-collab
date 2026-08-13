@@ -979,6 +979,73 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         )
         self.assertGreaterEqual(pipeline.body_pair_reduction_stats()["identity_frames"], 1)
 
+    def test_property_schema_switch_is_safe(self):
+        """Reduce a property-enabled buffer after a property-less one safely.
+
+        The first reduce installs zero-length material placeholders in the
+        gather scratch; a later same-capacity buffer WITH per-contact material
+        arrays must re-provision them or the gather writes out of bounds.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (0.0, 0.0, 0.0175))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        plain = pipeline.contacts()
+        pipeline.collide(state, plain)  # installs the property-less scratch
+
+        rich = Contacts(
+            rigid_contact_max=pipeline.rigid_contact_max,
+            soft_contact_max=0,
+            device=wp.get_device(),
+            per_contact_shape_properties=True,
+        )
+        pipeline.collide(state, rich)  # must not write into zero-length arrays
+        n = int(rich.rigid_contact_count.numpy()[0])
+        self.assertGreater(n, 0)
+        self.assertTrue(np.isfinite(rich.rigid_contact_friction.numpy()[:n]).all())
+
+    def test_clear_resets_reduced_provenance(self):
+        """Reset the reduced marker when the buffer is cleared.
+
+        A cleared buffer holds no contacts at all; keeping the stale marker
+        would make unsupported solvers reject an empty buffer.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (0.0, 0.0, 0.0175))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        self.assertTrue(contacts.rigid_contacts_reduced)
+        contacts.clear()
+        self.assertFalse(contacts.rigid_contacts_reduced)
+
+    def test_malformed_reset_masks_rejected(self):
+        """Reject reset masks with the wrong length, rank, or dtype.
+
+        A short mask would silently reset only a prefix of worlds.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        for _w in range(2):
+            builder.begin_world()
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0095), wp.quat_identity()), mass=1.0)
+            builder.add_shape_sphere(body, radius=0.01)
+            builder.end_world()
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        pipeline = _make_pipeline(model, True)
+        for bad in (
+            np.array([1], dtype=np.int32),  # short
+            np.array([1, 0, 1], dtype=np.int32),  # long
+            np.array([[1], [0]], dtype=np.int32),  # wrong rank
+        ):
+            with self.assertRaises(ValueError, msg=f"accepted malformed mask {bad!r}"):
+                pipeline.reset_body_pair_reduction_history(bad)
+
     def test_reduced_marker_tracks_pipeline_mode(self):
         """Assign buffer provenance from the pipeline mode on every collide.
 
@@ -1417,9 +1484,7 @@ class TestBodyPairReductionHysteresis(unittest.TestCase):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         for w in range(2):
             builder.begin_world()
-            body = builder.add_body(
-                xform=wp.transform(wp.vec3(2.0 * w, 0.0, 0.0095), wp.quat_identity()), mass=1.0
-            )
+            body = builder.add_body(xform=wp.transform(wp.vec3(2.0 * w, 0.0, 0.0095), wp.quat_identity()), mass=1.0)
             builder.add_shape_sphere(body, radius=0.01)
             builder.end_world()
         builder.add_ground_plane()

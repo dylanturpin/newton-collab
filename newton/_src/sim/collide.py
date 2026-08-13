@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import warnings
+import weakref
 from typing import Literal
 
 import numpy as np
@@ -1407,9 +1408,11 @@ class CollisionPipeline:
             # reduction key: aliasing two groups could evict a patch's deepest
             # contact.
             shape_group, group_count = build_reduction_groups(model)
-            if group_count > MAX_GROUP_ID:
+            if group_count > MAX_GROUP_ID + 1:
+                # ids are 0-based: MAX_GROUP_ID is the largest representable id
                 raise ValueError(
-                    f"reduce_contacts_body_pairs supports at most {MAX_GROUP_ID} reduction groups, got {group_count}"
+                    f"reduce_contacts_body_pairs supports at most {MAX_GROUP_ID + 1} reduction groups, "
+                    f"got {group_count}"
                 )
             self._body_pair_reducer = BodyPairContactReducer(
                 rigid_contact_max,
@@ -1574,6 +1577,28 @@ class CollisionPipeline:
                 contact threshold also incorporates per-shape margins from
                 ``model.shape_margin``.
         """
+        # Validate the buffer BEFORE any marker assignment, clear, or launch:
+        # a rejected buffer must come back untouched, and a wrong-device buffer
+        # must produce this ValueError rather than a cross-device Warp launch.
+        if self._body_pair_reducer is not None:
+            # The reducer's caches, scratch, and launch bounds are sized to the
+            # pipeline's capacity at construction; an external buffer with any
+            # other capacity would let the narrow phase write more contacts
+            # than the reducer's arrays can hold.
+            if contacts.rigid_contact_max != self._rigid_contact_max:
+                raise ValueError(
+                    f"reduce_contacts_body_pairs requires the Contacts buffer capacity "
+                    f"({contacts.rigid_contact_max}) to exactly match the pipeline's "
+                    f"rigid_contact_max ({self._rigid_contact_max}). Use CollisionPipeline.contacts() "
+                    f"or construct the pipeline with a matching rigid_contact_max."
+                )
+            if str(contacts.device) != str(self._body_pair_reducer._stats.device):
+                raise ValueError(
+                    f"reduce_contacts_body_pairs requires the Contacts buffer device "
+                    f"({contacts.device}) to match the pipeline device "
+                    f"({self._body_pair_reducer._stats.device})."
+                )
+
         # Keep the buffer's full-surface capability marker in sync with this pipeline on every call.
         # collide() may be handed a Contacts created elsewhere (or by a flag-off pipeline); the edge/
         # face passes below would otherwise populate records while the marker stayed False, so
@@ -1704,24 +1729,6 @@ class CollisionPipeline:
         writer_data.out_stiffness = contacts.rigid_contact_stiffness
         writer_data.out_damping = contacts.rigid_contact_damping
         writer_data.out_friction = contacts.rigid_contact_friction
-        if self._body_pair_reducer is not None:
-            # The reducer's caches, scratch, and launch bounds are sized to the
-            # pipeline's capacity at construction; an external buffer with any
-            # other capacity would let the narrow phase write more contacts
-            # than the reducer's arrays can hold.
-            if contacts.rigid_contact_max != self._rigid_contact_max:
-                raise ValueError(
-                    f"reduce_contacts_body_pairs requires the Contacts buffer capacity "
-                    f"({contacts.rigid_contact_max}) to exactly match the pipeline's "
-                    f"rigid_contact_max ({self._rigid_contact_max}). Use CollisionPipeline.contacts() "
-                    f"or construct the pipeline with a matching rigid_contact_max."
-                )
-            if str(contacts.device) != str(self._body_pair_reducer._stats.device):
-                raise ValueError(
-                    f"reduce_contacts_body_pairs requires the Contacts buffer device "
-                    f"({contacts.device}) to match the pipeline device "
-                    f"({self._body_pair_reducer._stats.device})."
-                )
         if self.deterministic and contacts.rigid_contact_max != self._sort_key_array.shape[0]:
             raise ValueError(
                 f"Contacts buffer capacity ({contacts.rigid_contact_max}) does not match the "
@@ -1871,9 +1878,13 @@ class CollisionPipeline:
         if self._body_pair_reducer is not None:
             # A different Contacts instance means a different stream of states;
             # winners recorded for the previous buffer must not bias this one.
-            if getattr(self, "_last_contacts_id", None) != id(contacts):
+            # Held as a weak reference: a raw id() can be recycled by the
+            # allocator after the old buffer dies, silently inheriting its
+            # history.
+            last = getattr(self, "_last_contacts_ref", None)
+            if last is None or last() is not contacts:
                 self._body_pair_reducer.reset_history()
-                self._last_contacts_id = id(contacts)
+                self._last_contacts_ref = weakref.ref(contacts)
 
         # Provenance is assigned on EVERY collide from the pipeline's mode --
         # never only set on reduction -- so a buffer reused across pipelines

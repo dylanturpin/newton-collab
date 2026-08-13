@@ -659,6 +659,7 @@ def _detect_identity_kernel(
         return
     if ht_active_slots[ht_capacity] == work:
         frame_state[wp.static(FRAME_IDENTITY)] = 1
+        wp.atomic_max(stats, wp.static(STAT_CONTACTS_KEPT), work)
         wp.atomic_add(stats, wp.static(STAT_IDENTITY_FRAMES), 1)
 
 
@@ -1507,13 +1508,16 @@ class BodyPairContactReducer:
         world_count: int = 1,
     ):
         self.rigid_contact_max = rigid_contact_max
-        self.cell_size = float(cell_size)
+        # Validate at KERNEL precision: the kernels receive float32, so a
+        # host-side double like 1e-50 would pass a double check and reach the
+        # cell division as zero, and a large finite double becomes inf.
+        self.cell_size = float(np.float32(cell_size))
         if not (math.isfinite(self.cell_size) and self.cell_size > 0.0):
-            raise ValueError(f"cell_size must be finite and positive, got {cell_size}")
+            raise ValueError(f"cell_size must be finite and positive in float32, got {cell_size}")
         self.device = device
-        self.hysteresis = float(hysteresis)
+        self.hysteresis = float(np.float32(hysteresis))
         if not (math.isfinite(self.hysteresis) and self.hysteresis >= 0.0):
-            raise ValueError(f"hysteresis must be finite and non-negative, got {hysteresis}")
+            raise ValueError(f"hysteresis must be finite and non-negative in float32, got {hysteresis}")
         hashtable_factor = float(hashtable_factor)
         if not (math.isfinite(hashtable_factor) and hashtable_factor > 0.0):
             raise ValueError(f"hashtable_factor must be finite and positive, got {hashtable_factor}")
@@ -1593,6 +1597,12 @@ class BodyPairContactReducer:
             self.entry_generation = wp.zeros(0, dtype=wp.int32, device=device)
             self.shape_world = wp.zeros(len(shape_group), dtype=wp.int32, device=device)
         self._scratch = None
+        # Preallocate the non-material scratch now: the pass promises CUDA
+        # graph-capture compatibility, and a first-use allocation inside the
+        # first captured reduce() would break that promise (and make
+        # describe() lie about the footprint until then). Material scratch
+        # stays lazy but size-checked in _ensure_scratch.
+        self._ensure_scratch(False)
 
     def _ensure_scratch(self, need_material: bool):
         if self._scratch is None:
@@ -1620,19 +1630,24 @@ class BodyPairContactReducer:
                 for name, dtype in dtypes.items()
             }
             self._scratch["point_id"] = wp.zeros(n, dtype=wp.int32, device=dev)
-        if need_material and "stiffness" not in self._scratch:
+            # Placeholders so kernels always receive valid (possibly unused)
+            # arguments when the buffer carries no per-contact materials.
+            zero = wp.zeros(0, dtype=wp.float32, device=dev)
+            for name in ("stiffness", "damping", "friction"):
+                self._scratch[name] = zero
+        if need_material and self._scratch["stiffness"].shape[0] < self.rigid_contact_max:
+            # The material scratch must be SIZE-checked, not key-checked: a
+            # property-less first buffer installs the zero-length placeholders
+            # above, and a later property-enabled buffer of the same capacity
+            # would otherwise make the gather write into zero-length arrays --
+            # an out-of-bounds device write, not a graceful failure.
             n = self.rigid_contact_max
-            dev = self.device
             borrowed = self._borrowed_scratch or {}
             for name in ("stiffness", "damping", "friction"):
                 arr = borrowed.get(name)
                 self._scratch[name] = (
-                    arr if arr is not None and arr.shape[0] >= n else wp.zeros(n, dtype=wp.float32, device=dev)
+                    arr if arr is not None and arr.shape[0] >= n else wp.zeros(n, dtype=wp.float32, device=self.device)
                 )
-        elif "stiffness" not in self._scratch:
-            zero = wp.zeros(0, dtype=wp.float32, device=self.device)
-            for name in ("stiffness", "damping", "friction"):
-                self._scratch[name] = zero
 
     def reduce(self, model, state, contacts):
         """Compact ``contacts`` in place, dropping patch-redundant candidates.
@@ -1943,6 +1958,12 @@ class BodyPairContactReducer:
                 if isinstance(world_mask, wp.array)
                 else wp.array(world_mask, dtype=wp.int32, device=self.device)
             )
+            if mask.ndim != 1 or mask.shape[0] != self.world_count:
+                raise ValueError(f"world_mask must be a 1-D array of length {self.world_count}, got shape {mask.shape}")
+            if mask.dtype is not wp.int32:
+                raise ValueError(f"world_mask must be int32, got {mask.dtype}")
+            if str(mask.device) != str(self.history_generation.device):
+                raise ValueError(f"world_mask must live on {self.history_generation.device}, got {mask.device}")
             wp.launch(
                 _bump_generations_kernel,
                 dim=self.world_count,
@@ -1989,8 +2010,12 @@ class BodyPairContactReducer:
             +/-127 range; non-zero means distant regions of one shape pair are
             merging on the periphery.
             ``max_contacts_in`` / ``max_contacts_kept``: peak live contact count
-            before and after reduction, i.e. the achieved reduction ratio and
-            the capacity the ``Contacts`` buffer actually needs.
+            before and after reduction.  ``max_contacts_in`` -- NOT kept -- is
+            the minimum observed safe ``rigid_contact_max``: the narrow phase
+            writes the unreduced candidates into the same buffer before the
+            reduction runs.  The two watermarks are accumulated independently
+            and may come from different frames, so their ratio is indicative,
+            not an exact per-frame reduction ratio.
             ``max_hashtable_entries`` / ``hashtable_capacity``: peak distinct
             (body pair, bin, cell) groups against the table that holds them.
             ``hashtable_load``: the ratio of those two -- linear probing degrades
