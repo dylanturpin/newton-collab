@@ -1414,9 +1414,10 @@ def _scatter_back_kernel(
 
     Runs after ``_write_reduced_count_kernel``, so ``contact_count`` already
     holds the KEPT count: only that range is touched, instead of copying
-    entire capacity-sized arrays back.  On an input-overflow frame the counter
-    was deliberately left at its raw (over-capacity) value, so the bound comes
-    from the frame state instead: zero, and nothing is written back.
+    entire capacity-sized arrays back.  Overflow, identity, and fallback
+    frames all zero the bound through the frame state: on overflow the counter
+    deliberately holds its raw over-capacity value, and on identity/fallback
+    the buffer already contains the result, so nothing is written back.
     """
     count = contact_count[0]
     if (
@@ -1563,8 +1564,12 @@ class BodyPairContactReducer:
         # Full-size gather scratch borrowed from the deterministic sorter (see
         # ContactSorter.borrow_full_scratch): the two stages run strictly
         # sequentially inside collide(), so sharing halves the pipeline's
-        # scratch footprint. Fields the sorter did not allocate (zero-length
-        # material arrays, point_id) are allocated locally on first use.
+        # scratch footprint. Fields the sorter did not allocate are provisioned
+        # locally at construction; only the per-contact MATERIAL scratch stays
+        # lazy (it is needed solely for buffers with per-contact shape
+        # properties, and eager allocation would cost 12 B/contact for every
+        # pipeline that never uses them). Consequence: a per-contact-props
+        # buffer must see one warm-up collide before CUDA graph capture.
         self._borrowed_scratch = borrowed_scratch
         self.verify = bool(verify)
         # Whole-run telemetry accumulators; see stats() for the slot meanings.
@@ -1987,11 +1992,15 @@ class BodyPairContactReducer:
         if self.hysteresis <= 0.0:
             return
         if world_mask is not None:
-            mask = (
-                world_mask
-                if isinstance(world_mask, wp.array)
-                else wp.array(world_mask, dtype=wp.int32, device=self.device)
-            )
+            if not isinstance(world_mask, wp.array):
+                host = np.asarray(world_mask)
+                if not np.issubdtype(host.dtype, np.integer):
+                    # Converting floats through wp.array would silently
+                    # truncate (0.5 -> 0) and turn the reset into a no-op.
+                    raise ValueError(f"world_mask must be an integer array, got dtype {host.dtype}")
+                mask = wp.array(host.astype(np.int32), dtype=wp.int32, device=self.device)
+            else:
+                mask = world_mask
             if mask.ndim != 1 or mask.shape[0] != self.world_count:
                 raise ValueError(f"world_mask must be a 1-D array of length {self.world_count}, got shape {mask.shape}")
             if mask.dtype is not wp.int32:

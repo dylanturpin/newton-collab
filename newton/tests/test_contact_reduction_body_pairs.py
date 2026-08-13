@@ -639,15 +639,19 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             solver.step(state_0, state_1, control, contacts, DT)
             state_0, state_1 = state_1, state_0
         z_end = float(state_0.body_q.numpy()[body][2])
-        return z_end, z_end < z0 - 0.005, peak_contacts
+        w_end = float(np.abs(state_0.body_qd.numpy()[body][:3]).max())
+        return z_end, z_end < z0 - 0.005, peak_contacts, w_end
 
     def _compare(self, build_fn, make_solver, tol=5e-4):
-        z_off, fell_off, contacts_off = self._settle(build_fn, make_solver, False)
-        z_on, fell_on, contacts_on = self._settle(build_fn, make_solver, True)
+        z_off, fell_off, contacts_off, w_off = self._settle(build_fn, make_solver, False)
+        z_on, fell_on, contacts_on, w_on = self._settle(build_fn, make_solver, True)
         self.assertTrue(fell_off and fell_on, "body did not fall: the solver is not simulating it")
         self.assertGreater(contacts_off, 0)
         self.assertGreater(contacts_on, 0)
         self.assertLess(abs(z_off - z_on), tol)
+        # angular residual: reduced must settle as calm as unreduced (allowing
+        # noise floor); pins the claim that the kept footprint does not rock
+        self.assertLess(w_on, max(2.0 * w_off, 0.05), f"reduced settle is rocking: |w| {w_on} vs {w_off}")
 
     def test_feather_pgs_conformance(self):
         """SolverFeatherPGS rests a free-jointed foot at the same height on/off.
