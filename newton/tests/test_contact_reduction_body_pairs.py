@@ -1427,8 +1427,10 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
 
         Graph replay repeats neither the buffer-switch history reset nor the
         provenance assignment, so two captured buffers would silently share
-        hysteresis history; collide() must raise at capture time instead.
-        Recapturing the SAME buffer stays legal.  Skipped on CPU devices.
+        hysteresis history; collide() must raise at capture time instead --
+        BEFORE any state mutation: the rejected buffer and the reducer's
+        history must come back untouched.  Recapturing the SAME buffer stays
+        legal.  Skipped on CPU devices.
         """
         device = wp.get_device()
         if not device.is_cuda:
@@ -1446,15 +1448,129 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         with wp.ScopedCapture(device) as capture_a2:
             pipeline.collide(state, contacts_a)
         wp.capture_launch(capture_a2.graph)
+        red = pipeline._body_pair_reducer
+        prev_keys_before = red.prev_keys.numpy().copy()
+        generations_before = red.history_generation.numpy().copy()
         # different buffer: must raise while capture is active; end the
         # capture outside the exception path so the stream is left clean
         capture_b = wp.ScopedCapture(device)
         capture_b.__enter__()
         try:
-            with self.assertRaisesRegex(RuntimeError, "at most one Contacts buffer"):
+            with self.assertRaisesRegex(RuntimeError, "per captured buffer"):
                 pipeline.collide(state, contacts_b)
         finally:
             capture_b.__exit__(None, None, None)
+        self.assertEqual(int(contacts_b.rigid_contact_count.numpy()[0]), 0, "rejected buffer was written")
+        self.assertFalse(contacts_b.rigid_contacts_reduced, "rejected buffer was stamped")
+        np.testing.assert_array_equal(red.prev_keys.numpy(), prev_keys_before)
+        np.testing.assert_array_equal(red.history_generation.numpy(), generations_before)
+
+    def test_ordinary_other_buffer_rejected_while_graph_live(self):
+        """Refuse ANY other buffer while a captured graph's binding is live.
+
+        An ordinary (uncaptured) collide with buffer B after capturing buffer
+        A passes a capture-time-only check, then resets and repopulates the
+        shared hysteresis state -- every subsequent replay of A's graph runs
+        against B's history.  The binding must reject other buffers whether
+        or not the current call is being captured.  Skipped on CPU devices.
+        """
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device")
+        model = self._foot_scene()
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts_a = pipeline.contacts()
+        contacts_b = pipeline.contacts()
+        pipeline.collide(state, contacts_a)  # warm-up
+        with wp.ScopedCapture(device) as capture_a:
+            pipeline.collide(state, contacts_a)
+        wp.capture_launch(capture_a.graph)
+        with self.assertRaisesRegex(RuntimeError, "per captured buffer"):
+            pipeline.collide(state, contacts_b)
+        # the captured buffer itself stays usable outside capture
+        pipeline.collide(state, contacts_a)
+
+    def test_capture_requires_warmed_buffer(self):
+        """Refuse to capture a Contacts buffer that never collided outside capture.
+
+        Capturing cold reaches the buffer-switch history reset inside the
+        capture, recording its fills and launches into the graph -- every
+        replay then erases hysteresis before reducing, silently restoring the
+        memoryless behavior the graph's owner did not ask for.  Skipped on
+        CPU devices.
+        """
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device")
+        model = self._foot_scene()
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        capture = wp.ScopedCapture(device)
+        capture.__enter__()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "outside capture before capturing"):
+                pipeline.collide(state, contacts)
+        finally:
+            capture.__exit__(None, None, None)
+
+    def test_capture_release_allows_new_buffer(self):
+        """Release the capture binding explicitly to rebind a new buffer.
+
+        The binding must survive the captured buffer's garbage collection (a
+        dead weakref proves nothing about the CUDA graph's lifetime), so
+        release_body_pair_reduction_capture() is the only way to move a
+        pipeline to a new captured buffer.  Skipped on CPU devices.
+        """
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device")
+        model = self._foot_scene()
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts_a = pipeline.contacts()
+        contacts_b = pipeline.contacts()
+        pipeline.collide(state, contacts_a)
+        with wp.ScopedCapture(device) as capture_a:
+            pipeline.collide(state, contacts_a)
+        wp.capture_launch(capture_a.graph)
+        del capture_a
+        pipeline.release_body_pair_reduction_capture()
+        self.assertFalse(contacts_a.rigid_contacts_reduced_capture, "release must clear the sticky marker")
+        pipeline.collide(state, contacts_b)  # warm-up now legal
+        with wp.ScopedCapture(device) as capture_b:
+            pipeline.collide(state, contacts_b)
+        wp.capture_launch(capture_b.graph)
+
+    def test_captured_buffer_keeps_conservative_provenance(self):
+        """Keep rejecting unsupported solvers after a non-reducing refill of a captured buffer.
+
+        Replay is invisible to host-side provenance: a plain pipeline can
+        refill a captured buffer and stamp it unreduced, then a replay of the
+        reducer graph compacts the device records again -- an unsupported
+        solver reading the plain marker would consume reduced contacts
+        without raising.  A buffer that was ever captured by a reducer
+        pipeline carries a sticky may-contain-reduced marker until the
+        binding is released.  Skipped on CPU devices.
+        """
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device")
+        model = self._foot_scene()
+        state_0, state_1 = model.state(), model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state_0, contacts)
+        with wp.ScopedCapture(device) as capture:
+            pipeline.collide(state_0, contacts)
+        wp.capture_launch(capture.graph)
+        plain = newton.CollisionPipeline(model, broad_phase="nxn")
+        plain.collide(state_0, contacts)
+        self.assertFalse(contacts.rigid_contacts_reduced, "plain refill should clear the per-collide marker")
+        solver = newton.solvers.SolverSemiImplicit(model)
+        with self.assertRaisesRegex(ValueError, "supports_reduced_contacts"):
+            solver.step(state_0, state_1, model.control(), contacts, DT)
 
     def test_requires_grad_diff_augmentation(self):
         """Populate the differentiable contact arrays from the compacted set.

@@ -1542,6 +1542,29 @@ class CollisionPipeline:
             raise RuntimeError("reduce_contacts_body_pairs is not enabled on this pipeline")
         self._body_pair_reducer.clear_stats()
 
+    def release_body_pair_reduction_capture(self):
+        """Release the reducer's captured-buffer binding.
+
+        Capturing :meth:`collide` into a CUDA graph binds this pipeline's
+        reducer state to that exact ``Contacts`` buffer; every other buffer is
+        rejected while the binding is live, and the binding deliberately
+        survives the buffer's garbage collection.  Call this after the
+        captured graph is destroyed to move the pipeline to a new buffer.
+        Also clears the buffer's conservative may-contain-reduced marker when
+        the buffer is still alive.  No-op when nothing is bound.
+
+        Raises:
+            RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.
+        """
+        if self._body_pair_reducer is None:
+            raise RuntimeError("reduce_contacts_body_pairs is not enabled on this pipeline")
+        bound = getattr(self, "_captured_contacts_ref", None)
+        if bound is not None:
+            target = bound()
+            if target is not None:
+                target.rigid_contacts_reduced_capture = False
+            self._captured_contacts_ref = None
+
     def body_pair_reduction_description(self) -> dict:
         """Currently allocated buffer footprint of the body-pair contact reduction by role.
 
@@ -1681,6 +1704,48 @@ class CollisionPipeline:
                     f"({contacts.device}) to match the pipeline device "
                     f"({self._body_pair_reducer._stats.device})."
                 )
+            # CUDA-graph capture lifecycle.  Replay repeats neither the
+            # buffer-switch history reset nor the provenance assignment, so a
+            # captured graph is only correct while the reducer's shared state
+            # stays exclusive to the captured buffer.  Enforced here, before
+            # any state mutation:
+            #   * while a capture binding is live, NO other buffer may use
+            #     this pipeline -- even an ordinary collide would reset and
+            #     repopulate the hysteresis state the graph replays against;
+            #   * a buffer must be warmed up (one ordinary collide) before
+            #     capture, so the history reset and lazy allocations are
+            #     never recorded into the graph;
+            #   * the binding survives the buffer's garbage collection (a
+            #     dead weakref proves nothing about the CUDA graph's
+            #     lifetime); release_body_pair_reduction_capture() is the
+            #     only way out.
+            bound = getattr(self, "_captured_contacts_ref", None)
+            if bound is not None and bound() is not contacts:
+                raise RuntimeError(
+                    "reduce_contacts_body_pairs: this pipeline's reducer state is bound to the "
+                    "Contacts buffer it captured in a CUDA graph; using any other buffer would "
+                    "corrupt the hysteresis state the graph replays against. Use one pipeline "
+                    "per captured buffer, or call release_body_pair_reduction_capture() after "
+                    "destroying the graph."
+                )
+            device = self._body_pair_reducer.device
+            if device.is_cuda and wp.get_stream(device).is_capturing:
+                last = getattr(self, "_last_contacts_ref", None)
+                if last is None or last() is not contacts:
+                    raise RuntimeError(
+                        "reduce_contacts_body_pairs: collide this exact Contacts buffer once "
+                        "outside capture before capturing it -- capturing cold would record "
+                        "the hysteresis history reset (and any lazy allocation) into the "
+                        "graph, repeating them on every replay."
+                    )
+                if bound is None:
+                    self._captured_contacts_ref = weakref.ref(contacts)
+                    # Replay is invisible to host-side provenance, so from now
+                    # on this buffer may contain reduced contacts at any moment
+                    # regardless of what last stamped it; the sticky marker
+                    # keeps unsupported solvers rejecting it (see
+                    # SolverBase._require_unreduced_contacts) until release.
+                    contacts.rigid_contacts_reduced_capture = True
 
         # Keep the buffer's full-surface capability marker in sync with this pipeline on every call.
         # collide() may be handed a Contacts created elsewhere (or by a flag-off pipeline); the edge/
@@ -1959,21 +2024,6 @@ class CollisionPipeline:
         # decomposition. Runs before the differentiable augmentation so the
         # diff arrays are built from the compacted set.
         if self._body_pair_reducer is not None:
-            # Graph replay repeats neither the history reset below nor the
-            # provenance assignment, so a reducer-enabled pipeline supports at
-            # most ONE captured buffer -- enforce the documented restriction
-            # (checked before any state mutation) rather than silently sharing
-            # hysteresis history between graphs. A dead weakref means the old
-            # graph can no longer be replayed, so a new buffer may capture.
-            if wp.get_stream(self._body_pair_reducer.device).is_capturing:
-                captured = getattr(self, "_captured_contacts_ref", None)
-                if captured is not None and captured() is not None and captured() is not contacts:
-                    raise RuntimeError(
-                        "reduce_contacts_body_pairs supports capturing at most one Contacts buffer "
-                        "per pipeline: hysteresis history and provenance are shared state that graph "
-                        "replay cannot re-partition. Use one pipeline per captured buffer."
-                    )
-                self._captured_contacts_ref = weakref.ref(contacts)
             # A different Contacts instance means a different stream of states;
             # winners recorded for the previous buffer must not bias this one.
             # Held as a weak reference: a raw id() can be recycled by the

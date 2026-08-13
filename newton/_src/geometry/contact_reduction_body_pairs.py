@@ -119,11 +119,17 @@ itself runs -- replaying a captured graph repeats neither.  A reducer-enabled
 pipeline must therefore not alternate multiple captured buffers (hysteresis
 history is shared state), and solver provenance checks reflect the last
 Python-level collide, not the last replay.  Per-buffer device-resident
-provenance is the eventual fix; until then capture one buffer per
-reducer-enabled pipeline (enforced at capture time in ``collide()``).  And
-under graph CAPTURE: a buffer with per-contact material properties must see
-one warm-up collide before capture, because its material scratch is
-provisioned lazily on first use.
+provenance is the eventual fix; until then ``collide()`` enforces an explicit
+capture lifecycle: the captured buffer must be warmed up with one ordinary
+collide before capture (so no history reset or lazy allocation is recorded
+into the graph -- this also provisions the lazily allocated material scratch
+of a buffer with per-contact properties), no other buffer may use the
+pipeline while the capture binding is live (even outside capture: an ordinary
+collide would repopulate the hysteresis state the graph replays against), a
+once-captured buffer carries a sticky may-contain-reduced marker that keeps
+unsupported solvers rejecting it after non-reducing refills, and the binding
+survives buffer garbage collection until
+``CollisionPipeline.release_body_pair_reduction_capture()``.
 """
 
 from __future__ import annotations

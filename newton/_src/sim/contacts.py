@@ -401,6 +401,13 @@ class Contacts:
         :meth:`newton.CollisionPipeline.collide` call from the pipeline's mode
         (never a sticky observation), and checked by solvers that have not
         been conformance-tested against reduced buffers."""
+        self.rigid_contacts_reduced_capture = False
+        """Sticky: True once a reducer-enabled pipeline captured this buffer
+        into a CUDA graph.  Replay is invisible to host-side provenance, so
+        the buffer may contain reduced contacts at any moment regardless of
+        :attr:`rigid_contacts_reduced`; cleared only by
+        ``CollisionPipeline.release_body_pair_reduction_capture()``
+        (deliberately survives :meth:`clear`)."""
 
     def clear(self, bump_generation: bool = True):
         """
@@ -421,7 +428,10 @@ class Contacts:
                 ``False`` to avoid an unnecessary double-bump per collision pass.
         """
         # Provenance resets with the contents: a cleared buffer holds no
-        # reduced contacts, whatever pipeline previously filled it.
+        # reduced contacts, whatever pipeline previously filled it.  The
+        # CAPTURE marker deliberately does not reset: a replay of the graph
+        # that captured this buffer can re-reduce it at any moment after the
+        # clear, so only an explicit capture release may drop it.
         self.rigid_contacts_reduced = False
         # Clear all counters and (optionally) bump generation in a single kernel launch.
         num_counters = self.contact_counters.shape[0]

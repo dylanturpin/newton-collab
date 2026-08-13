@@ -377,7 +377,12 @@ class SolverBase:
         """
         if (
             contacts is not None
-            and getattr(contacts, "rigid_contacts_reduced", False)
+            and (
+                getattr(contacts, "rigid_contacts_reduced", False)
+                # sticky: a buffer captured into a reducer graph may be
+                # re-reduced by any replay, invisibly to the per-collide marker
+                or getattr(contacts, "rigid_contacts_reduced_capture", False)
+            )
             and not type(self).supports_reduced_contacts
         ):
             raise ValueError(
