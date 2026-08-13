@@ -138,86 +138,6 @@ def update_articulation_origins(
 
 
 @wp.kernel
-def update_articulation_root_com_offsets(
-    articulation_start: wp.array[int],
-    joint_child: wp.array[int],
-    body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    # outputs
-    articulation_root_com_offset: wp.array[wp.vec3],
-):
-    # NOTE: This helper keeps the rotated root COM offset in world orientation.
-    # FeatherPGS currently uses update_articulation_origins() instead, which
-    # stores the absolute root COM world position for its free-root convention.
-    art = wp.tid()
-
-    start = articulation_start[art]
-    end = articulation_start[art + 1]
-
-    if start >= end:
-        articulation_root_com_offset[art] = wp.vec3()
-        return
-
-    root_body = joint_child[start]
-    if root_body >= 0:
-        rot = wp.transform_get_rotation(body_q[root_body])
-        articulation_root_com_offset[art] = wp.quat_rotate(rot, body_com[root_body])
-    else:
-        articulation_root_com_offset[art] = wp.vec3()
-
-
-@wp.kernel
-def convert_root_free_qd_world_to_local(
-    articulation_root_is_free: wp.array[int],
-    articulation_root_dof_start: wp.array[int],
-    articulation_root_com_offset: wp.array[wp.vec3],
-    # in/out
-    qd: wp.array[float],
-):
-    art = wp.tid()
-    if articulation_root_is_free[art] == 0:
-        return
-
-    ds = articulation_root_dof_start[art]
-    v_com = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
-    w = wp.vec3(qd[ds + 3], qd[ds + 4], qd[ds + 5])
-    com_offset = articulation_root_com_offset[art]
-
-    # Shift linear velocity from the public CoM convention to the internal
-    # root-body-origin linear term used by FeatherPGS integration/ID state.
-    v_local = v_com - wp.cross(w, com_offset)
-
-    qd[ds + 0] = v_local[0]
-    qd[ds + 1] = v_local[1]
-    qd[ds + 2] = v_local[2]
-
-
-@wp.kernel
-def convert_root_free_qd_local_to_world(
-    articulation_root_is_free: wp.array[int],
-    articulation_root_dof_start: wp.array[int],
-    articulation_root_com_offset: wp.array[wp.vec3],
-    # in/out
-    qd: wp.array[float],
-):
-    art = wp.tid()
-    if articulation_root_is_free[art] == 0:
-        return
-
-    ds = articulation_root_dof_start[art]
-    v_local = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
-    w = wp.vec3(qd[ds + 3], qd[ds + 4], qd[ds + 5])
-    com_offset = articulation_root_com_offset[art]
-
-    # Convert the internal root-body-origin linear term back to the public CoM convention.
-    v_com = v_local + wp.cross(w, com_offset)
-
-    qd[ds + 0] = v_com[0]
-    qd[ds + 1] = v_com[1]
-    qd[ds + 2] = v_com[2]
-
-
-@wp.kernel
 def clamp_free_root_velocity_limits(
     articulation_start: wp.array[int],
     joint_child: wp.array[int],
@@ -745,9 +665,14 @@ def jcalc_integrate(
         v_com = wp.vec3(joint_qd[dof_start + 0], joint_qd[dof_start + 1], joint_qd[dof_start + 2])
         w_s = wp.vec3(joint_qd[dof_start + 3], joint_qd[dof_start + 4], joint_qd[dof_start + 5])
 
-        # symplectic Euler
+        # symplectic Euler. joint_qdd's linear rows give the acceleration of the articulation-frame
+        # origin, a point fixed in the root body, so its velocity also changes by transport as the
+        # body rotates: that is the omega x v term. SolverFeatherstone performs the same conversion
+        # explicitly (a_com = a + alpha x x_com + omega x v_com); omitting it leaves the free base
+        # short by a term proportional to the spin.
+        w_prev = w_s
         w_s = w_s + m_s * dt
-        v_com = v_com + a_s * dt
+        v_com = v_com + (a_s + wp.cross(w_prev, v_com)) * dt
         w_s_integrate = w_s
 
         p_s = wp.vec3(joint_q[coord_start + 0], joint_q[coord_start + 1], joint_q[coord_start + 2])
@@ -1045,12 +970,11 @@ def compute_link_velocity(
     # body forces
     I_s = transform_spatial_inertia(X_sm_local, I_m)
 
+    # The root's linear inertial wrench is NOT spurious: the solve frame is centred on a material
+    # point of the root body, so that point accelerates as the body rotates and this term is what
+    # carries it. SolverFeatherstone keeps it and conserves momentum; zeroing it here leaked
+    # momentum on every rotating multi-link articulation.
     coriolis = spatial_cross_dual(v_s, I_s * v_s)
-    if parent < 0 and (type == JointType.FREE or type == JointType.DISTANCE):
-        # Root free bodies use a world-aligned frame centered at the root COM.
-        # In that convention the linear inertial wrench is m*a_com; the
-        # omega x (m*v_com) term from body-frame spatial algebra is spurious.
-        coriolis = wp.spatial_vector(wp.vec3(), wp.spatial_bottom(coriolis))
 
     f_b_s = I_s * a_s + coriolis
 
@@ -6571,13 +6495,16 @@ def flush_propagation_free_body_qd_to_vout(
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
     articulation_root_dof_start: wp.array[int],
-    articulation_root_com_offset: wp.array[wp.vec3],
     # in/out
     propagation_body_qd: wp.array2d[float],
     propagation_body_impulses: wp.array2d[float],
     v_out: wp.array[float],
 ):
-    """Write propagation live free-rigid velocities to v_out after propagation GS."""
+    """Write propagation live free-rigid velocities to v_out after propagation GS.
+
+    The generalized linear coordinate and the propagation body velocity both refer to the root
+    body's centre of mass, so the write-back is a plain copy.
+    """
     body = wp.tid()
     art = body_to_articulation[body]
     if art < 0:
@@ -6586,17 +6513,8 @@ def flush_propagation_free_body_qd_to_vout(
         return
 
     dof_start = articulation_root_dof_start[art]
-    v_com = wp.vec3(propagation_body_qd[body, 0], propagation_body_qd[body, 1], propagation_body_qd[body, 2])
-    w = wp.vec3(propagation_body_qd[body, 3], propagation_body_qd[body, 4], propagation_body_qd[body, 5])
-    com_offset = articulation_root_com_offset[art]
-    v_local = v_com - wp.cross(w, com_offset)
-
-    v_out[dof_start + 0] = v_local[0]
-    v_out[dof_start + 1] = v_local[1]
-    v_out[dof_start + 2] = v_local[2]
-    v_out[dof_start + 3] = w[0]
-    v_out[dof_start + 4] = w[1]
-    v_out[dof_start + 5] = w[2]
+    for r in range(6):
+        v_out[dof_start + r] = propagation_body_qd[body, r]
 
     for r in range(6):
         propagation_body_impulses[body, r] = 0.0
@@ -6607,12 +6525,15 @@ def refresh_propagation_free_body_qd_from_vout(
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
     articulation_root_dof_start: wp.array[int],
-    articulation_root_com_offset: wp.array[wp.vec3],
     v_out: wp.array[float],
     # out
     propagation_body_qd: wp.array2d[float],
 ):
-    """Refresh propagation live COM velocities for free-rigid bodies from v_out."""
+    """Refresh propagation live COM velocities for free-rigid bodies from v_out.
+
+    Both sides use the root body's centre of mass as the linear reference point, so the refresh is
+    a plain copy.
+    """
     body = wp.tid()
     art = body_to_articulation[body]
     if art < 0:
@@ -6621,17 +6542,8 @@ def refresh_propagation_free_body_qd_from_vout(
         return
 
     dof_start = articulation_root_dof_start[art]
-    v_local = wp.vec3(v_out[dof_start + 0], v_out[dof_start + 1], v_out[dof_start + 2])
-    w = wp.vec3(v_out[dof_start + 3], v_out[dof_start + 4], v_out[dof_start + 5])
-    com_offset = articulation_root_com_offset[art]
-    v_com = v_local + wp.cross(w, com_offset)
-
-    propagation_body_qd[body, 0] = v_com[0]
-    propagation_body_qd[body, 1] = v_com[1]
-    propagation_body_qd[body, 2] = v_com[2]
-    propagation_body_qd[body, 3] = w[0]
-    propagation_body_qd[body, 4] = w[1]
-    propagation_body_qd[body, 5] = w[2]
+    for r in range(6):
+        propagation_body_qd[body, r] = v_out[dof_start + r]
 
 
 @wp.kernel
@@ -6642,7 +6554,6 @@ def flush_propagation_active_free_body_qd_to_vout(
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
     articulation_root_dof_start: wp.array[int],
-    articulation_root_com_offset: wp.array[wp.vec3],
     # in/out
     propagation_body_qd: wp.array2d[float],
     propagation_body_impulses: wp.array2d[float],
@@ -6666,17 +6577,8 @@ def flush_propagation_active_free_body_qd_to_vout(
         return
 
     dof_start = articulation_root_dof_start[art]
-    v_com = wp.vec3(propagation_body_qd[body, 0], propagation_body_qd[body, 1], propagation_body_qd[body, 2])
-    w = wp.vec3(propagation_body_qd[body, 3], propagation_body_qd[body, 4], propagation_body_qd[body, 5])
-    com_offset = articulation_root_com_offset[art]
-    v_local = v_com - wp.cross(w, com_offset)
-
-    v_out[dof_start + 0] = v_local[0]
-    v_out[dof_start + 1] = v_local[1]
-    v_out[dof_start + 2] = v_local[2]
-    v_out[dof_start + 3] = w[0]
-    v_out[dof_start + 4] = w[1]
-    v_out[dof_start + 5] = w[2]
+    for r in range(6):
+        v_out[dof_start + r] = propagation_body_qd[body, r]
 
     for r in range(6):
         propagation_body_impulses[body, r] = 0.0
