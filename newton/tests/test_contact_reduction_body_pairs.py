@@ -54,6 +54,27 @@ def _cylinder_foot(builder, pos, mass=1.0, num_cyl=7, radius=0.02, half_height=0
     return body
 
 
+def _free_jointed_foot(builder, pos, num_cyl=7, radius=0.02, half_height=0.015):
+    """A cylinder-row foot attached to the world by an explicit free joint.
+
+    :class:`newton.solvers.SolverFeatherPGS` does not simulate unjointed
+    massive bodies as floating bodies (they stay frozen), so every FPGS
+    dynamics test must build its bodies this way or it validates nothing.
+    """
+    link = builder.add_link(xform=wp.transform(wp.vec3(*pos), wp.quat_identity()))
+    for i in range(num_cyl):
+        x = (i - (num_cyl - 1) / 2.0) * (2.2 * radius)
+        builder.add_shape_cylinder(
+            link,
+            xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()),
+            radius=radius,
+            half_height=half_height,
+        )
+    joint = builder.add_joint_free(parent=-1, child=link)
+    builder.add_articulation([joint])
+    return link
+
+
 def _sphere_grid_body(builder, pos, n=5, spacing=0.05, radius=0.01, mass=1.0):
     """One free body with an ``n x n`` grid of sphere colliders on its underside.
 
@@ -402,10 +423,6 @@ class TestBodyPairReductionDynamics(unittest.TestCase):
         np.testing.assert_allclose(traj_red, traj_base, atol=1e-6)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestBodyPairReductionGuarantees(unittest.TestCase):
     """Unsupported configurations are rejected at construction or solver start."""
 
@@ -595,40 +612,78 @@ class TestBodyPairReductionMultiPatch(unittest.TestCase):
 class TestBodyPairReductionSolverConformance(unittest.TestCase):
     """Every solver declaring supports_reduced_contacts settles identically on/off."""
 
-    def _settle_with(self, solver_cls, reduce_on, **solver_kwargs):
+    def _settle(self, build_fn, make_solver, reduce_on, steps=240):
+        """Drop, settle, and return (final z, fell, peak contact count).
+
+        The fell/contact guards make the comparison non-vacuous: a body a
+        solver silently refuses to simulate (e.g. an unjointed massive body on
+        FeatherPGS) neither falls nor proves anything by matching heights.
+        """
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-        body = _cylinder_foot(builder, (0.0, 0.0, 0.020))
+        body = build_fn(builder)
         builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
         state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
         control = model.control()
         pipeline = _make_pipeline(model, reduce_on)
         contacts = pipeline.contacts()
-        solver = solver_cls(model, **solver_kwargs)
-        for _ in range(240):
+        solver = make_solver(model)
+        z0 = float(state_0.body_q.numpy()[body][2])
+        peak_contacts = 0
+        for k in range(steps):
             pipeline.collide(state_0, contacts)
+            if k % 20 == 0:
+                peak_contacts = max(peak_contacts, int(contacts.rigid_contact_count.numpy()[0]))
             state_0.clear_forces()
             solver.step(state_0, state_1, control, contacts, DT)
             state_0, state_1 = state_1, state_0
-        return float(state_0.body_q.numpy()[body][2])
+        z_end = float(state_0.body_q.numpy()[body][2])
+        return z_end, z_end < z0 - 0.005, peak_contacts
+
+    def _compare(self, build_fn, make_solver, tol=5e-4):
+        z_off, fell_off, contacts_off = self._settle(build_fn, make_solver, False)
+        z_on, fell_on, contacts_on = self._settle(build_fn, make_solver, True)
+        self.assertTrue(fell_off and fell_on, "body did not fall: the solver is not simulating it")
+        self.assertGreater(contacts_off, 0)
+        self.assertGreater(contacts_on, 0)
+        self.assertLess(abs(z_off - z_on), tol)
 
     def test_feather_pgs_conformance(self):
-        """SolverFeatherPGS rests the multi-cylinder foot at the same height on/off.
+        """SolverFeatherPGS rests a free-jointed foot at the same height on/off.
 
         This is the conformance requirement for supports_reduced_contacts:
         the solver's contact-depth convention must agree with the ranking's
         canonical contact_surface_separation, or the kept set starves the
-        solver of its load-bearing contacts.
+        solver of its load-bearing contacts. The foot is attached by an
+        explicit free joint -- FeatherPGS does not simulate unjointed massive
+        bodies, so the previous add_body version compared two frozen bodies.
         """
-        z_off = self._settle_with(newton.solvers.SolverFeatherPGS, False, angular_damping=0.0)
-        z_on = self._settle_with(newton.solvers.SolverFeatherPGS, True, angular_damping=0.0)
-        self.assertLess(abs(z_off - z_on), 5e-4)
+        self._compare(
+            lambda b: _free_jointed_foot(b, (0.0, 0.0, 0.05)),
+            lambda m: newton.solvers.SolverFeatherPGS(m, angular_damping=0.0),
+        )
+
+    def test_feather_pgs_dynamic_dynamic_conformance(self):
+        """Settle a free-jointed foot dropped onto another free-jointed foot.
+
+        Covers articulated dynamic-dynamic contact: both the falling body and
+        its support are simulated bodies, so the reduced set must preserve the
+        body-body patch as well as the body-ground patches.
+        """
+
+        def build(b):
+            _free_jointed_foot(b, (0.0, 0.0, 0.0175))
+            return _free_jointed_foot(b, (0.0, 0.005, 0.09))
+
+        self._compare(build, lambda m: newton.solvers.SolverFeatherPGS(m, angular_damping=0.0), tol=2e-3)
 
     def test_xpbd_conformance(self):
         """SolverXPBD rests the multi-cylinder foot at the same height on/off."""
-        z_off = self._settle_with(newton.solvers.SolverXPBD, False, iterations=8)
-        z_on = self._settle_with(newton.solvers.SolverXPBD, True, iterations=8)
-        self.assertLess(abs(z_off - z_on), 5e-4)
+        self._compare(
+            lambda b: _cylinder_foot(b, (0.0, 0.0, 0.05)),
+            lambda m: newton.solvers.SolverXPBD(m, iterations=8),
+        )
 
 
 class TestBodyPairReductionGrouping(unittest.TestCase):
@@ -708,7 +763,7 @@ class TestBodyPairReductionGrouping(unittest.TestCase):
         pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_cell=10.0)
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
-        n, _s0, _s1, nrm, _p0 = _contact_snapshot(contacts)
+        n, _s0, _s1, _nrm, _p0 = _contact_snapshot(contacts)
         self.assertGreater(n, 0)
         # the raw narrow-phase output must actually contain both orientations,
         # or this test is vacuous (geometry-type dispatch produces the swap)
@@ -1004,10 +1059,11 @@ class TestBodyPairReductionFPGSImpact(unittest.TestCase):
 
         def run(reduce_on):
             builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-            body = _cylinder_foot(builder, (5.13, 5.07, 0.06))  # 3 cm drop
+            body = _free_jointed_foot(builder, (5.13, 5.07, 0.06))  # 3 cm drop
             builder.add_ground_plane()
             model = builder.finalize(device=wp.get_device())
             state_0, state_1 = model.state(), model.state()
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
             control = model.control()
             pipeline = _make_pipeline(model, reduce_on)
             contacts = pipeline.contacts()
@@ -1022,6 +1078,7 @@ class TestBodyPairReductionFPGSImpact(unittest.TestCase):
 
         z_off = run(False)
         z_on = run(True)
+        self.assertLess(float(z_off.min()), 0.04, "foot never fell: the solver is not simulating it")
         self.assertLess(abs(float(z_off[-30:].mean()) - float(z_on[-30:].mean())), 5e-4)
         # bounded touchdown transient: never punches through the resting height by > 2.5 mm
         self.assertGreater(float(z_on.min()), 0.015 - 2.5e-3)
@@ -1196,6 +1253,80 @@ class TestBodyPairReductionHysteresis(unittest.TestCase):
         pts = _world_points0(model, state, contacts)
         mid = np.abs(pts[:, 0]) < 0.02
         self.assertFalse(bool(mid.any()), "beaten incumbent depth winner was kept anyway")
+
+    def test_reset_history_matches_fresh_pipeline(self):
+        """Produce a fresh pipeline's kept set on the first collide after a reset.
+
+        Hysteresis history is trajectory state; episode resets and teleports
+        must be able to sever it so no incumbency bonus crosses the boundary.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (0.0, 0.0, 0.0175))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)  # establish history
+        pipeline.reset_body_pair_reduction_history()
+        pipeline.collide(state, contacts)
+        n_reset, s0_r, s1_r, _n1, p0_r = _contact_snapshot(contacts)
+
+        fresh = _make_pipeline(model, True)
+        contacts_f = fresh.contacts()
+        fresh.collide(state, contacts_f)
+        n_f, s0_f, s1_f, _n2, p0_f = _contact_snapshot(contacts_f)
+
+        self.assertEqual(n_reset, n_f)
+        rows_r = sorted(
+            (int(a), int(b), *(round(float(v), 6) for v in p)) for a, b, p in zip(s0_r, s1_r, p0_r, strict=True)
+        )
+        rows_f = sorted(
+            (int(a), int(b), *(round(float(v), 6) for v in p)) for a, b, p in zip(s0_f, s1_f, p0_f, strict=True)
+        )
+        self.assertEqual(rows_r, rows_f, "reset did not sever hysteresis history")
+
+    def test_new_contacts_buffer_resets_history(self):
+        """Sever hysteresis history automatically when a different buffer is supplied.
+
+        A different Contacts instance means a different stream of states;
+        winners recorded for the previous buffer must not bias the new one.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (0.0, 0.0, 0.0175))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts_a = pipeline.contacts()
+        pipeline.collide(state, contacts_a)
+        contacts_b = pipeline.contacts()
+        pipeline.collide(state, contacts_b)  # must not inherit buffer A's winners
+        red = pipeline._body_pair_reducer
+        masks = red.contact_incumbent.numpy()[: int(contacts_b.rigid_contact_count.numpy()[0])]
+        self.assertTrue((masks == 0).all(), "incumbency leaked across Contacts buffers")
+
+    def test_reducer_launches_stay_off_the_tape(self):
+        """Record no reducer bookkeeping launches on an active autodiff tape.
+
+        Every reducer kernel has backward disabled; recording them would only
+        bloat the tape. This guards the full reduce() path including the
+        hashtable maintenance kernels.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (0.0, 0.0, 0.0175))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)  # warm up allocations outside the tape
+        red = pipeline._body_pair_reducer
+        tape = wp.Tape()
+        with tape:
+            red.reduce(model, state, contacts)
+        self.assertEqual(len(tape.launches), 0, "reducer bookkeeping was recorded on the tape")
 
     def test_disabled_hysteresis_is_history_independent(self):
         """Reduce identically with hysteresis=0 regardless of what ran before.
@@ -1377,3 +1508,7 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
             self.assertTrue(np.isfinite(body_q).all() and np.isfinite(qd).all())
             self.assertLess(peak_red, max(3.0 * peak_raw, 10.0), f"trial {trial}: pile blew up")
             self.assertGreater(float(body_q[bodies, 2].min()), -0.06, f"trial {trial}: body tunneled")
+
+
+if __name__ == "__main__":
+    unittest.main()

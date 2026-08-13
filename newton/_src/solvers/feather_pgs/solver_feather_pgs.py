@@ -51,7 +51,6 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-    PROPAGATION_COLOR_TAIL,
     add_dense_contact_compliance_to_diag,
     allocate_joint_limit_slots,
     allocate_joint_velocity_limit_slots,
@@ -70,8 +69,8 @@ from .kernels import (
     build_propagation_contact_rows,
     cholesky_loop,
     clamp_augmented_joint_u0,
-    clamp_free_root_velocity_limits,
     collect_propagation_units,
+    clamp_free_root_velocity_limits,
     commit_mass_updates,
     compute_com_transforms,
     compute_composite_inertia,
@@ -117,6 +116,7 @@ from .kernels import (
     pgs_ncp_residuals_diagnostic_velocity,
     pgs_solve_loop,
     pgs_solve_mf_loop,
+    PROPAGATION_COLOR_TAIL,
     pgs_solve_propagation_contact_loop,
     populate_joint_limit_J_for_size,
     populate_joint_velocity_limit_J_for_size,
@@ -15051,8 +15051,8 @@ def _get_pgs_solve_mf_gs_kernel(
         drive_loads += """
         s_drive_vel_limit_dense[i] = world_drive_vel_limit.data[off_dense + i];"""
     drive_projection = (
-        """
-            if (row_type == 1) {
+        f"""
+            if (row_type == 1) {{
                 new_impulse = old_impulse * s_drive_imp_mul_dense[i]
                     + jv * s_drive_vel_mul_dense[i]
                     + s_drive_target_dense[i];
@@ -15060,7 +15060,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 if (new_impulse > max_imp) new_impulse = max_imp;
                 if (new_impulse < -max_imp) new_impulse = -max_imp;
                 delta_impulse = new_impulse - old_impulse;
-            }"""
+            }}"""
         if has_drive_rows
         else """
             if (row_type == 1) {

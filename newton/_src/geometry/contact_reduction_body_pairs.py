@@ -1564,7 +1564,7 @@ class BodyPairContactReducer:
             device=self.device,
             record_tape=False,
         )
-        self.hashtable.clear_active()
+        self.hashtable.clear_active(record_tape=False)
 
         geom_inputs = [
             contacts.rigid_contact_count,
@@ -1751,6 +1751,33 @@ class BodyPairContactReducer:
             device=self.device,
             record_tape=False,
         )
+
+    def reset_history(self):
+        """Erase the hysteresis snapshot so no incumbency crosses this point.
+
+        Call at episode/scene resets, teleports, or before replaying unrelated
+        states through one pipeline: the previous-winner snapshot is trajectory
+        state, and a 1 mm incumbency bonus inherited from an unrelated
+        trajectory is a (bounded) bias the caller never asked for.  Host-side;
+        call OUTSIDE CUDA graph capture.  The first collide after a reset
+        produces zero incumbent masks and matches a fresh pipeline exactly.
+        No-op when hysteresis is disabled.
+        """
+        if self.hysteresis > 0.0:
+            self.prev_keys.fill_(_HASHTABLE_EMPTY_KEY_VALUE)
+            self.prev_active_slots.zero_()
+            # Also retire the LIVE table: the next reduce() snapshots it into
+            # the history before clearing, so leaving last frame's winners in
+            # place would resurrect exactly the state this call severs.
+            wp.launch(
+                _clear_active_values_kernel,
+                dim=self.entry_stride_threads,
+                inputs=[self.hashtable.active_slots, self.hashtable.capacity, self.entry_stride_threads],
+                outputs=[self.ht_values],
+                device=self.device,
+                record_tape=False,
+            )
+            self.hashtable.clear_active(record_tape=False)
 
     def stats(self) -> dict:
         """Whole-run reduction telemetry (forces a device sync; read outside capture).

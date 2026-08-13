@@ -1009,20 +1009,29 @@ class CollisionPipeline:
                 ``True``.  Overhead is one extra kernel launch per collision
                 pass; disable in hot loops or CUDA graph capture once buffer
                 sizes are known to be adequate.
-            reduce_contacts_body_pairs: Compact the rigid contacts per body
-                pair and contact-normal bin after the narrow phase: each
-                group keeps its deepest contact plus the spatial extremes of
-                its near-touching footprint, and discards the redundant
-                interior/speculative candidates.  Bounds the registered
-                contact count of multi-shape bodies (a foot built from many
-                primitive colliders, self-collision candidate swarms) by the
-                patch structure instead of the collider decomposition.
+            reduce_contacts_body_pairs: Compact the rigid contacts per group
+                after the narrow phase, where a group is a (body pair,
+                material class, contact-normal bin, spatial cell): each group
+                keeps its deepest contact plus the spatial extremes of its
+                footprint and discards the redundant interior/speculative
+                candidates.  Bounds the registered contact count of
+                multi-shape bodies (a foot built from many primitive
+                colliders, self-collision candidate swarms) by the patch
+                structure instead of the collider decomposition.
                 ``rigid_contact_count`` reflects the reduction.  Not supported
                 together with ``contact_matching``.  The kept SET is
-                deterministic by construction (winner selection is a pure
-                function of contact content); combine with
+                deterministic: winner selection is a function of contact
+                geometry plus, when
+                ``reduce_contacts_body_pairs_hysteresis`` is nonzero (the
+                default), the previous step's winners; combine with
                 ``deterministic=True`` if a canonical buffer ORDER is also
-                required.  Defaults to ``False``.
+                required.  Known fidelity tradeoff: keeping a patch's rim
+                extremes strengthens its torsional (twist-about-normal)
+                friction by up to 1.5x the uniform-pressure value, a bias
+                inherent to any boundary-keeping reduction -- support,
+                tipping, and translational friction are preserved exactly.
+                Validate yaw-heavy motions before enabling in production.
+                Defaults to ``False``.
             reduce_contacts_body_pairs_cell: Spatial cell edge [m] used to
                 subdivide each body pair + normal bin on the bin's face
                 plane; every cell keeps its own deepest contact and footprint
@@ -1415,6 +1424,41 @@ class CollisionPipeline:
             )
         else:
             self._body_pair_reducer = None
+
+    def reset_body_pair_reduction_history(self):
+        """Erase the body-pair reduction's hysteresis history.
+
+        With ``reduce_contacts_body_pairs_hysteresis > 0`` the pipeline carries
+        last step's slot winners between :meth:`collide` calls.  Call this at
+        episode resets, teleports, or scene reloads so no incumbency bonus
+        crosses trajectory boundaries.  Host-side; call outside CUDA graph
+        capture.  No-op when reduction or hysteresis is disabled.
+        """
+        if self._body_pair_reducer is not None:
+            self._body_pair_reducer.reset_history()
+
+    def body_pair_reduction_stats(self) -> dict:
+        """Whole-run telemetry of the body-pair contact reduction.
+
+        Synchronizes the device; do not call during CUDA graph capture.  See
+        the returned keys' documentation on the reducer's ``stats()``.
+
+        Raises:
+            RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.
+        """
+        if self._body_pair_reducer is None:
+            raise RuntimeError("reduce_contacts_body_pairs is not enabled on this pipeline")
+        return self._body_pair_reducer.stats()
+
+    def body_pair_reduction_description(self) -> dict:
+        """Static buffer footprint of the body-pair contact reduction by role.
+
+        Raises:
+            RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.
+        """
+        if self._body_pair_reducer is None:
+            raise RuntimeError("reduce_contacts_body_pairs is not enabled on this pipeline")
+        return self._body_pair_reducer.describe()
 
     @property
     def rigid_contact_max(self) -> int:
@@ -1813,6 +1857,13 @@ class CollisionPipeline:
         # rigid_contact_count reflects the contact structure, not the collider
         # decomposition. Runs before the differentiable augmentation so the
         # diff arrays are built from the compacted set.
+        if self._body_pair_reducer is not None:
+            # A different Contacts instance means a different stream of states;
+            # winners recorded for the previous buffer must not bias this one.
+            if getattr(self, "_last_contacts_id", None) != id(contacts):
+                self._body_pair_reducer.reset_history()
+                self._last_contacts_id = id(contacts)
+
         # Provenance is assigned on EVERY collide from the pipeline's mode --
         # never only set on reduction -- so a buffer reused across pipelines
         # cannot carry a stale marker (see SolverBase.supports_reduced_contacts).

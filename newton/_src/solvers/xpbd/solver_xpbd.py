@@ -33,10 +33,6 @@ from .kernels import (
 
 
 class SolverXPBD(SolverBase, CouplingInterface):
-
-    # Conformance-tested against body-pair-reduced contact buffers
-    # (test_contact_reduction_body_pairs).
-    supports_reduced_contacts: bool = True
     """An implicit integrator using eXtended Position-Based Dynamics (XPBD) for rigid and soft body simulation.
 
     References:
@@ -99,6 +95,10 @@ class SolverXPBD(SolverBase, CouplingInterface):
             state_in, state_out = state_out, state_in
 
     """
+
+    # Conformance-tested against body-pair-reduced contact buffers
+    # (test_contact_reduction_body_pairs).
+    supports_reduced_contacts: bool = True
 
     @deprecate_nonkeyword_arguments
     def __init__(

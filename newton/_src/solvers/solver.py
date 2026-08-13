@@ -360,7 +360,8 @@ class SolverBase:
 
     :class:`newton.CollisionPipeline` with ``reduce_contacts_body_pairs=True``
     compacts the rigid contacts to each patch's deepest point plus footprint
-    extremes, ranked by :func:`newton._src.sim.contacts.contact_surface_separation`.
+    extremes, ranked by the collision pipeline's canonical signed surface
+    separation (normal directed shape0 to shape1, positive gap when separated).
     A solver may only declare support after a conformance test demonstrates it
     consumes contact depth with that same convention (see
     ``newton/tests/test_contact_reduction_body_pairs.py``). Solvers that do not
