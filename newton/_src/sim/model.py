@@ -615,6 +615,8 @@ class Model:
         "joint_target_ke": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_target_kd": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_damping": AttributeSpec(AttributeFrequency.JOINT_DOF),
+        "joint_spring_stiffness": AttributeSpec(AttributeFrequency.JOINT_DOF),
+        "joint_spring_ref": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_limit_lower": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_limit_upper": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_limit_ke": AttributeSpec(AttributeFrequency.JOINT_DOF),
@@ -1147,6 +1149,12 @@ class Model:
         """Joint damping [N·s/m or N·m·s/rad, depending on joint type], shape [joint_dof_count], float."""
         self.joint_damping: wp.array[wp.float32] | None = None
         """Passive velocity damping [N·s/m or N·m·s/rad, depending on joint type] always active on the joint, shape [joint_dof_count], float."""
+        self.joint_spring_stiffness: wp.array[wp.float32] | None = None
+        """Passive spring stiffness [N/m or N·m/rad, depending on joint type] always active on the joint,
+        applying ``k * (joint_spring_ref - q)``; 0 disables the spring. Shape [joint_dof_count], float."""
+        self.joint_spring_ref: wp.array[wp.float32] | None = None
+        """Passive spring reference (rest) position [m or rad, depending on joint type]. May lie outside the
+        joint limits to preload the joint against a limit, shape [joint_dof_count], float."""
         self.joint_effort_limit: wp.array[wp.float32] | None = None
         """Joint effort (force/torque) limits [N or N·m, depending on joint type], shape [joint_dof_count], float."""
         self.joint_velocity_limit: wp.array[wp.float32] | None = None
