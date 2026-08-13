@@ -75,6 +75,35 @@ def _free_jointed_foot(builder, pos, num_cyl=7, radius=0.02, half_height=0.015):
     return link
 
 
+def _free_jointed_foot_articulated(builder, pos, num_cyl=7, radius=0.02, half_height=0.015):
+    """The cylinder foot as a floating two-body ARTICULATION.
+
+    Fused propagation deliberately keeps single free bodies' contact rows on
+    the ordinary matrix-free family, so a fused conformance leg built on the
+    plain foot never runs the fused kernel.  A concentric fixed child makes
+    this a non-free articulation without changing the contact geometry.
+    """
+    link = builder.add_link(xform=wp.transform(wp.vec3(*pos), wp.quat_identity()))
+    for i in range(num_cyl):
+        x = (i - (num_cyl - 1) / 2.0) * (2.2 * radius)
+        builder.add_shape_cylinder(
+            link,
+            xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()),
+            radius=radius,
+            half_height=half_height,
+        )
+    child = builder.add_link(
+        xform=wp.transform(wp.vec3(*pos), wp.quat_identity()),
+        mass=0.1,
+        com=wp.vec3(0.0, 0.0, 0.0),
+        inertia=wp.mat33(0.0004, 0.0, 0.0, 0.0, 0.0004, 0.0, 0.0, 0.0, 0.0004),
+    )
+    free = builder.add_joint_free(parent=-1, child=link)
+    weld = builder.add_joint_fixed(parent=link, child=child)
+    builder.add_articulation([free, weld])
+    return link
+
+
 def _sphere_grid_body(builder, pos, n=5, spacing=0.05, radius=0.01, mass=1.0):
     """One free body with an ``n x n`` grid of sphere colliders on its underside.
 
@@ -705,29 +734,44 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             configs += [
                 ("matrix_free", "immediate", 8),
                 ("matrix_free", "propagation", 16),
-                ("matrix_free", "propagation-fused", 8),
+                ("matrix_free", "propagation-fused", 16),
                 ("matrix_free", "propagation-colored", 16),
             ]
-        # dense, propagation, and propagation-colored run 16 iterations: at
-        # the default 8 the UNREDUCED redundant set does not converge (dense
-        # settles 5 mm high, plain/colored propagation 4.8 mm high at 0.01980;
-        # the REDUCED set and split land at the true 0.01500 at every
-        # iteration count) -- redundant near-parallel rows hurt PGS
-        # conditioning, the same effect as the stack-collapse case, and
-        # reduction itself is what removes it.  The comparison must be against
-        # a converged baseline.
+        # dense and every propagation variant run 16 iterations: at the
+        # default 8 the UNREDUCED redundant set does not converge (dense
+        # settles 5 mm high, plain/colored propagation 4.8 mm high, fused 4.9
+        # mm LOW on the articulated foot; the REDUCED set and split land at
+        # the true height at every iteration count) -- redundant
+        # near-parallel rows hurt PGS conditioning, the same effect as the
+        # stack-collapse case, and reduction itself is what removes it.  The
+        # comparison must be against a converged baseline.  (Fused earlier
+        # "passed" at 8 only because its leg was vacuous: fused keeps single
+        # free bodies on the ordinary matrix-free family, so the plain foot
+        # never ran the fused kernel -- hence the articulated foot + loud
+        # activation asserts.)
         for mode, response, iters in configs:
             with self.subTest(pgs_mode=mode, response=response):
-                self._compare(
-                    lambda b: _free_jointed_foot(b, (0.0, 0.0, 0.05)),
-                    lambda m, mode=mode, response=response, iters=iters: newton.solvers.SolverFeatherPGS(
+                fused = response == "propagation-fused"
+                build_fn = _free_jointed_foot_articulated if fused else _free_jointed_foot
+
+                def make_solver(m, mode=mode, response=response, iters=iters, fused=fused):
+                    solver = newton.solvers.SolverFeatherPGS(
                         m,
                         angular_damping=0.0,
                         pgs_mode=mode,
                         pgs_iterations=iters,
                         articulated_contact_response=response,
-                    ),
-                )
+                    )
+                    if fused:
+                        # fail loudly if the leg silently falls back to the
+                        # ordinary matrix-free family (vacuous coverage)
+                        if not solver._propagation_contacts_enabled():
+                            raise AssertionError("fused leg did not activate propagation contacts")
+                        if solver._pgs_solve_propagation_full_iteration_kernel is None:
+                            raise AssertionError("fused leg did not construct the fused iteration kernel")
+                    return solver
+
+                self._compare(lambda b, build_fn=build_fn: build_fn(b, (0.0, 0.0, 0.05)), make_solver)
 
     def test_mixed_separation_tilted_patch(self):
         """Settle a tilted patch whose contacts mix penetrating and speculative.
