@@ -1995,6 +1995,16 @@ class BodyPairContactReducer:
             (body pair, bin, cell) groups against the table that holds them.
             ``hashtable_load``: the ratio of those two -- linear probing degrades
             well past ~0.7, and 1.0 means entries were refused and kept open.
+            ``input_overflow_frames``: frames whose narrow-phase output
+            exceeded the buffer capacity; the reduction skipped those frames
+            entirely and delivered the raw result (raise
+            ``rigid_contact_max``).
+            ``fallback_frames``: frames that deterministically kept the whole
+            unreduced set because the group table budget was exceeded (raise
+            the hashtable factor).
+            ``identity_frames``: frames where reduction provably removed
+            nothing; a large fraction means this scene does not benefit from
+            the feature and it should be disabled.
         """
         v = self._stats.numpy()
         entries = int(v[STAT_ENTRY_WATERMARK])
