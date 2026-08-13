@@ -1427,7 +1427,13 @@ class BodyPairContactReducer:
         # live count, so this only has to fill the device. See
         # REDUCTION_MAX_THREADS.
         self.stride_threads = min(rigid_contact_max, REDUCTION_MAX_THREADS)
-        self.entry_stride_threads = min(self.hashtable.capacity, REDUCTION_MAX_THREADS)
+        # The kernels that walk the ACTIVE entry list (clearing, snapshotting)
+        # touch only as many entries as the scene has groups -- thousands, not
+        # millions -- so their launch is sized an order of magnitude narrower
+        # than the contact-walking passes: at the capacity-derived width the
+        # snapshot kernel measured 1.9 ms to copy ~2.6k entries, all of it
+        # idle-thread overhead.
+        self.entry_stride_threads = min(self.hashtable.capacity, 32768)
         self.keep_flags = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
         self.keep_scan = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
         # pass-1 cache read by the selection pass: hashtable entry, canonical
