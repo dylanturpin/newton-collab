@@ -8,7 +8,7 @@ cylinders emits up to 28 points against the ground and up to 49 against another
 such foot, while a rigid contact patch is fully described by its deepest point
 plus the extremes of its footprint. The body-pair reduction pass compacts the
 narrow-phase output per body pair and normal bin, keeping the deepest contact
-unconditionally plus the spatial extremes of the near-touching set, so the
+unconditionally plus the spatial extremes of every group, so the
 registered contact count reflects the physics instead of the collider
 decomposition.
 
@@ -16,13 +16,14 @@ The tests here assert both halves of the contract:
 
 * the registered count drops on multi-shape pairs (and why: interior points of
   a single flat patch are the ones discarded), and
-* downstream dynamics are preserved -- rest height, support force, touchdown
-  capture, and trajectories of non-touching passes match the unreduced
-  pipeline.
+* supported FeatherPGS paths consume a strictly smaller buffer while retaining
+  bounded rest-height, angular-residual, multi-patch, and touchdown behavior.
 """
 
+import gc
 import unittest
 import unittest.mock
+import weakref
 
 import numpy as np
 import warp as wp
@@ -33,6 +34,7 @@ from newton._src.geometry.sdf_hydroelastic import HydroelasticSDF
 from newton._src.sim.contacts import Contacts
 
 DT = 1.0 / 240.0
+FPGS_PROPAGATION_PATH = 2
 
 
 def _cylinder_foot(builder, pos, mass=1.0, num_cyl=7, radius=0.02, half_height=0.015):
@@ -55,11 +57,11 @@ def _cylinder_foot(builder, pos, mass=1.0, num_cyl=7, radius=0.02, half_height=0
 
 
 def _free_jointed_foot(builder, pos, num_cyl=7, radius=0.02, half_height=0.015):
-    """A cylinder-row foot attached to the world by an explicit free joint.
+    """A cylinder-row foot with its free articulation written explicitly.
 
-    :class:`newton.solvers.SolverFeatherPGS` does not simulate unjointed
-    massive bodies as floating bodies (they stay frozen), so every FPGS
-    dynamics test must build its bodies this way or it validates nothing.
+    ``ModelBuilder.add_body`` creates the same free articulation as a
+    convenience. This expanded form is useful in tests that need to contrast
+    free-root routing with non-free propagation paths.
     """
     link = builder.add_link(xform=wp.transform(wp.vec3(*pos), wp.quat_identity()))
     for i in range(num_cyl):
@@ -75,15 +77,14 @@ def _free_jointed_foot(builder, pos, num_cyl=7, radius=0.02, half_height=0.015):
     return link
 
 
-def _free_jointed_foot_articulated(builder, pos, num_cyl=7, radius=0.02, half_height=0.015):
-    """The cylinder foot as a floating two-body ARTICULATION.
+def _prismatic_jointed_foot(builder, pos, num_cyl=7, radius=0.02, half_height=0.015):
+    """A cylinder-row foot on a world-rooted prismatic joint.
 
-    Fused propagation deliberately keeps single free bodies' contact rows on
-    the ordinary matrix-free family, so a fused conformance leg built on the
-    plain foot never runs the fused kernel.  A concentric fixed child makes
-    this a non-free articulation without changing the contact geometry.
+    Unlike a single-link free articulation, this is a non-free articulation.
+    Contacts on it must therefore take the articulated propagation-row path in
+    every propagation response mode, including ``propagation-fused``.
     """
-    link = builder.add_link(xform=wp.transform(wp.vec3(*pos), wp.quat_identity()))
+    link = builder.add_link()
     for i in range(num_cyl):
         x = (i - (num_cyl - 1) / 2.0) * (2.2 * radius)
         builder.add_shape_cylinder(
@@ -92,16 +93,61 @@ def _free_jointed_foot_articulated(builder, pos, num_cyl=7, radius=0.02, half_he
             radius=radius,
             half_height=half_height,
         )
-    child = builder.add_link(
-        xform=wp.transform(wp.vec3(*pos), wp.quat_identity()),
-        mass=0.1,
-        com=wp.vec3(0.0, 0.0, 0.0),
-        inertia=wp.mat33(0.0004, 0.0, 0.0, 0.0, 0.0004, 0.0, 0.0, 0.0, 0.0004),
+    joint = builder.add_joint_prismatic(
+        parent=-1,
+        child=link,
+        axis=newton.Axis.Z,
+        parent_xform=wp.transform(wp.vec3(*pos), wp.quat_identity()),
+        child_xform=wp.transform_identity(),
+        limit_lower=-1.0,
+        limit_upper=1.0,
     )
-    free = builder.add_joint_free(parent=-1, child=link)
-    weld = builder.add_joint_fixed(parent=link, child=child)
-    builder.add_articulation([free, weld])
+    builder.add_articulation([joint])
     return link
+
+
+def _same_articulation_scissor(builder):
+    """Build two overlapping sibling links in one non-free articulation."""
+    no_collision = builder.default_shape_cfg.copy()
+    no_collision.has_shape_collision = False
+    no_collision.collision_group = 0
+
+    base = builder.add_link()
+    builder.add_shape_box(base, hx=0.04, hy=0.04, hz=0.04, cfg=no_collision)
+    joints = [
+        builder.add_joint_revolute(
+            parent=-1,
+            child=base,
+            axis=newton.Axis.Z,
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+            child_xform=wp.transform_identity(),
+        )
+    ]
+    for side in (-1.0, 1.0):
+        link = builder.add_link()
+        # The siblings overlap. Three slightly overlapping boxes on each link
+        # make several box-box manifolds for one body pair, guaranteeing that
+        # body-pair reduction has more than one manifold's worth of real work.
+        for x in (-0.06, 0.0, 0.06):
+            builder.add_shape_box(
+                link,
+                xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()),
+                hx=0.05,
+                hy=0.04,
+                hz=0.04,
+            )
+        joints.append(
+            builder.add_joint_revolute(
+                parent=base,
+                child=link,
+                axis=newton.Axis.Z,
+                parent_xform=wp.transform(wp.vec3(0.06, side * 0.02, 0.0), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
+                collision_filter_parent=False,
+            )
+        )
+    builder.add_articulation(joints)
+    return base
 
 
 def _sphere_grid_body(builder, pos, n=5, spacing=0.05, radius=0.01, mass=1.0):
@@ -123,23 +169,6 @@ def _sphere_grid_body(builder, pos, n=5, spacing=0.05, radius=0.01, mass=1.0):
                 radius=radius,
             )
     return body
-
-
-def _peak_speed_unreduced(model, steps):
-    """Peak body speed of the same scene driven by unreduced contacts."""
-    state_0, state_1 = model.state(), model.state()
-    control = model.control()
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-    contacts = pipeline.contacts()
-    solver = newton.solvers.SolverXPBD(model, iterations=8)
-    peak = 0.0
-    for _ in range(steps):
-        pipeline.collide(state_0, contacts)
-        state_0.clear_forces()
-        solver.step(state_0, state_1, control, contacts, DT)
-        state_0, state_1 = state_1, state_0
-        peak = max(peak, float(np.abs(state_0.body_qd.numpy()).max()))
-    return peak
 
 
 def _make_pipeline(model, reduce_body_pairs, **kwargs):
@@ -341,117 +370,6 @@ class TestBodyPairReductionCounts(unittest.TestCase):
         np.testing.assert_allclose(snap1[4], snap2[4], atol=0.0)
 
 
-class TestBodyPairReductionDynamics(unittest.TestCase):
-    """Downstream dynamics are indistinguishable from the unreduced pipeline."""
-
-    def _settle(self, reduce_body_pairs, steps=240):
-        """Drop the 7-cylinder foot 5 mm above the plane and let it settle on XPBD.
-
-        Uses ``iterations=8``: a positional solver's per-iteration stiffness
-        scales with the number of contacts on a patch, so the redundant
-        21-contact baseline converges faster per iteration than any reduced
-        set. The comparison must be made near convergence, where both
-        describe the same patch. (Measured: the base/reduced rest-height gap
-        halves with every doubling of iterations -- 0.74/0.36/0.16 mm at
-        4/8/16.)
-        """
-        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-        body = _cylinder_foot(builder, (0.0, 0.0, 0.020))
-        builder.add_ground_plane()
-        model = builder.finalize(device=wp.get_device())
-        state_0, state_1 = model.state(), model.state()
-        control = model.control()
-
-        pipeline = _make_pipeline(model, reduce_body_pairs)
-        contacts = pipeline.contacts()
-        solver = newton.solvers.SolverXPBD(model, iterations=8)
-        heights, counts = [], []
-        for _ in range(steps):
-            pipeline.collide(state_0, contacts)
-            counts.append(int(contacts.rigid_contact_count.numpy()[0]))
-            state_0.clear_forces()
-            solver.step(state_0, state_1, control, contacts, DT)
-            state_0, state_1 = state_1, state_0
-            heights.append(float(state_0.body_q.numpy()[body][2]))
-        return np.array(heights), np.array(counts)
-
-    def test_settling_height_matches(self):
-        """Settle the multi-cylinder foot to the same rest height with and without reduction.
-
-        The kept patch must carry the same support wrench as the full manifold:
-        identical rest height (within a contact-regularization tolerance) and
-        no residual bouncing, while the registered count during sustained
-        contact drops by at least 2x.
-        """
-        h_base, c_base = self._settle(False)
-        h_red, c_red = self._settle(True)
-        # settled height identical
-        self.assertLess(abs(float(h_base[-30:].mean()) - float(h_red[-30:].mean())), 5e-4)
-        # both at rest (no residual bounce)
-        self.assertLess(float(np.std(h_red[-30:])), 1e-4)
-        # sustained-contact registration dropped
-        self.assertLess(float(c_red[-30:].mean()), 0.55 * float(c_base[-30:].mean()))
-
-    def test_touchdown_capture(self):
-        """Capture a falling foot's touchdown with bounded transient penetration.
-
-        Speculative candidates guard touchdown; reduction keeps at least the
-        closest point per patch. The bound is absolute rather than relative to
-        the unreduced run, because the redundant 21-contact baseline
-        over-stiffens XPBD's per-iteration response and lands artificially
-        hard (see :meth:`_settle`); what matters physically is that the
-        landing transient stays within a couple of solver steps of motion and
-        fully recovers.
-        """
-        h_base, _ = self._settle(False, steps=120)
-        h_red, _ = self._settle(True, steps=120)
-        rest = 0.015  # cylinder half-height: resting body origin height
-        pen_red = max(0.0, rest - float(h_red.min()))
-        self.assertLessEqual(pen_red, 2.5e-3)
-        # and it recovers to the same rest as the baseline
-        self.assertLess(abs(float(h_base[-20:].mean()) - float(h_red[-20:].mean())), 5e-4)
-
-    def test_non_touching_pass_trajectories_identical(self):
-        """Leave two feet passing within margin (never touching) exactly untouched.
-
-        The foot-pass candidate explosion (up to 49 pairs' worth of points)
-        carries no force. With reduction the registered count collapses, and
-        because none of those contacts fire, both trajectories must match to
-        solver precision.
-        """
-
-        def run(reduce_body_pairs):
-            builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-            _cylinder_foot(builder, (0.0, 0.0, 0.2))
-            # cylinder surfaces 3.6 mm apart during the pass (0.2336 - 2*half_height = 0.0036),
-            # inside the contact margin but never touching
-            b = _cylinder_foot(builder, (0.30, 0.0, 0.2336))
-            builder.add_ground_plane()
-            model = builder.finalize(device=wp.get_device())
-            state_0, state_1 = model.state(), model.state()
-            qd = state_0.body_qd.numpy()
-            qd[b][3] = -0.5  # drive body b across body a
-            state_0.body_qd.assign(qd)
-            control = model.control()
-            pipeline = _make_pipeline(model, reduce_body_pairs)
-            contacts = pipeline.contacts()
-            solver = newton.solvers.SolverXPBD(model, iterations=4)
-            traj, peak = [], 0
-            for _ in range(300):
-                pipeline.collide(state_0, contacts)
-                peak = max(peak, int(contacts.rigid_contact_count.numpy()[0]))
-                state_0.clear_forces()
-                solver.step(state_0, state_1, control, contacts, DT)
-                state_0, state_1 = state_1, state_0
-                traj.append(state_0.body_q.numpy().copy())
-            return np.array(traj), peak
-
-        traj_base, peak_base = run(False)
-        traj_red, peak_red = run(True)
-        self.assertLess(peak_red, peak_base)
-        np.testing.assert_allclose(traj_red, traj_base, atol=1e-6)
-
-
 class TestBodyPairReductionGuarantees(unittest.TestCase):
     """Unsupported configurations are rejected at construction or solver start."""
 
@@ -481,9 +399,9 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
     def test_set_deterministic_without_sort(self):
         """Produce the same kept set with the deterministic sorter disabled.
 
-        Winner selection packs (score, content fingerprint) and contacts
-        self-identify as winners, so the kept SET is a pure function of the
-        physical state -- no sorting required. Compare kept sets as
+        Winner selection packs score plus quantized pair-relative position,
+        and contacts self-identify as winners, so the kept SET is a pure
+        function of the physical state -- no sorting required. Compare kept sets as
         order-independent multisets across repeated collides of one state.
         """
         model = self._foot_model()
@@ -528,11 +446,17 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         pipeline = _make_pipeline(model, True)
         contacts = pipeline.contacts()
         pipeline.collide(state_0, contacts)
-        solver = newton.solvers.SolverSemiImplicit(model)
-        with self.assertRaisesRegex(ValueError, "supports_reduced_contacts"):
-            solver.step(state_0, state_1, model.control(), contacts, DT)
-        # the validated solvers accept the same buffer
-        self.assertTrue(newton.solvers.SolverXPBD.supports_reduced_contacts)
+        for solver in (
+            newton.solvers.SolverSemiImplicit(model),
+            # XPBD decides whether a contact is active after predicting body
+            # poses.  Pre-prediction spatial winners are therefore not a sound
+            # class-wide contract, even if selected settling examples match.
+            newton.solvers.SolverXPBD(model),
+        ):
+            with self.subTest(solver=type(solver).__name__):
+                with self.assertRaisesRegex(ValueError, "supports_reduced_contacts"):
+                    solver.step(state_0, state_1, model.control(), contacts, DT)
+        self.assertFalse(newton.solvers.SolverXPBD.supports_reduced_contacts)
         self.assertTrue(newton.solvers.SolverFeatherPGS.supports_reduced_contacts)
 
 
@@ -540,10 +464,15 @@ class TestBodyPairReductionMultiPatch(unittest.TestCase):
     """Same-normal patches far apart on ONE shape pair each keep full representation."""
 
     def _two_cluster_body(self, builder, spread=1.0):
-        """One rigid body with two 4-sphere feet ``spread`` apart on the same plane."""
+        """One rigid body with two 9-sphere feet ``spread`` apart on the same plane.
+
+        Nine contacts per cluster exceed the 7-slot budget, so each cluster is
+        both fully represented (deepest + extremes) AND strictly reduced --
+        the plank settle test asserts the latter to stay non-vacuous.
+        """
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0095), wp.quat_identity()), mass=2.0)
         for end in (-spread / 2.0, spread / 2.0):
-            for i, j in ((0, 0), (1, 0), (0, 1), (1, 1)):
+            for i, j in ((0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (2, 1), (0, 2), (1, 2), (2, 2)):
                 builder.add_shape_sphere(
                     body,
                     xform=wp.transform(wp.vec3(end + 0.03 * i, 0.03 * j, 0.0), wp.quat_identity()),
@@ -612,18 +541,18 @@ class TestBodyPairReductionMultiPatch(unittest.TestCase):
         builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
         state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
         control = model.control()
         pipeline = _make_pipeline(model, reduce_on)
         contacts = pipeline.contacts()
-        # iterations=16: the redundant unreduced set over-stiffens XPBD per
-        # iteration (see _settle); compare near convergence.
-        solver = newton.solvers.SolverXPBD(model, iterations=16)
+        solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
         for _ in range(240):
             pipeline.collide(state_0, contacts)
             state_0.clear_forces()
             solver.step(state_0, state_1, control, contacts, DT)
             state_0, state_1 = state_1, state_0
-        return state_0.body_q.numpy()[body]
+        stats = pipeline.body_pair_reduction_stats() if reduce_on else None
+        return state_0.body_q.numpy()[body], stats
 
     def test_plank_settles_level(self):
         """Settle the two-cluster plank level, at the unreduced rest height.
@@ -632,8 +561,9 @@ class TestBodyPairReductionMultiPatch(unittest.TestCase):
         the other end. The invariant is against the unreduced pipeline: same
         rest height (within solver noise) and no pitch, on the same scene.
         """
-        q_off = self._settle_plank(False)
-        q_on = self._settle_plank(True)
+        q_off, _ = self._settle_plank(False)
+        q_on, stats = self._settle_plank(True)
+        self.assertLess(stats["sum_contacts_kept"], stats["sum_contacts_in"], "plank contacts were never reduced")
         self.assertLess(abs(float(q_on[4])), 0.02, "plank tilted -- a cluster lost support")
         self.assertLess(abs(float(q_on[2]) - float(q_off[2])), 1.5e-3)
 
@@ -642,11 +572,12 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
     """Every solver declaring supports_reduced_contacts settles identically on/off."""
 
     def _settle(self, build_fn, make_solver, reduce_on, steps=240):
-        """Drop, settle, and return (final z, fell, peak contacts, angular residual).
+        """Drop, settle, and return dynamics plus solver-path watermarks.
 
-        The fell/contact guards make the comparison non-vacuous: a body a
-        solver silently refuses to simulate (e.g. an unjointed massive body on
-        FeatherPGS) neither falls nor proves anything by matching heights.
+        The fell/contact guards make the comparison non-vacuous: a body that
+        is accidentally kinematic, misconfigured, or not routed through the
+        intended solver path neither falls nor proves anything by matching
+        heights.
         The angular residual is the mean |omega| over the final quarter of the
         run -- ``body_qd`` is (linear, angular), so omega is components 3:6.
         """
@@ -673,20 +604,26 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             if k >= steps * 3 // 4 and k % 10 == 0:
                 w_tail.append(float(np.abs(state_0.body_qd.numpy()[body][3:6]).max()))
         z_end = float(state_0.body_q.numpy()[body][2])
-        return z_end, z_end < z0 - 0.005, peak_contacts, float(np.mean(w_tail))
+        watermarks = solver.constraint_row_watermarks() if hasattr(solver, "constraint_row_watermarks") else {}
+        return z_end, z_end < z0 - 0.005, peak_contacts, float(np.mean(w_tail)), watermarks
 
-    def _compare(self, build_fn, make_solver, tol=5e-4, w_tol=0.05):
-        z_off, fell_off, contacts_off, w_off = self._settle(build_fn, make_solver, False)
-        z_on, fell_on, contacts_on, w_on = self._settle(build_fn, make_solver, True)
+    def _compare(self, build_fn, make_solver, tol=5e-4, w_tol=0.05, expected_row_path=None):
+        z_off, fell_off, contacts_off, w_off, rows_off = self._settle(build_fn, make_solver, False)
+        z_on, fell_on, contacts_on, w_on, rows_on = self._settle(build_fn, make_solver, True)
         self.assertTrue(fell_off and fell_on, "body did not fall: the solver is not simulating it")
         self.assertGreater(contacts_off, 0)
         self.assertGreater(contacts_on, 0)
+        self.assertLess(contacts_on, contacts_off, "the reduced run never actually compacted a contact manifold")
+        if expected_row_path is not None:
+            key = f"{expected_row_path}_high_water"
+            self.assertGreater(rows_off[key], 0, f"unreduced run never exercised {expected_row_path} rows")
+            self.assertGreater(rows_on[key], 0, f"reduced run never exercised {expected_row_path} rows")
+            self.assertGreater(rows_on["contact_high_water"], 0, "solver saw no reduced rigid-contact rows")
         self.assertLess(abs(z_off - z_on), tol)
         # angular residual (true omega: body_qd components 3:6, tail-window
         # mean): reduced must settle as calm as unreduced up to a per-scene
-        # floor. XPBD on curved colliders sustains a bounded documented
-        # rocking (see the module's known-characteristic note), so its scenes
-        # pass an explicit measured bound instead of the calm default.
+        # floor. Individual supported scenes may pass an explicit measured
+        # bound instead of the calm default.
         self.assertLess(w_on, max(2.0 * w_off, w_tol), f"reduced settle is rocking: |w| {w_on} vs {w_off}")
 
     def test_feather_pgs_conformance(self):
@@ -695,9 +632,8 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         This is the conformance requirement for supports_reduced_contacts:
         the solver's contact-depth convention must agree with the ranking's
         canonical contact_surface_separation, or the kept set starves the
-        solver of its load-bearing contacts. The foot is attached by an
-        explicit free joint -- FeatherPGS does not simulate unjointed massive
-        bodies, so the previous add_body version compared two frozen bodies.
+        solver of its load-bearing contacts. The foot uses the explicit form
+        of the free articulation so this scene's routing is unambiguous.
         """
         self._compare(
             lambda b: _free_jointed_foot(b, (0.0, 0.0, 0.05)),
@@ -726,62 +662,131 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         mode the other tests exercise (matrix-free additionally runs generated
         native CUDA).
         """
-        configs = [("dense", "immediate", 16)]
-        if wp.get_device().is_cuda:
-            # matrix_free (and its propagation response family) is CUDA-only;
-            # the class-wide flag covers every articulated_contact_response
-            # variant, so each one needs its own settle evidence
-            configs += [
-                ("matrix_free", "immediate", 8),
-                ("matrix_free", "propagation", 16),
-                ("matrix_free", "propagation-fused", 16),
-                ("matrix_free", "propagation-colored", 16),
-            ]
-        # dense and every propagation variant run 16 iterations: at the
-        # default 8 the UNREDUCED redundant set does not converge (dense
-        # settles 5 mm high, plain/colored propagation 4.8 mm high, fused 4.9
-        # mm LOW on the articulated foot; the REDUCED set and split land at
-        # the true height at every iteration count) -- redundant
-        # near-parallel rows hurt PGS conditioning, the same effect as the
-        # stack-collapse case, and reduction itself is what removes it.  The
-        # comparison must be against a converged baseline.  (Fused earlier
-        # "passed" at 8 only because its leg was vacuous: fused keeps single
-        # free bodies on the ordinary matrix-free family, so the plain foot
-        # never ran the fused kernel -- hence the articulated foot + loud
-        # activation asserts.)
-        for mode, response, iters in configs:
-            with self.subTest(pgs_mode=mode, response=response):
-                fused = response == "propagation-fused"
-                build_fn = _free_jointed_foot_articulated if fused else _free_jointed_foot
+        if not wp.get_device().is_cuda:
+            self.skipTest("FeatherPGS contact-mode conformance is a CUDA-only merge gate")
 
-                def make_solver(m, mode=mode, response=response, iters=iters, fused=fused):
+        configs = [("dense", "immediate", 16, _free_jointed_foot, "dense")]
+        # Matrix-free (and its propagation response family) is CUDA-only. Use
+        # a non-free prismatic articulation for every propagation variant. A
+        # free-only scene disables propagation-fused and would let that
+        # subtest pass through the ordinary matrix-free solver.
+        configs += [
+            ("matrix_free", "immediate", None, _free_jointed_foot, "mf"),
+            ("matrix_free", "propagation", 16, _prismatic_jointed_foot, "propagation"),
+            ("matrix_free", "propagation-fused", None, _prismatic_jointed_foot, "propagation"),
+            ("matrix_free", "propagation-colored", 16, _prismatic_jointed_foot, "propagation"),
+        ]
+        # Dense, propagation, and propagation-colored run 16 iterations. The
+        # two ``None`` entries deliberately omit pgs_iterations and assert the
+        # production default (12), rather than testing a stale assumed default.
+        # At 8 iterations the UNREDUCED redundant set does not converge (dense
+        # settles 5 mm high, plain/colored propagation 4.8 mm high at 0.01980;
+        # the REDUCED set and split land at the true 0.01500 at every
+        # iteration count) -- redundant near-parallel rows hurt PGS
+        # conditioning, the same effect as the stack-collapse case, and
+        # reduction itself is what removes it.  The comparison must be against
+        # a converged baseline.
+        for mode, response, iters, build_foot, row_path in configs:
+            with self.subTest(pgs_mode=mode, response=response):
+
+                def make_solver(model, mode=mode, response=response, iters=iters, row_path=row_path):
+                    kwargs = {}
+                    if iters is not None:
+                        kwargs["pgs_iterations"] = iters
                     solver = newton.solvers.SolverFeatherPGS(
-                        m,
+                        model,
                         angular_damping=0.0,
                         pgs_mode=mode,
-                        pgs_iterations=iters,
                         articulated_contact_response=response,
+                        row_watermark=True,
+                        **kwargs,
                     )
-                    if fused:
-                        # fail loudly if the leg silently falls back to the
-                        # ordinary matrix-free family (vacuous coverage)
-                        if not solver._propagation_contacts_enabled():
-                            raise AssertionError("fused leg did not activate propagation contacts")
-                        if solver._pgs_solve_propagation_full_iteration_kernel is None:
-                            raise AssertionError("fused leg did not construct the fused iteration kernel")
+                    if iters is None:
+                        self.assertEqual(solver.pgs_iterations, 12)
+                    if row_path == "propagation":
+                        self.assertTrue(
+                            solver._propagation_contacts_enabled(),
+                            f"{response} test scene did not enable propagation contacts",
+                        )
+                    if response == "propagation-fused":
+                        self.assertTrue(solver.propagation_full_fused_iterations)
                     return solver
 
-                self._compare(lambda b, build_fn=build_fn: build_fn(b, (0.0, 0.0, 0.05)), make_solver)
+                self._compare(
+                    lambda b, build_foot=build_foot: build_foot(b, (0.0, 0.0, 0.05)),
+                    make_solver,
+                    tol=2e-3 if row_path == "propagation" else 5e-4,
+                    expected_row_path=row_path,
+                )
+
+    def test_feather_pgs_same_articulation_rows_are_nonvacuous(self):
+        """Route a strictly reduced sibling-link manifold to propagation rows.
+
+        The general propagation scenes are link-to-ground contacts. This pins
+        the opt-in cross-response path for contacts whose two bodies belong to
+        the same articulation, and proves both that reduction did work and
+        that the resulting rows reached the intended CUDA kernel family.
+        """
+        if not wp.get_device().is_cuda:
+            self.skipTest("matrix-free propagation requires CUDA")
+
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        _same_articulation_scissor(builder)
+        model = builder.finalize(device=wp.get_device())
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+
+        raw_pipeline = _make_pipeline(model, False)
+        raw_contacts = raw_pipeline.contacts()
+        raw_pipeline.collide(state_0, raw_contacts)
+        raw_count = int(raw_contacts.rigid_contact_count.numpy()[0])
+
+        reduced_pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_cell=10.0)
+        reduced_contacts = reduced_pipeline.contacts()
+        reduced_pipeline.collide(state_0, reduced_contacts)
+        reduced_count = int(reduced_contacts.rigid_contact_count.numpy()[0])
+        self.assertGreater(raw_count, 0, "scissor scene emitted no sibling-link contacts")
+        self.assertLess(reduced_count, raw_count, "same-articulation manifold was not reduced")
+
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            angular_damping=0.0,
+            pgs_mode="matrix_free",
+            articulated_contact_response="propagation",
+            propagation_same_articulation_rows=True,
+            pgs_iterations=0,
+            row_watermark=True,
+        )
+        self.assertTrue(solver._propagation_contacts_enabled())
+        solver.step(state_0, state_1, model.control(), reduced_contacts, DT)
+        rows = solver.constraint_row_watermarks()
+        self.assertGreater(rows["propagation_high_water"], 0)
+        active_paths = solver.contact_path.numpy()[:reduced_count]
+        routed = np.flatnonzero(active_paths == FPGS_PROPAGATION_PATH)
+        self.assertGreater(routed.size, 0, "no reduced contact was routed to the propagation path")
+        shape_body = model.shape_body.numpy()
+        body_art = solver.body_to_articulation.numpy()
+        shape0 = reduced_contacts.rigid_contact_shape0.numpy()[:reduced_count]
+        shape1 = reduced_contacts.rigid_contact_shape1.numpy()[:reduced_count]
+        for contact in routed:
+            body0 = int(shape_body[shape0[contact]])
+            body1 = int(shape_body[shape1[contact]])
+            self.assertGreaterEqual(body0, 0)
+            self.assertGreaterEqual(body1, 0)
+            self.assertEqual(
+                int(body_art[body0]),
+                int(body_art[body1]),
+                "the path assertion did not cover a same-articulation contact",
+            )
 
     def test_mixed_separation_tilted_patch(self):
         """Settle a tilted patch whose contacts mix penetrating and speculative.
 
-        The adversarial topology for solvers that ignore non-penetrating
-        contacts (XPBD): the spatial-extreme slots can be won by speculative
-        endpoints while interior points penetrate, so the retained PENETRATING
-        support could collapse toward the single deepest point. Measured, the
-        per-frame migration of the deepest slot keeps the dynamics equivalent;
-        this pins that behavior for both solver families.
+        This is also the adversarial topology that prevents an XPBD-wide
+        compatibility claim: footprint slots may be won by speculative
+        endpoints while other contacts become active after XPBD predicts its
+        body poses. The probe characterizes that reducer input, while dynamics
+        are checked only with the solver that declares compatibility.
         """
         pitch = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.06)
 
@@ -817,7 +822,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         # plane) and SURVIVES a strictly reducing compaction, while the
         # group's deepest survives too.  Note the canonical surface separation
         # of cylinder-plane witnesses saturates at >= 0 under penetration (the
-        # solvers derive their own depths from body poses at solve time), so
+        # solver derives depth from body poses at solve time), so
         # deep/shallow is a gap-band split, not a signed-depth split; the
         # dynamic equivalence itself is pinned by the settle comparisons
         # below.  Hysteresis is disabled on the probe pipeline so slot winners
@@ -832,7 +837,10 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         probe_contacts = probe_pipe.contacts()
         probe_solver = newton.solvers.SolverXPBD(probe_model, iterations=8)
         red = probe_pipe._body_pair_reducer
-        raw_pipe = newton.CollisionPipeline(probe_model, broad_phase="nxn")
+        # Match the reduced pipeline's deterministic producer and capacity so
+        # its pre-compaction scratch rows correspond one-for-one to this raw
+        # buffer when the topology is inspected below.
+        raw_pipe = _make_pipeline(probe_model, False)
         raw_contacts = raw_pipe.contacts()
         scan_dirs = [
             (float(np.cos(k * np.pi / 3.0)), float(np.sin(k * np.pi / 3.0)))
@@ -869,7 +877,9 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
                     if topology_seen:
                         break
             ps0.clear_forces()
-            probe_solver.step(ps0, ps1, probe_control, probe_contacts, DT)
+            # Advance using the unreduced buffer. XPBD's activity decision is
+            # made after this prediction, later than the reducer competition.
+            probe_solver.step(ps0, ps1, probe_control, raw_contacts, DT)
             ps0, ps1 = ps1, ps0
         self.assertTrue(
             topology_seen,
@@ -877,23 +887,8 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             "candidate and a shallow scan-direction slot winner",
         )
 
-        self._compare(build, lambda m: newton.solvers.SolverXPBD(m, iterations=8), tol=1e-3, w_tol=1.8)
         self._compare(
             build_jointed, lambda m: newton.solvers.SolverFeatherPGS(m, angular_damping=0.0), tol=1e-3, w_tol=0.15
-        )
-
-    def test_xpbd_conformance(self):
-        """SolverXPBD rests the multi-cylinder foot at the same height on/off.
-
-        Height and linear velocity match strictly. The angular bound is the
-        documented XPBD curved-collider rocking characteristic (1.17 rad/s
-        tail-mean at 8 iterations, decaying with iterations, unreduced ~0);
-        the bound guards against growth beyond the measured level.
-        """
-        self._compare(
-            lambda b: _cylinder_foot(b, (0.0, 0.0, 0.05)),
-            lambda m: newton.solvers.SolverXPBD(m, iterations=8),
-            w_tol=1.8,
         )
 
 
@@ -1071,6 +1066,7 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         state = model.state()
 
         counts = {}
+        overflow_stats = None
         for reduce_on in (False, True):
             pipeline = newton.CollisionPipeline(
                 model,
@@ -1081,8 +1077,14 @@ class TestBodyPairReductionSafety(unittest.TestCase):
             contacts = pipeline.contacts()
             pipeline.collide(state, contacts)  # must not crash or corrupt memory
             counts[reduce_on] = int(contacts.rigid_contact_count.numpy()[0])
+            if reduce_on:
+                overflow_stats = pipeline.body_pair_reduction_stats()
         self.assertGreater(counts[False], 8, "scene must actually overflow the buffer")
         self.assertEqual(counts[True], counts[False], "overflow frame must pass the raw counter through")
+        self.assertEqual(overflow_stats["total_frames"], 1)
+        self.assertEqual(overflow_stats["input_overflow_frames"], 1)
+        self.assertEqual(overflow_stats["sum_contacts_in"], 0)
+        self.assertEqual(overflow_stats["sum_contacts_kept"], 0)
 
     def test_hashtable_saturation_keeps_whole_frame(self):
         """Keep the entire unreduced set when the group table budget is exceeded.
@@ -1119,7 +1121,12 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         n_red = int(contacts.rigid_contact_count.numpy()[0])
         stats = pipeline._body_pair_reducer.stats()
         self.assertEqual(n_red, n_base, "saturated frame must keep the whole unreduced set")
-        self.assertGreaterEqual(stats["fallback_frames"], 1)
+        self.assertEqual(stats["fallback_frames"], 1)
+        self.assertGreater(stats["probe_failures"], 0)
+        self.assertEqual(stats["failed_insertions"], stats["probe_failures"])
+        self.assertEqual(stats["total_frames"], 1)
+        self.assertEqual(stats["sum_contacts_in"], n_base)
+        self.assertEqual(stats["sum_contacts_kept"], n_base)
 
     def test_mismatched_contacts_buffer_rejected(self):
         """Refuse an external Contacts buffer whose capacity differs from the pipeline's.
@@ -1197,7 +1204,11 @@ class TestBodyPairReductionSafety(unittest.TestCase):
             (int(a), int(b), *(round(float(v), 6) for v in p)) for a, b, p in zip(s0_r, s1_r, p0_r, strict=True)
         )
         self.assertEqual(rows_r, rows_b)
-        self.assertGreaterEqual(pipeline.body_pair_reduction_stats()["identity_frames"], 1)
+        stats = pipeline.body_pair_reduction_stats()
+        self.assertEqual(stats["identity_frames"], 1)
+        self.assertEqual(stats["total_frames"], 1)
+        self.assertEqual(stats["sum_contacts_in"], n_base)
+        self.assertEqual(stats["sum_contacts_kept"], n_base)
 
     def test_noop_frames_skip_compaction_for_small_groups(self):
         """Detect no-op frames whose groups are larger than one contact.
@@ -1248,13 +1259,27 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         state = model.state()
         pipeline = _make_pipeline(model, True)
         contacts = pipeline.contacts()
+        raw = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+        raw_contacts = raw.contacts()
+        observed_in = 0
+        observed_kept = 0
+        observed_max_in = 0
+        observed_max_kept = 0
         for _ in range(4):
+            raw.collide(state, raw_contacts)
+            frame_in = int(raw_contacts.rigid_contact_count.numpy()[0])
             pipeline.collide(state, contacts)
+            frame_kept = int(contacts.rigid_contact_count.numpy()[0])
+            observed_in += frame_in
+            observed_kept += frame_kept
+            observed_max_in = max(observed_max_in, frame_in)
+            observed_max_kept = max(observed_max_kept, frame_kept)
         stats = pipeline.body_pair_reduction_stats()
         self.assertEqual(stats["total_frames"], 4)
-        self.assertEqual(stats["sum_contacts_in"], 4 * stats["max_contacts_in"])
-        self.assertGreater(stats["sum_contacts_kept"], 0)
-        self.assertLessEqual(stats["sum_contacts_kept"], 4 * stats["max_contacts_kept"])
+        self.assertEqual(stats["sum_contacts_in"], observed_in)
+        self.assertEqual(stats["sum_contacts_kept"], observed_kept)
+        self.assertEqual(stats["max_contacts_in"], observed_max_in)
+        self.assertEqual(stats["max_contacts_kept"], observed_max_kept)
         self.assertLess(stats["sum_contacts_kept"], stats["sum_contacts_in"], "cylinder foot must reduce")
         pipeline.clear_body_pair_reduction_stats()
         cleared = pipeline.body_pair_reduction_stats()
@@ -1264,7 +1289,13 @@ class TestBodyPairReductionSafety(unittest.TestCase):
             "sum_contacts_kept",
             "max_contacts_in",
             "max_contacts_kept",
+            "probe_failures",
             "failed_insertions",
+            "cell_clamp_events",
+            "invariant_violations",
+            "outranked_discards",
+            "input_overflow_frames",
+            "fallback_frames",
             "identity_frames",
         ):
             self.assertEqual(cleared[key], 0, f"{key} survived clear")
@@ -1287,15 +1318,15 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         pipeline = _make_pipeline(model, True)
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)  # warm-up
-        capture = wp.ScopedCapture(device)
-        capture.__enter__()
-        try:
+        with wp.ScopedCapture(device) as capture:
+            # Record real reducer work first so the guard is exercised during
+            # a non-empty capture, not only in an otherwise empty graph.
+            pipeline.collide(state, contacts)
             with self.assertRaisesRegex(RuntimeError, "outside CUDA graph capture"):
                 pipeline.body_pair_reduction_stats()
             with self.assertRaisesRegex(RuntimeError, "outside CUDA graph capture"):
                 pipeline.clear_body_pair_reduction_stats()
-        finally:
-            capture.__exit__(None, None, None)
+        self.assertIsNotNone(capture.graph)
 
     def test_property_schema_switch_is_safe(self):
         """Reduce a property-enabled buffer after a property-less one safely.
@@ -1323,6 +1354,66 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         n = int(rich.rigid_contact_count.numpy()[0])
         self.assertGreater(n, 0)
         self.assertTrue(np.isfinite(rich.rigid_contact_friction.numpy()[:n]).all())
+
+    def test_deterministic_sort_keeps_rich_properties_aligned(self):
+        """Permute an external rich buffer's material triple with its geometry.
+
+        Reducer pipelines normally allocate property-less Contacts, but their
+        deterministic sorter must still provision material scratch for a rich
+        external buffer. Otherwise the subsequent reducer receives stiffness,
+        damping, and friction values attached to the wrong contact rows.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        for k in range(4):
+            builder.add_shape_sphere(-1, xform=wp.transform(wp.vec3(float(k), 0.0, 0.0), wp.quat_identity()))
+        model = builder.finalize(device=wp.get_device())
+        pipeline = _make_pipeline(model, True, rigid_contact_max=4)
+        contacts = Contacts(
+            rigid_contact_max=4,
+            soft_contact_max=0,
+            device=wp.get_device(),
+            per_contact_shape_properties=True,
+        )
+        contacts.rigid_contact_count.assign(np.array([4], dtype=np.int32))
+        contacts.rigid_contact_shape0.assign(np.arange(4, dtype=np.int32))
+        contacts.rigid_contact_shape1.assign(np.full(4, -1, dtype=np.int32))
+        points = np.arange(12, dtype=np.float32).reshape(4, 3)
+        zeros3 = np.zeros((4, 3), dtype=np.float32)
+        contacts.rigid_contact_point0.assign(points)
+        contacts.rigid_contact_point1.assign(points + 0.5)
+        contacts.rigid_contact_offset0.assign(zeros3)
+        contacts.rigid_contact_offset1.assign(zeros3)
+        contacts.rigid_contact_normal.assign(np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (4, 1)))
+        contacts.rigid_contact_margin0.assign(np.zeros(4, dtype=np.float32))
+        contacts.rigid_contact_margin1.assign(np.zeros(4, dtype=np.float32))
+        contacts.rigid_contact_tids.assign(np.arange(4, dtype=np.int32))
+        contacts.rigid_contact_stiffness.assign(np.arange(100.0, 104.0, dtype=np.float32))
+        contacts.rigid_contact_damping.assign(np.arange(200.0, 204.0, dtype=np.float32))
+        contacts.rigid_contact_friction.assign(np.arange(300.0, 304.0, dtype=np.float32))
+        pipeline._sort_key_array.assign(np.array([40, 30, 20, 10], dtype=np.int64))
+
+        pipeline._contact_sorter.sort_full(
+            pipeline._sort_key_array,
+            contacts.rigid_contact_count,
+            shape0=contacts.rigid_contact_shape0,
+            shape1=contacts.rigid_contact_shape1,
+            point0=contacts.rigid_contact_point0,
+            point1=contacts.rigid_contact_point1,
+            offset0=contacts.rigid_contact_offset0,
+            offset1=contacts.rigid_contact_offset1,
+            normal=contacts.rigid_contact_normal,
+            margin0=contacts.rigid_contact_margin0,
+            margin1=contacts.rigid_contact_margin1,
+            tids=contacts.rigid_contact_tids,
+            stiffness=contacts.rigid_contact_stiffness,
+            damping=contacts.rigid_contact_damping,
+            friction=contacts.rigid_contact_friction,
+            device=wp.get_device(),
+        )
+        np.testing.assert_array_equal(contacts.rigid_contact_shape0.numpy(), [3, 2, 1, 0])
+        np.testing.assert_allclose(contacts.rigid_contact_stiffness.numpy(), [103.0, 102.0, 101.0, 100.0])
+        np.testing.assert_allclose(contacts.rigid_contact_damping.numpy(), [203.0, 202.0, 201.0, 200.0])
+        np.testing.assert_allclose(contacts.rigid_contact_friction.numpy(), [303.0, 302.0, 301.0, 300.0])
 
     def test_clear_resets_reduced_provenance(self):
         """Reset the reduced marker when the buffer is cleared.
@@ -1432,11 +1523,13 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
                 _make_pipeline(model, True)
 
     @staticmethod
-    def _full_rows(contacts):
-        """Sorted per-contact rows over the full rigid-contact record schema.
+    def _full_rows(contacts, *, canonical=False):
+        """Per-contact rows over the full rigid-contact record schema.
 
         Covers shapes, witness points, offsets, normal, margins, point id, and
         the per-contact material properties when the buffer allocates them.
+        Buffer order is preserved by default because sequential PGS can observe
+        it; ``canonical=True`` is the order-independent kept-multiset view.
         ``rigid_contact_tids`` is deliberately excluded: it records which
         thread wrote the record (debug provenance, not consumed by solvers)
         and is not deterministic across launches.
@@ -1465,7 +1558,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
                 v = c[k]
                 row.extend(round(float(x), 6) for x in np.atleast_1d(v))
             rows.append(tuple(row))
-        return sorted(rows)
+        return sorted(rows) if canonical else rows
 
     def test_cuda_graph_capture(self):
         """Replay a captured collide() on changing states against an uncaptured reference.
@@ -1483,7 +1576,12 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         model = self._foot_scene()
         state = model.state()
         pipeline = _make_pipeline(model, True)
-        contacts = pipeline.contacts()
+        contacts = Contacts(
+            rigid_contact_max=pipeline.rigid_contact_max,
+            soft_contact_max=pipeline.soft_contact_max,
+            device=device,
+            per_contact_shape_properties=True,
+        )
         pipeline.collide(state, contacts)  # warm-up: lazy allocations + kernel loads
         with wp.ScopedCapture(device) as capture:
             pipeline.collide(state, contacts)
@@ -1494,10 +1592,16 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         # (capture itself records without executing: warm-up + two replays)
         state_ref = model.state()
         ref = _make_pipeline(model, True)
-        contacts_ref = ref.contacts()
+        contacts_ref = Contacts(
+            rigid_contact_max=ref.rigid_contact_max,
+            soft_contact_max=ref.soft_contact_max,
+            device=device,
+            per_contact_shape_properties=True,
+        )
         for _ in range(3):
             ref.collide(state_ref, contacts_ref)
-        self.assertEqual(self._full_rows(contacts), self._full_rows(contacts_ref))
+        self.assertEqual(self._full_rows(contacts, canonical=True), self._full_rows(contacts_ref, canonical=True))
+        self.assertEqual(self._full_rows(contacts), self._full_rows(contacts_ref), "captured row order changed")
 
         # mutate the captured state IN PLACE (the graph holds the pointers):
         # pitch shifts depth ownership across the foot, changing the kept set
@@ -1507,24 +1611,27 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         state.body_q.assign(q)
         state_ref.body_q.assign(q)
         wp.capture_launch(capture.graph)
-        rows_before = self._full_rows(contacts_ref)
+        rows_before = self._full_rows(contacts_ref, canonical=True)
         ref.collide(state_ref, contacts_ref)
-        rows_after = self._full_rows(contacts_ref)
+        rows_after = self._full_rows(contacts_ref, canonical=True)
         self.assertNotEqual(
             rows_before, rows_after, "pitch did not change the reference output; the changing-state leg is vacuous"
         )
         self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
-        self.assertEqual(self._full_rows(contacts), rows_after)
+        self.assertEqual(self._full_rows(contacts, canonical=True), rows_after)
+        self.assertEqual(self._full_rows(contacts), self._full_rows(contacts_ref), "captured row order changed")
 
-    def test_second_captured_buffer_rejected(self):
-        """Refuse to capture a second Contacts buffer on one reducer pipeline.
+    def test_second_reducer_graph_and_buffer_rejected(self):
+        """Refuse a second live reducer-writer graph or a second buffer.
 
         Graph replay repeats neither the buffer-switch history reset nor the
         provenance assignment, so two captured buffers would silently share
         hysteresis history; collide() must raise at capture time instead --
         BEFORE any state mutation: the rejected buffer and the reducer's
-        history must come back untouched.  Recapturing the SAME buffer stays
-        legal.  Skipped on CPU devices.
+        history must come back untouched.  Even the same buffer cannot be
+        recaptured while its first graph is live: independent replays would
+        race the reducer history, telemetry, and output rows.  Skipped on CPU
+        devices.
         """
         device = wp.get_device()
         if not device.is_cuda:
@@ -1538,13 +1645,18 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         with wp.ScopedCapture(device) as capture_a:
             pipeline.collide(state, contacts_a)
         wp.capture_launch(capture_a.graph)
-        # same buffer again: allowed
-        with wp.ScopedCapture(device) as capture_a2:
-            pipeline.collide(state, contacts_a)
-        wp.capture_launch(capture_a2.graph)
         red = pipeline._body_pair_reducer
         prev_keys_before = red.prev_keys.numpy().copy()
         generations_before = red.history_generation.numpy().copy()
+        # A second graph for the same buffer is unsafe even though its pointers
+        # match: either graph executable could be launched independently.
+        capture_a2 = wp.ScopedCapture(device)
+        capture_a2.__enter__()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "second body-pair reducer graph"):
+                pipeline.collide(state, contacts_a)
+        finally:
+            capture_a2.__exit__(None, None, None)
         # different buffer: must raise while capture is active; end the
         # capture outside the exception path so the stream is left clean
         capture_b = wp.ScopedCapture(device)
@@ -1558,6 +1670,14 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         self.assertFalse(contacts_b.rigid_contacts_reduced, "rejected buffer was stamped")
         np.testing.assert_array_equal(red.prev_keys.numpy(), prev_keys_before)
         np.testing.assert_array_equal(red.history_generation.numpy(), generations_before)
+        # Dropping the exclusive graph clears capture provenance and unlocks
+        # the pipeline, while preserving conservative ordinary provenance for
+        # rows left by the final replay.
+        del capture_a
+        gc.collect()
+        self.assertFalse(contacts_a.rigid_contacts_reduced_capture)
+        self.assertTrue(contacts_a.rigid_contacts_reduced)
+        pipeline.release_body_pair_reduction_capture()
 
     def test_ordinary_other_buffer_rejected_while_graph_live(self):
         """Refuse ANY other buffer while a captured graph's binding is live.
@@ -1610,12 +1730,12 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
             capture.__exit__(None, None, None)
 
     def test_capture_release_allows_new_buffer(self):
-        """Release the capture binding explicitly to rebind a new buffer.
+        """Destroy every graph lease before rebinding a new buffer.
 
-        The binding must survive the captured buffer's garbage collection (a
-        dead weakref proves nothing about the CUDA graph's lifetime), so
-        release_body_pair_reduction_capture() is the only way to move a
-        pipeline to a new captured buffer.  Skipped on CPU devices.
+        Explicit release must refuse to detach arrays from a live graph.  Once
+        the graph is destroyed its lease releases automatically, but ordinary
+        reduced provenance stays conservative until a new collide or clear.
+        Skipped on CPU devices.
         """
         device = wp.get_device()
         if not device.is_cuda:
@@ -1629,9 +1749,16 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         with wp.ScopedCapture(device) as capture_a:
             pipeline.collide(state, contacts_a)
         wp.capture_launch(capture_a.graph)
+        with self.assertRaisesRegex(RuntimeError, "graph is still live"):
+            pipeline.release_body_pair_reduction_capture()
         del capture_a
+        gc.collect()
         pipeline.release_body_pair_reduction_capture()
-        self.assertFalse(contacts_a.rigid_contacts_reduced_capture, "release must clear the sticky marker")
+        self.assertFalse(contacts_a.rigid_contacts_reduced_capture)
+        self.assertTrue(
+            contacts_a.rigid_contacts_reduced,
+            "destroying the last graph must conservatively describe rows left by its final replay",
+        )
         pipeline.collide(state, contacts_b)  # warm-up now legal
         with wp.ScopedCapture(device) as capture_b:
             pipeline.collide(state, contacts_b)
@@ -1644,9 +1771,9 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         refill a captured buffer and stamp it unreduced, then a replay of the
         reducer graph compacts the device records again -- an unsupported
         solver reading the plain marker would consume reduced contacts
-        without raising.  A buffer that was ever captured by a reducer
-        pipeline carries a sticky may-contain-reduced marker until the
-        binding is released.  Skipped on CPU devices.
+        without raising.  A buffer with any live reducer-writer graph lease
+        carries a may-contain-reduced marker until the last graph is
+        destroyed.  Skipped on CPU devices.
         """
         device = wp.get_device()
         if not device.is_cuda:
@@ -1662,9 +1789,126 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         plain = newton.CollisionPipeline(model, broad_phase="nxn")
         plain.collide(state_0, contacts)
         self.assertFalse(contacts.rigid_contacts_reduced, "plain refill should clear the per-collide marker")
+        # Recreate the exact dangerous state: replay compacts the device rows,
+        # but no Python collide runs to restamp ordinary provenance.
+        wp.capture_launch(capture.graph)
+        self.assertFalse(contacts.rigid_contacts_reduced)
+        self.assertTrue(contacts.rigid_contacts_reduced_capture)
         solver = newton.solvers.SolverSemiImplicit(model)
         with self.assertRaisesRegex(ValueError, "supports_reduced_contacts"):
             solver.step(state_0, state_1, model.control(), contacts, DT)
+
+    def test_graph_lease_retains_pipeline_and_contacts(self):
+        """The graph itself owns every reducer/contact array it recorded."""
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device")
+        model = self._foot_scene()
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        pipeline_ref = weakref.ref(pipeline)
+        contacts_ref = weakref.ref(contacts)
+        with wp.ScopedCapture(device) as capture:
+            pipeline.collide(state, contacts)
+        graph = capture.graph
+        del capture, contacts, pipeline
+        gc.collect()
+        self.assertIsNotNone(pipeline_ref(), "graph lease did not retain reducer arrays")
+        self.assertIsNotNone(contacts_ref(), "graph lease did not retain Contacts arrays")
+        del graph
+        gc.collect()
+        self.assertIsNone(pipeline_ref())
+        self.assertIsNone(contacts_ref())
+
+    def test_reducer_writer_graph_is_exclusive_across_pipelines(self):
+        """Two pipelines cannot capture writers for the same contact buffer."""
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device")
+        model = self._foot_scene()
+        state = model.state()
+        pipeline_a = _make_pipeline(model, True)
+        pipeline_b = _make_pipeline(model, True)
+        contacts = pipeline_a.contacts()
+        pipeline_a.collide(state, contacts)
+        pipeline_b.collide(state, contacts)
+        with wp.ScopedCapture(device) as capture_a:
+            pipeline_a.collide(state, contacts)
+        capture_b_rejected = wp.ScopedCapture(device)
+        capture_b_rejected.__enter__()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "second body-pair reducer graph"):
+                pipeline_b.collide(state, contacts)
+        finally:
+            capture_b_rejected.__exit__(None, None, None)
+
+        del capture_a
+        gc.collect()
+        self.assertFalse(contacts.rigid_contacts_reduced_capture)
+        pipeline_a.release_body_pair_reduction_capture()
+        # Once the first graph is truly gone, the already-warmed second
+        # pipeline may acquire the sole writer lease.
+        with wp.ScopedCapture(device) as capture_b:
+            pipeline_b.collide(state, contacts)
+        wp.capture_launch(capture_b.graph)
+        self.assertTrue(contacts.rigid_contacts_reduced_capture)
+        del capture_b
+        gc.collect()
+        self.assertFalse(contacts.rigid_contacts_reduced_capture)
+        self.assertTrue(contacts.rigid_contacts_reduced)
+        pipeline_b.release_body_pair_reduction_capture()
+
+    def test_precaptured_unsupported_solver_blocks_reducer_writer(self):
+        """A raw-contact solver graph cannot later replay over reduced rows."""
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device")
+        model = self._foot_scene()
+        state_0, state_1 = model.state(), model.state()
+        plain = newton.CollisionPipeline(model, broad_phase="nxn")
+        contacts = plain.contacts()
+        plain.collide(state_0, contacts)
+        solver = newton.solvers.SolverSemiImplicit(model)
+        control = model.control()
+        solver.step(state_0, state_1, control, contacts, DT)  # warm-up
+        with wp.ScopedCapture(device) as solver_capture:
+            solver.step(state_0, state_1, control, contacts, DT)
+
+        reducer = _make_pipeline(model, True)
+        with self.assertRaisesRegex(RuntimeError, "unsupported solver"):
+            reducer.collide(state_0, contacts)
+        self.assertFalse(contacts.rigid_contacts_reduced)
+        self.assertFalse(contacts.rigid_contacts_reduced_capture)
+        del solver_capture
+        gc.collect()
+        reducer.collide(state_0, contacts)
+
+    def test_capture_lifecycle_mutations_are_guarded(self):
+        """Host topology/reset/release mutations never enter a CUDA graph."""
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device")
+        model = self._foot_scene()
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        reset_mask = wp.zeros(max(int(model.world_count), 1), dtype=wp.int32, device=device)
+        with wp.ScopedCapture(device) as capture:
+            pipeline.collide(state, contacts)
+            with self.assertRaisesRegex(RuntimeError, "no CUDA graph capture"):
+                pipeline.refresh_body_pair_reduction_groups()
+            with self.assertRaisesRegex(RuntimeError, "host mask"):
+                pipeline.reset_body_pair_reduction_history(None)
+            with self.assertRaisesRegex(RuntimeError, "host mask"):
+                pipeline.reset_body_pair_reduction_history(np.ones(reset_mask.shape[0], dtype=np.int32))
+            # Device masks are the intentionally capture-safe reset path.
+            pipeline.reset_body_pair_reduction_history(reset_mask)
+            with self.assertRaisesRegex(RuntimeError, "lifecycle mutation"):
+                pipeline.release_body_pair_reduction_capture()
+        self.assertIsNotNone(capture.graph)
 
     def test_requires_grad_diff_augmentation(self):
         """Populate the differentiable contact arrays from the compacted set.
@@ -1748,10 +1992,12 @@ class TestBodyPairReductionFPGSImpact(unittest.TestCase):
                 solver.step(state_0, state_1, control, contacts, DT)
                 state_0, state_1 = state_1, state_0
                 zs.append(float(state_0.body_q.numpy()[body][2]))
-            return np.array(zs)
+            stats = pipeline.body_pair_reduction_stats() if reduce_on else None
+            return np.array(zs), stats
 
-        z_off = run(False)
-        z_on = run(True)
+        z_off, _ = run(False)
+        z_on, stats = run(True)
+        self.assertLess(stats["sum_contacts_kept"], stats["sum_contacts_in"], "touchdown contacts were never reduced")
         self.assertLess(float(z_off.min()), 0.04, "foot never fell: the solver is not simulating it")
         self.assertLess(abs(float(z_off[-30:].mean()) - float(z_on[-30:].mean())), 5e-4)
         # bounded touchdown transient: never punches through the resting height by > 2.5 mm
@@ -1760,6 +2006,50 @@ class TestBodyPairReductionFPGSImpact(unittest.TestCase):
 
 class TestBodyPairReductionGroupAssignment(unittest.TestCase):
     """Group assignment must be stable at world axes and under rigid translation."""
+
+    def test_grouping_uses_effective_surface_midpoint(self):
+        """Keep unequal-radius contacts together by their physical surface center.
+
+        The two synthetic records have different raw support-point midpoints
+        but exactly the same midpoint after applying their directed surface
+        margins. The tilted normal gives the raw displacement a component on
+        the selected bin plane, large enough to cross the 2 cm cell grid. A
+        raw-midpoint implementation therefore creates two table entries; the
+        effective-surface implementation creates one.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        body = builder.add_body(xform=wp.transform_identity(), mass=1.0)
+        shape_a = builder.add_shape_sphere(body, radius=0.01)
+        shape_b = builder.add_shape_sphere(body, radius=0.02)
+        ground = builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(
+            model,
+            True,
+            rigid_contact_max=2,
+            reduce_contacts_body_pairs_cell=0.02,
+            reduce_contacts_body_pairs_hysteresis=0.0,
+        )
+        contacts = pipeline.contacts()
+
+        normal = np.array([0.3, 0.0, np.sqrt(1.0 - 0.3**2)], dtype=np.float32)
+        margins0 = np.array([0.0, 0.2], dtype=np.float32)
+        raw_centers = np.stack([np.zeros(3, dtype=np.float32), -0.5 * margins0[1] * normal])
+        contacts.rigid_contact_count.assign(np.array([2], dtype=np.int32))
+        contacts.rigid_contact_shape0.assign(np.array([shape_a, shape_b], dtype=np.int32))
+        contacts.rigid_contact_shape1.assign(np.array([ground, ground], dtype=np.int32))
+        contacts.rigid_contact_point0.assign(raw_centers)
+        contacts.rigid_contact_point1.assign(raw_centers)
+        contacts.rigid_contact_normal.assign(np.stack([normal, normal]))
+        contacts.rigid_contact_margin0.assign(margins0)
+        contacts.rigid_contact_margin1.assign(np.zeros(2, dtype=np.float32))
+
+        reducer = pipeline._body_pair_reducer
+        reducer.reduce(model, state, contacts)
+        stats = reducer.stats()
+        self.assertEqual(stats["max_hashtable_entries"], 1)
+        np.testing.assert_allclose(reducer.contact_pos2d.numpy()[0], reducer.contact_pos2d.numpy()[1], atol=1e-6)
 
     def test_bin_margins_at_world_axes(self):
         """Keep every world axis well inside a bin, especially the ground normal.
@@ -1838,13 +2128,19 @@ class TestBodyPairReductionGroupAssignment(unittest.TestCase):
 class TestBodyPairReductionHysteresis(unittest.TestCase):
     """Temporal hysteresis: kept-set continuity without sticky wrong winners."""
 
-    def _curved_rock(self, hysteresis, steps=400):
-        """Sphere-grid plate rocking on a large-radius static sphere.
+    def _kept_set_handoffs(self, hysteresis, steps=120):
+        """Winner handoffs of a micro-rocked plate on curved support, solver-free.
 
-        Curvature makes the plate's contact scores near-degenerate and
-        continuously varying -- the regime where memoryless winner selection
-        churns the kept set every step and the plate never settles. Returns the
-        mean |angular velocity| over the final quarter of the run.
+        A sphere-grid plate on a 20 m dome has near-degenerate winner scores
+        (the gap spread across the plate is ~0.14 mm).  The plate is rocked
+        KINEMATICALLY with a 5 mrad tilt oscillation -- contact points move
+        ~0.4 mm per cycle, under the 0.5 mm identity quantum so incumbency can
+        attach, and the score shifts stay well inside the 1 mm margin.  The
+        kept set is identified by WHICH plate spheres survive; a handoff is
+        any step whose kept multiset differs from the previous step's.  No
+        solver runs, so this measures the reducer's own churn -- the quantity
+        hysteresis exists to remove -- independent of any solver's support
+        status.
         """
         r_ground = 20.0
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
@@ -1853,36 +2149,38 @@ class TestBodyPairReductionHysteresis(unittest.TestCase):
         )
         body = _sphere_grid_body(builder, (0.0, 0.0, 0.0095), n=4, spacing=0.05)
         model = builder.finalize(device=wp.get_device())
-        state_0, state_1 = model.state(), model.state()
-        control = model.control()
+        state = model.state()
         pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_hysteresis=hysteresis)
         contacts = pipeline.contacts()
-        solver = newton.solvers.SolverXPBD(model, iterations=8)
-        tail = []
+        q0 = state.body_q.numpy().copy()
+        prev, handoffs = None, 0
         for k in range(steps):
-            pipeline.collide(state_0, contacts)
-            state_0.clear_forces()
-            solver.step(state_0, state_1, control, contacts, DT)
-            state_0, state_1 = state_1, state_0
-            if k >= steps * 3 // 4:
-                # body_qd is (linear, angular): components 3:6 are omega
-                tail.append(float(np.abs(state_0.body_qd.numpy()[body][3:6]).max()))
-        return float(np.mean(tail))
+            theta = 0.005 * np.sin(2.0 * np.pi * k / 40.0)
+            rot = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), float(theta))
+            q = q0.copy()
+            q[body][3:7] = [rot[0], rot[1], rot[2], rot[3]]
+            state.body_q.assign(q)
+            pipeline.collide(state, contacts)
+            n = int(contacts.rigid_contact_count.numpy()[0])
+            rows = tuple(sorted(contacts.rigid_contact_shape1.numpy()[:n].tolist()))
+            if prev is not None and rows != prev:
+                handoffs += 1
+            prev = rows
+        return handoffs
 
-    def test_curved_support_settles(self):
-        """Settle a plate on curved support instead of sustaining a limit cycle.
+    def test_hysteresis_removes_winner_churn_on_curved_support(self):
+        """Stop near-degenerate winner handoffs on curved support.
 
-        With hysteresis off, near-degenerate winner handoffs re-excite the
-        contact set each step and the plate rocks forever; the incumbent bias
-        removes the churn. The off-case is measured in the same test so the
-        assertion is relative, not an absolute magic number.
+        Memoryless selection hands the kept set off repeatedly as the rock
+        sweeps the near-tied scores (measured 18 handoffs in 119 steps); the
+        1 mm incumbency margin removes ALL of them.  This is the reducer-level
+        mechanism behind the settle-churn the hysteresis feature was built
+        for, pinned without a solver in the loop.
         """
-        residual_off = self._curved_rock(hysteresis=0.0)
-        residual_on = self._curved_rock(hysteresis=0.001)
-        self.assertLess(
-            residual_on, 0.5 * residual_off, f"hysteresis did not calm the limit cycle: {residual_on} vs {residual_off}"
-        )
-        self.assertLess(residual_on, 0.02, f"plate still not at rest: {residual_on} rad/s")
+        churn_off = self._kept_set_handoffs(hysteresis=0.0)
+        churn_on = self._kept_set_handoffs(hysteresis=0.001)
+        self.assertGreaterEqual(churn_off, 10, "scene stopped churning; the probe is vacuous")
+        self.assertEqual(churn_on, 0, f"hysteresis left {churn_on} winner handoffs")
 
     def test_challenger_beyond_margin_wins_immediately(self):
         """Dethrone an incumbent depth winner as soon as a clearly deeper one exists.
@@ -2149,10 +2447,11 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
         builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
         state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
         control = model.control()
         pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_verify=True)
         contacts = pipeline.contacts()
-        solver = newton.solvers.SolverXPBD(model, iterations=8)
+        solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
         for _ in range(240):
             pipeline.collide(state_0, contacts)
             state_0.clear_forces()
@@ -2161,6 +2460,7 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
         stats = pipeline._body_pair_reducer.stats()
         self.assertEqual(stats["invariant_violations"], 0)
         self.assertEqual(stats["failed_insertions"], 0)
+        self.assertLess(stats["sum_contacts_kept"], stats["sum_contacts_in"], "certificate saw no discard")
 
     def test_kept_set_independent_of_previous_step(self):
         """Reduce a state to the same kept set whether or not a busier step preceded it.
@@ -2210,12 +2510,14 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
             self.assertEqual(stats["outranked_discards"], 0)
 
     def test_property_random_piles(self):
-        """Fuzz the invariant and stability on randomized primitive piles.
+        """Fuzz the invariant and stability on randomized multi-collider piles.
 
         Seeded random mixes of spheres, boxes, capsules, and cylinders are
-        dropped into a pile -- geometry nobody hand-picked. Asserts: the
-        certificate stays clean, the registered count is reduced, nothing
-        blows up, and no body tunnels through the ground.
+        dropped into a pile -- geometry nobody hand-picked. Every free-jointed
+        body has seven offset colliders, so the test cannot pass solely through
+        the reducer's one-collider identity path. At least one frame must
+        strictly reduce; the certificate must stay clean; and the supported
+        FeatherPGS consumer must remain finite and above the ground.
         """
         rng = np.random.default_rng(1234)
         for trial in range(3):
@@ -2226,50 +2528,66 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
                 # interpenetrating spawns make BOTH pipelines ballistic and the
                 # comparison chaotic rather than physical
                 pos = (float(rng.uniform(-0.15, 0.15)), float(rng.uniform(-0.15, 0.15)), 0.10 + 0.18 * k)
-                body = builder.add_body(xform=wp.transform(wp.vec3(*pos), wp.quat_identity()), mass=0.5)
+                body = builder.add_link(xform=wp.transform(wp.vec3(*pos), wp.quat_identity()))
                 bodies.append(body)
                 kind = int(rng.integers(0, 4))
-                if kind == 0:
-                    builder.add_shape_sphere(body, radius=float(rng.uniform(0.02, 0.05)))
-                elif kind == 1:
-                    builder.add_shape_box(
-                        body,
-                        hx=float(rng.uniform(0.02, 0.05)),
-                        hy=float(rng.uniform(0.02, 0.05)),
-                        hz=float(rng.uniform(0.02, 0.05)),
-                    )
-                elif kind == 2:
-                    builder.add_shape_capsule(
-                        body, radius=float(rng.uniform(0.015, 0.03)), half_height=float(rng.uniform(0.02, 0.05))
-                    )
-                else:
-                    builder.add_shape_cylinder(
-                        body, radius=float(rng.uniform(0.02, 0.04)), half_height=float(rng.uniform(0.02, 0.05))
-                    )
+                radius = float(rng.uniform(0.012, 0.02))
+                half_height = float(rng.uniform(0.012, 0.025))
+                for j in range(7):
+                    offset = wp.transform(wp.vec3((j - 3) * 2.2 * radius, 0.0, 0.0), wp.quat_identity())
+                    if kind == 0:
+                        builder.add_shape_sphere(body, xform=offset, radius=radius)
+                    elif kind == 1:
+                        builder.add_shape_box(body, xform=offset, hx=radius, hy=radius, hz=radius)
+                    elif kind == 2:
+                        builder.add_shape_capsule(body, xform=offset, radius=radius, half_height=half_height)
+                    else:
+                        builder.add_shape_cylinder(body, xform=offset, radius=radius, half_height=half_height)
+                joint = builder.add_joint_free(parent=-1, child=body)
+                builder.add_articulation([joint])
             builder.add_ground_plane()
             model = builder.finalize(device=wp.get_device())
             state_0, state_1 = model.state(), model.state()
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
             control = model.control()
             pipe_red = _make_pipeline(model, True, reduce_contacts_body_pairs_verify=True)
             pipe_raw = newton.CollisionPipeline(model, broad_phase="nxn")
             c_red, c_raw = pipe_red.contacts(), pipe_raw.contacts()
-            solver = newton.solvers.SolverXPBD(model, iterations=8)
-            raw_more, peak_red = 0, 0.0
+            solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+            raw_not_less, strict_reduction_frames, peak_red = 0, 0, 0.0
             for _ in range(150):
                 pipe_raw.collide(state_0, c_raw)
                 pipe_red.collide(state_0, c_red)
-                raw_more += int(c_raw.rigid_contact_count.numpy()[0] >= c_red.rigid_contact_count.numpy()[0])
+                raw_count = int(c_raw.rigid_contact_count.numpy()[0])
+                reduced_count = int(c_red.rigid_contact_count.numpy()[0])
+                raw_not_less += int(raw_count >= reduced_count)
+                strict_reduction_frames += int(raw_count > reduced_count)
                 state_0.clear_forces()
                 solver.step(state_0, state_1, control, c_red, DT)
                 state_0, state_1 = state_1, state_0
                 peak_red = max(peak_red, float(np.abs(state_0.body_qd.numpy()).max()))
-            # reference peak from the SAME pile driven by unreduced contacts: an
-            # absolute bound flakes here, because a random pile's peak speed is
-            # chaotic and legitimately reaches O(100) m/s in either pipeline
-            peak_raw = _peak_speed_unreduced(model, steps=150)
+
+            # Reference peak from the SAME pile and same solver family, driven
+            # by unreduced contacts. An absolute bound flakes on a random pile,
+            # whose peak speed can legitimately be large in either pipeline.
+            raw_state_0, raw_state_1 = model.state(), model.state()
+            newton.eval_fk(model, raw_state_0.joint_q, raw_state_0.joint_qd, raw_state_0)
+            raw_control = model.control()
+            raw_dynamics_pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+            raw_dynamics_contacts = raw_dynamics_pipeline.contacts()
+            raw_solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+            peak_raw = 0.0
+            for _ in range(150):
+                raw_dynamics_pipeline.collide(raw_state_0, raw_dynamics_contacts)
+                raw_state_0.clear_forces()
+                raw_solver.step(raw_state_0, raw_state_1, raw_control, raw_dynamics_contacts, DT)
+                raw_state_0, raw_state_1 = raw_state_1, raw_state_0
+                peak_raw = max(peak_raw, float(np.abs(raw_state_0.body_qd.numpy()).max()))
+
             stats = pipe_red._body_pair_reducer.stats()
             self.assertEqual(stats["invariant_violations"], 0, f"trial {trial}")
-            self.assertEqual(raw_more, 150, f"trial {trial}: reduction increased a count")
+            self.assertEqual(raw_not_less, 150, f"trial {trial}: reduction increased a count")
+            self.assertGreater(strict_reduction_frames, 0, f"trial {trial}: reducer never removed a contact")
             body_q = state_0.body_q.numpy()
             qd = state_0.body_qd.numpy()
             self.assertTrue(np.isfinite(body_q).all() and np.isfinite(qd).all())

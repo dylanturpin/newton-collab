@@ -96,9 +96,14 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
     """
 
-    # Conformance-tested against body-pair-reduced contact buffers
-    # (test_contact_reduction_body_pairs).
-    supports_reduced_contacts: bool = True
+    # XPBD evaluates rigid-contact activity after predicting body poses.  The
+    # body-pair reducer selects its footprint slots before that prediction and
+    # allows speculative candidates to win those slots.  Consequently a
+    # speculative winner can evict a contact that becomes penetrating during
+    # the XPBD prediction.  Until the reducer can rank the XPBD solve-time
+    # geometry (or XPBD gets its own post-prediction reduction pass), accepting
+    # a reduced buffer here would be a class-wide guarantee we cannot make.
+    supports_reduced_contacts: bool = False
 
     @deprecate_nonkeyword_arguments
     def __init__(
@@ -350,6 +355,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 is skipped; particle-particle contacts and model constraints are still solved.
             dt: Time step size [s].
         """
+        self._require_unreduced_contacts(contacts)
         self._apply_module_options()
         requires_grad = state_in.requires_grad
         self._particle_delta_counter = 0

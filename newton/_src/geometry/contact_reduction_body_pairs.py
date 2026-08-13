@@ -13,19 +13,22 @@ interior point's normal force is a convex combination of hull-point normal
 forces (support/tipping statics preserved) and translational friction capacity
 ``sum mu*N_i`` is position-independent.  But the hull itself is SAMPLED by
 :data:`BODY_PAIR_NUM_DIRECTIONS` fixed scan directions, and the sampling error
-carries NO universal bound -- the following are EXAMPLES, not ceilings.  A
-densely populated footprint (candidates near every direction) loses at most
-``1 - cos(pi/N)`` of the patch radius (~13% at six directions).  A sparse hull
-can lose the entire support of an unsampled direction: candidates at -60/120
-degrees plus a true hull vertex at 30 degrees that trails each of the six
-scan projections by an epsilon lose ALL of the 30-degree support (~58% of the
-patch radius there, and the discarded point is a true hull vertex).  Nonzero
-hysteresis further allows a retained representative to sit within the margin of
-the true winner.  Support, tipping, and translational friction are therefore
-preserved only to scene-dependent tolerances pinned by the test suite -- not
-exactly, and not within any shape-independent percentage.  Row count and
-placement also affect iterative-solver compliance, so equal capacity does not
-imply identical realized load distribution.
+carries NO universal bound -- the following are EXAMPLES, not ceilings.  For a
+continuous circular footprint whose radius is represented at every scan
+direction, the retained regular polygon has a radial deficit of
+``1 - cos(pi/N)`` halfway between directions (~13% at six directions).  That
+regular-circle construction is not a guarantee for an arbitrary finite or
+nominally dense candidate set.  A sparse hull can lose the entire support of an
+unsampled direction: candidates at -60/120 degrees plus a true hull vertex at
+30 degrees that trails each of the six scan projections by an epsilon lose ALL
+of the 30-degree support (~58% of the patch radius there, and the discarded
+point is a true hull vertex).  Nonzero hysteresis further allows a retained
+representative to sit within the margin of the true winner.  Support, tipping,
+and translational friction are therefore preserved only to scene-dependent
+tolerances pinned by the test suite -- not exactly, and not within any
+shape-independent percentage.  Row count and placement also affect
+iterative-solver compliance, so equal capacity does not imply identical
+realized load distribution.
 
 This pass runs after the narrow phase has written the ``Contacts`` buffer and
 compacts it in two kernels over the live contact range -- register, then select:
@@ -48,24 +51,27 @@ compacts it in two kernels over the live contact range -- register, then select:
   also lose true vertices that fall between scan directions (see above).
 
 **When this pays.** Only bodies whose collision is decomposed into several
-primitives generate more candidates per pair than the slot budget. On a walking
-G1 (7 cylinders per foot) the pass costs ~4% of the step and returns ~14% of
-throughput. On a scene of single-box bodies there is nothing to discard and it is
-pure overhead -- measured 5% slower on 1024x250 falling cubes. It is opt-in for
-that reason; ``stats()`` reports indicative in/kept watermarks and an
-``identity_frames`` counter -- frequent identity frames or watermarks near each
-other mean this scene does not want it.
+primitives generate more candidates per pair than the slot budget. Dense
+multi-collider patches can repay the extra registration and compaction work by
+substantially reducing solver rows; scenes dominated by one small manifold per
+body pair cannot and pay pure overhead. It is opt-in for that reason.
+``stats()`` reports paired input/kept totals and an ``identity_frames`` counter;
+frequent identity frames or a kept/input ratio near one mean this scene does not
+want it. Benchmark the complete collision-plus-solver step on the target GPU
+rather than inferring speedup from contact count alone.
 
-Depth is ranked with the canonical
-:func:`newton._src.sim.contacts.contact_surface_separation`, but only to choose
-each group's single deepest survivor: depth never gates or biases the spatial
-slots.  The policy therefore carries no tunable length scale at all, and no
+Depth is ranked with the canonical signed effective-surface separation
+``dot(normal, point1 - point0) - margin0 - margin1``, but only to choose each
+group's single deepest survivor: depth never gates or biases the spatial slots.
+The policy therefore carries no tunable length scale at all, and no
 classification can leave a patch without footprint support.
 
 Reduction never crosses a normal bin, so multi-patch configurations (a body
 touching floor and wall at once) keep representatives of every patch.  On
-hashtable overflow the pass fails open: a contact that cannot be registered is
-kept, never dropped.
+hashtable probe exhaustion the pass fails open: a contact that cannot be
+registered within the bounded probe budget is kept, never dropped.  Probe
+exhaustion can mean a full table or a long collision cluster; telemetry does
+not claim to distinguish the two.
 
 **Temporal hysteresis.** Winner selection alone is memoryless, and on curved or
 mesh support (flat analytic planes are immune) the score differences between a
@@ -80,56 +86,49 @@ itself under real sliding, and the kept set becomes a function of contact
 geometry plus the previous step's winners.  Set the margin to ``0`` for the
 exact, memoryless behavior.
 
-**Known characteristic -- XPBD residual rocking on curved colliders.** A
-row of cylinder colliders settles under XPBD with a sustained roll
-oscillation when reduced (tail-mean |omega| 1.17 rad/s at 8 iterations,
-0.63 at 16, 0.28 at 32, against ~0 unreduced; height and linear velocity
-stay correct), while FeatherPGS settles both variants to zero on the same
-scene.  A penetrating-extreme slot family was implemented and measured
-against this: the kept set did not change (the loaded and geometric hulls
-coincide at rest) and the oscillation persisted, so the cause is XPBD's
-sensitivity to candidate count/placement on curved rims, not hull
-membership -- and the extra family was removed again.  Prefer FeatherPGS
-for curved-collider feet under reduction, or raise XPBD iterations.
+**XPBD is not a supported consumer.** XPBD predicts body poses before deciding
+which speculative candidates are active, while this pass selects footprint
+representatives from the pre-prediction contact geometry. A spatial winner can
+therefore remain speculative after prediction while a discarded interior
+candidate becomes penetrating. Increasing XPBD iterations reduced a curved-foot
+rocking residual in one characterization scene but did not establish a
+class-wide selection invariant, so XPBD rejects reduced buffers. FeatherPGS is
+the supported solver.
 
 **Known characteristic -- torsional patch friction.** During twist, friction at
 every contact is saturated at ``mu*N_i``, so the resisting torque is
 ``mu * sum(N_i * r_i)`` -- fixed by WHERE the normal load sits, with no
-remaining freedom for the solver to redistribute.  Keeping only rim extremes
-forces the load to the largest lever arms, the maximizer of that sum: a
-spinning multi-collider disc stops ~25% sooner reduced than unreduced
-(adversarial A/B, mu 0.3 and 0.6; FPGS measures 1.34x the uniform-pressure
-torque, where the rim-loaded limit of a uniform CIRCULAR patch is 1.5x --
-elongated patches concentrate load further and can approach 2x, so the figure
-is scene-dependent, not a universal ceiling).  A dense point set approximates
-the uniform-pressure integral only by accident of even loading -- nobody
-reweights in either case -- and no placement of boundary points can match both
+remaining freedom for the solver to redistribute. Keeping only rim extremes
+forces the load toward the largest lever arms, increasing that sum. For a
+uniform circular patch, concentrating all load at the rim produces 1.5 times
+the continuum uniform-pressure torsion; other footprint shapes have different
+ratios, so this is not a universal ceiling. A dense point set approximates the
+uniform-pressure integral only by accident of even loading -- nobody reweights
+in either case -- and no placement of boundary points can match both
 translational capacity (``sum mu*N_i``) and the continuum torsion
-(``2/3 mu*W*R``) simultaneously: the bias is inherent to any reduction that
-keeps a patch's boundary points.  Bounded, smooth, and documented rather than
-patched; the principled fix, if yaw transfer measurably suffers, is an
-explicit per-patch torsion row in the solver, not point placement.  Watch
-yaw-tracking error when validating policies whose feet pivot.
+(``2/3 mu*W*R`` for a circle) simultaneously. The bias is inherent to a
+reduction that keeps a patch's boundary points. The principled fix, if yaw
+transfer measurably suffers, is an explicit per-patch torsion row in the
+solver, not point placement. Watch yaw-tracking error when validating policies
+whose feet pivot.
 
-All launches are fixed-size and the pass is CUDA-graph-capture compatible,
-with three documented lifecycle caveats.  Under graph REPLAY: the automatic
-history reset on a new ``Contacts`` buffer and the ``rigid_contacts_reduced``
-provenance marker are host-side Python and only execute when ``collide()``
-itself runs -- replaying a captured graph repeats neither.  A reducer-enabled
-pipeline must therefore not alternate multiple captured buffers (hysteresis
-history is shared state), and solver provenance checks reflect the last
-Python-level collide, not the last replay.  Per-buffer device-resident
-provenance is the eventual fix; until then ``collide()`` enforces an explicit
-capture lifecycle: the captured buffer must be warmed up with one ordinary
-collide before capture (so no history reset or lazy allocation is recorded
-into the graph -- this also provisions the lazily allocated material scratch
-of a buffer with per-contact properties), no other buffer may use the
-pipeline while the capture binding is live (even outside capture: an ordinary
-collide would repopulate the hysteresis state the graph replays against), a
-once-captured buffer carries a sticky may-contain-reduced marker that keeps
-unsupported solvers rejecting it after non-reducing refills, and the binding
-survives buffer garbage collection until
-``CollisionPipeline.release_body_pair_reduction_capture()``.
+All launches are fixed-size and the pass is CUDA-graph-capture compatible.
+The captured buffer must first receive one ordinary ``collide`` so history
+reset and lazy material-scratch allocation are not recorded into the graph.
+The resulting Warp graph owns a strong lease on the pipeline, reducer arrays,
+and exact ``Contacts`` buffer used by its launches.  Only one live reducer
+writer graph is allowed for a buffer: independent graph replays would race the
+stateful history, telemetry, and output arrays.  The lease disappears when its
+graph is destroyed; while it is live the pipeline rejects every other contact
+buffer. Serialize ordinary calls on that pipeline with graph replay; launching
+ordinary reducer work concurrently on another stream would still race the
+same stateful arrays.
+The buffer separately tracks reduced-writer and unreduced-only-solver reader
+leases, preventing a graph captured for an unsupported solver from later
+replaying over compacted rows.  Because the last reducer replay may be the last
+writer, final lease release conservatively preserves ordinary reduced-contact
+provenance until ``Contacts.clear`` or a subsequent Python ``collide`` replaces
+the contents.
 """
 
 from __future__ import annotations
@@ -377,8 +376,12 @@ def _make_group_key(group_a: int, group_b: int, bin_id: int, cx: int, cy: int) -
     )
 
 
-# Telemetry slots in the reducer's stats array. Whole-run accumulators (never
-# reset), read via BodyPairContactReducer.stats().
+# Telemetry slots in the reducer's int32 stats array.  The three watermarks are
+# whole-run maxima.  Event slots are per-frame atomic scratch: the preparation
+# kernel clears them, producers increment them, and the single-thread count
+# writer folds them into int64 lifetime totals.  This keeps high-contention
+# atomics at their fast/native width without allowing a long training run to
+# wrap its public counters.
 STAT_VIOLATIONS = 0
 STAT_FAIL_OPEN = 1
 STAT_OUTRANKED = 2
@@ -391,18 +394,24 @@ STAT_FALLBACK_FRAMES = 8
 STAT_IDENTITY_FRAMES = 9
 STAT_COUNT = 10
 
-# 64-bit whole-run accumulators, kept in a separate array: the per-frame SUMS
-# outgrow int32 within long training runs (1e5 contacts/frame wraps in ~6 hours
-# at 100 Hz), while the int32 slots above are watermarks and rare-event counts.
+# 64-bit whole-run accumulators, kept in a separate array.  Contact sums and
+# even nominally rare events can outgrow int32 in long-running training jobs.
 STAT64_TOTAL_FRAMES = 0
 STAT64_SUM_CONTACTS_IN = 1
 STAT64_SUM_CONTACTS_KEPT = 2
-STAT64_COUNT = 3
+STAT64_PROBE_FAILURES = 3
+STAT64_CELL_CLAMP_EVENTS = 4
+STAT64_INVARIANT_VIOLATIONS = 5
+STAT64_OUTRANKED_DISCARDS = 6
+STAT64_INPUT_OVERFLOW_FRAMES = 7
+STAT64_FALLBACK_FRAMES = 8
+STAT64_IDENTITY_FRAMES = 9
+STAT64_COUNT = 10
 
 # Per-frame device state, reset by the preparation kernel each reduce.
 FRAME_WORK_COUNT = 0  # validated loop bound for every reducer kernel
 FRAME_INPUT_OVERFLOW = 1  # narrow phase emitted more contacts than capacity
-FRAME_FALLBACK = 2  # hashtable budget exceeded: keep every contact this frame
+FRAME_FALLBACK = 2  # bounded group-key probe failed: keep every contact this frame
 FRAME_IDENTITY = 3  # every group holds one contact: reduction is a no-op
 FRAME_STATE_COUNT = 4
 
@@ -483,6 +492,15 @@ def _prepare_frame_kernel(
     wrong: batched reservations can leave unwritten holes where a batch
     crossed capacity.
     """
+    # Per-frame event scratch.  Watermark slots deliberately remain intact.
+    stats[wp.static(STAT_VIOLATIONS)] = 0
+    stats[wp.static(STAT_FAIL_OPEN)] = 0
+    stats[wp.static(STAT_OUTRANKED)] = 0
+    stats[wp.static(STAT_CELL_CLAMPS)] = 0
+    stats[wp.static(STAT_INPUT_OVERFLOWS)] = 0
+    stats[wp.static(STAT_FALLBACK_FRAMES)] = 0
+    stats[wp.static(STAT_IDENTITY_FRAMES)] = 0
+
     raw = contact_count[0]
     if raw >= 0 and raw <= reducer_capacity:
         frame_state[wp.static(FRAME_WORK_COUNT)] = raw
@@ -490,7 +508,7 @@ def _prepare_frame_kernel(
     else:
         frame_state[wp.static(FRAME_WORK_COUNT)] = 0
         frame_state[wp.static(FRAME_INPUT_OVERFLOW)] = 1
-        wp.atomic_add(stats, wp.static(STAT_INPUT_OVERFLOWS), 1)
+        stats[wp.static(STAT_INPUT_OVERFLOWS)] = 1
     frame_state[wp.static(FRAME_FALLBACK)] = 0
     frame_state[wp.static(FRAME_IDENTITY)] = 0
 
@@ -513,12 +531,12 @@ def _contact_group_key(
 ):
     """Compute (key, gap, face-plane position, cell_clamped) for contact ``i``.
 
-    The gap is :func:`newton._src.sim.contacts.contact_surface_separation` --
-    the one canonical signed-separation convention the solvers consume
-    (normal points shape0 -> shape1, positive = gap).  Depth must be ranked
-    with exactly that formula: a hand-rolled variant with the opposite point
-    order ranked SHALLOWEST as deepest and made the pass keep hovering
-    candidates while discarding the load-bearing contacts.
+    The gap is ``dot(normal, point1 - point0) - margin0 - margin1`` -- the one
+    canonical signed-separation convention the solvers consume (normal points
+    shape0 -> shape1, positive = gap). Depth must be ranked with exactly that
+    formula: a hand-rolled variant with the opposite point order ranked
+    SHALLOWEST as deepest and made the pass keep hovering candidates while
+    discarding the load-bearing contacts.
     Group ids come from :func:`build_reduction_groups`: static shapes keep
     unique ids, and dynamic shapes share a group per (body, exact material
     signature), so contacts carrying different solver-visible material laws
@@ -560,7 +578,15 @@ def _contact_group_key(
 
     n = contact_normal[i]
     gap = contact_surface_separation(p0_w, p1_w, n, contact_margin0[i], contact_margin1[i])
-    center = 0.5 * (p0_w + p1_w)
+    # Group and rank the physical contact footprint, not the raw support-shape
+    # witnesses.  The solver-visible effective surfaces are p0 + n*margin0 and
+    # p1 - n*margin1, so unequal effective radii/margins move their midpoint.
+    # Using the raw midpoint can split equivalent surface contacts into
+    # different cells (or change their extrema) whenever n differs from the
+    # selected normal-bin face.
+    surface0_w = p0_w + n * contact_margin0[i]
+    surface1_w = p1_w - n * contact_margin1[i]
+    center = 0.5 * (surface0_w + surface1_w)
 
     g0 = shape_group[s0]
     g1 = shape_group[s1]
@@ -723,7 +749,7 @@ def _detect_identity_kernel(
     if ht_active_slots[ht_capacity] == work:
         frame_state[wp.static(FRAME_IDENTITY)] = 1
         wp.atomic_max(stats, wp.static(STAT_CONTACTS_KEPT), work)
-        wp.atomic_add(stats, wp.static(STAT_IDENTITY_FRAMES), 1)
+        stats[wp.static(STAT_IDENTITY_FRAMES)] = 1
 
 
 @wp.kernel(enable_backward=False)
@@ -754,7 +780,7 @@ def _detect_noop_kernel(
     if keep_scan[work - 1] == work:
         frame_state[wp.static(FRAME_IDENTITY)] = 1
         wp.atomic_max(stats, wp.static(STAT_CONTACTS_KEPT), work)
-        wp.atomic_add(stats, wp.static(STAT_IDENTITY_FRAMES), 1)
+        stats[wp.static(STAT_IDENTITY_FRAMES)] = 1
 
 
 @wp.func
@@ -1515,17 +1541,39 @@ def _write_reduced_count_kernel(
     """Replace the contact count with the number of kept contacts.
 
     Also records the watermarks that size the pass (how many contacts arrived,
-    how many survived, how many hashtable entries the scene actually needed --
-    occupancy is what says whether ``hashtable_factor`` is generous or one busy
-    step away from failing open) and the paired whole-run totals that give the
-    achieved reduction ratio.  Overflow frames count toward ``total_frames``
-    but are excluded from both sums: their materialized prefix contains holes,
-    so no coherent in/kept pair exists for them.  Single-thread launch, so the
-    64-bit accumulators use plain read-modify-write.
+    how many survived, how many hashtable entries the scene actually needed),
+    the paired whole-run totals that give the achieved reduction ratio, and all
+    lifetime event counters.  Event producers use per-frame int32 atomics; this
+    single-thread launch folds those values into int64 totals before the next
+    frame clears them.  Overflow frames count toward ``total_frames`` but are
+    excluded from both contact sums: their materialized prefix contains holes,
+    so no coherent in/kept pair exists for them.
     """
     wp.atomic_max(stats, wp.static(STAT_CONTACTS_IN), contact_count[0])
     wp.atomic_max(stats, wp.static(STAT_ENTRY_WATERMARK), ht_active_slots[ht_capacity])
+    stats[wp.static(STAT_FALLBACK_FRAMES)] = frame_state[wp.static(FRAME_FALLBACK)]
     stats64[wp.static(STAT64_TOTAL_FRAMES)] = stats64[wp.static(STAT64_TOTAL_FRAMES)] + wp.int64(1)
+    stats64[wp.static(STAT64_PROBE_FAILURES)] = stats64[wp.static(STAT64_PROBE_FAILURES)] + wp.int64(
+        stats[wp.static(STAT_FAIL_OPEN)]
+    )
+    stats64[wp.static(STAT64_CELL_CLAMP_EVENTS)] = stats64[wp.static(STAT64_CELL_CLAMP_EVENTS)] + wp.int64(
+        stats[wp.static(STAT_CELL_CLAMPS)]
+    )
+    stats64[wp.static(STAT64_INVARIANT_VIOLATIONS)] = stats64[wp.static(STAT64_INVARIANT_VIOLATIONS)] + wp.int64(
+        stats[wp.static(STAT_VIOLATIONS)]
+    )
+    stats64[wp.static(STAT64_OUTRANKED_DISCARDS)] = stats64[wp.static(STAT64_OUTRANKED_DISCARDS)] + wp.int64(
+        stats[wp.static(STAT_OUTRANKED)]
+    )
+    stats64[wp.static(STAT64_INPUT_OVERFLOW_FRAMES)] = stats64[wp.static(STAT64_INPUT_OVERFLOW_FRAMES)] + wp.int64(
+        stats[wp.static(STAT_INPUT_OVERFLOWS)]
+    )
+    stats64[wp.static(STAT64_FALLBACK_FRAMES)] = stats64[wp.static(STAT64_FALLBACK_FRAMES)] + wp.int64(
+        stats[wp.static(STAT_FALLBACK_FRAMES)]
+    )
+    stats64[wp.static(STAT64_IDENTITY_FRAMES)] = stats64[wp.static(STAT64_IDENTITY_FRAMES)] + wp.int64(
+        stats[wp.static(STAT_IDENTITY_FRAMES)]
+    )
     if frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0:
         # Leave the raw counter untouched so the solver receives exactly what
         # an unreduced pipeline would deliver and overflow stays observable.
@@ -1539,7 +1587,6 @@ def _write_reduced_count_kernel(
     if frame_state[wp.static(FRAME_FALLBACK)] != 0:
         # Keep-all frames deliver the buffer untouched; the counter already
         # equals the kept count, so only the accounting runs.
-        wp.atomic_add(stats, wp.static(STAT_FALLBACK_FRAMES), 1)
         wp.atomic_max(stats, wp.static(STAT_CONTACTS_KEPT), work)
         stats64[wp.static(STAT64_SUM_CONTACTS_IN)] = stats64[wp.static(STAT64_SUM_CONTACTS_IN)] + wp.int64(work)
         stats64[wp.static(STAT64_SUM_CONTACTS_KEPT)] = stats64[wp.static(STAT64_SUM_CONTACTS_KEPT)] + wp.int64(work)
@@ -1615,24 +1662,25 @@ class BodyPairContactReducer:
         # Full-size gather scratch borrowed from the deterministic sorter (see
         # ContactSorter.borrow_full_scratch): the two stages run strictly
         # sequentially inside collide(), so sharing halves the pipeline's
-        # scratch footprint. Fields the sorter did not allocate are provisioned
-        # locally at construction; only the per-contact MATERIAL scratch stays
-        # lazy (it is needed solely for buffers with per-contact shape
-        # properties, and eager allocation would cost 12 B/contact for every
-        # pipeline that never uses them). Consequence: a per-contact-props
-        # buffer must see one warm-up collide before CUDA graph capture.
+        # scratch footprint. Deterministic reducer pipelines provision the
+        # sorter's material scratch eagerly so rich external Contacts remain
+        # aligned through the sort. Without borrowed material arrays, this
+        # reducer allocates its own lazily on first rich-buffer use. In either
+        # case the exact buffer must see a warm-up collide before capture.
         self._borrowed_scratch = borrowed_scratch
         self.verify = bool(verify)
-        # Whole-run telemetry accumulators; see stats() for the slot meanings.
+        # Telemetry storage: int32 watermarks/per-frame atomic scratch plus
+        # int64 lifetime totals; see stats() for the public meanings.
         self._stats = wp.zeros(STAT_COUNT, dtype=wp.int32, device=device)
         self._stats64 = wp.zeros(STAT64_COUNT, dtype=wp.int64, device=device)
         # Per-frame device state: validated work count + overflow/fallback
         # flags, reset by the preparation kernel each reduce.
         self._frame_state = wp.zeros(FRAME_STATE_COUNT, dtype=wp.int32, device=device)
         # One entry per (body pair, bin, cell) actually touched -- far fewer
-        # than contacts. Undersizing is safe: on a full table the insert
-        # kernels keep the contact unconditionally (fail open), so the factor
-        # trades memory for reduction coverage, never for dropped contacts.
+        # than contacts. Undersizing is safe: when a bounded probe cannot find
+        # or create an entry, the kernels keep the contact unconditionally
+        # (fail open), so the factor trades memory for reduction coverage,
+        # never for dropped contacts.
         self.hashtable = HashTable(max(1024, int(rigid_contact_max * hashtable_factor)), device=device)
         self.ht_values = wp.zeros(BODY_PAIR_REDUCTION_SLOTS * self.hashtable.capacity, dtype=wp.uint64, device=device)
         # Fixed launch width for every pass; the kernels grid-stride over the
@@ -1691,8 +1739,8 @@ class BodyPairContactReducer:
         # Preallocate the non-material scratch now: the pass promises CUDA
         # graph-capture compatibility, and a first-use allocation inside the
         # first captured reduce() would break that promise (and make
-        # describe() lie about the footprint until then). Material scratch
-        # stays lazy but size-checked in _ensure_scratch.
+        # describe() lie about the footprint until then). Locally owned
+        # material scratch stays lazy but size-checked in _ensure_scratch.
         self._ensure_scratch(False)
 
     def _ensure_scratch(self, need_material: bool):
@@ -2043,6 +2091,18 @@ class BodyPairContactReducer:
         """
         if self.hysteresis <= 0.0:
             return
+        if self.device.is_cuda and self.device.is_capturing:
+            current_stream_is_capturing = wp.get_stream(self.device).is_capturing
+            if world_mask is None or not isinstance(world_mask, wp.array):
+                raise RuntimeError(
+                    "reset_history() with None or a host mask mutates host-managed reducer state; "
+                    "call it when no CUDA graph capture is active on this device"
+                )
+            if not current_stream_is_capturing:
+                raise RuntimeError(
+                    "reset_history() cannot launch on one stream while another stream is capturing "
+                    "on this device; record the int32 device mask on the capturing stream"
+                )
         if world_mask is not None:
             if not isinstance(world_mask, wp.array):
                 host = np.asarray(world_mask)
@@ -2097,20 +2157,23 @@ class BodyPairContactReducer:
     def stats(self) -> dict:
         """Whole-run reduction telemetry (forces a device sync; read outside capture).
 
-        Every value is a whole-run accumulator -- a max watermark or a total --
-        never reset between steps, so one read at the end of a run characterizes
-        it. The three sizing watermarks exist so a scene that has outgrown its
-        provisioning says so instead of quietly reducing less well.
+        Every public value is a whole-run accumulator -- a max watermark or an
+        int64 total -- until :meth:`clear_stats` is called, so one read at the
+        end of a run characterizes it. The three sizing watermarks exist so a
+        scene that has outgrown its provisioning says so instead of quietly
+        reducing less well.
 
         Returns:
             ``invariant_violations``: disagreements found by the opt-in
             ``verify`` re-derivation (0 when verify is off).
-            ``failed_insertions``: group-table insertions that failed because
-            the hashtable was full.  Each one flags its WHOLE frame for the
-            deterministic keep-all fallback, so this counts trigger events,
-            not kept contacts (those frames' contacts appear in the sums and
-            ``fallback_frames``).  Sustained non-zero values mean the
-            ``hashtable_factor`` is too small for the scene.
+            ``probe_failures``: group-table insertions that could not find or
+            create their key within the bounded probe budget. Each one flags
+            its WHOLE frame for the deterministic keep-all fallback, so this
+            counts trigger events, not kept contacts. A failure can mean a full
+            table or a long hash cluster; sustained non-zero values usually
+            call for a larger ``hashtable_factor``, but inspect occupancy too.
+            ``failed_insertions`` is retained as a backwards-compatible alias
+            for the same value; it does not imply that the table was full.
             ``outranked_discards``: discarded contacts that out-rank their
             slot's recorded winner (verify mode only); non-zero means an atomic
             lost an update.
@@ -2134,8 +2197,9 @@ class BodyPairContactReducer:
             prefix contains holes, so no coherent in/kept pair exists).
             ``max_hashtable_entries`` / ``hashtable_capacity``: peak distinct
             (body pair, bin, cell) groups against the table that holds them.
-            ``hashtable_load``: the ratio of those two -- linear probing degrades
-            well past ~0.7, and 1.0 means entries were refused and kept open.
+            ``hashtable_load``: the ratio of those two -- linear probing
+            degrades well past ~0.7. Probe exhaustion may occur below 1.0 when
+            one collision cluster exceeds the bounded probe budget.
             ``input_overflow_frames``: frames whose narrow-phase output
             exceeded the buffer capacity; the reduction skipped those frames
             entirely and delivered the raw result (raise
@@ -2143,8 +2207,9 @@ class BodyPairContactReducer:
             kept watermark: their materialized prefix contains holes, so no
             meaningful kept count exists for them.
             ``fallback_frames``: frames that deterministically kept the whole
-            unreduced set because the group table budget was exceeded (raise
-            the hashtable factor).
+            unreduced set because a group key exhausted the bounded probe
+            budget. This can mean a full table or a long collision cluster;
+            inspect load and usually raise the hashtable factor.
             ``identity_frames``: frames where reduction provably removed
             nothing; a large fraction means this scene does not benefit from
             the feature and it should be disabled.
@@ -2153,19 +2218,21 @@ class BodyPairContactReducer:
         v = self._stats.numpy()
         v64 = self._stats64.numpy()
         entries = int(v[STAT_ENTRY_WATERMARK])
+        probe_failures = int(v64[STAT64_PROBE_FAILURES])
         return {
-            "invariant_violations": int(v[STAT_VIOLATIONS]),
-            "failed_insertions": int(v[STAT_FAIL_OPEN]),
-            "outranked_discards": int(v[STAT_OUTRANKED]),
-            "cell_clamp_events": int(v[STAT_CELL_CLAMPS]),
+            "invariant_violations": int(v64[STAT64_INVARIANT_VIOLATIONS]),
+            "probe_failures": probe_failures,
+            "failed_insertions": probe_failures,
+            "outranked_discards": int(v64[STAT64_OUTRANKED_DISCARDS]),
+            "cell_clamp_events": int(v64[STAT64_CELL_CLAMP_EVENTS]),
             "max_contacts_in": int(v[STAT_CONTACTS_IN]),
             "max_contacts_kept": int(v[STAT_CONTACTS_KEPT]),
             "max_hashtable_entries": entries,
             "hashtable_capacity": self.hashtable.capacity,
             "hashtable_load": entries / self.hashtable.capacity,
-            "input_overflow_frames": int(v[STAT_INPUT_OVERFLOWS]),
-            "fallback_frames": int(v[STAT_FALLBACK_FRAMES]),
-            "identity_frames": int(v[STAT_IDENTITY_FRAMES]),
+            "input_overflow_frames": int(v64[STAT64_INPUT_OVERFLOW_FRAMES]),
+            "fallback_frames": int(v64[STAT64_FALLBACK_FRAMES]),
+            "identity_frames": int(v64[STAT64_IDENTITY_FRAMES]),
             "total_frames": int(v64[STAT64_TOTAL_FRAMES]),
             "sum_contacts_in": int(v64[STAT64_SUM_CONTACTS_IN]),
             "sum_contacts_kept": int(v64[STAT64_SUM_CONTACTS_KEPT]),
@@ -2178,15 +2245,15 @@ class BodyPairContactReducer:
         ``clear_stats()`` would silently RECORD its zeroing into the graph and
         wipe telemetry on every replay.
         """
-        if self.device.is_cuda and wp.get_stream(self.device).is_capturing:
+        if self.device.is_cuda and self.device.is_capturing:
             raise RuntimeError(f"{what} is host-side telemetry; call it outside CUDA graph capture")
 
     def clear_stats(self):
         """Zero the whole-run telemetry accumulators (host-side, outside capture).
 
-        Lets long training runs isolate per-phase telemetry.  The watermark
-        and rare-event counters are int32; the frame and contact totals are
-        int64 and do not realistically wrap.
+        Lets long training runs isolate per-phase telemetry. Watermarks are
+        int32 because the underlying capacities/counts are int32; every
+        additive public counter is int64.
         """
         self._raise_if_capturing("clear_stats()")
         self._stats.zero_()
@@ -2195,10 +2262,11 @@ class BodyPairContactReducer:
     def describe(self) -> dict:
         """Currently allocated footprint of the pass: buffer bytes by role.
 
-        Mostly fixed at construction; the per-contact MATERIAL scratch is
-        provisioned on first use by a buffer with per-contact shape
-        properties, so ``gather_scratch_owned_bytes`` can grow once after
-        that first rich-buffer collide.
+        Mostly fixed at construction. When a deterministic sorter supplies
+        rich-schema scratch it is eagerly allocated and reported separately as
+        borrowed; otherwise this reducer provisions owned material scratch on
+        first use of a rich external buffer, so
+        ``gather_scratch_owned_bytes`` can grow once.
 
         Reported per role rather than as one total so an over-provisioned
         ``rigid_contact_max`` is distinguishable from the pass's own overhead;
@@ -2211,6 +2279,11 @@ class BodyPairContactReducer:
         for arr in (self._scratch or {}).values():
             if id(arr) not in borrowed_ids:
                 owned += arr.size * wp.types.type_size_in_bytes(arr.dtype)
+        borrowed = sum(
+            arr.size * wp.types.type_size_in_bytes(arr.dtype)
+            for arr in (self._borrowed_scratch or {}).values()
+            if arr.size > 0
+        )
         return {
             "rigid_contact_max": n,
             "hashtable_capacity": self.hashtable.capacity,
@@ -2227,4 +2300,5 @@ class BodyPairContactReducer:
                 + self.history_generation.size * 4
             ),
             "gather_scratch_owned_bytes": owned,
+            "gather_scratch_borrowed_bytes": borrowed,
         }

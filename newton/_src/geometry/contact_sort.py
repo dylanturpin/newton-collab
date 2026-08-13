@@ -380,7 +380,20 @@ class ContactSorter:
         n = self._capacity
         self._sort_and_permute(sort_keys, contact_count, device=device)
 
-        has_props = self._has_shape_props
+        # Scratch provisioning and the current buffer schema are separate.
+        # A reducer-enabled deterministic pipeline provisions material scratch
+        # so a later external rich Contacts buffer is safe, but its ordinary
+        # property-less buffer must not run an in-place permutation over the
+        # scratch placeholders themselves.
+        has_props = (
+            self._has_shape_props
+            and stiffness is not None
+            and damping is not None
+            and friction is not None
+            and stiffness.shape[0] > 0
+            and damping.shape[0] > 0
+            and friction.shape[0] > 0
+        )
         has_match = match_index is not None and match_index.shape[0] > 0
 
         data = _FullContactArrays()

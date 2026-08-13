@@ -1034,21 +1034,30 @@ class CollisionPipeline:
                 also required.  Known fidelity tradeoffs: the footprint hull is
                 sampled by six fixed directions, so support and tipping are
                 preserved only to scene-dependent sampling tolerances with
-                no shape-independent percentage (a densely populated
-                footprint loses at most ~13% of patch radius; a sparse hull
-                can lose the whole support of an unsampled direction) rather
-                than exactly, and
+                no shape-independent percentage (a regular circular example
+                has ~13% radial deficit halfway between samples, while a
+                sparse hull can lose the whole support of an unsampled
+                direction) rather than exactly, and
                 keeping rim extremes strengthens torsional (twist-about-
-                normal) friction -- measured 1.34x the uniform-pressure value
-                on a circular patch; elongated patches can be biased further.
-                With ``SolverXPBD`` at low iteration counts, reduced
-                curved-collider support can sustain a residual roll
-                oscillation (measured 1.17 rad/s tail-mean at 8 iterations on
-                a cylinder-row foot, decaying with iterations; FeatherPGS
-                settles the same scene to zero) -- prefer FeatherPGS for
-                curved feet or raise XPBD iterations.  Validate tipping- and
-                yaw-heavy motions before enabling in production.  Defaults to
-                ``False``.
+                normal) friction; the amount is footprint- and solver-
+                dependent (the theoretical all-load-at-rim value for a circle
+                is 1.5x its uniform-pressure torsion).
+                ``SolverXPBD`` rejects reduced buffers: it predicts body poses
+                before choosing active contacts, so a pre-prediction footprint
+                winner need not represent the contacts that become penetrating
+                at solve time. ``SolverFeatherPGS`` is the supported consumer.
+                Validate tipping- and yaw-heavy motions before enabling in
+                production.  For CUDA graph capture, first warm the exact
+                ``Contacts`` buffer with one ordinary collide.  Each
+                Warp-managed graph then strongly retains this pipeline and
+                that buffer through an exclusive writer lease.  Only one such
+                graph may be live for the buffer; destroy it before recapturing
+                or switching buffers, and serialize ordinary calls on this
+                pipeline with graph replay across streams. An unreduced-only
+                solver graph cannot coexist with a reducer writer for the same
+                buffer. The
+                :meth:`release_body_pair_reduction_capture` method validates
+                that no graph lease remains.  Defaults to ``False``.
             reduce_contacts_body_pairs_cell: Spatial cell edge [m] used to
                 subdivide each body pair + normal bin on the bin's face
                 plane; every cell keeps its own deepest contact and footprint
@@ -1073,11 +1082,13 @@ class CollisionPipeline:
                 restores exact memoryless selection.  Defaults to ``0.001``.
             reduce_contacts_body_pairs_hashtable_factor: Hashtable capacity for
                 the reduction's (body pair, bin, cell) groups, as a fraction of
-                ``rigid_contact_max``.  Undersizing cannot drop contacts: if
-                the budget is exceeded the whole frame deterministically keeps
-                the full unreduced set (counted in the reducer's
-                ``fallback_frames`` telemetry).  Raise it if that counter is
-                nonzero.  Defaults to ``0.25``.
+                ``rigid_contact_max``. Undersizing cannot drop contacts: if a
+                key cannot be found or created within the bounded probe budget,
+                the whole frame deterministically leaves the materialized
+                contact buffer unchanged (counted in ``fallback_frames``).
+                A failure can mean a full table or a long hash cluster; raise
+                the factor if failures recur, while also inspecting reported
+                occupancy. Defaults to ``0.25``.
 
         .. experimental::
 
@@ -1378,7 +1389,14 @@ class CollisionPipeline:
 
         self.requires_grad = requires_grad
         self.deterministic = deterministic
-        per_contact_props = self.narrow_phase.hydroelastic_sdf is not None
+        # A caller may supply an external Contacts buffer with per-contact
+        # properties even when this pipeline's ordinary contacts() buffer does
+        # not need them. Body-pair reduction explicitly supports that richer
+        # schema, so its deterministic sort scratch must be provisioned up
+        # front as well; otherwise geometry is permuted while the material
+        # triples stay behind and are subsequently compacted onto the wrong
+        # rows. The extra scratch remains opt-in with the reducer.
+        per_contact_props = self.narrow_phase.hydroelastic_sdf is not None or bool(reduce_contacts_body_pairs)
         if deterministic:
             with wp.ScopedDevice(device):
                 self._sort_key_array = wp.zeros(rigid_contact_max, dtype=wp.int64, device=device)
@@ -1445,6 +1463,32 @@ class CollisionPipeline:
             )
         else:
             self._body_pair_reducer = None
+        # A graph-owned lease retains this pipeline (and therefore every
+        # reducer array captured by its launches) plus the exact Contacts
+        # buffer.  Only one live writer graph is permitted: reducer history,
+        # telemetry, and the output buffer are stateful and cannot be replayed
+        # concurrently by independent graph executables.
+        self._body_pair_reduction_capture_tokens: set[object] = set()
+        self._captured_contacts: Contacts | None = None
+
+    def _acquire_contacts_graph_lease(self, token: object, contacts: Contacts, mode: str):
+        """Register a graph-owned reducer writer lease (Contacts callback)."""
+        if mode != "reduced_writer":
+            return
+        if self._captured_contacts is not None and self._captured_contacts is not contacts:
+            raise RuntimeError(
+                "reduce_contacts_body_pairs: one pipeline cannot bind different Contacts buffers into live CUDA graphs"
+            )
+        self._captured_contacts = contacts
+        self._body_pair_reduction_capture_tokens.add(token)
+
+    def _release_contacts_graph_lease(self, token: object, contacts: Contacts, mode: str):
+        """Drop one reducer writer token after its native graph is destroyed."""
+        if mode != "reduced_writer":
+            return
+        self._body_pair_reduction_capture_tokens.discard(token)
+        if not self._body_pair_reduction_capture_tokens:
+            self._captured_contacts = None
 
     def refresh_body_pair_reduction_groups(self):
         """Rebuild material-equivalence reduction groups from current materials.
@@ -1460,6 +1504,11 @@ class CollisionPipeline:
         """
         if self._body_pair_reducer is None:
             return
+        if self._body_pair_reducer.device.is_cuda and self._body_pair_reducer.device.is_capturing:
+            raise RuntimeError(
+                "refresh_body_pair_reduction_groups() mutates reducer topology; "
+                "call it when no CUDA graph capture is active on this device"
+            )
         shape_group, group_count = build_reduction_groups(self.model)
         if group_count > MAX_GROUP_ID + 1:
             raise ValueError(
@@ -1497,14 +1546,17 @@ class CollisionPipeline:
         """Whole-run telemetry of the body-pair contact reduction.
 
         Synchronizes the device; do not call during CUDA graph capture.  All
-        values are int (plus one float ratio), accumulated since construction
-        or the last :meth:`clear_body_pair_reduction_stats`:
+        values are int64 totals or int32 capacity watermarks (plus one float
+        ratio), accumulated since construction or the last
+        :meth:`clear_body_pair_reduction_stats`:
 
         * ``invariant_violations`` / ``outranked_discards`` -- certificate
           disagreements (verify mode only; any nonzero value is a bug).
-        * ``failed_insertions`` -- group-table insertions that failed because
-          the table was full; each flags its whole frame for the keep-all
-          fallback (trigger events, not kept contacts).
+        * ``probe_failures`` -- group-table keys that could not be found or
+          created within the bounded probe budget; each flags its whole frame
+          for the keep-all fallback (trigger events, not kept contacts). This
+          can mean a full table or a long hash cluster. ``failed_insertions``
+          remains a backwards-compatible alias for the same value.
         * ``cell_clamp_events`` -- contacts whose spatial cell hit the packed
           coordinate range.
         * ``max_contacts_in`` / ``max_contacts_kept`` -- independent peak
@@ -1531,9 +1583,9 @@ class CollisionPipeline:
     def clear_body_pair_reduction_stats(self):
         """Zero the reduction telemetry accumulators.
 
-        Host-side; call outside CUDA graph capture.  Lets long runs isolate
-        per-phase telemetry (the counters are int32 and otherwise accumulate
-        for the pipeline's lifetime).
+        Host-side; call outside CUDA graph capture. Lets long runs isolate
+        per-phase telemetry. Additive counters are int64; capacity watermarks
+        are int32 because the corresponding buffers and counts are int32.
 
         Raises:
             RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.
@@ -1543,35 +1595,44 @@ class CollisionPipeline:
         self._body_pair_reducer.clear_stats()
 
     def release_body_pair_reduction_capture(self):
-        """Release the reducer's captured-buffer binding.
+        """Confirm that all reducer graph leases have been released.
 
-        Capturing :meth:`collide` into a CUDA graph binds this pipeline's
-        reducer state to that exact ``Contacts`` buffer; every other buffer is
-        rejected while the binding is live, and the binding deliberately
-        survives the buffer's garbage collection.  Call this after the
-        captured graph is destroyed to move the pipeline to a new buffer.
-        Also clears the buffer's conservative may-contain-reduced marker when
-        the buffer is still alive.  No-op when nothing is bound.
+        A captured graph owns a strong, exclusive writer lease on this pipeline
+        and its exact ``Contacts`` buffer.  Destruction of the graph releases
+        that lease automatically.  This method is a lifecycle check:
+        call it after dropping *every* reference to the graph (including its
+        :class:`wp.ScopedCapture` object).  It raises rather than severing a
+        live graph from arrays the graph can still access.
+
+        The final lease release conservatively leaves
+        ``contacts.rigid_contacts_reduced`` true because the graph's final
+        replay may have left compacted rows.  A subsequent :meth:`Contacts.clear`
+        or ordinary Python-level :meth:`collide` establishes fresh provenance.
 
         Raises:
             RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.
         """
         if self._body_pair_reducer is None:
             raise RuntimeError("reduce_contacts_body_pairs is not enabled on this pipeline")
-        bound = getattr(self, "_captured_contacts_ref", None)
-        if bound is not None:
-            target = bound()
-            if target is not None:
-                target.rigid_contacts_reduced_capture = False
-            self._captured_contacts_ref = None
+        if self._body_pair_reducer.device.is_cuda and self._body_pair_reducer.device.is_capturing:
+            raise RuntimeError(
+                "release_body_pair_reduction_capture() is host-side lifecycle mutation; "
+                "call it when no CUDA graph capture is active on this device"
+            )
+        if self._body_pair_reduction_capture_tokens:
+            raise RuntimeError(
+                "cannot release body-pair reduction capture while a CUDA graph is still live; "
+                "drop every graph and ScopedCapture reference first"
+            )
+        self._captured_contacts = None
 
     def body_pair_reduction_description(self) -> dict:
         """Currently allocated buffer footprint of the body-pair contact reduction by role.
 
-        Mostly fixed at construction; the per-contact material scratch is
-        provisioned on the first collide of a buffer with per-contact shape
-        properties, so the reported total can grow once after that first
-        rich-buffer use.
+        Mostly fixed at construction. In deterministic mode the reducer borrows
+        the sorter's eagerly provisioned rich-schema scratch; otherwise its
+        owned material scratch is provisioned on first use of a rich external
+        buffer and the reported owned total can grow once.
 
         Raises:
             RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.
@@ -1715,21 +1776,38 @@ class CollisionPipeline:
             #   * a buffer must be warmed up (one ordinary collide) before
             #     capture, so the history reset and lazy allocations are
             #     never recorded into the graph;
-            #   * the binding survives the buffer's garbage collection (a
-            #     dead weakref proves nothing about the CUDA graph's
-            #     lifetime); release_body_pair_reduction_capture() is the
-            #     only way out.
-            bound = getattr(self, "_captured_contacts_ref", None)
-            if bound is not None and bound() is not contacts:
+            #   * the one permitted live writer graph strongly owns the
+            #     pipeline and buffer, and its lease is released only when
+            #     that graph is destroyed.
+            bound = self._captured_contacts
+            if bound is not None and bound is not contacts:
                 raise RuntimeError(
                     "reduce_contacts_body_pairs: this pipeline's reducer state is bound to the "
                     "Contacts buffer it captured in a CUDA graph; using any other buffer would "
                     "corrupt the hysteresis state the graph replays against. Use one pipeline "
-                    "per captured buffer, or call release_body_pair_reduction_capture() after "
-                    "destroying the graph."
+                    "per captured buffer, or destroy every graph that captured this pipeline "
+                    "before switching buffers."
+                )
+            if contacts._has_unreduced_solver_graph_lease:
+                raise RuntimeError(
+                    "reduce_contacts_body_pairs cannot write this Contacts buffer while a CUDA graph "
+                    "for an unsupported solver is live; destroy every reference to that solver graph first"
                 )
             device = self._body_pair_reducer.device
-            if device.is_cuda and wp.get_stream(device).is_capturing:
+            graph = contacts._current_warp_capture_graph()
+            current_stream_is_capturing = graph is not None
+            if device.is_cuda and device.is_capturing and not current_stream_is_capturing:
+                if wp.get_stream(device).is_capturing:
+                    raise RuntimeError(
+                        "reduce_contacts_body_pairs requires CUDA capture to be registered with Warp "
+                        "so the graph can own its Contacts lease; wrap an external capture with "
+                        "wp.capture_begin(external=True)"
+                    )
+                raise RuntimeError(
+                    "reduce_contacts_body_pairs cannot mutate shared reducer state on one stream "
+                    "while another stream is capturing on this device"
+                )
+            if current_stream_is_capturing:
                 last = getattr(self, "_last_contacts_ref", None)
                 if last is None or last() is not contacts:
                     raise RuntimeError(
@@ -1738,14 +1816,7 @@ class CollisionPipeline:
                         "the hysteresis history reset (and any lazy allocation) into the "
                         "graph, repeating them on every replay."
                     )
-                if bound is None:
-                    self._captured_contacts_ref = weakref.ref(contacts)
-                    # Replay is invisible to host-side provenance, so from now
-                    # on this buffer may contain reduced contacts at any moment
-                    # regardless of what last stamped it; the sticky marker
-                    # keeps unsupported solvers rejecting it (see
-                    # SolverBase._require_unreduced_contacts) until release.
-                    contacts.rigid_contacts_reduced_capture = True
+                contacts._acquire_graph_lease(graph, "reduced_writer", self)
 
         # Keep the buffer's full-surface capability marker in sync with this pipeline on every call.
         # collide() may be handed a Contacts created elsewhere (or by a flag-off pipeline); the edge/

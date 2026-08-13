@@ -373,23 +373,31 @@ class SolverBase:
         """Raise if ``contacts`` was compacted by body-pair reduction.
 
         Call at the top of :meth:`step` in solvers that have not been
-        conformance-tested against reduced contact buffers.
+        conformance-tested against reduced contact buffers.  During Warp CUDA
+        capture, a graph-owned reader lease also prevents a reducer pipeline
+        from compacting this buffer for as long as the captured solver graph
+        can be replayed.  The graph retains both the solver and Contacts arrays
+        that its recorded launches reference.
         """
-        if (
-            contacts is not None
-            and (
-                getattr(contacts, "rigid_contacts_reduced", False)
-                # sticky: a buffer captured into a reducer graph may be
-                # re-reduced by any replay, invisibly to the per-collide marker
-                or getattr(contacts, "rigid_contacts_reduced_capture", False)
-            )
-            and not type(self).supports_reduced_contacts
+        if contacts is None or type(self).supports_reduced_contacts:
+            return
+        if getattr(contacts, "rigid_contacts_reduced", False) or getattr(
+            contacts, "rigid_contacts_reduced_capture", False
         ):
             raise ValueError(
                 f"{type(self).__name__} is not validated for body-pair-reduced contacts; "
                 "disable CollisionPipeline(reduce_contacts_body_pairs=True) or use a solver "
                 "with supports_reduced_contacts=True"
             )
+        graph = contacts._current_warp_capture_graph()
+        if graph is None and contacts.device.is_cuda and wp.get_stream(contacts.device).is_capturing:
+            raise RuntimeError(
+                "capturing an unreduced-only solver requires a Warp-managed CUDA graph on the "
+                "current stream so Newton can retain and protect its Contacts buffer; wrap an "
+                "external capture with wp.capture_begin(external=True)"
+            )
+        if graph is not None:
+            contacts._acquire_graph_lease(graph, "unreduced_reader", self)
 
     def step(
         self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float
