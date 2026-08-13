@@ -1417,6 +1417,8 @@ class CollisionPipeline:
                 device,
                 shape_group=shape_group,
                 up_axis=int(getattr(model, "up_axis", 2)),
+                shape_world=(model.shape_world.numpy() if getattr(model, "shape_world", None) is not None else None),
+                world_count=max(int(getattr(model, "world_count", 1)), 1),
                 borrowed_scratch=(self._contact_sorter.borrow_full_scratch() if self._contact_sorter else None),
                 verify=reduce_contacts_body_pairs_verify,
                 hysteresis=reduce_contacts_body_pairs_hysteresis,
@@ -1425,17 +1427,26 @@ class CollisionPipeline:
         else:
             self._body_pair_reducer = None
 
-    def reset_body_pair_reduction_history(self):
+    def reset_body_pair_reduction_history(self, world_mask=None):
         """Erase the body-pair reduction's hysteresis history.
 
         With ``reduce_contacts_body_pairs_hysteresis > 0`` the pipeline carries
         last step's slot winners between :meth:`collide` calls.  Call this at
         episode resets, teleports, or scene reloads so no incumbency bonus
-        crosses trajectory boundaries.  Host-side; call outside CUDA graph
-        capture.  No-op when reduction or hysteresis is disabled.
+        crosses trajectory boundaries.  No-op when reduction or hysteresis is
+        disabled.
+
+        Args:
+            world_mask: ``None`` erases everything (host-side; call outside
+                CUDA graph capture).  Otherwise an int32 device array of length
+                ``model.world_count`` whose nonzero entries select the worlds
+                to reset -- a single fixed-size kernel launch that may be
+                recorded inside a CUDA graph with the caller rewriting the
+                mask buffer each step, for per-environment resets in
+                vectorized RL.
         """
         if self._body_pair_reducer is not None:
-            self._body_pair_reducer.reset_history()
+            self._body_pair_reducer.reset_history(world_mask)
 
     def body_pair_reduction_stats(self) -> dict:
         """Whole-run telemetry of the body-pair contact reduction.

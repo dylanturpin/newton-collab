@@ -697,8 +697,11 @@ def _detect_noop_kernel(
 def _incumbent_mask(
     key: wp.uint64,
     pos_key: wp.uint64,
+    world: int,
     prev_keys: wp.array[wp.uint64],
     prev_winner_pos: wp.array[wp.uint32],
+    prev_generation: wp.array[wp.int32],
+    history_generation: wp.array[wp.int32],
 ) -> int:
     """Return the bitmask of slots this contact won on the PREVIOUS step.
 
@@ -713,7 +716,9 @@ def _incumbent_mask(
     """
     mask = int(0)
     prev_entry = _bp_find(key, prev_keys)
-    if prev_entry >= 0:
+    # A stale generation means the contact's world was reset after the
+    # snapshot: its recorded winners belong to a severed trajectory.
+    if prev_entry >= 0 and prev_generation[prev_entry] == history_generation[world]:
         me = wp.uint32(pos_key)
         for slot in range(wp.static(BODY_PAIR_REDUCTION_SLOTS)):
             if prev_winner_pos[_slot_index(prev_entry, slot)] == me:
@@ -760,17 +765,39 @@ def _clear_prev_snapshot_kernel(
 
 
 @wp.kernel(enable_backward=False)
+def _bump_generations_kernel(
+    world_mask: wp.array[wp.int32],
+    # in/out
+    history_generation: wp.array[wp.int32],
+):
+    """Advance the history generation of every masked world.
+
+    Entries snapshotted under an older generation stop matching contacts from
+    that world (see :func:`_incumbent_mask`), which severs hysteresis history
+    for exactly the selected worlds -- the per-world reset vectorized RL needs
+    when individual environments teleport mid-rollout.  Fixed-size launch over
+    device buffers, so it may be recorded inside a CUDA graph with the caller
+    updating the mask buffer each step.
+    """
+    w = wp.tid()
+    if w < world_mask.shape[0] and world_mask[w] != 0:
+        history_generation[w] = history_generation[w] + 1
+
+
+@wp.kernel(enable_backward=False)
 def _snapshot_prev_kernel(
     ht_keys: wp.array[wp.uint64],
     ht_active_slots: wp.array[wp.int32],
     ht_values: wp.array[wp.uint64],
     ht_capacity: int,
     frame_state: wp.array[wp.int32],
+    entry_generation: wp.array[wp.int32],
     num_threads: int,
     # outputs
     prev_keys: wp.array[wp.uint64],
     prev_winner_pos: wp.array[wp.uint32],
     prev_active_slots: wp.array[wp.int32],
+    prev_generation: wp.array[wp.int32],
 ):
     """Snapshot last step's winners before the live table is cleared.
 
@@ -793,6 +820,7 @@ def _snapshot_prev_kernel(
         entry_idx = ht_active_slots[t]
         prev_active_slots[t] = entry_idx
         prev_keys[entry_idx] = ht_keys[entry_idx]
+        prev_generation[entry_idx] = entry_generation[entry_idx]
         for slot in range(wp.static(BODY_PAIR_REDUCTION_SLOTS)):
             idx = _slot_index(entry_idx, slot)
             prev_winner_pos[idx] = wp.uint32(ht_values[idx] & wp.uint64(0x7FFFFFFF))
@@ -812,6 +840,7 @@ def _register_contact_one(
     body_q: wp.array[wp.transform],
     shape_body: wp.array[wp.int32],
     shape_group: wp.array[wp.int32],
+    shape_world: wp.array[wp.int32],
     up_rotation: wp.mat33,
     cell_size: float,
     ht_keys: wp.array[wp.uint64],
@@ -820,6 +849,9 @@ def _register_contact_one(
     hysteresis: float,
     prev_keys: wp.array[wp.uint64],
     prev_winner_pos: wp.array[wp.uint32],
+    prev_generation: wp.array[wp.int32],
+    history_generation: wp.array[wp.int32],
+    entry_generation: wp.array[wp.int32],
     frame_state: wp.array[wp.int32],
     keep_flags: wp.array[wp.int32],
     contact_entry: wp.array[wp.int32],
@@ -883,7 +915,14 @@ def _register_contact_one(
     pos_key = _pos_key_31(pos_2d)
     mask = int(0)
     if hysteresis > 0.0:
-        mask = _incumbent_mask(key, pos_key, prev_keys, prev_winner_pos)
+        # A contact's world is its dynamic side's world; statics are -1.
+        world = wp.max(wp.max(shape_world[contact_shape0[i]], shape_world[contact_shape1[i]]), 0)
+        # Stamp the entry with its world's CURRENT generation at the moment
+        # the winners are recorded -- stamping at snapshot time instead would
+        # re-stamp pre-reset winners with the post-reset generation and undo
+        # the reset.
+        entry_generation[entry_idx] = history_generation[world]
+        mask = _incumbent_mask(key, pos_key, world, prev_keys, prev_winner_pos, prev_generation, history_generation)
         contact_incumbent[i] = mask
 
     depth_value = _pack_score(_biased_primary(-gap, hysteresis, mask, wp.static(DEEPEST_SLOT)), pos_key)
@@ -912,6 +951,7 @@ def _register_contacts_kernel(
     body_q: wp.array[wp.transform],
     shape_body: wp.array[wp.int32],
     shape_group: wp.array[wp.int32],
+    shape_world: wp.array[wp.int32],
     up_rotation: wp.mat33,
     cell_size: float,
     ht_keys: wp.array[wp.uint64],
@@ -920,6 +960,9 @@ def _register_contacts_kernel(
     hysteresis: float,
     prev_keys: wp.array[wp.uint64],
     prev_winner_pos: wp.array[wp.uint32],
+    prev_generation: wp.array[wp.int32],
+    history_generation: wp.array[wp.int32],
+    entry_generation: wp.array[wp.int32],
     frame_state: wp.array[wp.int32],
     num_threads: int,
     # outputs
@@ -953,6 +996,7 @@ def _register_contacts_kernel(
             body_q,
             shape_body,
             shape_group,
+            shape_world,
             up_rotation,
             cell_size,
             ht_keys,
@@ -961,6 +1005,9 @@ def _register_contacts_kernel(
             hysteresis,
             prev_keys,
             prev_winner_pos,
+            prev_generation,
+            history_generation,
+            entry_generation,
             frame_state,
             keep_flags,
             contact_entry,
@@ -1456,6 +1503,8 @@ class BodyPairContactReducer:
         borrowed_scratch: dict | None = None,
         verify: bool = False,
         hysteresis: float = 0.001,
+        shape_world=None,
+        world_count: int = 1,
     ):
         self.rigid_contact_max = rigid_contact_max
         self.cell_size = float(cell_size)
@@ -1516,17 +1565,33 @@ class BodyPairContactReducer:
         # capture. Zero-length when hysteresis is off: the kernels take the
         # arrays unconditionally but only touch them behind a hysteresis > 0
         # guard.
+        self.world_count = max(int(world_count), 1)
         if self.hysteresis > 0.0:
             cap = self.hashtable.capacity
             self.prev_keys = wp.full(cap, _HASHTABLE_EMPTY_KEY_VALUE, dtype=wp.uint64, device=device)
             self.prev_winner_pos = wp.zeros(BODY_PAIR_REDUCTION_SLOTS * cap, dtype=wp.uint32, device=device)
             self.prev_active_slots = wp.zeros(cap + 1, dtype=wp.int32, device=device)
             self.contact_incumbent = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
+            # Per-world history generations: a snapshot entry only grants
+            # incumbency while its stamped generation matches its world's
+            # current one, so bumping a world's generation severs history for
+            # exactly that world (see reset_history / _bump_generations_kernel).
+            self.history_generation = wp.zeros(self.world_count, dtype=wp.int32, device=device)
+            self.prev_generation = wp.zeros(cap, dtype=wp.int32, device=device)
+            self.entry_generation = wp.zeros(cap, dtype=wp.int32, device=device)
+            if shape_world is not None:
+                self.shape_world = wp.array(shape_world, dtype=wp.int32, device=device)
+            else:
+                self.shape_world = wp.zeros(len(shape_group), dtype=wp.int32, device=device)
         else:
             self.prev_keys = wp.zeros(0, dtype=wp.uint64, device=device)
             self.prev_winner_pos = wp.zeros(0, dtype=wp.uint32, device=device)
             self.prev_active_slots = wp.zeros(0, dtype=wp.int32, device=device)
             self.contact_incumbent = wp.zeros(0, dtype=wp.int32, device=device)
+            self.history_generation = wp.zeros(1, dtype=wp.int32, device=device)
+            self.prev_generation = wp.zeros(0, dtype=wp.int32, device=device)
+            self.entry_generation = wp.zeros(0, dtype=wp.int32, device=device)
+            self.shape_world = wp.zeros(len(shape_group), dtype=wp.int32, device=device)
         self._scratch = None
 
     def _ensure_scratch(self, need_material: bool):
@@ -1603,9 +1668,10 @@ class BodyPairContactReducer:
                     self.ht_values,
                     self.hashtable.capacity,
                     self._frame_state,
+                    self.entry_generation,
                     self.entry_stride_threads,
                 ],
-                outputs=[self.prev_keys, self.prev_winner_pos, self.prev_active_slots],
+                outputs=[self.prev_keys, self.prev_winner_pos, self.prev_active_slots, self.prev_generation],
                 device=self.device,
                 record_tape=False,
             )
@@ -1652,6 +1718,7 @@ class BodyPairContactReducer:
             state.body_q,
             model.shape_body,
             self.shape_group,
+            self.shape_world,
             self.up_rotation,
         ]
         wp.launch(
@@ -1666,6 +1733,9 @@ class BodyPairContactReducer:
                 self.hysteresis,
                 self.prev_keys,
                 self.prev_winner_pos,
+                self.prev_generation,
+                self.history_generation,
+                self.entry_generation,
                 self._frame_state,
                 self.stride_threads,
             ],
@@ -1842,17 +1912,46 @@ class BodyPairContactReducer:
             record_tape=False,
         )
 
-    def reset_history(self):
-        """Erase the hysteresis snapshot so no incumbency crosses this point.
+    def reset_history(self, world_mask=None):
+        """Erase hysteresis history globally or for selected worlds.
 
-        Call at episode/scene resets, teleports, or before replaying unrelated
-        states through one pipeline: the previous-winner snapshot is trajectory
-        state, and a 1 mm incumbency bonus inherited from an unrelated
-        trajectory is a (bounded) bias the caller never asked for.  Host-side;
-        call OUTSIDE CUDA graph capture.  The first collide after a reset
-        produces zero incumbent masks and matches a fresh pipeline exactly.
-        No-op when hysteresis is disabled.
+        The previous-winner snapshot is trajectory state, and a 1 mm incumbency
+        bonus inherited from an unrelated trajectory is a (bounded) bias the
+        caller never asked for -- sever it at episode resets, teleports, or
+        before replaying unrelated states.
+
+        Args:
+            world_mask: ``None`` erases everything (host-side; call OUTSIDE
+                CUDA graph capture).  Otherwise an int32 device array of
+                length ``world_count`` whose nonzero entries select worlds to
+                reset: their history generations advance, so snapshot entries
+                stamped earlier stop granting incumbency in exactly those
+                worlds.  This form is one fixed-size launch over device
+                buffers and MAY be recorded inside a CUDA graph, with the
+                caller rewriting the mask buffer each step -- the vectorized-RL
+                per-environment reset.
+
+        The first collide after a reset produces zero incumbent masks for the
+        affected worlds and matches a fresh pipeline exactly.  No-op when
+        hysteresis is disabled.
         """
+        if self.hysteresis <= 0.0:
+            return
+        if world_mask is not None:
+            mask = (
+                world_mask
+                if isinstance(world_mask, wp.array)
+                else wp.array(world_mask, dtype=wp.int32, device=self.device)
+            )
+            wp.launch(
+                _bump_generations_kernel,
+                dim=self.world_count,
+                inputs=[mask],
+                outputs=[self.history_generation],
+                device=self.device,
+                record_tape=False,
+            )
+            return
         if self.hysteresis > 0.0:
             self.prev_keys.fill_(_HASHTABLE_EMPTY_KEY_VALUE)
             self.prev_active_slots.zero_()
