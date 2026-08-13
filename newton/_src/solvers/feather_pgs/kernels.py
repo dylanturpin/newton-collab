@@ -693,14 +693,28 @@ def jcalc_integrate(
         # (p_s, r_s) track the child ANCHOR frame, so the lever to the COM must go through the
         # child anchor transform: with a non-identity X_cj the COM does not sit at
         # body_com[child] in anchor coordinates.
-        com_offset_world = wp.quat_rotate(r_s, wp.transform_point(wp.transform_inverse(X_cj), body_com[child]))
-        dpdt_s = v_com - wp.cross(w_s_integrate, com_offset_world)
+        r_ac = wp.transform_point(wp.transform_inverse(X_cj), body_com[child])
 
         drdt_s = wp.quat(w_s_integrate, 0.0) * r_s * 0.5
-
-        # new orientation (normalized)
-        p_s_new = p_s + dpdt_s * dt
         r_s_new = wp.normalize(r_s + drdt_s * dt)
+
+        if parent < 0:
+            # Reconstruct the root anchor from the integrated COM instead of
+            # advancing it with the linearized lever velocity: the COM is the
+            # point whose velocity the coordinate stores, so integrate it
+            # directly and place the anchor at x_com - R_new * r_ac.  A
+            # force-free COM then stays stationary to roundoff, where the
+            # linearized form (p += (v - w x R_old*r_ac) * dt) leaks
+            # omega * |r_ac| * dt of first-order truncation per step.
+            # SolverFeatherstone integrates body poses around the COM the
+            # same way.
+            x_com_new = p_s + wp.quat_rotate(r_s, r_ac) + v_com * dt
+            p_s_new = x_com_new - wp.quat_rotate(r_s_new, r_ac)
+        else:
+            # Descendant free joints keep the linearized relative update until
+            # the moving-parent-frame transport is derived.
+            dpdt_s = v_com - wp.cross(w_s_integrate, wp.quat_rotate(r_s, r_ac))
+            p_s_new = p_s + dpdt_s * dt
 
         if parent < 0:
             w_s = w_s * (1.0 - angular_damping * dt)
@@ -1318,31 +1332,30 @@ def dense_solve(
 
 
 @wp.func
-def _free_root_transport(
+def _free_root_dof_start(
     joint_type: wp.array[int],
     joint_parent: wp.array[int],
     joint_qd_start: wp.array[int],
     kinematic_joint_mask: wp.array[int],
-    joint_qd: wp.array[float],
     index: int,
 ):
-    """``omega x v`` for a dynamic free/distance ROOT joint, zero for every other joint.
+    """Dof start of a dynamic free/distance ROOT joint, ``-1`` for every other joint.
 
-    This is the transport term :func:`jcalc_integrate` adds to the root's linear
-    coordinate; the predictor and the velocity-to-acceleration conversion use it
-    to stay on the integrator's convention.
+    Eligibility is decided from joint metadata alone, never from the numeric
+    value of ``omega x v``: the cross product's forward value can be exactly
+    zero while its derivatives are not (at ``v = 0``, ``d(w x v)/dv != 0``),
+    so an early return keyed on the value would send Warp's autodiff down the
+    empty branch and drop the gradient.  Eligible joints own all six of their
+    dofs, so writing the three linear ones unconditionally races with nobody.
     """
     t = joint_type[index]
     if t != JointType.FREE and t != JointType.DISTANCE:
-        return wp.vec3()
+        return -1
     if joint_parent[index] >= 0:
-        return wp.vec3()
+        return -1
     if kinematic_joint_mask[index] != 0:
-        return wp.vec3()
-    d = joint_qd_start[index]
-    v = wp.vec3(joint_qd[d + 0], joint_qd[d + 1], joint_qd[d + 2])
-    w = wp.vec3(joint_qd[d + 3], joint_qd[d + 4], joint_qd[d + 5])
-    return wp.cross(w, v)
+        return -1
+    return joint_qd_start[index]
 
 
 @wp.kernel
@@ -1364,12 +1377,12 @@ def apply_free_root_transport_to_predictor(
     COM velocity the integrator never produces, off by ``dt * (omega x v)``.
     """
     index = wp.tid()
-    c = _free_root_transport(joint_type, joint_parent, joint_qd_start, kinematic_joint_mask, joint_qd, index)
-    # zero for every non-target joint; writing even a +0 to d+1/d+2 would race
-    # with the joints that own those dofs
-    if wp.length_sq(c) == 0.0:
+    d = _free_root_dof_start(joint_type, joint_parent, joint_qd_start, kinematic_joint_mask, index)
+    if d < 0:
         return
-    d = joint_qd_start[index]
+    v = wp.vec3(joint_qd[d + 0], joint_qd[d + 1], joint_qd[d + 2])
+    w = wp.vec3(joint_qd[d + 3], joint_qd[d + 4], joint_qd[d + 5])
+    c = wp.cross(w, v)
     v_hat[d + 0] = v_hat[d + 0] + c[0] * dt
     v_hat[d + 1] = v_hat[d + 1] + c[1] * dt
     v_hat[d + 2] = v_hat[d + 2] + c[2] * dt
@@ -1393,12 +1406,12 @@ def remove_free_root_transport_from_qdd(
     in the contact-free case recovers the dynamics' own ``qdd`` bit for bit.
     """
     index = wp.tid()
-    c = _free_root_transport(joint_type, joint_parent, joint_qd_start, kinematic_joint_mask, joint_qd, index)
-    # zero for every non-target joint; writing even a -0 to d+1/d+2 would race
-    # with the joints that own those dofs
-    if wp.length_sq(c) == 0.0:
+    d = _free_root_dof_start(joint_type, joint_parent, joint_qd_start, kinematic_joint_mask, index)
+    if d < 0:
         return
-    d = joint_qd_start[index]
+    v = wp.vec3(joint_qd[d + 0], joint_qd[d + 1], joint_qd[d + 2])
+    w = wp.vec3(joint_qd[d + 3], joint_qd[d + 4], joint_qd[d + 5])
+    c = wp.cross(w, v)
     joint_qdd[d + 0] = joint_qdd[d + 0] - c[0]
     joint_qdd[d + 1] = joint_qdd[d + 1] - c[1]
     joint_qdd[d + 2] = joint_qdd[d + 2] - c[2]
