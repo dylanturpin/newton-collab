@@ -1481,12 +1481,14 @@ class CollisionPipeline:
 
         Args:
             world_mask: ``None`` erases everything (host-side; call outside
-                CUDA graph capture).  Otherwise an int32 device array of length
-                ``model.world_count`` whose nonzero entries select the worlds
-                to reset -- a single fixed-size kernel launch that may be
-                recorded inside a CUDA graph with the caller rewriting the
-                mask buffer each step, for per-environment resets in
-                vectorized RL.
+                CUDA graph capture).  Otherwise a length-``model.world_count``
+                1-D mask whose nonzero entries select the worlds to reset:
+                either an int32 device array -- a single fixed-size kernel
+                launch that may be recorded inside a CUDA graph with the
+                caller rewriting the mask buffer each step, for
+                per-environment resets in vectorized RL -- or a host integer
+                array (any integer width; nonzero selects), which is
+                normalized and uploaded and must stay outside capture.
         """
         if self._body_pair_reducer is not None:
             self._body_pair_reducer.reset_history(world_mask)

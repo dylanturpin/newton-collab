@@ -2044,6 +2044,13 @@ class BodyPairContactReducer:
                     # Converting floats through wp.array would silently
                     # truncate (0.5 -> 0) and turn the reset into a no-op.
                     raise ValueError(f"world_mask must be an integer array, got dtype {host.dtype}")
+                # Validate shape BEFORE the device allocation: a malformed
+                # (e.g. huge) host mask must be rejected without first
+                # allocating and transferring GPU memory for it.
+                if host.ndim != 1 or host.shape[0] != self.world_count:
+                    raise ValueError(
+                        f"world_mask must be a 1-D array of length {self.world_count}, got shape {host.shape}"
+                    )
                 # Normalize nonzero -> 1 BEFORE the int32 conversion: a wide
                 # nonzero value like uint64(2**32) truncates to int32(0) and
                 # would silently deselect its world.
