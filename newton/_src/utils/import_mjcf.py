@@ -1716,6 +1716,9 @@ def parse_mjcf(
                                 f"but actuatorfrclimited='{actuatorfrclimited}'. Force clamping will be disabled."
                             )
 
+                spring_ref = parse_float(joint_attrib, "springref", 0.0)
+                if is_angular and use_degrees:
+                    spring_ref = np.deg2rad(spring_ref)
                 ax = ModelBuilder.JointDofConfig(
                     axis=axis_vec,
                     limit_lower=limit_lower,
@@ -1725,6 +1728,8 @@ def parse_mjcf(
                     target_ke=default_joint_target_ke,
                     target_kd=default_joint_target_kd,
                     damping=parse_float(joint_attrib, "damping", default_joint_damping),
+                    spring_stiffness=parse_float(joint_attrib, "stiffness", 0.0),
+                    spring_ref=spring_ref,
                     armature=joint_armature[-1],
                     friction=parse_float(joint_attrib, "frictionloss", 0.0),
                     effort_limit=effort_limit,

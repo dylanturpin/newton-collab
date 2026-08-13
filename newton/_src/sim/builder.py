@@ -701,6 +701,8 @@ class ModelBuilder:
             target_ke: float = 0.0,
             target_kd: float = 0.0,
             damping: float = 0.0,
+            spring_stiffness: float = 0.0,
+            spring_ref: float = 0.0,
             armature: float = 0.0,
             effort_limit: float = 1e6,
             velocity_limit: float = 1e6,
@@ -730,6 +732,12 @@ class ModelBuilder:
             """The derivative gain of the target drive PD controller. Defaults to 0.0."""
             self.damping = damping
             """Passive velocity damping [N·s/m or N·m·s/rad, depending on joint type] that is always active. Defaults to 0.0."""
+            self.spring_stiffness = spring_stiffness
+            """Passive spring stiffness [N/m or N·m/rad, depending on joint type] that is always active,
+            applying ``spring_stiffness * (spring_ref - q)``. Defaults to 0.0 (no spring)."""
+            self.spring_ref = spring_ref
+            """Passive spring reference (rest) position [m or rad, depending on joint type]. May lie outside
+            the joint limits to preload the joint against a limit. Defaults to 0.0."""
             self.armature = armature
             """Artificial inertia added around the joint axis [kg·m² or kg]. Defaults to 0."""
             self.effort_limit = effort_limit
@@ -1400,6 +1408,10 @@ class ModelBuilder:
         """Joint velocity limits accumulated for :attr:`Model.joint_velocity_limit`."""
         self.joint_friction: list[float] = []
         """Joint friction values accumulated for :attr:`Model.joint_friction`."""
+        self.joint_spring_stiffness: list[float] = []
+        """Passive joint spring stiffness values accumulated for :attr:`Model.joint_spring_stiffness`."""
+        self.joint_spring_ref: list[float] = []
+        """Passive joint spring reference positions accumulated for :attr:`Model.joint_spring_ref`."""
 
         self.joint_twist_lower: list[float] = []
         """Lower twist limits accumulated for :attr:`Model.joint_twist_lower`."""
@@ -4536,6 +4548,8 @@ class ModelBuilder:
             self.joint_effort_limit.append(dim.effort_limit)
             self.joint_velocity_limit.append(dim.velocity_limit)
             self.joint_friction.append(dim.friction)
+            self.joint_spring_stiffness.append(dim.spring_stiffness)
+            self.joint_spring_ref.append(dim.spring_ref)
             if np.isfinite(dim.limit_lower):
                 self.joint_limit_lower.append(dim.limit_lower)
             else:
@@ -5999,7 +6013,7 @@ class ModelBuilder:
         self.joint_coord_count = len(self.joint_q)
 
         # Trim per-DOF arrays that were not cleared/rebuilt above
-        for attr_name in ("joint_velocity_limit", "joint_friction"):
+        for attr_name in ("joint_velocity_limit", "joint_friction", "joint_spring_stiffness", "joint_spring_ref"):
             arr = getattr(self, attr_name)
             if len(arr) > self.joint_dof_count:
                 setattr(self, attr_name, arr[: self.joint_dof_count])
@@ -10475,6 +10489,8 @@ class ModelBuilder:
                 ("joint_effort_limit", self.joint_effort_limit),
                 ("joint_velocity_limit", self.joint_velocity_limit),
                 ("joint_friction", self.joint_friction),
+                ("joint_spring_stiffness", self.joint_spring_stiffness),
+                ("joint_spring_ref", self.joint_spring_ref),
                 ("joint_target_mode", self.joint_target_mode),
             ]
             for name, arr in dof_arrays:
@@ -11828,6 +11844,10 @@ class ModelBuilder:
             m.joint_effort_limit = wp.array(self.joint_effort_limit, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_velocity_limit = wp.array(self.joint_velocity_limit, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_friction = wp.array(self.joint_friction, dtype=wp.float32, requires_grad=requires_grad)
+            m.joint_spring_stiffness = wp.array(
+                self.joint_spring_stiffness, dtype=wp.float32, requires_grad=requires_grad
+            )
+            m.joint_spring_ref = wp.array(self.joint_spring_ref, dtype=wp.float32, requires_grad=requires_grad)
 
             m.joint_limit_lower = wp.array(self.joint_limit_lower, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_limit_upper = wp.array(self.joint_limit_upper, dtype=wp.float32, requires_grad=requires_grad)
