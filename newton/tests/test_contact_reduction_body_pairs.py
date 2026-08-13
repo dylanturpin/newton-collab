@@ -1154,6 +1154,72 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         )
         self.assertGreaterEqual(pipeline.body_pair_reduction_stats()["identity_frames"], 1)
 
+    def test_stats_totals_give_achieved_ratio(self):
+        """Accumulate paired frame totals that yield the achieved reduction ratio.
+
+        The max watermarks are independent and cannot form a ratio; the sums
+        are paired per frame, so on a statically reducing scene the achieved
+        ratio is exact: total_frames counts every collide, sum_contacts_in is
+        frame-count times the (deterministic) input count, and kept stays
+        strictly below in.  Clearing resets every accumulator, including the
+        64-bit ones.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (0.0, 0.0, 0.0175))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        for _ in range(4):
+            pipeline.collide(state, contacts)
+        stats = pipeline.body_pair_reduction_stats()
+        self.assertEqual(stats["total_frames"], 4)
+        self.assertEqual(stats["sum_contacts_in"], 4 * stats["max_contacts_in"])
+        self.assertGreater(stats["sum_contacts_kept"], 0)
+        self.assertLessEqual(stats["sum_contacts_kept"], 4 * stats["max_contacts_kept"])
+        self.assertLess(stats["sum_contacts_kept"], stats["sum_contacts_in"], "cylinder foot must reduce")
+        pipeline.clear_body_pair_reduction_stats()
+        cleared = pipeline.body_pair_reduction_stats()
+        for key in (
+            "total_frames",
+            "sum_contacts_in",
+            "sum_contacts_kept",
+            "max_contacts_in",
+            "max_contacts_kept",
+            "failed_insertions",
+            "identity_frames",
+        ):
+            self.assertEqual(cleared[key], 0, f"{key} survived clear")
+
+    def test_telemetry_rejected_during_capture(self):
+        """Reject stats reads and clears while a CUDA graph capture is active.
+
+        stats() would die on its device sync anyway, but cryptically;
+        clear_stats() would silently record its zeroing into the graph and
+        wipe telemetry on every replay.  Skipped on CPU devices.
+        """
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device")
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        _cylinder_foot(builder, (0.0, 0.0, 0.0175))
+        builder.add_ground_plane()
+        model = builder.finalize(device=device)
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)  # warm-up
+        capture = wp.ScopedCapture(device)
+        capture.__enter__()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "outside CUDA graph capture"):
+                pipeline.body_pair_reduction_stats()
+            with self.assertRaisesRegex(RuntimeError, "outside CUDA graph capture"):
+                pipeline.clear_body_pair_reduction_stats()
+        finally:
+            capture.__exit__(None, None, None)
+
     def test_property_schema_switch_is_safe(self):
         """Reduce a property-enabled buffer after a property-less one safely.
 
@@ -1884,7 +1950,7 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
             state_0, state_1 = state_1, state_0
         stats = pipeline._body_pair_reducer.stats()
         self.assertEqual(stats["invariant_violations"], 0)
-        self.assertEqual(stats["fail_open_keeps"], 0)
+        self.assertEqual(stats["failed_insertions"], 0)
 
     def test_kept_set_independent_of_previous_step(self):
         """Reduce a state to the same kept set whether or not a busier step preceded it.

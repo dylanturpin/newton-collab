@@ -1500,8 +1500,9 @@ class CollisionPipeline:
 
         * ``invariant_violations`` / ``outranked_discards`` -- certificate
           disagreements (verify mode only; any nonzero value is a bug).
-        * ``fail_open_keeps`` -- contacts kept because the group table was
-          full.
+        * ``failed_insertions`` -- group-table insertions that failed because
+          the table was full; each flags its whole frame for the keep-all
+          fallback (trigger events, not kept contacts).
         * ``cell_clamp_events`` -- contacts whose spatial cell hit the packed
           coordinate range.
         * ``max_contacts_in`` / ``max_contacts_kept`` -- independent peak
@@ -1513,6 +1514,10 @@ class CollisionPipeline:
           ``identity_frames`` -- frames that skipped reduction (input
           overflow), kept everything deterministically (table budget), or
           provably had nothing to remove.
+        * ``total_frames`` / ``sum_contacts_in`` / ``sum_contacts_kept`` --
+          paired whole-run totals (int64); ``sum_contacts_kept /
+          sum_contacts_in`` is the achieved reduction ratio.  Overflow frames
+          count toward ``total_frames`` but are excluded from both sums.
 
         Raises:
             RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.

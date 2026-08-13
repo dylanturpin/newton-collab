@@ -385,6 +385,14 @@ STAT_FALLBACK_FRAMES = 8
 STAT_IDENTITY_FRAMES = 9
 STAT_COUNT = 10
 
+# 64-bit whole-run accumulators, kept in a separate array: the per-frame SUMS
+# outgrow int32 within long training runs (1e5 contacts/frame wraps in ~6 hours
+# at 100 Hz), while the int32 slots above are watermarks and rare-event counts.
+STAT64_TOTAL_FRAMES = 0
+STAT64_SUM_CONTACTS_IN = 1
+STAT64_SUM_CONTACTS_KEPT = 2
+STAT64_COUNT = 3
+
 # Per-frame device state, reset by the preparation kernel each reduce.
 FRAME_WORK_COUNT = 0  # validated loop bound for every reducer kernel
 FRAME_INPUT_OVERFLOW = 1  # narrow phase emitted more contacts than capacity
@@ -1496,32 +1504,46 @@ def _write_reduced_count_kernel(
     # in/out
     contact_count: wp.array[wp.int32],
     stats: wp.array[wp.int32],
+    stats64: wp.array[wp.int64],
 ):
     """Replace the contact count with the number of kept contacts.
 
-    Also records the watermarks that size the pass: how many contacts arrived,
-    how many survived, and how many hashtable entries the scene actually needed.
-    Occupancy is what says whether ``hashtable_factor`` is generous or one busy
-    step away from failing open.
+    Also records the watermarks that size the pass (how many contacts arrived,
+    how many survived, how many hashtable entries the scene actually needed --
+    occupancy is what says whether ``hashtable_factor`` is generous or one busy
+    step away from failing open) and the paired whole-run totals that give the
+    achieved reduction ratio.  Overflow frames count toward ``total_frames``
+    but are excluded from both sums: their materialized prefix contains holes,
+    so no coherent in/kept pair exists for them.  Single-thread launch, so the
+    64-bit accumulators use plain read-modify-write.
     """
     wp.atomic_max(stats, wp.static(STAT_CONTACTS_IN), contact_count[0])
     wp.atomic_max(stats, wp.static(STAT_ENTRY_WATERMARK), ht_active_slots[ht_capacity])
-    if frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0 or frame_state[wp.static(FRAME_IDENTITY)] != 0:
-        # Overflow: leave the raw counter untouched so the solver receives
-        # exactly what an unreduced pipeline would deliver and overflow stays
-        # observable. Identity: the count is already the kept count.
+    stats64[wp.static(STAT64_TOTAL_FRAMES)] = stats64[wp.static(STAT64_TOTAL_FRAMES)] + wp.int64(1)
+    if frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0:
+        # Leave the raw counter untouched so the solver receives exactly what
+        # an unreduced pipeline would deliver and overflow stays observable.
+        return
+    work = frame_state[wp.static(FRAME_WORK_COUNT)]
+    if frame_state[wp.static(FRAME_IDENTITY)] != 0:
+        # The count is already the kept count.
+        stats64[wp.static(STAT64_SUM_CONTACTS_IN)] = stats64[wp.static(STAT64_SUM_CONTACTS_IN)] + wp.int64(work)
+        stats64[wp.static(STAT64_SUM_CONTACTS_KEPT)] = stats64[wp.static(STAT64_SUM_CONTACTS_KEPT)] + wp.int64(work)
         return
     if frame_state[wp.static(FRAME_FALLBACK)] != 0:
         # Keep-all frames deliver the buffer untouched; the counter already
         # equals the kept count, so only the accounting runs.
         wp.atomic_add(stats, wp.static(STAT_FALLBACK_FRAMES), 1)
-        wp.atomic_max(stats, wp.static(STAT_CONTACTS_KEPT), frame_state[wp.static(FRAME_WORK_COUNT)])
+        wp.atomic_max(stats, wp.static(STAT_CONTACTS_KEPT), work)
+        stats64[wp.static(STAT64_SUM_CONTACTS_IN)] = stats64[wp.static(STAT64_SUM_CONTACTS_IN)] + wp.int64(work)
+        stats64[wp.static(STAT64_SUM_CONTACTS_KEPT)] = stats64[wp.static(STAT64_SUM_CONTACTS_KEPT)] + wp.int64(work)
         return
-    work = frame_state[wp.static(FRAME_WORK_COUNT)]
     if work > 0:
         kept = keep_scan[work - 1]
         contact_count[0] = kept
         wp.atomic_max(stats, wp.static(STAT_CONTACTS_KEPT), kept)
+        stats64[wp.static(STAT64_SUM_CONTACTS_IN)] = stats64[wp.static(STAT64_SUM_CONTACTS_IN)] + wp.int64(work)
+        stats64[wp.static(STAT64_SUM_CONTACTS_KEPT)] = stats64[wp.static(STAT64_SUM_CONTACTS_KEPT)] + wp.int64(kept)
 
 
 class BodyPairContactReducer:
@@ -1597,6 +1619,7 @@ class BodyPairContactReducer:
         self.verify = bool(verify)
         # Whole-run telemetry accumulators; see stats() for the slot meanings.
         self._stats = wp.zeros(STAT_COUNT, dtype=wp.int32, device=device)
+        self._stats64 = wp.zeros(STAT64_COUNT, dtype=wp.int64, device=device)
         # Per-frame device state: validated work count + overflow/fallback
         # flags, reset by the preparation kernel each reduce.
         self._frame_state = wp.zeros(FRAME_STATE_COUNT, dtype=wp.int32, device=device)
@@ -1942,7 +1965,7 @@ class BodyPairContactReducer:
             _write_reduced_count_kernel,
             dim=1,
             inputs=[self.keep_scan, self.hashtable.active_slots, self.hashtable.capacity, self._frame_state],
-            outputs=[contacts.rigid_contact_count, self._stats],
+            outputs=[contacts.rigid_contact_count, self._stats, self._stats64],
             device=self.device,
             record_tape=False,
         )
@@ -2069,8 +2092,11 @@ class BodyPairContactReducer:
         Returns:
             ``invariant_violations``: disagreements found by the opt-in
             ``verify`` re-derivation (0 when verify is off).
-            ``fail_open_keeps``: contacts kept unconditionally because the
-            hashtable was full -- sustained non-zero values mean the
+            ``failed_insertions``: group-table insertions that failed because
+            the hashtable was full.  Each one flags its WHOLE frame for the
+            deterministic keep-all fallback, so this counts trigger events,
+            not kept contacts (those frames' contacts appear in the sums and
+            ``fallback_frames``).  Sustained non-zero values mean the
             ``hashtable_factor`` is too small for the scene.
             ``outranked_discards``: discarded contacts that out-rank their
             slot's recorded winner (verify mode only); non-zero means an atomic
@@ -2084,7 +2110,15 @@ class BodyPairContactReducer:
             writes the unreduced candidates into the same buffer before the
             reduction runs.  The two watermarks are accumulated independently
             and may come from different frames, so their ratio is indicative,
-            not an exact per-frame reduction ratio.
+            not an exact per-frame reduction ratio -- use the sums below for
+            the achieved ratio.
+            ``total_frames``: reduce() calls since construction or the last
+            :meth:`clear_stats` (int64).
+            ``sum_contacts_in`` / ``sum_contacts_kept``: paired whole-run
+            totals (int64); ``sum_contacts_kept / sum_contacts_in`` is the
+            achieved reduction ratio.  Input-overflow frames are counted in
+            ``total_frames`` but excluded from both sums (their materialized
+            prefix contains holes, so no coherent in/kept pair exists).
             ``max_hashtable_entries`` / ``hashtable_capacity``: peak distinct
             (body pair, bin, cell) groups against the table that holds them.
             ``hashtable_load``: the ratio of those two -- linear probing degrades
@@ -2102,11 +2136,13 @@ class BodyPairContactReducer:
             nothing; a large fraction means this scene does not benefit from
             the feature and it should be disabled.
         """
+        self._raise_if_capturing("stats()")
         v = self._stats.numpy()
+        v64 = self._stats64.numpy()
         entries = int(v[STAT_ENTRY_WATERMARK])
         return {
             "invariant_violations": int(v[STAT_VIOLATIONS]),
-            "fail_open_keeps": int(v[STAT_FAIL_OPEN]),
+            "failed_insertions": int(v[STAT_FAIL_OPEN]),
             "outranked_discards": int(v[STAT_OUTRANKED]),
             "cell_clamp_events": int(v[STAT_CELL_CLAMPS]),
             "max_contacts_in": int(v[STAT_CONTACTS_IN]),
@@ -2117,15 +2153,31 @@ class BodyPairContactReducer:
             "input_overflow_frames": int(v[STAT_INPUT_OVERFLOWS]),
             "fallback_frames": int(v[STAT_FALLBACK_FRAMES]),
             "identity_frames": int(v[STAT_IDENTITY_FRAMES]),
+            "total_frames": int(v64[STAT64_TOTAL_FRAMES]),
+            "sum_contacts_in": int(v64[STAT64_SUM_CONTACTS_IN]),
+            "sum_contacts_kept": int(v64[STAT64_SUM_CONTACTS_KEPT]),
         }
+
+    def _raise_if_capturing(self, what: str):
+        """Reject host-side telemetry operations during CUDA graph capture.
+
+        ``stats()`` would fail on its device sync anyway, but cryptically;
+        ``clear_stats()`` would silently RECORD its zeroing into the graph and
+        wipe telemetry on every replay.
+        """
+        if self.device.is_cuda and wp.get_stream(self.device).is_capturing:
+            raise RuntimeError(f"{what} is host-side telemetry; call it outside CUDA graph capture")
 
     def clear_stats(self):
         """Zero the whole-run telemetry accumulators (host-side, outside capture).
 
-        Lets long training runs isolate per-phase telemetry; the counters are
-        int32 and accumulate for the reducer's lifetime otherwise.
+        Lets long training runs isolate per-phase telemetry.  The watermark
+        and rare-event counters are int32; the frame and contact totals are
+        int64 and do not realistically wrap.
         """
+        self._raise_if_capturing("clear_stats()")
         self._stats.zero_()
+        self._stats64.zero_()
 
     def describe(self) -> dict:
         """Currently allocated footprint of the pass: buffer bytes by role.
