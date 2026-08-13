@@ -110,7 +110,7 @@ explicit per-patch torsion row in the solver, not point placement.  Watch
 yaw-tracking error when validating policies whose feet pivot.
 
 All launches are fixed-size and the pass is CUDA-graph-capture compatible,
-with two documented lifecycle caveats under graph REPLAY: the automatic
+with three documented lifecycle caveats.  Under graph REPLAY: the automatic
 history reset on a new ``Contacts`` buffer and the ``rigid_contacts_reduced``
 provenance marker are host-side Python and only execute when ``collide()``
 itself runs -- replaying a captured graph repeats neither.  A reducer-enabled
@@ -118,7 +118,10 @@ pipeline must therefore not alternate multiple captured buffers (hysteresis
 history is shared state), and solver provenance checks reflect the last
 Python-level collide, not the last replay.  Per-buffer device-resident
 provenance is the eventual fix; until then capture one buffer per
-reducer-enabled pipeline.
+reducer-enabled pipeline (enforced at capture time in ``collide()``).  And
+under graph CAPTURE: a buffer with per-contact material properties must see
+one warm-up collide before capture, because its material scratch is
+provisioned lazily on first use.
 """
 
 from __future__ import annotations

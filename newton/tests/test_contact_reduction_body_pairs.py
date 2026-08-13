@@ -1288,12 +1288,39 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "at most 5 reduction groups"):
                 _make_pipeline(model, True)
 
-    def test_cuda_graph_capture(self):
-        """Capture collide() with reduction into a CUDA graph and replay it.
+    @staticmethod
+    def _full_rows(contacts):
+        """Sorted per-contact rows over every solver-visible field."""
+        n = int(contacts.rigid_contact_count.numpy()[0])
+        cols = [
+            contacts.rigid_contact_shape0.numpy()[:n],
+            contacts.rigid_contact_shape1.numpy()[:n],
+            contacts.rigid_contact_point0.numpy()[:n],
+            contacts.rigid_contact_point1.numpy()[:n],
+            contacts.rigid_contact_offset0.numpy()[:n],
+            contacts.rigid_contact_offset1.numpy()[:n],
+            contacts.rigid_contact_normal.numpy()[:n],
+            contacts.rigid_contact_margin0.numpy()[:n],
+            contacts.rigid_contact_margin1.numpy()[:n],
+        ]
+        rows = []
+        for k in range(n):
+            row = []
+            for c in cols:
+                v = c[k]
+                row.extend(round(float(x), 6) for x in np.atleast_1d(v))
+            rows.append(tuple(row))
+        return sorted(rows)
 
-        All reduction launches are fixed-size, so capture must succeed and
-        replays must keep producing the same kept set on the same state.
-        Skipped on CPU devices.
+    def test_cuda_graph_capture(self):
+        """Replay a captured collide() on changing states against an uncaptured reference.
+
+        All reduction launches are fixed-size, so capture must succeed, and a
+        replay must equal an ordinary collide that saw the same state history
+        (hysteresis makes the kept set history-dependent, so the reference
+        pipeline is stepped through the identical sequence).  Every
+        solver-visible contact field is compared, on the settled pose and
+        again after pitching the foot in place.  Skipped on CPU devices.
         """
         device = wp.get_device()
         if not device.is_cuda:
@@ -1303,13 +1330,65 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         pipeline = _make_pipeline(model, True)
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)  # warm-up: lazy allocations + kernel loads
-        n_ref = int(contacts.rigid_contact_count.numpy()[0])
         with wp.ScopedCapture(device) as capture:
             pipeline.collide(state, contacts)
+        wp.capture_launch(capture.graph)
+        wp.capture_launch(capture.graph)
+
+        # reference: same model, fresh pipeline, identical executed history
+        # (capture itself records without executing: warm-up + two replays)
+        state_ref = model.state()
+        ref = _make_pipeline(model, True)
+        contacts_ref = ref.contacts()
         for _ in range(3):
-            wp.capture_launch(capture.graph)
-        n_replay = int(contacts.rigid_contact_count.numpy()[0])
-        self.assertEqual(n_ref, n_replay)
+            ref.collide(state_ref, contacts_ref)
+        self.assertEqual(self._full_rows(contacts), self._full_rows(contacts_ref))
+
+        # mutate the captured state IN PLACE (the graph holds the pointers):
+        # pitch shifts depth ownership across the foot, changing the kept set
+        q = state.body_q.numpy()
+        pitch = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.05)
+        q[0][3:7] = [pitch[0], pitch[1], pitch[2], pitch[3]]
+        state.body_q.assign(q)
+        state_ref.body_q.assign(q)
+        wp.capture_launch(capture.graph)
+        ref.collide(state_ref, contacts_ref)
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+        self.assertEqual(self._full_rows(contacts), self._full_rows(contacts_ref))
+
+    def test_second_captured_buffer_rejected(self):
+        """Refuse to capture a second Contacts buffer on one reducer pipeline.
+
+        Graph replay repeats neither the buffer-switch history reset nor the
+        provenance assignment, so two captured buffers would silently share
+        hysteresis history; collide() must raise at capture time instead.
+        Recapturing the SAME buffer stays legal.  Skipped on CPU devices.
+        """
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device")
+        model = self._foot_scene()
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts_a = pipeline.contacts()
+        contacts_b = pipeline.contacts()
+        pipeline.collide(state, contacts_a)  # warm-up
+        with wp.ScopedCapture(device) as capture_a:
+            pipeline.collide(state, contacts_a)
+        wp.capture_launch(capture_a.graph)
+        # same buffer again: allowed
+        with wp.ScopedCapture(device) as capture_a2:
+            pipeline.collide(state, contacts_a)
+        wp.capture_launch(capture_a2.graph)
+        # different buffer: must raise while capture is active; end the
+        # capture outside the exception path so the stream is left clean
+        capture_b = wp.ScopedCapture(device)
+        capture_b.__enter__()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "at most one Contacts buffer"):
+                pipeline.collide(state, contacts_b)
+        finally:
+            capture_b.__exit__(None, None, None)
 
     def test_requires_grad_diff_augmentation(self):
         """Populate the differentiable contact arrays from the compacted set.
@@ -1333,9 +1412,11 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         pipeline.collide(state, contacts)
         n = int(contacts.rigid_contact_count.numpy()[0])
         self.assertGreater(n, 0)
-        if contacts.rigid_contact_diff_distance is not None:
-            d = contacts.rigid_contact_diff_distance.numpy()[:n]
-            self.assertTrue(np.isfinite(d).all())
+        # requires_grad buffers always allocate the diff arrays; a None here
+        # means the augmentation was silently skipped
+        self.assertIsNotNone(contacts.rigid_contact_diff_distance)
+        d = contacts.rigid_contact_diff_distance.numpy()[:n]
+        self.assertTrue(np.isfinite(d).all())
 
     def test_multi_world_independence(self):
         """Reduce two worlds' identical feet to identical per-world kept sets.

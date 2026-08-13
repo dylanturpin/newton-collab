@@ -1940,6 +1940,21 @@ class CollisionPipeline:
         # decomposition. Runs before the differentiable augmentation so the
         # diff arrays are built from the compacted set.
         if self._body_pair_reducer is not None:
+            # Graph replay repeats neither the history reset below nor the
+            # provenance assignment, so a reducer-enabled pipeline supports at
+            # most ONE captured buffer -- enforce the documented restriction
+            # (checked before any state mutation) rather than silently sharing
+            # hysteresis history between graphs. A dead weakref means the old
+            # graph can no longer be replayed, so a new buffer may capture.
+            if wp.get_stream(self._body_pair_reducer.device).is_capturing:
+                captured = getattr(self, "_captured_contacts_ref", None)
+                if captured is not None and captured() is not None and captured() is not contacts:
+                    raise RuntimeError(
+                        "reduce_contacts_body_pairs supports capturing at most one Contacts buffer "
+                        "per pipeline: hysteresis history and provenance are shared state that graph "
+                        "replay cannot re-partition. Use one pipeline per captured buffer."
+                    )
+                self._captured_contacts_ref = weakref.ref(contacts)
             # A different Contacts instance means a different stream of states;
             # winners recorded for the previous buffer must not bias this one.
             # Held as a weak reference: a raw id() can be recycled by the
