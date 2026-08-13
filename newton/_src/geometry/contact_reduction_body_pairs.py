@@ -73,6 +73,18 @@ itself under real sliding, and the kept set becomes a function of contact
 geometry plus the previous step's winners.  Set the margin to ``0`` for the
 exact, memoryless behavior.
 
+**Known characteristic -- XPBD residual rocking on curved colliders.** A
+row of cylinder colliders settles under XPBD with a sustained roll
+oscillation when reduced (tail-mean |omega| 1.17 rad/s at 8 iterations,
+0.63 at 16, 0.28 at 32, against ~0 unreduced; height and linear velocity
+stay correct), while FeatherPGS settles both variants to zero on the same
+scene.  A penetrating-extreme slot family was implemented and measured
+against this: the kept set did not change (the loaded and geometric hulls
+coincide at rest) and the oscillation persisted, so the cause is XPBD's
+sensitivity to candidate count/placement on curved rims, not hull
+membership -- and the extra family was removed again.  Prefer FeatherPGS
+for curved-collider feet under reduction, or raise XPBD iterations.
+
 **Known characteristic -- torsional patch friction.** During twist, friction at
 every contact is saturated at ``mu*N_i``, so the resisting torque is
 ``mu * sum(N_i * r_i)`` -- fixed by WHERE the normal load sits, with no
