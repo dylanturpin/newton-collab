@@ -1451,7 +1451,7 @@ class TestBodyPairReductionFPGSImpact(unittest.TestCase):
         """Land a falling foot on FPGS at the same rest height with and without reduction.
 
         This covers the exact defect class found on the walking humanoid: a
-        mis-ranked kept set leaves no load-bearing contact at touchdown and
+        misranked kept set leaves no load-bearing contact at touchdown and
         the body free-falls before a violent late landing.
         """
 
