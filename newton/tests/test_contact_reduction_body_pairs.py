@@ -1217,6 +1217,7 @@ class TestBodyPairReductionSafety(unittest.TestCase):
             np.array([1], dtype=np.int32),  # short
             np.array([1, 0, 1], dtype=np.int32),  # long
             np.array([[1], [0]], dtype=np.int32),  # wrong rank
+            np.array([1.0, 0.0]),  # float: int conversion would truncate silently
         ):
             with self.assertRaises(ValueError, msg=f"accepted malformed mask {bad!r}"):
                 pipeline.reset_body_pair_reduction_history(bad)
@@ -1695,6 +1696,47 @@ class TestBodyPairReductionHysteresis(unittest.TestCase):
         after = masks_by_world()
         self.assertTrue(all(m == 0 for m in after[0]), "reset world kept incumbency")
         self.assertTrue(any(m != 0 for m in after[1]), "unreset world lost incumbency")
+
+    def test_wide_integer_reset_mask_is_normalized(self):
+        """Reset a world selected by a mask value that would truncate to int32 zero.
+
+        ``uint64(2**32)`` is nonzero but its low 32 bits are zero; a raw int32
+        conversion would silently turn the reset into a no-op for that world.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        for w in range(2):
+            builder.begin_world()
+            body = builder.add_body(xform=wp.transform(wp.vec3(2.0 * w, 0.0, 0.0095), wp.quat_identity()), mass=1.0)
+            builder.add_shape_sphere(body, radius=0.01)
+            builder.end_world()
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        pipeline.collide(state, contacts)  # winners are now incumbents
+
+        def masks_by_world():
+            red = pipeline._body_pair_reducer
+            n = int(contacts.rigid_contact_count.numpy()[0])
+            s0 = contacts.rigid_contact_shape0.numpy()[:n]
+            s1 = contacts.rigid_contact_shape1.numpy()[:n]
+            sw = model.shape_world.numpy()
+            masks = red.contact_incumbent.numpy()[:n]
+            out = {0: [], 1: []}
+            for k in range(n):
+                w = max(int(sw[s0[k]]), int(sw[s1[k]]))
+                out[w].append(int(masks[k]))
+            return out
+
+        before = masks_by_world()
+        self.assertTrue(any(m != 0 for m in before[0]) and any(m != 0 for m in before[1]))
+        pipeline.reset_body_pair_reduction_history(np.array([2**32, 0], dtype=np.uint64))
+        pipeline.collide(state, contacts)
+        after = masks_by_world()
+        self.assertTrue(all(m == 0 for m in after[0]), "wide nonzero mask truncated to a no-op")
+        self.assertTrue(any(m != 0 for m in after[1]), "unmasked world lost incumbency")
 
     def test_disabled_hysteresis_is_history_independent(self):
         """Reduce identically with hysteresis=0 regardless of what ran before.

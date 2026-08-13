@@ -2016,7 +2016,10 @@ class BodyPairContactReducer:
                     # Converting floats through wp.array would silently
                     # truncate (0.5 -> 0) and turn the reset into a no-op.
                     raise ValueError(f"world_mask must be an integer array, got dtype {host.dtype}")
-                mask = wp.array(host.astype(np.int32), dtype=wp.int32, device=self.device)
+                # Normalize nonzero -> 1 BEFORE the int32 conversion: a wide
+                # nonzero value like uint64(2**32) truncates to int32(0) and
+                # would silently deselect its world.
+                mask = wp.array((host != 0).astype(np.int32), dtype=wp.int32, device=self.device)
             else:
                 mask = world_mask
             if mask.ndim != 1 or mask.shape[0] != self.world_count:
