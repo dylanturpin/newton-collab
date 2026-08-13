@@ -340,13 +340,15 @@ STAT_CONTACTS_IN = 5
 STAT_CONTACTS_KEPT = 6
 STAT_INPUT_OVERFLOWS = 7
 STAT_FALLBACK_FRAMES = 8
-STAT_COUNT = 9
+STAT_IDENTITY_FRAMES = 9
+STAT_COUNT = 10
 
 # Per-frame device state, reset by the preparation kernel each reduce.
 FRAME_WORK_COUNT = 0  # validated loop bound for every reducer kernel
 FRAME_INPUT_OVERFLOW = 1  # narrow phase emitted more contacts than capacity
 FRAME_FALLBACK = 2  # hashtable budget exceeded: keep every contact this frame
-FRAME_STATE_COUNT = 3
+FRAME_IDENTITY = 3  # every group holds one contact: reduction is a no-op
+FRAME_STATE_COUNT = 4
 
 # Linear-probe budget for the reduction's hashtable accesses. The table is
 # provisioned for load far below saturation (measured 0.08 on the reference
@@ -434,6 +436,7 @@ def _prepare_frame_kernel(
         frame_state[wp.static(FRAME_INPUT_OVERFLOW)] = 1
         wp.atomic_add(stats, wp.static(STAT_INPUT_OVERFLOWS), 1)
     frame_state[wp.static(FRAME_FALLBACK)] = 0
+    frame_state[wp.static(FRAME_IDENTITY)] = 0
 
 
 @wp.func
@@ -628,6 +631,66 @@ def _slot_index(entry_idx: int, slot: int) -> int:
 # capacity against a peak of 7937 live contacts at 64 envs, a 12.9x margin that
 # holds as both scale with env count).
 REDUCTION_MAX_THREADS = 262144
+
+
+@wp.kernel(enable_backward=False)
+def _detect_identity_kernel(
+    ht_active_slots: wp.array[wp.int32],
+    ht_capacity: int,
+    # in/out
+    frame_state: wp.array[wp.int32],
+    stats: wp.array[wp.int32],
+):
+    """Flag frames where reduction provably cannot remove anything.
+
+    When the number of distinct groups equals the number of live contacts,
+    every group holds exactly one contact: the deepest IS the only extreme and
+    every contact is kept.  Selection, compaction, and write-back are then
+    pure bandwidth waste -- the buffer already contains the result.  This is
+    the structural no-benefit regime (single-collider bodies), where the pass
+    otherwise measures ~5% end-to-end overhead; the ``identity_frames``
+    telemetry doubles as the caller's signal that this scene does not want the
+    feature at all.
+    """
+    work = frame_state[wp.static(FRAME_WORK_COUNT)]
+    if work <= 0:
+        return
+    if frame_state[wp.static(FRAME_FALLBACK)] != 0:
+        return
+    if ht_active_slots[ht_capacity] == work:
+        frame_state[wp.static(FRAME_IDENTITY)] = 1
+        wp.atomic_add(stats, wp.static(STAT_IDENTITY_FRAMES), 1)
+
+
+@wp.kernel(enable_backward=False)
+def _detect_noop_kernel(
+    keep_scan: wp.array[wp.int32],
+    # in/out
+    frame_state: wp.array[wp.int32],
+    stats: wp.array[wp.int32],
+):
+    """Flag frames where selection kept everything (tier-2 no-op detection).
+
+    The group-count test above catches single-contact groups, but the common
+    no-benefit regime -- single-collider bodies like plain boxes -- produces
+    groups of up to ~5 contacts that all fit in the 7 slots, so nothing is
+    discarded even though groups are larger than one. That is only known after
+    the keep scan: when the kept count equals the work count, the compaction
+    would copy every contact onto itself, so the copy-back is skipped and the
+    buffer is delivered as-is.
+    """
+    if frame_state[wp.static(FRAME_IDENTITY)] != 0:
+        return  # tier 1 already fired
+    work = frame_state[wp.static(FRAME_WORK_COUNT)]
+    if work <= 0 or frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0:
+        return
+    if frame_state[wp.static(FRAME_FALLBACK)] != 0:
+        return  # fallback frames keep everything too, but their accounting
+        # (fallback_frames counter) lives in the count-write kernel
+    if keep_scan[work - 1] == work:
+        frame_state[wp.static(FRAME_IDENTITY)] = 1
+        wp.atomic_max(stats, wp.static(STAT_CONTACTS_KEPT), work)
+        wp.atomic_add(stats, wp.static(STAT_IDENTITY_FRAMES), 1)
 
 
 @wp.func
@@ -993,6 +1056,8 @@ def _select_winners_kernel(
     thread scheduling, buffer order, and buffer capacity.
     """
     count = frame_state[wp.static(FRAME_WORK_COUNT)]
+    if frame_state[wp.static(FRAME_IDENTITY)] != 0:
+        count = 0  # identity frames skip compaction entirely; flags are unused
     keep_all = frame_state[wp.static(FRAME_FALLBACK)] != 0
     i = wp.tid()
     while i < count:
@@ -1083,8 +1148,8 @@ def _verify_invariant_kernel(
     clearing bug, or ranking regression -- counted, never silent.
     """
     count = frame_state[wp.static(FRAME_WORK_COUNT)]
-    if frame_state[wp.static(FRAME_FALLBACK)] != 0:
-        count = 0  # keep-all frames are trivially consistent; slots are partial
+    if frame_state[wp.static(FRAME_FALLBACK)] != 0 or frame_state[wp.static(FRAME_IDENTITY)] != 0:
+        count = 0  # keep-all/identity frames are trivially consistent
     i = wp.tid()
     while i < count:
         _verify_invariant_one(
@@ -1141,6 +1206,8 @@ def _gather_kept_contacts_kernel(
 ):
     """Stable-compact kept contacts into the scratch arrays."""
     count = frame_state[wp.static(FRAME_WORK_COUNT)]
+    if frame_state[wp.static(FRAME_IDENTITY)] != 0:
+        count = 0  # the buffer already contains the result
     i = wp.tid()
     while i < count:
         if keep_flags[i] != 0:
@@ -1278,7 +1345,7 @@ def _scatter_back_kernel(
     from the frame state instead: zero, and nothing is written back.
     """
     count = contact_count[0]
-    if frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0:
+    if frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0 or frame_state[wp.static(FRAME_IDENTITY)] != 0:
         count = 0
     i = wp.tid()
     while i < count:
@@ -1337,9 +1404,10 @@ def _write_reduced_count_kernel(
     """
     wp.atomic_max(stats, wp.static(STAT_CONTACTS_IN), contact_count[0])
     wp.atomic_max(stats, wp.static(STAT_ENTRY_WATERMARK), ht_active_slots[ht_capacity])
-    if frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0:
-        # Leave the raw counter untouched: the solver receives exactly what an
-        # unreduced pipeline would deliver, and overflow stays observable.
+    if frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0 or frame_state[wp.static(FRAME_IDENTITY)] != 0:
+        # Overflow: leave the raw counter untouched so the solver receives
+        # exactly what an unreduced pipeline would deliver and overflow stays
+        # observable. Identity: the count is already the kept count.
         return
     if frame_state[wp.static(FRAME_FALLBACK)] != 0:
         wp.atomic_add(stats, wp.static(STAT_FALLBACK_FRAMES), 1)
@@ -1613,6 +1681,14 @@ class BodyPairContactReducer:
             record_tape=False,
         )
         wp.launch(
+            _detect_identity_kernel,
+            dim=1,
+            inputs=[self.hashtable.active_slots, self.hashtable.capacity],
+            outputs=[self._frame_state, self._stats],
+            device=self.device,
+            record_tape=False,
+        )
+        wp.launch(
             _select_winners_kernel,
             dim=self.stride_threads,
             inputs=[
@@ -1651,6 +1727,14 @@ class BodyPairContactReducer:
                 record_tape=False,
             )
         wp.utils.array_scan(self.keep_flags, self.keep_scan, True)
+        wp.launch(
+            _detect_noop_kernel,
+            dim=1,
+            inputs=[self.keep_scan],
+            outputs=[self._frame_state, self._stats],
+            device=self.device,
+            record_tape=False,
+        )
 
         has_material = int(has_material)
         mat_dst = (
@@ -1827,6 +1911,7 @@ class BodyPairContactReducer:
             "hashtable_load": entries / self.hashtable.capacity,
             "input_overflow_frames": int(v[STAT_INPUT_OVERFLOWS]),
             "fallback_frames": int(v[STAT_FALLBACK_FRAMES]),
+            "identity_frames": int(v[STAT_IDENTITY_FRAMES]),
         }
 
     def describe(self) -> dict:

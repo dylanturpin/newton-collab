@@ -905,6 +905,80 @@ class TestBodyPairReductionSafety(unittest.TestCase):
             with self.assertRaises(ValueError, msg=f"accepted invalid {kwargs}"):
                 _make_pipeline(model, True, **kwargs)
 
+    def test_identity_frames_leave_buffer_untouched(self):
+        """Detect no-benefit frames and skip compaction without changing results.
+
+        Single-collider bodies produce one contact per group; reduction cannot
+        remove anything, so the fast path must deliver the identical buffer an
+        unreduced pipeline would, and count the frame in telemetry.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        rng = np.random.default_rng(4)
+        for k in range(24):
+            body = builder.add_body(
+                xform=wp.transform(
+                    wp.vec3((k % 6) * 0.5, (k // 6) * 0.5, 0.0095 + float(rng.uniform(0, 0.001))),
+                    wp.quat_identity(),
+                ),
+                mass=1.0,
+            )
+            builder.add_shape_sphere(body, radius=0.01)
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+
+        base = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+        contacts_base = base.contacts()
+        base.collide(state, contacts_base)
+        n_base, s0_b, s1_b, _n1, p0_b = _contact_snapshot(contacts_base)
+
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        n_red, s0_r, s1_r, _n2, p0_r = _contact_snapshot(contacts)
+
+        self.assertEqual(n_red, n_base, "identity frame must keep every contact")
+        rows_b = sorted(
+            (int(a), int(b), *(round(float(v), 6) for v in p)) for a, b, p in zip(s0_b, s1_b, p0_b, strict=True)
+        )
+        rows_r = sorted(
+            (int(a), int(b), *(round(float(v), 6) for v in p)) for a, b, p in zip(s0_r, s1_r, p0_r, strict=True)
+        )
+        self.assertEqual(rows_r, rows_b)
+        self.assertGreaterEqual(pipeline.body_pair_reduction_stats()["identity_frames"], 1)
+
+    def test_noop_frames_skip_compaction_for_small_groups(self):
+        """Detect no-op frames whose groups are larger than one contact.
+
+        A plain box on the ground is ONE group of four contacts that all fit
+        in the slots: nothing is discarded, so the copy-back must be skipped
+        (tier-2 detection after the keep scan) and the buffer delivered
+        exactly as the unreduced pipeline would.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0495), wp.quat_identity()), mass=1.0)
+        builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+
+        base = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+        contacts_base = base.contacts()
+        base.collide(state, contacts_base)
+        n_base, _s0, _s1, _n1, p0_b = _contact_snapshot(contacts_base)
+        self.assertGreater(n_base, 1, "a box should rest on several contacts")
+
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        n_red, _s2, _s3, _n2, p0_r = _contact_snapshot(contacts)
+        self.assertEqual(n_red, n_base)
+        self.assertEqual(
+            sorted(tuple(round(float(v), 6) for v in q) for q in p0_r),
+            sorted(tuple(round(float(v), 6) for v in q) for q in p0_b),
+        )
+        self.assertGreaterEqual(pipeline.body_pair_reduction_stats()["identity_frames"], 1)
+
     def test_reduced_marker_tracks_pipeline_mode(self):
         """Assign buffer provenance from the pipeline mode on every collide.
 
