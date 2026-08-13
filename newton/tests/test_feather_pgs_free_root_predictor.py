@@ -18,6 +18,10 @@ root's velocity coordinate and its acceleration must use the same convention:
 Contact-free runs cannot see the mismatch (the two conversions cancel), which
 is how the momentum suite stayed green over it.  Both tests here have exact
 ground truths that hold only when the conventions agree.
+
+The anchored-spinner test pins the related free-joint lever defect: the
+integrator's anchor-to-COM lever assumed the joint's child anchor sits at the
+child body's origin, ignoring a non-identity ``child_xform``.
 """
 
 import unittest
@@ -77,6 +81,26 @@ def _slide_heights(model, omega_y, pgs_mode):
     return np.asarray(heights)
 
 
+def _world_com(model, state):
+    """World position of the root body's centre of mass [m]."""
+    com_local = model.body_com.numpy().astype(np.float64).reshape(-1, 3)[0]
+    q = state.body_q.numpy().astype(np.float64).reshape(-1, 7)[0]
+    rot = wp.quat(*(float(c) for c in q[3:7]))
+    return np.asarray(q[0:3]) + np.asarray(wp.quat_rotate(rot, wp.vec3(*com_local)))
+
+
+def _com_positions(model, state_0, state_1, steps):
+    """Step the model contact-free; return per-step world COM positions [m]."""
+    solver = SolverFeatherPGS(model, angular_damping=0.0)
+    control = model.control()
+    positions = []
+    for _ in range(steps):
+        solver.step(state_0, state_1, control, None, DT)
+        state_0, state_1 = state_1, state_0
+        positions.append(_world_com(model, state_0))
+    return np.asarray(positions)
+
+
 class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
     """Constraint rows must see the COM velocity the integrator realizes."""
 
@@ -97,6 +121,57 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
                 spinning = _slide_heights(model, OMEGA_Y, pgs_mode)
                 divergence = float(np.abs(spinning - still).max())
                 self.assertLess(divergence, 1e-4, f"spin changed a frictionless slide by {divergence} m")
+
+    def _anchored_spinner_drift(self, dt, steps):
+        """Max world COM drift [m] of a force-free spinner whose joint anchor is offset 0.1 m."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        body = builder.add_link(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+            mass=1.0,
+            com=wp.vec3(0.0, 0.0, 0.0),
+            inertia=wp.mat33(0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01),
+        )
+        free = builder.add_joint_free(
+            body,
+            child_xform=wp.transform(wp.vec3(0.1, 0.0, 0.0), wp.quat_identity()),
+        )
+        builder.add_articulation([free])
+        model = builder.finalize(device=wp.get_device())
+
+        state_0, state_1 = model.state(), model.state()
+        joint_qd = state_0.joint_qd.numpy()
+        joint_qd[3:6] = (0.0, 0.0, 10.0)
+        state_0.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        start = _world_com(model, state_0)
+
+        global DT  # noqa: PLW0603 - the step size is the quantity under test
+        original = DT
+        try:
+            DT = dt
+            positions = _com_positions(model, state_0, state_1, steps)
+        finally:
+            DT = original
+        return float(np.linalg.norm(positions - start[None, :], axis=1).max())
+
+    def test_anchored_spinner_com_stays_put(self):
+        """A force-free spinning body with an offset joint anchor keeps its COM in place.
+
+        The free joint's coordinate tracks the child ANCHOR frame, here offset
+        0.1 m from the body's COM by ``child_xform``.  With zero COM velocity
+        and no forces, the COM must stay put and the anchor must orbit it.  A
+        lever built from ``body_com`` alone pins the anchor instead, so the COM
+        orbits at 0.1 m radius -- a 0.2 m excursion within half a turn, from
+        nothing.  With the ``child_xform`` lever the residual is symplectic-
+        Euler truncation on the orbiting anchor, ``omega * r * dt`` = 5 mm at
+        this step size; the bound sits between the two, and the halved-step run
+        proves the residual is truncation, not formulation: a formulation error
+        would sit flat instead of halving.
+        """
+        coarse = self._anchored_spinner_drift(1.0 / 200.0, STEPS)
+        self.assertLess(coarse, 0.02, f"COM of a force-free spinner drifted {coarse} m")
+        fine = self._anchored_spinner_drift(1.0 / 400.0, 2 * STEPS)
+        self.assertLess(fine, 0.65 * coarse, "residual drift did not converge with dt: formulation error")
 
 
 if __name__ == "__main__":

@@ -597,6 +597,7 @@ def jcalc_integrate(
     type: int,
     child: int,
     body_com: wp.array[wp.vec3],
+    X_cj: wp.transform,
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
     joint_qdd: wp.array[float],
@@ -675,7 +676,13 @@ def jcalc_integrate(
         # constraint rows are built against a velocity this integration never realizes.
         w_prev = w_s
         w_s = w_s + m_s * dt
-        v_com = v_com + (a_s + wp.cross(w_prev, v_com)) * dt
+        if parent < 0:
+            v_com = v_com + (a_s + wp.cross(w_prev, v_com)) * dt
+        else:
+            # A descendant free joint's coordinate is a RELATIVE twist in the parent anchor
+            # frame; the root transport rule above is not derived for it, so integrate
+            # component-wise until the parent-frame transport is.
+            v_com = v_com + a_s * dt
         w_s_integrate = w_s
 
         p_s = wp.vec3(joint_q[coord_start + 0], joint_q[coord_start + 1], joint_q[coord_start + 2])
@@ -683,7 +690,10 @@ def jcalc_integrate(
         r_s = wp.quat(
             joint_q[coord_start + 3], joint_q[coord_start + 4], joint_q[coord_start + 5], joint_q[coord_start + 6]
         )
-        com_offset_world = wp.quat_rotate(r_s, body_com[child])
+        # (p_s, r_s) track the child ANCHOR frame, so the lever to the COM must go through the
+        # child anchor transform: with a non-identity X_cj the COM does not sit at
+        # body_com[child] in anchor coordinates.
+        com_offset_world = wp.quat_rotate(r_s, wp.transform_point(wp.transform_inverse(X_cj), body_com[child]))
         dpdt_s = v_com - wp.cross(w_s_integrate, com_offset_world)
 
         drdt_s = wp.quat(w_s_integrate, 0.0) * r_s * 0.5
@@ -1404,6 +1414,7 @@ def integrate_generalized_joints(
     kinematic_joint_mask: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     body_com: wp.array[wp.vec3],
+    joint_X_c: wp.array[wp.transform],
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
     joint_qdd: wp.array[float],
@@ -1435,6 +1446,7 @@ def integrate_generalized_joints(
         type,
         child,
         body_com,
+        joint_X_c[index],
         joint_q,
         joint_qd,
         joint_qdd,
