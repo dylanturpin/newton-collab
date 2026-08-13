@@ -30,6 +30,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.kernels import integrate_generalized_joints
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 200.0
@@ -251,8 +252,6 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         joint_qd[6:9] = (0.4, 0.0, 0.0)
         joint_qd[9:12] = (0.0, 0.0, 3.0)
         state.joint_qd.assign(joint_qd)
-
-        from newton._src.solvers.feather_pgs.kernels import integrate_generalized_joints
 
         device = wp.get_device()
         q_new = wp.zeros_like(state.joint_q)
