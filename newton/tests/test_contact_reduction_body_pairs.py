@@ -28,7 +28,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.geometry.contact_reduction_body_pairs import _BP_FACE_NORMALS_DATA
+from newton._src.geometry.contact_reduction_body_pairs import _BP_FACE_NORMALS_DATA, _up_axis_rotation
 from newton._src.geometry.sdf_hydroelastic import HydroelasticSDF
 from newton._src.sim.contacts import Contacts
 
@@ -631,6 +631,120 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         self.assertLess(abs(z_off - z_on), 5e-4)
 
 
+class TestBodyPairReductionGrouping(unittest.TestCase):
+    """Contacts may only compete when merging them cannot change the physics."""
+
+    def _pad_body(self, mu_pad, mu_ring):
+        """One body: a 5x5 low-mu sphere grid with one center pad sphere of mu_pad.
+
+        The pad sits at the patch's interior, the exact position body-level
+        grouping discards.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0095), wp.quat_identity()), mass=1.0)
+        ring_cfg = newton.ModelBuilder.ShapeConfig(mu=mu_ring)
+        pad_cfg = newton.ModelBuilder.ShapeConfig(mu=mu_pad)
+        for i in range(5):
+            for j in range(5):
+                if i == 2 and j == 2:
+                    continue
+                builder.add_shape_sphere(
+                    body,
+                    xform=wp.transform(wp.vec3((i - 2.0) * 0.04, (j - 2.0) * 0.04, 0.0), wp.quat_identity()),
+                    radius=0.01,
+                    cfg=ring_cfg,
+                )
+        builder.add_shape_sphere(
+            body, xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()), radius=0.01, cfg=pad_cfg
+        )
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        contacts = _collide_once(model, state, True, reduce_contacts_body_pairs_cell=10.0)
+        n, s0, s1, _n2, _p0 = _contact_snapshot(contacts)
+        mu_arr = model.shape_material_mu.numpy()
+        sb = model.shape_body.numpy()
+        kept_mus = {round(float(mu_arr[a if sb[a] >= 0 else b]), 3) for a, b in zip(s0, s1, strict=True)}
+        return n, kept_mus
+
+    def test_heterogeneous_materials_never_compete(self):
+        """Keep a high-friction center pad that body-level grouping would delete.
+
+        Solvers read material laws from the surviving shape ids. A center pad
+        is an interior point of the merged patch -- exactly what the reduction
+        discards -- so merging it with the surrounding low-friction colliders
+        deletes the high-friction law entirely. With material-equivalence
+        classes the pad is its own group and must survive. Identical materials
+        must still merge into one group (the point of body-level grouping).
+        """
+        _n_hetero, mus_hetero = self._pad_body(1.0, 0.2)
+        self.assertIn(1.0, mus_hetero, "the high-friction pad's contact was deleted")
+        n_homo, _mus_homo = self._pad_body(0.2, 0.2)
+        self.assertLessEqual(n_homo, 7, "identical materials must merge into one group")
+
+    def test_swapped_endpoints_share_one_group(self):
+        """Merge one physical patch whose contacts arrive with both endpoint orders.
+
+        The narrow phase orders each shape pair by geometry type, so a flat
+        interface between two bodies with interleaved sphere/box colliders
+        produces contacts in BOTH directions for the same body pair. Without a
+        canonical group normal they bin as two opposite-normal groups and keep
+        two slot sets for one patch.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        base = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()), mass=0.0)
+        builder.add_shape_box(base, hx=0.3, hy=0.1, hz=0.1)
+        top = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.2195), wp.quat_identity()), mass=1.0)
+        for i in range(4):
+            x = (i - 1.5) * 0.12
+            if i % 2 == 0:
+                builder.add_shape_sphere(top, xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()), radius=0.02)
+            else:
+                builder.add_shape_box(
+                    top, xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()), hx=0.02, hy=0.02, hz=0.02
+                )
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_cell=10.0)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        n, _s0, _s1, nrm, _p0 = _contact_snapshot(contacts)
+        self.assertGreater(n, 0)
+        # the raw narrow-phase output must actually contain both orientations,
+        # or this test is vacuous (geometry-type dispatch produces the swap)
+        base_pipe = newton.CollisionPipeline(model, broad_phase="nxn")
+        base_contacts = base_pipe.contacts()
+        base_pipe.collide(state, base_contacts)
+        nb = int(base_contacts.rigid_contact_count.numpy()[0])
+        nz = base_contacts.rigid_contact_normal.numpy()[:nb, 2]
+        self.assertGreater(int((nz > 0).sum()), 0)
+        self.assertGreater(int((nz < 0).sum()), 0, "scene no longer produces swapped endpoint orders")
+        # one flat patch between one body pair must occupy exactly ONE group;
+        # without the canonical normal the two orientations bin separately
+        stats = pipeline._body_pair_reducer.stats()
+        self.assertEqual(stats["max_hashtable_entries"], 1, "endpoint order leaked into grouping")
+        self.assertLessEqual(n, 7)
+
+    def test_up_axis_rotation_protects_ground_normals(self):
+        """Give the ground direction its wide bin margin in X-, Y-, and Z-up models.
+
+        The bin table is oriented for +Z; other up axes must be rotated into
+        that frame or their ground normals land near the table's narrow
+        horizontal margins and curved-terrain grouping churns again.
+        """
+        faces = np.array(_BP_FACE_NORMALS_DATA, dtype=np.float64).reshape(-1, 3)
+        for up_axis in (0, 1, 2):
+            rot = np.array(_up_axis_rotation(up_axis), dtype=np.float64)
+            self.assertTrue(np.allclose(rot @ rot.T, np.eye(3)), "rotation must be orthonormal")
+            self.assertAlmostEqual(float(np.linalg.det(rot)), 1.0, places=12)
+            up = np.zeros(3)
+            up[up_axis] = 1.0
+            for sign in (1.0, -1.0):
+                mapped = rot @ (sign * up)
+                dots = np.sort(faces @ mapped)[::-1]
+                self.assertGreater(dots[0] - dots[1], 0.2, f"ground margin lost for up_axis={up_axis}")
+
+
 class TestBodyPairReductionSafety(unittest.TestCase):
     """Resource exhaustion must fail open deterministically, never corrupt memory."""
 
@@ -783,15 +897,23 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
             )
 
     def test_group_id_capacity_rejected_at_construction(self):
-        """Reject scenes whose shape+body count exceeds the exact key budget.
+        """Reject scenes whose reduction-group count exceeds the exact key budget.
 
         Group ids pack exactly into the reduction key; overflow would alias
         two groups and could evict a patch's deepest contact, so the pipeline
-        must refuse at construction rather than mask bits at runtime.
+        must refuse at construction rather than mask bits at runtime. Groups
+        are material-equivalence classes: five bodies with distinct friction
+        coefficients plus the ground are six groups against a patched budget
+        of four.
         """
-        model = self._foot_scene()
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        for k in range(5):
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.2 * k, 0.0, 0.0095), wp.quat_identity()), mass=1.0)
+            builder.add_shape_sphere(body, radius=0.01, cfg=newton.ModelBuilder.ShapeConfig(mu=0.1 * (k + 1)))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
         with unittest.mock.patch("newton._src.sim.collide.MAX_GROUP_ID", 4):
-            with self.assertRaisesRegex(ValueError, "at most 4 shapes"):
+            with self.assertRaisesRegex(ValueError, "at most 4 reduction groups"):
                 _make_pipeline(model, True)
 
     def test_cuda_graph_capture(self):

@@ -88,6 +88,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import warp as wp
 
 from ..sim.contacts import contact_surface_separation
@@ -147,6 +148,78 @@ _BP_FACE_NORMALS_DATA = (
 BP_NUM_NORMAL_BINS = 20
 _bp_face_normals_mat = wp.types.matrix(shape=(BP_NUM_NORMAL_BINS, 3), dtype=wp.float32)
 BP_FACE_NORMALS = _bp_face_normals_mat(*_BP_FACE_NORMALS_DATA)
+
+
+def _up_axis_rotation(up_axis: int) -> tuple:
+    """Exact rotation (rows of a permutation matrix) mapping ``up_axis`` to +Z.
+
+    The bin table is oriented so its widest margins protect the WORLD UP
+    direction; Newton models can be X-, Y-, or Z-up, so grouping geometry is
+    rotated into a Z-up frame first.  The entries are exactly 0/1 (cyclic axis
+    permutations, det +1), so the rotation introduces no rounding.
+    """
+    if up_axis == 0:  # X-up: X->Z, Y->X, Z->Y
+        return ((0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0))
+    if up_axis == 1:  # Y-up: X->Y, Y->Z, Z->X
+        return ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    return ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+
+# Solver-visible contact material fields. Shapes on one body may only share a
+# reduction group when ALL of these are exactly equal: the surviving contacts'
+# shape ids are what the solvers read material laws from, so merging shapes
+# with different materials could delete e.g. a high-friction pad in favor of
+# the surrounding low-friction colliders and change grip. Exact equality, not
+# a hash -- a hash collision would silently merge incompatible laws.
+_MATERIAL_FIELDS = (
+    "shape_material_ke",
+    "shape_material_kd",
+    "shape_material_kf",
+    "shape_material_ka",
+    "shape_material_kh",
+    "shape_material_mu",
+    "shape_material_mu_torsional",
+    "shape_material_mu_rolling",
+    "shape_material_restitution",
+)
+
+
+def build_reduction_groups(model) -> tuple:
+    """Assign each shape a reduction-group id (host side, at construction).
+
+    Static shapes keep unique ids so distinct static colliders never merge.
+    Dynamic shapes share a group only per (body, exact material signature):
+    a body whose colliders differ in any solver-visible material field gets
+    one group per material class, so contacts carrying different physics never
+    compete for the same slots.
+
+    Returns:
+        ``(ids, group_count)`` where ids is an int32 array of length
+        ``shape_count``.
+    """
+    n = int(model.shape_count)
+    shape_body = model.shape_body.numpy()
+    mats = []
+    for name in _MATERIAL_FIELDS:
+        arr = getattr(model, name, None)
+        if arr is not None:
+            mats.append(arr.numpy())
+    ids = np.zeros(n, dtype=np.int32)
+    class_ids: dict = {}
+    next_id = 0
+    for shape in range(n):
+        body = int(shape_body[shape])
+        if body < 0:
+            key = ("static", shape)
+        else:
+            key = ("body", body, tuple(float(m[shape]) for m in mats))
+        gid = class_ids.get(key)
+        if gid is None:
+            gid = next_id
+            next_id += 1
+            class_ids[key] = gid
+        ids[shape] = gid
+    return ids, next_id
 
 
 @wp.func
@@ -375,7 +448,8 @@ def _contact_group_key(
     contact_margin1: wp.array[wp.float32],
     body_q: wp.array[wp.transform],
     shape_body: wp.array[wp.int32],
-    shape_count: int,
+    shape_group: wp.array[wp.int32],
+    up_rotation: wp.mat33,
     cell_size: float,
 ):
     """Compute (key, gap, face-plane position, cell_clamped) for contact ``i``.
@@ -386,9 +460,17 @@ def _contact_group_key(
     with exactly that formula: a hand-rolled variant with the opposite point
     order ranked SHALLOWEST as deepest and made the pass keep hovering
     candidates while discarding the load-bearing contacts.
-    The group id is the body for dynamic shapes (all shapes of a body form one
-    group) and the shape itself for static geometry (distinct static colliders
-    never merge).  The key also carries a spatial cell -- the contact's
+    Group ids come from :func:`build_reduction_groups`: static shapes keep
+    unique ids, and dynamic shapes share a group per (body, exact material
+    signature), so contacts carrying different solver-visible material laws
+    never compete for the same slots.  The pair is unordered but the stored
+    normal is directed shape0 -> shape1, and the narrow phase orders endpoints
+    by geometry type -- one physical patch between two mixed-collider bodies
+    can arrive with BOTH orientations.  Binning therefore uses a canonical
+    group normal (negated when the group endpoints are swapped) while the gap
+    keeps the original directed convention.  Grouping geometry is additionally
+    rotated so the model's up axis maps to +Z, where the private bin table has
+    its widest margins.  The key also carries a spatial cell -- the contact's
     position quantized on the bin's face plane by ``cell_size`` -- so multiple
     same-normal patches far apart on ONE shape pair (a long body across two
     regions of a terrain collider) each get their own deepest + extremes
@@ -421,14 +503,16 @@ def _contact_group_key(
     gap = contact_surface_separation(p0_w, p1_w, n, contact_margin0[i], contact_margin1[i])
     center = 0.5 * (p0_w + p1_w)
 
-    g0 = s0
-    if b0 >= 0:
-        g0 = shape_count + b0
-    g1 = s1
-    if b1 >= 0:
-        g1 = shape_count + b1
+    g0 = shape_group[s0]
+    g1 = shape_group[s1]
     ga = wp.min(g0, g1)
     gb = wp.max(g0, g1)
+    # Canonical group normal: contacts of one patch arriving with swapped
+    # endpoints carry opposite directed normals; without this they land in
+    # opposite bins and never compete, keeping two slot sets for one patch.
+    n_group = n
+    if g1 < g0:
+        n_group = -n
 
     # Cell origin: the pair's lowest-indexed dynamic body, or the world origin
     # when both sides are static. Chosen from body indices rather than from the
@@ -440,8 +524,8 @@ def _contact_group_key(
     elif b1 >= 0:
         ref = wp.transform_get_translation(body_q[b1])
 
-    bin_id = _bp_get_slot(n)
-    pos_2d = _bp_project_point_to_plane(bin_id, center - ref)
+    bin_id = _bp_get_slot(up_rotation * n_group)
+    pos_2d = _bp_project_point_to_plane(bin_id, up_rotation * (center - ref))
     # Round to nearest, not floor: that puts the reference body's origin at the
     # CENTER of cell 0 rather than on its corner. Flooring relative coordinates
     # would place the origin exactly on a cell boundary, so a patch centered
@@ -664,7 +748,8 @@ def _register_contact_one(
     contact_margin1: wp.array[wp.float32],
     body_q: wp.array[wp.transform],
     shape_body: wp.array[wp.int32],
-    shape_count: int,
+    shape_group: wp.array[wp.int32],
+    up_rotation: wp.mat33,
     cell_size: float,
     ht_keys: wp.array[wp.uint64],
     ht_active_slots: wp.array[wp.int32],
@@ -713,7 +798,8 @@ def _register_contact_one(
         contact_margin1,
         body_q,
         shape_body,
-        shape_count,
+        shape_group,
+        up_rotation,
         cell_size,
     )
     if cell_clamped:
@@ -762,7 +848,8 @@ def _register_contacts_kernel(
     contact_margin1: wp.array[wp.float32],
     body_q: wp.array[wp.transform],
     shape_body: wp.array[wp.int32],
-    shape_count: int,
+    shape_group: wp.array[wp.int32],
+    up_rotation: wp.mat33,
     cell_size: float,
     ht_keys: wp.array[wp.uint64],
     ht_active_slots: wp.array[wp.int32],
@@ -802,7 +889,8 @@ def _register_contacts_kernel(
             contact_margin1,
             body_q,
             shape_body,
-            shape_count,
+            shape_group,
+            up_rotation,
             cell_size,
             ht_keys,
             ht_active_slots,
@@ -1294,6 +1382,8 @@ class BodyPairContactReducer:
         rigid_contact_max: int,
         cell_size: float,
         device,
+        shape_group,
+        up_axis: int = 2,
         hashtable_factor: float = 0.25,
         borrowed_scratch: dict | None = None,
         verify: bool = False,
@@ -1310,6 +1400,11 @@ class BodyPairContactReducer:
         hashtable_factor = float(hashtable_factor)
         if not (math.isfinite(hashtable_factor) and hashtable_factor > 0.0):
             raise ValueError(f"hashtable_factor must be finite and positive, got {hashtable_factor}")
+        # Per-shape reduction-group ids from build_reduction_groups (material-
+        # equivalence classes), and the exact rotation mapping the model's up
+        # axis into the bin table's Z-up frame.
+        self.shape_group = wp.array(shape_group, dtype=wp.int32, device=device)
+        self.up_rotation = wp.mat33(*(v for row in _up_axis_rotation(int(up_axis)) for v in row))
         # Full-size gather scratch borrowed from the deterministic sorter (see
         # ContactSorter.borrow_full_scratch): the two stages run strictly
         # sequentially inside collide(), so sharing halves the pipeline's
@@ -1482,7 +1577,8 @@ class BodyPairContactReducer:
             contacts.rigid_contact_margin1,
             state.body_q,
             model.shape_body,
-            model.shape_count,
+            self.shape_group,
+            self.up_rotation,
         ]
         wp.launch(
             _register_contacts_kernel,

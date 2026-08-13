@@ -15,7 +15,7 @@ from ..geometry.collision_core import compute_tight_aabb_from_support
 from ..geometry.contact_data import ContactData, make_contact_sort_key
 from ..geometry.contact_match import ContactMatcher
 from ..geometry.contact_reduction import MAX_CONTACTS_PER_PAIR, NUM_NORMAL_BINS
-from ..geometry.contact_reduction_body_pairs import MAX_GROUP_ID, BodyPairContactReducer
+from ..geometry.contact_reduction_body_pairs import MAX_GROUP_ID, BodyPairContactReducer, build_reduction_groups
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import ShapeFlags
@@ -1392,17 +1392,22 @@ class CollisionPipeline:
                 # Hydroelastic contacts carry per-contact area/stiffness data
                 # the compaction does not preserve.
                 raise ValueError("reduce_contacts_body_pairs does not support hydroelastic contacts")
-            if model.shape_count + model.body_count > MAX_GROUP_ID:
-                # Group ids must pack exactly into the reduction key: aliasing two
-                # groups could evict a patch's deepest contact.
+            # Material-equivalence grouping: shapes on one body merge only when
+            # every solver-visible material field matches exactly (see
+            # build_reduction_groups). Group ids must pack exactly into the
+            # reduction key: aliasing two groups could evict a patch's deepest
+            # contact.
+            shape_group, group_count = build_reduction_groups(model)
+            if group_count > MAX_GROUP_ID:
                 raise ValueError(
-                    f"reduce_contacts_body_pairs supports at most {MAX_GROUP_ID} shapes + bodies, "
-                    f"got {model.shape_count + model.body_count}"
+                    f"reduce_contacts_body_pairs supports at most {MAX_GROUP_ID} reduction groups, got {group_count}"
                 )
             self._body_pair_reducer = BodyPairContactReducer(
                 rigid_contact_max,
                 reduce_contacts_body_pairs_cell,
                 device,
+                shape_group=shape_group,
+                up_axis=int(getattr(model, "up_axis", 2)),
                 borrowed_scratch=(self._contact_sorter.borrow_full_scratch() if self._contact_sorter else None),
                 verify=reduce_contacts_body_pairs_verify,
                 hysteresis=reduce_contacts_body_pairs_hysteresis,
