@@ -678,6 +678,68 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
 
         self._compare(build, lambda m: newton.solvers.SolverFeatherPGS(m, angular_damping=0.0), tol=2e-3)
 
+    def test_feather_pgs_contact_mode_conformance(self):
+        """Settle identically on/off in every FeatherPGS contact mode.
+
+        supports_reduced_contacts is class-wide, so the evidence must cover
+        the dense and matrix-free contact paths, not only the default split
+        mode the other tests exercise (matrix-free additionally runs generated
+        native CUDA).
+        """
+        if not wp.get_device().is_cuda:
+            self.skipTest("matrix_free requires a CUDA device")
+        # dense runs 16 iterations: at the default 8 the UNREDUCED redundant
+        # set does not converge (settles 5 mm high; split and the reduced set
+        # both land at the true height) -- redundant near-parallel rows hurt
+        # dense-PGS conditioning, the same effect as the stack-collapse case.
+        # The comparison must be against a converged baseline.
+        for mode, iters in (("dense", 16), ("matrix_free", 8)):
+            with self.subTest(pgs_mode=mode):
+                self._compare(
+                    lambda b: _free_jointed_foot(b, (0.0, 0.0, 0.05)),
+                    lambda m, mode=mode, iters=iters: newton.solvers.SolverFeatherPGS(
+                        m, angular_damping=0.0, pgs_mode=mode, pgs_iterations=iters
+                    ),
+                )
+
+    def test_mixed_separation_tilted_patch(self):
+        """Settle a tilted patch whose contacts mix penetrating and speculative.
+
+        The adversarial topology for solvers that ignore non-penetrating
+        contacts (XPBD): the spatial-extreme slots can be won by speculative
+        endpoints while interior points penetrate, so the retained PENETRATING
+        support could collapse toward the single deepest point. Measured, the
+        per-frame migration of the deepest slot keeps the dynamics equivalent;
+        this pins that behavior for both solver families.
+        """
+        pitch = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.06)
+
+        def build(b):
+            body = b.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.028), pitch), mass=1.0)
+            for i in range(7):
+                b.add_shape_cylinder(
+                    body,
+                    xform=wp.transform(wp.vec3((i - 3.0) * 0.044, 0.0, 0.0), wp.quat_identity()),
+                    radius=0.02,
+                    half_height=0.015,
+                )
+            return body
+
+        def build_jointed(b):
+            link = b.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.028), pitch))
+            for i in range(7):
+                b.add_shape_cylinder(
+                    link,
+                    xform=wp.transform(wp.vec3((i - 3.0) * 0.044, 0.0, 0.0), wp.quat_identity()),
+                    radius=0.02,
+                    half_height=0.015,
+                )
+            b.add_articulation([b.add_joint_free(parent=-1, child=link)])
+            return link
+
+        self._compare(build, lambda m: newton.solvers.SolverXPBD(m, iterations=8), tol=1e-3)
+        self._compare(build_jointed, lambda m: newton.solvers.SolverFeatherPGS(m, angular_damping=0.0), tol=1e-3)
+
     def test_xpbd_conformance(self):
         """SolverXPBD rests the multi-cylinder foot at the same height on/off."""
         self._compare(
