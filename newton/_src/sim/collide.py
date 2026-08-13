@@ -1033,15 +1033,22 @@ class CollisionPipeline:
                 with ``deterministic=True`` if a canonical buffer ORDER is
                 also required.  Known fidelity tradeoffs: the footprint hull is
                 sampled by six fixed directions, so support and tipping are
-                preserved only to scene-dependent sampling tolerances (a
-                densely populated footprint loses at most ~13% of patch
-                radius; a sparse adversarial hull can lose up to 50% in an
-                omitted direction) rather than exactly, and
+                preserved only to scene-dependent sampling tolerances with
+                no shape-independent percentage (a densely populated
+                footprint loses at most ~13% of patch radius; a sparse hull
+                can lose the whole support of an unsampled direction) rather
+                than exactly, and
                 keeping rim extremes strengthens torsional (twist-about-
                 normal) friction -- measured 1.34x the uniform-pressure value
                 on a circular patch; elongated patches can be biased further.
-                Validate tipping- and yaw-heavy motions before enabling in
-                production.  Defaults to ``False``.
+                With ``SolverXPBD`` at low iteration counts, reduced
+                curved-collider support can sustain a residual roll
+                oscillation (measured 1.17 rad/s tail-mean at 8 iterations on
+                a cylinder-row foot, decaying with iterations; FeatherPGS
+                settles the same scene to zero) -- prefer FeatherPGS for
+                curved feet or raise XPBD iterations.  Validate tipping- and
+                yaw-heavy motions before enabling in production.  Defaults to
+                ``False``.
             reduce_contacts_body_pairs_cell: Spatial cell edge [m] used to
                 subdivide each body pair + normal bin on the bin's face
                 plane; every cell keeps its own deepest contact and footprint
@@ -1529,7 +1536,12 @@ class CollisionPipeline:
         self._body_pair_reducer.clear_stats()
 
     def body_pair_reduction_description(self) -> dict:
-        """Static buffer footprint of the body-pair contact reduction by role.
+        """Currently allocated buffer footprint of the body-pair contact reduction by role.
+
+        Mostly fixed at construction; the per-contact material scratch is
+        provisioned on the first collide of a buffer with per-contact shape
+        properties, so the reported total can grow once after that first
+        rich-buffer use.
 
         Raises:
             RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.

@@ -13,12 +13,13 @@ interior point's normal force is a convex combination of hull-point normal
 forces (support/tipping statics preserved) and translational friction capacity
 ``sum mu*N_i`` is position-independent.  But the hull itself is SAMPLED by
 :data:`BODY_PAIR_NUM_DIRECTIONS` fixed scan directions, and the sampling error
-carries NO universal bound: for a densely populated footprint (candidates near
-every direction) the retained support boundary moves inward by at most
-``1 - cos(pi/N)`` of the patch radius (~13% at six directions), but a sparse
-adversarial hull whose omitted vertex is not the deepest can lose up to
-``1 - cos(pi/3)`` = 50% of its support radius in the omitted direction (three
-vertices at -29/30/89 degrees retain ~0.52 of the 30-degree support).  Nonzero
+carries NO universal bound -- the following are EXAMPLES, not ceilings.  A
+densely populated footprint (candidates near every direction) loses at most
+``1 - cos(pi/N)`` of the patch radius (~13% at six directions).  A sparse hull
+can lose the entire support of an unsampled direction: candidates at -60/120
+degrees plus a true hull vertex at 30 degrees that trails each of the six
+scan projections by an epsilon lose ALL of the 30-degree support (~58% of the
+patch radius there, and the discarded point is a true hull vertex).  Nonzero
 hysteresis further allows a retained representative to sit within the margin of
 the true winner.  Support, tipping, and translational friction are therefore
 preserved only to scene-dependent tolerances pinned by the test suite -- not
@@ -42,8 +43,9 @@ compacts it in two kernels over the live contact range -- register, then select:
   (see :data:`BODY_PAIR_REDUCTION_SLOTS` for the policies this replaced);
 * each contact then checks whether any value it submitted won its slot, and the
   survivors are compacted in place so ``rigid_contact_count`` itself drops.
-  Everything else -- interior points of a patch, whose force is a convex
-  combination of the hull points' -- is discarded.
+  Everything else is discarded -- typically interior points whose force is a
+  convex combination of the hull points', though a sparsely populated hull can
+  also lose true vertices that fall between scan directions (see above).
 
 **When this pays.** Only bodies whose collision is decomposed into several
 primitives generate more candidates per pair than the slot budget. On a walking
