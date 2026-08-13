@@ -1432,6 +1432,30 @@ class CollisionPipeline:
         else:
             self._body_pair_reducer = None
 
+    def refresh_body_pair_reduction_groups(self):
+        """Rebuild material-equivalence reduction groups from current materials.
+
+        Group ids are snapshotted at construction; Newton supports mutating
+        ``model.shape_material_*`` at runtime, and a shape whose material
+        diverged after construction would keep competing in its old class --
+        the surviving contact could then carry the wrong law.  Call this after
+        any material mutation that should affect contact reduction (typically
+        alongside ``notify_model_changed(SHAPE_PROPERTIES)``).  Host-side; call
+        outside CUDA graph capture.  Raises if the new class count exceeds the
+        group-id budget.  No-op when reduction is disabled.
+        """
+        if self._body_pair_reducer is None:
+            return
+        shape_group, group_count = build_reduction_groups(self.model)
+        if group_count > MAX_GROUP_ID + 1:
+            raise ValueError(
+                f"reduce_contacts_body_pairs supports at most {MAX_GROUP_ID + 1} reduction groups, got {group_count}"
+            )
+        self._body_pair_reducer.shape_group.assign(shape_group)
+        # Winners recorded under the old classes are not comparable to the new
+        # grouping; severing history is the conservative continuation.
+        self._body_pair_reducer.reset_history()
+
     def reset_body_pair_reduction_history(self, world_mask=None):
         """Erase the body-pair reduction's hysteresis history.
 

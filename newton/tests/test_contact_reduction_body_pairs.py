@@ -737,6 +737,47 @@ class TestBodyPairReductionGrouping(unittest.TestCase):
         n_homo, _mus_homo = self._pad_body(0.2, 0.2)
         self.assertLessEqual(n_homo, 7, "identical materials must merge into one group")
 
+    def test_material_mutation_requires_refresh_and_then_splits(self):
+        """Split reduction groups after a runtime material mutation + refresh.
+
+        Group ids are construction-time snapshots; mutating one collider's
+        friction afterwards must not silently keep it competing in its old
+        class once the caller refreshes the grouping.
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0095), wp.quat_identity()), mass=1.0)
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.2)
+        for i in range(5):
+            for j in range(5):
+                builder.add_shape_sphere(
+                    body,
+                    xform=wp.transform(wp.vec3((i - 2.0) * 0.04, (j - 2.0) * 0.04, 0.0), wp.quat_identity()),
+                    radius=0.01,
+                    cfg=cfg,
+                )
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_cell=10.0)
+        contacts = pipeline.contacts()
+
+        # mutate the CENTER collider (index 12: interior point of the patch)
+        mu = model.shape_material_mu.numpy()
+        mu[12] = 1.0
+        model.shape_material_mu.assign(mu)
+
+        pipeline.collide(state, contacts)  # stale classes: center still merged
+        _n, s0, s1, _n1, _p0 = _contact_snapshot(contacts)
+        sb = model.shape_body.numpy()
+        kept_mus_stale = {round(float(mu[a if sb[a] >= 0 else b]), 3) for a, b in zip(s0, s1, strict=True)}
+        self.assertNotIn(1.0, kept_mus_stale, "scene no longer discards the interior point: rebuild it")
+
+        pipeline.refresh_body_pair_reduction_groups()
+        pipeline.collide(state, contacts)
+        _n2b, s0, s1, _n2, _p0 = _contact_snapshot(contacts)
+        kept_mus = {round(float(mu[a if sb[a] >= 0 else b]), 3) for a, b in zip(s0, s1, strict=True)}
+        self.assertIn(1.0, kept_mus, "refreshed classes did not separate the mutated collider")
+
     def test_swapped_endpoints_share_one_group(self):
         """Merge one physical patch whose contacts arrive with both endpoint orders.
 
