@@ -2768,6 +2768,265 @@ def populate_connect_J_for_size(
 
 
 # =============================================================================
+# Bilateral Pre-elimination Kernels (mimic + connect Schur complement)
+# =============================================================================
+# Fold the bilateral internal equality rows (MIMIC + CONNECT) into the
+# response operator so every other row sees the closed-loop effective mass:
+# with B the bilateral block of one articulation, Y_B = H^-1 J_B^T and
+# S = J_B Y_B (+ regularization), every other row's response is corrected to
+# Y'_i = Y_i - Y_B S^-1 (J_B Y_i), which makes J_B Y'_i ~ 0 — sweep impulses
+# then preserve the closures exactly, and the corrected row diagonals fall out
+# of the unchanged diag_from_JY pass. The predictor velocity is projected once
+# (J_B v + b_B -> 0) to replace the eliminated rows' Baumgarte work. See
+# reports/vishal/robotiq/fpgs_preelimination_design.md (skild-IL-solver).
+
+PREELIM_MAX_ROWS = 8
+"""Per-articulation capacity of the pre-eliminated bilateral block (the
+Robotiq 2F-85 needs 7: one mimic + two 3-row connect closures)."""
+
+_preelim_vec = wp.types.vector(length=PREELIM_MAX_ROWS, dtype=wp.float32)
+
+
+@wp.func
+def preelim_solve(
+    n: int,
+    L: wp.array[float],
+    L_start: int,
+    b: _preelim_vec,
+) -> _preelim_vec:
+    """Solve (L L^T) x = b for the packed per-articulation Cholesky factor.
+
+    Mirrors :func:`dense_subs` but keeps the right-hand side in registers so
+    per-row callers need no global scratch.
+    """
+    x = _preelim_vec()
+    for i in range(n):
+        s = b[i]
+        for j in range(i):
+            s -= L[L_start + dense_index(n, i, j)] * x[j]
+        x[i] = s / L[L_start + dense_index(n, i, i)]
+    for ii in range(n):
+        i = n - 1 - ii
+        s = x[i]
+        for j in range(i + 1, n):
+            s -= L[L_start + dense_index(n, j, i)] * x[j]
+        x[i] = s / L[L_start + dense_index(n, i, i)]
+    return x
+
+
+@wp.kernel
+def preelim_setup_for_size(
+    group_to_art: wp.array[int],
+    art_to_preelim: wp.array[int],
+    mimic_slot: wp.array[int],
+    mimic_art: wp.array[int],
+    n_mimic: int,
+    connect_slot: wp.array[int],
+    connect_art: wp.array[int],
+    n_connect: int,
+    J_group: wp.array3d[float],
+    Y_group: wp.array3d[float],
+    n_dofs: int,
+    reg_rel: float,
+    reg_floor: float,
+    # outputs
+    preelim_slots: wp.array[int],
+    preelim_nB: wp.array[int],
+    S_scratch: wp.array[float],
+    reg: wp.array[float],
+    LS: wp.array[float],
+):
+    """Gather the bilateral block, form S = J_B Y_B, and factor it.
+
+    Launched once per size group with ``dim = n_arts_of_size`` after the
+    ``Y = H^-1 J^T`` stage; one thread per articulation (the block is tiny).
+    Ownership comes from the per-constraint ``*_art``/``*_slot`` tables — NOT
+    ``row_type``, which is per-world and would admit other articulations'
+    zero-J rows and make S singular. Zero-norm rows (the degenerate connect
+    axis the populate kernel already zeroes) are dropped here for the same
+    reason.
+    """
+    group_idx = wp.tid()
+    art = group_to_art[group_idx]
+    pe = art_to_preelim[art]
+    if pe < 0:
+        return
+    base = pe * PREELIM_MAX_ROWS
+
+    # Gather candidate slots owned by this articulation.
+    n = int(0)
+    for k in range(n_mimic):
+        if mimic_art[k] == art and mimic_slot[k] >= 0 and n < PREELIM_MAX_ROWS:
+            preelim_slots[base + n] = mimic_slot[k]
+            n += 1
+    for k in range(n_connect):
+        if connect_art[k] == art and connect_slot[k] >= 0:
+            for a in range(3):
+                if n < PREELIM_MAX_ROWS:
+                    preelim_slots[base + n] = connect_slot[k] + a
+                    n += 1
+
+    # Drop zero-norm rows (inert degenerate axes) by compaction.
+    m = int(0)
+    for p in range(n):
+        s = preelim_slots[base + p]
+        nrm = float(0.0)
+        for d in range(n_dofs):
+            nrm += J_group[group_idx, s, d] * J_group[group_idx, s, d]
+        if nrm > 1.0e-10:
+            preelim_slots[base + m] = s
+            m += 1
+    for p in range(m, PREELIM_MAX_ROWS):
+        preelim_slots[base + p] = -1
+    preelim_nB[pe] = m
+    if m == 0:
+        return
+
+    # S[p, q] = J_B[p] . Y_B[q]  (n x n, row-major with stride m).
+    s_base = pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS
+    for p in range(m):
+        sp = preelim_slots[base + p]
+        for q in range(m):
+            sq = preelim_slots[base + q]
+            acc = float(0.0)
+            for d in range(n_dofs):
+                acc += J_group[group_idx, sp, d] * Y_group[group_idx, sq, d]
+            S_scratch[s_base + dense_index(m, p, q)] = acc
+
+    # RELATIVE diagonal regularization: a planar four-bar's closure has one
+    # near-dependent axis, so after eliminating the well-conditioned rows the
+    # last pivot is pure float32 cancellation noise around zero — an absolute
+    # epsilon under the Delassus scale (which is huge for gram-scale links)
+    # goes negative in the sqrt. Scaling by the row's own diagonal keeps the
+    # factor SPD at any mass scale; the redundant axis just turns ~reg_rel
+    # soft, which is benign (the tree already enforces that direction).
+    for p in range(m):
+        reg[base + p] = reg_rel * S_scratch[s_base + dense_index(m, p, p)] + reg_floor
+
+    dense_cholesky(m, S_scratch, reg, s_base, base, LS)
+
+
+@wp.kernel
+def preelim_correct_Y_for_size(
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    art_to_preelim: wp.array[int],
+    constraint_count: wp.array[int],
+    preelim_slots: wp.array[int],
+    preelim_nB: wp.array[int],
+    LS: wp.array[float],
+    J_group: wp.array3d[float],
+    n_dofs: int,
+    max_constraints: int,
+    n_arts: int,
+    # outputs
+    Y_group: wp.array3d[float],
+):
+    """Correct every non-B row's response: Y_i -= Y_B S^-1 (J_B Y_i).
+
+    Launched per size group with ``dim = n_arts_of_size * max_constraints``.
+    B rows themselves are left intact (the projection kernel needs Y_B; their
+    sweep visits self-neutralize because the projected velocity already
+    satisfies J_B v = -b_B, so their residual is ~0).
+    """
+    idx = wp.tid()
+    group_idx = idx // max_constraints
+    i = idx % max_constraints
+    if group_idx >= n_arts:
+        return
+    art = group_to_art[group_idx]
+    pe = art_to_preelim[art]
+    if pe < 0:
+        return
+    world = art_to_world[art]
+    if i >= constraint_count[world]:
+        return
+    base = pe * PREELIM_MAX_ROWS
+    m = preelim_nB[pe]
+    if m == 0:
+        return
+    for p in range(m):
+        if preelim_slots[base + p] == i:
+            return  # B row: keep its response for the projection
+
+    # w = J_B . Y_i
+    w = _preelim_vec()
+    nonzero = int(0)
+    for p in range(m):
+        sp = preelim_slots[base + p]
+        acc = float(0.0)
+        for d in range(n_dofs):
+            acc += J_group[group_idx, sp, d] * Y_group[group_idx, i, d]
+        w[p] = acc
+        if acc != 0.0:
+            nonzero = 1
+    if nonzero == 0:
+        return  # row does not touch this articulation (e.g. other art's row)
+
+    z = preelim_solve(m, LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, w)
+
+    for d in range(n_dofs):
+        acc = float(0.0)
+        for p in range(m):
+            acc += Y_group[group_idx, preelim_slots[base + p], d] * z[p]
+        Y_group[group_idx, i, d] -= acc
+
+
+@wp.kernel
+def preelim_project_velocity_for_size(
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    art_to_preelim: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    preelim_slots: wp.array[int],
+    preelim_nB: wp.array[int],
+    LS: wp.array[float],
+    J_group: wp.array3d[float],
+    Y_group: wp.array3d[float],
+    world_rhs: wp.array2d[float],
+    n_dofs: int,
+    # outputs
+    v_out: wp.array[float],
+):
+    """One-shot bilateral projection: v_out -= Y_B S^-1 (J_B v_out + b_B).
+
+    Launched per size group with ``dim = n_arts_of_size`` after the sweep's
+    velocity buffer is seeded with the predictor (v_out = v_hat). Afterwards
+    J_B v_out = -b_B holds, and it stays held through the sweep because every
+    corrected column satisfies J_B Y'_i ~ 0. Each thread owns one
+    articulation's contiguous DOF window, so there are no write races.
+    """
+    group_idx = wp.tid()
+    art = group_to_art[group_idx]
+    pe = art_to_preelim[art]
+    if pe < 0:
+        return
+    m = preelim_nB[pe]
+    if m == 0:
+        return
+    base = pe * PREELIM_MAX_ROWS
+    world = art_to_world[art]
+    dof_start = articulation_dof_start[art]
+
+    r = _preelim_vec()
+    for p in range(m):
+        sp = preelim_slots[base + p]
+        acc = world_rhs[world, sp]
+        for d in range(n_dofs):
+            acc += J_group[group_idx, sp, d] * v_out[dof_start + d]
+        r[p] = acc
+
+    z = preelim_solve(m, LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, r)
+
+    for d in range(n_dofs):
+        acc = float(0.0)
+        for p in range(m):
+            acc += Y_group[group_idx, preelim_slots[base + p], d] * z[p]
+        if acc != 0.0:
+            v_out[dof_start + d] -= acc
+
+
+# =============================================================================
 # Joint Velocity-Limit Constraint Kernels
 # =============================================================================
 # These kernels mirror the PhysX per-DOF velocity-limit formulation documented
