@@ -51,6 +51,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PROPAGATION_COLOR_TAIL,
     add_dense_contact_compliance_to_diag,
     allocate_joint_limit_slots,
     allocate_joint_velocity_limit_slots,
@@ -59,6 +60,7 @@ from .kernels import (
     allocate_world_contact_slots,
     apply_augmented_joint_tau,
     apply_augmented_mass_diagonal_grouped,
+    apply_free_root_transport_to_predictor,
     apply_impulses_world_par_dof,
     build_augmented_joint_rows,
     build_mass_update_mask,
@@ -69,8 +71,8 @@ from .kernels import (
     build_propagation_contact_rows,
     cholesky_loop,
     clamp_augmented_joint_u0,
-    collect_propagation_units,
     clamp_free_root_velocity_limits,
+    collect_propagation_units,
     commit_mass_updates,
     compute_com_transforms,
     compute_composite_inertia,
@@ -90,8 +92,6 @@ from .kernels import (
     compute_spatial_inertia,
     compute_velocity_predictor,
     compute_world_contact_bias,
-    convert_root_free_qd_local_to_world,
-    convert_root_free_qd_world_to_local,
     copy_free_rigid_propagation_body_response,
     crba_fill_par_dof,
     delassus_par_row_col,
@@ -116,7 +116,6 @@ from .kernels import (
     pgs_ncp_residuals_diagnostic_velocity,
     pgs_solve_loop,
     pgs_solve_mf_loop,
-    PROPAGATION_COLOR_TAIL,
     pgs_solve_propagation_contact_loop,
     populate_joint_limit_J_for_size,
     populate_joint_velocity_limit_J_for_size,
@@ -129,6 +128,7 @@ from .kernels import (
     refine_same_articulation_propagation_rows,
     refresh_propagation_free_body_qd_from_vout,
     refresh_propagation_tree_body_qd_for_size,
+    remove_free_root_transport_from_qdd,
     reset_world_warmstart_buffers,
     rhs_accum_world_par_art,
     scatter_qdd_from_groups,
@@ -137,7 +137,6 @@ from .kernels import (
     snapshot_propagation_cache_qd_base,
     trisolve_loop,
     update_articulation_origins,
-    update_articulation_root_com_offsets,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
     vector_add_inplace,
@@ -828,8 +827,7 @@ class SolverFeatherPGS(SolverBase):
                 the only supported value. ``"net"`` is rejected with ``ValueError``.
             serial_kernel_block_dim (int, optional): CUDA block size for the serial
                 one-thread-per-articulation kernels (``eval_rigid_fk``, ``eval_rigid_id``,
-                ``eval_rigid_tau``, ``update_articulation_origins``,
-                ``update_articulation_root_com_offsets``). These kernels have no
+                ``eval_rigid_tau``, ``update_articulation_origins``). These kernels have no
                 cross-thread reductions, so changing this value is bit-identical; it only
                 changes occupancy/grid shape. Must be a positive multiple of 32.
                 Defaults to 256 (the Warp default).
@@ -1459,7 +1457,9 @@ class SolverFeatherPGS(SolverBase):
                 continue
             if not self._propagation_tree_has_non_free_by_size.get(size_i, True):
                 continue
-            if self._propagation_tree_single_dof_by_size.get(size_i, False) or self._propagation_tree_free_root_by_size.get(size_i, False):
+            if self._propagation_tree_single_dof_by_size.get(
+                size_i, False
+            ) or self._propagation_tree_free_root_by_size.get(size_i, False):
                 return True
         return False
 
@@ -1834,6 +1834,21 @@ class SolverFeatherPGS(SolverBase):
             self.articulation_max_dofs = 0
 
     def _compute_root_free_metadata(self, model):
+        if model.joint_count:
+            joint_type = model.joint_type.numpy()
+            joint_parent = model.joint_parent.numpy()
+            root_mask = ((joint_type == JointType.FREE) | (joint_type == JointType.DISTANCE)) & (joint_parent < 0)
+            free_root_joint_indices = np.flatnonzero(root_mask).astype(np.int32, copy=False)
+            self._free_root_joint_count = int(free_root_joint_indices.size)
+            self._free_root_joint_indices = (
+                wp.array(free_root_joint_indices, dtype=wp.int32, device=model.device)
+                if self._free_root_joint_count
+                else None
+            )
+        else:
+            self._free_root_joint_count = 0
+            self._free_root_joint_indices = None
+
         if not model.articulation_count or not model.joint_count:
             self.articulation_root_is_free = None
             self.articulation_root_dof_start = None
@@ -1841,8 +1856,6 @@ class SolverFeatherPGS(SolverBase):
             return
 
         articulation_start = model.articulation_start.numpy()
-        joint_type = model.joint_type.numpy()
-        joint_parent = model.joint_parent.numpy()
         joint_qd_start = model.joint_qd_start.numpy()
 
         root_is_free = np.zeros(model.articulation_count, dtype=np.int32)
@@ -2182,13 +2195,9 @@ class SolverFeatherPGS(SolverBase):
 
         if not model.articulation_count or not model.joint_count:
             self.articulation_origin = None
-            self.articulation_root_com_offset = None
             return
 
         self.articulation_origin = wp.zeros(
-            (model.articulation_count,), dtype=wp.vec3, device=model.device, requires_grad=model.requires_grad
-        )
-        self.articulation_root_com_offset = wp.zeros(
             (model.articulation_count,), dtype=wp.vec3, device=model.device, requires_grad=model.requires_grad
         )
 
@@ -2306,7 +2315,9 @@ class SolverFeatherPGS(SolverBase):
         self._max_contacts_alloc = max_contacts
         self.contact_world = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_slot = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self.contact_slots_needed = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self.contact_slots_needed = wp.zeros(
+            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
+        )
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
@@ -3235,11 +3246,7 @@ class SolverFeatherPGS(SolverBase):
         self._propagation_fused_worlds_per_block = 1
         self._pgs_solve_propagation_colored_block_kernel = None
         self._propagation_colored_block_dim = 64
-        if (
-            model.device.is_cuda
-            and self._propagation_colored
-            and self.propagation_max_constraints > 0
-        ):
+        if model.device.is_cuda and self._propagation_colored and self.propagation_max_constraints > 0:
             self._pgs_solve_propagation_colored_block_kernel = _get_pgs_solve_propagation_colored_block_kernel(
                 self.propagation_max_constraints,
                 PROPAGATION_COLOR_TAIL + 2,
@@ -3254,15 +3261,13 @@ class SolverFeatherPGS(SolverBase):
             self._propagation_colored_worlds_per_block = wpb
             # per-warp staging: 48B/body/world; keep total static shared under ~44KB
             if lanes in (1, 2, 4, 8, 16, 32) and wpb >= 1 and mb * wpb * 48 <= 45056:
-                self._pgs_solve_propagation_colored_warp_kernel = (
-                    _get_pgs_solve_propagation_colored_warp_kernel(
-                        self.propagation_max_constraints,
-                        PROPAGATION_COLOR_TAIL + 2,
-                        mb,
-                        lanes,
-                        wpb,
-                        device_arch,
-                    )
+                self._pgs_solve_propagation_colored_warp_kernel = _get_pgs_solve_propagation_colored_warp_kernel(
+                    self.propagation_max_constraints,
+                    PROPAGATION_COLOR_TAIL + 2,
+                    mb,
+                    lanes,
+                    wpb,
+                    device_arch,
                 )
             self._color_propagation_prebuild_kernel = _get_color_propagation_prebuild_kernel(
                 self.propagation_max_constraints,
@@ -3395,16 +3400,14 @@ class SolverFeatherPGS(SolverBase):
                 if warps <= 0:
                     continue
                 self._cached_response_block_dim_by_size[size_i] = 32 * warps
-                self._cached_response_tree_warp_kernels_by_size[size_i] = (
-                    _get_propagation_tree_cached_response_kernel(
-                        size_i,
-                        group_max_joints[size_i],
-                        self.max_propagation_bodies,
-                        self.propagation_cache_max_bodies,
-                        self.propagation_response_max_dofs,
-                        device_arch,
-                        has_free_root=not single_dof,
-                    )
+                self._cached_response_tree_warp_kernels_by_size[size_i] = _get_propagation_tree_cached_response_kernel(
+                    size_i,
+                    group_max_joints[size_i],
+                    self.max_propagation_bodies,
+                    self.propagation_cache_max_bodies,
+                    self.propagation_response_max_dofs,
+                    device_arch,
+                    has_free_root=not single_dof,
                 )
             if any(k is not None for k in self._cached_response_tree_warp_kernels_by_size.values()):
                 self._propagation_cached_response_active = True
@@ -3795,7 +3798,6 @@ class SolverFeatherPGS(SolverBase):
                 self.body_to_articulation,
                 self.is_free_rigid,
                 self.articulation_root_dof_start,
-                self.articulation_root_com_offset,
                 self.v_out,
             ],
             outputs=[self.propagation_body_qd],
@@ -4139,7 +4141,6 @@ class SolverFeatherPGS(SolverBase):
                     device=self.model.device,
                 )
 
-
     def _propagation_pgs_solve_colored_iteration(
         self,
         *,
@@ -4381,7 +4382,6 @@ class SolverFeatherPGS(SolverBase):
                 self.body_to_articulation,
                 self.is_free_rigid,
                 self.articulation_root_dof_start,
-                self.articulation_root_com_offset,
             ],
             outputs=[
                 self.propagation_body_qd,
@@ -4472,7 +4472,6 @@ class SolverFeatherPGS(SolverBase):
                     self.body_to_articulation,
                     self.is_free_rigid,
                     self.articulation_root_dof_start,
-                    self.articulation_root_com_offset,
                     self.world_group_art_start[int(fused_size)],
                     self.world_group_to_art[int(fused_size)],
                     self.model.articulation_start,
@@ -5844,34 +5843,9 @@ class SolverFeatherPGS(SolverBase):
             block_dim=self.serial_kernel_block_dim,
             device=model.device,
         )
-        wp.launch(
-            update_articulation_root_com_offsets,
-            dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                model.joint_child,
-                state_in.body_q,
-                model.body_com,
-            ],
-            outputs=[self.articulation_root_com_offset],
-            block_dim=self.serial_kernel_block_dim,
-            device=model.device,
-        )
         # evaluate joint inertias, motion vectors, and forces
         state_aug.body_f_s.zero_()
         wp.copy(self.qd_work, state_in.joint_qd)
-        if self._has_root_free:
-            wp.launch(
-                convert_root_free_qd_world_to_local,
-                dim=model.articulation_count,
-                inputs=[
-                    self.articulation_root_is_free,
-                    self.articulation_root_dof_start,
-                    self.articulation_root_com_offset,
-                ],
-                outputs=[self.qd_work],
-                device=model.device,
-            )
         if self.enable_joint_velocity_limits:
             wp.launch(
                 prescale_joint_velocity_limits,
@@ -6329,6 +6303,24 @@ class SolverFeatherPGS(SolverBase):
                 dt,
             ],
             outputs=[state_aug.joint_qdd, self.v_hat],
+            device=model.device,
+        )
+        # Keep v_hat on jcalc_integrate's free-root convention. The compact
+        # launch excludes every non-root joint; a live device mask handles
+        # runtime kinematic changes without changing graph topology.
+        if not self._free_root_joint_count:
+            return
+        wp.launch(
+            apply_free_root_transport_to_predictor,
+            dim=self._free_root_joint_count,
+            inputs=[
+                self._free_root_joint_indices,
+                model.joint_qd_start,
+                self._kinematic_joint_mask,
+                self.qd_work,
+                dt,
+            ],
+            outputs=[self.v_hat],
             device=model.device,
         )
 
@@ -6791,10 +6783,7 @@ class SolverFeatherPGS(SolverBase):
                     device=model.device,
                 )
 
-            if (
-                propagation_active
-                and self._propagation_colored
-            ):
+            if propagation_active and self._propagation_colored:
                 # v4 pre-build coloring: gather propagation contacts into
                 # per-world unit lists, color them, and rewrite contact_slot
                 # in color-sorted order so the row builder below writes every
@@ -8127,20 +8116,30 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
+    def _remove_free_root_transport(self, state_in: State, state_aug: State):
+        """Invert jcalc_integrate's free-root transport so it realizes the solved velocity exactly.
+
+        Runs after every velocity-to-acceleration conversion; no-op (no
+        launch) for fixed-base models.
+        """
+        if not self._free_root_joint_count:
+            return
+        model = self.model
+        wp.launch(
+            remove_free_root_transport_from_qdd,
+            dim=self._free_root_joint_count,
+            inputs=[
+                self._free_root_joint_indices,
+                model.joint_qd_start,
+                self._kinematic_joint_mask,
+                state_in.joint_qd,
+            ],
+            outputs=[state_aug.joint_qdd],
+            device=model.device,
+        )
+
     def _stage6_update_qdd(self, state_in: State, state_aug: State, dt: float):
         model = self.model
-        if self._has_root_free:
-            wp.launch(
-                convert_root_free_qd_local_to_world,
-                dim=model.articulation_count,
-                inputs=[
-                    self.articulation_root_is_free,
-                    self.articulation_root_dof_start,
-                    self.articulation_root_com_offset,
-                ],
-                outputs=[self.v_out],
-                device=model.device,
-            )
         wp.launch(
             update_qdd_from_velocity,
             dim=model.joint_dof_count,
@@ -8148,6 +8147,7 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.v_out, state_aug.joint_qdd],
             device=model.device,
         )
+        self._remove_free_root_transport(state_in, state_aug)
 
     def _stage6_integrate(self, state_in: State, state_aug: State, state_out: State, dt: float):
         model = self.model
@@ -8165,6 +8165,7 @@ class SolverFeatherPGS(SolverBase):
                     self._kinematic_joint_mask,
                     model.joint_dof_dim,
                     model.body_com,
+                    model.joint_X_c,
                     state_in.joint_q,
                     state_in.joint_qd,
                     state_aug.joint_qdd,
@@ -8193,18 +8194,6 @@ class SolverFeatherPGS(SolverBase):
 
         if model.joint_count:
             wp.copy(self.qd_work, velocity_internal)
-            if self._has_root_free:
-                wp.launch(
-                    convert_root_free_qd_local_to_world,
-                    dim=model.articulation_count,
-                    inputs=[
-                        self.articulation_root_is_free,
-                        self.articulation_root_dof_start,
-                        self.articulation_root_com_offset,
-                    ],
-                    outputs=[self.qd_work],
-                    device=model.device,
-                )
 
             wp.launch(
                 update_qdd_from_velocity,
@@ -8213,6 +8202,7 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[self.qd_work, state_aug.joint_qdd],
                 device=model.device,
             )
+            self._remove_free_root_transport(state_in, state_aug)
             wp.launch(
                 kernel=integrate_generalized_joints,
                 dim=model.joint_count,
@@ -8225,6 +8215,7 @@ class SolverFeatherPGS(SolverBase):
                     self._kinematic_joint_mask,
                     model.joint_dof_dim,
                     model.body_com,
+                    model.joint_X_c,
                     state_in.joint_q,
                     state_in.joint_qd,
                     state_aug.joint_qdd,
@@ -8243,19 +8234,6 @@ class SolverFeatherPGS(SolverBase):
         model = self.model
 
         if model.joint_count:
-            if self._has_root_free:
-                wp.launch(
-                    convert_root_free_qd_local_to_world,
-                    dim=model.articulation_count,
-                    inputs=[
-                        self.articulation_root_is_free,
-                        self.articulation_root_dof_start,
-                        self.articulation_root_com_offset,
-                    ],
-                    outputs=[self.v_out],
-                    device=model.device,
-                )
-
             wp.launch(
                 update_qdd_from_velocity,
                 dim=model.joint_dof_count,
@@ -8263,6 +8241,7 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[self.v_out, state_aug.joint_qdd],
                 device=model.device,
             )
+            self._remove_free_root_transport(state_in, state_aug)
             wp.copy(state_out.joint_qd, self.v_out)
             eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
 
@@ -10739,7 +10718,6 @@ def _get_pgs_solve_propagation_colored_block_kernel(
             }}
 """
 
-
     unit_solve_body_staged = f"""
             for (int rr = 0; ; ++rr) {{
                 const int slot = start_slot + rr;
@@ -11009,7 +10987,6 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     pgs_solve_propagation_colored_block_template.__name__ = name
     pgs_solve_propagation_colored_block_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_colored_block_template)
-
 
 
 def _get_pgs_solve_propagation_contact_kernel(
@@ -11741,24 +11718,9 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                         if (local_dof >= 0 && local_dof + 5 < __D__) {
                             root_k = s_v[local_dof + lane];
                         }
-                        const float vx = __shfl_sync(0x3fu, root_k, 0);
-                        const float vy = __shfl_sync(0x3fu, root_k, 1);
-                        const float vz = __shfl_sync(0x3fu, root_k, 2);
-                        const float wx = __shfl_sync(0x3fu, root_k, 3);
-                        const float wy = __shfl_sync(0x3fu, root_k, 4);
-                        const float wz = __shfl_sync(0x3fu, root_k, 5);
-                        const auto com_offset = articulation_root_com_offset.data[art];
-                        const float ox = com_offset[0];
-                        const float oy = com_offset[1];
-                        const float oz = com_offset[2];
-                        float qd = root_k;
-                        if (lane == 0) qd = vx + (wy * oz - wz * oy);
-                        else if (lane == 1) qd = vy + (wz * ox - wx * oz);
-                        else if (lane == 2) qd = vz + (wx * oy - wy * ox);
-                        else if (lane == 3) qd = wx;
-                        else if (lane == 4) qd = wy;
-                        else qd = wz;
-                        propagation_body_qd.data[body * 6 + lane] = qd;
+                        // Generalized linear coordinate and body velocity share the root-COM
+                        // reference point: the refresh is a plain copy.
+                        propagation_body_qd.data[body * 6 + lane] = root_k;
                     }
                     __syncwarp(MASK);
                 }
@@ -12054,26 +12016,12 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     const int body = propagation_body_list.data[body_base + local_body];
                     const int art = (body >= 0) ? body_to_articulation.data[body] : -1;
                     if (body >= 0 && art >= 0 && is_free_rigid.data[art] != 0 && lane < 6) {
+                        // Plain copy back: both sides are referenced at the root body's COM.
                         const float qdk = propagation_body_qd.data[body * 6 + lane];
-                        const float qd0 = __shfl_sync(0x3fu, qdk, 0);
-                        const float qd1 = __shfl_sync(0x3fu, qdk, 1);
-                        const float qd2 = __shfl_sync(0x3fu, qdk, 2);
-                        const float qd3 = __shfl_sync(0x3fu, qdk, 3);
-                        const float qd4 = __shfl_sync(0x3fu, qdk, 4);
-                        const float qd5 = __shfl_sync(0x3fu, qdk, 5);
-                        const auto com_offset = articulation_root_com_offset.data[art];
-                        const float ox = com_offset[0];
-                        const float oy = com_offset[1];
-                        const float oz = com_offset[2];
                         const int dof_start = articulation_root_dof_start.data[art];
                         const int local_dof = dof_start - w_dof_start;
                         if (local_dof >= 0 && local_dof + 5 < __D__) {
-                            if (lane == 0) s_v[local_dof + 0] = qd0 - (qd4 * oz - qd5 * oy);
-                            else if (lane == 1) s_v[local_dof + 1] = qd1 - (qd5 * ox - qd3 * oz);
-                            else if (lane == 2) s_v[local_dof + 2] = qd2 - (qd3 * oy - qd4 * ox);
-                            else if (lane == 3) s_v[local_dof + 3] = qd3;
-                            else if (lane == 4) s_v[local_dof + 4] = qd4;
-                            else s_v[local_dof + 5] = qd5;
+                            s_v[local_dof + lane] = qdk;
                         }
                         propagation_body_impulses.data[body * 6 + lane] = 0.0f;
                     }
@@ -12184,7 +12132,6 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         body_to_articulation: wp.array[int],
         is_free_rigid: wp.array[int],
         articulation_root_dof_start: wp.array[int],
-        articulation_root_com_offset: wp.array[wp.vec3],
         world_group_art_start: wp.array[int],
         world_group_to_art: wp.array[int],
         articulation_start: wp.array[int],
@@ -12256,7 +12203,6 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         body_to_articulation: wp.array[int],
         is_free_rigid: wp.array[int],
         articulation_root_dof_start: wp.array[int],
-        articulation_root_com_offset: wp.array[wp.vec3],
         world_group_art_start: wp.array[int],
         world_group_to_art: wp.array[int],
         articulation_start: wp.array[int],
@@ -12329,7 +12275,6 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
             body_to_articulation,
             is_free_rigid,
             articulation_root_dof_start,
-            articulation_root_com_offset,
             world_group_art_start,
             world_group_to_art,
             articulation_start,
@@ -15047,8 +14992,8 @@ def _get_pgs_solve_mf_gs_kernel(
         drive_loads += """
         s_drive_vel_limit_dense[i] = world_drive_vel_limit.data[off_dense + i];"""
     drive_projection = (
-        f"""
-            if (row_type == 1) {{
+        """
+            if (row_type == 1) {
                 new_impulse = old_impulse * s_drive_imp_mul_dense[i]
                     + jv * s_drive_vel_mul_dense[i]
                     + s_drive_target_dense[i];
@@ -15056,7 +15001,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 if (new_impulse > max_imp) new_impulse = max_imp;
                 if (new_impulse < -max_imp) new_impulse = -max_imp;
                 delta_impulse = new_impulse - old_impulse;
-            }}"""
+            }"""
         if has_drive_rows
         else """
             if (row_type == 1) {
