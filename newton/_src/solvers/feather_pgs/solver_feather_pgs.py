@@ -52,6 +52,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PREELIM_MAX_ROWS,
     PROPAGATION_COLOR_TAIL,
     add_dense_contact_compliance_to_diag,
     allocate_connect_slots,
@@ -126,6 +127,9 @@ from .kernels import (
     populate_physx_drive_J_for_size,
     populate_rigid_velocity_limit_rows,
     populate_world_J_for_size,
+    preelim_correct_Y_for_size,
+    preelim_project_velocity_for_size,
+    preelim_setup_for_size,
     prepare_world_impulses,
     prescale_joint_velocity_limits,
     propagate_tree_impulses_for_size,
@@ -551,6 +555,7 @@ class SolverFeatherPGS(SolverBase):
         enable_joint_limits: bool = False,
         enable_mimic_constraints: bool = True,
         enable_connect_constraints: bool = True,
+        enable_bilateral_preelimination: bool = False,
         enable_joint_springs: bool = True,
         enable_joint_passive_damping: bool = True,
         joint_limit_activation_gap: float = float("inf"),
@@ -658,6 +663,15 @@ class SolverFeatherPGS(SolverBase):
                 Loop joints are always excluded from the FK/dynamics tree regardless of this
                 flag; disabling only drops the closure rows, so closed linkages fall open
                 (useful for A/B comparison against the pre-connect solver). Defaults to True.
+            enable_bilateral_preelimination (bool, optional): Pre-eliminate the mimic and
+                connect rows of each articulation through a small Schur complement so every
+                other row (contacts especially) sees the closed-loop effective mass exactly:
+                responses become ``Y' = Y - Y_B S^-1 (J_B Y)`` and the predictor velocity is
+                projected onto the bilateral constraint manifold once per step, replacing the
+                iterative enforcement. Requires ``pgs_mode='matrix_free'`` with
+                ``pgs_velocity_iterations == 0`` and at most 8 bilateral rows per
+                articulation; unsupported configurations warn and fall back to iterative
+                rows. Defaults to False.
             enable_joint_springs (bool, optional): Apply passive joint springs
                 (:attr:`~newton.Model.joint_spring_stiffness` /
                 :attr:`~newton.Model.joint_spring_ref`) as an explicit torque
@@ -921,6 +935,7 @@ class SolverFeatherPGS(SolverBase):
         self.enable_joint_limits = enable_joint_limits
         self.enable_mimic_constraints = bool(enable_mimic_constraints)
         self.enable_connect_constraints = bool(enable_connect_constraints)
+        self.enable_bilateral_preelimination = bool(enable_bilateral_preelimination)
         self.enable_joint_springs = bool(enable_joint_springs)
         self.enable_joint_passive_damping = bool(enable_joint_passive_damping)
         try:
@@ -1251,6 +1266,7 @@ class SolverFeatherPGS(SolverBase):
         # counts their rows (see _estimate_dense_internal_rows_per_world).
         self._build_mimic_plan(model)
         self._build_connect_plan(model)
+        self._build_preelimination_plan(model)
         self._setup_passive_joint_forces(model)
         self.dense_max_constraints = self._select_dense_row_capacity(model)
         self._propagation_full_fused_size = self._select_propagation_full_fused_size()
@@ -1923,6 +1939,159 @@ class SolverFeatherPGS(SolverBase):
         self._connect_enabled = wp.array(self._connect_valid_np, dtype=wp.int32, device=device)
         self.connect_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
         self._connect_count = n
+
+    def _build_preelimination_plan(self, model) -> None:
+        """Precompute the static tables for bilateral (mimic + connect) pre-elimination.
+
+        Builds, per articulation that owns bilateral rows: an index into the packed
+        per-elimination buffers, plus the S-factor scratch. All buffers are allocated
+        once here (CUDA-graph-safe); the slot lists and the S factor are rebuilt every
+        step on device because both the row slots and J_B depend on the current state.
+        Unsupported configurations warn and fall back to iterative bilateral rows.
+        """
+        self._preelim_count = 0
+        self._preelim_active = False
+        n_bilateral = int(self._mimic_count or 0) + int(self._connect_count or 0)
+        if not self.enable_bilateral_preelimination or n_bilateral == 0:
+            return
+        if self.pgs_mode != "matrix_free":
+            warnings.warn(
+                "SolverFeatherPGS: enable_bilateral_preelimination requires "
+                f"pgs_mode='matrix_free' (got {self.pgs_mode!r}); falling back to "
+                "iterative mimic/connect rows.",
+                stacklevel=2,
+            )
+            return
+        if self.pgs_velocity_iterations > 0:
+            warnings.warn(
+                "SolverFeatherPGS: enable_bilateral_preelimination does not support "
+                "pgs_velocity_iterations > 0 yet (the velocity pass rebuilds v_out "
+                "without the bilateral projection); falling back to iterative rows.",
+                stacklevel=2,
+            )
+            return
+
+        # Per-articulation bilateral row capacity (upper bound: every valid constraint).
+        counts: dict[int, int] = {}
+        if self._mimic_count:
+            mimic_art_np = self._mimic_art.numpy()
+            mimic_valid_np = self._mimic_valid.numpy()
+            for k in range(self._mimic_count):
+                if mimic_valid_np[k]:
+                    a = int(mimic_art_np[k])
+                    counts[a] = counts.get(a, 0) + 1
+        if self._connect_count:
+            connect_art_np = self._connect_art.numpy()
+            for k in range(self._connect_count):
+                a = int(connect_art_np[k])
+                counts[a] = counts.get(a, 0) + 3
+        if not counts:
+            return
+        n_b_max = max(counts.values())
+        if n_b_max > PREELIM_MAX_ROWS:
+            warnings.warn(
+                f"SolverFeatherPGS: an articulation owns {n_b_max} bilateral rows, more "
+                f"than the pre-elimination capacity of {PREELIM_MAX_ROWS}; falling back "
+                "to iterative mimic/connect rows.",
+                stacklevel=2,
+            )
+            return
+
+        device = model.device
+        arts = sorted(counts)
+        n_pe = len(arts)
+        art_to_idx = np.full(model.articulation_count, -1, dtype=np.int32)
+        for i, a in enumerate(arts):
+            art_to_idx[a] = i
+        self._preelim_art_to_idx = wp.array(art_to_idx, dtype=wp.int32, device=device)
+        self._preelim_slots = wp.full((n_pe * PREELIM_MAX_ROWS,), -1, dtype=wp.int32, device=device)
+        self._preelim_nB = wp.zeros((n_pe,), dtype=wp.int32, device=device)
+        self._preelim_S = wp.zeros((n_pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS,), dtype=wp.float32, device=device)
+        self._preelim_LS = wp.zeros_like(self._preelim_S)
+        # Relative diagonal regularization for the S factor, rebuilt on device each
+        # step from the current S diagonal (see preelim_setup_for_size).
+        self._preelim_reg = wp.zeros((n_pe * PREELIM_MAX_ROWS,), dtype=wp.float32, device=device)
+        self._preelim_reg_rel = 1.0e-3
+        self._preelim_reg_floor = max(self.pgs_cfm, 1.0e-7)
+        self._preelim_count = n_pe
+        self._preelim_active = True
+
+    def _stage4_bilateral_preelim(self, size: int) -> None:
+        """Form/factor the bilateral Schur block and correct the response columns.
+
+        Runs after ``Y = H^-1 J^T`` and before the diagonal pass, so the corrected
+        diagonals fall out of the unchanged ``diag_from_JY`` computation.
+        """
+        n_arts = self.n_arts_by_size[size]
+        wp.launch(
+            preelim_setup_for_size,
+            dim=n_arts,
+            inputs=[
+                self.group_to_art[size],
+                self._preelim_art_to_idx,
+                self.mimic_slot if self.mimic_slot is not None else self._dummy_is_free_rigid,
+                self._mimic_art if self._mimic_count else self._dummy_is_free_rigid,
+                int(self._mimic_count or 0),
+                self.connect_slot if self.connect_slot is not None else self._dummy_is_free_rigid,
+                self._connect_art if self._connect_count else self._dummy_is_free_rigid,
+                int(self._connect_count or 0),
+                self.J_by_size[size],
+                self.Y_by_size[size],
+                size,
+                self._preelim_reg_rel,
+                self._preelim_reg_floor,
+            ],
+            outputs=[
+                self._preelim_slots,
+                self._preelim_nB,
+                self._preelim_S,
+                self._preelim_reg,
+                self._preelim_LS,
+            ],
+            device=self.model.device,
+        )
+        wp.launch(
+            preelim_correct_Y_for_size,
+            dim=n_arts * self.dense_max_constraints,
+            inputs=[
+                self.group_to_art[size],
+                self.art_to_world,
+                self._preelim_art_to_idx,
+                self.constraint_count,
+                self._preelim_slots,
+                self._preelim_nB,
+                self._preelim_LS,
+                self.J_by_size[size],
+                size,
+                self.dense_max_constraints,
+                n_arts,
+            ],
+            outputs=[self.Y_by_size[size]],
+            device=self.model.device,
+        )
+
+    def _stage6_project_bilateral_velocity(self) -> None:
+        """Enforce J_B v_out = -b_B once, right after v_out is seeded with v_hat."""
+        for size in self.size_groups:
+            wp.launch(
+                preelim_project_velocity_for_size,
+                dim=self.n_arts_by_size[size],
+                inputs=[
+                    self.group_to_art[size],
+                    self.art_to_world,
+                    self._preelim_art_to_idx,
+                    self.articulation_dof_start,
+                    self._preelim_slots,
+                    self._preelim_nB,
+                    self._preelim_LS,
+                    self.J_by_size[size],
+                    self.Y_by_size[size],
+                    self.rhs,
+                    size,
+                ],
+                outputs=[self.v_out],
+                device=self.model.device,
+            )
 
     def _setup_passive_joint_forces(self, model) -> None:
         """Select the passive spring/damping arrays applied in the inverse-dynamics pass.
@@ -5194,6 +5363,10 @@ class SolverFeatherPGS(SolverBase):
                 else:
                     self._stage4_hinv_jt_par_row(size)
 
+        if self._preelim_active:
+            for size in self.size_groups:
+                self._stage4_bilateral_preelim(size)
+
         self.diag.zero_()
         for size in self.size_groups:
             self._stage4_diag_from_JY(size)
@@ -5374,6 +5547,12 @@ class SolverFeatherPGS(SolverBase):
                         else:
                             self._stage4_hinv_jt_par_row(size)
 
+                # Bilateral pre-elimination: fold mimic/connect coupling into the
+                # response columns so the diag pass below sees closed-loop inertia.
+                if self._preelim_active:
+                    for size in self.size_groups:
+                        self._stage4_bilateral_preelim(size)
+
                 # Diagonal from J*Y (no full Delassus)
                 self.diag.zero_()
                 for size in self.size_groups:
@@ -5490,6 +5669,10 @@ class SolverFeatherPGS(SolverBase):
 
                 # Initialize v_out = v_hat before GS loop
                 self._stage6_prepare_world_velocity()
+                if self._preelim_active:
+                    # One-shot bilateral projection: J_B v_out = -b_B, preserved by
+                    # every sweep impulse through the corrected columns.
+                    self._stage6_project_bilateral_velocity()
 
                 # Pack MF metadata into int4 structs for coalesced 128-bit loads
                 self._pack_mf_meta(self.mf_rhs)
