@@ -31,9 +31,9 @@ import warp as wp
 
 import newton
 from newton._src.geometry.contact_reduction_body_pairs import (
+    _BP_FACE_NORMALS_DATA,
     CELL_COORD_MAX,
     BodyPairContactReducer,
-    _BP_FACE_NORMALS_DATA,
     _up_axis_rotation,
 )
 from newton._src.sim.contacts import Contacts
