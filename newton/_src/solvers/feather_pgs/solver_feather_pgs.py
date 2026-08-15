@@ -1951,7 +1951,7 @@ class SolverFeatherPGS(SolverBase):
             ]
 
         art_l, body_p, body_c, anchors_p, anchors_c, world_l, enab = [], [], [], [], [], [], []
-        for j, art in loop_candidates:
+        for j, range_art in loop_candidates:
             if int(joint_type[j]) != int(JointType.BALL):
                 warnings.warn(
                     f"SolverFeatherPGS: loop joint {j} has unsupported type "
@@ -1959,6 +1959,7 @@ class SolverFeatherPGS(SolverBase):
                     stacklevel=2,
                 )
                 continue
+            art = range_art
             if art is None:
                 art = body_art.get(int(joint_child[j]))
                 parent_art = body_art.get(int(joint_parent[j]), art)
