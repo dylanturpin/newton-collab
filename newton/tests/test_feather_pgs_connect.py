@@ -141,6 +141,90 @@ class TestFeatherPGSConnect(unittest.TestCase):
         self.assertAlmostEqual(q[2], q[0], delta=0.08)
         self.assertGreater(abs(q[2]), 0.3, "rocker did not move — loop not transmitting")
 
+    def test_connect_survives_foreign_joint_between_tree_and_loop(self):
+        """Attribute loop joints by body ownership when another articulation interleaves.
+
+        ``add_usd`` of a subtree containing a closed-loop robot AND a floating rigid
+        body creates the body's FREE joint during traversal but appends the equality
+        loop joints at the very end of the parse — so the closures no longer trail
+        their articulation's joint-index range (the trailing sentinel range of the LAST
+        articulation swallows them instead). Index-range attribution then silently
+        produced ZERO connect rows and the closed linkage fell open (measured on the
+        Robotiq 2F-85 through the IsaacLab scene path: 107 mm anchor gap, fingers
+        collapsed). The closure must be attributed via its child body's articulation.
+        This test reconstructs that joint ordering directly: four-bar tree, then a
+        free-jointed object articulation, THEN the closure ball joint.
+        """
+        b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        z0 = 0.6
+        crank = b.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, z0 - 0.1), wp.quat_identity()))
+        b.add_shape_box(crank, hx=0.02, hy=0.02, hz=0.1)
+        j_crank = b.add_joint_revolute(
+            parent=-1,
+            child=crank,
+            axis=wp.vec3(0.0, 1.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, z0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()),
+        )
+        coupler = b.add_link(xform=wp.transform(wp.vec3(0.2, 0.0, z0 - 0.2), wp.quat_identity()))
+        b.add_shape_box(coupler, hx=0.2, hy=0.02, hz=0.02)
+        j_coupler = b.add_joint_revolute(
+            parent=crank,
+            child=coupler,
+            axis=wp.vec3(0.0, 1.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
+        )
+        rocker = b.add_link(xform=wp.transform(wp.vec3(0.4, 0.0, z0 - 0.1), wp.quat_identity()))
+        b.add_shape_box(rocker, hx=0.02, hy=0.02, hz=0.1)
+        j_rocker = b.add_joint_revolute(
+            parent=-1,
+            child=rocker,
+            axis=wp.vec3(0.0, 1.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.4, 0.0, z0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()),
+        )
+        b.add_articulation([j_crank, j_coupler, j_rocker], label="four_bar")
+
+        # a second articulation's joint lands BETWEEN the tree and the loop joint
+        body = b.add_body(xform=wp.transform(wp.vec3(1.0, 0.0, 0.5), wp.quat_identity()))
+        b.add_shape_sphere(body, radius=0.05)
+        j_free = b.add_joint_free(child=body)
+        b.add_articulation([j_free], label="free_object")
+
+        # the loop closure, appended last (the add_usd equality-parse ordering)
+        b.add_joint_ball(
+            parent=coupler,
+            child=rocker,
+            parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1), wp.quat_identity()),
+        )
+        b.joint_target_ke[0] = 50.0
+        b.joint_target_kd[0] = 5.0
+        b.joint_target_mode[0] = int(newton.JointTargetMode.POSITION)
+        model = b.finalize()
+
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.1)
+        self.assertEqual(
+            getattr(solver, "_connect_count", 0),
+            1,
+            "closure row lost — loop joint attributed to the wrong articulation",
+        )
+
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        targets = model.joint_target_q.numpy().copy()
+        targets[0] = 0.6
+        control.joint_target_q.assign(targets)
+        gap_max = 0.0
+        for _ in range(360):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+            gap_max = max(gap_max, _loop_anchor_gap(model, state_0))
+        self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
+        self.assertLess(gap_max, 2.0e-3, f"loop closure not enforced (anchor gap {gap_max:.4f} m)")
+
 
 if __name__ == "__main__":
     unittest.main()
