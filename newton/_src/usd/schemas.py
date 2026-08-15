@@ -130,6 +130,10 @@ class SchemaResolverNewton(SchemaResolver):
             "armature": SchemaAttribute("newton:armature", 0.0),
             "damping": SchemaAttribute("newton:damping", None),
             "friction": SchemaAttribute("newton:friction", 0.0),
+            # Passive joint spring tau = k * (spring_ref - q). Angular values follow
+            # the USD per-degree convention; parse_usd converts to per-radian.
+            "spring_stiffness": SchemaAttribute("newton:springStiffness", None),
+            "spring_ref": SchemaAttribute("newton:springRef", None),
             "limit_ke": SchemaAttribute("newton:limitStiffness", None),
             "limit_kd": SchemaAttribute("newton:limitDamping", None),
             "velocity_limit": SchemaAttribute("newton:velocityLimit", float("inf")),
@@ -495,6 +499,12 @@ class SchemaResolverMjc(SchemaResolver):
         PrimType.JOINT: {
             "armature": SchemaAttribute("mjc:armature", 0.0),
             "friction": SchemaAttribute("mjc:frictionloss", 0.0),
+            # Passive joint spring (MjcJointAPI). mjc:stiffness is always per-radian
+            # (MuJoCo never expresses stiffness per-degree); mjc:springref follows the
+            # source spec's compiler angle units, recorded in the scene-level
+            # mjc:compiler:angle token — parse_usd handles that conversion.
+            "spring_stiffness": SchemaAttribute("mjc:stiffness", None),
+            "spring_ref": SchemaAttribute("mjc:springref", None),
             # Per-axis aliases mapped to solreflimit (MjcJointAPI authors joint limit solref here)
             "limit_transX_ke": SchemaAttribute("mjc:solreflimit", [0.02, 1.0], solref_to_stiffness),
             "limit_transY_ke": SchemaAttribute("mjc:solreflimit", [0.02, 1.0], solref_to_stiffness),

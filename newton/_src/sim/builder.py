@@ -4663,6 +4663,8 @@ class ModelBuilder:
         effort_limit: float | None = None,
         velocity_limit: float | None = None,
         friction: float | None = None,
+        spring_stiffness: float | None = None,
+        spring_ref: float | None = None,
         actuator_mode: JointTargetMode | None = None,
         label: str | None = None,
         collision_filter_parent: bool | None = None,
@@ -4693,6 +4695,8 @@ class ModelBuilder:
             effort_limit: Maximum effort (force/torque) the joint axis can exert. If None, the default value from ``ModelBuilder.default_joint_cfg.effort_limit`` is used.
             velocity_limit: Maximum velocity the joint axis can achieve. If None, the default value from ``ModelBuilder.default_joint_cfg.velocity_limit`` is used.
             friction: Friction coefficient for the joint axis. If None, the default value from ``ModelBuilder.default_joint_cfg.friction`` is used.
+            spring_stiffness: Passive spring stiffness [N·m/rad] applying ``k * (spring_ref - q)`` around the joint axis. If None, the default value from ``ModelBuilder.default_joint_cfg.spring_stiffness`` is used.
+            spring_ref: Passive spring reference angle [rad]. If None, the default value from ``ModelBuilder.default_joint_cfg.spring_ref`` is used.
             label: The label of the joint.
             collision_filter_parent: Whether to filter collisions between shapes of the parent and child bodies. Defaults to ``False`` for joints to world, ``True`` otherwise.
             enabled: Whether the joint is enabled.
@@ -4723,6 +4727,10 @@ class ModelBuilder:
                 effort_limit=effort_limit if effort_limit is not None else self.default_joint_cfg.effort_limit,
                 velocity_limit=velocity_limit if velocity_limit is not None else self.default_joint_cfg.velocity_limit,
                 friction=friction if friction is not None else self.default_joint_cfg.friction,
+                spring_stiffness=spring_stiffness
+                if spring_stiffness is not None
+                else self.default_joint_cfg.spring_stiffness,
+                spring_ref=spring_ref if spring_ref is not None else self.default_joint_cfg.spring_ref,
                 actuator_mode=actuator_mode if actuator_mode is not None else self.default_joint_cfg.actuator_mode,
             )
         return self.add_joint(
@@ -4761,6 +4769,8 @@ class ModelBuilder:
         effort_limit: float | None = None,
         velocity_limit: float | None = None,
         friction: float | None = None,
+        spring_stiffness: float | None = None,
+        spring_ref: float | None = None,
         actuator_mode: JointTargetMode | None = None,
         label: str | None = None,
         collision_filter_parent: bool | None = None,
@@ -4790,6 +4800,8 @@ class ModelBuilder:
             effort_limit: Maximum effort (force) the joint axis can exert. If None, the default value from ``ModelBuilder.default_joint_cfg.effort_limit`` is used.
             velocity_limit: Maximum velocity the joint axis can achieve. If None, the default value from ``ModelBuilder.default_joint_cfg.velocity_limit`` is used.
             friction: Friction coefficient for the joint axis. If None, the default value from ``ModelBuilder.default_joint_cfg.friction`` is used.
+            spring_stiffness: Passive spring stiffness [N/m] applying ``k * (spring_ref - q)`` along the joint axis. If None, the default value from ``ModelBuilder.default_joint_cfg.spring_stiffness`` is used.
+            spring_ref: Passive spring reference position [m]. If None, the default value from ``ModelBuilder.default_joint_cfg.spring_ref`` is used.
             label: The label of the joint.
             collision_filter_parent: Whether to filter collisions between shapes of the parent and child bodies. Defaults to ``False`` for joints to world, ``True`` otherwise.
             enabled: Whether the joint is enabled.
@@ -4820,6 +4832,10 @@ class ModelBuilder:
                 effort_limit=effort_limit if effort_limit is not None else self.default_joint_cfg.effort_limit,
                 velocity_limit=velocity_limit if velocity_limit is not None else self.default_joint_cfg.velocity_limit,
                 friction=friction if friction is not None else self.default_joint_cfg.friction,
+                spring_stiffness=spring_stiffness
+                if spring_stiffness is not None
+                else self.default_joint_cfg.spring_stiffness,
+                spring_ref=spring_ref if spring_ref is not None else self.default_joint_cfg.spring_ref,
                 actuator_mode=actuator_mode if actuator_mode is not None else self.default_joint_cfg.actuator_mode,
             )
         return self.add_joint(

@@ -1803,6 +1803,168 @@ def Xform "Articulation" (
         self.assertNotAlmostEqual(limit_ke, 999.0, places=0)
         self.assertNotAlmostEqual(limit_kd, 88.0, places=0)
 
+    @staticmethod
+    def _spring_stage_usda(joint_def: str, scene_attrs: str = "") -> str:
+        """Build a minimal two-body articulation usda string around one joint definition."""
+        return f"""#usda 1.0
+(
+    upAxis = "Z"
+)
+
+def PhysicsScene "physicsScene"
+{{
+{scene_attrs}
+}}
+
+def Xform "Articulation" (
+    prepend apiSchemas = ["PhysicsArticulationRootAPI"]
+)
+{{
+    def Xform "Body1" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+    )
+    {{
+        def Sphere "Collision1" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {{
+            double radius = 0.1
+        }}
+    }}
+
+    def Xform "Body2" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+    )
+    {{
+        double3 xformOp:translate = (1, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Sphere "Collision2" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {{
+            double radius = 0.1
+        }}
+    }}
+
+{joint_def}
+}}
+"""
+
+    def _import_spring_stage(self, usda: str):
+        """Import a spring-test stage with the Newton+Mjc resolver set and return the model."""
+        from pxr import Usd
+
+        from newton._src.usd.schemas import SchemaResolverMjc, SchemaResolverNewton  # noqa: PLC0415
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(usda)
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_usd(stage, schema_resolvers=[SchemaResolverNewton(), SchemaResolverMjc()])
+        return builder.finalize()
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_mjc_joint_spring_radian_scene(self):
+        """Import mjc:stiffness/mjc:springref exactly when the scene declares radian angle units."""
+        usda = self._spring_stage_usda(
+            joint_def="""    def PhysicsRevoluteJoint "Joint" (
+        prepend apiSchemas = ["MjcJointAPI"]
+    )
+    {
+        rel physics:body0 = </Articulation/Body1>
+        rel physics:body1 = </Articulation/Body2>
+        token physics:axis = "Z"
+        float physics:lowerLimit = -180
+        float physics:upperLimit = 180
+        uniform double mjc:stiffness = 0.05
+        uniform double mjc:springref = 2.62
+    }""",
+            scene_attrs='    custom uniform token mjc:compiler:angle = "radian"',
+        )
+        model = self._import_spring_stage(usda)
+        dof = int(model.joint_qd_start.numpy()[model.joint_label.index("/Articulation/Joint")])
+        self.assertAlmostEqual(float(model.joint_spring_stiffness.numpy()[dof]), 0.05, places=6)
+        self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof]), 2.62, places=6)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_mjc_joint_spring_degree_default(self):
+        """Convert mjc:springref from degrees when the scene omits mjc:compiler:angle.
+
+        The MjcSceneAPI schema default is degrees, so springref must be deg->rad
+        converted while stiffness stays per-radian (MuJoCo never expresses
+        stiffness per-degree).
+        """
+        usda = self._spring_stage_usda(
+            joint_def="""    def PhysicsRevoluteJoint "Joint" (
+        prepend apiSchemas = ["MjcJointAPI"]
+    )
+    {
+        rel physics:body0 = </Articulation/Body1>
+        rel physics:body1 = </Articulation/Body2>
+        token physics:axis = "Z"
+        float physics:lowerLimit = -180
+        float physics:upperLimit = 180
+        uniform double mjc:stiffness = 0.05
+        uniform double mjc:springref = 150
+    }""",
+        )
+        model = self._import_spring_stage(usda)
+        dof = int(model.joint_qd_start.numpy()[model.joint_label.index("/Articulation/Joint")])
+        self.assertAlmostEqual(float(model.joint_spring_stiffness.numpy()[dof]), 0.05, places=6)
+        self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof]), math.radians(150.0), places=5)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_mjc_joint_spring_prismatic_no_conversion(self):
+        """Import prismatic spring values without any angle conversion."""
+        usda = self._spring_stage_usda(
+            joint_def="""    def PhysicsPrismaticJoint "Joint" (
+        prepend apiSchemas = ["MjcJointAPI"]
+    )
+    {
+        rel physics:body0 = </Articulation/Body1>
+        rel physics:body1 = </Articulation/Body2>
+        token physics:axis = "X"
+        float physics:lowerLimit = -1
+        float physics:upperLimit = 1
+        uniform double mjc:stiffness = 40
+        uniform double mjc:springref = 0.02
+    }""",
+        )
+        model = self._import_spring_stage(usda)
+        dof = int(model.joint_qd_start.numpy()[model.joint_label.index("/Articulation/Joint")])
+        self.assertAlmostEqual(float(model.joint_spring_stiffness.numpy()[dof]), 40.0, places=5)
+        self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof]), 0.02, places=6)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_newton_joint_spring_precedence_and_units(self):
+        """Prefer newton:springStiffness/springRef over mjc values and apply the per-degree convention.
+
+        Newton-authored angular values follow the USD per-degree convention:
+        stiffness converts per-degree -> per-radian, springref degrees -> radians.
+        """
+        usda = self._spring_stage_usda(
+            joint_def="""    def PhysicsRevoluteJoint "Joint" (
+        prepend apiSchemas = ["MjcJointAPI"]
+    )
+    {
+        rel physics:body0 = </Articulation/Body1>
+        rel physics:body1 = </Articulation/Body2>
+        token physics:axis = "Z"
+        float physics:lowerLimit = -180
+        float physics:upperLimit = 180
+        custom float newton:springStiffness = 1.0
+        custom float newton:springRef = 45.0
+        uniform double mjc:stiffness = 0.05
+        uniform double mjc:springref = 2.62
+    }""",
+            scene_attrs='    custom uniform token mjc:compiler:angle = "radian"',
+        )
+        model = self._import_spring_stage(usda)
+        dof = int(model.joint_qd_start.numpy()[model.joint_label.index("/Articulation/Joint")])
+        self.assertAlmostEqual(float(model.joint_spring_stiffness.numpy()[dof]), math.degrees(1.0), places=4)
+        self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof]), math.radians(45.0), places=5)
+
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_joint_ordering(self):
         builder_dfs = newton.ModelBuilder()

@@ -173,6 +173,8 @@ class _DofParams:
 
     armature: float
     friction: float
+    spring_stiffness: float
+    spring_ref: float
     damping: float
     velocity_limit: float | None
     limit_lower: float
@@ -605,6 +607,10 @@ def parse_usd(
     physics_scene_prim = None
     physics_dt = None
     max_solver_iters = None
+    # Angle units for mjc:springref: the MuJoCo USD converter records the source
+    # spec's compiler setting on the scene prim (mjc:compiler:angle); the schema
+    # default is degrees. mjc:stiffness is always per-radian regardless.
+    mjc_angle_is_degree = True
 
     visual_shape_cfg = ModelBuilder.ShapeConfig(
         density=0.0,
@@ -762,6 +768,46 @@ def parse_usd(
         if spec.usd_value_transformer is not None:
             return spec.usd_value_transformer(spec.default)
         return spec.default
+
+    def _resolve_joint_spring(prim: Usd.Prim, is_angular: bool) -> tuple[float, float]:
+        """Resolve passive spring stiffness and reference for one DOF, in Newton units.
+
+        ``mjc:stiffness`` is always per-radian (MuJoCo never expresses stiffness
+        per-degree); ``mjc:springref`` follows the source spec's compiler angle
+        units recorded in the scene-level ``mjc:compiler:angle`` token (schema
+        default: degrees). Newton-authored values follow the USD per-degree
+        convention for angular DOFs.
+        """
+        spring_stiffness = None
+        spring_ref = None
+        for resolver in R.resolvers:
+            joint_mapping = resolver.mapping.get(PrimType.JOINT, {})
+            if "spring_stiffness" not in joint_mapping and "spring_ref" not in joint_mapping:
+                continue
+            k = resolver.get_value(prim, PrimType.JOINT, "spring_stiffness")
+            ref = resolver.get_value(prim, PrimType.JOINT, "spring_ref")
+            if k is None and ref is None:
+                continue
+            R._collect_on_first_use(resolver, prim)
+            if resolver.name == "mjc":
+                if is_angular and ref is not None and mjc_angle_is_degree:
+                    ref *= DegreesToRadian
+            elif is_angular:
+                if k is not None:
+                    k /= DegreesToRadian
+                if ref is not None:
+                    ref *= DegreesToRadian
+            if spring_stiffness is None:
+                spring_stiffness = k
+            if spring_ref is None:
+                spring_ref = ref
+            if spring_stiffness is not None and spring_ref is not None:
+                break
+        if spring_stiffness is None:
+            spring_stiffness = builder.default_joint_cfg.spring_stiffness
+        if spring_ref is None:
+            spring_ref = builder.default_joint_cfg.spring_ref
+        return spring_stiffness, spring_ref
 
     def _resolve_joint_limit_gain(
         prim: Usd.Prim, key: str, builder_default: float
@@ -1561,6 +1607,8 @@ def parse_usd(
         friction = R.get_value(
             jp_prim, prim_type=PrimType.JOINT, key="friction", default=default_joint_friction, verbose=verbose
         )
+        # Already in Newton units; must not pass through the revolute deg->rad block below.
+        spring_stiffness, spring_ref = _resolve_joint_spring(jp_prim, is_revolute)
         _damping_usd = R.get_value(jp_prim, prim_type=PrimType.JOINT, key="damping", default=None, verbose=verbose)
         damping_authored = _damping_usd is not None
         damping = _damping_usd if damping_authored else default_joint_damping
@@ -1637,6 +1685,8 @@ def parse_usd(
         return _DofParams(
             armature=armature,
             friction=friction,
+            spring_stiffness=spring_stiffness,
+            spring_ref=spring_ref,
             damping=damping,
             velocity_limit=velocity_limit,
             limit_lower=limit_lower,
@@ -1705,6 +1755,8 @@ def parse_usd(
             joint_params["limit_kd"] = dof.limit_kd
             joint_params["armature"] = dof.armature
             joint_params["friction"] = dof.friction
+            joint_params["spring_stiffness"] = dof.spring_stiffness
+            joint_params["spring_ref"] = dof.spring_ref
             joint_params["damping"] = dof.damping
             joint_params["velocity_limit"] = dof.velocity_limit
             if dof.has_drive:
@@ -1732,6 +1784,9 @@ def parse_usd(
             joint_friction = R.get_value(
                 joint_prim, prim_type=PrimType.JOINT, key="friction", default=default_joint_friction, verbose=verbose
             )
+            # Per-joint spring values replicated to every axis (like armature/friction above).
+            lin_spring_stiffness, lin_spring_ref = _resolve_joint_spring(joint_prim, is_angular=False)
+            ang_spring_stiffness, ang_spring_ref = _resolve_joint_spring(joint_prim, is_angular=True)
             _joint_damping_usd = R.get_value(
                 joint_prim, prim_type=PrimType.JOINT, key="damping", default=None, verbose=verbose
             )
@@ -1874,6 +1929,8 @@ def parse_usd(
                             if joint_velocity_limit is not None
                             else default_joint_velocity_limit,
                             friction=joint_friction,
+                            spring_stiffness=lin_spring_stiffness,
+                            spring_ref=lin_spring_ref,
                             actuator_mode=actuator_mode,
                         )
                     )
@@ -1940,6 +1997,8 @@ def parse_usd(
                             if joint_velocity_limit is not None
                             else default_joint_velocity_limit,
                             friction=joint_friction,
+                            spring_stiffness=ang_spring_stiffness,
+                            spring_ref=ang_spring_ref,
                             actuator_mode=actuator_mode,
                         )
                     )
@@ -2307,6 +2366,7 @@ def parse_usd(
         max_solver_iters = R.get_value(
             physics_scene_prim, prim_type=PrimType.SCENE, key="max_solver_iterations", default=None, verbose=verbose
         )
+        mjc_angle_is_degree = usd.get_attribute(physics_scene_prim, "mjc:compiler:angle") != "radian"
 
     stage_up_axis = Axis.from_string(str(UsdGeom.GetStageUpAxis(stage)))
 
@@ -4042,9 +4102,7 @@ def parse_usd(
                 # When mass is authored but inertia is not, scale the accumulated
                 # inertia to be consistent with the authored mass.
                 use_physx_missing_inertia_fallback = (
-                    not has_effective_inertia
-                    and mass > 0.0
-                    and (mass_compute_failed or physx_missing_inertia_fallback)
+                    not has_effective_inertia and mass > 0.0 and (mass_compute_failed or physx_missing_inertia_fallback)
                 )
                 if use_physx_missing_inertia_fallback:
                     radius = 0.1 / linear_unit if linear_unit > 0.0 else 0.1
