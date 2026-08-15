@@ -558,7 +558,7 @@ def test_kinematic_free_base_drives_dense_articulation(
 ):
     model, _kinematic_body, _probe_body, kinematic_joint, probe_joint = _build_free_root_to_prismatic_scene(device)
     solver = solver_fn(model)
-    collision_pipeline, contacts = _create_contacts(model, solver)
+    _collision_pipeline, contacts = _create_contacts(model, solver)
     state_0, state_1 = model.state(), model.state()
     q_start = int(model.joint_q_start.numpy()[kinematic_joint])
     qd_start = int(model.joint_qd_start.numpy()[kinematic_joint])

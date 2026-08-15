@@ -20,7 +20,6 @@ from __future__ import annotations
 import math
 import unittest
 
-import numpy as np
 import warp as wp
 
 import newton

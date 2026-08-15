@@ -3415,7 +3415,7 @@ class SolverFeatherPGS(SolverBase):
         body_to_art_np = self.body_to_articulation.numpy()
         art_to_world_np = self.art_to_world.numpy()
         world_body_counts = np.zeros((worlds,), dtype=np.int32)
-        for body, art in enumerate(body_to_art_np):
+        for art in body_to_art_np:
             if art >= 0:
                 world = art_to_world_np[art]
                 if world >= 0:

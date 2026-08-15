@@ -11,8 +11,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONNECT
-
-from .test_feather_pgs_connect import _build_four_bar, _loop_anchor_gap
+from newton.tests.test_feather_pgs_connect import _build_four_bar, _loop_anchor_gap
 
 
 def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: int = 2, **solver_kwargs):

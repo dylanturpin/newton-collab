@@ -3280,8 +3280,6 @@ def allocate_world_contact_slots(
     # D-wide generalized rows.
     is_mf = 0
     is_propagation = 0
-    a_is_free_or_ground = art_a < 0
-    b_is_free_or_ground = art_b < 0
     if has_free_rigid != 0:
         a_is_mf_compatible = not a_has_dofs or is_free_rigid[art_a] != 0
         b_is_mf_compatible = not b_has_dofs or is_free_rigid[art_b] != 0
@@ -6257,7 +6255,6 @@ def factor_propagation_tree_for_size(
     art = group_to_art[group_idx]
     joint_start = articulation_start[art]
     joint_end = articulation_start[art + 1]
-    dof_start_art = articulation_dof_start[art]
 
     for joint in range(joint_start, joint_end):
         body = joint_child[joint]

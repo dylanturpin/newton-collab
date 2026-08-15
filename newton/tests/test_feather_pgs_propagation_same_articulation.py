@@ -125,11 +125,13 @@ def _analytic_H_and_X(model: newton.Model, state) -> tuple[np.ndarray, np.ndarra
 
     def rot(q):
         x, y, z, w = q
-        return np.array([
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ])
+        return np.array(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ]
+        )
 
     D = int(model.joint_dof_count)
     n_bodies = model.body_count
@@ -155,7 +157,9 @@ def _analytic_H_and_X(model: newton.Model, state) -> tuple[np.ndarray, np.ndarra
             pp = np.zeros(3)
         Xp_p, Xp_q = joint_X_p[j, :3], joint_X_p[j, 3:]
         anchor_w[j] = pp + Rp @ Xp_p
-        axis_w[j] = Rp @ rot(Xp_q) @ joint_axis[joint_qd_start[j]] if joint_axis.ndim == 2 else Rp @ rot(Xp_q) @ joint_axis[j]
+        axis_w[j] = (
+            Rp @ rot(Xp_q) @ joint_axis[joint_qd_start[j]] if joint_axis.ndim == 2 else Rp @ rot(Xp_q) @ joint_axis[j]
+        )
         parent_joint_of_body[int(joint_child[j])] = j
 
     X = np.zeros((n_bodies, 6, D))
@@ -232,7 +236,8 @@ class TestPropagationSameArticulation(unittest.TestCase):
         state = _zero_iteration_step(model, solver)
         prop_rows = _contact_rows(solver, PROPAGATION_PATH)
         self.assertEqual(
-            set(prop_rows.keys()), set(dense_rows.keys()),
+            set(prop_rows.keys()),
+            set(dense_rows.keys()),
             "same-articulation contacts were not routed to propagation rows",
         )
         prop_diag = _propagation_operator_diag(solver)
@@ -258,9 +263,9 @@ class TestPropagationSameArticulation(unittest.TestCase):
             y_got = Y[dense_slot, :width]
             err = min(np.linalg.norm(y_got - y_ref), np.linalg.norm(y_got + y_ref))
             self.assertLess(
-                err / max(np.linalg.norm(y_ref), 1e-12), 1.0e-3,
-                f"analytic reference disagrees with solver Y row {dense_slot}: "
-                f"{y_got} vs {y_ref}",
+                err / max(np.linalg.norm(y_ref), 1e-12),
+                1.0e-3,
+                f"analytic reference disagrees with solver Y row {dense_slot}: {y_got} vs {y_ref}",
             )
 
         checked = 0
@@ -277,7 +282,8 @@ class TestPropagationSameArticulation(unittest.TestCase):
             checked += 1
             rel = abs(got - ref) / ref
             self.assertLess(
-                rel, 1.0e-3,
+                rel,
+                1.0e-3,
                 f"contact {contact}: propagation W_kk {got:.6e} vs reference {ref:.6e} "
                 f"(rel {rel:.3e}) — cross response term missing or wrong",
             )

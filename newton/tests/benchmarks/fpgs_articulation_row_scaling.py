@@ -230,7 +230,7 @@ def _build_articulated_free_builder(case: BenchCase) -> tuple[newton.ModelBuilde
         joints: list[int] = []
         link_bodies: list[int] = []
 
-        for link_idx in range(case.links):
+        for _ in range(case.links):
             link = builder.add_link()
             link_bodies.append(link)
             builder.add_shape_box(link, hx=link_hx, hy=link_hy, hz=link_hz)

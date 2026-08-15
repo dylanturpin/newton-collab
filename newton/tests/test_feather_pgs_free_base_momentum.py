@@ -209,7 +209,6 @@ class TestFeatherPgsFreeBaseMomentum(unittest.TestCase):
         self.assertGreater(coarse, 0.0)
         self.assertLess(fine, 0.65 * coarse)
 
-
     def test_offset_root_com_conserves_com_velocity(self):
         """A root link whose own COM is offset from its origin conserves momentum too.
 
@@ -227,7 +226,7 @@ class TestFeatherPgsFreeBaseMomentum(unittest.TestCase):
         it is an independent reference. A depth-2 serial chain is the shallowest case that
         distinguishes a correct free-base bias from one that merely looks right on a welded pair.
         """
-        from newton.solvers import SolverFeatherstone
+        from newton.solvers import SolverFeatherstone  # noqa: PLC0415
 
         model = _build_serial_chain(wp.get_device(), depth=2)
         trajectories = []
