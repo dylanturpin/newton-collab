@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import warnings
 import weakref
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -879,11 +880,96 @@ class CollisionPipeline:
         them in optimization loops.
     """
 
+    @dataclass(frozen=True)
+    class ContactReductionConfig:
+        """Configure ordinary rigid-contact reduction stages.
+
+        Args:
+            mesh: Reduce mesh and heightfield triangle contacts while they are
+                generated.  This is the behavior selected by the legacy
+                ``reduce_contacts=True`` value and is supported by every
+                solver.  It is automatically inactive when the scene has no
+                colliding mesh or heightfield shapes; inspect
+                ``pipeline.mesh_contact_reduction_enabled`` for that effective
+                state while ``pipeline.reduce_contacts`` preserves the
+                requested legacy policy.
+            body_pairs: Post-reduce materialized ordinary contacts by body-pair
+                patch.  This is intended for compound bodies made from many
+                colliders and is currently supported by
+                :class:`~newton.solvers.SolverFeatherPGS` only.  Must be used
+                with ``mesh=True`` when mesh or heightfield collision paths
+                are present.
+            body_pair_cell_size: Spatial cell edge [m] used to keep separated
+                same-normal patches independently represented.
+            body_pair_verify: Recheck reducer implementation invariants each
+                frame.  Intended for tests and debugging.
+            body_pair_hysteresis: Previous-winner preference [m].  Set to zero
+                for memoryless selection.
+            body_pair_hashtable_size_factor: Body-pair group-table capacity as
+                a fraction of ``rigid_contact_max``.
+
+        Hydroelastic contact reduction is configured independently through
+        :class:`~newton.geometry.HydroelasticSDF.Config`, because it preserves
+        pressure, area, and moment data that ordinary contact reducers do not
+        carry.
+
+        Body-pair reduction keeps one deepest contact and six sampled footprint
+        extremes per group among contacts already delivered by the narrow
+        phase.  It is an approximation with scene-dependent support error and
+        possible upward torsional-friction bias; validate tipping- and
+        yaw-sensitive tasks.  It is incompatible with contact matching and
+        active hydroelastic contacts.  Call
+        :meth:`CollisionPipeline.reset_body_pair_reduction_history` after
+        episode resets or teleports, and
+        :meth:`CollisionPipeline.refresh_body_pair_reduction_groups` after
+        runtime material changes.  CUDA graph capture requires one ordinary
+        warm-up collide on the exact buffer before capture and only one live
+        reducer-writer graph for that buffer.
+        """
+
+        mesh: bool = True
+        body_pairs: bool = False
+        body_pair_cell_size: float = 0.25
+        body_pair_verify: bool = False
+        body_pair_hysteresis: float = 0.001
+        body_pair_hashtable_size_factor: float = 0.25
+
+        def __post_init__(self):
+            """Validate configuration before any device allocation."""
+            for name in ("mesh", "body_pairs", "body_pair_verify"):
+                if not isinstance(getattr(self, name), bool):
+                    raise TypeError(f"ContactReductionConfig.{name} must be bool")
+            try:
+                cell_size = float(self.body_pair_cell_size)
+                hysteresis = float(self.body_pair_hysteresis)
+                hashtable_size_factor = float(self.body_pair_hashtable_size_factor)
+            except (TypeError, ValueError) as error:
+                raise TypeError("ContactReductionConfig numeric fields must be real numbers") from error
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                cell_size_f32 = float(np.float32(cell_size))
+                hysteresis_f32 = float(np.float32(hysteresis))
+            if not np.isfinite(cell_size_f32) or cell_size_f32 <= 0.0:
+                raise ValueError(
+                    "ContactReductionConfig.body_pair_cell_size must be finite and > 0 at float32 precision"
+                )
+            if (
+                not np.isfinite(hysteresis_f32)
+                or hysteresis < 0.0
+                or hysteresis_f32 < 0.0
+                or (hysteresis > 0.0 and hysteresis_f32 == 0.0)
+            ):
+                raise ValueError(
+                    "ContactReductionConfig.body_pair_hysteresis must be finite and >= 0 without "
+                    "underflow at float32 precision"
+                )
+            if not np.isfinite(hashtable_size_factor) or hashtable_size_factor <= 0.0:
+                raise ValueError("ContactReductionConfig.body_pair_hashtable_size_factor must be finite and > 0")
+
     def __init__(
         self,
         model: Model,
         *,
-        reduce_contacts: bool = True,
+        reduce_contacts: bool | CollisionPipeline.ContactReductionConfig = True,
         rigid_contact_max: int | None = None,
         max_triangle_pairs: int = 1000000,
         shape_pairs_filtered: wp.array[wp.vec2i] | None = None,
@@ -907,18 +993,27 @@ class CollisionPipeline:
         contact_report: bool = False,
         verify_buffers: bool = True,
         contact_reduction_hashtable_size_factor: float = 0.25,
-        reduce_contacts_body_pairs: bool = False,
-        reduce_contacts_body_pairs_cell: float = 0.25,
-        reduce_contacts_body_pairs_verify: bool = False,
-        reduce_contacts_body_pairs_hysteresis: float = 0.001,
-        reduce_contacts_body_pairs_hashtable_factor: float = 0.25,
     ):
         """
         Initialize the CollisionPipeline (expert API).
 
         Args:
             model: The simulation model.
-            reduce_contacts: Whether to reduce contacts for mesh-mesh collisions. Defaults to True.
+            reduce_contacts: Ordinary rigid-contact reduction policy.  A bool
+                preserves the existing API exactly: ``True`` enables
+                mesh/heightfield reduction during contact generation and
+                ``False`` disables it; neither value enables body-pair
+                post-reduction.  Pass
+                :class:`CollisionPipeline.ContactReductionConfig` to configure
+                the two stages explicitly.  Body-pair reduction is opt-in and
+                currently produces contacts supported only by
+                :class:`~newton.solvers.SolverFeatherPGS`.  In mesh or
+                heightfield scenes, body-pair reduction requires the mesh
+                stage because the postpass cannot recover contacts lost while
+                materializing an over-capacity raw triangle stream.
+                Hydroelastic reduction is configured independently through
+                :class:`~newton.geometry.HydroelasticSDF.Config`.  Defaults to
+                ``True``.
             rigid_contact_max: Maximum number of rigid contacts to allocate.
                 Resolution order:
                 - If provided, use this value.
@@ -932,7 +1027,10 @@ class CollisionPipeline:
             contact_reduction_hashtable_size_factor: Multiplier applied to
                 ``max_triangle_pairs`` when allocating the global contact
                 reduction hashtable. Increase this if hashtable fill/failure
-                warnings appear. Defaults to ``0.25`` for memory compatibility.
+                warnings appear. This sizes only the mesh/heightfield producer
+                stage; body-pair sizing lives in
+                ``ContactReductionConfig.body_pair_hashtable_size_factor``.
+                Defaults to ``0.25`` for memory compatibility.
             soft_contact_max: Maximum number of soft contacts to allocate.
                 If None, defaults to ``soft_rigid_contact_pair_count``, the number
                 of precomputed soft-rigid (particle-shape) pairs launched for soft
@@ -954,6 +1052,12 @@ class CollisionPipeline:
                 a prebuilt broad phase instance for expert usage.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
+                Its effective ``reduce_contacts`` state is authoritative for
+                the mesh/heightfield producer stage; the pipeline exposes that
+                state through ``pipeline.mesh_contact_reduction_enabled``.
+                ``pipeline.reduce_contacts`` and
+                ``pipeline.contact_reduction_config.mesh`` retain the requested
+                policy for backwards-compatible inspection.
             shape_pairs_filtered: Precomputed shape pairs for EXPLICIT mode.
                 When broad_phase is "explicit", uses model.shape_contact_pairs if not provided. For
                 "nxn"/"sap" modes, ignored.
@@ -1010,86 +1114,6 @@ class CollisionPipeline:
                 ``True``.  Overhead is one extra kernel launch per collision
                 pass; disable in hot loops or CUDA graph capture once buffer
                 sizes are known to be adequate.
-            reduce_contacts_body_pairs: Compact the rigid contacts per group
-                after the narrow phase, where a group is a (body pair,
-                material class, contact-normal bin, spatial cell): each group
-                keeps its deepest contact plus the spatial extremes of its
-                footprint and discards the redundant interior/speculative
-                candidates.  Bounds the registered contact count of
-                multi-shape bodies (a foot built from many primitive
-                colliders, self-collision candidate swarms) by the patch
-                structure instead of the collider decomposition.
-                ``rigid_contact_count`` reflects the reduction.  Not supported
-                together with ``contact_matching``.  The kept SET is
-                deterministic: winner selection is a function of contact
-                geometry plus, when
-                ``reduce_contacts_body_pairs_hysteresis`` is nonzero (the
-                default), the previous step's winners -- with two documented
-                qualifications: exactly coincident duplicate contacts are all
-                kept (so duplicated colliders can exceed the per-group slot
-                bound), and near group-table saturation the reduced-vs-
-                fail-open OUTCOME can vary with scheduling (keep
-                ``fallback_frames`` at zero by sizing the table).  Combine
-                with ``deterministic=True`` if a canonical buffer ORDER is
-                also required.  Known fidelity tradeoffs: the footprint hull is
-                sampled by six fixed directions, so support and tipping are
-                preserved only to scene-dependent sampling tolerances with
-                no shape-independent percentage (a regular circular example
-                has ~13% radial deficit halfway between samples, while a
-                sparse hull can lose the whole support of an unsampled
-                direction) rather than exactly, and
-                keeping rim extremes strengthens torsional (twist-about-
-                normal) friction; the amount is footprint- and solver-
-                dependent (the theoretical all-load-at-rim value for a circle
-                is 1.5x its uniform-pressure torsion).
-                ``SolverXPBD`` rejects reduced buffers: it predicts body poses
-                before choosing active contacts, so a pre-prediction footprint
-                winner need not represent the contacts that become penetrating
-                at solve time. ``SolverFeatherPGS`` is the supported consumer.
-                Validate tipping- and yaw-heavy motions before enabling in
-                production.  For CUDA graph capture, first warm the exact
-                ``Contacts`` buffer with one ordinary collide.  Each
-                Warp-managed graph then strongly retains this pipeline and
-                that buffer through an exclusive writer lease.  Only one such
-                graph may be live for the buffer; destroy it before recapturing
-                or switching buffers, and serialize ordinary calls on this
-                pipeline with graph replay across streams. An unreduced-only
-                solver graph cannot coexist with a reducer writer for the same
-                buffer. The
-                :meth:`release_body_pair_reduction_capture` method validates
-                that no graph lease remains.  Defaults to ``False``.
-            reduce_contacts_body_pairs_cell: Spatial cell edge [m] used to
-                subdivide each body pair + normal bin on the bin's face
-                plane; every cell keeps its own deepest contact and footprint
-                extremes, so same-normal patches farther apart than a cell
-                (a long body across separate regions of one terrain collider)
-                are each fully represented.  Defaults to ``0.25``.
-            reduce_contacts_body_pairs_verify: Launch a certificate kernel each
-                collide that re-derives every keep/discard decision and counts
-                disagreements into a telemetry counter (read via the reducer's
-                ``stats()``).  Debug/CI aid; costs one extra pass over the
-                contacts.  Defaults to ``False``.
-            reduce_contacts_body_pairs_hysteresis: Temporal hysteresis margin
-                [m] for the reduction's winner selection: a contact that won a
-                slot on the previous step keeps it unless a challenger beats it
-                by more than this margin.  Without it, winner selection is
-                memoryless and near-degenerate extremes on curved or mesh
-                support hand off every step, so a multi-collider body never
-                comes to rest (a bounded rocking limit cycle).  Flat analytic
-                planes are unaffected either way.  The margin also bounds how
-                far the kept depth/extreme representatives may deviate from the
-                exact argmax winners.  ``0`` disables the mechanism and
-                restores exact memoryless selection.  Defaults to ``0.001``.
-            reduce_contacts_body_pairs_hashtable_factor: Hashtable capacity for
-                the reduction's (body pair, bin, cell) groups, as a fraction of
-                ``rigid_contact_max``. Undersizing cannot drop contacts: if a
-                key cannot be found or created within the bounded probe budget,
-                the whole frame deterministically leaves the materialized
-                contact buffer unchanged (counted in ``fallback_frames``).
-                A failure can mean a full table or a long hash cluster; raise
-                the factor if failures recur, while also inspecting reported
-                occupancy. Defaults to ``0.25``.
-
         .. experimental::
 
             When ``requires_grad`` is true (explicitly or via
@@ -1097,6 +1121,16 @@ class CollisionPipeline:
             ``rigid_contact_diff_*`` may change without prior notice; see
             :meth:`collide`.
         """
+        if isinstance(reduce_contacts, bool):
+            reduction_config = self.ContactReductionConfig(mesh=reduce_contacts)
+        elif isinstance(reduce_contacts, self.ContactReductionConfig):
+            reduction_config = reduce_contacts
+        else:
+            raise TypeError(
+                "reduce_contacts must be bool or CollisionPipeline.ContactReductionConfig, "
+                f"got {type(reduce_contacts).__name__}"
+            )
+
         if contact_matching not in ("disabled", "latest", "sticky"):
             raise ValueError(
                 f"contact_matching must be one of 'disabled', 'latest', 'sticky', got {contact_matching!r}"
@@ -1113,6 +1147,10 @@ class CollisionPipeline:
         matching_sticky = contact_matching == "sticky"
         if contact_report and not matching_enabled:
             raise ValueError('contact_report=True requires contact_matching != "disabled"')
+        if reduction_config.body_pairs and matching_enabled:
+            # Compaction renumbers contacts, which invalidates the matcher's
+            # index-based frame-to-frame bookkeeping.
+            raise ValueError("body-pair contact reduction is not supported together with contact_matching")
 
         # Any non-disabled matching mode implies deterministic sorting.
         if matching_enabled:
@@ -1131,8 +1169,8 @@ class CollisionPipeline:
         using_expert_components = broad_phase_instance is not None or narrow_phase is not None
 
         # Resolve rigid contact capacity with explicit > model > estimated precedence.
+        model_rigid_contact_max = int(getattr(model, "rigid_contact_max", 0) or 0)
         if rigid_contact_max is None:
-            model_rigid_contact_max = int(getattr(model, "rigid_contact_max", 0) or 0)
             if model_rigid_contact_max > 0:
                 rigid_contact_max = model_rigid_contact_max
             else:
@@ -1155,7 +1193,11 @@ class CollisionPipeline:
         self.model = model
         self.shape_count = shape_count
         self.device = device
-        self.reduce_contacts = reduce_contacts
+        # Preserve the released requested-policy attribute.  NarrowPhase may
+        # make the mesh stage inactive for a primitive-only scene; the
+        # effective state is exposed separately after its construction.
+        self.reduce_contacts = reduction_config.mesh
+        self.contact_reduction_config = reduction_config
         self.requires_grad = requires_grad
         self.soft_contact_margin = soft_contact_margin
         self.include_static_kinematic_pairs = include_static_kinematic_pairs
@@ -1334,6 +1376,29 @@ class CollisionPipeline:
             )
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
 
+        # NarrowPhase is authoritative for the producer stage: it disables
+        # mesh/heightfield reduction when no such collision path exists, and
+        # expert construction may provide a preconfigured instance.  Publish
+        # the effective state separately from the released requested-policy
+        # ``reduce_contacts`` attribute.
+        self.mesh_contact_reduction_enabled = bool(self.narrow_phase.reduce_contacts)
+
+        if (
+            self.contact_reduction_config.body_pairs
+            and not self.mesh_contact_reduction_enabled
+            and (self.narrow_phase.has_meshes or self.narrow_phase.has_heightfields)
+        ):
+            raise ValueError(
+                "ContactReductionConfig(body_pairs=True) requires the NarrowPhase mesh/heightfield "
+                "producer reduction to be active when those collision paths are present. Body-pair "
+                "reduction runs after contact generation and cannot recover contacts lost to an "
+                "over-capacity raw triangle stream."
+            )
+        if self.contact_reduction_config.body_pairs and self.narrow_phase.hydroelastic_sdf is not None:
+            # Hydroelastic contacts carry per-contact area/stiffness data the
+            # ordinary body-pair compaction does not preserve.
+            raise ValueError("body-pair contact reduction does not support hydroelastic contacts")
+
         # Allocate buffers
         with wp.ScopedDevice(device):
             self.broad_phase_pair_count = wp.zeros(1, dtype=wp.int32, device=device)
@@ -1396,7 +1461,7 @@ class CollisionPipeline:
         # front as well; otherwise geometry is permuted while the material
         # triples stay behind and are subsequently compacted onto the wrong
         # rows. The extra scratch remains opt-in with the reducer.
-        per_contact_props = self.narrow_phase.hydroelastic_sdf is not None or bool(reduce_contacts_body_pairs)
+        per_contact_props = self.narrow_phase.hydroelastic_sdf is not None or self.contact_reduction_config.body_pairs
         if deterministic:
             with wp.ScopedDevice(device):
                 self._sort_key_array = wp.zeros(rigid_contact_max, dtype=wp.int64, device=device)
@@ -1426,16 +1491,7 @@ class CollisionPipeline:
         else:
             self._contact_matcher = None
 
-        self.reduce_contacts_body_pairs = bool(reduce_contacts_body_pairs)
-        if self.reduce_contacts_body_pairs:
-            if matching_enabled:
-                # Compaction renumbers contacts, which would invalidate the
-                # matcher's index-based frame-to-frame bookkeeping.
-                raise ValueError("reduce_contacts_body_pairs is not supported together with contact_matching")
-            if sdf_hydroelastic_config is not None or self.narrow_phase.hydroelastic_sdf is not None:
-                # Hydroelastic contacts carry per-contact area/stiffness data
-                # the compaction does not preserve.
-                raise ValueError("reduce_contacts_body_pairs does not support hydroelastic contacts")
+        if self.contact_reduction_config.body_pairs:
             # Material-equivalence grouping: shapes on one body merge only when
             # every solver-visible material field matches exactly (see
             # build_reduction_groups). Group ids must pack exactly into the
@@ -1445,21 +1501,21 @@ class CollisionPipeline:
             if group_count > MAX_GROUP_ID + 1:
                 # ids are 0-based: MAX_GROUP_ID is the largest representable id
                 raise ValueError(
-                    f"reduce_contacts_body_pairs supports at most {MAX_GROUP_ID + 1} reduction groups, "
+                    f"body-pair contact reduction supports at most {MAX_GROUP_ID + 1} reduction groups, "
                     f"got {group_count}"
                 )
             self._body_pair_reducer = BodyPairContactReducer(
                 rigid_contact_max,
-                reduce_contacts_body_pairs_cell,
+                self.contact_reduction_config.body_pair_cell_size,
                 device,
                 shape_group=shape_group,
                 up_axis=int(getattr(model, "up_axis", 2)),
                 shape_world=(model.shape_world.numpy() if getattr(model, "shape_world", None) is not None else None),
                 world_count=max(int(getattr(model, "world_count", 1)), 1),
                 borrowed_scratch=(self._contact_sorter.borrow_full_scratch() if self._contact_sorter else None),
-                verify=reduce_contacts_body_pairs_verify,
-                hysteresis=reduce_contacts_body_pairs_hysteresis,
-                hashtable_factor=reduce_contacts_body_pairs_hashtable_factor,
+                verify=self.contact_reduction_config.body_pair_verify,
+                hysteresis=self.contact_reduction_config.body_pair_hysteresis,
+                hashtable_factor=self.contact_reduction_config.body_pair_hashtable_size_factor,
             )
         else:
             self._body_pair_reducer = None
@@ -1477,7 +1533,7 @@ class CollisionPipeline:
             return
         if self._captured_contacts is not None and self._captured_contacts is not contacts:
             raise RuntimeError(
-                "reduce_contacts_body_pairs: one pipeline cannot bind different Contacts buffers into live CUDA graphs"
+                "body-pair contact reduction: one pipeline cannot bind different Contacts buffers into live CUDA graphs"
             )
         self._captured_contacts = contacts
         self._body_pair_reduction_capture_tokens.add(token)
@@ -1512,7 +1568,7 @@ class CollisionPipeline:
         shape_group, group_count = build_reduction_groups(self.model)
         if group_count > MAX_GROUP_ID + 1:
             raise ValueError(
-                f"reduce_contacts_body_pairs supports at most {MAX_GROUP_ID + 1} reduction groups, got {group_count}"
+                f"body-pair contact reduction supports at most {MAX_GROUP_ID + 1} reduction groups, got {group_count}"
             )
         self._body_pair_reducer.shape_group.assign(shape_group)
         # Winners recorded under the old classes are not comparable to the new
@@ -1522,7 +1578,7 @@ class CollisionPipeline:
     def reset_body_pair_reduction_history(self, world_mask=None):
         """Erase the body-pair reduction's hysteresis history.
 
-        With ``reduce_contacts_body_pairs_hysteresis > 0`` the pipeline carries
+        With ``ContactReductionConfig.body_pair_hysteresis > 0`` the pipeline carries
         last step's slot winners between :meth:`collide` calls.  Call this at
         episode resets, teleports, or scene reloads so no incumbency bonus
         crosses trajectory boundaries.  No-op when reduction or hysteresis is
@@ -1550,8 +1606,9 @@ class CollisionPipeline:
         ratio), accumulated since construction or the last
         :meth:`clear_body_pair_reduction_stats`:
 
-        * ``invariant_violations`` / ``outranked_discards`` -- certificate
-          disagreements (verify mode only; any nonzero value is a bug).
+        * ``invariant_violations`` / ``outranked_discards`` -- implementation-
+          invariant disagreements (verify mode only; any nonzero value is a
+          reducer bug, not a physical-error estimate).
         * ``probe_failures`` -- group-table keys that could not be found or
           created within the bounded probe budget; each flags its whole frame
           for the keep-all fallback (trigger events, not kept contacts). This
@@ -1574,10 +1631,10 @@ class CollisionPipeline:
           count toward ``total_frames`` but are excluded from both sums.
 
         Raises:
-            RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.
+            RuntimeError: If body-pair contact reduction is not enabled.
         """
         if self._body_pair_reducer is None:
-            raise RuntimeError("reduce_contacts_body_pairs is not enabled on this pipeline")
+            raise RuntimeError("body-pair contact reduction is not enabled on this pipeline")
         return self._body_pair_reducer.stats()
 
     def clear_body_pair_reduction_stats(self):
@@ -1588,10 +1645,10 @@ class CollisionPipeline:
         are int32 because the corresponding buffers and counts are int32.
 
         Raises:
-            RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.
+            RuntimeError: If body-pair contact reduction is not enabled.
         """
         if self._body_pair_reducer is None:
-            raise RuntimeError("reduce_contacts_body_pairs is not enabled on this pipeline")
+            raise RuntimeError("body-pair contact reduction is not enabled on this pipeline")
         self._body_pair_reducer.clear_stats()
 
     def release_body_pair_reduction_capture(self):
@@ -1610,10 +1667,10 @@ class CollisionPipeline:
         or ordinary Python-level :meth:`collide` establishes fresh provenance.
 
         Raises:
-            RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.
+            RuntimeError: If body-pair contact reduction is not enabled.
         """
         if self._body_pair_reducer is None:
-            raise RuntimeError("reduce_contacts_body_pairs is not enabled on this pipeline")
+            raise RuntimeError("body-pair contact reduction is not enabled on this pipeline")
         if self._body_pair_reducer.device.is_cuda and self._body_pair_reducer.device.is_capturing:
             raise RuntimeError(
                 "release_body_pair_reduction_capture() is host-side lifecycle mutation; "
@@ -1635,10 +1692,10 @@ class CollisionPipeline:
         buffer and the reported owned total can grow once.
 
         Raises:
-            RuntimeError: If ``reduce_contacts_body_pairs`` is not enabled.
+            RuntimeError: If body-pair contact reduction is not enabled.
         """
         if self._body_pair_reducer is None:
-            raise RuntimeError("reduce_contacts_body_pairs is not enabled on this pipeline")
+            raise RuntimeError("body-pair contact reduction is not enabled on this pipeline")
         return self._body_pair_reducer.describe()
 
     @property
@@ -1754,14 +1811,14 @@ class CollisionPipeline:
             # than the reducer's arrays can hold.
             if contacts.rigid_contact_max != self._rigid_contact_max:
                 raise ValueError(
-                    f"reduce_contacts_body_pairs requires the Contacts buffer capacity "
+                    f"body-pair contact reduction requires the Contacts buffer capacity "
                     f"({contacts.rigid_contact_max}) to exactly match the pipeline's "
                     f"rigid_contact_max ({self._rigid_contact_max}). Use CollisionPipeline.contacts() "
                     f"or construct the pipeline with a matching rigid_contact_max."
                 )
             if str(contacts.device) != str(self._body_pair_reducer._stats.device):
                 raise ValueError(
-                    f"reduce_contacts_body_pairs requires the Contacts buffer device "
+                    f"body-pair contact reduction requires the Contacts buffer device "
                     f"({contacts.device}) to match the pipeline device "
                     f"({self._body_pair_reducer._stats.device})."
                 )
@@ -1782,7 +1839,7 @@ class CollisionPipeline:
             bound = self._captured_contacts
             if bound is not None and bound is not contacts:
                 raise RuntimeError(
-                    "reduce_contacts_body_pairs: this pipeline's reducer state is bound to the "
+                    "body-pair contact reduction: this pipeline's reducer state is bound to the "
                     "Contacts buffer it captured in a CUDA graph; using any other buffer would "
                     "corrupt the hysteresis state the graph replays against. Use one pipeline "
                     "per captured buffer, or destroy every graph that captured this pipeline "
@@ -1790,7 +1847,7 @@ class CollisionPipeline:
                 )
             if contacts._has_unreduced_solver_graph_lease:
                 raise RuntimeError(
-                    "reduce_contacts_body_pairs cannot write this Contacts buffer while a CUDA graph "
+                    "body-pair contact reduction cannot write this Contacts buffer while a CUDA graph "
                     "for an unsupported solver is live; destroy every reference to that solver graph first"
                 )
             device = self._body_pair_reducer.device
@@ -1799,19 +1856,19 @@ class CollisionPipeline:
             if device.is_cuda and device.is_capturing and not current_stream_is_capturing:
                 if wp.get_stream(device).is_capturing:
                     raise RuntimeError(
-                        "reduce_contacts_body_pairs requires CUDA capture to be registered with Warp "
+                        "body-pair contact reduction requires CUDA capture to be registered with Warp "
                         "so the graph can own its Contacts lease; wrap an external capture with "
                         "wp.capture_begin(external=True)"
                     )
                 raise RuntimeError(
-                    "reduce_contacts_body_pairs cannot mutate shared reducer state on one stream "
+                    "body-pair contact reduction cannot mutate shared reducer state on one stream "
                     "while another stream is capturing on this device"
                 )
             if current_stream_is_capturing:
                 last = getattr(self, "_last_contacts_ref", None)
                 if last is None or last() is not contacts:
                     raise RuntimeError(
-                        "reduce_contacts_body_pairs: collide this exact Contacts buffer once "
+                        "body-pair contact reduction: collide this exact Contacts buffer once "
                         "outside capture before capturing it -- capturing cold would record "
                         "the hysteresis history reset (and any lazy allocation) into the "
                         "graph, repeating them on every replay."
@@ -2107,7 +2164,8 @@ class CollisionPipeline:
 
         # Provenance is assigned on EVERY collide from the pipeline's mode --
         # never only set on reduction -- so a buffer reused across pipelines
-        # cannot carry a stale marker (see SolverBase.supports_reduced_contacts).
+        # cannot carry a stale marker (see
+        # SolverBase.supports_body_pair_reduced_contacts).
         contacts.rigid_contacts_reduced = self._body_pair_reducer is not None
         if self._body_pair_reducer is not None:
             self._body_pair_reducer.reduce(model, state, contacts)

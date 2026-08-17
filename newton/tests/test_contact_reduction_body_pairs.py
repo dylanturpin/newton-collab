@@ -30,8 +30,8 @@ import warp as wp
 
 import newton
 from newton._src.geometry.contact_reduction_body_pairs import _BP_FACE_NORMALS_DATA, _up_axis_rotation
-from newton._src.geometry.sdf_hydroelastic import HydroelasticSDF
 from newton._src.sim.contacts import Contacts
+from newton.geometry import HydroelasticSDF
 
 DT = 1.0 / 240.0
 FPGS_PROPAGATION_PATH = 2
@@ -171,12 +171,23 @@ def _sphere_grid_body(builder, pos, n=5, spacing=0.05, radius=0.01, mass=1.0):
     return body
 
 
-def _make_pipeline(model, reduce_body_pairs, **kwargs):
+def _make_pipeline(model, reduce_body_pairs, *, reduce_mesh_contacts=True, **kwargs):
+    config_fields = {
+        "body_pair_cell_size",
+        "body_pair_verify",
+        "body_pair_hysteresis",
+        "body_pair_hashtable_size_factor",
+    }
+    config_kwargs = {name: kwargs.pop(name) for name in tuple(kwargs) if name in config_fields}
     return newton.CollisionPipeline(
         model,
         broad_phase="nxn",
         deterministic=True,
-        reduce_contacts_body_pairs=reduce_body_pairs,
+        reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(
+            mesh=reduce_mesh_contacts,
+            body_pairs=reduce_body_pairs,
+            **config_kwargs,
+        ),
         **kwargs,
     )
 
@@ -235,7 +246,7 @@ class TestBodyPairReductionCounts(unittest.TestCase):
         model = builder.finalize(device=wp.get_device())
         state = model.state()
         # one spatial cell: this test asserts the tight single-patch slot bound
-        return model, state, _collide_once(model, state, reduce_body_pairs, reduce_contacts_body_pairs_cell=10.0)
+        return model, state, _collide_once(model, state, reduce_body_pairs, body_pair_cell_size=10.0)
 
     def test_flat_patch_keeps_extremes_and_deepest(self):
         """Reduce a 25-point flat patch to at most 7 while keeping its footprint.
@@ -342,7 +353,7 @@ class TestBodyPairReductionCounts(unittest.TestCase):
 
         base = _collide_once(model, state, reduce_body_pairs=False)
         # one spatial cell: the foot spans two default cells, this asserts the per-cell bound
-        red = _collide_once(model, state, reduce_body_pairs=True, reduce_contacts_body_pairs_cell=10.0)
+        red = _collide_once(model, state, reduce_body_pairs=True, body_pair_cell_size=10.0)
         n_base, *_ = _contact_snapshot(base)
         n_red, *_ = _contact_snapshot(red)
         self.assertGreaterEqual(n_base, 7)
@@ -373,26 +384,123 @@ class TestBodyPairReductionCounts(unittest.TestCase):
 class TestBodyPairReductionGuarantees(unittest.TestCase):
     """Unsupported configurations are rejected at construction or solver start."""
 
+    def _mesh_model(self):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.6), wp.quat_identity()))
+        mesh = newton.Mesh.create_box(0.25, 0.25, 0.25, duplicate_vertices=False, compute_inertia=False)
+        builder.add_shape_mesh(body, mesh=mesh)
+        builder.add_ground_plane()
+        return builder.finalize(device=wp.get_device())
+
     def _foot_model(self):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         _cylinder_foot(builder, (0.0, 0.0, 0.020))
         builder.add_ground_plane()
         return builder.finalize(device=wp.get_device())
 
-    def test_hydroelastic_rejected_at_construction(self):
-        """Reject reduce_contacts_body_pairs together with hydroelastic contacts.
+    def test_unified_reduce_contacts_bool_compatibility(self):
+        """Keep the released bool spelling limited to producer-side reduction."""
+        model = self._mesh_model()
+        enabled = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=True)
+        disabled = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+        self.assertTrue(enabled.reduce_contacts)
+        self.assertTrue(enabled.contact_reduction_config.mesh)
+        self.assertTrue(enabled.mesh_contact_reduction_enabled)
+        self.assertFalse(enabled.contact_reduction_config.body_pairs)
+        self.assertFalse(disabled.reduce_contacts)
+        self.assertFalse(disabled.contact_reduction_config.mesh)
+        self.assertFalse(disabled.mesh_contact_reduction_enabled)
+        self.assertFalse(disabled.contact_reduction_config.body_pairs)
 
-        The compaction does not carry the hydroelastic per-contact area and
-        stiffness fields, so the combination must fail at pipeline
-        construction, not corrupt data at runtime.
+    def test_unified_config_enables_body_pair_stage(self):
+        """Select body-pair reduction through the existing reduce_contacts entry."""
+        model = self._foot_model()
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True),
+        )
+        # The requested producer policy remains visible, while the effective
+        # stage is inactive because this model has no mesh path.
+        self.assertTrue(pipeline.reduce_contacts)
+        self.assertTrue(pipeline.contact_reduction_config.mesh)
+        self.assertFalse(pipeline.mesh_contact_reduction_enabled)
+        self.assertTrue(pipeline.contact_reduction_config.body_pairs)
+        self.assertIsNotNone(pipeline._body_pair_reducer)
+
+    def test_body_pair_stage_requires_mesh_stage_for_mesh_scenes(self):
+        """Reject a postpass that cannot protect raw mesh output from overflow."""
+        model = self._mesh_model()
+        config = newton.CollisionPipeline.ContactReductionConfig(mesh=False, body_pairs=True)
+        with self.assertRaisesRegex(ValueError, "producer reduction to be active"):
+            newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=config)
+
+    def test_mesh_and_body_pair_stages_compose(self):
+        """Run producer and body-pair reduction in order on one compound mesh patch."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.01), wp.quat_identity()))
+        tile = newton.Mesh.create_box(0.035, 0.035, 0.01, duplicate_vertices=False, compute_inertia=False)
+        for x in (-0.04, 0.04):
+            for y in (-0.04, 0.04):
+                builder.add_shape_mesh(
+                    body,
+                    mesh=tile,
+                    xform=wp.transform(wp.vec3(x, y, 0.0), wp.quat_identity()),
+                )
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(model, True, body_pair_cell_size=1.0)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        stats = pipeline.body_pair_reduction_stats()
+        self.assertTrue(pipeline.mesh_contact_reduction_enabled, "mesh producer reduction was not active")
+        self.assertEqual(stats["input_overflow_frames"], 0)
+        self.assertGreater(stats["sum_contacts_in"], stats["sum_contacts_kept"])
+
+    def test_unified_reduce_contacts_rejects_unknown_policy(self):
+        model = self._foot_model()
+        with self.assertRaisesRegex(TypeError, "reduce_contacts must be bool"):
+            newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts="body_pairs")
+
+    def test_unused_hydroelastic_config_is_allowed(self):
+        """Allow a hydroelastic config when the model has no active hydro pair.
+
+        Merely supplying the independent hydro configuration must not disable
+        body-pair reduction for an ordinary-contact-only model.
         """
         model = self._foot_model()
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            deterministic=True,
+            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True),
+            sdf_hydroelastic_config=HydroelasticSDF.Config(),
+        )
+        self.assertIsNone(pipeline.narrow_phase.hydroelastic_sdf)
+
+    def test_active_hydroelastic_contacts_rejected_at_construction(self):
+        """Reject body-pair reduction when hydroelastic contacts are active."""
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("hydroelastic contacts require a CUDA device")
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        builder.default_shape_cfg = newton.ModelBuilder.ShapeConfig(
+            is_hydroelastic=True,
+            sdf_max_resolution=16,
+            sdf_narrow_band_range=(-0.02, 0.02),
+            gap=0.01,
+        )
+        body0 = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()))
+        body1 = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.08), wp.quat_identity()))
+        builder.add_shape_box(body0, hx=0.05, hy=0.05, hz=0.05)
+        builder.add_shape_box(body1, hx=0.05, hy=0.05, hz=0.05)
+        model = builder.finalize(device=device)
         with self.assertRaisesRegex(ValueError, "hydroelastic"):
             newton.CollisionPipeline(
                 model,
                 broad_phase="nxn",
-                deterministic=True,
-                reduce_contacts_body_pairs=True,
+                reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True),
                 sdf_hydroelastic_config=HydroelasticSDF.Config(),
             )
 
@@ -419,7 +527,7 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
             model,
             broad_phase="nxn",
             deterministic=False,
-            reduce_contacts_body_pairs=True,
+            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True),
         )
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
@@ -434,7 +542,7 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         self.assertEqual(kept_set(sorted_contacts), first)
 
     def test_unvalidated_solver_rejected_at_step(self):
-        """A solver without supports_reduced_contacts refuses a reduced buffer.
+        """A solver without body-pair reduction support refuses a reduced buffer.
 
         Reduced buffers are stamped; every in-repo solver that has not been
         conformance-tested calls ``_require_unreduced_contacts`` at the top of
@@ -454,10 +562,10 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
             newton.solvers.SolverXPBD(model),
         ):
             with self.subTest(solver=type(solver).__name__):
-                with self.assertRaisesRegex(ValueError, "supports_reduced_contacts"):
+                with self.assertRaisesRegex(ValueError, "supports_body_pair_reduced_contacts"):
                     solver.step(state_0, state_1, model.control(), contacts, DT)
-        self.assertFalse(newton.solvers.SolverXPBD.supports_reduced_contacts)
-        self.assertTrue(newton.solvers.SolverFeatherPGS.supports_reduced_contacts)
+        self.assertFalse(newton.solvers.SolverXPBD.supports_body_pair_reduced_contacts)
+        self.assertTrue(newton.solvers.SolverFeatherPGS.supports_body_pair_reduced_contacts)
 
 
 class TestBodyPairReductionMultiPatch(unittest.TestCase):
@@ -569,7 +677,7 @@ class TestBodyPairReductionMultiPatch(unittest.TestCase):
 
 
 class TestBodyPairReductionSolverConformance(unittest.TestCase):
-    """Every solver declaring supports_reduced_contacts settles identically on/off."""
+    """Every solver declaring body-pair reduction support settles identically on/off."""
 
     def _settle(self, build_fn, make_solver, reduce_on, steps=240):
         """Drop, settle, and return dynamics plus solver-path watermarks.
@@ -629,7 +737,8 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
     def test_feather_pgs_conformance(self):
         """SolverFeatherPGS rests a free-jointed foot at the same height on/off.
 
-        This is the conformance requirement for supports_reduced_contacts:
+        This is the conformance requirement for
+        supports_body_pair_reduced_contacts:
         the solver's contact-depth convention must agree with the ranking's
         canonical contact_surface_separation, or the kept set starves the
         solver of its load-bearing contacts. The foot uses the explicit form
@@ -657,7 +766,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
     def test_feather_pgs_contact_mode_conformance(self):
         """Settle identically on/off in every FeatherPGS contact mode.
 
-        supports_reduced_contacts is class-wide, so the evidence must cover
+        supports_body_pair_reduced_contacts is class-wide, so the evidence must cover
         the dense and matrix-free contact paths, not only the default split
         mode the other tests exercise (matrix-free additionally runs generated
         native CUDA).
@@ -741,7 +850,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         raw_pipeline.collide(state_0, raw_contacts)
         raw_count = int(raw_contacts.rigid_contact_count.numpy()[0])
 
-        reduced_pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_cell=10.0)
+        reduced_pipeline = _make_pipeline(model, True, body_pair_cell_size=10.0)
         reduced_contacts = reduced_pipeline.contacts()
         reduced_pipeline.collide(state_0, reduced_contacts)
         reduced_count = int(reduced_contacts.rigid_contact_count.numpy()[0])
@@ -833,7 +942,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         probe_model = probe_builder.finalize(device=wp.get_device())
         ps0, ps1 = probe_model.state(), probe_model.state()
         probe_control = probe_model.control()
-        probe_pipe = _make_pipeline(probe_model, True, reduce_contacts_body_pairs_hysteresis=0.0)
+        probe_pipe = _make_pipeline(probe_model, True, body_pair_hysteresis=0.0)
         probe_contacts = probe_pipe.contacts()
         probe_solver = newton.solvers.SolverXPBD(probe_model, iterations=8)
         red = probe_pipe._body_pair_reducer
@@ -921,7 +1030,7 @@ class TestBodyPairReductionGrouping(unittest.TestCase):
         builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
         state = model.state()
-        contacts = _collide_once(model, state, True, reduce_contacts_body_pairs_cell=10.0)
+        contacts = _collide_once(model, state, True, body_pair_cell_size=10.0)
         n, s0, s1, _n2, _p0 = _contact_snapshot(contacts)
         mu_arr = model.shape_material_mu.numpy()
         sb = model.shape_body.numpy()
@@ -964,7 +1073,7 @@ class TestBodyPairReductionGrouping(unittest.TestCase):
         builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
         state = model.state()
-        pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_cell=10.0)
+        pipeline = _make_pipeline(model, True, body_pair_cell_size=10.0)
         contacts = pipeline.contacts()
 
         # mutate the CENTER collider (index 12: interior point of the patch)
@@ -1007,7 +1116,7 @@ class TestBodyPairReductionGrouping(unittest.TestCase):
                 )
         model = builder.finalize(device=wp.get_device())
         state = model.state()
-        pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_cell=10.0)
+        pipeline = _make_pipeline(model, True, body_pair_cell_size=10.0)
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
         n, _s0, _s1, _nrm, _p0 = _contact_snapshot(contacts)
@@ -1072,7 +1181,7 @@ class TestBodyPairReductionSafety(unittest.TestCase):
                 model,
                 broad_phase="nxn",
                 rigid_contact_max=8,  # deliberately far below the ~25 candidates
-                reduce_contacts_body_pairs=reduce_on,
+                reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=reduce_on),
             )
             contacts = pipeline.contacts()
             pipeline.collide(state, contacts)  # must not crash or corrupt memory
@@ -1115,7 +1224,7 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         self.assertGreater(n_base, 1024)
 
         # a factor small enough to hit the 1024-entry floor: 1200 groups cannot fit
-        pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_hashtable_factor=1e-6)
+        pipeline = _make_pipeline(model, True, body_pair_hashtable_size_factor=1e-6)
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
         n_red = int(contacts.rigid_contact_count.numpy()[0])
@@ -1154,12 +1263,15 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
         for kwargs in (
-            {"reduce_contacts_body_pairs_cell": 0.0},
-            {"reduce_contacts_body_pairs_cell": float("inf")},
-            {"reduce_contacts_body_pairs_cell": float("nan")},
-            {"reduce_contacts_body_pairs_hysteresis": float("inf")},
-            {"reduce_contacts_body_pairs_hysteresis": -1.0},
-            {"reduce_contacts_body_pairs_hashtable_factor": 0.0},
+            {"body_pair_cell_size": 0.0},
+            {"body_pair_cell_size": float("inf")},
+            {"body_pair_cell_size": float("nan")},
+            {"body_pair_cell_size": 1.0e-50},
+            {"body_pair_hysteresis": float("inf")},
+            {"body_pair_hysteresis": -1.0},
+            {"body_pair_hysteresis": -1.0e-50},
+            {"body_pair_hysteresis": 1.0e-50},
+            {"body_pair_hashtable_size_factor": 0.0},
         ):
             with self.assertRaises(ValueError, msg=f"accepted invalid {kwargs}"):
                 _make_pipeline(model, True, **kwargs)
@@ -1487,7 +1599,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         return builder.finalize(device=wp.get_device())
 
     def test_contact_matching_rejected_at_construction(self):
-        """Reject reduce_contacts_body_pairs together with contact matching.
+        """Reject body-pair contact reduction together with contact matching.
 
         Compaction renumbers contacts, which would silently invalidate the
         matcher's index-based frame-to-frame bookkeeping.
@@ -1499,7 +1611,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
                 broad_phase="nxn",
                 deterministic=True,
                 contact_matching="latest",
-                reduce_contacts_body_pairs=True,
+                reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True),
             )
 
     def test_group_id_capacity_rejected_at_construction(self):
@@ -1795,7 +1907,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         self.assertFalse(contacts.rigid_contacts_reduced)
         self.assertTrue(contacts.rigid_contacts_reduced_capture)
         solver = newton.solvers.SolverSemiImplicit(model)
-        with self.assertRaisesRegex(ValueError, "supports_reduced_contacts"):
+        with self.assertRaisesRegex(ValueError, "supports_body_pair_reduced_contacts"):
             solver.step(state_0, state_1, model.control(), contacts, DT)
 
     def test_graph_lease_retains_pipeline_and_contacts(self):
@@ -1925,7 +2037,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
             model,
             broad_phase="nxn",
             deterministic=True,
-            reduce_contacts_body_pairs=True,
+            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True),
             requires_grad=True,
         )
         contacts = pipeline.contacts()
@@ -1952,7 +2064,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
         state = model.state()
-        red = _collide_once(model, state, reduce_body_pairs=True, reduce_contacts_body_pairs_cell=10.0)
+        red = _collide_once(model, state, reduce_body_pairs=True, body_pair_cell_size=10.0)
         n, s0, s1, _, _ = _contact_snapshot(red)
         shape_body = model.shape_body.numpy()
         per_world = [0, 0]
@@ -2028,8 +2140,8 @@ class TestBodyPairReductionGroupAssignment(unittest.TestCase):
             model,
             True,
             rigid_contact_max=2,
-            reduce_contacts_body_pairs_cell=0.02,
-            reduce_contacts_body_pairs_hysteresis=0.0,
+            body_pair_cell_size=0.02,
+            body_pair_hysteresis=0.0,
         )
         contacts = pipeline.contacts()
 
@@ -2150,7 +2262,7 @@ class TestBodyPairReductionHysteresis(unittest.TestCase):
         body = _sphere_grid_body(builder, (0.0, 0.0, 0.0095), n=4, spacing=0.05)
         model = builder.finalize(device=wp.get_device())
         state = model.state()
-        pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_hysteresis=hysteresis)
+        pipeline = _make_pipeline(model, True, body_pair_hysteresis=hysteresis)
         contacts = pipeline.contacts()
         q0 = state.body_q.numpy().copy()
         prev, handoffs = None, 0
@@ -2410,12 +2522,12 @@ class TestBodyPairReductionHysteresis(unittest.TestCase):
         q[body][0] += 0.01  # a slightly different "previous" step
         state_b.body_q.assign(q)
 
-        with_history = _make_pipeline(model, True, reduce_contacts_body_pairs_hysteresis=0.0)
+        with_history = _make_pipeline(model, True, body_pair_hysteresis=0.0)
         contacts_h = with_history.contacts()
         with_history.collide(state_b, contacts_h)
         with_history.collide(state_a, contacts_h)
 
-        fresh = _make_pipeline(model, True, reduce_contacts_body_pairs_hysteresis=0.0)
+        fresh = _make_pipeline(model, True, body_pair_hysteresis=0.0)
         contacts_f = fresh.contacts()
         fresh.collide(state_a, contacts_f)
 
@@ -2431,11 +2543,11 @@ class TestBodyPairReductionHysteresis(unittest.TestCase):
         self.assertEqual(rows_h, rows_f)
 
 
-class TestBodyPairReductionCertificate(unittest.TestCase):
+class TestBodyPairReductionVerifier(unittest.TestCase):
     """The verify mode re-derives every keep/discard decision and finds zero disagreements."""
 
-    def test_certificate_zero_violations_settling(self):
-        """Certify the invariant over a full settling trajectory.
+    def test_verifier_zero_violations_settling(self):
+        """Verify the implementation invariant over a full settling trajectory.
 
         Every collide re-checks: no discarded contact out-ranks a slot winner
         it was eligible for, and every kept registered contact matches a slot
@@ -2449,7 +2561,7 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
         state_0, state_1 = model.state(), model.state()
         newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
         control = model.control()
-        pipeline = _make_pipeline(model, True, reduce_contacts_body_pairs_verify=True)
+        pipeline = _make_pipeline(model, True, body_pair_verify=True)
         contacts = pipeline.contacts()
         solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
         for _ in range(240):
@@ -2460,7 +2572,7 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
         stats = pipeline._body_pair_reducer.stats()
         self.assertEqual(stats["invariant_violations"], 0)
         self.assertEqual(stats["failed_insertions"], 0)
-        self.assertLess(stats["sum_contacts_kept"], stats["sum_contacts_in"], "certificate saw no discard")
+        self.assertLess(stats["sum_contacts_kept"], stats["sum_contacts_in"], "verifier saw no discard")
 
     def test_kept_set_independent_of_previous_step(self):
         """Reduce a state to the same kept set whether or not a busier step preceded it.
@@ -2484,13 +2596,13 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
             q[b][2] += 5.0  # lift two feet clear of the ground
         state_quiet.body_q.assign(q)
 
-        with_history = _make_pipeline(model, True, reduce_contacts_body_pairs_verify=True)
+        with_history = _make_pipeline(model, True, body_pair_verify=True)
         contacts_h = with_history.contacts()
         with_history.collide(state_busy, contacts_h)
         n_busy = int(contacts_h.rigid_contact_count.numpy()[0])
         with_history.collide(state_quiet, contacts_h)
 
-        fresh = _make_pipeline(model, True, reduce_contacts_body_pairs_verify=True)
+        fresh = _make_pipeline(model, True, body_pair_verify=True)
         contacts_f = fresh.contacts()
         fresh.collide(state_quiet, contacts_f)
 
@@ -2516,8 +2628,8 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
         dropped into a pile -- geometry nobody hand-picked. Every free-jointed
         body has seven offset colliders, so the test cannot pass solely through
         the reducer's one-collider identity path. At least one frame must
-        strictly reduce; the certificate must stay clean; and the supported
-        FeatherPGS consumer must remain finite and above the ground.
+        strictly reduce; the invariant verifier must stay clean; and the
+        supported FeatherPGS consumer must remain finite and above the ground.
         """
         rng = np.random.default_rng(1234)
         for trial in range(3):
@@ -2550,7 +2662,7 @@ class TestBodyPairReductionCertificate(unittest.TestCase):
             state_0, state_1 = model.state(), model.state()
             newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
             control = model.control()
-            pipe_red = _make_pipeline(model, True, reduce_contacts_body_pairs_verify=True)
+            pipe_red = _make_pipeline(model, True, body_pair_verify=True)
             pipe_raw = newton.CollisionPipeline(model, broad_phase="nxn")
             c_red, c_raw = pipe_red.contacts(), pipe_raw.contacts()
             solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)

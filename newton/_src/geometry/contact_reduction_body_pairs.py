@@ -1602,8 +1602,9 @@ def _write_reduced_count_kernel(
 class BodyPairContactReducer:
     """Owns the buffers and launch sequence for body-pair contact reduction.
 
-    Created by :class:`newton.CollisionPipeline` when
-    ``reduce_contacts_body_pairs=True``; not part of the public API.
+    Created by :class:`newton.CollisionPipeline` through
+    ``CollisionPipeline.ContactReductionConfig(body_pairs=True)``; not part of
+    the public API.
 
     Args:
         rigid_contact_max: Capacity of the ``Contacts`` buffer being reduced.

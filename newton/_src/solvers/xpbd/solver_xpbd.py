@@ -103,7 +103,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
     # the XPBD prediction.  Until the reducer can rank the XPBD solve-time
     # geometry (or XPBD gets its own post-prediction reduction pass), accepting
     # a reduced buffer here would be a class-wide guarantee we cannot make.
-    supports_reduced_contacts: bool = False
+    supports_body_pair_reduced_contacts: bool = False
 
     @deprecate_nonkeyword_arguments
     def __init__(

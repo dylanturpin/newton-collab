@@ -966,19 +966,67 @@ Supported methods: ``"convex_hull"`` (default), ``"bounding_box"``, ``"bounding_
 Contact Reduction
 ^^^^^^^^^^^^^^^^^
 
-Contact reduction is enabled by default. For scenes with many mesh-mesh interactions that generate thousands of contacts, reduction selects a significantly smaller representative set that maintains stable contact behavior while improving solver performance.
+Newton has three reduction stages with different physical contracts.  They are
+configured separately even when they share the word "reduction":
 
-**How it works:**
+**Mesh and heightfield contact generation**
 
-1. Contacts are binned by normal direction (polyhedron face directions)
-2. Within each bin, contacts are scored by spatial distribution and penetration depth
-3. Representative contacts are selected to preserve coverage and depth cues
+The released ``CollisionPipeline(reduce_contacts=True)`` default reduces
+ordinary triangle contacts while the narrow phase generates them.  It prevents
+dense mesh or heightfield candidate streams from filling the final contact
+buffer and is supported by every solver.  It is automatically inactive in
+primitive-only scenes.  Passing ``False`` retains the old behavior of disabling
+only this producer stage.
 
-To disable reduction, set ``reduce_contacts=False`` when creating the pipeline.
+**Body-pair patch post-reduction**
 
-**Configuring contact reduction (HydroelasticSDF.Config):**
+Compound bodies made from many colliders can generate several shape-pair
+manifolds for one physical patch.  Enable the optional postpass through the same
+public entry point, using a configuration object rather than another constructor
+flag:
 
-For hydroelastic and SDF-based contacts, use :class:`~geometry.HydroelasticSDF.Config` to tune reduction behavior:
+.. code-block:: python
+
+    reduction = newton.CollisionPipeline.ContactReductionConfig(
+        mesh=True,
+        body_pairs=True,
+        body_pair_cell_size=0.25,
+        body_pair_hysteresis=0.001,
+    )
+    pipeline = newton.CollisionPipeline(model, reduce_contacts=reduction)
+
+The postpass groups the *finalized narrow-phase contacts* by body pair,
+material class, normal bin, and spatial cell, then retains the deepest contact
+and six sampled footprint extremes.  This is a bounded spatial approximation,
+not an exact patch-wrench representation: support error is scene dependent,
+coincident duplicate contacts may exceed the nominal slot count, and selecting
+rim representatives can strengthen torsional friction.  Measure the reduction
+ratio with :meth:`~CollisionPipeline.body_pair_reduction_stats` and keep the
+feature disabled when it does not provide a material end-to-end benefit.
+
+The default hysteresis carries previous winners between frames.  Call
+:meth:`~CollisionPipeline.reset_body_pair_reduction_history` after episode
+resets, teleports, or scene reloads.  If solver-visible shape materials are
+changed at runtime, call
+:meth:`~CollisionPipeline.refresh_body_pair_reduction_groups` so contacts with
+different material laws stop competing in a stale equivalence class.
+
+Body-pair reduction is currently supported only by
+:class:`~newton.solvers.SolverFeatherPGS`.  It is incompatible with active
+hydroelastic contacts and contact matching.  Mesh/heightfield producer
+reduction must remain enabled when the postpass is selected, because a pass
+after materialization cannot recover contacts lost to output-buffer overflow.
+
+**Hydroelastic contact reduction**
+
+Hydroelastic reduction preserves pressure, area, aggregate force, and optional
+moment data, so it remains independently controlled by
+:class:`~geometry.HydroelasticSDF.Config`:
+
+The short doctest below demonstrates the configuration syntax on an ordinary
+model.  The hydroelastic pipeline is instantiated only in a real scene where
+both shapes in at least one collision pair have ``is_hydroelastic=True`` and
+valid SDF data.
 
 .. testsetup:: hydro-config
 
@@ -1005,7 +1053,7 @@ For hydroelastic and SDF-based contacts, use :class:`~geometry.HydroelasticSDF.C
 
     pipeline = CollisionPipeline(model, sdf_hydroelastic_config=config)
 
-**Other reduction options:**
+**Hydroelastic reduction options:**
 
 .. list-table::
    :header-rows: 1
