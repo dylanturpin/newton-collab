@@ -53,6 +53,8 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PROPAGATION_COLOR_TAIL,
     add_dense_contact_compliance_to_diag,
+    advance_frozen_mf_phi,
+    advance_frozen_row_errors,
     allocate_joint_limit_slots,
     allocate_joint_velocity_limit_slots,
     allocate_physx_drive_slots,
@@ -527,6 +529,7 @@ class SolverFeatherPGS(SolverBase):
         velocity_limit_activation_fraction: float = 0.0,
         fuse_joint_velocity_limits: bool = True,
         pgs_iterations: int = 12,
+        pgs_inner_substeps: int = 1,
         pgs_velocity_iterations: int = 0,
         pgs_beta: float = 0.2,
         pgs_cfm: float = 1.0e-6,
@@ -676,6 +679,17 @@ class SolverFeatherPGS(SolverBase):
                 iterations under ``pgs_velocity_drive_mode="freeze"``, exactly like the
                 dedicated rows it replaces. Defaults to True.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
+            pgs_inner_substeps (int, optional): Frozen-basis inner substeps (TGS-style position loop).
+                With N > 1, one :meth:`step` call builds the problem once (contacts, Jacobians, mass
+                factorization, free acceleration) and then runs N cycles of [``pgs_iterations`` GS
+                iterations, joint integration at dt/N, first-order row-error re-measurement
+                ``phi += dt*J*v``]. Raises the stable Baumgarte correction rate like true substeps while
+                rebuilding the dynamics only once per step; total correction per step is ``1-(1-pgs_beta)^N``. Requires
+                ``pgs_mode='matrix_free'``, ``articulated_contact_response='immediate'``, and no
+                velocity iterations, warm starting or ``pgs_debug``. The saving over true substeps
+                depends on the scene: it is largest when the per-step build (mass matrix, Cholesky,
+                Jacobians) dominates and small when the Gauss-Seidel sweep and contact work dominate,
+                since those still run once per inner substep. Defaults to 1 (off).
             pgs_velocity_iterations (int, optional): Additional matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
                 geometric bias corrects positions first, then final velocity iterations run without Baumgarte bias.
@@ -886,6 +900,31 @@ class SolverFeatherPGS(SolverBase):
             # explicit never-activate kill-switch.
             raise ValueError("velocity_limit_activation_fraction must be in [0, 1] or inf")
         self.pgs_iterations = pgs_iterations
+        self.pgs_inner_substeps = int(pgs_inner_substeps)
+        if self.pgs_inner_substeps < 1:
+            raise ValueError("pgs_inner_substeps must be >= 1")
+        if self.pgs_inner_substeps > 1:
+            # Frozen-basis inner substeps re-measure row errors and integrate
+            # inside step(); the paths below re-derive their own problem data
+            # mid-step and would silently disagree with the frozen basis.
+            if pgs_mode != "matrix_free":
+                raise ValueError("pgs_inner_substeps > 1 requires pgs_mode='matrix_free'")
+            if int(pgs_velocity_iterations) > 0:
+                raise ValueError("pgs_inner_substeps > 1 does not support pgs_velocity_iterations yet")
+            if articulated_contact_response != "immediate":
+                # Every non-immediate response routes contacts through the propagation row
+                # family, whose phi the inner loop does not advance.
+                raise ValueError(
+                    "pgs_inner_substeps > 1 requires articulated_contact_response='immediate' "
+                    f"(got {articulated_contact_response!r})"
+                )
+            if pgs_debug:
+                raise ValueError("pgs_inner_substeps > 1 does not support pgs_debug")
+            if pgs_warmstart:
+                # v_out restarts from v_hat every substep, so a carried dense lambda breaks
+                # v = v_hat + M^-1 J^T lambda; resetting it instead discards the warm start
+                # the flag asks for. Reject rather than silently do one or the other.
+                raise ValueError("pgs_inner_substeps > 1 does not support pgs_warmstart")
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
         self.dense_contact_compliance = dense_contact_compliance
@@ -951,6 +990,12 @@ class SolverFeatherPGS(SolverBase):
         # allocated, so the determinism/bit-identity ladder is unaffected.
         _env_ws = os.getenv("IL_NEWTON_FPGS_MF_WARMSTART", "0").lower() in {"1", "true", "yes", "on"}
         self._mf_warmstart_enabled = bool(mf_warmstart) or _env_ws
+        if self.pgs_inner_substeps > 1 and self._mf_warmstart_enabled:
+            # Guard the RESOLVED flag: IL_NEWTON_FPGS_MF_WARMSTART enables warm starting
+            # independently of the kwarg. The end-of-step snapshot holds an accumulated
+            # full-step impulse, which would seed the next step's first dt/N substep
+            # roughly N times too large.
+            raise ValueError("pgs_inner_substeps > 1 does not support matrix-free warm starting")
         try:
             self._mf_warmstart_decay = float(os.getenv("IL_NEWTON_FPGS_MF_WARMSTART_DECAY", str(mf_warmstart_decay)))
         except (TypeError, ValueError):
@@ -2134,6 +2179,12 @@ class SolverFeatherPGS(SolverBase):
             self.v_hat = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_out = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.qd_work = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+            if self.pgs_inner_substeps > 1:
+                # Frozen-basis inner substeps: world-convention velocity copy and
+                # per-substep qdd scratch (state_aug.joint_qdd must keep the free
+                # acceleration for the v_hat predictor between substeps).
+                self._inner_v_world = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+                self._inner_qdd = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_mf_accum = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_out_snap = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self._deferred_dense_tau = None
@@ -4998,6 +5049,13 @@ class SolverFeatherPGS(SolverBase):
             self._step += 1
             return state_out
 
+        # Frozen-basis inner substeps: the whole build below (v_hat, rhs,
+        # drive descriptors, compliance) must see the substep dt, exactly as
+        # true substeps would. dt_full is only used for particle integration.
+        dt_full = dt
+        if self.pgs_inner_substeps > 1:
+            dt = dt / self.pgs_inner_substeps
+
         # Double-buffer: select buffer set and wait for its memset to finish
         if self._memset_stream is not None:
             self.H_by_size = self._H_bufs[self._buf_idx]
@@ -5376,6 +5434,8 @@ class SolverFeatherPGS(SolverBase):
                     # Stack per-iter [world, 6] arrays into [iters, world, 6].
                     self._pgs_ncp_residual_log[-1] = np.stack(self._pgs_ncp_residual_log[-1], axis=0)
 
+                elif self.pgs_inner_substeps > 1:
+                    self._run_frozen_inner_substeps(state_in, state_aug, state_out, dt)
                 else:
                     self._launch_matrix_free_position_solve(
                         iterations=self.pgs_iterations,
@@ -5493,7 +5553,12 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 7: Update qdd + integrate
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
+            if self.pgs_mode == "matrix_free" and self.pgs_inner_substeps > 1:
+                # Positions/velocities were integrated per inner substep; only
+                # the final FK and particle integration remain.
+                eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+                self.integrate_particles(model, state_in, state_out, dt_full)
+            elif self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
                 self._stage6_write_final_velocity(state_in, state_aug, state_out, dt)
             else:
                 self._stage6_update_qdd(state_in, state_aug, dt)
@@ -8184,6 +8249,167 @@ class SolverFeatherPGS(SolverBase):
             eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
 
         self.integrate_particles(model, state_in, state_out, dt)
+
+    def _run_frozen_inner_substeps(self, state_in: State, state_aug: State, state_out: State, dt_sub: float):
+        """Frozen-basis inner substeps (TGS-style position loop).
+
+        With the contact manifold, row Jacobians, mass factorization, and free
+        acceleration all frozen from this step's single build, run
+        ``pgs_inner_substeps`` cycles of [PGS solve, joint integrate,
+        re-measure row errors]. Positions use the true nonlinear joint update
+        each substep; row errors advance by ``dt*J*v`` (first order in the
+        frozen J). ``v_out`` stays in internal (about-origin) coordinates
+        throughout — the sweep's convention — and only per-substep copies are
+        converted to the public world/COM convention for integration. The
+        final FK and particle integration are the caller's responsibility.
+        """
+        model = self.model
+        n = self.pgs_inner_substeps
+        friction_start = self._contact_friction_start_iteration(self.pgs_iterations)
+        mf_active = self._has_free_rigid_bodies and self.pgs_mode != "dense"
+
+        for k in range(n):
+            self._launch_matrix_free_position_solve(
+                iterations=self.pgs_iterations,
+                friction_start_iteration=friction_start,
+            )
+            self._stage6_clamp_rigid_velocity_limits()
+
+            src = state_in if k == 0 else state_out
+            wp.copy(self._inner_v_world, self.v_out)
+            if self._has_root_free:
+                wp.launch(
+                    convert_root_free_qd_local_to_world,
+                    dim=model.articulation_count,
+                    inputs=[
+                        self.articulation_root_is_free,
+                        self.articulation_root_dof_start,
+                        self.articulation_root_com_offset,
+                    ],
+                    outputs=[self._inner_v_world],
+                    device=model.device,
+                )
+            # The last substep writes state_aug.joint_qdd. Note this is the FINAL
+            # SUBSTEP's acceleration, (v_final - v_{N-1}) / dt_sub, not the whole-step
+            # average the single-step path reports. Earlier substeps must leave the buffer
+            # holding the step's free acceleration for the v_hat predictor below.
+            qdd_out = state_aug.joint_qdd if k == n - 1 else self._inner_qdd
+            wp.launch(
+                update_qdd_from_velocity,
+                dim=model.joint_dof_count,
+                inputs=[src.joint_qd, self._kinematic_dof_mask, 1.0 / dt_sub],
+                outputs=[self._inner_v_world, qdd_out],
+                device=model.device,
+            )
+            wp.launch(
+                kernel=integrate_generalized_joints,
+                dim=model.joint_count,
+                inputs=[
+                    model.joint_type,
+                    model.joint_parent,
+                    model.joint_child,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    self._kinematic_joint_mask,
+                    model.joint_dof_dim,
+                    model.body_com,
+                    src.joint_q,
+                    src.joint_qd,
+                    qdd_out,
+                    dt_sub,
+                    self.angular_damping,
+                ],
+                outputs=[state_out.joint_q, state_out.joint_qd],
+                device=model.device,
+            )
+
+            if k == n - 1:
+                break
+
+            # Re-seed the internal (about-origin) velocity track from the state the
+            # integrator produced: jcalc_integrate applies angular_damping while writing
+            # state_out.joint_qd, and continuing from the pre-damping v_out would let the
+            # next substep undo it, applying the damping ~1/N as strongly as one step does.
+            wp.copy(self.v_out, state_out.joint_qd)
+            if self._has_root_free:
+                wp.launch(
+                    convert_root_free_qd_world_to_local,
+                    dim=model.articulation_count,
+                    inputs=[
+                        self.articulation_root_is_free,
+                        self.articulation_root_dof_start,
+                        self.articulation_root_com_offset,
+                    ],
+                    outputs=[self.v_out],
+                    device=model.device,
+                )
+
+            # Re-measure row errors on the frozen basis, then rebuild the
+            # cheap per-substep problem data: rhs, drive descriptors, v_hat,
+            # impulse init. Everything expensive (J, Y, H, Cholesky, slots)
+            # stays frozen.
+            wp.launch(
+                advance_frozen_row_errors,
+                dim=self.world_count * self.dense_max_constraints,
+                inputs=[
+                    self.constraint_count,
+                    self.dense_max_constraints,
+                    self.world_dof_indices,
+                    self.max_world_dofs,
+                    self.row_type,
+                    self.J_world,
+                    self.v_out,
+                    dt_sub,
+                ],
+                outputs=[self.phi, self.drive_geom_error],
+                device=model.device,
+            )
+            if mf_active:
+                wp.launch(
+                    advance_frozen_mf_phi,
+                    dim=self.world_count * self.mf_max_constraints,
+                    inputs=[
+                        self.mf_constraint_count,
+                        self.mf_max_constraints,
+                        self.world_dof_indices,
+                        self.mf_row_type,
+                        self.mf_J_a,
+                        self.mf_J_b,
+                        self.mf_dof_a,
+                        self.mf_dof_b,
+                        self.v_out,
+                        dt_sub,
+                    ],
+                    outputs=[self.mf_phi],
+                    device=model.device,
+                )
+
+            # v_hat_{k+1} = v_k + dt_sub * qdd_free (state_aug.joint_qdd still
+            # holds the step's free acceleration here).
+            wp.launch(
+                compute_velocity_predictor,
+                dim=model.joint_dof_count,
+                inputs=[self.v_out, self._kinematic_dof_mask, dt_sub],
+                outputs=[state_aug.joint_qdd, self.v_hat],
+                device=model.device,
+            )
+            self._stage4_compute_rhs_world(dt_sub)
+            self._stage4_compute_physx_drive_desc(dt_sub)
+            if mf_active:
+                self._compute_mf_rhs_bias(dt_sub, bias_scale=1.0, output=self.mf_rhs)
+            self._stage5_prepare_impulses_world()
+            # prepare_world_impulses retains lambda on contact/limit rows when warm starting
+            # is on, but v_out restarts from v_hat below, so a carried lambda breaks
+            # v = v_hat + M^-1 J^T lambda for the dense family exactly as it did for MF.
+            self.impulses.zero_()
+            if mf_active:
+                # v_out restarts from v_hat below, so the matrix-free impulses must restart
+                # with it: the GS kernel applies (lambda_k - lambda_{k-1}), which for a
+                # carried lambda can be net-attractive on a unilateral row and sizes the
+                # friction cone from the accumulated rather than the per-substep normal.
+                self.mf_impulses.zero_()
+            self._pack_mf_meta(self.mf_rhs)
+            wp.copy(self.v_out, self.v_hat)
 
     def _stage6_integrate_position_from_velocity(
         self,
