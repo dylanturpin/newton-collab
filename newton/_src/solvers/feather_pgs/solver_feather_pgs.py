@@ -445,6 +445,10 @@ class SolverFeatherPGS(SolverBase):
 
     """
 
+    # Conformance-tested against body-pair-reduced contact buffers
+    # (test_contact_reduction_body_pairs).
+    supports_body_pair_reduced_contacts: bool = True
+
     joint_qd_public_convention: bool = True
     """Whether free-joint ``joint_qd`` uses Newton's public twist convention.
 

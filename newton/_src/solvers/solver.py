@@ -355,6 +355,50 @@ class SolverBase:
         """
         pass
 
+    supports_body_pair_reduced_contacts: bool = False
+    """Whether this solver is validated against body-pair-reduced contact buffers.
+
+    :class:`newton.CollisionPipeline` with
+    ``ContactReductionConfig(body_pairs=True)`` compacts rigid contacts to each
+    patch's deepest point plus footprint extremes.  This is distinct from the
+    producer-side mesh/heightfield reduction selected by the legacy
+    ``reduce_contacts=True`` bool, which all solvers may consume.  A solver may
+    only declare body-pair support after a conformance test demonstrates that
+    it consumes contact depth with the reducer's signed-separation convention.
+    Solvers that do not declare support must reject such buffers via
+    :meth:`_require_unreduced_contacts` at the top of :meth:`step`.
+    """
+
+    def _require_unreduced_contacts(self, contacts: Contacts | None) -> None:
+        """Raise if ``contacts`` was compacted by body-pair reduction.
+
+        Call at the top of :meth:`step` in solvers that have not been
+        conformance-tested against reduced contact buffers.  During Warp CUDA
+        capture, a graph-owned reader lease also prevents a reducer pipeline
+        from compacting this buffer for as long as the captured solver graph
+        can be replayed.  The graph retains both the solver and Contacts arrays
+        that its recorded launches reference.
+        """
+        if contacts is None or type(self).supports_body_pair_reduced_contacts:
+            return
+        if getattr(contacts, "rigid_contacts_reduced", False) or getattr(
+            contacts, "rigid_contacts_reduced_capture", False
+        ):
+            raise ValueError(
+                f"{type(self).__name__} is not validated for body-pair-reduced contacts; "
+                "disable CollisionPipeline.ContactReductionConfig(body_pairs=True) or use a solver "
+                "with supports_body_pair_reduced_contacts=True"
+            )
+        graph = contacts._current_warp_capture_graph()
+        if graph is None and contacts.device.is_cuda and wp.get_stream(contacts.device).is_capturing:
+            raise RuntimeError(
+                "capturing an unreduced-only solver requires a Warp-managed CUDA graph on the "
+                "current stream so Newton can retain and protect its Contacts buffer; wrap an "
+                "external capture with wp.capture_begin(external=True)"
+            )
+        if graph is not None:
+            contacts._acquire_graph_lease(graph, "unreduced_reader", self)
+
     def step(
         self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float
     ) -> None:

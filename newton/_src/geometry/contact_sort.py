@@ -246,6 +246,36 @@ class ContactSorter:
     # Public API
     # ------------------------------------------------------------------
 
+    def borrow_full_scratch(self) -> dict:
+        """Expose the full-layout scratch buffers for reuse by a sequential stage.
+
+        The buffers are only live INSIDE :meth:`sort_full`; between calls their
+        contents are dead, so a pipeline stage that runs strictly after the sort
+        (and finishes before the next one) may reuse them instead of allocating
+        a second full-size copy of every contact array. The borrower must treat
+        the contents as clobbered by every :meth:`sort_full` call.
+
+        Returns:
+            Mapping from contact field name to the scratch array. The
+            ``stiffness``/``damping``/``friction`` entries are zero-length
+            unless the sorter was built with ``per_contact_shape_properties``.
+        """
+        return {
+            "shape0": self._full_shape0_buf,
+            "shape1": self._full_shape1_buf,
+            "point0": self._full_point0_buf,
+            "point1": self._full_point1_buf,
+            "offset0": self._full_offset0_buf,
+            "offset1": self._full_offset1_buf,
+            "normal": self._full_normal_buf,
+            "margin0": self._full_margin0_buf,
+            "margin1": self._full_margin1_buf,
+            "tids": self._full_tids_buf,
+            "stiffness": self._full_stiffness_buf,
+            "damping": self._full_damping_buf,
+            "friction": self._full_friction_buf,
+        }
+
     def sort_simple(
         self,
         sort_keys: wp.array,
@@ -350,7 +380,20 @@ class ContactSorter:
         n = self._capacity
         self._sort_and_permute(sort_keys, contact_count, device=device)
 
-        has_props = self._has_shape_props
+        # Scratch provisioning and the current buffer schema are separate.
+        # A reducer-enabled deterministic pipeline provisions material scratch
+        # so a later external rich Contacts buffer is safe, but its ordinary
+        # property-less buffer must not run an in-place permutation over the
+        # scratch placeholders themselves.
+        has_props = (
+            self._has_shape_props
+            and stiffness is not None
+            and damping is not None
+            and friction is not None
+            and stiffness.shape[0] > 0
+            and damping.shape[0] > 0
+            and friction.shape[0] > 0
+        )
         has_match = match_index is not None and match_index.shape[0] > 0
 
         data = _FullContactArrays()

@@ -90,6 +90,71 @@ def contact_surface_point(
     return wp.transform_point(X_wb, point_local + offset_local)
 
 
+class _ContactsGraphLease:
+    """Keep graph-captured contact users and their storage alive.
+
+    Warp graphs retain executable modules, but not arbitrary arrays passed to
+    recorded launches.  A lease is therefore attached to the Python Graph
+    object itself.  It owns both the Contacts buffer and the object whose
+    launches captured it (a collision pipeline or solver), and releases the
+    corresponding compatibility token only after the graph is destroyed.
+    """
+
+    def __init__(self, contacts: Contacts, mode: str, owner):
+        # Keep construction transactional. In particular, a rejected writer
+        # must not run the normal final-release path from __del__ and falsely
+        # stamp an untouched raw buffer as reduced.
+        self.contacts = None
+        self.mode = mode
+        self.owner = None
+        self.token = object()
+        acquired = False
+        try:
+            contacts._acquire_graph_use(self.token, mode)
+            acquired = True
+            self.contacts = contacts
+            self.owner = owner
+            callback = getattr(owner, "_acquire_contacts_graph_lease", None)
+            if callback is not None:
+                callback(self.token, contacts, mode)
+        except Exception:
+            if acquired:
+                contacts._release_graph_use(self.token, mode, preserve_provenance=False)
+            self.contacts = None
+            self.owner = None
+            raise
+
+    def matches(self, contacts: Contacts, mode: str, owner) -> bool:
+        return self.contacts is contacts and self.mode == mode and self.owner is owner
+
+    def release(self):
+        contacts = self.contacts
+        if contacts is None:
+            return
+        owner = self.owner
+        token = self.token
+        mode = self.mode
+        # Break strong references first so an exception during interpreter
+        # shutdown cannot make a second release observe a live lease.
+        self.contacts = None
+        self.owner = None
+        try:
+            contacts._release_graph_use(token, mode)
+        finally:
+            callback = getattr(owner, "_release_contacts_graph_lease", None)
+            if callback is not None:
+                callback(token, contacts, mode)
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            # Module teardown may clear Python globals and bound methods in an
+            # arbitrary order.  Graph destruction must remain best-effort and
+            # never turn garbage collection into a user-visible exception.
+            pass
+
+
 class Contacts:
     """
     Stores contact information for rigid and soft body collisions, to be consumed by a solver.
@@ -395,6 +460,94 @@ class Contacts:
         self.rigid_contact_max = rigid_contact_max
         self.soft_contact_max = soft_contact_max
 
+        self.rigid_contacts_reduced = False
+        """Provenance: whether the pipeline that last wrote this buffer runs
+        body-pair contact reduction.  Assigned on every
+        :meth:`newton.CollisionPipeline.collide` call from the pipeline's mode
+        (never a sticky observation), and checked by solvers that have not
+        been conformance-tested against reduced buffers."""
+        self.rigid_contacts_reduced_capture = False
+        """Whether a live CUDA graph can write reduced contacts.
+
+        Replay is invisible to host-side provenance, so this remains true
+        until the graph-owned writer lease is destroyed.  It deliberately
+        survives :meth:`clear` while such a graph is live.
+        """
+        self._rigid_contact_reduction_graph_leases: set[object] = set()
+        self._unreduced_solver_graph_leases: set[object] = set()
+
+    def _current_warp_capture_graph(self):
+        """Return the Warp graph recording the current CUDA stream, if any."""
+        device = self.device
+        if not device.is_cuda:
+            return None
+        stream = wp.get_stream(device)
+        # Warp registers wp.capture_begin/ScopedCapture graphs here, including
+        # external captures introduced with capture_begin(external=True).
+        # Reading the registry avoids a CUDA driver is-capturing query on every
+        # ordinary solver step.
+        return getattr(device, "captures", {}).get(stream)
+
+    def _acquire_graph_lease(self, graph, mode: str, owner):
+        """Attach one compatible contact lease per (graph, mode, owner)."""
+        leases = getattr(graph, "_newton_contact_graph_leases", None)
+        if leases is None:
+            leases = []
+            graph._newton_contact_graph_leases = leases
+        for lease in leases:
+            if lease.matches(self, mode, owner):
+                return lease
+        lease = _ContactsGraphLease(self, mode, owner)
+        leases.append(lease)
+        return lease
+
+    def _acquire_graph_use(self, token: object, mode: str):
+        if mode == "reduced_writer":
+            if self._unreduced_solver_graph_leases:
+                raise RuntimeError(
+                    "cannot write body-pair-reduced contacts while a CUDA graph for an "
+                    "unsupported solver still reads this Contacts buffer; destroy every "
+                    "reference to that solver graph first"
+                )
+            if self._rigid_contact_reduction_graph_leases:
+                raise RuntimeError(
+                    "cannot capture a second body-pair reducer graph for the same Contacts "
+                    "buffer; the reducer and output buffer are stateful and concurrent graph "
+                    "replays would race. Destroy every reference to the existing graph first"
+                )
+            self._rigid_contact_reduction_graph_leases.add(token)
+            self.rigid_contacts_reduced_capture = True
+        elif mode == "unreduced_reader":
+            if self._rigid_contact_reduction_graph_leases:
+                raise RuntimeError(
+                    "cannot capture an unreduced-only solver while a reducer CUDA graph "
+                    "can still write this Contacts buffer"
+                )
+            self._unreduced_solver_graph_leases.add(token)
+        else:
+            raise ValueError(f"unknown Contacts graph lease mode {mode!r}")
+
+    def _release_graph_use(self, token: object, mode: str, preserve_provenance: bool = True):
+        if mode == "reduced_writer":
+            if token not in self._rigid_contact_reduction_graph_leases:
+                return
+            self._rigid_contact_reduction_graph_leases.remove(token)
+            if not self._rigid_contact_reduction_graph_leases:
+                self.rigid_contacts_reduced_capture = False
+                if preserve_provenance:
+                    # The final replay may have left compacted rows in the
+                    # buffer. Preserve conservative ordinary provenance until
+                    # clear() or a subsequent Python-level collide proves what
+                    # replaced them.
+                    self.rigid_contacts_reduced = True
+        elif mode == "unreduced_reader":
+            if token in self._unreduced_solver_graph_leases:
+                self._unreduced_solver_graph_leases.remove(token)
+
+    @property
+    def _has_unreduced_solver_graph_lease(self) -> bool:
+        return bool(self._unreduced_solver_graph_leases)
+
     def clear(self, bump_generation: bool = True):
         """
         Clear contact data, resetting counts and optionally clearing all buffers.
@@ -413,6 +566,12 @@ class Contacts:
                 generation via another fused kernel (e.g. :func:`compute_shape_aabbs`) can pass
                 ``False`` to avoid an unnecessary double-bump per collision pass.
         """
+        # Provenance resets with the contents: a cleared buffer holds no
+        # reduced contacts, whatever pipeline previously filled it.  The
+        # CAPTURE marker deliberately does not reset: a replay of the graph
+        # that captured this buffer can re-reduce it at any moment after the
+        # clear, so destruction of the final writer graph lease drops it.
+        self.rigid_contacts_reduced = False
         # Clear all counters and (optionally) bump generation in a single kernel launch.
         num_counters = self.contact_counters.shape[0]
         wp.launch(
