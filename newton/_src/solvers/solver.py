@@ -356,20 +356,28 @@ class SolverBase:
         pass
 
     supports_body_pair_reduced_contacts: bool = False
-    """Whether this solver is validated against body-pair-reduced contact buffers.
+    """Whether this solver's default configuration accepts body-pair-reduced contacts.
 
     :class:`newton.CollisionPipeline` with
     ``ContactReductionConfig(body_pairs=True)`` compacts rigid contacts to each
-    patch's deepest point plus footprint extremes.  This is distinct from the
-    producer-side mesh/heightfield reduction selected by the legacy
+    patch's depth and sampled footprint representatives.  This is distinct from
+    the producer-side mesh/heightfield reduction selected by the legacy
     ``reduce_contacts=True`` bool, which all solvers may consume.  A solver may
     only declare body-pair support after a conformance test demonstrates that
     it consumes contact depth with the reducer's signed-separation convention.
-    Solvers that do not declare support must reject such buffers via
-    :meth:`_require_unreduced_contacts` at the top of :meth:`step`.
+    Configuration-specific features may impose a stricter requirement.  Solvers
+    that do not declare support, and unsupported configurations of a declared
+    solver, must reject such buffers via :meth:`_require_unreduced_contacts` at
+    the top of :meth:`step`.
     """
 
-    def _require_unreduced_contacts(self, contacts: Contacts | None) -> None:
+    def _require_unreduced_contacts(
+        self,
+        contacts: Contacts | None,
+        *,
+        supports_body_pair_reduced_contacts: bool | None = None,
+        configuration: str | None = None,
+    ) -> None:
         """Raise if ``contacts`` was compacted by body-pair reduction.
 
         Call at the top of :meth:`step` in solvers that have not been
@@ -378,17 +386,38 @@ class SolverBase:
         from compacting this buffer for as long as the captured solver graph
         can be replayed.  The graph retains both the solver and Contacts arrays
         that its recorded launches reference.
+
+        A solver with configuration-specific restrictions may override its
+        class-wide capability for one call.  This still acquires the graph-owned
+        reader lease needed to keep a later reducer graph from changing the
+        buffer behind a captured solver replay.
+
+        Args:
+            contacts: Contact buffer the solver will consume.
+            supports_body_pair_reduced_contacts: Per-call capability override.
+                ``None`` uses the solver class declaration.
+            configuration: Optional configuration label included in an error.
         """
-        if contacts is None or type(self).supports_body_pair_reduced_contacts:
+        if supports_body_pair_reduced_contacts is None:
+            supports_body_pair_reduced_contacts = type(self).supports_body_pair_reduced_contacts
+        if contacts is None or supports_body_pair_reduced_contacts:
             return
-        if getattr(contacts, "rigid_contacts_reduced", False) or getattr(
-            contacts, "rigid_contacts_reduced_capture", False
+        if getattr(contacts, "rigid_contacts_body_pair_reduced", False) or getattr(
+            contacts, "rigid_contacts_body_pair_reduced_capture", False
         ):
-            raise ValueError(
-                f"{type(self).__name__} is not validated for body-pair-reduced contacts; "
-                "disable CollisionPipeline.ContactReductionConfig(body_pairs=True) or use a solver "
-                "with supports_body_pair_reduced_contacts=True"
-            )
+            subject = type(self).__name__
+            if configuration:
+                subject += f" with {configuration}"
+                remedy = (
+                    "disable CollisionPipeline.ContactReductionConfig(body_pairs=True) or disable "
+                    f"{configuration}; supports_body_pair_reduced_contacts only covers validated configurations"
+                )
+            else:
+                remedy = (
+                    "disable CollisionPipeline.ContactReductionConfig(body_pairs=True) or use a solver "
+                    "with supports_body_pair_reduced_contacts=True"
+                )
+            raise ValueError(f"{subject} is not validated for body-pair-reduced contacts; {remedy}")
         graph = contacts._current_warp_capture_graph()
         if graph is None and contacts.device.is_cuda and wp.get_stream(contacts.device).is_capturing:
             raise RuntimeError(
