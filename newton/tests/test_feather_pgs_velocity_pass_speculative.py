@@ -30,12 +30,51 @@ DROP = 0.30
 
 RESPONSE_MODES = ("immediate", "propagation", "propagation-fused", "propagation-colored")
 
+# Values written into ``SolverFeatherPGS.contact_path``.
+PATH_DENSE = 0
+PATH_MATRIX_FREE = 1
+PATH_PROPAGATION = 2
 
-def _drop(device, velocity_iterations, response="immediate", steps=1400):
-    """Drop a sphere onto a plane; return per-step surface height, velocity, contact count."""
+# Routes each response mode must exercise, measured rather than assumed. The
+# characteristic path is REQUIRED; ALLOWED bounds what else may appear, since
+# which bodies are touching on a given step varies run to run (an articulated
+# scene under "immediate" may or may not have produced a dense row yet).
+# "propagation-fused" needs an articulation before it uses propagation rows at
+# all -- with a lone free body it degrades to the matrix-free path, so a
+# single-sphere scene cannot claim to cover it.
+REQUIRED_PATHS = {
+    ("free", "immediate"): {PATH_MATRIX_FREE},
+    ("free", "propagation"): {PATH_PROPAGATION},
+    ("free", "propagation-fused"): {PATH_MATRIX_FREE},
+    ("free", "propagation-colored"): {PATH_PROPAGATION},
+    ("articulated", "immediate"): {PATH_MATRIX_FREE},
+    ("articulated", "propagation"): {PATH_PROPAGATION},
+    ("articulated", "propagation-fused"): {PATH_PROPAGATION},
+    ("articulated", "propagation-colored"): {PATH_PROPAGATION},
+}
+ALLOWED_PATHS = {PATH_DENSE, PATH_MATRIX_FREE, PATH_PROPAGATION}
+
+
+def _drop(device, velocity_iterations, response="immediate", steps=1400, scene="free"):
+    """Drop a body onto a plane; return heights, velocities, contact counts, routes used.
+
+    ``scene="articulated"`` adds a revolute-jointed second link, which is what
+    makes ``propagation-fused`` use propagation rows rather than degrading to
+    the matrix-free path.
+    """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, RADIUS + DROP), wp.quat_identity()))
     builder.add_shape_sphere(body, radius=RADIUS, cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+    if scene == "articulated":
+        link = builder.add_body(xform=wp.transform(wp.vec3(0.12, 0.0, RADIUS + DROP), wp.quat_identity()))
+        builder.add_shape_sphere(link, radius=RADIUS, cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+        builder.add_joint_revolute(
+            parent=body,
+            child=link,
+            axis=(0.0, 1.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.12, 0.0, 0.0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+        )
     builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
     model = builder.finalize(device=device)
     solver = newton.solvers.SolverFeatherPGS(
@@ -49,6 +88,7 @@ def _drop(device, velocity_iterations, response="immediate", steps=1400):
     control = model.control()
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
     heights, velocities, contact_counts = [], [], []
+    routes = set()
     for _ in range(steps):
         contacts = model.collide(state_0)
         state_0.clear_forces()
@@ -56,8 +96,11 @@ def _drop(device, velocity_iterations, response="immediate", steps=1400):
         state_0, state_1 = state_1, state_0
         heights.append(float(state_0.body_q.numpy()[body][2]) - RADIUS)
         velocities.append(float(state_0.body_qd.numpy()[body][2]))
-        contact_counts.append(int(contacts.rigid_contact_count.numpy()[0]))
-    return np.asarray(heights), np.asarray(velocities), np.asarray(contact_counts)
+        n = int(contacts.rigid_contact_count.numpy()[0])
+        contact_counts.append(n)
+        if n:
+            routes.update(int(v) for v in solver.contact_path.numpy()[:n] if v >= 0)
+    return np.asarray(heights), np.asarray(velocities), np.asarray(contact_counts), routes
 
 
 def _assert_landed(test, heights, velocities, contact_counts, label):
@@ -80,7 +123,7 @@ def test_velocity_iterations_do_not_halt_a_falling_body(test, device):
     there for the rest of the run instead of reaching the surface.
     """
     for iterations in (2, 4, 8):
-        h, v, n = _drop(device, iterations)
+        h, v, n, _r = _drop(device, iterations)
         _assert_landed(test, h, v, n, f"pgs_velocity_iterations={iterations}")
 
 
@@ -90,8 +133,8 @@ def test_velocity_iterations_match_the_position_only_landing(test, device):
     The velocity pass refines velocities; it must not change where a simple
     unconstrained drop comes to rest.
     """
-    baseline, base_v, base_n = _drop(device, 0)
-    with_velocity, vel_v, vel_n = _drop(device, 4)
+    baseline, base_v, base_n, _r0 = _drop(device, 0)
+    with_velocity, vel_v, vel_n, _r4 = _drop(device, 4)
     _assert_landed(test, baseline, base_v, base_n, "velocity_iterations=0")
     _assert_landed(test, with_velocity, vel_v, vel_n, "velocity_iterations=4")
     test.assertAlmostEqual(
@@ -112,9 +155,22 @@ def test_every_contact_response_route_lands(test, device):
     through propagation rows, so a fix applied only to the matrix-free route
     leaves them hovering.
     """
-    for response in RESPONSE_MODES:
-        h, v, n = _drop(device, 4, response=response)
-        _assert_landed(test, h, v, n, f"articulated_contact_response={response!r}")
+    for scene in ("free", "articulated"):
+        for response in RESPONSE_MODES:
+            label = f"{scene}/{response}"
+            h, v, n, routes = _drop(device, 4, response=response, scene=scene)
+            _assert_landed(test, h, v, n, label)
+            # Assert the route actually taken, so the test cannot silently claim
+            # coverage of a path the scene never reaches.
+            required = REQUIRED_PATHS[(scene, response)]
+            test.assertTrue(
+                required <= routes,
+                f"{label}: exercised contact_path {sorted(routes)}, missing required {sorted(required - routes)}",
+            )
+            test.assertTrue(
+                routes <= ALLOWED_PATHS,
+                f"{label}: exercised unexpected contact_path {sorted(routes - ALLOWED_PATHS)}",
+            )
 
 
 def test_separated_body_still_falls_through_the_margin(test, device):
@@ -123,7 +179,7 @@ def test_separated_body_still_falls_through_the_margin(test, device):
     The speculative row exists well before the surface is reached; it must not
     apply an impulse until the body would actually cross it.
     """
-    heights, _v, _n = _drop(device, 4, steps=500)
+    heights, _v, _n, _r = _drop(device, 4, steps=500)
     descending = np.diff(heights[:450])
     test.assertLess(
         float(descending.max()),
