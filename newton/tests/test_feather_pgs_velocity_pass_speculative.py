@@ -28,8 +28,11 @@ RADIUS = 0.05
 DROP = 0.30
 
 
-def _drop_heights(device, velocity_iterations, steps=1400):
-    """Drop a sphere onto a plane and return its surface height each step."""
+RESPONSE_MODES = ("immediate", "propagation", "propagation-fused", "propagation-colored")
+
+
+def _drop(device, velocity_iterations, response="immediate", steps=1400):
+    """Drop a sphere onto a plane; return per-step surface height, velocity, contact count."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, RADIUS + DROP), wp.quat_identity()))
     builder.add_shape_sphere(body, radius=RADIUS, cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
@@ -40,18 +43,34 @@ def _drop_heights(device, velocity_iterations, steps=1400):
         angular_damping=0.0,
         pgs_mode="matrix_free",
         pgs_velocity_iterations=velocity_iterations,
+        articulated_contact_response=response,
     )
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-    heights = []
+    heights, velocities, contact_counts = [], [], []
     for _ in range(steps):
         contacts = model.collide(state_0)
         state_0.clear_forces()
         solver.step(state_0, state_1, control, contacts, SIM_DT)
         state_0, state_1 = state_1, state_0
         heights.append(float(state_0.body_q.numpy()[body][2]) - RADIUS)
-    return np.asarray(heights)
+        velocities.append(float(state_0.body_qd.numpy()[body][2]))
+        contact_counts.append(int(contacts.rigid_contact_count.numpy()[0]))
+    return np.asarray(heights), np.asarray(velocities), np.asarray(contact_counts)
+
+
+def _assert_landed(test, heights, velocities, contact_counts, label):
+    """Assert the sphere came to rest ON the plane, not through it and not above it."""
+    final_h, final_v = float(heights[-1]), float(velocities[-1])
+    # Bounded on BOTH sides: a tunnelling body has negative heights and would
+    # satisfy any upper bound on its own.
+    test.assertLess(abs(final_h), 0.005, f"{label}: rested at {final_h:+.4f} m instead of on the surface")
+    test.assertLess(abs(final_v), 0.02, f"{label}: still moving at {final_v:+.4f} m/s")
+    test.assertGreater(float(heights[:200].min()), 0.05, f"{label}: sphere was not still falling early in the run")
+    test.assertGreater(int(contact_counts.max()), 0, f"{label}: no contact was ever generated")
+    settled = heights[-400:]
+    test.assertLess(float(settled.max() - settled.min()), 0.002, f"{label}: resting height was not stable")
 
 
 def test_velocity_iterations_do_not_halt_a_falling_body(test, device):
@@ -61,13 +80,8 @@ def test_velocity_iterations_do_not_halt_a_falling_body(test, device):
     there for the rest of the run instead of reaching the surface.
     """
     for iterations in (2, 4, 8):
-        heights = _drop_heights(device, iterations)
-        settled = float(heights[-400:].max())
-        test.assertLess(
-            settled,
-            0.005,
-            f"pgs_velocity_iterations={iterations}: sphere halted at {settled:.4f} m instead of landing",
-        )
+        h, v, n = _drop(device, iterations)
+        _assert_landed(test, h, v, n, f"pgs_velocity_iterations={iterations}")
 
 
 def test_velocity_iterations_match_the_position_only_landing(test, device):
@@ -76,8 +90,10 @@ def test_velocity_iterations_match_the_position_only_landing(test, device):
     The velocity pass refines velocities; it must not change where a simple
     unconstrained drop comes to rest.
     """
-    baseline = _drop_heights(device, 0)
-    with_velocity = _drop_heights(device, 4)
+    baseline, base_v, base_n = _drop(device, 0)
+    with_velocity, vel_v, vel_n = _drop(device, 4)
+    _assert_landed(test, baseline, base_v, base_n, "velocity_iterations=0")
+    _assert_landed(test, with_velocity, vel_v, vel_n, "velocity_iterations=4")
     test.assertAlmostEqual(
         float(with_velocity[-1]),
         float(baseline[-1]),
@@ -89,13 +105,25 @@ def test_velocity_iterations_match_the_position_only_landing(test, device):
     )
 
 
+def test_every_contact_response_route_lands(test, device):
+    """Land correctly on all four internal contact-response routes.
+
+    ``propagation`` and ``propagation-colored`` route even free/ground contacts
+    through propagation rows, so a fix applied only to the matrix-free route
+    leaves them hovering.
+    """
+    for response in RESPONSE_MODES:
+        h, v, n = _drop(device, 4, response=response)
+        _assert_landed(test, h, v, n, f"articulated_contact_response={response!r}")
+
+
 def test_separated_body_still_falls_through_the_margin(test, device):
     """Keep a body accelerating while it is inside the margin but not touching.
 
     The speculative row exists well before the surface is reached; it must not
     apply an impulse until the body would actually cross it.
     """
-    heights = _drop_heights(device, 4, steps=500)
+    heights, _v, _n = _drop(device, 4, steps=500)
     descending = np.diff(heights[:450])
     test.assertLess(
         float(descending.max()),
@@ -118,6 +146,7 @@ class TestFeatherPGSVelocityPassSpeculative(unittest.TestCase):
 
 for _fn in (
     test_velocity_iterations_do_not_halt_a_falling_body,
+    test_every_contact_response_route_lands,
     test_velocity_iterations_match_the_position_only_landing,
     test_separated_body_still_falls_through_the_margin,
 ):

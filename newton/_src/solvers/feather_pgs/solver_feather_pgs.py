@@ -4235,6 +4235,7 @@ class SolverFeatherPGS(SolverBase):
         *,
         bias_scale: float,
         speculative_scale: float = 1.0,
+        retain_inactive_speculative: bool = False,
         output: wp.array,
     ) -> None:
         if not self._propagation_contacts_enabled():
@@ -4253,6 +4254,8 @@ class SolverFeatherPGS(SolverBase):
                 dt,
                 bias_scale,
                 speculative_scale,
+                self.propagation_impulses,
+                int(retain_inactive_speculative),
                 self.propagation_max_constraints,
             ],
             outputs=[output],
@@ -4783,6 +4786,7 @@ class SolverFeatherPGS(SolverBase):
             dt,
             bias_scale=0.0,
             contact_speculative_scale=0.0,
+            retain_inactive_speculative=True,
             joint_limit_speculative_scale=1.0,
             output=self.rhs_unbiased,
         )
@@ -4799,6 +4803,7 @@ class SolverFeatherPGS(SolverBase):
                 dt,
                 bias_scale=0.0,
                 speculative_scale=0.0,
+                retain_inactive_speculative=True,
                 output=self.propagation_rhs_unbiased,
             )
 
@@ -4922,7 +4927,6 @@ class SolverFeatherPGS(SolverBase):
                     dt,
                     bias_scale=0.0,
                     speculative_scale=0.0,
-                    retain_inactive_speculative=True,
                     output=self.mf_rhs_unbiased,
                 )
             wp.launch(
@@ -7318,6 +7322,7 @@ class SolverFeatherPGS(SolverBase):
         *,
         bias_scale: float = 1.0,
         contact_speculative_scale: float = 1.0,
+        retain_inactive_speculative: bool = False,
         joint_limit_speculative_scale: float = 1.0,
         output=None,
     ):
@@ -7336,6 +7341,8 @@ class SolverFeatherPGS(SolverBase):
                 dt,
                 bias_scale,
                 contact_speculative_scale,
+                self.impulses,
+                int(retain_inactive_speculative),
                 joint_limit_speculative_scale,
             ],
             outputs=[rhs_out],

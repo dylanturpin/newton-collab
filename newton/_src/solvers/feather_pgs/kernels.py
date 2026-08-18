@@ -3737,6 +3737,8 @@ def compute_world_contact_bias(
     dt: float,
     bias_scale: float,
     contact_speculative_scale: float,
+    world_position_impulse: wp.array2d[float],
+    retain_inactive_speculative: int,
     joint_limit_speculative_scale: float,
     # outputs
     world_rhs: wp.array2d[float],
@@ -3769,7 +3771,12 @@ def compute_world_contact_bias(
             if phi < 0.0:
                 rhs += bias_scale * beta * phi * inv_dt  # Negative for penetration
             else:
-                rhs += contact_speculative_scale * phi * inv_dt
+                if retain_inactive_speculative != 0 and world_position_impulse[world, i] <= wp.static(
+                    PGS_VELOCITY_PASS_LOADED_IMPULSE
+                ):
+                    rhs += phi * inv_dt
+                else:
+                    rhs += contact_speculative_scale * phi * inv_dt
         elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
             if phi < 0.0:
                 rhs += bias_scale * beta * phi * inv_dt  # Negative for violation
@@ -4928,6 +4935,15 @@ def compute_mf_effective_mass_and_rhs(
     mf_rhs[world, i] = bias
 
 
+# Loaded-row tolerance for the velocity pass. A row that took no position
+# impulse is not in contact this substep, so it must keep its speculative
+# allowance; comparing against exact zero would let an arbitrarily small
+# impulse flip the bias discontinuously. The retained term is phi/h, which
+# shrinks to zero as a row approaches activation, so a misclassification near
+# the boundary injects a vanishing bias rather than a step change.
+PGS_VELOCITY_PASS_LOADED_IMPULSE = 1.0e-9
+
+
 @wp.kernel
 def compute_mf_rhs_bias(
     mf_constraint_count: wp.array[int],
@@ -4979,7 +4995,9 @@ def compute_mf_rhs_bias(
             # remaining gap" as "you may not approach at all", which halts a
             # falling body at the edge of the collision margin and leaves it
             # hovering. The position pass passes 0 here and is unchanged.
-            if retain_inactive_speculative != 0 and mf_position_impulse[world, i] <= 0.0:
+            if retain_inactive_speculative != 0 and mf_position_impulse[world, i] <= wp.static(
+                PGS_VELOCITY_PASS_LOADED_IMPULSE
+            ):
                 bias = phi_val / dt
             else:
                 bias = speculative_scale * phi_val / dt
@@ -5438,6 +5456,8 @@ def compute_propagation_rhs_bias(
     dt: float,
     bias_scale: float,
     speculative_scale: float,
+    propagation_position_impulse: wp.array2d[float],
+    retain_inactive_speculative: int,
     propagation_max_constraints: int,
     # outputs
     propagation_rhs: wp.array2d[float],
@@ -5467,7 +5487,12 @@ def compute_propagation_rhs_bias(
             if max_depen > 0.0 and wp.isfinite(max_depen):
                 bias = wp.max(bias, -max_depen)
         else:
-            bias = speculative_scale * phi_val / dt
+            if retain_inactive_speculative != 0 and propagation_position_impulse[world, i] <= wp.static(
+                PGS_VELOCITY_PASS_LOADED_IMPULSE
+            ):
+                bias = phi_val / dt
+            else:
+                bias = speculative_scale * phi_val / dt
     propagation_rhs[world, i] = bias
 
 
