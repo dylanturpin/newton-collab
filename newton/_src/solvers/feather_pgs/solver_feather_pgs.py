@@ -4787,7 +4787,13 @@ class SolverFeatherPGS(SolverBase):
             output=self.rhs_unbiased,
         )
         if self._has_free_rigid_bodies:
-            self._compute_mf_rhs_bias(dt, bias_scale=0.0, speculative_scale=0.0, output=self.mf_rhs_unbiased)
+            self._compute_mf_rhs_bias(
+                dt,
+                bias_scale=0.0,
+                speculative_scale=0.0,
+                retain_inactive_speculative=True,
+                output=self.mf_rhs_unbiased,
+            )
         if self._propagation_contacts_enabled():
             self._compute_propagation_rhs_bias(
                 dt,
@@ -4912,7 +4918,13 @@ class SolverFeatherPGS(SolverBase):
         if self._has_free_rigid_bodies:
             self._mf_pgs_setup(state_aug, dt)
             if include_unbiased_rhs:
-                self._compute_mf_rhs_bias(dt, bias_scale=0.0, speculative_scale=0.0, output=self.mf_rhs_unbiased)
+                self._compute_mf_rhs_bias(
+                    dt,
+                    bias_scale=0.0,
+                    speculative_scale=0.0,
+                    retain_inactive_speculative=True,
+                    output=self.mf_rhs_unbiased,
+                )
             wp.launch(
                 compute_mf_world_dof_offsets,
                 dim=self.world_count * self.mf_max_constraints,
@@ -7997,6 +8009,7 @@ class SolverFeatherPGS(SolverBase):
         *,
         bias_scale: float,
         speculative_scale: float = 1.0,
+        retain_inactive_speculative: bool = False,
         output: wp.array,
     ):
         """Recompute MF contact RHS for the current rows without touching effective mass."""
@@ -8016,6 +8029,8 @@ class SolverFeatherPGS(SolverBase):
                 dt,
                 bias_scale,
                 speculative_scale,
+                self.mf_impulses,
+                int(retain_inactive_speculative),
                 self.mf_max_constraints,
             ],
             outputs=[output],

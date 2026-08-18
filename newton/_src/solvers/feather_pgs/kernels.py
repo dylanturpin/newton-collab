@@ -4942,6 +4942,8 @@ def compute_mf_rhs_bias(
     dt: float,
     bias_scale: float,
     speculative_scale: float,
+    mf_position_impulse: wp.array2d[float],
+    retain_inactive_speculative: int,
     mf_max_constraints: int,
     # outputs
     mf_rhs: wp.array2d[float],
@@ -4972,7 +4974,15 @@ def compute_mf_rhs_bias(
             if max_depen > 0.0 and wp.isfinite(max_depen):
                 bias = wp.max(bias, -max_depen)
         else:
-            bias = speculative_scale * phi_val / dt
+            # A separated row carrying no position impulse is not in contact this
+            # substep. Dropping its phi/h term rewrites "you may close by the
+            # remaining gap" as "you may not approach at all", which halts a
+            # falling body at the edge of the collision margin and leaves it
+            # hovering. The position pass passes 0 here and is unchanged.
+            if retain_inactive_speculative != 0 and mf_position_impulse[world, i] <= 0.0:
+                bias = phi_val / dt
+            else:
+                bias = speculative_scale * phi_val / dt
     elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         bias = mf_phi[world, i]
 
