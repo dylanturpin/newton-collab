@@ -137,6 +137,71 @@ def test_separated_body_still_falls_through_the_margin(test, device):
     )
 
 
+def _single_step_velocity(device, gap, approach_speed, velocity_iterations=4):
+    """Place a sphere ``gap`` above the plane moving down at ``approach_speed``; step once.
+
+    Returns (velocity before the step, velocity after one step). One step keeps
+    the branch under test isolated: nothing else has had a chance to act.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))  # no gravity: isolate the constraint
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, RADIUS + gap), wp.quat_identity()))
+    builder.add_shape_sphere(body, radius=RADIUS, cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverFeatherPGS(
+        model, angular_damping=0.0, pgs_mode="matrix_free", pgs_velocity_iterations=velocity_iterations
+    )
+    state_0, state_1 = model.state(), model.state()
+    # A free body is driven through joint_qd; writing body_qd alone is discarded
+    # by the forward kinematics the solver runs from joint state.
+    joint_qd = state_0.joint_qd.numpy()
+    joint_qd[2] = -abs(approach_speed)
+    state_0.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    before = float(state_0.body_qd.numpy()[body][2])
+    contacts = model.collide(state_0)
+    state_0.clear_forces()
+    solver.step(state_0, state_1, model.control(), contacts, SIM_DT)
+    return before, float(state_1.body_qd.numpy()[body][2])
+
+
+def test_non_crossing_row_keeps_its_speculative_allowance(test, device):
+    """Leave the velocity untouched when the body cannot reach the surface this step.
+
+    With ``phi + h*u > 0`` the row is positively slack. If the velocity pass
+    dropped its ``phi/h`` allowance it would forbid any approach and brake a
+    body that is still far from contact.
+    """
+    gap = 0.02
+    speed = 0.5 * gap / SIM_DT  # crosses only half the gap this step
+    before, after = _single_step_velocity(device, gap, speed)
+    test.assertLess(before, -1.0, "test setup failed to give the body an approach velocity")
+    test.assertAlmostEqual(
+        after, before, delta=0.02 * abs(before), msg=f"free approach was braked: {before:.3f} -> {after:.3f} m/s"
+    )
+
+
+def test_crossing_row_loses_its_speculative_allowance(test, device):
+    """Stop the body at the surface when it would cross within this step.
+
+    With ``phi + h*u <= 0`` the row loads, so the allowance must be removed and
+    the outgoing velocity must not still be approaching at the full rate. This
+    is the case a blanket "always retain phi/h" implementation would fail.
+    """
+    gap = 0.002
+    speed = 5.0 * gap / SIM_DT  # overshoots the gap fivefold
+    before, after = _single_step_velocity(device, gap, speed)
+    test.assertLess(before, -1.0, "test setup failed to give the body an approach velocity")
+    # Magnitude, not a signed bound: "after <= 0.05*|before|" is satisfied by any
+    # negative value, so a row that merely slowed from -20 to -4 m/s would pass.
+    test.assertLess(
+        abs(after),
+        0.05 * abs(before),
+        f"crossing contact kept approaching: {before:.3f} -> {after:.3f} m/s "
+        "(a retained phi/h allowance leaves it closing at the gap rate)",
+    )
+
+
 devices = get_selected_cuda_test_devices()
 
 
@@ -147,6 +212,8 @@ class TestFeatherPGSVelocityPassSpeculative(unittest.TestCase):
 for _fn in (
     test_velocity_iterations_do_not_halt_a_falling_body,
     test_every_contact_response_route_lands,
+    test_non_crossing_row_keeps_its_speculative_allowance,
+    test_crossing_row_loses_its_speculative_allowance,
     test_velocity_iterations_match_the_position_only_landing,
     test_separated_body_still_falls_through_the_margin,
 ):

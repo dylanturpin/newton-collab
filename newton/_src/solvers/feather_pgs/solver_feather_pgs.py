@@ -936,6 +936,18 @@ class SolverFeatherPGS(SolverBase):
             "propagation-colored",
         )
         self.pgs_warmstart = pgs_warmstart
+        if self.pgs_warmstart and self.pgs_velocity_iterations > 0:
+            # The velocity pass decides whether a contact row is loaded from its
+            # position impulse, which is an exact complementarity test only while
+            # impulses start each substep at zero. Warm start seeds them from the
+            # previous substep, so a slack row can carry residue and be treated as
+            # loaded -- it would then lose its speculative allowance and stop a
+            # body that never reached the surface. Lifting this needs the
+            # end-of-solve gap predicate rather than the impulse.
+            raise NotImplementedError(
+                "pgs_warmstart with pgs_velocity_iterations > 0 is not supported: the velocity pass "
+                "classifies contact rows by position impulse, which warm-start residue makes unreliable"
+            )
         if self.pgs_warmstart and self.contact_friction_position_iterations >= 0:
             raise NotImplementedError(
                 "contact_friction_position_iterations with pgs_warmstart=True needs an explicit "

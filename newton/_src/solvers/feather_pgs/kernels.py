@@ -3771,9 +3771,7 @@ def compute_world_contact_bias(
             if phi < 0.0:
                 rhs += bias_scale * beta * phi * inv_dt  # Negative for penetration
             else:
-                if retain_inactive_speculative != 0 and world_position_impulse[world, i] <= wp.static(
-                    PGS_VELOCITY_PASS_LOADED_IMPULSE
-                ):
+                if retain_inactive_speculative != 0 and world_position_impulse[world, i] <= 0.0:
                     rhs += phi * inv_dt
                 else:
                     rhs += contact_speculative_scale * phi * inv_dt
@@ -4935,13 +4933,19 @@ def compute_mf_effective_mass_and_rhs(
     mf_rhs[world, i] = bias
 
 
-# Loaded-row tolerance for the velocity pass. A row that took no position
-# impulse is not in contact this substep, so it must keep its speculative
-# allowance; comparing against exact zero would let an arbitrarily small
-# impulse flip the bias discontinuously. The retained term is phi/h, which
-# shrinks to zero as a row approaches activation, so a misclassification near
-# the boundary injects a vanishing bias rather than a step change.
-PGS_VELOCITY_PASS_LOADED_IMPULSE = 1.0e-9
+# Complementarity test for the velocity pass: a contact row is loaded iff the
+# position solve gave it a positive impulse. With warm start disabled the
+# impulses are zero-initialised each substep, so a slack row carries exactly
+# zero and the comparison is exact rather than a tolerance -- an absolute
+# impulse threshold would be wrong here, because impulse magnitude scales with
+# effective mass, units and timestep and says nothing about whether the
+# position solution reached the contact boundary. A lightly loaded row with an
+# arbitrarily small positive impulse is genuinely in contact and must lose its
+# speculative allowance. The robust general predicate is the end-of-solve gap
+# phi + h*(J v_position - v_target), which is expressed in distance rather than
+# impulse; it requires a per-row J*v that this pass does not currently compute,
+# and is a prerequisite for warm-start configurations (see the constructor
+# guard) and for restitution, which needs the same quantity.
 
 
 @wp.kernel
@@ -4995,9 +4999,7 @@ def compute_mf_rhs_bias(
             # remaining gap" as "you may not approach at all", which halts a
             # falling body at the edge of the collision margin and leaves it
             # hovering. The position pass passes 0 here and is unchanged.
-            if retain_inactive_speculative != 0 and mf_position_impulse[world, i] <= wp.static(
-                PGS_VELOCITY_PASS_LOADED_IMPULSE
-            ):
+            if retain_inactive_speculative != 0 and mf_position_impulse[world, i] <= 0.0:
                 bias = phi_val / dt
             else:
                 bias = speculative_scale * phi_val / dt
@@ -5487,9 +5489,7 @@ def compute_propagation_rhs_bias(
             if max_depen > 0.0 and wp.isfinite(max_depen):
                 bias = wp.max(bias, -max_depen)
         else:
-            if retain_inactive_speculative != 0 and propagation_position_impulse[world, i] <= wp.static(
-                PGS_VELOCITY_PASS_LOADED_IMPULSE
-            ):
+            if retain_inactive_speculative != 0 and propagation_position_impulse[world, i] <= 0.0:
                 bias = phi_val / dt
             else:
                 bias = speculative_scale * phi_val / dt
