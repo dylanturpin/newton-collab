@@ -3019,6 +3019,71 @@ def prescribed_relative_contact_target(
 
 
 @wp.func
+def world_contact_row_dot(
+    world_dof_count: wp.array[int],
+    world_dof_indices: wp.array2d[int],
+    world_J: wp.array3d[float],
+    velocity: wp.array[float],
+    world: int,
+    i: int,
+):
+    """Dot one dense world row's Jacobian with a global velocity state."""
+    out = float(0.0)
+    for d in range(world_dof_count[world]):
+        global_dof = world_dof_indices[world, d]
+        if global_dof >= 0:
+            out += world_J[world, i, d] * velocity[global_dof]
+    return out
+
+
+@wp.func
+def mf_contact_row_dot(
+    mf_J_a: wp.array3d[float],
+    mf_J_b: wp.array3d[float],
+    dof_a: int,
+    dof_b: int,
+    world_dof_indices: wp.array2d[int],
+    velocity: wp.array[float],
+    world: int,
+    i: int,
+):
+    """Dot one matrix-free row's two body Jacobians with a global velocity."""
+    out = float(0.0)
+    if dof_a >= 0:
+        for k in range(6):
+            global_dof = world_dof_indices[world, dof_a + k]
+            if global_dof >= 0:
+                out += mf_J_a[world, i, k] * velocity[global_dof]
+    if dof_b >= 0:
+        for k in range(6):
+            global_dof = world_dof_indices[world, dof_b + k]
+            if global_dof >= 0:
+                out += mf_J_b[world, i, k] * velocity[global_dof]
+    return out
+
+
+@wp.func
+def propagation_contact_row_dot(
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    body_qd: wp.array2d[float],
+    world: int,
+    i: int,
+    body_a: int,
+    body_b: int,
+):
+    """Dot one propagation row's two body Jacobians with body velocities."""
+    out = float(0.0)
+    if body_a >= 0:
+        for k in range(6):
+            out += propagation_J_a[world, i, k] * body_qd[body_a, k]
+    if body_b >= 0:
+        for k in range(6):
+            out += propagation_J_b[world, i, k] * body_qd[body_b, k]
+    return out
+
+
+@wp.func
 def contact_restitution_fires(
     phi: float,
     relative_incident: float,
@@ -3878,12 +3943,10 @@ def apply_world_contact_restitution_matrix_free(
 
     phi = world_phi[world, i]
     target_vel = world_target_velocity[world, i]
-    relative_incident = float(0.0)
-    for d in range(world_dof_count[world]):
-        global_dof = world_dof_indices[world, d]
-        if global_dof >= 0:
-            relative_incident += world_J[world, i, d] * world_incident_velocity[global_dof]
-    relative_incident -= target_vel
+    relative_incident = (
+        world_contact_row_dot(world_dof_count, world_dof_indices, world_J, world_incident_velocity, world, i)
+        - target_vel
+    )
 
     if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
         # Matrix-free GS adds live J*v itself, so store only
@@ -3967,22 +4030,19 @@ def compute_world_contact_velocity_bias(
         if apply_restitution != 0:
             restitution = world_row_restitution[world, i]
         if restitution > 0.0:
-            for d in range(world_dof_count[world]):
-                global_dof = world_dof_indices[world, d]
-                if global_dof >= 0:
-                    relative_incident += world_J[world, i, d] * world_incident_velocity[global_dof]
-            relative_incident -= target_vel
+            relative_incident = (
+                world_contact_row_dot(world_dof_count, world_dof_indices, world_J, world_incident_velocity, world, i)
+                - target_vel
+            )
             if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
                 bounce = int(1)
 
         if bounce != 0:
             rhs += restitution * relative_incident
         elif phi > 0.0:
-            jv_position = float(0.0)
-            for d in range(world_dof_count[world]):
-                global_dof = world_dof_indices[world, d]
-                if global_dof >= 0:
-                    jv_position += world_J[world, i, d] * world_position_velocity[global_dof]
+            jv_position = world_contact_row_dot(
+                world_dof_count, world_dof_indices, world_J, world_position_velocity, world, i
+            )
             end_gap = phi + dt * (jv_position - target_vel)
             if end_gap > _FPGS_CONTACT_END_GAP_SLOP:
                 rhs += phi * inv_dt
@@ -5211,18 +5271,9 @@ def compute_mf_rhs_bias(
         if apply_restitution != 0:
             restitution = mf_row_restitution[world, i]
         if restitution > 0.0:
-            dof_a = mf_dof_a[world, i]
-            dof_b = mf_dof_b[world, i]
-            if dof_a >= 0:
-                for k in range(6):
-                    global_dof = world_dof_indices[world, dof_a + k]
-                    if global_dof >= 0:
-                        relative_incident += mf_J_a[world, i, k] * incident_velocity[global_dof]
-            if dof_b >= 0:
-                for k in range(6):
-                    global_dof = world_dof_indices[world, dof_b + k]
-                    if global_dof >= 0:
-                        relative_incident += mf_J_b[world, i, k] * incident_velocity[global_dof]
+            relative_incident = mf_contact_row_dot(
+                mf_J_a, mf_J_b, mf_dof_a[world, i], mf_dof_b[world, i], world_dof_indices, incident_velocity, world, i
+            )
             target_velocity = float(0.0)
             if has_target_velocity != 0:
                 target_velocity = mf_target_velocity[world, i]
@@ -5251,19 +5302,16 @@ def compute_mf_rhs_bias(
             if preserve_unreached_speculative != 0 and phi_val > 0.0:
                 # Evaluate the same linearized end gap constrained by the
                 # position solve, using its realized velocity.
-                jv_position = float(0.0)
-                dof_a = mf_dof_a[world, i]
-                dof_b = mf_dof_b[world, i]
-                if dof_a >= 0:
-                    for k in range(6):
-                        global_dof = world_dof_indices[world, dof_a + k]
-                        if global_dof >= 0:
-                            jv_position += mf_J_a[world, i, k] * position_velocity[global_dof]
-                if dof_b >= 0:
-                    for k in range(6):
-                        global_dof = world_dof_indices[world, dof_b + k]
-                        if global_dof >= 0:
-                            jv_position += mf_J_b[world, i, k] * position_velocity[global_dof]
+                jv_position = mf_contact_row_dot(
+                    mf_J_a,
+                    mf_J_b,
+                    mf_dof_a[world, i],
+                    mf_dof_b[world, i],
+                    world_dof_indices,
+                    position_velocity,
+                    world,
+                    i,
+                )
                 target_velocity = float(0.0)
                 if has_target_velocity != 0:
                     target_velocity = mf_target_velocity[world, i]
@@ -5719,13 +5767,9 @@ def compute_propagation_effective_mass_and_rhs(
             bias = phi_val / dt
         restitution = propagation_row_restitution[world, i]
         if restitution > 0.0:
-            relative_incident = float(0.0)
-            if ba >= 0:
-                for k in range(6):
-                    relative_incident += propagation_J_a[world, i, k] * propagation_body_qd[ba, k]
-            if bb >= 0:
-                for k in range(6):
-                    relative_incident += propagation_J_b[world, i, k] * propagation_body_qd[bb, k]
+            relative_incident = propagation_contact_row_dot(
+                propagation_J_a, propagation_J_b, propagation_body_qd, world, i, ba, bb
+            )
             if contact_restitution_fires(phi_val, relative_incident, dt, restitution_velocity_threshold):
                 restitution_target = -restitution * relative_incident
                 # The propagation solve adds live J*v to this bias, so the
@@ -5786,15 +5830,15 @@ def compute_propagation_rhs_bias(
         else:
             end_gap = float(0.0)
             if preserve_unreached_speculative != 0 and phi_val > 0.0:
-                jv_position = float(0.0)
-                ba = propagation_body_a[world, i]
-                bb = propagation_body_b[world, i]
-                if ba >= 0:
-                    for k in range(6):
-                        jv_position += propagation_J_a[world, i, k] * position_body_qd[ba, k]
-                if bb >= 0:
-                    for k in range(6):
-                        jv_position += propagation_J_b[world, i, k] * position_body_qd[bb, k]
+                jv_position = propagation_contact_row_dot(
+                    propagation_J_a,
+                    propagation_J_b,
+                    position_body_qd,
+                    world,
+                    i,
+                    propagation_body_a[world, i],
+                    propagation_body_b[world, i],
+                )
                 end_gap = phi_val + dt * jv_position
             if preserve_unreached_speculative != 0 and end_gap > _FPGS_CONTACT_END_GAP_SLOP:
                 bias = phi_val / dt
