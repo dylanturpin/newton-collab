@@ -921,12 +921,13 @@ class SolverFeatherPGS(SolverBase):
         self.speculative_dense_contact_compliance = speculative_dense_contact_compliance
         self.pgs_omega = pgs_omega
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
+        threshold_error = "restitution_velocity_threshold must be finite and non-negative"
         try:
             self.restitution_velocity_threshold = float(restitution_velocity_threshold)
         except (TypeError, ValueError) as exc:
-            raise ValueError("restitution_velocity_threshold must be finite and non-negative") from exc
+            raise ValueError(threshold_error) from exc
         if not np.isfinite(self.restitution_velocity_threshold) or self.restitution_velocity_threshold < 0.0:
-            raise ValueError("restitution_velocity_threshold must be finite and non-negative")
+            raise ValueError(threshold_error)
         self.pgs_velocity_omega = self.pgs_omega if pgs_velocity_omega is None else float(pgs_velocity_omega)
         if pgs_velocity_drive_mode not in ("active", "freeze"):
             raise ValueError(f"pgs_velocity_drive_mode must be 'active' or 'freeze', got {pgs_velocity_drive_mode!r}")

@@ -3019,6 +3019,26 @@ def prescribed_relative_contact_target(
 
 
 @wp.func
+def contact_restitution_fires(
+    phi: float,
+    relative_incident: float,
+    dt: float,
+    restitution_velocity_threshold: float,
+):
+    """Return whether a frozen incident impact qualifies for a rebound target.
+
+    Fires only for a sufficiently fast closing contact that is already at the
+    surface or is predicted to reach it during the step; the end-gap slop
+    absorbs float32 residuals on rows that land exactly at contact.
+    """
+    if relative_incident >= -restitution_velocity_threshold:
+        return False
+    if phi <= _FPGS_CONTACT_END_GAP_SLOP:
+        return True
+    return phi + dt * relative_incident <= _FPGS_CONTACT_END_GAP_SLOP
+
+
+@wp.func
 def mixed_contact_restitution(
     shape_a: int,
     shape_b: int,
@@ -3865,10 +3885,7 @@ def apply_world_contact_restitution_matrix_free(
             relative_incident += world_J[world, i, d] * world_incident_velocity[global_dof]
     relative_incident -= target_vel
 
-    predicted_end_gap = phi + dt * relative_incident
-    if relative_incident < -restitution_velocity_threshold and (
-        phi <= _FPGS_CONTACT_END_GAP_SLOP or predicted_end_gap <= _FPGS_CONTACT_END_GAP_SLOP
-    ):
+    if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
         # Matrix-free GS adds live J*v itself, so store only
         # -target + e*u_incident as the row bias.
         world_rhs[world, i] = -target_vel + restitution * relative_incident
@@ -3905,10 +3922,7 @@ def apply_world_contact_restitution_accumulated(
     if phi < 0.0:
         geometric_bias = world_row_beta[world, i] * phi / dt
     relative_incident = world_rhs[world, i] - geometric_bias
-    predicted_end_gap = phi + dt * relative_incident
-    if relative_incident < -restitution_velocity_threshold and (
-        phi <= _FPGS_CONTACT_END_GAP_SLOP or predicted_end_gap <= _FPGS_CONTACT_END_GAP_SLOP
-    ):
+    if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
         # Impulse-space RHS contains u_incident already.  Replacing geometric
         # bias with the Newton target yields (1+e)*u_incident.
         world_rhs[world, i] = (1.0 + restitution) * relative_incident
@@ -3958,10 +3972,7 @@ def compute_world_contact_velocity_bias(
                 if global_dof >= 0:
                     relative_incident += world_J[world, i, d] * world_incident_velocity[global_dof]
             relative_incident -= target_vel
-            predicted_end_gap = phi + dt * relative_incident
-            if relative_incident < -restitution_velocity_threshold and (
-                phi <= _FPGS_CONTACT_END_GAP_SLOP or predicted_end_gap <= _FPGS_CONTACT_END_GAP_SLOP
-            ):
+            if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
                 bounce = int(1)
 
         if bounce != 0:
@@ -5144,10 +5155,7 @@ def compute_mf_effective_mass_and_rhs(
             if has_target_velocity != 0:
                 target_vel = mf_target_velocity[world, i]
             relative_incident -= target_vel
-            predicted_end_gap = phi_val + dt * relative_incident
-            if relative_incident < -restitution_velocity_threshold and (
-                phi_val <= _FPGS_CONTACT_END_GAP_SLOP or predicted_end_gap <= _FPGS_CONTACT_END_GAP_SLOP
-            ):
+            if contact_restitution_fires(phi_val, relative_incident, dt, restitution_velocity_threshold):
                 bias = restitution * relative_incident
     elif rtype == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         bias = mf_phi[world, i]
@@ -5219,10 +5227,7 @@ def compute_mf_rhs_bias(
             if has_target_velocity != 0:
                 target_velocity = mf_target_velocity[world, i]
             relative_incident -= target_velocity
-            predicted_end_gap = phi_val + dt * relative_incident
-            if relative_incident < -restitution_velocity_threshold and (
-                phi_val <= _FPGS_CONTACT_END_GAP_SLOP or predicted_end_gap <= _FPGS_CONTACT_END_GAP_SLOP
-            ):
+            if contact_restitution_fires(phi_val, relative_incident, dt, restitution_velocity_threshold):
                 bounce = int(1)
 
         if bounce != 0:
@@ -5721,10 +5726,7 @@ def compute_propagation_effective_mass_and_rhs(
             if bb >= 0:
                 for k in range(6):
                     relative_incident += propagation_J_b[world, i, k] * propagation_body_qd[bb, k]
-            predicted_end_gap = phi_val + dt * relative_incident
-            if relative_incident < -restitution_velocity_threshold and (
-                phi_val <= _FPGS_CONTACT_END_GAP_SLOP or predicted_end_gap <= _FPGS_CONTACT_END_GAP_SLOP
-            ):
+            if contact_restitution_fires(phi_val, relative_incident, dt, restitution_velocity_threshold):
                 restitution_target = -restitution * relative_incident
                 # The propagation solve adds live J*v to this bias, so the
                 # Newton target replaces (rather than augments) speculative or
