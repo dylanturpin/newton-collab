@@ -2818,8 +2818,6 @@ def allocate_world_contact_slots(
     # D-wide generalized rows.
     is_mf = 0
     is_propagation = 0
-    a_is_free_or_ground = art_a < 0
-    b_is_free_or_ground = art_b < 0
     if has_free_rigid != 0:
         a_is_mf_compatible = not a_has_dofs or is_free_rigid[art_a] != 0
         b_is_mf_compatible = not b_has_dofs or is_free_rigid[art_b] != 0
@@ -3737,8 +3735,6 @@ def compute_world_contact_bias(
     dt: float,
     bias_scale: float,
     contact_speculative_scale: float,
-    world_position_impulse: wp.array2d[float],
-    retain_inactive_speculative: int,
     joint_limit_speculative_scale: float,
     # outputs
     world_rhs: wp.array2d[float],
@@ -3771,10 +3767,7 @@ def compute_world_contact_bias(
             if phi < 0.0:
                 rhs += bias_scale * beta * phi * inv_dt  # Negative for penetration
             else:
-                if retain_inactive_speculative != 0 and world_position_impulse[world, i] <= 0.0:
-                    rhs += phi * inv_dt
-                else:
-                    rhs += contact_speculative_scale * phi * inv_dt
+                rhs += contact_speculative_scale * phi * inv_dt
         elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
             if phi < 0.0:
                 rhs += bias_scale * beta * phi * inv_dt  # Negative for violation
@@ -3793,6 +3786,53 @@ def compute_world_contact_bias(
         # ``J*v_hat`` term added by ``rhs_accum_world_par_art``.
 
         world_rhs[world, i] = rhs
+
+
+@wp.kernel
+def compute_world_contact_velocity_bias(
+    world_constraint_count: wp.array[int],
+    max_constraints: int,
+    world_dof_count: wp.array[int],
+    world_phi: wp.array2d[float],
+    world_row_type: wp.array2d[int],
+    world_target_velocity: wp.array2d[float],
+    world_position_velocity: wp.array[float],
+    world_dof_indices: wp.array2d[int],
+    world_J: wp.array3d[float],
+    dt: float,
+    # outputs
+    world_rhs: wp.array2d[float],
+):
+    """Build the velocity-pass RHS from the position solution's end gap."""
+    tid = wp.tid()
+    world = tid // max_constraints
+    i = tid - world * max_constraints
+    if i >= world_constraint_count[world]:
+        return
+    inv_dt = 1.0 / dt
+
+    phi = world_phi[world, i]
+    row_type = world_row_type[world, i]
+    target_vel = world_target_velocity[world, i]
+    rhs = -target_vel
+
+    if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        if phi > 0.0:
+            jv_position = float(0.0)
+            for d in range(world_dof_count[world]):
+                global_dof = world_dof_indices[world, d]
+                if global_dof >= 0:
+                    jv_position += world_J[world, i, d] * world_position_velocity[global_dof]
+            end_gap = phi + dt * (jv_position - target_vel)
+            if end_gap > 0.0:
+                rhs += phi * inv_dt
+    elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
+        if phi >= 0.0:
+            rhs += phi * inv_dt
+    elif row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+        rhs = 0.0
+
+    world_rhs[world, i] = rhs
 
 
 @wp.kernel
@@ -4933,27 +4973,16 @@ def compute_mf_effective_mass_and_rhs(
     mf_rhs[world, i] = bias
 
 
-# Cold-start participation heuristic for the velocity pass: a contact row is
-# treated as having participated in the position solve iff it came out with a
-# positive impulse. This is not an exact complementarity test -- lambda = 0 with
-# a zero end-gap is valid complementarity, and a finite coupled PGS can leave a
-# positive impulse on a row that ends up slack -- but with warm start disabled
-# the impulses start each substep at zero, which makes it a cheap and reliable
-# indication in the cold-started case this solver supports. An absolute impulse
-# threshold would be worse than either: impulse magnitude scales with effective
-# mass, units and timestep, so a light body's genuine impact falls below any
-# fixed cutoff. The robust predicate is the end-of-solve gap
-# phi + h*(J v_position - v_target), retaining the allowance only while that
-# stays positive; it is expressed in distance rather than impulse, needs a
-# per-row J*v this pass does not compute, and is the prerequisite for lifting
-# the warm-start restriction enforced in the solver constructor.
-
-
 @wp.kernel
 def compute_mf_rhs_bias(
     mf_constraint_count: wp.array[int],
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
+    mf_dof_a: wp.array2d[int],
+    mf_dof_b: wp.array2d[int],
+    mf_J_a: wp.array3d[float],
+    mf_J_b: wp.array3d[float],
+    world_dof_indices: wp.array2d[int],
     mf_phi: wp.array2d[float],
     mf_row_type: wp.array2d[int],
     mf_target_velocity: wp.array2d[float],
@@ -4963,8 +4992,8 @@ def compute_mf_rhs_bias(
     dt: float,
     bias_scale: float,
     speculative_scale: float,
-    mf_position_impulse: wp.array2d[float],
-    retain_inactive_speculative: int,
+    position_velocity: wp.array[float],
+    preserve_unreached_speculative: int,
     mf_max_constraints: int,
     # outputs
     mf_rhs: wp.array2d[float],
@@ -4995,12 +5024,28 @@ def compute_mf_rhs_bias(
             if max_depen > 0.0 and wp.isfinite(max_depen):
                 bias = wp.max(bias, -max_depen)
         else:
-            # A separated row carrying no position impulse is not in contact this
-            # substep. Dropping its phi/h term rewrites "you may close by the
-            # remaining gap" as "you may not approach at all", which halts a
-            # falling body at the edge of the collision margin and leaves it
-            # hovering. The position pass passes 0 here and is unchanged.
-            if retain_inactive_speculative != 0 and mf_position_impulse[world, i] <= 0.0:
+            end_gap = float(0.0)
+            if preserve_unreached_speculative != 0 and phi_val > 0.0:
+                # Evaluate the same linearized end gap constrained by the
+                # position solve, using its realized velocity.
+                jv_position = float(0.0)
+                dof_a = mf_dof_a[world, i]
+                dof_b = mf_dof_b[world, i]
+                if dof_a >= 0:
+                    for k in range(6):
+                        global_dof = world_dof_indices[world, dof_a + k]
+                        if global_dof >= 0:
+                            jv_position += mf_J_a[world, i, k] * position_velocity[global_dof]
+                if dof_b >= 0:
+                    for k in range(6):
+                        global_dof = world_dof_indices[world, dof_b + k]
+                        if global_dof >= 0:
+                            jv_position += mf_J_b[world, i, k] * position_velocity[global_dof]
+                target_velocity = float(0.0)
+                if has_target_velocity != 0:
+                    target_velocity = mf_target_velocity[world, i]
+                end_gap = phi_val + dt * (jv_position - target_velocity)
+            if preserve_unreached_speculative != 0 and end_gap > 0.0:
                 bias = phi_val / dt
             else:
                 bias = speculative_scale * phi_val / dt
@@ -5452,6 +5497,8 @@ def compute_propagation_rhs_bias(
     propagation_constraint_count: wp.array[int],
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
     rigid_body_max_depenetration_velocity: wp.array[float],
@@ -5459,8 +5506,8 @@ def compute_propagation_rhs_bias(
     dt: float,
     bias_scale: float,
     speculative_scale: float,
-    propagation_position_impulse: wp.array2d[float],
-    retain_inactive_speculative: int,
+    position_body_qd: wp.array2d[float],
+    preserve_unreached_speculative: int,
     propagation_max_constraints: int,
     # outputs
     propagation_rhs: wp.array2d[float],
@@ -5490,7 +5537,19 @@ def compute_propagation_rhs_bias(
             if max_depen > 0.0 and wp.isfinite(max_depen):
                 bias = wp.max(bias, -max_depen)
         else:
-            if retain_inactive_speculative != 0 and propagation_position_impulse[world, i] <= 0.0:
+            end_gap = float(0.0)
+            if preserve_unreached_speculative != 0 and phi_val > 0.0:
+                jv_position = float(0.0)
+                ba = propagation_body_a[world, i]
+                bb = propagation_body_b[world, i]
+                if ba >= 0:
+                    for k in range(6):
+                        jv_position += propagation_J_a[world, i, k] * position_body_qd[ba, k]
+                if bb >= 0:
+                    for k in range(6):
+                        jv_position += propagation_J_b[world, i, k] * position_body_qd[bb, k]
+                end_gap = phi_val + dt * jv_position
+            if preserve_unreached_speculative != 0 and end_gap > 0.0:
                 bias = phi_val / dt
             else:
                 bias = speculative_scale * phi_val / dt
@@ -5826,7 +5885,6 @@ def factor_propagation_tree_for_size(
     art = group_to_art[group_idx]
     joint_start = articulation_start[art]
     joint_end = articulation_start[art + 1]
-    dof_start_art = articulation_dof_start[art]
 
     for joint in range(joint_start, joint_end):
         body = joint_child[joint]
