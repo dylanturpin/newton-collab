@@ -213,6 +213,7 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
     phi = wp.array([[1.0]], dtype=wp.float32, device=device)
     row_type = wp.array([[0]], dtype=wp.int32, device=device)
     target_velocity = wp.zeros((1, 1), dtype=wp.float32, device=device)
+    row_restitution = wp.zeros((1, 1), dtype=wp.float32, device=device)
     max_depenetration_velocity = wp.array([float("inf")], dtype=wp.float32, device=device)
     position_velocity = wp.zeros((6,), dtype=wp.float32, device=device)
     rhs = wp.zeros((1, 1), dtype=wp.float32, device=device)
@@ -235,6 +236,7 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
                 phi,
                 row_type,
                 target_velocity,
+                row_restitution,
                 has_target,
                 max_depenetration_velocity,
                 0.2,
@@ -242,7 +244,10 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
                 0.0,
                 0.0,
                 position_velocity,
+                position_velocity,
                 1,
+                0,
+                0.5,
                 1,
             ],
             outputs=[rhs],

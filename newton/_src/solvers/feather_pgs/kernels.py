@@ -3018,6 +3018,30 @@ def prescribed_relative_contact_target(
     return -known_jv
 
 
+@wp.func
+def mixed_contact_restitution(
+    shape_a: int,
+    shape_b: int,
+    shape_material_restitution: wp.array[float],
+):
+    """Return the arithmetic-mean coefficient for one shape pair."""
+    restitution = float(0.0)
+    material_count = int(0)
+    if shape_a >= 0:
+        value_a = shape_material_restitution[shape_a]
+        if wp.isfinite(value_a):
+            restitution += wp.clamp(value_a, 0.0, 1.0)
+        material_count += 1
+    if shape_b >= 0:
+        value_b = shape_material_restitution[shape_b]
+        if wp.isfinite(value_b):
+            restitution += wp.clamp(value_b, 0.0, 1.0)
+        material_count += 1
+    if material_count > 0:
+        restitution /= float(material_count)
+    return restitution
+
+
 @wp.kernel
 def populate_world_J_for_size(
     contact_count: wp.array[int],
@@ -3048,6 +3072,8 @@ def populate_world_J_for_size(
     prescribed_articulation: wp.array[int],
     shape_transform: wp.array[wp.transform],
     shape_material_mu: wp.array[float],
+    shape_material_restitution: wp.array[float],
+    enable_restitution: int,
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
@@ -3065,6 +3091,7 @@ def populate_world_J_for_size(
     world_row_cfm: wp.array2d[float],
     world_phi: wp.array2d[float],
     world_target_velocity: wp.array2d[float],
+    world_row_restitution: wp.array2d[float],
 ):
     """
     Phase 2 of multi-articulation contact building (per size group).
@@ -3139,6 +3166,9 @@ def populate_world_J_for_size(
         mat_count += 1
     if mat_count > 0:
         mu /= float(mat_count)
+    restitution = float(0.0)
+    if enable_restitution != 0:
+        restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
     friction_anchor_rank = int(0)
     same_next_contact = int(0)
     if contact_friction_anchor_limit > 0:
@@ -3360,6 +3390,8 @@ def populate_world_J_for_size(
         world_row_cfm[world, slot] = pgs_cfm
         world_phi[world, slot] = phi
         world_target_velocity[world, slot] = normal_target
+        if enable_restitution != 0:
+            world_row_restitution[world, slot] = restitution
 
         if will_add_friction:
             # Friction row 1
@@ -3370,6 +3402,8 @@ def populate_world_J_for_size(
             world_row_cfm[world, slot + 1] = pgs_cfm
             world_phi[world, slot + 1] = 0.0
             world_target_velocity[world, slot + 1] = friction0_target
+            if enable_restitution != 0:
+                world_row_restitution[world, slot + 1] = 0.0
 
             # Friction row 2
             world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_FRICTION
@@ -3378,6 +3412,8 @@ def populate_world_J_for_size(
             world_row_beta[world, slot + 2] = 0.0
             world_row_cfm[world, slot + 2] = pgs_cfm
             world_phi[world, slot + 2] = 0.0
+            if enable_restitution != 0:
+                world_row_restitution[world, slot + 2] = 0.0
             world_target_velocity[world, slot + 2] = friction1_target
 
     elif art_b >= 0 and articulation_response_dof_count[art_b] == target_size:
@@ -3389,6 +3425,8 @@ def populate_world_J_for_size(
         world_row_cfm[world, slot] = pgs_cfm
         world_phi[world, slot] = phi
         world_target_velocity[world, slot] = normal_target
+        if enable_restitution != 0:
+            world_row_restitution[world, slot] = restitution
 
         if will_add_friction:
             world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_FRICTION
@@ -3398,6 +3436,8 @@ def populate_world_J_for_size(
             world_row_cfm[world, slot + 1] = pgs_cfm
             world_phi[world, slot + 1] = 0.0
             world_target_velocity[world, slot + 1] = friction0_target
+            if enable_restitution != 0:
+                world_row_restitution[world, slot + 1] = 0.0
 
             world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 2] = slot
@@ -3406,6 +3446,8 @@ def populate_world_J_for_size(
             world_row_cfm[world, slot + 2] = pgs_cfm
             world_phi[world, slot + 2] = 0.0
             world_target_velocity[world, slot + 2] = friction1_target
+            if enable_restitution != 0:
+                world_row_restitution[world, slot + 2] = 0.0
 
 
 @wp.kernel
@@ -3801,10 +3843,14 @@ def compute_world_contact_velocity_bias(
     world_phi: wp.array2d[float],
     world_row_type: wp.array2d[int],
     world_target_velocity: wp.array2d[float],
+    world_row_restitution: wp.array2d[float],
     world_position_velocity: wp.array[float],
+    world_incident_velocity: wp.array[float],
     world_dof_indices: wp.array2d[int],
     world_J: wp.array3d[float],
     dt: float,
+    apply_restitution: int,
+    restitution_velocity_threshold: float,
     # outputs
     world_rhs: wp.array2d[float],
 ):
@@ -3822,6 +3868,7 @@ def compute_world_contact_velocity_bias(
     rhs = -target_vel
 
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        reached = int(1)
         if phi > 0.0:
             jv_position = float(0.0)
             for d in range(world_dof_count[world]):
@@ -3831,6 +3878,19 @@ def compute_world_contact_velocity_bias(
             end_gap = phi + dt * (jv_position - target_vel)
             if end_gap > _FPGS_CONTACT_END_GAP_SLOP:
                 rhs += phi * inv_dt
+                reached = int(0)
+        restitution = float(0.0)
+        if apply_restitution != 0:
+            restitution = world_row_restitution[world, i]
+        if reached != 0 and restitution > 0.0:
+            jv_incident = float(0.0)
+            for d in range(world_dof_count[world]):
+                global_dof = world_dof_indices[world, d]
+                if global_dof >= 0:
+                    jv_incident += world_J[world, i, d] * world_incident_velocity[global_dof]
+            relative_incident = jv_incident - target_vel
+            if relative_incident < -restitution_velocity_threshold:
+                rhs += restitution * relative_incident
     elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
         if phi >= 0.0:
             rhs += phi * inv_dt
@@ -4047,6 +4107,8 @@ def build_mf_contact_rows(
     prescribed_articulation: wp.array[int],
     has_target_velocity: int,
     shape_material_mu: wp.array[float],
+    shape_material_restitution: wp.array[float],
+    enable_restitution: int,
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
@@ -4064,6 +4126,7 @@ def build_mf_contact_rows(
     mf_row_mu: wp.array2d[float],
     mf_phi: wp.array2d[float],
     mf_target_velocity: wp.array2d[float],
+    mf_row_restitution: wp.array2d[float],
 ):
     """Build MF constraint rows for contacts between free rigid bodies / ground.
 
@@ -4142,6 +4205,9 @@ def build_mf_contact_rows(
         mat_count += 1
     if mat_count > 0:
         mu /= float(mat_count)
+    restitution = float(0.0)
+    if enable_restitution != 0:
+        restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
     friction_anchor_rank = int(0)
     same_next_contact = int(0)
     if contact_friction_anchor_limit > 0:
@@ -4225,10 +4291,14 @@ def build_mf_contact_rows(
             mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
             mf_row_parent[world, row_idx] = -1
             mf_phi[world, row_idx] = phi
+            if enable_restitution != 0:
+                mf_row_restitution[world, row_idx] = restitution
         else:
             mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
             mf_row_parent[world, row_idx] = slot
             mf_phi[world, row_idx] = 0.0
+            if enable_restitution != 0:
+                mf_row_restitution[world, row_idx] = 0.0
         if row_offset == 0:
             mf_row_mu[world, row_idx] = mu
         else:
@@ -4265,6 +4335,8 @@ def build_propagation_contact_rows(
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     shape_material_mu: wp.array[float],
+    shape_material_restitution: wp.array[float],
+    enable_restitution: int,
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
@@ -4284,6 +4356,7 @@ def build_propagation_contact_rows(
     propagation_row_parent: wp.array2d[int],
     propagation_row_mu: wp.array2d[float],
     propagation_phi: wp.array2d[float],
+    propagation_row_restitution: wp.array2d[float],
 ):
     """Build fixed-size body-space rows for contacts touching non-free articulations.
 
@@ -4355,6 +4428,9 @@ def build_propagation_contact_rows(
         mat_count += 1
     if mat_count > 0:
         mu /= float(mat_count)
+    restitution = float(0.0)
+    if enable_restitution != 0:
+        restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
 
     friction_anchor_rank = int(0)
     same_next_contact = int(0)
@@ -4438,11 +4514,15 @@ def build_propagation_contact_rows(
             propagation_row_parent[world, row_idx] = -1
             propagation_phi[world, row_idx] = phi
             propagation_row_mu[world, row_idx] = mu
+            if enable_restitution != 0:
+                propagation_row_restitution[world, row_idx] = restitution
         else:
             propagation_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
             propagation_row_parent[world, row_idx] = slot
             propagation_phi[world, row_idx] = 0.0
             propagation_row_mu[world, row_idx] = friction_mu
+            if enable_restitution != 0:
+                propagation_row_restitution[world, row_idx] = 0.0
 
 
 @wp.kernel
@@ -4991,6 +5071,7 @@ def compute_mf_rhs_bias(
     mf_phi: wp.array2d[float],
     mf_row_type: wp.array2d[int],
     mf_target_velocity: wp.array2d[float],
+    mf_row_restitution: wp.array2d[float],
     has_target_velocity: int,
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_beta: float,
@@ -4998,7 +5079,10 @@ def compute_mf_rhs_bias(
     bias_scale: float,
     speculative_scale: float,
     position_velocity: wp.array[float],
+    incident_velocity: wp.array[float],
     preserve_unreached_speculative: int,
+    apply_restitution: int,
+    restitution_velocity_threshold: float,
     mf_max_constraints: int,
     # outputs
     mf_rhs: wp.array2d[float],
@@ -5013,6 +5097,7 @@ def compute_mf_rhs_bias(
     bias = float(0.0)
     row_type = mf_row_type[world, i]
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        reached = int(1)
         phi_val = mf_phi[world, i]
         if phi_val < 0.0:
             bias = bias_scale * pgs_beta * phi_val / dt
@@ -5052,8 +5137,32 @@ def compute_mf_rhs_bias(
                 end_gap = phi_val + dt * (jv_position - target_velocity)
             if preserve_unreached_speculative != 0 and end_gap > _FPGS_CONTACT_END_GAP_SLOP:
                 bias = phi_val / dt
+                reached = int(0)
             else:
                 bias = speculative_scale * phi_val / dt
+        restitution = float(0.0)
+        if apply_restitution != 0:
+            restitution = mf_row_restitution[world, i]
+        if reached != 0 and restitution > 0.0:
+            jv_incident = float(0.0)
+            dof_a = mf_dof_a[world, i]
+            dof_b = mf_dof_b[world, i]
+            if dof_a >= 0:
+                for k in range(6):
+                    global_dof = world_dof_indices[world, dof_a + k]
+                    if global_dof >= 0:
+                        jv_incident += mf_J_a[world, i, k] * incident_velocity[global_dof]
+            if dof_b >= 0:
+                for k in range(6):
+                    global_dof = world_dof_indices[world, dof_b + k]
+                    if global_dof >= 0:
+                        jv_incident += mf_J_b[world, i, k] * incident_velocity[global_dof]
+            target_velocity = float(0.0)
+            if has_target_velocity != 0:
+                target_velocity = mf_target_velocity[world, i]
+            relative_incident = jv_incident - target_velocity
+            if relative_incident < -restitution_velocity_threshold:
+                bias += restitution * relative_incident
     elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         bias = mf_phi[world, i]
 
@@ -5424,18 +5533,23 @@ def compute_propagation_effective_mass_and_rhs(
     propagation_body_response: wp.array3d[float],
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
+    propagation_row_restitution: wp.array2d[float],
+    propagation_body_qd: wp.array2d[float],
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_cfm: float,
     pgs_beta: float,
     dense_contact_compliance: float,
     speculative_dense_contact_compliance: float,
     dt: float,
+    enable_restitution: int,
+    restitution_velocity_threshold: float,
     propagation_max_constraints: int,
     # outputs
     propagation_eff_mass_inv: wp.array2d[float],
     propagation_MiJt_a: wp.array3d[float],
     propagation_MiJt_b: wp.array3d[float],
     propagation_rhs: wp.array2d[float],
+    propagation_restitution_target: wp.array2d[float],
 ):
     tid = wp.tid()
     world = tid // propagation_max_constraints
@@ -5478,6 +5592,7 @@ def compute_propagation_effective_mass_and_rhs(
         propagation_eff_mass_inv[world, i] = 0.0
 
     bias = float(0.0)
+    restitution_target = float(0.0)
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
         phi_val = propagation_phi[world, i]
         if phi_val < 0.0:
@@ -5494,7 +5609,22 @@ def compute_propagation_effective_mass_and_rhs(
                 bias = wp.max(bias, -max_depen)
         else:
             bias = phi_val / dt
+        restitution = float(0.0)
+        if enable_restitution != 0:
+            restitution = propagation_row_restitution[world, i]
+        if restitution > 0.0:
+            relative_incident = float(0.0)
+            if ba >= 0:
+                for k in range(6):
+                    relative_incident += propagation_J_a[world, i, k] * propagation_body_qd[ba, k]
+            if bb >= 0:
+                for k in range(6):
+                    relative_incident += propagation_J_b[world, i, k] * propagation_body_qd[bb, k]
+            if relative_incident < -restitution_velocity_threshold:
+                restitution_target = -restitution * relative_incident
     propagation_rhs[world, i] = bias
+    if enable_restitution != 0:
+        propagation_restitution_target[world, i] = restitution_target
 
 
 @wp.kernel
@@ -5506,6 +5636,7 @@ def compute_propagation_rhs_bias(
     propagation_J_b: wp.array3d[float],
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
+    propagation_restitution_target: wp.array2d[float],
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_beta: float,
     dt: float,
@@ -5513,6 +5644,7 @@ def compute_propagation_rhs_bias(
     speculative_scale: float,
     position_body_qd: wp.array2d[float],
     preserve_unreached_speculative: int,
+    apply_restitution: int,
     propagation_max_constraints: int,
     # outputs
     propagation_rhs: wp.array2d[float],
@@ -5526,6 +5658,7 @@ def compute_propagation_rhs_bias(
     bias = float(0.0)
     row_type = propagation_row_type[world, i]
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        reached = int(1)
         phi_val = propagation_phi[world, i]
         if phi_val < 0.0:
             bias = bias_scale * pgs_beta * phi_val / dt
@@ -5556,8 +5689,11 @@ def compute_propagation_rhs_bias(
                 end_gap = phi_val + dt * jv_position
             if preserve_unreached_speculative != 0 and end_gap > _FPGS_CONTACT_END_GAP_SLOP:
                 bias = phi_val / dt
+                reached = int(0)
             else:
                 bias = speculative_scale * phi_val / dt
+        if apply_restitution != 0 and reached != 0:
+            bias -= propagation_restitution_target[world, i]
     propagation_rhs[world, i] = bias
 
 

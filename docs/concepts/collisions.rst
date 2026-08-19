@@ -1751,6 +1751,12 @@ Shape material properties control contact resolution. Configure via :class:`~Mod
 .. note::
    :class:`~newton.solvers.SolverXPBD` requires ``enable_restitution=True`` on
    the solver constructor before ``restitution`` takes effect.
+   :class:`~newton.solvers.SolverFeatherPGS` applies restitution only with
+   ``pgs_mode="matrix_free"`` and positive ``pgs_velocity_iterations``. It
+   averages the two shape coefficients and uses a configurable incident-speed
+   threshold to suppress low-speed resting-contact bounce. Coefficients are
+   read while rebuilding rows, so in-place material updates work under an
+   already-captured graph when the velocity pass was enabled at construction.
 
 Example:
 
