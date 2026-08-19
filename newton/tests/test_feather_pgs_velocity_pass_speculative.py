@@ -201,7 +201,7 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
 
 
 def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
-    """Treat an exactly reached surface as active without consulting impulse."""
+    """Treat exactly and numerically reached surfaces as active without consulting impulse."""
     count = wp.array([1], dtype=wp.int32, device=device)
     body_a = wp.array([[0]], dtype=wp.int32, device=device)
     body_b = wp.array([[-1]], dtype=wp.int32, device=device)
@@ -250,7 +250,26 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
         )
         return float(rhs.numpy()[0, 0])
 
+    outside_velocity = np.float32(-1.999997)
+    outside_end_gap = np.float32(1.0) + np.float32(0.5) * outside_velocity
+    near_velocity = np.float32(-1.999999)
+    near_end_gap = np.float32(1.0) + np.float32(0.5) * near_velocity
+
+    test.assertGreater(float(outside_end_gap), 1.0e-6, "outside test case did not clear the activation slop")
+    test.assertGreater(float(near_end_gap), 0.0, "near-boundary test case did not retain a positive residual")
+    test.assertLessEqual(float(near_end_gap), 1.0e-6, "near-boundary test case exceeded the activation slop")
+
     test.assertEqual(classify(-1.0), 2.0, "a row ending 0.5 m away lost its speculative allowance")
+    test.assertEqual(
+        classify(float(outside_velocity)),
+        2.0,
+        "a row ending beyond the numerical boundary lost its speculative allowance",
+    )
+    test.assertEqual(
+        classify(float(near_velocity)),
+        0.0,
+        "a binding row with a small positive residual retained its speculative allowance",
+    )
     test.assertEqual(classify(-2.0), 0.0, "a row reaching the surface retained its speculative allowance")
     test.assertEqual(
         classify(-1.0, target=1.0, has_target=1),

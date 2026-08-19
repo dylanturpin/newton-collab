@@ -680,8 +680,9 @@ class SolverFeatherPGS(SolverBase):
             pgs_velocity_iterations (int, optional): Additional matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
                 geometric bias corrects positions first, then final velocity iterations run without Baumgarte bias.
-                Positive-gap rows whose linearized position trajectory remains separated keep their speculative
-                closing allowance; rows whose linearized end gap reaches zero use the unbiased contact law.
+                Positive-gap rows whose linearized position trajectory remains separated by more than a 1e-6 m
+                numerical slop keep their speculative closing allowance; rows within the slop use the unbiased
+                contact law.
                 Only supported with ``pgs_mode="matrix_free"``. Defaults to 0.
             pgs_beta (float, optional): ERP style position correction factor. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.

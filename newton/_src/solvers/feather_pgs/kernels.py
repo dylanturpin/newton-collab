@@ -62,6 +62,11 @@ _FPGS_BISECTION_ITERS = 20
 _FPGS_COULOMB_NEWTON_EXPAND_ITERS = 30
 _FPGS_COULOMB_NEWTON_NEWTON_ITERS = 50
 
+# One-sided distance slop [m] for float32 cancellation at the speculative
+# bound. Rows within 1e-6 m are treated as reaching the surface, bounding early
+# activation to 1e-6 m of linearized separation.
+_FPGS_CONTACT_END_GAP_SLOP = wp.constant(1.0e-6)
+
 
 @wp.kernel
 def commit_mass_updates(
@@ -3824,7 +3829,7 @@ def compute_world_contact_velocity_bias(
                 if global_dof >= 0:
                     jv_position += world_J[world, i, d] * world_position_velocity[global_dof]
             end_gap = phi + dt * (jv_position - target_vel)
-            if end_gap > 0.0:
+            if end_gap > _FPGS_CONTACT_END_GAP_SLOP:
                 rhs += phi * inv_dt
     elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
         if phi >= 0.0:
@@ -5045,7 +5050,7 @@ def compute_mf_rhs_bias(
                 if has_target_velocity != 0:
                     target_velocity = mf_target_velocity[world, i]
                 end_gap = phi_val + dt * (jv_position - target_velocity)
-            if preserve_unreached_speculative != 0 and end_gap > 0.0:
+            if preserve_unreached_speculative != 0 and end_gap > _FPGS_CONTACT_END_GAP_SLOP:
                 bias = phi_val / dt
             else:
                 bias = speculative_scale * phi_val / dt
@@ -5549,7 +5554,7 @@ def compute_propagation_rhs_bias(
                     for k in range(6):
                         jv_position += propagation_J_b[world, i, k] * position_body_qd[bb, k]
                 end_gap = phi_val + dt * jv_position
-            if preserve_unreached_speculative != 0 and end_gap > 0.0:
+            if preserve_unreached_speculative != 0 and end_gap > _FPGS_CONTACT_END_GAP_SLOP:
                 bias = phi_val / dt
             else:
                 bias = speculative_scale * phi_val / dt
