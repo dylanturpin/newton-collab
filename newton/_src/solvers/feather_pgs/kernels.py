@@ -4933,19 +4933,20 @@ def compute_mf_effective_mass_and_rhs(
     mf_rhs[world, i] = bias
 
 
-# Complementarity test for the velocity pass: a contact row is loaded iff the
-# position solve gave it a positive impulse. With warm start disabled the
-# impulses are zero-initialised each substep, so a slack row carries exactly
-# zero and the comparison is exact rather than a tolerance -- an absolute
-# impulse threshold would be wrong here, because impulse magnitude scales with
-# effective mass, units and timestep and says nothing about whether the
-# position solution reached the contact boundary. A lightly loaded row with an
-# arbitrarily small positive impulse is genuinely in contact and must lose its
-# speculative allowance. The robust general predicate is the end-of-solve gap
-# phi + h*(J v_position - v_target), which is expressed in distance rather than
-# impulse; it requires a per-row J*v that this pass does not currently compute,
-# and is a prerequisite for warm-start configurations (see the constructor
-# guard) and for restitution, which needs the same quantity.
+# Cold-start participation heuristic for the velocity pass: a contact row is
+# treated as having participated in the position solve iff it came out with a
+# positive impulse. This is not an exact complementarity test -- lambda = 0 with
+# a zero end-gap is valid complementarity, and a finite coupled PGS can leave a
+# positive impulse on a row that ends up slack -- but with warm start disabled
+# the impulses start each substep at zero, which makes it a cheap and reliable
+# indication in the cold-started case this solver supports. An absolute impulse
+# threshold would be worse than either: impulse magnitude scales with effective
+# mass, units and timestep, so a light body's genuine impact falls below any
+# fixed cutoff. The robust predicate is the end-of-solve gap
+# phi + h*(J v_position - v_target), retaining the allowance only while that
+# stays positive; it is expressed in distance rather than impulse, needs a
+# per-row J*v this pass does not compute, and is the prerequisite for lifting
+# the warm-start restriction enforced in the solver constructor.
 
 
 @wp.kernel

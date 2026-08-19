@@ -702,6 +702,10 @@ class SolverFeatherPGS(SolverBase):
                 rows stored per world. Free rigid body contacts are stored separately, bounded by
                 mf_max_constraints. Defaults to 32.
             pgs_warmstart (bool, optional): Re-use impulses from the previous frame when contacts persist. Defaults to False.
+                Not supported together with ``pgs_velocity_iterations > 0``: the velocity pass
+                identifies rows that participated in the position solve by their impulse, which
+                warm-start residue makes unreliable. The same restriction applies to
+                ``mf_warmstart`` and to the ``IL_NEWTON_FPGS_MF_WARMSTART`` environment override.
             pgs_mode (str, optional): PGS mode. "dense" builds the full Delassus matrix C = J*H^{-1}*J^T
                 and solves in impulse space (Gauss-Seidel) for all contacts. "split" uses the dense
                 path for articulated bodies and a cheaper matrix-free PGS path for free rigid body
@@ -936,18 +940,6 @@ class SolverFeatherPGS(SolverBase):
             "propagation-colored",
         )
         self.pgs_warmstart = pgs_warmstart
-        if self.pgs_warmstart and self.pgs_velocity_iterations > 0:
-            # The velocity pass decides whether a contact row is loaded from its
-            # position impulse, which is an exact complementarity test only while
-            # impulses start each substep at zero. Warm start seeds them from the
-            # previous substep, so a slack row can carry residue and be treated as
-            # loaded -- it would then lose its speculative allowance and stop a
-            # body that never reached the surface. Lifting this needs the
-            # end-of-solve gap predicate rather than the impulse.
-            raise NotImplementedError(
-                "pgs_warmstart with pgs_velocity_iterations > 0 is not supported: the velocity pass "
-                "classifies contact rows by position impulse, which warm-start residue makes unreliable"
-            )
         if self.pgs_warmstart and self.contact_friction_position_iterations >= 0:
             raise NotImplementedError(
                 "contact_friction_position_iterations with pgs_warmstart=True needs an explicit "
@@ -963,6 +955,26 @@ class SolverFeatherPGS(SolverBase):
         # allocated, so the determinism/bit-identity ladder is unaffected.
         _env_ws = os.getenv("IL_NEWTON_FPGS_MF_WARMSTART", "0").lower() in {"1", "true", "yes", "on"}
         self._mf_warmstart_enabled = bool(mf_warmstart) or _env_ws
+        if self.pgs_velocity_iterations > 0 and (self.pgs_warmstart or self._mf_warmstart_enabled):
+            # The velocity pass decides whether a contact row participated in the
+            # position solve by looking at its impulse, which only distinguishes
+            # participation while impulses start each substep at zero. Either
+            # warm-start mechanism seeds them from the previous substep, so a
+            # slack row can carry residue, be taken for a loaded one, lose its
+            # speculative allowance, and stop a body that never reached the
+            # surface. Both entry points are covered here, including the
+            # IL_NEWTON_FPGS_MF_WARMSTART environment override folded into
+            # _mf_warmstart_enabled. Lifting this needs the end-of-solve gap
+            # predicate rather than the impulse.
+            enabled = []
+            if self.pgs_warmstart:
+                enabled.append("pgs_warmstart")
+            if self._mf_warmstart_enabled:
+                enabled.append("mf_warmstart")
+            raise NotImplementedError(
+                f"{' and '.join(enabled)} with pgs_velocity_iterations > 0 is not supported: the velocity "
+                "pass classifies contact rows by position impulse, which warm-start residue makes unreliable"
+            )
         try:
             self._mf_warmstart_decay = float(os.getenv("IL_NEWTON_FPGS_MF_WARMSTART_DECAY", str(mf_warmstart_decay)))
         except (TypeError, ValueError):
