@@ -1751,12 +1751,17 @@ Shape material properties control contact resolution. Configure via :class:`~Mod
 .. note::
    :class:`~newton.solvers.SolverXPBD` requires ``enable_restitution=True`` on
    the solver constructor before ``restitution`` takes effect.
-   :class:`~newton.solvers.SolverFeatherPGS` applies restitution only with
-   ``pgs_mode="matrix_free"`` and positive ``pgs_velocity_iterations``. It
-   averages the two shape coefficients and uses a configurable incident-speed
-   threshold to suppress low-speed resting-contact bounce. Coefficients are
-   read while rebuilding rows, so in-place material updates work under an
-   already-captured graph when the velocity pass was enabled at construction.
+   :class:`~newton.solvers.SolverFeatherPGS` applies restitution with
+   ``pgs_mode="matrix_free"``. It automatically runs one velocity-only
+   correction iteration when constructed with positive restitution;
+   ``pgs_velocity_iterations`` can request a larger total iteration count for
+   coupled-contact convergence. It averages the two shape coefficients and uses
+   a configurable incident-speed threshold to suppress low-speed resting-contact
+   bounce. Coefficients are read while rebuilding rows, so in-place material
+   updates work under an already-captured graph when restitution storage was
+   provisioned by positive construction-time material or explicit velocity
+   iterations. Enabling restitution on an all-zero, zero-iteration solver
+   requires reconstructing the solver and recapturing its graph.
 
 Example:
 

@@ -444,10 +444,12 @@ class SolverFeatherPGS(SolverBase):
             solver.step(state_in, state_out, control, contacts, dt)
             state_in, state_out = state_out, state_in
 
-    Rigid-contact restitution is available in ``pgs_mode="matrix_free"`` when
-    ``pgs_velocity_iterations`` is positive. It uses the arithmetic mean of the
-    two shape coefficients and evaluates the rebound target from the incident
-    relative normal velocity before speculative contact impulses are applied.
+    Rigid-contact restitution is available in ``pgs_mode="matrix_free"``. It
+    uses the arithmetic mean of the two shape coefficients and evaluates the
+    rebound target from the incident relative normal velocity before
+    speculative contact impulses are applied. A model constructed with positive
+    restitution automatically receives one velocity-only correction iteration;
+    ``pgs_velocity_iterations`` can request a larger total count explicitly.
 
     """
 
@@ -683,14 +685,15 @@ class SolverFeatherPGS(SolverBase):
                 iterations under ``pgs_velocity_drive_mode="freeze"``, exactly like the
                 dedicated rows it replaces. Defaults to True.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
-            pgs_velocity_iterations (int, optional): Additional matrix-free iterations using a velocity-only RHS
+            pgs_velocity_iterations (int, optional): Number of matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
                 geometric bias corrects positions first, then final velocity iterations run without Baumgarte bias.
                 Positive-gap rows whose linearized position trajectory remains separated by more than a 1e-6 m
                 numerical slop keep their speculative closing allowance; rows within the slop use the unbiased
-                contact law. Positive shape restitution is applied automatically in this pass; therefore a
-                matrix-free model containing a positive restitution coefficient requires at least one velocity
-                iteration. Only supported with ``pgs_mode="matrix_free"``. Defaults to 0.
+                contact law. A matrix-free model constructed with positive shape restitution runs at least one such
+                iteration automatically. A positive value sets the total velocity-only iteration count and can
+                improve convergence for coupled contacts. Only supported with ``pgs_mode="matrix_free"``. Defaults
+                to 0.
             pgs_beta (float, optional): ERP style position correction factor. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
             dense_contact_compliance (float, optional): Normal contact compliance [m/N] applied
@@ -1005,16 +1008,17 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_schedule = pgs_schedule
         if self.pgs_velocity_iterations > 0 and self.pgs_mode != "matrix_free":
             raise ValueError("pgs_velocity_iterations is currently only supported with pgs_mode='matrix_free'")
-        if (
+        has_positive_restitution = (
             self.pgs_mode == "matrix_free"
-            and self.pgs_velocity_iterations <= 0
+            and self.pgs_velocity_iterations == 0
             and self._model_has_positive_restitution(model)
-        ):
-            raise ValueError(
-                "FeatherPGS restitution requires pgs_velocity_iterations > 0 with pgs_mode='matrix_free'; "
-                "shape_material_restitution contains a positive coefficient"
-            )
-        self._restitution_buffers_enabled = self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0
+        )
+        self._velocity_post_iterations = max(self.pgs_velocity_iterations, int(has_positive_restitution))
+        # Explicit velocity iterations reserve restitution storage even when all
+        # coefficients start at zero, allowing later in-place material updates.
+        self._restitution_buffers_enabled = self.pgs_mode == "matrix_free" and (
+            has_positive_restitution or self.pgs_velocity_iterations > 0
+        )
         if drive_mode not in ("augmented", "physx_pgs"):
             raise ValueError(f"drive_mode must be 'augmented' or 'physx_pgs', got {drive_mode!r}")
         if drive_mode == "physx_pgs" and self.pgs_mode != "matrix_free":
@@ -1105,11 +1109,9 @@ class SolverFeatherPGS(SolverBase):
         self._double_buffer = double_buffer
         self._nvtx = nvtx
         self.pgs_debug = pgs_debug
-        # Debug capture buffers (``_debug_stage3_*`` / ``_debug_position_*``) are
-        # only consumed by the pgs_debug diagnostics and the velocity-iteration
-        # position snapshot; skip allocating them (several GB at large world
-        # counts) when neither path can run.
-        self._debug_buffers_enabled = bool(pgs_debug) or self.pgs_velocity_iterations > 0
+        # The position/velocity split needs only v_out_snap. Full row snapshots
+        # are diagnostics and can consume several GB in large batched models.
+        self._debug_buffers_enabled = bool(pgs_debug)
         self._pgs_convergence_log: list[np.ndarray] = []
         # Per-step, per-iteration NCP / MDP residual log for the matrix_free
         # debug path. Each entry is an ndarray of shape
@@ -1374,8 +1376,9 @@ class SolverFeatherPGS(SolverBase):
             and self._model_has_positive_restitution(self.model)
         ):
             raise RuntimeError(
-                "A positive shape restitution coefficient was added to a FeatherPGS solver without a "
-                "velocity pass; reconstruct it with pgs_velocity_iterations > 0 and recapture any CUDA graph"
+                "A positive shape restitution coefficient was added to a FeatherPGS solver that was constructed "
+                "without restitution storage; reconstruct the solver and recapture any CUDA graph, or "
+                "construct it with positive restitution or pgs_velocity_iterations > 0 before capture."
             )
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
             self._update_kinematic_state()
@@ -4834,7 +4837,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def _run_matrix_free_velocity_post_solve(self) -> None:
-        if self.pgs_velocity_iterations <= 0:
+        if self._velocity_post_iterations <= 0:
             return
 
         self._pack_mf_meta(self.mf_rhs_unbiased)
@@ -4843,10 +4846,10 @@ class SolverFeatherPGS(SolverBase):
                 dense_rhs=self.rhs_unbiased,
                 propagation_rhs=self.propagation_rhs_unbiased,
                 mf_meta=self.mf_meta_packed,
-                iterations=self.pgs_velocity_iterations,
+                iterations=self._velocity_post_iterations,
                 omega=self.pgs_velocity_omega,
                 friction_start_iteration=self._contact_friction_start_iteration(
-                    self.pgs_velocity_iterations, velocity_pass=True
+                    self._velocity_post_iterations, velocity_pass=True
                 ),
                 freeze_drive_rows=self.pgs_velocity_drive_mode == "freeze",
             )
@@ -4854,10 +4857,10 @@ class SolverFeatherPGS(SolverBase):
             self._launch_matrix_free_gs_solve(
                 dense_rhs=self.rhs_unbiased,
                 mf_meta=self.mf_meta_packed,
-                iterations=self.pgs_velocity_iterations,
+                iterations=self._velocity_post_iterations,
                 omega=self.pgs_velocity_omega,
                 friction_start_iteration=self._contact_friction_start_iteration(
-                    self.pgs_velocity_iterations, velocity_pass=True
+                    self._velocity_post_iterations, velocity_pass=True
                 ),
                 freeze_drive_rows=self.pgs_velocity_drive_mode == "freeze",
             )
@@ -4870,13 +4873,13 @@ class SolverFeatherPGS(SolverBase):
         # joint-position delta from the original drive position bias. The
         # velocity-pass descriptor below approximates that delta as
         # ``dt * J * v_position_solve``.
-        velocity_drive_position_delta_scale = 1.0 if self.pgs_velocity_drive_mode == "active" else 0.0
-        self._stage4_compute_physx_drive_desc(
-            dt,
-            position_bias_scale=1.0,
-            position_delta_velocity=self.v_out_snap,
-            position_delta_scale=velocity_drive_position_delta_scale,
-        )
+        if self.pgs_velocity_drive_mode == "active":
+            self._stage4_compute_physx_drive_desc(
+                dt,
+                position_bias_scale=1.0,
+                position_delta_velocity=self.v_out_snap,
+                position_delta_scale=1.0,
+            )
         self._stage4_compute_rhs_world(
             dt,
             bias_scale=0.0,
@@ -4906,9 +4909,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def _snapshot_matrix_free_position_problem(self, contacts: Contacts | None) -> None:
-        """Copy the biased q0 position-solve problem before concluding rows for velocity iterations."""
-        # The _debug_position_* buffers only exist when debugging or velocity
-        # iterations were requested at construction time.
+        """Copy the biased q0 position-solve problem for diagnostics."""
         assert self._debug_buffers_enabled, "debug capture buffers were not allocated"
         wp.copy(self._debug_position_constraint_count, self.constraint_count)
         wp.copy(self._debug_position_impulses, self.impulses)
@@ -5498,7 +5499,7 @@ class SolverFeatherPGS(SolverBase):
 
             self._stage6_clamp_rigid_velocity_limits()
 
-            if self.pgs_velocity_iterations > 0:
+            if self._velocity_post_iterations > 0:
                 if self._propagation_contacts_enabled() and self.pgs_iterations > 0:
                     phase_5_wrote_velocity = self._split_matrix_free_row_phase_may_have_work(5)
                     contact_then_internal_wrote_velocity = (
@@ -5510,11 +5511,11 @@ class SolverFeatherPGS(SolverBase):
                         # phase. Later internal rows update v_out only, so bring
                         # the classifier back to the velocity being integrated.
                         self._refresh_propagation_body_qd_from_vout(force=True)
-                wp.copy(self._debug_position_v_out, self.v_out)
-                self._snapshot_matrix_free_position_problem(contacts)
+                if self.pgs_debug:
+                    wp.copy(self._debug_position_v_out, self.v_out)
+                    self._snapshot_matrix_free_position_problem(contacts)
                 wp.copy(self.v_out_snap, self.v_out)
                 self._conclude_matrix_free_position_problem(dt)
-                wp.copy(self.v_out, self.v_out_snap)
                 wp.copy(self.v_hat, self.v_out_snap)
                 self._clamp_rigid_velocity_limits(self.v_hat)
                 self._run_matrix_free_velocity_post_solve()
@@ -5618,7 +5619,7 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 7: Update qdd + integrate
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
+            if self.pgs_mode == "matrix_free" and self._velocity_post_iterations > 0:
                 self._stage6_write_final_velocity(state_in, state_aug, state_out, dt)
             else:
                 self._stage6_update_qdd(state_in, state_aug, dt)
@@ -8402,7 +8403,8 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[state_out.joint_q, state_out.joint_qd],
                 device=model.device,
             )
-            eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+            # _stage6_write_final_velocity replaces joint_qd and evaluates FK
+            # once, so evaluating the temporary position velocity here is wasteful.
 
         self.integrate_particles(model, state_in, state_out, dt)
 

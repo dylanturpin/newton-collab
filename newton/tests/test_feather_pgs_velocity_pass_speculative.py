@@ -159,7 +159,11 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
     model = builder.finalize(device=device)
     with mock.patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "0"}):
         solver = newton.solvers.SolverFeatherPGS(
-            model, angular_damping=0.0, pgs_mode="matrix_free", pgs_velocity_iterations=velocity_iterations
+            model,
+            angular_damping=0.0,
+            pgs_mode="matrix_free",
+            pgs_velocity_iterations=velocity_iterations,
+            pgs_debug=True,
         )
     state_0, state_1 = model.state(), model.state()
     # A free body is driven through joint_qd; writing body_qd alone is discarded

@@ -118,7 +118,7 @@ def _build_plane_model(
 def _make_solver(
     model,
     *,
-    velocity_iterations=8,
+    velocity_iterations=0,
     response="immediate",
     restitution_velocity_threshold=0.0,
     pgs_iterations=16,
@@ -645,16 +645,19 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
                 test.assertGreater(float(end_gap[world]), 0.0, f"world {world} unexpectedly reached the surface")
 
 
-def test_restitution_configuration_requires_a_velocity_pass(test, device):
-    """Reject positive restitution without velocity iterations and validate the threshold."""
+def test_restitution_runs_automatically_and_validates_configuration(test, device):
+    """Provision one automatic restitution sweep and validate configuration boundaries."""
     positive_model, _ = _build_plane_model(
         device,
         separation=1.0e-3,
         restitution=0.6,
     )
-    error_pattern = "restitution.*pgs_velocity_iterations|pgs_velocity_iterations.*restitution"
-    with test.assertRaisesRegex(ValueError, error_pattern):
-        _make_solver(positive_model, velocity_iterations=0)
+    automatic_solver = _make_solver(positive_model, velocity_iterations=0)
+    test.assertEqual(automatic_solver.pgs_velocity_iterations, 0)
+    test.assertEqual(automatic_solver._velocity_post_iterations, 1)
+    test.assertTrue(automatic_solver._restitution_buffers_enabled)
+    test.assertFalse(automatic_solver._debug_buffers_enabled)
+    test.assertIsNone(automatic_solver._debug_position_v_out)
     for invalid_threshold in (-1.0, float("nan"), float("inf")):
         with test.subTest(invalid_threshold=invalid_threshold):
             with test.assertRaisesRegex(ValueError, "restitution_velocity_threshold"):
@@ -667,17 +670,23 @@ def test_restitution_configuration_requires_a_velocity_pass(test, device):
     )
     zero_solver = _make_solver(zero_model, velocity_iterations=0)
     test.assertEqual(zero_solver.pgs_velocity_iterations, 0)
+    test.assertEqual(zero_solver._velocity_post_iterations, 0)
+    test.assertFalse(zero_solver._restitution_buffers_enabled)
 
-    default_solver = _make_solver(positive_model, velocity_iterations=1, restitution_velocity_threshold=None)
+    zero_model.shape_material_restitution.fill_(0.6)
+    with test.assertRaisesRegex(RuntimeError, "reconstruct.*recapture"):
+        zero_solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+
+    default_solver = _make_solver(positive_model, velocity_iterations=0, restitution_velocity_threshold=None)
     test.assertAlmostEqual(default_solver.restitution_velocity_threshold, 0.5)
 
 
-def test_explicit_velocity_iteration_counts_reach_the_same_single_row_solution(test, device):
-    """Reach the analytical one-row result for every positive explicit iteration count."""
+def test_velocity_iteration_counts_reach_the_same_single_row_solution(test, device):
+    """Reach the one-row result with the automatic sweep and explicit refinement counts."""
     restitution = 0.7
     speed = 2.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
-    for iterations in (1, 4, 12):
+    for iterations in (0, 1, 4, 12):
         with test.subTest(velocity_iterations=iterations):
             result = _step_plane(
                 device,
@@ -803,9 +812,9 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
         model, body = _build_plane_model(
             device,
             separation=separation,
-            restitution=0.0,
+            restitution=0.25,
         )
-        solver = _make_solver(model, velocity_iterations=8)
+        solver = _make_solver(model, velocity_iterations=0)
         state_in, state_out = model.state(), model.state()
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
         contacts = pipeline.contacts()
@@ -837,9 +846,10 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
     with wp.ScopedCapture(device) as capture:
         graph_step()
 
-    # Enable restitution only after capture. The velocity-pass configuration
-    # owns stable row storage, while the value itself must come from the current
-    # model array rather than a captured host scalar.
+    # Change restitution after capture. Positive construction-time material
+    # provisioned the automatic pass and stable row storage, while the current
+    # coefficient must still come from the device array rather than a captured
+    # host scalar.
     graph_model.shape_material_restitution.fill_(0.75)
     eager_model.shape_material_restitution.fill_(0.75)
     wp.capture_launch(capture.graph)
@@ -873,8 +883,8 @@ for _fn in (
     test_restitution_is_relative_to_a_moving_kinematic_surface,
     test_every_contact_response_route_enforces_restitution,
     test_multiworld_restitution_keeps_case_data_isolated,
-    test_restitution_configuration_requires_a_velocity_pass,
-    test_explicit_velocity_iteration_counts_reach_the_same_single_row_solution,
+    test_restitution_runs_automatically_and_validates_configuration,
+    test_velocity_iteration_counts_reach_the_same_single_row_solution,
     test_warm_start_history_does_not_change_or_repeat_restitution,
     test_redundant_box_contacts_do_not_multiply_restitution_energy,
     test_cuda_graph_replay_reads_current_restitution_and_matches_eager,

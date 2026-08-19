@@ -179,8 +179,7 @@ formulation.
   :class:`~newton.solvers.SolverSemiImplicit`.
 - ``restitution``: :class:`~newton.solvers.SolverXPBD` when
   ``enable_restitution=True``, :class:`~newton.solvers.SolverFeatherPGS` when
-  ``pgs_mode="matrix_free"`` and ``pgs_velocity_iterations > 0``, and
-  :class:`~newton.solvers.SolverKamino`.
+  ``pgs_mode="matrix_free"``, and :class:`~newton.solvers.SolverKamino`.
 - ``mu_torsional`` / ``mu_rolling``: :class:`~newton.solvers.SolverXPBD` and
   :class:`~newton.solvers.SolverMuJoCo`.
 - ``kh``: consumed by hydroelastic contact generation for Newton-generated
