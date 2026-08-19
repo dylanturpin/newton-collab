@@ -289,6 +289,11 @@ def test_crossing_result_is_invariant_to_dt_and_time_of_impact(test, device):
     restitution = 0.65
     speed = 3.0
     cases = (
+        # At impact_fraction -> 0 the single-state position law coincides with
+        # the analytical rebound (both e*speed*dt), so the first case anchors
+        # the position assertions to exact ground truth; the rest pin the law
+        # and its known (1+e)*separation deviation across the step phase.
+        (1.0e-3, 0.01),
         (2.5e-4, 0.1),
         (2.5e-4, 0.9),
         (1.0e-3, 0.5),
@@ -445,8 +450,66 @@ def test_restitution_velocity_threshold_uses_incident_relative_speed(test, devic
         restitution_velocity_threshold=threshold,
     )
     test.assertEqual(count, 1, "relative-threshold test generated no unique contact")
-    _assert_velocity(test, out_a, 9.8, 0.4, "relative threshold, body A")
-    _assert_velocity(test, out_b, 9.8, 0.4, "relative threshold, body B")
+    # Restitution is suppressed, but the pair still closes the remaining gap
+    # under the speculative allowance and arrives touching with relative speed
+    # separation/dt, the impulse shared equally between the equal masses -- the
+    # same rule the single-body sub-cases assert above. Expecting a common 9.8
+    # would freeze the bodies mid-air while still separated.
+    residual_closing = IMPACT_FRACTION * (10.0 - 9.6)
+    _assert_velocity(test, out_a, 9.8 + 0.5 * residual_closing, 0.4, "relative threshold, body A")
+    _assert_velocity(test, out_b, 9.8 - 0.5 * residual_closing, 0.4, "relative threshold, body B")
+    test.assertAlmostEqual(out_a + out_b, 19.6, delta=1.0e-4, msg="relative threshold: momentum drifted")
+
+
+def test_bouncing_ball_settles_to_rest_under_gravity(test, device):
+    """Settle a bouncing ball on the surface without perpetual micro-bounce or sinking.
+
+    Restitution shares the contact row with the speculative/Baumgarte law, so
+    the long-run interaction with resting contact is a distinct failure mode
+    from any single-impact assertion: a bounce target that keeps firing at
+    resting speeds produces a Zeno micro-bounce, while an over-eager gate
+    lets the row sink. Impacts decay 2.0 -> 1.0 -> 0.5 m/s, the third landing
+    falls at the 0.5 m/s threshold and is suppressed, and the tail of the
+    rollout must be quiescent on the surface.
+    """
+    restitution = 0.5
+    speed = 2.0
+    gravity = 9.81
+    separation = IMPACT_FRACTION * speed * DEFAULT_DT
+    model, body = _build_plane_model(
+        device,
+        separation=separation,
+        restitution=restitution,
+        gravity=(0.0, 0.0, -gravity),
+    )
+    solver = _make_solver(model, restitution_velocity_threshold=0.5)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    contacts = pipeline.contacts()
+    state_in, state_out = model.state(), model.state()
+    _reset_state(model, state_in, -speed)
+
+    heights, speeds = [], []
+    for _ in range(800):
+        contacts.clear()
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
+        state_in, state_out = state_out, state_in
+        heights.append(float(state_in.body_q.numpy()[body][2]))
+        speeds.append(float(state_in.body_qd.numpy()[body][2]))
+    heights = np.array(heights)
+    speeds = np.array(speeds)
+
+    # Non-vacuity: the first impact must actually rebound at ~e*speed.
+    test.assertGreater(float(speeds[:100].max()), 0.9 * restitution * speed, "the ball never bounced")
+    test.assertLess(float(heights.min()), RADIUS + 1.0e-3, "the ball never reached the surface")
+    test.assertGreater(float(heights.min()), RADIUS - 2.0e-3, "the ball sank through the plane")
+    # Quiescence: by 0.6 s every impact is below the threshold, so the tail
+    # must rest on the surface instead of bouncing or creeping.
+    tail_heights = heights[-200:]
+    tail_speeds = speeds[-200:]
+    test.assertLess(float(np.abs(tail_speeds).max()), 0.1, "resting contact kept bouncing")
+    test.assertLess(float(tail_heights.max()), RADIUS + 1.5e-3, "resting contact hovered above the surface")
+    test.assertGreater(float(tail_heights.min()), RADIUS - 1.5e-3, "resting contact sank into the plane")
 
 
 def _build_two_sphere_model(device, *, separation, restitution, mass_a, mass_b):
@@ -1038,6 +1101,7 @@ for _fn in (
     test_non_crossing_speculative_contact_does_not_bounce,
     test_shape_restitution_uses_symmetric_arithmetic_average,
     test_restitution_velocity_threshold_uses_incident_relative_speed,
+    test_bouncing_ball_settles_to_rest_under_gravity,
     test_two_body_impact_conserves_momentum_and_reverses_relative_speed,
     test_restitution_is_relative_to_a_moving_kinematic_surface,
     test_every_contact_response_route_enforces_restitution,
