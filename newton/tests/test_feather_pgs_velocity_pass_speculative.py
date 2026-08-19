@@ -15,8 +15,8 @@ No restitution is involved anywhere here: this is ordinary free fall with
 ``pgs_velocity_iterations`` enabled.
 """
 
-import os
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -53,7 +53,7 @@ EXPECTED_PATHS = {
 }
 
 
-def _build(scene, mass=1.0):
+def _build(device, scene, mass=1.0):
     """Free sphere, or a two-link articulation whose root carries the contact."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
@@ -79,12 +79,12 @@ def _build(scene, mass=1.0):
         )
         builder.add_articulation([root_joint, hinge])
     builder.add_ground_plane(cfg=cfg)
-    return builder.finalize(device=wp.get_device()), body
+    return builder.finalize(device=device), body
 
 
 def _drop(device, velocity_iterations, response="immediate", steps=620, scene="free"):
     """Drop a body onto a plane; return heights, velocities, contact counts, routes."""
-    model, body = _build(scene)
+    model, body = _build(device, scene)
     solver = newton.solvers.SolverFeatherPGS(
         model,
         angular_damping=0.0,
@@ -126,9 +126,10 @@ def _assert_landed(test, heights, velocities, counts, label):
 def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
     """One step of a body ``gap`` above the plane closing at ``approach_speed``.
 
-    Returns the velocity before and after, the contact count, the row's gap, and
-    the position-solve impulse, so a test can confirm it exercised a genuine
-    positive-gap contact rather than passing because nothing was generated.
+    Returns the velocity before and after, the contact count, the position-pass
+    impulse on positive-gap rows, and the largest such gap, so a test can
+    confirm it exercised a genuine speculative contact rather than passing
+    because nothing was generated.
     """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))  # no gravity: isolate the constraint
     # density=0 so the body's mass is exactly the requested value: the point of
@@ -137,7 +138,7 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
     body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, RADIUS + gap), wp.quat_identity()), mass=mass)
     builder.add_shape_sphere(body, radius=RADIUS, cfg=cfg)
     builder.add_ground_plane(cfg=cfg)
-    model = builder.finalize(device=wp.get_device())
+    model = builder.finalize(device=device)
     solver = newton.solvers.SolverFeatherPGS(
         model, angular_damping=0.0, pgs_mode="matrix_free", pgs_velocity_iterations=velocity_iterations
     )
@@ -153,8 +154,15 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
     state_0.clear_forces()
     solver.step(state_0, state_1, model.control(), contacts, SIM_DT)
     n = int(contacts.rigid_contact_count.numpy()[0])
-    impulse = float(np.abs(solver.mf_impulses.numpy()).max())
-    return before, float(state_1.body_qd.numpy()[body][2]), n, impulse
+    # The classification reads the impulse the POSITION solve produced;
+    # solver.mf_impulses has since been overwritten by the velocity pass.
+    rows = int(solver.mf_constraint_count.numpy()[0])
+    phi = solver._debug_position_mf_phi.numpy()[0][:rows]
+    lam = solver._debug_position_mf_impulses.numpy()[0][:rows]
+    contact_rows = np.flatnonzero(phi > 0.0)
+    position_impulse = float(lam[contact_rows].max()) if contact_rows.size else 0.0
+    max_phi = float(phi[contact_rows].max()) if contact_rows.size else 0.0
+    return before, float(state_1.body_qd.numpy()[body][2]), n, position_impulse, max_phi
 
 
 def test_velocity_iterations_do_not_halt_a_falling_body(test, device):
@@ -208,9 +216,10 @@ def test_non_crossing_row_keeps_its_speculative_allowance(test, device):
     approach and brake a body still far from contact.
     """
     gap = 0.02
-    before, after, n, impulse = _single_step(device, gap, 0.5 * gap / SIM_DT)
+    before, after, n, impulse, phi = _single_step(device, gap, 0.5 * gap / SIM_DT)
     test.assertLess(before, -1.0, "setup failed to give the body an approach velocity")
     test.assertGreater(n, 0, "no speculative contact was generated, so the branch was never reached")
+    test.assertGreater(phi, 0.0, "the row under test was not a positive-gap speculative contact")
     test.assertEqual(impulse, 0.0, f"a non-crossing row took a position impulse of {impulse:.3e}")
     test.assertAlmostEqual(
         after, before, delta=0.02 * abs(before), msg=f"free approach was braked: {before:.3f} -> {after:.3f} m/s"
@@ -224,9 +233,10 @@ def test_crossing_row_loses_its_speculative_allowance(test, device):
     rate instead, which this bound catches.
     """
     gap = 0.002
-    before, after, n, impulse = _single_step(device, gap, 5.0 * gap / SIM_DT)
+    before, after, n, impulse, phi = _single_step(device, gap, 5.0 * gap / SIM_DT)
     test.assertLess(before, -1.0, "setup failed to give the body an approach velocity")
     test.assertGreater(n, 0, "no contact was generated")
+    test.assertGreater(phi, 0.0, "the row under test was not a positive-gap speculative contact")
     test.assertGreater(impulse, 0.0, "a crossing row took no position impulse, so it was never classified loaded")
     # Magnitude, not a signed bound: "after <= 0.05*|before|" is satisfied by any
     # negative value, so a row that merely slowed from -20 to -4 m/s would pass.
@@ -248,9 +258,13 @@ def test_light_body_crossing_is_still_classified_loaded(test, device):
     unphysical: the point is the classification boundary, not the scenario.
     """
     gap = 0.002
-    before, after, n, impulse = _single_step(device, gap, 5.0 * gap / SIM_DT, mass=1.0e-12)
+    before, after, n, impulse, phi = _single_step(device, gap, 5.0 * gap / SIM_DT, mass=1.0e-12)
     test.assertGreater(n, 0, "no contact was generated")
+    test.assertGreater(phi, 0.0, "the row under test was not a positive-gap speculative contact")
+    # Straddles the 1e-9 cutoff this implementation once used: positive, so the
+    # row genuinely loaded, yet small enough that an absolute threshold misses it.
     test.assertGreater(impulse, 0.0, "light crossing row took no position impulse")
+    test.assertLess(impulse, 1.0e-9, f"position impulse {impulse:.3e} does not straddle the old 1e-9 cutoff")
     test.assertLess(
         abs(after),
         0.05 * abs(before),
@@ -264,7 +278,7 @@ def test_warm_start_with_velocity_iterations_is_rejected(test, device):
     Warm start seeds the impulse array the velocity pass reads to decide which
     rows participated, so residue would revive the stopping behaviour.
     """
-    model, _body = _build("free")
+    model, _body = _build(device, "free")
 
     def make(**kwargs):
         return newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_velocity_iterations=4, **kwargs)
@@ -273,12 +287,9 @@ def test_warm_start_with_velocity_iterations_is_rejected(test, device):
         make(pgs_warmstart=True)
     with test.assertRaises(NotImplementedError):
         make(mf_warmstart=True)
-    os.environ["IL_NEWTON_FPGS_MF_WARMSTART"] = "1"
-    try:
+    with mock.patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "1"}):
         with test.assertRaises(NotImplementedError):
             make()
-    finally:
-        os.environ.pop("IL_NEWTON_FPGS_MF_WARMSTART", None)
     # Warm start remains available when no velocity pass runs.
     newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_velocity_iterations=0, pgs_warmstart=True)
 
