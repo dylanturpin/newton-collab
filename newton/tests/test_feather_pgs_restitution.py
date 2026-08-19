@@ -3,15 +3,14 @@
 
 """Analytical CUDA tests for FeatherPGS rigid-contact restitution.
 
-The position solve advances a crossing speculative contact only to the impact
-surface.  The velocity pass must nevertheless use the incident velocity from
-before that solve and enforce Newton's impact law
+The ordinary normal contact row freezes the unconstrained incident velocity
+before solving and enforces Newton's impact law
 
     u_n^+ = -e u_n^-
 
-on the final velocity.  These tests use one-step, frictionless scenes so that
-the expected velocity and energy are closed-form rather than inferred from a
-later bounce height.
+for a contact predicted to reach the surface during the step. These tests use
+one-step, frictionless scenes so the expected velocity and energy are
+closed-form rather than inferred from a later bounce height.
 """
 
 import unittest
@@ -124,12 +123,13 @@ def _make_solver(
     pgs_iterations=16,
     pgs_warmstart=False,
     mf_warmstart=False,
+    pgs_mode="matrix_free",
 ):
-    """Construct the deterministic frictionless matrix-free test solver."""
+    """Construct a deterministic frictionless FeatherPGS test solver."""
     kwargs = {
         "angular_damping": 0.0,
         "enable_contact_friction": False,
-        "pgs_mode": "matrix_free",
+        "pgs_mode": pgs_mode,
         "articulated_contact_response": response,
         "pgs_iterations": pgs_iterations,
         "pgs_velocity_iterations": velocity_iterations,
@@ -170,9 +170,10 @@ def _step_plane(
     initial_vertical_velocity=None,
     scene="free",
     response="immediate",
-    velocity_iterations=8,
+    velocity_iterations=0,
     restitution_velocity_threshold=0.0,
     pgs_iterations=16,
+    pgs_mode="matrix_free",
 ):
     """Run one sphere-plane step and return observable contact and state data."""
     model, body = _build_plane_model(
@@ -190,6 +191,7 @@ def _step_plane(
         response=response,
         restitution_velocity_threshold=restitution_velocity_threshold,
         pgs_iterations=pgs_iterations,
+        pgs_mode=pgs_mode,
     )
     state_in, state_out = model.state(), model.state()
     vz = -speed if initial_vertical_velocity is None else initial_vertical_velocity
@@ -231,18 +233,31 @@ def _assert_crossing_setup(test, result, separation, speed, dt, label):
     test.assertLess(separation, speed * dt, f"{label}: contact could not reach the surface this step")
     test.assertEqual(result["contact_count"], 1, f"{label}: expected exactly one contact")
     _assert_velocity(test, result["before"], -speed, speed, f"{label}, incident state", rtol=1.0e-6, atol=1.0e-6)
-    position_tolerance = max(5.0e-6, 0.03 * separation)
-    test.assertLess(
-        abs(result["end_gap"]),
-        position_tolerance,
-        f"{label}: position solve ended at {result['end_gap']:+.3e} m",
+
+
+def _assert_restitution_row_position(test, result, separation, speed, restitution, dt, label):
+    """Assert the single-state PGS position law and its known time-of-impact error."""
+    expected_gap = separation + restitution * speed * dt
+    test.assertAlmostEqual(
+        result["end_gap"],
+        expected_gap,
+        delta=max(5.0e-6, 3.0e-3 * expected_gap),
+        msg=f"{label}: ordinary restitution row used an unexpected position trajectory",
+    )
+    physical_gap = restitution * (speed * dt - separation)
+    expected_error = (1.0 + restitution) * separation
+    test.assertAlmostEqual(
+        result["end_gap"] - physical_gap,
+        expected_error,
+        delta=max(8.0e-6, 4.0e-3 * expected_error),
+        msg=f"{label}: phase-dependent position error changed unexpectedly",
     )
 
 
 def test_one_step_restitution_law_over_coefficient_speed_and_mass(test, device):
     """Enforce Newton's impact law across coefficient, speed, and mass scales."""
     cases = []
-    cases.extend((f"e={e}", e, 4.0, 1.0) for e in (0.0, 0.25, 0.6, 1.0))
+    cases.extend((f"e={e}", e, 4.0, 1.0) for e in (0.25, 0.6, 1.0))
     cases.extend((f"speed={speed}", 0.6, speed, 1.0) for speed in (0.05, 2.0, 20.0))
     cases.extend((f"mass={mass}", 0.6, 4.0, mass) for mass in (1.0e-6, 1.0, 1.0e6))
 
@@ -259,6 +274,7 @@ def test_one_step_restitution_law_over_coefficient_speed_and_mass(test, device):
             _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
             expected = restitution * speed
             _assert_velocity(test, result["after"], expected, speed, label)
+            _assert_restitution_row_position(test, result, separation, speed, restitution, DEFAULT_DT, label)
             energy_ratio = (result["after"] / speed) ** 2
             test.assertAlmostEqual(
                 energy_ratio,
@@ -279,18 +295,43 @@ def test_crossing_result_is_invariant_to_dt_and_time_of_impact(test, device):
         (1.0e-2, 0.1),
         (1.0e-2, 0.9),
     )
-    for dt, impact_fraction in cases:
-        label = f"dt={dt:g}, impact/dt={impact_fraction:g}"
-        with test.subTest(dt=dt, impact_fraction=impact_fraction):
-            separation = speed * dt * impact_fraction
+    for pgs_iterations in (1, 2, 8):
+        for dt, impact_fraction in cases:
+            label = f"iters={pgs_iterations}, dt={dt:g}, impact/dt={impact_fraction:g}"
+            with test.subTest(pgs_iterations=pgs_iterations, dt=dt, impact_fraction=impact_fraction):
+                separation = speed * dt * impact_fraction
+                result = _step_plane(
+                    device,
+                    separation=separation,
+                    speed=speed,
+                    restitution=restitution,
+                    dt=dt,
+                    pgs_iterations=pgs_iterations,
+                )
+                _assert_crossing_setup(test, result, separation, speed, dt, label)
+                _assert_velocity(test, result["after"], restitution * speed, speed, label)
+                _assert_restitution_row_position(test, result, separation, speed, restitution, dt, label)
+
+
+def test_penetrating_impact_replaces_baumgarte_with_restitution(test, device):
+    """Keep penetration correction out of the qualifying restitution target."""
+    restitution = 0.5
+    speed = 2.0
+    for penetration in (1.0e-5, 1.0e-4, 1.0e-3, 1.0e-2):
+        label = f"penetration={penetration:g}"
+        with test.subTest(penetration=penetration):
             result = _step_plane(
                 device,
-                separation=separation,
+                separation=-penetration,
                 speed=speed,
                 restitution=restitution,
-                dt=dt,
+                velocity_iterations=0,
+                pgs_iterations=8,
+                pgs_mode="split",
             )
-            _assert_crossing_setup(test, result, separation, speed, dt, label)
+            test.assertEqual(result["contact_count"], 1, f"{label}: expected exactly one contact")
+            test.assertEqual(result["paths"], {PATH_MATRIX_FREE}, f"{label}: wrong contact route")
+            _assert_velocity(test, result["before"], -speed, speed, f"{label}, incident state")
             _assert_velocity(test, result["after"], restitution * speed, speed, label)
 
 
@@ -313,7 +354,9 @@ def test_restitution_uses_the_post_force_incident_predictor(test, device):
 
     test.assertEqual(result["contact_count"], 1, "gravity case generated no unique contact")
     _assert_velocity(test, result["before"], -initial_speed, initial_speed, "gravity, authored velocity")
-    test.assertLess(abs(result["end_gap"]), 3.0e-4, "gravity case did not reach the surface")
+    _assert_restitution_row_position(
+        test, result, separation, incident_speed, restitution, dt, "gravity, post-force incident predictor"
+    )
     _assert_velocity(
         test,
         result["after"],
@@ -382,8 +425,12 @@ def test_restitution_velocity_threshold_uses_incident_relative_speed(test, devic
                 restitution_velocity_threshold=threshold,
             )
             _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
-            expected = restitution * speed if speed > threshold else 0.0
+            expected = restitution * speed if speed > threshold else -separation / DEFAULT_DT
             _assert_velocity(test, result["after"], expected, speed, label)
+            if speed > threshold:
+                _assert_restitution_row_position(test, result, separation, speed, restitution, DEFAULT_DT, label)
+            else:
+                test.assertLess(abs(result["end_gap"]), 5.0e-6, f"{label}: speculative row missed the surface")
 
     # Both bodies move quickly in the world frame, but their closing speed is
     # below the threshold. This catches a gate applied to either body's
@@ -486,7 +533,10 @@ def test_two_body_impact_conserves_momentum_and_reverses_relative_speed(test, de
             ) / total_mass
             test.assertEqual(count, 1, f"{label}: expected exactly one sphere-sphere contact")
             test.assertEqual(paths, {PATH_MATRIX_FREE}, f"{label}: unexpected contact route {paths}")
-            test.assertAlmostEqual(distance, 2.0 * RADIUS, delta=2.0e-4, msg=f"{label}: wrong end separation")
+            closing_speed = velocity_a - velocity_b
+            separation = IMPACT_FRACTION * closing_speed * DEFAULT_DT
+            expected_distance = 2.0 * RADIUS + separation + restitution * closing_speed * DEFAULT_DT
+            test.assertAlmostEqual(distance, expected_distance, delta=2.0e-4, msg=f"{label}: wrong end separation")
             _assert_velocity(test, out_a, expected_a, velocity_a - velocity_b, f"{label}, body A")
             _assert_velocity(test, out_b, expected_b, velocity_a - velocity_b, f"{label}, body B")
 
@@ -590,12 +640,40 @@ def test_every_contact_response_route_enforces_restitution(test, device):
                     restitution=restitution,
                     scene=scene,
                     response=response,
-                    velocity_iterations=16,
+                    velocity_iterations=0,
                     pgs_iterations=16,
                 )
                 _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
                 test.assertEqual(result["paths"], EXPECTED_PATHS[(scene, response)], f"{label}: wrong route")
                 _assert_velocity(test, result["after"], restitution * speed, speed, label, rtol=5.0e-3)
+
+
+def test_dense_and_production_split_modes_enforce_restitution_without_velocity_iterations(test, device):
+    """Apply restitution in dense and production split rows with explicit zero refinement."""
+    restitution = 0.65
+    speed = 3.0
+    separation = IMPACT_FRACTION * speed * DEFAULT_DT
+    cases = (
+        ("dense/free", "dense", "free", PATH_DENSE),
+        ("dense/articulated", "dense", "articulated", PATH_DENSE),
+        ("split/free", "split", "free", PATH_MATRIX_FREE),
+        ("split/articulated", "split", "articulated", PATH_DENSE),
+    )
+    for label, pgs_mode, scene, expected_path in cases:
+        with test.subTest(case=label):
+            result = _step_plane(
+                device,
+                separation=separation,
+                speed=speed,
+                restitution=restitution,
+                scene=scene,
+                velocity_iterations=0,
+                pgs_iterations=16,
+                pgs_mode=pgs_mode,
+            )
+            _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
+            test.assertEqual(result["paths"], {expected_path}, f"{label}: wrong route")
+            _assert_velocity(test, result["after"], restitution * speed, speed, label, rtol=5.0e-3)
 
 
 def test_multiworld_restitution_keeps_case_data_isolated(test, device):
@@ -637,27 +715,38 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
     for world, (restitution, speed, _mass, impact_fraction) in enumerate(cases):
         with test.subTest(world=world):
             crossing = impact_fraction < 1.0
-            expected = restitution * speed if crossing else -speed
+            if crossing and restitution > 0.0:
+                expected = restitution * speed
+            elif crossing:
+                expected = -impact_fraction * speed
+            else:
+                expected = -speed
             _assert_velocity(test, float(after[world]), expected, speed, f"world {world}")
-            if crossing:
+            if crossing and restitution > 0.0:
+                expected_gap = impact_fraction * speed * DEFAULT_DT + restitution * speed * DEFAULT_DT
+                test.assertAlmostEqual(
+                    float(end_gap[world]), expected_gap, delta=2.0e-4, msg=f"world {world} wrong row trajectory"
+                )
+            elif crossing:
                 test.assertLess(abs(float(end_gap[world])), 2.0e-4, f"world {world} missed the surface")
             else:
                 test.assertGreater(float(end_gap[world]), 0.0, f"world {world} unexpectedly reached the surface")
 
 
-def test_restitution_runs_automatically_and_validates_configuration(test, device):
-    """Provision one automatic restitution sweep and validate configuration boundaries."""
+def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device):
+    """Keep velocity iterations explicit while provisioning live restitution rows."""
     positive_model, _ = _build_plane_model(
         device,
         separation=1.0e-3,
         restitution=0.6,
     )
-    automatic_solver = _make_solver(positive_model, velocity_iterations=0)
-    test.assertEqual(automatic_solver.pgs_velocity_iterations, 0)
-    test.assertEqual(automatic_solver._velocity_post_iterations, 1)
-    test.assertTrue(automatic_solver._restitution_buffers_enabled)
-    test.assertFalse(automatic_solver._debug_buffers_enabled)
-    test.assertIsNone(automatic_solver._debug_position_v_out)
+    solver = _make_solver(positive_model, velocity_iterations=0)
+    test.assertEqual(solver.pgs_velocity_iterations, 0)
+    test.assertFalse(hasattr(solver, "_velocity_post_iterations"), "zero iterations were silently overridden")
+    test.assertFalse(solver._debug_buffers_enabled)
+    test.assertIsNone(solver._debug_position_v_out)
+    test.assertEqual(solver.row_restitution.shape, (solver.world_count, solver.dense_max_constraints))
+    test.assertEqual(solver.mf_row_restitution.shape, (solver.world_count, solver.mf_max_constraints))
     for invalid_threshold in (-1.0, float("nan"), float("inf")):
         with test.subTest(invalid_threshold=invalid_threshold):
             with test.assertRaisesRegex(ValueError, "restitution_velocity_threshold"):
@@ -670,19 +759,16 @@ def test_restitution_runs_automatically_and_validates_configuration(test, device
     )
     zero_solver = _make_solver(zero_model, velocity_iterations=0)
     test.assertEqual(zero_solver.pgs_velocity_iterations, 0)
-    test.assertEqual(zero_solver._velocity_post_iterations, 0)
-    test.assertFalse(zero_solver._restitution_buffers_enabled)
 
     zero_model.shape_material_restitution.fill_(0.6)
-    with test.assertRaisesRegex(RuntimeError, "reconstruct.*recapture"):
-        zero_solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+    zero_solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
 
     default_solver = _make_solver(positive_model, velocity_iterations=0, restitution_velocity_threshold=None)
     test.assertAlmostEqual(default_solver.restitution_velocity_threshold, 0.5)
 
 
 def test_velocity_iteration_counts_reach_the_same_single_row_solution(test, device):
-    """Reach the one-row result with the automatic sweep and explicit refinement counts."""
+    """Keep restitution correct while optional velocity iterations refine the row."""
     restitution = 0.7
     speed = 2.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
@@ -705,10 +791,12 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
     # Both incident speeds used below must cross from this same authored pose.
     separation = IMPACT_FRACTION * 2.0 * DEFAULT_DT
     cases = (
-        ("matrix-free", "free", True, False, PATH_MATRIX_FREE),
-        ("dense", "articulated", False, True, PATH_DENSE),
+        ("matrix-free MF", "matrix_free", "free", True, False, PATH_MATRIX_FREE),
+        ("matrix-free dense", "matrix_free", "articulated", False, True, PATH_DENSE),
+        ("split MF", "split", "free", True, False, PATH_MATRIX_FREE),
+        ("split dense", "split", "articulated", False, True, PATH_DENSE),
     )
-    for label, scene, mf_warmstart, pgs_warmstart, expected_path in cases:
+    for label, pgs_mode, scene, mf_warmstart, pgs_warmstart, expected_path in cases:
         with test.subTest(warmstart=label):
             model, body = _build_plane_model(
                 device,
@@ -718,9 +806,10 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
             )
             solver = _make_solver(
                 model,
-                velocity_iterations=4,
+                velocity_iterations=0,
                 mf_warmstart=mf_warmstart,
                 pgs_warmstart=pgs_warmstart,
+                pgs_mode=pgs_mode,
             )
             pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
             contacts = pipeline.contacts()
@@ -790,7 +879,8 @@ def test_redundant_box_contacts_do_not_multiply_restitution_energy(test, device)
     _assert_velocity(test, float(qd[2]), restitution * speed, speed, "flat box", rtol=1.0e-2)
     test.assertLess(np.linalg.norm(qd[:2]), 1.0e-2, f"flat box gained tangential speed {qd[:2]}")
     test.assertLess(np.linalg.norm(qd[3:]), 2.0e-2, f"flat box gained angular speed {qd[3:]}")
-    test.assertLess(abs(end_gap), 3.0e-4, f"flat box ended at gap {end_gap:+.3e} m")
+    expected_gap = separation + restitution * speed * DEFAULT_DT
+    test.assertAlmostEqual(end_gap, expected_gap, delta=3.0e-4, msg=f"flat box ended at gap {end_gap:+.3e} m")
     energy_before = 0.5 * mass * speed * speed
     energy_after = 0.5 * mass * float(np.dot(qd[:3], qd[:3])) + 0.5 * (
         ix * qd[3] ** 2 + iy * qd[4] ** 2 + iz * qd[5] ** 2
@@ -803,6 +893,75 @@ def test_redundant_box_contacts_do_not_multiply_restitution_energy(test, device)
     )
 
 
+def test_articulated_redundant_manifold_preserves_symmetric_rebound(test, device):
+    """Bounce an articulated four-point foot without spurious spin or energy gain."""
+    mass = 2.0
+    child_mass = 0.25
+    half = 0.08
+    sphere_radius = 0.02
+    foot_offset = 0.03
+    restitution = 0.6
+    speed = 3.0
+    separation = IMPACT_FRACTION * speed * DEFAULT_DT
+    root_height = foot_offset + sphere_radius + separation
+    inertia = _diagonal_inertia(0.02)
+
+    for joint_kind in ("fixed", "revolute"):
+        for response in ("immediate", "propagation-fused", "propagation-colored"):
+            with test.subTest(joint=joint_kind, response=response):
+                builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                xform = wp.transform(wp.vec3(0.0, 0.0, root_height), wp.quat_identity())
+                root = builder.add_link(xform=xform, mass=mass, inertia=inertia, lock_inertia=True)
+                child = builder.add_link(
+                    xform=xform,
+                    mass=child_mass,
+                    inertia=_diagonal_inertia(0.002),
+                    lock_inertia=True,
+                )
+                root_joint = builder.add_joint_free(child=root)
+                if joint_kind == "fixed":
+                    child_joint = builder.add_joint_fixed(parent=root, child=child)
+                else:
+                    child_joint = builder.add_joint_revolute(
+                        parent=root,
+                        child=child,
+                        axis=wp.vec3(0.0, 0.0, 1.0),
+                    )
+                builder.add_articulation([root_joint, child_joint])
+                cfg = _shape_cfg(restitution)
+                for sx, sy in ((-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)):
+                    builder.add_shape_sphere(
+                        root,
+                        xform=wp.transform(wp.vec3(sx * half, sy * half, -foot_offset), wp.quat_identity()),
+                        radius=sphere_radius,
+                        cfg=cfg,
+                    )
+                builder.add_ground_plane(cfg=cfg)
+                model = builder.finalize(device=device)
+                solver = _make_solver(
+                    model,
+                    response=response,
+                    velocity_iterations=0,
+                    pgs_iterations=16,
+                )
+                state_in, state_out = model.state(), model.state()
+                _reset_state(model, state_in, -speed)
+                pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+                contacts = pipeline.contacts()
+                pipeline.collide(state_in, contacts)
+                solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
+
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+                qd = state_out.body_qd.numpy()[root].astype(np.float64)
+                expected_path = PATH_DENSE if response == "immediate" else PATH_PROPAGATION
+                label = f"{joint_kind}/{response}"
+                test.assertGreaterEqual(count, 4, f"{label}: manifold had only {count} contacts")
+                test.assertEqual(paths, {expected_path}, f"{label}: wrong contact route")
+                _assert_velocity(test, float(qd[2]), restitution * speed, speed, label, rtol=7.5e-3)
+                test.assertLess(np.linalg.norm(qd[3:]), 3.0e-2, f"{label}: symmetric foot spun at {qd[3:]}")
+
+
 def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, device):
     """Replay collide plus restitution with stable pointers and device-read material data."""
     speed = 3.0
@@ -812,7 +971,7 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
         model, body = _build_plane_model(
             device,
             separation=separation,
-            restitution=0.25,
+            restitution=0.0,
         )
         solver = _make_solver(model, velocity_iterations=0)
         state_in, state_out = model.state(), model.state()
@@ -846,10 +1005,9 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
     with wp.ScopedCapture(device) as capture:
         graph_step()
 
-    # Change restitution after capture. Positive construction-time material
-    # provisioned the automatic pass and stable row storage, while the current
-    # coefficient must still come from the device array rather than a captured
-    # host scalar.
+    # Change restitution from zero after capture. Row storage is independent
+    # of construction-time values, and the coefficient must come from the
+    # device array rather than a captured host scalar.
     graph_model.shape_material_restitution.fill_(0.75)
     eager_model.shape_material_restitution.fill_(0.75)
     wp.capture_launch(capture.graph)
@@ -875,6 +1033,7 @@ class TestFeatherPGSRestitution(unittest.TestCase):
 for _fn in (
     test_one_step_restitution_law_over_coefficient_speed_and_mass,
     test_crossing_result_is_invariant_to_dt_and_time_of_impact,
+    test_penetrating_impact_replaces_baumgarte_with_restitution,
     test_restitution_uses_the_post_force_incident_predictor,
     test_non_crossing_speculative_contact_does_not_bounce,
     test_shape_restitution_uses_symmetric_arithmetic_average,
@@ -882,11 +1041,13 @@ for _fn in (
     test_two_body_impact_conserves_momentum_and_reverses_relative_speed,
     test_restitution_is_relative_to_a_moving_kinematic_surface,
     test_every_contact_response_route_enforces_restitution,
+    test_dense_and_production_split_modes_enforce_restitution_without_velocity_iterations,
     test_multiworld_restitution_keeps_case_data_isolated,
-    test_restitution_runs_automatically_and_validates_configuration,
+    test_restitution_uses_ordinary_rows_and_validates_configuration,
     test_velocity_iteration_counts_reach_the_same_single_row_solution,
     test_warm_start_history_does_not_change_or_repeat_restitution,
     test_redundant_box_contacts_do_not_multiply_restitution_energy,
+    test_articulated_redundant_manifold_preserves_symmetric_rebound,
     test_cuda_graph_replay_reads_current_restitution_and_matches_eager,
 ):
     add_function_test(TestFeatherPGSRestitution, _fn.__name__, _fn, devices=devices)

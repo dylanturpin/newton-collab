@@ -1751,17 +1751,22 @@ Shape material properties control contact resolution. Configure via :class:`~Mod
 .. note::
    :class:`~newton.solvers.SolverXPBD` requires ``enable_restitution=True`` on
    the solver constructor before ``restitution`` takes effect.
-   :class:`~newton.solvers.SolverFeatherPGS` applies restitution with
-   ``pgs_mode="matrix_free"``. It automatically runs one velocity-only
-   correction iteration when constructed with positive restitution;
-   ``pgs_velocity_iterations`` can request a larger total iteration count for
-   coupled-contact convergence. It averages the two shape coefficients and uses
-   a configurable incident-speed threshold to suppress low-speed resting-contact
-   bounce. Coefficients are read while rebuilding rows, so in-place material
-   updates work under an already-captured graph when restitution storage was
-   provisioned by positive construction-time material or explicit velocity
-   iterations. Enabling restitution on an all-zero, zero-iteration solver
-   requires reconstructing the solver and recapturing its graph.
+   :class:`~newton.solvers.SolverFeatherPGS` applies restitution in ``dense``,
+   ``split``, and ``matrix_free`` modes. Its ordinary normal row averages the
+   two shape coefficients, freezes incident relative normal velocity, and uses
+   the rebound target only when a sufficiently fast contact is predicted to
+   reach the surface during the timestep. Other rows retain their speculative
+   or Baumgarte law. ``pgs_velocity_iterations`` remains optional and exactly
+   user-controlled; positive values refine the velocity result but restitution
+   never enables them implicitly. Coefficients are read while rebuilding rows,
+   so in-place zero-to-positive material updates work under an already-captured
+   graph.
+
+   FeatherPGS applies the qualifying rebound velocity over the whole discrete
+   step, like conventional PGS. This makes post-impact velocity accurate but
+   leaves a first-order, impact-phase-dependent position offset because no
+   time-of-impact substep is introduced. Use a smaller timestep when impact
+   position or timing is important.
 
 Example:
 
