@@ -5,8 +5,9 @@
 
 Multi-shape bodies multiply narrow-phase output: a foot approximated by 7
 cylinders emits up to 28 candidate contacts against a plane and up to 49
-against another such foot, while the underlying physics is one flat patch that
-is described by its deepest point plus the extremes of its footprint.
+against another such foot, even when the underlying physics is one flat patch.
+The pass represents that patch with one depth slot and six sampled footprint
+support slots rather than treating collider decomposition as physical detail.
 
 **Approximation, stated precisely.** For contacts RETAINED at the true hull, an
 interior point's normal force is a convex combination of hull-point normal
@@ -42,8 +43,10 @@ compacts it in two kernels over the live contact range -- register, then select:
   :func:`_contact_group_key`);
 * every contact enters its group's depth slot and all
   :data:`BODY_PAIR_NUM_DIRECTIONS` spatial-extreme slots, competing on
-  projection alone, so each slot ends up holding that direction's true extreme
-  (see :data:`BODY_PAIR_REDUCTION_SLOTS` for the policies this replaced);
+  projection alone.  With zero hysteresis each slot holds its instantaneous
+  winner; with hysteresis an incumbent may trail that winner by no more than
+  the configured score margin (see :data:`BODY_PAIR_REDUCTION_SLOTS` for the
+  policies this replaced);
 * each contact then checks whether any value it submitted won its slot, and the
   survivors are compacted in place so ``rigid_contact_count`` itself drops.
   Everything else is discarded -- typically interior points whose force is a
@@ -62,9 +65,11 @@ rather than inferring speedup from contact count alone.
 
 Depth is ranked with the canonical signed effective-surface separation
 ``dot(normal, point1 - point0) - margin0 - margin1``, but only to choose each
-group's single deepest survivor: depth never gates or biases the spatial slots.
-The policy therefore carries no tunable length scale at all, and no
-classification can leave a patch without footprint support.
+group's depth representative: depth never gates or biases the spatial slots.
+The memoryless slot-ranking rule therefore introduces no additional depth
+threshold.  The pass still has explicit spatial-cell and temporal-hysteresis
+length scales, and no depth classification can leave a patch without footprint
+support.
 
 Reduction never crosses a normal bin, so multi-patch configurations (a body
 touching floor and wall at once) keep representatives of every patch.  On
@@ -124,11 +129,11 @@ buffer. Serialize ordinary calls on that pipeline with graph replay; launching
 ordinary reducer work concurrently on another stream would still race the
 same stateful arrays.
 The buffer separately tracks reduced-writer and unreduced-only-solver reader
-leases, preventing a graph captured for an unsupported solver from later
-replaying over compacted rows.  Because the last reducer replay may be the last
-writer, final lease release conservatively preserves ordinary reduced-contact
-provenance until ``Contacts.clear`` or a subsequent Python ``collide`` replaces
-the contents.
+leases, preventing a graph captured for an unreduced-only solver configuration
+from later replaying over compacted rows.  Because the last reducer replay may
+be the last writer, final lease release conservatively preserves ordinary
+reduced-contact provenance until ``Contacts.clear`` or a subsequent Python
+``collide`` replaces the contents.
 """
 
 from __future__ import annotations
@@ -267,6 +272,48 @@ def build_reduction_groups(model) -> tuple:
             class_ids[key] = gid
         ids[shape] = gid
     return ids, next_id
+
+
+def build_reduction_group_pair_bound(model, shape_group) -> int:
+    """Count the distinct ``(group_a, group_b)`` pairs the model can ever produce.
+
+    The reduction key is ``(group_a, group_b, normal bin, spatial cell)``.  This
+    returns an EXACT upper bound on the pair dimension alone: the image of
+    ``model.shape_contact_pairs`` under :func:`build_reduction_groups`, deduped
+    the same unordered way :func:`_make_group_key` packs it.  Every broad-phase
+    mode applies the same filtering as ``find_shape_contact_pairs``, so no
+    candidate pair reaching the narrow phase is missing from that list.
+
+    It bounds ONE dimension of the key, not the entry count, and is loose in
+    both directions: a pair spread over several normal bins or spatial cells
+    occupies several entries, while pairs that are reachable but never
+    simultaneously in contact occupy none.  How loose is scene-dependent --
+    scenes whose candidate pairs are mostly potential rather than active sit
+    far below it.  It is therefore a sizing ANCHOR, not a guarantee: its value
+    is that it scales with the scene topology the group count is actually a
+    function of, rather than with contact-buffer capacity, which it is not.
+    Read ``stats()["max_hashtable_entries"]`` for what a given scene needs.
+
+    Args:
+        model: The simulation model.
+        shape_group: Per-shape group ids from :func:`build_reduction_groups`.
+
+    Returns:
+        The number of distinct unordered group pairs, or ``-1`` when the model
+        carries no precomputed contact-pair list to derive it from.
+    """
+    pairs = getattr(model, "shape_contact_pairs", None)
+    if pairs is None:
+        return -1
+    p = pairs.numpy() if hasattr(pairs, "numpy") else np.asarray(pairs)
+    if p.size == 0:
+        return 0
+    sg = np.asarray(shape_group, dtype=np.int64)
+    ga, gb = sg[p[:, 0]], sg[p[:, 1]]
+    lo, hi = np.minimum(ga, gb), np.maximum(ga, gb)
+    # Group ids are asserted below MAX_GROUP_ID (2**21) at pipeline construction,
+    # so this packing stays far inside int64 and cannot alias two distinct pairs.
+    return int(np.unique(lo * (int(sg.max()) + 1) + hi).size)
 
 
 @wp.func
@@ -667,9 +714,9 @@ def _pack_score(primary: float, pos_key: wp.uint64) -> wp.uint64:
     the window, and a high-order "near" preference is won outright by the
     group's deepest contact (trivially near), which then takes all slots.
     Either way a tilted box face collapses to single-point support and
-    diverges.  Pure projection competition gives each direction slot to that
-    direction's true spatial extreme, so the SAMPLED footprint support cannot
-    be removed by any tuning parameter (the sampling itself is the remaining
+    diverges.  Pure projection competition gives each direction slot to its
+    sampled-support representative, subject only to the explicitly bounded
+    temporal hysteresis (the directional sampling itself is the remaining
     approximation; see the module docstring).
 
     The low bits are the GEOMETRIC tie-break: the contact's own quantized
@@ -678,22 +725,22 @@ def _pack_score(primary: float, pos_key: wp.uint64) -> wp.uint64:
     coordinate exactly -- and the previous tie-break, a hash of contact
     content, flipped winners whenever any input float moved (a static shape's
     witness point is world-space, so it changes under pure translation),
-    churning the kept set of a body sliding in a straight line.  The position
-    key cannot see translation, and unlike a single scalar it identifies the
-    contact (up to 0.5 mm co-location), so a tie means two physically
-    coincident contacts -- both are kept, and the <= 7-per-group bound holds
-    for all genuinely distinct geometry.
+    churning the kept set of a body sliding in a straight line.  The
+    pair-anchored key preserves geometric ordering under rigid translation and,
+    unlike a single scalar, identifies the contact up to 0.5 mm co-location.
+    Quantization can merge identities into a tie under sub-quantum motion; ties
+    fail open by keeping every coincident packed duplicate.
 
     No buffer index is stored: winners identify THEMSELVES in the selection
     pass by comparing their own packed value against the slot, so the winning
-    SET is a pure function of contact geometry: invariant to thread
-    scheduling, buffer order, buffer capacity, and rigid translation.  Two
-    qualifications: contacts that are exactly coincident (same position to the
-    0.5 mm quantum) all tie and are all kept, so duplicated colliders can
-    exceed the per-group slot bound; and near the hashtable's probe budget the
-    OUTCOME (reduced vs whole-frame fail-open) can depend on concurrent
-    insertion order even though each outcome's kept set is itself
-    deterministic.  Size the table so ``fallback_frames`` stays zero.
+    SET is a pure function of contact geometry: invariant to thread scheduling,
+    buffer order, and buffer capacity, while rigid translation preserves the
+    key ordering.  Two qualifications: contacts that are coincident at the
+    0.5 mm quantum all tie and are all kept, so duplicated colliders can exceed
+    the per-group slot bound; and near the hashtable's probe budget the OUTCOME
+    (reduced vs whole-frame fail-open) can depend on concurrent insertion order
+    even though each outcome's kept set is itself deterministic.  Size the
+    table so ``fallback_frames`` stays zero.
     """
     return (wp.uint64(float_flip(primary)) << wp.uint64(31)) | pos_key
 
@@ -1634,7 +1681,8 @@ class BodyPairContactReducer:
         device,
         shape_group,
         up_axis: int = 2,
-        hashtable_factor: float = 0.25,
+        hashtable_headroom: float = 1.0,
+        group_pair_bound: int | None = None,
         borrowed_scratch: dict | None = None,
         verify: bool = False,
         hysteresis: float = 0.001,
@@ -1652,9 +1700,9 @@ class BodyPairContactReducer:
         self.hysteresis = float(np.float32(hysteresis))
         if not (math.isfinite(self.hysteresis) and self.hysteresis >= 0.0):
             raise ValueError(f"hysteresis must be finite and non-negative in float32, got {hysteresis}")
-        hashtable_factor = float(hashtable_factor)
-        if not (math.isfinite(hashtable_factor) and hashtable_factor > 0.0):
-            raise ValueError(f"hashtable_factor must be finite and positive, got {hashtable_factor}")
+        hashtable_headroom = float(hashtable_headroom)
+        if not (math.isfinite(hashtable_headroom) and hashtable_headroom > 0.0):
+            raise ValueError(f"hashtable_headroom must be finite and positive, got {hashtable_headroom}")
         # Per-shape reduction-group ids from build_reduction_groups (material-
         # equivalence classes), and the exact rotation mapping the model's up
         # axis into the bin table's Z-up frame.
@@ -1677,12 +1725,30 @@ class BodyPairContactReducer:
         # Per-frame device state: validated work count + overflow/fallback
         # flags, reset by the preparation kernel each reduce.
         self._frame_state = wp.zeros(FRAME_STATE_COUNT, dtype=wp.int32, device=device)
-        # One entry per (body pair, bin, cell) actually touched -- far fewer
-        # than contacts. Undersizing is safe: when a bounded probe cannot find
-        # or create an entry, the kernels keep the contact unconditionally
-        # (fail open), so the factor trades memory for reduction coverage,
-        # never for dropped contacts.
-        self.hashtable = HashTable(max(1024, int(rigid_contact_max * hashtable_factor)), device=device)
+        # One entry per (body pair, bin, cell) actually touched. Sized from the
+        # scene's own topology -- the distinct group pairs its contact-pair list
+        # can produce (see build_reduction_group_pair_bound) -- rather than from
+        # rigid_contact_max, which counts CONTACTS and relates to the group
+        # count only through how many contacts share a patch, i.e. through
+        # exactly the quantity this pass exists to vary.
+        #
+        # The anchor is loose in both directions and deliberately so: it bounds
+        # only the pair dimension of the key, and reachable pairs are not
+        # simultaneously active. Neither direction is unsafe. Undersizing
+        # cannot drop a contact -- a bounded probe failure makes the whole
+        # frame keep everything, counted in fallback_frames -- and
+        # rigid_contact_max caps the request because a group cannot exist
+        # without a contact to create it. Tune with hashtable_headroom against
+        # the fallback_frames / max_hashtable_entries telemetry.
+        if group_pair_bound is not None and group_pair_bound > 0:
+            capacity_request = int(group_pair_bound * hashtable_headroom)
+        else:
+            # No precomputed pair list to derive from; fall back to the old
+            # contact-anchored heuristic rather than guessing.
+            capacity_request = int(rigid_contact_max * 0.25 * hashtable_headroom)
+        self.hashtable_capacity_request = max(1024, min(capacity_request, rigid_contact_max))
+        self.group_pair_bound = int(group_pair_bound) if group_pair_bound is not None else -1
+        self.hashtable = HashTable(self.hashtable_capacity_request, device=device)
         self.ht_values = wp.zeros(BODY_PAIR_REDUCTION_SLOTS * self.hashtable.capacity, dtype=wp.uint64, device=device)
         # Fixed launch width for every pass; the kernels grid-stride over the
         # live count, so this only has to fill the device. See
@@ -2172,7 +2238,7 @@ class BodyPairContactReducer:
             its WHOLE frame for the deterministic keep-all fallback, so this
             counts trigger events, not kept contacts. A failure can mean a full
             table or a long hash cluster; sustained non-zero values usually
-            call for a larger ``hashtable_factor``, but inspect occupancy too.
+            call for a larger ``hashtable_headroom``, but inspect occupancy too.
             ``failed_insertions`` is retained as a backwards-compatible alias
             for the same value; it does not imply that the table was full.
             ``outranked_discards``: discarded contacts that out-rank their
@@ -2288,6 +2354,12 @@ class BodyPairContactReducer:
         return {
             "rigid_contact_max": n,
             "hashtable_capacity": self.hashtable.capacity,
+            # The topology anchor the capacity was derived from (-1 when the
+            # model carried no contact-pair list and the contact-anchored
+            # fallback was used). Compare against stats()["max_hashtable_entries"]
+            # to see how much of the anchor's slack this scene actually needs.
+            "group_pair_bound": self.group_pair_bound,
+            "hashtable_capacity_request": self.hashtable_capacity_request,
             "slots_per_entry": BODY_PAIR_REDUCTION_SLOTS,
             "hashtable_bytes": self.hashtable.keys.size * 8 + self.hashtable.active_slots.size * 4,
             "slot_value_bytes": self.ht_values.size * 8,

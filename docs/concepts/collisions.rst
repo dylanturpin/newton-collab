@@ -996,13 +996,19 @@ flag:
     pipeline = newton.CollisionPipeline(model, reduce_contacts=reduction)
 
 The postpass groups the *finalized narrow-phase contacts* by body pair,
-material class, normal bin, and spatial cell, then retains the deepest contact
-and six sampled footprint extremes.  This is a bounded spatial approximation,
-not an exact patch-wrench representation: support error is scene dependent,
-coincident duplicate contacts may exceed the nominal slot count, and selecting
-rim representatives can strengthen torsional friction.  Measure the reduction
-ratio with :meth:`~CollisionPipeline.body_pair_reduction_stats` and keep the
-feature disabled when it does not provide a material end-to-end benefit.
+material class, normal bin, and spatial cell, then retains one depth
+representative and up to six sampled footprint representatives.  With nonzero
+hysteresis, an incumbent may trail the instantaneous slot winner by no more
+than the configured margin; coincident contacts with identical packed winner
+keys can exceed the nominal slot count.  This is a bounded-work spatial
+approximation, not an exact patch-wrench representation: support error is scene
+dependent, and selecting rim representatives can strengthen torsional friction.
+The group table is sized from the model's contact-pair topology, scaled by
+``body_pair_hashtable_headroom``; a table too small costs reduction quality for
+individual frames (reported as ``fallback_frames``) but never drops a contact.
+Measure the reduction ratio, ``fallback_frames``, and ``max_hashtable_entries`` with
+:meth:`~CollisionPipeline.body_pair_reduction_stats` and keep the feature
+disabled when it does not provide a material end-to-end benefit.
 
 The default hysteresis carries previous winners between frames.  Call
 :meth:`~CollisionPipeline.reset_body_pair_reduction_history` after episode
@@ -1011,11 +1017,12 @@ changed at runtime, call
 :meth:`~CollisionPipeline.refresh_body_pair_reduction_groups` so contacts with
 different material laws stop competing in a stale equivalence class.
 
-Body-pair reduction is currently supported only by
-:class:`~newton.solvers.SolverFeatherPGS`.  It is incompatible with active
-hydroelastic contacts and contact matching.  Mesh/heightfield producer
-reduction must remain enabled when the postpass is selected, because a pass
-after materialization cannot recover contacts lost to output-buffer overflow.
+Body-pair reduction is currently supported only by the default, non-warm-started
+configuration of :class:`~newton.solvers.SolverFeatherPGS`.  It is incompatible
+with active hydroelastic contacts, contact matching, ``pgs_warmstart=True``, and
+``mf_warmstart=True``.  Mesh/heightfield producer reduction must remain enabled
+when the postpass is selected, because a pass after materialization cannot
+recover contacts lost to output-buffer overflow.
 
 **Hydroelastic contact reduction**
 

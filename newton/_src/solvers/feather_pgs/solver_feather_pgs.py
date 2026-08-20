@@ -461,8 +461,9 @@ class SolverFeatherPGS(SolverBase):
 
     """
 
-    # Conformance-tested against body-pair-reduced contact buffers
-    # (test_contact_reduction_body_pairs).
+    # The default configuration is conformance-tested against body-pair-reduced
+    # contact buffers (test_contact_reduction_body_pairs). Warm-start modes have
+    # stricter contact-identity requirements and reject those buffers in step().
     supports_body_pair_reduced_contacts: bool = True
 
     joint_qd_public_convention: bool = True
@@ -722,7 +723,17 @@ class SolverFeatherPGS(SolverBase):
             dense_max_constraints (int, optional): Maximum number of dense (articulation) contact constraint
                 rows stored per world. Free rigid body contacts are stored separately, bounded by
                 mf_max_constraints. Defaults to 32.
-            pgs_warmstart (bool, optional): Re-use impulses from the previous frame when contacts persist. Defaults to False.
+            pgs_warmstart (bool, optional): Re-use dense impulses from the
+                previous frame.  This currently requires unreduced contacts:
+                body-pair compaction may change the physical contact occupying a
+                dense row while index-based warm start would reuse that row's old
+                impulse.  Defaults to False.
+            mf_warmstart (bool, optional): Re-use matrix-free contact impulses by
+                contact-match identity.  This requires contact matching, which is
+                currently incompatible with body-pair contact reduction.  Defaults
+                to False.
+            mf_warmstart_decay (float, optional): Scale applied to matrix-free
+                impulses carried from the previous frame.  Defaults to 1.0.
             pgs_mode (str, optional): PGS mode. "dense" builds the full Delassus matrix C = J*H^{-1}*J^T
                 and solves in impulse space (Gauss-Seidel) for all contacts. "split" uses the dense
                 path for articulated bodies and a cheaper matrix-free PGS path for free rigid body
@@ -5054,6 +5065,22 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        warmstart_modes = []
+        if self.pgs_warmstart:
+            warmstart_modes.append("pgs_warmstart=True")
+        if self._mf_warmstart_enabled:
+            warmstart_modes.append("mf_warmstart=True")
+        if warmstart_modes:
+            # Dense warm start reuses impulses by row index, while MF warm start
+            # requires contact matching. Body-pair compaction provides neither
+            # identity contract. Use the shared helper so a captured warm-start
+            # solver also holds the unreduced-reader lease that blocks a later
+            # reducer graph from changing its rows behind replay.
+            self._require_unreduced_contacts(
+                contacts,
+                supports_body_pair_reduced_contacts=False,
+                configuration=" and ".join(warmstart_modes),
+            )
         if _FPGS_CAPTURE:
             self._fpgs_step_n = getattr(self, "_fpgs_step_n", -1) + 1
         if self._last_step_dt is None:

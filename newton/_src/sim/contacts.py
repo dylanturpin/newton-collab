@@ -460,13 +460,13 @@ class Contacts:
         self.rigid_contact_max = rigid_contact_max
         self.soft_contact_max = soft_contact_max
 
-        self.rigid_contacts_reduced = False
+        self.rigid_contacts_body_pair_reduced = False
         """Provenance: whether the pipeline that last wrote this buffer runs
         body-pair contact reduction.  Assigned on every
         :meth:`newton.CollisionPipeline.collide` call from the pipeline's mode
-        (never a sticky observation), and checked by solvers that have not
-        been conformance-tested against reduced buffers."""
-        self.rigid_contacts_reduced_capture = False
+        (never a sticky observation), and checked by solvers or solver
+        configurations that require unreduced buffers."""
+        self.rigid_contacts_body_pair_reduced_capture = False
         """Whether a live CUDA graph can write reduced contacts.
 
         Replay is invisible to host-side provenance, so this remains true
@@ -506,7 +506,7 @@ class Contacts:
             if self._unreduced_solver_graph_leases:
                 raise RuntimeError(
                     "cannot write body-pair-reduced contacts while a CUDA graph for an "
-                    "unsupported solver still reads this Contacts buffer; destroy every "
+                    "unreduced-only solver configuration still reads this Contacts buffer; destroy every "
                     "reference to that solver graph first"
                 )
             if self._rigid_contact_reduction_graph_leases:
@@ -516,7 +516,7 @@ class Contacts:
                     "replays would race. Destroy every reference to the existing graph first"
                 )
             self._rigid_contact_reduction_graph_leases.add(token)
-            self.rigid_contacts_reduced_capture = True
+            self.rigid_contacts_body_pair_reduced_capture = True
         elif mode == "unreduced_reader":
             if self._rigid_contact_reduction_graph_leases:
                 raise RuntimeError(
@@ -533,13 +533,13 @@ class Contacts:
                 return
             self._rigid_contact_reduction_graph_leases.remove(token)
             if not self._rigid_contact_reduction_graph_leases:
-                self.rigid_contacts_reduced_capture = False
+                self.rigid_contacts_body_pair_reduced_capture = False
                 if preserve_provenance:
                     # The final replay may have left compacted rows in the
                     # buffer. Preserve conservative ordinary provenance until
                     # clear() or a subsequent Python-level collide proves what
                     # replaced them.
-                    self.rigid_contacts_reduced = True
+                    self.rigid_contacts_body_pair_reduced = True
         elif mode == "unreduced_reader":
             if token in self._unreduced_solver_graph_leases:
                 self._unreduced_solver_graph_leases.remove(token)
@@ -571,7 +571,7 @@ class Contacts:
         # CAPTURE marker deliberately does not reset: a replay of the graph
         # that captured this buffer can re-reduce it at any moment after the
         # clear, so destruction of the final writer graph lease drops it.
-        self.rigid_contacts_reduced = False
+        self.rigid_contacts_body_pair_reduced = False
         # Clear all counters and (optionally) bump generation in a single kernel launch.
         num_counters = self.contact_counters.shape[0]
         wp.launch(
