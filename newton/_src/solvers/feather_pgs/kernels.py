@@ -62,6 +62,11 @@ _FPGS_BISECTION_ITERS = 20
 _FPGS_COULOMB_NEWTON_EXPAND_ITERS = 30
 _FPGS_COULOMB_NEWTON_NEWTON_ITERS = 50
 
+# One-sided distance slop [m] for float32 cancellation at the speculative
+# bound. Rows within 1e-6 m are treated as reaching the surface, bounding early
+# activation to 1e-6 m of linearized separation.
+_FPGS_CONTACT_END_GAP_SLOP = wp.constant(1.0e-6)
+
 
 @wp.kernel
 def commit_mass_updates(
@@ -2818,8 +2823,6 @@ def allocate_world_contact_slots(
     # D-wide generalized rows.
     is_mf = 0
     is_propagation = 0
-    a_is_free_or_ground = art_a < 0
-    b_is_free_or_ground = art_b < 0
     if has_free_rigid != 0:
         a_is_mf_compatible = not a_has_dofs or is_free_rigid[art_a] != 0
         b_is_mf_compatible = not b_has_dofs or is_free_rigid[art_b] != 0
@@ -3788,6 +3791,53 @@ def compute_world_contact_bias(
         # ``J*v_hat`` term added by ``rhs_accum_world_par_art``.
 
         world_rhs[world, i] = rhs
+
+
+@wp.kernel
+def compute_world_contact_velocity_bias(
+    world_constraint_count: wp.array[int],
+    max_constraints: int,
+    world_dof_count: wp.array[int],
+    world_phi: wp.array2d[float],
+    world_row_type: wp.array2d[int],
+    world_target_velocity: wp.array2d[float],
+    world_position_velocity: wp.array[float],
+    world_dof_indices: wp.array2d[int],
+    world_J: wp.array3d[float],
+    dt: float,
+    # outputs
+    world_rhs: wp.array2d[float],
+):
+    """Build the velocity-pass RHS from the position solution's end gap."""
+    tid = wp.tid()
+    world = tid // max_constraints
+    i = tid - world * max_constraints
+    if i >= world_constraint_count[world]:
+        return
+    inv_dt = 1.0 / dt
+
+    phi = world_phi[world, i]
+    row_type = world_row_type[world, i]
+    target_vel = world_target_velocity[world, i]
+    rhs = -target_vel
+
+    if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        if phi > 0.0:
+            jv_position = float(0.0)
+            for d in range(world_dof_count[world]):
+                global_dof = world_dof_indices[world, d]
+                if global_dof >= 0:
+                    jv_position += world_J[world, i, d] * world_position_velocity[global_dof]
+            end_gap = phi + dt * (jv_position - target_vel)
+            if end_gap > _FPGS_CONTACT_END_GAP_SLOP:
+                rhs += phi * inv_dt
+    elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
+        if phi >= 0.0:
+            rhs += phi * inv_dt
+    elif row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+        rhs = 0.0
+
+    world_rhs[world, i] = rhs
 
 
 @wp.kernel
@@ -4933,6 +4983,11 @@ def compute_mf_rhs_bias(
     mf_constraint_count: wp.array[int],
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
+    mf_dof_a: wp.array2d[int],
+    mf_dof_b: wp.array2d[int],
+    mf_J_a: wp.array3d[float],
+    mf_J_b: wp.array3d[float],
+    world_dof_indices: wp.array2d[int],
     mf_phi: wp.array2d[float],
     mf_row_type: wp.array2d[int],
     mf_target_velocity: wp.array2d[float],
@@ -4942,6 +4997,8 @@ def compute_mf_rhs_bias(
     dt: float,
     bias_scale: float,
     speculative_scale: float,
+    position_velocity: wp.array[float],
+    preserve_unreached_speculative: int,
     mf_max_constraints: int,
     # outputs
     mf_rhs: wp.array2d[float],
@@ -4972,7 +5029,31 @@ def compute_mf_rhs_bias(
             if max_depen > 0.0 and wp.isfinite(max_depen):
                 bias = wp.max(bias, -max_depen)
         else:
-            bias = speculative_scale * phi_val / dt
+            end_gap = float(0.0)
+            if preserve_unreached_speculative != 0 and phi_val > 0.0:
+                # Evaluate the same linearized end gap constrained by the
+                # position solve, using its realized velocity.
+                jv_position = float(0.0)
+                dof_a = mf_dof_a[world, i]
+                dof_b = mf_dof_b[world, i]
+                if dof_a >= 0:
+                    for k in range(6):
+                        global_dof = world_dof_indices[world, dof_a + k]
+                        if global_dof >= 0:
+                            jv_position += mf_J_a[world, i, k] * position_velocity[global_dof]
+                if dof_b >= 0:
+                    for k in range(6):
+                        global_dof = world_dof_indices[world, dof_b + k]
+                        if global_dof >= 0:
+                            jv_position += mf_J_b[world, i, k] * position_velocity[global_dof]
+                target_velocity = float(0.0)
+                if has_target_velocity != 0:
+                    target_velocity = mf_target_velocity[world, i]
+                end_gap = phi_val + dt * (jv_position - target_velocity)
+            if preserve_unreached_speculative != 0 and end_gap > _FPGS_CONTACT_END_GAP_SLOP:
+                bias = phi_val / dt
+            else:
+                bias = speculative_scale * phi_val / dt
     elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         bias = mf_phi[world, i]
 
@@ -5421,6 +5502,8 @@ def compute_propagation_rhs_bias(
     propagation_constraint_count: wp.array[int],
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
     rigid_body_max_depenetration_velocity: wp.array[float],
@@ -5428,6 +5511,8 @@ def compute_propagation_rhs_bias(
     dt: float,
     bias_scale: float,
     speculative_scale: float,
+    position_body_qd: wp.array2d[float],
+    preserve_unreached_speculative: int,
     propagation_max_constraints: int,
     # outputs
     propagation_rhs: wp.array2d[float],
@@ -5457,7 +5542,22 @@ def compute_propagation_rhs_bias(
             if max_depen > 0.0 and wp.isfinite(max_depen):
                 bias = wp.max(bias, -max_depen)
         else:
-            bias = speculative_scale * phi_val / dt
+            end_gap = float(0.0)
+            if preserve_unreached_speculative != 0 and phi_val > 0.0:
+                jv_position = float(0.0)
+                ba = propagation_body_a[world, i]
+                bb = propagation_body_b[world, i]
+                if ba >= 0:
+                    for k in range(6):
+                        jv_position += propagation_J_a[world, i, k] * position_body_qd[ba, k]
+                if bb >= 0:
+                    for k in range(6):
+                        jv_position += propagation_J_b[world, i, k] * position_body_qd[bb, k]
+                end_gap = phi_val + dt * jv_position
+            if preserve_unreached_speculative != 0 and end_gap > _FPGS_CONTACT_END_GAP_SLOP:
+                bias = phi_val / dt
+            else:
+                bias = speculative_scale * phi_val / dt
     propagation_rhs[world, i] = bias
 
 
@@ -5790,7 +5890,6 @@ def factor_propagation_tree_for_size(
     art = group_to_art[group_idx]
     joint_start = articulation_start[art]
     joint_end = articulation_start[art + 1]
-    dof_start_art = articulation_dof_start[art]
 
     for joint in range(joint_start, joint_end):
         body = joint_child[joint]
