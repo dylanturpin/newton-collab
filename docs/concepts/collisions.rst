@@ -1751,6 +1751,22 @@ Shape material properties control contact resolution. Configure via :class:`~Mod
 .. note::
    :class:`~newton.solvers.SolverXPBD` requires ``enable_restitution=True`` on
    the solver constructor before ``restitution`` takes effect.
+   :class:`~newton.solvers.SolverFeatherPGS` applies restitution in ``dense``,
+   ``split``, and ``matrix_free`` modes. Its ordinary normal row averages the
+   two shape coefficients, freezes incident relative normal velocity, and uses
+   the rebound target only when a sufficiently fast contact is predicted to
+   reach the surface during the timestep. Other rows retain their speculative
+   or Baumgarte law. ``pgs_velocity_iterations`` remains optional and exactly
+   user-controlled; positive values refine the velocity result but restitution
+   never enables them implicitly. Coefficients are read while rebuilding rows,
+   so in-place zero-to-positive material updates work under an already-captured
+   graph.
+
+   FeatherPGS applies the qualifying rebound velocity over the whole discrete
+   step, like conventional PGS. This makes post-impact velocity accurate but
+   leaves a first-order, impact-phase-dependent position offset because no
+   time-of-impact substep is introduced. Use a smaller timestep when impact
+   position or timing is important.
 
 Example:
 

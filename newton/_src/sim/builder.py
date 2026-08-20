@@ -465,6 +465,12 @@ class ModelBuilder:
 
         :class:`~newton.solvers.SolverXPBD` requires ``enable_restitution=True``
         on the solver constructor for this field to take effect.
+        :class:`~newton.solvers.SolverFeatherPGS` applies this field inside the
+        ordinary normal contact row in ``dense``, ``split``, and
+        ``matrix_free`` modes without any implicit velocity iterations.
+        FeatherPGS clamps finite coefficients to ``[0, 1]``, treats non-finite
+        values as zero, and uses the arithmetic mean of the two contacting
+        shapes.
         """
         mu_torsional: float = 0.005
         """The coefficient of torsional friction (resistance to spinning at contact point)."""

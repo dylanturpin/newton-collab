@@ -62,6 +62,9 @@ from .kernels import (
     apply_augmented_mass_diagonal_grouped,
     apply_free_root_transport_to_predictor,
     apply_impulses_world_par_dof,
+    apply_mf_warmstart_impulses,
+    apply_world_contact_restitution_accumulated,
+    apply_world_contact_restitution_matrix_free,
     build_augmented_joint_rows,
     build_mass_update_mask,
     build_mf_body_map,
@@ -444,6 +447,18 @@ class SolverFeatherPGS(SolverBase):
             solver.step(state_in, state_out, control, contacts, dt)
             state_in, state_out = state_out, state_in
 
+    Rigid-contact restitution is part of the ordinary normal contact row in
+    ``"dense"``, ``"split"``, and ``"matrix_free"`` modes. It uses the
+    arithmetic mean of the two shape coefficients and freezes the incident
+    relative normal velocity before contact impulses are applied. A sufficiently
+    fast contact predicted to reach the surface during the step replaces its
+    geometric/speculative bias with Newton's rebound target. Optional
+    ``pgs_velocity_iterations`` refine the result but are never enabled
+    implicitly. As in a conventional discrete PGS solver, the qualifying
+    rebound velocity is used for the whole step; this gives the intended
+    post-impact velocity but a first-order, impact-phase-dependent position
+    offset. Reduce the timestep when substep impact position matters.
+
     """
 
     # Conformance-tested against body-pair-reduced contact buffers
@@ -571,6 +586,7 @@ class SolverFeatherPGS(SolverBase):
         serial_kernel_block_dim: int = 256,
         tile_threads: int = 64,
         row_watermark: bool = False,
+        restitution_velocity_threshold: float = 0.5,
     ):
         """
         Args:
@@ -677,13 +693,14 @@ class SolverFeatherPGS(SolverBase):
                 iterations under ``pgs_velocity_drive_mode="freeze"``, exactly like the
                 dedicated rows it replaces. Defaults to True.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
-            pgs_velocity_iterations (int, optional): Additional matrix-free iterations using a velocity-only RHS
+            pgs_velocity_iterations (int, optional): Number of matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
                 geometric bias corrects positions first, then final velocity iterations run without Baumgarte bias.
                 Positive-gap rows whose linearized position trajectory remains separated by more than a 1e-6 m
                 numerical slop keep their speculative closing allowance; rows within the slop use the unbiased
-                contact law.
-                Only supported with ``pgs_mode="matrix_free"``. Defaults to 0.
+                contact law. Restitution does not change this value: zero means no velocity-only iteration, while a
+                positive value explicitly requests that many refinement iterations for coupled contacts. Only
+                supported with ``pgs_mode="matrix_free"``. Defaults to 0.
             pgs_beta (float, optional): ERP style position correction factor. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
             dense_contact_compliance (float, optional): Normal contact compliance [m/N] applied
@@ -844,6 +861,14 @@ class SolverFeatherPGS(SolverBase):
                 change floating-point reduction order with the block size, so non-default
                 values are not bit-identical (results stay within numerical tolerance).
                 Must be one of {32, 64, 128, 256}. Defaults to 64.
+            restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
+                relative normal velocity required to apply restitution. The contact must also be at the surface or
+                be predicted to reach it during the timestep. Slower contacts retain the existing speculative or
+                Baumgarte contact law, preventing resting contacts from repeatedly bouncing under small
+                accelerations.
+                Restitution coefficients are averaged across the two shapes after clamping finite values to
+                ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
+                to every closing impact. Defaults to 0.5 m/s.
         Auto selection behavior:
             - auto: size > threshold -> tiled, else loop/par_row.
             - Delassus auto/tiled: streaming kernel (handles any constraint count via chunking).
@@ -896,6 +921,13 @@ class SolverFeatherPGS(SolverBase):
         self.speculative_dense_contact_compliance = speculative_dense_contact_compliance
         self.pgs_omega = pgs_omega
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
+        threshold_error = "restitution_velocity_threshold must be finite and non-negative"
+        try:
+            self.restitution_velocity_threshold = float(restitution_velocity_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(threshold_error) from exc
+        if not np.isfinite(self.restitution_velocity_threshold) or self.restitution_velocity_threshold < 0.0:
+            raise ValueError(threshold_error)
         self.pgs_velocity_omega = self.pgs_omega if pgs_velocity_omega is None else float(pgs_velocity_omega)
         if pgs_velocity_drive_mode not in ("active", "freeze"):
             raise ValueError(f"pgs_velocity_drive_mode must be 'active' or 'freeze', got {pgs_velocity_drive_mode!r}")
@@ -1076,11 +1108,9 @@ class SolverFeatherPGS(SolverBase):
         self._double_buffer = double_buffer
         self._nvtx = nvtx
         self.pgs_debug = pgs_debug
-        # Debug capture buffers (``_debug_stage3_*`` / ``_debug_position_*``) are
-        # only consumed by the pgs_debug diagnostics and the velocity-iteration
-        # position snapshot; skip allocating them (several GB at large world
-        # counts) when neither path can run.
-        self._debug_buffers_enabled = bool(pgs_debug) or self.pgs_velocity_iterations > 0
+        # The position/velocity split needs only v_out_snap. Full row snapshots
+        # are diagnostics and can consume several GB in large batched models.
+        self._debug_buffers_enabled = bool(pgs_debug)
         self._pgs_convergence_log: list[np.ndarray] = []
         # Per-step, per-iteration NCP / MDP residual log for the matrix_free
         # debug path. Each entry is an ndarray of shape
@@ -1280,6 +1310,12 @@ class SolverFeatherPGS(SolverBase):
             self.shape_material_mu = wp.zeros(
                 (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
             )
+        if model.shape_material_restitution is not None:
+            self.shape_material_restitution = model.shape_material_restitution
+        else:
+            self.shape_material_restitution = wp.zeros(
+                (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
+            )
 
         self._init_double_buffer_stream()
 
@@ -1323,7 +1359,7 @@ class SolverFeatherPGS(SolverBase):
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
-        """Refresh cached dynamics data after body, joint, or inertial model changes."""
+        """Refresh cached solver data after supported model changes."""
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
             self._update_kinematic_state()
             self._scatter_armature_to_groups()
@@ -2575,6 +2611,12 @@ class SolverFeatherPGS(SolverBase):
         self.row_mu = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
+        self.row_restitution = wp.zeros(
+            (self.world_count, max_constraints),
+            dtype=wp.float32,
+            device=device,
+            requires_grad=requires_grad,
+        )
         self._debug_position_row_mu = (
             wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
             if self._debug_buffers_enabled
@@ -2774,6 +2816,9 @@ class SolverFeatherPGS(SolverBase):
         self.mf_row_parent = wp.full((worlds, mf_max_c), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_row_mu = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.mf_phi = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self.mf_row_restitution = wp.zeros(
+            (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
         self._debug_position_mf_row_type = (
             wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
             if self._debug_buffers_enabled
@@ -2872,6 +2917,7 @@ class SolverFeatherPGS(SolverBase):
         self.mf_row_parent = wp.full((worlds, 1), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
         for name in ("mf_rhs", "mf_rhs_unbiased", "mf_impulses", "mf_eff_mass_inv", "mf_row_mu", "mf_phi"):
             setattr(self, name, wp.zeros((worlds, 1), dtype=wp.float32, device=device, requires_grad=requires_grad))
+        self.mf_row_restitution = wp.zeros((worlds, 1), dtype=wp.float32, device=device)
         for name in ("mf_J_a", "mf_J_b", "mf_MiJt_a", "mf_MiJt_b"):
             setattr(self, name, wp.zeros((worlds, 1, 6), dtype=wp.float32, device=device, requires_grad=requires_grad))
         self.mf_meta_packed = wp.zeros((worlds, 4), dtype=wp.int32, device=device)
@@ -2909,6 +2955,8 @@ class SolverFeatherPGS(SolverBase):
             self.propagation_row_parent = None
             self.propagation_row_mu = None
             self.propagation_phi = None
+            self.propagation_row_restitution = None
+            self.propagation_restitution_target = None
             self.propagation_body_B = None
             self.propagation_body_qd_response = None
             self.propagation_body_response = None
@@ -3013,6 +3061,12 @@ class SolverFeatherPGS(SolverBase):
             (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.propagation_phi = wp.zeros(
+            (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.propagation_row_restitution = wp.zeros(
+            (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
+        )
+        self.propagation_restitution_target = wp.zeros(
             (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
 
@@ -4086,12 +4140,15 @@ class SolverFeatherPGS(SolverBase):
                     self.propagation_body_response,
                     self.propagation_phi,
                     self.propagation_row_type,
+                    self.propagation_row_restitution,
+                    self.propagation_body_qd,
                     self.rigid_body_max_depenetration_velocity,
                     self.pgs_cfm,
                     self.pgs_beta,
                     self.dense_contact_compliance,
                     self.speculative_dense_contact_compliance,
                     dt,
+                    self.restitution_velocity_threshold,
                     self.propagation_max_constraints,
                 ],
                 outputs=[
@@ -4099,6 +4156,7 @@ class SolverFeatherPGS(SolverBase):
                     self.propagation_MiJt_a,
                     self.propagation_MiJt_b,
                     self.propagation_rhs,
+                    self.propagation_restitution_target,
                 ],
                 device=self.model.device,
             )
@@ -4240,6 +4298,7 @@ class SolverFeatherPGS(SolverBase):
         bias_scale: float,
         speculative_scale: float = 1.0,
         preserve_unreached_speculative: bool = False,
+        apply_restitution: bool = False,
         output: wp.array,
     ) -> None:
         if not self._propagation_contacts_enabled():
@@ -4255,6 +4314,7 @@ class SolverFeatherPGS(SolverBase):
                 self.propagation_J_b,
                 self.propagation_phi,
                 self.propagation_row_type,
+                self.propagation_restitution_target,
                 self.rigid_body_max_depenetration_velocity,
                 self.pgs_beta,
                 dt,
@@ -4262,6 +4322,7 @@ class SolverFeatherPGS(SolverBase):
                 speculative_scale,
                 self.propagation_body_qd,
                 int(preserve_unreached_speculative),
+                int(apply_restitution),
                 self.propagation_max_constraints,
             ],
             outputs=[output],
@@ -4781,18 +4842,19 @@ class SolverFeatherPGS(SolverBase):
         # joint-position delta from the original drive position bias. The
         # velocity-pass descriptor below approximates that delta as
         # ``dt * J * v_position_solve``.
-        velocity_drive_position_delta_scale = 1.0 if self.pgs_velocity_drive_mode == "active" else 0.0
-        self._stage4_compute_physx_drive_desc(
-            dt,
-            position_bias_scale=1.0,
-            position_delta_velocity=self.v_out_snap,
-            position_delta_scale=velocity_drive_position_delta_scale,
-        )
+        if self.pgs_velocity_drive_mode == "active":
+            self._stage4_compute_physx_drive_desc(
+                dt,
+                position_bias_scale=1.0,
+                position_delta_velocity=self.v_out_snap,
+                position_delta_scale=1.0,
+            )
         self._stage4_compute_rhs_world(
             dt,
             bias_scale=0.0,
             contact_speculative_scale=0.0,
             preserve_unreached_speculative=True,
+            apply_restitution=True,
             joint_limit_speculative_scale=1.0,
             output=self.rhs_unbiased,
         )
@@ -4802,6 +4864,7 @@ class SolverFeatherPGS(SolverBase):
                 bias_scale=0.0,
                 speculative_scale=0.0,
                 preserve_unreached_speculative=True,
+                apply_restitution=True,
                 output=self.mf_rhs_unbiased,
             )
         if self._propagation_contacts_enabled():
@@ -4810,13 +4873,12 @@ class SolverFeatherPGS(SolverBase):
                 bias_scale=0.0,
                 speculative_scale=0.0,
                 preserve_unreached_speculative=True,
+                apply_restitution=True,
                 output=self.propagation_rhs_unbiased,
             )
 
     def _snapshot_matrix_free_position_problem(self, contacts: Contacts | None) -> None:
-        """Copy the biased q0 position-solve problem before concluding rows for velocity iterations."""
-        # The _debug_position_* buffers only exist when debugging or velocity
-        # iterations were requested at construction time.
+        """Copy the biased q0 position-solve problem for diagnostics."""
         assert self._debug_buffers_enabled, "debug capture buffers were not allocated"
         wp.copy(self._debug_position_constraint_count, self.constraint_count)
         wp.copy(self._debug_position_impulses, self.impulses)
@@ -5174,6 +5236,7 @@ class SolverFeatherPGS(SolverBase):
 
             for size in self.size_groups:
                 self._stage4_accumulate_rhs_world(size)
+            self._stage4_apply_world_contact_restitution(dt, matrix_free=False)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 5+6: PGS solve
@@ -5208,8 +5271,19 @@ class SolverFeatherPGS(SolverBase):
                             device=self.model.device,
                         )
 
+                self._stage4_apply_world_contact_restitution(dt, matrix_free=True)
+
                 # Initialize v_out = v_hat before GS loop
                 self._stage6_prepare_world_velocity()
+                if self.pgs_warmstart:
+                    # Matrix-free GS updates velocity from impulse deltas, so
+                    # cached dense lambdas must be represented in v_out before
+                    # the first delta is computed.
+                    for size in self.size_groups:
+                        self._stage6_apply_impulses_world(size)
+                self._apply_mf_warmstart_velocity(self.v_out, set_output_to_delta=False)
+                if (self.pgs_warmstart or self._mf_warmstart_enabled) and self._propagation_contacts_enabled():
+                    self._refresh_propagation_body_qd_from_vout(force=True)
 
                 # Pack MF metadata into int4 structs for coalesced 128-bit loads
                 self._pack_mf_meta(self.mf_rhs)
@@ -5418,11 +5492,11 @@ class SolverFeatherPGS(SolverBase):
                         # phase. Later internal rows update v_out only, so bring
                         # the classifier back to the velocity being integrated.
                         self._refresh_propagation_body_qd_from_vout(force=True)
-                wp.copy(self._debug_position_v_out, self.v_out)
-                self._snapshot_matrix_free_position_problem(contacts)
+                if self.pgs_debug:
+                    wp.copy(self._debug_position_v_out, self.v_out)
+                    self._snapshot_matrix_free_position_problem(contacts)
                 wp.copy(self.v_out_snap, self.v_out)
                 self._conclude_matrix_free_position_problem(dt)
-                wp.copy(self.v_out, self.v_out_snap)
                 wp.copy(self.v_hat, self.v_out_snap)
                 self._clamp_rigid_velocity_limits(self.v_hat)
                 self._run_matrix_free_velocity_post_solve()
@@ -5431,7 +5505,19 @@ class SolverFeatherPGS(SolverBase):
         elif self.pgs_mode == "split" and self._has_mixed_contacts:
             # Split mode with mixed contacts: interleaved dense and MF, 1 iteration each.
             self._mf_pgs_setup(state_aug, dt)
+            self._build_mf_body_map()
             self.v_mf_accum.zero_()
+            self._apply_mf_warmstart_velocity(
+                self.v_mf_accum,
+                set_output_to_delta=True,
+                body_map_ready=True,
+            )
+            if self._mf_warmstart_enabled:
+                # Split stores dense constraints in impulse space, so its RHS
+                # must include the velocity represented by the cached MF
+                # lambdas before the first interleaved dense iteration.
+                for size in self.size_groups:
+                    self._stage4_accumulate_rhs_world(size, velocity=self.v_mf_accum)
 
             for _pgs_iter in range(self.pgs_iterations):
                 # Dense PGS (1 iteration, impulse space)
@@ -5458,6 +5544,7 @@ class SolverFeatherPGS(SolverBase):
                     iterations=1,
                     friction_start_iteration=self._contact_friction_start_iteration(self.pgs_iterations),
                     iteration_offset=_pgs_iter,
+                    body_map_ready=True,
                 )
 
                 # v_mf_accum += (v_out - v_out_snap); v_out_snap = delta
@@ -5470,23 +5557,7 @@ class SolverFeatherPGS(SolverBase):
 
                 # Update dense rhs: world_rhs += J * delta_v_mf
                 for size in self.size_groups:
-                    n_arts = self.n_arts_by_size[size]
-                    wp.launch(
-                        rhs_accum_world_par_art,
-                        dim=n_arts,
-                        inputs=[
-                            self.constraint_count,
-                            self.dense_max_constraints,
-                            self.art_to_world,
-                            self.articulation_dof_start,
-                            self.v_out_snap,
-                            self.group_to_art[size],
-                            self.J_by_size[size],
-                            size,
-                        ],
-                        outputs=[self.rhs],
-                        device=self.model.device,
-                    )
+                    self._stage4_accumulate_rhs_world(size, velocity=self.v_out_snap)
 
             # v_out is already final (includes both dense and MF corrections)
 
@@ -6749,6 +6820,7 @@ class SolverFeatherPGS(SolverBase):
                         self._prescribed_articulation,
                         model.shape_transform,
                         self.shape_material_mu,
+                        self.shape_material_restitution,
                         enable_friction_flag,
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
@@ -6767,6 +6839,7 @@ class SolverFeatherPGS(SolverBase):
                         self.row_cfm,
                         self.phi,
                         self.target_velocity,
+                        self.row_restitution,
                     ],
                     device=model.device,
                 )
@@ -6798,6 +6871,7 @@ class SolverFeatherPGS(SolverBase):
                         self._prescribed_articulation,
                         int(self._has_prescribed_response),
                         self.shape_material_mu,
+                        self.shape_material_restitution,
                         enable_friction_flag,
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
@@ -6816,6 +6890,7 @@ class SolverFeatherPGS(SolverBase):
                         self.mf_row_mu,
                         self.mf_phi,
                         self.mf_target_velocity,
+                        self.mf_row_restitution,
                     ],
                     device=model.device,
                 )
@@ -6899,6 +6974,7 @@ class SolverFeatherPGS(SolverBase):
                         state_in.body_q,
                         model.body_com,
                         self.shape_material_mu,
+                        self.shape_material_restitution,
                         enable_friction_flag,
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
@@ -6919,6 +6995,7 @@ class SolverFeatherPGS(SolverBase):
                         self.propagation_row_parent,
                         self.propagation_row_mu,
                         self.propagation_phi,
+                        self.propagation_row_restitution,
                     ],
                     device=model.device,
                 )
@@ -7340,6 +7417,7 @@ class SolverFeatherPGS(SolverBase):
         bias_scale: float = 1.0,
         contact_speculative_scale: float = 1.0,
         preserve_unreached_speculative: bool = False,
+        apply_restitution: bool = False,
         joint_limit_speculative_scale: float = 1.0,
         output=None,
     ):
@@ -7356,10 +7434,14 @@ class SolverFeatherPGS(SolverBase):
                     self.phi,
                     self.row_type,
                     self.target_velocity,
+                    self.row_restitution,
                     self.v_out_snap,
+                    self.v_hat,
                     self.world_dof_indices,
                     self.J_world,
                     dt,
+                    int(apply_restitution),
+                    self.restitution_velocity_threshold,
                 ],
                 outputs=[rhs_out],
                 device=model.device,
@@ -7384,9 +7466,11 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage4_accumulate_rhs_world(self, size: int):
+    def _stage4_accumulate_rhs_world(self, size: int, velocity=None):
         model = self.model
         n_arts = self.n_arts_by_size[size]
+        if velocity is None:
+            velocity = self.v_hat
         wp.launch(
             rhs_accum_world_par_art,
             dim=n_arts,
@@ -7395,13 +7479,55 @@ class SolverFeatherPGS(SolverBase):
                 self.dense_max_constraints,
                 self.art_to_world,
                 self.articulation_dof_start,
-                self.v_hat,
+                velocity,
                 self.group_to_art[size],
                 self.J_by_size[size],
                 size,
             ],
             outputs=[self.rhs],
             device=model.device,
+        )
+
+    def _stage4_apply_world_contact_restitution(self, dt: float, *, matrix_free: bool) -> None:
+        """Replace geometric contact bias for impacts selected from ``v_hat``."""
+        if matrix_free:
+            wp.launch(
+                apply_world_contact_restitution_matrix_free,
+                dim=self.world_count * self.dense_max_constraints,
+                inputs=[
+                    self.constraint_count,
+                    self.dense_max_constraints,
+                    self.world_dof_count,
+                    self.phi,
+                    self.row_type,
+                    self.target_velocity,
+                    self.row_restitution,
+                    self.v_hat,
+                    self.world_dof_indices,
+                    self.J_world,
+                    dt,
+                    self.restitution_velocity_threshold,
+                ],
+                outputs=[self.rhs],
+                device=self.model.device,
+            )
+            return
+
+        wp.launch(
+            apply_world_contact_restitution_accumulated,
+            dim=self.world_count * self.dense_max_constraints,
+            inputs=[
+                self.constraint_count,
+                self.dense_max_constraints,
+                self.phi,
+                self.row_beta,
+                self.row_type,
+                self.row_restitution,
+                dt,
+                self.restitution_velocity_threshold,
+            ],
+            outputs=[self.rhs],
+            device=self.model.device,
         )
 
     def _stage5_prepare_impulses_world(self):
@@ -7544,6 +7670,60 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage6_prepare_world_velocity(self):
         wp.copy(self.v_out, self.v_hat)
+
+    def _build_mf_body_map(self) -> None:
+        """Build the per-world free-body map shared by MF warm start and PGS."""
+        wp.launch(
+            build_mf_body_map,
+            dim=self.world_count,
+            inputs=[
+                self.mf_constraint_count,
+                self.mf_body_a,
+                self.mf_body_b,
+                self.body_to_articulation,
+                self.articulation_dof_start,
+                self.max_mf_bodies,
+            ],
+            outputs=[
+                self.mf_body_list,
+                self.mf_body_dof_start,
+                self.mf_body_count,
+                self.mf_local_body_a,
+                self.mf_local_body_b,
+            ],
+            device=self.model.device,
+        )
+
+    def _apply_mf_warmstart_velocity(
+        self,
+        velocity: wp.array,
+        *,
+        set_output_to_delta: bool,
+        body_map_ready: bool = False,
+    ) -> None:
+        """Install cached MF impulse response into a live velocity state."""
+        if not self._mf_warmstart_enabled or not self._has_free_rigid_bodies:
+            return
+        if not body_map_ready:
+            self._build_mf_body_map()
+        wp.launch(
+            apply_mf_warmstart_impulses,
+            dim=self.world_count * self.max_mf_bodies * 6,
+            inputs=[
+                self.mf_constraint_count,
+                self.mf_body_count,
+                self.mf_body_dof_start,
+                self.mf_local_body_a,
+                self.mf_local_body_b,
+                self.mf_MiJt_a,
+                self.mf_MiJt_b,
+                self.mf_impulses,
+                self.max_mf_bodies,
+                int(set_output_to_delta),
+            ],
+            outputs=[velocity],
+            device=self.model.device,
+        )
 
     def _clamp_rigid_velocity_limits(self, qd: wp.array):
         if not self._has_root_free or not self._has_rigid_body_velocity_limits:
@@ -7989,9 +8169,16 @@ class SolverFeatherPGS(SolverBase):
     def _stage6b_mf_pgs(self, state_aug: State, dt: float):
         """Run matrix-free PGS for free rigid body contacts."""
         self._mf_pgs_setup(state_aug, dt)
+        self._build_mf_body_map()
+        self._apply_mf_warmstart_velocity(
+            self.v_out,
+            set_output_to_delta=False,
+            body_map_ready=True,
+        )
         self._mf_pgs_solve(
             self.pgs_iterations,
             friction_start_iteration=self._contact_friction_start_iteration(self.pgs_iterations),
+            body_map_ready=True,
         )
 
     def _mf_pgs_setup(self, state_aug: State, dt: float):
@@ -8029,11 +8216,16 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_phi,
                 self.mf_row_type,
                 self.mf_target_velocity,
+                self.mf_row_restitution,
                 int(self._has_prescribed_response),
+                self.body_to_articulation,
+                self.articulation_dof_start,
+                self.v_hat,
                 self.rigid_body_max_depenetration_velocity,
                 self.pgs_cfm,
                 self.pgs_beta,
                 dt,
+                self.restitution_velocity_threshold,
                 self.mf_max_constraints,
             ],
             outputs=[
@@ -8052,6 +8244,7 @@ class SolverFeatherPGS(SolverBase):
         bias_scale: float,
         speculative_scale: float = 1.0,
         preserve_unreached_speculative: bool = False,
+        apply_restitution: bool = False,
         output: wp.array,
     ):
         """Recompute MF contact RHS for the current rows without touching effective mass."""
@@ -8070,6 +8263,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_phi,
                 self.mf_row_type,
                 self.mf_target_velocity,
+                self.mf_row_restitution,
                 int(self._has_prescribed_response),
                 self.rigid_body_max_depenetration_velocity,
                 self.pgs_beta,
@@ -8077,7 +8271,10 @@ class SolverFeatherPGS(SolverBase):
                 bias_scale,
                 speculative_scale,
                 self.v_out_snap,
+                self.v_hat,
                 int(preserve_unreached_speculative),
+                int(apply_restitution),
+                self.restitution_velocity_threshold,
                 self.mf_max_constraints,
             ],
             outputs=[output],
@@ -8089,33 +8286,15 @@ class SolverFeatherPGS(SolverBase):
         iterations: int,
         friction_start_iteration: int | None = None,
         iteration_offset: int = 0,
+        body_map_ready: bool = False,
     ):
         """MF PGS solve with given iteration count."""
         model = self.model
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
 
-        # Build propagation body map for standalone MF kernel
-        wp.launch(
-            build_mf_body_map,
-            dim=self.world_count,
-            inputs=[
-                self.mf_constraint_count,
-                self.mf_body_a,
-                self.mf_body_b,
-                self.body_to_articulation,
-                self.articulation_dof_start,
-                self.max_mf_bodies,
-            ],
-            outputs=[
-                self.mf_body_list,
-                self.mf_body_dof_start,
-                self.mf_body_count,
-                self.mf_local_body_a,
-                self.mf_local_body_b,
-            ],
-            device=model.device,
-        )
+        if not body_map_ready:
+            self._build_mf_body_map()
 
         if model.device.is_cuda:
             mf_pgs_kernel = self._pgs_solve_mf_kernel
@@ -8291,7 +8470,8 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[state_out.joint_q, state_out.joint_qd],
                 device=model.device,
             )
-            eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+            # _stage6_write_final_velocity replaces joint_qd and evaluates FK
+            # once, so evaluating the temporary position velocity here is wasteful.
 
         self.integrate_particles(model, state_in, state_out, dt)
 
