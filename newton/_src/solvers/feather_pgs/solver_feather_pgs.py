@@ -6177,8 +6177,8 @@ class SolverFeatherPGS(SolverBase):
                 model.joint_target_kd,
                 state_in.joint_q,
                 state_in.joint_qd,
-                control.joint_target_pos,
-                control.joint_target_vel,
+                control.joint_target_q,
+                control.joint_target_qd,
                 self.articulation_max_dofs,
                 dt,
             ],
@@ -6552,8 +6552,8 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_target_kd,
                         model.joint_effort_limit,
                         state_in.joint_q,
-                        control.joint_target_pos,
-                        control.joint_target_vel,
+                        control.joint_target_q,
+                        control.joint_target_qd,
                         self._drive_vel_limit_src_arg,
                         # Equals int(fuse_joint_velocity_limits) here: this
                         # launch is guarded by drive_active (drive_slot set).
