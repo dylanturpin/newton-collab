@@ -14,11 +14,6 @@ from newton._src.core.types import Axis
 from newton._src.solvers.kamino._src.core.bodies import RigidBodyDescriptor
 from newton._src.solvers.kamino._src.core.builder import ModelBuilderKamino
 from newton._src.solvers.kamino._src.core.geometry import GeometryDescriptor
-from newton._src.solvers.kamino._src.core.gravity import (
-    GRAVITY_ACCEL_DEFAULT,
-    GRAVITY_DIREC_DEFAULT,
-    GRAVITY_NAME_DEFAULT,
-)
 from newton._src.solvers.kamino._src.core.joints import JointActuationType, JointDescriptor, JointDoFType
 from newton._src.solvers.kamino._src.core.materials import MaterialDescriptor
 from newton._src.solvers.kamino._src.core.model import ModelKamino
@@ -58,7 +53,7 @@ def assert_model_matches_builder(test: unittest.TestCase, builder: ModelBuilderK
         test.assertEqual(model.info.num_passive_joint_dofs.numpy()[w], world.num_passive_joint_dofs)
         test.assertEqual(model.info.num_actuated_joint_coords.numpy()[w], world.num_actuated_joint_coords)
         test.assertEqual(model.info.num_actuated_joint_dofs.numpy()[w], world.num_actuated_joint_dofs)
-        test.assertEqual(model.info.num_joint_cts.numpy()[w], world.num_joint_cts)
+        test.assertEqual(model.info.num_joint_bilateral_cts.numpy()[w], world.num_bilateral_joint_cts)
         test.assertEqual(model.info.num_joint_dynamic_cts.numpy()[w], world.num_dynamic_joint_cts)
         test.assertEqual(model.info.num_joint_kinematic_cts.numpy()[w], world.num_kinematic_joint_cts)
         test.assertEqual(model.info.bodies_offset.numpy()[w], world.bodies_idx_offset)
@@ -71,9 +66,11 @@ def assert_model_matches_builder(test: unittest.TestCase, builder: ModelBuilderK
         test.assertEqual(model.info.joint_passive_dofs_offset.numpy()[w], world.joint_passive_dofs_idx_offset)
         test.assertEqual(model.info.joint_actuated_coords_offset.numpy()[w], world.joint_actuated_coords_idx_offset)
         test.assertEqual(model.info.joint_actuated_dofs_offset.numpy()[w], world.joint_actuated_dofs_idx_offset)
-        # TODO: test.assertEqual(model.info.joint_cts_offset.numpy()[w], world.joint_cts_idx_offset)
+        test.assertEqual(model.info.joint_bilateral_cts_offset.numpy()[w], world.joint_bilateral_cts_idx_offset)
         test.assertEqual(model.info.joint_dynamic_cts_offset.numpy()[w], world.joint_dynamic_cts_idx_offset)
         test.assertEqual(model.info.joint_kinematic_cts_offset.numpy()[w], world.joint_kinematic_cts_idx_offset)
+        test.assertEqual(model.info.joint_bounded_cts_offset.numpy()[w], world.joint_bounded_cts_idx_offset)
+        test.assertEqual(model.info.joint_friction_cts_offset.numpy()[w], world.joint_friction_cts_idx_offset)
 
     test.assertEqual(builder.num_bodies, model.size.sum_of_num_bodies)
     for i, body in enumerate(builder.all_bodies):
@@ -115,7 +112,7 @@ def assert_model_matches_builder(test: unittest.TestCase, builder: ModelBuilderK
     msg.info("model.info.body_dofs_offset: %s", model.info.body_dofs_offset)
     msg.info("model.info.joint_coords_offset: %s", model.info.joint_coords_offset)
     msg.info("model.info.joint_dofs_offset: %s", model.info.joint_dofs_offset)
-    msg.info("model.info.joint_cts_offset: %s\n", model.info.joint_cts_offset)
+    msg.info("model.info.joint_bilateral_cts_offset: %s\n", model.info.joint_bilateral_cts_offset)
     msg.info("model.info.joint_dynamic_cts_offset: %s\n", model.info.joint_dynamic_cts_offset)
     msg.info("model.info.joint_kinematic_cts_offset: %s\n", model.info.joint_kinematic_cts_offset)
     msg.info("model.info.joint_passive_coords_offset: %s", model.info.joint_passive_coords_offset)
@@ -161,7 +158,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(builder.num_joint_dofs, 0)
         self.assertEqual(builder.num_passive_joint_dofs, 0)
         self.assertEqual(builder.num_actuated_joint_dofs, 0)
-        self.assertEqual(builder.num_joint_cts, 0)
+        self.assertEqual(builder.num_bilateral_joint_cts, 0)
         self.assertEqual(builder.num_dynamic_joint_cts, 0)
         self.assertEqual(builder.num_kinematic_joint_cts, 0)
         self.assertEqual(len(builder.bodies), 0)
@@ -180,7 +177,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(builder.num_joint_dofs, 0)
         self.assertEqual(builder.num_passive_joint_dofs, 0)
         self.assertEqual(builder.num_actuated_joint_dofs, 0)
-        self.assertEqual(builder.num_joint_cts, 0)
+        self.assertEqual(builder.num_bilateral_joint_cts, 0)
         self.assertEqual(len(builder.bodies), 1)
         self.assertEqual(len(builder.bodies[0]), 0)
         self.assertEqual(len(builder.joints), 1)
@@ -188,6 +185,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(len(builder.geoms), 1)
         self.assertEqual(len(builder.geoms[0]), 0)
         self.assertEqual(len(builder.materials), 1)  # Default material is always created
+        np.testing.assert_array_equal(builder.gravity[0].vector, np.array([0.0, 0.0, -9.81], dtype=np.float32))
 
     def test_02_add_world(self):
         builder = ModelBuilderKamino()
@@ -197,9 +195,32 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(builder.worlds[wid].wid, wid)
         self.assertEqual(builder.worlds[wid].name, "test_world")
         self.assertEqual(builder.up_axes[wid], Axis.Y)
-        self.assertEqual(builder.gravity[wid].name, GRAVITY_NAME_DEFAULT)
-        self.assertEqual(builder.gravity[wid].acceleration, GRAVITY_ACCEL_DEFAULT)
-        np.testing.assert_array_equal(builder.gravity[wid].direction, np.array(GRAVITY_DIREC_DEFAULT, dtype=np.float32))
+        np.testing.assert_array_equal(builder.gravity[wid].vector, np.array([0.0, -9.81, 0.0], dtype=np.float32))
+
+    def test_add_world_accepts_arraylike_gravity(self):
+        """Store a list gravity vector when adding a world."""
+        builder = ModelBuilderKamino()
+
+        wid = builder.add_world(gravity=[1.0, -2.0, 3.0])
+
+        np.testing.assert_array_equal(builder.gravity[wid].vector, np.array([1.0, -2.0, 3.0], dtype=np.float32))
+
+    def test_set_gravity_accepts_numpy_vector(self):
+        """Store a NumPy gravity vector after adding a world."""
+        builder = ModelBuilderKamino()
+        builder.add_world()
+
+        builder.set_gravity(np.array([1.0, -2.0, 3.0], dtype=np.float32))
+
+        np.testing.assert_array_equal(builder.gravity[0].vector, np.array([1.0, -2.0, 3.0], dtype=np.float32))
+
+    def test_set_gravity_rejects_invalid_vector_shape(self):
+        """Reject gravity vectors without exactly three components."""
+        builder = ModelBuilderKamino()
+        builder.add_world()
+
+        with self.assertRaisesRegex(ValueError, r"shape \(3,\)"):
+            builder.set_gravity([0.0, -9.81])
 
     def test_03_add_rigid_body(self):
         builder = ModelBuilderKamino()
@@ -401,9 +422,7 @@ class TestModelBuilder(unittest.TestCase):
         wid = builder.add_world(name="test_world", up_axis=Axis.Z)
         self.assertEqual(builder.num_materials, 1)  # Default material exists
 
-        material = MaterialDescriptor(
-            name="test_material", density=500.0, restitution=0.8, static_friction=0.6, dynamic_friction=0.4
-        )
+        material = MaterialDescriptor(name="test_material", restitution=0.8, static_friction=0.6, dynamic_friction=0.4)
 
         mid = builder.add_material(material=material)
         self.assertEqual(builder.num_materials, 2)
@@ -411,7 +430,6 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(mid, builder.materials[mid].mid)
         self.assertEqual(builder.materials[mid].name, "test_material")
         self.assertEqual(builder.materials[mid].wid, wid)
-        self.assertEqual(builder.materials[mid].density, 500.0)
         self.assertEqual(builder.materials[mid].restitution, 0.8)
         self.assertEqual(builder.materials[mid].static_friction, 0.6)
         self.assertEqual(builder.materials[mid].dynamic_friction, 0.4)
@@ -599,7 +617,7 @@ class TestModelBuilder(unittest.TestCase):
         msg.info("world_min_contacts: %s", world_min_contacts)
 
         # Check that the generated meta-data matches expected values for this model
-        expected_contacts_per_world = 2 * len(model_candidate_pairs) * 12  # 12 is the max contacts per pair
+        expected_contacts_per_world = len(model_candidate_pairs) * 8  # Box-box pairs generate up to 8 contacts.
         self.assertEqual(world_num_collidables[0], 5)
         self.assertEqual(model_num_collidables, 5)
         self.assertEqual(len(model_candidate_pairs), 6)
@@ -662,7 +680,7 @@ class TestModelBuilder(unittest.TestCase):
         msg.info("world_min_contacts: %s", world_min_contacts)
 
         # Check that the generated meta-data matches expected values for this model
-        expected_contacts_per_world = 2 * len(model_candidate_pairs) * 12  # 12 is the max contacts per pair
+        expected_contacts_per_world = len(model_candidate_pairs) * 8  # Box-box pairs generate up to 8 contacts.
         self.assertEqual(world_num_collidables[0], 3)
         self.assertEqual(model_num_collidables, 3)
         self.assertEqual(len(model_candidate_pairs), 2)
@@ -758,7 +776,7 @@ class TestModelBuilder(unittest.TestCase):
         msg.info("world_min_contacts: %s", world_min_contacts)
 
         # Check that the generated meta-data matches expected values for this model
-        expected_contacts_per_world = 2 * 6 * 12  # 12 is the max contacts per pair
+        expected_contacts_per_world = 6 * 8  # Six box-box pairs generate up to 8 contacts each.
         self.assertEqual(model_num_collidables, 5 * builder.num_worlds)
         self.assertEqual(world_num_collidables, [5] * builder.num_worlds)
         self.assertEqual(len(model_candidate_pairs), 6 * builder.num_worlds)

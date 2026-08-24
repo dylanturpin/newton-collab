@@ -15,7 +15,6 @@ import warp as wp
 
 from .....core.types import Axis
 from .....geometry import ShapeFlags
-from ..utils import logger as msg
 from .bodies import RigidBodiesModel, RigidBodyDescriptor
 from .geometry import GeometriesModel, GeometryDescriptor
 from .gravity import GravityDescriptor, GravityModel
@@ -31,7 +30,7 @@ from .model import ModelKamino, ModelKaminoInfo
 from .shapes import ShapeDescriptorType, max_contacts_for_shape_pair
 from .size import SizeKamino
 from .time import TimeModel
-from .types import to_warp_int32_array
+from .types import ArrayLike, to_warp_int32_array
 from .world import WorldDescriptor
 
 ###
@@ -85,9 +84,11 @@ class ModelBuilderKamino:
         self._num_joint_passive_dofs: int = 0
         self._num_joint_actuated_coords: int = 0
         self._num_joint_actuated_dofs: int = 0
-        self._num_joint_cts: int = 0
+        self._num_joint_bilateral_cts: int = 0
         self._num_joint_kinematic_cts: int = 0
         self._num_joint_dynamic_cts: int = 0
+        self._num_joint_bounded_cts: int = 0
+        self._num_joint_friction_cts: int = 0
 
         # Contact capacity settings
         self._max_contacts_per_pair: int | None = None
@@ -180,9 +181,9 @@ class ModelBuilderKamino:
         return self._num_joint_actuated_dofs
 
     @property
-    def num_joint_cts(self) -> int:
-        """Returns the total number of joint constraints contained in the model."""
-        return self._num_joint_cts
+    def num_bilateral_joint_cts(self) -> int:
+        """Returns the total number of bilateral joint constraints contained in the model."""
+        return self._num_joint_bilateral_cts
 
     @property
     def num_dynamic_joint_cts(self) -> int:
@@ -193,6 +194,16 @@ class ModelBuilderKamino:
     def num_kinematic_joint_cts(self) -> int:
         """Returns the number of kinematic joint constraints contained in the model."""
         return self._num_joint_kinematic_cts
+
+    @property
+    def num_bounded_joint_cts(self) -> int:
+        """Returns the number of bounded-multiplier joint constraint rows contained in the model."""
+        return self._num_joint_bounded_cts
+
+    @property
+    def num_friction_joint_cts(self) -> int:
+        """Returns the number of Coulomb joint friction constraint rows contained in the model."""
+        return self._num_joint_friction_cts
 
     @property
     def worlds(self) -> list[WorldDescriptor]:
@@ -206,7 +217,7 @@ class ModelBuilderKamino:
 
     @property
     def gravity(self) -> list[GravityDescriptor]:
-        """Returns the list of gravity descriptors for each world contained in the model."""
+        """Returns the gravity descriptor for each world contained in the model."""
         return self._gravity
 
     @property
@@ -261,7 +272,7 @@ class ModelBuilderKamino:
         name: str = "world",
         uid: str | None = None,
         up_axis: Axis | None = None,
-        gravity: GravityDescriptor | None = None,
+        gravity: GravityDescriptor | ArrayLike | None = None,
     ) -> int:
         """
         Add a new world to the model.
@@ -272,8 +283,8 @@ class ModelBuilderKamino:
                 If None, a UUID will be generated.
             up_axis: The up axis of the world.
                 If None, Axis.Z will be used.
-            gravity: The gravity descriptor of the world.
-                If None, a default gravity descriptor will be used.
+            gravity: The gravity descriptor or vector [m/s²] of the world.
+                If ``None``, Newton's default gravity is used along the negative up axis.
 
         Returns:
             The index of the newly added world.
@@ -293,7 +304,9 @@ class ModelBuilderKamino:
 
         # Set gravity
         if gravity is None:
-            gravity = GravityDescriptor()
+            gravity = GravityDescriptor.default_from_up_axis(up_axis)
+        elif not isinstance(gravity, GravityDescriptor):
+            gravity = GravityDescriptor.from_array(gravity)
         self._gravity.append(gravity)
 
         # Register the default material in the new world
@@ -397,6 +410,7 @@ class ModelBuilderKamino:
         tau_j_max: list[float] | float | None = None,
         a_j: list[float] | float | None = None,
         b_j: list[float] | float | None = None,
+        f_j: list[float] | float | None = None,
         k_p_j: list[float] | float | None = None,
         k_d_j: list[float] | float | None = None,
         name: str | None = None,
@@ -421,6 +435,7 @@ class ModelBuilderKamino:
             tau_j_max: The maximum joint effort limits.
             a_j: The joint armature along each DoF.
             b_j: The joint damping along each DoF.
+            f_j: The Coulomb friction force or torque limit along each DoF [N, N·m].
             k_p_j: The joint proportional gain along each DoF.
             k_d_j: The joint derivative gain along each DoF.
             name: The name of the joint.
@@ -460,6 +475,7 @@ class ModelBuilderKamino:
             tau_j_max=tau_j_max,
             a_j=a_j,
             b_j=b_j,
+            f_j=f_j,
             k_p_j=k_p_j,
             k_d_j=k_d_j,
         )
@@ -484,6 +500,8 @@ class ModelBuilderKamino:
         # Check if the descriptor is valid
         if not isinstance(joint, JointDescriptor):
             raise TypeError(f"Invalid joint descriptor type: {type(joint)}. Must be `JointDescriptor`.")
+        if joint.dof_type == JointDoFType.FREE and any(value > 0.0 for value in joint.f_j):
+            msg.warning("Ignoring joint friction on FREE joint %r.", joint.name)
 
         # Check if the world index is valid
         world = self._check_world_index(world_index)
@@ -500,9 +518,11 @@ class ModelBuilderKamino:
         self._num_joint_passive_dofs += joint.num_passive_dofs
         self._num_joint_actuated_coords += joint.num_actuated_coords
         self._num_joint_actuated_dofs += joint.num_actuated_dofs
-        self._num_joint_cts += joint.num_cts
+        self._num_joint_bilateral_cts += joint.num_bilateral_cts
         self._num_joint_dynamic_cts += joint.num_dynamic_cts
         self._num_joint_kinematic_cts += joint.num_kinematic_cts
+        self._num_joint_bounded_cts += joint.num_bounded_cts
+        self._num_joint_friction_cts += joint.num_friction_cts
 
         # Return the new joint index
         return joint.jid
@@ -719,9 +739,11 @@ class ModelBuilderKamino:
             self._num_joint_passive_dofs += world.num_passive_joint_dofs
             self._num_joint_actuated_coords += world.num_actuated_joint_coords
             self._num_joint_actuated_dofs += world.num_actuated_joint_dofs
-            self._num_joint_cts += world.num_joint_cts
+            self._num_joint_bilateral_cts += world.num_bilateral_joint_cts
             self._num_joint_dynamic_cts += world.num_dynamic_joint_cts
             self._num_joint_kinematic_cts += world.num_kinematic_joint_cts
+            self._num_joint_bounded_cts += world.num_bounded_joint_cts
+            self._num_joint_friction_cts += world.num_friction_joint_cts
 
         # Update the number of worlds
         self._num_worlds += other._num_worlds
@@ -752,26 +774,20 @@ class ModelBuilderKamino:
         # Set the new up axis
         self._up_axes[world_index] = axis
 
-    def set_gravity(self, gravity: GravityDescriptor, world_index: int = 0):
+    def set_gravity(self, gravity: GravityDescriptor | ArrayLike, world_index: int = 0):
         """
-        Set the gravity descriptor for a specific world.
+        Set the gravity vector for a specific world.
 
         Args:
-            gravity: The new gravity descriptor to be set.
-            world_index: The index of the world for which to set the gravity descriptor.
+            gravity: The new gravity descriptor or vector [m/s²].
+            world_index: The index of the world for which to set gravity.
                 Defaults to the first world with index `0`.
-
-        Raises:
-            TypeError: If the provided gravity descriptor is not of type `GravityDescriptor`.
         """
         # Check if the world index is valid
         self._check_world_index(world_index)
 
-        # Check if the gravity descriptor is valid
         if not isinstance(gravity, GravityDescriptor):
-            raise TypeError(f"Invalid gravity descriptor type: {type(gravity)}. Must be `GravityDescriptor`.")
-
-        # Set the new gravity configurations
+            gravity = GravityDescriptor.from_array(gravity)
         self._gravity[world_index] = gravity
 
     def set_default_material(self, material: MaterialDescriptor, world_index: int = 0):
@@ -912,6 +928,7 @@ class ModelBuilderKamino:
         self._compute_world_offsets()
 
         # Validate base body/joint data for each world, and fill in missing data if possible
+        has_world_without_base_body = False
         for w, world in enumerate(self._worlds):
             if world.has_base_joint:
                 base_joint = self._joints[w][world.base_joint_idx]
@@ -937,11 +954,10 @@ class ModelBuilderKamino:
                             break
                 # As a last fallback, set body 0 in that world as base body (no base joint), if no unary
                 # joints were found (else this is not a floating-base model and we assign no base body).
-                if not world.has_base_body and not has_unary_joint:
-                    if world.num_bodies == 0:
-                        msg.warning(f"Zero bodies in world {w}, no base body assigned.")
-                        continue
+                if not world.has_base_body and not has_unary_joint and world.num_bodies > 0:
                     world.set_base_body(0)
+
+            has_world_without_base_body = has_world_without_base_body or not world.has_base_body
 
         ###
         # ModelKamino data collection
@@ -964,6 +980,8 @@ class ModelBuilderKamino:
         info_njc = []
         info_njdc = []
         info_njkc = []
+        info_nbc = []
+        info_nfc = []
         info_bio = []
         info_jio = []
         info_gio = []
@@ -977,11 +995,12 @@ class ModelBuilderKamino:
         info_jcio = []
         info_jdcio = []
         info_jkcio = []
+        info_jbcio = []
+        info_jfcio = []
         info_base_bid = []
         info_base_jid = []
 
         # Initialize the gravity data collections
-        gravity_g_dir_acc = []
         gravity_vector = []
 
         # Initialize the body data collections
@@ -1017,12 +1036,15 @@ class ModelBuilderKamino:
         joints_tau_j_max = []
         joints_a_j = []
         joints_b_j = []
+        joints_f_j = []
         joints_k_p_j = []
         joints_k_d_j = []
         joints_ncoords_j = []
         joints_ndofs_j = []
         joints_ncts_j = []
         joints_nkincts_j = []
+        joints_nbccts_j = []
+        joints_nfriccts_j = []
         joints_ndyncts_j = []
         joints_q_start = []
         joints_dq_start = []
@@ -1033,6 +1055,8 @@ class ModelBuilderKamino:
         joints_cts_start = []
         joints_dcts_start = []
         joints_kcts_start = []
+        joints_bcts_start = []
+        joints_fcts_start = []
 
         # Initialize the collision geometry data collections
         geoms_label = []
@@ -1076,9 +1100,11 @@ class ModelBuilderKamino:
                 info_njpd.append(world.num_passive_joint_dofs)
                 info_njaq.append(world.num_actuated_joint_coords)
                 info_njad.append(world.num_actuated_joint_dofs)
-                info_njc.append(world.num_joint_cts)
+                info_njc.append(world.num_bilateral_joint_cts)
                 info_njdc.append(world.num_dynamic_joint_cts)
                 info_njkc.append(world.num_kinematic_joint_cts)
+                info_nbc.append(world.num_bounded_joint_cts)
+                info_nfc.append(world.num_friction_joint_cts)
                 info_bio.append(world.bodies_idx_offset)
                 info_jio.append(world.joints_idx_offset)
                 info_gio.append(world.geoms_idx_offset)
@@ -1092,17 +1118,18 @@ class ModelBuilderKamino:
                 info_jpdio.append(world.joint_passive_dofs_idx_offset)
                 info_jaqio.append(world.joint_actuated_coords_idx_offset)
                 info_jadio.append(world.joint_actuated_dofs_idx_offset)
-                info_jcio.append(world.joint_cts_idx_offset)
+                info_jcio.append(world.joint_bilateral_cts_idx_offset)
                 info_jdcio.append(world.joint_dynamic_cts_idx_offset)
                 info_jkcio.append(world.joint_kinematic_cts_idx_offset)
+                info_jbcio.append(world.joint_bounded_cts_idx_offset)
+                info_jfcio.append(world.joint_friction_cts_idx_offset)
                 info_base_bid.append((world.base_body_idx + world.bodies_idx_offset) if world.has_base_body else -1)
                 info_base_jid.append((world.base_joint_idx + world.joints_idx_offset) if world.has_base_joint else -1)
 
         # A helper function to collect model gravity data
         def collect_gravity_model_data():
             for w in range(num_worlds):
-                gravity_g_dir_acc.append(self._gravity[w].dir_accel())
-                gravity_vector.append(self._gravity[w].vector())
+                gravity_vector.append(self._gravity[w].vector)
 
         # A helper function to collect model bodies data
         def collect_body_model_data():
@@ -1156,22 +1183,27 @@ class ModelBuilderKamino:
                 joints_tau_j_max.extend(joint.tau_j_max)
                 joints_a_j.extend(joint.a_j)
                 joints_b_j.extend(joint.b_j)
+                joints_f_j.extend(joint.f_j)
                 joints_k_p_j.extend(joint.k_p_j)
                 joints_k_d_j.extend(joint.k_d_j)
                 joints_ncoords_j.append(joint.num_coords)
                 joints_ndofs_j.append(joint.num_dofs)
-                joints_ncts_j.append(joint.num_cts)
+                joints_ncts_j.append(joint.num_bilateral_cts)
                 joints_ndyncts_j.append(joint.num_dynamic_cts)
                 joints_nkincts_j.append(joint.num_kinematic_cts)
+                joints_nbccts_j.append(joint.num_bounded_cts)
+                joints_nfriccts_j.append(joint.num_friction_cts)
                 joints_q_start.append(joint.coords_offset + world.joint_coords_idx_offset)
                 joints_dq_start.append(joint.dofs_offset + world.joint_dofs_idx_offset)
                 joints_pq_start.append(joint.passive_coords_offset + world.joint_passive_coords_idx_offset)
                 joints_pdq_start.append(joint.passive_dofs_offset + world.joint_passive_dofs_idx_offset)
                 joints_aq_start.append(joint.actuated_coords_offset + world.joint_actuated_coords_idx_offset)
                 joints_adq_start.append(joint.actuated_dofs_offset + world.joint_actuated_dofs_idx_offset)
-                joints_cts_start.append(joint.cts_offset + world.joint_cts_idx_offset)
+                joints_cts_start.append(joint.bilateral_cts_offset + world.joint_bilateral_cts_idx_offset)
                 joints_dcts_start.append(joint.dynamic_cts_offset + world.joint_dynamic_cts_idx_offset)
                 joints_kcts_start.append(joint.kinematic_cts_offset + world.joint_kinematic_cts_idx_offset)
+                joints_bcts_start.append(joint.bounded_cts_offset + world.joint_bounded_cts_idx_offset)
+                joints_fcts_start.append(joint.friction_cts_offset + world.joint_friction_cts_idx_offset)
                 joints_bid_B.append(joint.bid_B + world_bio if joint.bid_B >= 0 else -1)
                 joints_bid_F.append(joint.bid_F + world_bio if joint.bid_F >= 0 else -1)
 
@@ -1182,9 +1214,11 @@ class ModelBuilderKamino:
             joints_pdq_start.append(self._num_joint_passive_dofs)
             joints_aq_start.append(self._num_joint_actuated_coords)
             joints_adq_start.append(self._num_joint_actuated_dofs)
-            joints_cts_start.append(self._num_joint_cts)
+            joints_cts_start.append(self._num_joint_bilateral_cts)
             joints_dcts_start.append(self._num_joint_dynamic_cts)
             joints_kcts_start.append(self._num_joint_kinematic_cts)
+            joints_bcts_start.append(self._num_joint_bounded_cts)
+            joints_fcts_start.append(self._num_joint_friction_cts)
 
         # A helper function to collect model collision geometries data
         def collect_geometry_model_data():
@@ -1273,22 +1307,28 @@ class ModelBuilderKamino:
             max_of_num_fk_actuated_joint_dofs=max([world.num_fk_actuated_joint_dofs for world in self._worlds]),
             sum_of_num_actuated_joint_dofs=self._num_joint_actuated_dofs,
             max_of_num_actuated_joint_dofs=max([world.num_actuated_joint_dofs for world in self._worlds]),
-            sum_of_num_joint_cts=self._num_joint_cts,
-            max_of_num_joint_cts=max([world.num_joint_cts for world in self._worlds]),
+            sum_of_num_bilateral_joint_cts=self._num_joint_bilateral_cts,
+            max_of_num_bilateral_joint_cts=max([world.num_bilateral_joint_cts for world in self._worlds]),
             sum_of_num_dynamic_joint_cts=self._num_joint_dynamic_cts,
             max_of_num_dynamic_joint_cts=max([world.num_dynamic_joint_cts for world in self._worlds]),
             sum_of_num_kinematic_joint_cts=self._num_joint_kinematic_cts,
             max_of_num_kinematic_joint_cts=max([world.num_kinematic_joint_cts for world in self._worlds]),
-            # Initialize unilateral counts (limits, and contacts) to zero
+            sum_of_num_bounded_joint_cts=self._num_joint_bounded_cts,
+            max_of_num_bounded_joint_cts=max([world.num_bounded_joint_cts for world in self._worlds]),
+            sum_of_num_friction_joint_cts=self._num_joint_friction_cts,
+            max_of_num_friction_joint_cts=max([world.num_friction_joint_cts for world in self._worlds]),
+            # Initialize inequality entity counts to zero
             sum_of_max_limits=0,
             max_of_max_limits=0,
             sum_of_max_contacts=0,
             max_of_max_contacts=0,
-            sum_of_max_unilaterals=0,
-            max_of_max_unilaterals=0,
-            # Initialize total constraint counts to the same as the joint constraint counts
-            sum_of_max_total_cts=self._num_joint_cts,
-            max_of_max_total_cts=max([world.num_joint_cts for world in self._worlds]),
+            sum_of_max_inequalities=0,
+            max_of_max_inequalities=0,
+            # Initialize total constraint counts to joint + bounded constraint counts
+            sum_of_max_total_cts=self._num_joint_bilateral_cts + self._num_joint_bounded_cts,
+            max_of_max_total_cts=max(
+                [world.num_bilateral_joint_cts + world.num_bounded_joint_cts for world in self._worlds]
+            ),
         )
 
         # Append total number of bodies to body offsets
@@ -1338,9 +1378,11 @@ class ModelBuilderKamino:
                 num_passive_joint_dofs=to_warp_int32_array(info_njpd),
                 num_actuated_joint_coords=to_warp_int32_array(info_njaq),
                 num_actuated_joint_dofs=to_warp_int32_array(info_njad),
-                num_joint_cts=to_warp_int32_array(info_njc),
+                num_joint_bilateral_cts=to_warp_int32_array(info_njc),
                 num_joint_dynamic_cts=to_warp_int32_array(info_njdc),
                 num_joint_kinematic_cts=to_warp_int32_array(info_njkc),
+                num_joint_bounded_cts=to_warp_int32_array(info_nbc),
+                num_joint_friction_cts=to_warp_int32_array(info_nfc),
                 bodies_offset=to_warp_int32_array(info_bio),
                 joints_offset=to_warp_int32_array(info_jio),
                 geoms_offset=to_warp_int32_array(info_gio),
@@ -1351,11 +1393,14 @@ class ModelBuilderKamino:
                 joint_passive_dofs_offset=to_warp_int32_array(info_jpdio),
                 joint_actuated_coords_offset=to_warp_int32_array(info_jaqio),
                 joint_actuated_dofs_offset=to_warp_int32_array(info_jadio),
-                joint_cts_offset=to_warp_int32_array(info_jcio),
+                joint_bilateral_cts_offset=to_warp_int32_array(info_jcio),
                 joint_dynamic_cts_offset=to_warp_int32_array(info_jdcio),
                 joint_kinematic_cts_offset=to_warp_int32_array(info_jkcio),
+                joint_bounded_cts_offset=to_warp_int32_array(info_jbcio),
+                joint_friction_cts_offset=to_warp_int32_array(info_jfcio),
                 base_body_index=to_warp_int32_array(info_base_bid),
                 base_joint_index=to_warp_int32_array(info_base_jid),
+                has_world_without_base_body=has_world_without_base_body,
             )
 
             # Create the model time data
@@ -1364,10 +1409,7 @@ class ModelBuilderKamino:
             )
 
             # Construct model gravity data
-            model_gravity = GravityModel(
-                g_dir_acc=wp.array(gravity_g_dir_acc, dtype=wp.vec4f),
-                vector=wp.array(gravity_vector, dtype=wp.vec4f, requires_grad=requires_grad),
-            )
+            model_gravity = GravityModel(vector=wp.array(gravity_vector, dtype=wp.vec3, requires_grad=requires_grad))
 
             # Create the bodies model
             model_bodies = RigidBodiesModel(
@@ -1407,24 +1449,29 @@ class ModelBuilderKamino:
                 tau_j_max=wp.array(joints_tau_j_max, dtype=wp.float32, requires_grad=requires_grad),
                 a_j=wp.array(joints_a_j, dtype=wp.float32, requires_grad=requires_grad),
                 b_j=wp.array(joints_b_j, dtype=wp.float32, requires_grad=requires_grad),
+                f_j=wp.array(joints_f_j, dtype=wp.float32, requires_grad=requires_grad),
                 k_p_j=wp.array(joints_k_p_j, dtype=wp.float32, requires_grad=requires_grad),
                 k_d_j=wp.array(joints_k_d_j, dtype=wp.float32, requires_grad=requires_grad),
                 q_j_0=wp.array(joints_q_j_0, dtype=wp.float32, requires_grad=requires_grad),
                 dq_j_0=wp.array(joints_dq_j_0, dtype=wp.float32, requires_grad=requires_grad),
                 num_coords=to_warp_int32_array(joints_ncoords_j),
                 num_dofs=to_warp_int32_array(joints_ndofs_j),
-                num_cts=to_warp_int32_array(joints_ncts_j),
+                num_bilateral_cts=to_warp_int32_array(joints_ncts_j),
                 num_dynamic_cts=to_warp_int32_array(joints_ndyncts_j),
                 num_kinematic_cts=to_warp_int32_array(joints_nkincts_j),
+                num_bounded_cts=to_warp_int32_array(joints_nbccts_j),
+                num_friction_cts=to_warp_int32_array(joints_nfriccts_j),
                 coords_offset=to_warp_int32_array(joints_q_start),
                 dofs_offset=to_warp_int32_array(joints_dq_start),
                 passive_coords_offset=to_warp_int32_array(joints_pq_start),
                 passive_dofs_offset=to_warp_int32_array(joints_pdq_start),
                 actuated_coords_offset=to_warp_int32_array(joints_aq_start),
                 actuated_dofs_offset=to_warp_int32_array(joints_adq_start),
-                cts_offset=to_warp_int32_array(joints_cts_start),
+                bilateral_cts_offset=to_warp_int32_array(joints_cts_start),
                 dynamic_cts_offset=to_warp_int32_array(joints_dcts_start),
                 kinematic_cts_offset=to_warp_int32_array(joints_kcts_start),
+                bounded_cts_offset=to_warp_int32_array(joints_bcts_start),
+                friction_cts_offset=to_warp_int32_array(joints_fcts_start),
             )
 
             # Create the collision geometries model
@@ -1766,7 +1813,7 @@ class ModelBuilderKamino:
                 else:
                     world_max_contacts[geom1.wid] += num_contacts
 
-        # Override the per-world maximum contacts if specified in the settings
+        # Cap per-world totals when a per-world maximum is specified
         if max_contacts_per_world is not None:
             for w in range(self.num_worlds):
                 world_max_contacts[w] = min(world_max_contacts[w], max_contacts_per_world)
@@ -1812,9 +1859,11 @@ class ModelBuilderKamino:
         joint_passive_dofs_idx_offset: int = 0
         joint_actuated_coords_idx_offset: int = 0
         joint_actuated_dofs_idx_offset: int = 0
-        joint_cts_idx_offset: int = 0
+        joint_bilateral_cts_idx_offset: int = 0
         joint_dynamic_cts_idx_offset: int = 0
         joint_kinematic_cts_idx_offset: int = 0
+        joint_bounded_cts_idx_offset: int = 0
+        joint_friction_cts_idx_offset: int = 0
         # Iterate over each world and set their model offsets
         for world in self._worlds:
             # Set the offsets in the world descriptor to the current values
@@ -1828,9 +1877,11 @@ class ModelBuilderKamino:
             world.joint_passive_dofs_idx_offset = int(joint_passive_dofs_idx_offset)
             world.joint_actuated_coords_idx_offset = int(joint_actuated_coords_idx_offset)
             world.joint_actuated_dofs_idx_offset = int(joint_actuated_dofs_idx_offset)
-            world.joint_cts_idx_offset = int(joint_cts_idx_offset)
+            world.joint_bilateral_cts_idx_offset = int(joint_bilateral_cts_idx_offset)
             world.joint_dynamic_cts_idx_offset = int(joint_dynamic_cts_idx_offset)
             world.joint_kinematic_cts_idx_offset = int(joint_kinematic_cts_idx_offset)
+            world.joint_bounded_cts_idx_offset = int(joint_bounded_cts_idx_offset)
+            world.joint_friction_cts_idx_offset = int(joint_friction_cts_idx_offset)
             # Update the offsets for the next world
             bodies_idx_offset += world.num_bodies
             joints_idx_offset += world.num_joints
@@ -1842,9 +1893,11 @@ class ModelBuilderKamino:
             joint_passive_dofs_idx_offset += world.num_passive_joint_dofs
             joint_actuated_coords_idx_offset += world.num_actuated_joint_coords
             joint_actuated_dofs_idx_offset += world.num_actuated_joint_dofs
-            joint_cts_idx_offset += world.num_joint_cts
+            joint_bilateral_cts_idx_offset += world.num_bilateral_joint_cts
             joint_dynamic_cts_idx_offset += world.num_dynamic_joint_cts
             joint_kinematic_cts_idx_offset += world.num_kinematic_joint_cts
+            joint_bounded_cts_idx_offset += world.num_bounded_joint_cts
+            joint_friction_cts_idx_offset += world.num_friction_joint_cts
 
     def _collect_geom_max_contact_hints(self) -> tuple[int, list[int]]:
         """
