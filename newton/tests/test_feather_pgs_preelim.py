@@ -62,6 +62,48 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertLess(gap_on, 2.0e-5, f"pre-eliminated closure gap {gap_on:.2e} m not exact")
         self.assertLess(gap_on, 0.01 * gap_off, f"expected >100x tightening, got {gap_off / max(gap_on, 1e-12):.1f}x")
 
+    def test_dense_warmstart_preserves_projected_closure(self):
+        """Project the predictor after installing dense warm-start impulses.
+
+        Seed a nonempty cache, reverse the drive, and disable the iterative
+        sweeps for one step. This isolates the stage-6 initializer: moving the
+        bilateral projection before warm-start application lets the latter
+        overwrite it and opens the loop by millimetres.
+        """
+        model = _build_four_bar().finalize()
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            pgs_iterations=2,
+            pgs_beta=0.1,
+            enable_bilateral_preelimination=True,
+            pgs_warmstart=True,
+        )
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        targets = model.joint_target_q.numpy().copy()
+        targets[0] = 0.6
+        control.joint_target_q.assign(targets)
+        for _ in range(120):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+
+        cache_peak = np.max(np.abs(solver.impulses.numpy()))
+        targets[0] = -0.6
+        control.joint_target_q.assign(targets)
+        solver.pgs_iterations = 0
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+        gap = _loop_anchor_gap(model, state_0)
+
+        self.assertTrue(solver._preelim_active)
+        self.assertTrue(solver.pgs_warmstart)
+        self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
+        self.assertGreater(cache_peak, 1.0e-4, "warm-start cache stayed empty")
+        self.assertLess(gap, 2.0e-5, f"warm-started projection left a {gap:.2e} m closure gap")
+
     def test_mechanism_behavior_preserved(self):
         """The rocker still tracks the crank through the closed loop (parallel four-bar)."""
         _, _, state, _ = _run_four_bar(enable_bilateral_preelimination=True, pgs_iterations=16)
