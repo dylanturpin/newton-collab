@@ -3281,6 +3281,7 @@ def allocate_world_contact_slots(
     propagation_articulated_contacts: int,
     propagation_same_articulation: int,
     propagation_free_free: int,
+    contact_gap_gate: float,
     max_constraints: int,
     mf_max_constraints: int,
     propagation_max_constraints: int,
@@ -3308,6 +3309,8 @@ def allocate_world_contact_slots(
 
     Each contact reserves 1 slot for the normal row and, when enabled below the
     friction gap threshold, 2 adjacent slots for Coulomb friction rows.
+    A positive contact gap gate excludes wider speculative contacts before any
+    route reserves slots; zero disables the gate.
     """
     c = wp.tid()
     total_contacts = contact_count[0]
@@ -3387,6 +3390,13 @@ def allocate_world_contact_slots(
     else:
         point_b_world = point_b_local + thickness_b * normal
     phi = wp.dot(normal, point_a_world - point_b_world)
+
+    # A zero gate preserves every collision-generated contact. A positive gate
+    # drops wider speculative contacts before any route reserves row storage.
+    if contact_gap_gate > 0.0 and phi > contact_gap_gate:
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
 
     # Classify: MF path if both sides are free rigid or ground.
     # Propagation path is an opt-in matrix-free route for any contact touching a
@@ -4539,6 +4549,7 @@ def apply_world_contact_restitution_accumulated(
     world_row_type: wp.array2d[int],
     world_row_restitution: wp.array2d[float],
     dt: float,
+    contact_speculative_scale: float,
     restitution_velocity_threshold: float,
     # in/out
     world_rhs: wp.array2d[float],
@@ -4557,7 +4568,7 @@ def apply_world_contact_restitution_accumulated(
         return
 
     phi = world_phi[world, i]
-    geometric_bias = phi / dt
+    geometric_bias = contact_speculative_scale * phi / dt
     if phi < 0.0:
         geometric_bias = world_row_beta[world, i] * phi / dt
     relative_incident = world_rhs[world, i] - geometric_bias
@@ -5678,6 +5689,7 @@ def compute_mf_effective_mass_and_rhs(
     pgs_cfm: float,
     pgs_beta: float,
     dt: float,
+    contact_speculative_scale: float,
     restitution_velocity_threshold: float,
     mf_max_constraints: int,
     # outputs
@@ -5775,7 +5787,7 @@ def compute_mf_effective_mass_and_rhs(
             if max_depen > 0.0 and wp.isfinite(max_depen):
                 bias = wp.max(bias, -max_depen)
         else:
-            bias = phi_val / dt
+            bias = contact_speculative_scale * phi_val / dt
         restitution = mf_row_restitution[world, i]
         if restitution > 0.0:
             relative_incident = float(0.0)
@@ -6274,6 +6286,7 @@ def compute_propagation_effective_mass_and_rhs(
     dense_contact_compliance: float,
     speculative_dense_contact_compliance: float,
     dt: float,
+    contact_speculative_scale: float,
     restitution_velocity_threshold: float,
     propagation_max_constraints: int,
     # outputs
@@ -6340,7 +6353,7 @@ def compute_propagation_effective_mass_and_rhs(
             if max_depen > 0.0 and wp.isfinite(max_depen):
                 bias = wp.max(bias, -max_depen)
         else:
-            bias = phi_val / dt
+            bias = contact_speculative_scale * phi_val / dt
         restitution = propagation_row_restitution[world, i]
         if restitution > 0.0:
             relative_incident = propagation_contact_row_dot(

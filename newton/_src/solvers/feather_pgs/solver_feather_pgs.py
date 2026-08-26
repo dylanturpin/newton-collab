@@ -630,6 +630,8 @@ class SolverFeatherPGS(SolverBase):
         tile_threads: int = 64,
         row_watermark: bool = False,
         restitution_velocity_threshold: float = 0.5,
+        contact_speculative_scale: float = 1.0,
+        contact_gap_gate: float = 0.0,
     ):
         """
         Args:
@@ -670,6 +672,15 @@ class SolverFeatherPGS(SolverBase):
                 used by generated friction rows. This is a diagnostic hook for matching solver-prep
                 semantics such as PhysX's per-friction-anchor scaling; it does not affect normal
                 contact rows. Defaults to 1.0.
+            contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
+                for normal contact rows on the dense, matrix-free free-rigid, and propagation
+                paths. A value of 0.0 removes speculative closing allowance without changing
+                penetrating-contact stabilization or the unbiased velocity pass. Must be finite
+                and non-negative. Defaults to 1.0.
+            contact_gap_gate (float, optional): If positive, skip normal contacts whose
+                world-space gap exceeds this distance before allocating any dense, matrix-free,
+                or propagation rows. A value of 0.0 disables the gate and preserves all
+                collision-generated contacts. Must be finite and non-negative. Defaults to 0.0.
             contact_shared_anchor (bool, optional): If true, all contact rows use the midpoint between
                 the two witness points as the Jacobian point on both bodies, matching PhysX contact
                 prep's single ``contact.point`` lever arm. ``phi`` is still computed from the original
@@ -968,6 +979,18 @@ class SolverFeatherPGS(SolverBase):
         self.contact_friction_shared_anchor = bool(contact_friction_shared_anchor)
         self.contact_friction_anchor_limit = int(contact_friction_anchor_limit)
         self.contact_friction_scale = float(contact_friction_scale)
+        try:
+            self.contact_speculative_scale = float(contact_speculative_scale)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("contact_speculative_scale must be finite and non-negative") from exc
+        if not np.isfinite(self.contact_speculative_scale) or self.contact_speculative_scale < 0.0:
+            raise ValueError("contact_speculative_scale must be finite and non-negative")
+        try:
+            self.contact_gap_gate = float(contact_gap_gate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("contact_gap_gate must be finite and non-negative") from exc
+        if not np.isfinite(self.contact_gap_gate) or self.contact_gap_gate < 0.0:
+            raise ValueError("contact_gap_gate must be finite and non-negative")
         self.contact_shared_anchor = bool(contact_shared_anchor)
         if self.contact_friction_position_iterations < -1:
             raise ValueError(
@@ -4642,6 +4665,7 @@ class SolverFeatherPGS(SolverBase):
                     self.dense_contact_compliance,
                     self.speculative_dense_contact_compliance,
                     dt,
+                    self.contact_speculative_scale,
                     self.restitution_velocity_threshold,
                     self.propagation_max_constraints,
                 ],
@@ -5476,7 +5500,7 @@ class SolverFeatherPGS(SolverBase):
         self._stage4_add_dense_contact_compliance(dt)
         self._stage4_compute_physx_drive_desc(dt, position_bias_scale=1.0)
 
-        self._stage4_compute_rhs_world(dt)
+        self._stage4_compute_rhs_world(dt, contact_speculative_scale=self.contact_speculative_scale)
         if include_unbiased_rhs:
             self._stage4_compute_rhs_world(
                 dt,
@@ -5690,7 +5714,7 @@ class SolverFeatherPGS(SolverBase):
                 self._stage4_compute_physx_drive_desc(dt)
 
                 # RHS = bias only (J*v recomputed per iteration)
-                self._stage4_compute_rhs_world(dt)
+                self._stage4_compute_rhs_world(dt, contact_speculative_scale=self.contact_speculative_scale)
                 # NOTE: skip _stage4_accumulate_rhs_world — J*v_hat not baked into rhs
 
             # MF: compute mf_MiJt, mf_rhs, mf_eff_mass_inv, body maps
@@ -5752,7 +5776,7 @@ class SolverFeatherPGS(SolverBase):
                 self._stage4_finalize_world_diag_cfm()
 
             self._stage4_add_dense_contact_compliance(dt)
-            self._stage4_compute_rhs_world(dt)
+            self._stage4_compute_rhs_world(dt, contact_speculative_scale=self.contact_speculative_scale)
 
             for size in self.size_groups:
                 self._stage4_accumulate_rhs_world(size)
@@ -7414,6 +7438,7 @@ class SolverFeatherPGS(SolverBase):
                     # counter and silently drop them (bodies fall through the
                     # ground).
                     1 if (self._route_free_free_contacts and propagation_active) else 0,
+                    self.contact_gap_gate,
                     max_constraints,
                     self.mf_max_constraints,
                     self.propagation_max_constraints,
@@ -8178,6 +8203,7 @@ class SolverFeatherPGS(SolverBase):
                 self.row_type,
                 self.row_restitution,
                 dt,
+                self.contact_speculative_scale,
                 self.restitution_velocity_threshold,
             ],
             outputs=[self.rhs],
@@ -8879,6 +8905,7 @@ class SolverFeatherPGS(SolverBase):
                 self.pgs_cfm,
                 self.pgs_beta,
                 dt,
+                self.contact_speculative_scale,
                 self.restitution_velocity_threshold,
                 self.mf_max_constraints,
             ],
