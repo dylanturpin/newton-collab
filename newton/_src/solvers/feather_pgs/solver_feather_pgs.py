@@ -579,8 +579,10 @@ class SolverFeatherPGS(SolverBase):
         enable_mimic_constraints: bool = True,
         enable_connect_constraints: bool = True,
         enable_bilateral_preelimination: bool = False,
+        bilateral_preelimination_include_mimics: bool = True,
         enable_joint_springs: bool = True,
         enable_joint_passive_damping: bool = True,
+        debug_record_residuals: bool = False,
         joint_limit_activation_gap: float = float("inf"),
         enable_joint_velocity_limits: bool = False,
         velocity_limit_activation_fraction: float = 0.0,
@@ -695,6 +697,14 @@ class SolverFeatherPGS(SolverBase):
                 ``pgs_velocity_iterations == 0`` and at most 8 bilateral rows per
                 articulation; unsupported configurations warn and fall back to iterative
                 rows. Defaults to False.
+            bilateral_preelimination_include_mimics (bool, optional): Include the mimic
+                rows in the pre-eliminated bilateral block. Set False to eliminate only
+                the connect (loop-closure) rows and leave mimics to the iterative sweep —
+                the right choice when a mimic is nearly linearly dependent on the closure
+                rows (e.g. an auxiliary parallel-pad mimic on a near-parallelogram
+                four-bar), where exact joint elimination makes the Schur block
+                near-singular and the projection can lock the mechanism. Defaults to
+                True.
             enable_joint_springs (bool, optional): Apply passive joint springs
                 (:attr:`~newton.Model.joint_spring_stiffness` /
                 :attr:`~newton.Model.joint_spring_ref`) as an explicit torque
@@ -707,6 +717,14 @@ class SolverFeatherPGS(SolverBase):
                 ``joint_target_kd`` are unaffected — they stay on the implicit augmented
                 path). Disable to recover the historical FeatherPGS behavior of ignoring
                 ``joint_damping``. Defaults to True.
+            debug_record_residuals (bool, optional): Debug telemetry: record every dense
+                constraint row's pre-update residual ``J.v + rhs`` at each Gauss-Seidel
+                visit into :attr:`pgs_residual_log`, a float32 array of shape
+                ``[world_count * pgs_iterations * dense_max_constraints]`` indexed as
+                ``(world, global_iteration, row)`` and zeroed at the start of every
+                velocity solve. Matrix-free (body-pair) rows are not recorded. Adds a
+                per-visit global store and rebuilds the GS kernel; intended for probe
+                instrumentation, not production runs. Defaults to False.
             joint_limit_activation_gap (float, optional): Distance from a finite lower or upper
                 position limit at which a joint-limit PGS row becomes active. A lower row is
                 allocated when ``q <= lower + gap``; an upper row is allocated when
@@ -959,8 +977,10 @@ class SolverFeatherPGS(SolverBase):
         self.enable_mimic_constraints = bool(enable_mimic_constraints)
         self.enable_connect_constraints = bool(enable_connect_constraints)
         self.enable_bilateral_preelimination = bool(enable_bilateral_preelimination)
+        self.bilateral_preelimination_include_mimics = bool(bilateral_preelimination_include_mimics)
         self.enable_joint_springs = bool(enable_joint_springs)
         self.enable_joint_passive_damping = bool(enable_joint_passive_damping)
+        self.debug_record_residuals = bool(debug_record_residuals)
         try:
             self.joint_limit_activation_gap = float(joint_limit_activation_gap)
         except (TypeError, ValueError) as exc:
@@ -2028,7 +2048,7 @@ class SolverFeatherPGS(SolverBase):
 
         # Per-articulation bilateral row capacity (upper bound: every valid constraint).
         counts: dict[int, int] = {}
-        if self._mimic_count:
+        if self._mimic_count and self.bilateral_preelimination_include_mimics:
             mimic_art_np = self._mimic_art.numpy()
             mimic_valid_np = self._mimic_valid.numpy()
             for k in range(self._mimic_count):
@@ -2086,7 +2106,7 @@ class SolverFeatherPGS(SolverBase):
                 self._preelim_art_to_idx,
                 self.mimic_slot if self.mimic_slot is not None else self._dummy_is_free_rigid,
                 self._mimic_art if self._mimic_count else self._dummy_is_free_rigid,
-                int(self._mimic_count or 0),
+                int(self._mimic_count or 0) if self.bilateral_preelimination_include_mimics else 0,
                 self.connect_slot if self.connect_slot is not None else self._dummy_is_free_rigid,
                 self._connect_art if self._connect_count else self._dummy_is_free_rigid,
                 int(self._connect_count or 0),
@@ -3753,7 +3773,20 @@ class SolverFeatherPGS(SolverBase):
                 fuse_vel_limits=self.fuse_joint_velocity_limits,
                 friction_mode=self.friction_mode,
                 shared_metadata=False,
+                record_residuals=self.debug_record_residuals,
             )
+            self._resid_iter_cap = 0
+            self.pgs_residual_log = wp.zeros(1, dtype=wp.float32, device=model.device)
+            if self.debug_record_residuals:
+                # Per-visit dense-row residuals (J.v + rhs, pre-update), one slot per
+                # (world, global GS iteration, dense row). Debug telemetry only:
+                # allocated and written when debug_record_residuals is on.
+                self._resid_iter_cap = int(self.pgs_iterations)
+                self.pgs_residual_log = wp.zeros(
+                    self.world_count * self._resid_iter_cap * self.dense_max_constraints,
+                    dtype=wp.float32,
+                    device=model.device,
+                )
 
         self._pgs_solve_mf_kernel = None
         if model.device.is_cuda and hasattr(self, "max_mf_bodies") and self.mf_max_constraints > 0:
@@ -4109,6 +4142,10 @@ class SolverFeatherPGS(SolverBase):
         mf_gs_kernel = self._pgs_solve_mf_gs_kernel
         if mf_gs_kernel is None:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
+        if getattr(self, "_resid_iter_cap", 0) > 0:
+            # Fresh telemetry per solve: rows skipped this solve must not carry
+            # stale residuals from the previous step into the readback.
+            self.pgs_residual_log.zero_()
 
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
             if (
@@ -4214,6 +4251,8 @@ class SolverFeatherPGS(SolverBase):
                         int(phase_iteration_offset),
                         int(freeze_drive_rows),
                         int(defer_dense_response),
+                        self.pgs_residual_log,
+                        int(getattr(self, "_resid_iter_cap", 0)),
                     ],
                     outputs=[self.v_out],
                     block_dim=32,
@@ -14752,6 +14791,7 @@ def _get_pgs_solve_mf_gs_kernel(
     has_drive_rows: bool = True,
     has_dense_velocity_limit_rows: bool = True,
     fuse_vel_limits: bool = False,
+    record_residuals: bool = False,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -15768,6 +15808,18 @@ def _get_pgs_solve_mf_gs_kernel(
     )
     dense_load_start = "load_lo" if fuse_vel_limits else "dense_lo"
 
+    # Optional per-visit residual telemetry (debug_record_residuals): store the
+    # pre-update dense-row residual J.v + rhs into a (world, global_iter, row)
+    # log. Emission-gated so the default generated source carries no extra work.
+    resid_store_code = (
+        f"""
+            if (lane == 0 && global_iter < resid_iter_cap) {{
+                resid_log.data[((size_t)world * (size_t)resid_iter_cap + (size_t)global_iter) * {M_D} + i] = residual;
+            }}"""
+        if record_residuals
+        else ""
+    )
+
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
@@ -15907,7 +15959,7 @@ def _get_pgs_solve_mf_gs_kernel(
             my_sum += __shfl_down_sync(MASK, my_sum, 1);
             float jv = __shfl_sync(MASK, my_sum, 0);
 
-            float residual = jv + s_rhs_dense[i];
+            float residual = jv + s_rhs_dense[i];{resid_store_code}
             float delta = -residual / denom;
             float old_impulse = s_lam_dense[i];
             float new_impulse = old_impulse + omega * delta;
@@ -16268,6 +16320,8 @@ def _get_pgs_solve_mf_gs_kernel(
         iteration_offset: int,
         freeze_drive_rows: int,
         defer_dense_response: int,
+        resid_log: wp.array[float],
+        resid_iter_cap: int,
         # Output
         v_out: wp.array[float],
     ): ...
@@ -16309,6 +16363,8 @@ def _get_pgs_solve_mf_gs_kernel(
         iteration_offset: int,
         freeze_drive_rows: int,
         defer_dense_response: int,
+        resid_log: wp.array[float],
+        resid_iter_cap: int,
         # Output
         v_out: wp.array[float],
     ):
@@ -16348,6 +16404,8 @@ def _get_pgs_solve_mf_gs_kernel(
             iteration_offset,
             freeze_drive_rows,
             defer_dense_response,
+            resid_log,
+            resid_iter_cap,
             v_out,
         )
 
@@ -16357,6 +16415,8 @@ def _get_pgs_solve_mf_gs_kernel(
     )
     if fuse_vel_limits:
         name += "_fvl"
+    if record_residuals:
+        name += "_resid"
     if not software_pipeline:
         name += "_nopipe"
     if not shared_metadata:
