@@ -12,6 +12,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_ROW_TYPE_MASK,
     _FeatherPGSExecutionPlan,
     _select_hinv_jt_chunk_size,
+    _use_resident_mfgs_metadata,
     _validate_dense_metadata_encoding,
 )
 from newton.solvers import SolverFeatherPGS
@@ -167,6 +168,11 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 49152, 64), 64)
         self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 49152, 256), 32)
 
+    def test_hinv_chunk_selection_caps_compact_articulations(self):
+        """Cap compact articulation chunks without restricting larger groups."""
+        self.assertEqual(_select_hinv_jt_chunk_size(20, 384, 101376, 64), 32)
+        self.assertEqual(_select_hinv_jt_chunk_size(21, 384, 101376, 64), 64)
+
     def test_dense_metadata_encoding_bounds(self):
         _validate_dense_metadata_encoding(32)
         self.assertGreaterEqual(_DENSE_META_ROW_TYPE_MASK + 1, 5)
@@ -223,6 +229,16 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         )
         self.assertTrue(fitting.use_fused_hinv_jt(23))
         self.assertFalse(oversized.use_fused_hinv_jt(23))
+
+    def test_mfgs_metadata_storage_respects_resource_budget(self):
+        """Keep resident metadata only when its complete working set fits."""
+        compact = _use_resident_mfgs_metadata(192, 64, 29, 101376, has_drive_rows=False, fuse_vel_limits=False)
+        large = _use_resident_mfgs_metadata(1024, 4096, 604, 101376, has_drive_rows=False, fuse_vel_limits=False)
+        overcommitted = _use_resident_mfgs_metadata(192, 64, 29, 4096, has_drive_rows=False, fuse_vel_limits=False)
+
+        self.assertTrue(compact)
+        self.assertFalse(large)
+        self.assertFalse(overcommitted)
 
     def test_serial_kernel_block_dim_validation(self):
         model = newton.ModelBuilder().finalize()
