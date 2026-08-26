@@ -167,6 +167,8 @@ _FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture
 _FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in {"1", "true", "yes", "on"}
 _FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", "20"))
 _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUNT", "1")), 0)
+_MFGS_RESIDENT_METADATA_MAX_BYTES = 4096
+_MFGS_TILE_SHARED_STORAGE_BYTES = 128
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
 
 
@@ -340,7 +342,31 @@ def _validate_dense_metadata_encoding(max_constraints: int) -> None:
         )
 
 
+def _use_resident_mfgs_metadata(
+    max_constraints: int,
+    mf_max_constraints: int,
+    max_world_dofs: int,
+    max_shared_memory: int,
+    *,
+    has_drive_rows: bool,
+    fuse_vel_limits: bool,
+) -> bool:
+    """Select resident MF-GS metadata for compact solver shapes.
+
+    Resident row metadata removes repeated global loads across PGS iterations,
+    but larger shapes lose more throughput from the resulting occupancy drop.
+    Keep at most one 4-KiB metadata working set resident and stream larger sets.
+    """
+    metadata_arrays = 4 + 4 * int(has_drive_rows) + int(fuse_vel_limits)
+    metadata_bytes = 4 * max_constraints * metadata_arrays
+    base_shared_bytes = 4 * (max_world_dofs + max_constraints + mf_max_constraints)
+    total_shared_bytes = _MFGS_TILE_SHARED_STORAGE_BYTES + base_shared_bytes + metadata_bytes
+    return metadata_bytes <= _MFGS_RESIDENT_METADATA_MAX_BYTES and total_shared_bytes <= max_shared_memory
+
+
 _HINV_JT_MAX_CHUNK_SIZE = 64
+_HINV_JT_COMPACT_DOF_MAX = 20
+_HINV_JT_COMPACT_CHUNK_SIZE = 32
 
 
 def _align_shared_memory(size: int) -> int:
@@ -360,10 +386,11 @@ def _estimate_hinv_jt_shared_memory(n_dofs: int, constraint_count: int, *, fused
 def _select_hinv_jt_chunk_size(
     n_dofs: int, max_constraints: int, max_shared_memory: int, tile_threads: int
 ) -> int | None:
-    """Select the largest validated H-inverse chunk that fits the device."""
+    """Select a validated H-inverse chunk from articulation and device resources."""
     if n_dofs <= 0 or max_constraints <= 0:
         return None
-    candidates = (_HINV_JT_MAX_CHUNK_SIZE, 32, 16, 8, 4, 2, 1)
+    max_chunk_size = _HINV_JT_COMPACT_CHUNK_SIZE if n_dofs <= _HINV_JT_COMPACT_DOF_MAX else _HINV_JT_MAX_CHUNK_SIZE
+    candidates = (max_chunk_size, 32, 16, 8, 4, 2, 1)
     tried: set[int] = set()
     for candidate in candidates:
         chunk_size = min(candidate, max_constraints)
@@ -3835,22 +3862,25 @@ class SolverFeatherPGS(SolverBase):
             and getattr(self, "max_world_dofs", 0) > 0
             and self.mf_max_constraints > 0
         ):
-            # shared_metadata=False streams the nine read-only per-row metadata
-            # arrays from global/L2 instead of shared memory. Measured on RTX
-            # 5080: occupancy rises from floor(smem/(10*M_D*4B)) to the
-            # register/stream limit, cutting the GS kernel 10% at D=104 and
-            # 58% at D=388/M_D=1024 where shared capacity pinned it to two
-            # worlds per SM. Values are unchanged, only the storage class.
+            has_drive_rows = self.drive_mode == "physx_pgs"
+            shared_metadata = _use_resident_mfgs_metadata(
+                self.dense_max_constraints,
+                self.mf_max_constraints,
+                self.max_world_dofs,
+                int(getattr(model.device, "max_shared_memory_per_block", 0)),
+                has_drive_rows=has_drive_rows,
+                fuse_vel_limits=self.fuse_joint_velocity_limits,
+            )
             self._pgs_solve_mf_gs_kernel = _get_pgs_solve_mf_gs_kernel(
                 self.dense_max_constraints,
                 self.mf_max_constraints,
                 self.max_world_dofs,
                 device_arch,
-                has_drive_rows=self.drive_mode == "physx_pgs",
+                has_drive_rows=has_drive_rows,
                 has_dense_velocity_limit_rows=self.enable_joint_velocity_limits,
                 fuse_vel_limits=self.fuse_joint_velocity_limits,
                 friction_mode=self.friction_mode,
-                shared_metadata=False,
+                shared_metadata=shared_metadata,
             )
 
         self._pgs_solve_mf_kernel = None
