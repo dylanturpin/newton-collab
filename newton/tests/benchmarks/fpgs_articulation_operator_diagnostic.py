@@ -41,6 +41,7 @@ from fpgs_articulation_row_scaling import (  # noqa: E402
     _prepare_case_run,
     _restore_state,
 )
+
 from newton.solvers import SolverFeatherPGS  # noqa: E402
 
 
@@ -114,9 +115,9 @@ class OperatorDiagnosticResult:
 def _parse_int_list(value: str) -> list[int]:
     out = []
     for item in value.split(","):
-        item = item.strip()
-        if item:
-            out.append(int(item))
+        token = item.strip()
+        if token:
+            out.append(int(token))
     if not out:
         raise argparse.ArgumentTypeError("expected at least one integer")
     return out
@@ -274,7 +275,9 @@ def _dense_rows_in_propagation_order(
     row_count: int,
 ) -> tuple[np.ndarray, bool]:
     old_parent = old_solver.row_parent.numpy()[world, :row_count].astype(np.int32, copy=True)
-    propagation_parent = propagation_solver.propagation_row_parent.numpy()[world, :row_count].astype(np.int32, copy=True)
+    propagation_parent = propagation_solver.propagation_row_parent.numpy()[world, :row_count].astype(
+        np.int32, copy=True
+    )
     dense_by_key = _contact_row_map(old_solver, world, 0, row_count, old_parent)
     propagation_by_key = _contact_row_map(propagation_solver, world, 2, row_count, propagation_parent)
 
@@ -629,8 +632,12 @@ def _diagnose_case(
         row_parent_old = np.full_like(row_parent_old_selected, -1)
         parent_mask = row_parent_old_selected >= 0
         row_parent_old[parent_mask] = old_to_propagation[row_parent_old_selected[parent_mask]]
-        row_type_propagation = propagation_solver.propagation_row_type.numpy()[world, :dense_rows].astype(np.int32, copy=True)
-        row_parent_propagation = propagation_solver.propagation_row_parent.numpy()[world, :dense_rows].astype(np.int32, copy=True)
+        row_type_propagation = propagation_solver.propagation_row_type.numpy()[world, :dense_rows].astype(
+            np.int32, copy=True
+        )
+        row_parent_propagation = propagation_solver.propagation_row_parent.numpy()[world, :dense_rows].astype(
+            np.int32, copy=True
+        )
         row_type_mismatch = int(np.count_nonzero(row_type_old != row_type_propagation))
         row_parent_mismatch = int(np.count_nonzero(row_parent_old != row_parent_propagation))
 
@@ -661,7 +668,9 @@ def _diagnose_case(
         )
 
         diag_old = np.array([old_aligned[int(source), int(source)] for source in source_rows], dtype=np.float64)
-        diag_propagation = np.array([propagation[int(source), col] for col, source in enumerate(source_rows)], dtype=np.float64)
+        diag_propagation = np.array(
+            [propagation[int(source), col] for col, source in enumerate(source_rows)], dtype=np.float64
+        )
         diag_diff = diag_propagation - diag_old
 
         abs_linf = float(np.max(np.abs(diff))) if diff.size else 0.0

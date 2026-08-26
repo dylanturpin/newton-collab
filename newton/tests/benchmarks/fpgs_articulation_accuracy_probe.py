@@ -45,7 +45,6 @@ if str(_NEWTON_REPO) not in sys.path:
 import newton  # noqa: E402
 from newton.solvers import SolverFeatherPGS  # noqa: E402
 
-
 PATHS = ("mf_immediate", "propagation")
 CONVERGENCE_KEYS = (
     "max_delta_lambda",
@@ -108,10 +107,10 @@ class AccuracyResult:
 def _parse_int_list(value: str) -> list[int]:
     out: list[int] = []
     for raw in value.split(","):
-        raw = raw.strip()
-        if not raw:
+        token = raw.strip()
+        if not token:
             continue
-        out.append(int(raw))
+        out.append(int(token))
     if not out:
         raise argparse.ArgumentTypeError("expected at least one integer")
     return out
@@ -186,20 +185,20 @@ def _count_rows(solver: SolverFeatherPGS) -> tuple[int, int, int]:
 
 def _last_debug_metrics(solver: SolverFeatherPGS) -> tuple[dict[str, float], dict[str, float]]:
     if not solver._pgs_convergence_log:
-        return ({key: math.nan for key in CONVERGENCE_KEYS}, {key: math.nan for key in NCP_KEYS})
+        return (dict.fromkeys(CONVERGENCE_KEYS, math.nan), dict.fromkeys(NCP_KEYS, math.nan))
 
     convergence = np.asarray(solver._pgs_convergence_log[-1], dtype=np.float64)
     if convergence.size == 0:
-        conv = {key: math.nan for key in CONVERGENCE_KEYS}
+        conv = dict.fromkeys(CONVERGENCE_KEYS, math.nan)
     else:
         conv = {key: float(convergence[-1, idx]) for idx, key in enumerate(CONVERGENCE_KEYS)}
 
     if not solver._pgs_ncp_residual_log:
-        ncp = {key: math.nan for key in NCP_KEYS}
+        ncp = dict.fromkeys(NCP_KEYS, math.nan)
     else:
         ncp_log = np.asarray(solver._pgs_ncp_residual_log[-1], dtype=np.float64)
         if ncp_log.size == 0:
-            ncp = {key: math.nan for key in NCP_KEYS}
+            ncp = dict.fromkeys(NCP_KEYS, math.nan)
         else:
             final = np.max(ncp_log[-1], axis=0)
             ncp = {key: float(final[idx]) for idx, key in enumerate(NCP_KEYS)}
@@ -352,7 +351,9 @@ def write_outputs(out_dir: Path, rows: list[AccuracyResult]) -> None:
                     f"{row.final_tangent_residual:.6g}",
                     f"{row.self_ref_joint_qd_abs_linf:.6g}",
                     f"{row.mf_ref_joint_qd_abs_linf:.6g}",
-                    "" if row.same_iter_vs_mf_joint_qd_abs_linf is None else f"{row.same_iter_vs_mf_joint_qd_abs_linf:.6g}",
+                    ""
+                    if row.same_iter_vs_mf_joint_qd_abs_linf is None
+                    else f"{row.same_iter_vs_mf_joint_qd_abs_linf:.6g}",
                 ]
             )
             + " |"
@@ -363,7 +364,9 @@ def write_outputs(out_dir: Path, rows: list[AccuracyResult]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--out-dir", type=Path, default=Path("artifacts/fpgs_articulation_row_scaling/frozen_accuracy_probe"))
+    parser.add_argument(
+        "--out-dir", type=Path, default=Path("artifacts/fpgs_articulation_row_scaling/frozen_accuracy_probe")
+    )
     parser.add_argument("--articulations", type=int, default=1)
     parser.add_argument("--links", type=int, default=64)
     parser.add_argument("--link-sweep", type=_parse_int_list, default=None)

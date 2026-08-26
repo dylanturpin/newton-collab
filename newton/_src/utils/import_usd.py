@@ -4437,9 +4437,7 @@ def parse_usd(
                 # When mass is authored but inertia is not, scale the accumulated
                 # inertia to be consistent with the authored mass.
                 use_physx_missing_inertia_fallback = (
-                    not has_effective_inertia
-                    and mass > 0.0
-                    and (mass_compute_failed or physx_missing_inertia_fallback)
+                    not has_effective_inertia and mass > 0.0 and (mass_compute_failed or physx_missing_inertia_fallback)
                 )
                 if use_physx_missing_inertia_fallback:
                     radius = 0.1 / linear_unit if linear_unit > 0.0 else 0.1
