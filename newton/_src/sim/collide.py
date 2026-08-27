@@ -1414,7 +1414,7 @@ class CollisionPipeline:
                 Either a broad phase mode string ("explicit", "nxn", "sap") or
                 a prebuilt broad phase instance for expert usage.
             box_box_sat: Route box-box pairs through the SAT reference-face
-                clipping primitive instead of GJK/MPR, with a quadrant-reduced
+                clipping primitive instead of GJK/MPR, with a feature-identity-reduced
                 4-slot manifold. Stable multi-point box manifolds (no witness-
                 point teleports). Cannot be combined with a prebuilt
                 ``narrow_phase``. Defaults to False.

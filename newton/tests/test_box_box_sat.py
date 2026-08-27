@@ -242,40 +242,44 @@ def test_box_box_aligned_manifold_distinct_corners(test: unittest.TestCase, devi
     """Exactly aligned equal boxes emit coincident duplicate candidates from
     different clip lines; the reduction must admit four DISTINCT spread
     corners, not a duplicated corner plus a missing one (a degenerate
-    support that collapses under load)."""
-    with wp.ScopedDevice(device):
-        builder = newton.ModelBuilder()
-        builder.rigid_gap = 0.003
-        cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
-        a = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
-        builder.add_shape_box(a, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
-        b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.149), wp.quat_identity()))
-        builder.add_shape_box(b, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
-        model = builder.finalize()
-        pipeline = newton.CollisionPipeline(
-            model,
-            reduce_contacts=True,
-            rigid_contact_max=64,
-            broad_phase="nxn",
-            deterministic=True,
-            contact_matching="latest",
-            box_box_sat=True,
-        )
-        contacts = pipeline.contacts()
-        state = model.state()
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-        pipeline.collide(state, contacts)
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        test.assertEqual(count, 4, f"expected a 4-contact manifold, got {count}")
-        # contact points on each shape, in world space via body transforms
-        p0 = contacts.rigid_contact_point0.numpy()[:count]
-        quads = set()
-        for i in range(count):
-            quads.add((p0[i][0] > 0.0, p0[i][1] > 0.0))
-            for j in range(i):
-                d = np.linalg.norm(np.asarray(p0[i]) - np.asarray(p0[j]))
-                test.assertGreater(d, 0.01, f"contacts {i},{j} nearly coincident ({d * 1000:.2f} mm apart)")
-        test.assertEqual(len(quads), 4, f"manifold does not span four corners: {sorted(quads)}")
+    support that collapses under load). The dedup tolerance scales with the
+    box extent, so millimeter-size parts keep their distinct corners too."""
+    for hx, gap, label in ((0.05, 0.003, "5 cm"), (0.001, 0.0001, "1 mm")):
+        with wp.ScopedDevice(device):
+            builder = newton.ModelBuilder()
+            builder.rigid_gap = gap
+            cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
+            a = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, hx), wp.quat_identity()))
+            builder.add_shape_box(a, hx=hx, hy=hx, hz=hx, cfg=cfg)
+            b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 2.98 * hx), wp.quat_identity()))
+            builder.add_shape_box(b, hx=hx, hy=hx, hz=hx, cfg=cfg)
+            model = builder.finalize()
+            pipeline = newton.CollisionPipeline(
+                model,
+                reduce_contacts=True,
+                rigid_contact_max=64,
+                broad_phase="nxn",
+                deterministic=True,
+                contact_matching="latest",
+                box_box_sat=True,
+            )
+            contacts = pipeline.contacts()
+            state = model.state()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+            pipeline.collide(state, contacts)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            test.assertEqual(count, 4, f"{label}: expected a 4-contact manifold, got {count}")
+            # contact points on each shape, in world space via body transforms
+            p0 = contacts.rigid_contact_point0.numpy()[:count]
+            quads = set()
+            for i in range(count):
+                quads.add((p0[i][0] > 0.0, p0[i][1] > 0.0))
+                for j in range(i):
+                    d = np.linalg.norm(np.asarray(p0[i]) - np.asarray(p0[j]))
+                    test.assertGreater(
+                        d, 0.2 * hx, f"{label}: contacts {i},{j} nearly coincident ({d * 1000:.3f} mm apart)"
+                    )
+            test.assertEqual(len(quads), 4, f"{label}: manifold does not span four corners: {sorted(quads)}")
 
 
 class TestBoxBoxSAT(unittest.TestCase):
