@@ -2716,6 +2716,7 @@ def allocate_world_contact_slots(
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_anchor_limit: int,
+    contact_patch_wrench: int,
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -2867,6 +2868,33 @@ def allocate_world_contact_slots(
     if add_friction and (contact_friction_anchor_limit == 0 or friction_anchor_rank < contact_friction_anchor_limit):
         slots_needed = 3
     contact_slots_needed[c] = slots_needed
+
+    if contact_patch_wrench != 0 and is_mf != 0:
+        # The run leader owns the coplanar patch as one 6-row block; coplanar
+        # followers own no rows; non-coplanar or overflow followers fall
+        # through to classic per-contact rows (never dropped).
+        patch_rank = int(0)
+        for lookback in range(1, 9):
+            prev = c - lookback
+            if prev < 0:
+                break
+            if prev >= total_contacts:
+                break
+            if contact_shape0[prev] == shape_a and contact_shape1[prev] == shape_b:
+                patch_rank += int(1)
+            else:
+                break
+        if patch_rank == 0:
+            slots_needed = 6
+            contact_slots_needed[c] = slots_needed
+        elif patch_rank < 8 and wp.dot(contact_normal[c], contact_normal[c - patch_rank]) >= 0.98:
+            contact_slots_needed[c] = 0
+            contact_slot[c] = -1
+            contact_world[c] = world
+            contact_art_a[c] = art_a
+            contact_art_b[c] = art_b
+            contact_path[c] = 1
+            return
 
     if is_mf != 0:
         # Matrix-free path
@@ -4270,6 +4298,7 @@ def build_mf_contact_rows(
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
+    patch_wrench: int,
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -4388,6 +4417,255 @@ def build_mf_contact_rows(
     if contact_friction_anchor_limit > 0 and friction_anchor_rank >= contact_friction_anchor_limit:
         will_add_friction = False
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
+
+    # Only the run leader builds the block; other wrench-mode contacts here
+    # are allocate's non-coplanar / overflow fallbacks (classic rows).
+    wrench_leader = int(patch_wrench)
+    if wrench_leader != 0 and c > 0 and contact_shape0[c - 1] == shape_a and contact_shape1[c - 1] == shape_b:
+        wrench_leader = 0
+
+    if wrench_leader != 0:
+        # ── Patch-wrench block: [F, f0, f1, Mx, My, Mn] ─────────────────────
+        # One 6-row block per coplanar contact patch. F is the total normal
+        # force at the patch center; f0/f1 the tangential friction pair
+        # (existing sibling-cone semantics, cone = mu * F: the whole patch's
+        # Coulomb budget); Mx/My are pure-torque rows about the tangents with
+        # box clamps |M| <= extent * F (negative-mu sentinel) — the inscribed
+        # center-of-pressure constraint. Making the patch moment an explicit
+        # solver variable removes the moment-redistribution lag that drives
+        # the tall-stack rocking instability (notes §16).
+        total_c = contact_count[0]
+        # Separated contacts carry no load and must not widen the support;
+        # touching/penetrating contacts keep full weight. All-separated
+        # patches fall back to relative-to-deepest weights.
+        phi_min = float(1.0e6)
+        u0_min = float(1.0e6)
+        u0_max = float(-1.0e6)
+        u1_min = float(1.0e6)
+        u1_max = float(-1.0e6)
+        n_run = int(0)
+        for j in range(8):  # patch window = leader + ranks 1..7 (allocate's fallback bound)
+            cc = c + j
+            if cc >= total_c:
+                break
+            if contact_shape0[cc] != shape_a or contact_shape1[cc] != shape_b:
+                break
+            n_j = -contact_normal[cc]
+            if wp.dot(n_j, normal) < 0.98:
+                continue
+            pa_j = contact_point0[cc]
+            pb_j = contact_point1[cc]
+            if body_a >= 0:
+                pa_j = wp.transform_point(body_q[body_a], pa_j)
+            pa_j = pa_j - contact_thickness0[cc] * normal
+            if body_b >= 0:
+                pb_j = wp.transform_point(body_q[body_b], pb_j)
+            pb_j = pb_j + contact_thickness1[cc] * normal
+            mid = 0.5 * (pa_j + pb_j)
+            phi_min = wp.min(phi_min, wp.dot(normal, pa_j - pb_j))
+            u0_r = wp.dot(t0, mid)
+            u1_r = wp.dot(t1, mid)
+            u0_min = wp.min(u0_min, u0_r)
+            u0_max = wp.max(u0_max, u0_r)
+            u1_min = wp.min(u1_min, u1_r)
+            u1_max = wp.max(u1_max, u1_r)
+            n_run += 1
+        if n_run == 0:
+            return
+        # Span from projection ranges: invariant to run-leader order.
+        d0_span = u0_max - u0_min
+        d1_span = u1_max - u1_min
+        span = wp.max(wp.sqrt(d0_span * d0_span + d1_span * d1_span), 1.0e-4)
+        band = wp.max(0.0003, 0.002 * span)
+        w_ref = wp.max(phi_min, 0.0)
+
+        center = wp.vec3(0.0)
+        mean_phi = float(0.0)
+        w_sum = float(0.0)
+        for j in range(8):  # patch window = leader + ranks 1..7 (allocate's fallback bound)
+            cc = c + j
+            if cc >= total_c:
+                break
+            if contact_shape0[cc] != shape_a or contact_shape1[cc] != shape_b:
+                break
+            n_j = -contact_normal[cc]
+            if wp.dot(n_j, normal) < 0.98:
+                continue
+            pa_j = contact_point0[cc]
+            pb_j = contact_point1[cc]
+            if body_a >= 0:
+                pa_j = wp.transform_point(body_q[body_a], pa_j)
+            pa_j = pa_j - contact_thickness0[cc] * normal
+            if body_b >= 0:
+                pb_j = wp.transform_point(body_q[body_b], pb_j)
+            pb_j = pb_j + contact_thickness1[cc] * normal
+            phi_j = wp.dot(normal, pa_j - pb_j)
+            w_j = wp.clamp(1.0 - (phi_j - w_ref) / band, 0.0, 1.0)
+            center += w_j * 0.5 * (pa_j + pb_j)
+            mean_phi += w_j * phi_j
+            w_sum += w_j
+        center = center / w_sum
+        mean_phi = mean_phi / w_sum
+        # The moment reference must lie inside the support (the clamp encodes
+        # "center of pressure within the patch"); principal axes keep the
+        # clamp tight for line/point supports diagonal to the tangent basis.
+        sxx = float(1.0e-10)
+        sxy = float(0.0)
+        syy = float(1.0e-10)
+        for j in range(8):  # patch window = leader + ranks 1..7 (allocate's fallback bound)
+            cc = c + j
+            if cc >= total_c:
+                break
+            if contact_shape0[cc] != shape_a or contact_shape1[cc] != shape_b:
+                break
+            n_j = -contact_normal[cc]
+            if wp.dot(n_j, normal) < 0.98:
+                continue
+            pa_j = contact_point0[cc]
+            pb_j = contact_point1[cc]
+            if body_a >= 0:
+                pa_j = wp.transform_point(body_q[body_a], pa_j)
+            pa_j = pa_j - contact_thickness0[cc] * normal
+            if body_b >= 0:
+                pb_j = wp.transform_point(body_q[body_b], pb_j)
+            pb_j = pb_j + contact_thickness1[cc] * normal
+            w_j = wp.clamp(1.0 - (wp.dot(normal, pa_j - pb_j) - w_ref) / band, 0.0, 1.0)
+            mid = 0.5 * (pa_j + pb_j)
+            u0c = wp.dot(t0, mid - center)
+            u1c = wp.dot(t1, mid - center)
+            sxx += w_j * u0c * u0c
+            sxy += w_j * u0c * u1c
+            syy += w_j * u1c * u1c
+        # Rotate only for clearly anisotropic supports; a square face's
+        # principal angle is covariance noise.
+        lam_diff = wp.sqrt((sxx - syy) * (sxx - syy) + 4.0 * sxy * sxy)
+        if lam_diff > 0.5 * (sxx + syy):
+            ang = 0.5 * wp.atan2(2.0 * sxy, sxx - syy)
+            ca = wp.cos(ang)
+            sa = wp.sin(ang)
+            t0p = ca * t0 + sa * t1
+            t1p = -sa * t0 + ca * t1
+            t0 = t0p
+            t1 = t1p
+
+        # No positional bias on moment rows: it selects the wrong
+        # equilibrium for laterally offset stacks.
+        e0 = float(1.0e-4)
+        e1 = float(1.0e-4)
+        # Diagonal extents: with the axis bounds they clamp the center of
+        # pressure to an octagon instead of the circumscribing box.
+        ed0 = float(1.0e-4)
+        ed1 = float(1.0e-4)
+        for j in range(8):  # patch window = leader + ranks 1..7 (allocate's fallback bound)
+            cc = c + j
+            if cc >= total_c:
+                break
+            if contact_shape0[cc] != shape_a or contact_shape1[cc] != shape_b:
+                break
+            n_j = -contact_normal[cc]
+            if wp.dot(n_j, normal) < 0.98:
+                continue
+            pa_j = contact_point0[cc]
+            pb_j = contact_point1[cc]
+            if body_a >= 0:
+                pa_j = wp.transform_point(body_q[body_a], pa_j)
+            pa_j = pa_j - contact_thickness0[cc] * normal
+            if body_b >= 0:
+                pb_j = wp.transform_point(body_q[body_b], pb_j)
+            pb_j = pb_j + contact_thickness1[cc] * normal
+            w_j = wp.clamp(1.0 - (wp.dot(normal, pa_j - pb_j) - w_ref) / band, 0.0, 1.0)
+            mid = 0.5 * (pa_j + pb_j)
+            u0 = wp.dot(t0, mid - center)
+            u1 = wp.dot(t1, mid - center)
+            e0 = wp.max(e0, w_j * wp.abs(u0))
+            e1 = wp.max(e1, w_j * wp.abs(u1))
+            ed0 = wp.max(ed0, w_j * wp.abs(u0 + u1) * 0.70710678)
+            ed1 = wp.max(ed1, w_j * wp.abs(u0 - u1) * 0.70710678)
+
+        for row_offset in range(6):
+            row_idx = slot + row_offset
+            if row_offset == 0:
+                d = normal
+            elif row_offset == 1:
+                d = t0
+            elif row_offset == 2:
+                d = t1
+            elif row_offset == 3:
+                d = t0  # torque axis
+            elif row_offset == 4:
+                d = t1
+            else:
+                d = normal  # torsion axis (spin about the contact normal)
+            is_torque = row_offset >= 3
+            if response_body_a >= 0:
+                art_a2 = contact_art_a[c]
+                origin_a2 = articulation_origin[art_a2]
+                if is_torque:
+                    mf_J_a[world, row_idx, 0] = 0.0
+                    mf_J_a[world, row_idx, 1] = 0.0
+                    mf_J_a[world, row_idx, 2] = 0.0
+                    mf_J_a[world, row_idx, 3] = d[0]
+                    mf_J_a[world, row_idx, 4] = d[1]
+                    mf_J_a[world, row_idx, 5] = d[2]
+                else:
+                    r_a2 = center - origin_a2
+                    ang_a2 = wp.cross(r_a2, d)
+                    mf_J_a[world, row_idx, 0] = d[0]
+                    mf_J_a[world, row_idx, 1] = d[1]
+                    mf_J_a[world, row_idx, 2] = d[2]
+                    mf_J_a[world, row_idx, 3] = ang_a2[0]
+                    mf_J_a[world, row_idx, 4] = ang_a2[1]
+                    mf_J_a[world, row_idx, 5] = ang_a2[2]
+            if response_body_b >= 0:
+                art_b2 = contact_art_b[c]
+                origin_b2 = articulation_origin[art_b2]
+                if is_torque:
+                    mf_J_b[world, row_idx, 0] = 0.0
+                    mf_J_b[world, row_idx, 1] = 0.0
+                    mf_J_b[world, row_idx, 2] = 0.0
+                    mf_J_b[world, row_idx, 3] = -d[0]
+                    mf_J_b[world, row_idx, 4] = -d[1]
+                    mf_J_b[world, row_idx, 5] = -d[2]
+                else:
+                    r_b2 = center - origin_b2
+                    ang_b2 = wp.cross(r_b2, d)
+                    mf_J_b[world, row_idx, 0] = -d[0]
+                    mf_J_b[world, row_idx, 1] = -d[1]
+                    mf_J_b[world, row_idx, 2] = -d[2]
+                    mf_J_b[world, row_idx, 3] = -ang_b2[0]
+                    mf_J_b[world, row_idx, 4] = -ang_b2[1]
+                    mf_J_b[world, row_idx, 5] = -ang_b2[2]
+            mf_body_a[world, row_idx] = response_body_a
+            mf_body_b[world, row_idx] = response_body_b
+            if row_offset == 0:
+                mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
+                mf_row_parent[world, row_idx] = -1
+                mf_phi[world, row_idx] = mean_phi
+                mf_row_restitution[world, row_idx] = restitution
+                mf_row_mu[world, row_idx] = mu
+            else:
+                mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
+                mf_row_parent[world, row_idx] = slot
+                # Diagonal extents ride in the tipping pair's unused phi slots.
+                if row_offset == 3:
+                    mf_phi[world, row_idx] = ed0
+                elif row_offset == 4:
+                    mf_phi[world, row_idx] = ed1
+                else:
+                    mf_phi[world, row_idx] = 0.0
+                mf_row_restitution[world, row_idx] = 0.0
+                if row_offset <= 2:
+                    mf_row_mu[world, row_idx] = mu * contact_friction_scale
+                elif row_offset == 3:
+                    # torque about t0 shifts pressure along t1
+                    mf_row_mu[world, row_idx] = -e1
+                elif row_offset == 4:
+                    mf_row_mu[world, row_idx] = -e0
+                else:
+                    # torsional friction: |Mn| <= mu * r_eff * F
+                    mf_row_mu[world, row_idx] = -(mu * contact_friction_scale * 0.5 * (e0 + e1))
+            mf_target_velocity[world, row_idx] = 0.0
+        return
 
     # Write rows for normal + friction
     for row_offset in range(3):
@@ -4730,8 +5008,12 @@ def gather_mf_warmstart(
         mf_impulses[world, new_slot] = decay * dt_scale * prev_mf_impulses[world, prev_slot]
     # else: leave 0 (already memset)
 
-    # Friction rows: only if THIS step allocated them here and they belong
-    # to this contact's block (parent == base slot).
+    # Friction rows (offsets 1..5): only if THIS step allocated them here and
+    # they belong to this contact's block (parent == base slot). Legacy
+    # contacts carry two friction rows; patch-wrench blocks carry five
+    # (tangential pair, two moment rows, torsion), and the moment carry is what lets
+    # a jitter-offset stack hold its static interface moments at low
+    # iteration counts instead of rebuilding them from zero every frame.
     for r in range(1, 6):
         new_r = new_slot + r
         if new_r < mf_max_c:
@@ -4754,6 +5036,7 @@ def snapshot_mf_prev_slots(
     contact_slot: wp.array[int],
     contact_shape0: wp.array[int],
     contact_shape1: wp.array[int],
+    contact_patch_wrench: int,
     # out
     prev_slot_sorted: wp.array[int],
 ):
@@ -4772,6 +5055,19 @@ def snapshot_mf_prev_slots(
         prev_slot_sorted[c] = -1
         return
     slot = contact_slot[c]
+    if contact_patch_wrench != 0:
+        # Block identity is the pair: every run contact records the leader's
+        # slot so any within-pair match recovers the block carry.
+        sa = contact_shape0[c]
+        sb = contact_shape1[c]
+        for lookback in range(1, 9):
+            prev = c - lookback
+            if prev < 0:
+                break
+            if contact_shape0[prev] != sa or contact_shape1[prev] != sb:
+                break
+            if contact_slot[prev] >= 0:
+                slot = contact_slot[prev]
     prev_slot_sorted[c] = slot
 
 
@@ -7705,6 +8001,7 @@ def friction_step_current(
     mf_MiJt_b: wp.array3d[float],
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
+    mf_phi: wp.array2d[float],
     body_to_articulation: wp.array[int],
     art_dof_start: wp.array[int],
     mf_impulses: wp.array2d[float],
@@ -7752,6 +8049,27 @@ def friction_step_current(
     parent_idx = mf_row_parent[world, i]
     lambda_n = mf_impulses[world, parent_idx]
     mu_val = mf_row_mu[world, i]
+    if mu_val < 0.0:
+        # Patch-wrench moment row (negative-mu sentinel = support extent):
+        # box clamp plus, for the tipping pair, the diagonal bounds
+        # |Mx -+ My| <= sqrt(2)*ed*F stored in the pair's phi slots.
+        radius_m = wp.max(-mu_val * lambda_n, 0.0)
+        lam_m = wp.clamp(new_impulse, -radius_m, radius_m)
+        moff = i - parent_idx
+        if moff == 3 or moff == 4:
+            lam_s = mf_impulses[world, parent_idx + 7 - moff]
+            f_pos = wp.max(lambda_n, 0.0)
+            b_d0 = 1.41421356 * mf_phi[world, parent_idx + 3] * f_pos
+            b_d1 = 1.41421356 * mf_phi[world, parent_idx + 4] * f_pos
+            lo = wp.max(wp.max(-radius_m, lam_s - b_d0), -lam_s - b_d1)
+            hi = wp.min(wp.min(radius_m, lam_s + b_d0), -lam_s + b_d1)
+            if lo > hi:
+                # Infeasible vs a stale sibling: midpoint, capped at the box bound.
+                mid_m = wp.clamp(0.5 * (lo + hi), -radius_m, radius_m)
+                lo = mid_m
+                hi = mid_m
+            lam_m = wp.clamp(lam_m, lo, hi)
+        return lam_m
     radius = wp.max(mu_val * lambda_n, 0.0)
 
     if radius <= 0.0:
@@ -8342,6 +8660,7 @@ def pgs_solve_mf_loop(
     mf_row_type: wp.array2d[int],
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
+    mf_phi: wp.array2d[float],
     contact_compliance: float,
     compliance_inv_1pg: float,
     body_to_articulation: wp.array[int],
@@ -8482,6 +8801,7 @@ def pgs_solve_mf_loop(
                         mf_MiJt_b,
                         mf_row_parent,
                         mf_row_mu,
+                        mf_phi,
                         body_to_articulation,
                         art_dof_start,
                         mf_impulses,
