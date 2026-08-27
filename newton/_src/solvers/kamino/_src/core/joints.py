@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from enum import IntEnum
 
@@ -15,7 +14,7 @@ from warp._src.types import Any, Int, Vector
 
 from .....core.types import MAXVAL, override
 from .....sim import JointTargetMode, JointType
-from .math import FLOAT32_MAX, FLOAT32_MIN
+from .math import FLOAT32_MAX
 from .types import (
     ArrayLike,
     Descriptor,
@@ -304,6 +303,8 @@ class JointDoFType(IntEnum):
     Conventions:
     - Each joint connects a Base body `B` to a Follower body `F`.
     - The relative motion of body `F' w.r.t. body `B` defines the positive direction of the joint's DoFs.
+    - Mixed linear/angular vectors follow Newton's ``(linear, angular)`` ordering; translational entries
+      before rotational entries.
     - `R_x`, `R_y`, `R_z`: denote rotational DoFs about the local x, y, z axes respectively.
     - `T_x`, `T_y`, `T_z`: denote translational DoFs along the local x, y, z axes respectively.
     - Joints are indexed by `j`, and we often employ the subscript notation `*_j`.
@@ -315,13 +316,13 @@ class JointDoFType(IntEnum):
 
     FREE = 0
     """
-    A 6-DoF free-floating joint, with rotational + translational DoFs
-    along {`R_x`, `R_y`, `R_z`, `T_x`, `T_y`, `T_z`}.
+    A 6-DoF free-floating joint, with translational + rotational DoFs
+    along {`T_x`, `T_y`, `T_z`, `R_x`, `R_y`, `R_z`}.
 
     Coordinates:
         7D transform: 3D position + 4D unit quaternion
     DoFs:
-        6D twist: 3D angular velocity + 3D linear velocity
+        6D twist: 3D linear velocity + 3D angular velocity
     Constraints:
         None
     """
@@ -352,12 +353,12 @@ class JointDoFType(IntEnum):
 
     CYLINDRICAL = 3
     """
-    A 2-DoF cylindrical joint, with rotational + translational DoFs along {`R_x`, `T_x`}.
+    A 2-DoF cylindrical joint, with translational + rotational DoFs along {`T_x`, `R_x`}.
 
     Coordinates:
-        2D vector of angle {`R_x`} + 1D distance {`T_x`}
+        2D vector of distance {`T_x`} + angle {`R_x`}
     DoFs:
-        2D vector of angular velocity {`R_x`} + linear velocity {`T_x`}
+        2D vector of linear velocity {`T_x`} + angular velocity {`R_x`}
     """
 
     # TODO: Add support for PLANAR joints with 2D linear DOFS along {`T_x`, `T_y`}
@@ -417,6 +418,29 @@ class JointDoFType(IntEnum):
         6D vector: {`T_x`, `T_y`, `T_z`, `R_x`, `R_y`, `R_z`}
     """
 
+    GIMBAL = 8
+    """
+    A 3-DoF rotational D6 joint using three intrinsic Euler coordinates.
+
+    Coordinates:
+        3D vector of angles about the configured axes, applied in authored
+        order with later axes transported through earlier rotations.
+    DoFs:
+        3D vector of intrinsic Euler rates.
+    Constraints:
+        3D vector: {`T_x`, `T_y`, `T_z`}
+    """
+
+    GIMBAL_LEFT_HANDED = 9
+    """
+    A 3-DoF rotational D6 joint whose configured axes form a left-handed
+    orthonormal triple.
+
+    This has the same storage layout as :attr:`GIMBAL`. Its third coordinate
+    and rate are expressed about the authored third axis, which is opposite to
+    the canonical right-handed joint-frame axis.
+    """
+
     ###
     # Operations
     ###
@@ -432,6 +456,11 @@ class JointDoFType(IntEnum):
         return self.__str__()
 
     @property
+    def is_pure_three_dof_rotation(self) -> bool:
+        """Whether the joint has exactly three rotational DoFs."""
+        return self in (JointDoFType.SPHERICAL, JointDoFType.GIMBAL, JointDoFType.GIMBAL_LEFT_HANDED)
+
+    @property
     def num_coords(self) -> int:
         """
         Returns the number of generalized coordinates defined by the joint DoF type.
@@ -443,11 +472,13 @@ class JointDoFType(IntEnum):
         elif self.value == self.PRISMATIC:
             return 1  # 1D distance
         elif self.value == self.CYLINDRICAL:
-            return 2  # 2D vector of angle + distance
+            return 2  # 2D vector of distance + angle
         elif self.value == self.UNIVERSAL:
             return 2  # 2D angles
         elif self.value == self.SPHERICAL:
             return 4  # 4D unit-quaternion
+        elif self.value == self.GIMBAL or self.value == self.GIMBAL_LEFT_HANDED:
+            return 3  # 3D intrinsic Euler angles
         elif self.value == self.CARTESIAN:
             return 3  # 3D distances
         elif self.value == self.FIXED:
@@ -461,17 +492,19 @@ class JointDoFType(IntEnum):
         Returns the number of DoFs defined by the joint DoF type.
         """
         if self.value == self.FREE:
-            return 6  # 3D angular velocity + 3D linear velocity
+            return 6  # 3D linear velocity + 3D angular velocity
         elif self.value == self.REVOLUTE:
             return 1  # 1D angular velocity
         elif self.value == self.PRISMATIC:
             return 1  # 1D linear velocity
         elif self.value == self.CYLINDRICAL:
-            return 2  # 1D angular velocity + 1D linear velocity
+            return 2  # 1D linear velocity + 1D angular velocity
         elif self.value == self.UNIVERSAL:
             return 2  # 2D angular velocities
         elif self.value == self.SPHERICAL:
             return 3  # 3D angular velocities
+        elif self.value == self.GIMBAL or self.value == self.GIMBAL_LEFT_HANDED:
+            return 3  # 3D intrinsic Euler rates
         elif self.value == self.CARTESIAN:
             return 3  # 3D linear velocities
         elif self.value == self.FIXED:
@@ -496,6 +529,8 @@ class JointDoFType(IntEnum):
             return 4  # 4D vector for `{R_x, R_y, R_z, R_w}`
         elif self.value == self.SPHERICAL:
             return 3  # 3D vector for `{R_x, R_y, R_z}`
+        elif self.value == self.GIMBAL or self.value == self.GIMBAL_LEFT_HANDED:
+            return 3  # 3D vector for `{T_x, T_y, T_z}`
         elif self.value == self.CARTESIAN:
             return 3  # 3D vector for `{T_x, T_y, T_z}`
         elif self.value == self.FIXED:
@@ -519,6 +554,8 @@ class JointDoFType(IntEnum):
         elif self.value == self.UNIVERSAL:
             return wp.constant(wp.vec4i(0, 1, 2, 5))
         elif self.value == self.SPHERICAL:
+            return wp.constant(wp.vec3i(0, 1, 2))
+        elif self.value == self.GIMBAL or self.value == self.GIMBAL_LEFT_HANDED:
             return wp.constant(wp.vec3i(0, 1, 2))
         elif self.value == self.CARTESIAN:
             return wp.constant(wp.vec3i(3, 4, 5))
@@ -544,6 +581,8 @@ class JointDoFType(IntEnum):
             return wp.constant(wp.vec2i(3, 4))
         elif self.value == self.SPHERICAL:
             return wp.constant(wp.vec3i(3, 4, 5))
+        elif self.value == self.GIMBAL or self.value == self.GIMBAL_LEFT_HANDED:
+            return wp.constant(wp.vec3i(3, 4, 5))
         elif self.value == self.CARTESIAN:
             return wp.constant(wp.vec3i(0, 1, 2))
         elif self.value == self.FIXED:
@@ -568,6 +607,8 @@ class JointDoFType(IntEnum):
             return wp.vec2f
         elif self.value == self.SPHERICAL:
             return wp.vec4f
+        elif self.value == self.GIMBAL or self.value == self.GIMBAL_LEFT_HANDED:
+            return wp.vec3f
         elif self.value == self.CARTESIAN:
             return wp.vec3f
         elif self.value == self.FIXED:
@@ -592,6 +633,8 @@ class JointDoFType(IntEnum):
             return wp.vec2f
         elif self.value == self.SPHERICAL:
             return wp.quatf
+        elif self.value == self.GIMBAL or self.value == self.GIMBAL_LEFT_HANDED:
+            return wp.vec3f
         elif self.value == self.CARTESIAN:
             return wp.vec3f
         elif self.value == self.FIXED:
@@ -616,6 +659,8 @@ class JointDoFType(IntEnum):
             return [0.0, 0.0]
         elif self.value == self.SPHERICAL:
             return [0.0, 0.0, 0.0, 1.0]
+        elif self.value == self.GIMBAL or self.value == self.GIMBAL_LEFT_HANDED:
+            return [0.0, 0.0, 0.0]
         elif self.value == self.CARTESIAN:
             return [0.0, 0.0, 0.0]
         elif self.value == self.FIXED:
@@ -642,6 +687,8 @@ class JointDoFType(IntEnum):
             return [rotation_bound, rotation_bound]
         elif self.value == self.SPHERICAL:
             return [JOINT_QMAX] * 4
+        elif self.value == self.GIMBAL or self.value == self.GIMBAL_LEFT_HANDED:
+            return [rotation_bound] * 3
         elif self.value == self.CARTESIAN:
             return [JOINT_QMAX] * 3
         elif self.value == self.FIXED:
@@ -670,6 +717,8 @@ class JointDoFType(IntEnum):
             JointDoFType.REVOLUTE: JointType.REVOLUTE,
             JointDoFType.PRISMATIC: JointType.PRISMATIC,
             JointDoFType.SPHERICAL: JointType.BALL,
+            JointDoFType.GIMBAL: JointType.D6,
+            JointDoFType.GIMBAL_LEFT_HANDED: JointType.D6,
             JointDoFType.FIXED: JointType.FIXED,
             # All kamino-specific joint types map to D6
             JointDoFType.CARTESIAN: JointType.D6,
@@ -689,6 +738,7 @@ class JointDoFType(IntEnum):
         dof_dim: tuple[int, int],
         limit_lower: np.ndarray,
         limit_upper: np.ndarray,
+        dof_axes: np.ndarray | None = None,
     ) -> JointDoFType:
         """
         Converts a `JointType` to the corresponding `JointDoFType`.
@@ -700,6 +750,7 @@ class JointDoFType(IntEnum):
             dof_dim: The Newton dof dimension (linear/angular dof counts) for this joint.
             limit_lower: The lower position limits from Newton for this joint (in dof space).
             limit_upper: The upper position limits from Newton for this joint (in dof space).
+            dof_axes: The Newton joint axes, used to distinguish gimbal handedness.
 
         Returns:
             The corresponding joint DoF type.
@@ -769,7 +820,15 @@ class JointDoFType(IntEnum):
             elif q_count == 3 and qd_count == 3 and dof_dim == (3, 0):
                 dof_type = JointDoFType.CARTESIAN
             elif q_count == 3 and qd_count == 3 and dof_dim == (0, 3):
-                raise ValueError("Unsupported joint type: GIMBAL joints are not currently supported.")
+                if (
+                    dof_axes is not None
+                    and dof_axes.shape == (3, 3)
+                    and np.all(np.isfinite(dof_axes))
+                    and np.dot(np.cross(dof_axes[0], dof_axes[1]), dof_axes[2]) < 0.0
+                ):
+                    dof_type = JointDoFType.GIMBAL_LEFT_HANDED
+                else:
+                    dof_type = JointDoFType.GIMBAL
             elif q_count == 4 and qd_count == 3 and dof_dim == (0, 3):
                 dof_type = JointDoFType.SPHERICAL
             elif q_count == 7 and qd_count == 6:
@@ -804,6 +863,7 @@ class JointDoFType(IntEnum):
         dof_dim: wp.vec2i,
         limit_lower: vec6f,
         limit_upper: vec6f,
+        dof_axes: mat63f,
     ) -> wp.int32:
         """
         Converts a Newton `JointType` to the corresponding Kamino `JointDoFType`.
@@ -818,6 +878,7 @@ class JointDoFType(IntEnum):
             dof_dim: The Newton dof dimension (linear/angular dof counts) for this joint.
             limit_lower: The lower position limits from Newton for this joint (in dof space).
             limit_upper: The upper position limits from Newton for this joint (in dof space).
+            dof_axes: The Newton joint axes, used to distinguish gimbal handedness.
 
         Returns:
             The corresponding joint DoF type, or -1 if the joint type is not
@@ -850,7 +911,9 @@ class JointDoFType(IntEnum):
         elif q_count == 3 and qd_count == 3 and dof_dim == wp.vec2i(3, 0):
             return JointDoFType.CARTESIAN
         elif q_count == 3 and qd_count == 3 and dof_dim == wp.vec2i(0, 3):
-            return -1
+            if wp.dot(wp.cross(dof_axes[0], dof_axes[1]), dof_axes[2]) < 0.0:
+                return JointDoFType.GIMBAL_LEFT_HANDED
+            return JointDoFType.GIMBAL
         elif q_count == 4 and qd_count == 3 and dof_dim == wp.vec2i(0, 3):
             return JointDoFType.SPHERICAL
         elif q_count == 7 and qd_count == 6:
@@ -883,11 +946,13 @@ class JointDoFType(IntEnum):
         elif dof_type == JointDoFType.PRISMATIC:
             return 1  # 1D distance
         elif dof_type == JointDoFType.CYLINDRICAL:
-            return 2  # 2D vector of angle + distance
+            return 2  # 2D vector of distance + angle
         elif dof_type == JointDoFType.UNIVERSAL:
             return 2  # 2D angles
         elif dof_type == JointDoFType.SPHERICAL:
             return 4  # 4D unit-quaternion
+        elif dof_type == JointDoFType.GIMBAL or dof_type == JointDoFType.GIMBAL_LEFT_HANDED:
+            return 3  # 3D intrinsic Euler angles
         elif dof_type == JointDoFType.CARTESIAN:
             return 3  # 3D distances
         elif dof_type == JointDoFType.FIXED:
@@ -908,17 +973,19 @@ class JointDoFType(IntEnum):
             invalid.
         """
         if dof_type == JointDoFType.FREE:
-            return 6  # 3D angular velocity + 3D linear velocity
+            return 6  # 3D linear velocity + 3D angular velocity
         elif dof_type == JointDoFType.REVOLUTE:
             return 1  # 1D angular velocity
         elif dof_type == JointDoFType.PRISMATIC:
             return 1  # 1D linear velocity
         elif dof_type == JointDoFType.CYLINDRICAL:
-            return 2  # 1D angular velocity + 1D linear velocity
+            return 2  # 1D linear velocity + 1D angular velocity
         elif dof_type == JointDoFType.UNIVERSAL:
             return 2  # 2D angular velocities
         elif dof_type == JointDoFType.SPHERICAL:
             return 3  # 3D angular velocities
+        elif dof_type == JointDoFType.GIMBAL or dof_type == JointDoFType.GIMBAL_LEFT_HANDED:
+            return 3  # 3D intrinsic Euler rates
         elif dof_type == JointDoFType.CARTESIAN:
             return 3  # 3D linear velocities
         elif dof_type == JointDoFType.FIXED:
@@ -950,6 +1017,8 @@ class JointDoFType(IntEnum):
             return 4  # 4D vector for `{R_x, R_y, R_z, R_w}`
         elif dof_type == JointDoFType.SPHERICAL:
             return 3  # 3D vector for `{R_x, R_y, R_z}`
+        elif dof_type == JointDoFType.GIMBAL or dof_type == JointDoFType.GIMBAL_LEFT_HANDED:
+            return 3  # 3D vector for `{T_x, T_y, T_z}`
         elif dof_type == JointDoFType.CARTESIAN:
             return 3  # 3D vector for `{T_x, T_y, T_z}`
         elif dof_type == JointDoFType.FIXED:
@@ -995,6 +1064,8 @@ class JointDoFType(IntEnum):
             R_axis_j = wp.matrix_from_cols(ax, ay, az)
         elif dof_type == JointDoFType.SPHERICAL:
             R_axis_j = wp.matrix_from_cols(dof_axes[0], dof_axes[1], dof_axes[2])
+        elif dof_type == JointDoFType.GIMBAL or dof_type == JointDoFType.GIMBAL_LEFT_HANDED:
+            R_axis_j = wp.matrix_from_cols(dof_axes[0], dof_axes[1], wp.cross(dof_axes[0], dof_axes[1]))
         elif dof_type == JointDoFType.CARTESIAN:
             R_axis_j = wp.matrix_from_cols(dof_axes[0], dof_axes[1], dof_axes[2])
         elif dof_type == JointDoFType.FREE:
@@ -1182,6 +1253,21 @@ class JointDescriptor(Descriptor):
     that the joint has no internal damping and is thus frictionless.
     """
 
+    f_j: ArrayLike | float | None = None
+    """
+    Coulomb friction force or torque along each joint DoF [N, N·m].
+
+    Each translational DoF uses a force [N], and each rotational DoF uses a torque [N·m].
+    Accepts `ArrayLike`, `float`, or `None`.
+
+    If specified as a type conforming to the `ArrayLike` union, then the
+    number of elements must equal the number of DoFs of the joint, i.e.
+    `num_dofs = dof_type.num_dofs`.
+
+    Defaults to zero. Positive values allocate a bounded-multiplier constraint row
+    for every DoF of the joint. Friction on free joints is ignored.
+    """
+
     k_p_j: ArrayLike | float | None = None
     """
     Implicit PD-control proportional gain.
@@ -1258,10 +1344,10 @@ class JointDescriptor(Descriptor):
     all actuated joint DoFs in the world it belongs to.
     """
 
-    cts_offset: int = -1
+    bilateral_cts_offset: int = -1
     """
-    Index offset of this joint's constraints among all
-    joint constraints in the world it belongs to.
+    Index offset of this joint's bilateral constraints among all bilateral
+    joint constraints (kinematic + dynamic) in the world it belongs to.
     """
 
     dynamic_cts_offset: int = -1
@@ -1274,6 +1360,18 @@ class JointDescriptor(Descriptor):
     """
     Index offset of this joint's kinematic constraints among all
     kinematic joint constraints in the world it belongs to.
+    """
+
+    bounded_cts_offset: int = -1
+    """
+    Index offset of this joint's bounded-multiplier rows among all
+    bounded-multiplier constraints in its world.
+    """
+
+    friction_cts_offset: int = -1
+    """
+    Index offset of this joint's friction rows among all
+    Coulomb joint friction constraints in its world.
     """
 
     ###
@@ -1323,9 +1421,9 @@ class JointDescriptor(Descriptor):
         return self.dof_type.num_dofs if self.is_actuated else 0
 
     @property
-    def num_cts(self) -> int:
+    def num_bilateral_cts(self) -> int:
         """
-        Returns the total number of constraints introduced by this joint.
+        Returns the total number of bilateral constraints introduced by this joint.
         """
         return self.num_dynamic_cts + self.num_kinematic_cts
 
@@ -1342,6 +1440,16 @@ class JointDescriptor(Descriptor):
         Returns the number of kinematic constraints introduced by this joint.
         """
         return self.dof_type.num_cts
+
+    @property
+    def num_bounded_cts(self) -> int:
+        """Returns the number of bounded-multiplier constraint rows introduced by this joint."""
+        return self.num_friction_cts
+
+    @property
+    def num_friction_cts(self) -> int:
+        """Returns the number of Coulomb joint friction rows introduced by this joint."""
+        return self.num_dofs if self.dof_type != JointDoFType.FREE and np.any(self.f_j) else 0
 
     @property
     def is_binary(self) -> bool:
@@ -1451,19 +1559,25 @@ class JointDescriptor(Descriptor):
         # Set default values for internal inertia, damping, and implicit PD gains if not provided
         self.a_j = self._check_dofs_array(self.a_j, self.num_dofs, 0.0)
         self.b_j = self._check_dofs_array(self.b_j, self.num_dofs, 0.0)
+        self.f_j = self._check_dofs_array(self.f_j, self.num_dofs, 0.0)
         self.k_p_j = self._check_dofs_array(self.k_p_j, self.num_dofs, 0.0)
         self.k_d_j = self._check_dofs_array(self.k_d_j, self.num_dofs, 0.0)
 
         # Validate that the specified parameters are valid
         self._check_parameter_values()
 
-        # TODO: Add support for dynamic multi-dof joints in the future.
+        # TODO: Add support for missing multi-DOF joint types in the future.
         # Ensure that only revolute and prismatic joints are dynamically constrained
-        supported_implicit_joint_types = (JointDoFType.REVOLUTE, JointDoFType.PRISMATIC)
+        supported_implicit_joint_types = (
+            JointDoFType.REVOLUTE,
+            JointDoFType.PRISMATIC,
+            JointDoFType.GIMBAL,
+            JointDoFType.GIMBAL_LEFT_HANDED,
+        )
         if (self.is_dynamic or self.is_implicit_pd) and self.dof_type not in supported_implicit_joint_types:
             raise ValueError(
                 "Invalid joint: Kamino currently supports dynamic/implicit joints "
-                f"for those that are REVOLUTE or PRISMATIC (name={self.name}, uid={self.uid})."
+                f"for REVOLUTE, PRISMATIC, or GIMBAL types (name={self.name}, uid={self.uid})."
             )
 
         # TODO: Add more checks based on JointDoFType because how do we
@@ -1527,6 +1641,7 @@ class JointDescriptor(Descriptor):
             "----------------------------------------------\n"
             f"a_j: {self.a_j},\n"
             f"b_j: {self.b_j},\n"
+            f"f_j: {self.f_j},\n"
             f"k_p_j: {self.k_p_j},\n"
             f"k_d_j: {self.k_d_j},\n"
             "----------------------------------------------\n"
@@ -1586,12 +1701,7 @@ class JointDescriptor(Descriptor):
             return [float(default) for _ in range(size)]
 
         if isinstance(x, (int, float, np.floating)):
-            if x == math.inf:
-                return [float(FLOAT32_MAX) for _ in range(size)]
-            elif x == -math.inf:
-                return [float(FLOAT32_MIN) for _ in range(size)]
-            else:
-                return [x] * size
+            return [x] * size
 
         if isinstance(x, ArrayLike):
             if len(x) == 0:
@@ -1601,11 +1711,6 @@ class JointDescriptor(Descriptor):
                 raise ValueError(f"Invalid DOF array length: {len(x)} != {size}")
 
             if all(isinstance(x, (float, np.floating)) for x in x):
-                for i in range(len(x)):
-                    if x[i] == math.inf:
-                        x[i] = float(FLOAT32_MAX)
-                    elif x[i] == -math.inf:
-                        x[i] = float(FLOAT32_MIN)
                 return x
             else:
                 raise TypeError(f"Unsupported DOF array type: {type(x)!r}; expected float, iterable of floats, or None")
@@ -1639,6 +1744,8 @@ class JointDescriptor(Descriptor):
                 raise ValueError(f"Invalid joint armature: a_j[{i}] < 0 (name={self.name}, uid={self.uid}).")
             if self.b_j[i] < 0:
                 raise ValueError(f"Invalid joint damping: b_j[{i}] < 0 (name={self.name}, uid={self.uid}).")
+            if self.f_j[i] < 0:
+                raise ValueError(f"Invalid joint friction: f_j[{i}] < 0 (name={self.name}, uid={self.uid}).")
             if self.k_p_j[i] < 0:
                 raise ValueError(f"Invalid joint proportional gain: k_p_j[{i}] < 0 (name={self.name}, uid={self.uid}).")
             if self.k_d_j[i] < 0:
@@ -1753,9 +1860,10 @@ class JointsModel:
     """
     Minimum (a.k.a. lower) joint DoF limits of each joint (as flat array).
 
-    Limits are dimensioned according to the number of DoFs of each joint,
-    as opposed to the number of coordinates in order to handle cases such
-    where joints have more coordinates than DoFs (e.g. spherical joints).
+    Although applying to joint coordinates, limits are dimensioned
+    according to the number of DoFs of each joint, as the number of limits
+    depends on the intrinsic number of DoFs, not on its (possibly redundant,
+    e.g. for spherical joints) parameterization into coordinates.
 
     Shape of ``(sum_of_num_joint_dofs,)``.
     """
@@ -1764,9 +1872,10 @@ class JointsModel:
     """
     Maximum (a.k.a. upper) joint DoF limits of each joint (as flat array).
 
-    Limits are dimensioned according to the number of DoFs of each joint,
-    as opposed to the number of coordinates in order to handle cases such
-    where joints have more coordinates than DoFs (e.g. spherical joints).
+    Although applying to joint coordinates, limits are dimensioned
+    according to the number of DoFs of each joint, as the number of limits
+    depends on the intrinsic number of DoFs, not on its (possibly redundant,
+    e.g. for spherical joints) parameterization into coordinates.
 
     Shape of ``(sum_of_num_joint_dofs,)``.
     """
@@ -1796,6 +1905,14 @@ class JointsModel:
     b_j: wp.array[wp.float32] | None = None
     """
     Internal damping of each joint (as flat array) used for implicit integration of joint dynamics.
+    Shape of ``(sum_of_num_joint_dofs,)``.
+    """
+
+    f_j: wp.array[wp.float32] | None = None
+    """
+    Coulomb friction force or torque of each joint DoF [N, N·m].
+
+    Each translational DoF uses a force [N], and each rotational DoF uses a torque [N·m].
     Shape of ``(sum_of_num_joint_dofs,)``.
     """
 
@@ -1855,9 +1972,9 @@ class JointsModel:
 
     # TODO: Consider making this a wp.vec2i containing
     # both dynamic and kinematic constraint counts
-    num_cts: wp.array[wp.int32] | None = None
+    num_bilateral_cts: wp.array[wp.int32] | None = None
     """
-    Number of total constraints of each joint.
+    Number of bilateral constraints of each joint (dynamic + kinematic).
     Shape of ``(num_joints,)``.
     """
 
@@ -1872,6 +1989,12 @@ class JointsModel:
     Number of kinematic constraints of each joint.
     Shape of ``(num_joints,)``.
     """
+
+    num_bounded_cts: wp.array[wp.int32] | None = None
+    """Number of bounded-multiplier rows of each joint."""
+
+    num_friction_cts: wp.array[wp.int32] | None = None
+    """Number of Coulomb joint friction rows of each joint."""
 
     coords_offset: wp.array[wp.int32] | None = None
     """
@@ -1949,15 +2072,15 @@ class JointsModel:
     actuated DoFs count is encoded as ``actuated_dofs_offset[j+1] - actuated_dofs_offset[j]``.
     """
 
-    cts_offset: wp.array[wp.int32] | None = None
+    bilateral_cts_offset: wp.array[wp.int32] | None = None
     """
-    Index offset of each joint's constraints block, in model-wide
+    Index offset of each joint's bilateral constraints block, in model-wide
     flattened joint constraints arrays (dynamic + kinematic).
 
     Shape of ``(num_joints + 1,)``.
 
     The last entry is the total joint constraints count, so that the per-joint
-    constraints count is encoded as ``cts_offset[j+1] - cts_offset[j]``.
+    constraints count is encoded as ``bilateral_cts_offset[j+1] - bilateral_cts_offset[j]``.
     """
 
     dynamic_cts_offset: wp.array[wp.int32] | None = None
@@ -1992,26 +2115,32 @@ class JointsModel:
     kinematic constraints count is encoded as ``kinematic_cts_offset[j+1] - kinematic_cts_offset[j]``.
     """
 
-    dynamic_cts_offset_joint_cts: wp.array[wp.int32] | None = None
+    bounded_cts_offset: wp.array[wp.int32] | None = None
     """
-    Index offset of each joint's dynamic constraints block, in model-wide
-    flattened joint constraints arrays.
+    Index offset of each joint's bounded-multiplier constraints block, in model-wide
+    flattened joint bounded constraints arrays.
 
-    Shape of ``(num_joints,)``.
+    Shape of ``(num_joints + 1,)``.
+
+    The last entry is the total joint bounded-multiplier constraints count, so that the per-joint
+    bounded constraints count is encoded as ``bounded_cts_offset[j+1] - bounded_cts_offset[j]``.
     """
 
-    kinematic_cts_offset_joint_cts: wp.array[wp.int32] | None = None
+    friction_cts_offset: wp.array[wp.int32] | None = None
     """
-    Index offset of each joint's kinematic constraints block, in model-wide
-    flattened joint constraints arrays.
+    Index offset of each joint's friction constraints block, in model-wide
+    flattened Coulomb joint friction constraints arrays.
 
-    Shape of ``(num_joints,)``.
+    Shape of ``(num_joints + 1,)``.
+
+    The last entry is the total joint friction constraints count, so that the per-joint
+    friction constraints count is encoded as ``friction_cts_offset[j+1] - friction_cts_offset[j]``.
     """
 
     dynamic_cts_offset_total_cts: wp.array[wp.int32] | None = None
     """
     Index offset of each joint's dynamic constraints block, in model-wide
-    flattened total constraints arrays (joints + limits + contacts).
+    flattened total constraints arrays (joints + bounded + limits + contacts).
 
     Shape of ``(num_joints,)``.
     """
@@ -2019,7 +2148,15 @@ class JointsModel:
     kinematic_cts_offset_total_cts: wp.array[wp.int32] | None = None
     """
     Index offset of each joint's kinematic constraints block, in model-wide
-    flattened total constraints arrays (joints + limits + contacts).
+    flattened total constraints arrays (joints + bounded + limits + contacts).
+
+    Shape of ``(num_joints,)``.
+    """
+
+    friction_cts_offset_total_cts: wp.array[wp.int32] | None = None
+    """
+    Index offset of each joint's friction constraints block, in model-wide
+    flattened total constraints arrays (joints + bounded + limits + contacts).
 
     Shape of ``(num_joints,)``.
     """
@@ -2094,21 +2231,45 @@ class JointsData:
     Shape of ``(sum_of_num_kinematic_joint_cts,)``.
     """
 
-    lambda_j: wp.array[wp.float32] | None = None
+    lambda_kin_j: wp.array[wp.float32] | None = None
     """
-    Flat array of joint constraint Lagrange multipliers.
+    Flat array of joint kinematic constraint Lagrange multipliers.
 
-    To access the constraint multipliers of a specific world `w` use:
-    - to get the start index: ``model.info.joint_cts_offset[w]``
-    - to get the size: ``model.info.num_joint_cts[w]``
+    To access the constraint multipliers of a specific world ``w`` use:
+    - to get the start index: ``model.info.joint_kinematic_cts_offset[w]``
+    - to get the size: ``model.info.num_joint_kinematic_cts[w]``
 
-    Then to access the individual dynamic or kinematic constraint blocks, use:
-    - dynamic constraints:
-        ``model.info.joint_dynamic_cts_group_offset[w]`` and ``model.info.num_joint_dynamic_cts[w]``
-    - kinematic constraints:
-        ``model.info.joint_kinematic_cts_group_offset[w]`` and ``model.info.num_joint_kinematic_cts[w]``
+    To access the multipliers of a specific joint ``j`` use ``model.joints.kinematic_cts_offset[j]``
+    as the start index. The per-joint row count is
+    ``model.joints.kinematic_cts_offset[j + 1] - model.joints.kinematic_cts_offset[j]``.
 
-    Shape of ``(sum_of_num_joint_cts,)``.
+    Shape of ``(sum_of_num_kinematic_joint_cts,)``.
+    """
+
+    lambda_dyn_j: wp.array[wp.float32] | None = None
+    """
+    Flat array of joint dynamic constraint Lagrange multipliers.
+
+    To access the constraint multipliers of a specific world ``w`` use:
+    - to get the start index: ``model.info.joint_dynamic_cts_offset[w]``
+    - to get the size: ``model.info.num_joint_dynamic_cts[w]``
+
+    To access the multipliers of a specific joint ``j`` use ``model.joints.dynamic_cts_offset[j]``
+    as the start index. The per-joint row count is
+    ``model.joints.dynamic_cts_offset[j + 1] - model.joints.dynamic_cts_offset[j]``.
+
+    Shape of ``(sum_of_num_dynamic_joint_cts,)``.
+    """
+
+    lambda_f_j: wp.array[wp.float32] | None = None
+    """
+    Flat array of Coulomb joint friction Lagrange multipliers.
+
+    To access the multipliers of a specific joint ``j`` use ``model.joints.friction_cts_offset[j]``
+    as the start index. The per-joint row count is
+    ``model.joints.friction_cts_offset[j + 1] - model.joints.friction_cts_offset[j]``.
+
+    Shape of ``(sum_of_num_friction_cts,)``.
     """
 
     ###
@@ -2226,6 +2387,8 @@ class JointsData:
     in and about the corresponding joint frame.
     Its direction follows the convention that
     joints act on the follower by the base body.
+    This is the sum of :attr:`j_w_a_j`, :attr:`j_w_c_j`,
+    :attr:`j_w_f_j`, and :attr:`j_w_l_j`.
     Shape of ``(num_joints,)``.
     """
 
@@ -2241,7 +2404,18 @@ class JointsData:
 
     j_w_c_j: wp.array[wp.spatial_vectorf] | None = None
     """
-    Constraint wrench applied by each joint, expressed
+    Bilateral constraint wrench applied by each joint, expressed
+    in and about the corresponding joint frame.
+    This includes the dynamic and kinematic constraint reactions only.
+    Its direction is defined by the convention that positive wrenches
+    in the joint frame are those inducing a positive change in the
+    twist of the follower body relative to the base body.
+    Shape of ``(num_joints,)``.
+    """
+
+    j_w_f_j: wp.array[wp.spatial_vectorf] | None = None
+    """
+    Joint friction wrench applied by each joint, expressed
     in and about the corresponding joint frame.
     Its direction is defined by the convention that positive wrenches
     in the joint frame are those inducing a positive change in the
@@ -2277,6 +2451,7 @@ class JointsData:
             self.q_j.zero_()
             self.q_j_p.zero_()
         self.dq_j.zero_()
+        self.lambda_f_j.zero_()
 
     def reset_references(
         self,
@@ -2323,7 +2498,9 @@ class JointsData:
         """
         Resets all joint constraint reactions to zero.
         """
-        self.lambda_j.zero_()
+        self.lambda_kin_j.zero_()
+        self.lambda_dyn_j.zero_()
+        self.lambda_f_j.zero_()
 
     def clear_actuation_forces(self):
         """
@@ -2338,6 +2515,7 @@ class JointsData:
         if self.j_w_j is not None:
             self.j_w_j.zero_()
             self.j_w_c_j.zero_()
+            self.j_w_f_j.zero_()
             self.j_w_a_j.zero_()
             self.j_w_l_j.zero_()
 

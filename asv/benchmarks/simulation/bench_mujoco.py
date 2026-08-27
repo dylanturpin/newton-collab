@@ -19,10 +19,8 @@ from asv_runner.benchmarks.mark import SkipNotImplemented, skip_benchmark_if
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
 
-from benchmark_metrics import (
-    _SimulationMetricTracks,
-    collect_simulation_metrics,
-)
+from benchmark_metric_tracks import _SimulationMetricTracks
+from benchmark_metrics import collect_simulation_metrics
 
 
 class _SimulationMetricTracksMuJoCo(_SimulationMetricTracks):
@@ -49,7 +47,6 @@ class _KpiBenchmark(_SimulationMetricTracksMuJoCo):
     params = None
     robot = None
     samples = None
-    ls_iteration = None
     random_init = None
     environment = "None"
     expected_bodies_per_world = None
@@ -66,7 +63,6 @@ class _KpiBenchmark(_SimulationMetricTracksMuJoCo):
             use_cuda_graph=True,
             builder=builder,
             world_count=world_count,
-            ls_iteration=self.ls_iteration,
             environment=self.environment,
         )
         if workload.graph is None:
@@ -218,7 +214,6 @@ class _NewtonOverheadBenchmark:
     params = None
     robot = None
     samples = None
-    ls_iteration = None
     random_init = None
 
     def setup(self, world_count):
@@ -249,7 +244,6 @@ class _NewtonOverheadBenchmark:
                     world_count=world_count,
                     use_cuda_graph=True,
                     builder=self.builder[world_count],
-                    ls_iteration=self.ls_iteration,
                 )
 
                 for _ in range(self.num_frames):
@@ -270,7 +264,6 @@ class FastCartpole(_KpiBenchmark):
     num_frames = 50
     robot = "cartpole"
     samples = 4
-    ls_iteration = 3
     random_init = True
     environment = "None"
 
@@ -284,7 +277,6 @@ class FastG1(_KpiBenchmark):
     robot = "g1"
     timeout = 900
     samples = 2
-    ls_iteration = 10
     random_init = True
     environment = "None"
 
@@ -298,7 +290,6 @@ class FastNewtonOverheadG1(_NewtonOverheadBenchmark):
     robot = "g1"
     timeout = 900
     samples = 2
-    ls_iteration = 10
     random_init = True
 
 
@@ -307,7 +298,6 @@ class FastHumanoid(_KpiBenchmark):
     num_frames = 100
     robot = "humanoid"
     samples = 4
-    ls_iteration = 15
     random_init = True
     environment = "None"
 
@@ -326,7 +316,6 @@ class FastNewtonOverheadHumanoid(_NewtonOverheadBenchmark):
     num_frames = 100
     robot = "humanoid"
     samples = 4
-    ls_iteration = 15
     random_init = True
 
 
@@ -336,7 +325,6 @@ class FastAllegro(_KpiBenchmark):
     robot = "allegro"
     timeout = 900
     samples = 2
-    ls_iteration = 10
     random_init = False
     environment = "None"
 
@@ -352,7 +340,6 @@ class FastKitchenG1(_KpiBenchmark):
     timeout = 900
     version = "2"  # The pre-v2 series accidentally omitted the kitchen environment.
     samples = 2
-    ls_iteration = 10
     random_init = True
     environment = "kitchen"
     expected_bodies_per_world = 111
