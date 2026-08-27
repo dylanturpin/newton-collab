@@ -4821,6 +4821,29 @@ def gather_JY_to_world(
     Y_world[world, c, local_d] = Y_group[idx, c, d]
 
 
+@wp.kernel
+def diag_from_JY_world(
+    world_constraint_count: wp.array[int],
+    world_dof_count: wp.array[int],
+    J_world: wp.array3d[float],
+    Y_world: wp.array3d[float],
+    max_constraints: int,
+    # output
+    world_diag: wp.array2d[float],
+):
+    """Compute the matrix-free Delassus diagonal from world-indexed J/Y buffers."""
+    tid = wp.tid()
+    row = tid % max_constraints
+    world = tid // max_constraints
+    if row >= world_constraint_count[world]:
+        return
+
+    value = float(0.0)
+    for dof in range(world_dof_count[world]):
+        value += J_world[world, row, dof] * Y_world[world, row, dof]
+    world_diag[world, row] = value
+
+
 # =============================================================================
 # Matrix-Free PGS Kernels for Free Rigid Bodies
 # =============================================================================
@@ -9445,13 +9468,17 @@ def hinv_jt_par_row(
     # Indirection arrays
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
     world_constraint_count: wp.array[int],
     # Size parameters
     n_dofs: int,
     max_constraints: int,
     n_arts: int,
+    write_world: int,
     # Output: Y = H^-1 * J^T [n_arts_of_size, max_constraints, n_dofs]
     Y_group: wp.array3d[float],
+    J_world: wp.array3d[float],
+    Y_world: wp.array3d[float],
 ):
     """
     Compute Y = H^-1 * J^T for one size group using forward/backward substitution.
@@ -9525,6 +9552,12 @@ def hinv_jt_par_row(
             Y_group[idx, c, i] = val / L_ii
         else:
             Y_group[idx, c, i] = 0.0
+
+    if write_world != 0:
+        dof_offset = articulation_world_dof_offset[art]
+        for i in range(n_dofs):
+            J_world[world, c, dof_offset + i] = J_group[idx, c, i]
+            Y_world[world, c, dof_offset + i] = Y_group[idx, c, i]
 
 
 @wp.kernel
