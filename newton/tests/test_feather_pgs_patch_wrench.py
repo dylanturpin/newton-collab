@@ -470,6 +470,122 @@ def test_patch_wrench_moving_kinematic_surface(test: unittest.TestCase, device):
             test.assertLess(abs(z - 0.2505), 0.01, f"{case}: box lost the surface (z={z:.4f})")
 
 
+def _patch_scene(device, mu=0.7, box_z=0.0505, box_quat=None, friction=True):
+    builder = newton.ModelBuilder()
+    builder.rigid_gap = 0.003
+    cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=mu)
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=mu))
+    box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, box_z), box_quat or wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+    model = builder.finalize()
+    pipeline = newton.CollisionPipeline(
+        model,
+        reduce_contacts=True,
+        rigid_contact_max=64,
+        broad_phase="nxn",
+        deterministic=True,
+        contact_matching="latest",
+    )
+    solver = newton.solvers.SolverFeatherPGS(
+        model,
+        pgs_mode="matrix_free",
+        pgs_iterations=8,
+        contact_patch_wrench=True,
+        mf_warmstart=True,
+        enable_contact_friction=friction,
+    )
+    return model, pipeline, solver, box
+
+
+def test_patch_wrench_speculative_patch_does_not_hang(test: unittest.TestCase, device):
+    """A tilted patch of purely separated (speculative) contacts must not
+    hang or brake the body before impact: the smooth support-weight fade
+    gives an all-separated patch its geometry, but the F row's phi bias
+    still forbids impulse before closing."""
+    with wp.ScopedDevice(device):
+        q = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), float(np.radians(1.0)))
+        model, pipeline, solver, box = _patch_scene(device, box_z=0.0665, box_quat=q)
+        contacts = pipeline.contacts()
+        s0, s1 = model.state(), model.state()
+        control = model.control()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+        min_vz = 0.0
+        touched_at = -1
+        for k in range(240):
+            pipeline.collide(s0, contacts)
+            s0.clear_forces()
+            solver.step(s0, s1, control, contacts, 1.0 / 60.0)
+            s0, s1 = s1, s0
+            z = float(s0.body_q.numpy()[box][2])
+            vz = float(s0.body_qd.numpy()[box][2])
+            min_vz = min(min_vz, vz)
+            if touched_at < 0 and z < 0.052:
+                touched_at = k
+        test.assertGreaterEqual(touched_at, 0, "box never reached the ground")
+        test.assertLess(touched_at, 10, f"box hung on a speculative patch (touched at frame {touched_at})")
+        # free fall over ~15 mm reaches ~0.54 m/s; braking before contact
+        # would cap it well below that
+        test.assertLess(min_vz, -0.45, f"approach was braked before contact (min vz {min_vz:.3f})")
+        z = float(s0.body_q.numpy()[box][2])
+        test.assertLess(abs(z - 0.05), 0.01, f"box did not settle flat (z={z:.4f})")
+
+
+def test_patch_wrench_torsion(test: unittest.TestCase, device):
+    """Torsion contract: patch torsion friction stops a pure twist without
+    translating the box; with mu=0 the twist runs nearly free (no hidden
+    rotational glue); combined slide-and-twist comes to rest without
+    freezing the slide."""
+    with wp.ScopedDevice(device):
+        # pure twist
+        for mu, label in ((0.7, "mu=0.7"), (0.0, "mu=0")):
+            model, pipeline, solver, box = _patch_scene(device, mu=mu)
+            contacts = pipeline.contacts()
+            s0, s1 = model.state(), model.state()
+            control = model.control()
+            joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+            joint_qd[5] = 5.0
+            s0.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, s0.joint_q, s0.joint_qd, s0)
+            for _k in range(120):
+                pipeline.collide(s0, contacts)
+                s0.clear_forces()
+                solver.step(s0, s1, control, contacts, 1.0 / 60.0)
+                s0, s1 = s1, s0
+            wz = float(s0.body_qd.numpy()[box][5])
+            pos = s0.body_q.numpy()[box]
+            if mu > 0.0:
+                test.assertLess(abs(wz), 0.05, f"{label}: torsion friction failed to stop the twist (wz={wz:.3f})")
+                test.assertLess(
+                    float(np.hypot(pos[0], pos[1])), 0.005, f"{label}: pure twist translated the box"
+                )
+            else:
+                test.assertGreater(wz, 3.0, f"{label}: frictionless twist was braked (wz={wz:.3f})")
+
+        # slide and twist
+        model, pipeline, solver, box = _patch_scene(device, mu=0.7)
+        contacts = pipeline.contacts()
+        s0, s1 = model.state(), model.state()
+        control = model.control()
+        joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+        joint_qd[0] = 2.0
+        joint_qd[5] = 5.0
+        s0.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, s0.joint_q, s0.joint_qd, s0)
+        for _k in range(180):
+            pipeline.collide(s0, contacts)
+            s0.clear_forces()
+            solver.step(s0, s1, control, contacts, 1.0 / 60.0)
+            s0, s1 = s1, s0
+        qd = s0.body_qd.numpy()[box]
+        speed = float(np.linalg.norm(qd[:3]))
+        wz = float(qd[5])
+        dx = float(s0.body_q.numpy()[box][0])
+        test.assertLess(speed, 0.05, f"slide-and-twist did not come to rest (speed={speed:.3f})")
+        test.assertLess(abs(wz), 0.05, f"slide-and-twist kept spinning (wz={wz:.3f})")
+        test.assertGreater(dx, 0.05, f"slide was frozen instantly (dx={dx * 1000:.1f}mm)")
+        test.assertLess(dx, 0.6, f"slide overshot the friction budget (dx={dx:.3f}m)")
+
+
 class TestFeatherPGSPatchWrench(unittest.TestCase):
     pass
 
@@ -508,6 +624,18 @@ add_function_test(
     TestFeatherPGSPatchWrench,
     "test_patch_wrench_moving_kinematic_surface",
     test_patch_wrench_moving_kinematic_surface,
+    devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSPatchWrench,
+    "test_patch_wrench_speculative_patch_does_not_hang",
+    test_patch_wrench_speculative_patch_does_not_hang,
+    devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSPatchWrench,
+    "test_patch_wrench_torsion",
+    test_patch_wrench_torsion,
     devices=get_selected_cuda_test_devices(),
 )
 

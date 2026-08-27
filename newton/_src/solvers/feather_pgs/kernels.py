@@ -4604,9 +4604,14 @@ def build_mf_contact_rows(
         # the tall-stack rocking instability (notes §16).
         patch_rows = contact_slots_needed[c]
         total_c = contact_count[0]
-        # Separated contacts carry no load and must not widen the support;
-        # touching/penetrating contacts keep full weight. All-separated
-        # patches fall back to relative-to-deepest weights.
+        # Support weights: full weight at the reference separation (deepest
+        # member, floored at touching), fading to zero across a band above
+        # it. The smooth fade -- not a hard phi > 0 cutoff -- keeps the
+        # patch geometry continuous through the hover noise of resting
+        # stacks. An all-separated (speculative) patch deliberately keeps
+        # relative-to-deepest weights so the block enters impact with the
+        # real support shape; the F row's phi bias still prevents any
+        # impulse before closing.
         phi_min = float(1.0e6)
         u0_min = float(1.0e6)
         u0_max = float(-1.0e6)
@@ -4642,6 +4647,9 @@ def build_mf_contact_rows(
         d0_span = u0_max - u0_min
         d1_span = u1_max - u1_min
         span = wp.max(wp.sqrt(d0_span * d0_span + d1_span * d1_span), 1.0e-4)
+        # Band floor 0.3 mm covers the hover noise of resting contacts
+        # (~0.1-0.2 mm at production gap settings); the 0.002 * span slope
+        # is an angular tolerance (~0.11 deg of patch tilt).
         band = wp.max(0.0003, 0.002 * span)
         w_ref = wp.max(phi_min, 0.0)
 
