@@ -801,10 +801,16 @@ class SolverFeatherPGS(SolverBase):
             pgs_contact_regularization (float, optional): Dimensionless proximal regularizer for
                 matrix-free contact rows: the penalty ``g * diag`` enters both the Gauss-Seidel
                 residual and divisor during position iterations (never the velocity-only relax
-                pass). Makes statically indeterminate normal-force splits unique. Unlike
-                ``dense_contact_compliance`` this is not a physical compliance [m/N]; nonzero
-                values change the equilibrium and cause a small, predictable resting sag.
-                ``0`` (default) is the exact rigid law. Defaults to 0.0.
+                pass). Makes statically indeterminate normal-force splits unique by pulling the
+                converged split toward the minimum-norm solution. The direct cost is a load
+                deficit: a determined support carries ``1/(1+g)`` of the rigid impulse per
+                position pass, which surfaces as a small resting sag (useful range is a few
+                percent, e.g. 0.01-0.05; ``0`` (default) is the exact rigid law). Applies to
+                the matrix-free contact routes of ``articulated_contact_response`` modes
+                ``"immediate"`` and ``"propagation-fused"``; the pure propagation routings
+                move those contacts off the matrix-free family and reject a nonzero value.
+                Unlike ``dense_contact_compliance`` this is not a physical compliance [m/N].
+                Defaults to 0.0.
             pgs_velocity_omega (float | None, optional): Relaxation factor for the velocity-only post-pass.
                 Defaults to ``pgs_omega`` when unset.
             pgs_velocity_drive_mode (str, optional): Drive-row treatment during velocity-only post-pass
@@ -1043,6 +1049,21 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_contact_regularization = float(pgs_contact_regularization)
         if not math.isfinite(self.pgs_contact_regularization) or self.pgs_contact_regularization < 0.0:
             raise ValueError("pgs_contact_regularization must be finite and non-negative")
+        # Kernels consume w = 1/(1+g): the update is w-weighted toward the
+        # hard solution and (1-w)-weighted toward zero impulse, which avoids
+        # a g*lambda product and is exact at g = 0 (w = 1).
+        self._pgs_contact_regularization_w = 1.0 / (1.0 + self.pgs_contact_regularization)
+        if self.pgs_contact_regularization > 0.0 and articulated_contact_response in (
+            "propagation",
+            "propagation-colored",
+        ):
+            # Those routings move free/free contacts off the matrix-free
+            # family, where this regularizer is defined; refuse rather than
+            # silently solve them unregularized.
+            raise NotImplementedError(
+                "pgs_contact_regularization requires articulated_contact_response "
+                "'immediate' or 'propagation-fused'"
+            )
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
         threshold_error = "restitution_velocity_threshold must be finite and non-negative"
         try:
@@ -4276,8 +4297,7 @@ class SolverFeatherPGS(SolverBase):
                         self.mf_MiJt_a,
                         self.mf_MiJt_b,
                         self.mf_row_mu,
-                        0.0 if soft_relax else self.pgs_contact_regularization,
-                        1.0 if soft_relax else 1.0 / (1.0 + self.pgs_contact_regularization),
+                        1.0 if soft_relax else self._pgs_contact_regularization_w,
                         phase_iterations,
                         omega,
                         row_phase,
@@ -5013,6 +5033,7 @@ class SolverFeatherPGS(SolverBase):
         friction_start_iteration: int,
         iteration_offset: int,
         freeze_drive_rows: bool,
+        soft_relax: bool = False,
     ) -> None:
         if iterations <= 0:
             return
@@ -5096,6 +5117,8 @@ class SolverFeatherPGS(SolverBase):
                     self.propagation_tree_D_inv,
                     iterations,
                     omega,
+                    # velocity-only pass solves the exact rigid law
+                    1.0 if soft_relax else self._pgs_contact_regularization_w,
                     int(friction_start_iteration),
                     int(iteration_offset),
                     int(freeze_drive_rows),
@@ -5228,6 +5251,7 @@ class SolverFeatherPGS(SolverBase):
         friction_start_iteration: int | None = None,
         iteration_offset: int = 0,
         freeze_drive_rows: bool = False,
+        soft_relax: bool = False,
     ) -> None:
         if iterations <= 0:
             return
@@ -5245,6 +5269,7 @@ class SolverFeatherPGS(SolverBase):
                 friction_start_iteration=friction_start_iteration,
                 iteration_offset=iteration_offset,
                 freeze_drive_rows=freeze_drive_rows,
+                soft_relax=soft_relax,
             )
             return
 
@@ -5349,6 +5374,7 @@ class SolverFeatherPGS(SolverBase):
         self._pack_mf_meta(self.mf_rhs_unbiased)
         if self._propagation_contacts_enabled():
             self._launch_matrix_free_gs_solve_propagation_tree(
+                soft_relax=True,
                 dense_rhs=self.rhs_unbiased,
                 propagation_rhs=self.propagation_rhs_unbiased,
                 mf_meta=self.mf_meta_packed,
@@ -9030,8 +9056,7 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_row_type,
                     self.mf_row_parent,
                     self.mf_row_mu,
-                    self.pgs_contact_regularization,
-                    1.0 / (1.0 + self.pgs_contact_regularization),
+                    self._pgs_contact_regularization_w,
                     self.mf_impulses,
                     self.v_out,
                     iterations,
@@ -9060,8 +9085,7 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_row_type,
                     self.mf_row_parent,
                     self.mf_row_mu,
-                    self.pgs_contact_regularization,
-                    1.0 / (1.0 + self.pgs_contact_regularization),
+                    self._pgs_contact_regularization_w,
                     self.body_to_articulation,
                     self.articulation_dof_start,
                     iterations,
@@ -10361,7 +10385,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
                 float delta = -(jv + rhs_i) * eff_inv;
                 if (row_type == 0) {{
                     // Diagonal contact compliance (see the fused MF-GS kernel).
-                    delta = -((jv + rhs_i) * eff_inv + contact_compliance * old_impulse) * compliance_inv_1pg;
+                    delta = -(jv + rhs_i) * eff_inv * contact_regularization_w - (1.0f - contact_regularization_w) * old_impulse;
                 }}
                 float new_impulse = old_impulse + omega * delta;
 
@@ -10482,8 +10506,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
         mf_row_type: wp.array2d[int],
         mf_row_parent: wp.array2d[int],
         mf_row_mu: wp.array2d[float],
-        contact_compliance: float,
-        compliance_inv_1pg: float,
+        contact_regularization_w: float,
         mf_impulses: wp.array2d[float],
         v_out: wp.array[float],
         iterations: int,
@@ -10507,8 +10530,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
         mf_row_type: wp.array2d[int],
         mf_row_parent: wp.array2d[int],
         mf_row_mu: wp.array2d[float],
-        contact_compliance: float,
-        compliance_inv_1pg: float,
+        contact_regularization_w: float,
         mf_impulses: wp.array2d[float],
         v_out: wp.array[float],
         iterations: int,
@@ -10533,8 +10555,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
             mf_row_type,
             mf_row_parent,
             mf_row_mu,
-            contact_compliance,
-            compliance_inv_1pg,
+            contact_regularization_w,
             mf_impulses,
             v_out,
             iterations,
@@ -12563,8 +12584,12 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     const float jv = __shfl_sync(MASK, my_sum, 0);
 
                     const float residual = jv + __int_as_float(meta.z);
-                    const float delta = -residual * mf_diag;
                     const float old_impulse = s_lam_mf[i];
+                    float delta = -residual * mf_diag;
+                    if (mf_rt == 0) {
+                        // Proximal contact regularization, w = 1/(1+g); w = 1 is the exact hard update.
+                        delta = -residual * mf_diag * contact_regularization_w - (1.0f - contact_regularization_w) * old_impulse;
+                    }
                     float new_impulse = old_impulse + omega * delta;
                     float delta_impulse = 0.0f;
 
@@ -13117,6 +13142,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         propagation_tree_D_inv: wp.array3d[float],
         iterations: int,
         omega: float,
+        contact_regularization_w: float,
         friction_start_iteration: int,
         iteration_offset: int,
         freeze_drive_rows: int,
@@ -13188,6 +13214,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
         propagation_tree_D_inv: wp.array3d[float],
         iterations: int,
         omega: float,
+        contact_regularization_w: float,
         friction_start_iteration: int,
         iteration_offset: int,
         freeze_drive_rows: int,
@@ -13260,6 +13287,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
             propagation_tree_D_inv,
             iterations,
             omega,
+            contact_regularization_w,
             friction_start_iteration,
             iteration_offset,
             freeze_drive_rows,
@@ -16351,7 +16379,7 @@ def _get_pgs_solve_mf_gs_kernel(
             if (mf_rt == 0) {{
                 // Relative diagonal regularization (residual + divisor): makes
                 // indeterminate normal-force splits unique. Identity at g = 0.
-                delta = -(residual * mf_diag + contact_compliance * old_impulse) * compliance_inv_1pg;
+                delta = -residual * mf_diag * contact_regularization_w - (1.0f - contact_regularization_w) * old_impulse;
             }}
             float new_impulse = old_impulse + omega * delta;
             float delta_impulse = 0.0f;
@@ -16576,8 +16604,7 @@ def _get_pgs_solve_mf_gs_kernel(
         mf_MiJt_a: wp.array3d[float],
         mf_MiJt_b: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
-        contact_compliance: float,
-        compliance_inv_1pg: float,
+        contact_regularization_w: float,
         # Shared
         iterations: int,
         omega: float,
@@ -16619,8 +16646,7 @@ def _get_pgs_solve_mf_gs_kernel(
         mf_MiJt_a: wp.array3d[float],
         mf_MiJt_b: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
-        contact_compliance: float,
-        compliance_inv_1pg: float,
+        contact_regularization_w: float,
         # Shared
         iterations: int,
         omega: float,
@@ -16661,8 +16687,7 @@ def _get_pgs_solve_mf_gs_kernel(
             mf_MiJt_a,
             mf_MiJt_b,
             mf_row_mu,
-            contact_compliance,
-            compliance_inv_1pg,
+            contact_regularization_w,
             iterations,
             omega,
             row_phase,

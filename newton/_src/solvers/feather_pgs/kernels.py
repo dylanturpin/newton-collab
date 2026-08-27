@@ -5317,8 +5317,10 @@ def gather_mf_warmstart(
         mf_impulses[world, new_slot] = decay * dt_scale * prev_mf_impulses[world, prev_slot]
     # else: leave 0 (already memset)
 
-    # Friction rows: only if THIS step allocated them here and they belong
-    # to this contact's block (parent == base slot).
+    # Offset rows: only if THIS step allocated them here and they belong to
+    # this contact's block (parent == base slot). Classic contacts carry two
+    # friction rows; offsets 3..5 exist for the stacked patch-wrench block
+    # layout and never match on classic 1- or 3-row blocks.
     for r in range(1, 6):
         new_r = new_slot + r
         if new_r < mf_max_c:
@@ -8931,8 +8933,7 @@ def pgs_solve_mf_loop(
     mf_row_type: wp.array2d[int],
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
-    contact_compliance: float,
-    compliance_inv_1pg: float,
+    contact_regularization_w: float,
     body_to_articulation: wp.array[int],
     art_dof_start: wp.array[int],
     iterations: int,
@@ -8998,8 +8999,10 @@ def pgs_solve_mf_loop(
             old_impulse = mf_impulses[world, i]
             delta = -residual * eff_inv
             if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-                # Relative diagonal regularization; exact identity at 0.
-                delta = -(residual * eff_inv + contact_compliance * old_impulse) * compliance_inv_1pg
+                # Proximal regularization in w-form (w = 1/(1+g)): identical
+                # algebra, but no g*lambda product that could overflow for
+                # extreme finite g; w = 1 (g = 0) is the exact hard update.
+                delta = -residual * eff_inv * contact_regularization_w - (1.0 - contact_regularization_w) * old_impulse
             new_impulse = old_impulse + omega * delta
             delta_impulse = float(0.0)
 
