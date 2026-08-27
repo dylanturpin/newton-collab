@@ -3471,7 +3471,8 @@ def allocate_world_contact_slots(
     (leader included), -1 for classic per-contact rows and non-MF contacts.
     """
     c = wp.tid()
-    contact_block_owner[c] = -1
+    if contact_patch_wrench != 0:
+        contact_block_owner[c] = -1
     total_contacts = contact_count[0]
     if c >= total_contacts:
         contact_slot[c] = -1
@@ -5093,6 +5094,7 @@ def build_mf_contact_rows(
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
+    contact_patch_wrench: int,
     contact_block_owner: wp.array[int],
     contact_slots_needed: wp.array[int],
     # outputs
@@ -5217,8 +5219,8 @@ def build_mf_contact_rows(
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
 
     # Only a patch leader (allocate assigned it its own block) builds the
-    # 6-row block; other contacts reaching here are classic fallbacks.
-    if contact_block_owner[c] == c:
+    # block; other contacts reaching here are classic fallbacks.
+    if contact_patch_wrench != 0 and contact_block_owner[c] == c:
         # ── Patch-wrench block: [F, f0, f1, Mx, My, Mn], or [F, Mx, My]
         # without active friction (allocate decided; read the count back).
         # F is the total normal force at the patch center; f0/f1 the
@@ -5500,8 +5502,6 @@ def build_mf_contact_rows(
                         articulation_origin,
                         body_v_s,
                     )
-            else:
-                mf_target_velocity[world, row_idx] = 0.0
         return
 
     # Write rows for normal + friction
@@ -5792,6 +5792,7 @@ def gather_mf_warmstart(
     contact_path: wp.array[int],
     contact_slot: wp.array[int],
     contact_world: wp.array[int],
+    contact_patch_wrench: int,
     contact_block_owner: wp.array[int],
     match_index: wp.array[int],  # rigid_contact_match_index (sorted-current -> prev-sorted idx)
     prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev block base (see snapshot)
@@ -5843,7 +5844,9 @@ def gather_mf_warmstart(
         return
 
     world = contact_world[c]
-    owner = contact_block_owner[c]
+    owner = int(-1)
+    if contact_patch_wrench != 0:
+        owner = contact_block_owner[c]
 
     prev_slot = int(-1)
     carry_offsets = int(1)
@@ -5928,6 +5931,7 @@ def snapshot_mf_prev_slots(
     contact_count: wp.array[int],
     contact_path: wp.array[int],
     contact_slot: wp.array[int],
+    contact_patch_wrench: int,
     contact_block_owner: wp.array[int],
     # out
     prev_slot_sorted: wp.array[int],
@@ -5950,7 +5954,9 @@ def snapshot_mf_prev_slots(
     if contact_path[c] != 1:
         prev_slot_sorted[c] = -1
         return
-    owner = contact_block_owner[c]
+    owner = int(-1)
+    if contact_patch_wrench != 0:
+        owner = contact_block_owner[c]
     if owner >= 0:
         leader_slot = contact_slot[owner]
         if leader_slot >= 0:

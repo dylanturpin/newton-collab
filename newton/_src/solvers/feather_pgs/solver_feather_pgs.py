@@ -1367,7 +1367,9 @@ class SolverFeatherPGS(SolverBase):
         self._has_prescribed_response = bool(np.any(self._model_plan.prescribed_articulation != 0))
         # mf_target_velocity is consumed by the RHS when prescribed motion or
         # patch-wrench blocks write per-row targets.
-        self._mf_write_targets = bool(self._has_prescribed_response or self.contact_patch_wrench)
+        # Prescribed-motion targets only; patch rows write targets under the
+        # same gate, so the wrench alone no longer forces the buffer.
+        self._mf_write_targets = bool(self._has_prescribed_response)
         self._compute_articulation_metadata(model)
         self._validate_heterogeneous_world_support(model)
         # Loop-closing joints are excluded from the tree (see _FeatherPGSModelPlan.build)
@@ -6239,6 +6241,7 @@ class SolverFeatherPGS(SolverBase):
                             contacts.rigid_contact_count,
                             self.contact_path,
                             self.contact_slot,
+                            int(self.contact_patch_wrench),
                             self.contact_block_owner,
                         ],
                         outputs=[self._ws_prev_slot_sorted],
@@ -7654,6 +7657,7 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
+                        int(self.contact_patch_wrench),
                         self.contact_block_owner,
                         self.contact_slots_needed,
                     ],
@@ -7896,6 +7900,7 @@ class SolverFeatherPGS(SolverBase):
                             self.contact_path,
                             self.contact_slot,
                             self.contact_world,
+                            int(self.contact_patch_wrench),
                             self.contact_block_owner,
                             match_index,
                             self._ws_prev_slot_sorted,

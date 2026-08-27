@@ -274,6 +274,7 @@ def test_patch_wrench_warmstart_gather_ownership(test: unittest.TestCase, device
                     contact_path,
                     contact_slot,
                     contact_world,
+                    1,  # contact_patch_wrench
                     contact_block_owner,
                     match_index,
                     prev_slot_sorted,
