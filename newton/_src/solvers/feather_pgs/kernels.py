@@ -9581,8 +9581,7 @@ def pgs_solve_mf_loop(
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
     mf_phi: wp.array2d[float],
-    contact_compliance: float,
-    compliance_inv_1pg: float,
+    contact_regularization_w: float,
     body_to_articulation: wp.array[int],
     art_dof_start: wp.array[int],
     iterations: int,
@@ -9650,8 +9649,10 @@ def pgs_solve_mf_loop(
             old_impulse = mf_impulses[world, i]
             delta = -residual * eff_inv
             if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-                # Relative diagonal regularization; exact identity at 0.
-                delta = -(residual * eff_inv + contact_compliance * old_impulse) * compliance_inv_1pg
+                # Proximal regularization in w-form (w = 1/(1+g)): identical
+                # algebra, but no g*lambda product that could overflow for
+                # extreme finite g; w = 1 (g = 0) is the exact hard update.
+                delta = -residual * eff_inv * contact_regularization_w - (1.0 - contact_regularization_w) * old_impulse
             new_impulse = old_impulse + omega * delta
             delta_impulse = float(0.0)
 
