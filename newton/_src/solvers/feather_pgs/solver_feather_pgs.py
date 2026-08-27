@@ -105,6 +105,7 @@ from .kernels import (
     delassus_par_row_col,
     detect_limit_count_changes,
     diag_from_JY_par_art,
+    diag_from_JY_world,
     eval_rigid_fk,
     eval_rigid_id,
     eval_rigid_tau,
@@ -1386,6 +1387,12 @@ class SolverFeatherPGS(SolverBase):
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
+        # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
+        # so that path must retain the existing post-correction world gather.
+        self._hinv_jt_writes_world = (
+            self.pgs_mode == "matrix_free" and not self._jy_world_aliased and not self._preelim_active
+        )
+        self._hinv_jt_tiled_writes_group = not self._hinv_jt_writes_world or self.pgs_warmstart
         self._allocate_mf_buffers(model)
         self._allocate_propagation_buffers(model)
         self.mf_target_velocity = (
@@ -3777,6 +3784,8 @@ class SolverFeatherPGS(SolverBase):
                     device_arch,
                     self.tile_threads,
                     constraint_chunk_size=hinv_jt_chunk_size,
+                    write_world=self._hinv_jt_writes_world,
+                    write_group=self._hinv_jt_tiled_writes_group,
                 )
             self._hinv_jt_fused_kernels_by_size[size] = (
                 _get_hinv_jt_fused_kernel(size, self.dense_max_constraints, device_arch, self.tile_threads)
@@ -5524,8 +5533,11 @@ class SolverFeatherPGS(SolverBase):
                 self._stage4_bilateral_preelim(size)
 
         self.diag.zero_()
-        for size in self.size_groups:
-            self._stage4_diag_from_JY(size)
+        if self._hinv_jt_writes_world:
+            self._stage4_diag_from_JY_world()
+        else:
+            for size in self.size_groups:
+                self._stage4_diag_from_JY(size)
         self._stage4_finalize_world_diag_cfm()
         self._stage4_add_dense_contact_compliance(dt)
         self._stage4_compute_physx_drive_desc(dt, position_bias_scale=1.0)
@@ -5574,9 +5586,9 @@ class SolverFeatherPGS(SolverBase):
                     output=self.propagation_rhs_unbiased,
                 )
 
-        # Skipped under the J/Y alias (identity layout, see
-        # _detect_jy_world_identity), matching the step() gather.
-        for size in self.size_groups if not self._jy_world_aliased else ():
+        # Skipped when the buffers alias or H^-1 J^T writes the world layout.
+        needs_gather = not self._jy_world_aliased and not self._hinv_jt_writes_world
+        for size in self.size_groups if needs_gather else ():
             n_arts = self.n_arts_by_size[size]
             wp.launch(
                 gather_JY_to_world,
@@ -5738,8 +5750,11 @@ class SolverFeatherPGS(SolverBase):
 
                 # Diagonal from J*Y (no full Delassus)
                 self.diag.zero_()
-                for size in self.size_groups:
-                    self._stage4_diag_from_JY(size)
+                if self._hinv_jt_writes_world:
+                    self._stage4_diag_from_JY_world()
+                else:
+                    for size in self.size_groups:
+                        self._stage4_diag_from_JY(size)
                 self._stage4_finalize_world_diag_cfm()
                 self._stage4_add_dense_contact_compliance(dt)
                 # Reads J_world only when position_delta_scale != 0; under the
@@ -5830,7 +5845,7 @@ class SolverFeatherPGS(SolverBase):
                 # Skipped when J_world/Y_world alias the group buffers (identity
                 # layout, see _detect_jy_world_identity).
                 # No J_world/Y_world zeroing needed: gather writes all DOFs unconditionally
-                if not self._jy_world_aliased:
+                if not self._jy_world_aliased and not self._hinv_jt_writes_world:
                     for size in self.size_groups:
                         n_arts = self.n_arts_by_size[size]
                         wp.launch(
@@ -7937,6 +7952,9 @@ class SolverFeatherPGS(SolverBase):
         model = self.model
         n_arts = self.n_arts_by_size[size]
         hinv_jt_kernel = self._hinv_jt_kernels_by_size[size]
+        J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
+        Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
+        world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
         if hinv_jt_kernel is None:
             raise RuntimeError(f"H^-1 J^T tiled kernel is unavailable for DOF size {size}")
         wp.launch_tiled(
@@ -7947,9 +7965,10 @@ class SolverFeatherPGS(SolverBase):
                 self.J_by_size[size],
                 self.group_to_art[size],
                 self.art_to_world,
+                world_dof_offset,
                 self.constraint_count,
             ],
-            outputs=[self.Y_by_size[size]],
+            outputs=[self.Y_by_size[size], J_world, Y_world],
             block_dim=self.tile_threads,
             device=model.device,
         )
@@ -7979,6 +7998,9 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_hinv_jt_par_row(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
+        J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
+        Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
+        world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
         wp.launch(
             hinv_jt_par_row,
             dim=n_arts * self.dense_max_constraints,
@@ -7987,12 +8009,14 @@ class SolverFeatherPGS(SolverBase):
                 self.J_by_size[size],
                 self.group_to_art[size],
                 self.art_to_world,
+                world_dof_offset,
                 self.constraint_count,
                 size,
                 self.dense_max_constraints,
                 n_arts,
+                int(self._hinv_jt_writes_world),
             ],
-            outputs=[self.Y_by_size[size]],
+            outputs=[self.Y_by_size[size], J_world, Y_world],
             device=model.device,
         )
 
@@ -8120,6 +8144,21 @@ class SolverFeatherPGS(SolverBase):
                 size,
                 self.dense_max_constraints,
                 n_arts,
+            ],
+            outputs=[self.diag],
+            device=self.model.device,
+        )
+
+    def _stage4_diag_from_JY_world(self):
+        wp.launch(
+            diag_from_JY_world,
+            dim=self.world_count * self.dense_max_constraints,
+            inputs=[
+                self.constraint_count,
+                self.world_dof_count,
+                self.J_world,
+                self.Y_world,
+                self.dense_max_constraints,
             ],
             outputs=[self.diag],
             device=self.model.device,
@@ -9216,6 +9255,8 @@ def _get_hinv_jt_kernel(
     device_arch: str,
     tile_threads: int = 64,
     constraint_chunk_size: int | None = None,
+    write_world: bool = False,
+    write_group: bool = True,
 ) -> "wp.Kernel":
     """Build specialized H^-1*J^T kernel for given dimensions.
 
@@ -9232,15 +9273,20 @@ def _get_hinv_jt_kernel(
         raise ValueError("constraint_chunk_size must be in [1, max_constraints]")
     TILE_CONSTRAINTS_LOCAL = wp.constant(chunk_size)
     BOUNDS_CHECK = max_constraints % chunk_size != 0
+    WRITE_WORLD = wp.constant(1 if write_world else 0)
+    WRITE_GROUP = wp.constant(1 if write_group else 0)
 
     def hinv_jt_tiled_template(
         L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
         J_group: wp.array3d[float],  # [n_arts, max_c, n_dofs]
         group_to_art: wp.array[int],
         art_to_world: wp.array[int],
+        articulation_world_dof_offset: wp.array[int],
         world_constraint_count: wp.array[int],
         # output
         Y_group: wp.array3d[float],  # [n_arts, max_c, n_dofs]
+        J_world: wp.array3d[float],
+        Y_world: wp.array3d[float],
     ):
         idx, chunk = wp.tid()
         art = group_to_art[idx]
@@ -9271,9 +9317,17 @@ def _get_hinv_jt_kernel(
 
         # Store Y = H^-1 * J^T (transpose back to row layout)
         Y_out_tile = wp.tile_transpose(X_tile)
-        wp.tile_store(Y_group[idx], Y_out_tile, offset=(row_start, 0), bounds_check=BOUNDS_CHECK)
+        if WRITE_GROUP != 0:
+            wp.tile_store(Y_group[idx], Y_out_tile, offset=(row_start, 0), bounds_check=BOUNDS_CHECK)
 
-    hinv_jt_tiled_template.__name__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}_c{chunk_size}_bd{tile_threads}"
+        if WRITE_WORLD != 0:
+            dof_offset = articulation_world_dof_offset[art]
+            wp.tile_store(J_world[world], J_tile, offset=(row_start, dof_offset), bounds_check=BOUNDS_CHECK)
+            wp.tile_store(Y_world[world], Y_out_tile, offset=(row_start, dof_offset), bounds_check=BOUNDS_CHECK)
+
+    suffix = "_world" if write_world else ""
+    suffix += "_nogroup" if not write_group else ""
+    hinv_jt_tiled_template.__name__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}_c{chunk_size}_bd{tile_threads}{suffix}"
     hinv_jt_tiled_template.__qualname__ = hinv_jt_tiled_template.__name__
     return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_template)
 
