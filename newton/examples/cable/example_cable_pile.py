@@ -9,6 +9,12 @@
 # orientations (X/Y axis) and sinusoidal waviness. Tests multi-body contact
 # resolution, stacking stability, and friction in dense cable assemblies.
 #
+# Run interactively:
+#   uv run --extra examples python -m newton.examples.cable.example_cable_pile
+#
+# Run as a test:
+#   uv run --extra examples python -m newton.examples.cable.example_cable_pile --test --viewer null
+#
 ###########################################################################
 
 import math
@@ -48,7 +54,7 @@ class Example:
         self.cable_length = self.num_elements * segment_length
         cable_radius = 0.012
         stretch_stiffness = 5.0e5
-        bend_stiffness = 2.0e1
+        bend_stiffness = 1.0e2
 
         # Layers and lanes
         self.layers = layers
@@ -125,7 +131,7 @@ class Example:
 
                 cable_length = float(self.cable_length)
                 start0 = start - 0.5 * cable_length * dir_vec
-                pts = newton.utils.create_straight_cable_points(
+                pts = newton.utils.cable_straight_points(
                     start=start0,
                     direction=dir_vec,
                     length=cable_length,
@@ -142,7 +148,7 @@ class Example:
                         amp = wav * cable_length * waviness_scale
                         pts[i] = pts[i] + ortho_vec * (amp * math.sin(phase))
 
-                edge_q = newton.utils.create_parallel_transport_cable_quaternions(pts, twist_total=float(twist))
+                edge_q = newton.utils.rod_parallel_transport_quaternions(pts, twist_total=float(twist))
 
                 builder.add_rod(
                     positions=pts,
@@ -159,13 +165,14 @@ class Example:
         builder.color()
 
         self.model = builder.finalize()
-        # Size persistent contact history before CUDA graph capture.
-        self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="latest")
+        # Size persistent contact history before graph capture.
+        self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="sticky")
         self.contacts = self.collision_pipeline.contacts()
 
         self.solver = newton.solvers.SolverVBD(
             self.model,
             iterations=self.sim_iterations,
+            rigid_compliant_alm=True,
             rigid_body_contact_buffer_size=256,
             rigid_contact_history=True,
         )
@@ -175,6 +182,8 @@ class Example:
         self.control = self.model.control()
 
         self.viewer.set_model(self.model)
+        if hasattr(self.viewer, "camera"):
+            self.viewer.camera.fov = 40.0
 
         picking = getattr(self.viewer, "picking", None)
         if picking is not None:

@@ -108,6 +108,7 @@ def _find_label_index(labels: list[str], suffix: str) -> int:
 
 class Example:
     def __init__(self, viewer, args):
+        newton.use_coord_layout_targets = True
         self.viewer = viewer
         self.sim_time = 0.0
         self.fps = 60
@@ -126,7 +127,7 @@ class Example:
         template.rigid_gap = 0.005
         SolverMuJoCo.register_custom_attributes(template)
         if self.payload_kind == "vbd-cable":
-            SolverVBD.register_custom_attributes(template, dahl_defaults_enabled=False)
+            SolverVBD.register_custom_attributes(template)
         self._emit_template(template)
 
         bodies_per_world = template.body_count
@@ -220,6 +221,7 @@ class Example:
             return lambda v: SolverVBD(
                 model=v,
                 iterations=vbd_iterations,
+                rigid_compliant_alm=True,
                 rigid_contact_history=False,
             )
         if self.payload_kind == "xpbd-chain":
@@ -308,7 +310,7 @@ class Example:
             margin=0.001,
             gap=0.002,
         )
-        points, quats = newton.utils.create_straight_cable_points_and_quaternions(
+        points, quats = newton.utils.rod_straight_points_and_quaternions(
             start=PAYLOAD_CENTER - wp.vec3(0.5 * PAYLOAD_LENGTH, 0.0, 0.0),
             direction=wp.vec3(1.0, 0.0, 0.0),
             length=PAYLOAD_LENGTH,
