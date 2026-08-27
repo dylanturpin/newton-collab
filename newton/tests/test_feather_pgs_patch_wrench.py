@@ -188,33 +188,38 @@ def test_patch_wrench_warmstart_gather_ownership(test: unittest.TestCase, device
       next block's rows (previous-parent validation).
     """
     with wp.ScopedDevice(device):
-        n_contacts = 6
-        mf_max_c = 16
+        n_contacts = 7
+        mf_max_c = 20
         CT = PGS_CONSTRAINT_TYPE_CONTACT
         FR = PGS_CONSTRAINT_TYPE_FRICTION
+        PM = PGS_CONSTRAINT_TYPE_PATCH_MOMENT
+        PT = PGS_CONSTRAINT_TYPE_PATCH_TORSION
+        BLOCK6 = [CT, FR, FR, PM, PM, PT]
 
         contact_count = wp.array([n_contacts], dtype=wp.int32)
         contact_path = wp.array([1] * n_contacts, dtype=wp.int32)
-        # contacts 0..3: patch (leader 0, slot 0); 4: classic slot 6; 5: classic slot 9
-        contact_slot = wp.array([0, -1, -1, -1, 6, 9], dtype=wp.int32)
+        # contacts 0..3: patch (leader 0, slot 0); 4: classic slot 6;
+        # 5: classic slot 9; 6: frictionless 3-row patch leader at slot 12
+        contact_slot = wp.array([0, -1, -1, -1, 6, 9, 12], dtype=wp.int32)
         contact_world = wp.zeros(n_contacts, dtype=wp.int32)
-        contact_block_owner = wp.array([0, 0, 0, 0, -1, -1], dtype=wp.int32)
+        contact_block_owner = wp.array([0, 0, 0, 0, -1, -1, 6], dtype=wp.int32)
         # leader unmatched; follower 1 matched -> prev sorted idx 2;
         # contact 4 matched -> prev idx 5 (a prev patch member);
-        # contact 5 matched -> prev idx 7 (a prev 1-row classic contact)
-        match_index = wp.array([-1, 2, -1, -1, 5, 7], dtype=wp.int32)
+        # contact 5 matched -> prev idx 7 (a prev 1-row classic contact);
+        # contact 6 matched -> prev idx 8 (the prev 6-row patch block)
+        match_index = wp.array([-1, 2, -1, -1, 5, 7, 8], dtype=wp.int32)
         prev_slot_sorted_np = np.full(n_contacts + 4, -1, dtype=np.int32)
         prev_slot_sorted_np[2] = -2 - 4  # prev patch block base slot 4
         prev_slot_sorted_np[5] = -2 - 4
         prev_slot_sorted_np[7] = 10  # prev classic base slot 10
+        prev_slot_sorted_np[8] = -2 - 4
         prev_slot_sorted = wp.array(prev_slot_sorted_np, dtype=wp.int32)
 
         prev_type = np.zeros((1, mf_max_c), dtype=np.int32)
         prev_parent = np.full((1, mf_max_c), -1, dtype=np.int32)
         prev_imp = np.zeros((1, mf_max_c), dtype=np.float32)
-        # prev patch block rows 4..9
-        prev_type[0, 4] = CT
-        prev_type[0, 5:10] = FR
+        # prev patch block rows 4..9 (typed 6-row layout)
+        prev_type[0, 4:10] = BLOCK6
         prev_parent[0, 5:10] = 4
         prev_imp[0, 4:10] = [10.0, 1.0, 2.0, 3.0, 4.0, 5.0]
         # prev classic 1-row at 10, then an unrelated 3-row block at 11..13
@@ -228,9 +233,8 @@ def test_patch_wrench_warmstart_gather_ownership(test: unittest.TestCase, device
 
         cur_type = np.zeros((1, mf_max_c), dtype=np.int32)
         cur_parent = np.full((1, mf_max_c), -1, dtype=np.int32)
-        # current patch block rows 0..5
-        cur_type[0, 0] = CT
-        cur_type[0, 1:6] = FR
+        # current patch block rows 0..5 (typed 6-row layout)
+        cur_type[0, 0:6] = BLOCK6
         cur_parent[0, 1:6] = 0
         # current classic 3-row blocks at 6..8 and 9..11
         for base in (6, 9):
@@ -239,6 +243,11 @@ def test_patch_wrench_warmstart_gather_ownership(test: unittest.TestCase, device
             cur_type[0, base + 2] = FR
             cur_parent[0, base + 1] = base
             cur_parent[0, base + 2] = base
+        # current frictionless 3-row patch [F, Mx, My] at 12..14
+        cur_type[0, 12] = CT
+        cur_type[0, 13] = PM
+        cur_type[0, 14] = PM
+        cur_parent[0, 13:15] = 12
 
         up = [0.0, 0.0, 1.0]
         tx = [1.0, 0.0, 0.0]
@@ -250,6 +259,8 @@ def test_patch_wrench_warmstart_gather_ownership(test: unittest.TestCase, device
             basis_t0 = np.zeros((1, mf_max_c, 3), dtype=np.float32)
             basis_n[0, 0] = up
             basis_t0[0, 0] = tx
+            basis_n[0, 12] = up
+            basis_t0[0, 12] = tx
             prev_basis_n = np.zeros((1, mf_max_c, 3), dtype=np.float32)
             prev_basis_t0 = np.zeros((1, mf_max_c, 3), dtype=np.float32)
             prev_basis_n[0, 4] = prev_n_base
@@ -290,6 +301,9 @@ def test_patch_wrench_warmstart_gather_ownership(test: unittest.TestCase, device
         np.testing.assert_allclose(out[6:9], 0.0, err_msg="classic contact seeded from a previous patch block")
         test.assertAlmostEqual(float(out[9]), 7.0, msg="classic normal carry lost")
         np.testing.assert_allclose(out[10:12], 0.0, err_msg="seeded from the next block's rows")
+        # 6-row -> 3-row layout transition: F carries, moved rows cold start
+        test.assertAlmostEqual(float(out[12]), 10.0, msg="F carry lost across a 6->3 layout change")
+        np.testing.assert_allclose(out[13:15], 0.0, err_msg="rows whose offset meaning moved were carried")
 
         out = run(up, rot_t)
         test.assertAlmostEqual(float(out[0]), 10.0, msg="F carry lost on tangent-frame rotation")
@@ -350,6 +364,11 @@ def test_patch_wrench_membership_eligibility(test: unittest.TestCase, device):
         # run ends at a different shape pair
         mask = run_mask(0, square, [down] * 4, [(0, 1), (0, 1), (1, 0), (1, 0)])
         test.assertEqual(mask, 0b0011, "membership must stop at the pair boundary")
+
+        # the window covers at most eight contacts; the ninth stays classic
+        many = [(0.01 * i, 0.0, 0.0) for i in range(9)]
+        mask = run_mask(0, many, [down] * 9, [(0, 1)] * 9)
+        test.assertEqual(mask, 0b11111111, "window must cap at eight contacts")
 
 
 def test_patch_wrench_row_layout(test: unittest.TestCase, device):
@@ -685,6 +704,89 @@ def test_patch_wrench_row_capacity_overflow(test: unittest.TestCase, device):
         test.assertGreaterEqual(held, 2, "pairs that fit must keep their rows under overflow")
 
 
+def test_patch_wrench_contact_force_reporting(test: unittest.TestCase, device):
+    """Reported contact forces must use the patch's (possibly principal-axis
+    rotated) basis and carry the block moments: a thin diagonal box under a
+    lateral load must report friction along the load direction, the whole
+    block on the leader, zero on followers, and a nonzero leader torque."""
+    with wp.ScopedDevice(device):
+        diag = np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0)
+        builder = newton.ModelBuilder(gravity=(1.4 * diag[0], 1.4 * diag[1], -9.81))
+        builder.rigid_gap = 0.003
+        cfg = newton.ModelBuilder.ShapeConfig(density=8000.0, mu=0.7)
+        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.7))
+        yaw45 = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(np.radians(45.0)))
+        box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0205), yaw45))
+        builder.add_shape_box(box, hx=0.15, hy=0.02, hz=0.02, cfg=cfg)
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(
+            model,
+            reduce_contacts=True,
+            rigid_contact_max=64,
+            broad_phase="nxn",
+            deterministic=True,
+            contact_matching="latest",
+        )
+        contacts = pipeline.contacts()
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            pgs_iterations=8,
+            contact_patch_wrench=True,
+            mf_warmstart=True,
+        )
+        s0, s1 = model.state(), model.state()
+        control = model.control()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+        for _k in range(60):
+            pipeline.collide(s0, contacts)
+            s0.clear_forces()
+            solver.step(s0, s1, control, contacts, 1.0 / 60.0)
+            s0, s1 = s1, s0
+        # box must be sticking, not sliding
+        speed = float(np.linalg.norm(s0.body_qd.numpy()[box][:3]))
+        test.assertLess(speed, 0.01, f"box is sliding (v={speed:.3f}); lateral load too high for the test")
+        solver.update_contacts(contacts)
+
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        owner = solver.contact_block_owner.numpy()[:count]
+        force = contacts.rigid_contact_force.numpy()[:count]
+        torque = solver._rigid_contact_torque.numpy()[:count]
+        leaders = [i for i in range(count) if owner[i] == i]
+        test.assertEqual(len(leaders), 1, "expected one patch leader")
+        for i in range(count):
+            if owner[i] >= 0 and i != owner[i]:
+                np.testing.assert_allclose(force[i], 0.0, err_msg="patch follower must report zero force")
+
+        total = force.sum(axis=0)
+        mass = 8000.0 * 0.3 * 0.04 * 0.04
+        # normal component balances gravity
+        test.assertAlmostEqual(abs(float(total[2])), mass * 9.81, delta=0.15 * mass * 9.81)
+        # tangential component balances the lateral load ALONG ITS DIRECTION:
+        # with the arbitrary per-contact basis this comes out rotated
+        tang = total[:2]
+        t_mag = float(np.linalg.norm(tang))
+        test.assertAlmostEqual(t_mag, mass * 1.4, delta=0.15 * mass * 1.4)
+        cos = abs(float(np.dot(tang / t_mag, diag[:2])))
+        test.assertGreater(cos, 0.95, f"friction force direction off by {np.degrees(np.arccos(min(cos, 1.0))):.1f} deg")
+        # the lateral load acts above the surface: the leader must report a
+        # nonzero tipping moment
+        test.assertGreater(float(np.linalg.norm(torque[leaders[0]])), 1.0e-4, "patch moment missing from report")
+
+
+def test_patch_wrench_dense_mode_rejected(test: unittest.TestCase, device):
+    """pgs_mode='dense' disables the matrix-free path the feature lives on;
+    enabling both must raise instead of silently ignoring the option."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(b, hx=0.05, hy=0.05, hz=0.05)
+        model = builder.finalize()
+        with test.assertRaises(NotImplementedError):
+            newton.solvers.SolverFeatherPGS(model, pgs_mode="dense", contact_patch_wrench=True)
+
+
 class TestFeatherPGSPatchWrench(unittest.TestCase):
     pass
 
@@ -748,6 +850,18 @@ add_function_test(
     "test_patch_wrench_row_capacity_overflow",
     test_patch_wrench_row_capacity_overflow,
     devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSPatchWrench,
+    "test_patch_wrench_contact_force_reporting",
+    test_patch_wrench_contact_force_reporting,
+    devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSPatchWrench,
+    "test_patch_wrench_dense_mode_rejected",
+    test_patch_wrench_dense_mode_rejected,
+    devices=get_test_devices(),
 )
 
 if __name__ == "__main__":

@@ -1594,12 +1594,23 @@ def compute_contact_linear_force_from_impulses(
     mf_row_parent: wp.array2d[wp.int32],
     propagation_row_type: wp.array2d[wp.int32],
     propagation_row_parent: wp.array2d[wp.int32],
+    contact_patch_wrench: int,
+    contact_block_owner: wp.array[wp.int32],
+    mf_patch_basis_n: wp.array2d[wp.vec3],
+    mf_patch_basis_t0: wp.array2d[wp.vec3],
     enable_friction: int,
     inv_dt: float,
     # outputs
     rigid_contact_force: wp.array[wp.vec3],
+    rigid_contact_torque: wp.array[wp.vec3],
 ):
-    """Convert solved FeatherPGS contact impulses into world-frame forces."""
+    """Convert solved FeatherPGS contact impulses into world-frame forces.
+
+    A patch-wrench leader reports the whole block's totals: force in the
+    block basis (which may be rotated onto the patch's principal axes, not
+    the arbitrary per-contact basis) and the tipping/torsion moments as a
+    torque. Followers own no rows and report zero.
+    """
     c = wp.tid()
     total_contacts = contact_count[0]
     if c >= total_contacts:
@@ -1659,12 +1670,38 @@ def compute_contact_linear_force_from_impulses(
                 lam_t0 = propagation_impulses[world, slot + 1]
                 lam_t1 = propagation_impulses[world, slot + 2]
 
-        force = lam_n * normal
-        if enable_friction != 0:
-            tangent0, tangent1 = contact_tangent_basis(normal)
-            force += lam_t0 * tangent0 + lam_t1 * tangent1
+        torque = wp.vec3(0.0)
+        is_patch_leader = int(0)
+        if contact_patch_wrench != 0 and path == 1:
+            if contact_block_owner[c] == c:
+                is_patch_leader = 1
+        if is_patch_leader != 0:
+            n_b = mf_patch_basis_n[world, slot]
+            t0_b = mf_patch_basis_t0[world, slot]
+            t1_b = wp.cross(n_b, t0_b)
+            force = lam_n * n_b + lam_t0 * t0_b + lam_t1 * t1_b
+            # Moment rows sit at +3/+4(+5) with friction, +1/+2 without.
+            m0 = slot + 3
+            if mf_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_PATCH_MOMENT:
+                m0 = slot + 1
+            count_mf = mf_constraint_count[world]
+            if m0 + 1 < count_mf and mf_row_type[world, m0] == PGS_CONSTRAINT_TYPE_PATCH_MOMENT:
+                torque = mf_impulses[world, m0] * t0_b + mf_impulses[world, m0 + 1] * t1_b
+                mn = m0 + 2
+                if mn < count_mf and mf_row_type[world, mn] == PGS_CONSTRAINT_TYPE_PATCH_TORSION:
+                    torque += mf_impulses[world, mn] * n_b
+        else:
+            force = lam_n * normal
+            if enable_friction != 0:
+                tangent0, tangent1 = contact_tangent_basis(normal)
+                force += lam_t0 * tangent0 + lam_t1 * tangent1
         force *= inv_dt
+        torque *= inv_dt
+        rigid_contact_torque[c] = torque
+        rigid_contact_force[c] = force
+        return
 
+    rigid_contact_torque[c] = wp.vec3(0.0)
     rigid_contact_force[c] = force
 
 
@@ -1672,16 +1709,18 @@ def compute_contact_linear_force_from_impulses(
 def pack_contact_linear_force_as_spatial(
     contact_count: wp.array[wp.int32],
     rigid_contact_force: wp.array[wp.vec3],
+    rigid_contact_torque: wp.array[wp.vec3],
     # outputs
     contact_force: wp.array[wp.spatial_vector],
 ):
-    """Pack linear contact forces into Newton's spatial-force contact buffer."""
+    """Pack contact forces (and patch-wrench moments) into Newton's
+    spatial-force contact buffer."""
     c = wp.tid()
     total_contacts = contact_count[0]
     if c >= total_contacts:
         return
 
-    contact_force[c] = wp.spatial_vector(rigid_contact_force[c], wp.vec3(0.0))
+    contact_force[c] = wp.spatial_vector(rigid_contact_force[c], rigid_contact_torque[c])
 
 
 # Computes J*v contribution on the fly by walking the tree
@@ -5187,8 +5226,8 @@ def build_mf_contact_rows(
         # patch's Coulomb budget); Mx/My are typed tipping-moment rows about
         # the tangents with box clamps |M| <= extent * F — the inscribed
         # center-of-pressure constraint. Making the patch moment an explicit
-        # solver variable removes the moment-redistribution lag that drives
-        # the tall-stack rocking instability (notes §16).
+        # solver variable removes the moment-redistribution lag that
+        # destabilizes tall stacks at low iteration counts.
         patch_rows = contact_slots_needed[c]
         total_c = contact_count[0]
         # Support weights: full weight at the reference separation (deepest
@@ -5405,12 +5444,10 @@ def build_mf_contact_rows(
             if role == 0:
                 mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
                 mf_row_parent[world, row_idx] = -1
-                # Weighted-mean phi, not deepest: A/B on the 19-scenario
-                # battery showed deepest-phi collapses the 60 s quiet soak
-                # tower (507 mm drift) and worsens jenga drift 20x by
-                # over-correcting the whole patch for one corner, while the
-                # worst-point penetration (100x mass ratio: 2.3 mm) is
-                # identical either way - it is governed by the contact bias.
+                # Weighted-mean phi, not deepest: measured A/B showed the
+                # deepest point over-corrects the whole patch for one corner
+                # and destabilizes resting stacks, while the worst-point
+                # penetration is governed by the contact bias either way.
                 mf_phi[world, row_idx] = mean_phi
                 mf_row_restitution[world, row_idx] = restitution
                 mf_row_mu[world, row_idx] = mu

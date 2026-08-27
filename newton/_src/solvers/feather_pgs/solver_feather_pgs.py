@@ -814,8 +814,16 @@ class SolverFeatherPGS(SolverBase):
                 contact, curved surface, distinct faces) keep classic per-contact rows.
                 Matrix-free contacts only; requires ``friction_mode="current"``, pair-sorted
                 contacts (``CollisionPipeline(deterministic=True)`` or any contact-matching
-                mode), and ``articulated_contact_response="immediate"``. Each patch leader
-                reserves six MF row slots. Defaults to False.
+                mode), ``articulated_contact_response="immediate"``, and a matrix-free
+                ``pgs_mode``. A patch covers at most eight contacts of a pair; further
+                contacts keep classic rows. A leader reserves six MF row slots with active
+                friction ([F, f0, f1, Mx, My, Mn]) and three without ([F, Mx, My]).
+                Torsional friction is a box approximation with its own budget
+                (``|Mn| <= mu * r_eff * F``) independent of the tangential cone, so combined
+                sliding and twisting can exceed a coupled Coulomb friction-wrench limit.
+                Reported contact forces attribute the whole block (force in the patch basis
+                plus the moments as a torque) to the leader contact; patch followers report
+                zero. Defaults to False.
             pgs_velocity_omega (float | None, optional): Relaxation factor for the velocity-only post-pass.
                 Defaults to ``pgs_omega`` when unset.
             pgs_velocity_drive_mode (str, optional): Drive-row treatment during velocity-only post-pass
@@ -1004,6 +1012,9 @@ class SolverFeatherPGS(SolverBase):
                 raise NotImplementedError("contact_patch_wrench requires friction_mode='current'")
             if articulated_contact_response != "immediate":
                 raise NotImplementedError("contact_patch_wrench requires articulated_contact_response='immediate'")
+            if pgs_mode == "dense":
+                # Dense mode disables the matrix-free path the feature lives on.
+                raise NotImplementedError("contact_patch_wrench requires pgs_mode 'matrix_free' or 'split'")
         self.contact_friction_scale = float(contact_friction_scale)
         try:
             self.contact_speculative_scale = float(contact_speculative_scale)
@@ -2918,6 +2929,9 @@ class SolverFeatherPGS(SolverBase):
         # Patch-block assignment (leader contact index for members, -1 for
         # classic rows); written by allocate_world_contact_slots every step.
         self.contact_block_owner = wp.full((max_contacts,), -1, dtype=wp.int32, device=device)
+        # Reported patch moments (zero for classic contacts and followers).
+        self._rigid_contact_torque = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
+        self._dummy_patch_basis = wp.zeros((1, 1), dtype=wp.vec3, device=device)
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
@@ -6357,6 +6371,12 @@ class SolverFeatherPGS(SolverBase):
         propagation_row_parent = getattr(self, "propagation_row_parent", None)
         if propagation_row_parent is None:
             propagation_row_parent = self._dummy_contact_row_parent
+        mf_patch_basis_n = getattr(self, "mf_patch_basis_n", None)
+        if mf_patch_basis_n is None:
+            mf_patch_basis_n = self._dummy_patch_basis
+        mf_patch_basis_t0 = getattr(self, "mf_patch_basis_t0", None)
+        if mf_patch_basis_t0 is None:
+            mf_patch_basis_t0 = self._dummy_patch_basis
 
         wp.launch(
             compute_contact_linear_force_from_impulses,
@@ -6379,10 +6399,14 @@ class SolverFeatherPGS(SolverBase):
                 mf_row_parent,
                 propagation_row_type,
                 propagation_row_parent,
+                int(self.contact_patch_wrench),
+                self.contact_block_owner,
+                mf_patch_basis_n,
+                mf_patch_basis_t0,
                 enable_friction_flag,
                 inv_dt,
             ],
-            outputs=[contacts.rigid_contact_force],
+            outputs=[contacts.rigid_contact_force, self._rigid_contact_torque],
             device=self.model.device,
         )
 
@@ -6393,6 +6417,7 @@ class SolverFeatherPGS(SolverBase):
                 inputs=[
                     contacts.rigid_contact_count,
                     contacts.rigid_contact_force,
+                    self._rigid_contact_torque,
                 ],
                 outputs=[contacts.force],
                 device=self.model.device,
