@@ -54,6 +54,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PREELIM_MAX_ROWS,
     PROPAGATION_COLOR_TAIL,
+    accumulate_group_diag_worlds,
     add_dense_contact_compliance_to_diag,
     allocate_connect_slots,
     allocate_joint_limit_slots,
@@ -1354,6 +1355,12 @@ class SolverFeatherPGS(SolverBase):
             hinv_jt_kernel=self.hinv_jt_kernel,
             small_dof_threshold=self.small_dof_threshold,
             tile_threads=self.tile_threads,
+        )
+        self._hinv_jt_computes_diag = self.pgs_mode == "matrix_free" and not self._preelim_active
+        self._hinv_jt_diag_sizes = frozenset(
+            size
+            for size in self.size_groups
+            if self._hinv_jt_computes_diag and self._execution_plan.use_tiled_hinv_jt(size)
         )
 
         self._allocate_common_buffers(model)
@@ -2789,6 +2796,8 @@ class SolverFeatherPGS(SolverBase):
             self.L_by_size = {}
             self.J_by_size = {}
             self.Y_by_size = {}
+            self.diag_by_size = {}
+            self._dummy_hinv_diag = None
             self.R_by_size = {}
             self.tau_by_size = {}
             self.qdd_by_size = {}
@@ -2802,6 +2811,8 @@ class SolverFeatherPGS(SolverBase):
 
         self.L_by_size = {}
         self.Y_by_size = {}
+        self.diag_by_size = {}
+        self._dummy_hinv_diag = wp.zeros((1, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.R_by_size = {}
         self.tau_by_size = {}
         self.qdd_by_size = {}
@@ -2836,6 +2847,11 @@ class SolverFeatherPGS(SolverBase):
 
             self.Y_by_size[size] = wp.zeros(
                 (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
+            )
+            self.diag_by_size[size] = (
+                wp.zeros((n_arts, j_rows), dtype=wp.float32, device=device, requires_grad=requires_grad)
+                if size in self._hinv_jt_diag_sizes
+                else self._dummy_hinv_diag
             )
 
             # Armature (regularization) [n_arts, h_dim] - needs to match H dimension for tile_diag_add
@@ -3750,6 +3766,7 @@ class SolverFeatherPGS(SolverBase):
                     device_arch,
                     self.tile_threads,
                     constraint_chunk_size=hinv_jt_chunk_size,
+                    compute_diag=self._hinv_jt_computes_diag,
                 )
             self._hinv_jt_fused_kernels_by_size[size] = (
                 _get_hinv_jt_fused_kernel(size, self.dense_max_constraints, device_arch, self.tile_threads)
@@ -5493,9 +5510,7 @@ class SolverFeatherPGS(SolverBase):
             for size in self.size_groups:
                 self._stage4_bilateral_preelim(size)
 
-        self.diag.zero_()
-        for size in self.size_groups:
-            self._stage4_diag_from_JY(size)
+        self._stage4_compute_matrix_free_diag()
         self._stage4_finalize_world_diag_cfm()
         self._stage4_add_dense_contact_compliance(dt)
         self._stage4_compute_physx_drive_desc(dt, position_bias_scale=1.0)
@@ -5701,9 +5716,7 @@ class SolverFeatherPGS(SolverBase):
                         self._stage4_bilateral_preelim(size)
 
                 # Diagonal from J*Y (no full Delassus)
-                self.diag.zero_()
-                for size in self.size_groups:
-                    self._stage4_diag_from_JY(size)
+                self._stage4_compute_matrix_free_diag()
                 self._stage4_finalize_world_diag_cfm()
                 self._stage4_add_dense_contact_compliance(dt)
                 # Reads J_world only when position_delta_scale != 0; under the
@@ -7913,7 +7926,7 @@ class SolverFeatherPGS(SolverBase):
                 self.art_to_world,
                 self.constraint_count,
             ],
-            outputs=[self.Y_by_size[size]],
+            outputs=[self.Y_by_size[size], self.diag_by_size[size]],
             block_dim=self.tile_threads,
             device=model.device,
         )
@@ -8088,6 +8101,30 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.diag],
             device=self.model.device,
         )
+
+    def _stage4_accumulate_hinv_diag(self, size: int):
+        wp.launch(
+            accumulate_group_diag_worlds,
+            dim=self.world_count * self.dense_max_constraints,
+            inputs=[
+                self.diag_by_size[size],
+                self.world_group_art_start[size],
+                self.world_group_to_art[size],
+                self.art_group_idx,
+                self.constraint_count,
+                self.dense_max_constraints,
+            ],
+            outputs=[self.diag],
+            device=self.model.device,
+        )
+
+    def _stage4_compute_matrix_free_diag(self):
+        self.diag.zero_()
+        for size in self.size_groups:
+            if size in self._hinv_jt_diag_sizes:
+                self._stage4_accumulate_hinv_diag(size)
+            else:
+                self._stage4_diag_from_JY(size)
 
     def _stage4_compute_rhs_world(
         self,
@@ -9180,6 +9217,7 @@ def _get_hinv_jt_kernel(
     device_arch: str,
     tile_threads: int = 64,
     constraint_chunk_size: int | None = None,
+    compute_diag: bool = False,
 ) -> "wp.Kernel":
     """Build specialized H^-1*J^T kernel for given dimensions.
 
@@ -9196,6 +9234,7 @@ def _get_hinv_jt_kernel(
         raise ValueError("constraint_chunk_size must be in [1, max_constraints]")
     TILE_CONSTRAINTS_LOCAL = wp.constant(chunk_size)
     BOUNDS_CHECK = max_constraints % chunk_size != 0
+    COMPUTE_DIAG = wp.constant(1 if compute_diag else 0)
 
     def hinv_jt_tiled_template(
         L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
@@ -9205,6 +9244,7 @@ def _get_hinv_jt_kernel(
         world_constraint_count: wp.array[int],
         # output
         Y_group: wp.array3d[float],  # [n_arts, max_c, n_dofs]
+        diag_group: wp.array2d[float],
     ):
         idx, chunk = wp.tid()
         art = group_to_art[idx]
@@ -9237,7 +9277,12 @@ def _get_hinv_jt_kernel(
         Y_out_tile = wp.tile_transpose(X_tile)
         wp.tile_store(Y_group[idx], Y_out_tile, offset=(row_start, 0), bounds_check=BOUNDS_CHECK)
 
-    hinv_jt_tiled_template.__name__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}_c{chunk_size}_bd{tile_threads}"
+        if COMPUTE_DIAG != 0:
+            diag_tile = wp.tile_sum(wp.tile_map(wp.mul, J_tile, Y_out_tile), axis=1)
+            wp.tile_store(diag_group[idx], diag_tile, offset=row_start, bounds_check=BOUNDS_CHECK)
+
+    suffix = "_diag" if compute_diag else ""
+    hinv_jt_tiled_template.__name__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}_c{chunk_size}_bd{tile_threads}{suffix}"
     hinv_jt_tiled_template.__qualname__ = hinv_jt_tiled_template.__name__
     return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_template)
 

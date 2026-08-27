@@ -4786,6 +4786,31 @@ def diag_from_JY_par_art(
 
 
 @wp.kernel
+def accumulate_group_diag_worlds(
+    group_diag: wp.array2d[float],
+    world_group_art_start: wp.array[int],
+    world_group_to_art: wp.array[int],
+    art_group_idx: wp.array[int],
+    world_constraint_count: wp.array[int],
+    max_constraints: int,
+    # output
+    world_diag: wp.array2d[float],
+):
+    """Accumulate one size group's response diagonal in deterministic world order."""
+    tid = wp.tid()
+    c = tid % max_constraints
+    world = tid // max_constraints
+    if c >= world_constraint_count[world]:
+        return
+    value = float(0.0)
+    for offset in range(world_group_art_start[world], world_group_art_start[world + 1]):
+        art = world_group_to_art[offset]
+        value += group_diag[art_group_idx[art], c]
+    if value != 0.0:
+        world_diag[world, c] += value
+
+
+@wp.kernel
 def gather_JY_to_world(
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
