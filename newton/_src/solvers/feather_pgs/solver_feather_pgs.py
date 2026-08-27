@@ -5576,6 +5576,12 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
+            raise ValueError(
+                "FeatherPGS contact capacity mismatch: received "
+                f"{contacts.rigid_contact_max} slots, but solver scratch was allocated for "
+                f"{self._max_contacts_alloc}. Set model.rigid_contact_max before constructing the solver."
+            )
         warmstart_modes = []
         if self.pgs_warmstart:
             warmstart_modes.append("pgs_warmstart=True")
