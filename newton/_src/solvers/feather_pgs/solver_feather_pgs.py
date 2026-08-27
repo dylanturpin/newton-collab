@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import math
 import os
 import re
 import time
@@ -550,6 +551,7 @@ class SolverFeatherPGS(SolverBase):
         dense_contact_compliance: float = 0.0,
         speculative_dense_contact_compliance: float = 0.0,
         pgs_omega: float = 1.0,
+        pgs_contact_regularization: float = 0.0,
         pgs_velocity_omega: float | None = None,
         pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
         dense_max_constraints: int = 32,
@@ -713,6 +715,13 @@ class SolverFeatherPGS(SolverBase):
                 separated/speculative contact normals. Converted to an impulse-space diagonal
                 term using ``compliance / dt^2``. Defaults to 0.0.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
+            pgs_contact_regularization (float, optional): Dimensionless proximal regularizer for
+                matrix-free contact rows: the penalty ``g * diag`` enters both the Gauss-Seidel
+                residual and divisor during position iterations (never the velocity-only relax
+                pass). Makes statically indeterminate normal-force splits unique. Unlike
+                ``dense_contact_compliance`` this is not a physical compliance [m/N]; nonzero
+                values change the equilibrium and cause a small, predictable resting sag.
+                ``0`` (default) is the exact rigid law. Defaults to 0.0.
             pgs_velocity_omega (float | None, optional): Relaxation factor for the velocity-only post-pass.
                 Defaults to ``pgs_omega`` when unset.
             pgs_velocity_drive_mode (str, optional): Drive-row treatment during velocity-only post-pass
@@ -931,6 +940,9 @@ class SolverFeatherPGS(SolverBase):
         self.dense_contact_compliance = dense_contact_compliance
         self.speculative_dense_contact_compliance = speculative_dense_contact_compliance
         self.pgs_omega = pgs_omega
+        self.pgs_contact_regularization = float(pgs_contact_regularization)
+        if not math.isfinite(self.pgs_contact_regularization) or self.pgs_contact_regularization < 0.0:
+            raise ValueError("pgs_contact_regularization must be finite and non-negative")
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
         threshold_error = "restitution_velocity_threshold must be finite and non-negative"
         try:
@@ -1004,6 +1016,7 @@ class SolverFeatherPGS(SolverBase):
             self._mf_warmstart_decay = float(mf_warmstart_decay)
         # Allocated lazily in :meth:`_allocate_mf_buffers` only when enabled.
         self._ws_prev_mf_impulses = None
+        self._ws_prev_dt = 0.0
         self._ws_prev_mf_row_type = None
         self._ws_prev_slot_sorted = None
         self._ws_warned_no_match = False
@@ -1221,6 +1234,9 @@ class SolverFeatherPGS(SolverBase):
             self._model_plan.prescribed_articulation, dtype=wp.int32, device=model.device
         )
         self._has_prescribed_response = bool(np.any(self._model_plan.prescribed_articulation != 0))
+        # mf_target_velocity is consumed by the RHS when prescribed motion
+        # writes per-row targets.
+        self._mf_write_targets = bool(self._has_prescribed_response)
         self._compute_articulation_metadata(model)
         self._validate_heterogeneous_world_support(model)
         self.dense_max_constraints = self._select_dense_row_capacity(model)
@@ -1244,7 +1260,7 @@ class SolverFeatherPGS(SolverBase):
         self._allocate_propagation_buffers(model)
         self.mf_target_velocity = (
             wp.zeros_like(self.mf_rhs, requires_grad=model.requires_grad)
-            if self._has_prescribed_response
+            if self._mf_write_targets
             else wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         )
         self._allocate_debug_buffers(model)
@@ -3647,6 +3663,7 @@ class SolverFeatherPGS(SolverBase):
         freeze_drive_rows: bool = False,
         row_phase_override: int | None = None,
         defer_dense_response: bool = False,
+        soft_relax: bool = False,
     ) -> None:
         if iterations <= 0:
             return
@@ -3753,6 +3770,8 @@ class SolverFeatherPGS(SolverBase):
                         self.mf_MiJt_a,
                         self.mf_MiJt_b,
                         self.mf_row_mu,
+                        0.0 if soft_relax else self.pgs_contact_regularization,
+                        1.0 if soft_relax else 1.0 / (1.0 + self.pgs_contact_regularization),
                         phase_iterations,
                         omega,
                         row_phase,
@@ -4835,6 +4854,7 @@ class SolverFeatherPGS(SolverBase):
             )
         else:
             self._launch_matrix_free_gs_solve(
+                soft_relax=True,
                 dense_rhs=self.rhs_unbiased,
                 mf_meta=self.mf_meta_packed,
                 iterations=self.pgs_velocity_iterations,
@@ -5638,11 +5658,18 @@ class SolverFeatherPGS(SolverBase):
             with wp.ScopedTimer("S7_MF_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
                 wp.copy(self._ws_prev_mf_impulses, self.mf_impulses)
                 wp.copy(self._ws_prev_mf_row_type, self.mf_row_type)
+                self._ws_prev_dt = float(dt)
                 if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
                     wp.launch(
                         snapshot_mf_prev_slots,
                         dim=contacts.rigid_contact_max,
-                        inputs=[contacts.rigid_contact_count, self.contact_path, self.contact_slot],
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            self.contact_path,
+                            self.contact_slot,
+                            contacts.rigid_contact_shape0,
+                            contacts.rigid_contact_shape1,
+                        ],
                         outputs=[self._ws_prev_slot_sorted],
                         device=model.device,
                     )
@@ -6464,7 +6491,7 @@ class SolverFeatherPGS(SolverBase):
         max_constraints = self.dense_max_constraints
         mf_active = self._has_free_rigid_bodies and self.pgs_mode != "dense"
         propagation_active = self._propagation_contacts_enabled()
-        if self._has_prescribed_response:
+        if self._mf_write_targets:
             self.mf_target_velocity.zero_()
 
         # Zero world-level buffers (only arrays that require it)
@@ -7149,7 +7176,11 @@ class SolverFeatherPGS(SolverBase):
                             self._ws_prev_mf_impulses,
                             self._ws_prev_mf_row_type,
                             self.mf_row_type,
+                            self.mf_row_parent,
                             self._mf_warmstart_decay,
+                            # Carried support impulses are proportional to dt, so
+                            # rescale by the exact step-size ratio (1 at fixed dt).
+                            dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
                             self.mf_max_constraints,
                         ],
                         outputs=[self.mf_impulses],
@@ -8244,7 +8275,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_row_type,
                 self.mf_target_velocity,
                 self.mf_row_restitution,
-                int(self._has_prescribed_response),
+                int(self._mf_write_targets),
                 self.body_to_articulation,
                 self.articulation_dof_start,
                 self.v_hat,
@@ -8291,7 +8322,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_row_type,
                 self.mf_target_velocity,
                 self.mf_row_restitution,
-                int(self._has_prescribed_response),
+                int(self._mf_write_targets),
                 self.rigid_body_max_depenetration_velocity,
                 self.pgs_beta,
                 dt,
@@ -8345,6 +8376,8 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_row_type,
                     self.mf_row_parent,
                     self.mf_row_mu,
+                    self.pgs_contact_regularization,
+                    1.0 / (1.0 + self.pgs_contact_regularization),
                     self.mf_impulses,
                     self.v_out,
                     iterations,
@@ -8373,6 +8406,8 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_row_type,
                     self.mf_row_parent,
                     self.mf_row_mu,
+                    self.pgs_contact_regularization,
+                    1.0 / (1.0 + self.pgs_contact_regularization),
                     self.body_to_articulation,
                     self.articulation_dof_start,
                     iterations,
@@ -9668,8 +9703,12 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
 
                 // PGS update
                 float rhs_i = mf_rhs.data[c_off + i];
-                float delta = -(jv + rhs_i) * eff_inv;
                 float old_impulse = s_impulse[i];
+                float delta = -(jv + rhs_i) * eff_inv;
+                if (row_type == 0) {{
+                    // Diagonal contact compliance (see the fused MF-GS kernel).
+                    delta = -((jv + rhs_i) * eff_inv + contact_compliance * old_impulse) * compliance_inv_1pg;
+                }}
                 float new_impulse = old_impulse + omega * delta;
 
                 // Project: contact or joint limit
@@ -9789,6 +9828,8 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
         mf_row_type: wp.array2d[int],
         mf_row_parent: wp.array2d[int],
         mf_row_mu: wp.array2d[float],
+        contact_compliance: float,
+        compliance_inv_1pg: float,
         mf_impulses: wp.array2d[float],
         v_out: wp.array[float],
         iterations: int,
@@ -9812,6 +9853,8 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
         mf_row_type: wp.array2d[int],
         mf_row_parent: wp.array2d[int],
         mf_row_mu: wp.array2d[float],
+        contact_compliance: float,
+        compliance_inv_1pg: float,
         mf_impulses: wp.array2d[float],
         v_out: wp.array[float],
         iterations: int,
@@ -9836,6 +9879,8 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
             mf_row_type,
             mf_row_parent,
             mf_row_mu,
+            contact_compliance,
+            compliance_inv_1pg,
             mf_impulses,
             v_out,
             iterations,
@@ -15647,8 +15692,13 @@ def _get_pgs_solve_mf_gs_kernel(
             float jv = __shfl_sync(MASK, my_sum, 0);
 
             float residual = jv + __int_as_float(meta.z);
-            float delta = -residual * mf_diag;
             float old_impulse = s_lam_mf[i];
+            float delta = -residual * mf_diag;
+            if (mf_rt == 0) {{
+                // Relative diagonal regularization (residual + divisor): makes
+                // indeterminate normal-force splits unique. Identity at g = 0.
+                delta = -(residual * mf_diag + contact_compliance * old_impulse) * compliance_inv_1pg;
+            }}
             float new_impulse = old_impulse + omega * delta;
             float delta_impulse = 0.0f;
 
@@ -15872,6 +15922,8 @@ def _get_pgs_solve_mf_gs_kernel(
         mf_MiJt_a: wp.array3d[float],
         mf_MiJt_b: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
+        contact_compliance: float,
+        compliance_inv_1pg: float,
         # Shared
         iterations: int,
         omega: float,
@@ -15913,6 +15965,8 @@ def _get_pgs_solve_mf_gs_kernel(
         mf_MiJt_a: wp.array3d[float],
         mf_MiJt_b: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
+        contact_compliance: float,
+        compliance_inv_1pg: float,
         # Shared
         iterations: int,
         omega: float,
@@ -15953,6 +16007,8 @@ def _get_pgs_solve_mf_gs_kernel(
             mf_MiJt_a,
             mf_MiJt_b,
             mf_row_mu,
+            contact_compliance,
+            compliance_inv_1pg,
             iterations,
             omega,
             row_phase,

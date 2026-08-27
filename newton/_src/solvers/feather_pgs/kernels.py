@@ -4454,7 +4454,7 @@ def build_mf_contact_rows(
         else:
             mf_row_mu[world, row_idx] = friction_mu
         if has_target_velocity != 0:
-            mf_target_velocity[world, row_idx] = prescribed_relative_contact_target(
+            row_target = prescribed_relative_contact_target(
                 body_a,
                 contact_art_a[c],
                 body_b,
@@ -4466,6 +4466,7 @@ def build_mf_contact_rows(
                 articulation_origin,
                 body_v_s,
             )
+            mf_target_velocity[world, row_idx] = row_target
 
 
 @wp.kernel
@@ -4681,7 +4682,9 @@ def gather_mf_warmstart(
     prev_mf_impulses: wp.array2d[float],
     prev_mf_row_type: wp.array2d[int],
     mf_row_type: wp.array2d[int],  # THIS step's row types (already built)
+    mf_row_parent: wp.array2d[int],
     decay: float,
+    dt_scale: float,
     mf_max_c: int,
     # in-out
     mf_impulses: wp.array2d[float],
@@ -4694,6 +4697,9 @@ def gather_mf_warmstart(
     the warm-start branch has zeroed ``mf_impulses``. One thread per contact;
     each writes only its own disjoint slot range, so unmatched / cold contacts
     keep the zero left by the memset and no stale slot survives.
+
+    ``dt_scale`` = dt_now / dt_prev rescales carried impulses across step-size
+    changes (impulse is proportional to dt for quasi-static loads); 1.0 at fixed dt.
 
     ``match_index[c] >= 0`` is the previous frame's *sorted* contact index;
     ``prev_slot_sorted`` is keyed the same way (see solver writeback), so
@@ -4721,14 +4727,15 @@ def gather_mf_warmstart(
 
     # Normal row (offset 0): always present for an MF contact.
     if matched and prev_slot >= 0 and prev_mf_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
-        mf_impulses[world, new_slot] = decay * prev_mf_impulses[world, prev_slot]
+        mf_impulses[world, new_slot] = decay * dt_scale * prev_mf_impulses[world, prev_slot]
     # else: leave 0 (already memset)
 
-    # Friction rows (offsets 1, 2): only if THIS step allocated them here.
-    for r in range(1, 3):
+    # Friction rows: only if THIS step allocated them here and they belong
+    # to this contact's block (parent == base slot).
+    for r in range(1, 6):
         new_r = new_slot + r
         if new_r < mf_max_c:
-            if mf_row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION:
+            if mf_row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION and mf_row_parent[world, new_r] == new_slot:
                 prev_r = prev_slot + r
                 if (
                     matched
@@ -4736,7 +4743,7 @@ def gather_mf_warmstart(
                     and prev_r < mf_max_c
                     and prev_mf_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
                 ):
-                    mf_impulses[world, new_r] = decay * prev_mf_impulses[world, prev_r]
+                    mf_impulses[world, new_r] = decay * dt_scale * prev_mf_impulses[world, prev_r]
                 # else: leave 0
 
 
@@ -4745,6 +4752,8 @@ def snapshot_mf_prev_slots(
     contact_count: wp.array[int],
     contact_path: wp.array[int],
     contact_slot: wp.array[int],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
     # out
     prev_slot_sorted: wp.array[int],
 ):
@@ -4762,7 +4771,8 @@ def snapshot_mf_prev_slots(
     if contact_path[c] != 1:
         prev_slot_sorted[c] = -1
         return
-    prev_slot_sorted[c] = contact_slot[c]
+    slot = contact_slot[c]
+    prev_slot_sorted[c] = slot
 
 
 @wp.kernel
@@ -8332,6 +8342,8 @@ def pgs_solve_mf_loop(
     mf_row_type: wp.array2d[int],
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
+    contact_compliance: float,
+    compliance_inv_1pg: float,
     body_to_articulation: wp.array[int],
     art_dof_start: wp.array[int],
     iterations: int,
@@ -8394,9 +8406,12 @@ def pgs_solve_mf_loop(
 
             # PGS update: delta = -(J*v_current + bias) / d_ii
             residual = jv + mf_rhs[world, i]
-            delta = -residual * eff_inv
-            new_impulse = mf_impulses[world, i] + omega * delta
             old_impulse = mf_impulses[world, i]
+            delta = -residual * eff_inv
+            if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+                # Relative diagonal regularization; exact identity at 0.
+                delta = -(residual * eff_inv + contact_compliance * old_impulse) * compliance_inv_1pg
+            new_impulse = old_impulse + omega * delta
             delta_impulse = float(0.0)
 
             # Project

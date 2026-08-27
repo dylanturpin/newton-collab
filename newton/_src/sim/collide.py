@@ -1069,6 +1069,11 @@ class CollisionPipeline:
             broad_phase:
                 Either a broad phase mode string ("explicit", "nxn", "sap") or
                 a prebuilt broad phase instance for expert usage.
+            box_box_sat: Route box-box pairs through the SAT reference-face
+                clipping primitive instead of GJK/MPR, with a quadrant-reduced
+                4-slot manifold. Stable multi-point box manifolds (no witness-
+                point teleports). Cannot be combined with a prebuilt
+                ``narrow_phase``. Defaults to False.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
                 Its effective ``reduce_contacts`` state is authoritative for
@@ -1226,6 +1231,11 @@ class CollisionPipeline:
                 raise ValueError("Provide both broad_phase and narrow_phase for expert component construction")
             if sdf_hydroelastic_config is not None:
                 raise ValueError("sdf_hydroelastic_config cannot be used when narrow_phase is provided")
+            if box_box_sat:
+                raise ValueError(
+                    "box_box_sat cannot be used when narrow_phase is provided; "
+                    "construct the NarrowPhase with box_box_sat=True instead"
+                )
             if contact_reduction_hashtable_size_factor != 0.25:
                 raise ValueError(
                     "contact_reduction_hashtable_size_factor cannot be used when narrow_phase is provided; "
