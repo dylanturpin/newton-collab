@@ -4818,6 +4818,12 @@ def build_mf_contact_rows(
             if role == 0:
                 mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
                 mf_row_parent[world, row_idx] = -1
+                # Weighted-mean phi, not deepest: A/B on the 19-scenario
+                # battery showed deepest-phi collapses the 60 s quiet soak
+                # tower (507 mm drift) and worsens jenga drift 20x by
+                # over-correcting the whole patch for one corner, while the
+                # worst-point penetration (100x mass ratio: 2.3 mm) is
+                # identical either way - it is governed by the contact bias.
                 mf_phi[world, row_idx] = mean_phi
                 mf_row_restitution[world, row_idx] = restitution
                 mf_row_mu[world, row_idx] = mu

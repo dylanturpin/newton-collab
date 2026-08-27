@@ -284,7 +284,9 @@ def test_patch_wrench_warmstart_gather_ownership(test: unittest.TestCase, device
             return mf_impulses.numpy()[0]
 
         out = run(up, tx)
-        np.testing.assert_allclose(out[0:6], [10.0, 1.0, 2.0, 3.0, 4.0, 5.0], err_msg="block not recovered via follower")
+        np.testing.assert_allclose(
+            out[0:6], [10.0, 1.0, 2.0, 3.0, 4.0, 5.0], err_msg="block not recovered via follower"
+        )
         np.testing.assert_allclose(out[6:9], 0.0, err_msg="classic contact seeded from a previous patch block")
         test.assertAlmostEqual(float(out[9]), 7.0, msg="classic normal carry lost")
         np.testing.assert_allclose(out[10:12], 0.0, err_msg="seeded from the next block's rows")
@@ -305,22 +307,22 @@ def test_patch_wrench_membership_eligibility(test: unittest.TestCase, device):
         def run_mask(leader, points, normals, pairs):
             n = len(points)
             # contact_normal is stored A-to-B; the kernel negates it.
-            args = dict(
-                contact_shape0=wp.array([p[0] for p in pairs], dtype=wp.int32),
-                contact_shape1=wp.array([p[1] for p in pairs], dtype=wp.int32),
-                contact_point0=wp.array([wp.vec3(*p) for p in points], dtype=wp.vec3),
-                contact_point1=wp.array([wp.vec3(p[0], p[1], 0.0) for p in points], dtype=wp.vec3),
-                contact_normal=wp.array([wp.vec3(*nrm) for nrm in normals], dtype=wp.vec3),
-                contact_thickness0=wp.zeros(n, dtype=wp.float32),
-                contact_thickness1=wp.zeros(n, dtype=wp.float32),
-                shape_body=wp.array([-1, -1], dtype=wp.int32),
-                body_q=wp.zeros(1, dtype=wp.transform),
-            )
+            arrays = [
+                wp.array([p[0] for p in pairs], dtype=wp.int32),
+                wp.array([p[1] for p in pairs], dtype=wp.int32),
+                wp.array([wp.vec3(*p) for p in points], dtype=wp.vec3),
+                wp.array([wp.vec3(p[0], p[1], 0.0) for p in points], dtype=wp.vec3),
+                wp.array([wp.vec3(*nrm) for nrm in normals], dtype=wp.vec3),
+                wp.zeros(n, dtype=wp.float32),
+                wp.zeros(n, dtype=wp.float32),
+                wp.array([-1, -1], dtype=wp.int32),
+                wp.zeros(1, dtype=wp.transform),
+            ]
             mask = wp.zeros(1, dtype=wp.int32)
             wp.launch(
                 _eval_patch_member_mask,
                 dim=1,
-                inputs=[leader, n, *args.values()],
+                inputs=[leader, n, *arrays],
                 outputs=[mask],
             )
             return int(mask.numpy()[0])
@@ -459,13 +461,9 @@ def test_patch_wrench_moving_kinematic_surface(test: unittest.TestCase, device):
                 s0, s1 = s1, s0
             qd = s0.body_qd.numpy()[box]
             if case == "translate":
-                test.assertAlmostEqual(
-                    float(qd[0]), 1.0, delta=0.05, msg="box not carried by the translating surface"
-                )
+                test.assertAlmostEqual(float(qd[0]), 1.0, delta=0.05, msg="box not carried by the translating surface")
             else:
-                test.assertAlmostEqual(
-                    float(qd[5]), 1.0, delta=0.1, msg="box not spun with the yawing surface"
-                )
+                test.assertAlmostEqual(float(qd[5]), 1.0, delta=0.1, msg="box not spun with the yawing surface")
             z = float(s0.body_q.numpy()[box][2])
             test.assertLess(abs(z - 0.2505), 0.01, f"{case}: box lost the surface (z={z:.4f})")
 
@@ -555,9 +553,7 @@ def test_patch_wrench_torsion(test: unittest.TestCase, device):
             pos = s0.body_q.numpy()[box]
             if mu > 0.0:
                 test.assertLess(abs(wz), 0.05, f"{label}: torsion friction failed to stop the twist (wz={wz:.3f})")
-                test.assertLess(
-                    float(np.hypot(pos[0], pos[1])), 0.005, f"{label}: pure twist translated the box"
-                )
+                test.assertLess(float(np.hypot(pos[0], pos[1])), 0.005, f"{label}: pure twist translated the box")
             else:
                 test.assertGreater(wz, 3.0, f"{label}: frictionless twist was braked (wz={wz:.3f})")
 
@@ -584,6 +580,109 @@ def test_patch_wrench_torsion(test: unittest.TestCase, device):
         test.assertLess(abs(wz), 0.05, f"slide-and-twist kept spinning (wz={wz:.3f})")
         test.assertGreater(dx, 0.05, f"slide was frozen instantly (dx={dx * 1000:.1f}mm)")
         test.assertLess(dx, 0.6, f"slide overshot the friction budget (dx={dx:.3f}m)")
+
+
+def test_patch_wrench_moments_ignore_friction_scheduling(test: unittest.TestCase, device):
+    """Tipping moments represent normal pressure and must stay active when
+    contact_friction_position_iterations delays friction rows entirely
+    (= 0, with no velocity pass): an offset-COM box needs Mx/My to hold its
+    center of pressure off-center, with no friction involved."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder()
+        builder.rigid_gap = 0.003
+        cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
+        heavy = newton.ModelBuilder.ShapeConfig(density=8000.0, mu=0.7)
+        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.7))
+        box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0505), wp.quat_identity()))
+        builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+        # rider shifts the COM ~10 mm along +x: static rest requires the
+        # patch moment rows to carry the gravity torque
+        builder.add_shape_box(
+            box,
+            xform=wp.transform(wp.vec3(0.03, 0.0, 0.07), wp.quat_identity()),
+            hx=0.02,
+            hy=0.02,
+            hz=0.02,
+            cfg=heavy,
+        )
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(
+            model,
+            reduce_contacts=True,
+            rigid_contact_max=64,
+            broad_phase="nxn",
+            deterministic=True,
+            contact_matching="latest",
+        )
+        contacts = pipeline.contacts()
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            pgs_iterations=8,
+            contact_patch_wrench=True,
+            mf_warmstart=True,
+            contact_friction_position_iterations=0,
+            pgs_velocity_iterations=0,
+        )
+        s0, s1 = model.state(), model.state()
+        control = model.control()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+        for _k in range(60):
+            pipeline.collide(s0, contacts)
+            s0.clear_forces()
+            solver.step(s0, s1, control, contacts, 1.0 / 60.0)
+            s0, s1 = s1, s0
+        q = s0.body_q.numpy()[box]
+        tilt = float(np.degrees(2.0 * np.arcsin(min(1.0, float(np.linalg.norm(q[3:6]))))))
+        test.assertLess(tilt, 1.0, f"offset-COM box tilted {tilt:.2f} deg: moment rows were scheduled off")
+        test.assertLess(abs(float(q[2]) - 0.0505), 0.005, "box lost rest height")
+
+
+def test_patch_wrench_row_capacity_overflow(test: unittest.TestCase, device):
+    """A patch block that does not fit in mf_max_constraints is dropped
+    whole (counter rolled back), never partially written: the step stays
+    finite and other pairs keep their rows."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder()
+        builder.rigid_gap = 0.003
+        cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
+        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.7))
+        boxes = []
+        for i in range(3):
+            b = builder.add_body(xform=wp.transform(wp.vec3(0.2 * i, 0.0, 0.0505), wp.quat_identity()))
+            builder.add_shape_box(b, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+            boxes.append(b)
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(
+            model,
+            reduce_contacts=True,
+            rigid_contact_max=64,
+            broad_phase="nxn",
+            deterministic=True,
+            contact_matching="latest",
+        )
+        contacts = pipeline.contacts()
+        # room for two 6-row blocks, not three
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            pgs_iterations=8,
+            contact_patch_wrench=True,
+            mf_warmstart=True,
+            mf_max_constraints=16,
+        )
+        s0, s1 = model.state(), model.state()
+        control = model.control()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+        for _k in range(30):
+            pipeline.collide(s0, contacts)
+            s0.clear_forces()
+            solver.step(s0, s1, control, contacts, 1.0 / 60.0)
+            s0, s1 = s1, s0
+        body_q = s0.body_q.numpy()
+        test.assertTrue(np.isfinite(body_q).all(), "overflow produced non-finite state")
+        held = sum(1 for b in boxes if abs(float(body_q[b][2]) - 0.0505) < 0.01)
+        test.assertGreaterEqual(held, 2, "pairs that fit must keep their rows under overflow")
 
 
 class TestFeatherPGSPatchWrench(unittest.TestCase):
@@ -636,6 +735,18 @@ add_function_test(
     TestFeatherPGSPatchWrench,
     "test_patch_wrench_torsion",
     test_patch_wrench_torsion,
+    devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSPatchWrench,
+    "test_patch_wrench_moments_ignore_friction_scheduling",
+    test_patch_wrench_moments_ignore_friction_scheduling,
+    devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSPatchWrench,
+    "test_patch_wrench_row_capacity_overflow",
+    test_patch_wrench_row_capacity_overflow,
     devices=get_selected_cuda_test_devices(),
 )
 
