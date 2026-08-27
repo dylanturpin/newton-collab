@@ -725,11 +725,14 @@ class SolverFeatherPGS(SolverBase):
                 ``0`` (default) is the exact rigid law. Defaults to 0.0.
             contact_patch_wrench (bool, optional): Solve each coplanar matrix-free contact patch
                 as one aggregated wrench block (total normal force, whole-patch friction pair,
-                two tipping-moment rows, torsion row) instead of per-contact rows. Matrix-free
-                contacts only; requires ``friction_mode="current"``, pair-sorted contacts
-                (``CollisionPipeline(deterministic=True)`` or any contact-matching mode), and
-                ``articulated_contact_response="immediate"``. Each patch leader reserves six MF
-                row slots. Defaults to False.
+                two tipping-moment rows, torsion row) instead of per-contact rows. A patch
+                requires at least two contacts of the same shape pair with near-identical
+                normals and coplanar witness midpoints; contacts that fail the test (single
+                contact, curved surface, distinct faces) keep classic per-contact rows.
+                Matrix-free contacts only; requires ``friction_mode="current"``, pair-sorted
+                contacts (``CollisionPipeline(deterministic=True)`` or any contact-matching
+                mode), and ``articulated_contact_response="immediate"``. Each patch leader
+                reserves six MF row slots. Defaults to False.
             pgs_velocity_omega (float | None, optional): Relaxation factor for the velocity-only post-pass.
                 Defaults to ``pgs_omega`` when unset.
             pgs_velocity_drive_mode (str, optional): Drive-row treatment during velocity-only post-pass
@@ -1032,6 +1035,7 @@ class SolverFeatherPGS(SolverBase):
         self._ws_prev_mf_impulses = None
         self._ws_prev_dt = 0.0
         self._ws_prev_mf_row_type = None
+        self._ws_prev_mf_row_parent = None
         self._ws_prev_slot_sorted = None
         self._ws_warned_no_match = False
 
@@ -2403,6 +2407,9 @@ class SolverFeatherPGS(SolverBase):
         self.contact_slots_needed = wp.zeros(
             (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
+        # Patch-block assignment (leader contact index for members, -1 for
+        # classic rows); written by allocate_world_contact_slots every step.
+        self.contact_block_owner = wp.full((max_contacts,), -1, dtype=wp.int32, device=device)
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
@@ -2836,6 +2843,7 @@ class SolverFeatherPGS(SolverBase):
                 (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
             )
             self._ws_prev_mf_row_type = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device)
+            self._ws_prev_mf_row_parent = wp.full((worlds, mf_max_c), -1, dtype=wp.int32, device=device)
             self._ws_prev_slot_sorted = wp.full(
                 (getattr(self, "_max_contacts_alloc", 1),), -1, dtype=wp.int32, device=device
             )
@@ -5673,6 +5681,7 @@ class SolverFeatherPGS(SolverBase):
             with wp.ScopedTimer("S7_MF_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
                 wp.copy(self._ws_prev_mf_impulses, self.mf_impulses)
                 wp.copy(self._ws_prev_mf_row_type, self.mf_row_type)
+                wp.copy(self._ws_prev_mf_row_parent, self.mf_row_parent)
                 self._ws_prev_dt = float(dt)
                 if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
                     wp.launch(
@@ -5682,9 +5691,7 @@ class SolverFeatherPGS(SolverBase):
                             contacts.rigid_contact_count,
                             self.contact_path,
                             self.contact_slot,
-                            contacts.rigid_contact_shape0,
-                            contacts.rigid_contact_shape1,
-                            int(self.contact_patch_wrench),
+                            self.contact_block_owner,
                         ],
                         outputs=[self._ws_prev_slot_sorted],
                         device=model.device,
@@ -6849,6 +6856,7 @@ class SolverFeatherPGS(SolverBase):
                     propagation_slot_counter,
                     self.dense_contact_world_flag,
                     self.contact_slots_needed,
+                    self.contact_block_owner,
                 ],
                 device=model.device,
             )
@@ -6956,7 +6964,7 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
-                        int(self.contact_patch_wrench),
+                        self.contact_block_owner,
                     ],
                     outputs=[
                         self.mf_body_a,
@@ -7195,10 +7203,12 @@ class SolverFeatherPGS(SolverBase):
                             self.contact_path,
                             self.contact_slot,
                             self.contact_world,
+                            self.contact_block_owner,
                             match_index,
                             self._ws_prev_slot_sorted,
                             self._ws_prev_mf_impulses,
                             self._ws_prev_mf_row_type,
+                            self._ws_prev_mf_row_parent,
                             self.mf_row_type,
                             self.mf_row_parent,
                             self._mf_warmstart_decay,

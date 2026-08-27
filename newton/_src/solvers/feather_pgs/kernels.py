@@ -2688,6 +2688,103 @@ def populate_joint_velocity_limit_J_for_size(
 # world. The constraint system becomes world-level instead of per-articulation.
 
 
+@wp.func
+def _patch_member_mask(
+    leader: int,
+    total_contacts: int,
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+):
+    """8-bit membership mask for the contact window starting at ``leader``.
+
+    Bit ``j`` set = contact ``leader + j`` belongs to the leader's coplanar
+    patch (bit 0 = the leader itself). Returns 0 when fewer than two contacts
+    qualify: a patch needs at least two members to carry support moments.
+    Membership requires the same shape pair, near-identical normals, and a
+    witness midpoint within a scale-aware distance of the leader's contact
+    plane. Pure function of the contact arrays, so allocation, row building,
+    and warm-start threads all derive identical membership.
+    """
+    sa = contact_shape0[leader]
+    sb = contact_shape1[leader]
+    n_l = -contact_normal[leader]
+    body_a = int(-1)
+    body_b = int(-1)
+    if sa >= 0:
+        body_a = shape_body[sa]
+    if sb >= 0:
+        body_b = shape_body[sb]
+
+    pa = contact_point0[leader]
+    if body_a >= 0:
+        pa = wp.transform_point(body_q[body_a], pa)
+    pa = pa - contact_thickness0[leader] * n_l
+    pb = contact_point1[leader]
+    if body_b >= 0:
+        pb = wp.transform_point(body_q[body_b], pb)
+    pb = pb + contact_thickness1[leader] * n_l
+    mid_l = 0.5 * (pa + pb)
+
+    # Tangential span of the normal-aligned candidates sets the coplanarity
+    # tolerance, so the test is scale-free.
+    span = float(0.0)
+    for j in range(1, 8):
+        cc = leader + j
+        if cc >= total_contacts:
+            break
+        if contact_shape0[cc] != sa or contact_shape1[cc] != sb:
+            break
+        if wp.dot(-contact_normal[cc], n_l) < 0.999:
+            continue
+        pa_j = contact_point0[cc]
+        if body_a >= 0:
+            pa_j = wp.transform_point(body_q[body_a], pa_j)
+        pa_j = pa_j - contact_thickness0[cc] * n_l
+        pb_j = contact_point1[cc]
+        if body_b >= 0:
+            pb_j = wp.transform_point(body_q[body_b], pb_j)
+        pb_j = pb_j + contact_thickness1[cc] * n_l
+        d = 0.5 * (pa_j + pb_j) - mid_l
+        d_t = d - wp.dot(d, n_l) * n_l
+        span = wp.max(span, wp.length(d_t))
+    # Floor covers contact hover noise; the slope accepts patches tilted up
+    # to ~2.9 deg and rejects witness sets from distinct faces.
+    tol = wp.max(0.001, 0.05 * span)
+
+    mask = int(1)
+    count = int(1)
+    for j in range(1, 8):
+        cc = leader + j
+        if cc >= total_contacts:
+            break
+        if contact_shape0[cc] != sa or contact_shape1[cc] != sb:
+            break
+        if wp.dot(-contact_normal[cc], n_l) < 0.999:
+            continue
+        pa_j = contact_point0[cc]
+        if body_a >= 0:
+            pa_j = wp.transform_point(body_q[body_a], pa_j)
+        pa_j = pa_j - contact_thickness0[cc] * n_l
+        pb_j = contact_point1[cc]
+        if body_b >= 0:
+            pb_j = wp.transform_point(body_q[body_b], pb_j)
+        pb_j = pb_j + contact_thickness1[cc] * n_l
+        if wp.abs(wp.dot(0.5 * (pa_j + pb_j) - mid_l, n_l)) > tol:
+            continue
+        mask |= 1 << j
+        count += 1
+    if count < 2:
+        return 0
+    return mask
+
+
 @wp.kernel
 def allocate_world_contact_slots(
     contact_count: wp.array[int],
@@ -2728,6 +2825,7 @@ def allocate_world_contact_slots(
     propagation_slot_counter: wp.array[int],
     dense_contact_world_flag: wp.array[int],
     contact_slots_needed: wp.array[int],
+    contact_block_owner: wp.array[int],
 ):
     """
     Phase 1 of multi-articulation contact building.
@@ -2738,8 +2836,13 @@ def allocate_world_contact_slots(
 
     Each contact reserves 1 slot for the normal row and, when enabled below the
     friction gap threshold, 2 adjacent slots for Coulomb friction rows.
+
+    ``contact_block_owner[c]`` is the patch-block assignment consumed by row
+    building and warm start: the leader's contact index for patch members
+    (leader included), -1 for classic per-contact rows and non-MF contacts.
     """
     c = wp.tid()
+    contact_block_owner[c] = -1
     total_contacts = contact_count[0]
     if c >= total_contacts:
         contact_slot[c] = -1
@@ -2870,9 +2973,10 @@ def allocate_world_contact_slots(
     contact_slots_needed[c] = slots_needed
 
     if contact_patch_wrench != 0 and is_mf != 0:
-        # The run leader owns the coplanar patch as one 6-row block; coplanar
-        # followers own no rows; non-coplanar or overflow followers fall
-        # through to classic per-contact rows (never dropped).
+        # The run leader owns a >=2-member coplanar patch as one 6-row block;
+        # member followers own no rows; everything else (single contact,
+        # non-coplanar member, beyond the 8-contact window) falls through to
+        # classic per-contact rows (never dropped).
         patch_rank = int(0)
         for lookback in range(1, 9):
             prev = c - lookback
@@ -2884,17 +2988,35 @@ def allocate_world_contact_slots(
                 patch_rank += int(1)
             else:
                 break
-        if patch_rank == 0:
-            slots_needed = 6
-            contact_slots_needed[c] = slots_needed
-        elif patch_rank < 8 and wp.dot(contact_normal[c], contact_normal[c - patch_rank]) >= 0.98:
-            contact_slots_needed[c] = 0
-            contact_slot[c] = -1
-            contact_world[c] = world
-            contact_art_a[c] = art_a
-            contact_art_b[c] = art_b
-            contact_path[c] = 1
-            return
+        if patch_rank < 8:
+            leader = c - patch_rank
+            mask = _patch_member_mask(
+                leader,
+                total_contacts,
+                contact_shape0,
+                contact_shape1,
+                contact_point0,
+                contact_point1,
+                contact_normal,
+                contact_thickness0,
+                contact_thickness1,
+                shape_body,
+                body_q,
+            )
+            if mask != 0:
+                if patch_rank == 0:
+                    slots_needed = 6
+                    contact_slots_needed[c] = slots_needed
+                    contact_block_owner[c] = c
+                elif (mask >> patch_rank) & 1 != 0:
+                    contact_block_owner[c] = leader
+                    contact_slots_needed[c] = 0
+                    contact_slot[c] = -1
+                    contact_world[c] = world
+                    contact_art_a[c] = art_a
+                    contact_art_b[c] = art_b
+                    contact_path[c] = 1
+                    return
 
     if is_mf != 0:
         # Matrix-free path
@@ -4298,7 +4420,7 @@ def build_mf_contact_rows(
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
-    patch_wrench: int,
+    contact_block_owner: wp.array[int],
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -4418,13 +4540,9 @@ def build_mf_contact_rows(
         will_add_friction = False
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
 
-    # Only the run leader builds the block; other wrench-mode contacts here
-    # are allocate's non-coplanar / overflow fallbacks (classic rows).
-    wrench_leader = int(patch_wrench)
-    if wrench_leader != 0 and c > 0 and contact_shape0[c - 1] == shape_a and contact_shape1[c - 1] == shape_b:
-        wrench_leader = 0
-
-    if wrench_leader != 0:
+    # Only a patch leader (allocate assigned it its own block) builds the
+    # 6-row block; other contacts reaching here are classic fallbacks.
+    if contact_block_owner[c] == c:
         # ── Patch-wrench block: [F, f0, f1, Mx, My, Mn] ─────────────────────
         # One 6-row block per coplanar contact patch. F is the total normal
         # force at the patch center; f0/f1 the tangential friction pair
@@ -4444,14 +4562,11 @@ def build_mf_contact_rows(
         u1_min = float(1.0e6)
         u1_max = float(-1.0e6)
         n_run = int(0)
-        for j in range(8):  # patch window = leader + ranks 1..7 (allocate's fallback bound)
+        for j in range(8):  # patch window: membership assigned by allocate
             cc = c + j
             if cc >= total_c:
                 break
-            if contact_shape0[cc] != shape_a or contact_shape1[cc] != shape_b:
-                break
-            n_j = -contact_normal[cc]
-            if wp.dot(n_j, normal) < 0.98:
+            if contact_block_owner[cc] != c:
                 continue
             pa_j = contact_point0[cc]
             pb_j = contact_point1[cc]
@@ -4482,14 +4597,11 @@ def build_mf_contact_rows(
         center = wp.vec3(0.0)
         mean_phi = float(0.0)
         w_sum = float(0.0)
-        for j in range(8):  # patch window = leader + ranks 1..7 (allocate's fallback bound)
+        for j in range(8):  # patch window: membership assigned by allocate
             cc = c + j
             if cc >= total_c:
                 break
-            if contact_shape0[cc] != shape_a or contact_shape1[cc] != shape_b:
-                break
-            n_j = -contact_normal[cc]
-            if wp.dot(n_j, normal) < 0.98:
+            if contact_block_owner[cc] != c:
                 continue
             pa_j = contact_point0[cc]
             pb_j = contact_point1[cc]
@@ -4512,14 +4624,11 @@ def build_mf_contact_rows(
         sxx = float(1.0e-10)
         sxy = float(0.0)
         syy = float(1.0e-10)
-        for j in range(8):  # patch window = leader + ranks 1..7 (allocate's fallback bound)
+        for j in range(8):  # patch window: membership assigned by allocate
             cc = c + j
             if cc >= total_c:
                 break
-            if contact_shape0[cc] != shape_a or contact_shape1[cc] != shape_b:
-                break
-            n_j = -contact_normal[cc]
-            if wp.dot(n_j, normal) < 0.98:
+            if contact_block_owner[cc] != c:
                 continue
             pa_j = contact_point0[cc]
             pb_j = contact_point1[cc]
@@ -4556,14 +4665,11 @@ def build_mf_contact_rows(
         # pressure to an octagon instead of the circumscribing box.
         ed0 = float(1.0e-4)
         ed1 = float(1.0e-4)
-        for j in range(8):  # patch window = leader + ranks 1..7 (allocate's fallback bound)
+        for j in range(8):  # patch window: membership assigned by allocate
             cc = c + j
             if cc >= total_c:
                 break
-            if contact_shape0[cc] != shape_a or contact_shape1[cc] != shape_b:
-                break
-            n_j = -contact_normal[cc]
-            if wp.dot(n_j, normal) < 0.98:
+            if contact_block_owner[cc] != c:
                 continue
             pa_j = contact_point0[cc]
             pb_j = contact_point1[cc]
@@ -4955,10 +5061,12 @@ def gather_mf_warmstart(
     contact_path: wp.array[int],
     contact_slot: wp.array[int],
     contact_world: wp.array[int],
+    contact_block_owner: wp.array[int],
     match_index: wp.array[int],  # rigid_contact_match_index (sorted-current -> prev-sorted idx)
-    prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev base MF slot (or -1)
+    prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev block base (see snapshot)
     prev_mf_impulses: wp.array2d[float],
     prev_mf_row_type: wp.array2d[int],
+    prev_mf_row_parent: wp.array2d[int],
     mf_row_type: wp.array2d[int],  # THIS step's row types (already built)
     mf_row_parent: wp.array2d[int],
     decay: float,
@@ -4980,11 +5088,15 @@ def gather_mf_warmstart(
     changes (impulse is proportional to dt for quasi-static loads); 1.0 at fixed dt.
 
     ``match_index[c] >= 0`` is the previous frame's *sorted* contact index;
-    ``prev_slot_sorted`` is keyed the same way (see solver writeback), so
-    ``prev_slot = prev_slot_sorted[match_index[c]]`` is the base slot that
-    contact occupied last step. Friction rows are only seeded when BOTH this
-    step and the previous step allocated a friction row at the corresponding
-    offset (guards the variable 1-vs-3 stride).
+    ``prev_slot_sorted`` is keyed the same way (see snapshot). A patch leader
+    recovers its block through ANY matched member (all members snapshot the
+    leader's slot), so the block carry survives the leader itself churning. A
+    classic contact whose match resolved inside a previous patch block stays
+    cold: the block impulse is the whole patch's, not that contact's share.
+    Offset rows are seeded only when both steps allocated the same-typed row
+    at that offset AND the previous row belongs to the previous block
+    (``prev parent == prev base``) — without the parent check a block that
+    shrank could steal the next block's rows.
     """
     c = wp.tid()
     if c >= contact_count[0]:
@@ -4996,34 +5108,56 @@ def gather_mf_warmstart(
         return
 
     world = contact_world[c]
+    owner = contact_block_owner[c]
 
-    mi = match_index[c]
-    matched = mi >= 0
     prev_slot = int(-1)
-    if matched:
-        prev_slot = prev_slot_sorted[mi]
+    if owner == c:
+        # Patch leader: search the window for any matched member.
+        for j in range(8):
+            cc = c + j
+            if cc >= contact_count[0]:
+                break
+            if contact_block_owner[cc] != c:
+                continue
+            mi = match_index[cc]
+            if mi >= 0:
+                raw = prev_slot_sorted[mi]
+                if raw <= -2:
+                    prev_slot = -2 - raw
+                    break
+                if raw >= 0:
+                    # Member was classic last step; its own rows still seed
+                    # the aligned block rows below (partial warm start).
+                    prev_slot = raw
+                    break
+    else:
+        mi = match_index[c]
+        if mi >= 0:
+            raw = prev_slot_sorted[mi]
+            if raw >= 0:
+                prev_slot = raw
+            # raw <= -2 (previous patch block): stay cold, see docstring.
+    if prev_slot < 0:
+        return  # cold: mf_impulses already zeroed
 
-    # Normal row (offset 0): always present for an MF contact.
-    if matched and prev_slot >= 0 and prev_mf_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+    # Normal row (offset 0): always present for an MF contact / block.
+    if prev_mf_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
         mf_impulses[world, new_slot] = decay * dt_scale * prev_mf_impulses[world, prev_slot]
-    # else: leave 0 (already memset)
 
-    # Friction rows (offsets 1..5): only if THIS step allocated them here and
-    # they belong to this contact's block (parent == base slot). Legacy
-    # contacts carry two friction rows; patch-wrench blocks carry five
-    # (tangential pair, two moment rows, torsion), and the moment carry is what lets
-    # a jitter-offset stack hold its static interface moments at low
-    # iteration counts instead of rebuilding them from zero every frame.
+    # Offset rows (1..5): classic contacts carry two friction rows;
+    # patch-wrench blocks carry five (tangential pair, two moment rows,
+    # torsion). The moment carry is what lets a jitter-offset stack hold its
+    # static interface moments at low iteration counts instead of rebuilding
+    # them from zero every frame.
     for r in range(1, 6):
         new_r = new_slot + r
         if new_r < mf_max_c:
             if mf_row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION and mf_row_parent[world, new_r] == new_slot:
                 prev_r = prev_slot + r
                 if (
-                    matched
-                    and prev_slot >= 0
-                    and prev_r < mf_max_c
+                    prev_r < mf_max_c
                     and prev_mf_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
+                    and prev_mf_row_parent[world, prev_r] == prev_slot
                 ):
                     mf_impulses[world, new_r] = decay * dt_scale * prev_mf_impulses[world, prev_r]
                 # else: leave 0
@@ -5034,18 +5168,20 @@ def snapshot_mf_prev_slots(
     contact_count: wp.array[int],
     contact_path: wp.array[int],
     contact_slot: wp.array[int],
-    contact_shape0: wp.array[int],
-    contact_shape1: wp.array[int],
-    contact_patch_wrench: int,
+    contact_block_owner: wp.array[int],
     # out
     prev_slot_sorted: wp.array[int],
 ):
-    """Record, per current sorted contact index, the base MF slot it occupied
-    this step (or -1 if it was not MF-routed / inactive). Run at the END of the
-    step so next step's ``rigid_contact_match_index`` (referencing this frame's
-    *sorted* index) resolves through it. One thread per contact-array slot;
-    indices beyond ``contact_count`` are written -1 so stale entries from a
-    larger previous frame can't leak.
+    """Record, per current sorted contact index, the base MF slot of the block
+    that solved it this step (or -1 if it was not MF-routed / inactive). Run at
+    the END of the step so next step's ``rigid_contact_match_index``
+    (referencing this frame's *sorted* index) resolves through it. One thread
+    per contact-array slot; indices beyond ``contact_count`` are written -1 so
+    stale entries from a larger previous frame can't leak.
+
+    Patch members record their leader's slot encoded as ``-2 - slot`` so the
+    gather can tell a patch block from a classic one: seeding a classic
+    contact from a whole-patch impulse would over-seed it by the member count.
     """
     c = wp.tid()
     if c >= contact_count[0]:
@@ -5054,21 +5190,15 @@ def snapshot_mf_prev_slots(
     if contact_path[c] != 1:
         prev_slot_sorted[c] = -1
         return
-    slot = contact_slot[c]
-    if contact_patch_wrench != 0:
-        # Block identity is the pair: every run contact records the leader's
-        # slot so any within-pair match recovers the block carry.
-        sa = contact_shape0[c]
-        sb = contact_shape1[c]
-        for lookback in range(1, 9):
-            prev = c - lookback
-            if prev < 0:
-                break
-            if contact_shape0[prev] != sa or contact_shape1[prev] != sb:
-                break
-            if contact_slot[prev] >= 0:
-                slot = contact_slot[prev]
-    prev_slot_sorted[c] = slot
+    owner = contact_block_owner[c]
+    if owner >= 0:
+        leader_slot = contact_slot[owner]
+        if leader_slot >= 0:
+            prev_slot_sorted[c] = -2 - leader_slot
+        else:
+            prev_slot_sorted[c] = -1
+    else:
+        prev_slot_sorted[c] = contact_slot[c]
 
 
 @wp.kernel
