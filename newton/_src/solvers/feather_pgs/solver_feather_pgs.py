@@ -15164,6 +15164,11 @@ def _get_pgs_solve_mf_gs_kernel(
     Phase 1 (dense): warp-parallel dot/update over D DOFs using J_world/Y_world.
     Phase 2 (MF): lanes 0-5 handle body_a, lanes 6-11 handle body_b (6 DOFs each).
 
+    A world stops early after an exactly stationary sweep. Since neither its
+    impulses nor velocities changed, every later sweep would repeat the same
+    operations with the same inputs; this preserves the configured iteration
+    count as an upper bound without introducing a convergence tolerance.
+
     Shared memory layout:
       s_v[D] — world velocity
       s_lam_dense[M_D] + metadata — dense impulses and constraint info
@@ -15419,6 +15424,7 @@ def _get_pgs_solve_mf_gs_kernel(
                     new_lambda_t1 = __shfl_sync(MASK, new_lambda_t1, 0);
                     d_n_total = __shfl_sync(MASK, d_n_total, 0);
                     d_t2_total = __shfl_sync(MASK, d_t2_total, 0);
+                    if (d_n_total != 0.0f || d_t2_total != 0.0f) iteration_changed = 1;
 
                     if (d_n_total != 0.0f) {
                         for (int d = lane; d < __D__; d += 32) {
@@ -15472,6 +15478,7 @@ def _get_pgs_solve_mf_gs_kernel(
                         new_impulse = a_val * scale;
                         float sib_new = b_val * scale;
                         float sib_delta = sib_new - b_val;
+                        if (sib_delta != 0.0f) iteration_changed = 1;
                         s_lam_dense[sib] = sib_new;
 
                         int sib_row_base = jy_world_base + sib * {D};
@@ -15683,6 +15690,7 @@ def _get_pgs_solve_mf_gs_kernel(
                     new_lambda_t1 = __shfl_sync(MASK, new_lambda_t1, 0);
                     d_n_total = __shfl_sync(MASK, d_n_total, 0);
                     d_t2_total = __shfl_sync(MASK, d_t2_total, 0);
+                    if (d_n_total != 0.0f || d_t2_total != 0.0f) iteration_changed = 1;
 
                     // Apply the normal-row v_out delta (all lanes).
                     if (d_n_total != 0.0f) {
@@ -15968,6 +15976,7 @@ def _get_pgs_solve_mf_gs_kernel(
                     new_lambda_t1 = __shfl_sync(MASK, new_lambda_t1, 0);
                     d_n_total = __shfl_sync(MASK, d_n_total, 0);
                     d_t2_total = __shfl_sync(MASK, d_t2_total, 0);
+                    if (d_n_total != 0.0f || d_t2_total != 0.0f) iteration_changed = 1;
 
                     // Apply normal-row v_out delta (all lanes).
                     if (d_n_total != 0.0f) {
@@ -16016,6 +16025,7 @@ def _get_pgs_solve_mf_gs_kernel(
                         new_impulse = a_val * scale;
                         float sib_new = b_val * scale;
                         float sib_delta = sib_new - b_val;
+                        if (sib_delta != 0.0f) iteration_changed = 1;
                         s_lam_mf[sib] = sib_new;
 
                         // Sibling v update (can't prefetch — random sib index)
@@ -16100,6 +16110,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 if (lane == 0) s_lam_dense[i] = delta_impulse_vlim;
 
                 if (delta_impulse_vlim != 0.0f) {{
+                    iteration_changed = 1;
                     for (int d = lane; d < {D}; d += 32) {{
                         if (defer_dense_response == 0 ||
                             world_deferred_dof_mask.data[deferred_mask_base + d] == 0) {{
@@ -16147,6 +16158,7 @@ def _get_pgs_solve_mf_gs_kernel(
 
                 if (fabsf(jv_fvl) > qdot_max_fvl) {{
                     float delta_fvl = (fminf(fmaxf(jv_fvl, -qdot_max_fvl), qdot_max_fvl) - jv_fvl) / denom_fvl;
+                    if (delta_fvl != 0.0f) iteration_changed = 1;
                     for (int d = lane; d < {D}; d += 32) {{
                         if (defer_dense_response == 0 ||
                             world_deferred_dof_mask.data[deferred_mask_base + d] == 0) {{
@@ -16259,6 +16271,7 @@ def _get_pgs_solve_mf_gs_kernel(
 
     for (int iter = 0; iter < iterations; iter++) {{
         int global_iter = iteration_offset + iter;
+        int iteration_changed = 0;
 
         // ── Phase 1: Dense constraints (D-DOF warp-parallel, software-pipelined) ──
 
@@ -16353,6 +16366,7 @@ def _get_pgs_solve_mf_gs_kernel(
 
             // V update using prefetched Y
             if (delta_impulse != 0.0f) {{
+                iteration_changed = 1;
                 {dense_v_update_code}
             }}
             __syncwarp();
@@ -16468,6 +16482,7 @@ def _get_pgs_solve_mf_gs_kernel(
 
             // V update using prefetched MiJt values
             if (delta_impulse != 0.0f) {{
+                iteration_changed = 1;
                 if (lane < 6 && dof_a >= 0) {{
                     s_v[dof_a + lane] += cur_MiJta * delta_impulse;
                 }}
@@ -16522,6 +16537,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 if (lane == 0) s_lam_mf[i] = delta_impulse_mf_vlim;
 
                 if (delta_impulse_mf_vlim != 0.0f) {{
+                    iteration_changed = 1;
                     if (lane < 6 && dof_a >= 0) {{
                         s_v[dof_a + lane] += mf_MiJt_a.data[row_mf6 + lane] * delta_impulse_mf_vlim;
                     }}
@@ -16531,6 +16547,14 @@ def _get_pgs_solve_mf_gs_kernel(
                 }}
                 __syncwarp();
             }}
+        }}
+
+        // Friction rows may intentionally remain inactive until a later
+        // iteration. Once they are active, an exactly stationary full sweep
+        // is a fixed point, so subsequent sweeps are redundant.
+        if (global_iter >= friction_start_iteration) {{
+            unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
+            if (changed == 0u) break;
         }}
     }}
 
