@@ -1036,6 +1036,8 @@ class SolverFeatherPGS(SolverBase):
         self._ws_prev_dt = 0.0
         self._ws_prev_mf_row_type = None
         self._ws_prev_mf_row_parent = None
+        self._ws_prev_patch_basis_n = None
+        self._ws_prev_patch_basis_t0 = None
         self._ws_prev_slot_sorted = None
         self._ws_warned_no_match = False
 
@@ -2828,6 +2830,12 @@ class SolverFeatherPGS(SolverBase):
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.mf_impulses = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        # Patch-block basis snapshots (leader slot only): warm start cold
+        # starts tangent/moment rows when the basis moved. Dummies when the
+        # feature is off (the writing branch is never taken).
+        basis_shape = (worlds, mf_max_c) if self.contact_patch_wrench else (1, 1)
+        self.mf_patch_basis_n = wp.zeros(basis_shape, dtype=wp.vec3, device=device)
+        self.mf_patch_basis_t0 = wp.zeros(basis_shape, dtype=wp.vec3, device=device)
 
         # MF warm-start carry buffers. Allocated ONLY when the feature is on so
         # the default-off path has zero memory / CUDA-graph delta. ``prev_mf_*``
@@ -2844,6 +2852,8 @@ class SolverFeatherPGS(SolverBase):
             )
             self._ws_prev_mf_row_type = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device)
             self._ws_prev_mf_row_parent = wp.full((worlds, mf_max_c), -1, dtype=wp.int32, device=device)
+            self._ws_prev_patch_basis_n = wp.zeros(basis_shape, dtype=wp.vec3, device=device)
+            self._ws_prev_patch_basis_t0 = wp.zeros(basis_shape, dtype=wp.vec3, device=device)
             self._ws_prev_slot_sorted = wp.full(
                 (getattr(self, "_max_contacts_alloc", 1),), -1, dtype=wp.int32, device=device
             )
@@ -5682,6 +5692,9 @@ class SolverFeatherPGS(SolverBase):
                 wp.copy(self._ws_prev_mf_impulses, self.mf_impulses)
                 wp.copy(self._ws_prev_mf_row_type, self.mf_row_type)
                 wp.copy(self._ws_prev_mf_row_parent, self.mf_row_parent)
+                if self.contact_patch_wrench:
+                    wp.copy(self._ws_prev_patch_basis_n, self.mf_patch_basis_n)
+                    wp.copy(self._ws_prev_patch_basis_t0, self.mf_patch_basis_t0)
                 self._ws_prev_dt = float(dt)
                 if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
                     wp.launch(
@@ -6978,6 +6991,8 @@ class SolverFeatherPGS(SolverBase):
                         self.mf_phi,
                         self.mf_target_velocity,
                         self.mf_row_restitution,
+                        self.mf_patch_basis_n,
+                        self.mf_patch_basis_t0,
                     ],
                     device=model.device,
                 )
@@ -7210,8 +7225,12 @@ class SolverFeatherPGS(SolverBase):
                             self._ws_prev_mf_impulses,
                             self._ws_prev_mf_row_type,
                             self._ws_prev_mf_row_parent,
+                            self._ws_prev_patch_basis_n,
+                            self._ws_prev_patch_basis_t0,
                             self.mf_row_type,
                             self.mf_row_parent,
+                            self.mf_patch_basis_n,
+                            self.mf_patch_basis_t0,
                             self._mf_warmstart_decay,
                             # Carried support impulses are proportional to dt, so
                             # rescale by the exact step-size ratio (1 at fixed dt).

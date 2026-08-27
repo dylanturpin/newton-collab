@@ -240,34 +240,61 @@ def test_patch_wrench_warmstart_gather_ownership(test: unittest.TestCase, device
             cur_parent[0, base + 1] = base
             cur_parent[0, base + 2] = base
 
-        mf_impulses = wp.zeros((1, mf_max_c), dtype=wp.float32)
-        wp.launch(
-            gather_mf_warmstart,
-            dim=n_contacts,
-            inputs=[
-                contact_count,
-                contact_path,
-                contact_slot,
-                contact_world,
-                contact_block_owner,
-                match_index,
-                prev_slot_sorted,
-                wp.array(prev_imp, dtype=wp.float32),
-                wp.array(prev_type, dtype=wp.int32),
-                wp.array(prev_parent, dtype=wp.int32),
-                wp.array(cur_type, dtype=wp.int32),
-                wp.array(cur_parent, dtype=wp.int32),
-                1.0,  # decay
-                1.0,  # dt_scale
-                mf_max_c,
-            ],
-            outputs=[mf_impulses],
-        )
-        out = mf_impulses.numpy()[0]
+        up = [0.0, 0.0, 1.0]
+        tx = [1.0, 0.0, 0.0]
+        rot_t = [0.9238795, 0.3826834, 0.0]  # t0 yawed 22.5 deg
+        rot_n = [0.3826834, 0.0, 0.9238795]  # normal tilted 22.5 deg
+
+        def run(prev_n_base, prev_t0_base):
+            basis_n = np.zeros((1, mf_max_c, 3), dtype=np.float32)
+            basis_t0 = np.zeros((1, mf_max_c, 3), dtype=np.float32)
+            basis_n[0, 0] = up
+            basis_t0[0, 0] = tx
+            prev_basis_n = np.zeros((1, mf_max_c, 3), dtype=np.float32)
+            prev_basis_t0 = np.zeros((1, mf_max_c, 3), dtype=np.float32)
+            prev_basis_n[0, 4] = prev_n_base
+            prev_basis_t0[0, 4] = prev_t0_base
+            mf_impulses = wp.zeros((1, mf_max_c), dtype=wp.float32)
+            wp.launch(
+                gather_mf_warmstart,
+                dim=n_contacts,
+                inputs=[
+                    contact_count,
+                    contact_path,
+                    contact_slot,
+                    contact_world,
+                    contact_block_owner,
+                    match_index,
+                    prev_slot_sorted,
+                    wp.array(prev_imp, dtype=wp.float32),
+                    wp.array(prev_type, dtype=wp.int32),
+                    wp.array(prev_parent, dtype=wp.int32),
+                    wp.array(prev_basis_n, dtype=wp.vec3),
+                    wp.array(prev_basis_t0, dtype=wp.vec3),
+                    wp.array(cur_type, dtype=wp.int32),
+                    wp.array(cur_parent, dtype=wp.int32),
+                    wp.array(basis_n, dtype=wp.vec3),
+                    wp.array(basis_t0, dtype=wp.vec3),
+                    1.0,  # decay
+                    1.0,  # dt_scale
+                    mf_max_c,
+                ],
+                outputs=[mf_impulses],
+            )
+            return mf_impulses.numpy()[0]
+
+        out = run(up, tx)
         np.testing.assert_allclose(out[0:6], [10.0, 1.0, 2.0, 3.0, 4.0, 5.0], err_msg="block not recovered via follower")
         np.testing.assert_allclose(out[6:9], 0.0, err_msg="classic contact seeded from a previous patch block")
         test.assertAlmostEqual(float(out[9]), 7.0, msg="classic normal carry lost")
         np.testing.assert_allclose(out[10:12], 0.0, err_msg="seeded from the next block's rows")
+
+        out = run(up, rot_t)
+        test.assertAlmostEqual(float(out[0]), 10.0, msg="F carry lost on tangent-frame rotation")
+        np.testing.assert_allclose(out[1:6], 0.0, err_msg="offset rows carried across a rotated tangent frame")
+
+        out = run(rot_n, tx)
+        np.testing.assert_allclose(out[0:6], 0.0, err_msg="block carried across a rotated normal")
 
 
 def test_patch_wrench_membership_eligibility(test: unittest.TestCase, device):

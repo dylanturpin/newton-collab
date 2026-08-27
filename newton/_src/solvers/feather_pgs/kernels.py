@@ -4480,6 +4480,8 @@ def build_mf_contact_rows(
     mf_phi: wp.array2d[float],
     mf_target_velocity: wp.array2d[float],
     mf_row_restitution: wp.array2d[float],
+    mf_patch_basis_n: wp.array2d[wp.vec3],
+    mf_patch_basis_t0: wp.array2d[wp.vec3],
 ):
     """Build MF constraint rows for contacts between free rigid bodies / ground.
 
@@ -4736,6 +4738,12 @@ def build_mf_contact_rows(
             e1 = wp.max(e1, w_j * wp.abs(u1))
             ed0 = wp.max(ed0, w_j * wp.abs(u0 + u1) * 0.70710678)
             ed1 = wp.max(ed1, w_j * wp.abs(u0 - u1) * 0.70710678)
+
+        # Block basis snapshot: warm start compares it next step and cold
+        # starts the tangent/moment rows when the basis moved (their carried
+        # scalars are meaningless on rotated axes).
+        mf_patch_basis_n[world, slot] = normal
+        mf_patch_basis_t0[world, slot] = t0
 
         for row_offset in range(6):
             if row_offset >= patch_rows:
@@ -5152,8 +5160,12 @@ def gather_mf_warmstart(
     prev_mf_impulses: wp.array2d[float],
     prev_mf_row_type: wp.array2d[int],
     prev_mf_row_parent: wp.array2d[int],
+    prev_patch_basis_n: wp.array2d[wp.vec3],
+    prev_patch_basis_t0: wp.array2d[wp.vec3],
     mf_row_type: wp.array2d[int],  # THIS step's row types (already built)
     mf_row_parent: wp.array2d[int],
+    mf_patch_basis_n: wp.array2d[wp.vec3],
+    mf_patch_basis_t0: wp.array2d[wp.vec3],
     decay: float,
     dt_scale: float,
     mf_max_c: int,
@@ -5196,8 +5208,10 @@ def gather_mf_warmstart(
     owner = contact_block_owner[c]
 
     prev_slot = int(-1)
+    carry_offsets = int(1)
     if owner == c:
         # Patch leader: search the window for any matched member.
+        prev_was_patch = int(0)
         for j in range(8):
             cc = c + j
             if cc >= contact_count[0]:
@@ -5209,12 +5223,23 @@ def gather_mf_warmstart(
                 raw = prev_slot_sorted[mi]
                 if raw <= -2:
                     prev_slot = -2 - raw
+                    prev_was_patch = 1
                     break
                 if raw >= 0:
                     # Member was classic last step; its own rows still seed
                     # the aligned block rows below (partial warm start).
                     prev_slot = raw
                     break
+        if prev_slot >= 0 and prev_was_patch != 0:
+            # Basis gate: carried tangent/moment scalars only mean the same
+            # world wrench while the patch basis holds. A rotated normal
+            # cold-starts the block; a rotated tangent frame (anisotropy
+            # gate flip, principal-axis jitter) keeps F and cold-starts the
+            # offset rows.
+            if wp.dot(prev_patch_basis_n[world, prev_slot], mf_patch_basis_n[world, new_slot]) < 0.999:
+                return
+            if wp.dot(prev_patch_basis_t0[world, prev_slot], mf_patch_basis_t0[world, new_slot]) < 0.999:
+                carry_offsets = 0
     else:
         mi = match_index[c]
         if mi >= 0:
@@ -5239,6 +5264,8 @@ def gather_mf_warmstart(
     # layout change (friction toggling 3<->6 rows, patch<->classic) cold
     # starts the rows whose meaning moved instead of misassigning them.
     for r in range(1, 6):
+        if carry_offsets == 0:
+            break
         new_r = new_slot + r
         if new_r < mf_max_c:
             cur_t = mf_row_type[world, new_r]
