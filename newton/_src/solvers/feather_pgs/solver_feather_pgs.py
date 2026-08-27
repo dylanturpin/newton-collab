@@ -2531,10 +2531,15 @@ class SolverFeatherPGS(SolverBase):
         if not model.body_count or not model.articulation_count:
             self.body_to_joint = None
             self.body_to_articulation = None
+            self.body_has_response_dofs = None
             return
 
         joint_child = model.joint_child.numpy()
+        joint_ancestor = model.joint_ancestor.numpy()
+        joint_qd_start = model.joint_qd_start.numpy()
         articulation_start = model.articulation_start.numpy()
+        articulation_dof_start = self._model_plan.articulation_dof_start
+        response_dof_count = self._model_plan.response_dof_count
 
         body_to_joint = [-1] * model.body_count
         body_to_articulation = [-1] * model.body_count
@@ -2555,9 +2560,26 @@ class SolverFeatherPGS(SolverBase):
                 body_to_joint[child] = joint_index
                 body_to_articulation[child] = articulation
 
+        body_has_response_dofs = np.zeros(model.body_count, dtype=np.int32)
+        for body, joint in enumerate(body_to_joint):
+            articulation = body_to_articulation[body]
+            if joint < 0 or articulation < 0:
+                continue
+            response_start = int(articulation_dof_start[articulation])
+            response_end = response_start + int(response_dof_count[articulation])
+            ancestor_joint = joint
+            while ancestor_joint >= 0:
+                joint_dof_start = int(joint_qd_start[ancestor_joint])
+                joint_dof_end = int(joint_qd_start[ancestor_joint + 1])
+                if max(joint_dof_start, response_start) < min(joint_dof_end, response_end):
+                    body_has_response_dofs[body] = 1
+                    break
+                ancestor_joint = int(joint_ancestor[ancestor_joint])
+
         device = model.device
         self.body_to_joint = wp.array(body_to_joint, dtype=wp.int32, device=device)
         self.body_to_articulation = wp.array(body_to_articulation, dtype=wp.int32, device=device)
+        self.body_has_response_dofs = wp.array(body_has_response_dofs, dtype=wp.int32, device=device)
 
     def _classify_free_rigid_bodies(self, model):
         """Materialize free-rigid execution metadata from the model plan."""
@@ -7428,6 +7450,7 @@ class SolverFeatherPGS(SolverBase):
                     self.art_to_world,
                     self.articulation_response_dof_count,
                     model.body_flags,
+                    self.body_has_response_dofs,
                     is_free_rigid,
                     has_free_rigid_flag,
                     propagation_flag,

@@ -23,7 +23,7 @@ PATH_MATRIX_FREE = 1
 PATH_PROPAGATION = 2
 
 
-def _launch_contact_allocator(*, route: int, gap: float, gate: float):
+def _launch_contact_allocator(*, route: int, gap: float, gate: float, responsive: bool = True):
     """Allocate one contact and return its route metadata and counters."""
     device = "cpu"
     outputs = {
@@ -61,6 +61,7 @@ def _launch_contact_allocator(*, route: int, gap: float, gate: float):
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([1], dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.array([int(responsive)], dtype=wp.int32, device=device),
             wp.array([int(is_free)], dtype=wp.int32, device=device),
             1,
             int(propagation_enabled),
@@ -297,6 +298,14 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                 result = _launch_contact_allocator(route=route, gap=0.001, gate=0.001)
                 self.assertEqual(result["path"], route)
                 self.assertEqual(result["slots_needed"], 1)
+
+    def test_allocator_skips_contacts_without_response_dofs(self):
+        """Do not allocate a row when neither contact body can change velocity."""
+        result = _launch_contact_allocator(route=PATH_DENSE, gap=-0.001, gate=0.0, responsive=False)
+
+        self.assertEqual(result["slot"], -1)
+        self.assertEqual(result["path"], -1)
+        self.assertEqual(result["dense_count"], 0)
 
 
 if __name__ == "__main__":

@@ -3276,6 +3276,7 @@ def allocate_world_contact_slots(
     art_to_world: wp.array[int],
     articulation_response_dof_count: wp.array[int],
     body_flags: wp.array[wp.int32],
+    body_has_response_dofs: wp.array[int],
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
     propagation_articulated_contacts: int,
@@ -3339,8 +3340,12 @@ def allocate_world_contact_slots(
 
     a_has_dofs = art_a >= 0 and articulation_response_dof_count[art_a] > 0
     b_has_dofs = art_b >= 0 and articulation_response_dof_count[art_b] > 0
-    a_can_respond = a_has_dofs and (body_flags[body_a] & BodyFlags.KINEMATIC) == 0
-    b_can_respond = b_has_dofs and (body_flags[body_b] & BodyFlags.KINEMATIC) == 0
+    a_can_respond = (
+        a_has_dofs and body_has_response_dofs[body_a] != 0 and (body_flags[body_a] & BodyFlags.KINEMATIC) == 0
+    )
+    b_can_respond = (
+        b_has_dofs and body_has_response_dofs[body_b] != 0 and (body_flags[body_b] & BodyFlags.KINEMATIC) == 0
+    )
     if not a_can_respond and not b_can_respond:
         contact_slot[c] = -1
         contact_path[c] = -1
