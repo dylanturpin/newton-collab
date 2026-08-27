@@ -382,6 +382,67 @@ def test_patch_wrench_row_layout(test: unittest.TestCase, device):
                 test.assertGreaterEqual(float(mu_row[base + r]), 0.0, "negative-mu sentinel must be gone")
 
 
+def test_patch_wrench_moving_kinematic_surface(test: unittest.TestCase, device):
+    """Patch rows must measure against prescribed surface motion: a box
+    resting on a translating kinematic slab is carried with it, and a box
+    on a yawing slab is spun with it (torque-row targets are the relative
+    prescribed angular velocity, not the point-velocity Jacobian)."""
+    for case in ("translate", "rotate"):
+        with wp.ScopedDevice(device):
+            builder = newton.ModelBuilder()
+            builder.rigid_gap = 0.003
+            cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
+            slab = builder.add_body(
+                xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()),
+                is_kinematic=True,
+            )
+            builder.add_shape_box(slab, hx=1.0, hy=1.0, hz=0.1, cfg=cfg)
+            box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.2505), wp.quat_identity()))
+            builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+            model = builder.finalize()
+            pipeline = newton.CollisionPipeline(
+                model,
+                reduce_contacts=True,
+                rigid_contact_max=64,
+                broad_phase="nxn",
+                deterministic=True,
+                contact_matching="latest",
+            )
+            contacts = pipeline.contacts()
+            solver = newton.solvers.SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                pgs_iterations=8,
+                contact_patch_wrench=True,
+                mf_warmstart=True,
+            )
+            s0, s1 = model.state(), model.state()
+            control = model.control()
+            joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+            if case == "translate":
+                joint_qd[0] = 1.0  # slab vx
+            else:
+                joint_qd[5] = 1.0  # slab yaw rate
+            s0.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, s0.joint_q, s0.joint_qd, s0)
+            for _k in range(40):
+                pipeline.collide(s0, contacts)
+                s0.clear_forces()
+                solver.step(s0, s1, control, contacts, 1.0 / 60.0)
+                s0, s1 = s1, s0
+            qd = s0.body_qd.numpy()[box]
+            if case == "translate":
+                test.assertAlmostEqual(
+                    float(qd[0]), 1.0, delta=0.05, msg="box not carried by the translating surface"
+                )
+            else:
+                test.assertAlmostEqual(
+                    float(qd[5]), 1.0, delta=0.1, msg="box not spun with the yawing surface"
+                )
+            z = float(s0.body_q.numpy()[box][2])
+            test.assertLess(abs(z - 0.2505), 0.01, f"{case}: box lost the surface (z={z:.4f})")
+
+
 class TestFeatherPGSPatchWrench(unittest.TestCase):
     pass
 
@@ -414,6 +475,12 @@ add_function_test(
     TestFeatherPGSPatchWrench,
     "test_patch_wrench_row_layout",
     test_patch_wrench_row_layout,
+    devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSPatchWrench,
+    "test_patch_wrench_moving_kinematic_surface",
+    test_patch_wrench_moving_kinematic_surface,
     devices=get_selected_cuda_test_devices(),
 )
 

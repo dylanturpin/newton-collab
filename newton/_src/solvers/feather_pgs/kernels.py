@@ -3191,6 +3191,31 @@ def prescribed_relative_contact_target(
 
 
 @wp.func
+def prescribed_relative_angular_target(
+    body_a: int,
+    art_a: int,
+    body_b: int,
+    art_b: int,
+    axis: wp.vec3,
+    prescribed_articulation: wp.array[int],
+    body_v_s: wp.array[wp.spatial_vector],
+):
+    """Return the target for a pure-torque row induced by prescribed motion.
+
+    A torque row measures ``dot(axis, omega_a - omega_b)``; prescribed sides
+    contribute their known angular velocity so the solved relative spin is
+    measured against the moving surface instead of the world. The
+    point-velocity helper is not the right Jacobian for these rows.
+    """
+    known_jv = float(0.0)
+    if body_a >= 0 and art_a >= 0 and prescribed_articulation[art_a] != 0:
+        known_jv += wp.dot(axis, wp.spatial_bottom(body_v_s[body_a]))
+    if body_b >= 0 and art_b >= 0 and prescribed_articulation[art_b] != 0:
+        known_jv -= wp.dot(axis, wp.spatial_bottom(body_v_s[body_b]))
+    return -known_jv
+
+
+@wp.func
 def world_contact_row_dot(
     world_dof_count: wp.array[int],
     world_dof_indices: wp.array2d[int],
@@ -4802,7 +4827,35 @@ def build_mf_contact_rows(
                     mf_phi[world, row_idx] = 0.0
                     # torsional friction: |Mn| <= mu * r_eff * F
                     mf_row_mu[world, row_idx] = mu * contact_friction_scale * 0.5 * (e0 + e1)
-            mf_target_velocity[world, row_idx] = 0.0
+            # A prescribed (kinematic) side moves the whole patch: point rows
+            # take the surface velocity at the patch center, torque rows the
+            # relative prescribed spin about their axis.
+            if has_target_velocity != 0:
+                if is_torque:
+                    mf_target_velocity[world, row_idx] = prescribed_relative_angular_target(
+                        body_a,
+                        contact_art_a[c],
+                        body_b,
+                        contact_art_b[c],
+                        d,
+                        prescribed_articulation,
+                        body_v_s,
+                    )
+                else:
+                    mf_target_velocity[world, row_idx] = prescribed_relative_contact_target(
+                        body_a,
+                        contact_art_a[c],
+                        body_b,
+                        contact_art_b[c],
+                        center,
+                        center,
+                        d,
+                        prescribed_articulation,
+                        articulation_origin,
+                        body_v_s,
+                    )
+            else:
+                mf_target_velocity[world, row_idx] = 0.0
         return
 
     # Write rows for normal + friction
