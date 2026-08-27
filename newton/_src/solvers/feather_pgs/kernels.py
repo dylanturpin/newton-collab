@@ -3311,9 +3311,18 @@ def allocate_world_contact_slots(
     friction gap threshold, 2 adjacent slots for Coulomb friction rows.
     A positive contact gap gate excludes wider speculative contacts before any
     route reserves slots; zero disables the gate.
+
+    The narrow phase increments ``contact_count`` before checking its output
+    capacity, so an overflowed count does not describe a fully materialized
+    prefix. Reject the whole frame instead of reading incomplete records.
     """
     c = wp.tid()
     total_contacts = contact_count[0]
+    if total_contacts > contact_shape0.shape[0]:
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        contact_slots_needed[c] = 0
+        return
     if c >= total_contacts:
         contact_slot[c] = -1
         contact_path[c] = -1
