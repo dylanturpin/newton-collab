@@ -238,6 +238,46 @@ def test_box_box_sat_speculative_approach(test: unittest.TestCase, device):
         test.assertLess(abs(z - 0.1505), 0.01, f"box did not settle on the slab (z={z:.4f})")
 
 
+def test_box_box_aligned_manifold_distinct_corners(test: unittest.TestCase, device):
+    """Exactly aligned equal boxes emit coincident duplicate candidates from
+    different clip lines; the reduction must admit four DISTINCT spread
+    corners, not a duplicated corner plus a missing one (a degenerate
+    support that collapses under load)."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder()
+        builder.rigid_gap = 0.003
+        cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
+        a = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
+        builder.add_shape_box(a, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+        b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.149), wp.quat_identity()))
+        builder.add_shape_box(b, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(
+            model,
+            reduce_contacts=True,
+            rigid_contact_max=64,
+            broad_phase="nxn",
+            deterministic=True,
+            contact_matching="latest",
+            box_box_sat=True,
+        )
+        contacts = pipeline.contacts()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        pipeline.collide(state, contacts)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        test.assertEqual(count, 4, f"expected a 4-contact manifold, got {count}")
+        # contact points on each shape, in world space via body transforms
+        p0 = contacts.rigid_contact_point0.numpy()[:count]
+        quads = set()
+        for i in range(count):
+            quads.add((p0[i][0] > 0.0, p0[i][1] > 0.0))
+            for j in range(i):
+                d = np.linalg.norm(np.asarray(p0[i]) - np.asarray(p0[j]))
+                test.assertGreater(d, 0.01, f"contacts {i},{j} nearly coincident ({d * 1000:.2f} mm apart)")
+        test.assertEqual(len(quads), 4, f"manifold does not span four corners: {sorted(quads)}")
+
+
 class TestBoxBoxSAT(unittest.TestCase):
     pass
 
@@ -264,6 +304,12 @@ add_function_test(
     TestBoxBoxSAT,
     "test_box_box_sat_speculative_approach",
     test_box_box_sat_speculative_approach,
+    devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestBoxBoxSAT,
+    "test_box_box_aligned_manifold_distinct_corners",
+    test_box_box_aligned_manifold_distinct_corners,
     devices=get_selected_cuda_test_devices(),
 )
 

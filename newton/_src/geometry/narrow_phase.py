@@ -796,11 +796,23 @@ def create_narrow_phase_primitive_kernel(
                     for ci in range(8):
                         if sat_dist[ci] >= MAXVAL:
                             continue
-                        taken = False
+                        skip = False
                         for c4 in range(4):
-                            if chosen[c4] == ci:
-                                taken = True
-                        if taken:
+                            cj = chosen[c4]
+                            if cj == ci:
+                                skip = True
+                            elif cj >= 0:
+                                # Aligned boxes emit coincident duplicates
+                                # from different clip lines; a duplicated
+                                # corner plus a missing one is a degenerate
+                                # support under load. 0.1 mm: well under any
+                                # physical manifold spacing.
+                                dx = sat_pos[ci, 0] - sat_pos[cj, 0]
+                                dy = sat_pos[ci, 1] - sat_pos[cj, 1]
+                                dz = sat_pos[ci, 2] - sat_pos[cj, 2]
+                                if dx * dx + dy * dy + dz * dz < 1.0e-8:
+                                    skip = True
+                        if skip:
                             continue
                         key = float((sat_feat[ci] >> 4) & 3) * 1.0e3 - sat_dist[ci]
                         if key > best_key:
