@@ -1061,8 +1061,7 @@ class SolverFeatherPGS(SolverBase):
             # family, where this regularizer is defined; refuse rather than
             # silently solve them unregularized.
             raise NotImplementedError(
-                "pgs_contact_regularization requires articulated_contact_response "
-                "'immediate' or 'propagation-fused'"
+                "pgs_contact_regularization requires articulated_contact_response 'immediate' or 'propagation-fused'"
             )
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
         threshold_error = "restitution_velocity_threshold must be finite and non-negative"

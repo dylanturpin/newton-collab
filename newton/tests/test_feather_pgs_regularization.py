@@ -169,9 +169,7 @@ def test_regularization_velocity_pass_exempt(test: unittest.TestCase, device):
     the exempt pass holds a settled stack to well under a millimeter."""
     with wp.ScopedDevice(device):
         for response in ("immediate", "propagation-fused"):
-            model, pipeline, solver, _bodies = _stack_scene(
-                device, g=0.05, response=response, velocity_iterations=4
-            )
+            model, pipeline, solver, _bodies = _stack_scene(device, g=0.05, response=response, velocity_iterations=4)
             _, zs = _run(model, pipeline, solver, 240)
             drift = abs(zs[-1] - zs[179])
             test.assertLess(
