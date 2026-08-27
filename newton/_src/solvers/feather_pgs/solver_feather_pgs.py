@@ -6965,6 +6965,7 @@ class SolverFeatherPGS(SolverBase):
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
                         self.contact_block_owner,
+                        self.contact_slots_needed,
                     ],
                     outputs=[
                         self.mf_body_a,
@@ -9697,7 +9698,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
             int global_iter = iteration_offset + iter;
             for (int i = 0; i < m; i++) {{
                 int row_type = mf_row_type.data[c_off + i];
-                if (row_type == 2 && global_iter < friction_start_iteration) {{
+                if ((row_type == 2 || row_type == 6) && global_iter < friction_start_iteration) {{
                     s_impulse[i] = 0.0f;
                     continue;
                 }}
@@ -9758,25 +9759,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
                     float mu = mf_row_mu.data[c_off + i];
                     float radius = fmaxf(mu * lambda_n, 0.0f);
 
-                    if (mu < 0.0f) {{
-                        // Patch-wrench moment row (negative-mu sentinel =
-                        // support extent): box clamp plus the pair's diagonal
-                        // bounds |Mx -+ My| <= sqrt(2)*ed*F from its phi slots.
-                        float radius_m = fmaxf(-mu * lambda_n, 0.0f);
-                        new_impulse = fminf(fmaxf(new_impulse, -radius_m), radius_m);
-                        int moff = i - parent_idx;
-                        if (moff == 3 || moff == 4) {{
-                            float lam_s = s_impulse[parent_idx + 7 - moff];
-                            float f_pos = fmaxf(lambda_n, 0.0f);
-                            float b_d0 = 1.41421356f * mf_phi.data[c_off + parent_idx + 3] * f_pos;
-                            float b_d1 = 1.41421356f * mf_phi.data[c_off + parent_idx + 4] * f_pos;
-                            float lo = fmaxf(fmaxf(-radius_m, lam_s - b_d0), -lam_s - b_d1);
-                            float hi = fminf(fminf(radius_m, lam_s + b_d0), -lam_s + b_d1);
-                            // Infeasible vs stale sibling: midpoint, capped at the box bound.
-                            if (lo > hi) {{ float mid_m = fminf(fmaxf(0.5f * (lo + hi), -radius_m), radius_m); lo = mid_m; hi = mid_m; }}
-                            new_impulse = fminf(fmaxf(new_impulse, lo), hi);
-                        }}
-                    }} else if (radius <= 0.0f) {{
+                    if (radius <= 0.0f) {{
                         new_impulse = 0.0f;
                     }} else {{
                         int sib = (i == parent_idx + 1) ? parent_idx + 2 : parent_idx + 1;
@@ -9816,6 +9799,34 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
                             }}
                         }}
                     }}
+                }}
+                // Project: patch tipping moment (octagonal CoP bound; the
+                // pair sits at parent +3/+4 in the 6-row layout, +1/+2 in
+                // the frictionless 3-row layout)
+                else if (row_type == 5) {{
+                    int parent_idx = mf_row_parent.data[c_off + i];
+                    float lambda_n = s_impulse[parent_idx];
+                    float extent = mf_row_mu.data[c_off + i];
+                    float radius_m = fmaxf(extent * lambda_n, 0.0f);
+                    new_impulse = fminf(fmaxf(new_impulse, -radius_m), radius_m);
+                    int moff = i - parent_idx;
+                    int sib = (moff <= 2) ? (parent_idx + 3 - moff) : (parent_idx + 7 - moff);
+                    int m0 = (i < sib) ? i : sib;
+                    float lam_s = s_impulse[sib];
+                    float f_pos = fmaxf(lambda_n, 0.0f);
+                    float b_d0 = 1.41421356f * mf_phi.data[c_off + m0] * f_pos;
+                    float b_d1 = 1.41421356f * mf_phi.data[c_off + m0 + 1] * f_pos;
+                    float lo = fmaxf(fmaxf(-radius_m, lam_s - b_d0), -lam_s - b_d1);
+                    float hi = fminf(fminf(radius_m, lam_s + b_d0), -lam_s + b_d1);
+                    // Infeasible vs stale sibling: midpoint, capped at the box bound.
+                    if (lo > hi) {{ float mid_m = fminf(fmaxf(0.5f * (lo + hi), -radius_m), radius_m); lo = mid_m; hi = mid_m; }}
+                    new_impulse = fminf(fmaxf(new_impulse, lo), hi);
+                }}
+                // Project: patch torsion, |Mn| <= (mu * r_eff) * F
+                else if (row_type == 6) {{
+                    int parent_idx = mf_row_parent.data[c_off + i];
+                    float t_radius = fmaxf(mf_row_mu.data[c_off + i] * s_impulse[parent_idx], 0.0f);
+                    new_impulse = fminf(fmaxf(new_impulse, -t_radius), t_radius);
                 }}
 
                 float delta_impulse = new_impulse - old_impulse;
@@ -15313,25 +15324,7 @@ def _get_pgs_solve_mf_gs_kernel(
                 float mu = mf_row_mu.data[off_mf + i];
                 float radius = fmaxf(mu * lambda_n, 0.0f);
 
-                if (mu < 0.0f) {
-                    // Patch-wrench moment row (negative-mu sentinel = support
-                    // extent): box clamp plus the pair's diagonal bounds
-                    // |Mx -+ My| <= sqrt(2)*ed*F from its phi slots.
-                    float radius_m = fmaxf(-mu * lambda_n, 0.0f);
-                    new_impulse = fminf(fmaxf(new_impulse, -radius_m), radius_m);
-                    int moff = i - mf_par;
-                    if (moff == 3 || moff == 4) {
-                        float lam_s = s_lam_mf[mf_par + 7 - moff];
-                        float f_pos = fmaxf(lambda_n, 0.0f);
-                        float b_d0 = 1.41421356f * mf_phi.data[off_mf + mf_par + 3] * f_pos;
-                        float b_d1 = 1.41421356f * mf_phi.data[off_mf + mf_par + 4] * f_pos;
-                        float lo = fmaxf(fmaxf(-radius_m, lam_s - b_d0), -lam_s - b_d1);
-                        float hi = fminf(fminf(radius_m, lam_s + b_d0), -lam_s + b_d1);
-                        // Infeasible vs stale sibling: midpoint, capped at the box bound.
-                        if (lo > hi) { float mid_m = fminf(fmaxf(0.5f * (lo + hi), -radius_m), radius_m); lo = mid_m; hi = mid_m; }
-                        new_impulse = fminf(fmaxf(new_impulse, lo), hi);
-                    }
-                } else if (radius <= 0.0f) {
+                if (radius <= 0.0f) {
                     new_impulse = 0.0f;
                 } else {
                     int sib = (i == mf_par + 1) ? mf_par + 2 : mf_par + 1;
@@ -15741,9 +15734,9 @@ def _get_pgs_solve_mf_gs_kernel(
             int packed_tp = meta.w;
             int mf_rt = packed_tp & 0xFFFF;
 
-            if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2) continue;
+            if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2 && mf_rt != 5 && mf_rt != 6) continue;
             if (row_phase == 0 && mf_rt == 4) continue;
-            if (mf_rt == 2 && global_iter < friction_start_iteration) {{
+            if ((mf_rt == 2 || mf_rt == 6) && global_iter < friction_start_iteration) {{
                 s_lam_mf[i] = 0.0f;
                 __syncwarp();
                 continue;
@@ -15789,6 +15782,33 @@ def _get_pgs_solve_mf_gs_kernel(
                 }}
             }} else if (mf_rt == 2) {{
                 {mf_friction_block}
+            }} else if (mf_rt == 5) {{
+                // Patch tipping-moment row: box clamp |M| <= extent * F plus
+                // the pair's diagonal bounds |Mx -+ My| <= sqrt(2)*ed*F from
+                // its phi slots (octagonal center-of-pressure bound). The
+                // pair sits at parent +3/+4 (6-row) or +1/+2 (3-row layout).
+                int mf_par = packed_tp >> 16;
+                float lambda_n = s_lam_mf[mf_par];
+                float extent = mf_row_mu.data[off_mf + i];
+                float radius_m = fmaxf(extent * lambda_n, 0.0f);
+                new_impulse = fminf(fmaxf(new_impulse, -radius_m), radius_m);
+                int moff = i - mf_par;
+                int sib = (moff <= 2) ? (mf_par + 3 - moff) : (mf_par + 7 - moff);
+                int m0 = (i < sib) ? i : sib;
+                float lam_s = s_lam_mf[sib];
+                float f_pos = fmaxf(lambda_n, 0.0f);
+                float b_d0 = 1.41421356f * mf_phi.data[off_mf + m0] * f_pos;
+                float b_d1 = 1.41421356f * mf_phi.data[off_mf + m0 + 1] * f_pos;
+                float lo = fmaxf(fmaxf(-radius_m, lam_s - b_d0), -lam_s - b_d1);
+                float hi = fminf(fminf(radius_m, lam_s + b_d0), -lam_s + b_d1);
+                // Infeasible vs stale sibling: midpoint, capped at the box bound.
+                if (lo > hi) {{ float mid_m = fminf(fmaxf(0.5f * (lo + hi), -radius_m), radius_m); lo = mid_m; hi = mid_m; }}
+                new_impulse = fminf(fmaxf(new_impulse, lo), hi);
+            }} else if (mf_rt == 6) {{
+                // Patch torsion row: |Mn| <= (mu * r_eff) * F.
+                int mf_par = packed_tp >> 16;
+                float t_radius = fmaxf(mf_row_mu.data[off_mf + i] * s_lam_mf[mf_par], 0.0f);
+                new_impulse = fminf(fmaxf(new_impulse, -t_radius), t_radius);
             }}
 
             if (mf_rt != 4) delta_impulse = new_impulse - old_impulse;

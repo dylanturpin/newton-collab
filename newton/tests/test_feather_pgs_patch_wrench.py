@@ -12,6 +12,8 @@ import newton
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_PATCH_MOMENT,
+    PGS_CONSTRAINT_TYPE_PATCH_TORSION,
     _patch_member_mask,
     gather_mf_warmstart,
 )
@@ -33,7 +35,7 @@ def _eval_patch_member_mask(
     body_q: wp.array[wp.transform],
     mask_out: wp.array[int],
 ):
-    mask_out[0] = _patch_member_mask(
+    mask, _phi_min = _patch_member_mask(
         leader,
         contact_count,
         contact_shape0,
@@ -46,7 +48,7 @@ def _eval_patch_member_mask(
         shape_body,
         body_q,
     )
-from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
+    mask_out[0] = mask
 
 
 def test_patch_wrench_tilted_box_falls_flat(test: unittest.TestCase, device):
@@ -321,6 +323,65 @@ def test_patch_wrench_membership_eligibility(test: unittest.TestCase, device):
         test.assertEqual(mask, 0b0011, "membership must stop at the pair boundary")
 
 
+def test_patch_wrench_row_layout(test: unittest.TestCase, device):
+    """Typed patch rows honor the friction controls: 6 rows
+    [F, f0, f1, Mx, My, Mn] with active friction, 3 rows [F, Mx, My] when
+    friction is disabled — the torsion row must disappear with the pair,
+    while the tipping moments (distributed normal pressure) stay."""
+    CT = PGS_CONSTRAINT_TYPE_CONTACT
+    FR = PGS_CONSTRAINT_TYPE_FRICTION
+    PM = PGS_CONSTRAINT_TYPE_PATCH_MOMENT
+    PT = PGS_CONSTRAINT_TYPE_PATCH_TORSION
+    for friction_on, want in ((True, [CT, FR, FR, PM, PM, PT]), (False, [CT, PM, PM])):
+        with wp.ScopedDevice(device):
+            builder = newton.ModelBuilder()
+            builder.rigid_gap = 0.003
+            cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
+            builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.7))
+            box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0505), wp.quat_identity()))
+            builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+            model = builder.finalize()
+            pipeline = newton.CollisionPipeline(
+                model,
+                reduce_contacts=True,
+                rigid_contact_max=64,
+                broad_phase="nxn",
+                deterministic=True,
+                contact_matching="latest",
+            )
+            contacts = pipeline.contacts()
+            solver = newton.solvers.SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                pgs_iterations=8,
+                contact_patch_wrench=True,
+                mf_warmstart=True,
+                enable_contact_friction=friction_on,
+            )
+            s0, s1 = model.state(), model.state()
+            control = model.control()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+            pipeline.collide(s0, contacts)
+            s0.clear_forces()
+            solver.step(s0, s1, control, contacts, 1.0 / 60.0)
+
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            owner = solver.contact_block_owner.numpy()[:count]
+            slot = solver.contact_slot.numpy()[:count]
+            leaders = [i for i in range(count) if owner[i] == i]
+            test.assertEqual(len(leaders), 1, "expected exactly one patch leader")
+            base = int(slot[leaders[0]])
+            row_type = solver.mf_row_type.numpy()[0]
+            row_parent = solver.mf_row_parent.numpy()[0]
+            got = [int(row_type[base + r]) for r in range(len(want))]
+            test.assertEqual(got, want, f"friction_on={friction_on}: row layout mismatch")
+            for r in range(1, len(want)):
+                test.assertEqual(int(row_parent[base + r]), base, f"row {r} not parented to block base")
+            mu_row = solver.mf_row_mu.numpy()[0]
+            for r in range(len(want)):
+                test.assertGreaterEqual(float(mu_row[base + r]), 0.0, "negative-mu sentinel must be gone")
+
+
 class TestFeatherPGSPatchWrench(unittest.TestCase):
     pass
 
@@ -348,6 +409,12 @@ add_function_test(
     "test_patch_wrench_membership_eligibility",
     test_patch_wrench_membership_eligibility,
     devices=get_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSPatchWrench,
+    "test_patch_wrench_row_layout",
+    test_patch_wrench_row_layout,
+    devices=get_selected_cuda_test_devices(),
 )
 
 if __name__ == "__main__":

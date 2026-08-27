@@ -31,7 +31,17 @@ PGS_CONSTRAINT_TYPE_JOINT_LIMIT = 3
 # appendix). Finite limits create two unilateral rows every step: one lower
 # bound row and one upper bound row. No Baumgarte / ERP bias.
 PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT = 4
-PGS_CONSTRAINT_TYPE_COUNT = 5
+# Patch-wrench tipping-moment row (Mx/My pair). Represents distributed normal
+# pressure, not friction: active from the first position iteration and
+# unaffected by friction enable/gap controls. ``mu`` stores the support
+# extent [m] (clamp = extent * F); the pair's phi slots store the diagonal
+# extents of the octagonal center-of-pressure bound.
+PGS_CONSTRAINT_TYPE_PATCH_MOMENT = 5
+# Patch-wrench torsion row (spin about the contact normal). Frictional:
+# follows friction scheduling and disappears with the tangential pair.
+# ``mu`` stores mu_c * r_eff [m] (clamp = mu * F).
+PGS_CONSTRAINT_TYPE_PATCH_TORSION = 6
+PGS_CONSTRAINT_TYPE_COUNT = 7
 
 # Numeric IDs for the ``friction_mode`` argument passed to the matrix-free
 # PGS solver kernels.  Mirrors the Python-side string enum on
@@ -2702,15 +2712,19 @@ def _patch_member_mask(
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
 ):
-    """8-bit membership mask for the contact window starting at ``leader``.
+    """8-bit membership mask for the contact window starting at ``leader``,
+    plus the minimum separation over the members.
 
     Bit ``j`` set = contact ``leader + j`` belongs to the leader's coplanar
-    patch (bit 0 = the leader itself). Returns 0 when fewer than two contacts
-    qualify: a patch needs at least two members to carry support moments.
-    Membership requires the same shape pair, near-identical normals, and a
-    witness midpoint within a scale-aware distance of the leader's contact
-    plane. Pure function of the contact arrays, so allocation, row building,
-    and warm-start threads all derive identical membership.
+    patch (bit 0 = the leader itself). Returns mask 0 when fewer than two
+    contacts qualify: a patch needs at least two members to carry support
+    moments. Membership requires the same shape pair, near-identical normals,
+    and a witness midpoint within a scale-aware distance of the leader's
+    contact plane. Pure function of the contact arrays, so allocation, row
+    building, and warm-start threads all derive identical membership.
+
+    The min member phi is what allocation gates the patch friction rows on
+    (any member within the friction gap activates the tangential pair).
     """
     sa = contact_shape0[leader]
     sb = contact_shape1[leader]
@@ -2731,6 +2745,7 @@ def _patch_member_mask(
         pb = wp.transform_point(body_q[body_b], pb)
     pb = pb + contact_thickness1[leader] * n_l
     mid_l = 0.5 * (pa + pb)
+    phi_min = wp.dot(n_l, pa - pb)
 
     # Tangential span of the normal-aligned candidates sets the coplanarity
     # tolerance, so the test is scale-free.
@@ -2780,9 +2795,10 @@ def _patch_member_mask(
             continue
         mask |= 1 << j
         count += 1
+        phi_min = wp.min(phi_min, wp.dot(n_l, pa_j - pb_j))
     if count < 2:
-        return 0
-    return mask
+        return 0, phi_min
+    return mask, phi_min
 
 
 @wp.kernel
@@ -2990,7 +3006,7 @@ def allocate_world_contact_slots(
                 break
         if patch_rank < 8:
             leader = c - patch_rank
-            mask = _patch_member_mask(
+            mask, patch_phi_min = _patch_member_mask(
                 leader,
                 total_contacts,
                 contact_shape0,
@@ -3005,7 +3021,13 @@ def allocate_world_contact_slots(
             )
             if mask != 0:
                 if patch_rank == 0:
-                    slots_needed = 6
+                    # 3 rows [F, Mx, My] without active friction; 6 rows
+                    # [F, f0, f1, Mx, My, Mn] when any member is within the
+                    # friction gap. Row build reads the count back from
+                    # contact_slots_needed so both stay in agreement.
+                    slots_needed = 3
+                    if enable_friction != 0 and patch_phi_min <= contact_friction_gap_threshold:
+                        slots_needed = 6
                     contact_slots_needed[c] = slots_needed
                     contact_block_owner[c] = c
                 elif (mask >> patch_rank) & 1 != 0:
@@ -4421,6 +4443,7 @@ def build_mf_contact_rows(
     contact_shared_anchor: int,
     pgs_beta: float,
     contact_block_owner: wp.array[int],
+    contact_slots_needed: wp.array[int],
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -4543,15 +4566,16 @@ def build_mf_contact_rows(
     # Only a patch leader (allocate assigned it its own block) builds the
     # 6-row block; other contacts reaching here are classic fallbacks.
     if contact_block_owner[c] == c:
-        # ── Patch-wrench block: [F, f0, f1, Mx, My, Mn] ─────────────────────
-        # One 6-row block per coplanar contact patch. F is the total normal
-        # force at the patch center; f0/f1 the tangential friction pair
-        # (existing sibling-cone semantics, cone = mu * F: the whole patch's
-        # Coulomb budget); Mx/My are pure-torque rows about the tangents with
-        # box clamps |M| <= extent * F (negative-mu sentinel) — the inscribed
+        # ── Patch-wrench block: [F, f0, f1, Mx, My, Mn], or [F, Mx, My]
+        # without active friction (allocate decided; read the count back).
+        # F is the total normal force at the patch center; f0/f1 the
+        # tangential friction pair (sibling-cone, cone = mu * F: the whole
+        # patch's Coulomb budget); Mx/My are typed tipping-moment rows about
+        # the tangents with box clamps |M| <= extent * F — the inscribed
         # center-of-pressure constraint. Making the patch moment an explicit
         # solver variable removes the moment-redistribution lag that drives
         # the tall-stack rocking instability (notes §16).
+        patch_rows = contact_slots_needed[c]
         total_c = contact_count[0]
         # Separated contacts carry no load and must not widen the support;
         # touching/penetrating contacts keep full weight. All-separated
@@ -4689,20 +4713,27 @@ def build_mf_contact_rows(
             ed1 = wp.max(ed1, w_j * wp.abs(u0 - u1) * 0.70710678)
 
         for row_offset in range(6):
+            if row_offset >= patch_rows:
+                break
             row_idx = slot + row_offset
-            if row_offset == 0:
+            # Role: 0=F, 1=f0, 2=f1, 3=Mx, 4=My, 5=Mn. The 3-row layout
+            # [F, Mx, My] skips the friction roles.
+            role = row_offset
+            if patch_rows == 3 and row_offset > 0:
+                role = row_offset + 2
+            if role == 0:
                 d = normal
-            elif row_offset == 1:
+            elif role == 1:
                 d = t0
-            elif row_offset == 2:
+            elif role == 2:
                 d = t1
-            elif row_offset == 3:
+            elif role == 3:
                 d = t0  # torque axis
-            elif row_offset == 4:
+            elif role == 4:
                 d = t1
             else:
                 d = normal  # torsion axis (spin about the contact normal)
-            is_torque = row_offset >= 3
+            is_torque = role >= 3
             if response_body_a >= 0:
                 art_a2 = contact_art_a[c]
                 origin_a2 = articulation_origin[art_a2]
@@ -4743,33 +4774,34 @@ def build_mf_contact_rows(
                     mf_J_b[world, row_idx, 5] = -ang_b2[2]
             mf_body_a[world, row_idx] = response_body_a
             mf_body_b[world, row_idx] = response_body_b
-            if row_offset == 0:
+            if role == 0:
                 mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
                 mf_row_parent[world, row_idx] = -1
                 mf_phi[world, row_idx] = mean_phi
                 mf_row_restitution[world, row_idx] = restitution
                 mf_row_mu[world, row_idx] = mu
             else:
-                mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
                 mf_row_parent[world, row_idx] = slot
-                # Diagonal extents ride in the tipping pair's unused phi slots.
-                if row_offset == 3:
-                    mf_phi[world, row_idx] = ed0
-                elif row_offset == 4:
-                    mf_phi[world, row_idx] = ed1
-                else:
-                    mf_phi[world, row_idx] = 0.0
                 mf_row_restitution[world, row_idx] = 0.0
-                if row_offset <= 2:
+                if role <= 2:
+                    mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
+                    mf_phi[world, row_idx] = 0.0
                     mf_row_mu[world, row_idx] = mu * contact_friction_scale
-                elif row_offset == 3:
+                elif role == 3:
+                    mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_PATCH_MOMENT
+                    # Diagonal extents ride in the tipping pair's unused phi slots.
+                    mf_phi[world, row_idx] = ed0
                     # torque about t0 shifts pressure along t1
-                    mf_row_mu[world, row_idx] = -e1
-                elif row_offset == 4:
-                    mf_row_mu[world, row_idx] = -e0
+                    mf_row_mu[world, row_idx] = e1
+                elif role == 4:
+                    mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_PATCH_MOMENT
+                    mf_phi[world, row_idx] = ed1
+                    mf_row_mu[world, row_idx] = e0
                 else:
+                    mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_PATCH_TORSION
+                    mf_phi[world, row_idx] = 0.0
                     # torsional friction: |Mn| <= mu * r_eff * F
-                    mf_row_mu[world, row_idx] = -(mu * contact_friction_scale * 0.5 * (e0 + e1))
+                    mf_row_mu[world, row_idx] = mu * contact_friction_scale * 0.5 * (e0 + e1)
             mf_target_velocity[world, row_idx] = 0.0
         return
 
@@ -5145,18 +5177,28 @@ def gather_mf_warmstart(
         mf_impulses[world, new_slot] = decay * dt_scale * prev_mf_impulses[world, prev_slot]
 
     # Offset rows (1..5): classic contacts carry two friction rows;
-    # patch-wrench blocks carry five (tangential pair, two moment rows,
-    # torsion). The moment carry is what lets a jitter-offset stack hold its
-    # static interface moments at low iteration counts instead of rebuilding
-    # them from zero every frame.
+    # patch-wrench blocks carry a tangential pair, a typed tipping-moment
+    # pair, and a torsion row (or just the moment pair without friction).
+    # The moment carry is what lets a jitter-offset stack hold its static
+    # interface moments at low iteration counts instead of rebuilding them
+    # from zero every frame. Seeding requires the previous row at the same
+    # offset to have the same type and belong to the previous block, so a
+    # layout change (friction toggling 3<->6 rows, patch<->classic) cold
+    # starts the rows whose meaning moved instead of misassigning them.
     for r in range(1, 6):
         new_r = new_slot + r
         if new_r < mf_max_c:
-            if mf_row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION and mf_row_parent[world, new_r] == new_slot:
+            cur_t = mf_row_type[world, new_r]
+            is_block_row = (
+                cur_t == PGS_CONSTRAINT_TYPE_FRICTION
+                or cur_t == PGS_CONSTRAINT_TYPE_PATCH_MOMENT
+                or cur_t == PGS_CONSTRAINT_TYPE_PATCH_TORSION
+            )
+            if is_block_row and mf_row_parent[world, new_r] == new_slot:
                 prev_r = prev_slot + r
                 if (
                     prev_r < mf_max_c
-                    and prev_mf_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
+                    and prev_mf_row_type[world, prev_r] == cur_t
                     and prev_mf_row_parent[world, prev_r] == prev_slot
                 ):
                     mf_impulses[world, new_r] = decay * dt_scale * prev_mf_impulses[world, prev_r]
@@ -8121,6 +8163,49 @@ def solve_coulomb_row(W: wp.mat33, b: wp.vec3, mu: float) -> FPGSCoulombNewtonRe
 
 
 @wp.func
+def patch_moment_step(
+    world: int,
+    i: int,
+    new_impulse: float,
+    mf_row_parent: wp.array2d[int],
+    mf_row_mu: wp.array2d[float],
+    mf_phi: wp.array2d[float],
+    mf_impulses: wp.array2d[float],
+):
+    """Project a patch tipping-moment row (``PGS_CONSTRAINT_TYPE_PATCH_MOMENT``).
+
+    Box clamp ``|M| <= extent * F`` (``mu`` stores the support extent) plus
+    the pair's diagonal bounds ``|Mx -+ My| <= sqrt(2) * ed * F`` from the
+    two rows' phi slots — together the octagonal center-of-pressure bound.
+    The pair sits at ``parent + 3/+4`` in the 6-row layout and ``+1/+2`` in
+    the frictionless 3-row layout.
+    """
+    parent_idx = mf_row_parent[world, i]
+    lambda_n = mf_impulses[world, parent_idx]
+    extent = mf_row_mu[world, i]
+    radius_m = wp.max(extent * lambda_n, 0.0)
+    lam_m = wp.clamp(new_impulse, -radius_m, radius_m)
+    moff = i - parent_idx
+    if moff <= 2:
+        sib = parent_idx + 3 - moff
+    else:
+        sib = parent_idx + 7 - moff
+    m0 = wp.min(i, sib)
+    lam_s = mf_impulses[world, sib]
+    f_pos = wp.max(lambda_n, 0.0)
+    b_d0 = 1.41421356 * mf_phi[world, m0] * f_pos
+    b_d1 = 1.41421356 * mf_phi[world, m0 + 1] * f_pos
+    lo = wp.max(wp.max(-radius_m, lam_s - b_d0), -lam_s - b_d1)
+    hi = wp.min(wp.min(radius_m, lam_s + b_d0), -lam_s + b_d1)
+    if lo > hi:
+        # Infeasible vs a stale sibling: midpoint, capped at the box bound.
+        mid_m = wp.clamp(0.5 * (lo + hi), -radius_m, radius_m)
+        lo = mid_m
+        hi = mid_m
+    return wp.clamp(lam_m, lo, hi)
+
+
+@wp.func
 def friction_step_current(
     world: int,
     i: int,
@@ -8179,27 +8264,6 @@ def friction_step_current(
     parent_idx = mf_row_parent[world, i]
     lambda_n = mf_impulses[world, parent_idx]
     mu_val = mf_row_mu[world, i]
-    if mu_val < 0.0:
-        # Patch-wrench moment row (negative-mu sentinel = support extent):
-        # box clamp plus, for the tipping pair, the diagonal bounds
-        # |Mx -+ My| <= sqrt(2)*ed*F stored in the pair's phi slots.
-        radius_m = wp.max(-mu_val * lambda_n, 0.0)
-        lam_m = wp.clamp(new_impulse, -radius_m, radius_m)
-        moff = i - parent_idx
-        if moff == 3 or moff == 4:
-            lam_s = mf_impulses[world, parent_idx + 7 - moff]
-            f_pos = wp.max(lambda_n, 0.0)
-            b_d0 = 1.41421356 * mf_phi[world, parent_idx + 3] * f_pos
-            b_d1 = 1.41421356 * mf_phi[world, parent_idx + 4] * f_pos
-            lo = wp.max(wp.max(-radius_m, lam_s - b_d0), -lam_s - b_d1)
-            hi = wp.min(wp.min(radius_m, lam_s + b_d0), -lam_s + b_d1)
-            if lo > hi:
-                # Infeasible vs a stale sibling: midpoint, capped at the box bound.
-                mid_m = wp.clamp(0.5 * (lo + hi), -radius_m, radius_m)
-                lo = mid_m
-                hi = mid_m
-            lam_m = wp.clamp(lam_m, lo, hi)
-        return lam_m
     radius = wp.max(mu_val * lambda_n, 0.0)
 
     if radius <= 0.0:
@@ -8829,7 +8893,9 @@ def pgs_solve_mf_loop(
     for it in range(iterations):
         for i in range(m_count):
             row_type = mf_row_type[world, i]
-            if row_type == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + it < friction_start_iteration:
+            if (
+                row_type == PGS_CONSTRAINT_TYPE_FRICTION or row_type == PGS_CONSTRAINT_TYPE_PATCH_TORSION
+            ) and iteration_offset + it < friction_start_iteration:
                 mf_impulses[world, i] = 0.0
                 continue
 
@@ -8937,6 +9003,21 @@ def pgs_solve_mf_loop(
                         mf_impulses,
                         v_out,
                     )
+            elif row_type == PGS_CONSTRAINT_TYPE_PATCH_MOMENT:
+                new_impulse = patch_moment_step(
+                    world,
+                    i,
+                    new_impulse,
+                    mf_row_parent,
+                    mf_row_mu,
+                    mf_phi,
+                    mf_impulses,
+                )
+            elif row_type == PGS_CONSTRAINT_TYPE_PATCH_TORSION:
+                # |Mn| <= (mu * r_eff) * F
+                t_parent = mf_row_parent[world, i]
+                t_radius = wp.max(mf_row_mu[world, i] * mf_impulses[world, t_parent], 0.0)
+                new_impulse = wp.clamp(new_impulse, -t_radius, t_radius)
 
             if row_type != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
                 delta_impulse = new_impulse - old_impulse
