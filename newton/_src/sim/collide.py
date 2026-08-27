@@ -1005,6 +1005,7 @@ class CollisionPipeline:
         sdf_hydroelastic_config: HydroelasticSDF.Config | None = None,
         shape_pairs_max: int | None = None,
         deterministic: bool = False,
+        box_box_sat: bool = False,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
         contact_matching_pos_threshold: float = 0.0005,
         contact_matching_normal_dot_threshold: float = 0.995,
@@ -1387,6 +1388,7 @@ class CollisionPipeline:
                 has_meshes=has_meshes,
                 has_heightfields=has_heightfields,
                 use_lean_gjk_mpr=use_lean_gjk_mpr,
+                box_box_sat=box_box_sat,
                 deterministic=deterministic,
                 contact_max=rigid_contact_max,
                 verify_buffers=verify_buffers,
@@ -2193,6 +2195,7 @@ class CollisionPipeline:
         # cannot carry a stale marker (see
         # SolverBase.supports_body_pair_reduced_contacts).
         contacts.rigid_contacts_body_pair_reduced = self._body_pair_reducer is not None
+        contacts.rigid_contacts_pair_sorted = bool(self.deterministic)
         if self._body_pair_reducer is not None:
             self._body_pair_reducer.reduce(model, state, contacts)
 

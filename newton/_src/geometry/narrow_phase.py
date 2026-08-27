@@ -20,6 +20,7 @@ from ..geometry.collision_core import (
     post_process_minkowski_only,
 )
 from ..geometry.collision_primitive import (
+    collide_box_box,
     collide_capsule_capsule,
     collide_plane_box,
     collide_plane_capsule,
@@ -134,7 +135,7 @@ def write_contact_simple(
         )
 
 
-def create_narrow_phase_primitive_kernel(writer_func: Any):
+def create_narrow_phase_primitive_kernel(writer_func: Any, box_box_sat: bool = False):
     """
     Create a kernel for fast analytical collision detection of primitive shapes.
 
@@ -149,7 +150,7 @@ def create_narrow_phase_primitive_kernel(writer_func: Any):
     Returns:
         A warp kernel for primitive collision detection
     """
-    _module = f"narrow_phase_primitive_{writer_func.__name__}"
+    _module = f"narrow_phase_primitive_{writer_func.__name__}_sat{int(box_box_sat)}"
 
     @wp.kernel(enable_backward=False, module=_module)
     def narrow_phase_primitive_kernel(
@@ -414,6 +415,98 @@ def create_narrow_phase_primitive_kernel(writer_func: Any):
                 contact_pos_1 = wp.vec3(positions4_box[1, 0], positions4_box[1, 1], positions4_box[1, 2])
                 contact_pos_2 = wp.vec3(positions4_box[2, 0], positions4_box[2, 1], positions4_box[2, 2])
                 contact_pos_3 = wp.vec3(positions4_box[3, 0], positions4_box[3, 1], positions4_box[3, 2])
+
+            # -----------------------------------------------------------------
+            # Box-Box collision via SAT reference-face clipping (opt-in).
+            # Produces up to 8 contacts with a deterministic clip order, so
+            # sort_sub_key doubles as a stable per-pair contact identity —
+            # the manifold-quality fix for GJK/MPR witness-point teleports
+            # (measured up to ~a face width per frame under micro-wobble).
+            # -----------------------------------------------------------------
+            elif wp.static(box_box_sat) and is_box_a and is_box_b:
+                box_rot_a = wp.quat_to_matrix(quat_a)
+                box_rot_b = wp.quat_to_matrix(quat_b)
+                sat_dist, sat_pos, sat_normals = collide_box_box(
+                    pos_a,
+                    box_rot_a,
+                    wp.vec3(scale_a[0], scale_a[1], scale_a[2]),
+                    pos_b,
+                    box_rot_b,
+                    wp.vec3(scale_b[0], scale_b[1], scale_b[2]),
+                    gap_sum,
+                )
+                # Quadrant reduction: a fixed 4-slot manifold with body-fixed
+                # slot identity (the user-port-proven "persistent quadrant
+                # contact" scheme). Contacts are binned by the sign of their
+                # tangential offset from box B's center along the reference
+                # box A's two axes most orthogonal to the contact normal;
+                # the deepest contact per quadrant survives and its quadrant
+                # becomes sort_sub_key — a stable per-pair identity that does
+                # not flicker with the raw SAT manifold's margin-band extras.
+                bb_n = wp.vec3(sat_normals[0, 0], sat_normals[0, 1], sat_normals[0, 2])
+                a0 = wp.quat_rotate(quat_a, wp.vec3(1.0, 0.0, 0.0))
+                a1 = wp.quat_rotate(quat_a, wp.vec3(0.0, 1.0, 0.0))
+                a2 = wp.quat_rotate(quat_a, wp.vec3(0.0, 0.0, 1.0))
+                d0 = wp.abs(wp.dot(a0, bb_n))
+                d1 = wp.abs(wp.dot(a1, bb_n))
+                d2 = wp.abs(wp.dot(a2, bb_n))
+                if d0 >= d1 and d0 >= d2:
+                    bb_t0 = a1
+                    bb_t1 = a2
+                elif d1 >= d2:
+                    bb_t0 = a0
+                    bb_t1 = a2
+                else:
+                    bb_t0 = a0
+                    bb_t1 = a1
+                quad_best = wp.vec4(float(MAXVAL), float(MAXVAL), float(MAXVAL), float(MAXVAL))
+                quad_idx = wp.vec4i(-1, -1, -1, -1)
+                for ci in range(8):
+                    if sat_dist[ci] < MAXVAL:
+                        pc = wp.vec3(sat_pos[ci, 0], sat_pos[ci, 1], sat_pos[ci, 2])
+                        rel = pc - pos_b
+                        q = int(0)
+                        if wp.dot(bb_t0, rel) > 0.0:
+                            q += 1
+                        if wp.dot(bb_t1, rel) > 0.0:
+                            q += 2
+                        if sat_dist[ci] < quad_best[q]:
+                            quad_best[q] = sat_dist[ci]
+                            quad_idx[q] = ci
+                bb_data = ContactData()
+                bb_data.margin_a = margin_offset_a
+                bb_data.margin_b = margin_offset_b
+                bb_data.shape_a = shape_a
+                bb_data.shape_b = shape_b
+                bb_data.gap_sum = gap_sum
+                num_valid = int(0)
+                for q in range(4):
+                    ci = quad_idx[q]
+                    if ci >= 0:
+                        bb_data.contact_point_center = wp.vec3(sat_pos[ci, 0], sat_pos[ci, 1], sat_pos[ci, 2])
+                        bb_data.contact_distance = sat_dist[ci]
+                        bb_data.contact_normal_a_to_b = wp.vec3(
+                            sat_normals[ci, 0], sat_normals[ci, 1], sat_normals[ci, 2]
+                        )
+                        if not contact_passes_gap_check(bb_data):
+                            quad_idx[q] = -1
+                        else:
+                            num_valid += 1
+                if num_valid > 0:
+                    bb_base = wp.atomic_add(writer_data.contact_count, 0, num_valid)
+                    if bb_base + num_valid <= writer_data.contact_max:
+                        for q in range(4):
+                            ci = quad_idx[q]
+                            if ci >= 0:
+                                bb_data.contact_point_center = wp.vec3(sat_pos[ci, 0], sat_pos[ci, 1], sat_pos[ci, 2])
+                                bb_data.contact_distance = sat_dist[ci]
+                                bb_data.contact_normal_a_to_b = wp.vec3(
+                                    sat_normals[ci, 0], sat_normals[ci, 1], sat_normals[ci, 2]
+                                )
+                                bb_data.sort_sub_key = q
+                                writer_func(bb_data, writer_data, bb_base)
+                                bb_base += 1
+                continue
 
             # -----------------------------------------------------------------
             # Sphere-Sphere collision (type_a=SPHERE=2, type_b=SPHERE=2)
@@ -1468,6 +1561,7 @@ class NarrowPhase:
         shape_aabb_upper: wp.array[wp.vec3] | None = None,
         shape_voxel_resolution: wp.array[wp.vec3i] | None = None,
         contact_writer_warp_func: Any | None = None,
+        box_box_sat: bool = False,
         hydroelastic_sdf: HydroelasticSDF | None = None,
         has_meshes: bool = True,
         has_heightfields: bool = False,
@@ -1590,7 +1684,7 @@ class NarrowPhase:
 
         # Create the appropriate kernel variants
         # Primitive kernel handles lightweight primitives and routes remaining pairs
-        self.primitive_kernel = create_narrow_phase_primitive_kernel(writer_func)
+        self.primitive_kernel = create_narrow_phase_primitive_kernel(writer_func, box_box_sat=box_box_sat)
         # GJK/MPR kernel handles remaining convex-convex pairs
         if use_lean_gjk_mpr:
             # Use lean support function (CONVEX_MESH, BOX, SPHERE only) and lean post-processing
