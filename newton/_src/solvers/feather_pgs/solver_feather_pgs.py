@@ -1207,6 +1207,10 @@ class SolverFeatherPGS(SolverBase):
         if pgs_mode not in ("dense", "split", "matrix_free"):
             raise ValueError(f"pgs_mode must be 'dense', 'split', or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
+        if self.enable_joint_velocity_limits and self.pgs_mode != "matrix_free":
+            raise NotImplementedError(
+                "enable_joint_velocity_limits=True currently requires pgs_mode='matrix_free'"
+            )
         if articulated_contact_response != "immediate" and self.pgs_mode != "matrix_free":
             raise NotImplementedError(
                 f"articulated_contact_response={articulated_contact_response!r} currently requires "
@@ -1347,6 +1351,16 @@ class SolverFeatherPGS(SolverBase):
         valid_pgs = {"loop", "tiled_row", "tiled_contact", "streaming"}
         if pgs_kernel not in valid_pgs:
             raise ValueError(f"pgs_kernel must be one of {sorted(valid_pgs)}")
+
+        if (
+            self.pgs_mode != "matrix_free"
+            and self.enable_joint_limits
+            and pgs_kernel in ("tiled_contact", "streaming")
+        ):
+            raise ValueError(
+                f"pgs_kernel={pgs_kernel!r} is contact-only and cannot solve joint-limit rows; "
+                "use pgs_kernel='loop' or 'tiled_row', or pgs_mode='matrix_free'"
+            )
 
         # Native tiled kernels are CUDA-only. Resolve the complete scalar
         # suite here so CPU callers cannot accidentally launch silent no-op
