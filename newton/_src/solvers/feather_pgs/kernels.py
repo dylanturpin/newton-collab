@@ -2551,7 +2551,8 @@ def populate_mimic_J_for_size(
     art_to_world: wp.array[int],
     group_to_art: wp.array[int],
     mimic_slot: wp.array[int],
-    mimic_art: wp.array[int],
+    mimic_art_start: wp.array[int],
+    mimic_art_list: wp.array[int],
     mimic_dof0: wp.array[int],
     mimic_dof1: wp.array[int],
     mimic_q0: wp.array[int],
@@ -2574,8 +2575,8 @@ def populate_mimic_J_for_size(
     """Populate Jacobian and metadata for mimic constraint rows.
 
     Launched once per size group with ``dim = n_arts_of_size``, matching the
-    joint-limit populate kernel. Each thread scans the (small) mimic table and
-    fills the rows belonging to its articulation:
+    joint-limit populate kernel. Each thread visits only its articulation's
+    range in the precomputed mimic table:
 
     * Jacobian ``J = e_follower - coef1 * e_leader`` — two entries.
     * ``phi = q_follower - coef1 * q_leader - coef0`` — the signed violation.
@@ -2585,10 +2586,8 @@ def populate_mimic_J_for_size(
     world = art_to_world[art]
     dof_start = articulation_dof_start[art]
 
-    n_mimic = mimic_art.shape[0]
-    for k in range(n_mimic):
-        if mimic_art[k] != art:
-            continue
+    for m in range(mimic_art_start[art], mimic_art_start[art + 1]):
+        k = mimic_art_list[m]
         slot = mimic_slot[k]
         if slot < 0:
             continue
@@ -2819,7 +2818,8 @@ def preelim_setup_for_size(
     group_to_art: wp.array[int],
     art_to_preelim: wp.array[int],
     mimic_slot: wp.array[int],
-    mimic_art: wp.array[int],
+    mimic_art_start: wp.array[int],
+    mimic_art_list: wp.array[int],
     n_mimic: int,
     connect_slot: wp.array[int],
     connect_art: wp.array[int],
@@ -2855,10 +2855,12 @@ def preelim_setup_for_size(
 
     # Gather candidate slots owned by this articulation.
     n = int(0)
-    for k in range(n_mimic):
-        if mimic_art[k] == art and mimic_slot[k] >= 0 and n < PREELIM_MAX_ROWS:
-            preelim_slots[base + n] = mimic_slot[k]
-            n += 1
+    if n_mimic > 0:
+        for m in range(mimic_art_start[art], mimic_art_start[art + 1]):
+            k = mimic_art_list[m]
+            if mimic_slot[k] >= 0 and n < PREELIM_MAX_ROWS:
+                preelim_slots[base + n] = mimic_slot[k]
+                n += 1
     for k in range(n_connect):
         if connect_art[k] == art and connect_slot[k] >= 0:
             for a in range(3):
