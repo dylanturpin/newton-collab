@@ -869,6 +869,53 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         # bound instead of the calm default.
         self.assertLess(w_on, max(2.0 * w_off, w_tol), f"reduced settle is rocking: |w| {w_on} vs {w_off}")
 
+    def test_row_watermark_reports_raw_dense_overflow(self):
+        """Report attempted dense rows separately from the clamped count."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        no_collision = builder.default_shape_cfg.copy()
+        no_collision.has_shape_collision = False
+        joints = []
+        parent = -1
+        for index in range(3):
+            child = builder.add_link()
+            builder.add_shape_box(child, hx=0.05, hy=0.05, hz=0.05, cfg=no_collision)
+            joints.append(
+                builder.add_joint_revolute(
+                    parent=parent,
+                    child=child,
+                    axis=newton.Axis.Z,
+                    parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.2 * index), wp.quat_identity()),
+                    child_xform=wp.transform_identity(),
+                    limit_lower=-1.0,
+                    limit_upper=1.0,
+                )
+            )
+            parent = child
+        builder.add_articulation(joints)
+        model = builder.finalize(device=wp.get_device())
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        pipeline = _make_pipeline(model, False)
+        contacts = pipeline.contacts()
+        pipeline.collide(state_0, contacts)
+
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            angular_damping=0.0,
+            dense_max_constraints=4,
+            enable_joint_limits=True,
+            joint_limit_activation_gap=float("inf"),
+            row_watermark=True,
+        )
+        solver.step(state_0, state_1, model.control(), contacts, DT)
+        rows = solver.constraint_row_watermarks()
+
+        self.assertGreater(rows["dense_high_water"], 0)
+        self.assertLessEqual(rows["dense_high_water"], 4)
+        self.assertGreater(rows["dense_raw_high_water"], rows["dense_high_water"])
+        self.assertEqual(rows["dense_overflow_world_steps"], 1)
+        self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
+
     def test_feather_pgs_conformance(self):
         """SolverFeatherPGS rests a free-jointed foot at the same height on/off.
 
