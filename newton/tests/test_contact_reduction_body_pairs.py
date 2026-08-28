@@ -729,8 +729,8 @@ class TestBodyPairReductionMultiPatch(unittest.TestCase):
     def test_both_clusters_fully_kept_far_from_origin(self):
         """Keep both clusters for a body 200 m from the origin, not just near it.
 
-        The spatial cell is packed as two signed 8-bit values. Measured from the
-        world origin those saturate past ~32 m, so both clusters of a distant
+        The spatial cell is packed as two signed 6-bit values. Measured from the
+        world origin those saturate past ~8 m, so both clusters of a distant
         body land in the same border cell, compete for one slot set, and one
         loses its support points -- while the identical scene at the origin
         passes. Anchoring the cell grid at the pair's reference body makes the
