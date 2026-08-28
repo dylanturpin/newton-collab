@@ -325,7 +325,7 @@ class _FeatherPGSModelPlan:
         return cls(*arrays, world_count)
 
 
-_DENSE_META_ROW_TYPE_BITS = 3
+_DENSE_META_ROW_TYPE_BITS = 4
 _DENSE_META_ROW_TYPE_MASK = (1 << _DENSE_META_ROW_TYPE_BITS) - 1
 _DENSE_META_MAX_PARENT = ((2**31 - 1) >> _DENSE_META_ROW_TYPE_BITS) - 1
 
@@ -576,6 +576,7 @@ class SolverFeatherPGS(SolverBase):
         contact_friction_anchor_limit: int = 0,
         contact_friction_scale: float = 1.0,
         contact_shared_anchor: bool = False,
+        contact_patch_wrench: bool = False,
         enable_joint_limits: bool = False,
         enable_mimic_constraints: bool = True,
         enable_connect_constraints: bool = True,
@@ -815,6 +816,24 @@ class SolverFeatherPGS(SolverBase):
                 move those contacts off the matrix-free family and reject a nonzero value.
                 Unlike ``dense_contact_compliance`` this is not a physical compliance [m/N].
                 Defaults to 0.0.
+            contact_patch_wrench (bool, optional): Solve each coplanar matrix-free contact patch
+                as one aggregated wrench block (total normal force, whole-patch friction pair,
+                two tipping-moment rows, torsion row) instead of per-contact rows. A patch
+                requires at least two contacts of the same shape pair with near-identical
+                normals and coplanar witness midpoints; contacts that fail the test (single
+                contact, curved surface, distinct faces) keep classic per-contact rows.
+                Matrix-free contacts only; requires ``friction_mode="current"``, pair-sorted
+                contacts (``CollisionPipeline(deterministic=True)`` or any contact-matching
+                mode), ``articulated_contact_response="immediate"``, and a matrix-free
+                ``pgs_mode``. A patch covers at most eight contacts of a pair; further
+                contacts keep classic rows. A leader reserves six MF row slots with active
+                friction ([F, f0, f1, Mx, My, Mn]) and three without ([F, Mx, My]).
+                Torsional friction is a box approximation with its own budget
+                (``|Mn| <= mu * r_eff * F``) independent of the tangential cone, so combined
+                sliding and twisting can exceed a coupled Coulomb friction-wrench limit.
+                Reported contact forces attribute the whole block (force in the patch basis
+                plus the moments as a torque) to the leader contact; patch followers report
+                zero. Defaults to False.
             pgs_velocity_omega (float | None, optional): Relaxation factor for the velocity-only post-pass.
                 Defaults to ``pgs_omega`` when unset.
             pgs_velocity_drive_mode (str, optional): Drive-row treatment during velocity-only post-pass
@@ -997,6 +1016,15 @@ class SolverFeatherPGS(SolverBase):
         self.contact_friction_position_iterations = int(contact_friction_position_iterations)
         self.contact_friction_shared_anchor = bool(contact_friction_shared_anchor)
         self.contact_friction_anchor_limit = int(contact_friction_anchor_limit)
+        self.contact_patch_wrench = bool(contact_patch_wrench)
+        if self.contact_patch_wrench:
+            if friction_mode != "current":
+                raise NotImplementedError("contact_patch_wrench requires friction_mode='current'")
+            if articulated_contact_response != "immediate":
+                raise NotImplementedError("contact_patch_wrench requires articulated_contact_response='immediate'")
+            if pgs_mode == "dense":
+                # Dense mode disables the matrix-free path the feature lives on.
+                raise NotImplementedError("contact_patch_wrench requires pgs_mode 'matrix_free' or 'split'")
         self.contact_friction_scale = float(contact_friction_scale)
         try:
             self.contact_speculative_scale = float(contact_speculative_scale)
@@ -1142,6 +1170,9 @@ class SolverFeatherPGS(SolverBase):
         self._ws_prev_mf_impulses = None
         self._ws_prev_dt = 0.0
         self._ws_prev_mf_row_type = None
+        self._ws_prev_mf_row_parent = None
+        self._ws_prev_patch_basis_n = None
+        self._ws_prev_patch_basis_t0 = None
         self._ws_prev_slot_sorted = None
         self._ws_warned_no_match = False
 
@@ -2916,6 +2947,12 @@ class SolverFeatherPGS(SolverBase):
         self.contact_slots_needed = wp.zeros(
             (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
+        # Patch-block assignment (leader contact index for members, -1 for
+        # classic rows); written by allocate_world_contact_slots every step.
+        self.contact_block_owner = wp.full((max_contacts,), -1, dtype=wp.int32, device=device)
+        # Reported patch moments (zero for classic contacts and followers).
+        self._rigid_contact_torque = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
+        self._dummy_patch_basis = wp.zeros((1, 1), dtype=wp.vec3, device=device)
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
@@ -3334,6 +3371,12 @@ class SolverFeatherPGS(SolverBase):
             (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
         self.mf_impulses = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        # Patch-block basis snapshots (leader slot only): warm start cold
+        # starts tangent/moment rows when the basis moved. Dummies when the
+        # feature is off (the writing branch is never taken).
+        basis_shape = (worlds, mf_max_c) if self.contact_patch_wrench else (1, 1)
+        self.mf_patch_basis_n = wp.zeros(basis_shape, dtype=wp.vec3, device=device)
+        self.mf_patch_basis_t0 = wp.zeros(basis_shape, dtype=wp.vec3, device=device)
 
         # MF warm-start carry buffers. Allocated ONLY when the feature is on so
         # the default-off path has zero memory / CUDA-graph delta. ``prev_mf_*``
@@ -3349,6 +3392,9 @@ class SolverFeatherPGS(SolverBase):
                 (worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
             )
             self._ws_prev_mf_row_type = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device)
+            self._ws_prev_mf_row_parent = wp.full((worlds, mf_max_c), -1, dtype=wp.int32, device=device)
+            self._ws_prev_patch_basis_n = wp.zeros(basis_shape, dtype=wp.vec3, device=device)
+            self._ws_prev_patch_basis_t0 = wp.zeros(basis_shape, dtype=wp.vec3, device=device)
             self._ws_prev_slot_sorted = wp.full(
                 (getattr(self, "_max_contacts_alloc", 1),), -1, dtype=wp.int32, device=device
             )
@@ -4297,6 +4343,7 @@ class SolverFeatherPGS(SolverBase):
                         self.mf_MiJt_a,
                         self.mf_MiJt_b,
                         self.mf_row_mu,
+                        self.mf_phi,
                         1.0 if soft_relax else self._pgs_contact_regularization_w,
                         phase_iterations,
                         omega,
@@ -6205,6 +6252,10 @@ class SolverFeatherPGS(SolverBase):
             with wp.ScopedTimer("S7_MF_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
                 wp.copy(self._ws_prev_mf_impulses, self.mf_impulses)
                 wp.copy(self._ws_prev_mf_row_type, self.mf_row_type)
+                wp.copy(self._ws_prev_mf_row_parent, self.mf_row_parent)
+                if self.contact_patch_wrench:
+                    wp.copy(self._ws_prev_patch_basis_n, self.mf_patch_basis_n)
+                    wp.copy(self._ws_prev_patch_basis_t0, self.mf_patch_basis_t0)
                 self._ws_prev_dt = float(dt)
                 if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
                     wp.launch(
@@ -6214,6 +6265,8 @@ class SolverFeatherPGS(SolverBase):
                             contacts.rigid_contact_count,
                             self.contact_path,
                             self.contact_slot,
+                            int(self.contact_patch_wrench),
+                            self.contact_block_owner,
                         ],
                         outputs=[self._ws_prev_slot_sorted],
                         device=model.device,
@@ -6345,6 +6398,12 @@ class SolverFeatherPGS(SolverBase):
         propagation_row_parent = getattr(self, "propagation_row_parent", None)
         if propagation_row_parent is None:
             propagation_row_parent = self._dummy_contact_row_parent
+        mf_patch_basis_n = getattr(self, "mf_patch_basis_n", None)
+        if mf_patch_basis_n is None:
+            mf_patch_basis_n = self._dummy_patch_basis
+        mf_patch_basis_t0 = getattr(self, "mf_patch_basis_t0", None)
+        if mf_patch_basis_t0 is None:
+            mf_patch_basis_t0 = self._dummy_patch_basis
 
         wp.launch(
             compute_contact_linear_force_from_impulses,
@@ -6367,10 +6426,14 @@ class SolverFeatherPGS(SolverBase):
                 mf_row_parent,
                 propagation_row_type,
                 propagation_row_parent,
+                int(self.contact_patch_wrench),
+                self.contact_block_owner,
+                mf_patch_basis_n,
+                mf_patch_basis_t0,
                 enable_friction_flag,
                 inv_dt,
             ],
-            outputs=[contacts.rigid_contact_force],
+            outputs=[contacts.rigid_contact_force, self._rigid_contact_torque],
             device=self.model.device,
         )
 
@@ -6381,6 +6444,7 @@ class SolverFeatherPGS(SolverBase):
                 inputs=[
                     contacts.rigid_contact_count,
                     contacts.rigid_contact_force,
+                    self._rigid_contact_torque,
                 ],
                 outputs=[contacts.force],
                 device=self.model.device,
@@ -7496,6 +7560,7 @@ class SolverFeatherPGS(SolverBase):
                     enable_friction_flag,
                     self.contact_friction_gap_threshold,
                     self.contact_friction_anchor_limit,
+                    int(self.contact_patch_wrench),
                 ],
                 outputs=[
                     self.contact_world,
@@ -7508,6 +7573,7 @@ class SolverFeatherPGS(SolverBase):
                     propagation_slot_counter,
                     self.dense_contact_world_flag,
                     self.contact_slots_needed,
+                    self.contact_block_owner,
                 ],
                 device=model.device,
             )
@@ -7576,6 +7642,12 @@ class SolverFeatherPGS(SolverBase):
 
             # Build MF contact rows
             if mf_active:
+                if self.contact_patch_wrench and not getattr(contacts, "rigid_contacts_pair_sorted", False):
+                    # Patch grouping assumes same-pair contacts are contiguous.
+                    raise ValueError(
+                        "contact_patch_wrench=True requires pair-sorted contacts: build the "
+                        "CollisionPipeline with deterministic=True (or any contact_matching mode)"
+                    )
                 wp.launch(
                     build_mf_contact_rows,
                     dim=contacts.rigid_contact_max,
@@ -7609,6 +7681,9 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
+                        int(self.contact_patch_wrench),
+                        self.contact_block_owner,
+                        self.contact_slots_needed,
                     ],
                     outputs=[
                         self.mf_body_a,
@@ -7621,6 +7696,8 @@ class SolverFeatherPGS(SolverBase):
                         self.mf_phi,
                         self.mf_target_velocity,
                         self.mf_row_restitution,
+                        self.mf_patch_basis_n,
+                        self.mf_patch_basis_t0,
                     ],
                     device=model.device,
                 )
@@ -7847,12 +7924,19 @@ class SolverFeatherPGS(SolverBase):
                             self.contact_path,
                             self.contact_slot,
                             self.contact_world,
+                            int(self.contact_patch_wrench),
+                            self.contact_block_owner,
                             match_index,
                             self._ws_prev_slot_sorted,
                             self._ws_prev_mf_impulses,
                             self._ws_prev_mf_row_type,
+                            self._ws_prev_mf_row_parent,
+                            self._ws_prev_patch_basis_n,
+                            self._ws_prev_patch_basis_t0,
                             self.mf_row_type,
                             self.mf_row_parent,
+                            self.mf_patch_basis_n,
+                            self.mf_patch_basis_t0,
                             self._mf_warmstart_decay,
                             # Carried support impulses are proportional to dt, so
                             # rescale by the exact step-size ratio (1 at fixed dt).
@@ -9054,6 +9138,7 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_row_type,
                     self.mf_row_parent,
                     self.mf_row_mu,
+                    self.mf_phi,
                     self._pgs_contact_regularization_w,
                     self.mf_impulses,
                     self.v_out,
@@ -9083,6 +9168,7 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_row_type,
                     self.mf_row_parent,
                     self.mf_row_mu,
+                    self.mf_phi,
                     self._pgs_contact_regularization_w,
                     self.body_to_articulation,
                     self.articulation_dof_start,
@@ -10337,7 +10423,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
             int global_iter = iteration_offset + iter;
             for (int i = 0; i < m; i++) {{
                 int row_type = mf_row_type.data[c_off + i];
-                if (row_type == 2 && global_iter < friction_start_iteration) {{
+                if ((row_type == 2 || row_type == 8) && global_iter < friction_start_iteration) {{
                     s_impulse[i] = 0.0f;
                     continue;
                 }}
@@ -10439,6 +10525,34 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
                         }}
                     }}
                 }}
+                // Project: patch tipping moment (octagonal CoP bound; the
+                // pair sits at parent +3/+4 in the 6-row layout, +1/+2 in
+                // the frictionless 3-row layout)
+                else if (row_type == 7) {{
+                    int parent_idx = mf_row_parent.data[c_off + i];
+                    float lambda_n = s_impulse[parent_idx];
+                    float extent = mf_row_mu.data[c_off + i];
+                    float radius_m = fmaxf(extent * lambda_n, 0.0f);
+                    new_impulse = fminf(fmaxf(new_impulse, -radius_m), radius_m);
+                    int moff = i - parent_idx;
+                    int sib = (moff <= 2) ? (parent_idx + 3 - moff) : (parent_idx + 7 - moff);
+                    int m0 = (i < sib) ? i : sib;
+                    float lam_s = s_impulse[sib];
+                    float f_pos = fmaxf(lambda_n, 0.0f);
+                    float b_d0 = 1.41421356f * mf_phi.data[c_off + m0] * f_pos;
+                    float b_d1 = 1.41421356f * mf_phi.data[c_off + m0 + 1] * f_pos;
+                    float lo = fmaxf(fmaxf(-radius_m, lam_s - b_d0), -lam_s - b_d1);
+                    float hi = fminf(fminf(radius_m, lam_s + b_d0), -lam_s + b_d1);
+                    // Infeasible vs stale sibling: midpoint, capped at the box bound.
+                    if (lo > hi) {{ float mid_m = fminf(fmaxf(0.5f * (lo + hi), -radius_m), radius_m); lo = mid_m; hi = mid_m; }}
+                    new_impulse = fminf(fmaxf(new_impulse, lo), hi);
+                }}
+                // Project: patch torsion, |Mn| <= (mu * r_eff) * F
+                else if (row_type == 8) {{
+                    int parent_idx = mf_row_parent.data[c_off + i];
+                    float t_radius = fmaxf(mf_row_mu.data[c_off + i] * s_impulse[parent_idx], 0.0f);
+                    new_impulse = fminf(fmaxf(new_impulse, -t_radius), t_radius);
+                }}
 
                 float delta_impulse = new_impulse - old_impulse;
                 s_impulse[i] = new_impulse;
@@ -10504,6 +10618,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
         mf_row_type: wp.array2d[int],
         mf_row_parent: wp.array2d[int],
         mf_row_mu: wp.array2d[float],
+        mf_phi: wp.array2d[float],
         contact_regularization_w: float,
         mf_impulses: wp.array2d[float],
         v_out: wp.array[float],
@@ -10528,6 +10643,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
         mf_row_type: wp.array2d[int],
         mf_row_parent: wp.array2d[int],
         mf_row_mu: wp.array2d[float],
+        mf_phi: wp.array2d[float],
         contact_regularization_w: float,
         mf_impulses: wp.array2d[float],
         v_out: wp.array[float],
@@ -10553,6 +10669,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
             mf_row_type,
             mf_row_parent,
             mf_row_mu,
+            mf_phi,
             contact_regularization_w,
             mf_impulses,
             v_out,
@@ -16346,9 +16463,9 @@ def _get_pgs_solve_mf_gs_kernel(
             int packed_tp = meta.w;
             int mf_rt = packed_tp & 0xFFFF;
 
-            if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2) continue;
+            if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2 && mf_rt != 7 && mf_rt != 8) continue;
             if (row_phase == 0 && mf_rt == 4) continue;
-            if (mf_rt == 2 && global_iter < friction_start_iteration) {{
+            if ((mf_rt == 2 || mf_rt == 8) && global_iter < friction_start_iteration) {{
                 s_lam_mf[i] = 0.0f;
                 __syncwarp();
                 continue;
@@ -16394,6 +16511,33 @@ def _get_pgs_solve_mf_gs_kernel(
                 }}
             }} else if (mf_rt == 2) {{
                 {mf_friction_block}
+            }} else if (mf_rt == 7) {{
+                // Patch tipping-moment row: box clamp |M| <= extent * F plus
+                // the pair's diagonal bounds |Mx -+ My| <= sqrt(2)*ed*F from
+                // its phi slots (octagonal center-of-pressure bound). The
+                // pair sits at parent +3/+4 (6-row) or +1/+2 (3-row layout).
+                int mf_par = packed_tp >> 16;
+                float lambda_n = s_lam_mf[mf_par];
+                float extent = mf_row_mu.data[off_mf + i];
+                float radius_m = fmaxf(extent * lambda_n, 0.0f);
+                new_impulse = fminf(fmaxf(new_impulse, -radius_m), radius_m);
+                int moff = i - mf_par;
+                int sib = (moff <= 2) ? (mf_par + 3 - moff) : (mf_par + 7 - moff);
+                int m0 = (i < sib) ? i : sib;
+                float lam_s = s_lam_mf[sib];
+                float f_pos = fmaxf(lambda_n, 0.0f);
+                float b_d0 = 1.41421356f * mf_phi.data[off_mf + m0] * f_pos;
+                float b_d1 = 1.41421356f * mf_phi.data[off_mf + m0 + 1] * f_pos;
+                float lo = fmaxf(fmaxf(-radius_m, lam_s - b_d0), -lam_s - b_d1);
+                float hi = fminf(fminf(radius_m, lam_s + b_d0), -lam_s + b_d1);
+                // Infeasible vs stale sibling: midpoint, capped at the box bound.
+                if (lo > hi) {{ float mid_m = fminf(fmaxf(0.5f * (lo + hi), -radius_m), radius_m); lo = mid_m; hi = mid_m; }}
+                new_impulse = fminf(fmaxf(new_impulse, lo), hi);
+            }} else if (mf_rt == 8) {{
+                // Patch torsion row: |Mn| <= (mu * r_eff) * F.
+                int mf_par = packed_tp >> 16;
+                float t_radius = fmaxf(mf_row_mu.data[off_mf + i] * s_lam_mf[mf_par], 0.0f);
+                new_impulse = fminf(fmaxf(new_impulse, -t_radius), t_radius);
             }}
 
             if (mf_rt != 4) delta_impulse = new_impulse - old_impulse;
@@ -16602,6 +16746,7 @@ def _get_pgs_solve_mf_gs_kernel(
         mf_MiJt_a: wp.array3d[float],
         mf_MiJt_b: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
+        mf_phi: wp.array2d[float],
         contact_regularization_w: float,
         # Shared
         iterations: int,
@@ -16644,6 +16789,7 @@ def _get_pgs_solve_mf_gs_kernel(
         mf_MiJt_a: wp.array3d[float],
         mf_MiJt_b: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
+        mf_phi: wp.array2d[float],
         contact_regularization_w: float,
         # Shared
         iterations: int,
@@ -16685,6 +16831,7 @@ def _get_pgs_solve_mf_gs_kernel(
             mf_MiJt_a,
             mf_MiJt_b,
             mf_row_mu,
+            mf_phi,
             contact_regularization_w,
             iterations,
             omega,

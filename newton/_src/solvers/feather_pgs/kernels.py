@@ -43,7 +43,17 @@ PGS_CONSTRAINT_TYPE_MIMIC = 5
 # joints; see ``_FeatherPGSModelPlan.build``). Three rows per closure, world-axis
 # directions, unbounded lambda, Baumgarte drift correction.
 PGS_CONSTRAINT_TYPE_CONNECT = 6
-PGS_CONSTRAINT_TYPE_COUNT = 7
+# Patch-wrench tipping-moment row (Mx/My pair). Represents distributed normal
+# pressure, not friction: active from the first position iteration and
+# unaffected by friction enable/gap controls. ``mu`` stores the support
+# extent [m] (clamp = extent * F); the pair's phi slots store the diagonal
+# extents of the octagonal center-of-pressure bound. Matrix-free rows only.
+PGS_CONSTRAINT_TYPE_PATCH_MOMENT = 7
+# Patch-wrench torsion row (spin about the contact normal). Frictional:
+# follows friction scheduling and disappears with the tangential pair.
+# ``mu`` stores mu_c * r_eff [m] (clamp = mu * F). Matrix-free rows only.
+PGS_CONSTRAINT_TYPE_PATCH_TORSION = 8
+PGS_CONSTRAINT_TYPE_COUNT = 9
 
 # Numeric IDs for the ``friction_mode`` argument passed to the matrix-free
 # PGS solver kernels.  Mirrors the Python-side string enum on
@@ -1584,12 +1594,23 @@ def compute_contact_linear_force_from_impulses(
     mf_row_parent: wp.array2d[wp.int32],
     propagation_row_type: wp.array2d[wp.int32],
     propagation_row_parent: wp.array2d[wp.int32],
+    contact_patch_wrench: int,
+    contact_block_owner: wp.array[wp.int32],
+    mf_patch_basis_n: wp.array2d[wp.vec3],
+    mf_patch_basis_t0: wp.array2d[wp.vec3],
     enable_friction: int,
     inv_dt: float,
     # outputs
     rigid_contact_force: wp.array[wp.vec3],
+    rigid_contact_torque: wp.array[wp.vec3],
 ):
-    """Convert solved FeatherPGS contact impulses into world-frame forces."""
+    """Convert solved FeatherPGS contact impulses into world-frame forces.
+
+    A patch-wrench leader reports the whole block's totals: force in the
+    block basis (which may be rotated onto the patch's principal axes, not
+    the arbitrary per-contact basis) and the tipping/torsion moments as a
+    torque. Followers own no rows and report zero.
+    """
     c = wp.tid()
     total_contacts = contact_count[0]
     if c >= total_contacts:
@@ -1649,12 +1670,38 @@ def compute_contact_linear_force_from_impulses(
                 lam_t0 = propagation_impulses[world, slot + 1]
                 lam_t1 = propagation_impulses[world, slot + 2]
 
-        force = lam_n * normal
-        if enable_friction != 0:
-            tangent0, tangent1 = contact_tangent_basis(normal)
-            force += lam_t0 * tangent0 + lam_t1 * tangent1
+        torque = wp.vec3(0.0)
+        is_patch_leader = int(0)
+        if contact_patch_wrench != 0 and path == 1:
+            if contact_block_owner[c] == c:
+                is_patch_leader = 1
+        if is_patch_leader != 0:
+            n_b = mf_patch_basis_n[world, slot]
+            t0_b = mf_patch_basis_t0[world, slot]
+            t1_b = wp.cross(n_b, t0_b)
+            force = lam_n * n_b + lam_t0 * t0_b + lam_t1 * t1_b
+            # Moment rows sit at +3/+4(+5) with friction, +1/+2 without.
+            m0 = slot + 3
+            if mf_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_PATCH_MOMENT:
+                m0 = slot + 1
+            count_mf = mf_constraint_count[world]
+            if m0 + 1 < count_mf and mf_row_type[world, m0] == PGS_CONSTRAINT_TYPE_PATCH_MOMENT:
+                torque = mf_impulses[world, m0] * t0_b + mf_impulses[world, m0 + 1] * t1_b
+                mn = m0 + 2
+                if mn < count_mf and mf_row_type[world, mn] == PGS_CONSTRAINT_TYPE_PATCH_TORSION:
+                    torque += mf_impulses[world, mn] * n_b
+        else:
+            force = lam_n * normal
+            if enable_friction != 0:
+                tangent0, tangent1 = contact_tangent_basis(normal)
+                force += lam_t0 * tangent0 + lam_t1 * tangent1
         force *= inv_dt
+        torque *= inv_dt
+        rigid_contact_torque[c] = torque
+        rigid_contact_force[c] = force
+        return
 
+    rigid_contact_torque[c] = wp.vec3(0.0)
     rigid_contact_force[c] = force
 
 
@@ -1662,16 +1709,18 @@ def compute_contact_linear_force_from_impulses(
 def pack_contact_linear_force_as_spatial(
     contact_count: wp.array[wp.int32],
     rigid_contact_force: wp.array[wp.vec3],
+    rigid_contact_torque: wp.array[wp.vec3],
     # outputs
     contact_force: wp.array[wp.spatial_vector],
 ):
-    """Pack linear contact forces into Newton's spatial-force contact buffer."""
+    """Pack contact forces (and patch-wrench moments) into Newton's
+    spatial-force contact buffer."""
     c = wp.tid()
     total_contacts = contact_count[0]
     if c >= total_contacts:
         return
 
-    contact_force[c] = wp.spatial_vector(rigid_contact_force[c], wp.vec3(0.0))
+    contact_force[c] = wp.spatial_vector(rigid_contact_force[c], rigid_contact_torque[c])
 
 
 # Computes J*v contribution on the fly by walking the tree
@@ -3259,6 +3308,109 @@ def populate_joint_velocity_limit_J_for_size(
 # world. The constraint system becomes world-level instead of per-articulation.
 
 
+@wp.func
+def _patch_member_mask(
+    leader: int,
+    total_contacts: int,
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+):
+    """8-bit membership mask for the contact window starting at ``leader``,
+    plus the minimum separation over the members.
+
+    Bit ``j`` set = contact ``leader + j`` belongs to the leader's coplanar
+    patch (bit 0 = the leader itself). Returns mask 0 when fewer than two
+    contacts qualify: a patch needs at least two members to carry support
+    moments. Membership requires the same shape pair, near-identical normals,
+    and a witness midpoint within a scale-aware distance of the leader's
+    contact plane. Pure function of the contact arrays, so allocation, row
+    building, and warm-start threads all derive identical membership.
+
+    The min member phi is what allocation gates the patch friction rows on
+    (any member within the friction gap activates the tangential pair).
+    """
+    sa = contact_shape0[leader]
+    sb = contact_shape1[leader]
+    n_l = -contact_normal[leader]
+    body_a = int(-1)
+    body_b = int(-1)
+    if sa >= 0:
+        body_a = shape_body[sa]
+    if sb >= 0:
+        body_b = shape_body[sb]
+
+    pa = contact_point0[leader]
+    if body_a >= 0:
+        pa = wp.transform_point(body_q[body_a], pa)
+    pa = pa - contact_thickness0[leader] * n_l
+    pb = contact_point1[leader]
+    if body_b >= 0:
+        pb = wp.transform_point(body_q[body_b], pb)
+    pb = pb + contact_thickness1[leader] * n_l
+    mid_l = 0.5 * (pa + pb)
+    phi_min = wp.dot(n_l, pa - pb)
+
+    # Tangential span of the normal-aligned candidates sets the coplanarity
+    # tolerance, so the test is scale-free.
+    span = float(0.0)
+    for j in range(1, 8):
+        cc = leader + j
+        if cc >= total_contacts:
+            break
+        if contact_shape0[cc] != sa or contact_shape1[cc] != sb:
+            break
+        if wp.dot(-contact_normal[cc], n_l) < 0.999:
+            continue
+        pa_j = contact_point0[cc]
+        if body_a >= 0:
+            pa_j = wp.transform_point(body_q[body_a], pa_j)
+        pa_j = pa_j - contact_thickness0[cc] * n_l
+        pb_j = contact_point1[cc]
+        if body_b >= 0:
+            pb_j = wp.transform_point(body_q[body_b], pb_j)
+        pb_j = pb_j + contact_thickness1[cc] * n_l
+        d = 0.5 * (pa_j + pb_j) - mid_l
+        d_t = d - wp.dot(d, n_l) * n_l
+        span = wp.max(span, wp.length(d_t))
+    # Floor covers contact hover noise; the slope accepts patches tilted up
+    # to ~2.9 deg and rejects witness sets from distinct faces.
+    tol = wp.max(0.001, 0.05 * span)
+
+    mask = int(1)
+    count = int(1)
+    for j in range(1, 8):
+        cc = leader + j
+        if cc >= total_contacts:
+            break
+        if contact_shape0[cc] != sa or contact_shape1[cc] != sb:
+            break
+        if wp.dot(-contact_normal[cc], n_l) < 0.999:
+            continue
+        pa_j = contact_point0[cc]
+        if body_a >= 0:
+            pa_j = wp.transform_point(body_q[body_a], pa_j)
+        pa_j = pa_j - contact_thickness0[cc] * n_l
+        pb_j = contact_point1[cc]
+        if body_b >= 0:
+            pb_j = wp.transform_point(body_q[body_b], pb_j)
+        pb_j = pb_j + contact_thickness1[cc] * n_l
+        if wp.abs(wp.dot(0.5 * (pa_j + pb_j) - mid_l, n_l)) > tol:
+            continue
+        mask |= 1 << j
+        count += 1
+        phi_min = wp.min(phi_min, wp.dot(n_l, pa_j - pb_j))
+    if count < 2:
+        return 0, phi_min
+    return mask, phi_min
+
+
 @wp.kernel
 def allocate_world_contact_slots(
     contact_count: wp.array[int],
@@ -3288,6 +3440,7 @@ def allocate_world_contact_slots(
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_anchor_limit: int,
+    contact_patch_wrench: int,
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -3299,6 +3452,7 @@ def allocate_world_contact_slots(
     propagation_slot_counter: wp.array[int],
     dense_contact_world_flag: wp.array[int],
     contact_slots_needed: wp.array[int],
+    contact_block_owner: wp.array[int],
 ):
     """
     Phase 1 of multi-articulation contact building.
@@ -3311,8 +3465,14 @@ def allocate_world_contact_slots(
     friction gap threshold, 2 adjacent slots for Coulomb friction rows.
     A positive contact gap gate excludes wider speculative contacts before any
     route reserves slots; zero disables the gate.
+
+    ``contact_block_owner[c]`` is the patch-block assignment consumed by row
+    building and warm start: the leader's contact index for patch members
+    (leader included), -1 for classic per-contact rows and non-MF contacts.
     """
     c = wp.tid()
+    if contact_patch_wrench != 0:
+        contact_block_owner[c] = -1
     total_contacts = contact_count[0]
     if c >= total_contacts:
         contact_slot[c] = -1
@@ -3448,6 +3608,58 @@ def allocate_world_contact_slots(
     if add_friction and (contact_friction_anchor_limit == 0 or friction_anchor_rank < contact_friction_anchor_limit):
         slots_needed = 3
     contact_slots_needed[c] = slots_needed
+
+    if contact_patch_wrench != 0 and is_mf != 0:
+        # The run leader owns a >=2-member coplanar patch as one 6-row block;
+        # member followers own no rows; everything else (single contact,
+        # non-coplanar member, beyond the 8-contact window) falls through to
+        # classic per-contact rows (never dropped).
+        patch_rank = int(0)
+        for lookback in range(1, 9):
+            prev = c - lookback
+            if prev < 0:
+                break
+            if prev >= total_contacts:
+                break
+            if contact_shape0[prev] == shape_a and contact_shape1[prev] == shape_b:
+                patch_rank += int(1)
+            else:
+                break
+        if patch_rank < 8:
+            leader = c - patch_rank
+            mask, patch_phi_min = _patch_member_mask(
+                leader,
+                total_contacts,
+                contact_shape0,
+                contact_shape1,
+                contact_point0,
+                contact_point1,
+                contact_normal,
+                contact_thickness0,
+                contact_thickness1,
+                shape_body,
+                body_q,
+            )
+            if mask != 0:
+                if patch_rank == 0:
+                    # 3 rows [F, Mx, My] without active friction; 6 rows
+                    # [F, f0, f1, Mx, My, Mn] when any member is within the
+                    # friction gap. Row build reads the count back from
+                    # contact_slots_needed so both stay in agreement.
+                    slots_needed = 3
+                    if enable_friction != 0 and patch_phi_min <= contact_friction_gap_threshold:
+                        slots_needed = 6
+                    contact_slots_needed[c] = slots_needed
+                    contact_block_owner[c] = c
+                elif (mask >> patch_rank) & 1 != 0:
+                    contact_block_owner[c] = leader
+                    contact_slots_needed[c] = 0
+                    contact_slot[c] = -1
+                    contact_world[c] = world
+                    contact_art_a[c] = art_a
+                    contact_art_b[c] = art_b
+                    contact_path[c] = 1
+                    return
 
     if is_mf != 0:
         # Matrix-free path
@@ -3596,6 +3808,31 @@ def prescribed_relative_contact_target(
         articulation_origin,
         body_v_s,
     )
+    return -known_jv
+
+
+@wp.func
+def prescribed_relative_angular_target(
+    body_a: int,
+    art_a: int,
+    body_b: int,
+    art_b: int,
+    axis: wp.vec3,
+    prescribed_articulation: wp.array[int],
+    body_v_s: wp.array[wp.spatial_vector],
+):
+    """Return the target for a pure-torque row induced by prescribed motion.
+
+    A torque row measures ``dot(axis, omega_a - omega_b)``; prescribed sides
+    contribute their known angular velocity so the solved relative spin is
+    measured against the moving surface instead of the world. The
+    point-velocity helper is not the right Jacobian for these rows.
+    """
+    known_jv = float(0.0)
+    if body_a >= 0 and art_a >= 0 and prescribed_articulation[art_a] != 0:
+        known_jv += wp.dot(axis, wp.spatial_bottom(body_v_s[body_a]))
+    if body_b >= 0 and art_b >= 0 and prescribed_articulation[art_b] != 0:
+        known_jv -= wp.dot(axis, wp.spatial_bottom(body_v_s[body_b]))
     return -known_jv
 
 
@@ -4857,6 +5094,9 @@ def build_mf_contact_rows(
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
+    contact_patch_wrench: int,
+    contact_block_owner: wp.array[int],
+    contact_slots_needed: wp.array[int],
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -4868,6 +5108,8 @@ def build_mf_contact_rows(
     mf_phi: wp.array2d[float],
     mf_target_velocity: wp.array2d[float],
     mf_row_restitution: wp.array2d[float],
+    mf_patch_basis_n: wp.array2d[wp.vec3],
+    mf_patch_basis_t0: wp.array2d[wp.vec3],
 ):
     """Build MF constraint rows for contacts between free rigid bodies / ground.
 
@@ -4975,6 +5217,292 @@ def build_mf_contact_rows(
     if contact_friction_anchor_limit > 0 and friction_anchor_rank >= contact_friction_anchor_limit:
         will_add_friction = False
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
+
+    # Only a patch leader (allocate assigned it its own block) builds the
+    # block; other contacts reaching here are classic fallbacks.
+    if contact_patch_wrench != 0 and contact_block_owner[c] == c:
+        # ── Patch-wrench block: [F, f0, f1, Mx, My, Mn], or [F, Mx, My]
+        # without active friction (allocate decided; read the count back).
+        # F is the total normal force at the patch center; f0/f1 the
+        # tangential friction pair (sibling-cone, cone = mu * F: the whole
+        # patch's Coulomb budget); Mx/My are typed tipping-moment rows about
+        # the tangents with box clamps |M| <= extent * F — the inscribed
+        # center-of-pressure constraint. Making the patch moment an explicit
+        # solver variable removes the moment-redistribution lag that
+        # destabilizes tall stacks at low iteration counts.
+        patch_rows = contact_slots_needed[c]
+        total_c = contact_count[0]
+        # Support weights: full weight at the reference separation (deepest
+        # member, floored at touching), fading to zero across a band above
+        # it. The smooth fade -- not a hard phi > 0 cutoff -- keeps the
+        # patch geometry continuous through the hover noise of resting
+        # stacks. An all-separated (speculative) patch deliberately keeps
+        # relative-to-deepest weights so the block enters impact with the
+        # real support shape; the F row's phi bias still prevents any
+        # impulse before closing.
+        phi_min = float(1.0e6)
+        u0_min = float(1.0e6)
+        u0_max = float(-1.0e6)
+        u1_min = float(1.0e6)
+        u1_max = float(-1.0e6)
+        n_run = int(0)
+        for j in range(8):  # patch window: membership assigned by allocate
+            cc = c + j
+            if cc >= total_c:
+                break
+            if contact_block_owner[cc] != c:
+                continue
+            pa_j = contact_point0[cc]
+            pb_j = contact_point1[cc]
+            if body_a >= 0:
+                pa_j = wp.transform_point(body_q[body_a], pa_j)
+            pa_j = pa_j - contact_thickness0[cc] * normal
+            if body_b >= 0:
+                pb_j = wp.transform_point(body_q[body_b], pb_j)
+            pb_j = pb_j + contact_thickness1[cc] * normal
+            mid = 0.5 * (pa_j + pb_j)
+            phi_min = wp.min(phi_min, wp.dot(normal, pa_j - pb_j))
+            u0_r = wp.dot(t0, mid)
+            u1_r = wp.dot(t1, mid)
+            u0_min = wp.min(u0_min, u0_r)
+            u0_max = wp.max(u0_max, u0_r)
+            u1_min = wp.min(u1_min, u1_r)
+            u1_max = wp.max(u1_max, u1_r)
+            n_run += 1
+        if n_run == 0:
+            return
+        # Span from projection ranges: invariant to run-leader order.
+        d0_span = u0_max - u0_min
+        d1_span = u1_max - u1_min
+        span = wp.max(wp.sqrt(d0_span * d0_span + d1_span * d1_span), 1.0e-4)
+        # Band floor 0.3 mm covers the hover noise of resting contacts
+        # (~0.1-0.2 mm at production gap settings); the 0.002 * span slope
+        # is an angular tolerance (~0.11 deg of patch tilt).
+        band = wp.max(0.0003, 0.002 * span)
+        w_ref = wp.max(phi_min, 0.0)
+
+        center = wp.vec3(0.0)
+        mean_phi = float(0.0)
+        w_sum = float(0.0)
+        for j in range(8):  # patch window: membership assigned by allocate
+            cc = c + j
+            if cc >= total_c:
+                break
+            if contact_block_owner[cc] != c:
+                continue
+            pa_j = contact_point0[cc]
+            pb_j = contact_point1[cc]
+            if body_a >= 0:
+                pa_j = wp.transform_point(body_q[body_a], pa_j)
+            pa_j = pa_j - contact_thickness0[cc] * normal
+            if body_b >= 0:
+                pb_j = wp.transform_point(body_q[body_b], pb_j)
+            pb_j = pb_j + contact_thickness1[cc] * normal
+            phi_j = wp.dot(normal, pa_j - pb_j)
+            w_j = wp.clamp(1.0 - (phi_j - w_ref) / band, 0.0, 1.0)
+            center += w_j * 0.5 * (pa_j + pb_j)
+            mean_phi += w_j * phi_j
+            w_sum += w_j
+        center = center / w_sum
+        mean_phi = mean_phi / w_sum
+        # The moment reference must lie inside the support (the clamp encodes
+        # "center of pressure within the patch"); principal axes keep the
+        # clamp tight for line/point supports diagonal to the tangent basis.
+        sxx = float(1.0e-10)
+        sxy = float(0.0)
+        syy = float(1.0e-10)
+        for j in range(8):  # patch window: membership assigned by allocate
+            cc = c + j
+            if cc >= total_c:
+                break
+            if contact_block_owner[cc] != c:
+                continue
+            pa_j = contact_point0[cc]
+            pb_j = contact_point1[cc]
+            if body_a >= 0:
+                pa_j = wp.transform_point(body_q[body_a], pa_j)
+            pa_j = pa_j - contact_thickness0[cc] * normal
+            if body_b >= 0:
+                pb_j = wp.transform_point(body_q[body_b], pb_j)
+            pb_j = pb_j + contact_thickness1[cc] * normal
+            w_j = wp.clamp(1.0 - (wp.dot(normal, pa_j - pb_j) - w_ref) / band, 0.0, 1.0)
+            mid = 0.5 * (pa_j + pb_j)
+            u0c = wp.dot(t0, mid - center)
+            u1c = wp.dot(t1, mid - center)
+            sxx += w_j * u0c * u0c
+            sxy += w_j * u0c * u1c
+            syy += w_j * u1c * u1c
+        # Rotate only for clearly anisotropic supports; a square face's
+        # principal angle is covariance noise.
+        lam_diff = wp.sqrt((sxx - syy) * (sxx - syy) + 4.0 * sxy * sxy)
+        if lam_diff > 0.5 * (sxx + syy):
+            ang = 0.5 * wp.atan2(2.0 * sxy, sxx - syy)
+            ca = wp.cos(ang)
+            sa = wp.sin(ang)
+            t0p = ca * t0 + sa * t1
+            t1p = -sa * t0 + ca * t1
+            t0 = t0p
+            t1 = t1p
+
+        # No positional bias on moment rows: it selects the wrong
+        # equilibrium for laterally offset stacks.
+        e0 = float(1.0e-4)
+        e1 = float(1.0e-4)
+        # Diagonal extents: with the axis bounds they clamp the center of
+        # pressure to an octagon instead of the circumscribing box.
+        ed0 = float(1.0e-4)
+        ed1 = float(1.0e-4)
+        for j in range(8):  # patch window: membership assigned by allocate
+            cc = c + j
+            if cc >= total_c:
+                break
+            if contact_block_owner[cc] != c:
+                continue
+            pa_j = contact_point0[cc]
+            pb_j = contact_point1[cc]
+            if body_a >= 0:
+                pa_j = wp.transform_point(body_q[body_a], pa_j)
+            pa_j = pa_j - contact_thickness0[cc] * normal
+            if body_b >= 0:
+                pb_j = wp.transform_point(body_q[body_b], pb_j)
+            pb_j = pb_j + contact_thickness1[cc] * normal
+            w_j = wp.clamp(1.0 - (wp.dot(normal, pa_j - pb_j) - w_ref) / band, 0.0, 1.0)
+            mid = 0.5 * (pa_j + pb_j)
+            u0 = wp.dot(t0, mid - center)
+            u1 = wp.dot(t1, mid - center)
+            e0 = wp.max(e0, w_j * wp.abs(u0))
+            e1 = wp.max(e1, w_j * wp.abs(u1))
+            ed0 = wp.max(ed0, w_j * wp.abs(u0 + u1) * 0.70710678)
+            ed1 = wp.max(ed1, w_j * wp.abs(u0 - u1) * 0.70710678)
+
+        # Block basis snapshot: warm start compares it next step and cold
+        # starts the tangent/moment rows when the basis moved (their carried
+        # scalars are meaningless on rotated axes).
+        mf_patch_basis_n[world, slot] = normal
+        mf_patch_basis_t0[world, slot] = t0
+
+        for row_offset in range(6):
+            if row_offset >= patch_rows:
+                break
+            row_idx = slot + row_offset
+            # Role: 0=F, 1=f0, 2=f1, 3=Mx, 4=My, 5=Mn. The 3-row layout
+            # [F, Mx, My] skips the friction roles.
+            role = row_offset
+            if patch_rows == 3 and row_offset > 0:
+                role = row_offset + 2
+            if role == 0:
+                d = normal
+            elif role == 1:
+                d = t0
+            elif role == 2:
+                d = t1
+            elif role == 3:
+                d = t0  # torque axis
+            elif role == 4:
+                d = t1
+            else:
+                d = normal  # torsion axis (spin about the contact normal)
+            is_torque = role >= 3
+            if response_body_a >= 0:
+                art_a2 = contact_art_a[c]
+                origin_a2 = articulation_origin[art_a2]
+                if is_torque:
+                    mf_J_a[world, row_idx, 0] = 0.0
+                    mf_J_a[world, row_idx, 1] = 0.0
+                    mf_J_a[world, row_idx, 2] = 0.0
+                    mf_J_a[world, row_idx, 3] = d[0]
+                    mf_J_a[world, row_idx, 4] = d[1]
+                    mf_J_a[world, row_idx, 5] = d[2]
+                else:
+                    r_a2 = center - origin_a2
+                    ang_a2 = wp.cross(r_a2, d)
+                    mf_J_a[world, row_idx, 0] = d[0]
+                    mf_J_a[world, row_idx, 1] = d[1]
+                    mf_J_a[world, row_idx, 2] = d[2]
+                    mf_J_a[world, row_idx, 3] = ang_a2[0]
+                    mf_J_a[world, row_idx, 4] = ang_a2[1]
+                    mf_J_a[world, row_idx, 5] = ang_a2[2]
+            if response_body_b >= 0:
+                art_b2 = contact_art_b[c]
+                origin_b2 = articulation_origin[art_b2]
+                if is_torque:
+                    mf_J_b[world, row_idx, 0] = 0.0
+                    mf_J_b[world, row_idx, 1] = 0.0
+                    mf_J_b[world, row_idx, 2] = 0.0
+                    mf_J_b[world, row_idx, 3] = -d[0]
+                    mf_J_b[world, row_idx, 4] = -d[1]
+                    mf_J_b[world, row_idx, 5] = -d[2]
+                else:
+                    r_b2 = center - origin_b2
+                    ang_b2 = wp.cross(r_b2, d)
+                    mf_J_b[world, row_idx, 0] = -d[0]
+                    mf_J_b[world, row_idx, 1] = -d[1]
+                    mf_J_b[world, row_idx, 2] = -d[2]
+                    mf_J_b[world, row_idx, 3] = -ang_b2[0]
+                    mf_J_b[world, row_idx, 4] = -ang_b2[1]
+                    mf_J_b[world, row_idx, 5] = -ang_b2[2]
+            mf_body_a[world, row_idx] = response_body_a
+            mf_body_b[world, row_idx] = response_body_b
+            if role == 0:
+                mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
+                mf_row_parent[world, row_idx] = -1
+                # Weighted-mean phi, not deepest: measured A/B showed the
+                # deepest point over-corrects the whole patch for one corner
+                # and destabilizes resting stacks, while the worst-point
+                # penetration is governed by the contact bias either way.
+                mf_phi[world, row_idx] = mean_phi
+                mf_row_restitution[world, row_idx] = restitution
+                mf_row_mu[world, row_idx] = mu
+            else:
+                mf_row_parent[world, row_idx] = slot
+                mf_row_restitution[world, row_idx] = 0.0
+                if role <= 2:
+                    mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
+                    mf_phi[world, row_idx] = 0.0
+                    mf_row_mu[world, row_idx] = mu * contact_friction_scale
+                elif role == 3:
+                    mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_PATCH_MOMENT
+                    # Diagonal extents ride in the tipping pair's unused phi slots.
+                    mf_phi[world, row_idx] = ed0
+                    # torque about t0 shifts pressure along t1
+                    mf_row_mu[world, row_idx] = e1
+                elif role == 4:
+                    mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_PATCH_MOMENT
+                    mf_phi[world, row_idx] = ed1
+                    mf_row_mu[world, row_idx] = e0
+                else:
+                    mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_PATCH_TORSION
+                    mf_phi[world, row_idx] = 0.0
+                    # torsional friction: |Mn| <= mu * r_eff * F
+                    mf_row_mu[world, row_idx] = mu * contact_friction_scale * 0.5 * (e0 + e1)
+            # A prescribed (kinematic) side moves the whole patch: point rows
+            # take the surface velocity at the patch center, torque rows the
+            # relative prescribed spin about their axis.
+            if has_target_velocity != 0:
+                if is_torque:
+                    mf_target_velocity[world, row_idx] = prescribed_relative_angular_target(
+                        body_a,
+                        contact_art_a[c],
+                        body_b,
+                        contact_art_b[c],
+                        d,
+                        prescribed_articulation,
+                        body_v_s,
+                    )
+                else:
+                    mf_target_velocity[world, row_idx] = prescribed_relative_contact_target(
+                        body_a,
+                        contact_art_a[c],
+                        body_b,
+                        contact_art_b[c],
+                        center,
+                        center,
+                        d,
+                        prescribed_articulation,
+                        articulation_origin,
+                        body_v_s,
+                    )
+        return
 
     # Write rows for normal + friction
     for row_offset in range(3):
@@ -5263,12 +5791,19 @@ def gather_mf_warmstart(
     contact_path: wp.array[int],
     contact_slot: wp.array[int],
     contact_world: wp.array[int],
+    contact_patch_wrench: int,
+    contact_block_owner: wp.array[int],
     match_index: wp.array[int],  # rigid_contact_match_index (sorted-current -> prev-sorted idx)
-    prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev base MF slot (or -1)
+    prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev block base (see snapshot)
     prev_mf_impulses: wp.array2d[float],
     prev_mf_row_type: wp.array2d[int],
+    prev_mf_row_parent: wp.array2d[int],
+    prev_patch_basis_n: wp.array2d[wp.vec3],
+    prev_patch_basis_t0: wp.array2d[wp.vec3],
     mf_row_type: wp.array2d[int],  # THIS step's row types (already built)
     mf_row_parent: wp.array2d[int],
+    mf_patch_basis_n: wp.array2d[wp.vec3],
+    mf_patch_basis_t0: wp.array2d[wp.vec3],
     decay: float,
     dt_scale: float,
     mf_max_c: int,
@@ -5288,11 +5823,15 @@ def gather_mf_warmstart(
     changes (impulse is proportional to dt for quasi-static loads); 1.0 at fixed dt.
 
     ``match_index[c] >= 0`` is the previous frame's *sorted* contact index;
-    ``prev_slot_sorted`` is keyed the same way (see solver writeback), so
-    ``prev_slot = prev_slot_sorted[match_index[c]]`` is the base slot that
-    contact occupied last step. Friction rows are only seeded when BOTH this
-    step and the previous step allocated a friction row at the corresponding
-    offset (guards the variable 1-vs-3 stride).
+    ``prev_slot_sorted`` is keyed the same way (see snapshot). A patch leader
+    recovers its block through ANY matched member (all members snapshot the
+    leader's slot), so the block carry survives the leader itself churning. A
+    classic contact whose match resolved inside a previous patch block stays
+    cold: the block impulse is the whole patch's, not that contact's share.
+    Offset rows are seeded only when both steps allocated the same-typed row
+    at that offset AND the previous row belongs to the previous block
+    (``prev parent == prev base``) — without the parent check a block that
+    shrank could steal the next block's rows.
     """
     c = wp.tid()
     if c >= contact_count[0]:
@@ -5304,30 +5843,83 @@ def gather_mf_warmstart(
         return
 
     world = contact_world[c]
+    owner = int(-1)
+    if contact_patch_wrench != 0:
+        owner = contact_block_owner[c]
 
-    mi = match_index[c]
-    matched = mi >= 0
     prev_slot = int(-1)
-    if matched:
-        prev_slot = prev_slot_sorted[mi]
+    carry_offsets = int(1)
+    if owner == c:
+        # Patch leader: search the window for any matched member.
+        prev_was_patch = int(0)
+        for j in range(8):
+            cc = c + j
+            if cc >= contact_count[0]:
+                break
+            if contact_block_owner[cc] != c:
+                continue
+            mi = match_index[cc]
+            if mi >= 0:
+                raw = prev_slot_sorted[mi]
+                if raw <= -2:
+                    prev_slot = -2 - raw
+                    prev_was_patch = 1
+                    break
+                if raw >= 0:
+                    # Member was classic last step; its own rows still seed
+                    # the aligned block rows below (partial warm start).
+                    prev_slot = raw
+                    break
+        if prev_slot >= 0 and prev_was_patch != 0:
+            # Basis gate: carried tangent/moment scalars only mean the same
+            # world wrench while the patch basis holds. A rotated normal
+            # cold-starts the block; a rotated tangent frame (anisotropy
+            # gate flip, principal-axis jitter) keeps F and cold-starts the
+            # offset rows.
+            if wp.dot(prev_patch_basis_n[world, prev_slot], mf_patch_basis_n[world, new_slot]) < 0.999:
+                return
+            if wp.dot(prev_patch_basis_t0[world, prev_slot], mf_patch_basis_t0[world, new_slot]) < 0.999:
+                carry_offsets = 0
+    else:
+        mi = match_index[c]
+        if mi >= 0:
+            raw = prev_slot_sorted[mi]
+            if raw >= 0:
+                prev_slot = raw
+            # raw <= -2 (previous patch block): stay cold, see docstring.
+    if prev_slot < 0:
+        return  # cold: mf_impulses already zeroed
 
-    # Normal row (offset 0): always present for an MF contact.
-    if matched and prev_slot >= 0 and prev_mf_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+    # Normal row (offset 0): always present for an MF contact / block.
+    if prev_mf_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
         mf_impulses[world, new_slot] = decay * dt_scale * prev_mf_impulses[world, prev_slot]
-    # else: leave 0 (already memset)
 
-    # Friction rows (offsets 1..2): only if THIS step allocated them here and
-    # they belong to this contact's block (parent == base slot).
-    for r in range(1, 3):
+    # Offset rows (1..5): classic contacts carry two friction rows;
+    # patch-wrench blocks carry a tangential pair, a typed tipping-moment
+    # pair, and a torsion row (or just the moment pair without friction).
+    # The moment carry is what lets a jitter-offset stack hold its static
+    # interface moments at low iteration counts instead of rebuilding them
+    # from zero every frame. Seeding requires the previous row at the same
+    # offset to have the same type and belong to the previous block, so a
+    # layout change (friction toggling 3<->6 rows, patch<->classic) cold
+    # starts the rows whose meaning moved instead of misassigning them.
+    for r in range(1, 6):
+        if carry_offsets == 0:
+            break
         new_r = new_slot + r
         if new_r < mf_max_c:
-            if mf_row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION and mf_row_parent[world, new_r] == new_slot:
+            cur_t = mf_row_type[world, new_r]
+            is_block_row = (
+                cur_t == PGS_CONSTRAINT_TYPE_FRICTION
+                or cur_t == PGS_CONSTRAINT_TYPE_PATCH_MOMENT
+                or cur_t == PGS_CONSTRAINT_TYPE_PATCH_TORSION
+            )
+            if is_block_row and mf_row_parent[world, new_r] == new_slot:
                 prev_r = prev_slot + r
                 if (
-                    matched
-                    and prev_slot >= 0
-                    and prev_r < mf_max_c
-                    and prev_mf_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
+                    prev_r < mf_max_c
+                    and prev_mf_row_type[world, prev_r] == cur_t
+                    and prev_mf_row_parent[world, prev_r] == prev_slot
                 ):
                     mf_impulses[world, new_r] = decay * dt_scale * prev_mf_impulses[world, prev_r]
                 # else: leave 0
@@ -5338,15 +5930,21 @@ def snapshot_mf_prev_slots(
     contact_count: wp.array[int],
     contact_path: wp.array[int],
     contact_slot: wp.array[int],
+    contact_patch_wrench: int,
+    contact_block_owner: wp.array[int],
     # out
     prev_slot_sorted: wp.array[int],
 ):
-    """Record, per current sorted contact index, the base MF slot it occupied
-    this step (or -1 if it was not MF-routed / inactive). Run at the END of the
-    step so next step's ``rigid_contact_match_index`` (referencing this frame's
-    *sorted* index) resolves through it. One thread per contact-array slot;
-    indices beyond ``contact_count`` are written -1 so stale entries from a
-    larger previous frame can't leak.
+    """Record, per current sorted contact index, the base MF slot of the block
+    that solved it this step (or -1 if it was not MF-routed / inactive). Run at
+    the END of the step so next step's ``rigid_contact_match_index``
+    (referencing this frame's *sorted* index) resolves through it. One thread
+    per contact-array slot; indices beyond ``contact_count`` are written -1 so
+    stale entries from a larger previous frame can't leak.
+
+    Patch members record their leader's slot encoded as ``-2 - slot`` so the
+    gather can tell a patch block from a classic one: seeding a classic
+    contact from a whole-patch impulse would over-seed it by the member count.
     """
     c = wp.tid()
     if c >= contact_count[0]:
@@ -5355,8 +5953,17 @@ def snapshot_mf_prev_slots(
     if contact_path[c] != 1:
         prev_slot_sorted[c] = -1
         return
-    slot = contact_slot[c]
-    prev_slot_sorted[c] = slot
+    owner = int(-1)
+    if contact_patch_wrench != 0:
+        owner = contact_block_owner[c]
+    if owner >= 0:
+        leader_slot = contact_slot[owner]
+        if leader_slot >= 0:
+            prev_slot_sorted[c] = -2 - leader_slot
+        else:
+            prev_slot_sorted[c] = -1
+    else:
+        prev_slot_sorted[c] = contact_slot[c]
 
 
 @wp.kernel
@@ -8281,6 +8888,49 @@ def solve_coulomb_row(W: wp.mat33, b: wp.vec3, mu: float) -> FPGSCoulombNewtonRe
 
 
 @wp.func
+def patch_moment_step(
+    world: int,
+    i: int,
+    new_impulse: float,
+    mf_row_parent: wp.array2d[int],
+    mf_row_mu: wp.array2d[float],
+    mf_phi: wp.array2d[float],
+    mf_impulses: wp.array2d[float],
+):
+    """Project a patch tipping-moment row (``PGS_CONSTRAINT_TYPE_PATCH_MOMENT``).
+
+    Box clamp ``|M| <= extent * F`` (``mu`` stores the support extent) plus
+    the pair's diagonal bounds ``|Mx -+ My| <= sqrt(2) * ed * F`` from the
+    two rows' phi slots — together the octagonal center-of-pressure bound.
+    The pair sits at ``parent + 3/+4`` in the 6-row layout and ``+1/+2`` in
+    the frictionless 3-row layout.
+    """
+    parent_idx = mf_row_parent[world, i]
+    lambda_n = mf_impulses[world, parent_idx]
+    extent = mf_row_mu[world, i]
+    radius_m = wp.max(extent * lambda_n, 0.0)
+    lam_m = wp.clamp(new_impulse, -radius_m, radius_m)
+    moff = i - parent_idx
+    if moff <= 2:
+        sib = parent_idx + 3 - moff
+    else:
+        sib = parent_idx + 7 - moff
+    m0 = wp.min(i, sib)
+    lam_s = mf_impulses[world, sib]
+    f_pos = wp.max(lambda_n, 0.0)
+    b_d0 = 1.41421356 * mf_phi[world, m0] * f_pos
+    b_d1 = 1.41421356 * mf_phi[world, m0 + 1] * f_pos
+    lo = wp.max(wp.max(-radius_m, lam_s - b_d0), -lam_s - b_d1)
+    hi = wp.min(wp.min(radius_m, lam_s + b_d0), -lam_s + b_d1)
+    if lo > hi:
+        # Infeasible vs a stale sibling: midpoint, capped at the box bound.
+        mid_m = wp.clamp(0.5 * (lo + hi), -radius_m, radius_m)
+        lo = mid_m
+        hi = mid_m
+    return wp.clamp(lam_m, lo, hi)
+
+
+@wp.func
 def friction_step_current(
     world: int,
     i: int,
@@ -8291,6 +8941,7 @@ def friction_step_current(
     mf_MiJt_b: wp.array3d[float],
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
+    mf_phi: wp.array2d[float],
     body_to_articulation: wp.array[int],
     art_dof_start: wp.array[int],
     mf_impulses: wp.array2d[float],
@@ -8928,6 +9579,7 @@ def pgs_solve_mf_loop(
     mf_row_type: wp.array2d[int],
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
+    mf_phi: wp.array2d[float],
     contact_regularization_w: float,
     body_to_articulation: wp.array[int],
     art_dof_start: wp.array[int],
@@ -8965,7 +9617,9 @@ def pgs_solve_mf_loop(
     for it in range(iterations):
         for i in range(m_count):
             row_type = mf_row_type[world, i]
-            if row_type == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + it < friction_start_iteration:
+            if (
+                row_type == PGS_CONSTRAINT_TYPE_FRICTION or row_type == PGS_CONSTRAINT_TYPE_PATCH_TORSION
+            ) and iteration_offset + it < friction_start_iteration:
                 mf_impulses[world, i] = 0.0
                 continue
 
@@ -9069,11 +9723,27 @@ def pgs_solve_mf_loop(
                         mf_MiJt_b,
                         mf_row_parent,
                         mf_row_mu,
+                        mf_phi,
                         body_to_articulation,
                         art_dof_start,
                         mf_impulses,
                         v_out,
                     )
+            elif row_type == PGS_CONSTRAINT_TYPE_PATCH_MOMENT:
+                new_impulse = patch_moment_step(
+                    world,
+                    i,
+                    new_impulse,
+                    mf_row_parent,
+                    mf_row_mu,
+                    mf_phi,
+                    mf_impulses,
+                )
+            elif row_type == PGS_CONSTRAINT_TYPE_PATCH_TORSION:
+                # |Mn| <= (mu * r_eff) * F
+                t_parent = mf_row_parent[world, i]
+                t_radius = wp.max(mf_row_mu[world, i] * mf_impulses[world, t_parent], 0.0)
+                new_impulse = wp.clamp(new_impulse, -t_radius, t_radius)
 
             if row_type != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
                 delta_impulse = new_impulse - old_impulse
