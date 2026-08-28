@@ -5569,7 +5569,7 @@ def build_mf_contact_rows(
         else:
             mf_row_mu[world, row_idx] = friction_mu
         if has_target_velocity != 0:
-            row_target = prescribed_relative_contact_target(
+            mf_target_velocity[world, row_idx] = prescribed_relative_contact_target(
                 body_a,
                 contact_art_a[c],
                 body_b,
@@ -5581,7 +5581,6 @@ def build_mf_contact_rows(
                 articulation_origin,
                 body_v_s,
             )
-            mf_target_velocity[world, row_idx] = row_target
 
 
 @wp.kernel

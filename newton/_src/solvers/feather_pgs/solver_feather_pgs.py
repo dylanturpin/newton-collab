@@ -803,10 +803,14 @@ class SolverFeatherPGS(SolverBase):
                 matrix-free contact rows: the penalty ``g * diag`` enters both the Gauss-Seidel
                 residual and divisor during position iterations (never the velocity-only relax
                 pass). Makes statically indeterminate normal-force splits unique by pulling the
-                converged split toward the minimum-norm solution. The direct cost is a load
-                deficit: a determined support carries ``1/(1+g)`` of the rigid impulse per
-                position pass, which surfaces as a small resting sag (useful range is a few
-                percent, e.g. 0.01-0.05; ``0`` (default) is the exact rigid law). Applies to
+                converged split toward the minimum-norm solution in the diagonal metric (rows
+                weighted by their effective-mass diagonal), not the Euclidean minimum. The
+                direct cost is a load deficit: a determined support carries ``1/(1+g)`` of the
+                rigid impulse per position pass, which surfaces as a small resting sag.
+                Restitution solves through the same rows: rebound follows
+                ``|v_out| = (e - g)/(1+g) * |v_in|`` and vanishes at ``g = e``, so keep ``g``
+                well below any restitution coefficient in use (useful range is a few percent,
+                e.g. 0.01-0.05; ``0`` (default) is the exact rigid law). Applies to
                 the matrix-free contact routes of ``articulated_contact_response`` modes
                 ``"immediate"`` and ``"propagation-fused"``; the pure propagation routings
                 move those contacts off the matrix-free family and reject a nonzero value.
@@ -1385,11 +1389,6 @@ class SolverFeatherPGS(SolverBase):
             self._model_plan.prescribed_articulation, dtype=wp.int32, device=model.device
         )
         self._has_prescribed_response = bool(np.any(self._model_plan.prescribed_articulation != 0))
-        # mf_target_velocity is consumed by the RHS when prescribed motion or
-        # patch-wrench blocks write per-row targets.
-        # Prescribed-motion targets only; patch rows write targets under the
-        # same gate, so the wrench alone no longer forces the buffer.
-        self._mf_write_targets = bool(self._has_prescribed_response)
         self._compute_articulation_metadata(model)
         self._validate_heterogeneous_world_support(model)
         # Loop-closing joints are excluded from the tree (see _FeatherPGSModelPlan.build)
@@ -1432,7 +1431,7 @@ class SolverFeatherPGS(SolverBase):
         self._allocate_propagation_buffers(model)
         self.mf_target_velocity = (
             wp.zeros_like(self.mf_rhs, requires_grad=model.requires_grad)
-            if self._mf_write_targets
+            if self._has_prescribed_response
             else wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         )
         self._allocate_debug_buffers(model)
@@ -7113,7 +7112,7 @@ class SolverFeatherPGS(SolverBase):
         max_constraints = self.dense_max_constraints
         mf_active = self._has_free_rigid_bodies and self.pgs_mode != "dense"
         propagation_active = self._propagation_contacts_enabled()
-        if self._mf_write_targets:
+        if self._has_prescribed_response:
             self.mf_target_velocity.zero_()
 
         # Zero world-level buffers (only arrays that require it)
@@ -9037,7 +9036,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_row_type,
                 self.mf_target_velocity,
                 self.mf_row_restitution,
-                int(self._mf_write_targets),
+                int(self._has_prescribed_response),
                 self.body_to_articulation,
                 self.articulation_dof_start,
                 self.v_hat,
@@ -9085,7 +9084,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_row_type,
                 self.mf_target_velocity,
                 self.mf_row_restitution,
-                int(self._mf_write_targets),
+                int(self._has_prescribed_response),
                 self.rigid_body_max_depenetration_velocity,
                 self.pgs_beta,
                 dt,

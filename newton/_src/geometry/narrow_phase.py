@@ -792,7 +792,9 @@ def create_narrow_phase_primitive_kernel(
                 # Dedup tolerance scaled by the smaller box so millimeter
                 # parts keep distinct manifold points; duplicates from
                 # different clip lines are (near-)exactly coincident.
-                min_ext = wp.min(wp.min(scale_a[0], wp.min(scale_a[1], scale_a[2])), wp.min(scale_b[0], wp.min(scale_b[1], scale_b[2])))
+                min_ext_a = wp.min(scale_a[0], wp.min(scale_a[1], scale_a[2]))
+                min_ext_b = wp.min(scale_b[0], wp.min(scale_b[1], scale_b[2]))
+                min_ext = wp.min(min_ext_a, min_ext_b)
                 dedup_eps_sq = (1.0e-3 * min_ext) * (1.0e-3 * min_ext)
                 chosen = wp.vec4i(-1, -1, -1, -1)
                 for slot4 in range(4):

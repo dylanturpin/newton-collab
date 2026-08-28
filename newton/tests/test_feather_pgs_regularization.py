@@ -272,6 +272,62 @@ def test_regularization_validation(test: unittest.TestCase, device):
             )
 
 
+def test_regularization_restitution_effect_documented(test: unittest.TestCase, device):
+    """Regularization flows through impact rows too. The regularized fixed
+    point of a restitution row is v_out = (e - g)/(1+g) * |v_in| (the
+    proximal pull mixes the incoming velocity back in, so rebound vanishes
+    at g = e) - documented, and quantified here so any future exemption of
+    restitution events shows up as a deliberate change."""
+
+    def rebound(g):
+        builder = newton.ModelBuilder()
+        builder.rigid_gap = 0.003
+        cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7, restitution=0.8)
+        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.7, restitution=0.8))
+        b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.25), wp.quat_identity()))
+        builder.add_shape_sphere(b, radius=0.05, cfg=cfg)
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(
+            model,
+            reduce_contacts=True,
+            rigid_contact_max=32,
+            broad_phase="nxn",
+            deterministic=True,
+            contact_matching="latest",
+        )
+        contacts = pipeline.contacts()
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            pgs_iterations=16,
+            pgs_velocity_iterations=0,
+            pgs_contact_regularization=g,
+            mf_warmstart=True,
+        )
+        s0, s1 = model.state(), model.state()
+        control = model.control()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+        max_up = 0.0
+        for _k in range(90):
+            pipeline.collide(s0, contacts)
+            s0.clear_forces()
+            solver.step(s0, s1, control, contacts, 1.0 / 60.0)
+            s0, s1 = s1, s0
+            max_up = max(max_up, float(s0.body_qd.numpy()[b][2]))
+        return max_up
+
+    with wp.ScopedDevice(device):
+        e = 0.8
+        v0 = rebound(0.0)
+        test.assertGreater(v0, 1.0, "no bounce measured")
+        for g in (0.02, 0.5):
+            expected = (e - g) / (e * (1.0 + g))  # v_out(g) / v_out(0)
+            ratio = rebound(g) / v0
+            test.assertAlmostEqual(
+                ratio, expected, delta=0.06, msg=f"g={g}: rebound ratio {ratio:.3f}, want {expected:.3f}"
+            )
+
+
 class TestFeatherPGSRegularization(unittest.TestCase):
     pass
 
@@ -305,6 +361,12 @@ add_function_test(
     "test_regularization_validation",
     test_regularization_validation,
     devices=get_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSRegularization,
+    "test_regularization_restitution_effect_documented",
+    test_regularization_restitution_effect_documented,
+    devices=get_selected_cuda_test_devices(),
 )
 
 if __name__ == "__main__":
