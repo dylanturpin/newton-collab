@@ -5041,7 +5041,7 @@ def build_mf_contact_rows(
         else:
             mf_row_mu[world, row_idx] = friction_mu
         if has_target_velocity != 0:
-            row_target = prescribed_relative_contact_target(
+            mf_target_velocity[world, row_idx] = prescribed_relative_contact_target(
                 body_a,
                 contact_art_a[c],
                 body_b,
@@ -5053,7 +5053,6 @@ def build_mf_contact_rows(
                 articulation_origin,
                 body_v_s,
             )
-            mf_target_velocity[world, row_idx] = row_target
 
 
 @wp.kernel
@@ -5317,11 +5316,9 @@ def gather_mf_warmstart(
         mf_impulses[world, new_slot] = decay * dt_scale * prev_mf_impulses[world, prev_slot]
     # else: leave 0 (already memset)
 
-    # Offset rows: only if THIS step allocated them here and they belong to
-    # this contact's block (parent == base slot). Classic contacts carry two
-    # friction rows; offsets 3..5 exist for the stacked patch-wrench block
-    # layout and never match on classic 1- or 3-row blocks.
-    for r in range(1, 6):
+    # Friction rows (offsets 1..2): only if THIS step allocated them here and
+    # they belong to this contact's block (parent == base slot).
+    for r in range(1, 3):
         new_r = new_slot + r
         if new_r < mf_max_c:
             if mf_row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION and mf_row_parent[world, new_r] == new_slot:
@@ -5341,8 +5338,6 @@ def snapshot_mf_prev_slots(
     contact_count: wp.array[int],
     contact_path: wp.array[int],
     contact_slot: wp.array[int],
-    contact_shape0: wp.array[int],
-    contact_shape1: wp.array[int],
     # out
     prev_slot_sorted: wp.array[int],
 ):
