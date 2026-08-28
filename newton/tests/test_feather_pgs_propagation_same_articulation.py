@@ -13,6 +13,7 @@ reference operator.
 
 from __future__ import annotations
 
+import inspect
 import unittest
 
 import numpy as np
@@ -24,6 +25,13 @@ from newton.solvers import SolverFeatherPGS
 CONTACT_ROW_TYPE = 0
 DENSE_PATH = 0
 PROPAGATION_PATH = 2
+
+
+class TestPropagationCapacityApi(unittest.TestCase):
+    def test_signature_exposes_independent_capacity(self):
+        """Expose a backward-compatible optional propagation capacity."""
+        parameter = inspect.signature(SolverFeatherPGS.__init__).parameters["propagation_max_constraints"]
+        self.assertIsNone(parameter.default)
 
 
 def _build_scissor_model(device: str) -> newton.Model:
@@ -202,6 +210,23 @@ def _propagation_operator_diag(solver: SolverFeatherPGS) -> np.ndarray:
 
 @unittest.skipUnless(wp.get_cuda_device_count() > 0, "requires CUDA")
 class TestPropagationSameArticulation(unittest.TestCase):
+    def test_propagation_capacity_can_be_sized_independently(self):
+        """Size dense and propagation row storage independently."""
+        model = _build_scissor_model("cuda:0")
+        solver = _make_solver(
+            model,
+            "propagation",
+            propagation_max_constraints=17,
+        )
+        self.assertEqual(solver._requested_dense_max_constraints, 64)
+        self.assertEqual(solver.propagation_max_constraints, 17)
+
+    def test_propagation_capacity_defaults_to_dense_request(self):
+        """Preserve the historical dense-capacity fallback."""
+        model = _build_scissor_model("cuda:0")
+        solver = _make_solver(model, "propagation")
+        self.assertEqual(solver.propagation_max_constraints, 64)
+
     def test_scissor_scene_produces_same_articulation_contact(self):
         model = _build_scissor_model("cuda:0")
         solver = _make_solver(model, "immediate")

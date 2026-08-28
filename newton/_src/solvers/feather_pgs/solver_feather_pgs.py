@@ -654,6 +654,7 @@ class SolverFeatherPGS(SolverBase):
         restitution_velocity_threshold: float = 0.5,
         contact_speculative_scale: float = 1.0,
         contact_gap_gate: float = 0.0,
+        propagation_max_constraints: int | None = None,
     ):
         """
         Args:
@@ -876,8 +877,13 @@ class SolverFeatherPGS(SolverBase):
                 links of the same articulation to propagation rows instead of dense generalized
                 rows. Their effective mass is recomputed with exact cross operational-space
                 response by propagating each row's combined test impulse through the articulated
-                body factorization. Requires ``articulated_contact_response="propagation"``.
-                Defaults to False (dense routing, prior behavior).
+                body factorization. Requires ``articulated_contact_response="propagation"``
+                or ``"propagation-colored"``. Defaults to False (dense routing, prior
+                behavior).
+            propagation_max_constraints (int | None, optional): Maximum number of
+                propagation constraint rows stored per world. ``None`` preserves the
+                historical behavior of using ``dense_max_constraints`` for both dense
+                and propagation storage. Defaults to None.
             propagation_cached_response (bool, optional): Replace the per-iteration
                 propagation tree walk with cached per-body response matrices. Within one
                 solver pass the tree factorization is fixed, so deferred body impulse ->
@@ -1082,7 +1088,7 @@ class SolverFeatherPGS(SolverBase):
         if propagation_same_articulation_rows and articulated_contact_response == "immediate":
             raise ValueError(
                 "propagation_same_articulation_rows requires articulated_contact_response "
-                "'propagation' or 'propagation-fused'"
+                "'propagation' or 'propagation-colored'"
             )
         if propagation_same_articulation_rows and articulated_contact_response == "propagation-fused":
             raise NotImplementedError(
@@ -1134,9 +1140,7 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(f"pgs_mode must be 'dense', 'split', or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
         if self.enable_joint_velocity_limits and self.pgs_mode != "matrix_free":
-            raise NotImplementedError(
-                "enable_joint_velocity_limits=True currently requires pgs_mode='matrix_free'"
-            )
+            raise NotImplementedError("enable_joint_velocity_limits=True currently requires pgs_mode='matrix_free'")
         if articulated_contact_response != "immediate" and self.pgs_mode != "matrix_free":
             raise NotImplementedError(
                 f"articulated_contact_response={articulated_contact_response!r} currently requires "
@@ -1237,9 +1241,14 @@ class SolverFeatherPGS(SolverBase):
             pass
         self.mf_max_constraints = int(mf_max_constraints)
         # Propagation rows replace the old D-wide dense articulated rows, not
-        # ordinary free/free MF rows. Keep their capacity tied to dense rows so
-        # mixed scenes with many free bodies do not allocate at the larger MF cap.
-        self.propagation_max_constraints = self._requested_dense_max_constraints
+        # ordinary free/free MF rows. Preserve the historical dense-capacity
+        # fallback while allowing workloads to size each row family from its
+        # independently measured demand.
+        self.propagation_max_constraints = (
+            self._requested_dense_max_constraints
+            if propagation_max_constraints is None
+            else int(propagation_max_constraints)
+        )
         if self.propagation_max_constraints < 1:
             raise ValueError("propagation_max_constraints must be positive")
         self._double_buffer = double_buffer
@@ -1277,11 +1286,7 @@ class SolverFeatherPGS(SolverBase):
         if pgs_kernel not in valid_pgs:
             raise ValueError(f"pgs_kernel must be one of {sorted(valid_pgs)}")
 
-        if (
-            self.pgs_mode != "matrix_free"
-            and self.enable_joint_limits
-            and pgs_kernel in ("tiled_contact", "streaming")
-        ):
+        if self.pgs_mode != "matrix_free" and self.enable_joint_limits and pgs_kernel in ("tiled_contact", "streaming"):
             raise ValueError(
                 f"pgs_kernel={pgs_kernel!r} is contact-only and cannot solve joint-limit rows; "
                 "use pgs_kernel='loop' or 'tiled_row', or pgs_mode='matrix_free'"
