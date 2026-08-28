@@ -109,6 +109,26 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         )
         self.assertEqual(propagation_debug.articulated_contact_response, "propagation")
 
+    def test_joint_limit_solver_compatibility_validation(self):
+        model = _build_chain_model(num_links=2, num_worlds=1)
+
+        with self.assertRaisesRegex(NotImplementedError, "requires pgs_mode='matrix_free'"):
+            SolverFeatherPGS(
+                model,
+                pgs_mode="split",
+                enable_joint_velocity_limits=True,
+            )
+
+        for pgs_kernel in ("tiled_contact", "streaming"):
+            with self.subTest(pgs_kernel=pgs_kernel):
+                with self.assertRaisesRegex(ValueError, "contact-only"):
+                    SolverFeatherPGS(
+                        model,
+                        pgs_mode="split",
+                        pgs_kernel=pgs_kernel,
+                        enable_joint_limits=True,
+                    )
+
     def test_default_kwargs_produce_identical_kernel_selection(self):
         model = _build_chain_model()
         implicit = SolverFeatherPGS(model)
