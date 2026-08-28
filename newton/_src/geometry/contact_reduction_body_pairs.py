@@ -311,7 +311,7 @@ def build_reduction_group_pair_bound(model, shape_group) -> int:
     sg = np.asarray(shape_group, dtype=np.int64)
     ga, gb = sg[p[:, 0]], sg[p[:, 1]]
     lo, hi = np.minimum(ga, gb), np.maximum(ga, gb)
-    # Group ids are asserted below MAX_GROUP_ID (2**21) at pipeline construction,
+    # Group ids are asserted below MAX_GROUP_ID (2**23) at pipeline construction,
     # so this packing stays far inside int64 and cannot alias two distinct pairs.
     return int(np.unique(lo * (int(sg.max()) + 1) + hi).size)
 
@@ -392,33 +392,38 @@ BODY_PAIR_REDUCTION_SLOTS = BODY_PAIR_NUM_DIRECTIONS + 1
 
 # Bit budget of the 63-bit group key. Group ids are asserted against this at
 # pipeline construction: aliasing two groups could evict a patch's deepest
-# contact, which would break the strict keep-deepest guarantee.
-GROUP_ID_BITS = 21
+# contact, which would break the strict keep-deepest guarantee. Replicated
+# scenes can create one material-equivalence group per body per world, so 21
+# bits can be exhausted before the contact or solver buffers are. Two bits are
+# borrowed from each spatial coordinate to support larger replicated scenes
+# without adding another lookup to the contact hot path.
+GROUP_ID_BITS = 23
 MAX_GROUP_ID = (1 << GROUP_ID_BITS) - 1
-# Cell coordinates are packed EXACTLY as two signed 8-bit values, measured from
+# Cell coordinates are packed EXACTLY as two signed 6-bit values, measured from
 # the pair's own reference body (see _contact_group_key), so the range covers a
-# +/-127-cell span ACROSS ONE BODY PAIR -- 32 m at the default cell size, far
-# more than any single pair of colliders spans. Beyond it the coordinate clamps
+# +/-31-cell span from that reference -- 7.75 m at the default cell size, or
+# 15.5 m across the full packed span. Beyond it the coordinate clamps
 # to the border cell, which only ever over-competes (the deepest of the merged
 # region is still kept) and is counted in the clamp telemetry.
-CELL_COORD_MAX = 127
+CELL_COORD_BITS = 6
+CELL_COORD_MAX = (1 << (CELL_COORD_BITS - 1)) - 1
 
 
 @wp.func
 def _make_group_key(group_a: int, group_b: int, bin_id: int, cx: int, cy: int) -> wp.uint64:
     """Pack (group_a, group_b, normal bin, exact spatial cell) into 63 bits.
 
-    Layout: ``[62:42] group_a (21b) | [41:21] group_b (21b) | [20:16] bin (5b)
-    | [15:8] cx (8b) | [7:0] cy (8b)``.  All fields are exact within their
+    Layout: ``[62:40] group_a (23b) | [39:17] group_b (23b) | [16:12] bin (5b)
+    | [11:6] cx (6b) | [5:0] cy (6b)``.  All fields are exact within their
     asserted/clamped ranges, so two distinct groups can never alias.
     """
     ux = wp.uint64(wp.clamp(cx, -CELL_COORD_MAX, CELL_COORD_MAX) + CELL_COORD_MAX)
     uy = wp.uint64(wp.clamp(cy, -CELL_COORD_MAX, CELL_COORD_MAX) + CELL_COORD_MAX)
     return (
-        (wp.uint64(group_a) << wp.uint64(42))
-        | (wp.uint64(group_b) << wp.uint64(21))
-        | ((wp.uint64(bin_id) & wp.uint64(0x1F)) << wp.uint64(16))
-        | (ux << wp.uint64(8))
+        (wp.uint64(group_a) << wp.uint64(40))
+        | (wp.uint64(group_b) << wp.uint64(17))
+        | ((wp.uint64(bin_id) & wp.uint64(0x1F)) << wp.uint64(12))
+        | (ux << wp.uint64(6))
         | uy
     )
 
@@ -603,7 +608,7 @@ def _contact_group_key(
     Both the cell and the returned face-plane position are measured from the
     pair's OWN reference body, not the world origin, because
     :func:`project_point_to_plane` is a pure linear map and the cell field is
-    only 8 bits per axis: absolute coordinates pin every contact past ~32 m to
+    only 6 bits per axis: absolute coordinates pin every contact past ~8 m to
     the border cell, which silently disables the subdivision for all but the
     envs nearest the origin.  Subtracting a per-group constant cannot change
     which contact is extreme in a direction, so the shift is free, and it also
@@ -675,7 +680,7 @@ def _contact_group_key(
     key = _make_group_key(ga, gb, bin_id, cx, cy)
     # Report the clamp rather than hide it: clamped cells merge distant regions
     # of one shape pair, which only over-competes, but a sustained nonzero count
-    # means one body pair spans more than +/-127 cells and reduction quality
+    # means one body pair spans more than +/-31 cells and reduction quality
     # across it is no longer what the cell size promises.
     clamped = wp.abs(cx) > CELL_COORD_MAX or wp.abs(cy) > CELL_COORD_MAX
     return key, gap, pos_2d, clamped
