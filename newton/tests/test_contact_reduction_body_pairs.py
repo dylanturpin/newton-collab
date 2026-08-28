@@ -916,6 +916,37 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         self.assertEqual(rows["dense_overflow_world_steps"], 1)
         self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
 
+    def test_row_watermark_includes_rolled_back_contact_rows(self):
+        """Count contact bundles rejected and rolled back by the allocator."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        _prismatic_jointed_foot(builder, (0.0, 0.0, 0.02))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        pipeline = _make_pipeline(model, False)
+        contacts = pipeline.contacts()
+        pipeline.collide(state_0, contacts)
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 1)
+
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            angular_damping=0.0,
+            dense_max_constraints=4,
+            row_watermark=True,
+        )
+        solver.step(state_0, state_1, model.control(), contacts, DT)
+        rows = solver.constraint_row_watermarks()
+
+        self.assertGreater(rows["dense_raw_high_water"], rows["dense_high_water"])
+        self.assertGreater(rows["dense_dropped_contact_rows_high_water"], 0)
+        self.assertEqual(
+            rows["dense_raw_high_water"],
+            rows["dense_high_water"] + rows["dense_dropped_contact_rows_high_water"],
+        )
+        self.assertEqual(rows["dense_overflow_world_steps"], 1)
+        self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
+
     def test_feather_pgs_conformance(self):
         """SolverFeatherPGS rests a free-jointed foot at the same height on/off.
 

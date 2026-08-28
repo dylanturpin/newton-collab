@@ -3288,6 +3288,7 @@ def allocate_world_contact_slots(
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_anchor_limit: int,
+    row_capacity_telemetry: int,
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -3299,6 +3300,9 @@ def allocate_world_contact_slots(
     propagation_slot_counter: wp.array[int],
     dense_contact_world_flag: wp.array[int],
     contact_slots_needed: wp.array[int],
+    dense_dropped_contact_rows: wp.array[int],
+    mf_dropped_contact_rows: wp.array[int],
+    propagation_dropped_contact_rows: wp.array[int],
 ):
     """
     Phase 1 of multi-articulation contact building.
@@ -3455,6 +3459,8 @@ def allocate_world_contact_slots(
         if slot + slots_needed > mf_max_constraints:
             # Roll back the counter so finalize sees only filled slots
             wp.atomic_add(mf_slot_counter, world, -slots_needed)
+            if row_capacity_telemetry != 0:
+                wp.atomic_add(mf_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
             contact_path[c] = -1
             return
@@ -3469,6 +3475,8 @@ def allocate_world_contact_slots(
         if slot + slots_needed > propagation_max_constraints:
             # Roll back the counter so finalize sees only filled slots
             wp.atomic_add(propagation_slot_counter, world, -slots_needed)
+            if row_capacity_telemetry != 0:
+                wp.atomic_add(propagation_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
             contact_path[c] = -1
             return
@@ -3483,6 +3491,8 @@ def allocate_world_contact_slots(
         if slot + slots_needed > max_constraints:
             # Roll back the counter so finalize sees only filled slots
             wp.atomic_add(world_slot_counter, world, -slots_needed)
+            if row_capacity_telemetry != 0:
+                wp.atomic_add(dense_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
             contact_path[c] = -1
             return

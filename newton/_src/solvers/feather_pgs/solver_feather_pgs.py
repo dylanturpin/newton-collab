@@ -204,15 +204,19 @@ def _accumulate_row_watermark(
 @wp.kernel
 def _accumulate_row_capacity_telemetry(
     raw_counts: wp.array[wp.int32],
+    dropped_contact_rows: wp.array[wp.int32],
     capacity: int,
     raw_watermark: wp.array[wp.int32],
+    dropped_contact_rows_watermark: wp.array[wp.int32],
     overflow_excess_watermark: wp.array[wp.int32],
     overflow_world_steps: wp.array[wp.int32],
 ):
     """Accumulate raw row demand and capacity overflow without changing solver state."""
     tid = wp.tid()
-    count = raw_counts[tid]
+    dropped = dropped_contact_rows[tid]
+    count = raw_counts[tid] + dropped
     wp.atomic_max(raw_watermark, 0, count)
+    wp.atomic_max(dropped_contact_rows_watermark, 0, dropped)
     excess = count - capacity
     if excess > 0:
         wp.atomic_max(overflow_excess_watermark, 0, excess)
@@ -1420,6 +1424,12 @@ class SolverFeatherPGS(SolverBase):
             self._row_watermark_dense_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_mf_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_propagation_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_dropped_dense = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
+            self._row_dropped_mf = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
+            self._row_dropped_propagation = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
+            self._row_dropped_dense_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_dropped_mf_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_dropped_propagation_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_overflow_dense_excess = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_overflow_mf_excess = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_overflow_propagation_excess = wp.zeros(1, dtype=wp.int32, device=wm_device)
@@ -1434,6 +1444,12 @@ class SolverFeatherPGS(SolverBase):
             self._row_watermark_dense_raw = None
             self._row_watermark_mf_raw = None
             self._row_watermark_propagation_raw = None
+            self._row_dropped_dense = None
+            self._row_dropped_mf = None
+            self._row_dropped_propagation = None
+            self._row_dropped_dense_high_water = None
+            self._row_dropped_mf_high_water = None
+            self._row_dropped_propagation_high_water = None
             self._row_overflow_dense_excess = None
             self._row_overflow_mf_excess = None
             self._row_overflow_propagation_excess = None
@@ -6242,8 +6258,10 @@ class SolverFeatherPGS(SolverBase):
                 dim=self.slot_counter.shape[0],
                 inputs=[
                     self.slot_counter,
+                    self._row_dropped_dense,
                     self.dense_max_constraints,
                     self._row_watermark_dense_raw,
+                    self._row_dropped_dense_high_water,
                     self._row_overflow_dense_excess,
                     self._row_overflow_dense_world_steps,
                 ],
@@ -6262,8 +6280,10 @@ class SolverFeatherPGS(SolverBase):
                     dim=self.mf_slot_counter.shape[0],
                     inputs=[
                         self.mf_slot_counter,
+                        self._row_dropped_mf,
                         self.mf_max_constraints,
                         self._row_watermark_mf_raw,
+                        self._row_dropped_mf_high_water,
                         self._row_overflow_mf_excess,
                         self._row_overflow_mf_world_steps,
                     ],
@@ -6282,8 +6302,10 @@ class SolverFeatherPGS(SolverBase):
                     dim=self.propagation_slot_counter.shape[0],
                     inputs=[
                         self.propagation_slot_counter,
+                        self._row_dropped_propagation,
                         self.propagation_max_constraints,
                         self._row_watermark_propagation_raw,
+                        self._row_dropped_propagation_high_water,
                         self._row_overflow_propagation_excess,
                         self._row_overflow_propagation_world_steps,
                     ],
@@ -6305,9 +6327,10 @@ class SolverFeatherPGS(SolverBase):
         """Return the opt-in constraint/contact row high-water marks.
 
         These are whole-run running maxima (warmup included) of retained and
-        raw per-world dense / matrix-free / rigid-contact row counts, plus the
-        peak over-capacity demand and number of overflowing world-steps. They
-        are accumulated inside the captured :meth:`step` when
+        raw per-world dense / matrix-free / rigid-contact row counts, rejected
+        contact rows that allocators rolled back, peak over-capacity demand,
+        and the number of overflowing world-steps. They are accumulated inside
+        the captured :meth:`step` when
         ``row_watermark`` is enabled. Reads ``.numpy()[0]`` from the device
         buffers and so must be called OUTSIDE any captured/timed region (it
         forces a device sync).
@@ -6319,14 +6342,17 @@ class SolverFeatherPGS(SolverBase):
             return {
                 "dense_high_water": 0,
                 "dense_raw_high_water": 0,
+                "dense_dropped_contact_rows_high_water": 0,
                 "dense_overflow_excess_high_water": 0,
                 "dense_overflow_world_steps": 0,
                 "mf_high_water": 0,
                 "mf_raw_high_water": 0,
+                "mf_dropped_contact_rows_high_water": 0,
                 "mf_overflow_excess_high_water": 0,
                 "mf_overflow_world_steps": 0,
                 "propagation_high_water": 0,
                 "propagation_raw_high_water": 0,
+                "propagation_dropped_contact_rows_high_water": 0,
                 "propagation_overflow_excess_high_water": 0,
                 "propagation_overflow_world_steps": 0,
                 "contact_high_water": 0,
@@ -6334,10 +6360,12 @@ class SolverFeatherPGS(SolverBase):
         return {
             "dense_high_water": int(self._row_watermark_dense.numpy()[0]),
             "dense_raw_high_water": int(self._row_watermark_dense_raw.numpy()[0]),
+            "dense_dropped_contact_rows_high_water": int(self._row_dropped_dense_high_water.numpy()[0]),
             "dense_overflow_excess_high_water": int(self._row_overflow_dense_excess.numpy()[0]),
             "dense_overflow_world_steps": int(self._row_overflow_dense_world_steps.numpy()[0]),
             "mf_high_water": int(self._row_watermark_mf.numpy()[0]),
             "mf_raw_high_water": int(self._row_watermark_mf_raw.numpy()[0]),
+            "mf_dropped_contact_rows_high_water": int(self._row_dropped_mf_high_water.numpy()[0]),
             "mf_overflow_excess_high_water": int(self._row_overflow_mf_excess.numpy()[0]),
             "mf_overflow_world_steps": int(self._row_overflow_mf_world_steps.numpy()[0]),
             "propagation_high_water": int(self._row_watermark_propagation.numpy()[0])
@@ -6345,6 +6373,9 @@ class SolverFeatherPGS(SolverBase):
             else 0,
             "propagation_raw_high_water": int(self._row_watermark_propagation_raw.numpy()[0])
             if self._row_watermark_propagation_raw is not None
+            else 0,
+            "propagation_dropped_contact_rows_high_water": int(self._row_dropped_propagation_high_water.numpy()[0])
+            if self._row_dropped_propagation_high_water is not None
             else 0,
             "propagation_overflow_excess_high_water": int(self._row_overflow_propagation_excess.numpy()[0])
             if self._row_overflow_propagation_excess is not None
@@ -7097,6 +7128,10 @@ class SolverFeatherPGS(SolverBase):
         # Zero world-level buffers (only arrays that require it)
         self.slot_counter.zero_()  # atomic-add counter
         self.dense_contact_world_flag.zero_()
+        if self._row_watermark:
+            self._row_dropped_dense.zero_()
+            self._row_dropped_mf.zero_()
+            self._row_dropped_propagation.zero_()
 
         if mf_active:
             self.mf_slot_counter.zero_()  # atomic-add counter
@@ -7132,6 +7167,9 @@ class SolverFeatherPGS(SolverBase):
         is_free_rigid = self.is_free_rigid if self.is_free_rigid is not None else self._dummy_is_free_rigid
         mf_slot_counter = self.mf_slot_counter if mf_active else self._dummy_mf_slot_counter
         propagation_slot_counter = self.propagation_slot_counter if propagation_active else self._dummy_mf_slot_counter
+        dense_dropped_rows = self._row_dropped_dense if self._row_watermark else self._dummy_mf_slot_counter
+        mf_dropped_rows = self._row_dropped_mf if self._row_watermark else self._dummy_mf_slot_counter
+        propagation_dropped_rows = self._row_dropped_propagation if self._row_watermark else self._dummy_mf_slot_counter
         j_buffers_zeroed = False
 
         drive_active = self.drive_mode == "physx_pgs" and self.drive_slot is not None
@@ -7539,6 +7577,7 @@ class SolverFeatherPGS(SolverBase):
                     enable_friction_flag,
                     self.contact_friction_gap_threshold,
                     self.contact_friction_anchor_limit,
+                    1 if self._row_watermark else 0,
                 ],
                 outputs=[
                     self.contact_world,
@@ -7551,6 +7590,9 @@ class SolverFeatherPGS(SolverBase):
                     propagation_slot_counter,
                     self.dense_contact_world_flag,
                     self.contact_slots_needed,
+                    dense_dropped_rows,
+                    mf_dropped_rows,
+                    propagation_dropped_rows,
                 ],
                 device=model.device,
             )

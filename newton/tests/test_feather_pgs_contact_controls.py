@@ -39,6 +39,9 @@ def _launch_contact_allocator(*, route: int, gap: float, gate: float):
         "mf_count": wp.zeros((1,), dtype=wp.int32, device=device),
         "propagation_count": wp.zeros((1,), dtype=wp.int32, device=device),
         "dense_world_flag": wp.zeros((1,), dtype=wp.int32, device=device),
+        "dense_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
+        "mf_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
+        "propagation_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
     }
     is_free = route == PATH_MATRIX_FREE
     propagation_enabled = route == PATH_PROPAGATION
@@ -73,6 +76,7 @@ def _launch_contact_allocator(*, route: int, gap: float, gate: float):
             0,
             float("inf"),
             0,
+            0,
         ],
         outputs=[
             outputs["world"],
@@ -85,6 +89,9 @@ def _launch_contact_allocator(*, route: int, gap: float, gate: float):
             counters["propagation_count"],
             counters["dense_world_flag"],
             outputs["slots_needed"],
+            counters["dense_dropped"],
+            counters["mf_dropped"],
+            counters["propagation_dropped"],
         ],
         device=device,
     )
