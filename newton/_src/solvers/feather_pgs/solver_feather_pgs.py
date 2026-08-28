@@ -1874,6 +1874,11 @@ class SolverFeatherPGS(SolverBase):
         per-step launches are CUDA-graph-safe.
         """
         self._mimic_count = 0
+        self._mimic_valid_np = None
+        self._mimic_world_np = None
+        self._mimic_art_start_np = None
+        self._mimic_art_start = None
+        self._mimic_art_list = None
         self.mimic_slot = None
         n = int(getattr(model, "constraint_mimic_count", 0) or 0)
         if not self.enable_mimic_constraints:
@@ -1883,10 +1888,8 @@ class SolverFeatherPGS(SolverBase):
                     "constraint(s); coupled joints will move independently.",
                     stacklevel=2,
                 )
-            self._mimic_world_np = None
             return
         if n == 0 or not model.articulation_count or self.art_to_world is None:
-            self._mimic_world_np = None
             return
 
         device = model.device
@@ -1936,9 +1939,21 @@ class SolverFeatherPGS(SolverBase):
             valid[k] = 1
             art[k] = a0
 
+        valid_indices = np.flatnonzero(valid).astype(np.int32, copy=False)
+        if valid_indices.size:
+            order = valid_indices[np.argsort(art[valid_indices], kind="stable")]
+            counts = np.bincount(art[order], minlength=model.articulation_count)
+        else:
+            order = np.empty(0, dtype=np.int32)
+            counts = np.zeros(model.articulation_count, dtype=np.int64)
+        art_start = np.zeros(model.articulation_count + 1, dtype=np.int32)
+        art_start[1:] = np.cumsum(counts, dtype=np.int64).astype(np.int32)
+
         self._mimic_valid_np = valid
         self._mimic_world_np = mimic_world
-        self._mimic_art = wp.array(art, dtype=wp.int32, device=device)
+        self._mimic_art_start_np = art_start
+        self._mimic_art_start = wp.array(art_start, dtype=wp.int32, device=device)
+        self._mimic_art_list = wp.array(order, dtype=wp.int32, device=device)
         self._mimic_valid = wp.array(valid, dtype=wp.int32, device=device)
         self._mimic_world = wp.array(mimic_world, dtype=wp.int32, device=device)
         self._mimic_dof0 = wp.array(joint_qd_start[j0], dtype=wp.int32, device=device)
@@ -2054,12 +2069,9 @@ class SolverFeatherPGS(SolverBase):
         # Per-articulation bilateral row capacity (upper bound: every valid constraint).
         counts: dict[int, int] = {}
         if self._mimic_count:
-            mimic_art_np = self._mimic_art.numpy()
-            mimic_valid_np = self._mimic_valid.numpy()
-            for k in range(self._mimic_count):
-                if mimic_valid_np[k]:
-                    a = int(mimic_art_np[k])
-                    counts[a] = counts.get(a, 0) + 1
+            for art, count in enumerate(np.diff(self._mimic_art_start_np)):
+                if count:
+                    counts[art] = int(count)
         if self._connect_count:
             connect_art_np = self._connect_art.numpy()
             for k in range(self._connect_count):
@@ -2110,7 +2122,8 @@ class SolverFeatherPGS(SolverBase):
                 self.group_to_art[size],
                 self._preelim_art_to_idx,
                 self.mimic_slot if self.mimic_slot is not None else self._dummy_is_free_rigid,
-                self._mimic_art if self._mimic_count else self._dummy_is_free_rigid,
+                self._mimic_art_start if self._mimic_count else self._dummy_is_free_rigid,
+                self._mimic_art_list if self._mimic_count else self._dummy_is_free_rigid,
                 int(self._mimic_count or 0),
                 self.connect_slot if self.connect_slot is not None else self._dummy_is_free_rigid,
                 self._connect_art if self._connect_count else self._dummy_is_free_rigid,
@@ -7158,7 +7171,8 @@ class SolverFeatherPGS(SolverBase):
                         self.art_to_world,
                         self.group_to_art[size],
                         self.mimic_slot,
-                        self._mimic_art,
+                        self._mimic_art_start,
+                        self._mimic_art_list,
                         self._mimic_dof0,
                         self._mimic_dof1,
                         self._mimic_q0,
