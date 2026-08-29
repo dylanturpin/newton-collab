@@ -639,6 +639,37 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                 )
                 self.assertEqual((slot, path, slots_needed), (0, PATH_DENSE, 1))
 
+    def test_negative_scoped_friction_gap_delays_only_articulation_pair_tangents(self):
+        """Keep pair normals while delaying friction, without changing free-body friction."""
+        shallow_pair = _launch_same_articulation_contact_allocator(
+            gap=-0.0005,
+            scoped_gate=0.0,
+            enable_friction=True,
+            friction_gap=-0.001,
+            friction_anchors=1,
+            friction_pairs_only=True,
+        )
+        deep_pair = _launch_same_articulation_contact_allocator(
+            gap=-0.002,
+            scoped_gate=0.0,
+            enable_friction=True,
+            friction_gap=-0.001,
+            friction_anchors=1,
+            friction_pairs_only=True,
+        )
+        free_body = _launch_contact_allocator(
+            route=PATH_MATRIX_FREE,
+            gap=0.004,
+            gate=0.0,
+            enable_friction=True,
+            friction_gap=-1.0,
+            friction_anchors=1,
+            friction_pairs_only=True,
+        )
+        self.assertEqual(shallow_pair, (0, PATH_DENSE, 1))
+        self.assertEqual(deep_pair, (0, PATH_DENSE, 3))
+        self.assertEqual(free_body["slots_needed"], 3)
+
     def test_speculative_scale_controls_every_position_rhs_family(self):
         """Scale positive-gap position bias on dense, MF, and propagation rows."""
         rhs_families = {
