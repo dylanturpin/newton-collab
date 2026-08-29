@@ -2153,6 +2153,38 @@ def allocate_physx_drive_slots(
 
 
 @wp.kernel
+def clear_grouped_jacobian_active_rows(
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    world_constraint_count: wp.array[int],
+    dof_count: int,
+    max_constraints: int,
+    # outputs
+    J_group: wp.array3d[float],
+):
+    """Clear only Jacobian rows that were active in the completed solve.
+
+    The launch assigns one warp to each articulation. Packing those warps in
+    ordinary CUDA blocks avoids the one-block-per-world scheduling overhead,
+    while lanes clear the compact active prefix cooperatively.
+    """
+    tid = wp.tid()
+    group_idx = tid // 32
+    lane = tid % 32
+    if group_idx >= group_to_art.shape[0]:
+        return
+
+    art = group_to_art[group_idx]
+    world = art_to_world[art]
+    row_count = wp.min(world_constraint_count[world], max_constraints)
+    element_count = row_count * dof_count
+    for element in range(lane, element_count, 32):
+        row = element // dof_count
+        dof = element - row * dof_count
+        J_group[group_idx, row, dof] = 0.0
+
+
+@wp.kernel
 def populate_physx_drive_J_for_size(
     articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
@@ -3186,9 +3218,10 @@ def populate_joint_velocity_limit_J_for_size(
 # world. The constraint system becomes world-level instead of per-articulation.
 
 
-@wp.kernel
-def allocate_world_contact_slots(
-    contact_count: wp.array[int],
+@wp.func
+def _allocate_world_contact_slot(
+    c: int,
+    total_contacts: int,
     contact_shape0: wp.array[int],
     contact_shape1: wp.array[int],
     contact_point0: wp.array[wp.vec3],
@@ -3228,8 +3261,7 @@ def allocate_world_contact_slots(
     dense_contact_world_flag: wp.array[int],
     contact_slots_needed: wp.array[int],
 ):
-    """
-    Phase 1 of multi-articulation contact building.
+    """Classify and allocate rows for one active contact.
 
     Allocates world-level constraint slots for each contact and records
     which articulations are involved. Contacts where both sides are free
@@ -3240,22 +3272,7 @@ def allocate_world_contact_slots(
     A positive contact gap gate excludes wider speculative contacts before any
     route reserves slots; zero disables the gate.
 
-    The narrow phase increments ``contact_count`` before checking its output
-    capacity, so an overflowed count does not describe a fully materialized
-    prefix. Reject the whole frame instead of reading incomplete records.
     """
-    c = wp.tid()
-    total_contacts = contact_count[0]
-    if total_contacts > contact_shape0.shape[0]:
-        contact_slot[c] = -1
-        contact_path[c] = -1
-        contact_slots_needed[c] = 0
-        return
-    if c >= total_contacts:
-        contact_slot[c] = -1
-        contact_path[c] = -1
-        return
-
     shape_a = contact_shape0[c]
     shape_b = contact_shape1[c]
 
@@ -3437,6 +3454,109 @@ def allocate_world_contact_slots(
         dense_contact_world_flag[world] = 1
 
 
+@wp.kernel
+def allocate_world_contact_slots(
+    contact_count: wp.array[int],
+    total_num_threads: int,
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    body_to_articulation: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    body_has_response_dofs: wp.array[int],
+    is_free_rigid: wp.array[int],
+    has_free_rigid: int,
+    propagation_articulated_contacts: int,
+    propagation_same_articulation: int,
+    propagation_free_free: int,
+    contact_gap_gate: float,
+    max_constraints: int,
+    mf_max_constraints: int,
+    propagation_max_constraints: int,
+    enable_friction: int,
+    contact_friction_gap_threshold: float,
+    contact_friction_anchor_limit: int,
+    # outputs
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    world_slot_counter: wp.array[int],
+    contact_path: wp.array[int],
+    mf_slot_counter: wp.array[int],
+    propagation_slot_counter: wp.array[int],
+    dense_contact_world_flag: wp.array[int],
+    contact_slots_needed: wp.array[int],
+):
+    """Allocate active contacts with work proportional to the materialized prefix.
+
+    The narrow phase increments :paramref:`contact_count` before checking its
+    output capacity. An overflowed count therefore does not describe a fully
+    materialized prefix; clear the routing arrays and reject that frame.
+    """
+    thread = wp.tid()
+    total_contacts = contact_count[0]
+    capacity = contact_shape0.shape[0]
+    if total_contacts > capacity:
+        for c in range(thread, capacity, total_num_threads):
+            contact_slot[c] = -1
+            contact_path[c] = -1
+            contact_slots_needed[c] = 0
+        return
+
+    for c in range(thread, total_contacts, total_num_threads):
+        _allocate_world_contact_slot(
+            c,
+            total_contacts,
+            contact_shape0,
+            contact_shape1,
+            contact_point0,
+            contact_point1,
+            contact_normal,
+            contact_thickness0,
+            contact_thickness1,
+            body_q,
+            shape_transform,
+            shape_body,
+            body_to_articulation,
+            art_to_world,
+            articulation_response_dof_count,
+            body_flags,
+            body_has_response_dofs,
+            is_free_rigid,
+            has_free_rigid,
+            propagation_articulated_contacts,
+            propagation_same_articulation,
+            propagation_free_free,
+            contact_gap_gate,
+            max_constraints,
+            mf_max_constraints,
+            propagation_max_constraints,
+            enable_friction,
+            contact_friction_gap_threshold,
+            contact_friction_anchor_limit,
+            contact_world,
+            contact_slot,
+            contact_art_a,
+            contact_art_b,
+            world_slot_counter,
+            contact_path,
+            mf_slot_counter,
+            propagation_slot_counter,
+            dense_contact_world_flag,
+            contact_slots_needed,
+        )
+
+
 @wp.func
 def accumulate_jacobian_row_world(
     body_index: int,
@@ -3538,6 +3658,313 @@ def prescribed_relative_contact_target(
         body_v_s,
     )
     return -known_jv
+
+
+@wp.kernel
+def prepare_world_contact_rows(
+    contact_count: wp.array[int],
+    total_num_threads: int,
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    contact_path: wp.array[int],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_v_s: wp.array[wp.spatial_vector],
+    prescribed_articulation: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    shape_material_mu: wp.array[float],
+    shape_material_restitution: wp.array[float],
+    enable_friction: int,
+    contact_friction_gap_threshold: float,
+    contact_friction_shared_anchor: int,
+    contact_friction_anchor_limit: int,
+    contact_friction_scale: float,
+    contact_shared_anchor: int,
+    pgs_beta: float,
+    pgs_cfm: float,
+    # outputs
+    world_row_type: wp.array2d[int],
+    world_row_parent: wp.array2d[int],
+    world_row_mu: wp.array2d[float],
+    world_row_beta: wp.array2d[float],
+    world_row_cfm: wp.array2d[float],
+    world_phi: wp.array2d[float],
+    world_target_velocity: wp.array2d[float],
+    world_row_restitution: wp.array2d[float],
+):
+    """Build dense-contact metadata once, independently of articulation size groups."""
+    total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+    for c in range(wp.tid(), total_contacts, total_num_threads):
+        if contact_path[c] != 0:
+            continue
+
+        slot = contact_slot[c]
+        if slot < 0:
+            continue
+
+        world = contact_world[c]
+        art_a = contact_art_a[c]
+        art_b = contact_art_b[c]
+        normal = -contact_normal[c]
+        shape_a = contact_shape0[c]
+        shape_b = contact_shape1[c]
+
+        body_a = -1
+        body_b = -1
+        if shape_a >= 0:
+            body_a = shape_body[shape_a]
+        if shape_b >= 0:
+            body_b = shape_body[shape_b]
+
+        point_a_world = contact_point0[c] - contact_thickness0[c] * normal
+        point_b_world = contact_point1[c] + contact_thickness1[c] * normal
+        if body_a >= 0:
+            point_a_world = wp.transform_point(body_q[body_a], contact_point0[c]) - contact_thickness0[c] * normal
+        if body_b >= 0:
+            point_b_world = wp.transform_point(body_q[body_b], contact_point1[c]) + contact_thickness1[c] * normal
+
+        phi = wp.dot(normal, point_a_world - point_b_world)
+        mu = float(0.0)
+        material_count = int(0)
+        if shape_a >= 0:
+            mu += shape_material_mu[shape_a]
+            material_count += 1
+        if shape_b >= 0:
+            mu += shape_material_mu[shape_b]
+            material_count += 1
+        if material_count > 0:
+            mu /= float(material_count)
+        restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
+
+        friction_anchor_rank = int(0)
+        same_next_contact = int(0)
+        if contact_friction_anchor_limit > 0:
+            for lookback in range(1, 9):
+                previous = c - lookback
+                if previous < 0 or previous >= total_contacts:
+                    break
+                if contact_shape0[previous] == shape_a and contact_shape1[previous] == shape_b:
+                    friction_anchor_rank += 1
+                else:
+                    break
+            following = c + 1
+            if (
+                following < total_contacts
+                and contact_shape0[following] == shape_a
+                and contact_shape1[following] == shape_b
+            ):
+                same_next_contact = 1
+
+        friction_anchor_scale = float(1.0)
+        if contact_friction_anchor_limit > 0 and (friction_anchor_rank > 0 or same_next_contact != 0):
+            friction_anchor_scale = 0.5
+        friction_mu = mu * contact_friction_scale * friction_anchor_scale
+
+        tangent0, tangent1 = contact_tangent_basis(normal)
+        add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
+        if contact_friction_anchor_limit > 0 and friction_anchor_rank >= contact_friction_anchor_limit:
+            add_friction = False
+
+        contact_anchor_world = 0.5 * (point_a_world + point_b_world)
+        point_a_normal = point_a_world
+        point_b_normal = point_b_world
+        if contact_shared_anchor != 0:
+            point_a_normal = contact_anchor_world
+            point_b_normal = contact_anchor_world
+        point_a_friction = point_a_world
+        point_b_friction = point_b_world
+        if contact_shared_anchor != 0 or contact_friction_shared_anchor != 0:
+            point_a_friction = contact_anchor_world
+            point_b_friction = contact_anchor_world
+
+        normal_target = prescribed_relative_contact_target(
+            body_a,
+            art_a,
+            body_b,
+            art_b,
+            point_a_normal,
+            point_b_normal,
+            normal,
+            prescribed_articulation,
+            articulation_origin,
+            body_v_s,
+        )
+        friction0_target = prescribed_relative_contact_target(
+            body_a,
+            art_a,
+            body_b,
+            art_b,
+            point_a_friction,
+            point_b_friction,
+            tangent0,
+            prescribed_articulation,
+            articulation_origin,
+            body_v_s,
+        )
+        friction1_target = prescribed_relative_contact_target(
+            body_a,
+            art_a,
+            body_b,
+            art_b,
+            point_a_friction,
+            point_b_friction,
+            tangent1,
+            prescribed_articulation,
+            articulation_origin,
+            body_v_s,
+        )
+
+        world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
+        world_row_parent[world, slot] = -1
+        world_row_mu[world, slot] = mu
+        world_row_beta[world, slot] = pgs_beta
+        world_row_cfm[world, slot] = pgs_cfm
+        world_phi[world, slot] = phi
+        world_target_velocity[world, slot] = normal_target
+        world_row_restitution[world, slot] = restitution
+
+        if add_friction:
+            world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_FRICTION
+            world_row_parent[world, slot + 1] = slot
+            world_row_mu[world, slot + 1] = friction_mu
+            world_row_beta[world, slot + 1] = 0.0
+            world_row_cfm[world, slot + 1] = pgs_cfm
+            world_phi[world, slot + 1] = 0.0
+            world_target_velocity[world, slot + 1] = friction0_target
+            world_row_restitution[world, slot + 1] = 0.0
+
+            world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_FRICTION
+            world_row_parent[world, slot + 2] = slot
+            world_row_mu[world, slot + 2] = friction_mu
+            world_row_beta[world, slot + 2] = 0.0
+            world_row_cfm[world, slot + 2] = pgs_cfm
+            world_phi[world, slot + 2] = 0.0
+            world_target_velocity[world, slot + 2] = friction1_target
+            world_row_restitution[world, slot + 2] = 0.0
+
+
+@wp.kernel
+def populate_world_J_for_compact_size(
+    contact_count: wp.array[int],
+    total_num_workers: int,
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    contact_slot: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    target_size: int,
+    articulation_response_dof_count: wp.array[int],
+    art_group_idx: wp.array[int],
+    art_dof_start: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    body_response_dof_mask: wp.array[wp.uint32],
+    joint_S_s: wp.array[wp.spatial_vector],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    contact_friction_shared_anchor: int,
+    contact_shared_anchor: int,
+    # output
+    J_group: wp.array3d[float],
+):
+    """Project one dense contact row/DOF per lane for compact articulations."""
+    worker, lane = wp.tid()
+    total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+    row = lane // target_size
+    local_dof = lane - row * target_size
+    if row >= 3 or local_dof >= target_size:
+        return
+
+    for c in range(worker, total_contacts, total_num_workers):
+        if contact_path[c] != 0 or contact_slot[c] < 0 or row >= contact_slots_needed[c]:
+            continue
+
+        shape_a = contact_shape0[c]
+        shape_b = contact_shape1[c]
+        body_a = -1
+        body_b = -1
+        if shape_a >= 0:
+            body_a = shape_body[shape_a]
+        if shape_b >= 0:
+            body_b = shape_body[shape_b]
+
+        normal = -contact_normal[c]
+        point_a_world = contact_point0[c] - contact_thickness0[c] * normal
+        point_b_world = contact_point1[c] + contact_thickness1[c] * normal
+        if body_a >= 0:
+            point_a_world = wp.transform_point(body_q[body_a], contact_point0[c]) - contact_thickness0[c] * normal
+        if body_b >= 0:
+            point_b_world = wp.transform_point(body_q[body_b], contact_point1[c]) + contact_thickness1[c] * normal
+
+        direction = normal
+        point_a = point_a_world
+        point_b = point_b_world
+        contact_anchor_world = 0.5 * (point_a_world + point_b_world)
+        if row == 0:
+            if contact_shared_anchor != 0:
+                point_a = contact_anchor_world
+                point_b = contact_anchor_world
+        else:
+            tangent0, tangent1 = contact_tangent_basis(normal)
+            if row == 1:
+                direction = tangent0
+            else:
+                direction = tangent1
+            if contact_shared_anchor != 0 or contact_friction_shared_anchor != 0:
+                point_a = contact_anchor_world
+                point_b = contact_anchor_world
+
+        art_a = contact_art_a[c]
+        art_b = contact_art_b[c]
+        group_a = -1
+        group_b = -1
+        value_a = float(0.0)
+        value_b = float(0.0)
+        bit = wp.uint32(1) << wp.uint32(local_dof)
+
+        if art_a >= 0 and articulation_response_dof_count[art_a] == target_size:
+            group_a = art_group_idx[art_a]
+            if body_a >= 0 and (body_response_dof_mask[body_a] & bit) != wp.uint32(0):
+                global_dof_a = art_dof_start[art_a] + local_dof
+                motion_a = joint_S_s[global_dof_a]
+                linear_a = wp.vec3(motion_a[0], motion_a[1], motion_a[2])
+                angular_a = wp.vec3(motion_a[3], motion_a[4], motion_a[5])
+                velocity_a = linear_a + wp.cross(angular_a, point_a - articulation_origin[art_a])
+                value_a = wp.dot(direction, velocity_a)
+
+        if art_b >= 0 and articulation_response_dof_count[art_b] == target_size:
+            group_b = art_group_idx[art_b]
+            if body_b >= 0 and (body_response_dof_mask[body_b] & bit) != wp.uint32(0):
+                global_dof_b = art_dof_start[art_b] + local_dof
+                motion_b = joint_S_s[global_dof_b]
+                linear_b = wp.vec3(motion_b[0], motion_b[1], motion_b[2])
+                angular_b = wp.vec3(motion_b[3], motion_b[4], motion_b[5])
+                velocity_b = linear_b + wp.cross(angular_b, point_b - articulation_origin[art_b])
+                value_b = -wp.dot(direction, velocity_b)
+
+        slot = contact_slot[c] + row
+        if group_a >= 0:
+            if group_b == group_a:
+                J_group[group_a, slot, local_dof] = value_a + value_b
+            else:
+                J_group[group_a, slot, local_dof] = value_a
+        if group_b >= 0 and group_b != group_a:
+            J_group[group_b, slot, local_dof] = value_b
 
 
 @wp.func
@@ -3649,9 +4076,10 @@ def mixed_contact_restitution(
     return restitution
 
 
-@wp.kernel
-def populate_world_J_for_size(
-    contact_count: wp.array[int],
+@wp.func
+def _populate_world_J_for_size_contact(
+    c: int,
+    total_contacts: int,
     contact_point0: wp.array[wp.vec3],
     contact_point1: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
@@ -3699,18 +4127,11 @@ def populate_world_J_for_size(
     world_target_velocity: wp.array2d[float],
     world_row_restitution: wp.array2d[float],
 ):
-    """
-    Phase 2 of multi-articulation contact building (per size group).
+    """Populate one contact for a specific articulation-size group.
 
-    Populates the Jacobian matrix for articulations of a specific DOF size.
-    Each contact may contribute to multiple articulations' J matrices.
+    Each contact may contribute to multiple articulations' Jacobian matrices.
     Contacts routed to the matrix-free path (contact_path==1) are skipped.
     """
-    c = wp.tid()
-    total_contacts = contact_count[0]
-    if c >= total_contacts:
-        return
-
     # Skip contacts routed to MF path
     if contact_path[c] != 0:
         return
@@ -4049,6 +4470,111 @@ def populate_world_J_for_size(
 
 
 @wp.kernel
+def populate_world_J_for_size(
+    contact_count: wp.array[int],
+    total_num_threads: int,
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    contact_path: wp.array[int],
+    target_size: int,
+    articulation_response_dof_count: wp.array[int],
+    art_group_idx: wp.array[int],
+    art_dof_start: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    body_to_joint: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_v_s: wp.array[wp.spatial_vector],
+    prescribed_articulation: wp.array[int],
+    shape_transform: wp.array[wp.transform],
+    shape_material_mu: wp.array[float],
+    shape_material_restitution: wp.array[float],
+    enable_friction: int,
+    contact_friction_gap_threshold: float,
+    contact_friction_shared_anchor: int,
+    contact_friction_anchor_limit: int,
+    contact_friction_scale: float,
+    contact_shared_anchor: int,
+    pgs_beta: float,
+    pgs_cfm: float,
+    # outputs
+    J_group: wp.array3d[float],
+    world_row_type: wp.array2d[int],
+    world_row_parent: wp.array2d[int],
+    world_row_mu: wp.array2d[float],
+    world_row_beta: wp.array2d[float],
+    world_row_cfm: wp.array2d[float],
+    world_phi: wp.array2d[float],
+    world_target_velocity: wp.array2d[float],
+    world_row_restitution: wp.array2d[float],
+):
+    """Populate active dense contacts with a capacity-independent launch."""
+    total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+    for c in range(wp.tid(), total_contacts, total_num_threads):
+        _populate_world_J_for_size_contact(
+            c,
+            total_contacts,
+            contact_point0,
+            contact_point1,
+            contact_normal,
+            contact_shape0,
+            contact_shape1,
+            contact_thickness0,
+            contact_thickness1,
+            contact_world,
+            contact_slot,
+            contact_art_a,
+            contact_art_b,
+            contact_path,
+            target_size,
+            articulation_response_dof_count,
+            art_group_idx,
+            art_dof_start,
+            articulation_origin,
+            body_to_joint,
+            joint_ancestor,
+            joint_qd_start,
+            joint_S_s,
+            shape_body,
+            body_q,
+            body_v_s,
+            prescribed_articulation,
+            shape_transform,
+            shape_material_mu,
+            shape_material_restitution,
+            enable_friction,
+            contact_friction_gap_threshold,
+            contact_friction_shared_anchor,
+            contact_friction_anchor_limit,
+            contact_friction_scale,
+            contact_shared_anchor,
+            pgs_beta,
+            pgs_cfm,
+            J_group,
+            world_row_type,
+            world_row_parent,
+            world_row_mu,
+            world_row_beta,
+            world_row_cfm,
+            world_phi,
+            world_target_velocity,
+            world_row_restitution,
+        )
+
+
+@wp.kernel
 def finalize_world_constraint_counts(
     world_slot_counter: wp.array[int],
     max_constraints: int,
@@ -4201,7 +4727,16 @@ def prepare_impulses(
     m = constraint_counts[articulation]
     base = articulation * max_constraints
 
-    for i in range(max_constraints):
+    # Cold-started solves consume only the current active prefix. Rows outside
+    # that prefix are ignored, and a row that becomes active on a later step is
+    # cleared then as part of that step's prefix. Warm-started solves retain the
+    # full-capacity pass because inactive cached rows must be invalidated before
+    # a later layout growth can accidentally reuse them.
+    clear_count = max_constraints
+    if warmstart == 0:
+        clear_count = m
+
+    for i in range(clear_count):
         if warmstart == 0 or i >= m:
             impulses[base + i] = 0.0
 
@@ -4542,7 +5077,16 @@ def prepare_world_impulses(
         elif b1 != p1:
             cold_start_from = wp.min(b1, p1)
 
-    for i in range(max_constraints):
+    # Cold-started solves consume only the current active prefix. Rows outside
+    # that prefix are ignored, and a row that becomes active on a later step is
+    # cleared then as part of that step's prefix. Warm-started solves retain the
+    # full-capacity pass because inactive cached rows must be invalidated before
+    # a later layout growth can accidentally reuse them.
+    clear_count = max_constraints
+    if warmstart == 0:
+        clear_count = m
+
+    for i in range(clear_count):
         if (
             warmstart == 0
             or i >= m
@@ -4702,9 +5246,10 @@ def diag_from_JY_world(
 # =============================================================================
 
 
-@wp.kernel
-def build_mf_contact_rows(
-    contact_count: wp.array[int],
+@wp.func
+def _build_mf_contact_row(
+    c: int,
+    total_contacts: int,
     contact_point0: wp.array[wp.vec3],
     contact_point1: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
@@ -4753,11 +5298,6 @@ def build_mf_contact_rows(
     uses contact position relative to that point:
         J = [d, r x d]   (r = p_contact - p_com_world)
     """
-    c = wp.tid()
-    total_contacts = contact_count[0]
-    if c >= total_contacts:
-        return
-
     if contact_path[c] != 1:
         return
 
@@ -4929,6 +5469,97 @@ def build_mf_contact_rows(
                 articulation_origin,
                 body_v_s,
             )
+
+
+@wp.kernel
+def build_mf_contact_rows(
+    contact_count: wp.array[int],
+    total_num_threads: int,
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_path: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_v_s: wp.array[wp.spatial_vector],
+    prescribed_articulation: wp.array[int],
+    has_target_velocity: int,
+    shape_material_mu: wp.array[float],
+    shape_material_restitution: wp.array[float],
+    enable_friction: int,
+    contact_friction_gap_threshold: float,
+    contact_friction_shared_anchor: int,
+    contact_friction_anchor_limit: int,
+    contact_friction_scale: float,
+    contact_shared_anchor: int,
+    pgs_beta: float,
+    # outputs
+    mf_body_a: wp.array2d[int],
+    mf_body_b: wp.array2d[int],
+    mf_J_a: wp.array3d[float],
+    mf_J_b: wp.array3d[float],
+    mf_row_type: wp.array2d[int],
+    mf_row_parent: wp.array2d[int],
+    mf_row_mu: wp.array2d[float],
+    mf_phi: wp.array2d[float],
+    mf_target_velocity: wp.array2d[float],
+    mf_row_restitution: wp.array2d[float],
+):
+    """Build active matrix-free contacts with a capacity-independent launch."""
+    total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+    for c in range(wp.tid(), total_contacts, total_num_threads):
+        _build_mf_contact_row(
+            c,
+            total_contacts,
+            contact_point0,
+            contact_point1,
+            contact_normal,
+            contact_shape0,
+            contact_shape1,
+            contact_thickness0,
+            contact_thickness1,
+            contact_world,
+            contact_slot,
+            contact_path,
+            contact_art_a,
+            contact_art_b,
+            articulation_response_dof_count,
+            articulation_origin,
+            shape_body,
+            body_q,
+            body_v_s,
+            prescribed_articulation,
+            has_target_velocity,
+            shape_material_mu,
+            shape_material_restitution,
+            enable_friction,
+            contact_friction_gap_threshold,
+            contact_friction_shared_anchor,
+            contact_friction_anchor_limit,
+            contact_friction_scale,
+            contact_shared_anchor,
+            pgs_beta,
+            mf_body_a,
+            mf_body_b,
+            mf_J_a,
+            mf_J_b,
+            mf_row_type,
+            mf_row_parent,
+            mf_row_mu,
+            mf_phi,
+            mf_target_velocity,
+            mf_row_restitution,
+        )
 
 
 @wp.kernel
