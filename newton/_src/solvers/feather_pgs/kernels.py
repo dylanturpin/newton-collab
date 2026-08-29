@@ -3237,6 +3237,7 @@ def _allocate_world_contact_slot(
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_anchor_limit: int,
+    contact_friction_articulation_pairs_only: int,
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -3375,8 +3376,15 @@ def _allocate_world_contact_slot(
             if propagation_same_articulation != 0 or not same_non_free_articulation:
                 is_propagation = 1
 
+    apply_friction_filter = (
+        contact_friction_articulation_pairs_only == 0 or (a_non_free and b_non_free)
+    )
+    effective_friction_anchor_limit = int(0)
+    if apply_friction_filter:
+        effective_friction_anchor_limit = contact_friction_anchor_limit
+
     friction_anchor_rank = int(0)
-    if contact_friction_anchor_limit > 0:
+    if effective_friction_anchor_limit > 0:
         for lookback in range(1, 9):
             prev = c - lookback
             if prev < 0:
@@ -3390,8 +3398,13 @@ def _allocate_world_contact_slot(
 
     # Allocate slots (1 normal + 2 friction)
     slots_needed = 1
-    add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
-    if add_friction and (contact_friction_anchor_limit == 0 or friction_anchor_rank < contact_friction_anchor_limit):
+    add_friction = enable_friction != 0 and (
+        not apply_friction_filter or phi <= contact_friction_gap_threshold
+    )
+    if add_friction and (
+        effective_friction_anchor_limit == 0
+        or friction_anchor_rank < effective_friction_anchor_limit
+    ):
         slots_needed = 3
     contact_slots_needed[c] = slots_needed
 
@@ -4100,6 +4113,8 @@ def _populate_world_J_for_size_contact(
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_anchor_limit: int,
+    contact_friction_articulation_pairs_only: int,
+    is_free_rigid: wp.array[int],
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
@@ -4182,9 +4197,18 @@ def _populate_world_J_for_size_contact(
     if mat_count > 0:
         mu /= float(mat_count)
     restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
+    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
+    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
+    apply_friction_filter = (
+        contact_friction_articulation_pairs_only == 0 or (a_non_free and b_non_free)
+    )
+    effective_friction_anchor_limit = int(0)
+    if apply_friction_filter:
+        effective_friction_anchor_limit = contact_friction_anchor_limit
+
     friction_anchor_rank = int(0)
     same_next_contact = int(0)
-    if contact_friction_anchor_limit > 0:
+    if effective_friction_anchor_limit > 0:
         for lookback in range(1, 9):
             prev = c - lookback
             if prev < 0:
@@ -4200,14 +4224,16 @@ def _populate_world_J_for_size_contact(
             same_next_contact = int(1)
 
     friction_anchor_scale = 1.0
-    if contact_friction_anchor_limit > 0 and (friction_anchor_rank > 0 or same_next_contact != 0):
+    if effective_friction_anchor_limit > 0 and (friction_anchor_rank > 0 or same_next_contact != 0):
         friction_anchor_scale = 0.5
     friction_mu = mu * contact_friction_scale * friction_anchor_scale
 
     # Compute tangent basis for friction
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
-    if contact_friction_anchor_limit > 0 and friction_anchor_rank >= contact_friction_anchor_limit:
+    will_add_friction = enable_friction != 0 and (
+        not apply_friction_filter or phi <= contact_friction_gap_threshold
+    )
+    if effective_friction_anchor_limit > 0 and friction_anchor_rank >= effective_friction_anchor_limit:
         will_add_friction = False
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
     target_point_a_normal = point_a_world
@@ -5263,6 +5289,7 @@ def _build_mf_contact_row(
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_anchor_limit: int,
+    contact_friction_articulation_pairs_only: int,
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
@@ -5351,9 +5378,14 @@ def _build_mf_contact_row(
     if mat_count > 0:
         mu /= float(mat_count)
     restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
+    apply_friction_filter = contact_friction_articulation_pairs_only == 0
+    effective_friction_anchor_limit = int(0)
+    if apply_friction_filter:
+        effective_friction_anchor_limit = contact_friction_anchor_limit
+
     friction_anchor_rank = int(0)
     same_next_contact = int(0)
-    if contact_friction_anchor_limit > 0:
+    if effective_friction_anchor_limit > 0:
         for lookback in range(1, 9):
             prev = c - lookback
             if prev < 0:
@@ -5369,14 +5401,16 @@ def _build_mf_contact_row(
             same_next_contact = int(1)
 
     friction_anchor_scale = 1.0
-    if contact_friction_anchor_limit > 0 and (friction_anchor_rank > 0 or same_next_contact != 0):
+    if effective_friction_anchor_limit > 0 and (friction_anchor_rank > 0 or same_next_contact != 0):
         friction_anchor_scale = 0.5
     friction_mu = mu * contact_friction_scale * friction_anchor_scale
 
     # Tangent basis
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
-    if contact_friction_anchor_limit > 0 and friction_anchor_rank >= contact_friction_anchor_limit:
+    will_add_friction = enable_friction != 0 and (
+        not apply_friction_filter or phi <= contact_friction_gap_threshold
+    )
+    if effective_friction_anchor_limit > 0 and friction_anchor_rank >= effective_friction_anchor_limit:
         will_add_friction = False
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
 
@@ -5563,15 +5597,19 @@ def build_propagation_contact_rows(
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
     contact_path: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
+    is_free_rigid: wp.array[int],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_anchor_limit: int,
+    contact_friction_articulation_pairs_only: int,
     contact_friction_scale: float,
     contact_shared_anchor: int,
     unit_order: wp.array[int],
@@ -5661,9 +5699,20 @@ def build_propagation_contact_rows(
         mu /= float(mat_count)
     restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
 
+    art_a = contact_art_a[c]
+    art_b = contact_art_b[c]
+    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
+    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
+    apply_friction_filter = (
+        contact_friction_articulation_pairs_only == 0 or (a_non_free and b_non_free)
+    )
+    effective_friction_anchor_limit = int(0)
+    if apply_friction_filter:
+        effective_friction_anchor_limit = contact_friction_anchor_limit
+
     friction_anchor_rank = int(0)
     same_next_contact = int(0)
-    if contact_friction_anchor_limit > 0:
+    if effective_friction_anchor_limit > 0:
         for lookback in range(1, 9):
             prev = c - lookback
             if prev < 0:
@@ -5679,13 +5728,15 @@ def build_propagation_contact_rows(
             same_next_contact = int(1)
 
     friction_anchor_scale = 1.0
-    if contact_friction_anchor_limit > 0 and (friction_anchor_rank > 0 or same_next_contact != 0):
+    if effective_friction_anchor_limit > 0 and (friction_anchor_rank > 0 or same_next_contact != 0):
         friction_anchor_scale = 0.5
     friction_mu = mu * contact_friction_scale * friction_anchor_scale
 
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
-    if contact_friction_anchor_limit > 0 and friction_anchor_rank >= contact_friction_anchor_limit:
+    will_add_friction = enable_friction != 0 and (
+        not apply_friction_filter or phi <= contact_friction_gap_threshold
+    )
+    if effective_friction_anchor_limit > 0 and friction_anchor_rank >= effective_friction_anchor_limit:
         will_add_friction = False
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
 

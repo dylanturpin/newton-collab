@@ -611,6 +611,7 @@ class SolverFeatherPGS(SolverBase):
         contact_friction_position_iterations: int = -1,
         contact_friction_shared_anchor: bool = False,
         contact_friction_anchor_limit: int = 0,
+        contact_friction_articulation_pairs_only: bool = False,
         contact_friction_scale: float = 1.0,
         contact_shared_anchor: bool = False,
         enable_joint_limits: bool = False,
@@ -707,6 +708,10 @@ class SolverFeatherPGS(SolverBase):
                 contiguous patch has more than one selected friction anchor, the effective Coulomb
                 coefficient is halved to mimic PhysX's two-anchor friction scaling. Defaults to 0
                 (disabled).
+            contact_friction_articulation_pairs_only (bool, optional): Apply
+                ``contact_friction_gap_threshold`` and ``contact_friction_anchor_limit`` only when
+                both contact bodies belong to non-free articulations. Contacts involving ground or a
+                free rigid body retain the legacy unbounded friction-row behavior. Defaults to False.
             contact_friction_scale (float, optional): Multiplies the effective Coulomb coefficient
                 used by generated friction rows. This is a diagnostic hook for matching solver-prep
                 semantics such as PhysX's per-friction-anchor scaling; it does not affect normal
@@ -1034,6 +1039,7 @@ class SolverFeatherPGS(SolverBase):
         self.contact_friction_position_iterations = int(contact_friction_position_iterations)
         self.contact_friction_shared_anchor = bool(contact_friction_shared_anchor)
         self.contact_friction_anchor_limit = int(contact_friction_anchor_limit)
+        self.contact_friction_articulation_pairs_only = bool(contact_friction_articulation_pairs_only)
         self.contact_friction_scale = float(contact_friction_scale)
         try:
             self.contact_speculative_scale = float(contact_speculative_scale)
@@ -7785,6 +7791,7 @@ class SolverFeatherPGS(SolverBase):
                     enable_friction_flag,
                     self.contact_friction_gap_threshold,
                     self.contact_friction_anchor_limit,
+                    1 if self.contact_friction_articulation_pairs_only else 0,
                 ],
                 outputs=[
                     self.contact_world,
@@ -7836,6 +7843,8 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
                         self.contact_friction_anchor_limit,
+                        1 if self.contact_friction_articulation_pairs_only else 0,
+                        is_free_rigid,
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
@@ -7980,6 +7989,7 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
                         self.contact_friction_anchor_limit,
+                        1 if self.contact_friction_articulation_pairs_only else 0,
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
@@ -8074,15 +8084,19 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_world,
                         self.contact_slot,
                         self.contact_path,
+                        self.contact_art_a,
+                        self.contact_art_b,
                         model.shape_body,
                         state_in.body_q,
                         model.body_com,
+                        is_free_rigid,
                         self.shape_material_mu,
                         self.shape_material_restitution,
                         enable_friction_flag,
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
                         self.contact_friction_anchor_limit,
+                        1 if self.contact_friction_articulation_pairs_only else 0,
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         builder_unit_order,
