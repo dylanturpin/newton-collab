@@ -2353,10 +2353,9 @@ def build_mass_update_mask(
 
 
 @wp.kernel
-def allocate_joint_limit_slots(
+def build_joint_limit_rows_for_size(
     articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
-    articulation_H_rows: wp.array[int],
     joint_type: wp.array[int],
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
@@ -2366,88 +2365,12 @@ def allocate_joint_limit_slots(
     joint_q: wp.array[float],
     joint_limit_activation_gap: float,
     art_to_world: wp.array[int],
-    max_constraints: int,
-    # outputs
-    limit_slot: wp.array[int],
-    limit_sign: wp.array[float],
-    world_slot_counter: wp.array[int],
-):
-    """Allocate speculative constraint slots for active joint limits.
-
-    ``joint_limit_activation_gap`` controls how far from a finite position limit
-    a row becomes active. ``inf`` mirrors the historical behavior by allocating
-    separate lower and upper rows for every finite limit. Finite gaps allocate
-    only when the current joint coordinate violates a limit or is within that
-    distance of the limit.
-
-    Outputs per-side arrays indexed as ``2 * dof + side`` where side 0 is the
-    lower row (+1 Jacobian sign) and side 1 is the upper row (-1 sign).
-    """
-    art = wp.tid()
-    world = art_to_world[art]
-
-    # Initialize all side rows of this articulation to "no limit row"
-    dof_base = articulation_dof_start[art]
-    dof_count = articulation_H_rows[art]
-    for d in range(dof_count):
-        lower_idx = 2 * (dof_base + d)
-        limit_slot[lower_idx] = -1
-        limit_slot[lower_idx + 1] = -1
-        limit_sign[lower_idx] = 0.0
-        limit_sign[lower_idx + 1] = 0.0
-
-    joint_start = articulation_start[art]
-    joint_end = articulation_start[art + 1]
-
-    for j in range(joint_start, joint_end):
-        jtype = joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
-            continue
-
-        lin_count = joint_dof_dim[j, 0]
-        ang_count = joint_dof_dim[j, 1]
-        axis_count = lin_count + ang_count
-        qd_start = joint_qd_start[j]
-        q_start = joint_q_start[j]
-
-        for axis in range(axis_count):
-            dof = qd_start + axis
-            q_val = joint_q[q_start + axis]
-            lower = joint_limit_lower[dof]
-            upper = joint_limit_upper[dof]
-
-            lower_idx = 2 * dof
-            if wp.isfinite(lower) and q_val <= lower + joint_limit_activation_gap:
-                slot = wp.atomic_add(world_slot_counter, world, 1)
-                if slot < max_constraints:
-                    limit_slot[lower_idx] = slot
-                    limit_sign[lower_idx] = 1.0
-
-            if wp.isfinite(upper) and q_val >= upper - joint_limit_activation_gap:
-                slot = wp.atomic_add(world_slot_counter, world, 1)
-                if slot < max_constraints:
-                    limit_slot[lower_idx + 1] = slot
-                    limit_sign[lower_idx + 1] = -1.0
-
-
-@wp.kernel
-def populate_joint_limit_J_for_size(
-    articulation_start: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    joint_type: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_limit_lower: wp.array[float],
-    joint_limit_upper: wp.array[float],
-    joint_q: wp.array[float],
-    art_to_world: wp.array[int],
-    limit_slot: wp.array[int],
-    limit_sign: wp.array[float],
     group_to_art: wp.array[int],
+    max_constraints: int,
     pgs_beta: float,
     pgs_cfm: float,
     # outputs
+    world_slot_counter: wp.array[int],
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
@@ -2457,34 +2380,20 @@ def populate_joint_limit_J_for_size(
     world_phi: wp.array2d[float],
     world_target_velocity: wp.array2d[float],
 ):
-    """Populate Jacobian and metadata for joint limit constraints.
-
-    Launched once per size group with ``dim = n_arts_of_size``.  Each thread
-    walks the joints of one articulation and, for every finite lower/upper row
-    whose ``limit_slot`` is non-negative, writes:
-
-    * A single ±1 entry in the Jacobian at the DOF's local column.
-    * Constraint metadata (type, phi, beta, cfm, etc.).
-    """
+    """Allocate and populate active joint-limit rows in one articulation pass."""
     group_idx = wp.tid()
     art = group_to_art[group_idx]
     world = art_to_world[art]
     dof_start = articulation_dof_start[art]
 
-    joint_start = articulation_start[art]
-    joint_end = articulation_start[art + 1]
-
-    for j in range(joint_start, joint_end):
+    for j in range(articulation_start[art], articulation_start[art + 1]):
         jtype = joint_type[j]
         if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
             continue
 
-        lin_count = joint_dof_dim[j, 0]
-        ang_count = joint_dof_dim[j, 1]
-        axis_count = lin_count + ang_count
+        axis_count = joint_dof_dim[j, 0] + joint_dof_dim[j, 1]
         qd_start = joint_qd_start[j]
         q_start = joint_q_start[j]
-
         for axis in range(axis_count):
             dof = qd_start + axis
             q_val = joint_q[q_start + axis]
@@ -2492,23 +2401,23 @@ def populate_joint_limit_J_for_size(
             upper = joint_limit_upper[dof]
 
             local_dof = dof - dof_start
-            lower_idx = 2 * dof
+
             for side in range(2):
-                row_idx = lower_idx + side
-                slot = limit_slot[row_idx]
-                if slot < 0:
+                sign = 1.0
+                phi = q_val - lower
+                active = wp.isfinite(lower) and q_val <= lower + joint_limit_activation_gap
+                if side == 1:
+                    sign = -1.0
+                    phi = upper - q_val
+                    active = wp.isfinite(upper) and q_val >= upper - joint_limit_activation_gap
+                if not active:
                     continue
 
-                sign = limit_sign[row_idx]
-                # phi is negative when violating and positive when separated.
-                phi = q_val - lower
-                if sign < 0.0:
-                    phi = upper - q_val
+                slot = wp.atomic_add(world_slot_counter, world, 1)
+                if slot >= max_constraints:
+                    continue
 
-                # Jacobian: single ±1 entry at the local DOF column.
                 J_group[group_idx, slot, local_dof] = sign
-
-                # Constraint metadata.
                 world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
                 world_row_parent[world, slot] = -1
                 world_row_mu[world, slot] = 0.0
@@ -3077,8 +2986,7 @@ def allocate_joint_velocity_limit_slots(
 ):
     """Allocate lower/upper velocity-limit rows for every finitely limited DOF.
 
-    Mirrors :func:`allocate_joint_limit_slots` for the PhysX velocity-limit
-    formulation. For each non-locked DOF of a PRISMATIC / REVOLUTE / D6 joint
+    For each non-locked DOF of a PRISMATIC / REVOLUTE / D6 joint
     with ``joint_velocity_limit[i] > 0``, two slots are atomically reserved in
     the per-world counter. The sign encodes which side of the bilateral box
     ``[-qdot_max, +qdot_max]`` each row enforces:
