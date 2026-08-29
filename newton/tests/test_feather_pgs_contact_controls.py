@@ -24,7 +24,16 @@ PATH_PROPAGATION = 2
 
 
 def _launch_contact_allocator(
-    *, route: int, gap: float, gate: float, scoped_gate: float = 0.0, pair_gate: float = 0.0
+    *,
+    route: int,
+    gap: float,
+    gate: float,
+    scoped_gate: float = 0.0,
+    pair_gate: float = 0.0,
+    enable_friction: bool = False,
+    friction_gap: float = float("inf"),
+    friction_anchors: int = 0,
+    friction_pairs_only: bool = False,
 ):
     """Allocate one contact and return its route metadata and counters."""
     device = "cpu"
@@ -77,9 +86,10 @@ def _launch_contact_allocator(
             8,
             8,
             8,
-            0,
-            float("inf"),
-            0,
+            int(enable_friction),
+            friction_gap,
+            friction_anchors,
+            int(friction_pairs_only),
             0,
         ],
         outputs=[
@@ -104,7 +114,15 @@ def _launch_contact_allocator(
 
 
 def _launch_same_articulation_contact_allocator(
-    *, gap: float, scoped_gate: float, pair_gate: float = 0.0, cross_articulation: bool = False
+    *,
+    gap: float,
+    scoped_gate: float,
+    pair_gate: float = 0.0,
+    cross_articulation: bool = False,
+    enable_friction: bool = False,
+    friction_gap: float = float("inf"),
+    friction_anchors: int = 0,
+    friction_pairs_only: bool = False,
 ):
     """Allocate one contact between two non-free articulated links."""
     device = "cpu"
@@ -143,9 +161,10 @@ def _launch_same_articulation_contact_allocator(
             8,
             8,
             8,
-            0,
-            float("inf"),
-            0,
+            int(enable_friction),
+            friction_gap,
+            friction_anchors,
+            int(friction_pairs_only),
             0,
         ],
         outputs=[
@@ -304,6 +323,7 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         self.assertEqual(solver.contact_gap_gate, 0.0)
         self.assertEqual(solver.same_articulation_contact_gap_gate, 0.0)
         self.assertEqual(solver.articulation_pair_contact_gap_gate, 0.0)
+        self.assertFalse(solver.contact_friction_articulation_pairs_only)
         parameters = tuple(inspect.signature(SolverFeatherPGS).parameters)
         self.assertIn("same_articulation_contact_gap_gate", parameters)
 
@@ -316,11 +336,13 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             contact_gap_gate=0.001,
             same_articulation_contact_gap_gate=0.002,
             articulation_pair_contact_gap_gate=0.003,
+            contact_friction_articulation_pairs_only=True,
         )
         self.assertEqual(solver.contact_speculative_scale, 0.0)
         self.assertEqual(solver.contact_gap_gate, 0.001)
         self.assertEqual(solver.same_articulation_contact_gap_gate, 0.002)
         self.assertEqual(solver.articulation_pair_contact_gap_gate, 0.003)
+        self.assertTrue(solver.contact_friction_articulation_pairs_only)
 
         for name in (
             "contact_speculative_scale",
@@ -386,6 +408,37 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         )
         self.assertEqual(result["path"], PATH_MATRIX_FREE)
         self.assertEqual(result["mf_count"], 1)
+
+    def test_articulation_pair_friction_filter_preserves_free_and_ground_rows(self):
+        """Scope tight friction controls to articulated pairs, not ball/ground routes."""
+        for route in (PATH_DENSE, PATH_MATRIX_FREE, PATH_PROPAGATION):
+            with self.subTest(route=route):
+                result = _launch_contact_allocator(
+                    route=route,
+                    gap=0.004,
+                    gate=0.0,
+                    enable_friction=True,
+                    friction_gap=0.002,
+                    friction_anchors=1,
+                    friction_pairs_only=True,
+                )
+                self.assertEqual(result["path"], route)
+                self.assertEqual(result["slots_needed"], 3)
+
+    def test_articulation_pair_friction_filter_reduces_pair_rows(self):
+        """Apply the configured friction gap to same- and cross-articulation contacts."""
+        for cross_articulation in (False, True):
+            with self.subTest(cross_articulation=cross_articulation):
+                slot, path, slots_needed = _launch_same_articulation_contact_allocator(
+                    gap=0.004,
+                    scoped_gate=0.0,
+                    cross_articulation=cross_articulation,
+                    enable_friction=True,
+                    friction_gap=0.002,
+                    friction_anchors=1,
+                    friction_pairs_only=True,
+                )
+                self.assertEqual((slot, path, slots_needed), (0, PATH_DENSE, 1))
 
     def test_speculative_scale_controls_every_position_rhs_family(self):
         """Scale positive-gap position bias on dense, MF, and propagation rows."""
