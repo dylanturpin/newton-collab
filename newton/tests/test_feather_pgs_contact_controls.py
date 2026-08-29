@@ -109,10 +109,12 @@ def _launch_contact_allocator(
 
 
 def _launch_same_articulation_contact_allocator(
-    *, gap: float, scoped_gate: float, pair_gate: float = 0.0
+    *, gap: float, scoped_gate: float, pair_gate: float = 0.0, cross_articulation: bool = False
 ):
-    """Allocate one two-link contact from a non-free articulation."""
+    """Allocate one contact between two non-free articulated links."""
     device = "cpu"
+    body_to_articulation = [0, 1] if cross_articulation else [0, 0]
+    articulation_count = 2 if cross_articulation else 1
     contact_slot = wp.full((1,), -9, dtype=wp.int32, device=device)
     contact_path = wp.full((1,), -9, dtype=wp.int32, device=device)
     dense_count = wp.zeros((1,), dtype=wp.int32, device=device)
@@ -131,11 +133,11 @@ def _launch_same_articulation_contact_allocator(
             wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device),
             wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device),
             wp.array([0, 1], dtype=wp.int32, device=device),
-            wp.array([0, 0], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([1], dtype=wp.int32, device=device),
+            wp.array(body_to_articulation, dtype=wp.int32, device=device),
+            wp.array([0] * articulation_count, dtype=wp.int32, device=device),
+            wp.array([1] * articulation_count, dtype=wp.int32, device=device),
             wp.zeros((2,), dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([0] * articulation_count, dtype=wp.int32, device=device),
             0,
             0,
             0,
@@ -555,15 +557,18 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                 self.assertEqual(result[counter], 1)
 
     def test_articulation_pair_gap_gate_drops_distant_pair_contact(self):
-        """The pair gate includes same-articulation contact without touching free-body routes."""
-        self.assertEqual(
-            _launch_same_articulation_contact_allocator(
-                gap=0.004,
-                scoped_gate=0.0,
-                pair_gate=0.003,
-            ),
-            (-1, -1, 0),
-        )
+        """The pair gate includes same/cross-articulation contact without touching free bodies."""
+        for cross_articulation in (False, True):
+            with self.subTest(cross_articulation=cross_articulation):
+                self.assertEqual(
+                    _launch_same_articulation_contact_allocator(
+                        gap=0.004,
+                        scoped_gate=0.0,
+                        pair_gate=0.003,
+                        cross_articulation=cross_articulation,
+                    ),
+                    (-1, -1, 0),
+                )
         result = _launch_contact_allocator(
             route=PATH_MATRIX_FREE,
             gap=0.04,
