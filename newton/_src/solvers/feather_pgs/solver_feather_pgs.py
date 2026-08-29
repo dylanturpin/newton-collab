@@ -177,6 +177,8 @@ _CONTACT_JACOBIAN_WORKER_CAP = 4096
 _CONTACT_JACOBIAN_MAX_DOF = 10
 _COMPOSITE_INERTIA_WARPS_PER_BLOCK = 4
 _JOINT_LIMIT_WARPS_PER_BLOCK = 4
+# The local solver performs a serial O(dof_count**2) triangular solve per row.
+_LOCAL_INTERNAL_MAX_DOF = 16
 
 
 @wp.kernel
@@ -1408,7 +1410,7 @@ class SolverFeatherPGS(SolverBase):
             and not model.requires_grad
             and self._has_free_rigid_bodies
             and local_worlds_supported
-            and all(int(size) <= 32 for size, count in local_art_counts.items() if count > 0)
+            and all(int(size) <= _LOCAL_INTERNAL_MAX_DOF for size, count in local_art_counts.items() if count > 0)
             and self.pgs_mode == "matrix_free"
             and self.articulated_contact_response == "immediate"
             and self.pgs_schedule == "interleaved"
