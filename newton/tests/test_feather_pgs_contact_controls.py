@@ -70,6 +70,7 @@ def _launch_contact_allocator(*, route: int, gap: float, gate: float):
             0,
             0,
             gate,
+            0.0,
             8,
             8,
             8,
@@ -97,6 +98,67 @@ def _launch_contact_allocator(*, route: int, gap: float, gate: float):
     )
     wp.synchronize_device(device)
     return {name: int(array.numpy()[0]) for name, array in (outputs | counters).items()}
+
+
+def _launch_same_articulation_contact_allocator(*, gap: float, scoped_gate: float):
+    """Allocate one two-link contact from a non-free articulation."""
+    device = "cpu"
+    contact_slot = wp.full((1,), -9, dtype=wp.int32, device=device)
+    contact_path = wp.full((1,), -9, dtype=wp.int32, device=device)
+    dense_count = wp.zeros((1,), dtype=wp.int32, device=device)
+    wp.launch(
+        allocate_world_contact_slots,
+        dim=1,
+        inputs=[
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([wp.vec3(gap, 0.0, 0.0)], dtype=wp.vec3, device=device),
+            wp.array([wp.vec3(0.0)], dtype=wp.vec3, device=device),
+            wp.array([wp.vec3(-1.0, 0.0, 0.0)], dtype=wp.vec3, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array([0, 1], dtype=wp.int32, device=device),
+            wp.array([0, 0], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.zeros((2,), dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            scoped_gate,
+            8,
+            8,
+            8,
+            0,
+            float("inf"),
+            0,
+            0,
+        ],
+        outputs=[
+            wp.full((1,), -9, dtype=wp.int32, device=device),
+            contact_slot,
+            wp.full((1,), -9, dtype=wp.int32, device=device),
+            wp.full((1,), -9, dtype=wp.int32, device=device),
+            dense_count,
+            contact_path,
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.full((1,), -9, dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+        ],
+        device=device,
+    )
+    wp.synchronize_device(device)
+    return int(contact_slot.numpy()[0]), int(contact_path.numpy()[0]), int(dense_count.numpy()[0])
 
 
 def _dense_speculative_rhs(scale: float) -> float:
@@ -232,21 +294,47 @@ class TestFeatherPGSContactControls(unittest.TestCase):
 
         self.assertEqual(solver.contact_speculative_scale, 1.0)
         self.assertEqual(solver.contact_gap_gate, 0.0)
+        self.assertEqual(solver.same_articulation_contact_gap_gate, 0.0)
         parameters = tuple(inspect.signature(SolverFeatherPGS).parameters)
-        self.assertEqual(parameters[-2:], ("contact_speculative_scale", "contact_gap_gate"))
+        self.assertIn("same_articulation_contact_gap_gate", parameters)
 
     def test_solver_validates_and_stores_contact_controls(self):
         """Accept finite non-negative controls and reject malformed values."""
         model = newton.ModelBuilder().finalize(device="cpu")
-        solver = SolverFeatherPGS(model, contact_speculative_scale=0.0, contact_gap_gate=0.001)
+        solver = SolverFeatherPGS(
+            model,
+            contact_speculative_scale=0.0,
+            contact_gap_gate=0.001,
+            same_articulation_contact_gap_gate=0.002,
+        )
         self.assertEqual(solver.contact_speculative_scale, 0.0)
         self.assertEqual(solver.contact_gap_gate, 0.001)
+        self.assertEqual(solver.same_articulation_contact_gap_gate, 0.002)
 
-        for name in ("contact_speculative_scale", "contact_gap_gate"):
+        for name in (
+            "contact_speculative_scale",
+            "contact_gap_gate",
+            "same_articulation_contact_gap_gate",
+        ):
             for value in (-0.1, float("nan"), float("inf"), "invalid"):
                 with self.subTest(name=name, value=value):
                     with self.assertRaisesRegex(ValueError, name):
                         SolverFeatherPGS(model, **{name: value})
+
+    def test_scoped_gap_gate_only_drops_distant_same_articulation_contact(self):
+        """The scoped gate retains near self-contact while bounding its speculative tail."""
+        self.assertEqual(
+            _launch_same_articulation_contact_allocator(gap=0.002, scoped_gate=0.003),
+            (0, PATH_DENSE, 1),
+        )
+        self.assertEqual(
+            _launch_same_articulation_contact_allocator(gap=0.004, scoped_gate=0.003),
+            (-1, -1, 0),
+        )
+        self.assertEqual(
+            _launch_same_articulation_contact_allocator(gap=0.004, scoped_gate=0.0),
+            (0, PATH_DENSE, 1),
+        )
 
     def test_speculative_scale_controls_every_position_rhs_family(self):
         """Scale positive-gap position bias on dense, MF, and propagation rows."""
