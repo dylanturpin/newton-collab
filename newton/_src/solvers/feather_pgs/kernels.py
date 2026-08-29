@@ -2012,7 +2012,7 @@ def build_contact_rows_normal(
 
 
 @wp.kernel
-def build_augmented_joint_rows(
+def build_augmented_joint_rows_and_apply_tau(
     articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
     articulation_H_rows: wp.array[int],
@@ -2026,14 +2026,15 @@ def build_augmented_joint_rows(
     joint_qd: wp.array[float],
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
+    joint_effort_limit: wp.array[float],
     max_dofs: int,
     dt: float,
     # outputs
     row_counts: wp.array[int],
     row_dof_index: wp.array[int],
     row_K: wp.array[float],
-    row_u0: wp.array[float],
     limit_counts: wp.array[int],
+    joint_tau: wp.array[float],
 ):
     articulation = wp.tid()
     if max_dofs == 0:
@@ -2087,8 +2088,11 @@ def build_augmented_joint_rows(
             target_pos = joint_target_pos[dof_index]
             target_vel = joint_target_vel[dof_index]
             u0 = -(ke * (q - target_pos + dt * qd_val) + kd * (qd_val - target_vel))
+            effort_limit = joint_effort_limit[dof_index]
+            if effort_limit > 0.0:
+                u0 = wp.clamp(u0, -effort_limit, effort_limit)
             row_K[row_index] = K
-            row_u0[row_index] = u0
+            joint_tau[dof_index] = joint_tau[dof_index] + u0
 
             slot += 1
             if slot >= max_dofs:
@@ -4278,33 +4282,6 @@ def apply_augmented_mass_diagonal_grouped(
 
 
 @wp.kernel
-def apply_augmented_joint_tau(
-    max_dofs: int,
-    row_counts: wp.array[int],
-    row_dof_index: wp.array[int],
-    row_u0: wp.array[float],
-    # outputs
-    joint_tau: wp.array[float],
-):
-    articulation = wp.tid()
-    if max_dofs == 0:
-        return
-
-    count = row_counts[articulation]
-    if count == 0:
-        return
-
-    for i in range(count):
-        row_index = articulation * max_dofs + i
-        dof = row_dof_index[row_index]
-        u0 = row_u0[row_index]
-        if u0 == 0.0:
-            continue
-
-        wp.atomic_add(joint_tau, dof, u0)
-
-
-@wp.kernel
 def prepare_impulses(
     constraint_counts: wp.array[int],
     max_constraints: int,
@@ -4319,92 +4296,6 @@ def prepare_impulses(
     for i in range(max_constraints):
         if warmstart == 0 or i >= m:
             impulses[base + i] = 0.0
-
-
-@wp.kernel
-def clamp_joint_tau(
-    joint_tau: wp.array[float],
-    joint_effort_limit: wp.array[float],
-):
-    """Net-generalized-torque clamp used by the baseline FPGS effort-limit path.
-
-    This kernel runs after ``eval_rigid_tau`` has deposited the rigid /
-    passive / Coriolis / gravity / external / ``joint_f`` contributions
-    into ``joint_tau`` *and* after ``apply_augmented_joint_tau`` has added
-    the explicit actuator-drive contribution ``u0`` into the same buffer.
-    The clamp therefore bounds the full net generalized torque per DOF,
-    which is the historical (baseline) FPGS semantics.
-
-    The alternative "actuator-only" semantics (see
-    :func:`clamp_augmented_joint_u0`) clamps the drive contribution in
-    isolation before it is folded into ``joint_tau`` and does not use
-    this kernel.
-    """
-    tid = wp.tid()
-
-    # Per-DoF effort limit (same convention as MuJoCo actuators)
-    limit = joint_effort_limit[tid]
-
-    # If limit <= 0, treat as unlimited
-    if limit <= 0.0:
-        return
-
-    t = joint_tau[tid]
-
-    if t > limit:
-        t = limit
-    elif t < -limit:
-        t = -limit
-
-    joint_tau[tid] = t
-
-
-@wp.kernel
-def clamp_augmented_joint_u0(
-    max_dofs: int,
-    row_counts: wp.array[int],
-    row_dof_index: wp.array[int],
-    joint_effort_limit: wp.array[float],
-    # outputs
-    row_u0: wp.array[float],
-):
-    """Actuator-drive-only effort-limit clamp (guarded alternative path).
-
-    Clamps each augmented row's explicit PD-drive output ``u0`` to
-    ``+/- joint_effort_limit[dof]`` *before* that row is accumulated into
-    ``joint_tau``. Under the alternative "actuator-only" semantics the
-    rigid / passive / Coriolis / gravity / external /
-    :attr:`~newton.Control.joint_f` bucket already sitting in
-    ``joint_tau`` is not touched by any clamp, matching the convention
-    used by MuJoCo's ``actuatorfrcrange`` and PhysX articulation drive
-    ``maxForce``.
-
-    This kernel is intentionally a sibling of :func:`clamp_joint_tau`
-    and is only launched when the FPGS solver is configured with
-    ``effort_limit_mode="actuator"``. A ``joint_effort_limit`` value of
-    ``<= 0`` is treated as "unlimited", matching the baseline kernel.
-    """
-    articulation = wp.tid()
-    if max_dofs == 0:
-        return
-
-    count = row_counts[articulation]
-    if count == 0:
-        return
-
-    for i in range(count):
-        row_index = articulation * max_dofs + i
-        dof = row_dof_index[row_index]
-
-        limit = joint_effort_limit[dof]
-        if limit <= 0.0:
-            continue
-
-        u0 = row_u0[row_index]
-        if u0 > limit:
-            row_u0[row_index] = limit
-        elif u0 < -limit:
-            row_u0[row_index] = -limit
 
 
 # --- Tile configuration for contact system build ---
