@@ -1385,8 +1385,11 @@ class SolverFeatherPGS(SolverBase):
             small_dof_threshold=self.small_dof_threshold,
             tile_threads=self.tile_threads,
         )
-        self._jy_world_aliased = (
-            self._detect_jy_world_identity() if self.pgs_mode == "matrix_free" and self.world_count else False
+        self._hinv_jt_computes_diag = self.pgs_mode == "matrix_free" and not self._preelim_active
+        self._hinv_jt_diag_sizes = frozenset(
+            size
+            for size in self.size_groups
+            if self._hinv_jt_computes_diag and self._execution_plan.use_tiled_hinv_jt(size)
         )
         local_art_counts = {size: int(self.world_group_to_art[size].shape[0]) for size in self.size_groups}
         local_response_mask = (self._model_plan.response_dof_count > 0) & (self._model_plan.is_free_rigid == 0)
@@ -1439,20 +1442,17 @@ class SolverFeatherPGS(SolverBase):
             else None
         )
 
+        self._allocate_common_buffers(model)
+        self._allocate_buffers(model)
+        self._allocate_world_buffers(model)
         # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
         # so that path must retain the existing post-correction world gather.
         self._hinv_jt_writes_world = (
             self.pgs_mode == "matrix_free" and not self._jy_world_aliased and not self._preelim_active
         )
         self._hinv_jt_tiled_writes_group = not self._hinv_jt_writes_world or self.pgs_warmstart
-        self._hinv_jt_diag_sizes = frozenset(
-            size
-            for size in self.size_groups
-            if self._hinv_jt_writes_world and self._execution_plan.use_tiled_hinv_jt(size)
-        )
-        self._allocate_common_buffers(model)
-        self._allocate_buffers(model)
-        self._allocate_world_buffers(model)
+        if not self._hinv_jt_writes_world:
+            self._hinv_jt_diag_sizes = frozenset()
         self._allocate_mf_buffers(model)
         self._allocate_propagation_buffers(model)
         self.mf_target_velocity = (
@@ -2977,6 +2977,7 @@ class SolverFeatherPGS(SolverBase):
             self.J_by_size = {}
             self.Y_by_size = {}
             self.diag_by_size = {}
+            self._dummy_hinv_diag = None
             self.R_by_size = {}
             self.tau_by_size = {}
             self.qdd_by_size = {}
@@ -2991,6 +2992,7 @@ class SolverFeatherPGS(SolverBase):
         self.L_by_size = {}
         self.Y_by_size = {}
         self.diag_by_size = {}
+        self._dummy_hinv_diag = wp.zeros((1, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.R_by_size = {}
         self.tau_by_size = {}
         self.qdd_by_size = {}
@@ -3026,10 +3028,11 @@ class SolverFeatherPGS(SolverBase):
             self.Y_by_size[size] = wp.zeros(
                 (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
             )
-            if size in self._hinv_jt_diag_sizes:
-                self.diag_by_size[size] = wp.zeros(
-                    (n_arts, j_rows), dtype=wp.float32, device=device, requires_grad=requires_grad
-                )
+            self.diag_by_size[size] = (
+                wp.zeros((n_arts, j_rows), dtype=wp.float32, device=device, requires_grad=requires_grad)
+                if size in self._hinv_jt_diag_sizes
+                else self._dummy_hinv_diag
+            )
 
             # Armature (regularization) [n_arts, h_dim] - needs to match H dimension for tile_diag_add
             self.R_by_size[size] = wp.zeros(
@@ -3227,6 +3230,7 @@ class SolverFeatherPGS(SolverBase):
         # Matrix-free uses world-indexed J/Y for both dense and rigid phases.
         if self.pgs_mode == "matrix_free":
             self._compute_world_response_dof_mapping(model)
+            self._jy_world_aliased = self._detect_jy_world_identity()
             if self._jy_world_aliased:
                 # gather_JY_to_world is an element-for-element identity copy for
                 # this model layout (one articulation per world, single size
@@ -3256,6 +3260,7 @@ class SolverFeatherPGS(SolverBase):
                 wp.zeros_like(self.Y_world, requires_grad=requires_grad) if self._debug_buffers_enabled else None
             )
         else:
+            self._jy_world_aliased = False
             self.J_world = None
             self.Y_world = None
             self._debug_position_J_world = None
