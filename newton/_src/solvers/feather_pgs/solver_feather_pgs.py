@@ -1431,11 +1431,8 @@ class SolverFeatherPGS(SolverBase):
             small_dof_threshold=self.small_dof_threshold,
             tile_threads=self.tile_threads,
         )
-        self._hinv_jt_computes_diag = self.pgs_mode == "matrix_free" and not self._preelim_active
-        self._hinv_jt_diag_sizes = frozenset(
-            size
-            for size in self.size_groups
-            if self._hinv_jt_computes_diag and self._execution_plan.use_tiled_hinv_jt(size)
+        self._jy_world_aliased = (
+            self._detect_jy_world_identity() if self.pgs_mode == "matrix_free" and self.world_count else False
         )
         local_art_counts = {size: int(self.world_group_to_art[size].shape[0]) for size in self.size_groups}
         local_response_mask = (self._model_plan.response_dof_count > 0) & (self._model_plan.is_free_rigid == 0)
@@ -1488,15 +1485,20 @@ class SolverFeatherPGS(SolverBase):
             else None
         )
 
-        self._allocate_common_buffers(model)
-        self._allocate_buffers(model)
-        self._allocate_world_buffers(model)
         # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
         # so that path must retain the existing post-correction world gather.
         self._hinv_jt_writes_world = (
             self.pgs_mode == "matrix_free" and not self._jy_world_aliased and not self._preelim_active
         )
         self._hinv_jt_tiled_writes_group = not self._hinv_jt_writes_world or self.pgs_warmstart
+        self._hinv_jt_diag_sizes = frozenset(
+            size
+            for size in self.size_groups
+            if self._hinv_jt_writes_world and self._execution_plan.use_tiled_hinv_jt(size)
+        )
+        self._allocate_common_buffers(model)
+        self._allocate_buffers(model)
+        self._allocate_world_buffers(model)
         self._allocate_mf_buffers(model)
         self._allocate_propagation_buffers(model)
         self.mf_target_velocity = (
@@ -2902,11 +2904,11 @@ class SolverFeatherPGS(SolverBase):
         self.world_deferred_dof_mask = wp.array(world_deferred_dof_mask_np, dtype=wp.int32, device=model.device)
 
     def _detect_jy_world_identity(self) -> bool:
-        """Return whether group and compact world J/Y layouts are identical."""
+        """Return whether host-side group and compact world J/Y layouts are identical."""
         if len(self.size_groups) != 1 or self.art_to_world is None:
             return False
         size = self.size_groups[0]
-        if size != self.max_world_dofs or self.n_arts_by_size[size] != self.world_count:
+        if self.n_arts_by_size[size] != self.world_count:
             return False
         articulation_world = self._model_plan.articulation_world
         group_to_art = np.flatnonzero(self._model_plan.response_dof_count == size)
@@ -3021,7 +3023,6 @@ class SolverFeatherPGS(SolverBase):
             self.J_by_size = {}
             self.Y_by_size = {}
             self.diag_by_size = {}
-            self._dummy_hinv_diag = None
             self.R_by_size = {}
             self.tau_by_size = {}
             self.qdd_by_size = {}
@@ -3036,7 +3037,6 @@ class SolverFeatherPGS(SolverBase):
         self.L_by_size = {}
         self.Y_by_size = {}
         self.diag_by_size = {}
-        self._dummy_hinv_diag = wp.zeros((1, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
         self.R_by_size = {}
         self.tau_by_size = {}
         self.qdd_by_size = {}
@@ -3072,11 +3072,10 @@ class SolverFeatherPGS(SolverBase):
             self.Y_by_size[size] = wp.zeros(
                 (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
             )
-            self.diag_by_size[size] = (
-                wp.zeros((n_arts, j_rows), dtype=wp.float32, device=device, requires_grad=requires_grad)
-                if size in self._hinv_jt_diag_sizes
-                else self._dummy_hinv_diag
-            )
+            if size in self._hinv_jt_diag_sizes:
+                self.diag_by_size[size] = wp.zeros(
+                    (n_arts, j_rows), dtype=wp.float32, device=device, requires_grad=requires_grad
+                )
 
             # Armature (regularization) [n_arts, h_dim] - needs to match H dimension for tile_diag_add
             self.R_by_size[size] = wp.zeros(
@@ -3274,7 +3273,6 @@ class SolverFeatherPGS(SolverBase):
         # Matrix-free uses world-indexed J/Y for both dense and rigid phases.
         if self.pgs_mode == "matrix_free":
             self._compute_world_response_dof_mapping(model)
-            self._jy_world_aliased = self._detect_jy_world_identity()
             if self._jy_world_aliased:
                 # gather_JY_to_world is an element-for-element identity copy for
                 # this model layout (one articulation per world, single size
@@ -3304,7 +3302,6 @@ class SolverFeatherPGS(SolverBase):
                 wp.zeros_like(self.Y_world, requires_grad=requires_grad) if self._debug_buffers_enabled else None
             )
         else:
-            self._jy_world_aliased = False
             self.J_world = None
             self.Y_world = None
             self._debug_position_J_world = None
@@ -3974,7 +3971,8 @@ class SolverFeatherPGS(SolverBase):
                 self._hinv_jt_chunk_count_by_size[size] = (
                     self.dense_max_constraints + hinv_jt_chunk_size - 1
                 ) // hinv_jt_chunk_size
-                self._hinv_jt_kernels_by_size[size] = _get_hinv_jt_kernel(
+                kernel_factory = _get_hinv_jt_diag_kernel if size in self._hinv_jt_diag_sizes else _get_hinv_jt_kernel
+                self._hinv_jt_kernels_by_size[size] = kernel_factory(
                     size,
                     self.dense_max_constraints,
                     device_arch,
@@ -3982,7 +3980,6 @@ class SolverFeatherPGS(SolverBase):
                     constraint_chunk_size=hinv_jt_chunk_size,
                     write_world=self._hinv_jt_writes_world,
                     write_group=self._hinv_jt_tiled_writes_group,
-                    compute_diag=self._hinv_jt_computes_diag,
                 )
             self._hinv_jt_fused_kernels_by_size[size] = (
                 _get_hinv_jt_fused_kernel(size, self.dense_max_constraints, device_arch, self.tile_threads)
@@ -8290,6 +8287,9 @@ class SolverFeatherPGS(SolverBase):
         world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
         if hinv_jt_kernel is None:
             raise RuntimeError(f"H^-1 J^T tiled kernel is unavailable for DOF size {size}")
+        outputs = [self.Y_by_size[size], J_world, Y_world]
+        if size in self._hinv_jt_diag_sizes:
+            outputs.append(self.diag_by_size[size])
         wp.launch_tiled(
             hinv_jt_kernel,
             dim=[n_arts, self._hinv_jt_chunk_count_by_size[size]],
@@ -8301,7 +8301,7 @@ class SolverFeatherPGS(SolverBase):
                 world_dof_offset,
                 self.constraint_count,
             ],
-            outputs=[self.Y_by_size[size], J_world, Y_world, self.diag_by_size[size]],
+            outputs=outputs,
             block_dim=self.tile_threads,
             device=model.device,
         )
@@ -9856,9 +9856,81 @@ def _get_hinv_jt_kernel(
     constraint_chunk_size: int | None = None,
     write_world: bool = False,
     write_group: bool = True,
-    compute_diag: bool = False,
 ) -> "wp.Kernel":
-    """Build specialized H^-1*J^T kernel for given dimensions.
+    """Build a specialized H^-1*J^T kernel without a diagonal output.
+
+    Keep this signature structurally separate from :func:`_get_hinv_jt_diag_kernel`.
+    Warp retains unused formal outputs and tiled reductions even behind a false
+    compile-time flag, which increases work for layouts that do not consume them.
+    """
+    TILE_DOF_LOCAL = wp.constant(int(n_dofs))
+    chunk_size = max_constraints if constraint_chunk_size is None else int(constraint_chunk_size)
+    if chunk_size <= 0 or chunk_size > max_constraints:
+        raise ValueError("constraint_chunk_size must be in [1, max_constraints]")
+    TILE_CONSTRAINTS_LOCAL = wp.constant(chunk_size)
+    BOUNDS_CHECK = max_constraints % chunk_size != 0
+    WRITE_WORLD = wp.constant(1 if write_world else 0)
+    WRITE_GROUP = wp.constant(1 if write_group else 0)
+
+    def hinv_jt_tiled_template(
+        L_group: wp.array3d[float],
+        J_group: wp.array3d[float],
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        articulation_world_dof_offset: wp.array[int],
+        world_constraint_count: wp.array[int],
+        Y_group: wp.array3d[float],
+        J_world: wp.array3d[float],
+        Y_world: wp.array3d[float],
+    ):
+        idx, chunk = wp.tid()
+        art = group_to_art[idx]
+        world = art_to_world[art]
+        n_constraints = world_constraint_count[world]
+        row_start = chunk * TILE_CONSTRAINTS_LOCAL
+
+        if row_start >= n_constraints:
+            return
+
+        L_tile = wp.tile_load(L_group[idx], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
+        J_tile = wp.tile_load(
+            J_group[idx],
+            shape=(TILE_CONSTRAINTS_LOCAL, TILE_DOF_LOCAL),
+            offset=(row_start, 0),
+            bounds_check=BOUNDS_CHECK,
+        )
+        Jt_tile = wp.tile_transpose(J_tile)
+        Z_tile = wp.tile_lower_solve(L_tile, Jt_tile)
+        Lt_tile = wp.tile_transpose(L_tile)
+        X_tile = wp.tile_upper_solve(Lt_tile, Z_tile)
+        Y_out_tile = wp.tile_transpose(X_tile)
+
+        if WRITE_GROUP != 0:
+            wp.tile_store(Y_group[idx], Y_out_tile, offset=(row_start, 0), bounds_check=BOUNDS_CHECK)
+
+        if WRITE_WORLD != 0:
+            dof_offset = articulation_world_dof_offset[art]
+            wp.tile_store(J_world[world], J_tile, offset=(row_start, dof_offset), bounds_check=BOUNDS_CHECK)
+            wp.tile_store(Y_world[world], Y_out_tile, offset=(row_start, dof_offset), bounds_check=BOUNDS_CHECK)
+
+    suffix = "_world" if write_world else ""
+    suffix += "_nogroup" if not write_group else ""
+    hinv_jt_tiled_template.__name__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}_c{chunk_size}_bd{tile_threads}{suffix}"
+    hinv_jt_tiled_template.__qualname__ = hinv_jt_tiled_template.__name__
+    return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_template)
+
+
+@cache
+def _get_hinv_jt_diag_kernel(
+    n_dofs: int,
+    max_constraints: int,
+    device_arch: str,
+    tile_threads: int = 64,
+    constraint_chunk_size: int | None = None,
+    write_world: bool = False,
+    write_group: bool = True,
+) -> "wp.Kernel":
+    """Build specialized H^-1*J^T and response-diagonal kernel.
 
     Solves Y = H^-1 * J^T using tiled Cholesky solve:
       L * L^T * Y = J^T
@@ -9875,7 +9947,6 @@ def _get_hinv_jt_kernel(
     BOUNDS_CHECK = max_constraints % chunk_size != 0
     WRITE_WORLD = wp.constant(1 if write_world else 0)
     WRITE_GROUP = wp.constant(1 if write_group else 0)
-    COMPUTE_DIAG = wp.constant(1 if compute_diag else 0)
 
     def hinv_jt_tiled_template(
         L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
@@ -9922,9 +9993,8 @@ def _get_hinv_jt_kernel(
         if WRITE_GROUP != 0:
             wp.tile_store(Y_group[idx], Y_out_tile, offset=(row_start, 0), bounds_check=BOUNDS_CHECK)
 
-        if COMPUTE_DIAG != 0:
-            diag_tile = wp.tile_sum(wp.tile_map(wp.mul, J_tile, Y_out_tile), axis=1)
-            wp.tile_store(diag_group[idx], diag_tile, offset=row_start, bounds_check=BOUNDS_CHECK)
+        diag_tile = wp.tile_sum(wp.tile_map(wp.mul, J_tile, Y_out_tile), axis=1)
+        wp.tile_store(diag_group[idx], diag_tile, offset=row_start, bounds_check=BOUNDS_CHECK)
 
         if WRITE_WORLD != 0:
             dof_offset = articulation_world_dof_offset[art]
@@ -9933,7 +10003,7 @@ def _get_hinv_jt_kernel(
 
     suffix = "_world" if write_world else ""
     suffix += "_nogroup" if not write_group else ""
-    suffix += "_diag" if compute_diag else ""
+    suffix += "_diag"
     hinv_jt_tiled_template.__name__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}_c{chunk_size}_bd{tile_threads}{suffix}"
     hinv_jt_tiled_template.__qualname__ = hinv_jt_tiled_template.__name__
     return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_template)
