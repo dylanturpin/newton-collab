@@ -3231,6 +3231,7 @@ def _allocate_world_contact_slot(
     propagation_same_articulation: int,
     propagation_free_free: int,
     contact_gap_gate: float,
+    same_articulation_contact_gap_gate: float,
     max_constraints: int,
     mf_max_constraints: int,
     propagation_max_constraints: int,
@@ -3340,6 +3341,22 @@ def _allocate_world_contact_slot(
     # A zero gate preserves every collision-generated contact. A positive gate
     # drops wider speculative contacts before any route reserves row storage.
     if contact_gap_gate > 0.0 and phi > contact_gap_gate:
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
+
+    # Preserve the full predictive horizon for free-body contacts (notably fast
+    # balls), while allowing callers to bound distant speculative self-contact
+    # rows on one articulation. Penetrating and near-contact self-collisions are
+    # unchanged because only positive gaps above the opt-in threshold are cut.
+    same_non_free_articulation = (
+        art_a >= 0 and art_b == art_a and is_free_rigid[art_a] == 0
+    )
+    if (
+        same_articulation_contact_gap_gate > 0.0
+        and same_non_free_articulation
+        and phi > same_articulation_contact_gap_gate
+    ):
         contact_slot[c] = -1
         contact_path[c] = -1
         return
