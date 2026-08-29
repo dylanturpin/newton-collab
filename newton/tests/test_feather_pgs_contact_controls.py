@@ -23,7 +23,7 @@ PATH_MATRIX_FREE = 1
 PATH_PROPAGATION = 2
 
 
-def _launch_contact_allocator(*, route: int, gap: float, gate: float):
+def _launch_contact_allocator(*, route: int, gap: float, gate: float, scoped_gate: float = 0.0):
     """Allocate one contact and return its route metadata and counters."""
     device = "cpu"
     outputs = {
@@ -70,7 +70,7 @@ def _launch_contact_allocator(*, route: int, gap: float, gate: float):
             0,
             0,
             gate,
-            0.0,
+            scoped_gate,
             8,
             8,
             8,
@@ -335,6 +335,23 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             _launch_same_articulation_contact_allocator(gap=0.004, scoped_gate=0.0),
             (0, PATH_DENSE, 1),
         )
+
+    def test_scoped_gap_gate_preserves_other_contact_routes(self):
+        """Do not shorten predictive contacts for ground, free-body, or cross-articulation rows."""
+        for route, counter in (
+            (PATH_DENSE, "dense_count"),
+            (PATH_MATRIX_FREE, "mf_count"),
+            (PATH_PROPAGATION, "propagation_count"),
+        ):
+            with self.subTest(route=route):
+                result = _launch_contact_allocator(
+                    route=route,
+                    gap=0.04,
+                    gate=0.0,
+                    scoped_gate=0.003,
+                )
+                self.assertEqual(result["path"], route)
+                self.assertEqual(result[counter], 1)
 
     def test_speculative_scale_controls_every_position_rhs_family(self):
         """Scale positive-gap position bias on dense, MF, and propagation rows."""
