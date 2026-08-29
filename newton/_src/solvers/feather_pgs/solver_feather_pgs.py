@@ -64,14 +64,13 @@ from .kernels import (
     allocate_physx_drive_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
-    apply_augmented_joint_tau,
     apply_augmented_mass_diagonal_grouped,
     apply_free_root_transport_to_predictor,
     apply_impulses_world_par_dof,
     apply_mf_warmstart_impulses,
     apply_world_contact_restitution_accumulated,
     apply_world_contact_restitution_matrix_free,
-    build_augmented_joint_rows,
+    build_augmented_joint_rows_and_apply_tau,
     build_mass_update_mask,
     build_mf_body_map,
     build_mf_contact_rows,
@@ -79,7 +78,6 @@ from .kernels import (
     build_propagation_body_map_partitioned,
     build_propagation_contact_rows,
     cholesky_loop,
-    clamp_augmented_joint_u0,
     clamp_free_root_velocity_limits,
     collect_propagation_units,
     commit_mass_updates,
@@ -1338,9 +1336,9 @@ class SolverFeatherPGS(SolverBase):
             pgs_kernel = "loop"
 
         # Effort-limit clamp is always actuator-only: the explicit-PD drive bucket
-        # (``aug_row_u0``) is clamped to ``+/- joint_effort_limit`` before it
-        # is summed into ``joint_tau``. Matches MuJoCo's ``actuatorfrcrange``
-        # and PhysX articulation drive ``maxForce`` conventions.
+        # is clamped to ``+/- joint_effort_limit`` before it is summed into
+        # ``joint_tau``. Matches MuJoCo's ``actuatorfrcrange`` and PhysX
+        # articulation drive ``maxForce`` conventions.
         if effort_limit_mode != "actuator":
             raise ValueError(
                 "effort_limit_mode must be 'actuator' (the only supported semantics). "
@@ -2920,7 +2918,6 @@ class SolverFeatherPGS(SolverBase):
         self.limit_change_mask = wp.zeros_like(self.aug_limit_counts)
         self.aug_row_dof_index = wp.zeros((total_rows,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.aug_row_K = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        self.aug_row_u0 = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
 
     def _allocate_buffers(self, model):
         if not self.size_groups:
@@ -6767,21 +6764,14 @@ class SolverFeatherPGS(SolverBase):
 
         - ``state_aug.joint_tau`` holds the rigid / passive / Coriolis /
           gravity / external / :attr:`~newton.Control.joint_f` contribution
-          (populated by ``eval_rigid_tau``) summed with the explicit-PD
-          drive contribution ``u0`` (added by
-          :meth:`apply_augmented_joint_tau` from the augmented-row buffer
-          ``self.aug_row_u0``).
-        - ``self.aug_row_u0`` transiently owns the explicit-PD
-          actuator-drive contribution per augmented row before it is
-          accumulated into ``joint_tau``.
+          summed with the clamped explicit-PD drive contribution ``u0``.
         - The implicit-PD drive response is carried by ``self.aug_row_K``
           and realized through ``H_tilde^{-1}`` during the linear solve.
 
         :attr:`~newton.Model.joint_effort_limit` is always applied as
-        an **actuator-only** clamp on ``self.aug_row_u0`` *before* it is
-        added to ``joint_tau``; the rigid / passive / external bucket is
-        left uncapped (MuJoCo ``actuatorfrcrange`` / PhysX drive
-        ``maxForce`` convention).
+        an **actuator-only** clamp on ``u0`` *before* it is added to
+        ``joint_tau``; the rigid / passive / external bucket is left uncapped
+        (MuJoCo ``actuatorfrcrange`` / PhysX drive ``maxForce`` convention).
 
         """
         model = self.model
@@ -6835,47 +6825,11 @@ class SolverFeatherPGS(SolverBase):
                     self.limit_change_mask.zero_()
                 return
 
-            # Populate `aug_row_u0` (and `aug_row_K`) with the explicit-PD
-            # actuator-drive bucket per augmented row.
-            self.build_augmented_joint_targets(state_in, control, dt)
+            # Build augmented rows, clamp the actuator-drive bucket, and add
+            # it to joint_tau in the same articulation pass.
+            self.build_augmented_joint_targets(state_in, state_aug, control, dt)
 
-            self._stage1_drives_apply_augmented_tau(state_aug)
-
-    def _stage1_drives_apply_augmented_tau(self, state_aug: State):
-        """Clamp (if needed) and fold the augmented-row ``u0`` into ``joint_tau``.
-
-        Factored out of :meth:`_stage1_drives` to keep the actuator-only
-        effort-limit clamp isolated from the rigid / passive / external
-        torque bucket.
-        """
-        model = self.model
-        if model.articulation_count == 0:
-            return
-
-        if self.articulation_max_dofs > 0:
-            # Actuator-only effort-limit clamp: cap the explicit-PD
-            # drive bucket (``u0``) to ``+/- joint_effort_limit`` before
-            # it is folded into ``joint_tau``. The rigid / passive /
-            # external bucket living in ``joint_tau`` is left uncapped;
-            # the implicit-PD drive response carried by
-            # ``H_tilde^{-1}`` is not clamped here either.
-            wp.launch(
-                clamp_augmented_joint_u0,
-                dim=model.articulation_count,
-                inputs=[
-                    self.articulation_max_dofs,
-                    self.aug_row_counts,
-                    self.aug_row_dof_index,
-                    model.joint_effort_limit,
-                ],
-                outputs=[self.aug_row_u0],
-                device=model.device,
-            )
-
-        # Accumulate (clamped) ``u0`` into ``joint_tau``.
-        self.apply_augmented_joint_tau(None, state_aug, 0.0)
-
-    def build_augmented_joint_targets(self, state_in: State, control: Control, dt: float):
+    def build_augmented_joint_targets(self, state_in: State, state_aug: State, control: Control, dt: float):
         model = self.model
         if model.articulation_count == 0 or self.articulation_max_dofs == 0:
             return
@@ -6885,7 +6839,7 @@ class SolverFeatherPGS(SolverBase):
         self.aug_limit_counts.zero_()
 
         wp.launch(
-            build_augmented_joint_rows,
+            build_augmented_joint_rows_and_apply_tau,
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start,
@@ -6901,6 +6855,7 @@ class SolverFeatherPGS(SolverBase):
                 state_in.joint_qd,
                 control.joint_target_q,
                 control.joint_target_qd,
+                model.joint_effort_limit,
                 self.articulation_max_dofs,
                 dt,
             ],
@@ -6908,8 +6863,8 @@ class SolverFeatherPGS(SolverBase):
                 self.aug_row_counts,
                 self.aug_row_dof_index,
                 self.aug_row_K,
-                self.aug_row_u0,
                 self.aug_limit_counts,
+                state_aug.joint_tau,
             ],
             device=device,
         )
@@ -6925,24 +6880,6 @@ class SolverFeatherPGS(SolverBase):
                 self.limit_change_mask,
             ],
             device=device,
-        )
-
-    def apply_augmented_joint_tau(self, state_in: State, state_aug: State, dt: float):
-        model = self.model
-        if model.articulation_count == 0 or self.articulation_max_dofs == 0:
-            return
-
-        wp.launch(
-            apply_augmented_joint_tau,
-            dim=model.articulation_count,
-            inputs=[
-                self.articulation_max_dofs,
-                self.aug_row_counts,
-                self.aug_row_dof_index,
-                self.aug_row_u0,
-            ],
-            outputs=[state_aug.joint_tau],
-            device=model.device,
         )
 
     def _stage1_crba(self, state_aug: State):
