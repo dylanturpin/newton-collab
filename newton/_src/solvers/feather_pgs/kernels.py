@@ -129,6 +129,18 @@ def compute_com_transforms(
 
 
 @wp.kernel
+def compose_body_com_transforms(
+    body_q: wp.array[wp.transform],
+    body_X_com: wp.array[wp.transform],
+    # outputs
+    body_q_com: wp.array[wp.transform],
+):
+    """Compose current body poses with their local center-of-mass offsets."""
+    body = wp.tid()
+    body_q_com[body] = body_q[body] * body_X_com[body]
+
+
+@wp.kernel
 def update_articulation_origins(
     articulation_start: wp.array[int],
     joint_child: wp.array[int],
@@ -1193,8 +1205,9 @@ def eval_rigid_tau(
         )
 
         if parent >= 0:
-            # update parent forces, todo: check that this is valid for the backwards pass
-            wp.atomic_add(body_ft_s, parent, f_s)
+            # One thread owns the complete articulation and visits children
+            # before parents, so no other thread can update this accumulator.
+            body_ft_s[parent] = body_ft_s[parent] + f_s
 
 
 @wp.kernel
