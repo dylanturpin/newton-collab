@@ -18,7 +18,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
 from newton.solvers import SolverFeatherPGS
 
 
-def _build_chain_model(num_links=3, num_worlds=2):
+def _build_chain_model(num_links=3, num_worlds=2, *, with_free_body=False):
     chain = newton.ModelBuilder()
     hx = 0.3
     joints = []
@@ -42,6 +42,10 @@ def _build_chain_model(num_links=3, num_worlds=2):
         )
         parent = link
     chain.add_articulation(joints)
+    if with_free_body:
+        body = chain.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        chain.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        chain.add_articulation([chain.add_joint_free(parent=-1, child=body)])
     main = newton.ModelBuilder()
     main.replicate(chain, num_worlds, spacing=(3.0, 3.0, 0.0))
     return main.finalize()
@@ -229,6 +233,27 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         )
         self.assertTrue(fitting.use_fused_hinv_jt(23))
         self.assertFalse(oversized.use_fused_hinv_jt(23))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free diagonal fusion requires CUDA")
+    def test_matrix_free_diagonal_fusion_requires_nonaliased_world_response(self):
+        """Keep the extra tiled reduction off response buffers that already alias world storage."""
+        aliased = SolverFeatherPGS(
+            _build_chain_model(num_links=23, num_worlds=1),
+            pgs_mode="matrix_free",
+            dense_max_constraints=192,
+        )
+        direct = SolverFeatherPGS(
+            _build_chain_model(num_links=23, num_worlds=1, with_free_body=True),
+            pgs_mode="matrix_free",
+            dense_max_constraints=192,
+        )
+
+        self.assertTrue(aliased._jy_world_aliased)
+        self.assertFalse(aliased._hinv_jt_writes_world)
+        self.assertEqual(aliased._hinv_jt_diag_sizes, frozenset())
+        self.assertFalse(direct._jy_world_aliased)
+        self.assertTrue(direct._hinv_jt_writes_world)
+        self.assertEqual(direct._hinv_jt_diag_sizes, frozenset((23,)))
 
     def test_mfgs_metadata_storage_respects_resource_budget(self):
         """Keep resident metadata only when its complete working set fits."""
