@@ -172,6 +172,7 @@ _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUN
 _MFGS_RESIDENT_METADATA_MAX_BYTES = 4096
 _MFGS_TILE_SHARED_STORAGE_BYTES = 128
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
+_COMPOSITE_INERTIA_WARPS_PER_BLOCK = 4
 
 
 @wp.kernel
@@ -1435,6 +1436,22 @@ class SolverFeatherPGS(SolverBase):
             size
             for size in self.size_groups
             if self._hinv_jt_computes_diag and self._execution_plan.use_tiled_hinv_jt(size)
+        )
+        composite_articulations = np.flatnonzero(self._model_plan.response_dof_count > 0).astype(np.int32, copy=False)
+        self._composite_articulation_count = int(composite_articulations.size)
+        self._parallel_composite_inertia = bool(model.device.is_cuda and self._composite_articulation_count)
+        self._composite_articulations = (
+            wp.array(composite_articulations, dtype=wp.int32, device=model.device)
+            if self._parallel_composite_inertia
+            else None
+        )
+        self._composite_inertia_warp_kernel = (
+            _get_composite_inertia_warp_kernel(
+                str(getattr(model.device, "arch", "")),
+                warps_per_block=_COMPOSITE_INERTIA_WARPS_PER_BLOCK,
+            )
+            if self._parallel_composite_inertia
+            else None
         )
 
         self._allocate_common_buffers(model)
@@ -6707,6 +6724,27 @@ class SolverFeatherPGS(SolverBase):
             block_dim=self.serial_kernel_block_dim,
             device=model.device,
         )
+        refresh_composite = (self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update
+        if self._parallel_composite_inertia and refresh_composite:
+            wp.launch_tiled(
+                self._composite_inertia_warp_kernel,
+                dim=[
+                    (self._composite_articulation_count + _COMPOSITE_INERTIA_WARPS_PER_BLOCK - 1)
+                    // _COMPOSITE_INERTIA_WARPS_PER_BLOCK
+                ],
+                inputs=[
+                    self._composite_articulation_count,
+                    self._composite_articulations,
+                    model.articulation_start,
+                    self.articulation_joint_end,
+                    model.joint_ancestor,
+                    model.joint_child,
+                    state_aug.body_I_s,
+                ],
+                outputs=[self.body_I_c],
+                block_dim=32 * _COMPOSITE_INERTIA_WARPS_PER_BLOCK,
+                device=model.device,
+            )
         if model.body_count:
             wp.launch(
                 update_body_qd_from_featherstone,
@@ -6932,21 +6970,25 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-        wp.launch(
-            compute_composite_inertia,
-            dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                self.articulation_joint_end,
-                self.mass_update_mask,
-                model.joint_ancestor,
-                model.joint_child,
-                state_aug.body_I_s,
-            ],
-            outputs=[self.body_I_c],
-            device=model.device,
-            block_dim=128,
-        )
+        # Global refreshes were accumulated by the warp-parallel launch next
+        # to inverse dynamics, while the link inertias were still hot. Keep the
+        # masked scalar path for device-selected limit changes on reuse steps.
+        if not (self._parallel_composite_inertia and global_flag):
+            wp.launch(
+                compute_composite_inertia,
+                dim=model.articulation_count,
+                inputs=[
+                    model.articulation_start,
+                    self.articulation_joint_end,
+                    self.mass_update_mask,
+                    model.joint_ancestor,
+                    model.joint_child,
+                    state_aug.body_I_s,
+                ],
+                outputs=[self.body_I_c],
+                device=model.device,
+                block_dim=128,
+            )
 
         # Zeroing H is hygiene, not a correctness requirement: H is only read
         # by the Cholesky kernels, which early-exit when mass_update_mask is 0,
@@ -9387,6 +9429,81 @@ class SolverFeatherPGS(SolverBase):
             self._remove_free_root_transport(state_in, state_aug)
             wp.copy(state_out.joint_qd, self.v_out)
             eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+
+
+@cache
+def _get_composite_inertia_warp_kernel(device_arch: str, warps_per_block: int) -> "wp.Kernel":
+    """Build a one-warp-per-articulation composite-inertia reduction."""
+    _ = device_arch
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int lane = threadIdx.x & 31;
+    const int candidate = block * {warps_per_block} + (threadIdx.x >> 5);
+    if (candidate >= composite_articulation_count) return;
+    const int articulation = composite_articulations.data[candidate];
+    const int start = articulation_start.data[articulation];
+    const int end = articulation_joint_end.data[articulation];
+    for (int joint = start; joint < end; ++joint) {{
+        const int body = joint_child.data[joint];
+        const float* src = reinterpret_cast<const float*>(&body_I_s.data[body]);
+        float* dst = reinterpret_cast<float*>(&body_I_c.data[body]);
+        for (int element = lane; element < 36; element += 32) dst[element] = src[element];
+    }}
+    __syncwarp();
+
+    for (int joint = end - 1; joint >= start; --joint) {{
+        const int parent_joint = joint_ancestor.data[joint];
+        if (parent_joint >= start) {{
+            const int body = joint_child.data[joint];
+            const int parent_body = joint_child.data[parent_joint];
+            const float* src = reinterpret_cast<const float*>(&body_I_c.data[body]);
+            float* dst = reinterpret_cast<float*>(&body_I_c.data[parent_body]);
+            for (int element = lane; element < 36; element += 32) dst[element] += src[element];
+        }}
+        __syncwarp();
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def composite_inertia_warp_native(
+        block: int,
+        composite_articulation_count: int,
+        composite_articulations: wp.array[int],
+        articulation_start: wp.array[int],
+        articulation_joint_end: wp.array[int],
+        joint_ancestor: wp.array[int],
+        joint_child: wp.array[int],
+        body_I_s: wp.array[wp.spatial_matrix],
+        body_I_c: wp.array[wp.spatial_matrix],
+    ): ...
+
+    def composite_inertia_warp_template(
+        composite_articulation_count: int,
+        composite_articulations: wp.array[int],
+        articulation_start: wp.array[int],
+        articulation_joint_end: wp.array[int],
+        joint_ancestor: wp.array[int],
+        joint_child: wp.array[int],
+        body_I_s: wp.array[wp.spatial_matrix],
+        body_I_c: wp.array[wp.spatial_matrix],
+    ):
+        block, _lane = wp.tid()
+        composite_inertia_warp_native(
+            block,
+            composite_articulation_count,
+            composite_articulations,
+            articulation_start,
+            articulation_joint_end,
+            joint_ancestor,
+            joint_child,
+            body_I_s,
+            body_I_c,
+        )
+
+    composite_inertia_warp_template.__name__ = f"compute_composite_inertia_warp{warps_per_block}"
+    composite_inertia_warp_template.__qualname__ = f"compute_composite_inertia_warp{warps_per_block}"
+    return wp.kernel(enable_backward=False, module="unique")(composite_inertia_warp_template)
 
 
 @cache
