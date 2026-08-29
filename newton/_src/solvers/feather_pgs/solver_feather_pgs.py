@@ -3971,16 +3971,27 @@ class SolverFeatherPGS(SolverBase):
                 self._hinv_jt_chunk_count_by_size[size] = (
                     self.dense_max_constraints + hinv_jt_chunk_size - 1
                 ) // hinv_jt_chunk_size
-                kernel_factory = _get_hinv_jt_diag_kernel if size in self._hinv_jt_diag_sizes else _get_hinv_jt_kernel
-                self._hinv_jt_kernels_by_size[size] = kernel_factory(
-                    size,
-                    self.dense_max_constraints,
-                    device_arch,
-                    self.tile_threads,
-                    constraint_chunk_size=hinv_jt_chunk_size,
-                    write_world=self._hinv_jt_writes_world,
-                    write_group=self._hinv_jt_tiled_writes_group,
-                )
+                if size in self._hinv_jt_diag_sizes:
+                    self._hinv_jt_kernels_by_size[size] = _get_hinv_jt_kernel(
+                        size,
+                        self.dense_max_constraints,
+                        device_arch,
+                        self.tile_threads,
+                        constraint_chunk_size=hinv_jt_chunk_size,
+                        write_world=self._hinv_jt_writes_world,
+                        write_group=self._hinv_jt_tiled_writes_group,
+                        compute_diag=True,
+                    )
+                else:
+                    self._hinv_jt_kernels_by_size[size] = _get_hinv_jt_plain_kernel(
+                        size,
+                        self.dense_max_constraints,
+                        device_arch,
+                        self.tile_threads,
+                        constraint_chunk_size=hinv_jt_chunk_size,
+                        write_world=self._hinv_jt_writes_world,
+                        write_group=self._hinv_jt_tiled_writes_group,
+                    )
             self._hinv_jt_fused_kernels_by_size[size] = (
                 _get_hinv_jt_fused_kernel(size, self.dense_max_constraints, device_arch, self.tile_threads)
                 if self._execution_plan.use_fused_hinv_jt(size)
@@ -9848,7 +9859,7 @@ def _get_composite_inertia_warp_kernel(device_arch: str, warps_per_block: int) -
 
 
 @cache
-def _get_hinv_jt_kernel(
+def _get_hinv_jt_plain_kernel(
     n_dofs: int,
     max_constraints: int,
     device_arch: str,
@@ -9859,7 +9870,7 @@ def _get_hinv_jt_kernel(
 ) -> "wp.Kernel":
     """Build a specialized H^-1*J^T kernel without a diagonal output.
 
-    Keep this signature structurally separate from :func:`_get_hinv_jt_diag_kernel`.
+    Keep this signature structurally separate from :func:`_get_hinv_jt_kernel`.
     Warp retains unused formal outputs and tiled reductions even behind a false
     compile-time flag, which increases work for layouts that do not consume them.
     """
@@ -9921,7 +9932,7 @@ def _get_hinv_jt_kernel(
 
 
 @cache
-def _get_hinv_jt_diag_kernel(
+def _get_hinv_jt_kernel(
     n_dofs: int,
     max_constraints: int,
     device_arch: str,
@@ -9929,8 +9940,9 @@ def _get_hinv_jt_diag_kernel(
     constraint_chunk_size: int | None = None,
     write_world: bool = False,
     write_group: bool = True,
+    compute_diag: bool = False,
 ) -> "wp.Kernel":
-    """Build specialized H^-1*J^T and response-diagonal kernel.
+    """Build specialized H^-1*J^T kernel for given dimensions.
 
     Solves Y = H^-1 * J^T using tiled Cholesky solve:
       L * L^T * Y = J^T
@@ -9947,6 +9959,7 @@ def _get_hinv_jt_diag_kernel(
     BOUNDS_CHECK = max_constraints % chunk_size != 0
     WRITE_WORLD = wp.constant(1 if write_world else 0)
     WRITE_GROUP = wp.constant(1 if write_group else 0)
+    COMPUTE_DIAG = wp.constant(1 if compute_diag else 0)
 
     def hinv_jt_tiled_template(
         L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
@@ -9993,8 +10006,9 @@ def _get_hinv_jt_diag_kernel(
         if WRITE_GROUP != 0:
             wp.tile_store(Y_group[idx], Y_out_tile, offset=(row_start, 0), bounds_check=BOUNDS_CHECK)
 
-        diag_tile = wp.tile_sum(wp.tile_map(wp.mul, J_tile, Y_out_tile), axis=1)
-        wp.tile_store(diag_group[idx], diag_tile, offset=row_start, bounds_check=BOUNDS_CHECK)
+        if COMPUTE_DIAG != 0:
+            diag_tile = wp.tile_sum(wp.tile_map(wp.mul, J_tile, Y_out_tile), axis=1)
+            wp.tile_store(diag_group[idx], diag_tile, offset=row_start, bounds_check=BOUNDS_CHECK)
 
         if WRITE_WORLD != 0:
             dof_offset = articulation_world_dof_offset[art]
@@ -10003,7 +10017,7 @@ def _get_hinv_jt_diag_kernel(
 
     suffix = "_world" if write_world else ""
     suffix += "_nogroup" if not write_group else ""
-    suffix += "_diag"
+    suffix += "_diag" if compute_diag else ""
     hinv_jt_tiled_template.__name__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}_c{chunk_size}_bd{tile_threads}{suffix}"
     hinv_jt_tiled_template.__qualname__ = hinv_jt_tiled_template.__name__
     return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_template)

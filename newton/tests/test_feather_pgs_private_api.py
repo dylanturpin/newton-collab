@@ -11,7 +11,7 @@ _TILED_KERNEL_HELPERS = (
     "_get_cholesky_kernel",
     "_get_triangular_solve_kernel",
     "_get_hinv_jt_kernel",
-    "_get_hinv_jt_diag_kernel",
+    "_get_hinv_jt_plain_kernel",
     "_get_hinv_jt_fused_kernel",
     "_get_delassus_kernel",
     "_get_pgs_solve_tiled_row_kernel",
@@ -61,18 +61,23 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
                 self.assertIn("device_arch", parameters)
 
     def test_plain_hinv_jt_kernel_omits_diagonal_output(self):
-        plain_factory = self.top_level_functions["_get_hinv_jt_kernel"]
-        diagonal_factory = self.top_level_functions["_get_hinv_jt_diag_kernel"]
+        plain_factory = self.top_level_functions["_get_hinv_jt_plain_kernel"]
+        diagonal_factory = self.top_level_functions["_get_hinv_jt_kernel"]
         plain_template = next(node for node in plain_factory.body if isinstance(node, ast.FunctionDef))
         diagonal_template = next(node for node in diagonal_factory.body if isinstance(node, ast.FunctionDef))
 
+        diagonal_factory_parameters = {argument.arg for argument in diagonal_factory.args.args}
         plain_parameters = {argument.arg for argument in plain_template.args.args}
         diagonal_parameters = {argument.arg for argument in diagonal_template.args.args}
         plain_names = {node.id for node in ast.walk(plain_template) if isinstance(node, ast.Name)}
+        diagonal_names = {node.id for node in ast.walk(diagonal_factory) if isinstance(node, ast.Name)}
 
         self.assertNotIn("diag_group", plain_parameters)
         self.assertNotIn("diag_tile", plain_names)
+        self.assertIn("compute_diag", diagonal_factory_parameters)
+        self.assertIn("COMPUTE_DIAG", diagonal_names)
         self.assertIn("diag_group", diagonal_parameters)
+        self.assertIn("diag_tile", diagonal_names)
 
     def test_cholesky_and_triangular_kernels_are_not_dense_constraint_gated(self):
         init_method = self.solver_methods["_init_tiled_kernels"]

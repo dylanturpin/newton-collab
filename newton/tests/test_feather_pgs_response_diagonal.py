@@ -7,7 +7,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs.kernels import accumulate_group_diag_worlds
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_hinv_jt_diag_kernel
+from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_hinv_jt_kernel
 
 
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
@@ -42,13 +42,14 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         world_response = wp.zeros_like(world_jacobian)
         group_diag = wp.zeros((num_articulations, max_constraints), dtype=wp.float32, device=device)
 
-        kernel = _get_hinv_jt_diag_kernel(
+        kernel = _get_hinv_jt_kernel(
             num_dofs,
             max_constraints,
             str(device.arch),
             constraint_chunk_size=8,
             write_world=True,
             write_group=False,
+            compute_diag=True,
         )
         wp.launch_tiled(
             kernel,
