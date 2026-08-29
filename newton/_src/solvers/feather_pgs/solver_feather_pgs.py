@@ -877,8 +877,9 @@ class SolverFeatherPGS(SolverBase):
                 links of the same articulation to propagation rows instead of dense generalized
                 rows. Their effective mass is recomputed with exact cross operational-space
                 response by propagating each row's combined test impulse through the articulated
-                body factorization. Requires ``articulated_contact_response="propagation"``
-                or ``"propagation-colored"``. Defaults to False (dense routing, prior
+                body factorization. With ``articulated_contact_response="immediate"``, ordinary
+                free/ground and free/free contacts retain their immediate paths while only this
+                same-articulation tail uses propagation. Defaults to False (dense routing, prior
                 behavior).
             propagation_max_constraints (int | None, optional): Maximum number of
                 propagation constraint rows stored per world. ``None`` preserves the
@@ -1085,11 +1086,6 @@ class SolverFeatherPGS(SolverBase):
         self.articulated_contact_response = articulated_contact_response
         self.propagation_full_fused_iterations = articulated_contact_response == "propagation-fused"
         self._propagation_colored = articulated_contact_response == "propagation-colored"
-        if propagation_same_articulation_rows and articulated_contact_response == "immediate":
-            raise ValueError(
-                "propagation_same_articulation_rows requires articulated_contact_response "
-                "'propagation' or 'propagation-colored'"
-            )
         if propagation_same_articulation_rows and articulated_contact_response == "propagation-fused":
             raise NotImplementedError(
                 "propagation_same_articulation_rows is not supported on the fused path yet; "
@@ -1141,10 +1137,13 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_mode = pgs_mode
         if self.enable_joint_velocity_limits and self.pgs_mode != "matrix_free":
             raise NotImplementedError("enable_joint_velocity_limits=True currently requires pgs_mode='matrix_free'")
-        if articulated_contact_response != "immediate" and self.pgs_mode != "matrix_free":
+        if (
+            articulated_contact_response != "immediate" or self.propagation_same_articulation_rows
+        ) and self.pgs_mode != "matrix_free":
             raise NotImplementedError(
-                f"articulated_contact_response={articulated_contact_response!r} currently requires "
-                "pgs_mode='matrix_free'"
+                "propagation contact routing currently requires pgs_mode='matrix_free'; "
+                f"got articulated_contact_response={articulated_contact_response!r}, "
+                f"propagation_same_articulation_rows={self.propagation_same_articulation_rows}"
             )
         if model.device.is_cpu and self.pgs_mode == "matrix_free":
             raise NotImplementedError(
@@ -1208,7 +1207,7 @@ class SolverFeatherPGS(SolverBase):
                     f"got pgs_mode={pgs_mode!r} with friction_mode={friction_mode!r}. "
                     "Select pgs_mode='matrix_free' or leave friction_mode='current'."
                 )
-            if articulated_contact_response != "immediate":
+            if articulated_contact_response != "immediate" or self.propagation_same_articulation_rows:
                 raise NotImplementedError(
                     f"articulated_contact_response={articulated_contact_response!r} currently supports "
                     "friction_mode='current' only"
@@ -1356,6 +1355,7 @@ class SolverFeatherPGS(SolverBase):
             self._kinematic_dof_mask_host,
             enable_prescribed_response=(
                 self.pgs_mode == "matrix_free" and self.articulated_contact_response == "immediate"
+                and not self.propagation_same_articulation_rows
             ),
         )
         self._prescribed_articulation = wp.array(
@@ -1371,11 +1371,14 @@ class SolverFeatherPGS(SolverBase):
             model.articulation_count
             and np.any(self._model_plan.articulation_joint_end < model.articulation_start.numpy()[1:])
         )
-        if self._has_loop_joints and self.articulated_contact_response != "immediate":
+        if self._has_loop_joints and (
+            self.articulated_contact_response != "immediate" or self.propagation_same_articulation_rows
+        ):
             raise ValueError(
                 "SolverFeatherPGS: loop-closing joints (imported connect/weld equalities) are "
-                f"only supported with articulated_contact_response='immediate' "
-                f"(got {self.articulated_contact_response!r})."
+                "only supported without propagation contact routing "
+                f"(got articulated_contact_response={self.articulated_contact_response!r}, "
+                f"propagation_same_articulation_rows={self.propagation_same_articulation_rows})."
             )
         # Mimic/connect plans must exist before capacity selection so the row census
         # counts their rows (see _estimate_dense_internal_rows_per_world).
@@ -1668,6 +1671,8 @@ class SolverFeatherPGS(SolverBase):
     def _propagation_contacts_enabled(self) -> bool:
         if self.pgs_mode != "matrix_free":
             return False
+        if self.articulated_contact_response == "immediate":
+            return self.propagation_same_articulation_rows and self._has_non_free_articulations
         if self.articulated_contact_response not in ("propagation", "propagation-fused", "propagation-colored"):
             return False
         if self._has_non_free_articulations:
@@ -1902,15 +1907,15 @@ class SolverFeatherPGS(SolverBase):
                 "counts. Use pgs_mode='matrix_free' or pgs_mode='split' (both with the "
                 "default articulated_contact_response='immediate') instead."
             )
-        if self.articulated_contact_response != "immediate":
+        if self.articulated_contact_response != "immediate" or self.propagation_same_articulation_rows:
             raise ValueError(
-                f"articulated_contact_response={self.articulated_contact_response!r} does not "
-                "support heterogeneous multi-world models "
+                "Propagation contact routing does not support heterogeneous multi-world models "
                 f"(found per-world DOF counts [{counts_str}]): the propagation-family contact "
                 "response uses fixed-width per-world velocity windows that silently corrupt "
                 "velocities across world boundaries when worlds have differing DOF counts. "
-                "Use articulated_contact_response='immediate' with pgs_mode='matrix_free', "
-                "or pgs_mode='split', instead."
+                "Use articulated_contact_response='immediate' with "
+                "propagation_same_articulation_rows=False and pgs_mode='matrix_free', or "
+                "pgs_mode='split', instead."
             )
 
     def _select_dense_row_capacity(self, model) -> int:

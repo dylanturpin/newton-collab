@@ -241,10 +241,13 @@ class TestPropagationSameArticulation(unittest.TestCase):
         self.assertEqual(int(solver.propagation_constraint_count.numpy()[0]), 0)
         self.assertGreater(len(_contact_rows(solver, DENSE_PATH)), 0)
 
-    def test_flag_requires_propagation_mode(self):
+    def test_immediate_mode_can_route_only_same_articulation_rows(self):
         model = _build_scissor_model("cuda:0")
-        with self.assertRaises(ValueError):
-            _make_solver(model, "immediate", propagation_same_articulation_rows=True)
+        solver = _make_solver(model, "immediate", propagation_same_articulation_rows=True)
+        _zero_iteration_step(model, solver)
+        self.assertTrue(solver._propagation_contacts_enabled())
+        self.assertGreater(len(_contact_rows(solver, PROPAGATION_PATH)), 0)
+        self.assertEqual(len(_contact_rows(solver, DENSE_PATH)), 0)
 
     def test_cross_response_effective_mass_matches_reference_operator(self):
         """The defining check: with same-articulation rows routed to propagation,
@@ -257,7 +260,9 @@ class TestPropagationSameArticulation(unittest.TestCase):
         dense_rows = _contact_rows(reference, DENSE_PATH)
         self.assertGreater(len(dense_rows), 0)
 
-        solver = _make_solver(model, "propagation", propagation_same_articulation_rows=True)
+        # Keep ordinary free/ground and free/free contacts on their immediate
+        # paths; only the same-articulation tail uses propagation.
+        solver = _make_solver(model, "immediate", propagation_same_articulation_rows=True)
         state = _zero_iteration_step(model, solver)
         prop_rows = _contact_rows(solver, PROPAGATION_PATH)
         self.assertEqual(
