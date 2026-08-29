@@ -35,9 +35,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
 
         impulses = wp.zeros((2, max_constraints), dtype=wp.float32, device=device)
         velocity_out = wp.array(velocity, dtype=wp.float32, device=device)
-        kernel = _get_pgs_solve_local_internal_kernel(
-            max_constraints, local_max_constraints, dof_count, device.arch
-        )
+        kernel = _get_pgs_solve_local_internal_kernel(max_constraints, local_max_constraints, dof_count, device.arch)
         wp.launch_tiled(
             kernel,
             dim=[2],
