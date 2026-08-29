@@ -672,6 +672,7 @@ class SolverFeatherPGS(SolverBase):
         contact_speculative_scale: float = 1.0,
         contact_gap_gate: float = 0.0,
         same_articulation_contact_gap_gate: float = 0.0,
+        articulation_pair_contact_gap_gate: float = 0.0,
     ):
         """
         Args:
@@ -726,6 +727,11 @@ class SolverFeatherPGS(SolverBase):
                 gap exceeds this distance. This can retain a long predictive horizon for fast
                 free bodies while bounding speculative self-contact row demand. A value of 0.0
                 disables the scoped gate. Must be finite and non-negative. Defaults to 0.0.
+            articulation_pair_contact_gap_gate (float, optional): If positive, skip contacts
+                between two non-free articulated bodies whose world-space gap exceeds this
+                distance. Contacts involving ground or a free rigid body retain the full
+                predictive horizon. A value of 0.0 disables the scoped gate. Must be finite
+                and non-negative. Defaults to 0.0.
             contact_shared_anchor (bool, optional): If true, all contact rows use the midpoint between
                 the two witness points as the Jacobian point on both bodies, matching PhysX contact
                 prep's single ``contact.point`` lever arm. ``phi`` is still computed from the original
@@ -1062,6 +1068,15 @@ class SolverFeatherPGS(SolverBase):
             or self.same_articulation_contact_gap_gate < 0.0
         ):
             raise ValueError("same_articulation_contact_gap_gate must be finite and non-negative")
+        try:
+            self.articulation_pair_contact_gap_gate = float(articulation_pair_contact_gap_gate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("articulation_pair_contact_gap_gate must be finite and non-negative") from exc
+        if (
+            not np.isfinite(self.articulation_pair_contact_gap_gate)
+            or self.articulation_pair_contact_gap_gate < 0.0
+        ):
+            raise ValueError("articulation_pair_contact_gap_gate must be finite and non-negative")
         self.contact_shared_anchor = bool(contact_shared_anchor)
         if self.contact_friction_position_iterations < -1:
             raise ValueError(
@@ -7795,6 +7810,7 @@ class SolverFeatherPGS(SolverBase):
                     1 if (self._route_free_free_contacts and propagation_active) else 0,
                     self.contact_gap_gate,
                     self.same_articulation_contact_gap_gate,
+                    self.articulation_pair_contact_gap_gate,
                     max_constraints,
                     self.mf_max_constraints,
                     self.propagation_max_constraints,

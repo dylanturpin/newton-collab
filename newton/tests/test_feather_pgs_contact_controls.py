@@ -28,7 +28,13 @@ PATH_PROPAGATION = 2
 
 
 def _launch_contact_allocator(
-    *, route: int, gap: float, gate: float, responsive: bool = True, scoped_gate: float = 0.0
+    *,
+    route: int,
+    gap: float,
+    gate: float,
+    responsive: bool = True,
+    scoped_gate: float = 0.0,
+    pair_gate: float = 0.0,
 ):
     """Allocate one contact and return its route metadata and counters."""
     device = "cpu"
@@ -76,6 +82,7 @@ def _launch_contact_allocator(
             0,
             gate,
             scoped_gate,
+            pair_gate,
             8,
             8,
             8,
@@ -101,7 +108,9 @@ def _launch_contact_allocator(
     return {name: int(array.numpy()[0]) for name, array in (outputs | counters).items()}
 
 
-def _launch_same_articulation_contact_allocator(*, gap: float, scoped_gate: float):
+def _launch_same_articulation_contact_allocator(
+    *, gap: float, scoped_gate: float, pair_gate: float = 0.0
+):
     """Allocate one two-link contact from a non-free articulation."""
     device = "cpu"
     contact_slot = wp.full((1,), -9, dtype=wp.int32, device=device)
@@ -133,6 +142,7 @@ def _launch_same_articulation_contact_allocator(*, gap: float, scoped_gate: floa
             0,
             0.0,
             scoped_gate,
+            pair_gate,
             8,
             8,
             8,
@@ -482,6 +492,7 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         self.assertEqual(solver.contact_speculative_scale, 1.0)
         self.assertEqual(solver.contact_gap_gate, 0.0)
         self.assertEqual(solver.same_articulation_contact_gap_gate, 0.0)
+        self.assertEqual(solver.articulation_pair_contact_gap_gate, 0.0)
         parameters = tuple(inspect.signature(SolverFeatherPGS).parameters)
         self.assertIn("same_articulation_contact_gap_gate", parameters)
 
@@ -493,15 +504,18 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             contact_speculative_scale=0.0,
             contact_gap_gate=0.001,
             same_articulation_contact_gap_gate=0.002,
+            articulation_pair_contact_gap_gate=0.003,
         )
         self.assertEqual(solver.contact_speculative_scale, 0.0)
         self.assertEqual(solver.contact_gap_gate, 0.001)
         self.assertEqual(solver.same_articulation_contact_gap_gate, 0.002)
+        self.assertEqual(solver.articulation_pair_contact_gap_gate, 0.003)
 
         for name in (
             "contact_speculative_scale",
             "contact_gap_gate",
             "same_articulation_contact_gap_gate",
+            "articulation_pair_contact_gap_gate",
         ):
             for value in (-0.1, float("nan"), float("inf"), "invalid"):
                 with self.subTest(name=name, value=value):
@@ -539,6 +553,25 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                 )
                 self.assertEqual(result["path"], route)
                 self.assertEqual(result[counter], 1)
+
+    def test_articulation_pair_gap_gate_drops_distant_pair_contact(self):
+        """The pair gate includes same-articulation contact without touching free-body routes."""
+        self.assertEqual(
+            _launch_same_articulation_contact_allocator(
+                gap=0.004,
+                scoped_gate=0.0,
+                pair_gate=0.003,
+            ),
+            (-1, -1, 0),
+        )
+        result = _launch_contact_allocator(
+            route=PATH_MATRIX_FREE,
+            gap=0.04,
+            gate=0.0,
+            pair_gate=0.003,
+        )
+        self.assertEqual(result["path"], PATH_MATRIX_FREE)
+        self.assertEqual(result["mf_count"], 1)
 
     def test_speculative_scale_controls_every_position_rhs_family(self):
         """Scale positive-gap position bias on dense, MF, and propagation rows."""
