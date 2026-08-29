@@ -9943,6 +9943,40 @@ def add_dense_contact_compliance_to_diag(
 # much better GPU utilization than the single-thread-per-articulation versions.
 
 
+@wp.func
+def solve_hinv_jt_row(
+    L_group: wp.array3d[float],
+    J_group: wp.array3d[float],
+    group_index: int,
+    constraint: int,
+    dof_count: int,
+    Y_group: wp.array3d[float],
+):
+    """Solve one grouped ``H^-1 J^T`` column in place."""
+    for i in range(dof_count):
+        value = J_group[group_index, constraint, i]
+        for k in range(i):
+            value -= L_group[group_index, i, k] * Y_group[group_index, constraint, k]
+
+        diagonal = L_group[group_index, i, i]
+        if diagonal != 0.0:
+            Y_group[group_index, constraint, i] = value / diagonal
+        else:
+            Y_group[group_index, constraint, i] = 0.0
+
+    for reverse in range(dof_count):
+        i = dof_count - 1 - reverse
+        value = Y_group[group_index, constraint, i]
+        for k in range(i + 1, dof_count):
+            value -= L_group[group_index, k, i] * Y_group[group_index, constraint, k]
+
+        diagonal = L_group[group_index, i, i]
+        if diagonal != 0.0:
+            Y_group[group_index, constraint, i] = value / diagonal
+        else:
+            Y_group[group_index, constraint, i] = 0.0
+
+
 @wp.kernel
 def hinv_jt_par_row(
     # Grouped Cholesky factor storage [n_arts, n_dofs, n_dofs]
@@ -9998,50 +10032,61 @@ def hinv_jt_par_row(
     if c >= n_constraints:
         return
 
-    # ----------------------------------------------------------------
-    # Forward substitution: L * z = j
-    # L is lower triangular, so solve from top to bottom
-    # ----------------------------------------------------------------
-    for i in range(n_dofs):
-        # z[i] = (j[i] - sum_{k<i} L[i,k] * z[k]) / L[i,i]
-        val = J_group[idx, c, i]
-
-        for k in range(i):
-            # z[k] is stored in Y_group temporarily
-            val -= L_group[idx, i, k] * Y_group[idx, c, k]
-
-        L_ii = L_group[idx, i, i]
-        if L_ii != 0.0:
-            Y_group[idx, c, i] = val / L_ii
-        else:
-            Y_group[idx, c, i] = 0.0
-
-    # ----------------------------------------------------------------
-    # Backward substitution: L^T * y = z
-    # L^T is upper triangular, so solve from bottom to top
-    # z is currently stored in Y_group, we overwrite with y
-    # ----------------------------------------------------------------
-    for i_rev in range(n_dofs):
-        i = n_dofs - 1 - i_rev
-
-        # y[i] = (z[i] - sum_{k>i} L[k,i] * y[k]) / L[i,i]
-        # Note: L^T[i,k] = L[k,i], so we read L[k,i] for k > i
-        val = Y_group[idx, c, i]  # This is z[i] from forward pass
-
-        for k in range(i + 1, n_dofs):
-            val -= L_group[idx, k, i] * Y_group[idx, c, k]
-
-        L_ii = L_group[idx, i, i]
-        if L_ii != 0.0:
-            Y_group[idx, c, i] = val / L_ii
-        else:
-            Y_group[idx, c, i] = 0.0
+    solve_hinv_jt_row(L_group, J_group, idx, c, n_dofs, Y_group)
 
     if write_world != 0:
         dof_offset = articulation_world_dof_offset[art]
         for i in range(n_dofs):
             J_world[world, c, dof_offset + i] = J_group[idx, c, i]
             Y_world[world, c, dof_offset + i] = Y_group[idx, c, i]
+
+
+@wp.kernel
+def hinv_jt_par_row_contact_fallback(
+    L_group: wp.array3d[float],
+    J_group: wp.array3d[float],
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
+    world_constraint_count: wp.array[int],
+    dense_phase_bounds: wp.array2d[int],
+    mf_constraint_count: wp.array[int],
+    n_dofs: int,
+    max_constraints: int,
+    local_internal_max_constraints: int,
+    n_arts: int,
+    write_world: int,
+    Y_group: wp.array3d[float],
+    J_world: wp.array3d[float],
+    Y_world: wp.array3d[float],
+):
+    """Compute response only for worlds that need the general contact solver."""
+    tid = wp.tid()
+    group_index = tid // 32
+    lane = tid % 32
+    if group_index >= n_arts:
+        return
+
+    art = group_to_art[group_index]
+    world = art_to_world[art]
+    constraint_count = world_constraint_count[world]
+    if (
+        constraint_count <= local_internal_max_constraints
+        and dense_phase_bounds[world, 1] == constraint_count
+        and mf_constraint_count[world] == 0
+    ):
+        return
+
+    constraint = lane
+    while constraint < constraint_count:
+        solve_hinv_jt_row(L_group, J_group, group_index, constraint, n_dofs, Y_group)
+
+        if write_world != 0:
+            dof_offset = articulation_world_dof_offset[art]
+            for i in range(n_dofs):
+                J_world[world, constraint, dof_offset + i] = J_group[group_index, constraint, i]
+                Y_world[world, constraint, dof_offset + i] = Y_group[group_index, constraint, i]
+        constraint += 32
 
 
 @wp.kernel
