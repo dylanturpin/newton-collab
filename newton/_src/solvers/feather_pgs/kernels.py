@@ -3232,6 +3232,7 @@ def _allocate_world_contact_slot(
     propagation_free_free: int,
     contact_gap_gate: float,
     same_articulation_contact_gap_gate: float,
+    articulation_pair_contact_gap_gate: float,
     max_constraints: int,
     mf_max_constraints: int,
     propagation_max_constraints: int,
@@ -3353,13 +3354,22 @@ def _allocate_world_contact_slot(
     # balls), while allowing callers to bound distant speculative self-contact
     # rows on one articulation. Penetrating and near-contact self-collisions are
     # unchanged because only positive gaps above the opt-in threshold are cut.
-    same_non_free_articulation = (
-        art_a >= 0 and art_b == art_a and is_free_rigid[art_a] == 0
-    )
+    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
+    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
+    same_non_free_articulation = a_non_free and b_non_free and art_a == art_b
     if (
         same_articulation_contact_gap_gate > 0.0
         and same_non_free_articulation
         and phi > same_articulation_contact_gap_gate
+    ):
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
+    if (
+        articulation_pair_contact_gap_gate > 0.0
+        and a_non_free
+        and b_non_free
+        and phi > articulation_pair_contact_gap_gate
     ):
         contact_slot[c] = -1
         contact_path[c] = -1
@@ -3385,8 +3395,6 @@ def _allocate_world_contact_slot(
         is_mf = 0
         is_propagation = 1
     if propagation_articulated_contacts != 0 and is_mf == 0 and is_propagation == 0:
-        a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
-        b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
         # Same-articulation two-link contacts need cross response terms between
         # the two touched links. They route to propagation rows only when the
         # cross-response path is enabled; otherwise they stay on the dense
