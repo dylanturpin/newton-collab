@@ -192,6 +192,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
             dim=capacity,
             inputs=[
                 wp.array([capacity + 1], dtype=wp.int32, device=device),
+                capacity,
                 wp.zeros((capacity,), dtype=wp.int32, device=device),
                 wp.full((capacity,), -1, dtype=wp.int32, device=device),
                 wp.zeros((capacity,), dtype=wp.vec3, device=device),

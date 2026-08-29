@@ -79,6 +79,7 @@ from .kernels import (
     build_propagation_contact_rows,
     cholesky_loop,
     clamp_free_root_velocity_limits,
+    clear_grouped_jacobian_active_rows,
     collect_propagation_units,
     commit_mass_updates,
     compose_body_com_transforms,
@@ -131,10 +132,12 @@ from .kernels import (
     populate_mimic_J_for_size,
     populate_physx_drive_J_for_size,
     populate_rigid_velocity_limit_rows,
+    populate_world_J_for_compact_size,
     populate_world_J_for_size,
     preelim_correct_Y_for_size,
     preelim_project_velocity_for_size,
     preelim_setup_for_size,
+    prepare_world_contact_rows,
     prepare_world_impulses,
     prescale_joint_velocity_limits,
     propagate_tree_impulses_for_size,
@@ -169,6 +172,9 @@ _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUN
 _MFGS_RESIDENT_METADATA_MAX_BYTES = 4096
 _MFGS_TILE_SHARED_STORAGE_BYTES = 128
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
+_CONTACT_BUILD_THREAD_CAP = 65536
+_CONTACT_JACOBIAN_WORKER_CAP = 4096
+_CONTACT_JACOBIAN_MAX_DOF = 10
 _COMPOSITE_INERTIA_WARPS_PER_BLOCK = 4
 _JOINT_LIMIT_WARPS_PER_BLOCK = 4
 
@@ -1800,6 +1806,13 @@ class SolverFeatherPGS(SolverBase):
         self._is_homogeneous = (len(self.size_groups) == 1) if self.size_groups else True
         self._build_body_maps(model)
         self._classify_free_rigid_bodies(model)
+        self._compact_contact_jacobian = bool(
+            model.device.is_cuda
+            and not model.requires_grad
+            and self.body_response_dof_mask is not None
+            and self.size_groups
+            and max(self.size_groups) <= _CONTACT_JACOBIAN_MAX_DOF
+        )
         self._propagation_tree_single_dof_by_size: dict[int, bool] = {}
         self._propagation_tree_free_root_by_size: dict[int, bool] = {}
         self._propagation_tree_has_non_free_by_size: dict[int, bool] = {}
@@ -2677,6 +2690,7 @@ class SolverFeatherPGS(SolverBase):
             self.body_to_joint = None
             self.body_to_articulation = None
             self.body_has_response_dofs = None
+            self.body_response_dof_mask = None
             return
 
         joint_child = model.joint_child.numpy()
@@ -2706,6 +2720,7 @@ class SolverFeatherPGS(SolverBase):
                 body_to_articulation[child] = articulation
 
         body_has_response_dofs = np.zeros(model.body_count, dtype=np.int32)
+        body_response_dof_mask = np.zeros(model.body_count, dtype=np.uint32)
         for body, joint in enumerate(body_to_joint):
             articulation = body_to_articulation[body]
             if joint < 0 or articulation < 0:
@@ -2716,15 +2731,21 @@ class SolverFeatherPGS(SolverBase):
             while ancestor_joint >= 0:
                 joint_dof_start = int(joint_qd_start[ancestor_joint])
                 joint_dof_end = int(joint_qd_start[ancestor_joint + 1])
-                if max(joint_dof_start, response_start) < min(joint_dof_end, response_end):
+                overlap_start = max(joint_dof_start, response_start)
+                overlap_end = min(joint_dof_end, response_end)
+                if overlap_start < overlap_end:
                     body_has_response_dofs[body] = 1
-                    break
+                    for global_dof in range(overlap_start, overlap_end):
+                        local_dof = global_dof - response_start
+                        if local_dof < 32:
+                            body_response_dof_mask[body] |= np.uint32(1 << local_dof)
                 ancestor_joint = int(joint_ancestor[ancestor_joint])
 
         device = model.device
         self.body_to_joint = wp.array(body_to_joint, dtype=wp.int32, device=device)
         self.body_to_articulation = wp.array(body_to_articulation, dtype=wp.int32, device=device)
         self.body_has_response_dofs = wp.array(body_has_response_dofs, dtype=wp.int32, device=device)
+        self.body_response_dof_mask = wp.array(body_response_dof_mask, dtype=wp.uint32, device=device)
 
     def _classify_free_rigid_bodies(self, model):
         """Materialize free-rigid execution metadata from the model plan."""
@@ -4254,11 +4275,13 @@ class SolverFeatherPGS(SolverBase):
                 self._size_events[size] = None
 
     def _init_double_buffer_stream(self):
-        """Create a dedicated CUDA stream for async memset of H/J buffers."""
+        """Create a CUDA stream for mass-matrix and active-Jacobian maintenance."""
         if self._H_bufs is None or not self.model.device.is_cuda:
             self._memset_stream = None
+            self._j_active_counts = None
             return
         self._memset_stream = wp.Stream(self.model.device)
+        self._j_active_counts = [wp.zeros_like(self.constraint_count), wp.zeros_like(self.constraint_count)]
         # Track the last memset-done event per buffer slot so the main stream
         # can wait only for the specific buffer it needs.
         self._memset_done_event: list[wp.Event | None] = [None, None]
@@ -6369,7 +6392,12 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
 
-        # Double-buffer: fork memset stream to zero current buffer for reuse.
+        # Double-buffer: fork the maintenance stream to clear the current
+        # buffer for reuse. The compact path snapshots this solve's row counts
+        # on the main stream, then clears only those active J prefixes; every
+        # inactive row is already clean by induction because each previously
+        # active prefix was cleared immediately after use. H keeps its existing
+        # conditional full-buffer clear.
         # ScopedStream(sync_enter=True) records an event on the main stream and
         # makes the memset stream wait — this is what forks it into graph capture.
         # J must be zeroed every step (constraint rows are rebuilt per step),
@@ -6385,11 +6413,25 @@ class SolverFeatherPGS(SolverBase):
         # the Cholesky kernels never read H when mass_update_mask is 0.
         if self._memset_stream is not None:
             with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=False):
+                wp.copy(self._j_active_counts[self._buf_idx], self.constraint_count)
                 with wp.ScopedStream(self._memset_stream):
                     for size in self.size_groups:
                         if self._mass_update_global_flag:
                             self._H_bufs[self._buf_idx][size].zero_()
-                        self._J_bufs[self._buf_idx][size].zero_()
+                        wp.launch(
+                            clear_grouped_jacobian_active_rows,
+                            dim=self.n_arts_by_size[size] * 32,
+                            inputs=[
+                                self.group_to_art[size],
+                                self.art_to_world,
+                                self._j_active_counts[self._buf_idx],
+                                size,
+                                self.dense_max_constraints,
+                            ],
+                            outputs=[self._J_bufs[self._buf_idx][size]],
+                            block_dim=256,
+                            device=self.model.device,
+                        )
                 self._memset_done_event[self._buf_idx] = self._memset_stream.record_event()
                 self._buf_idx = 1 - self._buf_idx
 
@@ -7571,12 +7613,14 @@ class SolverFeatherPGS(SolverBase):
             and contacts.rigid_contact_max > 0
         ):
             enable_friction_flag = 1 if self.enable_contact_friction else 0
+            contact_build_threads = min(contacts.rigid_contact_max, _CONTACT_BUILD_THREAD_CAP)
 
             wp.launch(
                 allocate_world_contact_slots,
-                dim=contacts.rigid_contact_max,
+                dim=contact_build_threads,
                 inputs=[
                     contacts.rigid_contact_count,
+                    contact_build_threads,
                     contacts.rigid_contact_shape0,
                     contacts.rigid_contact_shape1,
                     contacts.rigid_contact_point0,
@@ -7630,12 +7674,13 @@ class SolverFeatherPGS(SolverBase):
                     self.J_by_size[size].zero_()
                 j_buffers_zeroed = True
 
-            for size in self.size_groups:
+            if self._compact_contact_jacobian:
                 wp.launch(
-                    populate_world_J_for_size,
-                    dim=contacts.rigid_contact_max,
+                    prepare_world_contact_rows,
+                    dim=contact_build_threads,
                     inputs=[
                         contacts.rigid_contact_count,
+                        contact_build_threads,
                         contacts.rigid_contact_point0,
                         contacts.rigid_contact_point1,
                         contacts.rigid_contact_normal,
@@ -7648,20 +7693,11 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_art_a,
                         self.contact_art_b,
                         self.contact_path,
-                        size,  # target_size
-                        self.articulation_response_dof_count,
-                        self.art_group_idx,
-                        self.articulation_dof_start,
-                        self.articulation_origin,
-                        self.body_to_joint,
-                        model.joint_ancestor,
-                        model.joint_qd_start,
-                        state_aug.joint_S_s,
                         model.shape_body,
                         state_in.body_q,
                         state_aug.body_v_s,
                         self._prescribed_articulation,
-                        model.shape_transform,
+                        self.articulation_origin,
                         self.shape_material_mu,
                         self.shape_material_restitution,
                         enable_friction_flag,
@@ -7674,7 +7710,6 @@ class SolverFeatherPGS(SolverBase):
                         self.pgs_cfm,
                     ],
                     outputs=[
-                        self.J_by_size[size],
                         self.row_type,
                         self.row_parent,
                         self.row_mu,
@@ -7686,14 +7721,108 @@ class SolverFeatherPGS(SolverBase):
                     ],
                     device=model.device,
                 )
+                contact_jacobian_workers = min(contacts.rigid_contact_max, _CONTACT_JACOBIAN_WORKER_CAP)
+                for size in self.size_groups:
+                    wp.launch(
+                        populate_world_J_for_compact_size,
+                        dim=(contact_jacobian_workers, 32),
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            contact_jacobian_workers,
+                            contacts.rigid_contact_point0,
+                            contacts.rigid_contact_point1,
+                            contacts.rigid_contact_normal,
+                            contacts.rigid_contact_shape0,
+                            contacts.rigid_contact_shape1,
+                            contacts.rigid_contact_margin0,
+                            contacts.rigid_contact_margin1,
+                            self.contact_slot,
+                            self.contact_art_a,
+                            self.contact_art_b,
+                            self.contact_path,
+                            self.contact_slots_needed,
+                            size,
+                            self.articulation_response_dof_count,
+                            self.art_group_idx,
+                            self.articulation_dof_start,
+                            self.articulation_origin,
+                            self.body_response_dof_mask,
+                            state_aug.joint_S_s,
+                            model.shape_body,
+                            state_in.body_q,
+                            int(self.contact_friction_shared_anchor),
+                            int(self.contact_shared_anchor),
+                        ],
+                        outputs=[self.J_by_size[size]],
+                        device=model.device,
+                    )
+            else:
+                for size in self.size_groups:
+                    wp.launch(
+                        populate_world_J_for_size,
+                        dim=contact_build_threads,
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            contact_build_threads,
+                            contacts.rigid_contact_point0,
+                            contacts.rigid_contact_point1,
+                            contacts.rigid_contact_normal,
+                            contacts.rigid_contact_shape0,
+                            contacts.rigid_contact_shape1,
+                            contacts.rigid_contact_margin0,
+                            contacts.rigid_contact_margin1,
+                            self.contact_world,
+                            self.contact_slot,
+                            self.contact_art_a,
+                            self.contact_art_b,
+                            self.contact_path,
+                            size,
+                            self.articulation_response_dof_count,
+                            self.art_group_idx,
+                            self.articulation_dof_start,
+                            self.articulation_origin,
+                            self.body_to_joint,
+                            model.joint_ancestor,
+                            model.joint_qd_start,
+                            state_aug.joint_S_s,
+                            model.shape_body,
+                            state_in.body_q,
+                            state_aug.body_v_s,
+                            self._prescribed_articulation,
+                            model.shape_transform,
+                            self.shape_material_mu,
+                            self.shape_material_restitution,
+                            enable_friction_flag,
+                            self.contact_friction_gap_threshold,
+                            int(self.contact_friction_shared_anchor),
+                            self.contact_friction_anchor_limit,
+                            self.contact_friction_scale,
+                            int(self.contact_shared_anchor),
+                            self.pgs_beta,
+                            self.pgs_cfm,
+                        ],
+                        outputs=[
+                            self.J_by_size[size],
+                            self.row_type,
+                            self.row_parent,
+                            self.row_mu,
+                            self.row_beta,
+                            self.row_cfm,
+                            self.phi,
+                            self.target_velocity,
+                            self.row_restitution,
+                        ],
+                        device=model.device,
+                    )
 
             # Build MF contact rows
             if mf_active:
                 wp.launch(
                     build_mf_contact_rows,
-                    dim=contacts.rigid_contact_max,
+                    dim=contact_build_threads,
                     inputs=[
                         contacts.rigid_contact_count,
+                        contact_build_threads,
                         contacts.rigid_contact_point0,
                         contacts.rigid_contact_point1,
                         contacts.rigid_contact_normal,
