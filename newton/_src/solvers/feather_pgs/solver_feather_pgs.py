@@ -1247,10 +1247,19 @@ class SolverFeatherPGS(SolverBase):
             # :meth:`_allocate_buffers`.
             pass
         self.mf_max_constraints = int(mf_max_constraints)
-        # Propagation rows replace the old D-wide dense articulated rows, not
-        # ordinary free/free MF rows. Keep their capacity tied to dense rows so
-        # mixed scenes with many free bodies do not allocate at the larger MF cap.
-        self.propagation_max_constraints = self._requested_dense_max_constraints
+        # Propagation rows replaced the old D-wide dense articulated rows, so their
+        # capacity used to be the dense cap alone. In the "propagation" and
+        # "propagation-colored" modes EVERY contact row lives on this family — the
+        # free/free and free/ground rows that would otherwise be matrix-free rows
+        # plus the articulated-contact rows that would otherwise be dense rows — so
+        # its capacity is the sum of the two budgets it absorbs. With the dense cap
+        # alone (32 by default) allocate_world_contact_slots silently dropped every
+        # contact past the cap (contact_path = -1): on a tote-nesting manifold that
+        # kept 10 of 24 contacts and sank the stack. Other modes keep the dense cap.
+        if articulated_contact_response in ("propagation", "propagation-colored"):
+            self.propagation_max_constraints = int(mf_max_constraints) + self._requested_dense_max_constraints
+        else:
+            self.propagation_max_constraints = self._requested_dense_max_constraints
         if self.propagation_max_constraints < 1:
             raise ValueError("propagation_max_constraints must be positive")
         self._double_buffer = double_buffer
@@ -3863,6 +3872,19 @@ class SolverFeatherPGS(SolverBase):
         self._pgs_solve_propagation_colored_block_kernel = None
         self._propagation_colored_block_dim = 64
         if model.device.is_cuda and self._propagation_colored and self.propagation_max_constraints > 0:
+            # The pre-build colouring kernel stages one short per contact unit in shared
+            # memory (4 arrays). Friction units own 3 rows, so ceil(M/3) is the colored
+            # staging budget; finite gap or anchor filtering can create extra 1-row units,
+            # which the pre-build kernel appends to its ordered serial tail. Without
+            # friction every unit is a single row and must fit the staging budget.
+            m_rows = int(self.propagation_max_constraints)
+            self._propagation_color_max_units = (m_rows + 2) // 3 if self.enable_contact_friction else m_rows
+            if self._propagation_color_max_units > 4096:
+                raise ValueError(
+                    "propagation-colored: the colouring kernel stages up to "
+                    f"{self._propagation_color_max_units} contact units in shared memory (limit 4096). "
+                    "Lower mf_max_constraints/dense_max_constraints or enable contact friction."
+                )
             self._pgs_solve_propagation_colored_block_kernel = _get_pgs_solve_propagation_colored_block_kernel(
                 self.propagation_max_constraints,
                 PROPAGATION_COLOR_TAIL + 2,
@@ -3890,6 +3912,7 @@ class SolverFeatherPGS(SolverBase):
                 PROPAGATION_COLOR_TAIL + 2,
                 self._propagation_colored_block_dim,
                 device_arch,
+                max_units=self._propagation_color_max_units,
             )
         if (
             model.device.is_cuda
@@ -10652,7 +10675,11 @@ def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.K
 
 @cache
 def _get_color_propagation_prebuild_kernel(
-    propagation_max_constraints: int, n_color_entries: int, block_dim: int, device_arch: str
+    propagation_max_constraints: int,
+    n_color_entries: int,
+    block_dim: int,
+    device_arch: str,
+    max_units: int | None = None,
 ) -> "wp.Kernel":
     """Build the pre-build contact-unit coloring kernel (v4 layout).
 
@@ -10663,22 +10690,26 @@ def _get_color_propagation_prebuild_kernel(
     so the row builder writes every unit's rows at a color-ordered slot.
     Color segments therefore occupy contiguous row memory and the colored
     solve kernel's payload reads are sequential — no post-build permutation,
-    no staging copies. Also emits the unit-start order and per-color unit
-    offsets the solve kernel consumes.
+    no staging copies. Units beyond the shared-memory staging capacity are
+    appended to the ordered serial tail. Also emits the unit-start order and
+    per-color unit offsets the solve kernel consumes.
     """
     M = propagation_max_constraints
     NE = n_color_entries
     B = int(block_dim)
     cap = NE - 2  # color cap; index NE-2 is the tail bucket
+    U = int(max_units) if max_units is not None else M  # contact units staged in shared memory
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const int world = tile;
     if (world >= world_count) return;
-    int n_units = world_unit_cursor.data[world];
-    if (n_units > {M}) n_units = {M};
+    int n_units_total = world_unit_cursor.data[world];
+    if (n_units_total > {M}) n_units_total = {M};
+    int n_units = n_units_total;
+    if (n_units > {U}) n_units = {U};
     const int t = threadIdx.x;
-    if (n_units == 0) {{
+    if (n_units_total == 0) {{
         for (int c = t; c < {NE}; c += {B}) world_color_offsets.data[world * {NE} + c] = 0;
         return;
     }}
@@ -10688,10 +10719,10 @@ def _get_color_propagation_prebuild_kernel(
     __shared__ int s_next_work;
     __shared__ int s_counts[{NE}];
     __shared__ int s_offsets[{NE}];
-    __shared__ short s_unit_color[{M}];
-    __shared__ short s_work[{M}];
-    __shared__ short s_work_next[{M}];
-    __shared__ short s_sorted[{M}];
+    __shared__ short s_unit_color[{U}];
+    __shared__ short s_work[{U}];
+    __shared__ short s_work_next[{U}];
+    __shared__ short s_sorted[{U}];
 
     if (t == 0) {{
         s_n_work = n_units;
@@ -10787,6 +10818,17 @@ def _get_color_propagation_prebuild_kernel(
             contact_slot.data[cid] = row_acc;
             row_acc += unit_len.data[world_base + u];
         }}
+        // Mixed friction filtering can produce more units than ceil(M/3).
+        // Keep every unstaged unit in the serial tail instead of silently
+        // omitting it from the row build and solve ordering.
+        for (int u = n_units; u < n_units_total; ++u) {{
+            const int cid = unit_contact.data[world_base + u];
+            world_row_order.data[world_base + u] = row_acc;
+            unit_sorted_contact.data[world_base + u] = cid;
+            contact_slot.data[cid] = row_acc;
+            row_acc += unit_len.data[world_base + u];
+        }}
+        world_color_offsets.data[world * {NE} + {NE} - 1] = n_units_total;
     }}
 #endif
 """
@@ -10844,7 +10886,11 @@ def _get_color_propagation_prebuild_kernel(
 
 @cache
 def _get_color_propagation_prebuild_kernel(
-    propagation_max_constraints: int, n_color_entries: int, block_dim: int, device_arch: str
+    propagation_max_constraints: int,
+    n_color_entries: int,
+    block_dim: int,
+    device_arch: str,
+    max_units: int | None = None,
 ) -> "wp.Kernel":
     """Build the pre-build contact-unit coloring kernel (v4 layout).
 
@@ -10855,22 +10901,26 @@ def _get_color_propagation_prebuild_kernel(
     so the row builder writes every unit's rows at a color-ordered slot.
     Color segments therefore occupy contiguous row memory and the colored
     solve kernel's payload reads are sequential — no post-build permutation,
-    no staging copies. Also emits the unit-start order and per-color unit
-    offsets the solve kernel consumes.
+    no staging copies. Units beyond the shared-memory staging capacity are
+    appended to the ordered serial tail. Also emits the unit-start order and
+    per-color unit offsets the solve kernel consumes.
     """
     M = propagation_max_constraints
     NE = n_color_entries
     B = int(block_dim)
     cap = NE - 2  # color cap; index NE-2 is the tail bucket
+    U = int(max_units) if max_units is not None else M  # contact units staged in shared memory
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const int world = tile;
     if (world >= world_count) return;
-    int n_units = world_unit_cursor.data[world];
-    if (n_units > {M}) n_units = {M};
+    int n_units_total = world_unit_cursor.data[world];
+    if (n_units_total > {M}) n_units_total = {M};
+    int n_units = n_units_total;
+    if (n_units > {U}) n_units = {U};
     const int t = threadIdx.x;
-    if (n_units == 0) {{
+    if (n_units_total == 0) {{
         for (int c = t; c < {NE}; c += {B}) world_color_offsets.data[world * {NE} + c] = 0;
         return;
     }}
@@ -10880,10 +10930,10 @@ def _get_color_propagation_prebuild_kernel(
     __shared__ int s_next_work;
     __shared__ int s_counts[{NE}];
     __shared__ int s_offsets[{NE}];
-    __shared__ short s_unit_color[{M}];
-    __shared__ short s_work[{M}];
-    __shared__ short s_work_next[{M}];
-    __shared__ short s_sorted[{M}];
+    __shared__ short s_unit_color[{U}];
+    __shared__ short s_work[{U}];
+    __shared__ short s_work_next[{U}];
+    __shared__ short s_sorted[{U}];
 
     if (t == 0) {{
         s_n_work = n_units;
@@ -10979,6 +11029,17 @@ def _get_color_propagation_prebuild_kernel(
             contact_slot.data[cid] = row_acc;
             row_acc += unit_len.data[world_base + u];
         }}
+        // Mixed friction filtering can produce more units than ceil(M/3).
+        // Keep every unstaged unit in the serial tail instead of silently
+        // omitting it from the row build and solve ordering.
+        for (int u = n_units; u < n_units_total; ++u) {{
+            const int cid = unit_contact.data[world_base + u];
+            world_row_order.data[world_base + u] = row_acc;
+            unit_sorted_contact.data[world_base + u] = cid;
+            contact_slot.data[cid] = row_acc;
+            row_acc += unit_len.data[world_base + u];
+        }}
+        world_color_offsets.data[world * {NE} + {NE} - 1] = n_units_total;
     }}
 #endif
 """
