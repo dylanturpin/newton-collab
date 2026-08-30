@@ -388,9 +388,7 @@ def _use_resident_mfgs_metadata(
     return metadata_bytes <= _MFGS_RESIDENT_METADATA_MAX_BYTES and total_shared_bytes <= max_shared_memory
 
 
-_HINV_JT_MAX_CHUNK_SIZE = 64
-_HINV_JT_COMPACT_DOF_MAX = 20
-_HINV_JT_COMPACT_CHUNK_SIZE = 32
+_HINV_JT_MAX_CHUNK_SIZE = 32
 
 
 def _align_shared_memory(size: int) -> int:
@@ -410,11 +408,15 @@ def _estimate_hinv_jt_shared_memory(n_dofs: int, constraint_count: int, *, fused
 def _select_hinv_jt_chunk_size(
     n_dofs: int, max_constraints: int, max_shared_memory: int, tile_threads: int
 ) -> int | None:
-    """Select a validated H-inverse chunk from articulation and device resources."""
+    """Select a validated H-inverse chunk from articulation and device resources.
+
+    Keep response tiles at 32 rows or fewer. Larger tiles waste triangular-solve
+    work on the partially occupied tail common to per-world constraint systems;
+    inactive follow-on chunks return before loading the factor.
+    """
     if n_dofs <= 0 or max_constraints <= 0:
         return None
-    max_chunk_size = _HINV_JT_COMPACT_CHUNK_SIZE if n_dofs <= _HINV_JT_COMPACT_DOF_MAX else _HINV_JT_MAX_CHUNK_SIZE
-    candidates = (max_chunk_size, 32, 16, 8, 4, 2, 1)
+    candidates = (_HINV_JT_MAX_CHUNK_SIZE, 16, 8, 4, 2, 1)
     tried: set[int] = set()
     for candidate in candidates:
         chunk_size = min(candidate, max_constraints)
