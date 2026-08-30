@@ -1343,6 +1343,7 @@ class CollisionPipeline:
         sdf_hydroelastic_config: HydroelasticSDF.Config | None = None,
         shape_pairs_max: int | None = None,
         deterministic: bool = False,
+        box_box_sat: bool = False,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
         contact_matching_pos_threshold: float = 0.0005,
         contact_matching_normal_dot_threshold: float = 0.995,
@@ -1412,6 +1413,11 @@ class CollisionPipeline:
             broad_phase:
                 Either a broad phase mode string ("explicit", "nxn", "sap") or
                 a prebuilt broad phase instance for expert usage.
+            box_box_sat: Route box-box pairs through the SAT reference-face
+                clipping primitive instead of GJK/MPR, with a feature-identity-reduced
+                4-slot manifold. Stable multi-point box manifolds (no witness-
+                point teleports). Cannot be combined with a prebuilt
+                ``narrow_phase``. Defaults to False.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
                 Its effective ``reduce_contacts`` state is authoritative for
@@ -1582,6 +1588,11 @@ class CollisionPipeline:
                 raise ValueError("Provide both broad_phase and narrow_phase for expert component construction")
             if sdf_hydroelastic_config is not None:
                 raise ValueError("sdf_hydroelastic_config cannot be used when narrow_phase is provided")
+            if box_box_sat:
+                raise ValueError(
+                    "box_box_sat cannot be used when narrow_phase is provided; "
+                    "construct the NarrowPhase with box_box_sat=True instead"
+                )
             if contact_reduction_hashtable_size_factor != 0.25:
                 raise ValueError(
                     "contact_reduction_hashtable_size_factor cannot be used when narrow_phase is provided; "
@@ -1839,6 +1850,7 @@ class CollisionPipeline:
                 has_meshes=has_meshes,
                 has_heightfields=has_heightfields,
                 use_lean_gjk_mpr=use_lean_gjk_mpr,
+                box_box_sat=box_box_sat,
                 has_generic_convex_pairs=has_generic_convex_pairs,
                 split_gjk_mpr=split_gjk_mpr,
                 candidate_pair_work_estimate=candidate_pair_work_estimate,
@@ -2762,6 +2774,7 @@ class CollisionPipeline:
         # cannot carry a stale marker (see
         # SolverBase.supports_body_pair_reduced_contacts).
         contacts.rigid_contacts_body_pair_reduced = self._body_pair_reducer is not None
+        contacts.rigid_contacts_pair_sorted = bool(self.deterministic)
         if self._body_pair_reducer is not None:
             self._body_pair_reducer.reduce(model, state, contacts)
 
