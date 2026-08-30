@@ -187,9 +187,7 @@ def _build_clutter_model(device: str, *, n_boxes: int) -> newton.Model:
         clutter_cfg.mu = 0.0
         for b in range(n_boxes):
             ball = world.add_link(
-                xform=wp.transform(
-                    wp.vec3(-0.4 - 0.25 * (b % 3), 0.6 + 0.25 * (b // 3), 0.0995), wp.quat_identity()
-                )
+                xform=wp.transform(wp.vec3(-0.4 - 0.25 * (b % 3), 0.6 + 0.25 * (b // 3), 0.0995), wp.quat_identity())
             )
             world.add_shape_sphere(ball, radius=0.1, cfg=clutter_cfg)
             world.add_articulation([world.add_joint_free(parent=-1, child=ball)])
@@ -457,9 +455,7 @@ class TestPropagationCachedResponse(unittest.TestCase):
                 body = int(body_list[world, slot])
                 self.assertGreaterEqual(body, 0)
                 is_eligible = int(art_eligible[int(body_to_art[body])]) == 1
-                self.assertEqual(
-                    is_eligible, slot < n_elig, f"world {world} slot {slot}: eligible prefix violated"
-                )
+                self.assertEqual(is_eligible, slot < n_elig, f"world {world} slot {slot}: eligible prefix violated")
         self._assert_stats(stats, expect_min_bodies=5)
 
     def test_cached_matrices_match_numpy_reference(self):

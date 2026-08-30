@@ -5,7 +5,6 @@ import ast
 import unittest
 from pathlib import Path
 
-
 _TILED_KERNEL_HELPERS = (
     "_get_pack_mf_meta_kernel",
     "_get_pgs_solve_mf_gs_kernel",
@@ -34,9 +33,7 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
             for node in cls.solver_module.body
             if isinstance(node, ast.ClassDef) and node.name == "SolverFeatherPGS"
         )
-        cls.solver_methods = {
-            node.name: node for node in cls.solver_class.body if isinstance(node, ast.FunctionDef)
-        }
+        cls.solver_methods = {node.name: node for node in cls.solver_class.body if isinstance(node, ast.FunctionDef)}
 
     def test_prescribed_response_is_not_a_public_execution_knob(self):
         init_method = self.solver_methods["__init__"]
@@ -47,9 +44,7 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         self.assertNotIn("exclude_fully_kinematic_free_articulations", parameters)
 
     def test_tiled_kernel_factory_is_not_exported(self):
-        class_names = {
-            node.name for node in self.solver_module.body if isinstance(node, ast.ClassDef)
-        }
+        class_names = {node.name for node in self.solver_module.body if isinstance(node, ast.ClassDef)}
         self.assertNotIn("TiledKernelFactory", class_names)
 
     def test_tiled_kernel_helpers_are_private_cached_functions(self):
@@ -58,14 +53,9 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
                 self.assertIn(helper_name, self.top_level_functions)
                 helper = self.top_level_functions[helper_name]
                 decorator_names = {
-                    decorator.id
-                    for decorator in helper.decorator_list
-                    if isinstance(decorator, ast.Name)
+                    decorator.id for decorator in helper.decorator_list if isinstance(decorator, ast.Name)
                 }
-                parameters = {
-                    arg.arg
-                    for arg in [*helper.args.posonlyargs, *helper.args.args, *helper.args.kwonlyargs]
-                }
+                parameters = {arg.arg for arg in [*helper.args.posonlyargs, *helper.args.args, *helper.args.kwonlyargs]}
                 self.assertIn("cache", decorator_names)
                 self.assertIn("device_arch", parameters)
 
@@ -95,8 +85,7 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
     @staticmethod
     def _references_dense_max_constraints(node):
         return any(
-            isinstance(child, ast.Attribute) and child.attr == "dense_max_constraints"
-            for child in ast.walk(node)
+            isinstance(child, ast.Attribute) and child.attr == "dense_max_constraints" for child in ast.walk(node)
         )
 
     @classmethod
@@ -106,9 +95,7 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
             if isinstance(child, ast.If) and cls._references_dense_max_constraints(child.test):
                 for body_node in child.body:
                     continue_lines.extend(
-                        descendant.lineno
-                        for descendant in ast.walk(body_node)
-                        if isinstance(descendant, ast.Continue)
+                        descendant.lineno for descendant in ast.walk(body_node) if isinstance(descendant, ast.Continue)
                     )
         return min(continue_lines) if continue_lines else None
 
@@ -117,9 +104,7 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         call_lines = [
             child.lineno
             for child in ast.walk(node)
-            if isinstance(child, ast.Call)
-            and isinstance(child.func, ast.Name)
-            and child.func.id == function_name
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id == function_name
         ]
         if not call_lines:
             raise AssertionError(f"{function_name} is not called while initializing tiled kernels")
