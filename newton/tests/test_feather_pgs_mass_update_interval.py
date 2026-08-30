@@ -131,7 +131,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_limit_change_refresh_on_skipped_step_matches_full_rebuild(self):
         """A limit-count change on a global_flag=0 step must refresh that articulation's mass factor.
 
-        At this base revision ``build_augmented_joint_rows`` always writes
+        At this base revision ``build_augmented_joint_rows_and_apply_tau`` always writes
         ``aug_limit_counts = 0`` (the device-side producer is inert), so a joint
         crossing the limit activation gap cannot change the count yet. We emulate
         the crossing by perturbing ``aug_prev_limit_counts``, which is exactly the

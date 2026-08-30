@@ -63,6 +63,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
             dim=contact_count,
             inputs=[
                 contact_count_array,
+                contact_count,
                 contact_shape0,
                 contact_shape1,
                 contact_point0,
@@ -77,6 +78,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 wp.zeros((1,), dtype=wp.int32, device=device),
                 wp.array([6], dtype=wp.int32, device=device),
                 wp.zeros((1,), dtype=wp.int32, device=device),
+                wp.ones((1,), dtype=wp.int32, device=device),
                 wp.zeros((1,), dtype=wp.int32, device=device),
                 0,
                 1,
@@ -192,6 +194,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
             dim=capacity,
             inputs=[
                 wp.array([capacity + 1], dtype=wp.int32, device=device),
+                capacity,
                 wp.zeros((capacity,), dtype=wp.int32, device=device),
                 wp.full((capacity,), -1, dtype=wp.int32, device=device),
                 wp.zeros((capacity,), dtype=wp.vec3, device=device),
@@ -206,6 +209,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 wp.array([0], dtype=wp.int32, device=device),
                 wp.array([6], dtype=wp.int32, device=device),
                 wp.zeros((1,), dtype=wp.int32, device=device),
+                wp.ones((1,), dtype=wp.int32, device=device),
                 wp.zeros((1,), dtype=wp.int32, device=device),
                 0,
                 0,

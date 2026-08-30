@@ -88,6 +88,17 @@ class TestFeatherPGSMimic(unittest.TestCase):
         rows = [int(t) for w in range(row_types.shape[0]) for t in row_types[w, : counts[w]]]
         self.assertIn(PGS_CONSTRAINT_TYPE_MIMIC, rows)
 
+    def test_replicated_mimics_have_articulation_local_ranges(self):
+        """Verify replicated mimic rows use one compact lookup range per articulation."""
+        template, _, _ = _build_two_revolute_chain(coef0=0.0, coef1=1.0)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        builder.replicate(template, world_count=4)
+        model = builder.finalize()
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free")
+
+        self.assertEqual(solver._mimic_art_start.numpy().tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(solver._mimic_art_list.numpy().tolist(), [0, 1, 2, 3])
+
     def test_mimic_toggle_disables_coupling(self):
         """Verify enable_mimic_constraints=False reverts to the pre-mimic solver behavior.
 
