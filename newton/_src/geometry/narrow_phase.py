@@ -768,11 +768,15 @@ def create_narrow_phase_primitive_kernel(
             elif wp.static(box_box_sat) and is_box_a and is_box_b:
                 box_rot_a = wp.quat_to_matrix(quat_a)
                 box_rot_b = wp.quat_to_matrix(quat_b)
-                sat_margin = gap_sum
+                # SAT clips the raw box surfaces, while admission subtracts
+                # the per-shape collision margins. Include those margins in
+                # candidate generation so an inflated contact is not rejected
+                # before the shared admission gate can see it.
+                sat_margin = gap_sum + margin_offset_a + margin_offset_b
                 if wp.static(speculative):
                     # Candidates must exist beyond the static gap for
                     # predictive admission to see approaching boxes.
-                    sat_margin = gap_sum + max_speculative_extension
+                    sat_margin += max_speculative_extension
                 sat_dist, sat_pos, sat_normals, sat_feat = collide_box_box_features(
                     pos_a,
                     box_rot_a,

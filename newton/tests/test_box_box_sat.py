@@ -238,6 +238,39 @@ def test_box_box_sat_speculative_approach(test: unittest.TestCase, device):
         test.assertLess(abs(z - 0.1505), 0.01, f"box did not settle on the slab (z={z:.4f})")
 
 
+def test_box_box_sat_honors_shape_margin(test: unittest.TestCase, device):
+    """SAT candidate generation includes per-shape collision margins.
+
+    The raw boxes are separated by 15 mm, but their two 10 mm margins
+    overlap. The SAT path must therefore emit the same four-corner contact
+    manifold instead of rejecting the pair before the shared gap gate.
+    """
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder()
+        builder.rigid_gap = 0.003
+        cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, margin=0.01)
+        lower = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()))
+        builder.add_shape_box(lower, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+        upper = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.115), wp.quat_identity()))
+        builder.add_shape_box(upper, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(
+            model,
+            reduce_contacts=True,
+            rigid_contact_max=64,
+            broad_phase="nxn",
+            deterministic=True,
+            contact_matching="latest",
+            box_box_sat=True,
+        )
+        contacts = pipeline.contacts()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        pipeline.collide(state, contacts)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        test.assertEqual(count, 4, f"shape-margin overlap should produce four SAT contacts, got {count}")
+
+
 def test_box_box_aligned_manifold_distinct_corners(test: unittest.TestCase, device):
     """Exactly aligned equal boxes emit coincident duplicate candidates from
     different clip lines; the reduction must admit four DISTINCT spread
@@ -309,6 +342,12 @@ add_function_test(
     "test_box_box_sat_speculative_approach",
     test_box_box_sat_speculative_approach,
     devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestBoxBoxSAT,
+    "test_box_box_sat_honors_shape_margin",
+    test_box_box_sat_honors_shape_margin,
+    devices=get_test_devices(),
 )
 add_function_test(
     TestBoxBoxSAT,
