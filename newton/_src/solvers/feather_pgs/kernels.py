@@ -3483,6 +3483,7 @@ def allocate_world_contact_slots(
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_anchor_limit: int,
+    row_capacity_telemetry: int,
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -3494,6 +3495,9 @@ def allocate_world_contact_slots(
     propagation_slot_counter: wp.array[int],
     dense_contact_world_flag: wp.array[int],
     contact_slots_needed: wp.array[int],
+    dense_dropped_contact_rows: wp.array[int],
+    mf_dropped_contact_rows: wp.array[int],
+    propagation_dropped_contact_rows: wp.array[int],
 ):
     """Allocate active contacts with work proportional to the materialized prefix.
 
@@ -3542,6 +3546,7 @@ def allocate_world_contact_slots(
             enable_friction,
             contact_friction_gap_threshold,
             contact_friction_anchor_limit,
+            row_capacity_telemetry,
             contact_world,
             contact_slot,
             contact_art_a,
@@ -3552,6 +3557,9 @@ def allocate_world_contact_slots(
             propagation_slot_counter,
             dense_contact_world_flag,
             contact_slots_needed,
+            dense_dropped_contact_rows,
+            mf_dropped_contact_rows,
+            propagation_dropped_contact_rows,
         )
 
 
