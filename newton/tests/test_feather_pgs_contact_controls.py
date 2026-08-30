@@ -130,6 +130,7 @@ def _launch_same_articulation_contact_allocator(
         dim=1,
         inputs=[
             wp.array([1], dtype=wp.int32, device=device),
+            1,
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([1], dtype=wp.int32, device=device),
             wp.array([wp.vec3(gap, 0.0, 0.0)], dtype=wp.vec3, device=device),
@@ -144,7 +145,8 @@ def _launch_same_articulation_contact_allocator(
             wp.array([0] * articulation_count, dtype=wp.int32, device=device),
             wp.array([1] * articulation_count, dtype=wp.int32, device=device),
             wp.zeros((2,), dtype=wp.int32, device=device),
-            wp.array([0] * articulation_count, dtype=wp.int32, device=device),
+            wp.ones((2,), dtype=wp.int32, device=device),
+            wp.zeros((2,), dtype=wp.int32, device=device),
             0,
             0,
             0,
@@ -158,7 +160,6 @@ def _launch_same_articulation_contact_allocator(
             0,
             float("inf"),
             0,
-            0,
         ],
         outputs=[
             wp.full((1,), -9, dtype=wp.int32, device=device),
@@ -171,9 +172,6 @@ def _launch_same_articulation_contact_allocator(
             wp.zeros((1,), dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
             wp.full((1,), -9, dtype=wp.int32, device=device),
-            wp.zeros((1,), dtype=wp.int32, device=device),
-            wp.zeros((1,), dtype=wp.int32, device=device),
-            wp.zeros((1,), dtype=wp.int32, device=device),
         ],
         device=device,
     )
