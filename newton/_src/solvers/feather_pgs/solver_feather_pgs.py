@@ -8119,6 +8119,8 @@ class SolverFeatherPGS(SolverBase):
                             self.contact_friction_gap_threshold,
                             int(self.contact_friction_shared_anchor),
                             self.contact_friction_anchor_limit,
+                            1 if self.contact_friction_articulation_pairs_only else 0,
+                            is_free_rigid,
                             self.contact_friction_scale,
                             int(self.contact_shared_anchor),
                             self.pgs_beta,

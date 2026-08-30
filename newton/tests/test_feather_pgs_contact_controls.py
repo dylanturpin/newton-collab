@@ -433,6 +433,8 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             1.0,
             1,
             0,
+            0,
+            wp.zeros((1,), dtype=wp.int32, device=device),
             1.0,
             0,
             0.05,
@@ -466,6 +468,8 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             1.0,
             1,
             0,
+            0,
+            wp.zeros((1,), dtype=wp.int32, device=device),
             1.0,
             0,
             0.05,
@@ -641,17 +645,15 @@ class TestFeatherPGSContactControls(unittest.TestCase):
 
     def test_negative_scoped_friction_gap_delays_only_articulation_pair_tangents(self):
         """Keep pair normals while delaying friction, without changing free-body friction."""
-        shallow_pair = _launch_same_articulation_contact_allocator(
+        shallow_pair = _launch_articulation_pair_contact_allocator(
             gap=-0.0005,
-            scoped_gate=0.0,
             enable_friction=True,
             friction_gap=-0.001,
             friction_anchors=1,
             friction_pairs_only=True,
         )
-        deep_pair = _launch_same_articulation_contact_allocator(
+        deep_pair = _launch_articulation_pair_contact_allocator(
             gap=-0.002,
-            scoped_gate=0.0,
             enable_friction=True,
             friction_gap=-0.001,
             friction_anchors=1,

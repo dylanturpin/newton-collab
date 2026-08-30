@@ -3382,6 +3382,8 @@ def _allocate_world_contact_slot(
     # D-wide generalized rows.
     is_mf = 0
     is_propagation = 0
+    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
+    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
     if has_free_rigid != 0:
         a_is_mf_compatible = not a_has_dofs or is_free_rigid[art_a] != 0
         b_is_mf_compatible = not b_has_dofs or is_free_rigid[art_b] != 0
@@ -3737,6 +3739,8 @@ def prepare_world_contact_rows(
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_anchor_limit: int,
+    contact_friction_articulation_pairs_only: int,
+    is_free_rigid: wp.array[int],
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
@@ -3795,9 +3799,16 @@ def prepare_world_contact_rows(
             mu /= float(material_count)
         restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
 
+        a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
+        b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
+        apply_friction_filter = contact_friction_articulation_pairs_only == 0 or (a_non_free and b_non_free)
+        effective_friction_anchor_limit = int(0)
+        if apply_friction_filter:
+            effective_friction_anchor_limit = contact_friction_anchor_limit
+
         friction_anchor_rank = int(0)
         same_next_contact = int(0)
-        if contact_friction_anchor_limit > 0:
+        if effective_friction_anchor_limit > 0:
             for lookback in range(1, 9):
                 previous = c - lookback
                 if previous < 0 or previous >= total_contacts:
@@ -3815,13 +3826,13 @@ def prepare_world_contact_rows(
                 same_next_contact = 1
 
         friction_anchor_scale = float(1.0)
-        if contact_friction_anchor_limit > 0 and (friction_anchor_rank > 0 or same_next_contact != 0):
+        if effective_friction_anchor_limit > 0 and (friction_anchor_rank > 0 or same_next_contact != 0):
             friction_anchor_scale = 0.5
         friction_mu = mu * contact_friction_scale * friction_anchor_scale
 
         tangent0, tangent1 = contact_tangent_basis(normal)
-        add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
-        if contact_friction_anchor_limit > 0 and friction_anchor_rank >= contact_friction_anchor_limit:
+        add_friction = enable_friction != 0 and (not apply_friction_filter or phi <= contact_friction_gap_threshold)
+        if effective_friction_anchor_limit > 0 and friction_anchor_rank >= effective_friction_anchor_limit:
             add_friction = False
 
         contact_anchor_world = 0.5 * (point_a_world + point_b_world)
@@ -4568,6 +4579,8 @@ def populate_world_J_for_size(
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_anchor_limit: int,
+    contact_friction_articulation_pairs_only: int,
+    is_free_rigid: wp.array[int],
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
@@ -4621,6 +4634,8 @@ def populate_world_J_for_size(
             contact_friction_gap_threshold,
             contact_friction_shared_anchor,
             contact_friction_anchor_limit,
+            contact_friction_articulation_pairs_only,
+            is_free_rigid,
             contact_friction_scale,
             contact_shared_anchor,
             pgs_beta,
@@ -5571,6 +5586,7 @@ def build_mf_contact_rows(
     contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_anchor_limit: int,
+    contact_friction_articulation_pairs_only: int,
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
@@ -5617,6 +5633,7 @@ def build_mf_contact_rows(
             contact_friction_gap_threshold,
             contact_friction_shared_anchor,
             contact_friction_anchor_limit,
+            contact_friction_articulation_pairs_only,
             contact_friction_scale,
             contact_shared_anchor,
             pgs_beta,
