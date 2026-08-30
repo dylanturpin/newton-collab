@@ -7570,17 +7570,6 @@ class SolverFeatherPGS(SolverBase):
                     device=model.device,
                 )
 
-        # Unconditional: the phase-3 boundary must be valid even when drive
-        # and position-limit rows are disabled (it is then just the current
-        # watermark, i.e. the start of the velocity-limit segment).
-        wp.launch(
-            snapshot_dense_phase_bound,
-            dim=self.world_count,
-            inputs=[self.slot_counter, 0],
-            outputs=[self.dense_phase_bounds],
-            device=model.device,
-        )
-
         # Allocate and populate joint-limit rows per response-size group.
         if self.enable_joint_limits and self._joint_limit_sizes:
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
@@ -7658,6 +7647,17 @@ class SolverFeatherPGS(SolverBase):
                         ],
                         device=model.device,
                     )
+
+        # Unconditional: the phase-3 boundary must include position-limit
+        # rows and remain valid when that family is disabled (when it is just
+        # the current watermark at the start of the velocity-limit segment).
+        wp.launch(
+            snapshot_dense_phase_bound,
+            dim=self.world_count,
+            inputs=[self.slot_counter, 0],
+            outputs=[self.dense_phase_bounds],
+            device=model.device,
+        )
 
         # Allocate + populate joint velocity-limit rows (per-DOF clamp on
         # |qdot_i| against model.joint_velocity_limit). Dense contact rows
