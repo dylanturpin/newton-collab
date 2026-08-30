@@ -3872,9 +3872,11 @@ class SolverFeatherPGS(SolverBase):
         self._pgs_solve_propagation_colored_block_kernel = None
         self._propagation_colored_block_dim = 64
         if model.device.is_cuda and self._propagation_colored and self.propagation_max_constraints > 0:
-            # The pre-build colouring kernel stages one short per contact UNIT in shared
-            # memory (4 arrays). With contact friction on every unit owns 3 rows, so the
-            # unit capacity is ceil(M/3); without friction a unit can be a single row.
+            # The pre-build colouring kernel stages one short per contact unit in shared
+            # memory (4 arrays). Friction units own 3 rows, so ceil(M/3) is the colored
+            # staging budget; finite gap or anchor filtering can create extra 1-row units,
+            # which the pre-build kernel appends to its ordered serial tail. Without
+            # friction every unit is a single row and must fit the staging budget.
             m_rows = int(self.propagation_max_constraints)
             self._propagation_color_max_units = (m_rows + 2) // 3 if self.enable_contact_friction else m_rows
             if self._propagation_color_max_units > 4096:
@@ -10688,8 +10690,9 @@ def _get_color_propagation_prebuild_kernel(
     so the row builder writes every unit's rows at a color-ordered slot.
     Color segments therefore occupy contiguous row memory and the colored
     solve kernel's payload reads are sequential — no post-build permutation,
-    no staging copies. Also emits the unit-start order and per-color unit
-    offsets the solve kernel consumes.
+    no staging copies. Units beyond the shared-memory staging capacity are
+    appended to the ordered serial tail. Also emits the unit-start order and
+    per-color unit offsets the solve kernel consumes.
     """
     M = propagation_max_constraints
     NE = n_color_entries
@@ -10701,10 +10704,12 @@ def _get_color_propagation_prebuild_kernel(
 #if defined(__CUDA_ARCH__)
     const int world = tile;
     if (world >= world_count) return;
-    int n_units = world_unit_cursor.data[world];
+    int n_units_total = world_unit_cursor.data[world];
+    if (n_units_total > {M}) n_units_total = {M};
+    int n_units = n_units_total;
     if (n_units > {U}) n_units = {U};
     const int t = threadIdx.x;
-    if (n_units == 0) {{
+    if (n_units_total == 0) {{
         for (int c = t; c < {NE}; c += {B}) world_color_offsets.data[world * {NE} + c] = 0;
         return;
     }}
@@ -10813,6 +10818,17 @@ def _get_color_propagation_prebuild_kernel(
             contact_slot.data[cid] = row_acc;
             row_acc += unit_len.data[world_base + u];
         }}
+        // Mixed friction filtering can produce more units than ceil(M/3).
+        // Keep every unstaged unit in the serial tail instead of silently
+        // omitting it from the row build and solve ordering.
+        for (int u = n_units; u < n_units_total; ++u) {{
+            const int cid = unit_contact.data[world_base + u];
+            world_row_order.data[world_base + u] = row_acc;
+            unit_sorted_contact.data[world_base + u] = cid;
+            contact_slot.data[cid] = row_acc;
+            row_acc += unit_len.data[world_base + u];
+        }}
+        world_color_offsets.data[world * {NE} + {NE} - 1] = n_units_total;
     }}
 #endif
 """
@@ -10885,8 +10901,9 @@ def _get_color_propagation_prebuild_kernel(
     so the row builder writes every unit's rows at a color-ordered slot.
     Color segments therefore occupy contiguous row memory and the colored
     solve kernel's payload reads are sequential — no post-build permutation,
-    no staging copies. Also emits the unit-start order and per-color unit
-    offsets the solve kernel consumes.
+    no staging copies. Units beyond the shared-memory staging capacity are
+    appended to the ordered serial tail. Also emits the unit-start order and
+    per-color unit offsets the solve kernel consumes.
     """
     M = propagation_max_constraints
     NE = n_color_entries
@@ -10898,10 +10915,12 @@ def _get_color_propagation_prebuild_kernel(
 #if defined(__CUDA_ARCH__)
     const int world = tile;
     if (world >= world_count) return;
-    int n_units = world_unit_cursor.data[world];
+    int n_units_total = world_unit_cursor.data[world];
+    if (n_units_total > {M}) n_units_total = {M};
+    int n_units = n_units_total;
     if (n_units > {U}) n_units = {U};
     const int t = threadIdx.x;
-    if (n_units == 0) {{
+    if (n_units_total == 0) {{
         for (int c = t; c < {NE}; c += {B}) world_color_offsets.data[world * {NE} + c] = 0;
         return;
     }}
@@ -11010,6 +11029,17 @@ def _get_color_propagation_prebuild_kernel(
             contact_slot.data[cid] = row_acc;
             row_acc += unit_len.data[world_base + u];
         }}
+        // Mixed friction filtering can produce more units than ceil(M/3).
+        // Keep every unstaged unit in the serial tail instead of silently
+        // omitting it from the row build and solve ordering.
+        for (int u = n_units; u < n_units_total; ++u) {{
+            const int cid = unit_contact.data[world_base + u];
+            world_row_order.data[world_base + u] = row_acc;
+            unit_sorted_contact.data[world_base + u] = cid;
+            contact_slot.data[cid] = row_acc;
+            row_acc += unit_len.data[world_base + u];
+        }}
+        world_color_offsets.data[world * {NE} + {NE} - 1] = n_units_total;
     }}
 #endif
 """
