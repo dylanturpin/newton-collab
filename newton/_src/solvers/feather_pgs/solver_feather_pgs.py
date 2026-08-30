@@ -82,7 +82,6 @@ from .kernels import (
     clear_grouped_jacobian_active_rows,
     collect_propagation_units,
     commit_mass_updates,
-    compose_body_com_transforms,
     compute_com_transforms,
     compute_composite_inertia,
     compute_contact_linear_force_from_impulses,
@@ -108,6 +107,7 @@ from .kernels import (
     detect_limit_count_changes,
     diag_from_JY_par_art,
     diag_from_JY_world,
+    eval_rigid_fk,
     eval_rigid_id,
     eval_rigid_tau,
     factor_propagation_tree_for_size,
@@ -1001,8 +1001,8 @@ class SolverFeatherPGS(SolverBase):
                 ``H_tilde^{-1}`` is not clamped. ``"actuator"`` (the new default) is
                 the only supported value. ``"net"`` is rejected with ``ValueError``.
             serial_kernel_block_dim (int, optional): CUDA block size for the serial
-                one-thread-per-articulation kernels (``eval_rigid_id``, ``eval_rigid_tau``,
-                ``update_articulation_origins``). These kernels have no
+                one-thread-per-articulation kernels (``eval_rigid_fk``, ``eval_rigid_id``,
+                ``eval_rigid_tau``, ``update_articulation_origins``). These kernels have no
                 cross-thread reductions, so changing this value is bit-identical; it only
                 changes occupancy/grid shape. Must be a positive multiple of 32.
                 Defaults to 256 (the Warp default).
@@ -6819,14 +6819,31 @@ class SolverFeatherPGS(SolverBase):
     def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State):
         model = self.model
 
-        # Collision already consumed ``state_in.body_q`` from the same joint
-        # state. Reuse those authoritative body poses and only compose the COM
-        # offsets needed by inverse dynamics.
+        # Preserve the public step contract: callers may update generalized
+        # coordinates directly (for example during reset) without first
+        # synchronizing ``state_in.body_q`` themselves.  This serial FK launch
+        # is intentionally retained even though collision-aware integrations
+        # commonly arrive with an already-current body pose.
         wp.launch(
-            compose_body_com_transforms,
-            dim=model.body_count,
-            inputs=[state_in.body_q, self.body_X_com],
-            outputs=[state_aug.body_q_com],
+            eval_rigid_fk,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self.articulation_joint_end,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_in.joint_q,
+                model.joint_X_p,
+                model.joint_X_c,
+                self.body_X_com,
+                model.joint_axis,
+                model.joint_dof_dim,
+            ],
+            outputs=[state_in.body_q, state_aug.body_q_com],
+            block_dim=self.serial_kernel_block_dim,
             device=model.device,
         )
 

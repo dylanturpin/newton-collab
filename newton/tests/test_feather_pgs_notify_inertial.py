@@ -58,6 +58,48 @@ def _run_trajectory(model, solver, num_steps):
 
 
 class TestFeatherPGSNotifyInertial(unittest.TestCase):
+    def test_step_refreshes_body_pose_after_generalized_coordinate_update(self):
+        """A direct ``joint_q`` update must not require a caller-side FK pass.
+
+        ``SolverFeatherPGS.step`` historically derives body poses from the
+        generalized coordinates before inverse dynamics.  Reset and direct
+        generalized-coordinate callers rely on that public step behavior.
+        """
+        device = wp.get_device()
+        outputs = {}
+
+        for caller_refreshes_fk in (False, True):
+            model = _build_model(device, com=NEW_COM)
+            state_0 = model.state()
+            state_1 = model.state()
+
+            joint_q = state_0.joint_q.numpy()
+            joint_q[0] = 1.1
+            state_0.joint_q.assign(joint_q)
+            stale_body_q = state_0.body_q.numpy().copy()
+
+            if caller_refreshes_fk:
+                newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+
+            SolverFeatherPGS(model, pgs_mode="dense").step(
+                state_0,
+                state_1,
+                model.control(),
+                None,
+                DT,
+            )
+            outputs[caller_refreshes_fk] = {
+                "joint_q": state_1.joint_q.numpy().copy(),
+                "joint_qd": state_1.joint_qd.numpy().copy(),
+                "body_q": state_0.body_q.numpy().copy(),
+                "stale_body_q": stale_body_q,
+            }
+
+        self.assertFalse(np.allclose(outputs[False]["stale_body_q"], outputs[True]["body_q"]))
+        np.testing.assert_allclose(outputs[False]["body_q"], outputs[True]["body_q"], rtol=0.0, atol=1.0e-6)
+        np.testing.assert_allclose(outputs[False]["joint_q"], outputs[True]["joint_q"], rtol=0.0, atol=1.0e-6)
+        np.testing.assert_allclose(outputs[False]["joint_qd"], outputs[True]["joint_qd"], rtol=0.0, atol=1.0e-6)
+
     def test_notify_refreshes_baked_com_and_inertia_buffers(self):
         """Verify BODY_INERTIAL_PROPERTIES re-derives body_X_com and body_I_m.
 
