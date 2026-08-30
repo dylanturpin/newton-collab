@@ -176,8 +176,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         np.testing.assert_array_equal(indices[1, 1:], np.full(5, -1, dtype=np.int32))
 
     def test_hinv_chunk_selection_respects_shared_memory(self):
+        """Select the largest response chunk that fits shared memory."""
         cases = (
-            (23, 384, 101376, 64),
+            (23, 384, 101376, 32),
             (128, 384, 101376, 16),
             (160, 384, 101376, None),
             (23, 0, 101376, None),
@@ -190,13 +191,14 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 self.assertEqual(_select_hinv_jt_chunk_size(n_dofs, max_constraints, shared_memory, 64), expected)
 
     def test_hinv_chunk_selection_accounts_for_tile_threads(self):
-        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 49152, 64), 64)
-        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 49152, 256), 32)
+        """Include tile scratch space when selecting response chunks."""
+        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 64), 32)
+        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 256), 16)
 
-    def test_hinv_chunk_selection_caps_compact_articulations(self):
-        """Cap compact articulation chunks without restricting larger groups."""
+    def test_hinv_chunk_selection_caps_response_tiles(self):
+        """Cap response chunks at 32 rows across articulation sizes."""
         self.assertEqual(_select_hinv_jt_chunk_size(20, 384, 101376, 64), 32)
-        self.assertEqual(_select_hinv_jt_chunk_size(21, 384, 101376, 64), 64)
+        self.assertEqual(_select_hinv_jt_chunk_size(21, 384, 101376, 64), 32)
 
     def test_dense_metadata_encoding_bounds(self):
         _validate_dense_metadata_encoding(32)
