@@ -6,11 +6,184 @@ import unittest
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.solvers.feather_pgs.kernels import accumulate_group_diag_worlds
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_hinv_jt_kernel
+from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSExecutionPlan, _get_hinv_jt_kernel
+from newton.solvers import SolverFeatherPGS
+
+
+def _build_mixed_response_model(device, world_count=1):
+    """Build one 13-DOF articulation contacting one free rigid body."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.default_shape_cfg.density = 1000.0
+    builder.default_shape_cfg.ke = 1.0e5
+    builder.default_shape_cfg.kd = 1.0e3
+    builder.default_shape_cfg.mu = 0.0
+    builder.default_shape_cfg.margin = 0.0
+    builder.default_shape_cfg.gap = 0.0
+
+    arm = builder.add_link()
+    builder.add_shape_box(arm, hx=0.4, hy=0.05, hz=0.02)
+    joints = [
+        builder.add_joint_revolute(
+            parent=-1,
+            child=arm,
+            axis=wp.vec3(0.0, 1.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(-0.4, 0.0, 0.0), wp.quat_identity()),
+        )
+    ]
+    parent = arm
+    for index in range(12):
+        child = builder.add_link(
+            mass=0.05,
+            inertia=wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-3),
+            lock_inertia=True,
+        )
+        joints.append(
+            builder.add_joint_revolute(
+                parent=parent,
+                child=child,
+                axis=(newton.Axis.X, newton.Axis.Y, newton.Axis.Z)[index % 3],
+            )
+        )
+        parent = child
+    builder.add_articulation(joints)
+    builder.add_constraint_mimic(joint0=joints[1], joint1=joints[0], coef0=0.0, coef1=1.0)
+
+    box = builder.add_link(xform=wp.transform(wp.vec3(0.7, 0.0, 0.5695), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05)
+    builder.add_articulation([builder.add_joint_free(parent=-1, child=box)])
+    if world_count == 1:
+        return builder.finalize(device=device)
+    replicated = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    replicated.replicate(builder, world_count, spacing=(3.0, 0.0, 0.0))
+    return replicated.finalize(device=device)
+
+
+def _run_mixed_response(kernel, *, warmstart, preelimination):
+    """Run a short mixed-contact trajectory with one H-inverse implementation."""
+    model = _build_mixed_response_model("cuda:0")
+    solver = SolverFeatherPGS(
+        model,
+        pgs_mode="matrix_free",
+        hinv_jt_kernel=kernel,
+        pgs_warmstart=warmstart,
+        enable_bilateral_preelimination=preelimination,
+        enable_contact_friction=False,
+        pgs_iterations=8,
+        dense_max_constraints=32,
+        mf_max_constraints=32,
+    )
+    state_in, state_out = model.state(), model.state()
+    joint_qd = state_in.joint_qd.numpy()
+    free_articulation = int(np.flatnonzero(solver._model_plan.is_free_rigid)[0])
+    free_dof_start = int(solver._model_plan.articulation_dof_start[free_articulation])
+    joint_qd[free_dof_start + 2] = -3.0
+    state_in.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+    contacts = pipeline.contacts()
+    control = model.control()
+    samples = []
+    for _ in range(4):
+        state_in.clear_forces()
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+        constraint_count = int(solver.constraint_count.numpy()[0])
+        samples.append(
+            (
+                constraint_count,
+                solver.diag.numpy()[0, :constraint_count].copy(),
+                solver.impulses.numpy()[0, :constraint_count].copy(),
+                state_out.joint_q.numpy().copy(),
+                state_out.joint_qd.numpy().copy(),
+            )
+        )
+        state_in, state_out = state_out, state_in
+    return solver, samples
 
 
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
+    def test_mixed_world_diagonal_map_includes_free_rigid_response(self):
+        """Include free rigid articulations in every forced-tiled diagonal group."""
+        solver = SolverFeatherPGS(_build_mixed_response_model("cpu", world_count=2), dense_max_constraints=32)
+        self.assertEqual(set(solver.size_groups), {6, 13})
+
+        response_dof_count = solver._model_plan.response_dof_count
+        articulation_world = solver._model_plan.articulation_world
+        free_mask = solver._model_plan.is_free_rigid != 0
+        for size in solver.size_groups:
+            size_arts = np.flatnonzero(response_dof_count == size)
+            response_order = np.asarray(
+                sorted(size_arts, key=lambda art: (int(articulation_world[art]), int(art))), dtype=np.int32
+            )
+            propagation_order = response_order[~free_mask[response_order]]
+            response_counts = np.bincount(articulation_world[response_order], minlength=solver.world_count)
+            propagation_counts = np.bincount(articulation_world[propagation_order], minlength=solver.world_count)
+            response_starts = np.pad(np.cumsum(response_counts), (1, 0)).astype(np.int32)
+            propagation_starts = np.pad(np.cumsum(propagation_counts), (1, 0)).astype(np.int32)
+
+            np.testing.assert_array_equal(solver.world_response_group_art_start[size].numpy(), response_starts)
+            np.testing.assert_array_equal(solver.world_response_group_to_art[size].numpy(), response_order)
+            np.testing.assert_array_equal(solver.world_group_art_start[size].numpy(), propagation_starts)
+            np.testing.assert_array_equal(solver.world_group_to_art[size].numpy(), propagation_order)
+
+        free_articulations = np.flatnonzero(free_mask).astype(np.int32)
+        np.testing.assert_array_equal(solver.world_group_art_start[6].numpy(), np.array((0, 0, 0), dtype=np.int32))
+        np.testing.assert_array_equal(solver.world_group_to_art[6].numpy(), np.empty(0, dtype=np.int32))
+        np.testing.assert_array_equal(
+            solver.world_response_group_art_start[6].numpy(), np.array((0, 1, 2), dtype=np.int32)
+        )
+        np.testing.assert_array_equal(solver.world_response_group_to_art[6].numpy(), free_articulations)
+
+        forced_tiled = _FeatherPGSExecutionPlan.build(
+            solver.size_groups,
+            max_constraints=solver.dense_max_constraints,
+            max_shared_memory=101376,
+            hinv_jt_kernel="tiled",
+            small_dof_threshold=12,
+            tile_threads=64,
+        )
+        self.assertEqual(forced_tiled.hinv_jt_tiled_sizes, frozenset((6, 13)))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free response diagonal parity requires CUDA")
+    def test_forced_tiled_mixed_world_matches_par_row_trajectory(self):
+        """Match diagonal, impulses, and state when every response group is tiled."""
+        for warmstart in (False, True):
+            for preelimination in (False, True):
+                with self.subTest(warmstart=warmstart, preelimination=preelimination):
+                    reference_solver, reference = _run_mixed_response(
+                        "par_row", warmstart=warmstart, preelimination=preelimination
+                    )
+                    tiled_solver, tiled = _run_mixed_response(
+                        "tiled", warmstart=warmstart, preelimination=preelimination
+                    )
+
+                    self.assertEqual(reference_solver._hinv_jt_diag_sizes, frozenset())
+                    self.assertEqual(reference_solver._preelim_active, preelimination)
+                    self.assertEqual(tiled_solver._preelim_active, preelimination)
+                    expected_diag_sizes = frozenset() if preelimination else frozenset((6, 13))
+                    self.assertEqual(tiled_solver._hinv_jt_diag_sizes, expected_diag_sizes)
+                    self.assertEqual(len(reference), len(tiled))
+                    self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
+                    for step, (expected, actual) in enumerate(zip(reference, tiled, strict=True)):
+                        self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+                        for label, expected_value, actual_value in zip(
+                            ("diagonal", "impulses", "joint_q", "joint_qd"),
+                            expected[1:],
+                            actual[1:],
+                            strict=True,
+                        ):
+                            np.testing.assert_allclose(
+                                actual_value,
+                                expected_value,
+                                rtol=5.0e-4,
+                                atol=2.0e-6,
+                                err_msg=f"{label} differed at step {step}",
+                            )
+
     @unittest.skipUnless(wp.is_cuda_available(), "tiled H-inverse response requires CUDA")
     def test_tiled_response_diagonal_matches_dense_reference(self):
         device = wp.get_device("cuda:0")

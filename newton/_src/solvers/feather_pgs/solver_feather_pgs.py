@@ -2701,6 +2701,8 @@ class SolverFeatherPGS(SolverBase):
     def _setup_world_size_grouping(self, model):
         self.world_group_art_start = {}
         self.world_group_to_art = {}
+        self.world_response_group_art_start = {}
+        self.world_response_group_to_art = {}
         if (
             not model.articulation_count
             or self.art_to_world is None
@@ -2715,21 +2717,34 @@ class SolverFeatherPGS(SolverBase):
         is_free_rigid_np = self.is_free_rigid.numpy().astype(np.int32, copy=False)
         world_count = max(int(self.world_count), 0)
         for size in self.size_groups:
+            # Propagation handles free-rigid response separately; the fused
+            # diagonal accumulator must retain every solved articulation.
             per_world: list[list[int]] = [[] for _ in range(world_count)]
-            for art in np.where((art_size_np == int(size)) & (is_free_rigid_np == 0))[0]:
+            response_per_world: list[list[int]] = [[] for _ in range(world_count)]
+            for art in np.where(art_size_np == int(size))[0]:
                 world = int(art_to_world_np[int(art)])
                 if 0 <= world < world_count:
-                    per_world[world].append(int(art))
+                    response_per_world[world].append(int(art))
+                    if is_free_rigid_np[art] == 0:
+                        per_world[world].append(int(art))
 
             starts = np.zeros(world_count + 1, dtype=np.int32)
             flat: list[int] = []
+            response_starts = np.zeros(world_count + 1, dtype=np.int32)
+            response_flat: list[int] = []
             for world, arts in enumerate(per_world):
                 starts[world] = len(flat)
                 flat.extend(arts)
+                response_starts[world] = len(response_flat)
+                response_flat.extend(response_per_world[world])
             starts[world_count] = len(flat)
+            response_starts[world_count] = len(response_flat)
             flat_np = np.asarray(flat, dtype=np.int32)
+            response_flat_np = np.asarray(response_flat, dtype=np.int32)
             self.world_group_art_start[int(size)] = wp.array(starts, dtype=wp.int32, device=device)
             self.world_group_to_art[int(size)] = wp.array(flat_np, dtype=wp.int32, device=device)
+            self.world_response_group_art_start[int(size)] = wp.array(response_starts, dtype=wp.int32, device=device)
+            self.world_response_group_to_art[int(size)] = wp.array(response_flat_np, dtype=wp.int32, device=device)
 
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:
@@ -8528,8 +8543,8 @@ class SolverFeatherPGS(SolverBase):
             dim=self.world_count * self.dense_max_constraints,
             inputs=[
                 self.diag_by_size[size],
-                self.world_group_art_start[size],
-                self.world_group_to_art[size],
+                self.world_response_group_art_start[size],
+                self.world_response_group_to_art[size],
                 self.art_group_idx,
                 self.constraint_count,
                 self.dense_max_constraints,
