@@ -2250,7 +2250,7 @@ class BodyPairContactReducer:
             slot's recorded winner (verify mode only); non-zero means an atomic
             lost an update.
             ``cell_clamp_events``: contacts whose spatial cell hit the packed
-            +/-127 range; non-zero means distant regions of one shape pair are
+            +/-31 range; non-zero means distant regions of one shape pair are
             merging on the periphery.
             ``max_contacts_in`` / ``max_contacts_kept``: peak live contact count
             before and after reduction.  ``max_contacts_in`` -- NOT kept -- is

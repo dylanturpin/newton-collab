@@ -30,7 +30,12 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.geometry.contact_reduction_body_pairs import _BP_FACE_NORMALS_DATA, _up_axis_rotation
+from newton._src.geometry.contact_reduction_body_pairs import (
+    CELL_COORD_MAX,
+    BodyPairContactReducer,
+    _BP_FACE_NORMALS_DATA,
+    _up_axis_rotation,
+)
 from newton._src.sim.contacts import Contacts
 from newton.geometry import HydroelasticSDF
 
@@ -272,6 +277,10 @@ def _world_points0(model, state, contacts):
 
 class TestBodyPairReductionCounts(unittest.TestCase):
     """Registered contacts drop to patch-descriptive sets on multi-shape pairs."""
+
+    def test_stats_doc_tracks_packed_cell_range(self):
+        """Keep the public clamp telemetry contract aligned with its bit layout."""
+        self.assertIn(f"+/-{CELL_COORD_MAX} range", BodyPairContactReducer.stats.__doc__)
 
     def _grid_on_plane(self, reduce_body_pairs):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
