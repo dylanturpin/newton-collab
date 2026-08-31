@@ -198,7 +198,8 @@ def _launch_articulation_pair_contact_allocator(
         device=device,
     )
     wp.synchronize_device(device)
-    return int(contact_slot.numpy()[0]), int(contact_path.numpy()[0]), int(contact_slots_needed.numpy()[0])
+    slots_needed = max(0, int(contact_slots_needed.numpy()[0]))
+    return int(contact_slot.numpy()[0]), int(contact_path.numpy()[0]), slots_needed
 
 
 def _dense_speculative_rhs(scale: float) -> float:
