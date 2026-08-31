@@ -117,6 +117,7 @@ def _build_plane_model(
 def _make_solver(
     model,
     *,
+    enable_restitution=None,
     velocity_iterations=0,
     response="immediate",
     restitution_velocity_threshold=0.0,
@@ -139,6 +140,8 @@ def _make_solver(
         "pgs_warmstart": pgs_warmstart,
         "mf_warmstart": mf_warmstart,
     }
+    if enable_restitution is not None:
+        kwargs["enable_restitution"] = enable_restitution
     if restitution_velocity_threshold is not None:
         kwargs["restitution_velocity_threshold"] = restitution_velocity_threshold
     # Keep a developer's environment from silently turning warm starting on in
@@ -170,6 +173,7 @@ def _step_plane(
     initial_vertical_velocity=None,
     scene="free",
     response="immediate",
+    enable_restitution=None,
     velocity_iterations=0,
     restitution_velocity_threshold=0.0,
     pgs_iterations=16,
@@ -189,6 +193,7 @@ def _step_plane(
         model,
         velocity_iterations=velocity_iterations,
         response=response,
+        enable_restitution=enable_restitution,
         restitution_velocity_threshold=restitution_velocity_threshold,
         pgs_iterations=pgs_iterations,
         pgs_mode=pgs_mode,
@@ -830,6 +835,41 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
     test.assertAlmostEqual(default_solver.restitution_velocity_threshold, 0.5)
 
 
+def test_restitution_can_be_disabled_without_changing_materials(test, device):
+    """Disable restitution while retaining authored material coefficients."""
+    model, _ = _build_plane_model(device, separation=1.0e-3, restitution=0.8)
+    solver = _make_solver(
+        model,
+        enable_restitution=False,
+        restitution_velocity_threshold=0.75,
+    )
+    test.assertIs(solver.shape_material_restitution, model.shape_material_restitution)
+    test.assertAlmostEqual(solver.restitution_velocity_threshold, 0.75)
+    test.assertGreater(solver._effective_restitution_velocity_threshold, 1.0e30)
+
+    speed = 2.0
+    separation = IMPACT_FRACTION * speed * DEFAULT_DT
+    for scene, response in (("free", "immediate"), ("articulated", "immediate"), ("free", "propagation")):
+        with test.subTest(scene=scene, response=response):
+            result = _step_plane(
+                device,
+                separation=separation,
+                speed=speed,
+                restitution=0.8,
+                scene=scene,
+                response=response,
+                enable_restitution=False,
+            )
+            _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, f"{scene}/{response}")
+            _assert_velocity(
+                test,
+                result["after"],
+                -IMPACT_FRACTION * speed,
+                speed,
+                f"{scene}/{response}",
+            )
+
+
 def test_velocity_iteration_counts_reach_the_same_single_row_solution(test, device):
     """Keep restitution correct while optional velocity iterations refine the row."""
     restitution = 0.7
@@ -1108,6 +1148,7 @@ for _fn in (
     test_dense_and_production_split_modes_enforce_restitution_without_velocity_iterations,
     test_multiworld_restitution_keeps_case_data_isolated,
     test_restitution_uses_ordinary_rows_and_validates_configuration,
+    test_restitution_can_be_disabled_without_changing_materials,
     test_velocity_iteration_counts_reach_the_same_single_row_solution,
     test_warm_start_history_does_not_change_or_repeat_restitution,
     test_redundant_box_contacts_do_not_multiply_restitution_energy,

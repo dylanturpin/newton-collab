@@ -30,7 +30,12 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.geometry.contact_reduction_body_pairs import _BP_FACE_NORMALS_DATA, _up_axis_rotation
+from newton._src.geometry.contact_reduction_body_pairs import (
+    CELL_COORD_MAX,
+    BodyPairContactReducer,
+    _BP_FACE_NORMALS_DATA,
+    _up_axis_rotation,
+)
 from newton._src.sim.contacts import Contacts
 from newton.geometry import HydroelasticSDF
 
@@ -272,6 +277,10 @@ def _world_points0(model, state, contacts):
 
 class TestBodyPairReductionCounts(unittest.TestCase):
     """Registered contacts drop to patch-descriptive sets on multi-shape pairs."""
+
+    def test_stats_doc_tracks_packed_cell_range(self):
+        """Keep the public clamp telemetry contract aligned with its bit layout."""
+        self.assertIn(f"+/-{CELL_COORD_MAX} range", BodyPairContactReducer.stats.__doc__)
 
     def _grid_on_plane(self, reduce_body_pairs):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
@@ -729,8 +738,8 @@ class TestBodyPairReductionMultiPatch(unittest.TestCase):
     def test_both_clusters_fully_kept_far_from_origin(self):
         """Keep both clusters for a body 200 m from the origin, not just near it.
 
-        The spatial cell is packed as two signed 8-bit values. Measured from the
-        world origin those saturate past ~32 m, so both clusters of a distant
+        The spatial cell is packed as two signed 6-bit values. Measured from the
+        world origin those saturate past ~8 m, so both clusters of a distant
         body land in the same border cell, compete for one slot set, and one
         loses its support points -- while the identical scene at the origin
         passes. Anchoring the cell grid at the pair's reference body makes the
@@ -868,6 +877,84 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         # floor. Individual supported scenes may pass an explicit measured
         # bound instead of the calm default.
         self.assertLess(w_on, max(2.0 * w_off, w_tol), f"reduced settle is rocking: |w| {w_on} vs {w_off}")
+
+    def test_row_watermark_reports_raw_dense_overflow(self):
+        """Report attempted dense rows separately from the clamped count."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        no_collision = builder.default_shape_cfg.copy()
+        no_collision.has_shape_collision = False
+        joints = []
+        parent = -1
+        for index in range(3):
+            child = builder.add_link()
+            builder.add_shape_box(child, hx=0.05, hy=0.05, hz=0.05, cfg=no_collision)
+            joints.append(
+                builder.add_joint_revolute(
+                    parent=parent,
+                    child=child,
+                    axis=newton.Axis.Z,
+                    parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.2 * index), wp.quat_identity()),
+                    child_xform=wp.transform_identity(),
+                    limit_lower=-1.0,
+                    limit_upper=1.0,
+                )
+            )
+            parent = child
+        builder.add_articulation(joints)
+        model = builder.finalize(device=wp.get_device())
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        pipeline = _make_pipeline(model, False)
+        contacts = pipeline.contacts()
+        pipeline.collide(state_0, contacts)
+
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            angular_damping=0.0,
+            dense_max_constraints=4,
+            enable_joint_limits=True,
+            joint_limit_activation_gap=float("inf"),
+            row_watermark=True,
+        )
+        solver.step(state_0, state_1, model.control(), contacts, DT)
+        rows = solver.constraint_row_watermarks()
+
+        self.assertGreater(rows["dense_high_water"], 0)
+        self.assertLessEqual(rows["dense_high_water"], 4)
+        self.assertGreater(rows["dense_raw_high_water"], rows["dense_high_water"])
+        self.assertEqual(rows["dense_overflow_world_steps"], 1)
+        self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
+
+    def test_row_watermark_includes_rolled_back_contact_rows(self):
+        """Count contact bundles rejected and rolled back by the allocator."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        _prismatic_jointed_foot(builder, (0.0, 0.0, 0.02))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        pipeline = _make_pipeline(model, False)
+        contacts = pipeline.contacts()
+        pipeline.collide(state_0, contacts)
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 1)
+
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            angular_damping=0.0,
+            dense_max_constraints=4,
+            row_watermark=True,
+        )
+        solver.step(state_0, state_1, model.control(), contacts, DT)
+        rows = solver.constraint_row_watermarks()
+
+        self.assertGreater(rows["dense_raw_high_water"], rows["dense_high_water"])
+        self.assertGreater(rows["dense_dropped_contact_rows_high_water"], 0)
+        self.assertEqual(
+            rows["dense_raw_high_water"],
+            rows["dense_high_water"] + rows["dense_dropped_contact_rows_high_water"],
+        )
+        self.assertEqual(rows["dense_overflow_world_steps"], 1)
+        self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
 
     def test_feather_pgs_conformance(self):
         """SolverFeatherPGS rests a free-jointed foot at the same height on/off.

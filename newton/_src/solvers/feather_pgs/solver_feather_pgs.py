@@ -214,6 +214,28 @@ def _accumulate_row_watermark(
     wp.atomic_max(watermark, 0, counts[tid])
 
 
+@wp.kernel
+def _accumulate_row_capacity_telemetry(
+    raw_counts: wp.array[wp.int32],
+    dropped_contact_rows: wp.array[wp.int32],
+    capacity: int,
+    raw_watermark: wp.array[wp.int32],
+    dropped_contact_rows_watermark: wp.array[wp.int32],
+    overflow_excess_watermark: wp.array[wp.int32],
+    overflow_world_steps: wp.array[wp.int32],
+):
+    """Accumulate raw row demand and capacity overflow without changing solver state."""
+    tid = wp.tid()
+    dropped = dropped_contact_rows[tid]
+    count = raw_counts[tid] + dropped
+    wp.atomic_max(raw_watermark, 0, count)
+    wp.atomic_max(dropped_contact_rows_watermark, 0, dropped)
+    excess = count - capacity
+    if excess > 0:
+        wp.atomic_max(overflow_excess_watermark, 0, excess)
+        wp.atomic_add(overflow_world_steps, 0, 1)
+
+
 @dataclass(frozen=True)
 class _FeatherPGSModelPlan:
     """Immutable articulation and generalized-response plan."""
@@ -671,6 +693,10 @@ class SolverFeatherPGS(SolverBase):
         restitution_velocity_threshold: float = 0.5,
         contact_speculative_scale: float = 1.0,
         contact_gap_gate: float = 0.0,
+        contact_friction_articulation_pairs_only: bool = False,
+        enable_restitution: bool = True,
+        same_articulation_contact_gap_gate: float = 0.0,
+        articulation_pair_contact_gap_gate: float = 0.0,
     ):
         """
         Args:
@@ -707,6 +733,10 @@ class SolverFeatherPGS(SolverBase):
                 contiguous patch has more than one selected friction anchor, the effective Coulomb
                 coefficient is halved to mimic PhysX's two-anchor friction scaling. Defaults to 0
                 (disabled).
+            contact_friction_articulation_pairs_only (bool, optional): Apply
+                ``contact_friction_gap_threshold`` and ``contact_friction_anchor_limit`` only when
+                both contact bodies belong to non-free articulations. Contacts involving ground or a
+                free rigid body retain the legacy unbounded friction-row behavior. Defaults to False.
             contact_friction_scale (float, optional): Multiplies the effective Coulomb coefficient
                 used by generated friction rows. This is a diagnostic hook for matching solver-prep
                 semantics such as PhysX's per-friction-anchor scaling; it does not affect normal
@@ -720,6 +750,16 @@ class SolverFeatherPGS(SolverBase):
                 world-space gap exceeds this distance before allocating any dense, matrix-free,
                 or propagation rows. A value of 0.0 disables the gate and preserves all
                 collision-generated contacts. Must be finite and non-negative. Defaults to 0.0.
+            same_articulation_contact_gap_gate (float, optional): If positive, skip only
+                contacts between two links of the same non-free articulation whose world-space
+                gap exceeds this distance. This can retain a long predictive horizon for fast
+                free bodies while bounding speculative self-contact row demand. A value of 0.0
+                disables the scoped gate. Must be finite and non-negative. Defaults to 0.0.
+            articulation_pair_contact_gap_gate (float, optional): If positive, skip contacts
+                between two non-free articulated bodies whose world-space gap exceeds this
+                distance. Contacts involving ground or a free rigid body retain the full
+                predictive horizon. A value of 0.0 disables the scoped gate. Must be finite
+                and non-negative. Defaults to 0.0.
             contact_shared_anchor (bool, optional): If true, all contact rows use the midpoint between
                 the two witness points as the Jacobian point on both bodies, matching PhysX contact
                 prep's single ``contact.point`` lever arm. ``phi`` is still computed from the original
@@ -1011,6 +1051,8 @@ class SolverFeatherPGS(SolverBase):
                 change floating-point reduction order with the block size, so non-default
                 values are not bit-identical (results stay within numerical tolerance).
                 Must be one of {32, 64, 128, 256}. Defaults to 64.
+            enable_restitution: Whether rigid contacts apply their authored restitution coefficients. Defaults to
+                ``True`` to preserve FeatherPGS behavior before this option was exposed.
             restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
                 relative normal velocity required to apply restitution. The contact must also be at the surface or
                 be predicted to reach it during the timestep. Slower contacts retain the existing speculative or
@@ -1034,6 +1076,7 @@ class SolverFeatherPGS(SolverBase):
         self.contact_friction_position_iterations = int(contact_friction_position_iterations)
         self.contact_friction_shared_anchor = bool(contact_friction_shared_anchor)
         self.contact_friction_anchor_limit = int(contact_friction_anchor_limit)
+        self.contact_friction_articulation_pairs_only = bool(contact_friction_articulation_pairs_only)
         self.contact_friction_scale = float(contact_friction_scale)
         try:
             self.contact_speculative_scale = float(contact_speculative_scale)
@@ -1047,6 +1090,18 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError("contact_gap_gate must be finite and non-negative") from exc
         if not np.isfinite(self.contact_gap_gate) or self.contact_gap_gate < 0.0:
             raise ValueError("contact_gap_gate must be finite and non-negative")
+        try:
+            self.same_articulation_contact_gap_gate = float(same_articulation_contact_gap_gate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("same_articulation_contact_gap_gate must be finite and non-negative") from exc
+        if not np.isfinite(self.same_articulation_contact_gap_gate) or self.same_articulation_contact_gap_gate < 0.0:
+            raise ValueError("same_articulation_contact_gap_gate must be finite and non-negative")
+        try:
+            self.articulation_pair_contact_gap_gate = float(articulation_pair_contact_gap_gate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("articulation_pair_contact_gap_gate must be finite and non-negative") from exc
+        if not np.isfinite(self.articulation_pair_contact_gap_gate) or self.articulation_pair_contact_gap_gate < 0.0:
+            raise ValueError("articulation_pair_contact_gap_gate must be finite and non-negative")
         self.contact_shared_anchor = bool(contact_shared_anchor)
         if self.contact_friction_position_iterations < -1:
             raise ValueError(
@@ -1105,6 +1160,7 @@ class SolverFeatherPGS(SolverBase):
                 "pgs_contact_regularization requires articulated_contact_response 'immediate' or 'propagation-fused'"
             )
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
+        self.enable_restitution = bool(enable_restitution)
         threshold_error = "restitution_velocity_threshold must be finite and non-negative"
         try:
             self.restitution_velocity_threshold = float(restitution_velocity_threshold)
@@ -1112,6 +1168,9 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(threshold_error) from exc
         if not np.isfinite(self.restitution_velocity_threshold) or self.restitution_velocity_threshold < 0.0:
             raise ValueError(threshold_error)
+        self._effective_restitution_velocity_threshold = (
+            self.restitution_velocity_threshold if self.enable_restitution else np.finfo(np.float32).max
+        )
         self.pgs_velocity_omega = self.pgs_omega if pgs_velocity_omega is None else float(pgs_velocity_omega)
         if pgs_velocity_drive_mode not in ("active", "freeze"):
             raise ValueError(f"pgs_velocity_drive_mode must be 'active' or 'freeze', got {pgs_velocity_drive_mode!r}")
@@ -1185,6 +1244,8 @@ class SolverFeatherPGS(SolverBase):
         if pgs_mode not in ("dense", "split", "matrix_free"):
             raise ValueError(f"pgs_mode must be 'dense', 'split', or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
+        if self.enable_joint_velocity_limits and self.pgs_mode != "matrix_free":
+            raise NotImplementedError("enable_joint_velocity_limits=True currently requires pgs_mode='matrix_free'")
         if articulated_contact_response != "immediate" and self.pgs_mode != "matrix_free":
             raise NotImplementedError(
                 f"articulated_contact_response={articulated_contact_response!r} currently requires "
@@ -1325,6 +1386,12 @@ class SolverFeatherPGS(SolverBase):
         valid_pgs = {"loop", "tiled_row", "tiled_contact", "streaming"}
         if pgs_kernel not in valid_pgs:
             raise ValueError(f"pgs_kernel must be one of {sorted(valid_pgs)}")
+
+        if self.pgs_mode != "matrix_free" and self.enable_joint_limits and pgs_kernel in ("tiled_contact", "streaming"):
+            raise ValueError(
+                f"pgs_kernel={pgs_kernel!r} is contact-only and cannot solve joint-limit rows; "
+                "use pgs_kernel='loop' or 'tiled_row', or pgs_mode='matrix_free'"
+            )
 
         # Native tiled kernels are CUDA-only. Resolve the complete scalar
         # suite here so CPU callers cannot accidentally launch silent no-op
@@ -1526,16 +1593,12 @@ class SolverFeatherPGS(SolverBase):
         # allocate_world_contact_slots when the MF path is inactive (the
         # kernel never writes it when has_free_rigid == 0).
 
-        # Opt-in, behavior-neutral constraint/contact row high-water telemetry.
-        # When enabled, allocate three 1-element int32 device watermark buffers
-        # ONCE here (before any CUDA-graph capture) and accumulate running maxima
-        # of the per-world dense / matrix-free / rigid-contact row counts at the
-        # end of every captured step() (see step()). The kernel only reads the
-        # live counts and writes these separate buffers, so it never mutates
-        # solver state and is numerics-neutral. Buffers are never re-zeroed
-        # inside the captured region — the marks are whole-run running maxima
-        # (warmup included). Read back via constraint_row_watermarks() outside
-        # the captured region.
+        # Opt-in, behavior-neutral constraint/contact row telemetry. Allocate
+        # every scalar ONCE before CUDA-graph capture and accumulate at the end
+        # of every solver step. In addition to the clamped retained-row maxima,
+        # preserve the raw allocator demand before finalization clamps it to the
+        # configured capacity. This is the only reliable way to distinguish a
+        # full buffer from an actual overflow after a long captured rollout.
         self._row_watermark = bool(row_watermark)
         if self._row_watermark:
             wm_device = self.constraint_count.device
@@ -1543,11 +1606,41 @@ class SolverFeatherPGS(SolverBase):
             self._row_watermark_mf = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_propagation = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_contact = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_watermark_dense_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_watermark_mf_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_watermark_propagation_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_dropped_dense = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
+            self._row_dropped_mf = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
+            self._row_dropped_propagation = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
+            self._row_dropped_dense_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_dropped_mf_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_dropped_propagation_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_overflow_dense_excess = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_overflow_mf_excess = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_overflow_propagation_excess = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_overflow_dense_world_steps = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_overflow_mf_world_steps = wp.zeros(1, dtype=wp.int32, device=wm_device)
+            self._row_overflow_propagation_world_steps = wp.zeros(1, dtype=wp.int32, device=wm_device)
         else:
             self._row_watermark_dense = None
             self._row_watermark_mf = None
             self._row_watermark_propagation = None
             self._row_watermark_contact = None
+            self._row_watermark_dense_raw = None
+            self._row_watermark_mf_raw = None
+            self._row_watermark_propagation_raw = None
+            self._row_dropped_dense = None
+            self._row_dropped_mf = None
+            self._row_dropped_propagation = None
+            self._row_dropped_dense_high_water = None
+            self._row_dropped_mf_high_water = None
+            self._row_dropped_propagation_high_water = None
+            self._row_overflow_dense_excess = None
+            self._row_overflow_mf_excess = None
+            self._row_overflow_propagation_excess = None
+            self._row_overflow_dense_world_steps = None
+            self._row_overflow_mf_world_steps = None
+            self._row_overflow_propagation_world_steps = None
 
         self._debug_projected_root = os.getenv("IL_NEWTON_FPGS_PROJECTED_ROOT", "").lower() in {
             "1",
@@ -4989,7 +5082,7 @@ class SolverFeatherPGS(SolverBase):
                     self.speculative_dense_contact_compliance,
                     dt,
                     self.contact_speculative_scale,
-                    self.restitution_velocity_threshold,
+                    self._effective_restitution_velocity_threshold,
                     self.propagation_max_constraints,
                 ],
                 outputs=[
@@ -6561,6 +6654,20 @@ class SolverFeatherPGS(SolverBase):
                 inputs=[self.constraint_count, self._row_watermark_dense],
                 device=self.constraint_count.device,
             )
+            wp.launch(
+                _accumulate_row_capacity_telemetry,
+                dim=self.slot_counter.shape[0],
+                inputs=[
+                    self.slot_counter,
+                    self._row_dropped_dense,
+                    self.dense_max_constraints,
+                    self._row_watermark_dense_raw,
+                    self._row_dropped_dense_high_water,
+                    self._row_overflow_dense_excess,
+                    self._row_overflow_dense_world_steps,
+                ],
+                device=self.slot_counter.device,
+            )
             mf_counts = getattr(self, "mf_constraint_count", None)
             if mf_counts is not None and mf_counts.shape[0] > 0:
                 wp.launch(
@@ -6569,6 +6676,20 @@ class SolverFeatherPGS(SolverBase):
                     inputs=[mf_counts, self._row_watermark_mf],
                     device=mf_counts.device,
                 )
+                wp.launch(
+                    _accumulate_row_capacity_telemetry,
+                    dim=self.mf_slot_counter.shape[0],
+                    inputs=[
+                        self.mf_slot_counter,
+                        self._row_dropped_mf,
+                        self.mf_max_constraints,
+                        self._row_watermark_mf_raw,
+                        self._row_dropped_mf_high_water,
+                        self._row_overflow_mf_excess,
+                        self._row_overflow_mf_world_steps,
+                    ],
+                    device=self.mf_slot_counter.device,
+                )
             prop_counts = getattr(self, "propagation_constraint_count", None)
             if prop_counts is not None and prop_counts.shape[0] > 0:
                 wp.launch(
@@ -6576,6 +6697,20 @@ class SolverFeatherPGS(SolverBase):
                     dim=prop_counts.shape[0],
                     inputs=[prop_counts, self._row_watermark_propagation],
                     device=prop_counts.device,
+                )
+                wp.launch(
+                    _accumulate_row_capacity_telemetry,
+                    dim=self.propagation_slot_counter.shape[0],
+                    inputs=[
+                        self.propagation_slot_counter,
+                        self._row_dropped_propagation,
+                        self.propagation_max_constraints,
+                        self._row_watermark_propagation_raw,
+                        self._row_dropped_propagation_high_water,
+                        self._row_overflow_propagation_excess,
+                        self._row_overflow_propagation_world_steps,
+                    ],
+                    device=self.propagation_slot_counter.device,
                 )
             if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
                 contact_counts = contacts.rigid_contact_count
@@ -6592,11 +6727,14 @@ class SolverFeatherPGS(SolverBase):
     def constraint_row_watermarks(self) -> dict:
         """Return the opt-in constraint/contact row high-water marks.
 
-        These are whole-run running maxima (warmup included) of the per-world
-        dense / matrix-free / rigid-contact row counts, accumulated inside the
-        captured :meth:`step` when ``row_watermark`` is enabled. Reads
-        ``.numpy()[0]`` from the device buffers and so must be called OUTSIDE any
-        captured/timed region (it forces a device sync).
+        These are whole-run running maxima (warmup included) of retained and
+        raw per-world dense / matrix-free / rigid-contact row counts, rejected
+        contact rows that allocators rolled back, peak over-capacity demand,
+        and the number of overflowing world-steps. They are accumulated inside
+        the captured :meth:`step` when
+        ``row_watermark`` is enabled. Reads ``.numpy()[0]`` from the device
+        buffers and so must be called OUTSIDE any captured/timed region (it
+        forces a device sync).
 
         Returns ``0`` for every field when the telemetry was not enabled, so the
         caller never has to special-case the off path.
@@ -6604,15 +6742,47 @@ class SolverFeatherPGS(SolverBase):
         if not self._row_watermark:
             return {
                 "dense_high_water": 0,
+                "dense_raw_high_water": 0,
+                "dense_dropped_contact_rows_high_water": 0,
+                "dense_overflow_excess_high_water": 0,
+                "dense_overflow_world_steps": 0,
                 "mf_high_water": 0,
+                "mf_raw_high_water": 0,
+                "mf_dropped_contact_rows_high_water": 0,
+                "mf_overflow_excess_high_water": 0,
+                "mf_overflow_world_steps": 0,
                 "propagation_high_water": 0,
+                "propagation_raw_high_water": 0,
+                "propagation_dropped_contact_rows_high_water": 0,
+                "propagation_overflow_excess_high_water": 0,
+                "propagation_overflow_world_steps": 0,
                 "contact_high_water": 0,
             }
         return {
             "dense_high_water": int(self._row_watermark_dense.numpy()[0]),
+            "dense_raw_high_water": int(self._row_watermark_dense_raw.numpy()[0]),
+            "dense_dropped_contact_rows_high_water": int(self._row_dropped_dense_high_water.numpy()[0]),
+            "dense_overflow_excess_high_water": int(self._row_overflow_dense_excess.numpy()[0]),
+            "dense_overflow_world_steps": int(self._row_overflow_dense_world_steps.numpy()[0]),
             "mf_high_water": int(self._row_watermark_mf.numpy()[0]),
+            "mf_raw_high_water": int(self._row_watermark_mf_raw.numpy()[0]),
+            "mf_dropped_contact_rows_high_water": int(self._row_dropped_mf_high_water.numpy()[0]),
+            "mf_overflow_excess_high_water": int(self._row_overflow_mf_excess.numpy()[0]),
+            "mf_overflow_world_steps": int(self._row_overflow_mf_world_steps.numpy()[0]),
             "propagation_high_water": int(self._row_watermark_propagation.numpy()[0])
             if self._row_watermark_propagation is not None
+            else 0,
+            "propagation_raw_high_water": int(self._row_watermark_propagation_raw.numpy()[0])
+            if self._row_watermark_propagation_raw is not None
+            else 0,
+            "propagation_dropped_contact_rows_high_water": int(self._row_dropped_propagation_high_water.numpy()[0])
+            if self._row_dropped_propagation_high_water is not None
+            else 0,
+            "propagation_overflow_excess_high_water": int(self._row_overflow_propagation_excess.numpy()[0])
+            if self._row_overflow_propagation_excess is not None
+            else 0,
+            "propagation_overflow_world_steps": int(self._row_overflow_propagation_world_steps.numpy()[0])
+            if self._row_overflow_propagation_world_steps is not None
             else 0,
             "contact_high_water": int(self._row_watermark_contact.numpy()[0]),
         }
@@ -7328,6 +7498,10 @@ class SolverFeatherPGS(SolverBase):
         # Zero world-level buffers (only arrays that require it)
         self.slot_counter.zero_()  # atomic-add counter
         self.dense_contact_world_flag.zero_()
+        if self._row_watermark:
+            self._row_dropped_dense.zero_()
+            self._row_dropped_mf.zero_()
+            self._row_dropped_propagation.zero_()
 
         if mf_active:
             self.mf_slot_counter.zero_()  # atomic-add counter
@@ -7363,6 +7537,9 @@ class SolverFeatherPGS(SolverBase):
         is_free_rigid = self.is_free_rigid if self.is_free_rigid is not None else self._dummy_is_free_rigid
         mf_slot_counter = self.mf_slot_counter if mf_active else self._dummy_mf_slot_counter
         propagation_slot_counter = self.propagation_slot_counter if propagation_active else self._dummy_mf_slot_counter
+        dense_dropped_rows = self._row_dropped_dense if self._row_watermark else self._dummy_mf_slot_counter
+        mf_dropped_rows = self._row_dropped_mf if self._row_watermark else self._dummy_mf_slot_counter
+        propagation_dropped_rows = self._row_dropped_propagation if self._row_watermark else self._dummy_mf_slot_counter
         j_buffers_zeroed = False
 
         drive_active = self.drive_mode == "physx_pgs" and self.drive_slot is not None
@@ -7779,12 +7956,16 @@ class SolverFeatherPGS(SolverBase):
                     # ground).
                     1 if (self._route_free_free_contacts and propagation_active) else 0,
                     self.contact_gap_gate,
+                    self.same_articulation_contact_gap_gate,
+                    self.articulation_pair_contact_gap_gate,
                     max_constraints,
                     self.mf_max_constraints,
                     self.propagation_max_constraints,
                     enable_friction_flag,
                     self.contact_friction_gap_threshold,
                     self.contact_friction_anchor_limit,
+                    1 if self.contact_friction_articulation_pairs_only else 0,
+                    1 if self._row_watermark else 0,
                 ],
                 outputs=[
                     self.contact_world,
@@ -7797,6 +7978,9 @@ class SolverFeatherPGS(SolverBase):
                     propagation_slot_counter,
                     self.dense_contact_world_flag,
                     self.contact_slots_needed,
+                    dense_dropped_rows,
+                    mf_dropped_rows,
+                    propagation_dropped_rows,
                 ],
                 device=model.device,
             )
@@ -7836,6 +8020,8 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
                         self.contact_friction_anchor_limit,
+                        1 if self.contact_friction_articulation_pairs_only else 0,
+                        is_free_rigid,
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
@@ -7928,6 +8114,8 @@ class SolverFeatherPGS(SolverBase):
                             self.contact_friction_gap_threshold,
                             int(self.contact_friction_shared_anchor),
                             self.contact_friction_anchor_limit,
+                            1 if self.contact_friction_articulation_pairs_only else 0,
+                            is_free_rigid,
                             self.contact_friction_scale,
                             int(self.contact_shared_anchor),
                             self.pgs_beta,
@@ -7980,6 +8168,7 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
                         self.contact_friction_anchor_limit,
+                        1 if self.contact_friction_articulation_pairs_only else 0,
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
@@ -8074,15 +8263,19 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_world,
                         self.contact_slot,
                         self.contact_path,
+                        self.contact_art_a,
+                        self.contact_art_b,
                         model.shape_body,
                         state_in.body_q,
                         model.body_com,
+                        is_free_rigid,
                         self.shape_material_mu,
                         self.shape_material_restitution,
                         enable_friction_flag,
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
                         self.contact_friction_anchor_limit,
+                        1 if self.contact_friction_articulation_pairs_only else 0,
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         builder_unit_order,
@@ -8630,7 +8823,7 @@ class SolverFeatherPGS(SolverBase):
                     self.J_world,
                     dt,
                     int(apply_restitution),
-                    self.restitution_velocity_threshold,
+                    self._effective_restitution_velocity_threshold,
                 ],
                 outputs=[rhs_out],
                 device=model.device,
@@ -8695,7 +8888,7 @@ class SolverFeatherPGS(SolverBase):
                     self.world_dof_indices,
                     self.J_world,
                     dt,
-                    self.restitution_velocity_threshold,
+                    self._effective_restitution_velocity_threshold,
                 ],
                 outputs=[self.rhs],
                 device=self.model.device,
@@ -8714,7 +8907,7 @@ class SolverFeatherPGS(SolverBase):
                 self.row_restitution,
                 dt,
                 self.contact_speculative_scale,
-                self.restitution_velocity_threshold,
+                self._effective_restitution_velocity_threshold,
             ],
             outputs=[self.rhs],
             device=self.model.device,
@@ -9416,7 +9609,7 @@ class SolverFeatherPGS(SolverBase):
                 self.pgs_beta,
                 dt,
                 self.contact_speculative_scale,
-                self.restitution_velocity_threshold,
+                self._effective_restitution_velocity_threshold,
                 self.mf_max_constraints,
             ],
             outputs=[
@@ -9465,7 +9658,7 @@ class SolverFeatherPGS(SolverBase):
                 self.v_hat,
                 int(preserve_unreached_speculative),
                 int(apply_restitution),
-                self.restitution_velocity_threshold,
+                self._effective_restitution_velocity_threshold,
                 self.mf_max_constraints,
             ],
             outputs=[output],

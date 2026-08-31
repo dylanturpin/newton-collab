@@ -27,7 +27,19 @@ PATH_MATRIX_FREE = 1
 PATH_PROPAGATION = 2
 
 
-def _launch_contact_allocator(*, route: int, gap: float, gate: float, responsive: bool = True):
+def _launch_contact_allocator(
+    *,
+    route: int,
+    gap: float,
+    gate: float,
+    responsive: bool = True,
+    scoped_gate: float = 0.0,
+    pair_gate: float = 0.0,
+    enable_friction: bool = False,
+    friction_gap: float = float("inf"),
+    friction_anchors: int = 0,
+    friction_pairs_only: bool = False,
+):
     """Allocate one contact and return its route metadata and counters."""
     device = "cpu"
     outputs = {
@@ -43,6 +55,9 @@ def _launch_contact_allocator(*, route: int, gap: float, gate: float, responsive
         "mf_count": wp.zeros((1,), dtype=wp.int32, device=device),
         "propagation_count": wp.zeros((1,), dtype=wp.int32, device=device),
         "dense_world_flag": wp.zeros((1,), dtype=wp.int32, device=device),
+        "dense_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
+        "mf_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
+        "propagation_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
     }
     is_free = route == PATH_MATRIX_FREE
     propagation_enabled = route == PATH_PROPAGATION
@@ -73,11 +88,15 @@ def _launch_contact_allocator(*, route: int, gap: float, gate: float, responsive
             0,
             0,
             gate,
+            scoped_gate,
+            pair_gate,
             8,
             8,
             8,
-            0,
-            float("inf"),
+            int(enable_friction),
+            friction_gap,
+            friction_anchors,
+            int(friction_pairs_only),
             0,
         ],
         outputs=[
@@ -91,11 +110,96 @@ def _launch_contact_allocator(*, route: int, gap: float, gate: float, responsive
             counters["propagation_count"],
             counters["dense_world_flag"],
             outputs["slots_needed"],
+            counters["dense_dropped"],
+            counters["mf_dropped"],
+            counters["propagation_dropped"],
         ],
         device=device,
     )
     wp.synchronize_device(device)
     return {name: int(array.numpy()[0]) for name, array in (outputs | counters).items()}
+
+
+def _launch_articulation_pair_contact_allocator(
+    *,
+    gap: float,
+    scoped_gate: float = 0.0,
+    pair_gate: float = 0.0,
+    cross_articulation: bool = False,
+    enable_friction: bool = False,
+    friction_gap: float = float("inf"),
+    friction_anchors: int = 0,
+    friction_pairs_only: bool = False,
+):
+    """Allocate one contact between two non-free articulated links."""
+    device = "cpu"
+    body_to_articulation = [0, 1] if cross_articulation else [0, 0]
+    articulation_count = 2 if cross_articulation else 1
+    contact_slot = wp.full((1,), -9, dtype=wp.int32, device=device)
+    contact_path = wp.full((1,), -9, dtype=wp.int32, device=device)
+    contact_slots_needed = wp.full((1,), -9, dtype=wp.int32, device=device)
+    dense_count = wp.zeros((1,), dtype=wp.int32, device=device)
+    dense_dropped = wp.zeros((1,), dtype=wp.int32, device=device)
+    mf_dropped = wp.zeros((1,), dtype=wp.int32, device=device)
+    propagation_dropped = wp.zeros((1,), dtype=wp.int32, device=device)
+    wp.launch(
+        allocate_world_contact_slots,
+        dim=1,
+        inputs=[
+            wp.array([1], dtype=wp.int32, device=device),
+            1,
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([wp.vec3(gap, 0.0, 0.0)], dtype=wp.vec3, device=device),
+            wp.array([wp.vec3(0.0)], dtype=wp.vec3, device=device),
+            wp.array([wp.vec3(-1.0, 0.0, 0.0)], dtype=wp.vec3, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device),
+            wp.array([0, 1], dtype=wp.int32, device=device),
+            wp.array(body_to_articulation, dtype=wp.int32, device=device),
+            wp.array([0] * articulation_count, dtype=wp.int32, device=device),
+            wp.array([1] * articulation_count, dtype=wp.int32, device=device),
+            wp.zeros((2,), dtype=wp.int32, device=device),
+            wp.ones((2,), dtype=wp.int32, device=device),
+            wp.zeros((2,), dtype=wp.int32, device=device),
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            scoped_gate,
+            pair_gate,
+            8,
+            8,
+            8,
+            int(enable_friction),
+            friction_gap,
+            friction_anchors,
+            int(friction_pairs_only),
+            0,
+        ],
+        outputs=[
+            wp.full((1,), -9, dtype=wp.int32, device=device),
+            contact_slot,
+            wp.full((1,), -9, dtype=wp.int32, device=device),
+            wp.full((1,), -9, dtype=wp.int32, device=device),
+            dense_count,
+            contact_path,
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            wp.zeros((1,), dtype=wp.int32, device=device),
+            contact_slots_needed,
+            dense_dropped,
+            mf_dropped,
+            propagation_dropped,
+        ],
+        device=device,
+    )
+    wp.synchronize_device(device)
+    slots_needed = max(0, int(contact_slots_needed.numpy()[0]))
+    return int(contact_slot.numpy()[0]), int(contact_path.numpy()[0]), slots_needed
 
 
 def _dense_speculative_rhs(scale: float) -> float:
@@ -330,6 +434,8 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             1.0,
             1,
             0,
+            0,
+            wp.zeros((1,), dtype=wp.int32, device=device),
             1.0,
             0,
             0.05,
@@ -363,6 +469,8 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             1.0,
             1,
             0,
+            0,
+            wp.zeros((1,), dtype=wp.int32, device=device),
             1.0,
             0,
             0.05,
@@ -417,21 +525,172 @@ class TestFeatherPGSContactControls(unittest.TestCase):
 
         self.assertEqual(solver.contact_speculative_scale, 1.0)
         self.assertEqual(solver.contact_gap_gate, 0.0)
+        self.assertEqual(solver.same_articulation_contact_gap_gate, 0.0)
+        self.assertEqual(solver.articulation_pair_contact_gap_gate, 0.0)
+        self.assertFalse(solver.contact_friction_articulation_pairs_only)
         parameters = tuple(inspect.signature(SolverFeatherPGS).parameters)
-        self.assertEqual(parameters[-2:], ("contact_speculative_scale", "contact_gap_gate"))
+        self.assertIn("same_articulation_contact_gap_gate", parameters)
+        self.assertIn("contact_friction_articulation_pairs_only", parameters)
+
+    def test_new_contact_controls_preserve_legacy_positional_layout(self):
+        """Append new controls without shifting established positional arguments."""
+        parameters = tuple(inspect.signature(SolverFeatherPGS).parameters)
+        for sequence in (
+            ("contact_friction_anchor_limit", "contact_friction_scale", "contact_shared_anchor"),
+            ("row_watermark", "restitution_velocity_threshold", "contact_speculative_scale", "contact_gap_gate"),
+        ):
+            start = parameters.index(sequence[0])
+            self.assertEqual(parameters[start : start + len(sequence)], sequence)
+
+        legacy_tail = parameters.index("contact_gap_gate")
+        for name in (
+            "contact_friction_articulation_pairs_only",
+            "enable_restitution",
+            "same_articulation_contact_gap_gate",
+            "articulation_pair_contact_gap_gate",
+        ):
+            self.assertGreater(parameters.index(name), legacy_tail)
 
     def test_solver_validates_and_stores_contact_controls(self):
         """Accept finite non-negative controls and reject malformed values."""
         model = newton.ModelBuilder().finalize(device="cpu")
-        solver = SolverFeatherPGS(model, contact_speculative_scale=0.0, contact_gap_gate=0.001)
+        solver = SolverFeatherPGS(
+            model,
+            contact_speculative_scale=0.0,
+            contact_gap_gate=0.001,
+            same_articulation_contact_gap_gate=0.002,
+            articulation_pair_contact_gap_gate=0.003,
+            contact_friction_articulation_pairs_only=True,
+        )
         self.assertEqual(solver.contact_speculative_scale, 0.0)
         self.assertEqual(solver.contact_gap_gate, 0.001)
+        self.assertEqual(solver.same_articulation_contact_gap_gate, 0.002)
+        self.assertEqual(solver.articulation_pair_contact_gap_gate, 0.003)
+        self.assertTrue(solver.contact_friction_articulation_pairs_only)
 
-        for name in ("contact_speculative_scale", "contact_gap_gate"):
+        for name in (
+            "contact_speculative_scale",
+            "contact_gap_gate",
+            "same_articulation_contact_gap_gate",
+            "articulation_pair_contact_gap_gate",
+        ):
             for value in (-0.1, float("nan"), float("inf"), "invalid"):
                 with self.subTest(name=name, value=value):
                     with self.assertRaisesRegex(ValueError, name):
                         SolverFeatherPGS(model, **{name: value})
+
+    def test_scoped_gap_gate_only_drops_distant_same_articulation_contact(self):
+        """The scoped gate retains near self-contact while bounding its speculative tail."""
+        self.assertEqual(
+            _launch_articulation_pair_contact_allocator(gap=0.002, scoped_gate=0.003),
+            (0, PATH_DENSE, 1),
+        )
+        self.assertEqual(
+            _launch_articulation_pair_contact_allocator(gap=0.004, scoped_gate=0.003),
+            (-1, -1, 0),
+        )
+        self.assertEqual(
+            _launch_articulation_pair_contact_allocator(gap=0.004, scoped_gate=0.0),
+            (0, PATH_DENSE, 1),
+        )
+
+    def test_scoped_gap_gate_preserves_other_contact_routes(self):
+        """Do not shorten predictive contacts for ground, free-body, or cross-articulation rows."""
+        for route, counter in (
+            (PATH_DENSE, "dense_count"),
+            (PATH_MATRIX_FREE, "mf_count"),
+            (PATH_PROPAGATION, "propagation_count"),
+        ):
+            with self.subTest(route=route):
+                result = _launch_contact_allocator(
+                    route=route,
+                    gap=0.04,
+                    gate=0.0,
+                    scoped_gate=0.003,
+                )
+                self.assertEqual(result["path"], route)
+                self.assertEqual(result[counter], 1)
+
+    def test_articulation_pair_gap_gate_drops_distant_pair_contact(self):
+        """The pair gate includes same/cross-articulation contact without touching free bodies."""
+        for cross_articulation in (False, True):
+            with self.subTest(cross_articulation=cross_articulation):
+                self.assertEqual(
+                    _launch_articulation_pair_contact_allocator(
+                        gap=0.004,
+                        scoped_gate=0.0,
+                        pair_gate=0.003,
+                        cross_articulation=cross_articulation,
+                    ),
+                    (-1, -1, 0),
+                )
+        result = _launch_contact_allocator(
+            route=PATH_MATRIX_FREE,
+            gap=0.04,
+            gate=0.0,
+            pair_gate=0.003,
+        )
+        self.assertEqual(result["path"], PATH_MATRIX_FREE)
+        self.assertEqual(result["mf_count"], 1)
+
+    def test_articulation_pair_friction_filter_preserves_free_and_ground_rows(self):
+        """Scope tight friction controls to articulated pairs, not ball/ground routes."""
+        for route in (PATH_DENSE, PATH_MATRIX_FREE, PATH_PROPAGATION):
+            with self.subTest(route=route):
+                result = _launch_contact_allocator(
+                    route=route,
+                    gap=0.004,
+                    gate=0.0,
+                    enable_friction=True,
+                    friction_gap=0.002,
+                    friction_anchors=1,
+                    friction_pairs_only=True,
+                )
+                self.assertEqual(result["path"], route)
+                self.assertEqual(result["slots_needed"], 3)
+
+    def test_articulation_pair_friction_filter_reduces_pair_rows(self):
+        """Apply the configured friction gap to same- and cross-articulation contacts."""
+        for cross_articulation in (False, True):
+            with self.subTest(cross_articulation=cross_articulation):
+                slot, path, slots_needed = _launch_articulation_pair_contact_allocator(
+                    gap=0.004,
+                    cross_articulation=cross_articulation,
+                    enable_friction=True,
+                    friction_gap=0.002,
+                    friction_anchors=1,
+                    friction_pairs_only=True,
+                )
+                self.assertEqual((slot, path, slots_needed), (0, PATH_DENSE, 1))
+
+    def test_negative_scoped_friction_gap_delays_only_articulation_pair_tangents(self):
+        """Keep pair normals while delaying friction, without changing free-body friction."""
+        shallow_pair = _launch_articulation_pair_contact_allocator(
+            gap=-0.0005,
+            enable_friction=True,
+            friction_gap=-0.001,
+            friction_anchors=1,
+            friction_pairs_only=True,
+        )
+        deep_pair = _launch_articulation_pair_contact_allocator(
+            gap=-0.002,
+            enable_friction=True,
+            friction_gap=-0.001,
+            friction_anchors=1,
+            friction_pairs_only=True,
+        )
+        free_body = _launch_contact_allocator(
+            route=PATH_MATRIX_FREE,
+            gap=0.004,
+            gate=0.0,
+            enable_friction=True,
+            friction_gap=-1.0,
+            friction_anchors=1,
+            friction_pairs_only=True,
+        )
+        self.assertEqual(shallow_pair, (0, PATH_DENSE, 1))
+        self.assertEqual(deep_pair, (0, PATH_DENSE, 3))
+        self.assertEqual(free_body["slots_needed"], 3)
 
     def test_speculative_scale_controls_every_position_rhs_family(self):
         """Scale positive-gap position bias on dense, MF, and propagation rows."""
