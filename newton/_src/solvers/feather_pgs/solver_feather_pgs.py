@@ -691,6 +691,7 @@ class SolverFeatherPGS(SolverBase):
         serial_kernel_block_dim: int = 256,
         tile_threads: int = 64,
         row_watermark: bool = False,
+        enable_restitution: bool = True,
         restitution_velocity_threshold: float = 0.5,
         contact_speculative_scale: float = 1.0,
         contact_gap_gate: float = 0.0,
@@ -1050,6 +1051,8 @@ class SolverFeatherPGS(SolverBase):
                 change floating-point reduction order with the block size, so non-default
                 values are not bit-identical (results stay within numerical tolerance).
                 Must be one of {32, 64, 128, 256}. Defaults to 64.
+            enable_restitution: Whether rigid contacts apply their authored restitution coefficients. Defaults to
+                ``True`` to preserve FeatherPGS behavior before this option was exposed.
             restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
                 relative normal velocity required to apply restitution. The contact must also be at the surface or
                 be predicted to reach it during the timestep. Slower contacts retain the existing speculative or
@@ -1157,6 +1160,7 @@ class SolverFeatherPGS(SolverBase):
                 "pgs_contact_regularization requires articulated_contact_response 'immediate' or 'propagation-fused'"
             )
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
+        self.enable_restitution = bool(enable_restitution)
         threshold_error = "restitution_velocity_threshold must be finite and non-negative"
         try:
             self.restitution_velocity_threshold = float(restitution_velocity_threshold)
@@ -1666,7 +1670,7 @@ class SolverFeatherPGS(SolverBase):
             self.shape_material_mu = wp.zeros(
                 (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
             )
-        if model.shape_material_restitution is not None:
+        if self.enable_restitution and model.shape_material_restitution is not None:
             self.shape_material_restitution = model.shape_material_restitution
         else:
             self.shape_material_restitution = wp.zeros(
