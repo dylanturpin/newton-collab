@@ -532,6 +532,25 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         self.assertIn("same_articulation_contact_gap_gate", parameters)
         self.assertIn("contact_friction_articulation_pairs_only", parameters)
 
+    def test_new_contact_controls_preserve_legacy_positional_layout(self):
+        """Append new controls without shifting established positional arguments."""
+        parameters = tuple(inspect.signature(SolverFeatherPGS).parameters)
+        for sequence in (
+            ("contact_friction_anchor_limit", "contact_friction_scale", "contact_shared_anchor"),
+            ("row_watermark", "restitution_velocity_threshold", "contact_speculative_scale", "contact_gap_gate"),
+        ):
+            start = parameters.index(sequence[0])
+            self.assertEqual(parameters[start : start + len(sequence)], sequence)
+
+        legacy_tail = parameters.index("contact_gap_gate")
+        for name in (
+            "contact_friction_articulation_pairs_only",
+            "enable_restitution",
+            "same_articulation_contact_gap_gate",
+            "articulation_pair_contact_gap_gate",
+        ):
+            self.assertGreater(parameters.index(name), legacy_tail)
+
     def test_solver_validates_and_stores_contact_controls(self):
         """Accept finite non-negative controls and reject malformed values."""
         model = newton.ModelBuilder().finalize(device="cpu")
