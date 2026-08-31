@@ -837,6 +837,16 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
 
 def test_restitution_can_be_disabled_without_changing_materials(test, device):
     """Disable restitution while retaining authored material coefficients."""
+    model, _ = _build_plane_model(device, separation=1.0e-3, restitution=0.8)
+    solver = _make_solver(
+        model,
+        enable_restitution=False,
+        restitution_velocity_threshold=0.75,
+    )
+    test.assertIs(solver.shape_material_restitution, model.shape_material_restitution)
+    test.assertAlmostEqual(solver.restitution_velocity_threshold, 0.75)
+    test.assertGreater(solver._effective_restitution_velocity_threshold, 1.0e30)
+
     speed = 2.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
     for scene, response in (("free", "immediate"), ("articulated", "immediate"), ("free", "propagation")):

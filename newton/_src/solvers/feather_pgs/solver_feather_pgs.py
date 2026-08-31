@@ -1168,6 +1168,9 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(threshold_error) from exc
         if not np.isfinite(self.restitution_velocity_threshold) or self.restitution_velocity_threshold < 0.0:
             raise ValueError(threshold_error)
+        self._effective_restitution_velocity_threshold = (
+            self.restitution_velocity_threshold if self.enable_restitution else np.finfo(np.float32).max
+        )
         self.pgs_velocity_omega = self.pgs_omega if pgs_velocity_omega is None else float(pgs_velocity_omega)
         if pgs_velocity_drive_mode not in ("active", "freeze"):
             raise ValueError(f"pgs_velocity_drive_mode must be 'active' or 'freeze', got {pgs_velocity_drive_mode!r}")
@@ -1670,7 +1673,7 @@ class SolverFeatherPGS(SolverBase):
             self.shape_material_mu = wp.zeros(
                 (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
             )
-        if self.enable_restitution and model.shape_material_restitution is not None:
+        if model.shape_material_restitution is not None:
             self.shape_material_restitution = model.shape_material_restitution
         else:
             self.shape_material_restitution = wp.zeros(
@@ -5079,7 +5082,7 @@ class SolverFeatherPGS(SolverBase):
                     self.speculative_dense_contact_compliance,
                     dt,
                     self.contact_speculative_scale,
-                    self.restitution_velocity_threshold,
+                    self._effective_restitution_velocity_threshold,
                     self.propagation_max_constraints,
                 ],
                 outputs=[
@@ -8820,7 +8823,7 @@ class SolverFeatherPGS(SolverBase):
                     self.J_world,
                     dt,
                     int(apply_restitution),
-                    self.restitution_velocity_threshold,
+                    self._effective_restitution_velocity_threshold,
                 ],
                 outputs=[rhs_out],
                 device=model.device,
@@ -8885,7 +8888,7 @@ class SolverFeatherPGS(SolverBase):
                     self.world_dof_indices,
                     self.J_world,
                     dt,
-                    self.restitution_velocity_threshold,
+                    self._effective_restitution_velocity_threshold,
                 ],
                 outputs=[self.rhs],
                 device=self.model.device,
@@ -8904,7 +8907,7 @@ class SolverFeatherPGS(SolverBase):
                 self.row_restitution,
                 dt,
                 self.contact_speculative_scale,
-                self.restitution_velocity_threshold,
+                self._effective_restitution_velocity_threshold,
             ],
             outputs=[self.rhs],
             device=self.model.device,
@@ -9606,7 +9609,7 @@ class SolverFeatherPGS(SolverBase):
                 self.pgs_beta,
                 dt,
                 self.contact_speculative_scale,
-                self.restitution_velocity_threshold,
+                self._effective_restitution_velocity_threshold,
                 self.mf_max_constraints,
             ],
             outputs=[
@@ -9655,7 +9658,7 @@ class SolverFeatherPGS(SolverBase):
                 self.v_hat,
                 int(preserve_unreached_speculative),
                 int(apply_restitution),
-                self.restitution_velocity_threshold,
+                self._effective_restitution_velocity_threshold,
                 self.mf_max_constraints,
             ],
             outputs=[output],
