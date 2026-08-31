@@ -668,6 +668,7 @@ class SolverFeatherPGS(SolverBase):
         serial_kernel_block_dim: int = 256,
         tile_threads: int = 64,
         row_watermark: bool = False,
+        enable_restitution: bool = True,
         restitution_velocity_threshold: float = 0.5,
         contact_speculative_scale: float = 1.0,
         contact_gap_gate: float = 0.0,
@@ -1011,6 +1012,8 @@ class SolverFeatherPGS(SolverBase):
                 change floating-point reduction order with the block size, so non-default
                 values are not bit-identical (results stay within numerical tolerance).
                 Must be one of {32, 64, 128, 256}. Defaults to 64.
+            enable_restitution: Whether rigid contacts apply their authored restitution coefficients. Defaults to
+                ``True`` to preserve FeatherPGS behavior before this option was exposed.
             restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
                 relative normal velocity required to apply restitution. The contact must also be at the surface or
                 be predicted to reach it during the timestep. Slower contacts retain the existing speculative or
@@ -1105,6 +1108,7 @@ class SolverFeatherPGS(SolverBase):
                 "pgs_contact_regularization requires articulated_contact_response 'immediate' or 'propagation-fused'"
             )
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
+        self.enable_restitution = bool(enable_restitution)
         threshold_error = "restitution_velocity_threshold must be finite and non-negative"
         try:
             self.restitution_velocity_threshold = float(restitution_velocity_threshold)
@@ -1112,6 +1116,9 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(threshold_error) from exc
         if not np.isfinite(self.restitution_velocity_threshold) or self.restitution_velocity_threshold < 0.0:
             raise ValueError(threshold_error)
+        self._effective_restitution_velocity_threshold = (
+            self.restitution_velocity_threshold if self.enable_restitution else np.finfo(np.float32).max
+        )
         self.pgs_velocity_omega = self.pgs_omega if pgs_velocity_omega is None else float(pgs_velocity_omega)
         if pgs_velocity_drive_mode not in ("active", "freeze"):
             raise ValueError(f"pgs_velocity_drive_mode must be 'active' or 'freeze', got {pgs_velocity_drive_mode!r}")
@@ -4989,7 +4996,7 @@ class SolverFeatherPGS(SolverBase):
                     self.speculative_dense_contact_compliance,
                     dt,
                     self.contact_speculative_scale,
-                    self.restitution_velocity_threshold,
+                    self._effective_restitution_velocity_threshold,
                     self.propagation_max_constraints,
                 ],
                 outputs=[
@@ -8630,7 +8637,7 @@ class SolverFeatherPGS(SolverBase):
                     self.J_world,
                     dt,
                     int(apply_restitution),
-                    self.restitution_velocity_threshold,
+                    self._effective_restitution_velocity_threshold,
                 ],
                 outputs=[rhs_out],
                 device=model.device,
@@ -8695,7 +8702,7 @@ class SolverFeatherPGS(SolverBase):
                     self.world_dof_indices,
                     self.J_world,
                     dt,
-                    self.restitution_velocity_threshold,
+                    self._effective_restitution_velocity_threshold,
                 ],
                 outputs=[self.rhs],
                 device=self.model.device,
@@ -8714,7 +8721,7 @@ class SolverFeatherPGS(SolverBase):
                 self.row_restitution,
                 dt,
                 self.contact_speculative_scale,
-                self.restitution_velocity_threshold,
+                self._effective_restitution_velocity_threshold,
             ],
             outputs=[self.rhs],
             device=self.model.device,
@@ -9416,7 +9423,7 @@ class SolverFeatherPGS(SolverBase):
                 self.pgs_beta,
                 dt,
                 self.contact_speculative_scale,
-                self.restitution_velocity_threshold,
+                self._effective_restitution_velocity_threshold,
                 self.mf_max_constraints,
             ],
             outputs=[
@@ -9465,7 +9472,7 @@ class SolverFeatherPGS(SolverBase):
                 self.v_hat,
                 int(preserve_unreached_speculative),
                 int(apply_restitution),
-                self.restitution_velocity_threshold,
+                self._effective_restitution_velocity_threshold,
                 self.mf_max_constraints,
             ],
             outputs=[output],
