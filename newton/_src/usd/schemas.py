@@ -130,10 +130,6 @@ class SchemaResolverNewton(SchemaResolver):
             "armature": SchemaAttribute("newton:armature", 0.0),
             "damping": SchemaAttribute("newton:damping", None),
             "friction": SchemaAttribute("newton:friction", 0.0),
-            # Passive joint spring tau = k * (spring_ref - q). Angular values follow
-            # the USD per-degree convention; parse_usd converts to per-radian.
-            "spring_stiffness": SchemaAttribute("newton:springStiffness", None),
-            "spring_ref": SchemaAttribute("newton:springRef", None),
             "limit_ke": SchemaAttribute("newton:limitStiffness", None),
             "limit_kd": SchemaAttribute("newton:limitDamping", None),
             "velocity_limit": SchemaAttribute("newton:velocityLimit", float("inf")),

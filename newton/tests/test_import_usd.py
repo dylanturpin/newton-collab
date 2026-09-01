@@ -2098,33 +2098,45 @@ def Xform "Articulation" (
         self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof]), 0.02, places=6)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
-    def test_newton_joint_spring_precedence_and_units(self):
-        """Prefer newton:springStiffness/springRef over mjc values and apply the per-degree convention.
-
-        Newton-authored angular values follow the USD per-degree convention:
-        stiffness converts per-degree -> per-radian, springref degrees -> radians.
-        """
+    def test_mjc_joint_springs_survive_stacked_joint_d6_merge(self):
+        """Preserve each sibling spring when single-DOF joints merge into one D6 joint."""
         usda = self._spring_stage_usda(
-            joint_def="""    def PhysicsRevoluteJoint "Joint" (
+            joint_def="""    def PhysicsRevoluteJoint "JointX" (
         prepend apiSchemas = ["MjcJointAPI"]
     )
     {
         rel physics:body0 = </Articulation/Body1>
         rel physics:body1 = </Articulation/Body2>
-        token physics:axis = "Z"
+        token physics:axis = "X"
         float physics:lowerLimit = -180
         float physics:upperLimit = 180
-        custom float newton:springStiffness = 1.0
-        custom float newton:springRef = 45.0
         uniform double mjc:stiffness = 0.05
-        uniform double mjc:springref = 2.62
+        uniform double mjc:springref = 1.2
+    }
+
+    def PhysicsRevoluteJoint "JointY" (
+        prepend apiSchemas = ["MjcJointAPI"]
+    )
+    {
+        rel physics:body0 = </Articulation/Body1>
+        rel physics:body1 = </Articulation/Body2>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -180
+        float physics:upperLimit = 180
+        uniform double mjc:stiffness = 0.07
+        uniform double mjc:springref = 2.3
     }""",
             scene_attrs='    custom uniform token mjc:compiler:angle = "radian"',
         )
         model = self._import_spring_stage(usda)
-        dof = int(model.joint_qd_start.numpy()[model.joint_label.index("/Articulation/Joint")])
-        self.assertAlmostEqual(float(model.joint_spring_stiffness.numpy()[dof]), math.degrees(1.0), places=4)
-        self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof]), math.radians(45.0), places=5)
+        joint = model.joint_label.index("/Articulation/JointX")
+        dof = int(model.joint_qd_start.numpy()[joint])
+
+        self.assertEqual(int(model.joint_type.numpy()[joint]), int(newton.JointType.D6))
+        self.assertAlmostEqual(float(model.joint_spring_stiffness.numpy()[dof]), 0.05, places=6)
+        self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof]), 1.2, places=6)
+        self.assertAlmostEqual(float(model.joint_spring_stiffness.numpy()[dof + 1]), 0.07, places=6)
+        self.assertAlmostEqual(float(model.joint_spring_ref.numpy()[dof + 1]), 2.3, places=6)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_joint_ordering(self):

@@ -932,43 +932,28 @@ def parse_usd(
         return spec.default
 
     def _resolve_joint_spring(prim: Usd.Prim, is_angular: bool) -> tuple[float, float]:
-        """Resolve passive spring stiffness and reference for one DOF, in Newton units.
+        """Resolve an MjcJointAPI passive spring for one DOF, in Newton units.
 
         ``mjc:stiffness`` is always per-radian (MuJoCo never expresses stiffness
         per-degree); ``mjc:springref`` follows the source spec's compiler angle
         units recorded in the scene-level ``mjc:compiler:angle`` token (schema
-        default: degrees). Newton-authored values follow the USD per-degree
-        convention for angular DOFs.
+        default: degrees).
         """
-        spring_stiffness = None
-        spring_ref = None
-        for resolver in R.resolvers:
-            joint_mapping = resolver.mapping.get(PrimType.JOINT, {})
-            if "spring_stiffness" not in joint_mapping and "spring_ref" not in joint_mapping:
-                continue
-            k = resolver.get_value(prim, PrimType.JOINT, "spring_stiffness")
-            ref = resolver.get_value(prim, PrimType.JOINT, "spring_ref")
-            if k is None and ref is None:
-                continue
-            R._collect_on_first_use(resolver, prim)
-            if resolver.name == "mjc":
-                if is_angular and ref is not None and mjc_angle_is_degree:
-                    ref *= DegreesToRadian
-            elif is_angular:
-                if k is not None:
-                    k /= DegreesToRadian
-                if ref is not None:
-                    ref *= DegreesToRadian
-            if spring_stiffness is None:
-                spring_stiffness = k
-            if spring_ref is None:
-                spring_ref = ref
-            if spring_stiffness is not None and spring_ref is not None:
-                break
-        if spring_stiffness is None:
-            spring_stiffness = builder.default_joint_cfg.spring_stiffness
-        if spring_ref is None:
-            spring_ref = builder.default_joint_cfg.spring_ref
+        spring_stiffness = builder.default_joint_cfg.spring_stiffness
+        spring_ref = builder.default_joint_cfg.spring_ref
+        if mjc_resolver is None or not _has_api_schema(prim, "MjcJointAPI"):
+            return spring_stiffness, spring_ref
+
+        resolved_stiffness = mjc_resolver.get_value(prim, PrimType.JOINT, "spring_stiffness")
+        resolved_ref = mjc_resolver.get_value(prim, PrimType.JOINT, "spring_ref")
+        if resolved_stiffness is not None or resolved_ref is not None:
+            R._collect_on_first_use(mjc_resolver, prim)
+        if resolved_stiffness is not None:
+            spring_stiffness = resolved_stiffness
+        if resolved_ref is not None:
+            spring_ref = resolved_ref
+            if is_angular and mjc_angle_is_degree:
+                spring_ref *= DegreesToRadian
         return spring_stiffness, spring_ref
 
     def _resolve_joint_limit_gain(
@@ -2433,6 +2418,8 @@ def parse_usd(
                 damping=dof.damping,
                 armature=dof.armature,
                 friction=dof.friction,
+                spring_stiffness=dof.spring_stiffness,
+                spring_ref=dof.spring_ref,
                 effort_limit=dof.effort_limit,
                 velocity_limit=dof.velocity_limit if dof.velocity_limit is not None else default_joint_velocity_limit,
                 actuator_mode=dof.actuator_mode,
