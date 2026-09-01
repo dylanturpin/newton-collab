@@ -5115,6 +5115,7 @@ def prepare_world_impulses(
     world_constraint_count: wp.array[int],
     max_constraints: int,
     warmstart: int,
+    matched_contact_warmstart: int,
     world_row_type: wp.array2d[int],
     dense_phase_bounds: wp.array2d[int],
     dense_phase_bounds_prev: wp.array2d[int],
@@ -5161,7 +5162,17 @@ def prepare_world_impulses(
             or i >= m
             or i >= cold_start_from
             or world_row_type[world, i] == PGS_CONSTRAINT_TYPE_JOINT_TARGET
+            or (
+                matched_contact_warmstart != 0
+                and (
+                    world_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT
+                    or world_row_type[world, i] == PGS_CONSTRAINT_TYPE_FRICTION
+                )
+            )
         ):
+            # matched_contact_warmstart: contact/friction rows are cold-zeroed
+            # here and re-seeded by identity in gather_dense_warmstart, so a
+            # slot-layout shift can never hand a contact a stale impulse.
             world_impulses[world, i] = 0.0
 
 
@@ -5954,6 +5965,135 @@ def snapshot_mf_prev_slots(
         return
     slot = contact_slot[c]
     prev_slot_sorted[c] = slot
+
+
+@wp.kernel
+def snapshot_dense_prev_slots(
+    contact_count: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slot: wp.array[int],
+    # out
+    prev_slot_sorted: wp.array[int],
+):
+    """Dense-path mirror of :func:`snapshot_mf_prev_slots`.
+
+    Records, per current sorted contact index, the absolute dense world row the
+    contact's normal row occupied this step (or -1 when it was not
+    dense-routed / inactive), so next step's ``rigid_contact_match_index`` can
+    resolve previous impulses by contact identity.
+    """
+    c = wp.tid()
+    if c >= contact_count[0]:
+        prev_slot_sorted[c] = -1
+        return
+    if contact_path[c] != 0:
+        prev_slot_sorted[c] = -1
+        return
+    prev_slot_sorted[c] = contact_slot[c]
+
+
+@wp.kernel
+def gather_dense_warmstart(
+    contact_count: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_world: wp.array[int],
+    match_index: wp.array[int],  # rigid_contact_match_index (sorted-current -> prev-sorted idx)
+    prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev dense normal row (or -1)
+    prev_dense_impulses: wp.array2d[float],
+    prev_dense_row_type: wp.array2d[int],
+    world_row_type: wp.array2d[int],  # THIS step's dense row types (already built)
+    decay: float,
+    max_constraints: int,
+    # in-out
+    world_impulses: wp.array2d[float],
+):
+    """Seed this step's DENSE impulse buffer from the previous step's converged
+    impulses, matched by contact identity — the dense mirror of
+    :func:`gather_mf_warmstart`.
+
+    Runs after ``prepare_world_impulses`` has cold-zeroed the contact/friction
+    rows (``matched_contact_warmstart != 0``), so unmatched or fresh contacts
+    stay cold and no stale impulse survives a slot-layout shift. Friction rows
+    (offsets 1, 2 after the normal row) are seeded only when BOTH this step and
+    the previous step allocated a friction row at the corresponding offset.
+    ``decay`` scales every seeded impulse: at persistent quasi-static contacts
+    it damps the accumulate-on-impact overshoot while keeping the sweep's
+    starting point near the converged solution.
+    """
+    c = wp.tid()
+    if c >= contact_count[0]:
+        return
+    if contact_path[c] != 0:  # dense path only
+        return
+    new_slot = contact_slot[c]
+    if new_slot < 0:
+        return
+
+    world = contact_world[c]
+
+    mi = match_index[c]
+    matched = mi >= 0
+    prev_slot = int(-1)
+    if matched:
+        prev_slot = prev_slot_sorted[mi]
+
+    # Normal row (offset 0).
+    if matched and prev_slot >= 0 and prev_dense_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+        if world_row_type[world, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+            world_impulses[world, new_slot] = decay * prev_dense_impulses[world, prev_slot]
+
+    # Friction rows (offsets 1, 2): only if THIS step allocated them here.
+    for r in range(1, 3):
+        new_r = new_slot + r
+        if new_r < max_constraints:
+            if world_row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION:
+                prev_r = prev_slot + r
+                if (
+                    matched
+                    and prev_slot >= 0
+                    and prev_r < max_constraints
+                    and prev_dense_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
+                ):
+                    world_impulses[world, new_r] = decay * prev_dense_impulses[world, prev_r]
+
+
+@wp.kernel
+def apply_dense_warmstart_response(
+    world_constraint_count: wp.array[int],
+    max_constraints: int,
+    world_row_type: wp.array2d[int],
+    world_impulses: wp.array2d[float],
+    Y_world: wp.array3d[float],
+    world_dof_indices: wp.array2d[int],
+    # in-out
+    v_out: wp.array[float],
+):
+    """Fold warm-start-seeded contact/friction impulses into the solve's
+    starting velocity: ``v_out += Y·λ_seed``.
+
+    The MF-GS kernel initializes its shared velocity from ``v_out`` (RMW) and
+    its row updates apply only impulse *deltas*; a nonzero impulse seed whose
+    velocity response is absent from ``v_out`` would therefore be applied
+    twice — once as the carried impulse, once again by the sweep re-solving
+    the full row target. Launch once per solve, after ``v_out`` is seeded
+    (and bilateral-projected) and before the first GS phase. The
+    pre-elimination-corrected ``Y_world`` has no bilateral response, so the
+    projection ``J_B v = -b_B`` is preserved.
+    """
+    world, d = wp.tid()
+    g = world_dof_indices[world, d]
+    if g < 0:
+        return
+    m = world_constraint_count[world]
+    acc = float(0.0)
+    for i in range(m):
+        t = world_row_type[world, i]
+        if t == PGS_CONSTRAINT_TYPE_CONTACT or t == PGS_CONSTRAINT_TYPE_FRICTION:
+            lam = world_impulses[world, i]
+            if lam != 0.0:
+                acc += Y_world[world, i, d] * lam
+    v_out[g] = v_out[g] + acc
 
 
 @wp.kernel

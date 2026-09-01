@@ -64,6 +64,7 @@ from .kernels import (
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
     apply_augmented_mass_diagonal_grouped,
+    apply_dense_warmstart_response,
     apply_free_root_transport_to_predictor,
     apply_impulses_world_par_dof,
     apply_mf_warmstart_impulses,
@@ -116,6 +117,7 @@ from .kernels import (
     finalize_world_diag_cfm,
     flatten_propagation_joint_S,
     flush_propagation_free_body_qd_to_vout,
+    gather_dense_warmstart,
     gather_JY_to_world,
     gather_mf_warmstart,
     gather_tau_to_groups,
@@ -150,6 +152,7 @@ from .kernels import (
     rhs_accum_world_par_art,
     scatter_qdd_from_groups,
     snapshot_dense_phase_bound,
+    snapshot_dense_prev_slots,
     snapshot_mf_prev_slots,
     snapshot_propagation_cache_qd_base,
     trisolve_loop,
@@ -657,6 +660,8 @@ class SolverFeatherPGS(SolverBase):
         pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
         dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
+        pgs_warmstart_matched: bool = False,
+        pgs_warmstart_decay: float = 1.0,
         mf_warmstart: bool = False,
         mf_warmstart_decay: float = 1.0,
         pgs_mode: str = "split",
@@ -907,6 +912,13 @@ class SolverFeatherPGS(SolverBase):
                 body-pair compaction may change the physical contact occupying a
                 dense row while index-based warm start would reuse that row's old
                 impulse.  Defaults to False.
+            pgs_warmstart_matched (bool, optional): Identity-matched dense contact warm start: seed each
+                persistent contact's dense rows from the previous step's converged impulses via the
+                collision pipeline's ``rigid_contact_match_index`` (requires ``contact_matching`` enabled
+                on the Contacts buffer), instead of raw slot-index reuse. Implies :paramref:`pgs_warmstart`.
+                Defaults to False.
+            pgs_warmstart_decay (float, optional): Scale applied to every impulse seeded by the matched
+                warm start (damps accumulate-on-impact overshoot at contact onset). Defaults to 1.0.
             mf_warmstart (bool, optional): Re-use matrix-free contact impulses by
                 contact-match identity.  This requires contact matching, which is
                 currently incompatible with body-pair contact reduction.  Defaults
@@ -1214,7 +1226,12 @@ class SolverFeatherPGS(SolverBase):
             "propagation",
             "propagation-colored",
         )
-        self.pgs_warmstart = pgs_warmstart
+        self.pgs_warmstart_matched = bool(pgs_warmstart_matched)
+        self.pgs_warmstart_decay = float(pgs_warmstart_decay)
+        self.pgs_warmstart = pgs_warmstart or self.pgs_warmstart_matched
+        self._ws_prev_dense_impulses = None
+        self._ws_prev_dense_row_type = None
+        self._ws_prev_dense_slot_sorted = None
         if self.pgs_warmstart and self.contact_friction_position_iterations >= 0:
             raise NotImplementedError(
                 "contact_friction_position_iterations with pgs_warmstart=True needs an explicit "
@@ -1796,6 +1813,21 @@ class SolverFeatherPGS(SolverBase):
             inputs=[world_mask, dense_impulses, prev_mf_impulses, prev_mf_row_type],
             device=self.model.device,
         )
+        if self.pgs_warmstart_matched and self._ws_prev_dense_impulses is not None:
+            # Neutralize the dense matched-warm-start carry for reset worlds
+            # (the kernel is width-generic: it zeroes impulses and writes -1
+            # into the row-type table).
+            wp.launch(
+                reset_world_warmstart_buffers,
+                dim=self.world_count,
+                inputs=[
+                    world_mask,
+                    self._dummy_contact_impulses,
+                    self._ws_prev_dense_impulses,
+                    self._ws_prev_dense_row_type,
+                ],
+                device=self.model.device,
+            )
 
     @staticmethod
     def _parse_projected_root_worlds(value: str) -> set[int] | None:
@@ -3653,6 +3685,16 @@ class SolverFeatherPGS(SolverBase):
             )
             self._ws_prev_mf_row_type = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device)
             self._ws_prev_slot_sorted = wp.full(
+                (getattr(self, "_max_contacts_alloc", 1),), -1, dtype=wp.int32, device=device
+            )
+        # Dense matched warm-start carry buffers (mirror of the MF block above);
+        # allocated only when the feature is on so the default-off path is unchanged.
+        if self.pgs_warmstart_matched:
+            self._ws_prev_dense_impulses = wp.zeros_like(self.impulses)
+            self._ws_prev_dense_row_type = wp.full(
+                (self.impulses.shape[0], self.impulses.shape[1]), -1, dtype=wp.int32, device=device
+            )
+            self._ws_prev_dense_slot_sorted = wp.full(
                 (getattr(self, "_max_contacts_alloc", 1),), -1, dtype=wp.int32, device=device
             )
         self._debug_position_mf_impulses = (
@@ -6212,6 +6254,33 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S5_PGS_Prep", print=False, use_nvtx=self._nvtx, synchronize=False):
             self._stage5_prepare_impulses_world()
+            if self.pgs_warmstart_matched and self._ws_prev_dense_impulses is not None:
+                match_index = getattr(contacts, "rigid_contact_match_index", None) if contacts is not None else None
+                if match_index is None:
+                    raise NotImplementedError(
+                        "FeatherPGS pgs_warmstart_matched=True requires the Contacts buffer to be "
+                        "created with contact_matching enabled (rigid_contact_match_index is None). "
+                        'Build the CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
+                    )
+                wp.launch(
+                    gather_dense_warmstart,
+                    dim=contacts.rigid_contact_max,
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        self.contact_path,
+                        self.contact_slot,
+                        self.contact_world,
+                        match_index,
+                        self._ws_prev_dense_slot_sorted,
+                        self._ws_prev_dense_impulses,
+                        self._ws_prev_dense_row_type,
+                        self.row_type,
+                        self.pgs_warmstart_decay,
+                        self.dense_max_constraints,
+                    ],
+                    outputs=[self.impulses],
+                    device=self.model.device,
+                )
 
         if self.pgs_mode == "matrix_free":
             with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self._nvtx, synchronize=False):
@@ -6257,6 +6326,25 @@ class SolverFeatherPGS(SolverBase):
                     self._stage6_project_bilateral_velocity()
                 if (self.pgs_warmstart or self._mf_warmstart_enabled) and self._propagation_contacts_enabled():
                     self._refresh_propagation_body_qd_from_vout(force=True)
+
+                if self.pgs_warmstart_matched and self._ws_prev_dense_impulses is not None:
+                    # Fold the seeded contact/friction impulses' response into the
+                    # starting velocity — the GS kernel RMWs v_out and applies only
+                    # impulse deltas, so an unapplied seed would count twice.
+                    wp.launch(
+                        apply_dense_warmstart_response,
+                        dim=(self.world_count, self.max_world_dofs),
+                        inputs=[
+                            self.constraint_count,
+                            self.dense_max_constraints,
+                            self.row_type,
+                            self.impulses,
+                            self.Y_world,
+                            self.world_dof_indices,
+                        ],
+                        outputs=[self.v_out],
+                        device=self.model.device,
+                    )
 
                 # Pack MF metadata into int4 structs for coalesced 128-bit loads
                 self._pack_mf_meta(self.mf_rhs)
@@ -6580,6 +6668,22 @@ class SolverFeatherPGS(SolverBase):
         # row-type table + per-(sorted)-contact slot map so step N+1 can seed
         # from them by contact identity. Only runs when the feature is on, so
         # the default-off launch sequence is unchanged.
+        # Dense matched warm-start carry: snapshot this step's converged dense
+        # impulses + row types + per-(sorted)-contact dense-slot map (mirror of
+        # the MF carry below).
+        if self.pgs_warmstart_matched and self._ws_prev_dense_impulses is not None:
+            with wp.ScopedTimer("S7_Dense_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+                wp.copy(self._ws_prev_dense_impulses, self.impulses)
+                wp.copy(self._ws_prev_dense_row_type, self.row_type)
+                if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
+                    wp.launch(
+                        snapshot_dense_prev_slots,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[contacts.rigid_contact_count, self.contact_path, self.contact_slot],
+                        outputs=[self._ws_prev_dense_slot_sorted],
+                        device=model.device,
+                    )
+
         if self._mf_warmstart_enabled and self._has_free_rigid_bodies and self.pgs_mode != "dense":
             with wp.ScopedTimer("S7_MF_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
                 wp.copy(self._ws_prev_mf_impulses, self.mf_impulses)
@@ -8915,6 +9019,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage5_prepare_impulses_world(self):
         warmstart_flag = 1 if self.pgs_warmstart else 0
+        matched_flag = 1 if (self.pgs_warmstart_matched and self._ws_prev_dense_impulses is not None) else 0
         wp.launch(
             prepare_world_impulses,
             dim=self.world_count,
@@ -8922,6 +9027,7 @@ class SolverFeatherPGS(SolverBase):
                 self.constraint_count,
                 self.dense_max_constraints,
                 warmstart_flag,
+                matched_flag,
                 self.row_type,
                 self.dense_phase_bounds,
                 self.dense_phase_bounds_prev,
