@@ -83,7 +83,12 @@ def _run_mixed_response(kernel, *, warmstart, preelimination):
     state_in.joint_qd.assign(joint_qd)
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
 
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        reduce_contacts=False,
+        contact_matching="latest",
+    )
     contacts = pipeline.contacts()
     control = model.control()
     samples = []
