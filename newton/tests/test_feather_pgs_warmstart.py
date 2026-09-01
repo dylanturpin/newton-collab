@@ -77,24 +77,22 @@ def _run_press(steps: int, warm_kwargs: dict, contact_matching: str | None = "st
 @unittest.skipUnless(wp.get_device().is_cuda, "SolverFeatherPGS matrix-free mode requires CUDA")
 class TestFeatherPGSMatchedWarmstart(unittest.TestCase):
     def test_matched_warmstart_holds_static_press(self):
-        """Matched warm start keeps a stalled press in quiet, bounded equilibrium.
+        """Both warm-start paths keep a stalled press at the cold equilibrium.
 
-        This is the regression-first differential for the carry fix. The legacy
-        index-reuse warm start (``pgs_warmstart=True``) never folded the seeded
-        impulses' velocity response into the solve's starting velocity, so the
-        carried impulse re-applies on top of itself each step
-        (``lambda_{n+1} = lambda_n + lambda*``): the contact-impulse sum keeps
-        growing after the stall and the press jitters. The matched warm start
-        (``pgs_warmstart_matched=True``) must hold the impulse steady and the
-        joint quiet. Breaking either half of the fix — the identity gather or
-        the ``apply_dense_warmstart_response`` fold — regresses the matched run
-        to legacy behavior and trips the steadiness assertions.
+        Regression net for the warm-start velocity accounting: carried impulses
+        are installed into the starting velocity exactly once. A missing install
+        accumulates the ledger (``lambda_{n+1} = lambda_n + lambda*``, the
+        historical divergence); a duplicated install halves it (measured 0.5x
+        cold when the matched path added a second fold on top of
+        ``_stage6_apply_impulses_world``). The identity-matched path must also
+        stay quiet and match the cold ledger while seeding by contact identity
+        rather than raw slot index.
         """
         steps = 240
         stall = slice(120, None)  # well past touchdown + transient
 
         lam_cold, _speed_cold, _ = _run_press(steps, {})
-        lam_legacy, _speed_legacy, _ = _run_press(steps, {"pgs_warmstart": True})
+        lam_legacy, speed_legacy, _ = _run_press(steps, {"pgs_warmstart": True})
         lam_matched, speed_matched, state = _run_press(steps, {"pgs_warmstart_matched": True})
 
         self.assertTrue(np.isfinite(state.body_q.numpy()).all())
@@ -103,27 +101,23 @@ class TestFeatherPGSMatchedWarmstart(unittest.TestCase):
         legacy_end = lam_legacy[-10:].mean()
         matched_end = lam_matched[-10:].mean()
 
-        # Legacy carry: impulse keeps accumulating far past the cold equilibrium
-        # (measured ~250x at 240 steps). Without this the differential is meaningless.
-        self.assertGreater(
-            legacy_end,
-            10.0 * cold_end,
-            f"legacy warm start unexpectedly steady ({legacy_end:.2f} vs cold {cold_end:.2f})",
-        )
-
-        # Matched carry: impulse steady at the cold equilibrium level, press quiet.
+        # The solver installs carried impulses into the starting velocity
+        # (_stage6_apply_impulses_world under pgs_warmstart), so BOTH warm paths
+        # must sit at the cold equilibrium. A duplicated velocity install shows
+        # up here as a halved impulse ledger (measured 0.5x when the matched
+        # path folded the seed a second time); a missing install shows up as an
+        # accumulating ledger (lambda_{n+1} = lambda_n + lambda*).
         matched_growth = lam_matched[-10:].mean() / max(lam_matched[stall][:10].mean(), 1e-12)
         self.assertLess(matched_growth, 1.25, f"matched warm-start impulse grew x{matched_growth:.2f} at a stall")
-        self.assertLess(
-            matched_end,
-            2.0 * cold_end,
-            f"matched warm-start impulse {matched_end:.2f} far above the cold equilibrium {cold_end:.2f}",
-        )
-        self.assertLess(
-            speed_matched[stall].max(),
-            0.02,
-            f"press not quiet under matched warm start (peak |qd| {speed_matched[stall].max():.3f} m/s)",
-        )
+        for name, end in (("legacy", legacy_end), ("matched", matched_end)):
+            self.assertGreater(end, 0.7 * cold_end, f"{name} impulse ledger {end:.3f} below cold {cold_end:.3f}")
+            self.assertLess(end, 1.4 * cold_end, f"{name} impulse ledger {end:.3f} above cold {cold_end:.3f}")
+        for name, sp in (("legacy", speed_legacy), ("matched", speed_matched)):
+            self.assertLess(
+                sp[stall].max(),
+                0.02,
+                f"press not quiet under {name} warm start (peak |qd| {sp[stall].max():.3f} m/s)",
+            )
 
     def test_matched_warmstart_matches_cold_equilibrium(self):
         """The matched warm start converges to the cold solve's stall pose, not a new one.

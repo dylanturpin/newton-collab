@@ -6059,44 +6059,6 @@ def gather_dense_warmstart(
 
 
 @wp.kernel
-def apply_dense_warmstart_response(
-    world_constraint_count: wp.array[int],
-    max_constraints: int,
-    world_row_type: wp.array2d[int],
-    world_impulses: wp.array2d[float],
-    Y_world: wp.array3d[float],
-    world_dof_indices: wp.array2d[int],
-    # in-out
-    v_out: wp.array[float],
-):
-    """Fold warm-start-seeded contact/friction impulses into the solve's
-    starting velocity: ``v_out += Y·λ_seed``.
-
-    The MF-GS kernel initializes its shared velocity from ``v_out`` (RMW) and
-    its row updates apply only impulse *deltas*; a nonzero impulse seed whose
-    velocity response is absent from ``v_out`` would therefore be applied
-    twice — once as the carried impulse, once again by the sweep re-solving
-    the full row target. Launch once per solve, after ``v_out`` is seeded
-    (and bilateral-projected) and before the first GS phase. The
-    pre-elimination-corrected ``Y_world`` has no bilateral response, so the
-    projection ``J_B v = -b_B`` is preserved.
-    """
-    world, d = wp.tid()
-    g = world_dof_indices[world, d]
-    if g < 0:
-        return
-    m = world_constraint_count[world]
-    acc = float(0.0)
-    for i in range(m):
-        t = world_row_type[world, i]
-        if t == PGS_CONSTRAINT_TYPE_CONTACT or t == PGS_CONSTRAINT_TYPE_FRICTION:
-            lam = world_impulses[world, i]
-            if lam != 0.0:
-                acc += Y_world[world, i, d] * lam
-    v_out[g] = v_out[g] + acc
-
-
-@wp.kernel
 def allocate_rigid_velocity_limit_slots(
     free_rigid_body_indices: wp.array[int],
     body_to_articulation: wp.array[int],

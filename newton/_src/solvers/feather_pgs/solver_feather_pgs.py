@@ -64,7 +64,6 @@ from .kernels import (
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
     apply_augmented_mass_diagonal_grouped,
-    apply_dense_warmstart_response,
     apply_free_root_transport_to_predictor,
     apply_impulses_world_par_dof,
     apply_mf_warmstart_impulses,
@@ -6331,25 +6330,6 @@ class SolverFeatherPGS(SolverBase):
                     self._stage6_project_bilateral_velocity()
                 if (self.pgs_warmstart or self._mf_warmstart_enabled) and self._propagation_contacts_enabled():
                     self._refresh_propagation_body_qd_from_vout(force=True)
-
-                if self.pgs_warmstart_matched and self._ws_prev_dense_impulses is not None:
-                    # Fold the seeded contact/friction impulses' response into the
-                    # starting velocity — the GS kernel RMWs v_out and applies only
-                    # impulse deltas, so an unapplied seed would count twice.
-                    wp.launch(
-                        apply_dense_warmstart_response,
-                        dim=(self.world_count, self.max_world_dofs),
-                        inputs=[
-                            self.constraint_count,
-                            self.dense_max_constraints,
-                            self.row_type,
-                            self.impulses,
-                            self.Y_world,
-                            self.world_dof_indices,
-                        ],
-                        outputs=[self.v_out],
-                        device=self.model.device,
-                    )
 
                 # Pack MF metadata into int4 structs for coalesced 128-bit loads
                 self._pack_mf_meta(self.mf_rhs)
