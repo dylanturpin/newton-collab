@@ -659,10 +659,10 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
     def test_feather_pgs_warmstart_rejected_at_step(self):
         """Reject reduced contacts in FeatherPGS warm-start configurations.
 
-        Dense warm start reuses impulses by row index, while matrix-free warm
-        start requires contact-match identity.  Body-pair compaction guarantees
-        neither, so the otherwise-supported solver must reject both options
-        before recording launches or mutating step state.
+        Every contact warm-start route requires contact-match identity. Body-pair
+        compaction has not been validated against that contract, so the
+        otherwise-supported solver must reject both entry points before
+        recording launches or mutating step state.
         """
         model = self._foot_model()
         state_0, state_1 = model.state(), model.state()
@@ -671,7 +671,7 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         pipeline.collide(state_0, contacts)
         cases = (
             ("pgs_warmstart=True", {"pgs_mode": "dense", "pgs_warmstart": True}),
-            ("mf_warmstart=True", {"pgs_mode": "split", "mf_warmstart": True}),
+            ("pgs_warmstart=True", {"pgs_mode": "split", "mf_warmstart": True}),
         )
         for label, kwargs in cases:
             with self.subTest(configuration=label):
@@ -689,7 +689,7 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"IL_NEWTON_FPGS_MF_WARMSTART": "1"}):
             solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split")
         self.assertTrue(solver._mf_warmstart_enabled)
-        with self.assertRaisesRegex(ValueError, r"mf_warmstart=True.*not validated"):
+        with self.assertRaisesRegex(ValueError, r"pgs_warmstart=True.*not validated"):
             solver.step(state_0, state_1, model.control(), contacts, DT)
 
 
@@ -2270,16 +2270,16 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         """Protect a warm-start FPGS graph from later body-pair compaction.
 
         FeatherPGS supports reduced contacts in its default configuration, but
-        dense warm start does not have contact identity.  Its per-call override
-        must therefore acquire the same unreduced-reader lease as an unsupported
-        solver before graph replay becomes possible.
+        identity warm start has not been validated with compaction. Its per-call
+        override must therefore acquire the same unreduced-reader lease as an
+        unsupported solver before graph replay becomes possible.
         """
         device = wp.get_device()
         if not device.is_cuda:
             self.skipTest("CUDA graph capture requires a CUDA device")
         model = self._foot_scene()
         state_0, state_1 = model.state(), model.state()
-        plain = newton.CollisionPipeline(model, broad_phase="nxn")
+        plain = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
         contacts = plain.contacts()
         plain.collide(state_0, contacts)
         solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="dense", pgs_warmstart=True)

@@ -5115,65 +5115,30 @@ def prepare_world_impulses(
     world_constraint_count: wp.array[int],
     max_constraints: int,
     warmstart: int,
-    matched_contact_warmstart: int,
-    world_row_type: wp.array2d[int],
-    dense_phase_bounds: wp.array2d[int],
-    dense_phase_bounds_prev: wp.array2d[int],
     # in/out
     world_impulses: wp.array2d[float],
 ):
-    """Initialize world impulses (zero or warmstart).
+    """Cold-initialize dense rows before identity-gathering contact impulses.
 
-    Warm-start flicker hazard: the dense slot layout is [drive][joint-limit]
-    [joint-vel-limit][contact/friction] and warm-starting reuses impulses by
-    raw row index. Limit and vel-limit rows are dynamically gated
-    (``joint_limit_activation_gap``, ``velocity_limit_activation_fraction``),
-    so a step-to-step change in their counts shifts every following slot and
-    index-based reuse would hand contacts stale impulses from the wrong rows.
-    When a row-family boundary moved since the previous step, cold-start
-    everything from the first moved boundary onward for that world.
+    No current non-contact row family has a cross-step identity contract:
+    limits are activation-allocated, while mimic/connect rows can be enabled
+    dynamically and allocated atomically. Warm start therefore clears the
+    full capacity before the contact/friction identity gather; cold solves only
+    need to clear the current active prefix.
     """
     world = wp.tid()
     m = world_constraint_count[world]
 
-    cold_start_from = max_constraints
-    if warmstart != 0:
-        b0 = dense_phase_bounds[world, 0]
-        b1 = dense_phase_bounds[world, 1]
-        p0 = dense_phase_bounds_prev[world, 0]
-        p1 = dense_phase_bounds_prev[world, 1]
-        if b0 != p0:
-            cold_start_from = wp.min(b0, p0)
-        elif b1 != p1:
-            cold_start_from = wp.min(b1, p1)
-
     # Cold-started solves consume only the current active prefix. Rows outside
     # that prefix are ignored, and a row that becomes active on a later step is
-    # cleared then as part of that step's prefix. Warm-started solves retain the
-    # full-capacity pass because inactive cached rows must be invalidated before
-    # a later layout growth can accidentally reuse them.
+    # cleared then as part of that step's prefix. Warm-started solves clear full
+    # capacity so no inactive cache can survive a later layout growth.
     clear_count = max_constraints
     if warmstart == 0:
         clear_count = m
 
     for i in range(clear_count):
-        if (
-            warmstart == 0
-            or i >= m
-            or i >= cold_start_from
-            or world_row_type[world, i] == PGS_CONSTRAINT_TYPE_JOINT_TARGET
-            or (
-                matched_contact_warmstart != 0
-                and (
-                    world_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT
-                    or world_row_type[world, i] == PGS_CONSTRAINT_TYPE_FRICTION
-                )
-            )
-        ):
-            # matched_contact_warmstart: contact/friction rows are cold-zeroed
-            # here and re-seeded by identity in gather_dense_warmstart, so a
-            # slot-layout shift can never hand a contact a stale impulse.
-            world_impulses[world, i] = 0.0
+        world_impulses[world, i] = 0.0
 
 
 @wp.kernel
@@ -5182,6 +5147,7 @@ def reset_world_warmstart_buffers(
     dense_impulses: wp.array2d[float],
     prev_mf_impulses: wp.array2d[float],
     prev_mf_row_type: wp.array2d[int],
+    prev_mf_row_parent: wp.array2d[int],
 ):
     """Clear persistent warm-start state for selected worlds."""
     world = wp.tid()
@@ -5197,6 +5163,9 @@ def reset_world_warmstart_buffers(
     if world < prev_mf_row_type.shape[0]:
         for row in range(prev_mf_row_type.shape[1]):
             prev_mf_row_type[world, row] = -1
+    if world < prev_mf_row_parent.shape[0]:
+        for row in range(prev_mf_row_parent.shape[1]):
+            prev_mf_row_parent[world, row] = -1
 
 
 # =============================================================================
@@ -5875,6 +5844,8 @@ def gather_mf_warmstart(
     prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev base MF slot (or -1)
     prev_mf_impulses: wp.array2d[float],
     prev_mf_row_type: wp.array2d[int],
+    prev_mf_row_parent: wp.array2d[int],
+    mf_constraint_count: wp.array[int],
     mf_row_type: wp.array2d[int],  # THIS step's row types (already built)
     mf_row_parent: wp.array2d[int],
     decay: float,
@@ -5912,6 +5883,9 @@ def gather_mf_warmstart(
         return
 
     world = contact_world[c]
+    count = mf_constraint_count[world]
+    if new_slot >= count:
+        return
 
     mi = match_index[c]
     matched = mi >= 0
@@ -5920,7 +5894,13 @@ def gather_mf_warmstart(
         prev_slot = prev_slot_sorted[mi]
 
     # Normal row (offset 0): always present for an MF contact.
-    if matched and prev_slot >= 0 and prev_mf_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+    if (
+        matched
+        and prev_slot >= 0
+        and prev_slot < mf_max_c
+        and mf_row_type[world, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
+        and prev_mf_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
+    ):
         mf_impulses[world, new_slot] = decay * dt_scale * prev_mf_impulses[world, prev_slot]
     # else: leave 0 (already memset)
 
@@ -5928,7 +5908,7 @@ def gather_mf_warmstart(
     # they belong to this contact's block (parent == base slot).
     for r in range(1, 3):
         new_r = new_slot + r
-        if new_r < mf_max_c:
+        if new_r < count and new_r < mf_max_c:
             if mf_row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION and mf_row_parent[world, new_r] == new_slot:
                 prev_r = prev_slot + r
                 if (
@@ -5936,6 +5916,7 @@ def gather_mf_warmstart(
                     and prev_slot >= 0
                     and prev_r < mf_max_c
                     and prev_mf_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
+                    and prev_mf_row_parent[world, prev_r] == prev_slot
                 ):
                     mf_impulses[world, new_r] = decay * dt_scale * prev_mf_impulses[world, prev_r]
                 # else: leave 0
@@ -5993,6 +5974,25 @@ def snapshot_dense_prev_slots(
 
 
 @wp.kernel
+def snapshot_propagation_prev_slots(
+    contact_count: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slot: wp.array[int],
+    # out
+    prev_slot_sorted: wp.array[int],
+):
+    """Propagation-path mirror of :func:`snapshot_mf_prev_slots`."""
+    c = wp.tid()
+    if c >= contact_count[0]:
+        prev_slot_sorted[c] = -1
+        return
+    if contact_path[c] != 2:
+        prev_slot_sorted[c] = -1
+        return
+    prev_slot_sorted[c] = contact_slot[c]
+
+
+@wp.kernel
 def gather_dense_warmstart(
     contact_count: wp.array[int],
     contact_path: wp.array[int],
@@ -6002,8 +6002,12 @@ def gather_dense_warmstart(
     prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev dense normal row (or -1)
     prev_dense_impulses: wp.array2d[float],
     prev_dense_row_type: wp.array2d[int],
+    prev_dense_row_parent: wp.array2d[int],
+    world_constraint_count: wp.array[int],
     world_row_type: wp.array2d[int],  # THIS step's dense row types (already built)
+    world_row_parent: wp.array2d[int],
     decay: float,
+    dt_scale: float,
     max_constraints: int,
     # in-out
     world_impulses: wp.array2d[float],
@@ -6012,9 +6016,9 @@ def gather_dense_warmstart(
     impulses, matched by contact identity — the dense mirror of
     :func:`gather_mf_warmstart`.
 
-    Runs after ``prepare_world_impulses`` has cold-zeroed the contact/friction
-    rows (``matched_contact_warmstart != 0``), so unmatched or fresh contacts
-    stay cold and no stale impulse survives a slot-layout shift. Friction rows
+    Runs after ``prepare_world_impulses`` has cold-zeroed every dense row, so
+    unmatched or fresh contacts stay cold and no stale impulse survives a
+    slot-layout shift. Friction rows
     (offsets 1, 2 after the normal row) are seeded only when BOTH this step and
     the previous step allocated a friction row at the corresponding offset.
     ``decay`` scales every seeded impulse: at persistent quasi-static contacts
@@ -6031,6 +6035,9 @@ def gather_dense_warmstart(
         return
 
     world = contact_world[c]
+    count = world_constraint_count[world]
+    if new_slot >= count:
+        return
 
     mi = match_index[c]
     matched = mi >= 0
@@ -6039,23 +6046,128 @@ def gather_dense_warmstart(
         prev_slot = prev_slot_sorted[mi]
 
     # Normal row (offset 0).
-    if matched and prev_slot >= 0 and prev_dense_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+    if (
+        matched
+        and prev_slot >= 0
+        and prev_slot < max_constraints
+        and prev_dense_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
+    ):
         if world_row_type[world, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
-            world_impulses[world, new_slot] = decay * prev_dense_impulses[world, prev_slot]
+            world_impulses[world, new_slot] = decay * dt_scale * prev_dense_impulses[world, prev_slot]
 
     # Friction rows (offsets 1, 2): only if THIS step allocated them here.
     for r in range(1, 3):
         new_r = new_slot + r
-        if new_r < max_constraints:
-            if world_row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION:
+        if new_r < count and new_r < max_constraints:
+            if (
+                world_row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION
+                and world_row_parent[world, new_r] == new_slot
+            ):
                 prev_r = prev_slot + r
                 if (
                     matched
                     and prev_slot >= 0
                     and prev_r < max_constraints
                     and prev_dense_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
+                    and prev_dense_row_parent[world, prev_r] == prev_slot
                 ):
-                    world_impulses[world, new_r] = decay * prev_dense_impulses[world, prev_r]
+                    world_impulses[world, new_r] = decay * dt_scale * prev_dense_impulses[world, prev_r]
+
+
+@wp.kernel
+def gather_propagation_warmstart(
+    contact_count: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_world: wp.array[int],
+    match_index: wp.array[int],
+    prev_slot_sorted: wp.array[int],
+    prev_impulses: wp.array2d[float],
+    prev_row_type: wp.array2d[int],
+    prev_row_parent: wp.array2d[int],
+    constraint_count: wp.array[int],
+    row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    decay: float,
+    dt_scale: float,
+    max_constraints: int,
+    # in-out
+    impulses: wp.array2d[float],
+):
+    """Identity-gather converged impulses for propagation-routed contacts."""
+    c = wp.tid()
+    if c >= contact_count[0] or contact_path[c] != 2:
+        return
+    new_slot = contact_slot[c]
+    if new_slot < 0:
+        return
+    world = contact_world[c]
+    count = constraint_count[world]
+    if new_slot >= count:
+        return
+
+    mi = match_index[c]
+    prev_slot = int(-1)
+    if mi >= 0:
+        prev_slot = prev_slot_sorted[mi]
+
+    if (
+        prev_slot >= 0
+        and prev_slot < max_constraints
+        and row_type[world, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
+        and prev_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
+    ):
+        impulses[world, new_slot] = decay * dt_scale * prev_impulses[world, prev_slot]
+
+    for r in range(1, 3):
+        new_r = new_slot + r
+        prev_r = prev_slot + r
+        if (
+            new_r < count
+            and new_r < max_constraints
+            and prev_slot >= 0
+            and prev_r < max_constraints
+            and row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION
+            and row_parent[world, new_r] == new_slot
+            and prev_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
+            and prev_row_parent[world, prev_r] == prev_slot
+        ):
+            impulses[world, new_r] = decay * dt_scale * prev_impulses[world, prev_r]
+
+
+@wp.kernel
+def accumulate_propagation_warmstart_body_impulses(
+    constraint_count: wp.array[int],
+    body_a: wp.array2d[int],
+    body_b: wp.array2d[int],
+    J_a: wp.array3d[float],
+    J_b: wp.array3d[float],
+    MiJt_a: wp.array3d[float],
+    MiJt_b: wp.array3d[float],
+    impulses: wp.array2d[float],
+    max_constraints: int,
+    # in-out
+    body_qd: wp.array2d[float],
+    body_impulses: wp.array2d[float],
+):
+    """Convert seeded propagation row impulses to deferred body wrenches."""
+    tid = wp.tid()
+    world = tid // max_constraints
+    row = tid - world * max_constraints
+    if row >= constraint_count[world]:
+        return
+    impulse = impulses[world, row]
+    if impulse == 0.0:
+        return
+    ba = body_a[world, row]
+    bb = body_b[world, row]
+    for k in range(6):
+        if ba >= 0:
+            wp.atomic_add(body_qd, ba, k, MiJt_a[world, row, k] * impulse)
+            wp.atomic_add(body_impulses, ba, k, J_a[world, row, k] * impulse)
+        if bb >= 0:
+            wp.atomic_add(body_qd, bb, k, MiJt_b[world, row, k] * impulse)
+            wp.atomic_add(body_impulses, bb, k, J_b[world, row, k] * impulse)
 
 
 @wp.kernel
