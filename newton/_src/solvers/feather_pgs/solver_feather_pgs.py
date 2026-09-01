@@ -248,6 +248,7 @@ class _FeatherPGSModelPlan:
     prescribed_articulation: np.ndarray
     response_dof_count: np.ndarray
     articulation_joint_end: np.ndarray
+    loop_joint_articulation: np.ndarray
     world_count: int
 
     @classmethod
@@ -270,6 +271,7 @@ class _FeatherPGSModelPlan:
                 articulation_world[articulation_world < 0] = 0
 
         articulation_joint_end = np.zeros(articulation_count, dtype=np.int32)
+        loop_joint_articulation = np.full(model.joint_count, -1, dtype=np.int32)
         if articulation_count and model.joint_count:
             articulation_start = model.articulation_start.numpy()
             joint_parent = model.joint_parent.numpy()
@@ -279,6 +281,23 @@ class _FeatherPGSModelPlan:
 
             joint_articulation_arr = getattr(model, "joint_articulation", None)
             joint_articulation = joint_articulation_arr.numpy() if joint_articulation_arr is not None else None
+
+            if joint_articulation is not None:
+                # An unowned joint is a closure only when its child body already
+                # belongs to an articulation through a different, tree-owned joint.
+                # Standalone world-root joints are also unowned, but their child has
+                # no articulation owner and must remain outside the solver plan.
+                body_articulation = np.full(model.body_count, -1, dtype=np.int32)
+                for j in range(model.joint_count):
+                    art = int(joint_articulation[j])
+                    child = int(joint_child[j])
+                    if art >= 0 and child >= 0:
+                        body_articulation[child] = art
+                for j in range(model.joint_count):
+                    if int(joint_articulation[j]) < 0:
+                        child = int(joint_child[j])
+                        if child >= 0:
+                            loop_joint_articulation[j] = body_articulation[child]
 
             for art in range(articulation_count):
                 first_joint = int(articulation_start[art])
@@ -290,12 +309,12 @@ class _FeatherPGSModelPlan:
                 # H singular -> instant NaN) and out of the FK walk (they would overwrite
                 # their child's tree pose). They are consumed as CONNECT rows instead.
                 #
-                # Membership comes from Model.joint_articulation (the builder marks loop
-                # joints with -1 and guarantees an articulation's OWN joints are
-                # contiguous from its start). The prefix range derived from
-                # articulation_start may interleave FOREIGN entries after the tree —
-                # e.g. multi-source add_builder defers loop joints past a later
-                # articulation's free joint — so never adopt range members by position.
+                # Model.joint_articulation identifies the articulation's own contiguous
+                # tree joints; the body-ownership pass above separately distinguishes
+                # closures from other unowned joints. The prefix range derived from
+                # articulation_start may contain foreign entries after the tree — e.g.
+                # multi-source add_builder defers loop joints past a later articulation's
+                # free joint — so never adopt range members by position.
                 if joint_articulation is not None:
                     tree_end = first_joint
                     for j in range(first_joint, last_joint):
@@ -326,6 +345,7 @@ class _FeatherPGSModelPlan:
                                 f"after loop joints (articulation {art}, joint {j}). "
                                 "Loop-closing joints must be trailing."
                             )
+                        loop_joint_articulation[j] = art
                 articulation_joint_end[art] = tree_end
 
                 first_dof = int(joint_qd_start[first_joint])
@@ -376,6 +396,7 @@ class _FeatherPGSModelPlan:
             prescribed,
             response_dof_count,
             articulation_joint_end,
+            loop_joint_articulation,
         )
         for array in arrays:
             array.setflags(write=False)
@@ -1491,10 +1512,7 @@ class SolverFeatherPGS(SolverBase):
         # Loop-closing joints are excluded from the tree (see _FeatherPGSModelPlan.build)
         # and enforced as CONNECT rows; the propagation-family kernels still iterate full
         # articulation joint ranges, so gate that mode rather than corrupt silently.
-        self._has_loop_joints = bool(
-            model.articulation_count
-            and np.any(self._model_plan.articulation_joint_end < model.articulation_start.numpy()[1:])
-        )
+        self._has_loop_joints = bool(np.any(self._model_plan.loop_joint_articulation >= 0))
         if self._has_loop_joints and self.articulated_contact_response != "immediate":
             raise ValueError(
                 "SolverFeatherPGS: loop-closing joints (imported connect/weld equalities) are "
@@ -2235,12 +2253,12 @@ class SolverFeatherPGS(SolverBase):
     def _build_connect_plan(self, model) -> None:
         """Precompute the static per-closure lookup tables for the CONNECT row family.
 
-        Loop-closing joints (BALL joints trailing an articulation's tree prefix — how the
-        MJCF importer realizes ``connect`` equalities) are excluded from FK/ID by
+        Loop-closing BALL joints are excluded from FK/ID by
         :meth:`_FeatherPGSModelPlan.build` and enforced here as three bilateral rows
-        pinning the joint's parent/child anchors together. FIXED (weld) loop joints warn
-        and are ignored for now. All buffers are allocated once (CUDA-graph-safe);
-        ``joint_enabled`` is snapshotted at init.
+        pinning the joint's parent/child anchors together. Their stored owner comes from
+        the child body's tree articulation, independent of joint ordering. FIXED (weld)
+        loop joints warn and are ignored for now. All buffers are allocated once
+        (CUDA-graph-safe); ``joint_enabled`` is snapshotted at init.
         """
         self._connect_count = 0
         self.connect_slot = None
@@ -2258,8 +2276,6 @@ class SolverFeatherPGS(SolverBase):
             return
 
         device = model.device
-        articulation_start = model.articulation_start.numpy()
-        joint_end = self._model_plan.articulation_joint_end
         joint_type = model.joint_type.numpy()
         joint_parent = model.joint_parent.numpy()
         joint_child = model.joint_child.numpy()
@@ -2268,31 +2284,12 @@ class SolverFeatherPGS(SolverBase):
         joint_enabled_arr = getattr(model, "joint_enabled", None)
         joint_enabled = joint_enabled_arr.numpy() if joint_enabled_arr is not None else None
         articulation_world = self._model_plan.articulation_world
-
-        # Enumerate loop joints and attribute each to the articulation that OWNS ITS
-        # CHILD BODY — never by joint-index range: multi-source add_builder defers loop
-        # joints past later articulations' joints, so range membership misattributes
-        # them (measured: the gripper's closures landed in a rigid object's range and
-        # silently produced zero CONNECT rows — the fingers fell open).
-        joint_articulation_arr = getattr(model, "joint_articulation", None)
-        if joint_articulation_arr is not None:
-            ja = joint_articulation_arr.numpy()
-            body_art: dict[int, int] = {}
-            for j in range(model.joint_count):
-                a = int(ja[j])
-                if a >= 0:
-                    body_art[int(joint_child[j])] = a
-            loop_candidates = [(j, None) for j in range(model.joint_count) if int(ja[j]) < 0]
-        else:
-            body_art = None
-            loop_candidates = [
-                (j, art)
-                for art in range(model.articulation_count)
-                for j in range(int(joint_end[art]), int(articulation_start[art + 1]))
-            ]
+        loop_joint_articulation = self._model_plan.loop_joint_articulation
+        body_articulation = self.body_to_articulation.numpy() if self.body_to_articulation is not None else None
 
         art_l, body_p, body_c, anchors_p, anchors_c, world_l, enab = [], [], [], [], [], [], []
-        for j, range_art in loop_candidates:
+        for j in np.flatnonzero(loop_joint_articulation >= 0):
+            art = int(loop_joint_articulation[j])
             if int(joint_type[j]) != int(JointType.BALL):
                 warnings.warn(
                     f"SolverFeatherPGS: loop joint {j} has unsupported type "
@@ -2300,19 +2297,16 @@ class SolverFeatherPGS(SolverBase):
                     stacklevel=2,
                 )
                 continue
-            art = range_art
-            if art is None:
-                art = body_art.get(int(joint_child[j]))
-                parent_art = body_art.get(int(joint_parent[j]), art)
-                if art is None or parent_art != art:
-                    warnings.warn(
-                        f"SolverFeatherPGS: loop joint {j} closes across articulations "
-                        f"({parent_art} vs {art}) or on a body with no tree joint; ignored.",
-                        stacklevel=2,
-                    )
-                    continue
+            parent = int(joint_parent[j])
+            parent_art = int(body_articulation[parent]) if parent >= 0 and body_articulation is not None else -1
+            if parent_art >= 0 and parent_art != art:
+                warnings.warn(
+                    f"SolverFeatherPGS: loop joint {j} closes across articulations ({parent_art} vs {art}); ignored.",
+                    stacklevel=2,
+                )
+                continue
             art_l.append(art)
-            body_p.append(int(joint_parent[j]))
+            body_p.append(parent)
             body_c.append(int(joint_child[j]))
             anchors_p.append(joint_X_p[j][:3])
             anchors_c.append(joint_X_c[j][:3])

@@ -141,6 +141,63 @@ class TestFeatherPGSConnect(unittest.TestCase):
         self.assertAlmostEqual(q[2], q[0], delta=0.08)
         self.assertGreater(abs(q[2]), 0.3, "rocker did not move — loop not transmitting")
 
+    def test_connect_ownership_survives_interleaved_articulation(self):
+        """Keep a deferred closure with its child body's articulation."""
+        b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+
+        left = b.add_link()
+        b.add_shape_box(left, hx=0.05, hy=0.05, hz=0.1)
+        j_left = b.add_joint_revolute(parent=-1, child=left, axis=newton.Axis.Y)
+        right = b.add_link()
+        b.add_shape_box(right, hx=0.05, hy=0.05, hz=0.1)
+        j_right = b.add_joint_revolute(parent=-1, child=right, axis=newton.Axis.Y)
+        b.add_articulation([j_left, j_right], label="closed_linkage")
+
+        foreign = b.add_link()
+        b.add_shape_sphere(foreign, radius=0.05)
+        j_foreign = b.add_joint_free(child=foreign)
+        b.add_articulation([j_foreign], label="foreign")
+
+        loop_joint = b.add_joint_ball(parent=left, child=right)
+        model = b.finalize()
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free")
+
+        self.assertEqual(int(model.joint_articulation.numpy()[loop_joint]), -1)
+        np.testing.assert_array_equal(
+            solver._model_plan.loop_joint_articulation,
+            np.array([-1, -1, -1, 0], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(solver._connect_art.numpy(), np.array([0], dtype=np.int32))
+
+    def test_standalone_world_root_is_not_loop_joint(self):
+        """Do not treat an unrelated unowned world-root joint as a closure."""
+        b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+
+        articulated = b.add_link()
+        b.add_shape_box(articulated, hx=0.05, hy=0.05, hz=0.1)
+        tree_joint = b.add_joint_revolute(parent=-1, child=articulated, axis=newton.Axis.Y)
+        b.add_articulation([tree_joint], label="articulated")
+
+        standalone = b.add_link()
+        b.add_shape_box(standalone, hx=0.05, hy=0.05, hz=0.1)
+        standalone_joint = b.add_joint_fixed(parent=-1, child=standalone)
+
+        model = b.finalize()
+        self.assertEqual(model.joint_articulation.numpy().tolist(), [0, -1])
+        self.assertEqual(standalone_joint, 1)
+
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            articulated_contact_response="propagation",
+        )
+        self.assertFalse(solver._has_loop_joints)
+        self.assertEqual(solver._connect_count, 0)
+        np.testing.assert_array_equal(
+            solver._model_plan.loop_joint_articulation,
+            np.array([-1, -1], dtype=np.int32),
+        )
+
     def test_connect_survives_foreign_joint_between_tree_and_loop(self):
         """Attribute loop joints by body ownership when another articulation interleaves.
 
@@ -187,7 +244,7 @@ class TestFeatherPGSConnect(unittest.TestCase):
         b.add_articulation([j_crank, j_coupler, j_rocker], label="four_bar")
 
         # a second articulation's joint lands BETWEEN the tree and the loop joint
-        body = b.add_body(xform=wp.transform(wp.vec3(1.0, 0.0, 0.5), wp.quat_identity()))
+        body = b.add_link(xform=wp.transform(wp.vec3(1.0, 0.0, 0.5), wp.quat_identity()))
         b.add_shape_sphere(body, radius=0.05)
         j_free = b.add_joint_free(child=body)
         b.add_articulation([j_free], label="free_object")
