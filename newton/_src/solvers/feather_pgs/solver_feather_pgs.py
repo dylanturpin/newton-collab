@@ -1063,6 +1063,11 @@ class SolverFeatherPGS(SolverBase):
         )
         self.pgs_warmstart_matched = bool(pgs_warmstart_matched)
         self.pgs_warmstart_decay = float(pgs_warmstart_decay)
+        if self.pgs_warmstart_matched and pgs_mode != "matrix_free":
+            raise NotImplementedError(
+                f"pgs_warmstart_matched=True requires pgs_mode='matrix_free' (got {pgs_mode!r}): "
+                "the identity gather and starting-velocity fold run in the matrix-free solve path."
+            )
         self.pgs_warmstart = pgs_warmstart or self.pgs_warmstart_matched
         self._ws_prev_dense_impulses = None
         self._ws_prev_dense_row_type = None
@@ -3107,6 +3112,16 @@ class SolverFeatherPGS(SolverBase):
         self.impulses = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
+        # Dense matched warm-start carry buffers. Allocated here (not in the MF
+        # buffer path) so scenes WITHOUT free rigid bodies still get them —
+        # _allocate_mf_buffers early-returns for such scenes and the matched
+        # carry must never silently degrade to index reuse.
+        if self.pgs_warmstart_matched:
+            self._ws_prev_dense_impulses = wp.zeros_like(self.impulses)
+            self._ws_prev_dense_row_type = wp.full(
+                (self.world_count, max_constraints), -1, dtype=wp.int32, device=device
+            )
+            self._ws_prev_dense_slot_sorted = wp.full((self._max_contacts_alloc,), -1, dtype=wp.int32, device=device)
         self._debug_position_impulses = (
             wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
             if self._debug_buffers_enabled
@@ -3325,16 +3340,6 @@ class SolverFeatherPGS(SolverBase):
             )
             self._ws_prev_mf_row_type = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device)
             self._ws_prev_slot_sorted = wp.full(
-                (getattr(self, "_max_contacts_alloc", 1),), -1, dtype=wp.int32, device=device
-            )
-        # Dense matched warm-start carry buffers (mirror of the MF block above);
-        # allocated only when the feature is on so the default-off path is unchanged.
-        if self.pgs_warmstart_matched:
-            self._ws_prev_dense_impulses = wp.zeros_like(self.impulses)
-            self._ws_prev_dense_row_type = wp.full(
-                (self.impulses.shape[0], self.impulses.shape[1]), -1, dtype=wp.int32, device=device
-            )
-            self._ws_prev_dense_slot_sorted = wp.full(
                 (getattr(self, "_max_contacts_alloc", 1),), -1, dtype=wp.int32, device=device
             )
         self._debug_position_mf_impulses = (
