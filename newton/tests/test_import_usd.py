@@ -7317,6 +7317,36 @@ def Xform "Articulation" (
         self.assertAlmostEqual(rolling, 0.08, places=4)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_material_parsing_outside_import_root(self):
+        """A collider subtree may bind one global material shared by every clone."""
+        from pxr import Usd, UsdGeom, UsdPhysics, UsdShade
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        material = UsdShade.Material.Define(stage, "/World/PhysicsMaterials/Shared")
+        physics_material = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+        physics_material.GetStaticFrictionAttr().Set(0.7)
+        physics_material.GetDynamicFrictionAttr().Set(0.4)
+        physics_material.GetRestitutionAttr().Set(0.2)
+
+        body = UsdGeom.Xform.Define(stage, "/World/envs/env_0/Body")
+        UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+        collider = UsdGeom.Cube.Define(stage, "/World/envs/env_0/Body/Collider")
+        UsdPhysics.CollisionAPI.Apply(collider.GetPrim())
+        UsdShade.MaterialBindingAPI.Apply(collider.GetPrim()).Bind(material, "physics")
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, root_path="/World/envs/env_0")
+        model = builder.finalize()
+        shape_idx = result["path_shape_map"]["/World/envs/env_0/Body/Collider"]
+
+        self.assertAlmostEqual(model.shape_material_mu.numpy()[shape_idx], 0.4, places=4)
+        self.assertAlmostEqual(model.shape_material_restitution.numpy()[shape_idx], 0.2, places=4)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_visual_mesh_material_subsets_create_separate_visual_shapes(self):
         """Test that visual mesh material subsets import as separate colored shapes."""
         from pxr import Sdf, Usd, UsdGeom, UsdPhysics, UsdShade, Vt

@@ -2700,10 +2700,8 @@ def parse_usd(
             return True
         return False
 
-    # Parsing physics materials from the stage
-    for sdf_path, desc in data_for_key(ret_dict, UsdPhysics.ObjectType.RigidBodyMaterial):
-        if warn_invalid_desc(sdf_path, desc):
-            continue
+    def _physics_material_from_desc(sdf_path, desc):
+        """Convert one native USD material descriptor into Newton's shape material."""
         prim = stage.GetPrimAtPath(sdf_path)
 
         def _resolve_contact_attr(key, _prim=prim):
@@ -2718,7 +2716,7 @@ def parse_usd(
                 stacklevel=2,
             )
 
-        material_specs[str(sdf_path)] = PhysicsMaterial(
+        return PhysicsMaterial(
             staticFriction=desc.staticFriction,
             dynamicFriction=desc.dynamicFriction,
             restitution=desc.restitution,
@@ -2743,6 +2741,35 @@ def parse_usd(
             kd=_resolve_contact_attr("kd"),
             kf=_resolve_contact_attr("kf"),
             ka=_resolve_contact_attr("ka"),
+        )
+
+    # Parsing physics materials from the selected import subtree.
+    for sdf_path, desc in data_for_key(ret_dict, UsdPhysics.ObjectType.RigidBodyMaterial):
+        if warn_invalid_desc(sdf_path, desc):
+            continue
+        material_specs[str(sdf_path)] = _physics_material_from_desc(sdf_path, desc)
+
+    def _resolve_physics_material(material_path: str) -> PhysicsMaterial:
+        """Resolve a bound material, including an absolute target outside ``root_path``.
+
+        ``LoadUsdPhysicsFromRange`` reports collider material relationship targets even
+        when the material prim itself is outside the selected source subtree. Load that
+        one target on demand so clone sources can bind shared global materials without
+        forcing every material under every replicated environment.
+        """
+        if material_path in material_specs:
+            return material_specs[material_path]
+
+        external_results = UsdPhysics.LoadUsdPhysicsFromRange(stage, [material_path])
+        for sdf_path, desc in data_for_key(external_results, UsdPhysics.ObjectType.RigidBodyMaterial):
+            key = str(sdf_path)
+            if key != material_path or warn_invalid_desc(sdf_path, desc):
+                continue
+            material_specs[key] = _physics_material_from_desc(sdf_path, desc)
+            return material_specs[key]
+
+        raise ValueError(
+            f"Collider references physics material '{material_path}', but that target could not be parsed."
         )
 
     if UsdPhysics.ObjectType.RigidBody in ret_dict:
@@ -3660,7 +3687,7 @@ def parse_usd(
                 if has_shape_material:
                     if len(shape_spec.materials) > 1 and verbose:
                         print(f"Warning: More than one material found on shape at '{path}'.\nUsing only the first one.")
-                    material = material_specs[str(shape_spec.materials[0])]
+                    material = _resolve_physics_material(str(shape_spec.materials[0]))
                     if verbose:
                         print(
                             f"\tMaterial of '{path}':\tfriction: {material.dynamicFriction},\ttorsional friction: {material.torsionalFriction},\trolling friction: {material.rollingFriction},\trestitution: {material.restitution},\tdensity: {material.density}"
