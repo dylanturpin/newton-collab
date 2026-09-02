@@ -55,6 +55,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
+    PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
     PREELIM_MAX_ROWS,
     PROPAGATION_COLOR_TAIL,
@@ -130,6 +131,7 @@ from .kernels import (
     hinv_jt_par_row,
     hinv_jt_par_row_contact_fallback,
     integrate_generalized_joints,
+    local_solve_launch_gate,
     pack_contact_linear_force_as_spatial,
     pgs_convergence_diagnostic_velocity,
     pgs_ncp_residuals_diagnostic_velocity,
@@ -202,6 +204,8 @@ _LOCAL_PAIR_BLOCKS_PER_SM = 8
 # The local solver performs a serial O(dof_count**2) triangular solve per row.
 _LOCAL_INTERNAL_MAX_DOF = 16
 _LOCAL_SOLVE_MAX_ROWS = 20
+_LOCAL_RESIDUAL_MAX_ROWS = 40
+_LOCAL_RESIDUAL_MF_MAX_ROWS = 12
 
 
 @wp.kernel
@@ -1433,6 +1437,8 @@ class SolverFeatherPGS(SolverBase):
             if self._hinv_jt_computes_diag and self._execution_plan.use_tiled_hinv_jt(size)
         )
         self._local_solve_max_rows = min(_LOCAL_SOLVE_MAX_ROWS, self.dense_max_constraints)
+        self._local_residual_max_rows = min(_LOCAL_RESIDUAL_MAX_ROWS, self.dense_max_constraints)
+        self._local_residual_mf_max_rows = min(_LOCAL_RESIDUAL_MF_MAX_ROWS, self.mf_max_constraints)
         local_shared_limit = int(getattr(model.device, "max_shared_memory_per_block", 0))
         local_base_supported = bool(
             model.device.is_cuda
@@ -1453,18 +1459,25 @@ class SolverFeatherPGS(SolverBase):
         )
         local_primary_articulation = np.full(self.world_count, -1, dtype=np.int32)
         local_pair_articulation = np.full(self.world_count, -1, dtype=np.int32)
+        local_residual_pair_articulation = np.full(self.world_count, -1, dtype=np.int32)
         local_candidates: dict[int, list[int]] = {size: [] for size in self.size_groups}
         local_pair_candidates: dict[int, list[int]] = {size: [] for size in self.size_groups}
         local_pair_secondaries: dict[int, list[int]] = {size: [] for size in self.size_groups}
+        local_residual_candidates: dict[int, list[int]] = {size: [] for size in self.size_groups}
+        local_residual_secondaries: dict[int, list[int]] = {size: [] for size in self.size_groups}
         response_by_world: list[list[int]] = [[] for _ in range(self.world_count)]
         for art in np.flatnonzero(self._model_plan.response_dof_count > 0):
             response_by_world[int(self._model_plan.articulation_world[art])].append(int(art))
 
-        def local_shared_bytes(primary_dofs: int, secondary_dofs: int = 0) -> int:
+        def local_shared_bytes(
+            primary_dofs: int, secondary_dofs: int = 0, max_rows: int | None = None, mf_rows: int = 0
+        ) -> int:
+            if max_rows is None:
+                max_rows = self._local_solve_max_rows
             total_dofs = primary_dofs + secondary_dofs
             factor_words = primary_dofs * primary_dofs + secondary_dofs * secondary_dofs
-            row_words = 2 * self._local_solve_max_rows * total_dofs + 8 * self._local_solve_max_rows
-            return 128 + 4 * (factor_words + row_words + total_dofs)
+            row_words = 2 * max_rows * total_dofs + 8 * max_rows
+            return 128 + 4 * (factor_words + row_words + total_dofs + mf_rows)
 
         if local_base_supported:
             for world, response_arts in enumerate(response_by_world):
@@ -1497,9 +1510,24 @@ class SolverFeatherPGS(SolverBase):
                 local_pair_articulation[world] = secondary_art
                 local_pair_candidates[primary_dofs].append(primary_art)
                 local_pair_secondaries[primary_dofs].append(secondary_art)
+                if (
+                    local_shared_bytes(
+                        primary_dofs,
+                        secondary_dofs,
+                        self._local_residual_max_rows,
+                        self._local_residual_mf_max_rows,
+                    )
+                    <= local_shared_limit
+                ):
+                    local_residual_pair_articulation[world] = secondary_art
+                    local_residual_candidates[primary_dofs].append(primary_art)
+                    local_residual_secondaries[primary_dofs].append(secondary_art)
 
         self._local_primary_articulation = wp.array(local_primary_articulation, dtype=wp.int32, device=model.device)
         self._local_pair_articulation = wp.array(local_pair_articulation, dtype=wp.int32, device=model.device)
+        self._local_residual_pair_articulation = wp.array(
+            local_residual_pair_articulation, dtype=wp.int32, device=model.device
+        )
         self._local_solve_owner = wp.zeros(self.world_count, dtype=wp.int32, device=model.device)
         self._local_general_world_count = wp.zeros(1, dtype=wp.int32, device=model.device)
         self._local_general_worlds = wp.empty(self.world_count, dtype=wp.int32, device=model.device)
@@ -1519,8 +1547,19 @@ class SolverFeatherPGS(SolverBase):
             for size, arts in local_pair_secondaries.items()
             if arts
         }
+        self._local_residual_candidates = {
+            size: wp.array(arts, dtype=wp.int32, device=model.device)
+            for size, arts in local_residual_candidates.items()
+            if arts
+        }
+        self._local_residual_secondaries = {
+            size: wp.array(arts, dtype=wp.int32, device=model.device)
+            for size, arts in local_residual_secondaries.items()
+            if arts
+        }
         self._local_internal_art_counts = {size: len(arts) for size, arts in local_candidates.items()}
         self._local_pair_art_counts = {size: len(arts) for size, arts in local_pair_candidates.items()}
+        self._local_residual_art_counts = {size: len(arts) for size, arts in local_residual_candidates.items()}
         self._local_pair_active_counts = {
             size: wp.zeros(1, dtype=wp.int32, device=model.device)
             for size, count in self._local_pair_art_counts.items()
@@ -1536,10 +1575,46 @@ class SolverFeatherPGS(SolverBase):
             for size, count in self._local_pair_art_counts.items()
             if count > 0
         }
+        self._local_residual_active_counts = {
+            size: wp.zeros(1, dtype=wp.int32, device=model.device)
+            for size, count in self._local_residual_art_counts.items()
+            if count > 0
+        }
+        self._local_residual_active_candidates = {
+            size: wp.empty(count, dtype=wp.int32, device=model.device)
+            for size, count in self._local_residual_art_counts.items()
+            if count > 0
+        }
+        self._local_residual_active_secondaries = {
+            size: wp.empty(count, dtype=wp.int32, device=model.device)
+            for size, count in self._local_residual_art_counts.items()
+            if count > 0
+        }
         self._local_pair_solver_blocks = {
             size: min(count, max(1, int(model.device.sm_count) * _LOCAL_PAIR_BLOCKS_PER_SM))
             for size, count in self._local_pair_art_counts.items()
             if count > 0
+        }
+        self._local_residual_solver_warps = {
+            size: min(count, max(1, int(model.device.sm_count)))
+            for size, count in self._local_residual_art_counts.items()
+            if count > 0
+        }
+        self._local_residual_warps_per_block = {
+            size: (
+                2
+                if solver_warps % 2 == 0
+                and 2
+                * local_shared_bytes(
+                    size,
+                    6,
+                    self._local_residual_max_rows,
+                    self._local_residual_mf_max_rows,
+                )
+                <= local_shared_limit
+                else 1
+            )
+            for size, solver_warps in self._local_residual_solver_warps.items()
         }
         self._local_internal_fast_path = bool(
             local_base_supported and any(count > 0 for count in self._local_internal_art_counts.values())
@@ -4164,6 +4239,7 @@ class SolverFeatherPGS(SolverBase):
 
         self._pgs_solve_local_internal_kernels = {}
         self._pgs_solve_local_pair_kernels = {}
+        self._pgs_solve_local_residual_kernels = {}
         self._pgs_solve_local_internal_warps_per_block = {}
         self._pgs_solve_local_pair_warps_per_block = {}
         if self._local_internal_fast_path:
@@ -4192,6 +4268,20 @@ class SolverFeatherPGS(SolverBase):
                         paired_dof_count=6,
                         persistent_queue=True,
                         warps_per_block=warps_per_block,
+                    )
+            for size, count in self._local_residual_art_counts.items():
+                if count > 0:
+                    warps_per_block = self._local_residual_warps_per_block[size]
+                    self._pgs_solve_local_residual_kernels[size] = _get_pgs_solve_local_owned_kernel(
+                        self.dense_max_constraints,
+                        self._local_residual_max_rows,
+                        size,
+                        device_arch,
+                        paired_dof_count=6,
+                        persistent_queue=True,
+                        warps_per_block=warps_per_block,
+                        mf_max_constraints=self.mf_max_constraints,
+                        local_mf_max_constraints=self._local_residual_mf_max_rows,
                     )
 
         self._pgs_solve_mf_gs_kernel = None
@@ -4502,7 +4592,16 @@ class SolverFeatherPGS(SolverBase):
             wp.Stream(model.device)
             if self.use_parallel_streams
             and model.device.is_cuda
-            and (self._pgs_solve_local_internal_kernels or self._pgs_solve_local_pair_kernels)
+            and (
+                self._pgs_solve_local_internal_kernels
+                or self._pgs_solve_local_pair_kernels
+                or self._pgs_solve_local_residual_kernels
+            )
+            else None
+        )
+        self._local_residual_stream = (
+            wp.Stream(model.device, priority=-1)
+            if self._local_internal_stream is not None and self._pgs_solve_local_residual_kernels
             else None
         )
         self._local_pair_stream = (
@@ -4598,6 +4697,7 @@ class SolverFeatherPGS(SolverBase):
         *,
         solve_single: bool = True,
         solve_pair: bool = True,
+        solve_residual: bool = True,
     ) -> None:
         """Solve articulation-local dense rows without world response buffers."""
 
@@ -4633,6 +4733,15 @@ class SolverFeatherPGS(SolverBase):
                     self.row_type,
                     self.row_parent,
                     self.row_mu,
+                    self.mf_constraint_count,
+                    self.mf_meta_packed,
+                    self.mf_impulses,
+                    self.mf_J_a,
+                    self.mf_J_b,
+                    self.mf_MiJt_a,
+                    self.mf_MiJt_b,
+                    self.mf_row_mu,
+                    self._pgs_contact_regularization_w,
                     iterations,
                     omega,
                     friction_start_iteration,
@@ -4675,6 +4784,20 @@ class SolverFeatherPGS(SolverBase):
                     self._local_pair_active_counts[size],
                     True,
                     self._pgs_solve_local_pair_warps_per_block[size],
+                )
+        if solve_residual:
+            for size, kernel in self._pgs_solve_local_residual_kernels.items():
+                launch(
+                    kernel,
+                    self._local_residual_active_candidates[size],
+                    self._local_residual_active_secondaries[size],
+                    size,
+                    6,
+                    PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
+                    self._local_residual_solver_warps[size],
+                    self._local_residual_active_counts[size],
+                    True,
+                    self._local_residual_warps_per_block[size],
                 )
 
     def _launch_matrix_free_gs_solve(
@@ -4764,17 +4887,31 @@ class SolverFeatherPGS(SolverBase):
                     )
                 print(f"[fpgs-capture] wrote {_base}.npz/.json", flush=True)
             launch_local = bool(
-                (self._pgs_solve_local_internal_kernels or self._pgs_solve_local_pair_kernels) and row_phase == 0
+                (
+                    self._pgs_solve_local_internal_kernels
+                    or self._pgs_solve_local_pair_kernels
+                    or self._pgs_solve_local_residual_kernels
+                )
+                and row_phase == 0
             )
             local_stream = self._local_internal_stream if launch_local else None
             pair_stream = self._local_pair_stream if launch_local else None
+            residual_stream = self._local_residual_stream if launch_local else None
             if local_stream is not None:
                 local_ready_event = wp.get_stream(self.model.device).record_event()
                 local_stream.wait_event(local_ready_event)
                 if pair_stream is not None:
                     pair_stream.wait_event(local_ready_event)
+                if residual_stream is not None:
+                    residual_stream.wait_event(local_ready_event)
             use_general_queue = bool(self._local_internal_fast_path)
             general_block_count = self._local_general_solver_blocks if use_general_queue else self.world_count
+            if local_stream is not None and residual_stream is not None:
+                wp.launch(local_solve_launch_gate, dim=1, device=self.model.device)
+                bulk_ready_event = wp.get_stream(self.model.device).record_event()
+                local_stream.wait_event(bulk_ready_event)
+                if pair_stream is not None:
+                    pair_stream.wait_event(bulk_ready_event)
             with self._sync_timed(f"mfgs_phase{row_phase}_iters{phase_iterations}"):
                 wp.launch_tiled(
                     mf_gs_kernel,
@@ -4831,6 +4968,18 @@ class SolverFeatherPGS(SolverBase):
             local_done_events = []
             if launch_local:
                 if local_stream is not None:
+                    if residual_stream is not None:
+                        with wp.ScopedStream(residual_stream, sync_enter=False):
+                            self._launch_local_internal_solve(
+                                dense_rhs,
+                                phase_iterations,
+                                omega,
+                                friction_start_iteration,
+                                phase_iteration_offset,
+                                solve_single=False,
+                                solve_pair=False,
+                            )
+                        local_done_events.append(residual_stream.record_event())
                     if pair_stream is not None:
                         with wp.ScopedStream(pair_stream, sync_enter=False):
                             self._launch_local_internal_solve(
@@ -4840,6 +4989,7 @@ class SolverFeatherPGS(SolverBase):
                                 friction_start_iteration,
                                 phase_iteration_offset,
                                 solve_single=False,
+                                solve_residual=False,
                             )
                         local_done_events.append(pair_stream.record_event())
                     with wp.ScopedStream(local_stream, sync_enter=False):
@@ -4850,6 +5000,7 @@ class SolverFeatherPGS(SolverBase):
                             friction_start_iteration,
                             phase_iteration_offset,
                             solve_pair=pair_stream is None,
+                            solve_residual=residual_stream is None,
                         )
                     local_done_events.append(local_stream.record_event())
                 else:
@@ -8689,9 +8840,15 @@ class SolverFeatherPGS(SolverBase):
                     self.constraint_count,
                     self.dense_phase_bounds,
                     self.mf_constraint_count,
+                    self.mf_body_a,
+                    self.mf_body_b,
+                    self.body_to_articulation,
                     self._local_primary_articulation,
                     self._local_pair_articulation,
+                    self._local_residual_pair_articulation,
                     self._local_solve_max_rows,
+                    self._local_residual_max_rows,
+                    self._local_residual_mf_max_rows,
                 ],
                 outputs=[
                     self._local_solve_owner,
@@ -8700,24 +8857,50 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 device=model.device,
             )
-            for size, active_count in self._local_pair_active_counts.items():
-                active_count.zero_()
-                wp.launch(
-                    compact_local_pair_candidates,
-                    dim=self._local_pair_art_counts[size],
-                    inputs=[
-                        self._local_pair_candidates[size],
-                        self._local_pair_secondaries[size],
-                        self.art_to_world,
-                        self._local_solve_owner,
-                    ],
-                    outputs=[
-                        active_count,
-                        self._local_pair_active_candidates[size],
-                        self._local_pair_active_secondaries[size],
-                    ],
-                    device=model.device,
-                )
+            pair_tiers = (
+                (
+                    PGS_LOCAL_SOLVE_OWNER_PAIR,
+                    self._local_pair_art_counts,
+                    self._local_pair_candidates,
+                    self._local_pair_secondaries,
+                    self._local_pair_active_counts,
+                    self._local_pair_active_candidates,
+                    self._local_pair_active_secondaries,
+                ),
+                (
+                    PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
+                    self._local_residual_art_counts,
+                    self._local_residual_candidates,
+                    self._local_residual_secondaries,
+                    self._local_residual_active_counts,
+                    self._local_residual_active_candidates,
+                    self._local_residual_active_secondaries,
+                ),
+            )
+            for (
+                owner,
+                counts,
+                candidates,
+                secondaries,
+                active_counts,
+                active_candidates,
+                active_secondaries,
+            ) in pair_tiers:
+                for size, active_count in active_counts.items():
+                    active_count.zero_()
+                    wp.launch(
+                        compact_local_pair_candidates,
+                        dim=counts[size],
+                        inputs=[
+                            candidates[size],
+                            secondaries[size],
+                            self.art_to_world,
+                            self._local_solve_owner,
+                            owner,
+                        ],
+                        outputs=[active_count, active_candidates[size], active_secondaries[size]],
+                        device=model.device,
+                    )
 
     def _stage4_zero_world_C(self):
         self.C.zero_()
@@ -15586,6 +15769,8 @@ def _get_pgs_solve_local_owned_kernel(
     *,
     warps_per_block: int = 1,
     contact_capable: bool = True,
+    mf_max_constraints: int = 0,
+    local_mf_max_constraints: int = 0,
 ) -> "wp.Kernel":
     """Fuse response construction and PGS for one local articulation or pair."""
     del device_arch
@@ -15593,11 +15778,15 @@ def _get_pgs_solve_local_owned_kernel(
         raise ValueError("warps_per_block must be 1 or 2")
     if not contact_capable and paired_dof_count:
         raise ValueError("only single-articulation kernels may omit contact handling")
+    if local_mf_max_constraints and (not contact_capable or not paired_dof_count or mf_max_constraints <= 0):
+        raise ValueError("local MF rows require a contact-capable articulation pair and positive MF storage")
     max_rows = max_constraints
     local_rows = local_max_constraints
     dofs = dof_count
     paired_dofs = paired_dof_count
     total_dofs = dofs + paired_dofs
+    mf_storage_rows = mf_max_constraints
+    local_mf_rows = local_mf_max_constraints
 
     warp_setup = (
         """    const int warp = threadIdx.x >> 5;
@@ -15637,6 +15826,8 @@ def _get_pgs_solve_local_owned_kernel(
                 ("int", "s_active", local_rows),
             ]
         )
+    if local_mf_rows:
+        shared_specs.append(("float", "s_mf_lambda", local_mf_rows))
     if warps_per_block == 1:
         shared_declarations = "\n".join(
             f"    __shared__ {value_type} {name}[{count}];" for value_type, name, count in shared_specs
@@ -15799,6 +15990,116 @@ def _get_pgs_solve_local_owned_kernel(
         else "        if (__ballot_sync(MASK, changed != 0) == 0u) break;"
     )
     impulse_active = "s_active[row] != 0" if contact_capable else "(active_rows & (1u << row)) != 0u"
+    mf_setup = (
+        f"""
+    int mf_count = mf_constraint_count.data[world];
+    if (mf_count > {local_mf_rows}) mf_count = {local_mf_rows};
+    const int mf_offset = world * {mf_storage_rows};
+    const int mf_meta_offset = mf_offset * 4;
+    const int mf6_base = world * {mf_storage_rows * 6};
+    for (int row = lane; row < mf_count; row += 32)
+        s_mf_lambda[row] = mf_impulses.data[mf_offset + row];"""
+        if local_mf_rows
+        else ""
+    )
+    mf_solve = (
+        f"""
+        for (int mf_row = 0; mf_row < mf_count; ++mf_row) {{
+            const int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[mf_meta_offset + mf_row * 4]);
+            const int packed_dofs = meta.x;
+            const int dof_a = packed_dofs >> 16;
+            const int dof_b = (packed_dofs << 16) >> 16;
+            const float inverse_diagonal = __int_as_float(meta.y);
+            const int packed_type_parent = meta.w;
+            const int mf_row_type = packed_type_parent & 0xFFFF;
+            if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
+                && global_iteration < friction_start_iteration) {{
+                s_mf_lambda[mf_row] = 0.0f;
+                __syncwarp();
+                continue;
+            }}
+            if (inverse_diagonal <= 0.0f) continue;
+
+            const int mf6 = mf6_base + mf_row * 6;
+            float partial_mf = 0.0f;
+            if (lane < 6 && dof_a >= 0)
+                partial_mf = mf_J_a.data[mf6 + lane] * s_v[dof_a + lane];
+            if (lane >= 6 && lane < 12 && dof_b >= 0)
+                partial_mf = mf_J_b.data[mf6 + lane - 6] * s_v[dof_b + lane - 6];
+            partial_mf += __shfl_down_sync(MASK, partial_mf, 16);
+            partial_mf += __shfl_down_sync(MASK, partial_mf, 8);
+            partial_mf += __shfl_down_sync(MASK, partial_mf, 4);
+            partial_mf += __shfl_down_sync(MASK, partial_mf, 2);
+            partial_mf += __shfl_down_sync(MASK, partial_mf, 1);
+            const float velocity_mf = __shfl_sync(MASK, partial_mf, 0);
+
+            const float residual_mf = velocity_mf + __int_as_float(meta.z);
+            const float old_impulse_mf = s_mf_lambda[mf_row];
+            float delta_mf = -residual_mf * inverse_diagonal;
+            if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)})
+                delta_mf = -residual_mf * inverse_diagonal * contact_regularization_w
+                    - (1.0f - contact_regularization_w) * old_impulse_mf;
+            float new_impulse_mf = old_impulse_mf + omega * delta_mf;
+
+            if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}) {{
+                if (new_impulse_mf < 0.0f) new_impulse_mf = 0.0f;
+            }} else if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
+                const int parent_mf = packed_type_parent >> 16;
+                const float radius_mf = fmaxf(
+                    mf_row_mu.data[mf_offset + mf_row] * s_mf_lambda[parent_mf], 0.0f);
+                if (radius_mf <= 0.0f) {{
+                    new_impulse_mf = 0.0f;
+                }} else {{
+                    const int sibling_mf = mf_row == parent_mf + 1 ? parent_mf + 2 : parent_mf + 1;
+                    s_mf_lambda[mf_row] = new_impulse_mf;
+                    const float sibling_old_mf = s_mf_lambda[sibling_mf];
+                    const float magnitude_mf = sqrtf(
+                        new_impulse_mf * new_impulse_mf + sibling_old_mf * sibling_old_mf);
+                    if (magnitude_mf > radius_mf) {{
+                        const float scale_mf = radius_mf / magnitude_mf;
+                        new_impulse_mf *= scale_mf;
+                        const float sibling_new_mf = sibling_old_mf * scale_mf;
+                        const float sibling_delta_mf = sibling_new_mf - sibling_old_mf;
+                        if (sibling_delta_mf != 0.0f) {{
+                            changed = 1;
+                            s_mf_lambda[sibling_mf] = sibling_new_mf;
+                            const int sibling_meta_offset = mf_meta_offset + sibling_mf * 4;
+                            const int sibling_packed_dofs = mf_meta.data[sibling_meta_offset];
+                            const int sibling_dof_a = sibling_packed_dofs >> 16;
+                            const int sibling_dof_b = (sibling_packed_dofs << 16) >> 16;
+                            const int sibling_mf6 = mf6_base + sibling_mf * 6;
+                            if (lane < 6 && sibling_dof_a >= 0)
+                                s_v[sibling_dof_a + lane] +=
+                                    mf_MiJt_a.data[sibling_mf6 + lane] * sibling_delta_mf;
+                            if (lane >= 6 && lane < 12 && sibling_dof_b >= 0)
+                                s_v[sibling_dof_b + lane - 6] +=
+                                    mf_MiJt_b.data[sibling_mf6 + lane - 6] * sibling_delta_mf;
+                        }}
+                    }}
+                }}
+            }}
+
+            const float delta_impulse_mf = new_impulse_mf - old_impulse_mf;
+            s_mf_lambda[mf_row] = new_impulse_mf;
+            if (delta_impulse_mf != 0.0f) {{
+                changed = 1;
+                if (lane < 6 && dof_a >= 0)
+                    s_v[dof_a + lane] += mf_MiJt_a.data[mf6 + lane] * delta_impulse_mf;
+                if (lane >= 6 && lane < 12 && dof_b >= 0)
+                    s_v[dof_b + lane - 6] += mf_MiJt_b.data[mf6 + lane - 6] * delta_impulse_mf;
+            }}
+            __syncwarp();
+        }}"""
+        if local_mf_rows
+        else ""
+    )
+    mf_store = (
+        """
+    for (int row = lane; row < mf_count; row += 32)
+        mf_impulses.data[mf_offset + row] = s_mf_lambda[row];"""
+        if local_mf_rows
+        else ""
+    )
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
@@ -15815,6 +16116,7 @@ def _get_pgs_solve_local_owned_kernel(
     const int group_l_base = group * {dofs * dofs};
 {pair_setup}
 {shared_declarations}
+{mf_setup}
 
     for (int i = lane; i < {dofs * dofs}; i += 32) s_L[i] = L_group.data[group_l_base + i];
 {pair_factor_load}
@@ -15892,6 +16194,7 @@ def _get_pgs_solve_local_owned_kernel(
             }}
 {row_sync}
         }}
+{mf_solve}
 {early_exit}
     }}
 
@@ -15900,6 +16203,7 @@ def _get_pgs_solve_local_owned_kernel(
         world_diag.data[world_row_base + row] = s_diag[row];
         if ({impulse_active}) world_impulses.data[world_row_base + row] = s_lambda[row];
     }}
+{mf_store}
 {shared_cleanup}
 #endif
 """
@@ -15923,6 +16227,15 @@ def _get_pgs_solve_local_owned_kernel(
         world_row_type: wp.array2d[int],
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
+        mf_constraint_count: wp.array[int],
+        mf_meta: wp.array2d[int],
+        mf_impulses: wp.array2d[float],
+        mf_J_a: wp.array3d[float],
+        mf_J_b: wp.array3d[float],
+        mf_MiJt_a: wp.array3d[float],
+        mf_MiJt_b: wp.array3d[float],
+        mf_row_mu: wp.array2d[float],
+        contact_regularization_w: float,
         iterations: int,
         omega: float,
         friction_start_iteration: int,
@@ -15949,6 +16262,15 @@ def _get_pgs_solve_local_owned_kernel(
         world_row_type: wp.array2d[int],
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
+        mf_constraint_count: wp.array[int],
+        mf_meta: wp.array2d[int],
+        mf_impulses: wp.array2d[float],
+        mf_J_a: wp.array3d[float],
+        mf_J_b: wp.array3d[float],
+        mf_MiJt_a: wp.array3d[float],
+        mf_MiJt_b: wp.array3d[float],
+        mf_row_mu: wp.array2d[float],
+        contact_regularization_w: float,
         iterations: int,
         omega: float,
         friction_start_iteration: int,
@@ -15977,6 +16299,15 @@ def _get_pgs_solve_local_owned_kernel(
             world_row_type,
             world_row_parent,
             world_row_mu,
+            mf_constraint_count,
+            mf_meta,
+            mf_impulses,
+            mf_J_a,
+            mf_J_b,
+            mf_MiJt_a,
+            mf_MiJt_b,
+            mf_row_mu,
+            contact_regularization_w,
             iterations,
             omega,
             friction_start_iteration,
@@ -16005,6 +16336,15 @@ def _get_pgs_solve_local_owned_kernel(
         world_row_type: wp.array2d[int],
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
+        mf_constraint_count: wp.array[int],
+        mf_meta: wp.array2d[int],
+        mf_impulses: wp.array2d[float],
+        mf_J_a: wp.array3d[float],
+        mf_J_b: wp.array3d[float],
+        mf_MiJt_a: wp.array3d[float],
+        mf_MiJt_b: wp.array3d[float],
+        mf_row_mu: wp.array2d[float],
+        contact_regularization_w: float,
         iterations: int,
         omega: float,
         friction_start_iteration: int,
@@ -16035,6 +16375,15 @@ def _get_pgs_solve_local_owned_kernel(
                 world_row_type,
                 world_row_parent,
                 world_row_mu,
+                mf_constraint_count,
+                mf_meta,
+                mf_impulses,
+                mf_J_a,
+                mf_J_b,
+                mf_MiJt_a,
+                mf_MiJt_b,
+                mf_row_mu,
+                contact_regularization_w,
                 iterations,
                 omega,
                 friction_start_iteration,
@@ -16050,6 +16399,8 @@ def _get_pgs_solve_local_owned_kernel(
         name += f"_w{warps_per_block}"
     if not contact_capable:
         name += "_contact0"
+    if local_mf_rows:
+        name += f"_mf{local_mf_rows}"
     template = pgs_solve_local_internal_template
     if persistent_queue:
         name += "_queue"
