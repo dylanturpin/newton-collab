@@ -58,6 +58,8 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
         prev_types = np.full((1, max_c), -1, dtype=np.int32)
         prev_types[0, 4] = PGS_CONSTRAINT_TYPE_CONTACT
         prev_types[0, 5:7] = PGS_CONSTRAINT_TYPE_FRICTION
+        prev_parents = np.full((1, max_c), -1, dtype=np.int32)
+        prev_parents[0, 5:7] = 4
 
         current_types = np.full((1, max_c), -1, dtype=np.int32)
         current_types[0, 2] = PGS_CONSTRAINT_TYPE_CONTACT
@@ -78,6 +80,8 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
                 wp.array([4], dtype=wp.int32),  # previous base slot
                 wp.array(prev_impulses, dtype=wp.float32),
                 wp.array(prev_types, dtype=wp.int32),
+                wp.array(prev_parents, dtype=wp.int32),
+                wp.array([5], dtype=wp.int32),
                 wp.array(current_types, dtype=wp.int32),
                 wp.array(current_parents, dtype=wp.int32),
                 0.75,

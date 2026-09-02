@@ -109,7 +109,11 @@ def _drop(
     control = model.control()
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
     heights, velocities, counts, routes = [], [], [], set()
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest") if mf_warmstart else None
+    pipeline = (
+        newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
+        if pgs_warmstart or mf_warmstart
+        else None
+    )
     contacts = pipeline.contacts() if pipeline is not None else None
     for _ in range(steps):
         if pipeline is None:
