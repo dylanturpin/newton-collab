@@ -9740,6 +9740,7 @@ def classify_local_solve_worlds(
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
     body_to_articulation: wp.array[int],
+    articulation_dof_count: wp.array[int],
     local_primary_articulation: wp.array[int],
     local_pair_articulation: wp.array[int],
     local_residual_pair_articulation: wp.array[int],
@@ -9772,12 +9773,15 @@ def classify_local_solve_worlds(
         mf_row += 1
 
     owner = PGS_LOCAL_SOLVE_OWNER_GENERAL
-    if row_count > 0 and row_count <= local_max_constraints and mf_count == 0 and primary_articulation >= 0:
-        if single_phase:
+    single_row_capacity = int(0)
+    if primary_articulation >= 0:
+        single_row_capacity = wp.min(local_max_constraints, articulation_dof_count[primary_articulation])
+    if row_count > 0 and mf_count == 0:
+        if single_phase and row_count <= single_row_capacity:
             owner = PGS_LOCAL_SOLVE_OWNER_SINGLE
-        elif pair_articulation >= 0:
+        elif not single_phase and row_count <= local_max_constraints and pair_articulation >= 0:
             owner = PGS_LOCAL_SOLVE_OWNER_PAIR
-    elif (
+    if owner == PGS_LOCAL_SOLVE_OWNER_GENERAL and (
         row_count > 0
         and row_count <= local_residual_max_constraints
         and residual_pair_articulation >= 0
