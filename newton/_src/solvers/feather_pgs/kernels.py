@@ -1094,6 +1094,7 @@ def eval_rigid_fk_id(
     is_free_rigid: wp.array[int],
     materialize_all_body_inertia: int,
     materialize_body_inertia_terms: int,
+    reuse_cached: int,
     gravity: wp.array[wp.vec3],
     # outputs
     body_q: wp.array[wp.transform],
@@ -1105,9 +1106,12 @@ def eval_rigid_fk_id(
     body_v_s: wp.array[wp.spatial_vector],
     body_f_s: wp.array[wp.spatial_vector],
     body_a_s: wp.array[wp.spatial_vector],
+    fk_id_cache_valid: wp.array[int],
 ):
-    """Evaluate articulation poses and inverse dynamics in one serial traversal pipeline."""
+    """Evaluate and cache articulation poses and inverse dynamics."""
     index = wp.tid()
+    if reuse_cached != 0 and fk_id_cache_valid[index] != 0:
+        return
     start = articulation_start[index]
     end = articulation_joint_end[index]
 
@@ -1183,6 +1187,7 @@ def eval_rigid_fk_id(
             body_a_s,
         )
         cached_child = child
+    fk_id_cache_valid[index] = 1
 
 
 @wp.kernel
@@ -5398,6 +5403,20 @@ def reset_world_warmstart_buffers(
     if world < prev_mf_row_parent.shape[0]:
         for row in range(prev_mf_row_parent.shape[1]):
             prev_mf_row_parent[world, row] = -1
+
+
+@wp.kernel
+def invalidate_articulation_fk_id_cache(
+    world_mask: wp.array[wp.bool],
+    art_to_world: wp.array[int],
+    fk_id_cache_valid: wp.array[int],
+):
+    """Invalidate cached articulation dynamics for selected worlds."""
+    articulation = wp.tid()
+    world = art_to_world[articulation]
+    if world_mask and not world_mask[world]:
+        return
+    fk_id_cache_valid[articulation] = 0
 
 
 # =============================================================================
