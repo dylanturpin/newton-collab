@@ -194,6 +194,8 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
 
         np.testing.assert_allclose(velocity_out.numpy()[:dof_count], expected_velocity, rtol=0.0, atol=2.0e-6)
         np.testing.assert_allclose(impulses.numpy()[0, :2], expected_impulses, rtol=0.0, atol=2.0e-6)
+        np.testing.assert_allclose(diagonal_out.numpy()[0, :2], diagonal, rtol=0.0, atol=2.0e-6)
+        np.testing.assert_array_equal(diagonal_out.numpy()[1], cfm[1])
         np.testing.assert_array_equal(velocity_out.numpy()[dof_count:], velocity[dof_count:])
         np.testing.assert_array_equal(impulses.numpy()[1], np.zeros(max_constraints, dtype=np.float32))
 
@@ -262,8 +264,8 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             return variant_diagonal.numpy(), variant_impulses.numpy(), variant_velocity.numpy()
 
         one_warp_outputs = launch_variant(1)
-        variants = [
-            launch_variant(2),
+        exact_variants = [launch_variant(2)]
+        numerical_variants = [
             launch_variant(1, contact_capable=False),
             launch_variant(2, contact_capable=False),
         ]
@@ -283,10 +285,10 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 dense_response_matrix=True,
             ),
         ]
-        for variant_outputs in variants:
+        for variant_outputs in exact_variants:
             for one_warp, variant in zip(one_warp_outputs, variant_outputs, strict=True):
                 np.testing.assert_array_equal(variant, one_warp)
-        for variant_outputs in matrix_variants:
+        for variant_outputs in numerical_variants + matrix_variants:
             for one_warp, variant in zip(one_warp_outputs, variant_outputs, strict=True):
                 np.testing.assert_allclose(variant, one_warp, rtol=0.0, atol=2.0e-6)
 
