@@ -4922,12 +4922,19 @@ class SolverFeatherPGS(SolverBase):
                     residual_stream.wait_event(local_ready_event)
             use_general_queue = bool(self._local_internal_fast_path)
             general_block_count = self._local_general_solver_blocks if use_general_queue else self.world_count
-            if local_stream is not None and residual_stream is not None:
-                wp.launch(local_solve_launch_gate, dim=1, device=self.model.device)
-                bulk_ready_event = wp.get_stream(self.model.device).record_event()
-                local_stream.wait_event(bulk_ready_event)
+            if local_stream is not None:
+                # Admit scarce residual and paired worlds before the bulk single-world grid can occupy the GPU.
+                if residual_stream is not None:
+                    wp.launch(local_solve_launch_gate, dim=1, device=self.model.device)
+                    pair_ready_event = wp.get_stream(self.model.device).record_event()
+                    if pair_stream is not None:
+                        pair_stream.wait_event(pair_ready_event)
+                    else:
+                        local_stream.wait_event(pair_ready_event)
                 if pair_stream is not None:
-                    pair_stream.wait_event(bulk_ready_event)
+                    wp.launch(local_solve_launch_gate, dim=1, device=self.model.device)
+                    single_ready_event = wp.get_stream(self.model.device).record_event()
+                    local_stream.wait_event(single_ready_event)
             with self._sync_timed(f"mfgs_phase{row_phase}_iters{phase_iterations}"):
                 wp.launch_tiled(
                     mf_gs_kernel,
