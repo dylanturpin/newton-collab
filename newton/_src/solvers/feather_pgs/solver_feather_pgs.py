@@ -15981,7 +15981,7 @@ def _get_pgs_solve_local_owned_kernel(
         [
             ("float", "s_J", local_rows * total_dofs),
             ("float", "s_Y", local_rows * total_dofs),
-            ("float", "s_diag", local_rows),
+            ("float", "s_inverse_diagonal", local_rows),
             ("float", "s_v", total_dofs),
             ("float", "s_lambda", local_rows),
             ("float", "s_rhs", local_rows),
@@ -16026,8 +16026,11 @@ def _get_pgs_solve_local_owned_kernel(
         shared_cleanup = "\n".join(f"#undef {name}" for _, name, _ in shared_specs)
     pair_factor_load = (
         f"""
-    for (int i = lane; i < {paired_dofs * paired_dofs}; i += {lanes_per_world})
-        s_L_secondary[i] = secondary_L_group.data[secondary_group_l_base + i];"""
+    for (int i = lane; i < {paired_dofs * paired_dofs}; i += {lanes_per_world}) {{
+        float factor = secondary_L_group.data[secondary_group_l_base + i];
+        if (i % {paired_dofs + 1} == 0) factor = factor != 0.0f ? 1.0f / factor : 0.0f;
+        s_L_secondary[i] = factor;
+    }}"""
         if paired_dofs
         else ""
     )
@@ -16058,16 +16061,16 @@ def _get_pgs_solve_local_owned_kernel(
             float value = s_J[row * {total_dofs} + {dofs} + i];
             for (int k = 0; k < i; ++k)
                 value -= s_L_secondary[i * {paired_dofs} + k] * secondary_response[k];
-            const float factor_diagonal = s_L_secondary[i * {paired_dofs} + i];
-            secondary_response[i] = factor_diagonal != 0.0f ? value / factor_diagonal : 0.0f;
+            const float inverse_factor_diagonal = s_L_secondary[i * {paired_dofs} + i];
+            secondary_response[i] = value * inverse_factor_diagonal;
         }}
         for (int reverse = 0; reverse < {paired_dofs}; ++reverse) {{
             const int i = {paired_dofs} - 1 - reverse;
             float value = secondary_response[i];
             for (int k = i + 1; k < {paired_dofs}; ++k)
                 value -= s_L_secondary[k * {paired_dofs} + i] * secondary_response[k];
-            const float factor_diagonal = s_L_secondary[i * {paired_dofs} + i];
-            secondary_response[i] = factor_diagonal != 0.0f ? value / factor_diagonal : 0.0f;
+            const float inverse_factor_diagonal = s_L_secondary[i * {paired_dofs} + i];
+            secondary_response[i] = value * inverse_factor_diagonal;
         }}
         for (int i = 0; i < {paired_dofs}; ++i) {{
             s_Y[row * {total_dofs} + {dofs} + i] = secondary_response[i];
@@ -16313,7 +16316,7 @@ def _get_pgs_solve_local_owned_kernel(
     row_residual = (
         f"""            float delta = 0.0f;
             if ({dense_matrix_condition}) {{
-                delta = -s_base_residual[row] / denominator;
+                delta = -s_base_residual[row] * inverse_diagonal;
             }} else {{
                 float partial = 0.0f;
                 if (lane < {total_dofs}) partial = s_J[row * {total_dofs} + lane] * s_v[lane];
@@ -16323,7 +16326,7 @@ def _get_pgs_solve_local_owned_kernel(
                 partial += __shfl_down_sync(MASK, partial, 2);
                 partial += __shfl_down_sync(MASK, partial, 1);
                 const float velocity = __shfl_sync(MASK, partial, 0);
-                delta = -(velocity + s_rhs[row]) / denominator;
+                delta = -(velocity + s_rhs[row]) * inverse_diagonal;
             }}"""
         if dense_response_matrix
         else f"""            float partial = 0.0f;
@@ -16334,7 +16337,7 @@ def _get_pgs_solve_local_owned_kernel(
             partial += __shfl_down_sync(MASK, partial, 2);
             partial += __shfl_down_sync(MASK, partial, 1);
             const float velocity = __shfl_sync(MASK, partial, 0);
-            const float delta = -(velocity + s_rhs[row]) / denominator;"""
+            const float delta = -(velocity + s_rhs[row]) * inverse_diagonal;"""
     )
     main_state_update = (
         f"""if ({dense_matrix_condition}) {{
@@ -16534,6 +16537,18 @@ def _get_pgs_solve_local_owned_kernel(
         if local_mf_rows
         else ""
     )
+    factor_diagonal_load = (
+        f"""        if (i % {dofs + 1} == 0) factor = factor != 0.0f ? 1.0f / factor : 0.0f;"""
+        if contact_capable
+        else ""
+    )
+    factor_diagonal_solve = (
+        """            const float inverse_factor_diagonal = s_L[i * {dofs} + i];
+            response[i] = value * inverse_factor_diagonal;"""
+        if contact_capable
+        else """            const float factor_diagonal = s_L[i * {dofs} + i];
+            response[i] = factor_diagonal != 0.0f ? value / factor_diagonal : 0.0f;"""
+    ).format(dofs=dofs)
     snippet = f"""
 #if defined(__CUDA_ARCH__)
 {group_setup}
@@ -16551,8 +16566,11 @@ def _get_pgs_solve_local_owned_kernel(
 {shared_declarations}
 {mf_setup}
 
-    for (int i = lane; i < {dofs * dofs}; i += {lanes_per_world})
-        s_L[i] = L_group.data[group_l_base + i];
+    for (int i = lane; i < {dofs * dofs}; i += {lanes_per_world}) {{
+        float factor = L_group.data[group_l_base + i];
+{factor_diagonal_load}
+        s_L[i] = factor;
+    }}
 {pair_factor_load}
 {lane_metadata}
     for (int row = lane; row < row_count; row += {lanes_per_world}) {{
@@ -16575,15 +16593,13 @@ def _get_pgs_solve_local_owned_kernel(
         for (int i = 0; i < {dofs}; ++i) {{
             float value = s_J[row * {total_dofs} + i];
             for (int k = 0; k < i; ++k) value -= s_L[i * {dofs} + k] * response[k];
-            const float factor_diagonal = s_L[i * {dofs} + i];
-            response[i] = factor_diagonal != 0.0f ? value / factor_diagonal : 0.0f;
+{factor_diagonal_solve}
         }}
         for (int reverse = 0; reverse < {dofs}; ++reverse) {{
             const int i = {dofs} - 1 - reverse;
             float value = response[i];
             for (int k = i + 1; k < {dofs}; ++k) value -= s_L[k * {dofs} + i] * response[k];
-            const float factor_diagonal = s_L[i * {dofs} + i];
-            response[i] = factor_diagonal != 0.0f ? value / factor_diagonal : 0.0f;
+{factor_diagonal_solve}
         }}
 
         float diagonal = 0.0f;
@@ -16593,7 +16609,9 @@ def _get_pgs_solve_local_owned_kernel(
         }}
 {pair_response}
         {active_store}
-        s_diag[row] = diagonal + world_diag.data[world_row_base + row];
+        const float effective_diagonal = diagonal + world_diag.data[world_row_base + row];
+        s_inverse_diagonal[row] = effective_diagonal > 0.0f ? 1.0f / effective_diagonal : 0.0f;
+        world_diag.data[world_row_base + row] = effective_diagonal;
     }}
     __syncwarp();
 {response_matrix_setup}
@@ -16606,8 +16624,8 @@ def _get_pgs_solve_local_owned_kernel(
         for (int row = 0; row < row_count; ++row) {{
 {row_setup}
 {friction_gate}
-            const float denominator = s_diag[row];
-            if (denominator <= 0.0f) continue;
+            const float inverse_diagonal = s_inverse_diagonal[row];
+            if (inverse_diagonal <= 0.0f) continue;
 
 {row_residual}
             const float old_impulse = s_lambda[row];
@@ -16628,7 +16646,6 @@ def _get_pgs_solve_local_owned_kernel(
 {response_matrix_commit}
 {velocity_store}
     for (int row = lane; row < row_count; row += {lanes_per_world}) {{
-        world_diag.data[world_row_base + row] = s_diag[row];
         if ({impulse_active}) world_impulses.data[world_row_base + row] = s_lambda[row];
     }}
 {mf_store}
