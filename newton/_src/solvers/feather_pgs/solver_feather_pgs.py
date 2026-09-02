@@ -6379,7 +6379,7 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 1: FK/ID + drives + CRBA
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self._nvtx, synchronize=False):
-            global_inertia_ready = self._stage1_fk_id(state_in, state_aug, state_out)
+            global_inertia_ready, stage3_qd = self._stage1_fk_id(state_in, state_aug, state_out)
 
             if model.articulation_count:
                 self._stage1_drives(state_in, state_aug, control, dt)
@@ -6412,9 +6412,9 @@ class SolverFeatherPGS(SolverBase):
                         self._stage3_trisolve_tiled(size, state_aug)
                     else:
                         self._stage3_trisolve_loop(size, state_aug)
-            self._stage3_compute_v_hat(state_in, state_aug, dt)
+            self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
             self._clamp_rigid_velocity_limits(self.v_hat)
-            wp.copy(self._debug_stage3_qd_work, self.qd_work)
+            wp.copy(self._debug_stage3_qd_work, stage3_qd)
             wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
             wp.copy(self._debug_stage3_v_hat, self.v_hat)
 
@@ -7408,7 +7408,7 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State) -> wp.Event | None:
+    def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State) -> tuple[wp.Event | None, wp.array]:
         model = self.model
 
         # evaluate joint inertias, motion vectors, and forces
@@ -7418,8 +7418,8 @@ class SolverFeatherPGS(SolverBase):
             self._fk_id_cache_source_state = state_in
         else:
             state_aug.body_f_s.zero_()
-        wp.copy(self.qd_work, state_in.joint_qd)
         if self.enable_joint_velocity_limits:
+            wp.copy(self.qd_work, state_in.joint_qd)
             wp.launch(
                 prescale_joint_velocity_limits,
                 dim=model.articulation_count,
@@ -7437,6 +7437,9 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[self.qd_work],
                 device=model.device,
             )
+            stage3_qd = self.qd_work
+        else:
+            stage3_qd = state_in.joint_qd
 
         refresh_composite = (self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update
         parallel_global_refresh = refresh_composite and self._global_inertia_stream is not None
@@ -7452,7 +7455,7 @@ class SolverFeatherPGS(SolverBase):
                 model.joint_q_start,
                 model.joint_qd_start,
                 state_in.joint_q,
-                self.qd_work,
+                stage3_qd,
                 model.joint_X_p,
                 model.joint_X_c,
                 self.body_X_com,
@@ -7505,7 +7508,7 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[state_out.body_qd],
                 device=model.device,
             )
-        return global_inertia_ready
+        return global_inertia_ready, stage3_qd
 
     def _stage1_drives(self, state_in: State, state_aug: State, control: Control, dt: float):
         """Populate ``state_aug.joint_tau`` and apply the effort-limit clamp.
@@ -7842,7 +7845,7 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage3_compute_v_hat(self, state_in: State, state_aug: State, dt: float):
+    def _stage3_compute_v_hat(self, state_in: State, state_aug: State, dt: float, stage3_qd: wp.array):
         model = self.model
         if not model.joint_count:
             return
@@ -7850,7 +7853,7 @@ class SolverFeatherPGS(SolverBase):
             compute_velocity_predictor,
             dim=model.joint_dof_count,
             inputs=[
-                self.qd_work,
+                stage3_qd,
                 self._kinematic_dof_mask,
                 dt,
             ],
@@ -7869,7 +7872,7 @@ class SolverFeatherPGS(SolverBase):
                 self._free_root_joint_indices,
                 model.joint_qd_start,
                 self._kinematic_joint_mask,
-                self.qd_work,
+                stage3_qd,
                 dt,
             ],
             outputs=[self.v_hat],
