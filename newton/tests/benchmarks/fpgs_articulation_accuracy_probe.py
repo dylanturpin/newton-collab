@@ -36,6 +36,7 @@ from fpgs_articulation_row_scaling import (  # noqa: E402
     _restore_state,
     _snapshot_state,
     _state_linf,
+    scalar_hinv_jt,
 )
 
 _NEWTON_REPO = Path(__file__).resolve().parents[3]
@@ -140,21 +141,21 @@ def _make_solver(
 ) -> SolverFeatherPGS:
     dense_capacity, mf_capacity = _solver_capacities(case)
     response_mode = "propagation" if path == "propagation" else "immediate"
-    return SolverFeatherPGS(
-        model,
-        pgs_mode="matrix_free",
-        articulated_contact_response=response_mode,
-        hinv_jt_kernel="par_row",
-        pgs_iterations=pgs_iterations,
-        pgs_velocity_iterations=pgs_velocity_iterations,
-        enable_contact_friction=enable_contact_friction,
-        contact_friction_position_iterations=contact_friction_position_iterations,
-        dense_max_constraints=dense_capacity,
-        mf_max_constraints=mf_capacity,
-        pgs_warmstart=False,
-        mf_warmstart=False,
-        pgs_debug=pgs_debug,
-    )
+    with scalar_hinv_jt():
+        return SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            articulated_contact_response=response_mode,
+            pgs_iterations=pgs_iterations,
+            pgs_velocity_iterations=pgs_velocity_iterations,
+            enable_contact_friction=enable_contact_friction,
+            contact_friction_position_iterations=contact_friction_position_iterations,
+            dense_max_constraints=dense_capacity,
+            mf_max_constraints=mf_capacity,
+            pgs_warmstart=False,
+            mf_warmstart=False,
+            pgs_debug=pgs_debug,
+        )
 
 
 def _run_one_step(

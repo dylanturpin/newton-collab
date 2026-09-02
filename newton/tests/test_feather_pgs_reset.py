@@ -66,7 +66,7 @@ def _assert_worlds(test: unittest.TestCase, specs, reset_worlds: tuple[bool, boo
 class TestFeatherPGSReset(unittest.TestCase):
     def test_reset_clears_enabled_histories_by_scope(self):
         cases = (
-            ("dense selected", "dense", True, False, (True, False)),
+            ("dense selected", "split", True, False, (True, False)),
             ("MF selected", "split", False, True, (True, False)),
             ("combined selected", "split", True, True, (True, False)),
             ("combined all", "split", True, True, (True, True)),

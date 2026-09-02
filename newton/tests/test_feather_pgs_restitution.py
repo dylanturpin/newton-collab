@@ -136,7 +136,6 @@ def _make_solver(
         "pgs_velocity_iterations": velocity_iterations,
         "pgs_cfm": 0.0,
         "pgs_omega": 1.0,
-        "pgs_velocity_omega": 1.0,
         "pgs_warmstart": pgs_warmstart,
         "mf_warmstart": mf_warmstart,
     }
@@ -722,8 +721,6 @@ def test_dense_and_production_split_modes_enforce_restitution_without_velocity_i
     speed = 3.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
     cases = (
-        ("dense/free", "dense", "free", PATH_DENSE),
-        ("dense/articulated", "dense", "articulated", PATH_DENSE),
         ("split/free", "split", "free", PATH_MATRIX_FREE),
         ("split/articulated", "split", "articulated", PATH_DENSE),
     )

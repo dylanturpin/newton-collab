@@ -670,7 +670,7 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         contacts = pipeline.contacts()
         pipeline.collide(state_0, contacts)
         cases = (
-            ("pgs_warmstart=True", {"pgs_mode": "dense", "pgs_warmstart": True}),
+            ("pgs_warmstart=True", {"pgs_mode": "split", "pgs_warmstart": True}),
             ("pgs_warmstart=True", {"pgs_mode": "split", "mf_warmstart": True}),
         )
         for label, kwargs in cases:
@@ -1009,7 +1009,10 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         if not wp.get_device().is_cuda:
             self.skipTest("FeatherPGS contact-mode conformance is a CUDA-only merge gate")
 
-        configs = [("dense", "immediate", 16, _free_jointed_foot, "dense")]
+        configs = [
+            ("split", "immediate", 16, _prismatic_jointed_foot, "dense"),
+            ("split", "immediate", 16, _free_jointed_foot, "mf"),
+        ]
         # Matrix-free (and its propagation response family) is CUDA-only. Use
         # a non-free prismatic articulation for every propagation variant. A
         # free-only scene disables propagation-fused and would let that
@@ -2282,7 +2285,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         plain = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
         contacts = plain.contacts()
         plain.collide(state_0, contacts)
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="dense", pgs_warmstart=True)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_warmstart=True)
         control = model.control()
         solver.step(state_0, state_1, control, contacts, DT)
         with wp.ScopedCapture(device) as solver_capture:

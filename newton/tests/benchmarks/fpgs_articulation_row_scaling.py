@@ -12,6 +12,7 @@ no private generated-kernel calls and no reduced row-solver substitutes here.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import json
 import math
@@ -37,6 +38,23 @@ if str(_NEWTON_REPO) not in sys.path:
 
 import newton  # noqa: E402
 from newton.solvers import SolverFeatherPGS  # noqa: E402
+
+
+@contextlib.contextmanager
+def scalar_hinv_jt():
+    """Pin the scalar ``H^-1 J^T`` kernel for every solver built inside the block.
+
+    The row-scaling numbers were recorded with the scalar kernel so that the
+    cost curves isolate contact-row scaling from tiled-kernel occupancy effects;
+    keep them comparable by pinning it through the solver's private test hook.
+    """
+    previous = SolverFeatherPGS._kernel_overrides
+    SolverFeatherPGS._kernel_overrides = {**previous, "hinv_jt_kernel": "par_row"}
+    try:
+        yield
+    finally:
+        SolverFeatherPGS._kernel_overrides = previous
+
 
 PROPAGATION_PATHS = ("propagation", "propagation-fused", "propagation-colored")
 
@@ -546,20 +564,20 @@ def _run_case_path(
     peak_gpu_mem_bytes = _gpu_used_bytes()
     process_gpu_mem_baseline_bytes, process_gpu_mem_source = _current_process_gpu_mem_bytes()
     process_peak_gpu_mem_bytes = process_gpu_mem_baseline_bytes
-    solver = SolverFeatherPGS(
-        model,
-        pgs_mode="matrix_free",
-        articulated_contact_response=response_mode,
-        hinv_jt_kernel="par_row",
-        pgs_iterations=pgs_iterations,
-        pgs_velocity_iterations=pgs_velocity_iterations,
-        enable_contact_friction=enable_contact_friction,
-        contact_friction_position_iterations=contact_friction_position_iterations,
-        dense_max_constraints=dense_capacity,
-        mf_max_constraints=mf_capacity,
-        pgs_warmstart=False,
-        mf_warmstart=False,
-    )
+    with scalar_hinv_jt():
+        solver = SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            articulated_contact_response=response_mode,
+            pgs_iterations=pgs_iterations,
+            pgs_velocity_iterations=pgs_velocity_iterations,
+            enable_contact_friction=enable_contact_friction,
+            contact_friction_position_iterations=contact_friction_position_iterations,
+            dense_max_constraints=dense_capacity,
+            mf_max_constraints=mf_capacity,
+            pgs_warmstart=False,
+            mf_warmstart=False,
+        )
     wp.synchronize()
     peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, _gpu_used_bytes())
     current_process_bytes, current_process_source = _current_process_gpu_mem_bytes()
@@ -991,7 +1009,7 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
         f"dt {args.dt}, PGS iterations {args.pgs_iterations}, velocity iterations {args.pgs_velocity_iterations}, "
         f"contact friction {'off' if args.no_friction else 'on'}, "
         f"contact_friction_position_iterations={args.contact_friction_position_iterations}, "
-        f"`hinv_jt_kernel=par_row`, "
+        f"scalar `H^-1 J^T` kernel pinned, "
         f"joint_armature={args.joint_armature}."
     )
     lines.append("")

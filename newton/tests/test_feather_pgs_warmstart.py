@@ -319,17 +319,15 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
 
     def test_contacts_none_is_valid(self):
         model = newton.ModelBuilder().finalize(device="cpu")
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="dense", pgs_warmstart=True)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_warmstart=True)
         solver.step(model.state(), model.state(), model.control(), None, 1.0 / 60.0)
 
-    def test_dense_and_split_modes_hold_the_press(self):
-        """The identity carry works in both CPU-supported dense routes."""
-        for mode in ("dense", "split"):
-            with self.subTest(mode=mode):
-                impulses, speeds, _ = _run_press(120, {"pgs_warmstart": True}, pgs_mode=mode)
-                self.assertGreater(float(impulses[-1]), 0.0)
-                self.assertLess(float(np.ptp(impulses[-10:])), 1.0e-5)
-                self.assertLess(float(speeds[-10:].max()), 1.0e-4)
+    def test_split_mode_holds_the_press(self):
+        """The identity carry works on the CPU-supported dense-row route."""
+        impulses, speeds, _ = _run_press(120, {"pgs_warmstart": True}, pgs_mode="split")
+        self.assertGreater(float(impulses[-1]), 0.0)
+        self.assertLess(float(np.ptp(impulses[-10:])), 1.0e-5)
+        self.assertLess(float(speeds[-10:].max()), 1.0e-4)
 
 
 @unittest.skipUnless(wp.get_device().is_cuda, "SolverFeatherPGS matrix-free mode requires CUDA")

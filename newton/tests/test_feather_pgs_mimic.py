@@ -99,21 +99,6 @@ class TestFeatherPGSMimic(unittest.TestCase):
         self.assertEqual(solver._mimic_art_start.numpy().tolist(), [0, 1, 2, 3, 4])
         self.assertEqual(solver._mimic_art_list.numpy().tolist(), [0, 1, 2, 3])
 
-    def test_mimic_toggle_disables_coupling(self):
-        """Verify enable_mimic_constraints=False reverts to the pre-mimic solver behavior.
-
-        The solver must warn about the ignored constraint, build no MIMIC rows, and leave
-        the undriven follower swinging free instead of tracking the leader.
-        """
-        with self.assertWarns(UserWarning):
-            solver, q = _run_chain(coef0=0.0, coef1=1.0, leader_target=0.5, enable_mimic_constraints=False)
-        self.assertAlmostEqual(q[0], 0.5, delta=0.05)
-        self.assertNotAlmostEqual(q[1], q[0], delta=0.02)
-        row_types = solver.row_type.numpy()
-        counts = solver.constraint_count.numpy()
-        rows = [int(t) for w in range(row_types.shape[0]) for t in row_types[w, : counts[w]]]
-        self.assertNotIn(PGS_CONSTRAINT_TYPE_MIMIC, rows)
-
     def test_disabled_mimic_is_ignored(self):
         """Verify a disabled mimic constraint leaves the follower joint uncoupled."""
         builder, _, _ = _build_two_revolute_chain(0.0, 1.0)

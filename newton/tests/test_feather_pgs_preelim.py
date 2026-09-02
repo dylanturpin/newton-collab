@@ -126,7 +126,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             solver = newton.solvers.SolverFeatherPGS(
-                model, pgs_mode="dense", pgs_iterations=16, enable_bilateral_preelimination=True
+                model, pgs_mode="split", pgs_iterations=16, enable_bilateral_preelimination=True
             )
         self.assertFalse(solver._preelim_active)
         self.assertTrue(any("matrix_free" in str(w.message) for w in caught))

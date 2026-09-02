@@ -141,9 +141,6 @@ def _make_solver(
     path: str,
     *,
     enable_contact_friction: bool,
-    cholesky_kernel: str,
-    trisolve_kernel: str,
-    hinv_jt_kernel: str,
 ) -> SolverFeatherPGS:
     row_capacity = _planned_row_capacity(case)
     dense_capacity = row_capacity
@@ -154,9 +151,6 @@ def _make_solver(
         model,
         pgs_mode="matrix_free",
         articulated_contact_response=response_mode,
-        cholesky_kernel=cholesky_kernel,
-        trisolve_kernel=trisolve_kernel,
-        hinv_jt_kernel=hinv_jt_kernel,
         pgs_iterations=0,
         pgs_velocity_iterations=0,
         enable_contact_friction=enable_contact_friction,
@@ -560,9 +554,6 @@ def _diagnose_case(
     device: str,
     dt: float,
     enable_contact_friction: bool,
-    cholesky_kernel: str,
-    trisolve_kernel: str,
-    hinv_jt_kernel: str,
     max_sources: int,
     abs_tol: float,
     rel_tol: float,
@@ -574,18 +565,12 @@ def _diagnose_case(
         case,
         "mf_immediate",
         enable_contact_friction=enable_contact_friction,
-        cholesky_kernel=cholesky_kernel,
-        trisolve_kernel=trisolve_kernel,
-        hinv_jt_kernel=hinv_jt_kernel,
     )
     propagation_solver = _make_solver(
         model,
         case,
         "propagation",
         enable_contact_friction=enable_contact_friction,
-        cholesky_kernel=cholesky_kernel,
-        trisolve_kernel=trisolve_kernel,
-        hinv_jt_kernel=hinv_jt_kernel,
     )
     _run_zero_iteration_setup(model, old_solver, contacts, initial, dt=dt)
     _run_zero_iteration_setup(model, propagation_solver, contacts, initial, dt=dt)
@@ -724,7 +709,6 @@ def _write_summary(path: Path, results: list[OperatorDiagnosticResult], args: ar
         f"Classification: {'operator mismatch found' if any_mismatch else 'all sampled operators match'}.",
         f"Tolerance: abs_linf <= {args.abs_tol:g} and rel_fro <= {args.rel_tol:g}.",
         f"Friction rows: {'on' if not args.no_friction else 'off'}.",
-        f"Dense baseline kernels: cholesky={args.cholesky_kernel}, trisolve={args.trisolve_kernel}, hinv_jt={args.hinv_jt_kernel}.",
         "",
         "If this table reports `operator_match`, end-state differences at finite PGS iterations are convergence or ordering effects. If it reports `operator_mismatch`, the propagation operator differs before PGS convergence is relevant.",
         "",
@@ -804,9 +788,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-armature", type=float, default=0.0)
     parser.add_argument("--worst-limit", type=int, default=8)
     parser.add_argument("--no-friction", action="store_true")
-    parser.add_argument("--cholesky-kernel", choices=("auto", "loop", "tiled"), default="auto")
-    parser.add_argument("--trisolve-kernel", choices=("auto", "loop", "tiled"), default="auto")
-    parser.add_argument("--hinv-jt-kernel", choices=("auto", "par_row", "tiled"), default="par_row")
     parser.add_argument(
         "--out-dir",
         type=Path,
@@ -842,9 +823,6 @@ def main() -> None:
                 device=args.device,
                 dt=args.dt,
                 enable_contact_friction=not args.no_friction,
-                cholesky_kernel=args.cholesky_kernel,
-                trisolve_kernel=args.trisolve_kernel,
-                hinv_jt_kernel=args.hinv_jt_kernel,
                 max_sources=args.max_sources,
                 abs_tol=args.abs_tol,
                 rel_tol=args.rel_tol,

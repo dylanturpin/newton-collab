@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -310,17 +311,16 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "tiled launch-config step test requires CUDA")
     def test_non_default_tile_threads_compiles_and_steps(self):
         model = _build_chain_model()
-        solver = SolverFeatherPGS(
-            model,
-            serial_kernel_block_dim=64,
-            tile_threads=128,
-            cholesky_kernel="tiled",
-            trisolve_kernel="tiled",
-            hinv_jt_kernel="tiled",
-            pgs_mode="dense",
-            pgs_kernel="loop",
-            dense_max_constraints=384,
-        )
+        forced = {"cholesky_kernel": "tiled", "trisolve_kernel": "tiled", "hinv_jt_kernel": "tiled"}
+        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", forced):
+            solver = SolverFeatherPGS(
+                model,
+                serial_kernel_block_dim=64,
+                tile_threads=128,
+                pgs_mode="split",
+                pgs_kernel="loop",
+                dense_max_constraints=384,
+            )
         self.assertTrue(all(solver._execution_plan.use_tiled_hinv_jt(size) for size in solver.size_groups))
         self.assertFalse(any(solver._execution_plan.use_fused_hinv_jt(size) for size in solver.size_groups))
         state_0, state_1 = model.state(), model.state()

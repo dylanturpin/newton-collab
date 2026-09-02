@@ -56,6 +56,7 @@ from fpgs_articulation_row_scaling import (
     _restore_state,
     _row_solver_bytes,
     _snapshot_state,
+    scalar_hinv_jt,
 )
 
 import newton
@@ -120,20 +121,20 @@ def _build_model(case: TempCase, world_count: int, device: str, gravity: float) 
 
 def _make_solver(model: newton.Model, case: TempCase, mode: str, pgs_iterations: int) -> SolverFeatherPGS:
     row_capacity = _planned_row_capacity(_bench_case(case, 1))
-    return SolverFeatherPGS(
-        model,
-        pgs_mode="matrix_free",
-        articulated_contact_response="immediate" if mode not in PROPAGATION_PATHS else mode,
-        hinv_jt_kernel="par_row",
-        pgs_iterations=pgs_iterations,
-        pgs_velocity_iterations=0,
-        enable_contact_friction=True,
-        contact_friction_position_iterations=-1,
-        dense_max_constraints=row_capacity,
-        mf_max_constraints=16,
-        pgs_warmstart=False,
-        mf_warmstart=False,
-    )
+    with scalar_hinv_jt():
+        return SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            articulated_contact_response="immediate" if mode not in PROPAGATION_PATHS else mode,
+            pgs_iterations=pgs_iterations,
+            pgs_velocity_iterations=0,
+            enable_contact_friction=True,
+            contact_friction_position_iterations=-1,
+            dense_max_constraints=row_capacity,
+            mf_max_constraints=16,
+            pgs_warmstart=False,
+            mf_warmstart=False,
+        )
 
 
 def _articulated_contact_penetration_m(solver: SolverFeatherPGS) -> float:

@@ -120,19 +120,6 @@ class TestFeatherPGSConnect(unittest.TestCase):
         gap = _loop_anchor_gap(model, state)
         self.assertLess(gap, 2.0e-3, f"loop anchor gap {gap * 1e3:.2f} mm — four-bar not closed")
 
-    def test_connect_toggle_drops_closure(self):
-        """Verify enable_connect_constraints=False stays stable but leaves the loop open.
-
-        The loop joint must still be excluded from the dynamics tree (finite state), while
-        the missing CONNECT rows let the anchors separate far beyond the enforced tolerance
-        — the pre-connect solver behavior, kept reachable for A/B comparison.
-        """
-        with self.assertWarns(UserWarning):
-            _, model, state = _run(steps=720, crank_target=0.6, enable_connect_constraints=False)
-        self.assertTrue(np.isfinite(state.body_q.numpy()).all())
-        gap = _loop_anchor_gap(model, state)
-        self.assertGreater(gap, 1.0e-2, f"loop anchor gap {gap * 1e3:.2f} mm — closure still enforced?")
-
     def test_rocker_follows_crank(self):
         """Verify the undriven rocker moves coherently with the driven crank via the loop."""
         _, _model, state = _run(steps=720, crank_target=0.6)
