@@ -1009,7 +1009,10 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         if not wp.get_device().is_cuda:
             self.skipTest("FeatherPGS contact-mode conformance is a CUDA-only merge gate")
 
-        configs = [("split", "immediate", 16, _free_jointed_foot, "mf")]
+        configs = [
+            ("split", "immediate", 16, _prismatic_jointed_foot, "dense"),
+            ("split", "immediate", 16, _free_jointed_foot, "mf"),
+        ]
         # Matrix-free (and its propagation response family) is CUDA-only. Use
         # a non-free prismatic articulation for every propagation variant. A
         # free-only scene disables propagation-fused and would let that

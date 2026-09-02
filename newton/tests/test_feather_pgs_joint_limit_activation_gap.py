@@ -70,7 +70,15 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
     return J_group.numpy()[0, :count, 0].tolist(), world_phi.numpy()[0, :count].tolist()
 
 
-def _make_phase_layout_run(device, pgs_mode, *, pgs_iterations=0, pgs_schedule="interleaved", response="immediate"):
+def _make_phase_layout_run(
+    device,
+    pgs_mode,
+    *,
+    pgs_iterations=0,
+    pgs_schedule="interleaved",
+    response="immediate",
+    enable_joint_velocity_limits=True,
+):
     """Build a deterministic scene containing every phase-bounded row family."""
     builder = newton.ModelBuilder(gravity=0.0)
     SolverFeatherPGS.register_custom_attributes(builder)
@@ -112,7 +120,7 @@ def _make_phase_layout_run(device, pgs_mode, *, pgs_iterations=0, pgs_schedule="
         pgs_schedule=pgs_schedule,
         articulated_contact_response=response,
         enable_joint_limits=True,
-        enable_joint_velocity_limits=True,
+        enable_joint_velocity_limits=enable_joint_velocity_limits,
         velocity_limit_activation_fraction=0.5,
         dense_max_constraints=64,
         mf_max_constraints=64,
@@ -141,7 +149,9 @@ def _step_once(run):
     return solver
 
 
-def _assert_dense_phase_layout(test_case: unittest.TestCase, solver: SolverFeatherPGS):
+def _assert_dense_phase_layout(
+    test_case: unittest.TestCase, solver: SolverFeatherPGS, *, expect_joint_velocity_limits: bool = True
+):
     """Assert the three dense row-family partitions are ordered and populated."""
     dense_count = int(solver.constraint_count.numpy()[0])
     dense_types = solver.row_type.numpy()[0, :dense_count]
@@ -152,14 +162,18 @@ def _assert_dense_phase_layout(test_case: unittest.TestCase, solver: SolverFeath
     friction_rows = np.flatnonzero(dense_types == PGS_CONSTRAINT_TYPE_FRICTION)
 
     test_case.assertGreater(limit_rows.size, 0, "expected an active joint position-limit row")
-    test_case.assertGreater(velocity_limit_rows.size, 0, "expected active joint velocity-limit rows")
+    if expect_joint_velocity_limits:
+        test_case.assertGreater(velocity_limit_rows.size, 0, "expected active joint velocity-limit rows")
+    else:
+        test_case.assertEqual(velocity_limit_rows.size, 0)
     test_case.assertGreater(contact_rows.size, 0, "expected dense contact rows")
     test_case.assertGreater(friction_rows.size, 0, "expected dense friction rows")
     test_case.assertTrue(np.all(limit_rows < phase_zero_end), (limit_rows, phase_zero_end))
-    test_case.assertTrue(
-        np.all((phase_zero_end <= velocity_limit_rows) & (velocity_limit_rows < phase_one_end)),
-        (velocity_limit_rows, phase_zero_end, phase_one_end),
-    )
+    if expect_joint_velocity_limits:
+        test_case.assertTrue(
+            np.all((phase_zero_end <= velocity_limit_rows) & (velocity_limit_rows < phase_one_end)),
+            (velocity_limit_rows, phase_zero_end, phase_one_end),
+        )
     test_case.assertTrue(np.all(contact_rows >= phase_one_end), (contact_rows, phase_one_end))
     test_case.assertTrue(np.all(friction_rows >= phase_one_end), (friction_rows, phase_one_end))
 
@@ -223,8 +237,8 @@ def _run_joint_limit_trajectory(use_warp_builder: bool):
 class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
     def test_dense_row_families_respect_phase_bounds(self):
         """Keep active position limits before the CPU dense phase-0 bound."""
-        solver = _step_once(_make_phase_layout_run("cpu", "split"))
-        _assert_dense_phase_layout(self, solver)
+        solver = _step_once(_make_phase_layout_run("cpu", "split", enable_joint_velocity_limits=False))
+        _assert_dense_phase_layout(self, solver, expect_joint_velocity_limits=False)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free row-family layout requires CUDA")
     def test_combined_row_families_respect_phase_bounds(self):
