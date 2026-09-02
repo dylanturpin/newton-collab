@@ -94,21 +94,6 @@ _FPGS_CONTACT_END_GAP_SLOP = wp.constant(1.0e-6)
 
 
 @wp.kernel
-def commit_mass_updates(
-    src: wp.array[int],
-    mask: wp.array[int],
-    mass_update_requested: wp.array[int],
-    # outputs
-    dst: wp.array[int],
-):
-    tid = wp.tid()
-    if mask[tid] != 0:
-        dst[tid] = src[tid]
-    if tid == 0:
-        mass_update_requested[0] = 0
-
-
-@wp.kernel
 def compute_spatial_inertia(
     body_inertia: wp.array[wp.mat33],
     body_mass: wp.array[float],
@@ -2252,146 +2237,6 @@ def build_contact_rows_normal(
         )
 
 
-@wp.func
-def apply_augmented_joint_drives(
-    articulation: int,
-    articulation_start: wp.array[int],
-    articulation_H_rows: wp.array[int],
-    joint_type: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
-    joint_effort_limit: wp.array[float],
-    max_dofs: int,
-    dt: float,
-    # outputs
-    row_counts: wp.array[int],
-    row_dof_index: wp.array[int],
-    row_K: wp.array[float],
-    limit_counts: wp.array[int],
-    joint_tau: wp.array[float],
-):
-    if max_dofs == 0:
-        row_counts[articulation] = 0
-        limit_counts[articulation] = 0
-        return
-
-    dof_count = articulation_H_rows[articulation]
-    if dof_count == 0:
-        row_counts[articulation] = 0
-        limit_counts[articulation] = 0
-        return
-
-    joint_start = articulation_start[articulation]
-    joint_end = articulation_start[articulation + 1]
-
-    slot = int(0)
-    limit_counts[articulation] = 0
-
-    for joint_index in range(joint_start, joint_end):
-        type = joint_type[joint_index]
-        if type != JointType.PRISMATIC and type != JointType.REVOLUTE and type != JointType.D6:
-            continue
-
-        lin_axis_count = joint_dof_dim[joint_index, 0]
-        ang_axis_count = joint_dof_dim[joint_index, 1]
-        axis_count = lin_axis_count + ang_axis_count
-
-        qd_start = joint_qd_start[joint_index]
-        coord_start = joint_q_start[joint_index]
-
-        for axis in range(axis_count):
-            if slot >= max_dofs:
-                break
-            dof_index = qd_start + axis
-            coord_index = coord_start + axis
-
-            ke = joint_target_ke[dof_index]
-            kd = joint_target_kd[dof_index]
-            if ke <= 0.0 and kd <= 0.0:
-                continue
-
-            K = ke * dt * dt + kd * dt
-            if K <= 0.0:
-                continue
-
-            row_index = articulation * max_dofs + slot
-            row_dof_index[row_index] = dof_index
-            q = joint_q[coord_index]
-            qd_val = joint_qd[dof_index]
-            target_pos = joint_target_pos[dof_index]
-            target_vel = joint_target_vel[dof_index]
-            u0 = -(ke * (q - target_pos + dt * qd_val) + kd * (qd_val - target_vel))
-            effort_limit = joint_effort_limit[dof_index]
-            if effort_limit > 0.0:
-                u0 = wp.clamp(u0, -effort_limit, effort_limit)
-            row_K[row_index] = K
-            joint_tau[dof_index] = joint_tau[dof_index] + u0
-
-            slot += 1
-            if slot >= max_dofs:
-                break
-
-    row_counts[articulation] = slot
-    limit_counts[articulation] = 0
-
-
-@wp.kernel
-def build_augmented_joint_rows_and_apply_tau(
-    articulation_start: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    articulation_H_rows: wp.array[int],
-    joint_type: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
-    joint_effort_limit: wp.array[float],
-    max_dofs: int,
-    dt: float,
-    # outputs
-    row_counts: wp.array[int],
-    row_dof_index: wp.array[int],
-    row_K: wp.array[float],
-    limit_counts: wp.array[int],
-    joint_tau: wp.array[float],
-):
-    apply_augmented_joint_drives(
-        wp.tid(),
-        articulation_start,
-        articulation_H_rows,
-        joint_type,
-        joint_q_start,
-        joint_qd_start,
-        joint_dof_dim,
-        joint_target_ke,
-        joint_target_kd,
-        joint_q,
-        joint_qd,
-        joint_target_pos,
-        joint_target_vel,
-        joint_effort_limit,
-        max_dofs,
-        dt,
-        row_counts,
-        row_dof_index,
-        row_K,
-        limit_counts,
-        joint_tau,
-    )
-
-
 @wp.kernel
 def eval_rigid_tau_and_augmented_drives(
     articulation_start: wp.array[int],
@@ -2429,7 +2274,6 @@ def eval_rigid_tau_and_augmented_drives(
     row_counts: wp.array[int],
     row_dof_index: wp.array[int],
     row_K: wp.array[float],
-    limit_counts: wp.array[int],
     tau: wp.array[float],
 ):
     """Accumulate articulation forces and augmented drives in one launch."""
@@ -2461,29 +2305,57 @@ def eval_rigid_tau_and_augmented_drives(
         body_ft_s,
         tau,
     )
-    apply_augmented_joint_drives(
-        articulation,
-        articulation_start,
-        articulation_H_rows,
-        joint_type,
-        joint_q_start,
-        joint_qd_start,
-        joint_dof_dim,
-        joint_target_ke,
-        joint_target_kd,
-        joint_q,
-        joint_qd,
-        joint_target_pos,
-        joint_target_vel,
-        joint_effort_limit,
-        max_dofs,
-        dt,
-        row_counts,
-        row_dof_index,
-        row_K,
-        limit_counts,
-        tau,
-    )
+
+    dof_count = articulation_H_rows[articulation]
+    if dof_count == 0:
+        row_counts[articulation] = 0
+        return
+
+    joint_start = articulation_start[articulation]
+    joint_end = articulation_start[articulation + 1]
+    slot = int(0)
+    for joint_index in range(joint_start, joint_end):
+        type = joint_type[joint_index]
+        if type != JointType.PRISMATIC and type != JointType.REVOLUTE and type != JointType.D6:
+            continue
+
+        lin_axis_count = joint_dof_dim[joint_index, 0]
+        ang_axis_count = joint_dof_dim[joint_index, 1]
+        axis_count = lin_axis_count + ang_axis_count
+        qd_start = joint_qd_start[joint_index]
+        coord_start = joint_q_start[joint_index]
+        for axis in range(axis_count):
+            if slot >= max_dofs:
+                break
+            dof_index = qd_start + axis
+            coord_index = coord_start + axis
+            ke = joint_target_ke[dof_index]
+            kd = joint_target_kd[dof_index]
+            if ke <= 0.0 and kd <= 0.0:
+                continue
+
+            K = ke * dt * dt + kd * dt
+            if K <= 0.0:
+                continue
+
+            row_index = articulation * max_dofs + slot
+            row_dof_index[row_index] = dof_index
+            q = joint_q[coord_index]
+            qd_val = joint_qd[dof_index]
+            target_pos = joint_target_pos[dof_index]
+            target_vel = joint_target_vel[dof_index]
+            u0 = -(ke * (q - target_pos + dt * qd_val) + kd * (qd_val - target_vel))
+            effort_limit = joint_effort_limit[dof_index]
+            if effort_limit > 0.0:
+                u0 = wp.clamp(u0, -effort_limit, effort_limit)
+            row_K[row_index] = K
+            tau[dof_index] = tau[dof_index] + u0
+
+            slot += 1
+            if slot >= max_dofs:
+                break
+
+    row_counts[articulation] = slot
 
 
 @wp.kernel
@@ -2737,28 +2609,15 @@ def compute_physx_pgs_drive_desc(
 
 
 @wp.kernel
-def detect_limit_count_changes(
-    limit_counts: wp.array[int],
-    prev_limit_counts: wp.array[int],
-    # outputs
-    limit_change_mask: wp.array[int],
-):
-    tid = wp.tid()
-    change = 1 if limit_counts[tid] != prev_limit_counts[tid] else 0
-    limit_change_mask[tid] = change
-
-
-@wp.kernel
 def build_mass_update_mask(
     global_flag: int,
-    limit_change_mask: wp.array[int],
     mass_update_requested: wp.array[int],
     # outputs
     mass_update_mask: wp.array[int],
 ):
     tid = wp.tid()
     flag = 1 if global_flag != 0 else 0
-    if limit_change_mask[tid] != 0 or mass_update_requested[0] != 0:
+    if mass_update_requested[0] != 0:
         flag = 1
     mass_update_mask[tid] = flag
 

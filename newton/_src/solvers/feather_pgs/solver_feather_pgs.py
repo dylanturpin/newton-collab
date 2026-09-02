@@ -74,7 +74,6 @@ from .kernels import (
     apply_mf_warmstart_impulses,
     apply_world_contact_restitution_accumulated,
     apply_world_contact_restitution_matrix_free,
-    build_augmented_joint_rows_and_apply_tau,
     build_joint_limit_rows_for_size,
     build_mass_update_mask,
     build_mf_body_map,
@@ -88,7 +87,6 @@ from .kernels import (
     clear_grouped_jacobian_active_rows,
     clear_local_solve_diag,
     collect_propagation_units,
-    commit_mass_updates,
     compact_local_pair_candidates,
     compute_com_transforms,
     compute_composite_inertia,
@@ -112,7 +110,6 @@ from .kernels import (
     copy_free_rigid_propagation_body_response,
     crba_fill_par_dof,
     delassus_par_row_col,
-    detect_limit_count_changes,
     diag_from_JY_par_art,
     diag_from_JY_world,
     eval_rigid_fk_id,
@@ -3207,11 +3204,6 @@ class SolverFeatherPGS(SolverBase):
         self.aug_row_counts = wp.zeros(
             (articulation_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
-        self.aug_limit_counts = wp.zeros(
-            (articulation_count,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self.aug_prev_limit_counts = wp.zeros_like(self.aug_limit_counts)
-        self.limit_change_mask = wp.zeros_like(self.aug_limit_counts)
         self.aug_row_dof_index = wp.zeros((total_rows,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.aug_row_K = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
 
@@ -7534,17 +7526,9 @@ class SolverFeatherPGS(SolverBase):
                         self.aug_row_counts,
                         self.aug_row_dof_index,
                         self.aug_row_K,
-                        self.aug_limit_counts,
                         state_aug.joint_tau,
                     ],
                     block_dim=self.serial_kernel_block_dim,
-                    device=model.device,
-                )
-                wp.launch(
-                    detect_limit_count_changes,
-                    dim=model.articulation_count,
-                    inputs=[self.aug_limit_counts, self.aug_prev_limit_counts],
-                    outputs=[self.limit_change_mask],
                     device=model.device,
                 )
                 return
@@ -7590,66 +7574,7 @@ class SolverFeatherPGS(SolverBase):
             if self.drive_mode == "physx_pgs":
                 if self.articulation_max_dofs > 0:
                     self.aug_row_counts.zero_()
-                    self.aug_limit_counts.zero_()
-                    self.limit_change_mask.zero_()
                 return
-
-            # Build augmented rows, clamp the actuator-drive bucket, and add
-            # it to joint_tau in the same articulation pass.
-            self.build_augmented_joint_targets(state_in, state_aug, control, dt)
-
-    def build_augmented_joint_targets(self, state_in: State, state_aug: State, control: Control, dt: float):
-        model = self.model
-        if model.articulation_count == 0 or self.articulation_max_dofs == 0:
-            return
-        device = model.device
-
-        self.aug_row_counts.zero_()
-        self.aug_limit_counts.zero_()
-
-        wp.launch(
-            build_augmented_joint_rows_and_apply_tau,
-            dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                self.articulation_dof_start,
-                self.articulation_H_rows,
-                model.joint_type,
-                model.joint_q_start,
-                model.joint_qd_start,
-                model.joint_dof_dim,
-                model.joint_target_ke,
-                model.joint_target_kd,
-                state_in.joint_q,
-                state_in.joint_qd,
-                control.joint_target_q,
-                control.joint_target_qd,
-                model.joint_effort_limit,
-                self.articulation_max_dofs,
-                dt,
-            ],
-            outputs=[
-                self.aug_row_counts,
-                self.aug_row_dof_index,
-                self.aug_row_K,
-                self.aug_limit_counts,
-                state_aug.joint_tau,
-            ],
-            device=device,
-        )
-
-        wp.launch(
-            detect_limit_count_changes,
-            dim=model.articulation_count,
-            inputs=[
-                self.aug_limit_counts,
-                self.aug_prev_limit_counts,
-            ],
-            outputs=[
-                self.limit_change_mask,
-            ],
-            device=device,
-        )
 
     def _stage1_crba(self, state_aug: State, global_inertia_ready: wp.Event | None):
         model = self.model
@@ -7669,7 +7594,6 @@ class SolverFeatherPGS(SolverBase):
             dim=model.articulation_count,
             inputs=[
                 global_flag,
-                self.limit_change_mask,
                 self._mass_update_requested,
             ],
             outputs=[self.mass_update_mask],
@@ -7770,13 +7694,7 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-        wp.launch(
-            commit_mass_updates,
-            dim=model.articulation_count,
-            inputs=[self.aug_limit_counts, self.mass_update_mask, self._mass_update_requested],
-            outputs=[self.aug_prev_limit_counts],
-            device=model.device,
-        )
+        self._mass_update_requested.zero_()
 
         self._force_mass_update = False
 
