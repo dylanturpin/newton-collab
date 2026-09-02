@@ -89,6 +89,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         cfm[0, :2] = [0.01, 0.02]
         row_type = np.zeros((2, max_constraints), dtype=np.int32)
         row_type[0, :2] = [PGS_CONSTRAINT_TYPE_MIMIC, PGS_CONSTRAINT_TYPE_JOINT_LIMIT]
+        row_type[1, 0] = PGS_CONSTRAINT_TYPE_MIMIC
 
         impulses = wp.zeros((2, max_constraints), dtype=wp.float32, device=device)
         diagonal_out = wp.array(cfm, dtype=wp.float32, device=device)
@@ -147,6 +148,72 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         np.testing.assert_array_equal(velocity_out.numpy()[dof_count:], velocity[dof_count:])
         np.testing.assert_array_equal(impulses.numpy()[1], np.zeros(max_constraints, dtype=np.float32))
 
+        def launch_variant(
+            warps_per_block: int, *, contact_capable: bool = True, persistent_queue: bool = False, active_count: int = 2
+        ):
+            variant_diagonal = wp.array(cfm, dtype=wp.float32, device=device)
+            variant_impulses = wp.zeros((2, max_constraints), dtype=wp.float32, device=device)
+            variant_velocity = wp.array(velocity, dtype=wp.float32, device=device)
+            variant_kernel = _get_pgs_solve_local_owned_kernel(
+                max_constraints,
+                local_max_constraints,
+                dof_count,
+                device.arch,
+                persistent_queue=persistent_queue,
+                warps_per_block=warps_per_block,
+                contact_capable=contact_capable,
+            )
+            inputs = [candidate_articulations, candidate_articulations]
+            if persistent_queue:
+                inputs.extend([wp.array([active_count], dtype=wp.int32, device=device), 2])
+            inputs.extend(
+                [
+                    PGS_LOCAL_SOLVE_OWNER_SINGLE,
+                    wp.array([0, 1], dtype=wp.int32, device=device),
+                    wp.array([0, 1], dtype=wp.int32, device=device),
+                    wp.array([0, 3], dtype=wp.int32, device=device),
+                    wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE] * 2, dtype=wp.int32, device=device),
+                    wp.array([2, 1], dtype=wp.int32, device=device),
+                    lower_group,
+                    jacobian_group,
+                    lower_group,
+                    jacobian_group,
+                    wp.array(rhs, dtype=wp.float32, device=device),
+                    wp.array(row_type, dtype=wp.int32, device=device),
+                    wp.full((2, max_constraints), -1, dtype=wp.int32, device=device),
+                    wp.zeros((2, max_constraints), dtype=wp.float32, device=device),
+                    iterations,
+                    omega,
+                    0,
+                    0,
+                ]
+            )
+            wp.launch_tiled(
+                variant_kernel,
+                dim=[2 // warps_per_block],
+                inputs=inputs,
+                outputs=[variant_diagonal, variant_impulses, variant_velocity],
+                block_dim=32 * warps_per_block,
+                device=device,
+            )
+            wp.synchronize_device(device)
+            return variant_diagonal.numpy(), variant_impulses.numpy(), variant_velocity.numpy()
+
+        one_warp_outputs = launch_variant(1)
+        variants = [
+            launch_variant(2),
+            launch_variant(1, contact_capable=False),
+            launch_variant(2, contact_capable=False),
+        ]
+        for variant_outputs in variants:
+            for one_warp, variant in zip(one_warp_outputs, variant_outputs, strict=True):
+                np.testing.assert_array_equal(variant, one_warp)
+
+        one_warp_queue = launch_variant(1, persistent_queue=True, active_count=1)
+        two_warp_queue = launch_variant(2, persistent_queue=True, active_count=1)
+        for one_warp, two_warp in zip(one_warp_queue, two_warp_queue, strict=True):
+            np.testing.assert_array_equal(two_warp, one_warp)
+
     @unittest.skipUnless(wp.is_cuda_available(), "local internal solve requires CUDA")
     def test_local_kernel_waits_for_delayed_friction_activation(self):
         device = wp.get_cuda_device()
@@ -197,6 +264,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         np.testing.assert_allclose(diagonal.numpy()[0], np.ones(max_constraints), rtol=0.0, atol=1.0e-6)
         np.testing.assert_allclose(impulses.numpy()[0], [1.0, -0.5, 0.0], rtol=0.0, atol=1.0e-6)
         np.testing.assert_allclose(velocity.numpy(), [0.0, 0.5, 0.0], rtol=0.0, atol=1.0e-6)
+
 
 if __name__ == "__main__":
     unittest.main()

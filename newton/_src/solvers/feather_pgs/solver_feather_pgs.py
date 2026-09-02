@@ -4164,14 +4164,26 @@ class SolverFeatherPGS(SolverBase):
 
         self._pgs_solve_local_internal_kernels = {}
         self._pgs_solve_local_pair_kernels = {}
+        self._pgs_solve_local_internal_warps_per_block = {}
+        self._pgs_solve_local_pair_warps_per_block = {}
         if self._local_internal_fast_path:
             for size, count in self._local_internal_art_counts.items():
                 if count > 0:
+                    warps_per_block = 2 if count % 2 == 0 else 1
+                    self._pgs_solve_local_internal_warps_per_block[size] = warps_per_block
                     self._pgs_solve_local_internal_kernels[size] = _get_pgs_solve_local_owned_kernel(
-                        self.dense_max_constraints, self._local_solve_max_rows, size, device_arch
+                        self.dense_max_constraints,
+                        self._local_solve_max_rows,
+                        size,
+                        device_arch,
+                        warps_per_block=warps_per_block,
+                        contact_capable=False,
                     )
             for size, count in self._local_pair_art_counts.items():
                 if count > 0:
+                    solver_blocks = self._local_pair_solver_blocks[size]
+                    warps_per_block = 2 if solver_blocks % 2 == 0 else 1
+                    self._pgs_solve_local_pair_warps_per_block[size] = warps_per_block
                     self._pgs_solve_local_pair_kernels[size] = _get_pgs_solve_local_owned_kernel(
                         self.dense_max_constraints,
                         self._local_solve_max_rows,
@@ -4179,6 +4191,7 @@ class SolverFeatherPGS(SolverBase):
                         device_arch,
                         paired_dof_count=6,
                         persistent_queue=True,
+                        warps_per_block=warps_per_block,
                     )
 
         self._pgs_solve_mf_gs_kernel = None
@@ -4598,6 +4611,7 @@ class SolverFeatherPGS(SolverBase):
             count: int,
             active_count: wp.array,
             use_active_queue: bool,
+            warps_per_block: int = 1,
         ) -> None:
             secondary_group_size = secondary_size if secondary_size > 0 else primary_size
             inputs = [primary_candidates, secondary_candidates]
@@ -4627,10 +4641,10 @@ class SolverFeatherPGS(SolverBase):
             )
             wp.launch_tiled(
                 kernel,
-                dim=[count],
+                dim=[count // warps_per_block],
                 inputs=inputs,
                 outputs=[self.diag, self.impulses, self.v_out],
-                block_dim=32,
+                block_dim=32 * warps_per_block,
                 device=self.model.device,
             )
 
@@ -4646,6 +4660,7 @@ class SolverFeatherPGS(SolverBase):
                     self._local_internal_art_counts[size],
                     self._local_general_world_count,
                     False,
+                    self._pgs_solve_local_internal_warps_per_block[size],
                 )
         if solve_pair:
             for size, kernel in self._pgs_solve_local_pair_kernels.items():
@@ -4659,6 +4674,7 @@ class SolverFeatherPGS(SolverBase):
                     self._local_pair_solver_blocks[size],
                     self._local_pair_active_counts[size],
                     True,
+                    self._pgs_solve_local_pair_warps_per_block[size],
                 )
 
     def _launch_matrix_free_gs_solve(
@@ -15567,14 +15583,28 @@ def _get_pgs_solve_local_owned_kernel(
     device_arch: str,
     paired_dof_count: int = 0,
     persistent_queue: bool = False,
+    *,
+    warps_per_block: int = 1,
+    contact_capable: bool = True,
 ) -> "wp.Kernel":
     """Fuse response construction and PGS for one local articulation or pair."""
     del device_arch
+    if warps_per_block not in (1, 2):
+        raise ValueError("warps_per_block must be 1 or 2")
+    if not contact_capable and paired_dof_count:
+        raise ValueError("only single-articulation kernels may omit contact handling")
     max_rows = max_constraints
     local_rows = local_max_constraints
     dofs = dof_count
     paired_dofs = paired_dof_count
     total_dofs = dofs + paired_dofs
+
+    warp_setup = (
+        """    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;"""
+        if warps_per_block == 2
+        else "    const int lane = threadIdx.x;"
+    )
     pair_setup = (
         f"""
     const int secondary_art = candidate_secondary_articulations.data[candidate];
@@ -15585,12 +15615,42 @@ def _get_pgs_solve_local_owned_kernel(
         if paired_dofs
         else ""
     )
-    pair_shared = (
-        f"""
-    __shared__ float s_L_secondary[{paired_dofs * paired_dofs}];"""
-        if paired_dofs
-        else ""
+    shared_specs = [("float", "s_L", dofs * dofs)]
+    if paired_dofs:
+        shared_specs.append(("float", "s_L_secondary", paired_dofs * paired_dofs))
+    shared_specs.extend(
+        [
+            ("float", "s_J", local_rows * total_dofs),
+            ("float", "s_Y", local_rows * total_dofs),
+            ("float", "s_diag", local_rows),
+            ("float", "s_v", total_dofs),
+            ("float", "s_lambda", local_rows),
+            ("float", "s_rhs", local_rows),
+        ]
     )
+    if contact_capable:
+        shared_specs.extend(
+            [
+                ("int", "s_type", local_rows),
+                ("int", "s_parent", local_rows),
+                ("float", "s_mu", local_rows),
+                ("int", "s_active", local_rows),
+            ]
+        )
+    if warps_per_block == 1:
+        shared_declarations = "\n".join(
+            f"    __shared__ {value_type} {name}[{count}];" for value_type, name, count in shared_specs
+        )
+        shared_cleanup = ""
+    else:
+        shared_fields = "\n".join(f"        {value_type} {name}[{count}];" for value_type, name, count in shared_specs)
+        shared_aliases = "\n".join(f"#define {name} local_solve_scratch[warp].{name}" for _, name, _ in shared_specs)
+        shared_declarations = f"""    struct LocalSolveScratch {{
+{shared_fields}
+    }};
+    __shared__ LocalSolveScratch local_solve_scratch[{warps_per_block}];
+{shared_aliases}"""
+        shared_cleanup = "\n".join(f"#undef {name}" for _, name, _ in shared_specs)
     pair_factor_load = (
         f"""
     for (int i = lane; i < {paired_dofs * paired_dofs}; i += 32)
@@ -15657,10 +15717,92 @@ def _get_pgs_solve_local_owned_kernel(
         v_out.data[dof] = s_v[lane];
     }}"""
     )
+    lane_metadata = (
+        ""
+        if contact_capable
+        else """    int lane_joint_limit = 0;
+    int lane_active = 0;"""
+    )
+    row_metadata_load = (
+        """        s_type[row] = world_row_type.data[world_row_base + row];
+        s_parent[row] = world_row_parent.data[world_row_base + row];
+        s_mu[row] = world_row_mu.data[world_row_base + row];"""
+        if contact_capable
+        else f"""        const int row_type = world_row_type.data[world_row_base + row];
+        lane_joint_limit = row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)};"""
+    )
+    active_store = "s_active[row] = active;" if contact_capable else "lane_active = active;"
+    row_masks = (
+        ""
+        if contact_capable
+        else """    const unsigned active_rows = __ballot_sync(MASK, lane_active != 0);
+    const unsigned joint_limit_rows = __ballot_sync(MASK, lane_joint_limit != 0);"""
+    )
+    row_setup = (
+        """            if (s_active[row] == 0) continue;
+            const int row_type = s_type[row];"""
+        if contact_capable
+        else """            const unsigned row_bit = 1u << row;
+            if ((active_rows & row_bit) == 0u) continue;"""
+    )
+    iteration_setup = "        const int global_iteration = iteration_offset + iteration;" if contact_capable else ""
+    friction_gate = (
+        f"""            if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
+                && global_iteration < friction_start_iteration) {{
+                s_lambda[row] = 0.0f;
+                __syncwarp();
+                continue;
+            }}"""
+        if contact_capable
+        else ""
+    )
+    impulse_projection = (
+        f"""            if ((row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}
+                || row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)})
+                && new_impulse < 0.0f) new_impulse = 0.0f;
+            else if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
+                const int parent = s_parent[row];
+                const float radius = fmaxf(s_mu[row] * s_lambda[parent], 0.0f);
+                if (radius <= 0.0f) {{
+                    new_impulse = 0.0f;
+                }} else {{
+                    const int sibling = row == parent + 1 ? parent + 2 : parent + 1;
+                    s_lambda[row] = new_impulse;
+                    const float sibling_old = s_lambda[sibling];
+                    const float magnitude = sqrtf(new_impulse * new_impulse + sibling_old * sibling_old);
+                    if (magnitude > radius) {{
+                        const float scale = radius / magnitude;
+                        new_impulse *= scale;
+                        const float sibling_new = sibling_old * scale;
+                        const float sibling_delta = sibling_new - sibling_old;
+                        if (sibling_delta != 0.0f) {{
+                            changed = 1;
+                            s_lambda[sibling] = sibling_new;
+                            if (lane < {total_dofs})
+                                s_v[lane] += s_Y[sibling * {total_dofs} + lane] * sibling_delta;
+                        }}
+                    }}
+                }}
+            }}"""
+        if contact_capable
+        else """            if ((joint_limit_rows & row_bit) != 0u && new_impulse < 0.0f)
+                new_impulse = 0.0f;"""
+    )
+    row_sync = "            __syncwarp();" if contact_capable else ""
+    early_exit = (
+        """        // Friction rows may intentionally remain inactive until a later
+        // iteration. Do not mistake a stationary pre-friction sweep for the
+        // fixed point of the complete constraint system.
+        if (global_iteration >= friction_start_iteration
+            && __ballot_sync(MASK, changed != 0) == 0u) break;"""
+        if contact_capable
+        else "        if (__ballot_sync(MASK, changed != 0) == 0u) break;"
+    )
+    impulse_active = "s_active[row] != 0" if contact_capable else "(active_rows & (1u << row)) != 0u"
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
-    const int lane = threadIdx.x;
+{warp_setup}
     const int art = candidate_articulations.data[candidate];
     const int group = articulation_group_index.data[art];
     const int world = articulation_world.data[art];
@@ -15672,27 +15814,15 @@ def _get_pgs_solve_local_owned_kernel(
     const int group_j_base = group * {max_rows * dofs};
     const int group_l_base = group * {dofs * dofs};
 {pair_setup}
-    __shared__ float s_L[{dofs * dofs}];
-{pair_shared}
-    __shared__ float s_J[{local_rows * total_dofs}];
-    __shared__ float s_Y[{local_rows * total_dofs}];
-    __shared__ float s_diag[{local_rows}];
-    __shared__ float s_v[{total_dofs}];
-    __shared__ float s_lambda[{local_rows}];
-    __shared__ float s_rhs[{local_rows}];
-    __shared__ int s_type[{local_rows}];
-    __shared__ int s_parent[{local_rows}];
-    __shared__ float s_mu[{local_rows}];
-    __shared__ int s_active[{local_rows}];
+{shared_declarations}
 
     for (int i = lane; i < {dofs * dofs}; i += 32) s_L[i] = L_group.data[group_l_base + i];
 {pair_factor_load}
+{lane_metadata}
     for (int row = lane; row < row_count; row += 32) {{
         s_lambda[row] = world_impulses.data[world_row_base + row];
         s_rhs[row] = rhs_bias.data[world_row_base + row];
-        s_type[row] = world_row_type.data[world_row_base + row];
-        s_parent[row] = world_row_parent.data[world_row_base + row];
-        s_mu[row] = world_row_mu.data[world_row_base + row];
+{row_metadata_load}
     }}
 {velocity_load}
     __syncwarp();
@@ -15726,23 +15856,19 @@ def _get_pgs_solve_local_owned_kernel(
             diagonal += s_J[row * {total_dofs} + i] * response[i];
         }}
 {pair_response}
-        s_active[row] = active;
+        {active_store}
         s_diag[row] = diagonal + world_diag.data[world_row_base + row];
     }}
     __syncwarp();
 
+{row_masks}
+
     for (int iteration = 0; iteration < iterations; ++iteration) {{
-        const int global_iteration = iteration_offset + iteration;
+{iteration_setup}
         int changed = 0;
         for (int row = 0; row < row_count; ++row) {{
-            if (s_active[row] == 0) continue;
-            const int row_type = s_type[row];
-            if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
-                && global_iteration < friction_start_iteration) {{
-                s_lambda[row] = 0.0f;
-                __syncwarp();
-                continue;
-            }}
+{row_setup}
+{friction_gate}
             const float denominator = s_diag[row];
             if (denominator <= 0.0f) continue;
 
@@ -15757,53 +15883,24 @@ def _get_pgs_solve_local_owned_kernel(
             const float delta = -(velocity + s_rhs[row]) / denominator;
             const float old_impulse = s_lambda[row];
             float new_impulse = old_impulse + omega * delta;
-            if ((row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}
-                || row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)})
-                && new_impulse < 0.0f) new_impulse = 0.0f;
-            else if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
-                const int parent = s_parent[row];
-                const float radius = fmaxf(s_mu[row] * s_lambda[parent], 0.0f);
-                if (radius <= 0.0f) {{
-                    new_impulse = 0.0f;
-                }} else {{
-                    const int sibling = row == parent + 1 ? parent + 2 : parent + 1;
-                    s_lambda[row] = new_impulse;
-                    const float sibling_old = s_lambda[sibling];
-                    const float magnitude = sqrtf(new_impulse * new_impulse + sibling_old * sibling_old);
-                    if (magnitude > radius) {{
-                        const float scale = radius / magnitude;
-                        new_impulse *= scale;
-                        const float sibling_new = sibling_old * scale;
-                        const float sibling_delta = sibling_new - sibling_old;
-                        if (sibling_delta != 0.0f) {{
-                            changed = 1;
-                            s_lambda[sibling] = sibling_new;
-                            if (lane < {total_dofs})
-                                s_v[lane] += s_Y[sibling * {total_dofs} + lane] * sibling_delta;
-                        }}
-                    }}
-                }}
-            }}
+{impulse_projection}
             const float delta_impulse = new_impulse - old_impulse;
             s_lambda[row] = new_impulse;
             if (delta_impulse != 0.0f) {{
                 changed = 1;
                 if (lane < {total_dofs}) s_v[lane] += s_Y[row * {total_dofs} + lane] * delta_impulse;
             }}
-            __syncwarp();
+{row_sync}
         }}
-        // Friction rows may intentionally remain inactive until a later
-        // iteration. Do not mistake a stationary pre-friction sweep for the
-        // fixed point of the complete constraint system.
-        if (global_iteration >= friction_start_iteration
-            && __ballot_sync(MASK, changed != 0) == 0u) break;
+{early_exit}
     }}
 
 {velocity_store}
     for (int row = lane; row < row_count; row += 32) {{
         world_diag.data[world_row_base + row] = s_diag[row];
-        if (s_active[row] != 0) world_impulses.data[world_row_base + row] = s_lambda[row];
+        if ({impulse_active}) world_impulses.data[world_row_base + row] = s_lambda[row];
     }}
+{shared_cleanup}
 #endif
 """
 
@@ -15860,7 +15957,8 @@ def _get_pgs_solve_local_owned_kernel(
         world_impulses: wp.array2d[float],
         v_out: wp.array[float],
     ):
-        candidate, _lane = wp.tid()
+        candidate, lane = wp.tid()
+        candidate = candidate * warps_per_block + lane // 32
         pgs_solve_local_internal_native(
             candidate,
             candidate_articulations,
@@ -15915,8 +16013,9 @@ def _get_pgs_solve_local_owned_kernel(
         world_impulses: wp.array2d[float],
         v_out: wp.array[float],
     ):
-        candidate, _lane = wp.tid()
+        candidate, lane = wp.tid()
         candidate_count = active_candidate_count[0]
+        candidate = candidate * warps_per_block + lane // 32
         while candidate < candidate_count:
             pgs_solve_local_internal_native(
                 candidate,
@@ -15947,6 +16046,10 @@ def _get_pgs_solve_local_owned_kernel(
             candidate += candidate_grid_stride
 
     name = f"pgs_solve_local_internal_{max_rows}_{local_rows}_{dofs}_{paired_dofs}"
+    if warps_per_block != 1:
+        name += f"_w{warps_per_block}"
+    if not contact_capable:
+        name += "_contact0"
     template = pgs_solve_local_internal_template
     if persistent_queue:
         name += "_queue"
