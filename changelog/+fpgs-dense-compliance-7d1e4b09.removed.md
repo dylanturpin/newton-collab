@@ -1,0 +1,1 @@
+Remove the `SolverFeatherPGS` parameters `dense_contact_compliance` and `speculative_dense_contact_compliance`. They only enlarged the dense Gauss-Seidel divisor without changing the converged contact solution; use `pgs_contact_hertz` and `pgs_contact_damping_ratio` to soften contacts.

@@ -286,8 +286,6 @@ def _propagation_speculative_rhs(scale: float) -> float:
             wp.array([float("inf")], dtype=wp.float32, device="cpu"),
             1.0,
             0.2,
-            0.0,
-            0.0,
             0.5,
             scale,
             0.5,

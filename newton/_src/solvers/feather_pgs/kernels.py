@@ -6338,8 +6338,6 @@ def compute_propagation_effective_mass_and_rhs(
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_cfm: float,
     pgs_beta: float,
-    dense_contact_compliance: float,
-    speculative_dense_contact_compliance: float,
     dt: float,
     contact_speculative_scale: float,
     restitution_velocity_threshold: float,
@@ -6378,13 +6376,6 @@ def compute_propagation_effective_mass_and_rhs(
                 value += propagation_body_response[bb, r, c] * propagation_J_b[world, i, c]
             propagation_MiJt_b[world, i, r] = value
             d += propagation_J_b[world, i, r] * value
-
-    if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        compliance = dense_contact_compliance
-        if propagation_phi[world, i] > 0.0:
-            compliance += speculative_dense_contact_compliance
-        if compliance != 0.0 and dt > 0.0:
-            d += compliance / (dt * dt)
 
     if d > 0.0:
         propagation_eff_mass_inv[world, i] = 1.0 / d
@@ -6957,8 +6948,6 @@ def refine_same_articulation_propagation_rows(
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
     pgs_cfm: float,
-    dense_contact_compliance: float,
-    speculative_dense_contact_compliance: float,
     dt: float,
     propagation_max_constraints: int,
     # scratch
@@ -7122,13 +7111,6 @@ def refine_same_articulation_propagation_rows(
             propagation_MiJt_b[world, i, r] = mi_b
             d += propagation_J_a[world, i, r] * mi_a
             d += propagation_J_b[world, i, r] * mi_b
-
-        if propagation_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
-            compliance = dense_contact_compliance
-            if propagation_phi[world, i] > 0.0:
-                compliance += speculative_dense_contact_compliance
-            if compliance != 0.0 and dt > 0.0:
-                d += compliance / (dt * dt)
 
         if d > 0.0:
             propagation_eff_mass_inv[world, i] = 1.0 / d
@@ -9276,34 +9258,6 @@ def finalize_world_diag_cfm(
 
     for i in range(m):
         world_diag[world, i] += world_row_cfm[world, i]
-
-
-@wp.kernel
-def add_dense_contact_compliance_to_diag(
-    world_constraint_count: wp.array[int],
-    world_row_type: wp.array2d[int],
-    world_phi: wp.array2d[float],
-    contact_alpha: float,
-    speculative_contact_alpha: float,
-    # in/out
-    world_diag: wp.array2d[float],
-):
-    """Add normal-contact compliance to the dense PGS diagonal.
-
-    The dense articulated contact path uses a Delassus diagonal in impulse
-    space. A compliance ``alpha = compliance / dt^2`` contributes an additional
-    diagonal term for normal contact rows only, yielding a softer normal
-    response without changing friction or joint-limit rows. A separate
-    speculative term applies only while ``phi > 0``.
-    """
-    world = wp.tid()
-    m = world_constraint_count[world]
-
-    for i in range(m):
-        if world_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
-            world_diag[world, i] += contact_alpha
-            if world_phi[world, i] > 0.0:
-                world_diag[world, i] += speculative_contact_alpha
 
 
 # =============================================================================

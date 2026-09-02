@@ -57,7 +57,6 @@ from .kernels import (
     PROPAGATION_COLOR_TAIL,
     accumulate_group_diag_worlds,
     accumulate_propagation_warmstart_body_impulses,
-    add_dense_contact_compliance_to_diag,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
     allocate_mimic_slots,
@@ -636,8 +635,6 @@ class SolverFeatherPGS(SolverBase):
         pgs_velocity_iterations: int = 0,
         pgs_beta: float = 0.2,
         pgs_cfm: float = 1.0e-6,
-        dense_contact_compliance: float = 0.0,
-        speculative_dense_contact_compliance: float = 0.0,
         pgs_omega: float = 1.0,
         pgs_contact_regularization: float = 0.0,
         pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
@@ -822,14 +819,6 @@ class SolverFeatherPGS(SolverBase):
                 supported with ``pgs_mode="matrix_free"``. Defaults to 0.
             pgs_beta (float, optional): ERP style position correction factor. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
-            dense_contact_compliance (float, optional): Normal contact compliance [m/N] applied
-                only to dense articulated contact rows. Converted to an impulse-space diagonal
-                term using ``compliance / dt^2``. Defaults to 0.0.
-            speculative_dense_contact_compliance (float, optional): Additional normal contact
-                compliance [m/N] applied only to dense articulated contact rows with ``phi > 0``.
-                This leaves penetrating dense contacts at the base compliance while softening
-                separated/speculative contact normals. Converted to an impulse-space diagonal
-                term using ``compliance / dt^2``. Defaults to 0.0.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             pgs_contact_regularization (float, optional): Dimensionless proximal regularizer for
                 matrix-free contact rows: the penalty ``g * diag`` enters both the Gauss-Seidel
@@ -846,7 +835,6 @@ class SolverFeatherPGS(SolverBase):
                 the matrix-free contact routes of ``articulated_contact_response`` modes
                 ``"immediate"`` and ``"propagation-fused"``; the pure propagation routings
                 move those contacts off the matrix-free family and reject a nonzero value.
-                Unlike ``dense_contact_compliance`` this is not a physical compliance [m/N].
                 Defaults to 0.0.
             pgs_velocity_drive_mode (str, optional): Drive-row treatment during velocity-only post-pass
                 iterations. ``"freeze"`` keeps PhysX-style drive impulses from the biased position
@@ -1065,8 +1053,6 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_iterations = pgs_iterations
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
-        self.dense_contact_compliance = dense_contact_compliance
-        self.speculative_dense_contact_compliance = speculative_dense_contact_compliance
         self.pgs_omega = pgs_omega
         self.pgs_contact_regularization = float(pgs_contact_regularization)
         if not math.isfinite(self.pgs_contact_regularization) or self.pgs_contact_regularization < 0.0:
@@ -5002,8 +4988,6 @@ class SolverFeatherPGS(SolverBase):
                     self.rigid_body_max_depenetration_velocity,
                     self.pgs_cfm,
                     self.pgs_beta,
-                    self.dense_contact_compliance,
-                    self.speculative_dense_contact_compliance,
                     dt,
                     self.contact_speculative_scale,
                     self._effective_restitution_velocity_threshold,
@@ -5048,8 +5032,6 @@ class SolverFeatherPGS(SolverBase):
                         self.propagation_phi,
                         self.propagation_row_type,
                         self.pgs_cfm,
-                        self.dense_contact_compliance,
-                        self.speculative_dense_contact_compliance,
                         dt,
                         self.propagation_max_constraints,
                         self.propagation_tree_pA,
@@ -5940,7 +5922,6 @@ class SolverFeatherPGS(SolverBase):
                 # Diagonal from J*Y (no full Delassus)
                 self._stage4_compute_matrix_free_diag()
                 self._stage4_finalize_world_diag_cfm()
-                self._stage4_add_dense_contact_compliance(dt)
                 # Reads J_world only when position_delta_scale != 0; under the
                 # J/Y alias (see _detect_jy_world_identity) J_world here holds
                 # the CURRENT step's rows rather than last step's gathered
@@ -6010,7 +5991,6 @@ class SolverFeatherPGS(SolverBase):
 
                 self._stage4_finalize_world_diag_cfm()
 
-            self._stage4_add_dense_contact_compliance(dt)
             self._stage4_compute_rhs_world(dt, contact_speculative_scale=self.contact_speculative_scale)
 
             for size in self.size_groups:
@@ -8583,20 +8563,6 @@ class SolverFeatherPGS(SolverBase):
             inputs=[self.constraint_count, self.row_cfm],
             outputs=[self.diag],
             device=model.device,
-        )
-
-    def _stage4_add_dense_contact_compliance(self, dt: float):
-        if self.dense_contact_compliance <= 0.0 and self.speculative_dense_contact_compliance <= 0.0:
-            return
-
-        contact_alpha = float(self.dense_contact_compliance / (dt * dt))
-        speculative_contact_alpha = float(self.speculative_dense_contact_compliance / (dt * dt))
-        wp.launch(
-            add_dense_contact_compliance_to_diag,
-            dim=self.world_count,
-            inputs=[self.constraint_count, self.row_type, self.phi, contact_alpha, speculative_contact_alpha],
-            outputs=[self.diag],
-            device=self.model.device,
         )
 
     def _stage4_compute_physx_drive_desc(
