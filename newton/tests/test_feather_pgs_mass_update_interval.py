@@ -90,6 +90,21 @@ def _run_trajectory(model, solver, num_steps):
 
 
 class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "parallel compact inertia refresh requires CUDA")
+    def test_parallel_compact_refresh_matches_serial_trajectory(self):
+        trajectories = []
+        for use_parallel_streams in (False, True):
+            model = _build_model("cuda:0")
+            solver = SolverFeatherPGS(
+                model,
+                update_mass_matrix_interval=1,
+                double_buffer=False,
+                use_parallel_streams=use_parallel_streams,
+            )
+            trajectories.append(_run_trajectory(model, solver, num_steps=20))
+
+        np.testing.assert_allclose(trajectories[1], trajectories[0], rtol=0.0, atol=2.0e-6)
+
     def test_interval_two_contact_trajectory_stays_close_to_reference(self):
         device = wp.get_device()
         history = {}
