@@ -2119,6 +2119,12 @@ def create_narrow_phase_process_mesh_plane_contacts_kernel(
 # =============================================================================
 
 
+@wp.func
+def _is_ratio_at_or_above_percent(active_count: int, capacity: int, percent: int):
+    """Compare an integer occupancy ratio without overflowing 32-bit products."""
+    return wp.int64(active_count) * wp.int64(100) >= wp.int64(capacity) * wp.int64(percent)
+
+
 @wp.kernel(enable_backward=False)
 def verify_narrow_phase_buffers(
     broad_phase_count: wp.array[int],
@@ -2222,7 +2228,11 @@ def verify_narrow_phase_buffers(
         )
     if reduction_ht_capacity > 0:
         reduction_ht_active_count = reduction_ht_active_slots[reduction_ht_capacity]
-        if reduction_ht_active_count * 100 >= reduction_ht_capacity * reduction_ht_warn_load_percent:
+        if _is_ratio_at_or_above_percent(
+            reduction_ht_active_count,
+            reduction_ht_capacity,
+            reduction_ht_warn_load_percent,
+        ):
             wp.printf(
                 "Warning: Contact reduction hashtable fill ratio exceeded %d%% (%d / %d). "
                 "Increase contact_reduction_hashtable_size_factor or max_triangle_pairs.\n",
