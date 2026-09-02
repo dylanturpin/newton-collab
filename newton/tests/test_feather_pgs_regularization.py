@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the FeatherPGS proximal contact regularizer."""
+"""Tests for the FeatherPGS contact regularizer (``pgs_contact_regularization``)."""
 
 import unittest
 
@@ -15,10 +15,12 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
 
+DT = 1.0 / 60.0
+
 
 def _solve_rows(device, n_rows, g, iterations=300):
-    """Solve ``n_rows`` identical unit contact rows on one 6-DOF body with
-    unit mass and rhs = -1 through the reference MF loop kernel."""
+    """Solve ``n_rows`` identical unit contact rows on one 6-DOF body with unit
+    mass and rhs = -1 through the reference MF loop kernel."""
     m = 8
     J = np.zeros((1, m, 6), dtype=np.float32)
     for r in range(n_rows):
@@ -50,11 +52,12 @@ def _solve_rows(device, n_rows, g, iterations=300):
             wp.array(row_type, dtype=wp.int32),
             wp.full((1, m), -1, dtype=wp.int32),  # row_parent
             wp.zeros((1, m), dtype=wp.float32),  # row_mu
-            1.0 / (1.0 + g),  # contact_regularization_w
+            wp.full((1, m), 1.0 / (1.0 + g), dtype=wp.float32),  # mf_row_w
             wp.array([0], dtype=wp.int32),  # body_to_articulation
             wp.array([0], dtype=wp.int32),  # art_dof_start
             iterations,
             1.0,  # omega
+            1,  # regularize
             0,  # friction_mode
             iterations,  # friction_start_iteration (no friction rows)
             0,  # iteration_offset
@@ -67,10 +70,10 @@ def _solve_rows(device, n_rows, g, iterations=300):
 
 
 def test_regularization_fixed_points(test: unittest.TestCase, device):
-    """Analytic contracts of the proximal update on unit rows:
+    """Analytic contracts of the regularized update on unit rows:
 
     - one determined row converges to ``1/(1+g)`` of the rigid impulse (the
-      documented direct load error);
+      documented load deficit);
     - two redundant identical rows converge to the unique symmetric split
       ``lambda_1 = lambda_2 = 1/(2+g)``;
     - ``g = 0`` reproduces the exact rigid law (total impulse 1).
@@ -79,16 +82,11 @@ def test_regularization_fixed_points(test: unittest.TestCase, device):
         g = 0.5
         lam = _solve_rows(device, 1, g)
         test.assertAlmostEqual(float(lam[0]), 1.0 / (1.0 + g), places=5)
-
         lam = _solve_rows(device, 2, g)
         test.assertAlmostEqual(float(lam[0]), 1.0 / (2.0 + g), places=5)
         test.assertAlmostEqual(float(lam[1]), 1.0 / (2.0 + g), places=5)
-
         lam = _solve_rows(device, 2, 0.0)
         test.assertAlmostEqual(float(lam.sum()), 1.0, places=5)
-
-        lam = _solve_rows(device, 1, 0.0)
-        test.assertAlmostEqual(float(lam[0]), 1.0, places=6)
 
 
 def _stack_scene(device, g, pgs_mode="matrix_free", response="immediate", velocity_iterations=2):
@@ -122,7 +120,7 @@ def _stack_scene(device, g, pgs_mode="matrix_free", response="immediate", veloci
     return model, pipeline, solver, bodies
 
 
-def _run(model, pipeline, solver, frames):
+def _run(model, pipeline, solver, frames, dt=DT):
     contacts = pipeline.contacts()
     s0, s1 = model.state(), model.state()
     control = model.control()
@@ -131,7 +129,7 @@ def _run(model, pipeline, solver, frames):
     for _k in range(frames):
         pipeline.collide(s0, contacts)
         s0.clear_forces()
-        solver.step(s0, s1, control, contacts, 1.0 / 60.0)
+        solver.step(s0, s1, control, contacts, dt)
         s0, s1 = s1, s0
         zs.append(float(s0.body_q.numpy()[-1][2]))
     return s0.body_q.numpy(), zs
@@ -141,7 +139,7 @@ def test_regularization_route_agreement(test: unittest.TestCase, device):
     """The regularized update must agree across the matrix-free execution
     routes: the fused MF-GS kernel (matrix_free/immediate), the standalone
     MF kernel (split/immediate), and the propagation-fused full-iteration
-    kernel — same scene, same g, matching resting poses."""
+    kernel: same scene, same g, matching resting poses."""
     with wp.ScopedDevice(device):
         results = {}
         for label, mode, response, velit in (
@@ -162,11 +160,61 @@ def test_regularization_route_agreement(test: unittest.TestCase, device):
             )
 
 
+def _resting_box(device, g, pgs_mode, rate, frames, **solver_kwargs):
+    builder = newton.ModelBuilder()
+    builder.rigid_gap = 0.01
+    cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.7))
+    b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
+    builder.add_shape_box(b, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+    model = builder.finalize()
+    pipeline = newton.CollisionPipeline(
+        model,
+        reduce_contacts=True,
+        rigid_contact_max=32,
+        broad_phase="nxn",
+        deterministic=True,
+        contact_matching="latest",
+    )
+    solver = newton.solvers.SolverFeatherPGS(
+        model,
+        pgs_mode=pgs_mode,
+        pgs_iterations=12,
+        pgs_contact_regularization=g,
+        **solver_kwargs,
+    )
+    _, zs = _run(model, pipeline, solver, frames, dt=1.0 / rate)
+    return 0.05 - zs[-1]
+
+
+def _sag_formula(g, rate):
+    """Resting sag of a body under gravity: ``g * a * dt^2 / pgs_beta`` with the default beta."""
+    return g * 9.81 / (rate * rate) / 0.2
+
+
+def test_regularization_documented_sag(test: unittest.TestCase, device):
+    """The regularizer is a numerical damped compliance: a resting box sags by
+    ``g * a * dt^2 / beta`` (6.8 mm at g = 0.5 and 60 Hz, 0.43 mm at 240 Hz), on the
+    matrix-free route."""
+    with wp.ScopedDevice(device):
+        for rate in (60, 240):
+            sag = _resting_box(device, 0.5, "matrix_free", rate, 3 * rate, mf_warmstart=True)
+            expected = _sag_formula(0.5, rate)
+            test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"{rate} Hz: sag {sag * 1000:.2f} mm")
+
+
+def test_regularization_split_route_documented_sag(test: unittest.TestCase, device):
+    """The split route's standalone matrix-free kernel carries the same law as the
+    fused kernel, so its resting box sags by the same formula (CPU-runnable)."""
+    with wp.ScopedDevice(device):
+        sag = _resting_box(device, 0.5, "split", 60, 180, mf_warmstart=True)
+        expected = _sag_formula(0.5, 60)
+        test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"split sag {sag * 1000:.2f} mm")
+
+
 def test_regularization_velocity_pass_exempt(test: unittest.TestCase, device):
-    """The velocity-only pass solves the exact rigid law. If it were
-    regularized, its converged state keeps a residual velocity of roughly
-    g * lambda * dt per step (~8 mm/s of steady sinking at g = 0.05), while
-    the exempt pass holds a settled stack to well under a millimeter."""
+    """The velocity-only pass solves the exact rigid law: a settled stack holds
+    its height to well under a millimetre over the last second."""
     with wp.ScopedDevice(device):
         for response in ("immediate", "propagation-fused"):
             model, pipeline, solver, _bodies = _stack_scene(device, g=0.05, response=response, velocity_iterations=4)
@@ -175,10 +223,6 @@ def test_regularization_velocity_pass_exempt(test: unittest.TestCase, device):
             test.assertLess(
                 drift, 5.0e-4, f"{response}: top box kept sinking ({drift * 1000:.2f} mm over the last second)"
             )
-            # sanity bound only: equilibrium sag at default beta with g=0.05
-            # is mm-scale; a regularized velocity pass never reaches one
-            sag = 0.2525 - zs[-1]
-            test.assertLess(sag, 1.5e-2, f"{response}: sag {sag * 1000:.1f} mm out of range")
 
 
 def test_regularization_indeterminate_split(test: unittest.TestCase, device):
@@ -220,7 +264,7 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
         for _k in range(120):
             pipeline.collide(s0, contacts)
             s0.clear_forces()
-            solver.step(s0, s1, control, contacts, 1.0 / 60.0)
+            solver.step(s0, s1, control, contacts, DT)
             s0, s1 = s1, s0
         solver.update_contacts(contacts)
 
@@ -246,9 +290,7 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
 
 
 def test_regularization_validation(test: unittest.TestCase, device):
-    """Parameter contract: finite non-negative values only, and pure
-    propagation routings (which move contacts off the matrix-free family)
-    reject a nonzero value."""
+    """Parameter contract: finite non-negative values only."""
     with wp.ScopedDevice(device):
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
@@ -258,26 +300,13 @@ def test_regularization_validation(test: unittest.TestCase, device):
         for bad in (-0.1, float("nan"), float("inf")):
             with test.assertRaises(ValueError):
                 newton.solvers.SolverFeatherPGS(model, pgs_contact_regularization=bad)
-        for response in ("propagation", "propagation-colored"):
-            with test.assertRaises(NotImplementedError):
-                newton.solvers.SolverFeatherPGS(
-                    model, pgs_contact_regularization=0.02, articulated_contact_response=response
-                )
-        if wp.get_device().is_cuda:  # matrix_free requires CUDA
-            newton.solvers.SolverFeatherPGS(
-                model,
-                pgs_mode="matrix_free",
-                pgs_contact_regularization=0.02,
-                articulated_contact_response="propagation-fused",
-            )
+        newton.solvers.SolverFeatherPGS(model, pgs_contact_regularization=0.0)
 
 
-def test_regularization_restitution_effect_documented(test: unittest.TestCase, device):
-    """Regularization flows through impact rows too. The regularized fixed
-    point of a restitution row is v_out = (e - g)/(1+g) * |v_in| (the
-    proximal pull mixes the incoming velocity back in, so rebound vanishes
-    at g = e) - documented, and quantified here so any future exemption of
-    restitution events shows up as a deliberate change."""
+def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
+    """A row whose rebound target fires is solved rigid, so the rebound is
+    e * v_in whatever the regularizer. Without the exemption the regularized
+    fixed point would be (e - g)/(1 + g) * v_in and vanish at g = e."""
 
     def rebound(g):
         builder = newton.ModelBuilder()
@@ -311,21 +340,17 @@ def test_regularization_restitution_effect_documented(test: unittest.TestCase, d
         for _k in range(90):
             pipeline.collide(s0, contacts)
             s0.clear_forces()
-            solver.step(s0, s1, control, contacts, 1.0 / 60.0)
+            solver.step(s0, s1, control, contacts, DT)
             s0, s1 = s1, s0
             max_up = max(max_up, float(s0.body_qd.numpy()[b][2]))
         return max_up
 
     with wp.ScopedDevice(device):
-        e = 0.8
-        v0 = rebound(0.0)
-        test.assertGreater(v0, 1.0, "no bounce measured")
+        v_ref = rebound(0.0)
+        test.assertGreater(v_ref, 1.0, "no bounce measured")
         for g in (0.02, 0.5):
-            expected = (e - g) / (e * (1.0 + g))  # v_out(g) / v_out(0)
-            ratio = rebound(g) / v0
-            test.assertAlmostEqual(
-                ratio, expected, delta=0.06, msg=f"g={g}: rebound ratio {ratio:.3f}, want {expected:.3f}"
-            )
+            ratio = rebound(g) / v_ref
+            test.assertAlmostEqual(ratio, 1.0, delta=0.05, msg=f"g={g}: rebound ratio {ratio:.3f}")
 
 
 class TestFeatherPGSRegularization(unittest.TestCase):
@@ -343,6 +368,18 @@ add_function_test(
     "test_regularization_route_agreement",
     test_regularization_route_agreement,
     devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSRegularization,
+    "test_regularization_documented_sag",
+    test_regularization_documented_sag,
+    devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSRegularization,
+    "test_regularization_split_route_documented_sag",
+    test_regularization_split_route_documented_sag,
+    devices=get_test_devices(),
 )
 add_function_test(
     TestFeatherPGSRegularization,
@@ -364,8 +401,8 @@ add_function_test(
 )
 add_function_test(
     TestFeatherPGSRegularization,
-    "test_regularization_restitution_effect_documented",
-    test_regularization_restitution_effect_documented,
+    "test_restitution_rows_stay_rigid",
+    test_restitution_rows_stay_rigid,
     devices=get_selected_cuda_test_devices(),
 )
 

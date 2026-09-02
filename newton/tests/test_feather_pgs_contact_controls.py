@@ -219,8 +219,9 @@ def _dense_speculative_rhs(scale: float) -> float:
             1.0,
             scale,
             1.0,
+            1.0,
         ],
-        outputs=[rhs],
+        outputs=[rhs, wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
         device="cpu",
     )
     return float(rhs.numpy()[0, 0])
@@ -250,6 +251,7 @@ def _mf_speculative_rhs(scale: float) -> float:
             wp.array([float("inf")], dtype=wp.float32, device="cpu"),
             1.0,
             0.2,
+            1.0,
             0.5,
             scale,
             0.5,
@@ -260,6 +262,7 @@ def _mf_speculative_rhs(scale: float) -> float:
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             rhs,
+            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
         ],
         device="cpu",
     )
@@ -286,6 +289,7 @@ def _propagation_speculative_rhs(scale: float) -> float:
             wp.array([float("inf")], dtype=wp.float32, device="cpu"),
             1.0,
             0.2,
+            1.0,
             0.5,
             scale,
             0.5,
@@ -296,6 +300,7 @@ def _propagation_speculative_rhs(scale: float) -> float:
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             rhs,
+            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
         ],
         device="cpu",
@@ -320,7 +325,7 @@ def _dense_restitution_rhs(scale: float) -> float:
             scale,
             0.0,
         ],
-        outputs=[rhs],
+        outputs=[rhs, wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
         device="cpu",
     )
     return float(rhs.numpy()[0, 0])

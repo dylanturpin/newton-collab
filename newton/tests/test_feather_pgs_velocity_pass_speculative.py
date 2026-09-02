@@ -248,6 +248,7 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
                 has_target,
                 max_depenetration_velocity,
                 0.2,
+                1.0,
                 0.5,
                 0.0,
                 0.0,
