@@ -84,11 +84,11 @@ from .kernels import (
     cholesky_loop,
     clamp_free_root_velocity_limits,
     classify_local_solve_worlds,
-    compact_local_pair_candidates,
     clear_grouped_jacobian_active_rows,
     clear_local_solve_diag,
     collect_propagation_units,
     commit_mass_updates,
+    compact_local_pair_candidates,
     compute_com_transforms,
     compute_composite_inertia,
     compute_contact_linear_force_from_impulses,
@@ -114,9 +114,7 @@ from .kernels import (
     detect_limit_count_changes,
     diag_from_JY_par_art,
     diag_from_JY_world,
-    eval_rigid_fk,
     eval_rigid_fk_id,
-    eval_rigid_id,
     eval_rigid_tau,
     factor_propagation_tree_for_size,
     finalize_mf_constraint_counts,
@@ -153,6 +151,7 @@ from .kernels import (
     prescale_joint_velocity_limits,
     propagate_tree_impulses_for_size,
     refine_same_articulation_propagation_rows,
+    refresh_masked_body_inertia,
     refresh_propagation_free_body_qd_from_vout,
     refresh_propagation_tree_body_qd_for_size,
     remove_free_root_transport_from_qdd,
@@ -165,7 +164,6 @@ from .kernels import (
     snapshot_propagation_cache_qd_base,
     snapshot_propagation_prev_slots,
     trisolve_loop,
-    update_articulation_origins,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
     vector_add_inplace,
@@ -7155,6 +7153,7 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
+        refresh_composite = (self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update
         wp.launch(
             eval_rigid_fk_id,
             dim=model.articulation_count,
@@ -7174,7 +7173,10 @@ class SolverFeatherPGS(SolverBase):
                 model.joint_axis,
                 model.joint_dof_dim,
                 model.body_com,
-                self.body_I_m,
+                model.body_mass,
+                model.body_inertia,
+                self.is_free_rigid,
+                int(refresh_composite),
                 model.gravity,
             ],
             outputs=[
@@ -7190,7 +7192,6 @@ class SolverFeatherPGS(SolverBase):
             block_dim=16,
             device=model.device,
         )
-        refresh_composite = (self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update
         if self._parallel_composite_inertia and refresh_composite:
             wp.launch_tiled(
                 self._composite_inertia_warp_kernel,
@@ -7375,6 +7376,23 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.mass_update_mask],
             device=model.device,
         )
+
+        if not global_flag:
+            wp.launch(
+                refresh_masked_body_inertia,
+                dim=model.joint_count,
+                inputs=[
+                    self.articulation_joint_end,
+                    model.joint_articulation,
+                    model.joint_child,
+                    self.mass_update_mask,
+                    state_aug.body_q_com,
+                    self.articulation_origin,
+                    self.body_I_m,
+                ],
+                outputs=[state_aug.body_I_s],
+                device=model.device,
+            )
 
         # Global refreshes were accumulated by the warp-parallel launch next
         # to inverse dynamics, while the link inertias were still hot. Keep the
