@@ -362,6 +362,46 @@ def transform_spatial_inertia(t: wp.transform, I: wp.spatial_matrix):
     return wp.mul(wp.mul(wp.transpose(T), I), T)
 
 
+@wp.func
+def transform_com_inertia_terms(t: wp.transform, mass: float, inertia_com: wp.mat33):
+    """Rotate COM inertia and shift its angular block to the solve origin."""
+    rotation = wp.quat_to_matrix(wp.transform_get_rotation(t))
+    com = wp.transform_get_translation(t)
+    com_cross = wp.skew(com)
+    inertia_origin = rotation * inertia_com * wp.transpose(rotation) - mass * com_cross * com_cross
+    return com, inertia_origin
+
+
+@wp.func
+def assemble_com_spatial_inertia(mass: float, com: wp.vec3, inertia_origin: wp.mat33):
+    """Assemble a solve-frame spatial inertia from compact COM terms."""
+    mass_com_cross = mass * wp.skew(com)
+    # fmt: off
+    return wp.spatial_matrix(
+        mass, 0.0,  0.0,  -mass_com_cross[0, 0], -mass_com_cross[0, 1], -mass_com_cross[0, 2],
+        0.0,  mass, 0.0,  -mass_com_cross[1, 0], -mass_com_cross[1, 1], -mass_com_cross[1, 2],
+        0.0,  0.0,  mass, -mass_com_cross[2, 0], -mass_com_cross[2, 1], -mass_com_cross[2, 2],
+        mass_com_cross[0, 0], mass_com_cross[0, 1], mass_com_cross[0, 2],
+        inertia_origin[0, 0], inertia_origin[0, 1], inertia_origin[0, 2],
+        mass_com_cross[1, 0], mass_com_cross[1, 1], mass_com_cross[1, 2],
+        inertia_origin[1, 0], inertia_origin[1, 1], inertia_origin[1, 2],
+        mass_com_cross[2, 0], mass_com_cross[2, 1], mass_com_cross[2, 2],
+        inertia_origin[2, 0], inertia_origin[2, 1], inertia_origin[2, 2],
+    )
+    # fmt: on
+
+
+@wp.func
+def mul_com_spatial_inertia(mass: float, com: wp.vec3, inertia_origin: wp.mat33, velocity: wp.spatial_vector):
+    """Multiply a solve-frame twist by a COM-centered rigid-body inertia."""
+    linear = wp.spatial_top(velocity)
+    angular = wp.spatial_bottom(velocity)
+    return wp.spatial_vector(
+        mass * (linear - wp.cross(com, angular)),
+        mass * wp.cross(com, linear) + inertia_origin * angular,
+    )
+
+
 # compute transform across a joint
 @wp.func
 def jcalc_transform(
@@ -951,7 +991,9 @@ def compute_link_velocity(
     joint_qd: wp.array[float],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
-    body_I_m: wp.array[wp.spatial_matrix],
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    write_body_inertia: int,
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
     joint_X_p: wp.array[wp.transform],
@@ -1002,30 +1044,28 @@ def compute_link_velocity(
         wp.transform_get_translation(X_sm) - origin,
         wp.transform_get_rotation(X_sm),
     )
-    I_m = body_I_m[child]
+    mass = body_mass[child]
 
     # gravity and external forces (expressed in frame aligned with s but centered at body mass)
-    m = I_m[0, 0]
-
-    f_g = m * gravity
-    r_com = wp.transform_get_translation(X_sm_local)
-    f_g_s = wp.spatial_vector(f_g, wp.cross(r_com, f_g))
+    f_g = mass * gravity
+    com, inertia_origin = transform_com_inertia_terms(X_sm_local, mass, body_inertia[child])
+    f_g_s = wp.spatial_vector(f_g, wp.cross(com, f_g))
 
     # body forces
-    I_s = transform_spatial_inertia(X_sm_local, I_m)
+    if write_body_inertia != 0:
+        body_I_s[child] = assemble_com_spatial_inertia(mass, com, inertia_origin)
 
     # The root's linear inertial wrench is NOT spurious: the solve frame is centred on a material
     # point of the root body, so that point accelerates as the body rotates and this term is what
     # carries it. SolverFeatherstone keeps it and conserves momentum; zeroing it here leaked
     # momentum on every rotating multi-link articulation.
-    coriolis = spatial_cross_dual(v_s, I_s * v_s)
+    coriolis = spatial_cross_dual(v_s, mul_com_spatial_inertia(mass, com, inertia_origin, v_s))
 
-    f_b_s = I_s * a_s + coriolis
+    f_b_s = mul_com_spatial_inertia(mass, com, inertia_origin, a_s) + coriolis
 
     body_v_s[child] = v_s
     body_a_s[child] = a_s
     body_f_s[child] = f_b_s - f_g_s
-    body_I_s[child] = I_s
     return v_s, a_s
 
 
@@ -1046,7 +1086,10 @@ def eval_rigid_fk_id(
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
     body_com: wp.array[wp.vec3],
-    body_I_m: wp.array[wp.spatial_matrix],
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    is_free_rigid: wp.array[int],
+    materialize_all_body_inertia: int,
     gravity: wp.array[wp.vec3],
     # outputs
     body_q: wp.array[wp.transform],
@@ -1089,6 +1132,9 @@ def eval_rigid_fk_id(
     articulation_origin[index] = origin
 
     gravity_s = gravity[0]
+    write_body_inertia = materialize_all_body_inertia
+    if is_free_rigid[index] != 0:
+        write_body_inertia = 1
     cached_child = int(-1)
     cached_v_s = wp.spatial_vector()
     cached_a_s = wp.spatial_vector()
@@ -1117,7 +1163,9 @@ def eval_rigid_fk_id(
             joint_qd,
             joint_axis,
             joint_dof_dim,
-            body_I_m,
+            body_mass,
+            body_inertia,
+            write_body_inertia,
             body_q,
             body_q_com,
             joint_X_p,
@@ -1128,6 +1176,32 @@ def eval_rigid_fk_id(
             body_a_s,
         )
         cached_child = child
+
+
+@wp.kernel
+def refresh_masked_body_inertia(
+    articulation_joint_end: wp.array[int],
+    joint_articulation: wp.array[int],
+    joint_child: wp.array[int],
+    mass_update_mask: wp.array[int],
+    body_q_com: wp.array[wp.transform],
+    articulation_origin: wp.array[wp.vec3],
+    body_I_m: wp.array[wp.spatial_matrix],
+    # output
+    body_I_s: wp.array[wp.spatial_matrix],
+):
+    """Materialize current link inertias selected by a reuse-step mass update mask."""
+    joint = wp.tid()
+    articulation = joint_articulation[joint]
+    if articulation < 0 or joint >= articulation_joint_end[articulation] or mass_update_mask[articulation] == 0:
+        return
+    child = joint_child[joint]
+    X_sm = body_q_com[child]
+    X_sm_local = wp.transform(
+        wp.transform_get_translation(X_sm) - articulation_origin[articulation],
+        wp.transform_get_rotation(X_sm),
+    )
+    body_I_s[child] = transform_spatial_inertia(X_sm_local, body_I_m[child])
 
 
 # Inverse dynamics via Recursive Newton-Euler algorithm (Featherstone Table 5.1)
@@ -1142,7 +1216,10 @@ def eval_rigid_id(
     joint_qd: wp.array[float],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
-    body_I_m: wp.array[wp.spatial_matrix],
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    is_free_rigid: wp.array[int],
+    materialize_all_body_inertia: int,
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
     joint_X_p: wp.array[wp.transform],
@@ -1163,6 +1240,9 @@ def eval_rigid_id(
     end = articulation_joint_end[index]
     origin = articulation_origin[index]
     gravity_s = gravity[0]
+    write_body_inertia = materialize_all_body_inertia
+    if is_free_rigid[index] != 0:
+        write_body_inertia = 1
     cached_child = int(-1)
     cached_v_s = wp.spatial_vector()
     cached_a_s = wp.spatial_vector()
@@ -1193,7 +1273,9 @@ def eval_rigid_id(
             joint_qd,
             joint_axis,
             joint_dof_dim,
-            body_I_m,
+            body_mass,
+            body_inertia,
+            write_body_inertia,
             body_q,
             body_q_com,
             joint_X_p,
