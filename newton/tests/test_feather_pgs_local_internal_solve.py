@@ -40,7 +40,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         device = "cpu"
         constraint_count = wp.array([5, 8, 21, 8, 8, 8, 0, 41], dtype=wp.int32, device=device)
         phase_bounds = wp.array(
-            [[0, 5], [0, 2], [0, 2], [0, 2], [0, 2], [0, 2], [0, 0], [0, 2]],
+            [[0, 5], [0, 2], [0, 2], [0, 2], [0, 2], [0, 8], [0, 0], [0, 2]],
             dtype=wp.int32,
             device=device,
         )
@@ -48,6 +48,9 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         mf_body_a = wp.full((8, 1), -1, dtype=wp.int32, device=device)
         mf_body_b = wp.array([[-1], [-1], [-1], [0], [1], [-1], [-1], [-1]], dtype=wp.int32, device=device)
         body_to_articulation = wp.array([12, 99], dtype=wp.int32, device=device)
+        articulation_dof_count_host = np.full(16, 20, dtype=np.int32)
+        articulation_dof_count_host[5] = 7
+        articulation_dof_count = wp.array(articulation_dof_count_host, device=device)
         primary = wp.array([0, 1, 2, 3, 4, 5, 6, 7], dtype=wp.int32, device=device)
         pair = wp.array([-1, 10, 11, 12, 13, -1, 14, 15], dtype=wp.int32, device=device)
         residual_pair = wp.array([-1, 10, 11, 12, 13, -1, 14, 15], dtype=wp.int32, device=device)
@@ -65,6 +68,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 mf_body_a,
                 mf_body_b,
                 body_to_articulation,
+                articulation_dof_count,
                 primary,
                 pair,
                 residual_pair,
@@ -194,7 +198,13 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         np.testing.assert_array_equal(impulses.numpy()[1], np.zeros(max_constraints, dtype=np.float32))
 
         def launch_variant(
-            warps_per_block: int, *, contact_capable: bool = True, persistent_queue: bool = False, active_count: int = 2
+            warps_per_block: int,
+            *,
+            lanes_per_world: int = 32,
+            contact_capable: bool = True,
+            persistent_queue: bool = False,
+            active_count: int = 2,
+            dense_response_matrix: bool = False,
         ):
             variant_diagonal = wp.array(cfm, dtype=wp.float32, device=device)
             variant_impulses = wp.zeros((2, max_constraints), dtype=wp.float32, device=device)
@@ -206,7 +216,9 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 device.arch,
                 persistent_queue=persistent_queue,
                 warps_per_block=warps_per_block,
+                lanes_per_world=lanes_per_world,
                 contact_capable=contact_capable,
+                dense_response_matrix=dense_response_matrix,
             )
             inputs = [candidate_articulations, candidate_articulations]
             if persistent_queue:
@@ -234,9 +246,13 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                     0,
                 ]
             )
+            worlds_per_block = warps_per_block * 32 // lanes_per_world
+            block_count = 2 // worlds_per_block
+            if persistent_queue:
+                block_count = max(block_count, 1)
             wp.launch_tiled(
                 variant_kernel,
-                dim=[2 // warps_per_block],
+                dim=[block_count],
                 inputs=inputs,
                 outputs=[variant_diagonal, variant_impulses, variant_velocity],
                 block_dim=32 * warps_per_block,
@@ -251,9 +267,28 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             launch_variant(1, contact_capable=False),
             launch_variant(2, contact_capable=False),
         ]
+        matrix_variants = [
+            launch_variant(1, contact_capable=False, dense_response_matrix=True),
+            launch_variant(
+                1,
+                lanes_per_world=16,
+                contact_capable=False,
+                dense_response_matrix=True,
+            ),
+            launch_variant(
+                1,
+                lanes_per_world=8,
+                contact_capable=False,
+                persistent_queue=True,
+                dense_response_matrix=True,
+            ),
+        ]
         for variant_outputs in variants:
             for one_warp, variant in zip(one_warp_outputs, variant_outputs, strict=True):
                 np.testing.assert_array_equal(variant, one_warp)
+        for variant_outputs in matrix_variants:
+            for one_warp, variant in zip(one_warp_outputs, variant_outputs, strict=True):
+                np.testing.assert_allclose(variant, one_warp, rtol=0.0, atol=2.0e-6)
 
         one_warp_queue = launch_variant(1, persistent_queue=True, active_count=1)
         two_warp_queue = launch_variant(2, persistent_queue=True, active_count=1)
@@ -371,6 +406,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             warps_per_block=2,
             mf_max_constraints=max_constraints,
             local_mf_max_constraints=max_constraints,
+            dense_response_matrix=True,
         )
         wp.launch_tiled(
             kernel,

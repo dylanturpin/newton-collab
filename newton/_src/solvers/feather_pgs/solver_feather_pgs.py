@@ -1470,13 +1470,21 @@ class SolverFeatherPGS(SolverBase):
             response_by_world[int(self._model_plan.articulation_world[art])].append(int(art))
 
         def local_shared_bytes(
-            primary_dofs: int, secondary_dofs: int = 0, max_rows: int | None = None, mf_rows: int = 0
+            primary_dofs: int,
+            secondary_dofs: int = 0,
+            max_rows: int | None = None,
+            mf_rows: int = 0,
+            *,
+            dense_response_matrix: bool = False,
         ) -> int:
             if max_rows is None:
                 max_rows = self._local_solve_max_rows
             total_dofs = primary_dofs + secondary_dofs
             factor_words = primary_dofs * primary_dofs + secondary_dofs * secondary_dofs
             row_words = 2 * max_rows * total_dofs + 8 * max_rows
+            if dense_response_matrix:
+                response_rows = max_rows + mf_rows
+                row_words += response_rows * (response_rows + 1) // 2 + 2 * response_rows
             return 128 + 4 * (factor_words + row_words + total_dofs + mf_rows)
 
         if local_base_supported:
@@ -1490,7 +1498,12 @@ class SolverFeatherPGS(SolverBase):
                     primary_dofs <= 0
                     or primary_dofs > _LOCAL_INTERNAL_MAX_DOF
                     or self._execution_plan.use_tiled_hinv_jt(primary_dofs)
-                    or local_shared_bytes(primary_dofs) > local_shared_limit
+                    or local_shared_bytes(
+                        primary_dofs,
+                        max_rows=min(self._local_solve_max_rows, primary_dofs),
+                        dense_response_matrix=True,
+                    )
+                    > local_shared_limit
                 ):
                     continue
                 local_primary_articulation[world] = primary_art
@@ -1504,7 +1517,12 @@ class SolverFeatherPGS(SolverBase):
                 if (
                     secondary_dofs != 6
                     or self._execution_plan.use_tiled_hinv_jt(secondary_dofs)
-                    or local_shared_bytes(primary_dofs, secondary_dofs) > local_shared_limit
+                    or local_shared_bytes(
+                        primary_dofs,
+                        secondary_dofs,
+                        dense_response_matrix=True,
+                    )
+                    > local_shared_limit
                 ):
                     continue
                 local_pair_articulation[world] = secondary_art
@@ -1516,6 +1534,7 @@ class SolverFeatherPGS(SolverBase):
                         secondary_dofs,
                         self._local_residual_max_rows,
                         self._local_residual_mf_max_rows,
+                        dense_response_matrix=True,
                     )
                     <= local_shared_limit
                 ):
@@ -1610,6 +1629,7 @@ class SolverFeatherPGS(SolverBase):
                     6,
                     self._local_residual_max_rows,
                     self._local_residual_mf_max_rows,
+                    dense_response_matrix=True,
                 )
                 <= local_shared_limit
                 else 1
@@ -4256,19 +4276,32 @@ class SolverFeatherPGS(SolverBase):
         self._pgs_solve_local_pair_kernels = {}
         self._pgs_solve_local_residual_kernels = {}
         self._pgs_solve_local_internal_warps_per_block = {}
+        self._pgs_solve_local_internal_worlds_per_block = {}
         self._pgs_solve_local_pair_warps_per_block = {}
         if self._local_internal_fast_path:
             for size, count in self._local_internal_art_counts.items():
                 if count > 0:
-                    warps_per_block = 2 if count % 2 == 0 else 1
+                    lanes_per_world = 32
+                    if size <= 16:
+                        for candidate_lanes in (8, 16):
+                            if count % (32 // candidate_lanes) == 0:
+                                lanes_per_world = candidate_lanes
+                                break
+                    worlds_per_warp = 32 // lanes_per_world
+                    warps_per_block = 2 if count % (2 * worlds_per_warp) == 0 else 1
                     self._pgs_solve_local_internal_warps_per_block[size] = warps_per_block
+                    self._pgs_solve_local_internal_worlds_per_block[size] = (
+                        warps_per_block * 32 // lanes_per_world
+                    )
                     self._pgs_solve_local_internal_kernels[size] = _get_pgs_solve_local_owned_kernel(
                         self.dense_max_constraints,
-                        self._local_solve_max_rows,
+                        min(self._local_solve_max_rows, size),
                         size,
                         device_arch,
                         warps_per_block=warps_per_block,
+                        lanes_per_world=lanes_per_world,
                         contact_capable=False,
+                        dense_response_matrix=True,
                     )
             for size, count in self._local_pair_art_counts.items():
                 if count > 0:
@@ -4283,6 +4316,7 @@ class SolverFeatherPGS(SolverBase):
                         paired_dof_count=6,
                         persistent_queue=True,
                         warps_per_block=warps_per_block,
+                        dense_response_matrix=True,
                     )
             for size, count in self._local_residual_art_counts.items():
                 if count > 0:
@@ -4297,6 +4331,7 @@ class SolverFeatherPGS(SolverBase):
                         warps_per_block=warps_per_block,
                         mf_max_constraints=self.mf_max_constraints,
                         local_mf_max_constraints=self._local_residual_mf_max_rows,
+                        dense_response_matrix=True,
                     )
 
         self._pgs_solve_mf_gs_kernel = None
@@ -4728,7 +4763,10 @@ class SolverFeatherPGS(SolverBase):
             active_count: wp.array,
             use_active_queue: bool,
             warps_per_block: int = 1,
+            worlds_per_block: int | None = None,
         ) -> None:
+            if worlds_per_block is None:
+                worlds_per_block = warps_per_block
             secondary_group_size = secondary_size if secondary_size > 0 else primary_size
             inputs = [primary_candidates, secondary_candidates]
             if use_active_queue:
@@ -4766,7 +4804,7 @@ class SolverFeatherPGS(SolverBase):
             )
             wp.launch_tiled(
                 kernel,
-                dim=[count // warps_per_block],
+                dim=[count // worlds_per_block],
                 inputs=inputs,
                 outputs=[self.diag, self.impulses, self.v_out],
                 block_dim=32 * warps_per_block,
@@ -4786,6 +4824,7 @@ class SolverFeatherPGS(SolverBase):
                     self._local_general_world_count,
                     False,
                     self._pgs_solve_local_internal_warps_per_block[size],
+                    self._pgs_solve_local_internal_worlds_per_block[size],
                 )
         if solve_pair:
             for size, kernel in self._pgs_solve_local_pair_kernels.items():
@@ -8885,6 +8924,7 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_body_a,
                     self.mf_body_b,
                     self.body_to_articulation,
+                    self.articulation_H_rows,
                     self._local_primary_articulation,
                     self._local_pair_articulation,
                     self._local_residual_pair_articulation,
@@ -15891,14 +15931,18 @@ def _get_pgs_solve_local_owned_kernel(
     persistent_queue: bool = False,
     *,
     warps_per_block: int = 1,
+    lanes_per_world: int = 32,
     contact_capable: bool = True,
     mf_max_constraints: int = 0,
     local_mf_max_constraints: int = 0,
+    dense_response_matrix: bool = False,
 ) -> "wp.Kernel":
     """Fuse response construction and PGS for one local articulation or pair."""
     del device_arch
     if warps_per_block not in (1, 2):
         raise ValueError("warps_per_block must be 1 or 2")
+    if lanes_per_world not in (8, 16, 32):
+        raise ValueError("lanes_per_world must be 8, 16, or 32")
     if not contact_capable and paired_dof_count:
         raise ValueError("only single-articulation kernels may omit contact handling")
     if local_mf_max_constraints and (not contact_capable or not paired_dof_count or mf_max_constraints <= 0):
@@ -15908,15 +15952,20 @@ def _get_pgs_solve_local_owned_kernel(
     dofs = dof_count
     paired_dofs = paired_dof_count
     total_dofs = dofs + paired_dofs
+    if lanes_per_world < 32 and (contact_capable or total_dofs > 16):
+        raise ValueError("subwarp local solve groups require a contactless world with at most 16 DoFs")
     mf_storage_rows = mf_max_constraints
     local_mf_rows = local_mf_max_constraints
+    response_rows = local_rows + local_mf_rows
+    dense_matrix_condition = "true"
+    response_row_count = "row_count + mf_count" if local_mf_rows else "row_count"
+    groups_per_block = warps_per_block * 32 // lanes_per_world
 
-    warp_setup = (
-        """    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;"""
-        if warps_per_block == 2
-        else "    const int lane = threadIdx.x;"
-    )
+    lane_mask = (1 << lanes_per_world) - 1
+    lane_base_mask = 32 - lanes_per_world
+    group_setup = f"""    const int local_group = threadIdx.x / {lanes_per_world};
+    const int lane = threadIdx.x & {lanes_per_world - 1};
+    const unsigned MASK = {hex(lane_mask)}u << (threadIdx.x & {lane_base_mask});"""
     pair_setup = (
         f"""
     const int secondary_art = candidate_secondary_articulations.data[candidate];
@@ -15949,25 +15998,37 @@ def _get_pgs_solve_local_owned_kernel(
                 ("int", "s_active", local_rows),
             ]
         )
+    elif lanes_per_world < 32:
+        shared_specs.extend([("int", "s_active", local_rows), ("int", "s_joint_limit", local_rows)])
     if local_mf_rows:
         shared_specs.append(("float", "s_mf_lambda", local_mf_rows))
-    if warps_per_block == 1:
+    if dense_response_matrix:
+        shared_specs.extend(
+            [
+                ("float", "s_A", response_rows * (response_rows + 1) // 2),
+                ("float", "s_base_residual", response_rows),
+                ("float", "s_applied_delta", response_rows),
+            ]
+        )
+    if groups_per_block == 1:
         shared_declarations = "\n".join(
             f"    __shared__ {value_type} {name}[{count}];" for value_type, name, count in shared_specs
         )
         shared_cleanup = ""
     else:
         shared_fields = "\n".join(f"        {value_type} {name}[{count}];" for value_type, name, count in shared_specs)
-        shared_aliases = "\n".join(f"#define {name} local_solve_scratch[warp].{name}" for _, name, _ in shared_specs)
+        shared_aliases = "\n".join(
+            f"#define {name} local_solve_scratch[local_group].{name}" for _, name, _ in shared_specs
+        )
         shared_declarations = f"""    struct LocalSolveScratch {{
 {shared_fields}
     }};
-    __shared__ LocalSolveScratch local_solve_scratch[{warps_per_block}];
+    __shared__ LocalSolveScratch local_solve_scratch[{groups_per_block}];
 {shared_aliases}"""
         shared_cleanup = "\n".join(f"#undef {name}" for _, name, _ in shared_specs)
     pair_factor_load = (
         f"""
-    for (int i = lane; i < {paired_dofs * paired_dofs}; i += 32)
+    for (int i = lane; i < {paired_dofs * paired_dofs}; i += {lanes_per_world})
         s_L_secondary[i] = secondary_L_group.data[secondary_group_l_base + i];"""
         if paired_dofs
         else ""
@@ -15981,9 +16042,9 @@ def _get_pgs_solve_local_owned_kernel(
     }}"""
         if paired_dofs
         else f"""
-    if (lane < {dofs}) {{
-        const int dof = articulation_dof_start.data[art] + lane;
-        s_v[lane] = v_out.data[dof];
+    for (int local_dof = lane; local_dof < {dofs}; local_dof += {lanes_per_world}) {{
+        const int dof = articulation_dof_start.data[art] + local_dof;
+        s_v[local_dof] = v_out.data[dof];
     }}"""
     )
     pair_response = (
@@ -16026,39 +16087,46 @@ def _get_pgs_solve_local_owned_kernel(
     }}"""
         if paired_dofs
         else f"""
-    if (lane < {dofs}) {{
-        const int dof = articulation_dof_start.data[art] + lane;
-        v_out.data[dof] = s_v[lane];
+    for (int local_dof = lane; local_dof < {dofs}; local_dof += {lanes_per_world}) {{
+        const int dof = articulation_dof_start.data[art] + local_dof;
+        v_out.data[dof] = s_v[local_dof];
     }}"""
     )
-    lane_metadata = (
-        ""
-        if contact_capable
-        else """    int lane_joint_limit = 0;
-    int lane_active = 0;"""
-    )
-    row_metadata_load = (
-        """        s_type[row] = world_row_type.data[world_row_base + row];
+    if contact_capable:
+        lane_metadata = ""
+        row_metadata_load = """        s_type[row] = world_row_type.data[world_row_base + row];
         s_parent[row] = world_row_parent.data[world_row_base + row];
         s_mu[row] = world_row_mu.data[world_row_base + row];"""
-        if contact_capable
-        else f"""        const int row_type = world_row_type.data[world_row_base + row];
-        lane_joint_limit = row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)};"""
-    )
-    active_store = "s_active[row] = active;" if contact_capable else "lane_active = active;"
-    row_masks = (
-        ""
-        if contact_capable
-        else """    const unsigned active_rows = __ballot_sync(MASK, lane_active != 0);
-    const unsigned joint_limit_rows = __ballot_sync(MASK, lane_joint_limit != 0);"""
-    )
-    row_setup = (
-        """            if (s_active[row] == 0) continue;
+        active_store = "s_active[row] = active;"
+        row_masks = ""
+        row_setup = """            if (s_active[row] == 0) continue;
             const int row_type = s_type[row];"""
-        if contact_capable
-        else """            const unsigned row_bit = 1u << row;
+        joint_limit_projection = (
+            f"row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)} && new_impulse < 0.0f"
+        )
+        impulse_active = "s_active[row] != 0"
+    elif lanes_per_world < 32:
+        lane_metadata = ""
+        row_metadata_load = f"""        s_joint_limit[row] =
+            world_row_type.data[world_row_base + row] == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)};"""
+        active_store = "s_active[row] = active;"
+        row_masks = ""
+        row_setup = """            if (s_active[row] == 0) continue;
+            const int row_joint_limit = s_joint_limit[row];"""
+        joint_limit_projection = "row_joint_limit != 0 && new_impulse < 0.0f"
+        impulse_active = "s_active[row] != 0"
+    else:
+        lane_metadata = """    int lane_joint_limit = 0;
+    int lane_active = 0;"""
+        row_metadata_load = f"""        const int row_type = world_row_type.data[world_row_base + row];
+        lane_joint_limit = row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)};"""
+        active_store = "lane_active = active;"
+        row_masks = """    const unsigned active_rows = __ballot_sync(MASK, lane_active != 0);
+    const unsigned joint_limit_rows = __ballot_sync(MASK, lane_joint_limit != 0);"""
+        row_setup = """            const unsigned row_bit = 1u << row;
             if ((active_rows & row_bit) == 0u) continue;"""
-    )
+        joint_limit_projection = "(joint_limit_rows & row_bit) != 0u && new_impulse < 0.0f"
+        impulse_active = "(active_rows & (1u << row)) != 0u"
     iteration_setup = "        const int global_iteration = iteration_offset + iteration;" if contact_capable else ""
     friction_gate = (
         f"""            if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
@@ -16069,6 +16137,22 @@ def _get_pgs_solve_local_owned_kernel(
             }}"""
         if contact_capable
         else ""
+    )
+    sibling_state_update = (
+        f"""if ({dense_matrix_condition}) {{
+                                if (lane == 0) s_applied_delta[sibling] += sibling_delta;
+                                for (int target = lane; target < {response_row_count}; target += {lanes_per_world}) {{
+                                    const int matrix_hi = target > sibling ? target : sibling;
+                                    const int matrix_lo = target > sibling ? sibling : target;
+                                    const int matrix_index = matrix_hi * (matrix_hi + 1) / 2 + matrix_lo;
+                                    s_base_residual[target] += s_A[matrix_index] * sibling_delta;
+                                }}
+                            }} else if (lane < {total_dofs}) {{
+                                s_v[lane] += s_Y[sibling * {total_dofs} + lane] * sibling_delta;
+                            }}"""
+        if dense_response_matrix
+        else f"""if (lane < {total_dofs})
+                                s_v[lane] += s_Y[sibling * {total_dofs} + lane] * sibling_delta;"""
     )
     impulse_projection = (
         f"""            if ((row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}
@@ -16092,15 +16176,215 @@ def _get_pgs_solve_local_owned_kernel(
                         if (sibling_delta != 0.0f) {{
                             changed = 1;
                             s_lambda[sibling] = sibling_new;
-                            if (lane < {total_dofs})
-                                s_v[lane] += s_Y[sibling * {total_dofs} + lane] * sibling_delta;
+                            {sibling_state_update}
                         }}
                     }}
                 }}
             }}"""
         if contact_capable
-        else """            if ((joint_limit_rows & row_bit) != 0u && new_impulse < 0.0f)
+        else f"""            if ({joint_limit_projection})
                 new_impulse = 0.0f;"""
+    )
+    if dense_response_matrix and local_mf_rows:
+        response_matrix_setup = f"""
+    if ({dense_matrix_condition}) {{
+        const int matrix_row_count = row_count + mf_count;
+        for (int matrix_row = lane; matrix_row < matrix_row_count; matrix_row += {lanes_per_world}) {{
+            float base_residual;
+            if (matrix_row < row_count) {{
+                base_residual = s_rhs[matrix_row];
+                for (int d = 0; d < {total_dofs}; ++d)
+                    base_residual += s_J[matrix_row * {total_dofs} + d] * s_v[d];
+            }} else {{
+                const int mf_row = matrix_row - row_count;
+                const int4 row_meta =
+                    *reinterpret_cast<const int4*>(&mf_meta.data[mf_meta_offset + mf_row * 4]);
+                const int row_packed_dofs = row_meta.x;
+                const int row_dof_a = row_packed_dofs >> 16;
+                const int row_dof_b = (row_packed_dofs << 16) >> 16;
+                const int row_mf6 = mf6_base + mf_row * 6;
+                base_residual = __int_as_float(row_meta.z);
+                for (int d = 0; d < 6; ++d) {{
+                    if (row_dof_a >= 0)
+                        base_residual += mf_J_a.data[row_mf6 + d] * s_v[row_dof_a + d];
+                    if (row_dof_b >= 0)
+                        base_residual += mf_J_b.data[row_mf6 + d] * s_v[row_dof_b + d];
+                }}
+            }}
+            s_base_residual[matrix_row] = base_residual;
+            s_applied_delta[matrix_row] = 0.0f;
+        }}
+
+        const int matrix_entry_count = matrix_row_count * (matrix_row_count + 1) / 2;
+        int matrix_row = 0;
+        int matrix_row_start = 0;
+        int next_matrix_row_start = 1;
+        for (int matrix_index = lane; matrix_index < matrix_entry_count;
+             matrix_index += {lanes_per_world}) {{
+            while (matrix_index >= next_matrix_row_start) {{
+                matrix_row_start = next_matrix_row_start;
+                ++matrix_row;
+                next_matrix_row_start += matrix_row + 1;
+            }}
+            const int column = matrix_index - matrix_row_start;
+            float response_entry = 0.0f;
+            if (matrix_row < row_count) {{
+                for (int d = 0; d < {total_dofs}; ++d)
+                    response_entry += s_J[matrix_row * {total_dofs} + d]
+                        * s_Y[column * {total_dofs} + d];
+            }} else {{
+                const int mf_row = matrix_row - row_count;
+                const int4 row_meta =
+                    *reinterpret_cast<const int4*>(&mf_meta.data[mf_meta_offset + mf_row * 4]);
+                const int row_packed_dofs = row_meta.x;
+                const int row_dof_a = row_packed_dofs >> 16;
+                const int row_dof_b = (row_packed_dofs << 16) >> 16;
+                const int row_mf6 = mf6_base + mf_row * 6;
+                if (column < row_count) {{
+                    for (int d = 0; d < 6; ++d) {{
+                        if (row_dof_a >= 0)
+                            response_entry += mf_J_a.data[row_mf6 + d]
+                                * s_Y[column * {total_dofs} + row_dof_a + d];
+                        if (row_dof_b >= 0)
+                            response_entry += mf_J_b.data[row_mf6 + d]
+                                * s_Y[column * {total_dofs} + row_dof_b + d];
+                    }}
+                }} else {{
+                    const int column_mf = column - row_count;
+                    const int4 column_meta = *reinterpret_cast<const int4*>(
+                        &mf_meta.data[mf_meta_offset + column_mf * 4]);
+                    const int column_packed_dofs = column_meta.x;
+                    const int column_dof_a = column_packed_dofs >> 16;
+                    const int column_dof_b = (column_packed_dofs << 16) >> 16;
+                    const int column_mf6 = mf6_base + column_mf * 6;
+                    for (int d = 0; d < 6; ++d) {{
+                        if (row_dof_a >= 0) {{
+                            float response = 0.0f;
+                            if (column_dof_a == row_dof_a)
+                                response += mf_MiJt_a.data[column_mf6 + d];
+                            if (column_dof_b == row_dof_a)
+                                response += mf_MiJt_b.data[column_mf6 + d];
+                            response_entry += mf_J_a.data[row_mf6 + d] * response;
+                        }}
+                        if (row_dof_b >= 0) {{
+                            float response = 0.0f;
+                            if (column_dof_a == row_dof_b)
+                                response += mf_MiJt_a.data[column_mf6 + d];
+                            if (column_dof_b == row_dof_b)
+                                response += mf_MiJt_b.data[column_mf6 + d];
+                            response_entry += mf_J_b.data[row_mf6 + d] * response;
+                        }}
+                    }}
+                }}
+            }}
+            s_A[matrix_index] = response_entry;
+        }}
+        __syncwarp();
+    }}"""
+    elif dense_response_matrix:
+        response_matrix_setup = f"""
+    if ({dense_matrix_condition}) {{
+        for (int row = lane; row < row_count; row += {lanes_per_world}) {{
+            float base_residual = s_rhs[row];
+            for (int d = 0; d < {total_dofs}; ++d)
+                base_residual += s_J[row * {total_dofs} + d] * s_v[d];
+            s_base_residual[row] = base_residual;
+            s_applied_delta[row] = 0.0f;
+        }}
+
+        const int matrix_entry_count = row_count * (row_count + 1) / 2;
+        int matrix_row = 0;
+        int matrix_row_start = 0;
+        int next_matrix_row_start = 1;
+        for (int matrix_index = lane; matrix_index < matrix_entry_count;
+             matrix_index += {lanes_per_world}) {{
+            while (matrix_index >= next_matrix_row_start) {{
+                matrix_row_start = next_matrix_row_start;
+                ++matrix_row;
+                next_matrix_row_start += matrix_row + 1;
+            }}
+            const int column = matrix_index - matrix_row_start;
+            float response_entry = 0.0f;
+            for (int d = 0; d < {total_dofs}; ++d)
+                response_entry +=
+                    s_J[matrix_row * {total_dofs} + d] * s_Y[column * {total_dofs} + d];
+            s_A[matrix_index] = response_entry;
+        }}
+        __syncwarp();
+    }}"""
+    else:
+        response_matrix_setup = ""
+    row_residual = (
+        f"""            float delta = 0.0f;
+            if ({dense_matrix_condition}) {{
+                delta = -s_base_residual[row] / denominator;
+            }} else {{
+                float partial = 0.0f;
+                if (lane < {total_dofs}) partial = s_J[row * {total_dofs} + lane] * s_v[lane];
+                partial += __shfl_down_sync(MASK, partial, 16);
+                partial += __shfl_down_sync(MASK, partial, 8);
+                partial += __shfl_down_sync(MASK, partial, 4);
+                partial += __shfl_down_sync(MASK, partial, 2);
+                partial += __shfl_down_sync(MASK, partial, 1);
+                const float velocity = __shfl_sync(MASK, partial, 0);
+                delta = -(velocity + s_rhs[row]) / denominator;
+            }}"""
+        if dense_response_matrix
+        else f"""            float partial = 0.0f;
+            if (lane < {total_dofs}) partial = s_J[row * {total_dofs} + lane] * s_v[lane];
+            partial += __shfl_down_sync(MASK, partial, 16);
+            partial += __shfl_down_sync(MASK, partial, 8);
+            partial += __shfl_down_sync(MASK, partial, 4);
+            partial += __shfl_down_sync(MASK, partial, 2);
+            partial += __shfl_down_sync(MASK, partial, 1);
+            const float velocity = __shfl_sync(MASK, partial, 0);
+            const float delta = -(velocity + s_rhs[row]) / denominator;"""
+    )
+    main_state_update = (
+        f"""if ({dense_matrix_condition}) {{
+                    if (lane == 0) s_applied_delta[row] += delta_impulse;
+                    for (int target = lane; target < {response_row_count}; target += {lanes_per_world}) {{
+                        const int matrix_hi = target > row ? target : row;
+                        const int matrix_lo = target > row ? row : target;
+                        const int matrix_index = matrix_hi * (matrix_hi + 1) / 2 + matrix_lo;
+                        s_base_residual[target] += s_A[matrix_index] * delta_impulse;
+                    }}
+                }} else if (lane < {total_dofs}) {{
+                    s_v[lane] += s_Y[row * {total_dofs} + lane] * delta_impulse;
+                }}"""
+        if dense_response_matrix
+        else f"if (lane < {total_dofs}) s_v[lane] += s_Y[row * {total_dofs} + lane] * delta_impulse;"
+    )
+    mf_velocity_commit = (
+        f"""
+            for (int mf_row = 0; mf_row < mf_count; ++mf_row) {{
+                const int packed_dofs = mf_meta.data[mf_meta_offset + mf_row * 4];
+                const int dof_a = packed_dofs >> 16;
+                const int dof_b = (packed_dofs << 16) >> 16;
+                const int mf6 = mf6_base + mf_row * 6;
+                const float applied_delta = s_applied_delta[row_count + mf_row];
+                if (dof_a >= 0 && velocity_dof >= dof_a && velocity_dof < dof_a + 6)
+                    velocity += mf_MiJt_a.data[mf6 + velocity_dof - dof_a] * applied_delta;
+                if (dof_b >= 0 && velocity_dof >= dof_b && velocity_dof < dof_b + 6)
+                    velocity += mf_MiJt_b.data[mf6 + velocity_dof - dof_b] * applied_delta;
+            }}"""
+        if local_mf_rows
+        else ""
+    )
+    response_matrix_commit = (
+        f"""
+    if ({dense_matrix_condition}) {{
+        for (int velocity_dof = lane; velocity_dof < {total_dofs}; velocity_dof += {lanes_per_world}) {{
+            float velocity = s_v[velocity_dof];
+            for (int row = 0; row < row_count; ++row)
+                velocity += s_Y[row * {total_dofs} + velocity_dof] * s_applied_delta[row];
+{mf_velocity_commit}
+            s_v[velocity_dof] = velocity;
+        }}
+        __syncwarp();
+    }}"""
+        if dense_response_matrix
+        else ""
     )
     row_sync = "            __syncwarp();" if contact_capable else ""
     early_exit = (
@@ -16112,7 +16396,6 @@ def _get_pgs_solve_local_owned_kernel(
         if contact_capable
         else "        if (__ballot_sync(MASK, changed != 0) == 0u) break;"
     )
-    impulse_active = "s_active[row] != 0" if contact_capable else "(active_rows & (1u << row)) != 0u"
     mf_setup = (
         f"""
     int mf_count = mf_constraint_count.data[world];
@@ -16120,10 +16403,67 @@ def _get_pgs_solve_local_owned_kernel(
     const int mf_offset = world * {mf_storage_rows};
     const int mf_meta_offset = mf_offset * 4;
     const int mf6_base = world * {mf_storage_rows * 6};
-    for (int row = lane; row < mf_count; row += 32)
+    for (int row = lane; row < mf_count; row += {lanes_per_world})
         s_mf_lambda[row] = mf_impulses.data[mf_offset + row];"""
         if local_mf_rows
         else ""
+    )
+    mf_row_residual = (
+        "const float residual_mf = s_base_residual[row_count + mf_row];"
+        if dense_response_matrix
+        else """float partial_mf = 0.0f;
+            if (lane < 6 && dof_a >= 0)
+                partial_mf = mf_J_a.data[mf6 + lane] * s_v[dof_a + lane];
+            if (lane >= 6 && lane < 12 && dof_b >= 0)
+                partial_mf = mf_J_b.data[mf6 + lane - 6] * s_v[dof_b + lane - 6];
+            partial_mf += __shfl_down_sync(MASK, partial_mf, 16);
+            partial_mf += __shfl_down_sync(MASK, partial_mf, 8);
+            partial_mf += __shfl_down_sync(MASK, partial_mf, 4);
+            partial_mf += __shfl_down_sync(MASK, partial_mf, 2);
+            partial_mf += __shfl_down_sync(MASK, partial_mf, 1);
+            const float velocity_mf = __shfl_sync(MASK, partial_mf, 0);
+            const float residual_mf = velocity_mf + __int_as_float(meta.z);"""
+    )
+    mf_sibling_state_update = (
+        f"""const int sibling_matrix_row = row_count + sibling_mf;
+                            if (lane == 0)
+                                s_applied_delta[sibling_matrix_row] += sibling_delta_mf;
+                            for (int target = lane; target < row_count + mf_count; target += {lanes_per_world}) {{
+                                const int matrix_hi =
+                                    target > sibling_matrix_row ? target : sibling_matrix_row;
+                                const int matrix_lo =
+                                    target > sibling_matrix_row ? sibling_matrix_row : target;
+                                const int matrix_index = matrix_hi * (matrix_hi + 1) / 2 + matrix_lo;
+                                s_base_residual[target] += s_A[matrix_index] * sibling_delta_mf;
+                            }}"""
+        if dense_response_matrix
+        else """const int sibling_meta_offset = mf_meta_offset + sibling_mf * 4;
+                            const int sibling_packed_dofs = mf_meta.data[sibling_meta_offset];
+                            const int sibling_dof_a = sibling_packed_dofs >> 16;
+                            const int sibling_dof_b = (sibling_packed_dofs << 16) >> 16;
+                            const int sibling_mf6 = mf6_base + sibling_mf * 6;
+                            if (lane < 6 && sibling_dof_a >= 0)
+                                s_v[sibling_dof_a + lane] +=
+                                    mf_MiJt_a.data[sibling_mf6 + lane] * sibling_delta_mf;
+                            if (lane >= 6 && lane < 12 && sibling_dof_b >= 0)
+                                s_v[sibling_dof_b + lane - 6] +=
+                                    mf_MiJt_b.data[sibling_mf6 + lane - 6] * sibling_delta_mf;"""
+    )
+    mf_main_state_update = (
+        f"""const int matrix_row = row_count + mf_row;
+                if (lane == 0) s_applied_delta[matrix_row] += delta_impulse_mf;
+                for (int target = lane; target < row_count + mf_count; target += {lanes_per_world}) {{
+                    const int matrix_hi = target > matrix_row ? target : matrix_row;
+                    const int matrix_lo = target > matrix_row ? matrix_row : target;
+                    const int matrix_index = matrix_hi * (matrix_hi + 1) / 2 + matrix_lo;
+                    s_base_residual[target] += s_A[matrix_index] * delta_impulse_mf;
+                }}"""
+        if dense_response_matrix
+        else """if (lane < 6 && dof_a >= 0)
+                    s_v[dof_a + lane] += mf_MiJt_a.data[mf6 + lane] * delta_impulse_mf;
+                if (lane >= 6 && lane < 12 && dof_b >= 0)
+                    s_v[dof_b + lane - 6] +=
+                        mf_MiJt_b.data[mf6 + lane - 6] * delta_impulse_mf;"""
     )
     mf_solve = (
         f"""
@@ -16144,19 +16484,7 @@ def _get_pgs_solve_local_owned_kernel(
             if (inverse_diagonal <= 0.0f) continue;
 
             const int mf6 = mf6_base + mf_row * 6;
-            float partial_mf = 0.0f;
-            if (lane < 6 && dof_a >= 0)
-                partial_mf = mf_J_a.data[mf6 + lane] * s_v[dof_a + lane];
-            if (lane >= 6 && lane < 12 && dof_b >= 0)
-                partial_mf = mf_J_b.data[mf6 + lane - 6] * s_v[dof_b + lane - 6];
-            partial_mf += __shfl_down_sync(MASK, partial_mf, 16);
-            partial_mf += __shfl_down_sync(MASK, partial_mf, 8);
-            partial_mf += __shfl_down_sync(MASK, partial_mf, 4);
-            partial_mf += __shfl_down_sync(MASK, partial_mf, 2);
-            partial_mf += __shfl_down_sync(MASK, partial_mf, 1);
-            const float velocity_mf = __shfl_sync(MASK, partial_mf, 0);
-
-            const float residual_mf = velocity_mf + __int_as_float(meta.z);
+            {mf_row_residual}
             const float old_impulse_mf = s_mf_lambda[mf_row];
             float delta_mf = -residual_mf * inverse_diagonal;
             if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)})
@@ -16186,17 +16514,7 @@ def _get_pgs_solve_local_owned_kernel(
                         if (sibling_delta_mf != 0.0f) {{
                             changed = 1;
                             s_mf_lambda[sibling_mf] = sibling_new_mf;
-                            const int sibling_meta_offset = mf_meta_offset + sibling_mf * 4;
-                            const int sibling_packed_dofs = mf_meta.data[sibling_meta_offset];
-                            const int sibling_dof_a = sibling_packed_dofs >> 16;
-                            const int sibling_dof_b = (sibling_packed_dofs << 16) >> 16;
-                            const int sibling_mf6 = mf6_base + sibling_mf * 6;
-                            if (lane < 6 && sibling_dof_a >= 0)
-                                s_v[sibling_dof_a + lane] +=
-                                    mf_MiJt_a.data[sibling_mf6 + lane] * sibling_delta_mf;
-                            if (lane >= 6 && lane < 12 && sibling_dof_b >= 0)
-                                s_v[sibling_dof_b + lane - 6] +=
-                                    mf_MiJt_b.data[sibling_mf6 + lane - 6] * sibling_delta_mf;
+                            {mf_sibling_state_update}
                         }}
                     }}
                 }}
@@ -16206,10 +16524,7 @@ def _get_pgs_solve_local_owned_kernel(
             s_mf_lambda[mf_row] = new_impulse_mf;
             if (delta_impulse_mf != 0.0f) {{
                 changed = 1;
-                if (lane < 6 && dof_a >= 0)
-                    s_v[dof_a + lane] += mf_MiJt_a.data[mf6 + lane] * delta_impulse_mf;
-                if (lane >= 6 && lane < 12 && dof_b >= 0)
-                    s_v[dof_b + lane - 6] += mf_MiJt_b.data[mf6 + lane - 6] * delta_impulse_mf;
+                {mf_main_state_update}
             }}
             __syncwarp();
         }}"""
@@ -16217,16 +16532,15 @@ def _get_pgs_solve_local_owned_kernel(
         else ""
     )
     mf_store = (
-        """
-    for (int row = lane; row < mf_count; row += 32)
+        f"""
+    for (int row = lane; row < mf_count; row += {lanes_per_world})
         mf_impulses.data[mf_offset + row] = s_mf_lambda[row];"""
         if local_mf_rows
         else ""
     )
     snippet = f"""
 #if defined(__CUDA_ARCH__)
-    const unsigned MASK = 0xFFFFFFFF;
-{warp_setup}
+{group_setup}
     const int art = candidate_articulations.data[candidate];
     const int group = articulation_group_index.data[art];
     const int world = articulation_world.data[art];
@@ -16241,10 +16555,11 @@ def _get_pgs_solve_local_owned_kernel(
 {shared_declarations}
 {mf_setup}
 
-    for (int i = lane; i < {dofs * dofs}; i += 32) s_L[i] = L_group.data[group_l_base + i];
+    for (int i = lane; i < {dofs * dofs}; i += {lanes_per_world})
+        s_L[i] = L_group.data[group_l_base + i];
 {pair_factor_load}
 {lane_metadata}
-    for (int row = lane; row < row_count; row += 32) {{
+    for (int row = lane; row < row_count; row += {lanes_per_world}) {{
         s_lambda[row] = world_impulses.data[world_row_base + row];
         s_rhs[row] = rhs_bias.data[world_row_base + row];
 {row_metadata_load}
@@ -16252,7 +16567,7 @@ def _get_pgs_solve_local_owned_kernel(
 {velocity_load}
     __syncwarp();
 
-    for (int row = lane; row < row_count; row += 32) {{
+    for (int row = lane; row < row_count; row += {lanes_per_world}) {{
         float response[{dofs}];
         int active = 0;
         for (int i = 0; i < {dofs}; ++i) {{
@@ -16285,6 +16600,7 @@ def _get_pgs_solve_local_owned_kernel(
         s_diag[row] = diagonal + world_diag.data[world_row_base + row];
     }}
     __syncwarp();
+{response_matrix_setup}
 
 {row_masks}
 
@@ -16297,15 +16613,7 @@ def _get_pgs_solve_local_owned_kernel(
             const float denominator = s_diag[row];
             if (denominator <= 0.0f) continue;
 
-            float partial = 0.0f;
-            if (lane < {total_dofs}) partial = s_J[row * {total_dofs} + lane] * s_v[lane];
-            partial += __shfl_down_sync(MASK, partial, 16);
-            partial += __shfl_down_sync(MASK, partial, 8);
-            partial += __shfl_down_sync(MASK, partial, 4);
-            partial += __shfl_down_sync(MASK, partial, 2);
-            partial += __shfl_down_sync(MASK, partial, 1);
-            const float velocity = __shfl_sync(MASK, partial, 0);
-            const float delta = -(velocity + s_rhs[row]) / denominator;
+{row_residual}
             const float old_impulse = s_lambda[row];
             float new_impulse = old_impulse + omega * delta;
 {impulse_projection}
@@ -16313,7 +16621,7 @@ def _get_pgs_solve_local_owned_kernel(
             s_lambda[row] = new_impulse;
             if (delta_impulse != 0.0f) {{
                 changed = 1;
-                if (lane < {total_dofs}) s_v[lane] += s_Y[row * {total_dofs} + lane] * delta_impulse;
+                {main_state_update}
             }}
 {row_sync}
         }}
@@ -16321,8 +16629,9 @@ def _get_pgs_solve_local_owned_kernel(
 {early_exit}
     }}
 
+{response_matrix_commit}
 {velocity_store}
-    for (int row = lane; row < row_count; row += 32) {{
+    for (int row = lane; row < row_count; row += {lanes_per_world}) {{
         world_diag.data[world_row_base + row] = s_diag[row];
         if ({impulse_active}) world_impulses.data[world_row_base + row] = s_lambda[row];
     }}
@@ -16330,6 +16639,7 @@ def _get_pgs_solve_local_owned_kernel(
 {shared_cleanup}
 #endif
 """
+    snippet = snippet.replace("__syncwarp();", "__syncwarp(MASK);")
 
     @wp.func_native(snippet)
     def pgs_solve_local_internal_native(
@@ -16403,7 +16713,7 @@ def _get_pgs_solve_local_owned_kernel(
         v_out: wp.array[float],
     ):
         candidate, lane = wp.tid()
-        candidate = candidate * warps_per_block + lane // 32
+        candidate = candidate * groups_per_block + lane // lanes_per_world
         pgs_solve_local_internal_native(
             candidate,
             candidate_articulations,
@@ -16478,7 +16788,7 @@ def _get_pgs_solve_local_owned_kernel(
     ):
         candidate, lane = wp.tid()
         candidate_count = active_candidate_count[0]
-        candidate = candidate * warps_per_block + lane // 32
+        candidate = candidate * groups_per_block + lane // lanes_per_world
         while candidate < candidate_count:
             pgs_solve_local_internal_native(
                 candidate,
@@ -16520,10 +16830,14 @@ def _get_pgs_solve_local_owned_kernel(
     name = f"pgs_solve_local_internal_{max_rows}_{local_rows}_{dofs}_{paired_dofs}"
     if warps_per_block != 1:
         name += f"_w{warps_per_block}"
+    if lanes_per_world != 32:
+        name += f"_l{lanes_per_world}"
     if not contact_capable:
         name += "_contact0"
     if local_mf_rows:
         name += f"_mf{local_mf_rows}"
+    if dense_response_matrix:
+        name += "_denseamat"
     template = pgs_solve_local_internal_template
     if persistent_queue:
         name += "_queue"
