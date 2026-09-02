@@ -48,6 +48,15 @@ PGS_CONSTRAINT_TYPE_COUNT = 7
 PGS_LOCAL_SOLVE_OWNER_GENERAL = 0
 PGS_LOCAL_SOLVE_OWNER_SINGLE = 1
 PGS_LOCAL_SOLVE_OWNER_PAIR = 2
+PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL = 3
+
+
+@wp.kernel
+def local_solve_launch_gate():
+    """Create a minimal graph dependency ahead of the bulk local solves."""
+
+    pass
+
 
 # Numeric IDs for the ``friction_mode`` argument passed to the matrix-free
 # PGS solver kernels.  Mirrors the Python-side string enum on
@@ -9711,9 +9720,15 @@ def classify_local_solve_worlds(
     world_constraint_count: wp.array[int],
     dense_phase_bounds: wp.array2d[int],
     mf_constraint_count: wp.array[int],
+    mf_body_a: wp.array2d[int],
+    mf_body_b: wp.array2d[int],
+    body_to_articulation: wp.array[int],
     local_primary_articulation: wp.array[int],
     local_pair_articulation: wp.array[int],
+    local_residual_pair_articulation: wp.array[int],
     local_max_constraints: int,
+    local_residual_max_constraints: int,
+    local_residual_mf_max_constraints: int,
     # outputs
     local_solve_owner: wp.array[int],
     general_world_count: wp.array[int],
@@ -9722,19 +9737,38 @@ def classify_local_solve_worlds(
     """Assign exact solver ownership and compact active general worlds."""
     world = wp.tid()
     row_count = world_constraint_count[world]
+    mf_count = mf_constraint_count[world]
+    primary_articulation = local_primary_articulation[world]
+    pair_articulation = local_pair_articulation[world]
+    residual_pair_articulation = local_residual_pair_articulation[world]
+    single_phase = dense_phase_bounds[world, 1] == row_count
+
+    local_mf = mf_count > 0 and mf_count <= local_residual_mf_max_constraints and residual_pair_articulation >= 0
+    mf_row = int(0)
+    while mf_row < mf_count and local_mf:
+        body_a = mf_body_a[world, mf_row]
+        body_b = mf_body_b[world, mf_row]
+        if body_a >= 0 and body_to_articulation[body_a] != residual_pair_articulation:
+            local_mf = False
+        if body_b >= 0 and body_to_articulation[body_b] != residual_pair_articulation:
+            local_mf = False
+        mf_row += 1
+
     owner = PGS_LOCAL_SOLVE_OWNER_GENERAL
-    if (
-        row_count > 0
-        and row_count <= local_max_constraints
-        and mf_constraint_count[world] == 0
-        and local_primary_articulation[world] >= 0
-    ):
-        if dense_phase_bounds[world, 1] == row_count:
+    if row_count > 0 and row_count <= local_max_constraints and mf_count == 0 and primary_articulation >= 0:
+        if single_phase:
             owner = PGS_LOCAL_SOLVE_OWNER_SINGLE
-        elif local_pair_articulation[world] >= 0:
+        elif pair_articulation >= 0:
             owner = PGS_LOCAL_SOLVE_OWNER_PAIR
+    elif (
+        row_count > 0
+        and row_count <= local_residual_max_constraints
+        and residual_pair_articulation >= 0
+        and ((mf_count == 0 and not single_phase) or local_mf)
+    ):
+        owner = PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL
     local_solve_owner[world] = owner
-    if owner == PGS_LOCAL_SOLVE_OWNER_GENERAL and (row_count > 0 or mf_constraint_count[world] > 0):
+    if owner == PGS_LOCAL_SOLVE_OWNER_GENERAL and (row_count > 0 or mf_count > 0):
         general_index = wp.atomic_add(general_world_count, 0, 1)
         general_worlds[general_index] = world
 
@@ -9745,6 +9779,7 @@ def compact_local_pair_candidates(
     candidate_secondary_articulations: wp.array[int],
     articulation_world: wp.array[int],
     local_solve_owner: wp.array[int],
+    expected_owner: int,
     # outputs
     active_count: wp.array[int],
     active_articulations: wp.array[int],
@@ -9754,7 +9789,7 @@ def compact_local_pair_candidates(
     candidate = wp.tid()
     articulation = candidate_articulations[candidate]
     world = articulation_world[articulation]
-    if local_solve_owner[world] == PGS_LOCAL_SOLVE_OWNER_PAIR:
+    if local_solve_owner[world] == expected_owner:
         active_index = wp.atomic_add(active_count, 0, 1)
         active_articulations[active_index] = articulation
         active_secondary_articulations[active_index] = candidate_secondary_articulations[candidate]
