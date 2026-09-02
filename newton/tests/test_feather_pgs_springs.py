@@ -77,25 +77,11 @@ class TestFeatherPGSSprings(unittest.TestCase):
     def test_passive_damping_decays_velocity(self):
         """Verify passive joint damping decays velocity that persists when damping is disabled."""
         damped = _run(_build_hinge(spring_k=0.0, spring_ref=0.0, damping=0.02), steps=480, qd0=5.0)
-        undamped = _run(
-            _build_hinge(spring_k=0.0, spring_ref=0.0, damping=0.02),
-            steps=480,
-            qd0=5.0,
-            enable_joint_passive_damping=False,
-        )
+        undamped = _run(_build_hinge(spring_k=0.0, spring_ref=0.0, damping=0.0), steps=480, qd0=5.0)
         qd_damped = abs(float(damped.joint_qd.numpy()[0]))
         qd_undamped = abs(float(undamped.joint_qd.numpy()[0]))
         self.assertGreater(qd_undamped, 4.0, "undamped joint should keep coasting")
         self.assertLess(qd_damped, 0.2 * qd_undamped)
-
-    def test_spring_toggle_disables_spring(self):
-        """Verify enable_joint_springs=False leaves the joint at rest instead of tracking ref."""
-        state = _run(
-            _build_hinge(spring_k=0.5, spring_ref=0.5, damping=0.05),
-            enable_joint_springs=False,
-        )
-        q = state.joint_q.numpy()
-        self.assertLess(abs(float(q[0])), 0.05, "springless joint must not move toward ref")
 
 
 if __name__ == "__main__":

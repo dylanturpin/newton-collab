@@ -75,14 +75,6 @@ class TestFeatherPGSHeteroGuard(unittest.TestCase):
         # All 3-link chains: per-world DOF counts uniform -> homogeneous.
         cls.homogeneous_model = _build_model([3, 3, 3, 3], cls.device)
 
-    def test_hetero_dense_raises(self):
-        with self.assertRaises(ValueError) as ctx:
-            SolverFeatherPGS(self.hetero_model, pgs_mode="dense")
-        message = str(ctx.exception)
-        self.assertIn("dense", message)
-        self.assertIn("heterogeneous", message)
-        self.assertIn("1, 3", message)
-
     def test_hetero_propagation_family_raises(self):
         for response in PROPAGATION_RESPONSES:
             with self.subTest(articulated_contact_response=response):
@@ -107,7 +99,6 @@ class TestFeatherPGSHeteroGuard(unittest.TestCase):
 
     def test_homogeneous_all_modes_construct(self):
         for pgs_mode, response in (
-            ("dense", "immediate"),
             ("split", "immediate"),
             ("matrix_free", "immediate"),
             ("matrix_free", "propagation"),

@@ -550,7 +550,6 @@ def _run_case_path(
         model,
         pgs_mode="matrix_free",
         articulated_contact_response=response_mode,
-        hinv_jt_kernel="par_row",
         pgs_iterations=pgs_iterations,
         pgs_velocity_iterations=pgs_velocity_iterations,
         enable_contact_friction=enable_contact_friction,
@@ -991,7 +990,6 @@ def _write_summary(path: Path, results: list[RunResult], args: argparse.Namespac
         f"dt {args.dt}, PGS iterations {args.pgs_iterations}, velocity iterations {args.pgs_velocity_iterations}, "
         f"contact friction {'off' if args.no_friction else 'on'}, "
         f"contact_friction_position_iterations={args.contact_friction_position_iterations}, "
-        f"`hinv_jt_kernel=par_row`, "
         f"joint_armature={args.joint_armature}."
     )
     lines.append("")

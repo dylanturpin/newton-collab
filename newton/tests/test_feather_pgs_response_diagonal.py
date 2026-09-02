@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -61,13 +62,10 @@ def _build_mixed_response_model(device, world_count=1):
     return replicated.finalize(device=device)
 
 
-def _run_mixed_response(kernel, *, warmstart, preelimination):
-    """Run a short mixed-contact trajectory with one H-inverse implementation."""
-    model = _build_mixed_response_model("cuda:0")
-    solver = SolverFeatherPGS(
+def _build_mixed_response_solver(model, *, warmstart, preelimination):
+    return SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
-        hinv_jt_kernel=kernel,
         pgs_warmstart=warmstart,
         enable_bilateral_preelimination=preelimination,
         enable_contact_friction=False,
@@ -75,6 +73,13 @@ def _run_mixed_response(kernel, *, warmstart, preelimination):
         dense_max_constraints=32,
         mf_max_constraints=32,
     )
+
+
+def _run_mixed_response(kernel, *, warmstart, preelimination):
+    """Run a short mixed-contact trajectory with one H-inverse implementation."""
+    model = _build_mixed_response_model("cuda:0")
+    with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": kernel}):
+        solver = _build_mixed_response_solver(model, warmstart=warmstart, preelimination=preelimination)
     state_in, state_out = model.state(), model.state()
     joint_qd = state_in.joint_qd.numpy()
     free_articulation = int(np.flatnonzero(solver._model_plan.is_free_rigid)[0])

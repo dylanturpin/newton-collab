@@ -50,7 +50,6 @@ SLIDE_VX = 2.0
 # contact path
 SLIDER_CONFIGS = [
     ("split", "immediate", 0),
-    ("dense", "immediate", 0),
 ]
 SLIDER_CONFIGS_CUDA = [
     ("matrix_free", "immediate", 0),

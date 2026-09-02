@@ -223,7 +223,7 @@ def _run_joint_limit_trajectory(use_warp_builder: bool):
 class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
     def test_dense_row_families_respect_phase_bounds(self):
         """Keep active position limits before the CPU dense phase-0 bound."""
-        solver = _step_once(_make_phase_layout_run("cpu", "dense"))
+        solver = _step_once(_make_phase_layout_run("cpu", "split"))
         _assert_dense_phase_layout(self, solver)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free row-family layout requires CUDA")

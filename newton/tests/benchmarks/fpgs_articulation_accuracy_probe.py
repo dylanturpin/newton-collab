@@ -144,7 +144,6 @@ def _make_solver(
         model,
         pgs_mode="matrix_free",
         articulated_contact_response=response_mode,
-        hinv_jt_kernel="par_row",
         pgs_iterations=pgs_iterations,
         pgs_velocity_iterations=pgs_velocity_iterations,
         enable_contact_friction=enable_contact_friction,

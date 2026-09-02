@@ -81,7 +81,7 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
             if caller_refreshes_fk:
                 newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
 
-            SolverFeatherPGS(model, pgs_mode="dense").step(
+            SolverFeatherPGS(model, pgs_mode="split").step(
                 state_0,
                 state_1,
                 model.control(),
