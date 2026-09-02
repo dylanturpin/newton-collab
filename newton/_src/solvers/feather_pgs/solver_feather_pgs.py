@@ -1622,6 +1622,7 @@ class SolverFeatherPGS(SolverBase):
         composite_articulations = np.flatnonzero(self._model_plan.response_dof_count > 0).astype(np.int32, copy=False)
         self._composite_articulation_count = int(composite_articulations.size)
         self._parallel_composite_inertia = bool(model.device.is_cuda and self._composite_articulation_count)
+        self._compact_inertia_refresh = self._parallel_composite_inertia and self.use_parallel_streams
         self._composite_articulations = (
             wp.array(composite_articulations, dtype=wp.int32, device=model.device)
             if self._parallel_composite_inertia
@@ -1632,7 +1633,16 @@ class SolverFeatherPGS(SolverBase):
                 str(getattr(model.device, "arch", "")),
                 warps_per_block=_COMPOSITE_INERTIA_WARPS_PER_BLOCK,
             )
-            if self._parallel_composite_inertia
+            if self._parallel_composite_inertia and not self._compact_inertia_refresh
+            else None
+        )
+        self._compact_composite_inertia_warp_kernel = (
+            _get_composite_inertia_warp_kernel(
+                str(getattr(model.device, "arch", "")),
+                warps_per_block=_COMPOSITE_INERTIA_WARPS_PER_BLOCK,
+                compact_terms=True,
+            )
+            if self._compact_inertia_refresh
             else None
         )
 
@@ -3146,10 +3156,15 @@ class SolverFeatherPGS(SolverBase):
             self.body_I_c = wp.empty(
                 (model.body_count,), dtype=wp.spatial_matrix, device=model.device, requires_grad=model.requires_grad
             )
+            inertia_term_count = model.body_count if self._compact_inertia_refresh else 1
+            self._body_inertia_terms = wp.empty(
+                (inertia_term_count, 12), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
+            )
         else:
             self.body_I_m = None
             self.body_X_com = None
             self.body_I_c = None
+            self._body_inertia_terms = None
 
         if not model.articulation_count or not model.joint_count:
             self.articulation_origin = None
@@ -4611,6 +4626,7 @@ class SolverFeatherPGS(SolverBase):
             and self._pgs_solve_local_pair_kernels
             else None
         )
+        self._global_inertia_stream = wp.Stream(model.device) if self._compact_inertia_refresh else None
 
     def _init_double_buffer_stream(self):
         """Create a CUDA stream for mass-matrix and active-Jacobian maintenance."""
@@ -6289,12 +6305,12 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 1: FK/ID + drives + CRBA
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self._nvtx, synchronize=False):
-            self._stage1_fk_id(state_in, state_aug, state_out)
+            global_inertia_ready = self._stage1_fk_id(state_in, state_aug, state_out)
 
             if model.articulation_count:
                 self._stage1_drives(state_in, state_aug, control, dt)
 
-            self._stage1_crba(state_aug)
+            self._stage1_crba(state_aug, global_inertia_ready)
         # ══════════════════════════════════════════════════════════════
         # STAGE 2: Cholesky
         # ══════════════════════════════════════════════════════════════
@@ -7295,7 +7311,30 @@ class SolverFeatherPGS(SolverBase):
             for size in self.size_groups:
                 yield size, self._size_ctx(size)
 
-    def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State):
+    def _launch_parallel_composite_inertia(self, body_I_s: wp.array, *, compact_terms: bool = False) -> None:
+        kernel = self._compact_composite_inertia_warp_kernel if compact_terms else self._composite_inertia_warp_kernel
+        source = [self.model.body_mass, self._body_inertia_terms] if compact_terms else [body_I_s]
+        wp.launch_tiled(
+            kernel,
+            dim=[
+                (self._composite_articulation_count + _COMPOSITE_INERTIA_WARPS_PER_BLOCK - 1)
+                // _COMPOSITE_INERTIA_WARPS_PER_BLOCK
+            ],
+            inputs=[
+                self._composite_articulation_count,
+                self._composite_articulations,
+                self.model.articulation_start,
+                self.articulation_joint_end,
+                self.model.joint_ancestor,
+                self.model.joint_child,
+                *source,
+            ],
+            outputs=[self.body_I_c],
+            block_dim=32 * _COMPOSITE_INERTIA_WARPS_PER_BLOCK,
+            device=self.model.device,
+        )
+
+    def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State) -> wp.Event | None:
         model = self.model
 
         # evaluate joint inertias, motion vectors, and forces
@@ -7321,6 +7360,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
         refresh_composite = (self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update
+        parallel_global_refresh = refresh_composite and self._global_inertia_stream is not None
         wp.launch(
             eval_rigid_fk_id,
             dim=model.articulation_count,
@@ -7343,7 +7383,8 @@ class SolverFeatherPGS(SolverBase):
                 model.body_mass,
                 model.body_inertia,
                 self.is_free_rigid,
-                int(refresh_composite),
+                int(refresh_composite and not parallel_global_refresh),
+                int(parallel_global_refresh),
                 model.gravity,
             ],
             outputs=[
@@ -7352,6 +7393,7 @@ class SolverFeatherPGS(SolverBase):
                 self.articulation_origin,
                 state_aug.joint_S_s,
                 state_aug.body_I_s,
+                self._body_inertia_terms,
                 state_aug.body_v_s,
                 state_aug.body_f_s,
                 state_aug.body_a_s,
@@ -7359,26 +7401,15 @@ class SolverFeatherPGS(SolverBase):
             block_dim=16,
             device=model.device,
         )
-        if self._parallel_composite_inertia and refresh_composite:
-            wp.launch_tiled(
-                self._composite_inertia_warp_kernel,
-                dim=[
-                    (self._composite_articulation_count + _COMPOSITE_INERTIA_WARPS_PER_BLOCK - 1)
-                    // _COMPOSITE_INERTIA_WARPS_PER_BLOCK
-                ],
-                inputs=[
-                    self._composite_articulation_count,
-                    self._composite_articulations,
-                    model.articulation_start,
-                    self.articulation_joint_end,
-                    model.joint_ancestor,
-                    model.joint_child,
-                    state_aug.body_I_s,
-                ],
-                outputs=[self.body_I_c],
-                block_dim=32 * _COMPOSITE_INERTIA_WARPS_PER_BLOCK,
-                device=model.device,
-            )
+        global_inertia_ready = None
+        if parallel_global_refresh:
+            inertia_stream = self._global_inertia_stream
+            inertia_stream.wait_event(wp.get_stream(model.device).record_event())
+            with wp.ScopedStream(inertia_stream, sync_enter=False):
+                self._launch_parallel_composite_inertia(state_aug.body_I_s, compact_terms=True)
+            global_inertia_ready = inertia_stream.record_event()
+        elif self._parallel_composite_inertia and refresh_composite:
+            self._launch_parallel_composite_inertia(state_aug.body_I_s)
         if model.body_count:
             wp.launch(
                 update_body_qd_from_featherstone,
@@ -7393,6 +7424,7 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[state_out.body_qd],
                 device=model.device,
             )
+        return global_inertia_ready
 
     def _stage1_drives(self, state_in: State, state_aug: State, control: Control, dt: float):
         """Populate ``state_aug.joint_tau`` and apply the effort-limit clamp.
@@ -7519,7 +7551,7 @@ class SolverFeatherPGS(SolverBase):
             device=device,
         )
 
-    def _stage1_crba(self, state_aug: State):
+    def _stage1_crba(self, state_aug: State, global_inertia_ready: wp.Event | None):
         model = self.model
         global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
         # NOTE: this host-evaluated flag is BAKED into CUDA graphs at capture
@@ -7560,6 +7592,9 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[state_aug.body_I_s],
                 device=model.device,
             )
+
+        if global_inertia_ready is not None:
+            wp.get_stream(model.device).wait_event(global_inertia_ready)
 
         # Global refreshes were accumulated by the warp-parallel launch next
         # to inverse dynamics, while the link inertias were still hot. Keep the
@@ -10059,9 +10094,45 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
 
 
 @cache
-def _get_composite_inertia_warp_kernel(device_arch: str, warps_per_block: int) -> "wp.Kernel":
+def _get_composite_inertia_warp_kernel(
+    device_arch: str, warps_per_block: int, *, compact_terms: bool = False
+) -> "wp.Kernel":
     """Build a one-warp-per-articulation composite-inertia reduction."""
     _ = device_arch
+    if compact_terms:
+        initialize = """
+        const float mass = body_mass.data[body];
+        const float* terms = &body_inertia_terms.data[body * 12];
+        float* dst = reinterpret_cast<float*>(&body_I_c.data[body]);
+        for (int element = lane; element < 36; element += 32) {
+            const int row = element / 6;
+            const int col = element - row * 6;
+            float value = 0.0f;
+            if (row < 3 && col < 3) {
+                if (row == col) value = mass;
+            } else if (row >= 3 && col >= 3) {
+                value = terms[3 + (row - 3) * 3 + col - 3];
+            } else {
+                const int cross_row = row < 3 ? row : row - 3;
+                const int cross_col = col < 3 ? col : col - 3;
+                float cross = 0.0f;
+                if (cross_row == 0 && cross_col == 1) cross = -terms[2];
+                if (cross_row == 0 && cross_col == 2) cross = terms[1];
+                if (cross_row == 1 && cross_col == 0) cross = terms[2];
+                if (cross_row == 1 && cross_col == 2) cross = -terms[0];
+                if (cross_row == 2 && cross_col == 0) cross = -terms[1];
+                if (cross_row == 2 && cross_col == 1) cross = terms[0];
+                value = (row < 3 ? -mass : mass) * cross;
+            }
+            dst[element] = value;
+        }
+"""
+    else:
+        initialize = """
+        const float* src = reinterpret_cast<const float*>(&body_I_s.data[body]);
+        float* dst = reinterpret_cast<float*>(&body_I_c.data[body]);
+        for (int element = lane; element < 36; element += 32) dst[element] = src[element];
+"""
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const int lane = threadIdx.x & 31;
@@ -10072,9 +10143,7 @@ def _get_composite_inertia_warp_kernel(device_arch: str, warps_per_block: int) -
     const int end = articulation_joint_end.data[articulation];
     for (int joint = start; joint < end; ++joint) {{
         const int body = joint_child.data[joint];
-        const float* src = reinterpret_cast<const float*>(&body_I_s.data[body]);
-        float* dst = reinterpret_cast<float*>(&body_I_c.data[body]);
-        for (int element = lane; element < 36; element += 32) dst[element] = src[element];
+{initialize}
     }}
     __syncwarp();
 
@@ -10091,6 +10160,52 @@ def _get_composite_inertia_warp_kernel(device_arch: str, warps_per_block: int) -
     }}
 #endif
 """
+
+    if compact_terms:
+
+        @wp.func_native(snippet)
+        def composite_inertia_warp_compact_native(
+            block: int,
+            composite_articulation_count: int,
+            composite_articulations: wp.array[int],
+            articulation_start: wp.array[int],
+            articulation_joint_end: wp.array[int],
+            joint_ancestor: wp.array[int],
+            joint_child: wp.array[int],
+            body_mass: wp.array[float],
+            body_inertia_terms: wp.array2d[float],
+            body_I_c: wp.array[wp.spatial_matrix],
+        ): ...
+
+        def composite_inertia_warp_compact_template(
+            composite_articulation_count: int,
+            composite_articulations: wp.array[int],
+            articulation_start: wp.array[int],
+            articulation_joint_end: wp.array[int],
+            joint_ancestor: wp.array[int],
+            joint_child: wp.array[int],
+            body_mass: wp.array[float],
+            body_inertia_terms: wp.array2d[float],
+            body_I_c: wp.array[wp.spatial_matrix],
+        ):
+            block, _lane = wp.tid()
+            composite_inertia_warp_compact_native(
+                block,
+                composite_articulation_count,
+                composite_articulations,
+                articulation_start,
+                articulation_joint_end,
+                joint_ancestor,
+                joint_child,
+                body_mass,
+                body_inertia_terms,
+                body_I_c,
+            )
+
+        name = f"compute_composite_inertia_warp{warps_per_block}_compact"
+        composite_inertia_warp_compact_template.__name__ = name
+        composite_inertia_warp_compact_template.__qualname__ = name
+        return wp.kernel(enable_backward=False, module="unique")(composite_inertia_warp_compact_template)
 
     @wp.func_native(snippet)
     def composite_inertia_warp_native(
@@ -10128,8 +10243,9 @@ def _get_composite_inertia_warp_kernel(device_arch: str, warps_per_block: int) -
             body_I_c,
         )
 
-    composite_inertia_warp_template.__name__ = f"compute_composite_inertia_warp{warps_per_block}"
-    composite_inertia_warp_template.__qualname__ = f"compute_composite_inertia_warp{warps_per_block}"
+    name = f"compute_composite_inertia_warp{warps_per_block}"
+    composite_inertia_warp_template.__name__ = name
+    composite_inertia_warp_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(composite_inertia_warp_template)
 
 

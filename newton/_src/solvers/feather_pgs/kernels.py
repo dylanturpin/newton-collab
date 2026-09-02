@@ -1003,12 +1003,14 @@ def compute_link_velocity(
     body_mass: wp.array[float],
     body_inertia: wp.array[wp.mat33],
     write_body_inertia: int,
+    write_body_inertia_terms: int,
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
     joint_X_p: wp.array[wp.transform],
     # outputs
     joint_S_s: wp.array[wp.spatial_vector],
     body_I_s: wp.array[wp.spatial_matrix],
+    body_inertia_terms: wp.array2d[float],
     body_v_s: wp.array[wp.spatial_vector],
     body_f_s: wp.array[wp.spatial_vector],
     body_a_s: wp.array[wp.spatial_vector],
@@ -1063,6 +1065,13 @@ def compute_link_velocity(
     # body forces
     if write_body_inertia != 0:
         body_I_s[child] = assemble_com_spatial_inertia(mass, com, inertia_origin)
+    if write_body_inertia_terms != 0:
+        body_inertia_terms[child, 0] = com[0]
+        body_inertia_terms[child, 1] = com[1]
+        body_inertia_terms[child, 2] = com[2]
+        for row in range(3):
+            for col in range(3):
+                body_inertia_terms[child, 3 + 3 * row + col] = inertia_origin[row, col]
 
     # The root's linear inertial wrench is NOT spurious: the solve frame is centred on a material
     # point of the root body, so that point accelerates as the body rotates and this term is what
@@ -1099,6 +1108,7 @@ def eval_rigid_fk_id(
     body_inertia: wp.array[wp.mat33],
     is_free_rigid: wp.array[int],
     materialize_all_body_inertia: int,
+    materialize_body_inertia_terms: int,
     gravity: wp.array[wp.vec3],
     # outputs
     body_q: wp.array[wp.transform],
@@ -1106,6 +1116,7 @@ def eval_rigid_fk_id(
     articulation_origin: wp.array[wp.vec3],
     joint_S_s: wp.array[wp.spatial_vector],
     body_I_s: wp.array[wp.spatial_matrix],
+    body_inertia_terms: wp.array2d[float],
     body_v_s: wp.array[wp.spatial_vector],
     body_f_s: wp.array[wp.spatial_vector],
     body_a_s: wp.array[wp.spatial_vector],
@@ -1175,11 +1186,13 @@ def eval_rigid_fk_id(
             body_mass,
             body_inertia,
             write_body_inertia,
+            materialize_body_inertia_terms,
             body_q,
             body_q_com,
             joint_X_p,
             joint_S_s,
             body_I_s,
+            body_inertia_terms,
             body_v_s,
             body_f_s,
             body_a_s,
@@ -1229,6 +1242,7 @@ def eval_rigid_id(
     body_inertia: wp.array[wp.mat33],
     is_free_rigid: wp.array[int],
     materialize_all_body_inertia: int,
+    materialize_body_inertia_terms: int,
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
     joint_X_p: wp.array[wp.transform],
@@ -1237,6 +1251,7 @@ def eval_rigid_id(
     # outputs
     joint_S_s: wp.array[wp.spatial_vector],
     body_I_s: wp.array[wp.spatial_matrix],
+    body_inertia_terms: wp.array2d[float],
     body_v_s: wp.array[wp.spatial_vector],
     body_f_s: wp.array[wp.spatial_vector],
     body_a_s: wp.array[wp.spatial_vector],
@@ -1285,11 +1300,13 @@ def eval_rigid_id(
             body_mass,
             body_inertia,
             write_body_inertia,
+            materialize_body_inertia_terms,
             body_q,
             body_q_com,
             joint_X_p,
             joint_S_s,
             body_I_s,
+            body_inertia_terms,
             body_v_s,
             body_f_s,
             body_a_s,
