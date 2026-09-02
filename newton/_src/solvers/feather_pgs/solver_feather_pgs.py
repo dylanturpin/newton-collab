@@ -117,6 +117,7 @@ from .kernels import (
     diag_from_JY_world,
     eval_rigid_fk_id,
     eval_rigid_tau,
+    eval_rigid_tau_and_augmented_drives,
     factor_propagation_tree_for_size,
     finalize_mf_constraint_counts,
     finalize_world_constraint_counts,
@@ -7491,11 +7492,66 @@ class SolverFeatherPGS(SolverBase):
 
         if model.articulation_count:
             body_f = state_in.body_f if state_in.body_count else None
+            state_aug.body_ft_s.zero_()
+            if self.drive_mode == "augmented" and self.articulation_max_dofs > 0:
+                wp.launch(
+                    eval_rigid_tau_and_augmented_drives,
+                    dim=model.articulation_count,
+                    inputs=[
+                        model.articulation_start,
+                        self.articulation_joint_end,
+                        self.articulation_H_rows,
+                        model.joint_type,
+                        model.joint_parent,
+                        model.joint_child,
+                        model.joint_articulation,
+                        model.joint_qd_start,
+                        model.joint_q_start,
+                        model.joint_dof_dim,
+                        control.joint_f,
+                        state_in.joint_q,
+                        state_in.joint_qd,
+                        self._passive_spring_stiffness,
+                        self._passive_spring_ref,
+                        self._passive_joint_damping,
+                        state_aug.joint_S_s,
+                        state_aug.body_f_s,
+                        body_f,
+                        model.body_flags,
+                        state_in.body_q,
+                        model.body_com,
+                        self.articulation_origin,
+                        model.joint_target_ke,
+                        model.joint_target_kd,
+                        control.joint_target_q,
+                        control.joint_target_qd,
+                        model.joint_effort_limit,
+                        self.articulation_max_dofs,
+                        dt,
+                    ],
+                    outputs=[
+                        state_aug.body_ft_s,
+                        self.aug_row_counts,
+                        self.aug_row_dof_index,
+                        self.aug_row_K,
+                        self.aug_limit_counts,
+                        state_aug.joint_tau,
+                    ],
+                    block_dim=self.serial_kernel_block_dim,
+                    device=model.device,
+                )
+                wp.launch(
+                    detect_limit_count_changes,
+                    dim=model.articulation_count,
+                    inputs=[self.aug_limit_counts, self.aug_prev_limit_counts],
+                    outputs=[self.limit_change_mask],
+                    device=model.device,
+                )
+                return
             # Evaluate joint torques. After this launch `joint_tau` owns
             # the rigid / passive / Coriolis / gravity / external /
             # `control.joint_f` bucket only; the actuator-drive bucket has
             # not been added yet.
-            state_aug.body_ft_s.zero_()
             wp.launch(
                 eval_rigid_tau,
                 dim=model.articulation_count,
