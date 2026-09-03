@@ -13,9 +13,11 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     pgs_solve_mf_loop,
 )
+from newton.tests.test_feather_pgs_propagation_same_articulation import _build_scissor_model, _contact_rows
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
 
 DT = 1.0 / 60.0
+PATH_DENSE = 0  # contact routing id of the dense Delassus path
 
 
 def _solve_rows(device, n_rows, g, iterations=300):
@@ -225,6 +227,69 @@ def test_regularization_velocity_pass_exempt(test: unittest.TestCase, device):
             )
 
 
+def test_velocity_pass_rigid_on_propagation_schedules(test: unittest.TestCase, device):
+    """Same-articulation link-link contacts stay dense under the ``propagation`` and
+    ``propagation-colored`` schedules, and their velocity-only pass runs through
+    nested fused-GS launches inside the propagation-tree launcher. Every one of
+    those launches must be rigid (``soft_relax=True``), and the converged velocity
+    after the pass must be the ``g = 0`` solution, since the rigid law does not
+    depend on ``g``."""
+
+    def stepped(response, g):
+        model = _build_scissor_model(device)
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            articulated_contact_response=response,
+            pgs_iterations=8,
+            pgs_velocity_iterations=8,
+            pgs_contact_regularization=g,
+            enable_contact_friction=False,
+            dense_max_constraints=64,
+            mf_max_constraints=16,
+        )
+        calls = []
+        in_velocity_pass = {"on": False}
+        launch = solver._launch_matrix_free_gs_solve
+        post = solver._run_matrix_free_velocity_post_solve
+
+        def recording_launch(*args, **kwargs):
+            calls.append((in_velocity_pass["on"], bool(kwargs.get("soft_relax", False))))
+            return launch(*args, **kwargs)
+
+        def flagged_post():
+            in_velocity_pass["on"] = True
+            try:
+                return post()
+            finally:
+                in_velocity_pass["on"] = False
+
+        solver._launch_matrix_free_gs_solve = recording_launch
+        solver._run_matrix_free_velocity_post_solve = flagged_post
+        state_in, state_out = model.state(), model.state()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        contacts = model.contacts()
+        state_in.clear_forces()
+        model.collide(state_in, contacts)
+        solver.step(state_in, state_out, model.control(), contacts, 1.0 / 200.0)
+        wp.synchronize()
+        test.assertTrue(_contact_rows(solver, PATH_DENSE), f"{response}: scene produced no dense self-contact row")
+        return calls, state_out.joint_qd.numpy().copy()
+
+    with wp.ScopedDevice(device):
+        for response in ("propagation", "propagation-colored"):
+            calls, qd_soft = stepped(response, 0.5)
+            velocity_calls = [soft for on, soft in calls if on]
+            position_calls = [soft for on, soft in calls if not on]
+            test.assertTrue(velocity_calls, f"{response}: velocity pass issued no fused-GS launch")
+            test.assertTrue(all(velocity_calls), f"{response}: velocity-pass launches were regularized: {calls}")
+            test.assertFalse(any(position_calls), f"{response}: position-pass launches were rigid: {calls}")
+            _, qd_rigid = stepped(response, 0.0)
+            np.testing.assert_allclose(
+                qd_soft, qd_rigid, rtol=0.0, atol=1.0e-4, err_msg=f"{response}: velocity pass depends on g"
+            )
+
+
 def test_regularization_indeterminate_split(test: unittest.TestCase, device):
     """A plank on three identical supports has no unique rigid force split;
     the regularizer must select the symmetric one (outer supports equal)."""
@@ -385,6 +450,12 @@ add_function_test(
     TestFeatherPGSRegularization,
     "test_regularization_velocity_pass_exempt",
     test_regularization_velocity_pass_exempt,
+    devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSRegularization,
+    "test_velocity_pass_rigid_on_propagation_schedules",
+    test_velocity_pass_rigid_on_propagation_schedules,
     devices=get_selected_cuda_test_devices(),
 )
 add_function_test(

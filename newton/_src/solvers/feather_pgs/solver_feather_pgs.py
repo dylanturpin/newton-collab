@@ -5589,6 +5589,7 @@ class SolverFeatherPGS(SolverBase):
                 iteration_offset=global_iter,
                 freeze_drive_rows=freeze_drive_rows,
                 row_phase_override=row_phase,
+                soft_relax=soft_relax,
             )
 
         refresh_forced = self._propagation_tree_refresh_forced()
@@ -5621,6 +5622,7 @@ class SolverFeatherPGS(SolverBase):
                 iteration_offset=iteration_offset,
                 freeze_drive_rows=freeze_drive_rows,
                 row_phase_override=2,
+                soft_relax=soft_relax,
             )
         elif self.pgs_schedule == "physx_grasp":
             for local_iter in range(iterations):
