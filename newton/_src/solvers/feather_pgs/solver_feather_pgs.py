@@ -672,6 +672,7 @@ class SolverFeatherPGS(SolverBase):
         contact_shared_anchor: bool = False,
         enable_joint_limits: bool = False,
         enable_bilateral_preelimination: bool = False,
+        bilateral_preelimination_include_mimics: bool = True,
         joint_limit_activation_gap: float = float("inf"),
         enable_joint_velocity_limits: bool = False,
         velocity_limit_activation_fraction: float = 0.0,
@@ -798,6 +799,11 @@ class SolverFeatherPGS(SolverBase):
                 ``pgs_velocity_iterations == 0`` and at most 8 bilateral rows per
                 articulation; unsupported configurations warn and fall back to iterative
                 rows. Defaults to False.
+            bilateral_preelimination_include_mimics (bool, optional): Include mimic rows
+                in the pre-eliminated bilateral block. When False, only connect rows are
+                pre-eliminated and mimic rows remain in the iterative sweep. This avoids
+                making the Schur block singular when a mimic row is nearly dependent on
+                the loop-closure rows. Defaults to True.
             joint_limit_activation_gap (float, optional): Distance from a finite lower or upper
                 position limit at which a joint-limit PGS row becomes active. A lower row is
                 allocated when ``q <= lower + gap``; an upper row is allocated when
@@ -1088,6 +1094,7 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError("contact_friction_anchor_limit must be non-negative")
         self.enable_joint_limits = enable_joint_limits
         self.enable_bilateral_preelimination = bool(enable_bilateral_preelimination)
+        self.bilateral_preelimination_include_mimics = bool(bilateral_preelimination_include_mimics)
         try:
             self.joint_limit_activation_gap = float(joint_limit_activation_gap)
         except (TypeError, ValueError) as exc:
@@ -2244,7 +2251,9 @@ class SolverFeatherPGS(SolverBase):
         """
         self._preelim_count = 0
         self._preelim_active = False
-        n_bilateral = int(self._mimic_count or 0) + int(self._connect_count or 0)
+        n_bilateral = int(self._connect_count or 0)
+        if self.bilateral_preelimination_include_mimics:
+            n_bilateral += int(self._mimic_count or 0)
         if not self.enable_bilateral_preelimination or n_bilateral == 0:
             return
         if self.pgs_mode != "matrix_free":
@@ -2266,7 +2275,7 @@ class SolverFeatherPGS(SolverBase):
 
         # Per-articulation bilateral row capacity (upper bound: every valid constraint).
         counts: dict[int, int] = {}
-        if self._mimic_count:
+        if self._mimic_count and self.bilateral_preelimination_include_mimics:
             for art, count in enumerate(np.diff(self._mimic_art_start_np)):
                 if count:
                     counts[art] = int(count)
@@ -2322,7 +2331,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mimic_slot if self.mimic_slot is not None else self._dummy_is_free_rigid,
                 self._mimic_art_start if self._mimic_count else self._dummy_is_free_rigid,
                 self._mimic_art_list if self._mimic_count else self._dummy_is_free_rigid,
-                int(self._mimic_count or 0),
+                int(self._mimic_count or 0) if self.bilateral_preelimination_include_mimics else 0,
                 self.connect_slot if self.connect_slot is not None else self._dummy_is_free_rigid,
                 self._connect_art if self._connect_count else self._dummy_is_free_rigid,
                 int(self._connect_count or 0),

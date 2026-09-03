@@ -2341,7 +2341,7 @@ def populate_connect_J_for_size(
 # =============================================================================
 # Bilateral Pre-elimination Kernels (mimic + connect Schur complement)
 # =============================================================================
-# Fold the bilateral internal equality rows (MIMIC + CONNECT) into the
+# Fold the selected bilateral internal equality rows (MIMIC and/or CONNECT) into the
 # response operator so every other row sees the closed-loop effective mass:
 # with B the bilateral block of one articulation, Y_B = H^-1 J_B^T and
 # S = J_B Y_B (+ regularization), every other row's response is corrected to
@@ -2408,7 +2408,7 @@ def preelim_setup_for_size(
     reg: wp.array[float],
     LS: wp.array[float],
 ):
-    """Gather the bilateral block, form S = J_B Y_B, and factor it.
+    """Gather the selected bilateral block, form S = J_B Y_B, and factor it.
 
     Launched once per size group with ``dim = n_arts_of_size`` after the
     ``Y = H^-1 J^T`` stage; one thread per articulation (the block is tiny).
