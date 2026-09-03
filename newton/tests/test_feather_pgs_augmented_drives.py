@@ -9,12 +9,15 @@ import warp as wp
 from newton._src.sim.enums import JointType
 from newton._src.solvers.feather_pgs.kernels import (
     eval_rigid_tau,
+    eval_rigid_tau_add,
     eval_rigid_tau_and_augmented_drives,
+    prepare_augmented_joint_drives,
 )
 
 
 class TestFeatherPGSAugmentedDrives(unittest.TestCase):
-    def test_combined_tau_and_drive_kernel_accumulates_clamped_drives(self):
+    def test_split_augmented_drive_pipeline_matches_combined_kernel(self):
+        """Match combined drive forces and clear articulations without active drives."""
         device = wp.get_device()
         articulation_start = wp.array([0, 2], dtype=wp.int32, device=device)
         articulation_joint_end = wp.array([2], dtype=wp.int32, device=device)
@@ -144,14 +147,109 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
             ],
             device=device,
         )
-        wp.synchronize_device(device)
-
         np.testing.assert_array_equal(combined_body_ft.numpy(), sequential_body_ft.numpy())
         expected_tau = sequential_tau.numpy() + np.array([-1.25, 2.5], dtype=np.float32)
         np.testing.assert_allclose(combined_tau.numpy(), expected_tau, rtol=0.0, atol=1.0e-6)
         np.testing.assert_array_equal(combined_counts.numpy(), [2])
         np.testing.assert_array_equal(combined_indices.numpy(), [0, 1])
         np.testing.assert_allclose(combined_stiffness.numpy(), [0.2, 0.4], rtol=0.0, atol=1.0e-7)
+
+        prepared_counts = wp.zeros_like(combined_counts)
+        prepared_indices = wp.zeros_like(combined_indices)
+        prepared_stiffness = wp.zeros_like(combined_stiffness)
+        prepared_tau = wp.zeros_like(combined_tau)
+        wp.launch(
+            prepare_augmented_joint_drives,
+            dim=1,
+            inputs=[
+                articulation_start,
+                articulation_dof_count,
+                joint_type,
+                joint_start,
+                joint_start,
+                joint_dof_dim,
+                joint_q,
+                joint_qd,
+                target_ke,
+                target_kd,
+                target_q,
+                target_qd,
+                effort_limit,
+                2,
+                0.1,
+            ],
+            outputs=[prepared_counts, prepared_indices, prepared_stiffness, prepared_tau],
+            device=device,
+        )
+        np.testing.assert_array_equal(prepared_counts.numpy(), combined_counts.numpy())
+        np.testing.assert_array_equal(prepared_indices.numpy(), combined_indices.numpy())
+        np.testing.assert_array_equal(prepared_stiffness.numpy(), combined_stiffness.numpy())
+        np.testing.assert_allclose(prepared_tau.numpy(), [-1.25, 2.5], rtol=0.0, atol=1.0e-6)
+
+        additive_body_ft = wp.zeros_like(combined_body_ft)
+        wp.launch(
+            eval_rigid_tau_add,
+            dim=1,
+            inputs=[
+                articulation_start,
+                articulation_joint_end,
+                joint_type,
+                joint_parent,
+                joint_child,
+                joint_articulation,
+                joint_start,
+                joint_start,
+                joint_dof_dim,
+                joint_f,
+                joint_q,
+                joint_qd,
+                spring_stiffness,
+                spring_ref,
+                damping,
+                joint_S_s,
+                body_fb_s,
+                body_f_ext,
+                body_flags,
+                body_q,
+                body_com,
+                articulation_origin,
+            ],
+            outputs=[additive_body_ft, prepared_tau],
+            device=device,
+        )
+        np.testing.assert_array_equal(additive_body_ft.numpy(), combined_body_ft.numpy())
+        np.testing.assert_allclose(prepared_tau.numpy(), combined_tau.numpy(), rtol=0.0, atol=1.0e-6)
+
+        passive_counts = wp.array([7], dtype=wp.int32, device=device)
+        passive_tau = wp.array([3.0, -2.0], dtype=wp.float32, device=device)
+        zero_target_ke = wp.zeros_like(target_ke)
+        zero_target_kd = wp.zeros_like(target_kd)
+        wp.launch(
+            prepare_augmented_joint_drives,
+            dim=1,
+            inputs=[
+                articulation_start,
+                articulation_dof_count,
+                joint_type,
+                joint_start,
+                joint_start,
+                joint_dof_dim,
+                joint_q,
+                joint_qd,
+                zero_target_ke,
+                zero_target_kd,
+                target_q,
+                target_qd,
+                effort_limit,
+                2,
+                0.1,
+            ],
+            outputs=[passive_counts, prepared_indices, prepared_stiffness, passive_tau],
+            device=device,
+        )
+
+        np.testing.assert_array_equal(passive_counts.numpy(), [0])
+        np.testing.assert_array_equal(passive_tau.numpy(), [0.0, 0.0])
 
 
 if __name__ == "__main__":
