@@ -2160,6 +2160,7 @@ def pack_contact_linear_force_as_spatial(
 
     contact_force[c] = wp.spatial_vector(rigid_contact_force[c], wp.vec3(0.0))
 
+
 @wp.func
 def compute_augmented_drive_terms(
     ke: float,
