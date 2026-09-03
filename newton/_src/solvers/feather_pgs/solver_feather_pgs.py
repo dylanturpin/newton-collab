@@ -1649,9 +1649,14 @@ class SolverFeatherPGS(SolverBase):
         self._local_internal_fast_path = bool(
             local_base_supported and any(count > 0 for count in self._local_internal_art_counts.values())
         )
-        composite_articulations = np.flatnonzero(self._model_plan.response_dof_count > 0).astype(np.int32, copy=False)
+        response_dof_count = self._model_plan.response_dof_count
+        response_articulations = response_dof_count > 0
+        direct_body_inertia = np.isin(response_dof_count, tuple(self._free_body_inertia_sizes))
+        composite_articulations = np.flatnonzero(response_articulations & ~direct_body_inertia).astype(
+            np.int32, copy=False
+        )
         self._composite_articulation_count = int(composite_articulations.size)
-        self._parallel_composite_inertia = bool(model.device.is_cuda and self._composite_articulation_count)
+        self._parallel_composite_inertia = bool(model.device.is_cuda and np.any(response_articulations))
         self._compact_inertia_refresh = self._parallel_composite_inertia and self.use_parallel_streams
         self._composite_articulations = (
             wp.array(composite_articulations, dtype=wp.int32, device=model.device)
@@ -1663,7 +1668,7 @@ class SolverFeatherPGS(SolverBase):
                 str(getattr(model.device, "arch", "")),
                 warps_per_block=_COMPOSITE_INERTIA_WARPS_PER_BLOCK,
             )
-            if self._parallel_composite_inertia and not self._compact_inertia_refresh
+            if self._composite_articulation_count and not self._compact_inertia_refresh
             else None
         )
         self._compact_composite_inertia_warp_kernel = (
@@ -1672,7 +1677,7 @@ class SolverFeatherPGS(SolverBase):
                 warps_per_block=_COMPOSITE_INERTIA_WARPS_PER_BLOCK,
                 compact_terms=True,
             )
-            if self._compact_inertia_refresh
+            if self._composite_articulation_count and self._compact_inertia_refresh
             else None
         )
 
@@ -2809,6 +2814,7 @@ class SolverFeatherPGS(SolverBase):
         if not model.articulation_count or not model.joint_count:
             self.size_groups = []
             self.n_arts_by_size = {}
+            self._free_body_inertia_sizes = frozenset()
             self.articulation_response_dof_count = wp.zeros(
                 model.articulation_count, dtype=wp.int32, device=model.device
             )
@@ -2840,6 +2846,11 @@ class SolverFeatherPGS(SolverBase):
         self.group_to_art = {
             size: wp.array(group_to_art[size], dtype=wp.int32, device=model.device) for size in solve_sizes
         }
+        # A one-body free articulation has I_composite == I_body. Select the direct
+        # source only for whole size groups so the CRBA kernel remains branch-free.
+        self._free_body_inertia_sizes = frozenset(
+            size for size in solve_sizes if np.all(self._model_plan.is_free_rigid[group_to_art[size]] != 0)
+        )
 
         articulation_start = model.articulation_start.numpy()
         joint_type = model.joint_type.numpy()
@@ -7388,6 +7399,8 @@ class SolverFeatherPGS(SolverBase):
                 yield size, self._size_ctx(size)
 
     def _launch_parallel_composite_inertia(self, body_I_s: wp.array, *, compact_terms: bool = False) -> None:
+        if not self._composite_articulation_count:
+            return
         kernel = self._compact_composite_inertia_warp_kernel if compact_terms else self._composite_inertia_warp_kernel
         source = [self.model.body_mass, self._body_inertia_terms] if compact_terms else [body_I_s]
         wp.launch_tiled(
@@ -7715,7 +7728,7 @@ class SolverFeatherPGS(SolverBase):
                     model.joint_qd_start,
                     model.joint_dof_dim,
                     state_aug.joint_S_s,
-                    self.body_I_c,
+                    state_aug.body_I_s if size in self._free_body_inertia_sizes else self.body_I_c,
                     self.group_to_art[size],
                     size,
                 ],
