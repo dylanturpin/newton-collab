@@ -972,32 +972,23 @@ def dense_index(stride: int, i: int, j: int):
 
 
 @wp.func
-def compute_link_velocity(
+def compute_link_kinematics(
     i: int,
     parent: int,
     child: int,
     parent_v_s: wp.spatial_vector,
     parent_a_s: wp.spatial_vector,
     origin: wp.vec3,
-    gravity: wp.vec3,
     joint_type: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_qd: wp.array[float],
     joint_axis: wp.array[wp.vec3],
     joint_dof_dim: wp.array2d[int],
-    body_mass: wp.array[float],
-    body_inertia: wp.array[wp.mat33],
-    write_body_inertia: int,
-    write_body_inertia_terms: int,
     body_q: wp.array[wp.transform],
-    body_q_com: wp.array[wp.transform],
     joint_X_p: wp.array[wp.transform],
     # outputs
     joint_S_s: wp.array[wp.spatial_vector],
-    body_I_s: wp.array[wp.spatial_matrix],
-    body_inertia_terms: wp.array2d[float],
     body_v_s: wp.array[wp.spatial_vector],
-    body_f_s: wp.array[wp.spatial_vector],
     body_a_s: wp.array[wp.spatial_vector],
 ):
     type = joint_type[i]
@@ -1034,6 +1025,59 @@ def compute_link_velocity(
     v_s = parent_v_s + v_j_s
     a_s = parent_a_s + spatial_cross(v_s, v_j_s)
 
+    body_v_s[child] = v_s
+    body_a_s[child] = a_s
+    return v_s, a_s
+
+
+@wp.func
+def compute_link_velocity(
+    i: int,
+    parent: int,
+    child: int,
+    parent_v_s: wp.spatial_vector,
+    parent_a_s: wp.spatial_vector,
+    origin: wp.vec3,
+    gravity: wp.vec3,
+    joint_type: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_qd: wp.array[float],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    write_body_inertia: int,
+    write_body_inertia_terms: int,
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    joint_X_p: wp.array[wp.transform],
+    # outputs
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_I_s: wp.array[wp.spatial_matrix],
+    body_inertia_terms: wp.array2d[float],
+    body_v_s: wp.array[wp.spatial_vector],
+    body_f_s: wp.array[wp.spatial_vector],
+    body_a_s: wp.array[wp.spatial_vector],
+):
+    v_s, a_s = compute_link_kinematics(
+        i,
+        parent,
+        child,
+        parent_v_s,
+        parent_a_s,
+        origin,
+        joint_type,
+        joint_qd_start,
+        joint_qd,
+        joint_axis,
+        joint_dof_dim,
+        body_q,
+        joint_X_p,
+        joint_S_s,
+        body_v_s,
+        body_a_s,
+    )
+
     # compute body forces
     X_sm = body_q_com[child]
     X_sm_local = wp.transform(
@@ -1066,10 +1110,166 @@ def compute_link_velocity(
 
     f_b_s = mul_com_spatial_inertia(mass, com, inertia_origin, a_s) + coriolis
 
-    body_v_s[child] = v_s
-    body_a_s[child] = a_s
     body_f_s[child] = f_b_s - f_g_s
     return v_s, a_s
+
+
+@wp.kernel
+def eval_rigid_fk_kinematics(
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_X_com: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    body_com: wp.array[wp.vec3],
+    # outputs
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    articulation_origin: wp.array[wp.vec3],
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_v_s: wp.array[wp.spatial_vector],
+    body_a_s: wp.array[wp.spatial_vector],
+    fk_id_cache_valid: wp.array[int],
+):
+    """Propagate articulation poses, motion subspaces, velocities, and accelerations."""
+    index = wp.tid()
+    start = articulation_start[index]
+    end = articulation_joint_end[index]
+
+    for i in range(start, end):
+        compute_link_transform(
+            i,
+            joint_type,
+            joint_parent,
+            joint_child,
+            joint_q_start,
+            joint_qd_start,
+            joint_q,
+            joint_X_p,
+            joint_X_c,
+            body_X_com,
+            joint_axis,
+            joint_dof_dim,
+            body_q,
+            body_q_com,
+        )
+
+    origin = wp.vec3()
+    if start < articulation_start[index + 1]:
+        root_body = joint_child[start]
+        if root_body >= 0:
+            origin = wp.transform_point(body_q[root_body], body_com[root_body])
+    articulation_origin[index] = origin
+
+    cached_child = int(-1)
+    cached_v_s = wp.spatial_vector()
+    cached_a_s = wp.spatial_vector()
+    for i in range(start, end):
+        parent = joint_parent[i]
+        child = joint_child[i]
+        parent_v_s = wp.spatial_vector()
+        parent_a_s = wp.spatial_vector()
+        if parent >= 0:
+            if parent == cached_child:
+                parent_v_s = cached_v_s
+                parent_a_s = cached_a_s
+            else:
+                parent_v_s = body_v_s[parent]
+                parent_a_s = body_a_s[parent]
+        cached_v_s, cached_a_s = compute_link_kinematics(
+            i,
+            parent,
+            child,
+            parent_v_s,
+            parent_a_s,
+            origin,
+            joint_type,
+            joint_qd_start,
+            joint_qd,
+            joint_axis,
+            joint_dof_dim,
+            body_q,
+            joint_X_p,
+            joint_S_s,
+            body_v_s,
+            body_a_s,
+        )
+        cached_child = child
+    fk_id_cache_valid[index] = 1
+
+
+@wp.kernel
+def finalize_body_dynamics(
+    body_to_articulation: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    is_free_rigid: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    materialize_all_body_inertia: int,
+    materialize_body_inertia_terms: int,
+    gravity: wp.array[wp.vec3],
+    body_v_s: wp.array[wp.spatial_vector],
+    body_a_s: wp.array[wp.spatial_vector],
+    # outputs
+    body_I_s: wp.array[wp.spatial_matrix],
+    body_inertia_terms: wp.array2d[float],
+    body_f_s: wp.array[wp.spatial_vector],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Build independent body dynamics and publish COM velocity in parallel."""
+    body = wp.tid()
+    articulation = body_to_articulation[body]
+    v_s = body_v_s[body]
+    if articulation < 0:
+        com_world = wp.transform_point(body_q[body], body_com[body])
+        v_com = wp.spatial_top(v_s) + wp.cross(wp.spatial_bottom(v_s), com_world)
+        body_qd[body] = wp.spatial_vector(v_com, wp.spatial_bottom(v_s))
+        return
+
+    origin = articulation_origin[articulation]
+    X_sm = body_q_com[body]
+    X_sm_local = wp.transform(
+        wp.transform_get_translation(X_sm) - origin,
+        wp.transform_get_rotation(X_sm),
+    )
+    mass = body_mass[body]
+    com, inertia_origin = transform_com_inertia_terms(X_sm_local, mass, body_inertia[body])
+
+    write_body_inertia = materialize_all_body_inertia
+    if is_free_rigid[articulation] != 0:
+        write_body_inertia = 1
+    if write_body_inertia != 0:
+        body_I_s[body] = assemble_com_spatial_inertia(mass, com, inertia_origin)
+    if materialize_body_inertia_terms != 0:
+        body_inertia_terms[body, 0] = com[0]
+        body_inertia_terms[body, 1] = com[1]
+        body_inertia_terms[body, 2] = com[2]
+        for row in range(3):
+            for col in range(3):
+                body_inertia_terms[body, 3 + 3 * row + col] = inertia_origin[row, col]
+
+    a_s = body_a_s[body]
+    coriolis = spatial_cross_dual(v_s, mul_com_spatial_inertia(mass, com, inertia_origin, v_s))
+    f_b_s = mul_com_spatial_inertia(mass, com, inertia_origin, a_s) + coriolis
+    f_g = mass * gravity[0]
+    body_f_s[body] = f_b_s - wp.spatial_vector(f_g, wp.cross(com, f_g))
+
+    com_world = wp.transform_point(body_q[body], body_com[body])
+    com_rel = com_world - origin
+    v_com = wp.spatial_top(v_s) + wp.cross(wp.spatial_bottom(v_s), com_rel)
+    body_qd[body] = wp.spatial_vector(v_com, wp.spatial_bottom(v_s))
 
 
 @wp.kernel
