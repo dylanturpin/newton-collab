@@ -663,6 +663,107 @@ def sdf_cone_grad(point: wp.vec3, radius: float, half_height: float, up_axis: in
 
 
 @wp.func
+def is_analytic_sdf_primitive(geo: int) -> bool:
+    """True for shape types whose signed distance has a closed-form evaluator.
+
+    Box, sphere, capsule, cylinder, cone and ellipsoid (the ellipsoid distance is
+    the usual first-order approximation, exact on the surface and along the
+    axes). Planes are handled by dedicated kernels and meshes / convex meshes
+    carry sampled (texture or BVH) distance fields, so neither is listed here.
+    """
+    return (
+        geo == GeoType.BOX
+        or geo == GeoType.SPHERE
+        or geo == GeoType.CAPSULE
+        or geo == GeoType.CYLINDER
+        or geo == GeoType.CONE
+        or geo == GeoType.ELLIPSOID
+    )
+
+
+@wp.func
+def is_exact_analytic_sdf_primitive(geo: int) -> bool:
+    """Analytic primitives whose closed-form signed distance is exact.
+
+    Same set as :func:`is_analytic_sdf_primitive` minus the ellipsoid, whose
+    evaluator is a first-order approximation. Routes that sample the distance
+    itself, rather than only support points, use this predicate: the
+    approximation's error away from the principal axes reaches tens of percent
+    of the penetration depth.
+    """
+    return is_analytic_sdf_primitive(geo) and geo != GeoType.ELLIPSOID
+
+
+@wp.func
+def eval_analytic_sdf(geo: int, scale: wp.vec3, p: wp.vec3) -> float:
+    """Signed distance of an analytic primitive at shape-local ``p``.
+
+    ``scale`` carries the primitive parameters exactly as ``shape_scale`` stores
+    them (half-extents for a box, radius / half-height for the axial shapes,
+    radii for an ellipsoid). Axial shapes are Z-up. Callers must only pass
+    types accepted by :func:`is_analytic_sdf_primitive`; any other type is
+    evaluated as an ellipsoid with radii ``scale``.
+    """
+    if geo == GeoType.BOX:
+        return sdf_box(p, scale[0], scale[1], scale[2])
+    if geo == GeoType.SPHERE:
+        return sdf_sphere(p, scale[0])
+    if geo == GeoType.CAPSULE:
+        return sdf_capsule(p, scale[0], scale[1], int(Axis.Z))
+    if geo == GeoType.CYLINDER:
+        return sdf_cylinder(p, scale[0], scale[1], int(Axis.Z), -1.0, scale[2])
+    if geo == GeoType.CONE:
+        return sdf_cone(p, scale[0], scale[1], int(Axis.Z))
+    return sdf_ellipsoid(p, scale)
+
+
+@wp.func
+def eval_analytic_sdf_grad(geo: int, scale: wp.vec3, p: wp.vec3) -> tuple[float, wp.vec3]:
+    """``(distance, unit outward gradient)`` of an analytic primitive at shape-local ``p``.
+
+    Same conventions as :func:`eval_analytic_sdf`.
+    """
+    if geo == GeoType.BOX:
+        return sdf_box(p, scale[0], scale[1], scale[2]), sdf_box_grad(p, scale[0], scale[1], scale[2])
+    if geo == GeoType.SPHERE:
+        return sdf_sphere(p, scale[0]), sdf_sphere_grad(p, scale[0])
+    if geo == GeoType.CAPSULE:
+        return (
+            sdf_capsule(p, scale[0], scale[1], int(Axis.Z)),
+            sdf_capsule_grad(p, scale[0], scale[1], int(Axis.Z)),
+        )
+    if geo == GeoType.CYLINDER:
+        return (
+            sdf_cylinder(p, scale[0], scale[1], int(Axis.Z), -1.0, scale[2]),
+            sdf_cylinder_grad(p, scale[0], scale[1], int(Axis.Z), -1.0, scale[2]),
+        )
+    if geo == GeoType.CONE:
+        return sdf_cone(p, scale[0], scale[1], int(Axis.Z)), sdf_cone_grad(p, scale[0], scale[1], int(Axis.Z))
+    return sdf_ellipsoid(p, scale), sdf_ellipsoid_grad(p, scale)
+
+
+@wp.func
+def eval_analytic_sdf_lower_bound(geo: int, scale: wp.vec3, p: wp.vec3) -> float:
+    """A value that never exceeds the true signed distance of the primitive at ``p``.
+
+    Identical to :func:`eval_analytic_sdf` for the exact primitives. The ellipsoid
+    evaluator is approximate, so culls that rely on the 1-Lipschitz property use a
+    bound instead: with ``k = |p / r|``, the exact distance to the surface is at
+    least ``(k - 1) * min(r)`` outside (``k >= 1``) and the point is at most
+    ``(1 - k) * max(r)`` inside (``k < 1``), so ``(k - 1) * max(r)`` bounds the
+    negative signed distance from below there.
+    """
+    if geo == GeoType.ELLIPSOID:
+        k0 = wp.length(wp.cw_div(p, scale))
+        r_min = wp.min(wp.abs(scale[0]), wp.min(wp.abs(scale[1]), wp.abs(scale[2])))
+        r_max = wp.max(wp.abs(scale[0]), wp.max(wp.abs(scale[1]), wp.abs(scale[2])))
+        if k0 >= 1.0:
+            return (k0 - 1.0) * r_min
+        return (k0 - 1.0) * r_max
+    return eval_analytic_sdf(geo, scale, p)
+
+
+@wp.func
 def sdf_plane(point: wp.vec3, width: float, length: float):
     """Compute signed distance to a finite quad in the XY plane.
 

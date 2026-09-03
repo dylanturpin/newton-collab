@@ -21,7 +21,15 @@ from .contact_reduction_global import (
     export_and_reduce_predictive_contact,
 )
 from .flags import MeshSignMethod
-from .kernels import mesh_query_point_sign, resolve_mesh_sign_method
+from .kernels import (
+    eval_analytic_sdf,
+    eval_analytic_sdf_grad,
+    eval_analytic_sdf_lower_bound,
+    is_exact_analytic_sdf_primitive,
+    mesh_query_point_sign,
+    resolve_mesh_sign_method,
+)
+from .support_function import GenericShapeData, SupportMapDataProvider, support_map
 
 # Upper bound (mesh-local units) on the closest-point search for the mesh sign
 # queries below. It is not a physical contact range: culling uses the tight
@@ -653,6 +661,7 @@ def _create_sdf_contact_funcs(
     use_texture_sdf_only: bool,
     sample_sdf: Any,
     sample_pair: Any,
+    analytic_primitives: bool = False,
 ):
     """Generate SDF contact functions with heightfield branches eliminated at compile time.
 
@@ -663,6 +672,10 @@ def _create_sdf_contact_funcs(
 
     Args:
         enable_heightfields: When False, all heightfield code paths are compiled out.
+        analytic_primitives: When True, the SDF side of a pair may be an analytic
+            primitive whose signed distance is evaluated in closed form
+            (:func:`primitive_sdf`) instead of sampled from a texture or BVH. When
+            False, that branch is compiled out and the generated code is unchanged.
 
     Returns:
         The ``do_edge_sdf_collision`` function.
@@ -680,9 +693,14 @@ def _create_sdf_contact_funcs(
         sdf_is_heightfield: bool,
         hfd_sdf: HeightfieldData,
         elevation_data: wp.array[wp.float32],
+        sdf_is_analytic: bool,
+        sdf_geo: int,
+        sdf_prim_scale: wp.vec3,
     ) -> float:
         """Sample SDF at the point ``v0 + tt * edge_dir``."""
         pp = v0 + edge_dir * tt
+        if wp.static(analytic_primitives) and sdf_is_analytic:
+            return eval_analytic_sdf(sdf_geo, sdf_prim_scale, pp)
         if wp.static(enable_heightfields):
             if sdf_is_heightfield:
                 return sample_sdf_heightfield(hfd_sdf, elevation_data, pp)
@@ -713,6 +731,9 @@ def _create_sdf_contact_funcs(
         hfd_sdf: HeightfieldData,
         elevation_data: wp.array[wp.float32],
         precision_target: float,
+        sdf_is_analytic: bool,
+        sdf_geo: int,
+        sdf_prim_scale: wp.vec3,
     ) -> tuple[float, wp.vec3, int]:
         """Find the deepest point on an edge relative to an SDF volume.
 
@@ -765,7 +786,13 @@ def _create_sdf_contact_funcs(
         d_step = float(0.0)
         e_step = float(0.0)
 
-        if wp.static(use_texture_sdf_only and not enable_heightfields) and tol_floor < 0.25:
+        # Analytic primitives never take the texture pair fast path: their
+        # closed-form distance is exact, so they use the generic five-query
+        # Brent budget below even inside a texture-only compiled kernel.
+        max_iters = int(5)
+        if wp.static(use_texture_sdf_only and not enable_heightfields) and not sdf_is_analytic:
+            max_iters = int(3)
+        if wp.static(use_texture_sdf_only and not enable_heightfields) and not sdf_is_analytic and tol_floor < 0.25:
             offset = 0.5 * golden
             left = 0.5 - offset
             right = 0.5 + offset
@@ -800,7 +827,9 @@ def _create_sdf_contact_funcs(
                 fw = f_left
                 v_brent = right
                 fv = f_right
-        for _iter in range(wp.static(3 if use_texture_sdf_only and not enable_heightfields else 5)):
+        for _iter in range(5):
+            if _iter >= max_iters:
+                break
             m = 0.5 * (a + b)
             tol = wp.max(1.0e-2 * wp.abs(x) + 1.0e-8, tol_floor)
             tol2 = 2.0 * tol
@@ -862,6 +891,9 @@ def _create_sdf_contact_funcs(
                 sdf_is_heightfield,
                 hfd_sdf,
                 elevation_data,
+                sdf_is_analytic,
+                sdf_geo,
+                sdf_prim_scale,
             )
 
             # Update bracket
@@ -908,6 +940,9 @@ def _create_sdf_contact_funcs(
                 sdf_is_heightfield,
                 hfd_sdf,
                 elevation_data,
+                sdf_is_analytic,
+                sdf_geo,
+                sdf_prim_scale,
             )
             if f_end < best_f:
                 best_t = 0.0
@@ -925,6 +960,9 @@ def _create_sdf_contact_funcs(
                 sdf_is_heightfield,
                 hfd_sdf,
                 elevation_data,
+                sdf_is_analytic,
+                sdf_geo,
+                sdf_prim_scale,
             )
             if f_end < best_f:
                 best_t = 1.0
@@ -940,8 +978,8 @@ def _create_sdf_contact_funcs(
 
 @wp.kernel(enable_backward=False)
 def compute_mesh_mesh_edge_counts(
-    shape_pairs_mesh_mesh: wp.array[wp.vec2i],
-    shape_pairs_mesh_mesh_count: wp.array[int],
+    shape_pairs_mesh_sdf: wp.array[wp.vec2i],
+    shape_pairs_mesh_sdf_count: wp.array[int],
     shape_edge_range: wp.array[wp.vec2i],
     shape_heightfield_index: wp.array[wp.int32],
     heightfield_data: wp.array[HeightfieldData],
@@ -955,9 +993,9 @@ def compute_mesh_mesh_edge_counts(
     a triangle mesh or a heightfield. Threads stride over the active pair
     prefix and accumulate its total edge count.
     """
-    pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
+    pair_count = wp.min(shape_pairs_mesh_sdf_count[0], shape_pairs_mesh_sdf.shape[0])
     for i in range(wp.tid(), pair_count, total_num_threads):
-        pair_encoded = shape_pairs_mesh_mesh[i]
+        pair_encoded = shape_pairs_mesh_sdf[i]
         has_hfield = (pair_encoded[0] & SHAPE_PAIR_HFIELD_BIT) != 0
         pair = wp.vec2i(pair_encoded[0] & SHAPE_PAIR_INDEX_MASK, pair_encoded[1])
         pair_edges = int(0)
@@ -1005,8 +1043,8 @@ def compute_block_counts_from_weights(
 
 
 def compute_mesh_mesh_block_offsets_scan(
-    shape_pairs_mesh_mesh: wp.array[wp.vec2i],
-    shape_pairs_mesh_mesh_count: wp.array[int],
+    shape_pairs_mesh_sdf: wp.array[wp.vec2i],
+    shape_pairs_mesh_sdf_count: wp.array[int],
     shape_edge_range: wp.array[wp.vec2i],
     shape_heightfield_index: wp.array[wp.int32],
     heightfield_data: wp.array[HeightfieldData],
@@ -1031,8 +1069,8 @@ def compute_mesh_mesh_block_offsets_scan(
         kernel=compute_mesh_mesh_edge_counts,
         dim=launch_threads,
         inputs=[
-            shape_pairs_mesh_mesh,
-            shape_pairs_mesh_mesh_count,
+            shape_pairs_mesh_sdf,
+            shape_pairs_mesh_sdf_count,
             shape_edge_range,
             shape_heightfield_index,
             heightfield_data,
@@ -1050,8 +1088,8 @@ def compute_mesh_mesh_block_offsets_scan(
         inputs=[
             total_edge_count,
             block_counts,  # still holds per-pair edge counts, including heightfield edges
-            shape_pairs_mesh_mesh_count,
-            shape_pairs_mesh_mesh.shape[0],
+            shape_pairs_mesh_sdf_count,
+            shape_pairs_mesh_sdf.shape[0],
             target_blocks,
             block_offsets,  # reuse as temp for block counts
             launch_threads,
@@ -1071,11 +1109,25 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     use_precomputed_edge_data: bool = False,
     use_texture_sdf_only: bool = False,
     use_identity_sdf_scale: bool = False,
+    analytic_primitives: bool = False,
 ):
+    """Create the mesh-SDF edge-contact kernel.
+
+    ``analytic_primitives`` lets the SDF side of a routed pair be an analytic
+    primitive (box, sphere, capsule, cylinder, cone, ellipsoid). Its signed
+    distance is then evaluated in closed form at the other shape's edge samples,
+    so a triangle mesh resting on a box costs one distance query per mesh edge
+    sample instead of one GJK/MPR test per overlapping triangle. The flag is
+    compile-time: when False the generated kernels are byte-identical to before.
+    """
     if use_identity_sdf_scale and not use_texture_sdf_only:
         raise ValueError("identity SDF scale specialization requires texture-only SDFs")
     do_edge_sdf_collision = _create_sdf_contact_funcs(
-        enable_heightfields, use_texture_sdf_only, texture_sample_sdf_hw, _texture_sample_sdf_hw_pair
+        enable_heightfields,
+        use_texture_sdf_only,
+        texture_sample_sdf_hw,
+        _texture_sample_sdf_hw_pair,
+        analytic_primitives=analytic_primitives,
     )
     sample_clamped = _texture_sample_sdf_hw_clamped
     sample_grad = texture_sample_sdf_grad_only_hw
@@ -1092,11 +1144,13 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     _module = (
         f"sdf_contact_{writer_func.__name__}_{enable_heightfields}_{reduce_contacts}_"
         f"{speculative}_{use_precomputed_edge_data}_{use_texture_sdf_only}_{use_identity_sdf_scale}"
+        + ("_prim" if analytic_primitives else "")
     )
 
     @wp.kernel(enable_backward=False, module=_module)
     def mesh_sdf_collision_kernel(
         shape_data: wp.array[wp.vec4],
+        shape_types: wp.array[int],
         shape_transform: wp.array[wp.transform],
         shape_source: wp.array[wp.uint64],
         texture_sdf_table: wp.array[TextureSDFData],
@@ -1111,8 +1165,8 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         _shape_collision_aabb_lower: wp.array[wp.vec3],
         _shape_collision_aabb_upper: wp.array[wp.vec3],
         _shape_voxel_resolution: wp.array[wp.vec3i],
-        shape_pairs_mesh_mesh: wp.array[wp.vec2i],
-        shape_pairs_mesh_mesh_count: wp.array[int],
+        shape_pairs_mesh_sdf: wp.array[wp.vec2i],
+        shape_pairs_mesh_sdf_count: wp.array[int],
         shape_heightfield_index: wp.array[wp.int32],
         heightfield_data: wp.array[HeightfieldData],
         heightfield_elevations: wp.array[wp.float32],
@@ -1126,7 +1180,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         """Process mesh-mesh and mesh-heightfield collisions using SDF-based detection."""
         block_id, t = wp.tid()
 
-        pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
+        pair_count = wp.min(shape_pairs_mesh_sdf_count[0], shape_pairs_mesh_sdf.shape[0])
 
         edge_stack = wp.tile_stack(capacity=STACK_CAPACITY, dtype=EdgeCullResult)
         # ``progress[0]`` is the next edge index the upcoming cooperative
@@ -1137,7 +1191,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
 
         # Strided loop over pairs
         for pair_idx in range(block_id, pair_count, total_num_blocks):
-            pair_encoded = shape_pairs_mesh_mesh[pair_idx]
+            pair_encoded = shape_pairs_mesh_sdf[pair_idx]
             if wp.static(enable_heightfields):
                 has_hfield = (pair_encoded[0] & SHAPE_PAIR_HFIELD_BIT) != 0
                 pair = wp.vec2i(pair_encoded[0] & SHAPE_PAIR_INDEX_MASK, pair_encoded[1])
@@ -1163,6 +1217,15 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 mesh_id_tri = shape_source[tri_shape]
                 mesh_id_sdf = shape_source[sdf_shape]
 
+                # Analytic primitive on the SDF side: closed-form distance, no
+                # texture, no BVH, no mesh source required.
+                sdf_is_analytic = False
+                sdf_geo = int(GeoType.MESH)
+                if wp.static(analytic_primitives):
+                    if not sdf_is_hfield:
+                        sdf_geo = shape_types[sdf_shape]
+                        sdf_is_analytic = is_exact_analytic_sdf_primitive(sdf_geo)
+
                 # Edge carriers need a mesh source unless they are heightfields.
                 if not tri_is_hfield and mesh_id_tri == wp.uint64(0):
                     continue
@@ -1178,7 +1241,8 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
 
                 # SDF availability: heightfields always use on-the-fly evaluation
                 use_bvh_for_sdf = False
-                if not sdf_is_hfield:
+                sdf_idx = int(-1)
+                if not sdf_is_hfield and not sdf_is_analytic:
                     sdf_idx = shape_sdf_index[sdf_shape]
                     if wp.static(not use_texture_sdf_only):
                         use_bvh_for_sdf = sdf_idx < 0 or sdf_idx >= texture_sdf_table.shape[0]
@@ -1200,7 +1264,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 # from elevation grid. For texture SDF, override to identity when scale
                 # is already baked. For BVH fallback, use the shape scale.
                 texture_sdf = TextureSDFData()
-                if sdf_is_hfield:
+                if sdf_is_hfield or sdf_is_analytic:
+                    # Heightfields sample the elevation grid and analytic primitives
+                    # evaluate in their own local frame, so no query-time scaling.
                     sdf_scale = wp.vec3(1.0, 1.0, 1.0)
                 else:
                     if not use_bvh_for_sdf:
@@ -1232,10 +1298,10 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 use_texture_sdf_for_search = False
                 texture_voxel_radius = float(0.0)
                 if wp.static(enable_heightfields):
-                    if not sdf_is_hfield and not use_bvh_for_sdf:
+                    if not sdf_is_hfield and not sdf_is_analytic and not use_bvh_for_sdf:
                         use_texture_sdf_for_search = True
                         texture_voxel_radius = texture_sdf.voxel_radius
-                elif not use_bvh_for_sdf:
+                elif not sdf_is_analytic and not use_bvh_for_sdf:
                     use_texture_sdf_for_search = True
                     texture_voxel_radius = texture_sdf.voxel_radius
                 search_precision_unscaled = mesh_sdf_contact_search_precision(
@@ -1318,6 +1384,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
 
                             if wp.static(enable_heightfields) and sdf_is_heightfield:
                                 midpoint_sdf = sample_sdf_heightfield(hfd_sdf, heightfield_elevations, bsphere_center)
+                                add_edge = midpoint_sdf <= threshold
+                            elif wp.static(analytic_primitives) and sdf_is_analytic:
+                                midpoint_sdf = eval_analytic_sdf_lower_bound(sdf_geo, mesh_scale_sdf, bsphere_center)
                                 add_edge = midpoint_sdf <= threshold
                             elif wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
                                 midpoint_sdf = sample_sdf_using_mesh(
@@ -1407,6 +1476,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                 hfd_sdf,
                                 heightfield_elevations,
                                 search_precision_unscaled,
+                                sdf_is_analytic,
+                                sdf_geo,
+                                mesh_scale_sdf,
                             )
 
                             # Gap may widen the edge cull enough to find
@@ -1432,7 +1504,11 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                 best_endpoint == 0 or corner_ownership == 0 or (corner_ownership & best_endpoint) != 0
                             )
                             if dist_approx < contact_threshold and inner_cull_consistent and owns_endpoint:
-                                if wp.static(enable_heightfields):
+                                if wp.static(analytic_primitives) and sdf_is_analytic:
+                                    dist_unscaled, direction_unscaled = eval_analytic_sdf_grad(
+                                        sdf_geo, mesh_scale_sdf, point_unscaled
+                                    )
+                                elif wp.static(enable_heightfields):
                                     if sdf_is_hfield:
                                         dist_unscaled, direction_unscaled = sample_sdf_grad_heightfield(
                                             hfd_sdf, heightfield_elevations, point_unscaled
@@ -1533,6 +1609,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     @wp.kernel(enable_backward=False, launch_bounds=(256, 2), module=_module)
     def mesh_sdf_collision_global_reduce_kernel(
         shape_data: wp.array[wp.vec4],
+        shape_types: wp.array[int],
         shape_transform: wp.array[wp.transform],
         shape_source: wp.array[wp.uint64],
         texture_sdf_table: wp.array[TextureSDFData],
@@ -1547,8 +1624,8 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         shape_collision_aabb_lower: wp.array[wp.vec3],
         shape_collision_aabb_upper: wp.array[wp.vec3],
         shape_voxel_resolution: wp.array[wp.vec3i],
-        shape_pairs_mesh_mesh: wp.array[wp.vec2i],
-        shape_pairs_mesh_mesh_count: wp.array[int],
+        shape_pairs_mesh_sdf: wp.array[wp.vec2i],
+        shape_pairs_mesh_sdf_count: wp.array[int],
         shape_heightfield_index: wp.array[wp.int32],
         heightfield_data: wp.array[HeightfieldData],
         heightfield_elevations: wp.array[wp.float32],
@@ -1571,7 +1648,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         - Tri-shape AABB for voxel computation (alternates per mode)
         """
         block_id, t = wp.tid()
-        pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
+        pair_count = wp.min(shape_pairs_mesh_sdf_count[0], shape_pairs_mesh_sdf.shape[0])
         total_combos = block_offsets[pair_count]
 
         edge_stack = wp.tile_stack(capacity=STACK_CAPACITY, dtype=EdgeCullResult)
@@ -1594,7 +1671,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
             pair_block_start = block_offsets[pair_idx]
             block_in_pair = combo_idx - pair_block_start
             blocks_for_pair = block_offsets[pair_idx + 1] - pair_block_start
-            pair_encoded = shape_pairs_mesh_mesh[pair_idx]
+            pair_encoded = shape_pairs_mesh_sdf[pair_idx]
             if wp.static(enable_heightfields):
                 has_hfield = (pair_encoded[0] & SHAPE_PAIR_HFIELD_BIT) != 0
                 pair = wp.vec2i(pair_encoded[0] & SHAPE_PAIR_INDEX_MASK, pair_encoded[1])
@@ -1620,6 +1697,15 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 mesh_id_tri = shape_source[tri_shape]
                 mesh_id_sdf = shape_source[sdf_shape]
 
+                # Analytic primitive on the SDF side: closed-form distance, no
+                # texture, no BVH, no mesh source required.
+                sdf_is_analytic = False
+                sdf_geo = int(GeoType.MESH)
+                if wp.static(analytic_primitives):
+                    if not sdf_is_hfield:
+                        sdf_geo = shape_types[sdf_shape]
+                        sdf_is_analytic = is_exact_analytic_sdf_primitive(sdf_geo)
+
                 if not tri_is_hfield and mesh_id_tri == wp.uint64(0):
                     continue
 
@@ -1633,7 +1719,8 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 sdf_mesh_query_type = resolve_mesh_sign_method(shape_mesh_properties[sdf_shape])
 
                 use_bvh_for_sdf = False
-                if not sdf_is_hfield:
+                sdf_idx = int(-1)
+                if not sdf_is_hfield and not sdf_is_analytic:
                     sdf_idx = shape_sdf_index[sdf_shape]
                     if wp.static(not use_texture_sdf_only):
                         use_bvh_for_sdf = sdf_idx < 0 or sdf_idx >= texture_sdf_table.shape[0]
@@ -1651,7 +1738,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 X_sdf_ws = shape_transform[sdf_shape]
 
                 texture_sdf = TextureSDFData()
-                if sdf_is_hfield:
+                if sdf_is_hfield or sdf_is_analytic:
+                    # Heightfields sample the elevation grid and analytic primitives
+                    # evaluate in their own local frame, so no query-time scaling.
                     sdf_scale = wp.vec3(1.0, 1.0, 1.0)
                 else:
                     if not use_bvh_for_sdf:
@@ -1683,10 +1772,10 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 use_texture_sdf_for_search = False
                 texture_voxel_radius = float(0.0)
                 if wp.static(enable_heightfields):
-                    if not sdf_is_hfield and not use_bvh_for_sdf:
+                    if not sdf_is_hfield and not sdf_is_analytic and not use_bvh_for_sdf:
                         use_texture_sdf_for_search = True
                         texture_voxel_radius = texture_sdf.voxel_radius
-                elif not use_bvh_for_sdf:
+                elif not sdf_is_analytic and not use_bvh_for_sdf:
                     use_texture_sdf_for_search = True
                     texture_voxel_radius = texture_sdf.voxel_radius
                 search_precision_unscaled = mesh_sdf_contact_search_precision(
@@ -1759,6 +1848,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
 
                             if wp.static(enable_heightfields) and sdf_is_heightfield:
                                 midpoint_sdf = sample_sdf_heightfield(hfd_sdf, heightfield_elevations, bsphere_center)
+                                add_edge = midpoint_sdf <= threshold
+                            elif wp.static(analytic_primitives) and sdf_is_analytic:
+                                midpoint_sdf = eval_analytic_sdf_lower_bound(sdf_geo, mesh_scale_sdf, bsphere_center)
                                 add_edge = midpoint_sdf <= threshold
                             elif wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
                                 midpoint_sdf = sample_sdf_using_mesh(
@@ -1845,6 +1937,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                 hfd_sdf,
                                 heightfield_elevations,
                                 search_precision_unscaled,
+                                sdf_is_analytic,
+                                sdf_geo,
+                                mesh_scale_sdf,
                             )
 
                             # Gap may widen the edge cull enough to find
@@ -1870,7 +1965,11 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                 best_endpoint == 0 or corner_ownership == 0 or (corner_ownership & best_endpoint) != 0
                             )
                             if dist_approx < contact_threshold and inner_cull_consistent and owns_endpoint:
-                                if wp.static(enable_heightfields):
+                                if wp.static(analytic_primitives) and sdf_is_analytic:
+                                    dist_unscaled, direction_unscaled = eval_analytic_sdf_grad(
+                                        sdf_geo, mesh_scale_sdf, point_unscaled
+                                    )
+                                elif wp.static(enable_heightfields):
                                     if sdf_is_hfield:
                                         dist_unscaled, direction_unscaled = sample_sdf_grad_heightfield(
                                             hfd_sdf, heightfield_elevations, point_unscaled
@@ -1990,3 +2089,516 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                     wp.tile_stack_clear(edge_stack)
 
     return mesh_sdf_collision_global_reduce_kernel
+
+
+# =============================================================================
+# Mesh vs analytic-primitive face pass
+# =============================================================================
+#
+# The edge kernels above sample a distance field along the edges of the
+# triangle mesh. For a mesh against an analytic primitive that is complete
+# only when the minimum of the primitive's signed distance over every
+# triangle lies on the triangle boundary. A convex primitive whose surface
+# pokes through the interior of a triangle (a sphere under a coarse flat
+# face, a box corner through a large quad) has its minimum strictly inside
+# the face, where no edge sample reaches. This pass closes that gap: for
+# every triangle that survives a Lipschitz cull it takes the primitive's
+# support point along the face normal (the deepest primitive point relative to
+# the face plane), projects it onto the triangle and emits a face contact with
+# the face normal and the plane depth when the projection is interior. That is
+# the separating geometry a face-vs-convex contact needs, exact for every
+# convex primitive (support points are closed form, the ellipsoid included),
+# and costs one support evaluation per triangle. A box contributes each of its
+# eight corners so a face resting flat on a box top gets a proper manifold.
+# Boundary projections are left to the edge kernel, which owns them.
+
+# Barycentric coordinates below this belong to the triangle boundary, which the
+# edge kernel owns.
+FACE_INTERIOR_EPS = 1.0e-4
+
+
+@wp.func
+def _analytic_primitive_half_extents(geo: int, scale: wp.vec3) -> wp.vec3:
+    """Half extents of the primitive's local axis-aligned bounding box."""
+    if geo == GeoType.SPHERE:
+        return wp.vec3(scale[0], scale[0], scale[0])
+    if geo == GeoType.CAPSULE:
+        return wp.vec3(scale[0], scale[0], scale[1] + scale[0])
+    if geo == GeoType.CYLINDER or geo == GeoType.CONE:
+        return wp.vec3(scale[0], scale[0], scale[1])
+    # BOX and ELLIPSOID store half extents / radii directly
+    return wp.vec3(wp.abs(scale[0]), wp.abs(scale[1]), wp.abs(scale[2]))
+
+
+@wp.func
+def _box_corner(k: int, half: wp.vec3) -> wp.vec3:
+    """Corner ``k`` (0..7) of a box with the given half extents."""
+    sx = wp.where((k & 1) != 0, 1.0, -1.0)
+    sy = wp.where((k & 2) != 0, 1.0, -1.0)
+    sz = wp.where((k & 4) != 0, 1.0, -1.0)
+    return wp.vec3(sx * half[0], sy * half[1], sz * half[2])
+
+
+@wp.func
+def _box_edge_endpoints(k: int, h: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
+    """Endpoints of box edge ``k`` (0..11): four edges along each axis."""
+    axis = k // 4
+    s0 = wp.where((k & 1) != 0, 1.0, -1.0)
+    s1 = wp.where((k & 2) != 0, 1.0, -1.0)
+    if axis == 0:
+        return wp.vec3(-h[0], s0 * h[1], s1 * h[2]), wp.vec3(h[0], s0 * h[1], s1 * h[2])
+    if axis == 1:
+        return wp.vec3(s0 * h[0], -h[1], s1 * h[2]), wp.vec3(s0 * h[0], h[1], s1 * h[2])
+    return wp.vec3(s0 * h[0], s1 * h[1], -h[2]), wp.vec3(s0 * h[0], s1 * h[1], h[2])
+
+
+@wp.func
+def _segment_aabb_in_mesh_frame(
+    p0: wp.vec3, p1: wp.vec3, X_sdf_to_mesh: wp.transform, pad: float
+) -> tuple[wp.vec3, wp.vec3]:
+    """AABB (scaled mesh frame) of a primitive-frame segment, expanded by ``pad``."""
+    a = wp.transform_point(X_sdf_to_mesh, p0)
+    b = wp.transform_point(X_sdf_to_mesh, p1)
+    lo = wp.min(a, b) - wp.vec3(pad, pad, pad)
+    hi = wp.max(a, b) + wp.vec3(pad, pad, pad)
+    return lo, hi
+
+
+@wp.func
+def _box_aabb_in_mesh_frame(h: wp.vec3, X_sdf_to_mesh: wp.transform, pad: float) -> tuple[wp.vec3, wp.vec3]:
+    """AABB (scaled mesh frame) of a primitive-frame box with half extents ``h``, expanded by ``pad``."""
+    lo = wp.vec3(1.0e30, 1.0e30, 1.0e30)
+    hi = wp.vec3(-1.0e30, -1.0e30, -1.0e30)
+    for c in range(8):
+        sx = wp.where((c & 1) != 0, 1.0, -1.0)
+        sy = wp.where((c & 2) != 0, 1.0, -1.0)
+        sz = wp.where((c & 4) != 0, 1.0, -1.0)
+        q = wp.transform_point(X_sdf_to_mesh, wp.vec3(sx * h[0], sy * h[1], sz * h[2]))
+        lo = wp.min(lo, q)
+        hi = wp.max(hi, q)
+    return lo - wp.vec3(pad, pad, pad), hi + wp.vec3(pad, pad, pad)
+
+
+@wp.func
+def _aabb_to_raw_mesh_frame(lo: wp.vec3, hi: wp.vec3, mesh_scale: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
+    """Map a scaled-mesh-frame AABB to the unscaled frame ``wp.Mesh`` queries expect (sign-safe)."""
+    inv = wp.vec3(1.0 / mesh_scale[0], 1.0 / mesh_scale[1], 1.0 / mesh_scale[2])
+    a = wp.cw_mul(lo, inv)
+    b = wp.cw_mul(hi, inv)
+    return wp.min(a, b), wp.max(a, b)
+
+
+@wp.func
+def _aabb_overlap(lo_a: wp.vec3, hi_a: wp.vec3, lo_b: wp.vec3, hi_b: wp.vec3) -> bool:
+    return (
+        lo_a[0] <= hi_b[0]
+        and lo_b[0] <= hi_a[0]
+        and lo_a[1] <= hi_b[1]
+        and lo_b[1] <= hi_a[1]
+        and lo_a[2] <= hi_b[2]
+        and lo_b[2] <= hi_a[2]
+    )
+
+
+@wp.kernel(enable_backward=False)
+def compute_mesh_primitive_face_counts(
+    shape_pairs_mesh_sdf: wp.array[wp.vec2i],
+    shape_pairs_mesh_sdf_count: wp.array[int],
+    shape_types: wp.array[int],
+    shape_source: wp.array[wp.uint64],
+    face_counts: wp.array[wp.int32],
+    total_face_count: wp.array[wp.int32],
+    total_num_threads: int,
+):
+    """Per-pair work weights for the face pass: the mesh's triangle count for analytic pairs, else zero."""
+    pair_count = wp.min(shape_pairs_mesh_sdf_count[0], shape_pairs_mesh_sdf.shape[0])
+    for i in range(wp.tid(), pair_count, total_num_threads):
+        pair_encoded = shape_pairs_mesh_sdf[i]
+        has_hfield = (pair_encoded[0] & SHAPE_PAIR_HFIELD_BIT) != 0
+        pair = wp.vec2i(pair_encoded[0] & SHAPE_PAIR_INDEX_MASK, pair_encoded[1])
+        faces = int(0)
+        if not has_hfield:
+            for mode in range(2):
+                tri_shape = pair[mode]
+                sdf_shape = pair[1 - mode]
+                if is_exact_analytic_sdf_primitive(shape_types[sdf_shape]) and shape_types[tri_shape] == GeoType.MESH:
+                    mesh_id = shape_source[tri_shape]
+                    if mesh_id != wp.uint64(0):
+                        faces += wp.mesh_get(mesh_id).indices.shape[0] // 3
+        face_counts[i] = wp.int32(faces)
+        wp.atomic_add(total_face_count, 0, faces)
+
+
+def compute_mesh_primitive_face_block_offsets_scan(
+    shape_pairs_mesh_sdf: wp.array[wp.vec2i],
+    shape_pairs_mesh_sdf_count: wp.array[int],
+    shape_types: wp.array[int],
+    shape_source: wp.array[wp.uint64],
+    target_blocks: int,
+    block_offsets: wp.array[wp.int32],
+    block_counts: wp.array[wp.int32],
+    total_face_count: wp.array[wp.int32],
+    total_num_threads: int,
+    device: str | None = None,
+    record_tape: bool = True,
+) -> None:
+    """Load-balanced block offsets for the face pass (same three-stage scheme as the edge kernels)."""
+    n = block_counts.shape[0]
+    launch_threads = min(n, total_num_threads)
+    wp.launch(
+        kernel=compute_mesh_primitive_face_counts,
+        dim=launch_threads,
+        inputs=[
+            shape_pairs_mesh_sdf,
+            shape_pairs_mesh_sdf_count,
+            shape_types,
+            shape_source,
+            block_counts,
+            total_face_count,
+            launch_threads,
+        ],
+        device=device,
+        record_tape=record_tape,
+    )
+    wp.launch(
+        kernel=compute_block_counts_from_weights,
+        dim=launch_threads,
+        inputs=[
+            total_face_count,
+            block_counts,
+            shape_pairs_mesh_sdf_count,
+            shape_pairs_mesh_sdf.shape[0],
+            target_blocks,
+            block_offsets,
+            launch_threads,
+        ],
+        device=device,
+        record_tape=record_tape,
+    )
+    wp.utils.array_scan(block_offsets, block_offsets, inclusive=False)
+
+
+FACE_CANDIDATE_MODE_SHIFT = 30
+FACE_CANDIDATE_TRI_MASK = (1 << FACE_CANDIDATE_MODE_SHIFT) - 1
+
+
+@wp.func
+def _face_candidate_survives(
+    va: wp.vec3,
+    vb: wp.vec3,
+    vc: wp.vec3,
+    X_mesh_to_sdf: wp.transform,
+    sdf_geo: int,
+    prim_scale: wp.vec3,
+    contact_threshold: float,
+) -> bool:
+    """Lipschitz cull on one triangle (scaled mesh-frame vertices): can its minimum reach the threshold?"""
+    a = wp.transform_point(X_mesh_to_sdf, va)
+    b = wp.transform_point(X_mesh_to_sdf, vb)
+    c = wp.transform_point(X_mesh_to_sdf, vc)
+    centroid = (a + b + c) / 3.0
+    reach = wp.max(wp.length(a - centroid), wp.max(wp.length(b - centroid), wp.length(c - centroid)))
+    return eval_analytic_sdf_lower_bound(sdf_geo, prim_scale, centroid) <= contact_threshold + reach
+
+
+@wp.func
+def _push_face_candidate(
+    pair_idx: int,
+    mode: int,
+    tri: int,
+    face_candidates: wp.array[wp.vec2i],
+    face_candidate_count: wp.array[int],
+):
+    idx = wp.atomic_add(face_candidate_count, 0, 1)
+    if idx < face_candidates.shape[0]:
+        face_candidates[idx] = wp.vec2i(pair_idx, (mode << FACE_CANDIDATE_MODE_SHIFT) | tri)
+
+
+@wp.kernel(enable_backward=False)
+def mesh_primitive_face_candidates_kernel(
+    shape_data: wp.array[wp.vec4],
+    shape_types: wp.array[int],
+    shape_transform: wp.array[wp.transform],
+    shape_source: wp.array[wp.uint64],
+    shape_gap: wp.array[float],
+    shape_pairs_mesh_sdf: wp.array[wp.vec2i],
+    shape_pairs_mesh_sdf_count: wp.array[int],
+    block_offsets: wp.array[wp.int32],
+    face_candidates: wp.array[wp.vec2i],
+    face_candidate_count: wp.array[int],
+    total_num_blocks: int,
+):
+    """Collect the triangles of mesh vs analytic-primitive pairs that may carry a face contact.
+
+    Candidates come from BVH queries of the regions where such a minimum can exist:
+    for a box its twelve edges (a triangle inside one face's exterior region has a
+    constant gradient and no interior minimum), for the curved primitives the
+    primitive's bounds split into a grid of cells, every region expanded by the
+    contact threshold. Blocks are distributed over pairs in proportion to the mesh's
+    triangle count (``block_offsets``); within a pair every (block, lane) owns one
+    work item (an edge or a cell) and a triangle reachable from several items is
+    reported by exactly one. Survivors of the Lipschitz cull are appended to
+    ``face_candidates`` for :func:`create_mesh_primitive_face_contacts_kernel`, which
+    balances the support tests over all threads.
+    """
+    block_id, t = wp.tid()
+    pair_count = wp.min(shape_pairs_mesh_sdf_count[0], shape_pairs_mesh_sdf.shape[0])
+    block_dim = wp.block_dim()
+    total_combos = block_offsets[pair_count]
+
+    for combo_idx in range(block_id, total_combos, total_num_blocks):
+        lo_idx = int(0)
+        hi_idx = int(pair_count)
+        while lo_idx < hi_idx:
+            mid = (lo_idx + hi_idx) // 2
+            if block_offsets[mid + 1] <= combo_idx:
+                lo_idx = mid + 1
+            else:
+                hi_idx = mid
+        pair_idx = int(lo_idx)
+        pair_block_start = block_offsets[pair_idx]
+        blocks_for_pair = block_offsets[pair_idx + 1] - pair_block_start
+        # Interleave items across the pair's blocks so neighbouring cells, which
+        # tend to hold the contact band together, land in different blocks.
+        item = (combo_idx - pair_block_start) + blocks_for_pair * t
+        num_items = blocks_for_pair * block_dim
+
+        pair_encoded = shape_pairs_mesh_sdf[pair_idx]
+        if (pair_encoded[0] & SHAPE_PAIR_HFIELD_BIT) != 0:
+            continue
+        pair = wp.vec2i(pair_encoded[0] & SHAPE_PAIR_INDEX_MASK, pair_encoded[1])
+        gap_sum = shape_gap[pair[0]] + shape_gap[pair[1]]
+
+        for mode in range(2):
+            tri_shape = pair[mode]
+            sdf_shape = pair[1 - mode]
+            sdf_geo = shape_types[sdf_shape]
+            if not is_exact_analytic_sdf_primitive(sdf_geo) or shape_types[tri_shape] != GeoType.MESH:
+                continue
+            mesh_id = shape_source[tri_shape]
+            if mesh_id == wp.uint64(0):
+                continue
+
+            data_tri = shape_data[tri_shape]
+            data_sdf = shape_data[sdf_shape]
+            mesh_scale = wp.vec3(data_tri[0], data_tri[1], data_tri[2])
+            prim_scale = wp.vec3(data_sdf[0], data_sdf[1], data_sdf[2])
+            contact_threshold = gap_sum + data_tri[3] + data_sdf[3]
+
+            X_tri_ws = shape_transform[tri_shape]
+            X_sdf_ws = shape_transform[sdf_shape]
+            X_mesh_to_sdf = wp.transform_multiply(wp.transform_inverse(X_sdf_ws), X_tri_ws)
+            X_sdf_to_mesh = wp.transform_inverse(X_mesh_to_sdf)
+            mesh = wp.mesh_get(mesh_id)
+            half = _analytic_primitive_half_extents(sdf_geo, prim_scale)
+
+            if sdf_geo == GeoType.BOX:
+                # One box edge per work item. A triangle overlapping several edge
+                # regions is reported by the lowest edge index only.
+                for k in range(item, 12, num_items):
+                    e0, e1 = _box_edge_endpoints(k, half)
+                    lo_k, hi_k = _segment_aabb_in_mesh_frame(e0, e1, X_sdf_to_mesh, contact_threshold)
+                    lo_raw, hi_raw = _aabb_to_raw_mesh_frame(lo_k, hi_k, mesh_scale)
+                    query = wp.mesh_query_aabb(mesh_id, lo_raw, hi_raw)
+                    tri = int(0)
+                    while wp.mesh_query_aabb_next(query, tri):
+                        va = wp.cw_mul(mesh.points[mesh.indices[3 * tri]], mesh_scale)
+                        vb = wp.cw_mul(mesh.points[mesh.indices[3 * tri + 1]], mesh_scale)
+                        vc = wp.cw_mul(mesh.points[mesh.indices[3 * tri + 2]], mesh_scale)
+                        tri_lo = wp.min(va, wp.min(vb, vc))
+                        tri_hi = wp.max(va, wp.max(vb, vc))
+                        owned = int(1)
+                        for j in range(k):
+                            f0, f1 = _box_edge_endpoints(j, half)
+                            lo_j, hi_j = _segment_aabb_in_mesh_frame(f0, f1, X_sdf_to_mesh, contact_threshold)
+                            if _aabb_overlap(tri_lo, tri_hi, lo_j, hi_j):
+                                owned = int(0)
+                        if owned != 0 and _face_candidate_survives(
+                            va, vb, vc, X_mesh_to_sdf, sdf_geo, prim_scale, contact_threshold
+                        ):
+                            _push_face_candidate(pair_idx, mode, tri, face_candidates, face_candidate_count)
+            else:
+                # Curved primitive: its expanded bounds split into n x n x n cells with
+                # n^3 <= work items, one cell per item. Cells rather than slabs keep
+                # the number of lanes that fetch the same triangle near one. A
+                # triangle is owned by the cell holding its (clamped) centroid.
+                lo_all, hi_all = _box_aabb_in_mesh_frame(half, X_sdf_to_mesh, contact_threshold)
+                n_cells = int(1)
+                while (n_cells + 1) * (n_cells + 1) * (n_cells + 1) <= num_items:
+                    n_cells += 1
+                if item >= n_cells * n_cells * n_cells:
+                    continue
+                ix = item % n_cells
+                iy = (item // n_cells) % n_cells
+                iz = item // (n_cells * n_cells)
+                cell = (hi_all - lo_all) / float(n_cells)
+                cell_lo = lo_all + wp.cw_mul(cell, wp.vec3(float(ix), float(iy), float(iz)))
+                cell_hi = cell_lo + cell
+                lo_raw, hi_raw = _aabb_to_raw_mesh_frame(cell_lo, cell_hi, mesh_scale)
+                query = wp.mesh_query_aabb(mesh_id, lo_raw, hi_raw)
+                tri = int(0)
+                while wp.mesh_query_aabb_next(query, tri):
+                    va = wp.cw_mul(mesh.points[mesh.indices[3 * tri]], mesh_scale)
+                    vb = wp.cw_mul(mesh.points[mesh.indices[3 * tri + 1]], mesh_scale)
+                    vc = wp.cw_mul(mesh.points[mesh.indices[3 * tri + 2]], mesh_scale)
+                    cen = wp.min(wp.max((va + vb + vc) / 3.0, lo_all), hi_all)
+                    rel = wp.cw_div(cen - lo_all, cell)
+                    ox = wp.min(int(rel[0]), n_cells - 1)
+                    oy = wp.min(int(rel[1]), n_cells - 1)
+                    oz = wp.min(int(rel[2]), n_cells - 1)
+                    if ox != ix or oy != iy or oz != iz:
+                        continue
+                    if _face_candidate_survives(va, vb, vc, X_mesh_to_sdf, sdf_geo, prim_scale, contact_threshold):
+                        _push_face_candidate(pair_idx, mode, tri, face_candidates, face_candidate_count)
+
+
+def create_mesh_primitive_face_contacts_kernel(
+    writer_func: Any,
+    speculative: bool = False,
+):
+    """Build the kernel that turns collected face candidates into contacts.
+
+    One thread per candidate, strided, so the work is spread evenly regardless of
+    where the contact band sits. Contacts go through ``writer_func`` exactly like
+    the edge kernels, so the reducing and non-reducing pipelines both apply.
+    """
+    _module = f"sdf_face_contact_{writer_func.__name__}_{speculative}"
+
+    @wp.kernel(enable_backward=False, module=_module)
+    def mesh_primitive_face_sdf_kernel(
+        shape_data: wp.array[wp.vec4],
+        shape_transform: wp.array[wp.transform],
+        shape_source: wp.array[wp.uint64],
+        shape_gap: wp.array[float],
+        shape_base_gap: wp.array[float],
+        shape_types: wp.array[int],
+        shape_pairs_mesh_sdf: wp.array[wp.vec2i],
+        face_candidates: wp.array[wp.vec2i],
+        face_candidate_count: wp.array[int],
+        writer_data: Any,
+        total_num_threads: int,
+    ):
+        count = wp.min(face_candidate_count[0], face_candidates.shape[0])
+        for i in range(wp.tid(), count, total_num_threads):
+            cand = face_candidates[i]
+            pair_idx = cand[0]
+            mode = cand[1] >> FACE_CANDIDATE_MODE_SHIFT
+            tri = cand[1] & FACE_CANDIDATE_TRI_MASK
+            pair_encoded = shape_pairs_mesh_sdf[pair_idx]
+            pair = wp.vec2i(pair_encoded[0] & SHAPE_PAIR_INDEX_MASK, pair_encoded[1])
+            tri_shape = pair[mode]
+            sdf_shape = pair[1 - mode]
+            sdf_geo = shape_types[sdf_shape]
+            mesh_id = shape_source[tri_shape]
+
+            data_tri = shape_data[tri_shape]
+            data_sdf = shape_data[sdf_shape]
+            mesh_scale = wp.vec3(data_tri[0], data_tri[1], data_tri[2])
+            prim_scale = wp.vec3(data_sdf[0], data_sdf[1], data_sdf[2])
+            gap_sum = shape_gap[pair[0]] + shape_gap[pair[1]]
+            contact_threshold = gap_sum + data_tri[3] + data_sdf[3]
+            gap_value = gap_sum
+            if wp.static(speculative):
+                gap_value = shape_base_gap[pair[0]] + shape_base_gap[pair[1]]
+
+            X_tri_ws = shape_transform[tri_shape]
+            X_sdf_ws = shape_transform[sdf_shape]
+            X_mesh_to_sdf = wp.transform_multiply(wp.transform_inverse(X_sdf_ws), X_tri_ws)
+
+            mesh = wp.mesh_get(mesh_id)
+            a = wp.transform_point(X_mesh_to_sdf, wp.cw_mul(mesh.points[mesh.indices[3 * tri]], mesh_scale))
+            b = wp.transform_point(X_mesh_to_sdf, wp.cw_mul(mesh.points[mesh.indices[3 * tri + 1]], mesh_scale))
+            c = wp.transform_point(X_mesh_to_sdf, wp.cw_mul(mesh.points[mesh.indices[3 * tri + 2]], mesh_scale))
+
+            # Face normal pointing from the face toward the primitive (its frame origin),
+            # so the mesh winding does not matter.
+            n = wp.cross(b - a, c - a)
+            n_len_sq = wp.length_sq(n)
+            if n_len_sq <= 0.0:
+                continue
+            n = n / wp.sqrt(n_len_sq)
+            if wp.dot(a, n) > 0.0:
+                n = -n
+
+            geom = GenericShapeData()
+            geom.shape_type = sdf_geo
+            geom.scale = prim_scale
+            geom.auxiliary = wp.vec3(0.0, 0.0, 0.0)
+            geom.center = wp.vec3(0.0, 0.0, 0.0)
+            provider = SupportMapDataProvider()
+
+            # Support of the primitive along -n, i.e. its deepest point relative to
+            # the face plane. A box needs every corner tied for that minimum, so a
+            # face resting flat on it still yields a manifold: one corner for vertex
+            # support, two for an edge, four for a face. Corners that are not
+            # supporting sit on the far side of the box and must never be emitted.
+            num_points = int(1)
+            tie_eps = float(0.0)
+            support_single = wp.vec3(0.0, 0.0, 0.0)
+            if sdf_geo == GeoType.BOX:
+                num_points = int(8)
+                tie_eps = 1.0e-5 * (wp.abs(prim_scale[0]) + wp.abs(prim_scale[1]) + wp.abs(prim_scale[2]))
+            else:
+                support_single = support_map(geom, -n, provider)
+
+            min_sep = float(1.0e30)
+            for k in range(num_points):
+                support = support_single
+                if sdf_geo == GeoType.BOX:
+                    support = _box_corner(k, prim_scale)
+                # Signed distance of the support point to the face plane along n:
+                # negative means it has crossed the face into the mesh.
+                min_sep = wp.min(min_sep, wp.dot(support - a, n))
+            if min_sep >= contact_threshold:
+                continue
+
+            for k in range(num_points):
+                support = support_single
+                if sdf_geo == GeoType.BOX:
+                    support = _box_corner(k, prim_scale)
+                sep = wp.dot(support - a, n)
+                if sep > min_sep + tie_eps:
+                    continue
+                proj = support - n * sep
+                # Barycentric interior test of the projection.
+                v0 = b - a
+                v1 = c - a
+                v2 = proj - a
+                d00 = wp.dot(v0, v0)
+                d01 = wp.dot(v0, v1)
+                d11 = wp.dot(v1, v1)
+                d20 = wp.dot(v2, v0)
+                d21 = wp.dot(v2, v1)
+                denom = d00 * d11 - d01 * d01
+                if denom <= 0.0:
+                    continue
+                bv = (d11 * d20 - d01 * d21) / denom
+                bw = (d00 * d21 - d01 * d20) / denom
+                bu = 1.0 - bv - bw
+                if bu < FACE_INTERIOR_EPS or bv < FACE_INTERIOR_EPS or bw < FACE_INTERIOR_EPS:
+                    continue
+
+                point_world = wp.transform_point(X_sdf_ws, proj)
+                n_world = wp.transform_vector(X_sdf_ws, n)
+                # ``n`` points from the mesh face toward the primitive: that is the
+                # a->b normal when the face carrier is ``a``.
+                contact_normal = n_world if mode == 0 else -n_world
+
+                contact_data = ContactData()
+                contact_data.contact_point_center = point_world
+                contact_data.contact_normal_a_to_b = contact_normal
+                contact_data.contact_distance = sep
+                contact_data.radius_eff_a = 0.0
+                contact_data.radius_eff_b = 0.0
+                contact_data.margin_a = shape_data[pair[0]][3]
+                contact_data.margin_b = shape_data[pair[1]][3]
+                contact_data.shape_a = pair[0]
+                contact_data.shape_b = pair[1]
+                contact_data.gap_sum = gap_value
+                # Bit 0 set distinguishes face contacts from edge contacts of the same
+                # pair; the support index keeps a box's corners apart. Only the
+                # deterministic tie-break is affected if a mesh exceeds 2^18 triangles.
+                contact_data.sort_sub_key = (((tri << 3) | k) << 2) | (mode << 1) | 1
+                writer_func(contact_data, writer_data, -1)
+
+    return mesh_primitive_face_sdf_kernel

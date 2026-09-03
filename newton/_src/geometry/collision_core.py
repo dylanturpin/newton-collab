@@ -777,8 +777,8 @@ def pre_contact_check(
     shape_pairs_mesh_plane_cumsum: wp.array[int],
     shape_pairs_mesh_plane_count: wp.array[int],
     mesh_plane_vertex_total_count: wp.array[int],
-    shape_pairs_mesh_mesh: wp.array[wp.vec2i],
-    shape_pairs_mesh_mesh_count: wp.array[int],
+    shape_pairs_mesh_sdf: wp.array[wp.vec2i],
+    shape_pairs_mesh_sdf_count: wp.array[int],
 ):
     """
     Perform pre-contact checks for early rejection and special case handling.
@@ -805,8 +805,8 @@ def pre_contact_check(
         shape_pairs_mesh_plane_cumsum: Cumulative sum array for mesh-plane vertices
         shape_pairs_mesh_plane_count: Counter for mesh-plane collision pairs
         mesh_plane_vertex_total_count: Total vertex count for mesh-plane collisions
-        shape_pairs_mesh_mesh: Output array for mesh-mesh collision pairs
-        shape_pairs_mesh_mesh_count: Counter for mesh-mesh collision pairs
+        shape_pairs_mesh_sdf: Output array for mesh-mesh collision pairs
+        shape_pairs_mesh_sdf_count: Counter for mesh-mesh collision pairs
 
     Returns:
         Tuple of (skip_pair, is_infinite_plane_a, is_infinite_plane_b, bsphere_radius_a, bsphere_radius_b)
@@ -867,9 +867,9 @@ def pre_contact_check(
     # Check for mesh-mesh collisions - add to separate buffer for specialized handling
     if type_a == GeoType.MESH and type_b == GeoType.MESH:
         # Add to mesh-mesh collision buffer using atomic counter
-        mesh_mesh_pair_idx = wp.atomic_add(shape_pairs_mesh_mesh_count, 0, 1)
-        if mesh_mesh_pair_idx < shape_pairs_mesh_mesh.shape[0]:
-            shape_pairs_mesh_mesh[mesh_mesh_pair_idx] = pair
+        mesh_mesh_pair_idx = wp.atomic_add(shape_pairs_mesh_sdf_count, 0, 1)
+        if mesh_mesh_pair_idx < shape_pairs_mesh_sdf.shape[0]:
+            shape_pairs_mesh_sdf[mesh_mesh_pair_idx] = pair
         return True, is_infinite_plane_a, is_infinite_plane_b, bsphere_radius_a, bsphere_radius_b
 
     # Check for other mesh collisions (mesh vs non-mesh) - add to separate buffer for specialized handling

@@ -57,12 +57,16 @@ from ..geometry.contact_reduction_global import (
 )
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.flags import ShapeFlags
+from ..geometry.kernels import is_exact_analytic_sdf_primitive
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
     compute_block_counts_from_weights,
     compute_mesh_mesh_block_offsets_scan,
+    compute_mesh_primitive_face_block_offsets_scan,
+    create_mesh_primitive_face_contacts_kernel,
     create_narrow_phase_process_mesh_mesh_contacts_kernel,
+    mesh_primitive_face_candidates_kernel,
 )
 from ..geometry.sdf_hydroelastic import HydroelasticSDF
 from ..geometry.sdf_texture import TextureSDFData
@@ -407,6 +411,7 @@ def create_narrow_phase_primitive_kernel(
     sparse_gjk_pairs: bool = False,
     hydroelastic_enabled: bool = False,
     box_box_sat: bool = False,
+    mesh_primitive_sdf: bool = False,
 ):
     """
     Create a kernel for fast analytical collision detection of primitive shapes.
@@ -423,11 +428,18 @@ def create_narrow_phase_primitive_kernel(
         hydroelastic_enabled: Route hydroelastic pairs to the SDF-SDF pipeline.
         box_box_sat: Route box-box pairs through the SAT reference-face
             primitive instead of GJK/MPR (4-slot feature-identity manifold).
+        mesh_primitive_sdf: Route mesh vs analytic-primitive pairs (box, sphere,
+            capsule, cylinder, cone) to the mesh-SDF pair buffer, whose
+            kernels evaluate the primitive's distance in closed form, instead of
+            the per-triangle GJK/MPR mesh-convex path.
 
     Returns:
         A warp kernel for primitive collision detection
     """
-    _module = f"narrow_phase_primitive_{writer_func.__name__}_{speculative}_{sparse_gjk_pairs}_{hydroelastic_enabled}_sat{int(box_box_sat)}"
+    _module = (
+        f"narrow_phase_primitive_{writer_func.__name__}_{speculative}_{sparse_gjk_pairs}_"
+        f"{hydroelastic_enabled}_sat{int(box_box_sat)}" + ("_msdf" if mesh_primitive_sdf else "")
+    )
 
     @wp.func(module=_module)
     def _admit(
@@ -489,8 +501,8 @@ def create_narrow_phase_primitive_kernel(
         shape_pairs_mesh_plane_count: wp.array[int],
         mesh_plane_vertex_total_count: wp.array[int],
         # Output: mesh-mesh collision pairs
-        shape_pairs_mesh_mesh: wp.array[wp.vec2i],
-        shape_pairs_mesh_mesh_count: wp.array[int],
+        shape_pairs_mesh_sdf: wp.array[wp.vec2i],
+        shape_pairs_mesh_sdf_count: wp.array[int],
         # Output: sdf-sdf hydroelastic collision pairs
         shape_pairs_sdf_sdf: wp.array[wp.vec2i],
         shape_pairs_sdf_sdf_count: wp.array[int],
@@ -576,9 +588,9 @@ def create_narrow_phase_primitive_kernel(
                     else:
                         encoded_a = shape_a
                         encoded_b = shape_b
-                    idx = wp.atomic_add(shape_pairs_mesh_mesh_count, 0, 1)
-                    if idx < shape_pairs_mesh_mesh.shape[0]:
-                        shape_pairs_mesh_mesh[idx] = wp.vec2i(encoded_a, encoded_b)
+                    idx = wp.atomic_add(shape_pairs_mesh_sdf_count, 0, 1)
+                    if idx < shape_pairs_mesh_sdf.shape[0]:
+                        shape_pairs_mesh_sdf[idx] = wp.vec2i(encoded_a, encoded_b)
                     continue
 
                 # All other heightfield pairs: route through mesh midphase + GJK/MPR.
@@ -609,15 +621,33 @@ def create_narrow_phase_primitive_kernel(
             # texture SDF data and edges; otherwise the old routing is cheaper.
             # Keep box-box on its existing GJK/MPR path even when SDFs are
             # present. The output buffer must exist for the SDF edge route.
-            if (is_mesh_a and is_mesh_b) or (
-                shape_pairs_mesh_mesh.shape[0] > 0
-                and has_sdf_edges_a
-                and has_sdf_edges_b
-                and not (is_box_a and is_box_b)
+            #
+            # With ``mesh_primitive_sdf`` a mesh against an analytic primitive
+            # also takes the SDF edge route: the primitive's distance is
+            # evaluated in closed form at the mesh's edge samples, so the cost
+            # scales with the mesh's edges rather than with one GJK/MPR test
+            # per overlapping triangle (the mesh-convex path below). No SDF is
+            # required on either shape for this route; the primitive needs
+            # none and the mesh side falls back to its BVH.
+            route_mesh_primitive_sdf = False
+            if wp.static(mesh_primitive_sdf):
+                route_mesh_primitive_sdf = shape_pairs_mesh_sdf.shape[0] > 0 and (
+                    (is_mesh_a and is_exact_analytic_sdf_primitive(type_b))
+                    or (is_mesh_b and is_exact_analytic_sdf_primitive(type_a))
+                )
+            if (
+                (is_mesh_a and is_mesh_b)
+                or route_mesh_primitive_sdf
+                or (
+                    shape_pairs_mesh_sdf.shape[0] > 0
+                    and has_sdf_edges_a
+                    and has_sdf_edges_b
+                    and not (is_box_a and is_box_b)
+                )
             ):
-                idx = wp.atomic_add(shape_pairs_mesh_mesh_count, 0, 1)
-                if idx < shape_pairs_mesh_mesh.shape[0]:
-                    shape_pairs_mesh_mesh[idx] = wp.vec2i(shape_a, shape_b)
+                idx = wp.atomic_add(shape_pairs_mesh_sdf_count, 0, 1)
+                if idx < shape_pairs_mesh_sdf.shape[0]:
+                    shape_pairs_mesh_sdf[idx] = wp.vec2i(shape_a, shape_b)
                 continue
 
             # Mesh-plane collision (infinite plane only)
@@ -2141,6 +2171,8 @@ def verify_narrow_phase_buffers(
     max_mesh_mesh: int,
     sdf_sdf_count: wp.array[int],
     max_sdf_sdf: int,
+    face_candidate_count: wp.array[int],
+    max_face_candidates: int,
     contact_count: wp.array[int],
     max_contacts: int,
     reduction_ht_active_slots: wp.array[int],
@@ -2214,6 +2246,12 @@ def verify_narrow_phase_buffers(
                 sdf_sdf_count[0],
                 max_sdf_sdf,
             )
+    if max_face_candidates >= 0 and face_candidate_count[0] > max_face_candidates:
+        wp.printf(
+            "Warning: Mesh-primitive face candidate buffer overflowed %d > %d (raise max_triangle_pairs).\n",
+            face_candidate_count[0],
+            max_face_candidates,
+        )
     if contact_count[0] > max_contacts:
         wp.printf(
             "Warning: Contact buffer overflowed %d > %d.\n",
@@ -2253,7 +2291,7 @@ class NarrowPhase:
         *,
         max_candidate_pairs: int,
         max_triangle_pairs: int = 1000000,
-        max_mesh_mesh_pairs: int | None = None,
+        max_mesh_sdf_pairs: int | None = None,
         max_mesh_plane_pairs: int | None = None,
         reduce_contacts: bool = True,
         device: Devicelike | None = None,
@@ -2262,6 +2300,7 @@ class NarrowPhase:
         shape_voxel_resolution: wp.array[wp.vec3i] | None = None,
         contact_writer_warp_func: Any | None = None,
         box_box_sat: bool = False,
+        mesh_primitive_sdf: bool = False,
         hydroelastic_sdf: HydroelasticSDF | None = None,
         has_meshes: bool = True,
         has_heightfields: bool = False,
@@ -2287,7 +2326,18 @@ class NarrowPhase:
             max_candidate_pairs: Maximum number of candidate pairs from broad phase
             max_triangle_pairs: Maximum number of triangle pairs for mesh and
                 heightfield collisions (conservative estimate).
-            max_mesh_mesh_pairs: Maximum number of routed mesh-SDF pairs. Defaults
+            mesh_primitive_sdf: Route mesh vs analytic-primitive pairs (box, sphere,
+                capsule, cylinder, cone) through the SDF contact kernels
+                with the primitive's signed distance evaluated in closed form,
+                instead of the per-triangle GJK/MPR mesh-convex path. The edge
+                kernel samples the distance along the mesh edges and a face pass
+                emits the primitive's support point against each face it pokes
+                through, so a primitive inside a coarse face is found with the
+                face normal and plane depth. The primitive needs no
+                SDF; the reverse direction (primitive edges vs mesh SDF) runs only
+                for primitives that carry edge data, i.e. boxes with an SDF
+                resolution configured. Defaults to False.
+            max_mesh_sdf_pairs: Maximum number of routed mesh-SDF pairs. Defaults
                 to ``max_candidate_pairs``.
             max_mesh_plane_pairs: Maximum number of routed mesh-plane pairs. Defaults
                 to ``max_candidate_pairs``.
@@ -2337,7 +2387,7 @@ class NarrowPhase:
                 class (``gjk_candidate_pairs_count``, ``split_gjk_work_count``,
                 ``split_manifold_work_count``, ``shape_pairs_mesh_count``,
                 ``triangle_pairs_count``, ``shape_pairs_mesh_plane_count``,
-                ``shape_pairs_mesh_mesh_count``, ``shape_pairs_sdf_sdf_count``)
+                ``shape_pairs_mesh_sdf_count``, ``shape_pairs_sdf_sdf_count``)
                 and the output ``contact_count`` against the capacity of its
                 backing array, and checks the global contact reducer hashtable
                 fill/failure counters when reduction is enabled, printing
@@ -2359,13 +2409,13 @@ class NarrowPhase:
         """
         self.max_candidate_pairs = max_candidate_pairs
         self.max_triangle_pairs = max_triangle_pairs
-        if max_mesh_mesh_pairs is not None and max_mesh_mesh_pairs < 0:
-            raise ValueError("max_mesh_mesh_pairs must be non-negative or None")
+        if max_mesh_sdf_pairs is not None and max_mesh_sdf_pairs < 0:
+            raise ValueError("max_mesh_sdf_pairs must be non-negative or None")
         if max_mesh_plane_pairs is not None and max_mesh_plane_pairs < 0:
             raise ValueError("max_mesh_plane_pairs must be non-negative or None")
-        self.max_mesh_mesh_pairs = min(
+        self.max_mesh_sdf_pairs = min(
             max_candidate_pairs,
-            max_candidate_pairs if max_mesh_mesh_pairs is None else max_mesh_mesh_pairs,
+            max_candidate_pairs if max_mesh_sdf_pairs is None else max_mesh_sdf_pairs,
         )
         self.max_mesh_plane_pairs = min(
             max_candidate_pairs,
@@ -2450,12 +2500,14 @@ class NarrowPhase:
         self.split_gjk_mpr = device_obj.is_cuda and has_generic_convex_pairs and split_gjk_mpr
         # Create the appropriate kernel variants
         # Primitive kernel handles lightweight primitives and routes remaining pairs
+        self.mesh_primitive_sdf = bool(mesh_primitive_sdf) and has_meshes
         self.primitive_kernel = create_narrow_phase_primitive_kernel(
             writer_func,
             speculative=speculative,
             sparse_gjk_pairs=self.sparse_gjk_pairs,
             hydroelastic_enabled=hydroelastic_sdf is not None,
             box_box_sat=box_box_sat,
+            mesh_primitive_sdf=self.mesh_primitive_sdf,
         )
         # GJK/MPR kernel handles remaining convex-convex pairs
         if use_lean_gjk_mpr:
@@ -2519,6 +2571,7 @@ class NarrowPhase:
                     speculative=speculative,
                     use_texture_sdf_only=self.mesh_sdf_texture_only,
                     use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
+                    analytic_primitives=self.mesh_primitive_sdf,
                 )
                 self.mesh_mesh_contacts_kernel_precomputed = create_narrow_phase_process_mesh_mesh_contacts_kernel(
                     write_contact_to_reducer,
@@ -2528,6 +2581,7 @@ class NarrowPhase:
                     use_texture_sdf_only=self.mesh_sdf_texture_only,
                     use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
                     speculative=speculative,
+                    analytic_primitives=self.mesh_primitive_sdf,
                 )
             else:
                 self.mesh_mesh_contacts_kernel = create_narrow_phase_process_mesh_mesh_contacts_kernel(
@@ -2536,6 +2590,7 @@ class NarrowPhase:
                     speculative=speculative,
                     use_texture_sdf_only=self.mesh_sdf_texture_only,
                     use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
+                    analytic_primitives=self.mesh_primitive_sdf,
                 )
                 self.mesh_mesh_contacts_kernel_precomputed = create_narrow_phase_process_mesh_mesh_contacts_kernel(
                     writer_func,
@@ -2544,11 +2599,22 @@ class NarrowPhase:
                     use_texture_sdf_only=self.mesh_sdf_texture_only,
                     use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
                     speculative=speculative,
+                    analytic_primitives=self.mesh_primitive_sdf,
                 )
         else:
             self.mesh_plane_contacts_kernel = None
             self.mesh_mesh_contacts_kernel = None
             self.mesh_mesh_contacts_kernel_precomputed = None
+
+        # Face pass for mesh vs analytic-primitive pairs: closes the interior-of-face
+        # gap left by edge sampling. Same writer as the other mesh producers.
+        if self.mesh_primitive_sdf:
+            self.mesh_primitive_face_kernel = create_mesh_primitive_face_contacts_kernel(
+                write_contact_to_reducer if self.reduce_contacts else writer_func,
+                speculative=speculative,
+            )
+        else:
+            self.mesh_primitive_face_kernel = None
 
         # Create global contact reduction kernels for mesh/heightfield-triangle
         # contacts (mirror the predicate used to gate ``self.reduce_contacts``
@@ -2607,7 +2673,7 @@ class NarrowPhase:
             self.mesh_mesh_total_weight = (
                 c[mesh_weight_idx + 1 : mesh_weight_idx + 2] if mesh_weight_idx is not None else None
             )
-            self.shape_pairs_mesh_mesh_count = c[mesh_only_idx + 2 : mesh_only_idx + 3] if has_meshes else None
+            self.shape_pairs_mesh_sdf_count = c[mesh_only_idx + 2 : mesh_only_idx + 3] if has_meshes else None
 
             # Pair and work buffers
             self.gjk_candidate_pairs = wp.zeros(max_candidate_pairs, dtype=wp.vec2i, device=device)
@@ -2634,8 +2700,8 @@ class NarrowPhase:
             self.shape_pairs_mesh_plane_cumsum = (
                 wp.zeros(self.max_mesh_plane_pairs, dtype=wp.int32, device=device) if has_meshes else None
             )
-            self.shape_pairs_mesh_mesh = (
-                wp.zeros(self.max_mesh_mesh_pairs, dtype=wp.vec2i, device=device) if has_meshes else None
+            self.shape_pairs_mesh_sdf = (
+                wp.zeros(self.max_mesh_sdf_pairs, dtype=wp.vec2i, device=device) if has_meshes else None
             )
 
             self.empty_tangent = None
@@ -2656,6 +2722,23 @@ class NarrowPhase:
             self._empty_edge_centers = wp.zeros(1, dtype=wp.vec4, device=device)
             self._empty_edge_halves = wp.zeros(1, dtype=wp.vec4, device=device)
             self._empty_edge_range = wp.full(max(num_shapes, 1), (-1, 0), dtype=wp.vec2i, device=device)
+            # Face-pass work distribution (mesh vs analytic primitive), independent of
+            # the reducer so the non-reducing pipeline is load balanced too.
+            if self.mesh_primitive_sdf and self.max_mesh_sdf_pairs > 0:
+                face_scan_size = self.max_mesh_sdf_pairs + 1
+                self.mesh_face_block_offsets = wp.zeros(face_scan_size, dtype=wp.int32, device=device)
+                self.mesh_face_block_counts = wp.zeros(face_scan_size, dtype=wp.int32, device=device)
+                self.mesh_face_total_weight = wp.zeros(1, dtype=wp.int32, device=device)
+                # Culled face candidates (pair, mode|triangle); same capacity as the
+                # legacy triangle-pair buffer, which bounds the same kind of work.
+                self.mesh_face_candidates = wp.zeros(max_triangle_pairs, dtype=wp.vec2i, device=device)
+                self.mesh_face_candidate_count = wp.zeros(1, dtype=wp.int32, device=device)
+            else:
+                self.mesh_face_block_offsets = None
+                self.mesh_face_block_counts = None
+                self.mesh_face_total_weight = None
+                self.mesh_face_candidates = None
+                self.mesh_face_candidate_count = None
             # Indexed by shape id; all-zero means "no watertight bit set" so the
             # sign method falls back to automatic selection (see resolve_mesh_sign_method).
             self._empty_mesh_properties = wp.zeros(max(num_shapes, 1), dtype=wp.int32, device=device)
@@ -2700,9 +2783,10 @@ class NarrowPhase:
             # Mesh-mesh
             self.num_mesh_mesh_blocks = target_blocks * 2 if device_obj.is_cuda else target_blocks
             self.mesh_mesh_target_blocks = target_blocks
-            mesh_mesh_scan_size = self.max_mesh_mesh_pairs + 1
+            mesh_mesh_scan_size = self.max_mesh_sdf_pairs + 1
             self.mesh_mesh_block_offsets = wp.zeros(mesh_mesh_scan_size, dtype=wp.int32, device=device)
             self.mesh_mesh_block_counts = wp.zeros(mesh_mesh_scan_size, dtype=wp.int32, device=device)
+            self.num_mesh_face_blocks = self.num_mesh_mesh_blocks
             # Mesh-plane
             self.num_mesh_plane_blocks = target_blocks
             self.mesh_plane_target_blocks = target_blocks
@@ -2714,6 +2798,7 @@ class NarrowPhase:
             self.mesh_mesh_target_blocks = self.num_tile_blocks
             self.mesh_mesh_block_offsets = None
             self.mesh_mesh_block_counts = None
+            self.num_mesh_face_blocks = self.num_tile_blocks
             self.num_mesh_plane_blocks = self.num_tile_blocks
             self.mesh_plane_target_blocks = self.num_tile_blocks
             self.mesh_plane_block_offsets = None
@@ -2853,8 +2938,8 @@ class NarrowPhase:
                 self.shape_pairs_mesh_plane_cumsum,
                 self.shape_pairs_mesh_plane_count,
                 self.mesh_plane_vertex_total_count,
-                self.shape_pairs_mesh_mesh,
-                self.shape_pairs_mesh_mesh_count,
+                self.shape_pairs_mesh_sdf,
+                self.shape_pairs_mesh_sdf_count,
                 self.shape_pairs_sdf_sdf,
                 self.shape_pairs_sdf_sdf_count,
             ],
@@ -3101,6 +3186,66 @@ class NarrowPhase:
                     record_tape=False,
                 )
 
+            # Face pass for mesh vs analytic-primitive pairs. Writes into the same
+            # buffer as the mesh-triangle producers so the registration below
+            # picks its contacts up; the edge kernel later adds the boundary minima.
+            if self.mesh_primitive_face_kernel is not None and self.mesh_face_block_offsets is not None:
+                self.mesh_face_total_weight.zero_()
+                compute_mesh_primitive_face_block_offsets_scan(
+                    shape_pairs_mesh_sdf=self.shape_pairs_mesh_sdf,
+                    shape_pairs_mesh_sdf_count=self.shape_pairs_mesh_sdf_count,
+                    shape_types=shape_types,
+                    shape_source=shape_source,
+                    target_blocks=self.num_mesh_face_blocks,
+                    block_offsets=self.mesh_face_block_offsets,
+                    block_counts=self.mesh_face_block_counts,
+                    total_face_count=self.mesh_face_total_weight,
+                    total_num_threads=self.total_num_threads,
+                    device=device,
+                    record_tape=False,
+                )
+                self.mesh_face_candidate_count.zero_()
+                wp.launch_tiled(
+                    kernel=mesh_primitive_face_candidates_kernel,
+                    dim=(self.num_mesh_face_blocks,),
+                    inputs=[
+                        shape_data,
+                        shape_types,
+                        shape_transform,
+                        shape_source,
+                        shape_gap,
+                        self.shape_pairs_mesh_sdf,
+                        self.shape_pairs_mesh_sdf_count,
+                        self.mesh_face_block_offsets,
+                        self.mesh_face_candidates,
+                        self.mesh_face_candidate_count,
+                        self.num_mesh_face_blocks,
+                    ],
+                    device=device,
+                    block_dim=self.tile_size_mesh_mesh,
+                    record_tape=False,
+                )
+                wp.launch(
+                    kernel=self.mesh_primitive_face_kernel,
+                    dim=self.total_num_threads,
+                    inputs=[
+                        shape_data,
+                        shape_transform,
+                        shape_source,
+                        shape_gap,
+                        shape_base_gap,
+                        shape_types,
+                        self.shape_pairs_mesh_sdf,
+                        self.mesh_face_candidates,
+                        self.mesh_face_candidate_count,
+                        reducer_data if self.reduce_contacts else writer_data,
+                        self.total_num_threads,
+                    ],
+                    device=device,
+                    block_dim=self.block_dim,
+                    record_tape=False,
+                )
+
             # Register mesh-plane/mesh-triangle contacts in hashtable BEFORE mesh-mesh.
             # Mesh-mesh does inline hashtable registration in its kernel.
             if self.reduce_contacts:
@@ -3159,7 +3304,7 @@ class NarrowPhase:
             if shape_edge_range is None:
                 shape_edge_range = self._empty_edge_range
 
-            if self.mesh_mesh_contacts_kernel is not None and self.max_mesh_mesh_pairs > 0:
+            if self.mesh_mesh_contacts_kernel is not None and self.max_mesh_sdf_pairs > 0:
                 mesh_mesh_contacts_kernel = (
                     self.mesh_mesh_contacts_kernel_precomputed
                     if has_precomputed_edge_data
@@ -3168,8 +3313,8 @@ class NarrowPhase:
                 if self.reduce_contacts and self.mesh_mesh_block_offsets is not None:
                     # Mesh-mesh contacts → buffer + inline hashtable registration
                     compute_mesh_mesh_block_offsets_scan(
-                        shape_pairs_mesh_mesh=self.shape_pairs_mesh_mesh,
-                        shape_pairs_mesh_mesh_count=self.shape_pairs_mesh_mesh_count,
+                        shape_pairs_mesh_sdf=self.shape_pairs_mesh_sdf,
+                        shape_pairs_mesh_sdf_count=self.shape_pairs_mesh_sdf_count,
                         shape_edge_range=shape_edge_range,
                         shape_heightfield_index=shape_heightfield_index,
                         heightfield_data=heightfield_data,
@@ -3187,6 +3332,7 @@ class NarrowPhase:
                         dim=(self.num_mesh_mesh_blocks,),
                         inputs=[
                             shape_data,
+                            shape_types,
                             shape_transform,
                             shape_source,
                             texture_sdf_data,
@@ -3201,8 +3347,8 @@ class NarrowPhase:
                             shape_collision_aabb_lower,
                             shape_collision_aabb_upper,
                             shape_voxel_resolution,
-                            self.shape_pairs_mesh_mesh,
-                            self.shape_pairs_mesh_mesh_count,
+                            self.shape_pairs_mesh_sdf,
+                            self.shape_pairs_mesh_sdf_count,
                             shape_heightfield_index,
                             heightfield_data,
                             heightfield_elevations,
@@ -3225,6 +3371,7 @@ class NarrowPhase:
                         dim=(self.num_tile_blocks,),
                         inputs=[
                             shape_data,
+                            shape_types,
                             shape_transform,
                             shape_source,
                             texture_sdf_data,
@@ -3239,8 +3386,8 @@ class NarrowPhase:
                             shape_collision_aabb_lower,
                             shape_collision_aabb_upper,
                             shape_voxel_resolution,
-                            self.shape_pairs_mesh_mesh,
-                            self.shape_pairs_mesh_mesh_count,
+                            self.shape_pairs_mesh_sdf,
+                            self.shape_pairs_mesh_sdf_count,
                             shape_heightfield_index,
                             heightfield_data,
                             heightfield_elevations,
@@ -3347,10 +3494,14 @@ class NarrowPhase:
                     self.triangle_pairs.shape[0] if self.triangle_pairs is not None else 0,
                     self.shape_pairs_mesh_plane_count,
                     self.shape_pairs_mesh_plane.shape[0] if self.shape_pairs_mesh_plane is not None else 0,
-                    self.shape_pairs_mesh_mesh_count,
-                    self.shape_pairs_mesh_mesh.shape[0] if self.shape_pairs_mesh_mesh is not None else 0,
+                    self.shape_pairs_mesh_sdf_count,
+                    self.shape_pairs_mesh_sdf.shape[0] if self.shape_pairs_mesh_sdf is not None else 0,
                     self.shape_pairs_sdf_sdf_count,
                     self.shape_pairs_sdf_sdf.shape[0] if self.shape_pairs_sdf_sdf is not None else 0,
+                    self.mesh_face_candidate_count
+                    if self.mesh_face_candidate_count is not None
+                    else self.shape_pairs_sdf_sdf_count,
+                    self.mesh_face_candidates.shape[0] if self.mesh_face_candidates is not None else -1,
                     writer_data.contact_count,
                     writer_data.contact_max,
                     reduction_ht_active_slots,

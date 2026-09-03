@@ -1344,6 +1344,7 @@ class CollisionPipeline:
         shape_pairs_max: int | None = None,
         deterministic: bool = False,
         box_box_sat: bool = False,
+        mesh_primitive_sdf: bool = False,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
         contact_matching_pos_threshold: float = 0.0005,
         contact_matching_normal_dot_threshold: float = 0.995,
@@ -1418,6 +1419,28 @@ class CollisionPipeline:
                 4-slot manifold. Stable multi-point box manifolds (no witness-
                 point teleports). Cannot be combined with a prebuilt
                 ``narrow_phase``. Defaults to False.
+            mesh_primitive_sdf: Route triangle-mesh vs analytic-primitive pairs
+                (box, sphere, capsule, cylinder, cone) through the
+                SDF contact kernels: the primitive's signed distance is
+                evaluated in closed form along the mesh's edges, and a face
+                pass emits the primitive's support point against each mesh
+                face it pokes through, with the face normal and the plane
+                depth. This replaces the mesh-convex path that runs one
+                GJK/MPR test per triangle overlapping the primitive. The cost
+                scales with the mesh's edge count plus the faces near the
+                primitive rather than with the overlap area, which is what
+                matters for a dense mesh resting on a large box; a curved
+                primitive as large as a dense mesh is slower than the
+                mesh-convex path. Experimental. Ellipsoid pairs keep the
+                mesh-convex path because Newton's ellipsoid distance is a
+                first-order approximation that the edge sampling would inherit.
+                The primitive needs no SDF and is not converted to a mesh; the
+                mesh side uses its texture SDF when present and its BVH
+                otherwise. Box-box and every other primitive pair keep their
+                existing paths. Off by default; when off the routing kernel is
+                unchanged (the mesh-SDF kernels gain a ``shape_types`` input
+                either way). Cannot be combined with ``narrow_phase``: build
+                the ``NarrowPhase`` with the flag instead.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
                 Its effective ``reduce_contacts`` state is authoritative for
@@ -1593,6 +1616,11 @@ class CollisionPipeline:
                     "box_box_sat cannot be used when narrow_phase is provided; "
                     "construct the NarrowPhase with box_box_sat=True instead"
                 )
+            if mesh_primitive_sdf:
+                raise ValueError(
+                    "mesh_primitive_sdf cannot be used when narrow_phase is provided; "
+                    "construct the NarrowPhase with mesh_primitive_sdf=True instead"
+                )
             if contact_reduction_hashtable_size_factor != 0.25:
                 raise ValueError(
                     "contact_reduction_hashtable_size_factor cannot be used when narrow_phase is provided; "
@@ -1639,6 +1667,8 @@ class CollisionPipeline:
                 )
             self.narrow_phase = narrow_phase
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
+            # The narrow phase owns the routing policy.
+            self.mesh_primitive_sdf = bool(getattr(narrow_phase, "mesh_primitive_sdf", False))
         else:
             self.broad_phase_mode = mode_from_broad_phase if mode_from_broad_phase is not None else "explicit"
 
@@ -1704,7 +1734,7 @@ class CollisionPipeline:
             use_lean_gjk_mpr = False
             mesh_sdf_texture_only = False
             mesh_sdf_identity_scale_only = False
-            max_mesh_mesh_pairs = self.shape_pairs_max
+            max_mesh_sdf_pairs = self.shape_pairs_max
             max_mesh_plane_pairs = self.shape_pairs_max
             if hasattr(model, "shape_type") and model.shape_type is not None:
                 shape_types = model.shape_type.numpy()
@@ -1778,13 +1808,23 @@ class CollisionPipeline:
                 if self.broad_phase_mode == "explicit":
                     # Explicit pairs are not constrained by shape_world and may
                     # intentionally connect shapes from different worlds.
-                    max_mesh_mesh_pairs = self.shape_pairs_max
+                    max_mesh_sdf_pairs = self.shape_pairs_max
                     max_mesh_plane_pairs = self.shape_pairs_max
                 else:
-                    max_mesh_mesh_pairs = min(
-                        self.shape_pairs_max,
-                        _compute_per_world_mask_pair_max(model, mesh_sdf_pair_mask),
-                    )
+                    mesh_sdf_pair_max = _compute_per_world_mask_pair_max(model, mesh_sdf_pair_mask)
+                    if mesh_primitive_sdf:
+                        # Mesh vs analytic-primitive pairs share the mesh-mesh (SDF
+                        # edge) buffer when routed there; size it for them too.
+                        analytic_types = [
+                            int(GeoType.SPHERE),
+                            int(GeoType.BOX),
+                            int(GeoType.CAPSULE),
+                            int(GeoType.CYLINDER),
+                            int(GeoType.CONE),
+                        ]
+                        analytic_mask = colliding_mask & np.isin(shape_types, analytic_types)
+                        mesh_sdf_pair_max += _compute_per_world_mask_pair_max(model, mesh_mask, analytic_mask)
+                    max_mesh_sdf_pairs = min(self.shape_pairs_max, mesh_sdf_pair_max)
                     max_mesh_plane_pairs = min(
                         self.shape_pairs_max,
                         _compute_per_world_mask_pair_max(model, mesh_mask, plane_mask),
@@ -1838,7 +1878,7 @@ class CollisionPipeline:
             self.narrow_phase = NarrowPhase(
                 max_candidate_pairs=self.shape_pairs_max,
                 max_triangle_pairs=max_triangle_pairs,
-                max_mesh_mesh_pairs=max_mesh_mesh_pairs,
+                max_mesh_sdf_pairs=max_mesh_sdf_pairs,
                 max_mesh_plane_pairs=max_mesh_plane_pairs,
                 reduce_contacts=self.reduce_contacts,
                 device=device,
@@ -1863,6 +1903,7 @@ class CollisionPipeline:
                 contact_reduction_hashtable_size_factor=contact_reduction_hashtable_size_factor,
                 speculative=self._speculative_enabled,
                 contact_writer_supports_speculative=self._speculative_enabled,
+                mesh_primitive_sdf=mesh_primitive_sdf,
             )
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
 

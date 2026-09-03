@@ -2246,8 +2246,8 @@ class TestShapePairsMaxScaling(unittest.TestCase):
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=True)
         narrow_phase = pipeline.narrow_phase
 
-        self.assertEqual(narrow_phase.max_mesh_mesh_pairs, 1)
-        self.assertEqual(narrow_phase.shape_pairs_mesh_mesh.shape[0], 1)
+        self.assertEqual(narrow_phase.max_mesh_sdf_pairs, 1)
+        self.assertEqual(narrow_phase.shape_pairs_mesh_sdf.shape[0], 1)
         self.assertEqual(narrow_phase.mesh_mesh_block_offsets.shape[0], 2)
         self.assertEqual(narrow_phase.max_mesh_plane_pairs, 2)
         self.assertEqual(narrow_phase.shape_pairs_mesh_plane.shape[0], 2)
@@ -2273,7 +2273,7 @@ class TestShapePairsMaxScaling(unittest.TestCase):
                 )
                 contacts = pipeline.contacts()
 
-                self.assertEqual(pipeline.narrow_phase.max_mesh_mesh_pairs, 1)
+                self.assertEqual(pipeline.narrow_phase.max_mesh_sdf_pairs, 1)
                 pipeline.collide(model.state(), contacts)
                 self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
@@ -2316,7 +2316,7 @@ class TestShapePairsMaxScaling(unittest.TestCase):
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=True)
         contacts = pipeline.contacts()
 
-        self.assertEqual(pipeline.narrow_phase.max_mesh_mesh_pairs, 0)
+        self.assertEqual(pipeline.narrow_phase.max_mesh_sdf_pairs, 0)
         self.assertEqual(pipeline.narrow_phase.max_mesh_plane_pairs, 0)
         pipeline.collide(state, contacts)
         self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
@@ -2694,7 +2694,7 @@ def test_mesh_convex_with_sdf_routes_to_sdf_contact(test, device):
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
 
-    sdf_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0])
+    sdf_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_sdf_count.numpy()[0])
     mesh_convex_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_count.numpy()[0])
     contact_count = int(contacts.rigid_contact_count.numpy()[0])
     test.assertGreater(sdf_pair_count, 0)
@@ -2805,7 +2805,7 @@ def test_mesh_convex_one_sdf_keeps_existing_route(test, device):
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
 
-    sdf_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0])
+    sdf_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_sdf_count.numpy()[0])
     mesh_convex_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_count.numpy()[0])
     test.assertEqual(sdf_pair_count, 0)
     test.assertGreater(mesh_convex_pair_count, 0)
@@ -2831,7 +2831,7 @@ def test_mesh_box_with_sdf_routes_to_sdf_contact(test, device):
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
 
-    sdf_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0])
+    sdf_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_sdf_count.numpy()[0])
     mesh_convex_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_count.numpy()[0])
     contact_count = int(contacts.rigid_contact_count.numpy()[0])
     test.assertGreater(sdf_pair_count, 0)
@@ -2857,7 +2857,7 @@ def test_box_box_with_sdf_keeps_primitive_route(test, device):
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
 
-    sdf_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0])
+    sdf_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_sdf_count.numpy()[0])
     gjk_pair_count = int(pipeline.narrow_phase.gjk_candidate_pairs_count.numpy()[0])
     contact_count = int(contacts.rigid_contact_count.numpy()[0])
     test.assertEqual(sdf_pair_count, 0)
@@ -2883,7 +2883,7 @@ def test_convex_convex_with_sdf_routes_to_sdf_contact(test, device):
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
 
-    sdf_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0])
+    sdf_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_sdf_count.numpy()[0])
     gjk_pair_count = int(pipeline.narrow_phase.gjk_candidate_pairs_count.numpy()[0])
     contact_count = int(contacts.rigid_contact_count.numpy()[0])
     test.assertGreater(sdf_pair_count, 0)
