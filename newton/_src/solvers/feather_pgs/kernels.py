@@ -616,6 +616,7 @@ def jcalc_tau(
     lin_axis_count: int,
     ang_axis_count: int,
     body_f_s: wp.spatial_vector,
+    add_existing_tau: int,
     # outputs
     tau: wp.array[float],
 ):
@@ -629,7 +630,10 @@ def jcalc_tau(
             # w = joint_qd[dof_start + i]
             # r = joint_q[coord_start + i]
 
-            tau[dof_start + i] = -wp.dot(S_s, body_f_s) + joint_f[dof_start + i]
+            value = -wp.dot(S_s, body_f_s) + joint_f[dof_start + i]
+            if add_existing_tau != 0:
+                value += tau[dof_start + i]
+            tau[dof_start + i] = value
             # tau -= w * target_kd - r * target_ke
 
         return
@@ -637,7 +641,10 @@ def jcalc_tau(
     if type == JointType.FREE or type == JointType.DISTANCE:
         for i in range(6):
             S_s = joint_S_s[dof_start + i]
-            tau[dof_start + i] = -wp.dot(S_s, body_f_s) + joint_f[dof_start + i]
+            value = -wp.dot(S_s, body_f_s) + joint_f[dof_start + i]
+            if add_existing_tau != 0:
+                value += tau[dof_start + i]
+            tau[dof_start + i] = value
 
         return
 
@@ -653,7 +660,10 @@ def jcalc_tau(
             passive_f = joint_spring_stiffness[j] * (joint_spring_ref[j] - joint_q[coord_start + i])
             passive_f -= joint_damping[j] * joint_qd[j]
             # total torque / force on the joint (drive forces handled via augmented mass)
-            tau[j] = -wp.dot(S_s, body_f_s) + joint_f[j] + passive_f
+            value = -wp.dot(S_s, body_f_s) + joint_f[j] + passive_f
+            if add_existing_tau != 0:
+                value += tau[j]
+            tau[j] = value
 
         return
 
@@ -1529,6 +1539,7 @@ def accumulate_articulation_tau(
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     articulation_origin: wp.array[wp.vec3],
+    add_existing_tau: int,
     # outputs
     body_ft_s: wp.array[wp.spatial_vector],
     tau: wp.array[float],
@@ -1590,6 +1601,7 @@ def accumulate_articulation_tau(
             lin_axis_count,
             ang_axis_count,
             f_s,
+            add_existing_tau,
             tau,
         )
 
@@ -1652,6 +1664,66 @@ def eval_rigid_tau(
         body_q,
         body_com,
         articulation_origin,
+        0,
+        body_ft_s,
+        tau,
+    )
+
+
+@wp.kernel
+def eval_rigid_tau_add(
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_articulation: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_f: wp.array[float],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_spring_stiffness: wp.array[float],
+    joint_spring_ref: wp.array[float],
+    joint_damping: wp.array[float],
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_fb_s: wp.array[wp.spatial_vector],
+    body_f_ext: wp.array[wp.spatial_vector],
+    body_flags: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    articulation_origin: wp.array[wp.vec3],
+    # outputs
+    body_ft_s: wp.array[wp.spatial_vector],
+    tau: wp.array[float],
+):
+    """Accumulate inverse dynamics onto a previously prepared drive-force bucket."""
+    accumulate_articulation_tau(
+        wp.tid(),
+        articulation_start,
+        articulation_joint_end,
+        joint_type,
+        joint_parent,
+        joint_child,
+        joint_articulation,
+        joint_qd_start,
+        joint_q_start,
+        joint_dof_dim,
+        joint_f,
+        joint_q,
+        joint_qd,
+        joint_spring_stiffness,
+        joint_spring_ref,
+        joint_damping,
+        joint_S_s,
+        body_fb_s,
+        body_f_ext,
+        body_flags,
+        body_q,
+        body_com,
+        articulation_origin,
+        1,
         body_ft_s,
         tau,
     )
@@ -2442,6 +2514,108 @@ def build_contact_rows_normal(
         )
 
 
+@wp.func
+def compute_augmented_drive_terms(
+    ke: float,
+    kd: float,
+    q: float,
+    qd: float,
+    target_pos: float,
+    target_vel: float,
+    effort_limit: float,
+    dt: float,
+) -> wp.vec2:
+    """Return the implicit diagonal ``K`` and clamped explicit force ``u0``."""
+    K = ke * dt * dt + kd * dt
+    u0 = -(ke * (q - target_pos + dt * qd) + kd * (qd - target_vel))
+    if effort_limit > 0.0:
+        u0 = wp.clamp(u0, -effort_limit, effort_limit)
+    return wp.vec2(K, u0)
+
+
+@wp.func
+def prepare_articulation_augmented_drives(
+    articulation: int,
+    articulation_start: wp.array[int],
+    articulation_H_rows: wp.array[int],
+    joint_type: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_target_ke: wp.array[float],
+    joint_target_kd: wp.array[float],
+    joint_target_pos: wp.array[float],
+    joint_target_vel: wp.array[float],
+    joint_effort_limit: wp.array[float],
+    max_dofs: int,
+    dt: float,
+    reset_tau: int,
+    # outputs
+    row_counts: wp.array[int],
+    row_dof_index: wp.array[int],
+    row_K: wp.array[float],
+    tau: wp.array[float],
+):
+    """Prepare one articulation's implicit drive rows and explicit force."""
+    joint_start = articulation_start[articulation]
+    joint_end = articulation_start[articulation + 1]
+    if reset_tau != 0:
+        dof_start = joint_qd_start[joint_start]
+        dof_end = dof_start + articulation_H_rows[articulation]
+        for dof_index in range(dof_start, dof_end):
+            tau[dof_index] = 0.0
+
+    if articulation_H_rows[articulation] == 0:
+        row_counts[articulation] = 0
+        return
+
+    slot = int(0)
+    for joint_index in range(joint_start, joint_end):
+        type = joint_type[joint_index]
+        if type != JointType.PRISMATIC and type != JointType.REVOLUTE and type != JointType.D6:
+            continue
+
+        axis_count = joint_dof_dim[joint_index, 0] + joint_dof_dim[joint_index, 1]
+        qd_start = joint_qd_start[joint_index]
+        coord_start = joint_q_start[joint_index]
+        for axis in range(axis_count):
+            if slot >= max_dofs:
+                break
+            dof_index = qd_start + axis
+            ke = joint_target_ke[dof_index]
+            kd = joint_target_kd[dof_index]
+            if ke <= 0.0 and kd <= 0.0:
+                continue
+
+            terms = compute_augmented_drive_terms(
+                ke,
+                kd,
+                joint_q[coord_start + axis],
+                joint_qd[dof_index],
+                joint_target_pos[dof_index],
+                joint_target_vel[dof_index],
+                joint_effort_limit[dof_index],
+                dt,
+            )
+            if terms[0] <= 0.0:
+                continue
+
+            row_index = articulation * max_dofs + slot
+            row_dof_index[row_index] = dof_index
+            row_K[row_index] = terms[0]
+            if reset_tau != 0:
+                tau[dof_index] = terms[1]
+            else:
+                tau[dof_index] = tau[dof_index] + terms[1]
+            slot += 1
+            if slot >= max_dofs:
+                break
+
+    row_counts[articulation] = slot
+
+
 @wp.kernel
 def eval_rigid_tau_and_augmented_drives(
     articulation_start: wp.array[int],
@@ -2507,60 +2681,83 @@ def eval_rigid_tau_and_augmented_drives(
         body_q,
         body_com,
         articulation_origin,
+        0,
         body_ft_s,
         tau,
     )
 
-    dof_count = articulation_H_rows[articulation]
-    if dof_count == 0:
-        row_counts[articulation] = 0
-        return
+    prepare_articulation_augmented_drives(
+        articulation,
+        articulation_start,
+        articulation_H_rows,
+        joint_type,
+        joint_qd_start,
+        joint_q_start,
+        joint_dof_dim,
+        joint_q,
+        joint_qd,
+        joint_target_ke,
+        joint_target_kd,
+        joint_target_pos,
+        joint_target_vel,
+        joint_effort_limit,
+        max_dofs,
+        dt,
+        0,
+        row_counts,
+        row_dof_index,
+        row_K,
+        tau,
+    )
 
-    joint_start = articulation_start[articulation]
-    joint_end = articulation_start[articulation + 1]
-    slot = int(0)
-    for joint_index in range(joint_start, joint_end):
-        type = joint_type[joint_index]
-        if type != JointType.PRISMATIC and type != JointType.REVOLUTE and type != JointType.D6:
-            continue
 
-        lin_axis_count = joint_dof_dim[joint_index, 0]
-        ang_axis_count = joint_dof_dim[joint_index, 1]
-        axis_count = lin_axis_count + ang_axis_count
-        qd_start = joint_qd_start[joint_index]
-        coord_start = joint_q_start[joint_index]
-        for axis in range(axis_count):
-            if slot >= max_dofs:
-                break
-            dof_index = qd_start + axis
-            coord_index = coord_start + axis
-            ke = joint_target_ke[dof_index]
-            kd = joint_target_kd[dof_index]
-            if ke <= 0.0 and kd <= 0.0:
-                continue
-
-            K = ke * dt * dt + kd * dt
-            if K <= 0.0:
-                continue
-
-            row_index = articulation * max_dofs + slot
-            row_dof_index[row_index] = dof_index
-            q = joint_q[coord_index]
-            qd_val = joint_qd[dof_index]
-            target_pos = joint_target_pos[dof_index]
-            target_vel = joint_target_vel[dof_index]
-            u0 = -(ke * (q - target_pos + dt * qd_val) + kd * (qd_val - target_vel))
-            effort_limit = joint_effort_limit[dof_index]
-            if effort_limit > 0.0:
-                u0 = wp.clamp(u0, -effort_limit, effort_limit)
-            row_K[row_index] = K
-            tau[dof_index] = tau[dof_index] + u0
-
-            slot += 1
-            if slot >= max_dofs:
-                break
-
-    row_counts[articulation] = slot
+@wp.kernel
+def prepare_augmented_joint_drives(
+    articulation_start: wp.array[int],
+    articulation_H_rows: wp.array[int],
+    joint_type: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_target_ke: wp.array[float],
+    joint_target_kd: wp.array[float],
+    joint_target_pos: wp.array[float],
+    joint_target_vel: wp.array[float],
+    joint_effort_limit: wp.array[float],
+    max_dofs: int,
+    dt: float,
+    # outputs
+    row_counts: wp.array[int],
+    row_dof_index: wp.array[int],
+    row_K: wp.array[float],
+    drive_tau: wp.array[float],
+):
+    """Prepare implicit drive rows and their explicit force independently of inverse dynamics."""
+    prepare_articulation_augmented_drives(
+        wp.tid(),
+        articulation_start,
+        articulation_H_rows,
+        joint_type,
+        joint_qd_start,
+        joint_q_start,
+        joint_dof_dim,
+        joint_q,
+        joint_qd,
+        joint_target_ke,
+        joint_target_kd,
+        joint_target_pos,
+        joint_target_vel,
+        joint_effort_limit,
+        max_dofs,
+        dt,
+        1,
+        row_counts,
+        row_dof_index,
+        row_K,
+        drive_tau,
+    )
 
 
 @wp.kernel
