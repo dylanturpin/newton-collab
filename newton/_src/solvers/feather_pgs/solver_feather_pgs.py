@@ -115,6 +115,7 @@ from .kernels import (
     eval_rigid_fk_id,
     eval_rigid_fk_kinematics,
     eval_rigid_tau,
+    eval_rigid_tau_add,
     eval_rigid_tau_and_augmented_drives,
     factor_propagation_tree_for_size,
     finalize_body_dynamics,
@@ -149,6 +150,7 @@ from .kernels import (
     preelim_correct_Y_for_size,
     preelim_project_velocity_for_size,
     preelim_setup_for_size,
+    prepare_augmented_joint_drives,
     prepare_world_contact_rows,
     prepare_world_impulses,
     prescale_joint_velocity_limits,
@@ -1700,6 +1702,13 @@ class SolverFeatherPGS(SolverBase):
         self._composite_articulation_count = int(composite_articulations.size)
         self._parallel_composite_inertia = bool(model.device.is_cuda and np.any(response_articulations))
         self._compact_inertia_refresh = self._parallel_composite_inertia and self.use_parallel_streams
+        self._async_augmented_drives = bool(
+            self.use_parallel_streams
+            and model.device.is_cuda
+            and not model.requires_grad
+            and self.drive_mode == "augmented"
+            and self.articulation_max_dofs > 0
+        )
         self._composite_articulations = (
             wp.array(composite_articulations, dtype=wp.int32, device=model.device)
             if self._parallel_composite_inertia
@@ -4747,6 +4756,7 @@ class SolverFeatherPGS(SolverBase):
             else None
         )
         self._global_inertia_stream = wp.Stream(model.device) if self._compact_inertia_refresh else None
+        self._articulation_dynamics_stream = wp.Stream(model.device) if self._async_augmented_drives else None
 
     def _init_double_buffer_stream(self):
         """Create a CUDA stream for mass-matrix and active-Jacobian maintenance."""
@@ -6438,12 +6448,17 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 1: FK/ID + drives + CRBA
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self._nvtx, synchronize=False):
+            drive_rows_ready = self._stage1_prepare_augmented_drives(state_in, state_aug, control, dt)
             global_inertia_ready, stage3_qd = self._stage1_fk_id(state_in, state_aug, state_out)
 
             if model.articulation_count:
-                self._stage1_drives(state_in, state_aug, control, dt)
+                inverse_dynamics_ready = self._stage1_complete_joint_tau(
+                    state_in, state_aug, control, dt, drive_rows_ready
+                )
+            else:
+                inverse_dynamics_ready = None
 
-            self._stage1_crba(state_aug, global_inertia_ready)
+            self._stage1_crba(state_aug, global_inertia_ready, drive_rows_ready)
         # ══════════════════════════════════════════════════════════════
         # STAGE 2: Cholesky
         # ══════════════════════════════════════════════════════════════
@@ -6461,6 +6476,8 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 3: Triangular solve + v_hat
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S3_Trisolve_Vhat", print=False, use_nvtx=self._nvtx, synchronize=False):
+            if inverse_dynamics_ready is not None:
+                wp.get_stream(model.device).wait_event(inverse_dynamics_ready)
             self._stage3_zero_qdd(state_aug)
             for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                 with ctx:
@@ -7581,6 +7598,107 @@ class SolverFeatherPGS(SolverBase):
             )
         return global_inertia_ready, stage3_qd
 
+    def _stage1_prepare_augmented_drives(
+        self, state_in: State, state_aug: State, control: Control, dt: float
+    ) -> wp.Event | None:
+        """Launch DOF-local augmented-drive preparation independently of FK/ID."""
+        if not self._async_augmented_drives:
+            return None
+
+        model = self.model
+        dynamics_stream = self._articulation_dynamics_stream
+        dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
+        with wp.ScopedStream(dynamics_stream, sync_enter=False):
+            wp.launch(
+                prepare_augmented_joint_drives,
+                dim=model.articulation_count,
+                inputs=[
+                    model.articulation_start,
+                    self.articulation_H_rows,
+                    model.joint_type,
+                    model.joint_qd_start,
+                    model.joint_q_start,
+                    model.joint_dof_dim,
+                    state_in.joint_q,
+                    state_in.joint_qd,
+                    model.joint_target_ke,
+                    model.joint_target_kd,
+                    control.joint_target_q,
+                    control.joint_target_qd,
+                    model.joint_effort_limit,
+                    self.articulation_max_dofs,
+                    dt,
+                ],
+                outputs=[
+                    self.aug_row_counts,
+                    self.aug_row_dof_index,
+                    self.aug_row_K,
+                    state_aug.joint_tau,
+                ],
+                block_dim=self.serial_kernel_block_dim,
+                device=model.device,
+            )
+        return dynamics_stream.record_event()
+
+    def _launch_rigid_tau(
+        self, state_in: State, state_aug: State, control: Control, *, add_to_existing: bool = False
+    ) -> None:
+        """Launch inverse dynamics for the non-actuator torque bucket."""
+        model = self.model
+        body_f = state_in.body_f if state_in.body_count else None
+        state_aug.body_ft_s.zero_()
+        wp.launch(
+            eval_rigid_tau_add if add_to_existing else eval_rigid_tau,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self.articulation_joint_end,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_articulation,
+                model.joint_qd_start,
+                model.joint_q_start,
+                model.joint_dof_dim,
+                control.joint_f,
+                state_in.joint_q,
+                state_in.joint_qd,
+                self._passive_spring_stiffness,
+                self._passive_spring_ref,
+                self._passive_joint_damping,
+                state_aug.joint_S_s,
+                state_aug.body_f_s,
+                body_f,
+                model.body_flags,
+                state_in.body_q,
+                model.body_com,
+                self.articulation_origin,
+            ],
+            outputs=[state_aug.body_ft_s, state_aug.joint_tau],
+            block_dim=self.serial_kernel_block_dim,
+            device=model.device,
+        )
+
+    def _stage1_complete_joint_tau(
+        self,
+        state_in: State,
+        state_aug: State,
+        control: Control,
+        dt: float,
+        drive_rows_ready: wp.Event | None,
+    ) -> wp.Event | None:
+        """Complete ``joint_tau`` through async inverse dynamics or the fused fallback."""
+        if drive_rows_ready is None:
+            self._stage1_drives(state_in, state_aug, control, dt)
+            return None
+
+        model = self.model
+        dynamics_stream = self._articulation_dynamics_stream
+        dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
+        with wp.ScopedStream(dynamics_stream, sync_enter=False):
+            self._launch_rigid_tau(state_in, state_aug, control, add_to_existing=True)
+        return dynamics_stream.record_event()
+
     def _stage1_drives(self, state_in: State, state_aug: State, control: Control, dt: float):
         """Populate ``state_aug.joint_tau`` and apply the effort-limit clamp.
 
@@ -7601,9 +7719,9 @@ class SolverFeatherPGS(SolverBase):
         model = self.model
 
         if model.articulation_count:
-            body_f = state_in.body_f if state_in.body_count else None
-            state_aug.body_ft_s.zero_()
             if self.drive_mode == "augmented" and self.articulation_max_dofs > 0:
+                body_f = state_in.body_f if state_in.body_count else None
+                state_aug.body_ft_s.zero_()
                 wp.launch(
                     eval_rigid_tau_and_augmented_drives,
                     dim=model.articulation_count,
@@ -7654,47 +7772,19 @@ class SolverFeatherPGS(SolverBase):
             # the rigid / passive / Coriolis / gravity / external /
             # `control.joint_f` bucket only; the actuator-drive bucket has
             # not been added yet.
-            wp.launch(
-                eval_rigid_tau,
-                dim=model.articulation_count,
-                inputs=[
-                    model.articulation_start,
-                    self.articulation_joint_end,
-                    model.joint_type,
-                    model.joint_parent,
-                    model.joint_child,
-                    model.joint_articulation,
-                    model.joint_qd_start,
-                    model.joint_q_start,
-                    model.joint_dof_dim,
-                    control.joint_f,
-                    state_in.joint_q,
-                    state_in.joint_qd,
-                    self._passive_spring_stiffness,
-                    self._passive_spring_ref,
-                    self._passive_joint_damping,
-                    state_aug.joint_S_s,
-                    state_aug.body_f_s,
-                    body_f,
-                    model.body_flags,
-                    state_in.body_q,
-                    model.body_com,
-                    self.articulation_origin,
-                ],
-                outputs=[
-                    state_aug.body_ft_s,
-                    state_aug.joint_tau,
-                ],
-                block_dim=self.serial_kernel_block_dim,
-                device=model.device,
-            )
+            self._launch_rigid_tau(state_in, state_aug, control)
 
             if self.drive_mode == "physx_pgs":
                 if self.articulation_max_dofs > 0:
                     self.aug_row_counts.zero_()
                 return
 
-    def _stage1_crba(self, state_aug: State, global_inertia_ready: wp.Event | None):
+    def _stage1_crba(
+        self,
+        state_aug: State,
+        global_inertia_ready: wp.Event | None = None,
+        drive_rows_ready: wp.Event | None = None,
+    ):
         model = self.model
         global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
         # NOTE: this host-evaluated flag is BAKED into CUDA graphs at capture
@@ -7792,6 +7882,9 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
                 block_dim=128,
             )
+
+        if drive_rows_ready is not None:
+            wp.get_stream(model.device).wait_event(drive_rows_ready)
 
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
