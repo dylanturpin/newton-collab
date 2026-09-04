@@ -1927,6 +1927,24 @@ class CollisionPipeline:
                 f"(expected {shape_count}, got {self.narrow_phase.shape_aabb_upper.shape[0]})"
             )
 
+        # The mesh contact kernels index the voxel-resolution table per shape. Expert
+        # construction rarely supplies it, and the pipeline holds the authoritative model
+        # data, so bind it here; leaving the narrow phase without one faults inside those
+        # kernels. A supplied table must match the model it is used with.
+        voxel_resolution = getattr(self.narrow_phase, "shape_voxel_resolution", None)
+        if voxel_resolution is None:
+            self.narrow_phase.shape_voxel_resolution = model._shape_voxel_resolution
+        elif voxel_resolution.shape[0] != shape_count:
+            raise ValueError(
+                "narrow_phase.shape_voxel_resolution must have one entry per model shape "
+                f"(expected {shape_count}, got {voxel_resolution.shape[0]})"
+            )
+        elif voxel_resolution.device != model.device:
+            raise ValueError(
+                "narrow_phase.shape_voxel_resolution must be on the model device "
+                f"(expected {model.device}, got {voxel_resolution.device})"
+            )
+
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.
         self.soft_rigid_contact_pairs = _build_soft_particle_rigid_contact_pairs(model)

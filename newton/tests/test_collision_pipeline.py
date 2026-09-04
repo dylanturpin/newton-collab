@@ -13,12 +13,14 @@ import warp.examples
 import newton
 from newton import GeoType
 from newton._src.geometry import create_mesh_terrain
+from newton._src.geometry.broad_phase_nxn import BroadPhaseAllPairs
 from newton._src.geometry.flags import MeshProperties, MeshSignMethod, ParticleFlags, ShapeFlags
 from newton._src.geometry.kernels import (
     create_soft_contacts,
     mesh_sdf,
     resolve_mesh_sign_method,
 )
+from newton._src.geometry.narrow_phase import NarrowPhase
 from newton._src.geometry.sdf_texture import TextureSDFData
 from newton._src.geometry.soft_contacts_sdf import (
     SDF_EDGE_ITERS,
@@ -45,6 +47,7 @@ from newton._src.sim.collide import (
     _compute_per_world_shape_pairs_max,
     _count_soft_particle_rigid_contact_pairs,
     _estimate_rigid_contact_max,
+    write_contact,
 )
 from newton._src.utils.heightfield import HeightfieldData
 from newton.examples import test_body_state
@@ -5132,6 +5135,64 @@ add_function_test(
     "test_edge_face_pairs_respect_worlds",
     test_edge_face_pairs_respect_worlds,
     devices=soft_devices,
+)
+
+
+def _expert_mesh_box_model(device):
+    """Static mesh cube overlapping a box on a body, for expert-component construction."""
+    builder = newton.ModelBuilder()
+    mesh = newton.Mesh.create_box(
+        0.25, 0.25, 0.25, duplicate_vertices=False, compute_normals=False, compute_uvs=False, compute_inertia=False
+    )
+    builder.add_shape_mesh(body=-1, xform=wp.transform(wp.vec3(0.0, 0.0, 0.24), wp.quat_identity()), mesh=mesh)
+    body = builder.add_body(xform=wp.transform_identity())
+    builder.add_shape_box(
+        body, xform=wp.transform(wp.vec3(0.0, 0.0, -0.25), wp.quat_identity()), hx=2.0, hy=2.0, hz=0.25
+    )
+    return builder.finalize(device=device)
+
+
+def test_expert_narrow_phase_voxel_resolution(test, device):
+    """The pipeline binds the model's voxel-resolution table to a hand-built narrow phase.
+
+    The mesh contact kernels index that table per shape, so an expert narrow phase built
+    without one previously faulted inside them. A supplied table must match the model.
+    """
+    model = _expert_mesh_box_model(device)
+    state = model.state()
+    broad_phase = BroadPhaseAllPairs(model.shape_world, model.shape_flags, device=device)
+
+    def make_narrow_phase(**kwargs):
+        return NarrowPhase(
+            max_candidate_pairs=64,
+            max_triangle_pairs=100000,
+            device=device,
+            shape_aabb_lower=wp.zeros(model.shape_count, dtype=wp.vec3, device=device),
+            shape_aabb_upper=wp.zeros(model.shape_count, dtype=wp.vec3, device=device),
+            contact_writer_warp_func=write_contact,
+            **kwargs,
+        )
+
+    narrow_phase = make_narrow_phase()
+    test.assertIsNone(narrow_phase.shape_voxel_resolution)
+    pipeline = CollisionPipeline(model, broad_phase=broad_phase, narrow_phase=narrow_phase, rigid_contact_max=1024)
+    test.assertIs(pipeline.narrow_phase.shape_voxel_resolution, model._shape_voxel_resolution)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+
+    wrong_length = make_narrow_phase(
+        shape_voxel_resolution=wp.zeros(model.shape_count + 1, dtype=wp.vec3i, device=device)
+    )
+    with test.assertRaisesRegex(ValueError, "shape_voxel_resolution"):
+        CollisionPipeline(model, broad_phase=broad_phase, narrow_phase=wrong_length, rigid_contact_max=1024)
+
+
+add_function_test(
+    TestCollisionPipeline,
+    "test_expert_narrow_phase_voxel_resolution",
+    test_expert_narrow_phase_voxel_resolution,
+    devices=get_test_devices(),
 )
 
 
