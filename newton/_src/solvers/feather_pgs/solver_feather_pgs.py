@@ -827,10 +827,11 @@ class SolverFeatherPGS(SolverBase):
             pgs_beta (float, optional): ERP style position correction factor for contact, joint-limit,
                 mimic and connect rows. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
-            dense_contact_compliance (float | None, optional): Deprecated, no effect. Kept so positional
-                callers are not rebound; passing a value warns. Defaults to None.
-            speculative_dense_contact_compliance (float | None, optional): Deprecated, no effect. Kept so
-                positional callers are not rebound; passing a value warns. Defaults to None.
+            dense_contact_compliance (float | None, optional): Removed compatibility placeholder. Only
+                ``None`` or ``0`` is accepted so positional callers are not rebound. Defaults to None.
+            speculative_dense_contact_compliance (float | None, optional): Removed compatibility
+                placeholder. Only ``None`` or ``0`` is accepted so positional callers are not rebound.
+                Defaults to None.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             pgs_contact_regularization (float, optional): Dimensionless regularizer ``g`` of contact
                 rows on every route (matrix-free, dense, propagation). Each position iteration moves a
@@ -1064,12 +1065,8 @@ class SolverFeatherPGS(SolverBase):
             ("dense_contact_compliance", dense_contact_compliance),
             ("speculative_dense_contact_compliance", speculative_dense_contact_compliance),
         ):
-            if value is not None:
-                warnings.warn(
-                    f"SolverFeatherPGS: {name} is deprecated and has no effect; it will be removed in a future release.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
+            if value is not None and value != 0.0:
+                raise ValueError(f"SolverFeatherPGS: {name} was removed and must be None or 0")
         self.pgs_contact_regularization = float(pgs_contact_regularization)
         if not math.isfinite(self.pgs_contact_regularization) or self.pgs_contact_regularization < 0.0:
             raise ValueError("pgs_contact_regularization must be finite and non-negative")
@@ -9317,7 +9314,7 @@ class SolverFeatherPGS(SolverBase):
                     self.v_out,
                     iterations,
                     self.pgs_omega,
-                    1,
+                    int(self._regularization_enabled),
                     int(friction_start_iteration),
                     int(iteration_offset),
                 ],
@@ -9347,7 +9344,7 @@ class SolverFeatherPGS(SolverBase):
                     self.articulation_dof_start,
                     iterations,
                     self.pgs_omega,
-                    1,
+                    int(self._regularization_enabled),
                     self._friction_mode_id,
                     int(friction_start_iteration),
                     int(iteration_offset),

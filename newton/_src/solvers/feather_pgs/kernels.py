@@ -4493,7 +4493,7 @@ def compute_world_contact_bias(
         # over this substep: Jv + phi / dt >= 0.  For penetration, keep the
         # Baumgarte correction and let velocity-only passes scale it to zero.
         if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-            if phi < 0.0:
+            if phi <= 0.0:
                 rhs += bias_scale * beta * phi * inv_dt  # Negative for penetration
                 row_w = contact_w
             else:
@@ -6196,7 +6196,7 @@ def compute_mf_effective_mass_and_rhs(
     rtype = mf_row_type[world, i]
     if rtype == PGS_CONSTRAINT_TYPE_CONTACT:
         phi_val = mf_phi[world, i]
-        if phi_val < 0.0:
+        if phi_val <= 0.0:
             # Positive-gap (speculative) rows stay rigid so a closing contact
             # reaches the surface instead of leaking closing speed into penetration.
             row_w = contact_w
@@ -6412,7 +6412,7 @@ def compute_propagation_effective_mass_and_rhs(
     row_w = float(1.0)
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
         phi_val = propagation_phi[world, i]
-        if phi_val < 0.0:
+        if phi_val <= 0.0:
             # Positive-gap (speculative) rows stay rigid so a closing contact
             # reaches the surface instead of leaking closing speed into penetration.
             row_w = contact_w

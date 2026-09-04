@@ -5,7 +5,6 @@
 
 import inspect
 import unittest
-import warnings
 
 import numpy as np
 import warp as wp
@@ -13,6 +12,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
+    compute_world_contact_bias,
     pgs_solve_mf_loop,
 )
 from newton.tests.test_feather_pgs_propagation_same_articulation import _build_scissor_model, _contact_rows
@@ -387,9 +387,123 @@ def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, dev
         test.assertEqual(solver.row_w.shape, (1, 1))
 
 
-def test_constructor_positional_layout_and_deprecated_placeholders(test: unittest.TestCase, device):
-    """The removed compliance knobs stay as no-op placeholders in their positions so
-    existing positional callers are not rebound, and they warn when set."""
+def test_zero_regularization_split_runtime_uses_no_weights(test: unittest.TestCase, device):
+    """The standalone MF route must not read its one-element inactive weight argument."""
+    with wp.ScopedDevice(device):
+        model, pipeline, solver, _bodies = _stack_scene(
+            device, g=0.0, pgs_mode="split", response="immediate", velocity_iterations=0
+        )
+        body_q, _zs = _run(model, pipeline, solver, 1)
+        test.assertGreater(int(solver.mf_constraint_count.numpy().sum()), 1)
+        test.assertTrue(np.isfinite(body_q).all())
+        test.assertIs(solver.mf_row_w, solver._contact_row_w_dummy)
+        test.assertEqual(float(solver.mf_row_w.numpy()[0, 0]), 1.0)
+
+
+def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
+    """A zero-gap contact is active; only a strictly positive gap is speculative."""
+    with wp.ScopedDevice(device):
+        row_w = wp.zeros((1, 1), dtype=wp.float32, device=device)
+        wp.launch(
+            compute_world_contact_bias,
+            dim=1,
+            inputs=[
+                wp.array([1], dtype=wp.int32, device=device),
+                1,
+                wp.zeros((1, 1), dtype=wp.float32, device=device),
+                wp.full((1, 1), 0.2, dtype=wp.float32, device=device),
+                wp.full((1, 1), PGS_CONSTRAINT_TYPE_CONTACT, dtype=wp.int32, device=device),
+                wp.zeros((1, 1), dtype=wp.float32, device=device),
+                DT,
+                1.0,
+                1.0,
+                1.0,
+                0.5,
+            ],
+            outputs=[wp.zeros((1, 1), dtype=wp.float32, device=device), row_w],
+            device=device,
+        )
+        test.assertEqual(float(row_w.numpy()[0, 0]), 0.5)
+
+
+def test_assembled_dense_regularization_scales_diagonal(test: unittest.TestCase, device):
+    """An actual articulated dense contact receives the same g*d diagonal term."""
+    with wp.ScopedDevice(device):
+        model = _build_scissor_model(device)
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="split",
+            pgs_iterations=0,
+            pgs_velocity_iterations=0,
+            pgs_contact_regularization=0.5,
+            enable_contact_friction=False,
+            dense_max_constraints=64,
+            mf_max_constraints=16,
+        )
+        unregularized_diag = {}
+        apply_regularization = solver._stage6_apply_contact_regularization
+
+        def recording_apply_regularization():
+            unregularized_diag["value"] = solver.diag.numpy()[0].copy()
+            apply_regularization()
+
+        solver._stage6_apply_contact_regularization = recording_apply_regularization
+        state_in = model.state()
+        state_out = model.state()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        contacts = model.contacts()
+        state_in.clear_forces()
+        model.collide(state_in, contacts)
+        solver.step(state_in, state_out, model.control(), contacts, 1.0 / 200.0)
+        wp.synchronize()
+        rows = _contact_rows(solver, PATH_DENSE)
+        test.assertGreater(len(rows), 0)
+        base_diag = unregularized_diag["value"]
+        regularized_diag = solver.diag.numpy()[0]
+        weights = solver.row_w.numpy()[0]
+        for slot in rows.values():
+            test.assertAlmostEqual(float(weights[slot]), 2.0 / 3.0, places=6)
+            test.assertAlmostEqual(
+                float(regularized_diag[slot]),
+                1.5 * float(base_diag[slot]),
+                delta=1.0e-5 * max(float(base_diag[slot]), 1.0),
+            )
+
+
+def test_regularized_propagation_rows_execute(test: unittest.TestCase, device):
+    """Serial and colored propagation solve real articulated rows with per-row weights."""
+    with wp.ScopedDevice(device):
+        for response in ("propagation", "propagation-colored"):
+            model = _build_scissor_model(device)
+            solver = newton.solvers.SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                articulated_contact_response=response,
+                propagation_same_articulation_rows=True,
+                pgs_iterations=1,
+                pgs_velocity_iterations=0,
+                pgs_contact_regularization=0.5,
+                enable_contact_friction=False,
+                dense_max_constraints=64,
+                mf_max_constraints=16,
+            )
+            state_in, state_out = model.state(), model.state()
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            contacts = model.contacts()
+            state_in.clear_forces()
+            model.collide(state_in, contacts)
+            solver.step(state_in, state_out, model.control(), contacts, 1.0 / 200.0)
+            wp.synchronize()
+            rows = _contact_rows(solver, 2)
+            test.assertGreater(len(rows), 0, f"{response}: no propagation rows")
+            weights = solver.propagation_row_w.numpy()[0]
+            for slot in rows.values():
+                test.assertAlmostEqual(float(weights[slot]), 2.0 / 3.0, places=6)
+            test.assertTrue(np.isfinite(state_out.joint_qd.numpy()).all())
+
+
+def test_constructor_positional_layout_and_removed_placeholders(test: unittest.TestCase, device):
+    """Removed compliance slots remain reserved without silently accepting old physics."""
     names = tuple(inspect.signature(newton.solvers.SolverFeatherPGS).parameters)
     start = names.index("pgs_beta")
     test.assertEqual(
@@ -409,14 +523,10 @@ def test_constructor_positional_layout_and_deprecated_placeholders(test: unittes
         b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
         builder.add_shape_box(b, hx=0.05, hy=0.05, hz=0.05)
         model = builder.finalize()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with test.assertRaises(ValueError):
             newton.solvers.SolverFeatherPGS(model, dense_contact_compliance=1.0e-4)
-        test.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in caught))
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            newton.solvers.SolverFeatherPGS(model)
-        test.assertFalse(any(issubclass(w.category, DeprecationWarning) for w in caught))
+        newton.solvers.SolverFeatherPGS(model, dense_contact_compliance=0.0)
+        newton.solvers.SolverFeatherPGS(model, speculative_dense_contact_compliance=0.0)
 
 
 def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
@@ -529,8 +639,32 @@ add_function_test(
 )
 add_function_test(
     TestFeatherPGSRegularization,
-    "test_constructor_positional_layout_and_deprecated_placeholders",
-    test_constructor_positional_layout_and_deprecated_placeholders,
+    "test_zero_regularization_split_runtime_uses_no_weights",
+    test_zero_regularization_split_runtime_uses_no_weights,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSRegularization,
+    "test_exact_surface_contact_is_regularized",
+    test_exact_surface_contact_is_regularized,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSRegularization,
+    "test_assembled_dense_regularization_scales_diagonal",
+    test_assembled_dense_regularization_scales_diagonal,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSRegularization,
+    "test_regularized_propagation_rows_execute",
+    test_regularized_propagation_rows_execute,
+    devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSRegularization,
+    "test_constructor_positional_layout_and_removed_placeholders",
+    test_constructor_positional_layout_and_removed_placeholders,
     devices=get_test_devices(),
 )
 add_function_test(
