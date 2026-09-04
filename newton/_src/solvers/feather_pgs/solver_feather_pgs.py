@@ -228,6 +228,64 @@ def _accumulate_row_capacity_telemetry(
         wp.atomic_add(overflow_world_steps, 0, 1)
 
 
+@wp.kernel
+def _warn_constraint_row_overflow(
+    dense_raw_counts: wp.array[wp.int32],
+    dense_dropped_contact_rows: wp.array[wp.int32],
+    dense_capacity: int,
+    mf_raw_counts: wp.array[wp.int32],
+    mf_dropped_contact_rows: wp.array[wp.int32],
+    mf_capacity: int,
+    mf_active: int,
+    propagation_raw_counts: wp.array[wp.int32],
+    propagation_dropped_contact_rows: wp.array[wp.int32],
+    propagation_capacity: int,
+    propagation_active: int,
+    warning_emitted: wp.array[wp.int32],
+):
+    """Emit one device-side warning per overflowing FeatherPGS row family."""
+    world = wp.tid()
+
+    dense_dropped = dense_dropped_contact_rows[world]
+    dense_requested = dense_raw_counts[world] + dense_dropped
+    if dense_requested > dense_capacity and wp.atomic_exch(warning_emitted, 0, 1) == 0:
+        wp.printf(
+            "Warning: FeatherPGS dense constraint-row overflow in world %d: requested %d rows, limit %d; "
+            "dropped %d contact/friction rows. Increase dense_max_constraints.\n",
+            world,
+            dense_requested,
+            dense_capacity,
+            dense_dropped,
+        )
+
+    if mf_active != 0:
+        mf_dropped = mf_dropped_contact_rows[world]
+        mf_requested = mf_raw_counts[world] + mf_dropped
+        if mf_requested > mf_capacity and wp.atomic_exch(warning_emitted, 1, 1) == 0:
+            wp.printf(
+                "Warning: FeatherPGS matrix-free constraint-row overflow in world %d: requested %d rows, "
+                "limit %d; dropped %d contact/friction rows. Increase mf_max_constraints.\n",
+                world,
+                mf_requested,
+                mf_capacity,
+                mf_dropped,
+            )
+
+    if propagation_active != 0:
+        propagation_dropped = propagation_dropped_contact_rows[world]
+        propagation_requested = propagation_raw_counts[world] + propagation_dropped
+        if propagation_requested > propagation_capacity and wp.atomic_exch(warning_emitted, 2, 1) == 0:
+            wp.printf(
+                "Warning: FeatherPGS propagation constraint-row overflow in world %d: requested %d rows, "
+                "limit %d; dropped %d contact/friction rows. Increase dense_max_constraints or "
+                "mf_max_constraints.\n",
+                world,
+                propagation_requested,
+                propagation_capacity,
+                propagation_dropped,
+            )
+
+
 @dataclass(frozen=True)
 class _FeatherPGSModelPlan:
     """Immutable articulation and generalized-response plan."""
@@ -677,6 +735,7 @@ class SolverFeatherPGS(SolverBase):
         same_articulation_contact_gap_gate: float = 0.0,
         articulation_pair_contact_gap_gate: float = 0.0,
         pgs_warmstart_decay: float = 1.0,
+        warn_constraint_overflow: bool = True,
     ):
         """
         Args:
@@ -856,6 +915,10 @@ class SolverFeatherPGS(SolverBase):
             pgs_warmstart_decay (float, optional): Finite non-negative scale applied to
                 contact impulses carried from the previous frame. This option is appended to
                 the constructor to preserve its established positional layout. Defaults to 1.0.
+            warn_constraint_overflow (bool, optional): Emit a device-side warning the first time each dense,
+                matrix-free, or propagation row family exceeds its configured per-world capacity. The warning
+                reports the world, requested rows, row limit, and dropped contact/friction rows without a host
+                synchronization, so it remains compatible with CUDA graph capture. Defaults to True.
             mf_warmstart (bool, optional): Legacy compatibility alias for ``pgs_warmstart``
                 (this option was historically matrix-free-only). New callers should use
                 ``pgs_warmstart``. Defaults to False.
@@ -1084,6 +1147,7 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(f"pgs_velocity_drive_mode must be 'active' or 'freeze', got {pgs_velocity_drive_mode!r}")
         self.pgs_velocity_drive_mode = pgs_velocity_drive_mode
         self._requested_dense_max_constraints = int(dense_max_constraints)
+        self.warn_constraint_overflow = bool(warn_constraint_overflow)
         if articulated_contact_response not in (
             "immediate",
             "propagation",
@@ -1514,15 +1578,25 @@ class SolverFeatherPGS(SolverBase):
         # allocate_world_contact_slots when the MF path is inactive (the
         # kernel never writes it when has_free_rigid == 0).
 
-        # Opt-in, behavior-neutral constraint/contact row telemetry. Allocate
-        # every scalar ONCE before CUDA-graph capture and accumulate at the end
-        # of every solver step. In addition to the clamped retained-row maxima,
-        # preserve the raw allocator demand before finalization clamps it to the
-        # configured capacity. This is the only reliable way to distinguish a
-        # full buffer from an actual overflow after a long captured rollout.
+        # Constraint-capacity diagnostics are allocated once before CUDA graph
+        # capture. The warning path tracks only current-step dropped rows and a
+        # three-family one-shot flag; row_watermark additionally accumulates
+        # whole-run high-water telemetry for explicit readback.
         self._row_watermark = bool(row_watermark)
+        self._track_row_capacity = self._row_watermark or self.warn_constraint_overflow
+        wm_device = model.device
+        if self._track_row_capacity:
+            self._row_dropped_dense = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
+            self._row_dropped_mf = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
+            self._row_dropped_propagation = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
+        else:
+            self._row_dropped_dense = None
+            self._row_dropped_mf = None
+            self._row_dropped_propagation = None
+        self._row_overflow_warning_emitted = (
+            wp.zeros(3, dtype=wp.int32, device=wm_device) if self.warn_constraint_overflow else None
+        )
         if self._row_watermark:
-            wm_device = self.constraint_count.device
             self._row_watermark_dense = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_mf = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_propagation = wp.zeros(1, dtype=wp.int32, device=wm_device)
@@ -1530,9 +1604,6 @@ class SolverFeatherPGS(SolverBase):
             self._row_watermark_dense_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_mf_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_propagation_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_dropped_dense = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
-            self._row_dropped_mf = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
-            self._row_dropped_propagation = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
             self._row_dropped_dense_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_dropped_mf_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_dropped_propagation_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
@@ -1550,9 +1621,6 @@ class SolverFeatherPGS(SolverBase):
             self._row_watermark_dense_raw = None
             self._row_watermark_mf_raw = None
             self._row_watermark_propagation_raw = None
-            self._row_dropped_dense = None
-            self._row_dropped_mf = None
-            self._row_dropped_propagation = None
             self._row_dropped_dense_high_water = None
             self._row_dropped_mf_high_water = None
             self._row_dropped_propagation_high_water = None
@@ -7419,7 +7487,7 @@ class SolverFeatherPGS(SolverBase):
         # Zero world-level buffers (only arrays that require it)
         self.slot_counter.zero_()  # atomic-add counter
         self.dense_contact_world_flag.zero_()
-        if self._row_watermark:
+        if self._track_row_capacity:
             self._row_dropped_dense.zero_()
             self._row_dropped_mf.zero_()
             self._row_dropped_propagation.zero_()
@@ -7458,9 +7526,11 @@ class SolverFeatherPGS(SolverBase):
         is_free_rigid = self.is_free_rigid if self.is_free_rigid is not None else self._dummy_is_free_rigid
         mf_slot_counter = self.mf_slot_counter if mf_active else self._dummy_mf_slot_counter
         propagation_slot_counter = self.propagation_slot_counter if propagation_active else self._dummy_mf_slot_counter
-        dense_dropped_rows = self._row_dropped_dense if self._row_watermark else self._dummy_mf_slot_counter
-        mf_dropped_rows = self._row_dropped_mf if self._row_watermark else self._dummy_mf_slot_counter
-        propagation_dropped_rows = self._row_dropped_propagation if self._row_watermark else self._dummy_mf_slot_counter
+        dense_dropped_rows = self._row_dropped_dense if self._track_row_capacity else self._dummy_mf_slot_counter
+        mf_dropped_rows = self._row_dropped_mf if self._track_row_capacity else self._dummy_mf_slot_counter
+        propagation_dropped_rows = (
+            self._row_dropped_propagation if self._track_row_capacity else self._dummy_mf_slot_counter
+        )
         j_buffers_zeroed = False
 
         drive_active = self.drive_mode == "physx_pgs" and self.drive_slot is not None
@@ -7886,7 +7956,7 @@ class SolverFeatherPGS(SolverBase):
                     self.contact_friction_gap_threshold,
                     self.contact_friction_anchor_limit,
                     1 if self.contact_friction_articulation_pairs_only else 0,
-                    1 if self._row_watermark else 0,
+                    1 if self._track_row_capacity else 0,
                 ],
                 outputs=[
                     self.contact_world,
@@ -8460,6 +8530,29 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.constraint_count],
             device=model.device,
         )
+
+        if self.warn_constraint_overflow:
+            mf_raw_counts = self.mf_slot_counter if mf_active else self.slot_counter
+            propagation_raw_counts = self.propagation_slot_counter if propagation_active else self.slot_counter
+            wp.launch(
+                _warn_constraint_row_overflow,
+                dim=self.world_count,
+                inputs=[
+                    self.slot_counter,
+                    self._row_dropped_dense,
+                    self.dense_max_constraints,
+                    mf_raw_counts,
+                    self._row_dropped_mf,
+                    self.mf_max_constraints,
+                    1 if mf_active else 0,
+                    propagation_raw_counts,
+                    self._row_dropped_propagation,
+                    self.propagation_max_constraints,
+                    1 if propagation_active else 0,
+                    self._row_overflow_warning_emitted,
+                ],
+                device=model.device,
+            )
 
     def _stage4_zero_world_C(self):
         self.C.zero_()

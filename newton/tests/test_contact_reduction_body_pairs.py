@@ -924,6 +924,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         self.assertGreater(rows["dense_raw_high_water"], rows["dense_high_water"])
         self.assertEqual(rows["dense_overflow_world_steps"], 1)
         self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
+        self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
 
     def test_row_watermark_includes_rolled_back_contact_rows(self):
         """Count contact bundles rejected and rolled back by the allocator."""
@@ -955,6 +956,65 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         )
         self.assertEqual(rows["dense_overflow_world_steps"], 1)
         self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
+
+    def test_constraint_overflow_warning_does_not_require_row_watermark(self):
+        """Keep the default warning active without full high-water telemetry."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        _prismatic_jointed_foot(builder, (0.0, 0.0, 0.02))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        pipeline = _make_pipeline(model, False)
+        contacts = pipeline.contacts()
+        pipeline.collide(state_0, contacts)
+
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            angular_damping=0.0,
+            dense_max_constraints=4,
+        )
+        solver.step(state_0, state_1, model.control(), contacts, DT)
+
+        self.assertFalse(solver._row_watermark)
+        self.assertTrue(solver._track_row_capacity)
+        self.assertGreater(int(solver._row_dropped_dense.numpy().max()), 0)
+        self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
+
+    def test_constraint_overflow_warning_covers_matrix_free_and_propagation_rows(self):
+        """Identify overflows on both non-dense contact row families."""
+        if not wp.get_device().is_cuda:
+            self.skipTest("matrix-free FeatherPGS overflow coverage is CUDA-only")
+
+        cases = (
+            ("immediate", _free_jointed_foot, 1, "_row_dropped_mf"),
+            ("propagation", _prismatic_jointed_foot, 2, "_row_dropped_propagation"),
+        )
+        for response, build_foot, warning_index, dropped_attribute in cases:
+            with self.subTest(response=response):
+                builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                build_foot(builder, (0.0, 0.0, 0.02))
+                builder.add_ground_plane()
+                model = builder.finalize(device=wp.get_device())
+                state_0, state_1 = model.state(), model.state()
+                newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+                pipeline = _make_pipeline(model, False)
+                contacts = pipeline.contacts()
+                pipeline.collide(state_0, contacts)
+
+                solver = newton.solvers.SolverFeatherPGS(
+                    model,
+                    angular_damping=0.0,
+                    pgs_mode="matrix_free",
+                    articulated_contact_response=response,
+                    dense_max_constraints=4,
+                    mf_max_constraints=4,
+                )
+                solver.step(state_0, state_1, model.control(), contacts, DT)
+
+                dropped_rows = getattr(solver, dropped_attribute)
+                self.assertGreater(int(dropped_rows.numpy().max()), 0)
+                self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[warning_index]), 1)
 
     def test_feather_pgs_conformance(self):
         """SolverFeatherPGS rests a free-jointed foot at the same height on/off.
