@@ -4521,7 +4521,8 @@ def compute_world_contact_bias(
         # ``J*v_hat`` term added by ``rhs_accum_world_par_art``.
 
         world_rhs[world, i] = rhs
-        world_row_w[world, i] = row_w
+        if contact_w < 1.0:
+            world_row_w[world, i] = row_w
 
 
 @wp.kernel
@@ -4538,6 +4539,7 @@ def apply_world_contact_restitution_matrix_free(
     world_J: wp.array3d[float],
     dt: float,
     restitution_velocity_threshold: float,
+    write_row_w: int,
     # in/out
     world_rhs: wp.array2d[float],
     world_row_w: wp.array2d[float],
@@ -4566,7 +4568,8 @@ def apply_world_contact_restitution_matrix_free(
         # Matrix-free GS adds live J*v itself, so store only
         # -target + e*u_incident as the row bias.
         world_rhs[world, i] = -target_vel + restitution * relative_incident
-        world_row_w[world, i] = 1.0
+        if write_row_w != 0:
+            world_row_w[world, i] = 1.0
 
 
 @wp.kernel
@@ -4580,6 +4583,7 @@ def apply_world_contact_restitution_accumulated(
     dt: float,
     contact_speculative_scale: float,
     restitution_velocity_threshold: float,
+    write_row_w: int,
     # in/out
     world_rhs: wp.array2d[float],
     world_row_w: wp.array2d[float],
@@ -4606,7 +4610,8 @@ def apply_world_contact_restitution_accumulated(
         # Impulse-space RHS contains u_incident already.  Replacing geometric
         # bias with the Newton target yields (1+e)*u_incident.
         world_rhs[world, i] = (1.0 + restitution) * relative_incident
-        world_row_w[world, i] = 1.0
+        if write_row_w != 0:
+            world_row_w[world, i] = 1.0
 
 
 @wp.kernel
@@ -6234,7 +6239,8 @@ def compute_mf_effective_mass_and_rhs(
     if has_target_velocity != 0:
         bias -= mf_target_velocity[world, i]
     mf_rhs[world, i] = bias
-    mf_row_w[world, i] = row_w
+    if contact_w < 1.0:
+        mf_row_w[world, i] = row_w
 
 
 @wp.kernel
@@ -6438,7 +6444,8 @@ def compute_propagation_effective_mass_and_rhs(
                 row_w = 1.0
     propagation_rhs[world, i] = bias
     propagation_restitution_target[world, i] = restitution_target
-    propagation_row_w[world, i] = row_w
+    if contact_w < 1.0:
+        propagation_row_w[world, i] = row_w
 
 
 @wp.kernel

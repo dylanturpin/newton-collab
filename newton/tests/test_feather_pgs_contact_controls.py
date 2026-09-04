@@ -324,6 +324,7 @@ def _dense_restitution_rhs(scale: float) -> float:
             1.0,
             scale,
             0.0,
+            0,
         ],
         outputs=[rhs, wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
         device="cpu",

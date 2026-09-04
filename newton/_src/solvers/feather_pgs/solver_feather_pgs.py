@@ -177,6 +177,10 @@ _FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", 
 _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUNT", "1")), 0)
 _MFGS_RESIDENT_METADATA_MAX_BYTES = 4096
 _SMALL_DOF_THRESHOLD_DEFAULT = 12
+# Beyond this guard, the relaxation weight is too close to zero to be a
+# useful float32 PGS update and the assembled split path risks overflow when
+# it converts the weight back to a diagonal regularizer.
+_MAX_CONTACT_REGULARIZATION = 1.0e6
 
 
 _MFGS_TILE_SHARED_STORAGE_BYTES = 128
@@ -838,8 +842,8 @@ class SolverFeatherPGS(SolverBase):
                 sag of ``g * a * dt^2 / pgs_beta`` per loaded row (0.3 mm at 60 Hz for a body under
                 gravity at ``g = 0.02``). Positive-gap speculative rows and rows whose rebound
                 target fires are solved rigid, and the velocity-only pass ignores ``g``. ``0`` is the
-                exact rigid law. Values above ``1e6`` are rejected because their float32 weight
-                underflows. Defaults to 0.0.
+                exact rigid law. Values above ``1e6`` are rejected because they are not
+                numerically useful in the float32 solve. Defaults to 0.0.
             pgs_velocity_drive_mode (str, optional): Drive-row treatment during velocity-only post-pass
                 iterations. ``"freeze"`` keeps PhysX-style drive impulses from the biased position
                 solve and lets only contacts, friction, and limits clean up velocity residuals;
@@ -1069,14 +1073,15 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_contact_regularization = float(pgs_contact_regularization)
         if not math.isfinite(self.pgs_contact_regularization) or self.pgs_contact_regularization < 0.0:
             raise ValueError("pgs_contact_regularization must be finite and non-negative")
-        if self.pgs_contact_regularization > 1.0e6:
+        if self.pgs_contact_regularization > _MAX_CONTACT_REGULARIZATION:
             raise ValueError(
-                "pgs_contact_regularization must be at most 1e6; larger values underflow the float32 weight"
+                f"pgs_contact_regularization must be at most {_MAX_CONTACT_REGULARIZATION:g}; "
+                "larger values are not numerically useful in the float32 solve"
             )
-        # Kernels consume the weight w = 1/(1+g); w = 1 is the exact hard update.
-        self._contact_w = 1.0 / (1.0 + self.pgs_contact_regularization)
-        # g = 0 pays nothing: no weights are read in the solve loops and no dense fold-in runs.
-        self._regularization_enabled = self.pgs_contact_regularization > 0.0
+        # Kernels consume the float32 weight w = 1/(1+g). Values too small to
+        # change w are the exact hard update and stay on the zero-cost path.
+        self._contact_w = float(np.float32(1.0 / (1.0 + self.pgs_contact_regularization)))
+        self._regularization_enabled = self._contact_w < 1.0
         self.pgs_cfm = pgs_cfm
         self.pgs_omega = pgs_omega
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
@@ -1482,6 +1487,10 @@ class SolverFeatherPGS(SolverBase):
             else None
         )
 
+        # All inactive weight arguments alias this one element. Their producer
+        # kernels skip stores and their consumer kernels skip reads when
+        # regularization is disabled.
+        self._contact_row_w_dummy = wp.full((1, 1), 1.0, dtype=wp.float32, device=model.device)
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
@@ -3390,9 +3399,13 @@ class SolverFeatherPGS(SolverBase):
         self.row_cfm = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        # Per-row proximal weight of dense contact rows and the impulse-space
-        # regularizer (1/w - 1) * d derived from it once the RHS is final.
-        self.row_w = wp.full((self.world_count, max_constraints), 1.0, dtype=wp.float32, device=device)
+        # Per-row weight is needed only when regularization is active because
+        # speculative and restitution rows selectively use the rigid law.
+        self.row_w = (
+            wp.full((self.world_count, max_constraints), 1.0, dtype=wp.float32, device=device)
+            if self._regularization_enabled
+            else self._contact_row_w_dummy
+        )
         self.phi = wp.zeros(
             (self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
@@ -3536,9 +3549,11 @@ class SolverFeatherPGS(SolverBase):
         )
 
         self.mf_rhs = wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
-        # Per-row proximal weight w = 1/(1+g), written each step by
-        # compute_mf_effective_mass_and_rhs; the velocity pass ignores it.
-        self.mf_row_w = wp.full((worlds, mf_max_c), 1.0, dtype=wp.float32, device=device)
+        self.mf_row_w = (
+            wp.full((worlds, mf_max_c), 1.0, dtype=wp.float32, device=device)
+            if self._regularization_enabled
+            else self._contact_row_w_dummy
+        )
         self._debug_position_mf_rhs = (
             wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
             if self._debug_buffers_enabled
@@ -3694,7 +3709,7 @@ class SolverFeatherPGS(SolverBase):
         ):
             setattr(self, name, wp.zeros((worlds, 1), dtype=wp.float32, device=device, requires_grad=requires_grad))
         self.mf_row_restitution = wp.zeros((worlds, 1), dtype=wp.float32, device=device)
-        self.mf_row_w = wp.full((worlds, 1), 1.0, dtype=wp.float32, device=device)
+        self.mf_row_w = self._contact_row_w_dummy
         for name in ("mf_J_a", "mf_J_b", "mf_MiJt_a", "mf_MiJt_b"):
             setattr(self, name, wp.zeros((worlds, 1, 6), dtype=wp.float32, device=device, requires_grad=requires_grad))
         self.mf_meta_packed = wp.zeros((worlds, 4), dtype=wp.int32, device=device)
@@ -3823,7 +3838,11 @@ class SolverFeatherPGS(SolverBase):
         self.propagation_rhs = wp.zeros(
             (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
-        self.propagation_row_w = wp.full(self.propagation_rhs.shape, 1.0, dtype=wp.float32, device=device)
+        self.propagation_row_w = (
+            wp.full(self.propagation_rhs.shape, 1.0, dtype=wp.float32, device=device)
+            if self._regularization_enabled
+            else self._contact_row_w_dummy
+        )
         self.propagation_rhs_unbiased = wp.zeros(
             (worlds, propagation_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad
         )
@@ -8836,6 +8855,7 @@ class SolverFeatherPGS(SolverBase):
                     self.J_world,
                     dt,
                     self._effective_restitution_velocity_threshold,
+                    int(self._regularization_enabled),
                 ],
                 outputs=[self.rhs, self.row_w],
                 device=self.model.device,
@@ -8855,6 +8875,7 @@ class SolverFeatherPGS(SolverBase):
                 dt,
                 self.contact_speculative_scale,
                 self._effective_restitution_velocity_threshold,
+                int(self._regularization_enabled),
             ],
             outputs=[self.rhs, self.row_w],
             device=self.model.device,

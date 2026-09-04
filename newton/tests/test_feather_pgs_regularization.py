@@ -371,6 +371,21 @@ def test_regularization_validation(test: unittest.TestCase, device):
         newton.solvers.SolverFeatherPGS(model, pgs_contact_regularization=1.0e6)
 
 
+def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, device):
+    """The exact-rigid path carries no capacity-sized per-row weight buffers."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+        model = builder.finalize()
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free")
+        test.assertFalse(solver._regularization_enabled)
+        test.assertIs(solver.row_w, solver._contact_row_w_dummy)
+        test.assertIs(solver.mf_row_w, solver._contact_row_w_dummy)
+        test.assertEqual(solver.row_w.shape, (1, 1))
+
+
 def test_constructor_positional_layout_and_deprecated_placeholders(test: unittest.TestCase, device):
     """The removed compliance knobs stay as no-op placeholders in their positions so
     existing positional callers are not rebound, and they warn when set."""
@@ -503,6 +518,12 @@ add_function_test(
     TestFeatherPGSRegularization,
     "test_regularization_validation",
     test_regularization_validation,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSRegularization,
+    "test_zero_regularization_shares_one_weight_slot",
+    test_zero_regularization_shares_one_weight_slot,
     devices=get_test_devices(),
 )
 add_function_test(
