@@ -79,7 +79,9 @@ def _add_primitive(builder, body, geo, scale, xform, cfg=None):
     if geo == GeoType.CAPSULE:
         return builder.add_shape_capsule(body, xform=xform, radius=scale[0], half_height=scale[1], cfg=cfg)
     if geo == GeoType.CYLINDER:
-        return builder.add_shape_cylinder(body, xform=xform, radius=scale[0], half_height=scale[1], cfg=cfg)
+        return builder.add_shape_cylinder(
+            body, xform=xform, radius=scale[0], half_height=scale[1], barrel_radius=scale[2], cfg=cfg
+        )
     if geo == GeoType.CONE:
         return builder.add_shape_cone(body, xform=xform, radius=scale[0], half_height=scale[1], cfg=cfg)
     if geo == GeoType.ELLIPSOID:
@@ -105,6 +107,10 @@ def _support_height(geo, scale, rot):
     if geo == GeoType.CAPSULE:
         return float(scale[0] + scale[1] * abs(d[2]))
     if geo == GeoType.CYLINDER:
+        if scale[2] > 0.0:
+            z = min(scale[2] * abs(d[2]), scale[1])
+            radius = scale[0] - np.sqrt(scale[2] ** 2 - scale[1] ** 2) + np.sqrt(scale[2] ** 2 - z**2)
+            return float(radius * np.hypot(d[0], d[1]) + z * abs(d[2]))
         return float(scale[0] * np.hypot(d[0], d[1]) + scale[1] * abs(d[2]))
     if geo == GeoType.CONE:
         return float(max(scale[1] * d[2], scale[0] * np.hypot(d[0], d[1]) - scale[1] * d[2]))
@@ -213,6 +219,38 @@ def test_shallow_contacts(test, device):
         n, sep, _ = _deepest(device, geo, scale, rot, EXACT, penetration=shallow, gap=1.0e-3)
         test.assertGreater(n, 0, msg=f"{geo!r}: shallow contact missed")
         test.assertAlmostEqual(sep, -shallow, delta=2.0e-5, msg=f"{geo!r} separation {sep}")
+
+
+def test_near_axial_rim_contacts(test, device):
+    """Preserve shallow circular contacts across the face-on threshold and both reduction modes."""
+    flip = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), wp.pi)
+    cases = (
+        ("cylinder top", GeoType.CYLINDER, (0.2, 0.15, 0.0), wp.quat_identity()),
+        ("cylinder bottom", GeoType.CYLINDER, (0.2, 0.15, 0.0), flip),
+        ("barrel cylinder", GeoType.CYLINDER, (0.2, 0.15, 0.15), wp.quat_identity()),
+        ("cone base", GeoType.CONE, (0.25, 0.2, 0.0), flip),
+    )
+    for name, geo, scale, base_rot in cases:
+        for angle in (0.0, 0.01, 0.04, 0.05):
+            tilt = wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 1.0, 0.0)), angle)
+            rot = wp.mul(tilt, base_rot)
+            for reduce_contacts in (False, True):
+                with test.subTest(primitive=name, angle=angle, reduce_contacts=reduce_contacts):
+                    n, sep, normal = _deepest(
+                        device,
+                        geo,
+                        scale,
+                        rot,
+                        EXACT,
+                        penetration=1.0e-4,
+                        gap=1.0e-3,
+                        reduce_contacts=reduce_contacts,
+                    )
+                    test.assertGreater(n, 0, msg="Shallow contact missed")
+                    test.assertAlmostEqual(sep, -1.0e-4, delta=2.0e-5)
+                    test.assertGreater(float(abs(normal[2])), 0.999)
+                    if angle == 0.0 and not reduce_contacts:
+                        test.assertEqual(n, 4, msg="Flat circular face should retain four contacts")
 
 
 def test_box_manifold_is_supporting_corners_only(test, device):

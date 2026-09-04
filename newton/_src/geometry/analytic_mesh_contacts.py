@@ -23,7 +23,7 @@ EDGE_MIN_ITERS = 24
 # barycentric slack for the face test; inclusive so a support point on a shared edge is kept
 FACE_INTERIOR_EPS = -1.0e-6
 
-# a support direction within this of an axis is face-on: the support is a rim or a segment
+# Sample around the exact support near an axis to retain flat face manifolds.
 FACE_ON_TOL = 1.0e-3
 
 # per-triangle contact slots in the sort key: 3 vertices, 3 edges, up to 8 face points
@@ -73,27 +73,23 @@ def face_support_point(
         return box_corner(k, scale)
     # must mirror face_support_count exactly
     rim = False
-    z_cap = float(0.0)
     if geo == GeoType.CYLINDER:
         if wp.abs(n[2]) > 1.0 - FACE_ON_TOL:
             rim = True
-            z_cap = -wp.sign(n[2]) * scale[1]
     elif geo == GeoType.CONE:
         if n[2] > 1.0 - FACE_ON_TOL:
             rim = True
-            z_cap = -scale[1]
     if rim:
-        cx = 0.0
-        cy = 0.0
-        if k == 0:
-            cx = 1.0
-        elif k == 1:
-            cy = 1.0
+        # Cardinal rim samples alone miss the true support at small tilts.
+        # Rotations preserve the surface of revolution, including barrel sides.
+        s = support_map(geom, -n, provider)
+        if k == 1:
+            return wp.vec3(-s[1], s[0], s[2])
         elif k == 2:
-            cx = -1.0
-        else:
-            cy = -1.0
-        return wp.vec3(cx * scale[0], cy * scale[0], z_cap)
+            return wp.vec3(-s[0], -s[1], s[2])
+        elif k == 3:
+            return wp.vec3(s[1], -s[0], s[2])
+        return s
     if geo == GeoType.CAPSULE:
         if wp.abs(n[2]) < FACE_ON_TOL:
             z_end = wp.where(k == 0, -scale[1], scale[1])
