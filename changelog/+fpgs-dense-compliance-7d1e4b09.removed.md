@@ -1,1 +1,0 @@
-Remove the `SolverFeatherPGS` parameters `dense_contact_compliance` and `speculative_dense_contact_compliance`. They only enlarged the dense Gauss-Seidel divisor without changing the converged contact solution. Drop them from configurations; `pgs_contact_regularization` is the remaining contact regularizer and now applies to dense rows as well.

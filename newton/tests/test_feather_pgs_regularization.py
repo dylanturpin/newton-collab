@@ -3,7 +3,9 @@
 
 """Tests for the FeatherPGS contact regularizer (``pgs_contact_regularization``)."""
 
+import inspect
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -362,10 +364,43 @@ def test_regularization_validation(test: unittest.TestCase, device):
         b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
         builder.add_shape_box(b, hx=0.05, hy=0.05, hz=0.05)
         model = builder.finalize()
-        for bad in (-0.1, float("nan"), float("inf")):
+        for bad in (-0.1, float("nan"), float("inf"), 1.0e7):
             with test.assertRaises(ValueError):
                 newton.solvers.SolverFeatherPGS(model, pgs_contact_regularization=bad)
         newton.solvers.SolverFeatherPGS(model, pgs_contact_regularization=0.0)
+        newton.solvers.SolverFeatherPGS(model, pgs_contact_regularization=1.0e6)
+
+
+def test_constructor_positional_layout_and_deprecated_placeholders(test: unittest.TestCase, device):
+    """The removed compliance knobs stay as no-op placeholders in their positions so
+    existing positional callers are not rebound, and they warn when set."""
+    names = tuple(inspect.signature(newton.solvers.SolverFeatherPGS).parameters)
+    start = names.index("pgs_beta")
+    test.assertEqual(
+        names[start : start + 6],
+        (
+            "pgs_beta",
+            "pgs_cfm",
+            "dense_contact_compliance",
+            "speculative_dense_contact_compliance",
+            "pgs_omega",
+            "pgs_contact_regularization",
+        ),
+    )
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(b, hx=0.05, hy=0.05, hz=0.05)
+        model = builder.finalize()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            newton.solvers.SolverFeatherPGS(model, dense_contact_compliance=1.0e-4)
+        test.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in caught))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            newton.solvers.SolverFeatherPGS(model)
+        test.assertFalse(any(issubclass(w.category, DeprecationWarning) for w in caught))
 
 
 def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
@@ -468,6 +503,12 @@ add_function_test(
     TestFeatherPGSRegularization,
     "test_regularization_validation",
     test_regularization_validation,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSRegularization,
+    "test_constructor_positional_layout_and_deprecated_placeholders",
+    test_constructor_positional_layout_and_deprecated_placeholders,
     devices=get_test_devices(),
 )
 add_function_test(

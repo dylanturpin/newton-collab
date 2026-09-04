@@ -35,7 +35,7 @@ PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT = 4
 # ``q_follower - coef1 * q_leader - coef0 = 0`` between two 1-DoF joints of the
 # same articulation, from ``Model.constraint_mimic_*``. Jacobian has two
 # entries (+1 on the follower DOF, -coef1 on the leader DOF); lambda is
-# unbounded; drift is removed with the Baumgarte bias derived from ``pgs_hertz``.
+# unbounded; drift is removed with the standard Baumgarte ``pgs_beta`` bias.
 PGS_CONSTRAINT_TYPE_MIMIC = 5
 # Connect (loop-closure) row: one axis of the bilateral 3-DoF point-coincidence equality
 # ``p_anchor(parent) - p_anchor(child) = 0`` closing a kinematic loop between two links of
@@ -6254,7 +6254,6 @@ def compute_mf_rhs_bias(
     has_target_velocity: int,
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_beta: float,
-    contact_w: float,
     dt: float,
     bias_scale: float,
     speculative_scale: float,
@@ -6454,7 +6453,6 @@ def compute_propagation_rhs_bias(
     propagation_restitution_target: wp.array2d[float],
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_beta: float,
-    contact_w: float,
     dt: float,
     bias_scale: float,
     speculative_scale: float,
@@ -9302,33 +9300,26 @@ def apply_contact_regularization(
     world_constraint_count: wp.array[int],
     world_row_type: wp.array2d[int],
     world_row_w: wp.array2d[float],
-    augment_matrix: int,
     # in/out
     world_diag: wp.array2d[float],
     world_C: wp.array3d[float],
-    # outputs
-    world_row_reg: wp.array2d[float],
 ):
-    """Turn the per-row weight of dense contact rows into a regularizer.
+    """Fold the per-row weight of dense contact rows into the assembled Delassus system.
 
-    Adding ``reg = (1/w - 1) * d`` to both the Delassus diagonal and the
-    residual is the w-form update ``delta = -w*r/d - (1-w)*lambda`` used by the
-    matrix-free rows. Routes that solve with the assembled matrix take ``reg``
-    in place (matrix diagonal and divisor); the fused velocity-residual routes
-    read ``world_row_reg`` themselves.
+    Adding ``reg = (1/w - 1) * d`` to the matrix diagonal and the divisor is the
+    w-form update ``delta = -w*r/d - (1-w)*lambda`` used by every other route.
+    Only the split mode, which solves with the assembled matrix, needs this; the
+    fused velocity-residual routes read ``world_row_w`` directly.
     """
     world = wp.tid()
     m = world_constraint_count[world]
     for i in range(m):
-        reg = float(0.0)
         if world_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
             w = world_row_w[world, i]
             if w < 1.0:
                 reg = (1.0 / w - 1.0) * world_diag[world, i]
-        world_row_reg[world, i] = reg
-        if augment_matrix != 0 and reg != 0.0:
-            world_diag[world, i] += reg
-            world_C[world, i, i] += reg
+                world_diag[world, i] += reg
+                world_C[world, i, i] += reg
 
 
 # =============================================================================
