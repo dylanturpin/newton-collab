@@ -5974,6 +5974,30 @@ def diag_from_JY_world(
     world_diag[world, row] = value
 
 
+@wp.kernel
+def finalize_local_owner_world_diag(
+    world_constraint_count: wp.array[int],
+    local_solve_owner: wp.array[int],
+    world_dof_count: wp.array[int],
+    J_world: wp.array3d[float],
+    Y_world: wp.array3d[float],
+    world_row_cfm: wp.array2d[float],
+    # output
+    world_diag: wp.array2d[float],
+):
+    """Finalize each world diagonal according to its selected solve owner."""
+    world = wp.tid()
+    row_count = world_constraint_count[world]
+    dof_count = world_dof_count[world]
+    general = local_solve_owner[world] == PGS_LOCAL_SOLVE_OWNER_GENERAL
+    for row in range(row_count):
+        value = float(0.0)
+        if general:
+            for dof in range(dof_count):
+                value += J_world[world, row, dof] * Y_world[world, row, dof]
+        world_diag[world, row] = value + world_row_cfm[world, row]
+
+
 # =============================================================================
 # Matrix-Free PGS Kernels for Free Rigid Bodies
 # =============================================================================

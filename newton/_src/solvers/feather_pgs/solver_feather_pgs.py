@@ -127,6 +127,7 @@ from .kernels import (
     factor_diagonal_mass,
     factor_propagation_tree_for_size,
     finalize_body_dynamics,
+    finalize_local_owner_world_diag,
     finalize_mf_constraint_counts,
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
@@ -11754,6 +11755,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_finalize_world_diag_cfm(self):
+        if self._local_internal_fast_path and self._hinv_jt_writes_world:
+            return
         model = self.model
         wp.launch(
             finalize_world_diag_cfm,
@@ -11910,6 +11913,22 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def _stage4_diag_from_JY_world(self):
+        if self._local_internal_fast_path:
+            wp.launch(
+                finalize_local_owner_world_diag,
+                dim=self.world_count,
+                inputs=[
+                    self.constraint_count,
+                    self._local_solve_owner,
+                    self.world_dof_count,
+                    self.J_world,
+                    self.Y_world,
+                    self.row_cfm,
+                ],
+                outputs=[self.diag],
+                device=self.model.device,
+            )
+            return
         wp.launch(
             diag_from_JY_world,
             dim=self.world_count * self.dense_max_constraints,

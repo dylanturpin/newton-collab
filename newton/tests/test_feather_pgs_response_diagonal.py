@@ -13,8 +13,10 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
     accumulate_group_diag_worlds,
+    finalize_local_owner_world_diag,
     prepare_fused_diagonal_joint_limits,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSExecutionPlan, _get_hinv_jt_kernel
@@ -175,6 +177,37 @@ def _run_mixed_response(
 
 
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "local-owner diagonal finalization requires CUDA")
+    def test_local_owner_diagonal_finalization_computes_only_general_response(self):
+        """Add response only for general worlds while preserving every row CFM."""
+        device = wp.get_device("cuda:0")
+        counts = wp.array([2, 2], dtype=wp.int32, device=device)
+        owners = wp.array([PGS_LOCAL_SOLVE_OWNER_PAIR, PGS_LOCAL_SOLVE_OWNER_GENERAL], dtype=wp.int32, device=device)
+        dof_counts = wp.array([2, 2], dtype=wp.int32, device=device)
+        jacobian_np = np.array([[[1.0, 2.0], [3.0, 4.0]], [[0.5, -1.0], [2.0, 0.25]]], dtype=np.float32)
+        response_np = np.array([[[5.0, 6.0], [7.0, 8.0]], [[1.5, 2.0], [-0.5, 4.0]]], dtype=np.float32)
+        cfm_np = np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32)
+        diagonal = wp.zeros((2, 2), dtype=wp.float32, device=device)
+
+        wp.launch(
+            finalize_local_owner_world_diag,
+            dim=2,
+            inputs=[
+                counts,
+                owners,
+                dof_counts,
+                wp.array(jacobian_np, device=device),
+                wp.array(response_np, device=device),
+                wp.array(cfm_np, device=device),
+            ],
+            outputs=[diagonal],
+            device=device,
+        )
+
+        expected = cfm_np.copy()
+        expected[1] += np.sum(jacobian_np[1] * response_np[1], axis=1)
+        np.testing.assert_allclose(diagonal.numpy(), expected, rtol=0.0, atol=1.0e-6)
+
     @unittest.skipUnless(wp.is_cuda_available(), "fused diagonal limits require CUDA")
     def test_fused_diagonal_limits_match_dense_rows(self):
         """Match ordinary lower/upper rows when limits precede a coupled contact."""
