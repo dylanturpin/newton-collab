@@ -502,31 +502,21 @@ def test_regularized_propagation_rows_execute(test: unittest.TestCase, device):
             test.assertTrue(np.isfinite(state_out.joint_qd.numpy()).all())
 
 
-def test_constructor_positional_layout_and_removed_placeholders(test: unittest.TestCase, device):
-    """Removed compliance slots remain reserved without silently accepting old physics."""
+def test_compliance_parameters_removed(test: unittest.TestCase, device):
+    """The no-op dense compliance knobs are gone; passing them fails loudly."""
     names = tuple(inspect.signature(newton.solvers.SolverFeatherPGS).parameters)
+    test.assertNotIn("dense_contact_compliance", names)
+    test.assertNotIn("speculative_dense_contact_compliance", names)
     start = names.index("pgs_beta")
-    test.assertEqual(
-        names[start : start + 6],
-        (
-            "pgs_beta",
-            "pgs_cfm",
-            "dense_contact_compliance",
-            "speculative_dense_contact_compliance",
-            "pgs_omega",
-            "pgs_contact_regularization",
-        ),
-    )
+    test.assertEqual(names[start : start + 4], ("pgs_beta", "pgs_cfm", "pgs_omega", "pgs_contact_regularization"))
     with wp.ScopedDevice(device):
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
         b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
         builder.add_shape_box(b, hx=0.05, hy=0.05, hz=0.05)
         model = builder.finalize()
-        with test.assertRaises(ValueError):
+        with test.assertRaises(TypeError):
             newton.solvers.SolverFeatherPGS(model, dense_contact_compliance=1.0e-4)
-        newton.solvers.SolverFeatherPGS(model, dense_contact_compliance=0.0)
-        newton.solvers.SolverFeatherPGS(model, speculative_dense_contact_compliance=0.0)
 
 
 def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
@@ -663,8 +653,8 @@ add_function_test(
 )
 add_function_test(
     TestFeatherPGSRegularization,
-    "test_constructor_positional_layout_and_removed_placeholders",
-    test_constructor_positional_layout_and_removed_placeholders,
+    "test_compliance_parameters_removed",
+    test_compliance_parameters_removed,
     devices=get_test_devices(),
 )
 add_function_test(

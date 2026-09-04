@@ -640,8 +640,6 @@ class SolverFeatherPGS(SolverBase):
         pgs_velocity_iterations: int = 0,
         pgs_beta: float = 0.2,
         pgs_cfm: float = 1.0e-6,
-        dense_contact_compliance: float | None = None,
-        speculative_dense_contact_compliance: float | None = None,
         pgs_omega: float = 1.0,
         pgs_contact_regularization: float = 0.0,
         pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
@@ -827,11 +825,6 @@ class SolverFeatherPGS(SolverBase):
             pgs_beta (float, optional): ERP style position correction factor for contact, joint-limit,
                 mimic and connect rows. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
-            dense_contact_compliance (float | None, optional): Removed compatibility placeholder. Only
-                ``None`` or ``0`` is accepted so positional callers are not rebound. Defaults to None.
-            speculative_dense_contact_compliance (float | None, optional): Removed compatibility
-                placeholder. Only ``None`` or ``0`` is accepted so positional callers are not rebound.
-                Defaults to None.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             pgs_contact_regularization (float, optional): Dimensionless regularizer ``g`` of contact
                 rows on every route (matrix-free, dense, propagation). Each position iteration moves a
@@ -1061,12 +1054,6 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError("velocity_limit_activation_fraction must be in [0, 1] or inf")
         self.pgs_iterations = pgs_iterations
         self.pgs_beta = pgs_beta
-        for name, value in (
-            ("dense_contact_compliance", dense_contact_compliance),
-            ("speculative_dense_contact_compliance", speculative_dense_contact_compliance),
-        ):
-            if value is not None and value != 0.0:
-                raise ValueError(f"SolverFeatherPGS: {name} was removed and must be None or 0")
         self.pgs_contact_regularization = float(pgs_contact_regularization)
         if not math.isfinite(self.pgs_contact_regularization) or self.pgs_contact_regularization < 0.0:
             raise ValueError("pgs_contact_regularization must be finite and non-negative")
