@@ -8,10 +8,14 @@ from pathlib import Path
 _TILED_KERNEL_HELPERS = (
     "_get_pack_mf_meta_kernel",
     "_get_pgs_solve_mf_gs_kernel",
+    "_get_crba_cholesky_warp_kernel",
+    "_get_crba_cholesky_kernel",
     "_get_cholesky_kernel",
     "_get_triangular_solve_kernel",
     "_get_hinv_jt_kernel",
     "_get_hinv_jt_plain_kernel",
+    "_get_hinv_jt_persistent_kernel",
+    "_get_hinv_jt_persistent_plain_kernel",
     "_get_hinv_jt_fused_kernel",
     "_get_delassus_kernel",
     "_get_pgs_solve_tiled_row_kernel",
@@ -20,12 +24,26 @@ _TILED_KERNEL_HELPERS = (
     "_get_pgs_solve_mf_kernel",
 )
 
+_DYNAMICS_COMPILE_DOMAINS = {
+    "eval_rigid_fk_id": "_KINEMATICS_KERNEL_MODULE",
+    "eval_rigid_fk_kinematics": "_KINEMATICS_KERNEL_MODULE",
+    "eval_rigid_tau_add": "_INVERSE_DYNAMICS_KERNEL_MODULE",
+    "compute_composite_inertia": "_MASS_DYNAMICS_KERNEL_MODULE",
+    "crba_fill_par_dof": "_MASS_DYNAMICS_KERNEL_MODULE",
+    "finalize_body_dynamics": "_MASS_DYNAMICS_KERNEL_MODULE",
+}
+
 
 class TestFeatherPGSPrivateApi(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         solver_path = Path(__file__).parents[1] / "_src" / "solvers" / "feather_pgs" / "solver_feather_pgs.py"
         cls.solver_module = ast.parse(solver_path.read_text())
+        kernels_path = solver_path.with_name("kernels.py")
+        cls.kernels_module = ast.parse(kernels_path.read_text())
+        cls.kernel_functions = {
+            node.name: node for node in cls.kernels_module.body if isinstance(node, ast.FunctionDef)
+        }
         cls.top_level_functions = {
             node.name: node for node in cls.solver_module.body if isinstance(node, ast.FunctionDef)
         }
@@ -60,6 +78,21 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
                 self.assertIn("cache", decorator_names)
                 self.assertIn("device_arch", parameters)
 
+    def test_launch_specific_dynamics_kernels_have_separate_compile_domains(self):
+        for kernel_name, expected_module in _DYNAMICS_COMPILE_DOMAINS.items():
+            with self.subTest(kernel_name=kernel_name):
+                kernel = self.kernel_functions[kernel_name]
+                decorator = next(
+                    decorator
+                    for decorator in kernel.decorator_list
+                    if isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr == "kernel"
+                )
+                module_keyword = next(keyword for keyword in decorator.keywords if keyword.arg == "module")
+                self.assertIsInstance(module_keyword.value, ast.Name)
+                self.assertEqual(module_keyword.value.id, expected_module)
+
     def test_plain_hinv_jt_kernel_omits_diagonal_output(self):
         plain_factory = self.top_level_functions["_get_hinv_jt_plain_kernel"]
         diagonal_factory = self.top_level_functions["_get_hinv_jt_kernel"]
@@ -79,6 +112,22 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         self.assertIn("diag_group", diagonal_parameters)
         self.assertIn("diag_tile", diagonal_names)
 
+    def test_persistent_plain_hinv_jt_kernel_omits_diagonal_output(self):
+        plain_factory = self.top_level_functions["_get_hinv_jt_persistent_plain_kernel"]
+        diagonal_factory = self.top_level_functions["_get_hinv_jt_persistent_kernel"]
+        plain_template = next(node for node in plain_factory.body if isinstance(node, ast.FunctionDef))
+        diagonal_template = next(node for node in diagonal_factory.body if isinstance(node, ast.FunctionDef))
+
+        plain_parameters = {argument.arg for argument in plain_template.args.args}
+        diagonal_parameters = {argument.arg for argument in diagonal_template.args.args}
+        plain_names = {node.id for node in ast.walk(plain_template) if isinstance(node, ast.Name)}
+        diagonal_names = {node.id for node in ast.walk(diagonal_template) if isinstance(node, ast.Name)}
+
+        self.assertNotIn("diag_group", plain_parameters)
+        self.assertNotIn("diag_tile", plain_names)
+        self.assertIn("diag_group", diagonal_parameters)
+        self.assertIn("diag_tile", diagonal_names)
+
     def test_cholesky_and_triangular_kernels_are_not_dense_constraint_gated(self):
         init_method = self.solver_methods["_init_tiled_kernels"]
         size_group_loop = self._find_size_group_loop(init_method)
@@ -93,6 +142,12 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         dense_guarded_none_assignments = self._dense_guarded_none_assignments(size_group_loop)
         self.assertNotIn("_cholesky_kernels_by_size", dense_guarded_none_assignments)
         self.assertNotIn("_triangular_solve_kernels_by_size", dense_guarded_none_assignments)
+
+    def test_tiled_triangular_solve_has_no_grouped_vector_buffers(self):
+        """Keep the tiled solve boundary in canonical joint storage."""
+        attribute_names = {node.attr for node in ast.walk(self.solver_class) if isinstance(node, ast.Attribute)}
+        self.assertNotIn("tau_by_size", attribute_names)
+        self.assertNotIn("qdd_by_size", attribute_names)
 
     @staticmethod
     def _find_size_group_loop(function_node):

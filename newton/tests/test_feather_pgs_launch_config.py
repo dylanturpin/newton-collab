@@ -8,10 +8,15 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.kernels import hinv_jt_diagonal
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
+    _estimate_cholesky_shared_memory,
+    _estimate_hinv_jt_shared_memory,
     _FeatherPGSExecutionPlan,
+    _get_hinv_jt_diagonal_warp_kernel,
+    _get_triangular_solve_kernel,
     _select_hinv_jt_chunk_size,
     _use_resident_mfgs_metadata,
     _validate_dense_metadata_encoding,
@@ -49,6 +54,26 @@ def _build_chain_model(num_links=3, num_worlds=2, *, with_free_body=False):
         chain.add_articulation([chain.add_joint_free(parent=-1, child=body)])
     main = newton.ModelBuilder()
     main.replicate(chain, num_worlds, spacing=(3.0, 3.0, 0.0))
+    return main.finalize()
+
+
+def _build_fixed_base_star_model(num_branches=16, num_worlds=2):
+    star = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    base = star.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    joints = [star.add_joint_fixed(parent=-1, child=base)]
+    for branch in range(num_branches):
+        child = star.add_link(mass=1.0 + 0.01 * branch, inertia=wp.mat33(np.eye(3)))
+        joints.append(
+            star.add_joint_prismatic(
+                parent=base,
+                child=child,
+                axis=newton.Axis.Z,
+                parent_xform=wp.transform(wp.vec3(0.02 * branch, 0.0, 0.0), wp.quat_identity()),
+            )
+        )
+    star.add_articulation(joints)
+    main = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    main.replicate(star, num_worlds, spacing=(2.0, 2.0, 0.0))
     return main.finalize()
 
 
@@ -183,22 +208,30 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             (160, 384, 101376, None),
             (23, 0, 101376, None),
             (23, 384, 8192, 16),
-            (23, 384, 2500, None),
+            (23, 384, 2500, 1),
             (100, 1, 49152, 1),
         )
         for n_dofs, max_constraints, shared_memory, expected in cases:
             with self.subTest(n_dofs=n_dofs, max_constraints=max_constraints, shared_memory=shared_memory):
-                self.assertEqual(_select_hinv_jt_chunk_size(n_dofs, max_constraints, shared_memory, 64), expected)
+                self.assertEqual(
+                    _select_hinv_jt_chunk_size(n_dofs, max_constraints, shared_memory, compute_diag=False),
+                    expected,
+                )
 
-    def test_hinv_chunk_selection_accounts_for_tile_threads(self):
-        """Include tile scratch space when selecting response chunks."""
-        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 64), 32)
-        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 256), 16)
+    def test_hinv_chunk_selection_accounts_for_diagonal_working_set(self):
+        """Include the retained response tile needed by diagonal reduction."""
+        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, compute_diag=False), 32)
+        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, compute_diag=True), 16)
+        self.assertEqual(
+            _estimate_hinv_jt_shared_memory(108, 32, compute_diag=True, fused=False),
+            101952,
+        )
+        self.assertEqual(_select_hinv_jt_chunk_size(108, 192, 101376, compute_diag=True), 16)
 
     def test_hinv_chunk_selection_caps_response_tiles(self):
         """Cap response chunks at 32 rows across articulation sizes."""
-        self.assertEqual(_select_hinv_jt_chunk_size(20, 384, 101376, 64), 32)
-        self.assertEqual(_select_hinv_jt_chunk_size(21, 384, 101376, 64), 32)
+        self.assertEqual(_select_hinv_jt_chunk_size(20, 384, 101376, compute_diag=False), 32)
+        self.assertEqual(_select_hinv_jt_chunk_size(21, 384, 101376, compute_diag=False), 32)
 
     def test_dense_metadata_encoding_bounds(self):
         _validate_dense_metadata_encoding(32)
@@ -211,9 +244,11 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             [160],
             max_constraints=384,
             max_shared_memory=101376,
+            diagonal_mass_sizes=frozenset(),
+            cholesky_kernel="auto",
             hinv_jt_kernel="auto",
+            hinv_jt_compute_diag=False,
             small_dof_threshold=12,
-            tile_threads=64,
         )
         self.assertFalse(fallback.use_tiled_hinv_jt(160))
 
@@ -221,9 +256,11 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             [23],
             max_constraints=0,
             max_shared_memory=101376,
+            diagonal_mass_sizes=frozenset(),
+            cholesky_kernel="auto",
             hinv_jt_kernel="tiled",
+            hinv_jt_compute_diag=False,
             small_dof_threshold=12,
-            tile_threads=64,
         )
         self.assertFalse(zero_capacity.use_tiled_hinv_jt(23))
 
@@ -232,9 +269,11 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 [160],
                 max_constraints=384,
                 max_shared_memory=101376,
+                diagonal_mass_sizes=frozenset(),
+                cholesky_kernel="auto",
                 hinv_jt_kernel="tiled",
+                hinv_jt_compute_diag=False,
                 small_dof_threshold=12,
-                tile_threads=64,
             )
 
     def test_hinv_fusion_requires_full_working_set_to_fit(self):
@@ -242,20 +281,158 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             [23],
             max_constraints=64,
             max_shared_memory=101376,
+            diagonal_mass_sizes=frozenset(),
+            cholesky_kernel="auto",
             hinv_jt_kernel="auto",
+            hinv_jt_compute_diag=False,
             small_dof_threshold=12,
-            tile_threads=64,
         )
         oversized = _FeatherPGSExecutionPlan.build(
             [23],
             max_constraints=384,
             max_shared_memory=101376,
+            diagonal_mass_sizes=frozenset(),
+            cholesky_kernel="auto",
             hinv_jt_kernel="auto",
+            hinv_jt_compute_diag=False,
             small_dof_threshold=12,
-            tile_threads=64,
         )
         self.assertTrue(fitting.use_fused_hinv_jt(23))
         self.assertFalse(oversized.use_fused_hinv_jt(23))
+
+    def test_cholesky_execution_plan_respects_shared_memory(self):
+        """Fall back for oversized auto tiles and reject forced invalid launches."""
+        self.assertEqual(_estimate_cholesky_shared_memory(108), 140400)
+        automatic = _FeatherPGSExecutionPlan.build(
+            [23, 108],
+            max_constraints=0,
+            max_shared_memory=101376,
+            diagonal_mass_sizes=frozenset(),
+            cholesky_kernel="auto",
+            hinv_jt_kernel="auto",
+            hinv_jt_compute_diag=False,
+            small_dof_threshold=12,
+        )
+        self.assertTrue(automatic.use_tiled_cholesky(23))
+        self.assertFalse(automatic.use_tiled_cholesky(108))
+
+        with self.assertRaisesRegex(ValueError, "cholesky_kernel='tiled'.*140400.*101376"):
+            _FeatherPGSExecutionPlan.build(
+                [108],
+                max_constraints=0,
+                max_shared_memory=101376,
+                diagonal_mass_sizes=frozenset(),
+                cholesky_kernel="tiled",
+                hinv_jt_kernel="auto",
+                hinv_jt_compute_diag=False,
+                small_dof_threshold=12,
+            )
+
+    def test_fixed_base_sibling_branches_use_diagonal_mass_path(self):
+        """Match the dense reference while selecting independent branch solves."""
+        model = _build_fixed_base_star_model()
+        optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
+        self.assertEqual(optimized._diagonal_mass_sizes, frozenset((16,)))
+        self.assertTrue(optimized._execution_plan.use_diagonal_mass(16))
+        self.assertIsNone(optimized._cholesky_kernels_by_size[16])
+        self.assertIsNone(optimized._triangular_solve_kernels_by_size[16])
+        self.assertIsNone(optimized._hinv_jt_kernels_by_size[16])
+
+        forced = {"cholesky_kernel": "loop", "trisolve_kernel": "loop", "hinv_jt_kernel": "par_row"}
+        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", forced):
+            reference = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
+        self.assertFalse(reference._execution_plan.use_diagonal_mass(16))
+
+        q = np.tile(np.linspace(-0.04, 0.04, 16, dtype=np.float32), 2)
+        qd = np.tile(np.linspace(0.1, -0.1, 16, dtype=np.float32), 2)
+        trajectories = []
+        for solver in (optimized, reference):
+            state_0, state_1 = model.state(), model.state()
+            state_0.joint_q.assign(q)
+            state_0.joint_qd.assign(qd)
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+            control = model.control()
+            history = []
+            for _ in range(5):
+                state_0.clear_forces()
+                solver.step(state_0, state_1, control, None, 1.0 / 120.0)
+                state_0, state_1 = state_1, state_0
+                history.append((state_0.joint_q.numpy().copy(), state_0.joint_qd.numpy().copy()))
+            trajectories.append(history)
+
+        for diagonal, dense in zip(*trajectories, strict=True):
+            np.testing.assert_allclose(diagonal[0], dense[0], rtol=0.0, atol=2.0e-6)
+            np.testing.assert_allclose(diagonal[1], dense[1], rtol=0.0, atol=2.0e-6)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "diagonal warp response requires CUDA")
+    def test_diagonal_warp_response_matches_scalar_reference(self):
+        """Match every active grouped/world response and reduced diagonal."""
+        device = "cuda:0"
+        group_count, dof_count, row_capacity, world_dofs = 2, 37, 7, 41
+        rng = np.random.default_rng(17)
+        factor = np.zeros((group_count, dof_count, dof_count), dtype=np.float32)
+        diagonal = rng.uniform(0.3, 2.0, size=(group_count, dof_count)).astype(np.float32)
+        factor[:, np.arange(dof_count), np.arange(dof_count)] = diagonal
+        jacobian = rng.normal(size=(group_count, row_capacity, dof_count)).astype(np.float32)
+        group_to_art = wp.array((0, 1), dtype=wp.int32, device=device)
+        art_to_world = wp.array((0, 1), dtype=wp.int32, device=device)
+        world_offsets = wp.array((2, 1), dtype=wp.int32, device=device)
+        row_counts = wp.array((7, 4), dtype=wp.int32, device=device)
+        factor_wp = wp.array(factor, dtype=wp.float32, device=device)
+        jacobian_wp = wp.array(jacobian, dtype=wp.float32, device=device)
+
+        def outputs():
+            return (
+                wp.zeros_like(jacobian_wp),
+                wp.zeros((group_count, row_capacity, world_dofs), dtype=wp.float32, device=device),
+                wp.zeros((group_count, row_capacity, world_dofs), dtype=wp.float32, device=device),
+                wp.zeros((group_count, row_capacity), dtype=wp.float32, device=device),
+            )
+
+        scalar = outputs()
+        wp.launch(
+            hinv_jt_diagonal,
+            dim=group_count * row_capacity,
+            inputs=[
+                factor_wp,
+                jacobian_wp,
+                group_to_art,
+                art_to_world,
+                world_offsets,
+                row_counts,
+                dof_count,
+                row_capacity,
+                group_count,
+                1,
+                1,
+                1,
+            ],
+            outputs=scalar,
+            device=device,
+        )
+        parallel = outputs()
+        kernel = _get_hinv_jt_diagonal_warp_kernel(
+            dof_count,
+            row_capacity,
+            world_dofs,
+            wp.get_device(device).arch,
+            write_group=True,
+            write_world=True,
+            compute_diag=True,
+        )
+        wp.launch_tiled(
+            kernel,
+            dim=[group_count],
+            inputs=[factor_wp, jacobian_wp, group_to_art, art_to_world, world_offsets, row_counts],
+            outputs=parallel,
+            block_dim=128,
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        for actual, expected in zip(parallel[:3], scalar[:3], strict=True):
+            np.testing.assert_allclose(actual.numpy(), expected.numpy(), rtol=0.0, atol=1.0e-6)
+        np.testing.assert_allclose(parallel[3].numpy(), scalar[3].numpy(), rtol=2.0e-6, atol=2.0e-6)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free diagonal fusion requires CUDA")
     def test_matrix_free_diagonal_fusion_requires_nonaliased_world_response(self):
@@ -334,6 +511,82 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         wp.synchronize()
         self.assertTrue(np.isfinite(state_0.joint_q.numpy()).all())
         self.assertTrue(np.isfinite(state_0.joint_qd.numpy()).all())
+
+    @unittest.skipUnless(wp.is_cuda_available(), "canonical tiled triangular solve requires CUDA")
+    def test_tiled_triangular_solve_writes_canonical_articulation_order(self):
+        """Solve permuted size groups directly into canonical joint storage."""
+        device = wp.get_device("cuda:0")
+        dof_count = 5
+        group_to_art = np.array((2, 0, 1), dtype=np.int32)
+        articulation_dof_start = np.arange(3, dtype=np.int32) * dof_count
+        rng = np.random.default_rng(1234)
+        factors = np.tril(rng.uniform(-0.2, 0.2, (3, dof_count, dof_count))).astype(np.float32)
+        factors[:, np.arange(dof_count), np.arange(dof_count)] += 1.5
+        tau = rng.uniform(-1.0, 1.0, 3 * dof_count).astype(np.float32)
+        expected = np.empty_like(tau)
+        for group, art in enumerate(group_to_art):
+            start = articulation_dof_start[art]
+            z = np.linalg.solve(factors[group], tau[start : start + dof_count])
+            expected[start : start + dof_count] = np.linalg.solve(factors[group].T, z)
+
+        qdd = wp.zeros_like(wp.array(tau, device=device))
+        kernel = _get_triangular_solve_kernel(dof_count, device.arch, tile_threads=64)
+        wp.launch_tiled(
+            kernel,
+            dim=[len(group_to_art)],
+            inputs=[
+                wp.array(factors, device=device),
+                wp.array(group_to_art, device=device),
+                wp.array(articulation_dof_start, device=device),
+                wp.array(tau, device=device),
+            ],
+            outputs=[qdd],
+            block_dim=64,
+            device=device,
+        )
+        wp.synchronize()
+
+        np.testing.assert_allclose(qdd.numpy(), expected, rtol=2.0e-5, atol=2.0e-5)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "fused CRBA/Cholesky requires CUDA")
+    def test_fused_crba_cholesky_matches_materialized_mass_pipeline(self):
+        """Match the reference trajectory while keeping H articulation-local."""
+        for num_links in (9, 16):
+            trajectories = []
+            for use_parallel_streams in (False, True):
+                model = _build_chain_model(num_links=num_links, num_worlds=2)
+                model.joint_target_ke.assign(np.full(model.joint_dof_count, 20.0, dtype=np.float32))
+                model.joint_target_kd.assign(np.full(model.joint_dof_count, 2.0, dtype=np.float32))
+                solver = SolverFeatherPGS(
+                    model,
+                    double_buffer=False,
+                    update_mass_matrix_interval=1,
+                    use_parallel_streams=use_parallel_streams,
+                )
+                if use_parallel_streams and num_links <= solver.small_dof_threshold:
+                    self.assertIsNotNone(solver._crba_cholesky_warp_kernels_by_size[num_links])
+                elif use_parallel_streams:
+                    self.assertIsNotNone(solver._crba_cholesky_kernels_by_size[num_links])
+
+                state_0, state_1 = model.state(), model.state()
+                initial_q = np.tile(np.linspace(-0.1, 0.1, num_links, dtype=np.float32), 2)
+                initial_qd = np.tile(np.linspace(0.2, -0.2, num_links, dtype=np.float32), 2)
+                state_0.joint_q.assign(initial_q)
+                state_0.joint_qd.assign(initial_qd)
+                newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+                control = model.control()
+                control.joint_target_q.assign(np.full(model.joint_dof_count, 0.15, dtype=np.float32))
+                history = []
+                for _ in range(5):
+                    state_0.clear_forces()
+                    solver.step(state_0, state_1, control, None, 1.0 / 600.0)
+                    state_0, state_1 = state_1, state_0
+                    history.append((state_0.joint_q.numpy().copy(), state_0.joint_qd.numpy().copy()))
+                trajectories.append(history)
+
+            for fused, reference in zip(trajectories[1], trajectories[0], strict=True):
+                np.testing.assert_allclose(fused[0], reference[0], rtol=0.0, atol=2.0e-5)
+                np.testing.assert_allclose(fused[1], reference[1], rtol=0.0, atol=2.0e-5)
 
     @unittest.skipUnless(wp.is_cuda_available(), "propagation matrix-free step test requires CUDA")
     def test_propagation_matrix_free_compiles_and_steps_with_velocity_limit_rows(self):
