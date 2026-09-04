@@ -162,6 +162,17 @@ class TestSelection(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Articulations are not identical"):
             ArticulationView(model, "robot_*", verbose=False)
 
+        # Alternating heterogeneous worlds are sparse by world ID but retain a regular
+        # entity-row stride. Keep this common case on the direct strided binding path.
+        regular_scene = newton.ModelBuilder()
+        for world in (robot_a, robot_b, robot_a, robot_b, robot_a):
+            regular_scene.add_world(world)
+        regular_model = regular_scene.finalize(device="cpu")
+        regular_view = ArticulationView(regular_model, "robot_a", verbose=False)
+        self.assertTrue(regular_view.is_sparse)
+        self.assertFalse(regular_view.uses_explicit_model_indices)
+        assert_np_equal(regular_view.world_ids.numpy(), [0, 2, 4])
+
     def test_unsorted_include_indices_deprecated(self):
         builder = newton.ModelBuilder()
         root = builder.add_link(label="root")
