@@ -379,7 +379,8 @@ def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, dev
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
         builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
         model = builder.finalize()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free")
+        pgs_mode = "split" if wp.get_device(device).is_cpu else "matrix_free"
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=pgs_mode)
         test.assertFalse(solver._regularization_enabled)
         test.assertIs(solver.row_w, solver._contact_row_w_dummy)
         test.assertIs(solver.mf_row_w, solver._contact_row_w_dummy)
