@@ -63,6 +63,7 @@ from newton._src.geometry.hashtable import (
 )
 
 from ..utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
+from .analytic_mesh_contacts import create_triangle_analytic_contacts
 from .collision_core import (
     create_compute_gjk_mpr_contacts,
     get_triangle_shape_from_mesh,
@@ -79,6 +80,7 @@ from .contact_reduction import (
     get_spatial_direction_2d,
     project_point_to_plane,
 )
+from .kernels import is_exact_analytic_sdf_primitive
 from .support_function import (
     GeoTypeEx,
     create_triangle_prism_penetration_refiner,
@@ -2313,6 +2315,7 @@ def mesh_triangle_contacts_to_reducer_kernel(
     triangle_pairs_count: wp.array[int],
     reducer_data: GlobalContactReducerData,
     total_num_threads: int,
+    analytic_features: int,
 ):
     """Process mesh/heightfield-triangle contacts and store them in GlobalContactReducer.
 
@@ -2385,6 +2388,28 @@ def mesh_triangle_contacts_to_reducer_kernel(
         gap_a = shape_gap[shape_a]
         gap_b = shape_gap[shape_b]
         gap_sum = gap_a + gap_b
+
+        type_b = shape_types[shape_b]
+        if analytic_features != 0 and type_a == GeoType.MESH and is_exact_analytic_sdf_primitive(type_b):
+            X_prim_ws = shape_transform[shape_b]
+            X_ws_prim = wp.transform_inverse(X_prim_ws)
+            prim_scale = wp.vec3(shape_data[shape_b][0], shape_data[shape_b][1], shape_data[shape_b][2])
+            wp.static(create_triangle_analytic_contacts(write_contact_to_reducer))(
+                wp.transform_point(X_ws_prim, pos_a),
+                wp.transform_point(X_ws_prim, pos_a + shape_data_a.scale),
+                wp.transform_point(X_ws_prim, pos_a + shape_data_a.auxiliary),
+                type_b,
+                prim_scale,
+                X_prim_ws,
+                gap_sum,
+                margin_offset_a,
+                margin_offset_b,
+                shape_a,
+                shape_b,
+                tri_idx,
+                reducer_data,
+            )
+            continue
 
         wp.static(
             create_compute_gjk_mpr_contacts(
