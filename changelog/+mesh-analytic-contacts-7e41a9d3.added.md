@@ -1,0 +1,1 @@
+Add closed-form feature contacts for mesh vs box, sphere, capsule, cylinder and cone pairs in the mesh-convex narrow phase, replacing GJK/MPR for those pairs, and narrow the midphase to the contact band; ellipsoid pairs keep GJK/MPR.

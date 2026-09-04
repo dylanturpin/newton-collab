@@ -15,24 +15,9 @@ Nothing imports this module except the collision launcher, so it is cycle-free.
 import warp as wp
 
 from .flags import ShapeFlags
-from .kernels import (
-    counter_increment,
-    sdf_box,
-    sdf_box_grad,
-    sdf_capsule,
-    sdf_capsule_grad,
-    sdf_cone,
-    sdf_cone_grad,
-    sdf_cylinder,
-    sdf_cylinder_grad,
-    sdf_ellipsoid,
-    sdf_ellipsoid_grad,
-    sdf_plane,
-    sdf_sphere,
-    sdf_sphere_grad,
-)
+from .kernels import counter_increment, eval_analytic_sdf_grad, is_analytic_sdf_primitive, sdf_plane
 from .sdf_texture import TextureSDFData, texture_sample_sdf_grad
-from .types import Axis, GeoType
+from .types import GeoType
 
 # Fixed iteration counts -> data-independent loops -> CUDA-graph-capturable. Passed as kernel args
 # (uniform across threads/launches). Tuned against a brute-force grid reference
@@ -47,15 +32,7 @@ SDF_LS_ITERS = 16
 @wp.func
 def _is_analytic(geo: wp.int32):
     """True for primitives that evaluate phi/grad in closed form (no volume SDF needed)."""
-    return (
-        geo == GeoType.SPHERE
-        or geo == GeoType.BOX
-        or geo == GeoType.CAPSULE
-        or geo == GeoType.CYLINDER
-        or geo == GeoType.CONE
-        or geo == GeoType.ELLIPSOID
-        or geo == GeoType.PLANE
-    )
+    return is_analytic_sdf_primitive(geo) or geo == GeoType.PLANE
 
 
 @wp.func
@@ -79,24 +56,9 @@ def eval_shape_sdf(
     ``create_soft_contacts``); shapes with a provisioned volume SDF (``shape_sdf_index >= 0``) sample
     the texture SDF with query-time scaling.
     """
-    if geo == GeoType.SPHERE:
-        p = sdf_sphere(x_local, scale[0])
-        return p, p, sdf_sphere_grad(x_local, scale[0])
-    if geo == GeoType.BOX:
-        p = sdf_box(x_local, scale[0], scale[1], scale[2])
-        return p, p, sdf_box_grad(x_local, scale[0], scale[1], scale[2])
-    if geo == GeoType.CAPSULE:
-        p = sdf_capsule(x_local, scale[0], scale[1], int(Axis.Z))
-        return p, p, sdf_capsule_grad(x_local, scale[0], scale[1], int(Axis.Z))
-    if geo == GeoType.CYLINDER:
-        p = sdf_cylinder(x_local, scale[0], scale[1], int(Axis.Z), -1.0, scale[2])
-        return p, p, sdf_cylinder_grad(x_local, scale[0], scale[1], int(Axis.Z), -1.0, scale[2])
-    if geo == GeoType.CONE:
-        p = sdf_cone(x_local, scale[0], scale[1], int(Axis.Z))
-        return p, p, sdf_cone_grad(x_local, scale[0], scale[1], int(Axis.Z))
-    if geo == GeoType.ELLIPSOID:
-        p = sdf_ellipsoid(x_local, scale)
-        return p, p, sdf_ellipsoid_grad(x_local, scale)
+    if is_analytic_sdf_primitive(geo):
+        p, g = eval_analytic_sdf_grad(geo, scale, x_local)
+        return p, p, g
     if geo == GeoType.PLANE:
         p = sdf_plane(x_local, scale[0] * 0.5, scale[1] * 0.5)
         return p, p, wp.vec3(0.0, 0.0, 1.0)

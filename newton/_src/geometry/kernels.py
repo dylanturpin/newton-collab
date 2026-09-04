@@ -692,6 +692,72 @@ def sdf_cone_grad(point: wp.vec3, radius: float, half_height: float, up_axis: in
 
 
 @wp.func
+def is_analytic_sdf_primitive(geo: int) -> bool:
+    """Shape types with a closed-form signed distance; the ellipsoid's is approximate."""
+    return (
+        geo == GeoType.BOX
+        or geo == GeoType.SPHERE
+        or geo == GeoType.CAPSULE
+        or geo == GeoType.CYLINDER
+        or geo == GeoType.CONE
+        or geo == GeoType.ELLIPSOID
+    )
+
+
+@wp.func
+def is_exact_analytic_sdf_primitive(geo: int) -> bool:
+    """Analytic primitives whose signed distance is exact and 1-Lipschitz: all but the ellipsoid."""
+    return (
+        geo == GeoType.BOX
+        or geo == GeoType.SPHERE
+        or geo == GeoType.CAPSULE
+        or geo == GeoType.CYLINDER
+        or geo == GeoType.CONE
+    )
+
+
+@wp.func
+def eval_analytic_sdf(geo: int, scale: wp.vec3, p: wp.vec3) -> float:
+    """Signed distance of an analytic primitive at shape-local ``p``.
+
+    ``scale`` holds the primitive parameters as ``shape_scale`` stores them; axial shapes are Z-up.
+    """
+    if geo == GeoType.BOX:
+        return sdf_box(p, scale[0], scale[1], scale[2])
+    if geo == GeoType.SPHERE:
+        return sdf_sphere(p, scale[0])
+    if geo == GeoType.CAPSULE:
+        return sdf_capsule(p, scale[0], scale[1], int(Axis.Z))
+    if geo == GeoType.CYLINDER:
+        return sdf_cylinder(p, scale[0], scale[1], int(Axis.Z), -1.0, scale[2])
+    if geo == GeoType.CONE:
+        return sdf_cone(p, scale[0], scale[1], int(Axis.Z))
+    return sdf_ellipsoid(p, scale)
+
+
+@wp.func
+def eval_analytic_sdf_grad(geo: int, scale: wp.vec3, p: wp.vec3) -> tuple[float, wp.vec3]:
+    """Signed distance and unit outward gradient of an analytic primitive at shape-local ``p``."""
+    if geo == GeoType.BOX:
+        return sdf_box(p, scale[0], scale[1], scale[2]), sdf_box_grad(p, scale[0], scale[1], scale[2])
+    if geo == GeoType.SPHERE:
+        return sdf_sphere(p, scale[0]), sdf_sphere_grad(p, scale[0])
+    if geo == GeoType.CAPSULE:
+        return (
+            sdf_capsule(p, scale[0], scale[1], int(Axis.Z)),
+            sdf_capsule_grad(p, scale[0], scale[1], int(Axis.Z)),
+        )
+    if geo == GeoType.CYLINDER:
+        return (
+            sdf_cylinder(p, scale[0], scale[1], int(Axis.Z), -1.0, scale[2]),
+            sdf_cylinder_grad(p, scale[0], scale[1], int(Axis.Z), -1.0, scale[2]),
+        )
+    if geo == GeoType.CONE:
+        return sdf_cone(p, scale[0], scale[1], int(Axis.Z)), sdf_cone_grad(p, scale[0], scale[1], int(Axis.Z))
+    return sdf_ellipsoid(p, scale), sdf_ellipsoid_grad(p, scale)
+
+
+@wp.func
 def sdf_plane(point: wp.vec3, width: float, length: float):
     """Compute signed distance to a finite quad in the XY plane.
 
