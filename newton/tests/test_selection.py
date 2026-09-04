@@ -98,6 +98,70 @@ class TestSelection(unittest.TestCase):
         model = builder.finalize()
         self.assertRaises(KeyError, ArticulationView, model, pattern="no_match")
 
+    def test_sparse_world_articulation_view(self):
+        """A view compacts matching heterogeneous worlds and gathers/scatters by absolute row."""
+
+        def make_world(label: str, link_count: int):
+            world = newton.ModelBuilder()
+            parent = world.add_link(label=f"{label}/root")
+            joints = [world.add_joint_free(child=parent, label=f"{label}/root_joint")]
+            for index in range(1, link_count):
+                child = world.add_link(label=f"{label}/link_{index}")
+                joints.append(
+                    world.add_joint_revolute(
+                        parent=parent,
+                        child=child,
+                        axis=wp.vec3(0.0, 0.0, 1.0),
+                        label=f"{label}/joint_{index}",
+                    )
+                )
+                parent = child
+            world.add_articulation(joints, label=label)
+            return world
+
+        robot_a = make_world("robot_a", 2)
+        robot_b = make_world("robot_b", 4)
+        scene = newton.ModelBuilder()
+        for world in (robot_a, robot_b, robot_a, robot_b, robot_b, robot_a):
+            scene.add_world(world)
+        model = scene.finalize(device="cpu")
+
+        view = ArticulationView(model, "robot_a", verbose=False)
+        self.assertEqual(view.count, 3)
+        self.assertEqual(view.world_count, 3)
+        self.assertEqual(view.count_per_world, 1)
+        self.assertTrue(view.is_sparse)
+        self.assertTrue(view.uses_explicit_model_indices)
+        assert_np_equal(view.world_ids.numpy(), [0, 2, 5])
+        assert_np_equal(view.articulation_ids.numpy(), [[0], [2], [5]])
+
+        q = np.arange(model.joint_coord_count, dtype=np.float32)
+        model.joint_q.assign(q)
+        dof_layout = view.frequency_layouts[newton.Model.AttributeFrequency.JOINT_COORD]
+        absolute_q_indices = dof_layout.get_model_indices().numpy()
+        actual = view.get_dof_positions(model).numpy()
+        expected = q[absolute_q_indices]
+        assert_np_equal(actual, expected)
+
+        # A compact world mask addresses view worlds, while writes land in the correct
+        # non-contiguous model rows and leave both the second match and other robot types alone.
+        replacement = np.full(actual.shape, -7.0, dtype=np.float32)
+        view.set_dof_positions(model, replacement, mask=[True, False, False])
+        updated_q = model.joint_q.numpy()
+        assert_np_equal(updated_q[absolute_q_indices[0]], replacement[0])
+        assert_np_equal(updated_q[absolute_q_indices[1]], expected[1])
+        untouched = np.ones(model.joint_coord_count, dtype=bool)
+        untouched[absolute_q_indices[0].reshape(-1)] = False
+        assert_np_equal(updated_q[untouched], q[untouched])
+
+        expected_model_mask = np.array([True, False, True, False, False, True])
+        assert_np_equal(view.get_model_articulation_mask().numpy(), expected_model_mask)
+
+        # Selecting unlike topology under one view remains illegal; heterogeneity is
+        # represented by separate sparse views, one per articulation type.
+        with self.assertRaisesRegex(ValueError, "Articulations are not identical"):
+            ArticulationView(model, "robot_*", verbose=False)
+
     def test_unsorted_include_indices_deprecated(self):
         builder = newton.ModelBuilder()
         root = builder.add_link(label="root")
