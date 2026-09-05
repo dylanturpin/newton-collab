@@ -113,7 +113,6 @@ from .kernels import (
     eval_rigid_tau,
     factor_propagation_tree_for_size,
     finalize_mf_constraint_counts,
-    finalize_world_constraint_counts,
     finalize_world_diag_cfm,
     flatten_propagation_joint_S,
     flush_propagation_free_body_qd_to_vout,
@@ -226,6 +225,65 @@ def _accumulate_row_capacity_telemetry(
     if excess > 0:
         wp.atomic_max(overflow_excess_watermark, 0, excess)
         wp.atomic_add(overflow_world_steps, 0, 1)
+
+
+@wp.kernel
+def _clear_dense_row_state(slot_counter: wp.array[int], contact_world: wp.array[int], dropped: wp.array2d[int]):
+    """Clear allocation state and row-loss counters together."""
+    world = wp.tid()
+    slot_counter[world] = 0
+    contact_world[world] = 0
+    for family in range(3):
+        dropped[family, world] = 0
+
+
+@wp.kernel
+def _finalize_constraint_status(
+    dense_count: wp.array[int],
+    mf_count: wp.array[int],
+    propagation_count: wp.array[int],
+    dropped: wp.array2d[int],
+    contact_count: wp.array[int],
+    reduction_overflow: wp.array[int],
+    dense_capacity: int,
+    mf_capacity: int,
+    propagation_capacity: int,
+    contact_capacity: int,
+    overflow: wp.array[wp.bool],
+    constraint_count: wp.array[int],
+):
+    """Finalize row counts and retain invalid-world status until reset."""
+    world = wp.tid()
+    constraint_count[world] = wp.min(dense_count[world], dense_capacity)
+    if (
+        dense_count[world] > dense_capacity
+        or mf_count[world] > mf_capacity
+        or propagation_count[world] > propagation_capacity
+        or dropped[0, world] > 0
+        or dropped[1, world] > 0
+        or dropped[2, world] > 0
+        or contact_count[0] > contact_capacity
+        or reduction_overflow[0] != 0
+    ):
+        overflow[world] = True
+
+
+@wp.kernel
+def _reset_solver_status(
+    world_mask: wp.array[wp.bool],
+    articulation_world: wp.array[int],
+    mass_update_requested: wp.array[int],
+    overflow: wp.array[wp.bool],
+):
+    """Clear selected world status and request only its articulation factors."""
+    tid = wp.tid()
+    if tid < overflow.shape[0]:
+        if not world_mask or world_mask[tid] != 0:
+            overflow[tid] = False
+    if tid < mass_update_requested.shape[0]:
+        world = articulation_world[tid]
+        if not world_mask or world_mask[world] != 0:
+            mass_update_requested[tid] = 1
 
 
 @dataclass(frozen=True)
@@ -547,6 +605,16 @@ class SolverFeatherPGS(SolverBase):
     rebound velocity is used for the whole step; this gives the intended
     post-impact velocity but a first-order, impact-phase-dependent position
     offset. Reduce the timestep when substep impact position matters.
+
+    ``constraint_overflow`` is a device boolean array with one entry per solver
+    world. It records contact-buffer overflow or dropped constraint rows even
+    when detailed row watermarks are disabled, and persists until :meth:`reset`.
+    Global mesh-reducer table/buffer losses conservatively mark every world
+    invalid because that producer does not attribute losses to individual worlds.
+    Other broad/narrow-phase pair-buffer failures are outside this status contract.
+    Read it in an RL observation/termination kernel, or call
+    :meth:`check_constraint_capacity` outside capture at an observation boundary
+    to reject incomplete physics. Ordinary stepping does not synchronize it.
 
     """
 
@@ -1352,7 +1420,7 @@ class SolverFeatherPGS(SolverBase):
 
         self._step = 0
         self._force_mass_update = False
-        self._mass_update_requested = wp.zeros(1, dtype=wp.int32, device=model.device)
+        self._mass_update_requested = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
         # Host mirror of the global mass-update flag evaluated by the last
         # _stage1_crba call; gates the per-step H memsets (see _stage1_crba).
         self._mass_update_global_flag = True
@@ -1530,9 +1598,6 @@ class SolverFeatherPGS(SolverBase):
             self._row_watermark_dense_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_mf_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_propagation_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_dropped_dense = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
-            self._row_dropped_mf = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
-            self._row_dropped_propagation = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
             self._row_dropped_dense_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_dropped_mf_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_dropped_propagation_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
@@ -1550,9 +1615,6 @@ class SolverFeatherPGS(SolverBase):
             self._row_watermark_dense_raw = None
             self._row_watermark_mf_raw = None
             self._row_watermark_propagation_raw = None
-            self._row_dropped_dense = None
-            self._row_dropped_mf = None
-            self._row_dropped_propagation = None
             self._row_dropped_dense_high_water = None
             self._row_dropped_mf_high_water = None
             self._row_dropped_propagation_high_water = None
@@ -1562,6 +1624,12 @@ class SolverFeatherPGS(SolverBase):
             self._row_overflow_dense_world_steps = None
             self._row_overflow_mf_world_steps = None
             self._row_overflow_propagation_world_steps = None
+
+        self.constraint_overflow = wp.zeros(self.world_count, dtype=wp.bool, device=model.device)
+        self._row_dropped_all = wp.zeros((3, max(self.world_count, 1)), dtype=wp.int32, device=model.device)
+        self._row_dropped_dense = self._row_dropped_all[0]
+        self._row_dropped_mf = self._row_dropped_all[1]
+        self._row_dropped_propagation = self._row_dropped_all[2]
 
         if model.shape_material_mu is not None:
             self.shape_material_mu = model.shape_material_mu
@@ -1618,7 +1686,13 @@ class SolverFeatherPGS(SolverBase):
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
-        """Refresh cached solver data after supported model changes."""
+        """Refresh supported model caches and invalidate affected impulse history.
+
+        Material-equivalence changes also require
+        :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups` when
+        body-pair reduction is enabled. Capacity failures remain latched until
+        an explicit episode reset.
+        """
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
             self._update_kinematic_state()
             self._scatter_armature_to_groups()
@@ -1642,6 +1716,13 @@ class SolverFeatherPGS(SolverBase):
                 device=self.model.device,
             )
             self._mass_update_requested.fill_(1)
+        if flags & (
+            ModelFlags.BODY_PROPERTIES
+            | ModelFlags.BODY_INERTIAL_PROPERTIES
+            | ModelFlags.JOINT_DOF_PROPERTIES
+            | ModelFlags.SHAPE_PROPERTIES
+        ):
+            self._clear_warmstart_history(None)
 
     @override
     def reset(
@@ -1653,7 +1734,9 @@ class SolverFeatherPGS(SolverBase):
         """Clear persistent warm-start state for reset worlds.
 
         The authored simulation state is preserved. Only solver-owned dense
-        matrix-free, and propagation impulse history is cleared.
+        matrix-free, and propagation impulse history and overflow status are
+        cleared. Mass factors for selected worlds refresh on the next step
+        after a teleport; other worlds retain their normal refresh cadence.
 
         Args:
             state: Simulation state, which is left unchanged.
@@ -1668,6 +1751,18 @@ class SolverFeatherPGS(SolverBase):
         if self.world_count == 0:
             return
 
+        wp.launch(
+            _reset_solver_status,
+            dim=max(self.world_count, self.model.articulation_count),
+            inputs=[world_mask, self.art_to_world, self._mass_update_requested, self.constraint_overflow],
+            device=self.model.device,
+        )
+        self._clear_warmstart_history(world_mask)
+
+    def _clear_warmstart_history(self, world_mask: wp.array | None) -> None:
+        """Discard solver impulses independently of latched capacity status."""
+        if self.world_count == 0:
+            return
         prev_mf_impulses = self._ws_prev_mf_impulses
         if not self.pgs_warmstart and prev_mf_impulses is None:
             return
@@ -2190,6 +2285,13 @@ class SolverFeatherPGS(SolverBase):
                 "SolverFeatherPGS: enable_bilateral_preelimination requires "
                 f"pgs_mode='matrix_free' (got {self.pgs_mode!r}); falling back to "
                 "iterative mimic/connect rows.",
+                stacklevel=2,
+            )
+            return
+        if self.articulated_contact_response != "immediate":
+            warnings.warn(
+                "SolverFeatherPGS: bilateral pre-elimination does not support propagation "
+                "contact response yet; falling back to iterative mimic/connect rows.",
                 stacklevel=2,
             )
             return
@@ -6645,6 +6747,26 @@ class SolverFeatherPGS(SolverBase):
         self._step += 1
         return state_out
 
+    def check_constraint_capacity(self) -> None:
+        """Raise for worlds invalidated by contact or constraint capacity exhaustion.
+
+        Call at a host observation boundary, outside CUDA graph capture. The
+        device-resident :attr:`constraint_overflow` boolean array is always
+        maintained, including when ``row_watermark=False``; GPU consumers can
+        inspect it without host synchronization. Status remains set until
+        :meth:`reset` clears the affected worlds. Increasing capacity requires
+        constructing a solver and recapturing graphs before restarting the
+        invalidated transition.
+        """
+        if self.model.device.is_cuda and self.model.device.is_capturing:
+            raise RuntimeError("check_constraint_capacity() must run outside CUDA graph capture")
+        worlds = np.flatnonzero(self.constraint_overflow.numpy())
+        if worlds.size:
+            raise RuntimeError(
+                f"FeatherPGS constraint/contact capacity exceeded in worlds {worlds[:16].tolist()}"
+                f" ({worlds.size} invalid worlds); increase capacities and reset before accepting transitions."
+            )
+
     def constraint_row_watermarks(self) -> dict:
         """Return the opt-in constraint/contact row high-water marks.
 
@@ -7417,12 +7539,12 @@ class SolverFeatherPGS(SolverBase):
             self.mf_target_velocity.zero_()
 
         # Zero world-level buffers (only arrays that require it)
-        self.slot_counter.zero_()  # atomic-add counter
-        self.dense_contact_world_flag.zero_()
-        if self._row_watermark:
-            self._row_dropped_dense.zero_()
-            self._row_dropped_mf.zero_()
-            self._row_dropped_propagation.zero_()
+        wp.launch(
+            _clear_dense_row_state,
+            dim=self.world_count,
+            inputs=[self.slot_counter, self.dense_contact_world_flag, self._row_dropped_all],
+            device=model.device,
+        )
 
         if mf_active:
             self.mf_slot_counter.zero_()  # atomic-add counter
@@ -7458,9 +7580,9 @@ class SolverFeatherPGS(SolverBase):
         is_free_rigid = self.is_free_rigid if self.is_free_rigid is not None else self._dummy_is_free_rigid
         mf_slot_counter = self.mf_slot_counter if mf_active else self._dummy_mf_slot_counter
         propagation_slot_counter = self.propagation_slot_counter if propagation_active else self._dummy_mf_slot_counter
-        dense_dropped_rows = self._row_dropped_dense if self._row_watermark else self._dummy_mf_slot_counter
-        mf_dropped_rows = self._row_dropped_mf if self._row_watermark else self._dummy_mf_slot_counter
-        propagation_dropped_rows = self._row_dropped_propagation if self._row_watermark else self._dummy_mf_slot_counter
+        dense_dropped_rows = self._row_dropped_dense
+        mf_dropped_rows = self._row_dropped_mf
+        propagation_dropped_rows = self._row_dropped_propagation
         j_buffers_zeroed = False
 
         drive_active = self.drive_mode == "physx_pgs" and self.drive_slot is not None
@@ -7886,7 +8008,7 @@ class SolverFeatherPGS(SolverBase):
                     self.contact_friction_gap_threshold,
                     self.contact_friction_anchor_limit,
                     1 if self.contact_friction_articulation_pairs_only else 0,
-                    1 if self._row_watermark else 0,
+                    1,  # capacity failures are always observable
                 ],
                 outputs=[
                     self.contact_world,
@@ -8452,12 +8574,23 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-        slots_per_contact_dense = 3 if self.enable_contact_friction else 1
         wp.launch(
-            finalize_world_constraint_counts,
+            _finalize_constraint_status,
             dim=self.world_count,
-            inputs=[self.slot_counter, max_constraints, slots_per_contact_dense],
-            outputs=[self.constraint_count],
+            inputs=[
+                self.slot_counter,
+                self.mf_slot_counter if self._has_free_rigid_bodies else self._dummy_mf_slot_counter,
+                self.propagation_slot_counter if self._propagation_contacts_enabled() else self._dummy_mf_slot_counter,
+                self._row_dropped_all,
+                contacts.rigid_contact_count if contacts is not None else self._dummy_contact_count,
+                contacts._reduction_overflow if contacts is not None else self._dummy_contact_count,
+                self.dense_max_constraints,
+                self.mf_max_constraints,
+                self.propagation_max_constraints,
+                contacts.rigid_contact_max if contacts is not None else 0,
+                self.constraint_overflow,
+                self.constraint_count,
+            ],
             device=model.device,
         )
 
@@ -10087,13 +10220,12 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
     ELEMS_PER_THREAD_1D = (TILE_M + 31) // 32
 
     def gen_load_1d(dst, src):
-        return "\n".join(
-            [
-                f"    {dst}[lane + {k * 32}] = {src}.data[off1 + lane + {k * 32}];"
-                for k in range(ELEMS_PER_THREAD_1D)
-                if (k * 32) < TILE_M
-            ]
-        )
+        lines = []
+        for k in range(ELEMS_PER_THREAD_1D):
+            offset = k * 32
+            guard = f"if (lane + {offset} < TILE_M) " if offset + 32 > TILE_M else ""
+            lines.append(f"    {guard}{dst}[lane + {offset}] = {src}.data[off1 + lane + {offset}];")
+        return "\n".join(lines)
 
     # Build a deterministic packed-lower-tri index order: row-major over (i, j<=i)
     # idx = i*(i+1)/2 + j
@@ -10139,13 +10271,12 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
             )
     dot_code = "\n".join(["float my_sum = 0.0f;", "int base_i = (i * (i + 1)) >> 1;", *dot_terms])
 
-    store_code = "\n".join(
-        [
-            f"    world_impulses.data[off1 + lane + {k * 32}] = s_lam[lane + {k * 32}];"
-            for k in range(ELEMS_PER_THREAD_1D)
-            if (k * 32) < TILE_M
-        ]
-    )
+    store_lines = []
+    for k in range(ELEMS_PER_THREAD_1D):
+        offset = k * 32
+        guard = f"if (lane + {offset} < TILE_M) " if offset + 32 > TILE_M else ""
+        store_lines.append(f"    {guard}world_impulses.data[off1 + lane + {offset}] = s_lam[lane + {offset}];")
+    store_code = "\n".join(store_lines)
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)

@@ -10,8 +10,9 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONNECT
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONNECT, PGS_CONSTRAINT_TYPE_CONTACT
 from newton.tests.test_feather_pgs_connect import _build_four_bar, _loop_anchor_gap
+from newton.tests.test_feather_pgs_mimic import _build_two_revolute_chain
 
 
 def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: int = 2, **solver_kwargs):
@@ -62,46 +63,73 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertLess(gap_on, 0.01 * gap_off, f"expected >100x tightening, got {gap_off / max(gap_on, 1e-12):.1f}x")
 
     def test_dense_warmstart_preserves_projected_closure(self):
-        """Project the predictor after installing dense warm-start impulses.
-
-        Seed a nonempty cache, reverse the drive, and disable the iterative
-        sweeps for one step. This isolates the stage-6 initializer: moving the
-        bilateral projection before warm-start application lets the latter
-        overwrite it and opens the loop by millimetres.
-        """
-        model = _build_four_bar().finalize()
+        """Project loaded contact history and an unsaturated drive kick at zero sweeps."""
+        builder = _build_four_bar()
+        # An unlimited drive stays in the augmented predictor, so reversing it
+        # still changes velocity in the final step with no PGS drive sweeps.
+        builder.joint_effort_limit[0] = float("inf")
+        builder.add_shape_box(
+            -1,
+            xform=wp.transform(wp.vec3(-0.04, 0.0, 0.5), wp.quat_identity()),
+            hx=0.02,
+            hy=0.1,
+            hz=0.1,
+        )
+        model = builder.finalize()
         solver = newton.solvers.SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",
             pgs_iterations=2,
             pgs_beta=0.1,
+            dense_max_constraints=128,
             enable_bilateral_preelimination=True,
             pgs_warmstart=True,
         )
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        contacts = pipeline.contacts()
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         targets = model.joint_target_q.numpy().copy()
         targets[0] = 0.6
         control.joint_target_q.assign(targets)
         for _ in range(120):
+            pipeline.collide(state_0, contacts)
             state_0.clear_forces()
-            solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
             state_0, state_1 = state_1, state_0
 
-        cache_peak = np.max(np.abs(solver.impulses.numpy()))
+        count = int(solver.constraint_count.numpy()[0])
+        contact_rows = solver.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+        self.assertTrue(contact_rows.any())
+        cache_peak = np.max(solver.impulses.numpy()[0, :count][contact_rows])
+        self.assertGreater(cache_peak, 1.0e-4, "loaded contact cache stayed empty")
+        previous_predictor = solver.v_hat.numpy().copy()
         targets[0] = -0.6
         control.joint_target_q.assign(targets)
         solver.pgs_iterations = 0
+        pipeline.collide(state_0, contacts)
         state_0.clear_forces()
-        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
-        state_0, state_1 = state_1, state_0
-        gap = _loop_anchor_gap(model, state_0)
-
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        gap = _loop_anchor_gap(model, state_1)
         self.assertTrue(solver._preelim_active)
-        self.assertTrue(solver.pgs_warmstart)
-        self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
-        self.assertGreater(cache_peak, 1.0e-4, "warm-start cache stayed empty")
+        self.assertTrue(np.isfinite(state_1.body_q.numpy()).all())
+        self.assertGreater(np.max(solver.impulses.numpy()), 1.0e-4)
+        self.assertGreater(np.linalg.norm(solver.v_hat.numpy() - previous_predictor), 1.0e-3)
         self.assertLess(gap, 2.0e-5, f"warm-started projection left a {gap:.2e} m closure gap")
+
+    def test_propagation_uses_iterative_bilateral_fallback(self):
+        """Keep bilateral rows active when propagation lacks a projected response."""
+        builder, _, _ = _build_two_revolute_chain(0.0, 1.0)
+        model = builder.finalize()
+        with self.assertWarnsRegex(UserWarning, "propagation"):
+            solver = newton.solvers.SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                articulated_contact_response="propagation",
+                enable_bilateral_preelimination=True,
+            )
+        self.assertFalse(solver._preelim_active)
+        self.assertGreater(solver._mimic_count, 0)
 
     def test_mechanism_behavior_preserved(self):
         """The rocker still tracks the crank through the closed loop (parallel four-bar)."""

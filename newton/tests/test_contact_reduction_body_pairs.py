@@ -2966,7 +2966,10 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
             pipe_red = _make_pipeline(model, True, body_pair_verify=True)
             pipe_raw = newton.CollisionPipeline(model, broad_phase="nxn")
             c_red, c_raw = pipe_red.contacts(), pipe_raw.contacts()
-            solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+            # Seven colliders per body generate thousands of speculative rows.
+            # Both consumers must retain them for this to test reduction stability.
+            mf_capacity = 3 * max(c_red.rigid_contact_max, c_raw.rigid_contact_max)
+            solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, mf_max_constraints=mf_capacity)
             raw_not_less, strict_reduction_frames, peak_red = 0, 0, 0.0
             for _ in range(150):
                 pipe_raw.collide(state_0, c_raw)
@@ -2988,7 +2991,7 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
             raw_control = model.control()
             raw_dynamics_pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
             raw_dynamics_contacts = raw_dynamics_pipeline.contacts()
-            raw_solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+            raw_solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, mf_max_constraints=mf_capacity)
             peak_raw = 0.0
             for _ in range(150):
                 raw_dynamics_pipeline.collide(raw_state_0, raw_dynamics_contacts)
@@ -2997,6 +3000,8 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
                 raw_state_0, raw_state_1 = raw_state_1, raw_state_0
                 peak_raw = max(peak_raw, float(np.abs(raw_state_0.body_qd.numpy()).max()))
 
+            solver.check_constraint_capacity()
+            raw_solver.check_constraint_capacity()
             stats = pipe_red._body_pair_reducer.stats()
             self.assertEqual(stats["invariant_violations"], 0, f"trial {trial}")
             self.assertEqual(raw_not_less, 150, f"trial {trial}: reduction increased a count")
