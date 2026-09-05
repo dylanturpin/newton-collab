@@ -50,6 +50,12 @@ PGS_LOCAL_SOLVE_OWNER_SINGLE = 1
 PGS_LOCAL_SOLVE_OWNER_PAIR = 2
 PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL = 3
 
+# Keep launch-geometry-specific dynamics kernels out of the large general
+# kernel module. Warp compiles one whole module variant per block dimension.
+_KINEMATICS_KERNEL_MODULE = wp.Module(f"{__name__}.kinematics")
+_INVERSE_DYNAMICS_KERNEL_MODULE = wp.Module(f"{__name__}.inverse_dynamics")
+_MASS_DYNAMICS_KERNEL_MODULE = wp.Module(f"{__name__}.mass_dynamics")
+
 
 @wp.kernel
 def local_solve_launch_gate():
@@ -126,7 +132,7 @@ def compute_com_transforms(
     body_X_com[tid] = wp.transform(com, wp.quat_identity())
 
 
-@wp.kernel
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE)
 def update_articulation_origins(
     articulation_start: wp.array[int],
     joint_child: wp.array[int],
@@ -877,7 +883,7 @@ def compute_link_transform(
     body_q_com[child] = X_sm
 
 
-@wp.kernel
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE)
 def eval_rigid_fk(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -1072,7 +1078,7 @@ def compute_link_velocity(
     return v_s, a_s
 
 
-@wp.kernel
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE)
 def eval_rigid_fk_id(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -1212,7 +1218,7 @@ def refresh_masked_body_inertia(
 
 
 # Inverse dynamics via Recursive Newton-Euler algorithm (Featherstone Table 5.1)
-@wp.kernel
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE)
 def eval_rigid_id(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -1394,7 +1400,7 @@ def accumulate_articulation_tau(
             body_ft_s[parent] = body_ft_s[parent] + f_s
 
 
-@wp.kernel
+@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE)
 def eval_rigid_tau(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -1452,7 +1458,7 @@ def eval_rigid_tau(
     )
 
 
-@wp.kernel
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
 def compute_composite_inertia(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -1884,7 +1890,7 @@ def pack_contact_linear_force_as_spatial(
     contact_force[c] = wp.spatial_vector(rigid_contact_force[c], wp.vec3(0.0))
 
 
-@wp.kernel
+@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE)
 def eval_rigid_tau_and_augmented_drives(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -9956,7 +9962,7 @@ def delassus_par_row_col(
 # =============================================================================
 
 
-@wp.kernel
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
 def crba_fill_par_dof(
     articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
