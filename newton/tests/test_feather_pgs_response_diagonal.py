@@ -17,8 +17,8 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSExecut
 from newton.solvers import SolverFeatherPGS
 
 
-def _build_mixed_response_model(device, world_count=1, *, friction=0.0, restitution=0.0):
-    """Build one 13-DOF articulation contacting one free rigid body."""
+def _build_mixed_response_model(device, world_count=1, *, dof_count=13, friction=0.0, restitution=0.0):
+    """Build one serial articulation contacting one free rigid body."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.default_shape_cfg.density = 1000.0
     builder.default_shape_cfg.ke = 1.0e5
@@ -40,7 +40,7 @@ def _build_mixed_response_model(device, world_count=1, *, friction=0.0, restitut
         )
     ]
     parent = arm
-    for index in range(12):
+    for index in range(dof_count - 1):
         child = builder.add_link(
             mass=0.05,
             inertia=wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-3),
@@ -72,13 +72,15 @@ def _run_mixed_response(
     *,
     warmstart,
     preelimination,
+    dof_count=13,
+    dense_max_constraints=32,
     inactive_joint_limit_capacity=False,
     friction=0.0,
     restitution=0.0,
     tangential_velocity=0.0,
 ):
     """Run a short mixed-contact trajectory with one H-inverse implementation."""
-    model = _build_mixed_response_model("cuda:0", friction=friction, restitution=restitution)
+    model = _build_mixed_response_model("cuda:0", dof_count=dof_count, friction=friction, restitution=restitution)
     with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": kernel}):
         solver = SolverFeatherPGS(
             model,
@@ -89,7 +91,7 @@ def _run_mixed_response(
             enable_joint_limits=inactive_joint_limit_capacity,
             joint_limit_activation_gap=0.0,
             pgs_iterations=8,
-            dense_max_constraints=32,
+            dense_max_constraints=dense_max_constraints,
             mf_max_constraints=32,
         )
     state_in, state_out = model.state(), model.state()
@@ -209,6 +211,41 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                                 atol=2.0e-6,
                                 err_msg=f"{label} differed at step {step}",
                             )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
+    def test_paired_response_matches_general_23_dof_trajectory(self):
+        """Match the general response when one warp owns a robot/free-body pair."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "dof_count": 23,
+            "dense_max_constraints": 96,
+            "inactive_joint_limit_capacity": True,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+        }
+        reference_solver, reference = _run_mixed_response("par_row", **run_kwargs)
+        paired_solver, paired = _run_mixed_response("auto", **run_kwargs)
+
+        self.assertIsNone(reference_solver._paired_response_primary_size)
+        self.assertEqual(paired_solver._paired_response_primary_size, 23)
+        self.assertEqual(paired_solver._paired_response_secondary_size, 6)
+        self.assertIsNotNone(paired_solver._paired_response_kernel)
+        self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
+        for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
+            self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+            np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
+            for label, expected_value, actual_value in zip(
+                ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+            ):
+                np.testing.assert_allclose(
+                    actual_value,
+                    expected_value,
+                    rtol=5.0e-4,
+                    atol=1.0e-5,
+                    err_msg=f"{label} differed at step {step}",
+                )
 
     @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
     def test_local_internal_mixed_world_matches_general_response(self):

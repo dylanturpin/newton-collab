@@ -200,6 +200,7 @@ _MFGS_TILE_SHARED_STORAGE_BYTES = 128
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
 _CONTACT_BUILD_THREAD_CAP = 65536
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
+_PAIRED_RESPONSE_WARPS_PER_BLOCK = 4
 _CONTACT_JACOBIAN_MAX_DOF = 10
 _COMPOSITE_INERTIA_WARPS_PER_BLOCK = 4
 _JOINT_LIMIT_WARPS_PER_BLOCK = 4
@@ -214,6 +215,7 @@ _LOCAL_INTERNAL_MAX_DOF = 16
 _LOCAL_SOLVE_MAX_ROWS = 20
 _LOCAL_RESIDUAL_MAX_ROWS = 40
 _LOCAL_RESIDUAL_MF_MAX_ROWS = 12
+_PERSISTENT_HINV_JT_MIN_DOF = 17
 
 
 @wp.kernel
@@ -1588,6 +1590,18 @@ class SolverFeatherPGS(SolverBase):
             if self._hinv_jt_computes_diag
             and (self._execution_plan.use_diagonal_mass(size) or self._execution_plan.use_tiled_hinv_jt(size))
         )
+        self._paired_response_candidate_sizes = frozenset(
+            size
+            for size in self.size_groups
+            if model.device.is_cuda
+            and not model.requires_grad
+            and self.pgs_mode == "matrix_free"
+            and not self._preelim_active
+            and size >= _PERSISTENT_HINV_JT_MIN_DOF
+            and size + 6 <= 32
+            and self._execution_plan.use_tiled_hinv_jt(size)
+            and self._execution_plan.hinv_jt_chunk_size(size) < self.dense_max_constraints
+        )
         self._local_solve_max_rows = min(_LOCAL_SOLVE_MAX_ROWS, self.dense_max_constraints)
         self._local_residual_max_rows = min(_LOCAL_RESIDUAL_MAX_ROWS, self.dense_max_constraints)
         self._local_residual_mf_max_rows = min(_LOCAL_RESIDUAL_MF_MAX_ROWS, self.mf_max_constraints)
@@ -1846,7 +1860,22 @@ class SolverFeatherPGS(SolverBase):
             self.pgs_mode == "matrix_free" and not self._jy_world_aliased and not self._preelim_active
         )
         self._hinv_jt_tiled_writes_group = not self._hinv_jt_writes_world or self.pgs_warmstart
-        if not self._hinv_jt_writes_world:
+        response_pair = self._select_paired_response()
+        self._paired_response_primary_size = response_pair[0] if response_pair is not None else None
+        self._paired_response_secondary_size = response_pair[1] if response_pair is not None else None
+        self._paired_response_secondary_groups = (
+            wp.array(response_pair[2], dtype=wp.int32, device=model.device) if response_pair is not None else None
+        )
+        self._paired_response_inverse_identity = None
+        if response_pair is not None:
+            for response_size in response_pair[:2]:
+                self.Hinv_by_size[response_size] = wp.zeros_like(self.L_by_size[response_size])
+            self._paired_response_inverse_identity = wp.array(
+                np.eye(self._paired_response_primary_size, dtype=np.float32),
+                dtype=wp.float32,
+                device=model.device,
+            )
+        if not self._hinv_jt_writes_world and response_pair is None:
             self._hinv_jt_diag_sizes = frozenset()
         self._allocate_mf_buffers(model)
         self._allocate_propagation_buffers(model)
@@ -3383,6 +3412,45 @@ class SolverFeatherPGS(SolverBase):
         expected_world = np.arange(len(group_to_art), dtype=articulation_world.dtype)
         return np.array_equal(articulation_world[group_to_art], expected_world)
 
+    def _select_paired_response(self) -> tuple[int, int, np.ndarray] | None:
+        """Select one complete robot/free-body response pair per world."""
+        if not self._hinv_jt_writes_world or self._hinv_jt_tiled_writes_group or 6 not in self.size_groups:
+            return None
+        if self._execution_plan.use_tiled_hinv_jt(6):
+            return None
+
+        response_dofs = self._model_plan.response_dof_count
+        articulation_world = self._model_plan.articulation_world
+        is_free_rigid = self._model_plan.is_free_rigid
+        response_by_world: list[list[int]] = [[] for _ in range(self.world_count)]
+        for art in np.flatnonzero(response_dofs > 0):
+            response_by_world[int(articulation_world[art])].append(int(art))
+
+        secondary_group_arts = np.flatnonzero(response_dofs == 6)
+        secondary_group_index = {int(art): group for group, art in enumerate(secondary_group_arts)}
+        for primary_size in sorted(self._paired_response_candidate_sizes, reverse=True):
+            primary_arts = np.flatnonzero(response_dofs == primary_size)
+            if len(primary_arts) != self.world_count:
+                continue
+            paired_groups: list[int] = []
+            paired_arts: list[int] = []
+            for primary_art in primary_arts:
+                world_arts = response_by_world[int(articulation_world[primary_art])]
+                secondaries = [
+                    art
+                    for art in world_arts
+                    if art != primary_art and response_dofs[art] == 6 and is_free_rigid[art] != 0
+                ]
+                if len(world_arts) != 2 or len(secondaries) != 1:
+                    break
+                secondary_art = secondaries[0]
+                paired_arts.append(secondary_art)
+                paired_groups.append(secondary_group_index[secondary_art])
+            else:
+                if len(set(paired_arts)) == len(secondary_group_arts) and set(paired_arts) == set(secondary_group_arts):
+                    return primary_size, 6, np.asarray(paired_groups, dtype=np.int32)
+        return None
+
     def _allocate_common_buffers(self, model):
         if model.joint_count:
             # Unused: kept as an attribute for introspection compatibility only.
@@ -3545,6 +3613,7 @@ class SolverFeatherPGS(SolverBase):
     def _allocate_buffers(self, model):
         if not self.size_groups:
             self.H_by_size = {}
+            self.Hinv_by_size = {}
             self.L_by_size = {}
             self.J_by_size = {}
             self.Y_by_size = {}
@@ -3562,6 +3631,7 @@ class SolverFeatherPGS(SolverBase):
         max_constraints = self.dense_max_constraints
 
         self.L_by_size = {}
+        self.Hinv_by_size = {}
         self.Y_by_size = {}
         self.diag_by_size = {}
         self._dummy_hinv_diag = wp.zeros((1, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
@@ -3596,6 +3666,7 @@ class SolverFeatherPGS(SolverBase):
             self.L_by_size[size] = wp.zeros(
                 (n_arts, h_dim, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
             )
+            self.Hinv_by_size[size] = None
 
             self.Y_by_size[size] = wp.zeros(
                 (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
@@ -4526,6 +4597,7 @@ class SolverFeatherPGS(SolverBase):
         self._crba_cholesky_kernels_by_size = {}
         self._crba_cholesky_warp_kernels_by_size = {}
         self._triangular_solve_kernels_by_size = {}
+        self._inverse_cholesky_kernels_by_size = {}
         self._hinv_jt_kernels_by_size = {}
         self._hinv_jt_chunk_count_by_size = {}
         self._hinv_jt_fused_kernels_by_size = {}
@@ -4541,6 +4613,7 @@ class SolverFeatherPGS(SolverBase):
                 and use_tiled_cholesky
                 and size <= _FACTOR_DENSE_MAX_DOF
                 and size in self._crba_source_dof_by_size
+                and size != self._paired_response_primary_size
             )
             fuse_crba_cholesky_warp = bool(
                 model.device.is_cuda
@@ -4551,6 +4624,7 @@ class SolverFeatherPGS(SolverBase):
                 and size <= self.small_dof_threshold
                 and size in self._crba_source_dof_by_size
                 and size in self._crba_lower_schedule_by_size
+                and size != self._paired_response_primary_size
             )
             self._crba_cholesky_kernels_by_size[size] = (
                 _get_crba_cholesky_kernel(size, device_arch, self.tile_threads) if fuse_crba_cholesky else None
@@ -4562,7 +4636,12 @@ class SolverFeatherPGS(SolverBase):
             )
             self._cholesky_kernels_by_size[size] = (
                 _get_cholesky_kernel(size, device_arch, self.tile_threads)
-                if use_tiled_cholesky and not fuse_crba_cholesky
+                if use_tiled_cholesky and not fuse_crba_cholesky and size != self._paired_response_primary_size
+                else None
+            )
+            self._inverse_cholesky_kernels_by_size[size] = (
+                _get_inverse_cholesky_register_kernel(size, device_arch)
+                if size == self._paired_response_secondary_size
                 else None
             )
             self._triangular_solve_kernels_by_size[size] = (
@@ -4611,6 +4690,23 @@ class SolverFeatherPGS(SolverBase):
             )
             self._delassus_kernels_by_size[size] = _get_delassus_kernel(
                 size, self.dense_max_constraints, device_arch, chunk_size=None
+            )
+
+        self._paired_cholesky_inverse_kernel = None
+        self._paired_response_kernel = None
+        if self._paired_response_primary_size is not None:
+            primary_size = self._paired_response_primary_size
+            secondary_size = self._paired_response_secondary_size
+            self._paired_cholesky_inverse_kernel = _get_cholesky_inverse_tiled_kernel(
+                primary_size, device_arch, self.tile_threads
+            )
+            self._paired_response_kernel = _get_paired_hinv_jt_kernel(
+                primary_size,
+                secondary_size,
+                self.dense_max_constraints,
+                self.max_world_dofs,
+                device_arch,
+                _PAIRED_RESPONSE_WARPS_PER_BLOCK,
             )
 
         self._pgs_solve_tiled_row_kernel = None
@@ -6737,6 +6833,7 @@ class SolverFeatherPGS(SolverBase):
                         self._stage2_cholesky_tiled(size)
                     else:
                         self._stage2_cholesky_loop(size)
+                    self._stage2_materialize_paired_inverse(size)
         # ══════════════════════════════════════════════════════════════
         # STAGE 3: Triangular solve + v_hat
         # ══════════════════════════════════════════════════════════════
@@ -6776,6 +6873,11 @@ class SolverFeatherPGS(SolverBase):
             with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                     with ctx:
+                        if size == self._paired_response_secondary_size:
+                            continue
+                        if size == self._paired_response_primary_size:
+                            self._stage4_hinv_jt_paired(size, self._paired_response_secondary_size)
+                            continue
                         if self._execution_plan.use_diagonal_mass(size):
                             self._stage4_hinv_jt_diagonal(size)
                         elif self._execution_plan.use_tiled_hinv_jt(size):
@@ -6791,7 +6893,8 @@ class SolverFeatherPGS(SolverBase):
 
                 # Diagonal from J*Y (no full Delassus)
                 self._stage4_compute_matrix_free_diag()
-                self._stage4_finalize_world_diag_cfm()
+                if self._paired_response_primary_size is None:
+                    self._stage4_finalize_world_diag_cfm()
                 # Reads J_world only when position_delta_scale != 0; under the
                 # J/Y alias (see _detect_jy_world_identity) J_world here holds
                 # the CURRENT step's rows rather than last step's gathered
@@ -8283,6 +8386,24 @@ class SolverFeatherPGS(SolverBase):
         n_arts = self.n_arts_by_size[size]
         if self._crba_cholesky_kernels_by_size[size] is not None:
             return
+        if size == self._paired_response_primary_size:
+            if self._paired_cholesky_inverse_kernel is None or self._paired_response_inverse_identity is None:
+                raise RuntimeError("Paired Cholesky/inverse kernel is unavailable")
+            wp.launch_tiled(
+                self._paired_cholesky_inverse_kernel,
+                dim=[n_arts],
+                inputs=[
+                    self.H_by_size[size],
+                    self.R_by_size[size],
+                    self._paired_response_inverse_identity,
+                    self.group_to_art[size],
+                    self.mass_update_mask,
+                ],
+                outputs=[self.L_by_size[size], self.Hinv_by_size[size]],
+                block_dim=self.tile_threads,
+                device=model.device,
+            )
+            return
         cholesky_kernel = self._cholesky_kernels_by_size[size]
         if cholesky_kernel is None:
             raise RuntimeError(f"Cholesky tiled kernel is unavailable for DOF size {size}")
@@ -8317,6 +8438,20 @@ class SolverFeatherPGS(SolverBase):
             ],
             outputs=[self.L_by_size[size]],
             device=model.device,
+        )
+
+    def _stage2_materialize_paired_inverse(self, size: int) -> None:
+        """Materialize the compact secondary inverse for a paired response."""
+        kernel = self._inverse_cholesky_kernels_by_size[size]
+        if kernel is None:
+            return
+        wp.launch(
+            kernel,
+            dim=self.n_arts_by_size[size] * 32,
+            inputs=[self.L_by_size[size], self.group_to_art[size], self.mass_update_mask],
+            outputs=[self.Hinv_by_size[size]],
+            device=self.model.device,
+            block_dim=256,
         )
 
     def _stage3_zero_qdd(self, state_aug: State):
@@ -9615,6 +9750,31 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
+    def _stage4_hinv_jt_paired(self, primary_size: int, secondary_size: int) -> None:
+        """Build one world response from its robot and free-body components."""
+        if self._paired_response_kernel is None or self._paired_response_secondary_groups is None:
+            raise RuntimeError("Paired H^-1 J^T kernel is unavailable")
+        wp.launch_tiled(
+            self._paired_response_kernel,
+            dim=[self.n_arts_by_size[primary_size]],
+            inputs=[
+                self.Hinv_by_size[primary_size],
+                self.J_by_size[primary_size],
+                self.group_to_art[primary_size],
+                self.Hinv_by_size[secondary_size],
+                self.J_by_size[secondary_size],
+                self.group_to_art[secondary_size],
+                self._paired_response_secondary_groups,
+                self.art_to_world,
+                self.articulation_world_dof_offset,
+                self.constraint_count,
+                self.row_cfm,
+            ],
+            outputs=[self.J_world, self.Y_world, self.diag],
+            block_dim=32 * _PAIRED_RESPONSE_WARPS_PER_BLOCK,
+            device=self.model.device,
+        )
+
     def _stage4_hinv_jt_tiled_fused(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
@@ -9834,6 +9994,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_compute_matrix_free_diag(self):
+        if self._paired_response_primary_size is not None:
+            return
         self.diag.zero_()
         if self._hinv_jt_diag_sizes:
             for size in self.size_groups:
@@ -11560,6 +11722,249 @@ def _get_cholesky_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) 
     cholesky_tiled_template.__name__ = f"cholesky_tiled_{n_dofs}_bd{tile_threads}"
     cholesky_tiled_template.__qualname__ = f"cholesky_tiled_{n_dofs}_bd{tile_threads}"
     return wp.kernel(enable_backward=False, module="unique")(cholesky_tiled_template)
+
+
+@cache
+def _get_cholesky_inverse_tiled_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) -> "wp.Kernel":
+    """Build a tiled kernel that factors the mass matrix and materializes its inverse."""
+    del device_arch
+    dofs = wp.constant(int(n_dofs))
+
+    def cholesky_inverse_tiled_template(
+        H_group: wp.array3d[float],
+        R_group: wp.array2d[float],
+        identity: wp.array2d[float],
+        group_to_art: wp.array[int],
+        mass_update_mask: wp.array[int],
+        L_group: wp.array3d[float],
+        Hinv_group: wp.array3d[float],
+    ):
+        group, _lane = wp.tid()
+        art = group_to_art[group]
+        if mass_update_mask[art] == 0:
+            return
+        H_tile = wp.tile_load(H_group[group], shape=(dofs, dofs), bounds_check=False)
+        armature_tile = wp.tile_load(R_group[group], shape=(dofs,), bounds_check=False)
+        identity_tile = wp.tile_load(identity, shape=(dofs, dofs), bounds_check=False)
+        L_tile = wp.tile_cholesky(wp.tile_diag_add(H_tile, armature_tile))
+        Hinv_tile = wp.tile_cholesky_solve(L_tile, identity_tile, "lower")
+        wp.tile_store(L_group[group], L_tile, bounds_check=False)
+        wp.tile_store(Hinv_group[group], Hinv_tile, bounds_check=False)
+
+    name = f"cholesky_inverse_tiled_{int(n_dofs)}_bd{int(tile_threads)}"
+    cholesky_inverse_tiled_template.__name__ = name
+    cholesky_inverse_tiled_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(cholesky_inverse_tiled_template)
+
+
+@cache
+def _get_inverse_cholesky_register_kernel(n_dofs: int, device_arch: str) -> "wp.Kernel":
+    """Build a small-system inverse kernel with one right-hand side per warp lane."""
+    del device_arch
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int lane = tid & 31;
+    const int group = tid / 32;
+    if (lane >= {n_dofs}) return;
+    const int art = group_to_art.data[group];
+    if (mass_update_mask.data[art] == 0) return;
+
+    const int factor_base = group * {n_dofs * n_dofs};
+    float column[{n_dofs}];
+#pragma unroll
+    for (int i = 0; i < {n_dofs}; ++i) {{
+        float value = i == lane ? 1.0f : 0.0f;
+#pragma unroll
+        for (int k = 0; k < i; ++k)
+            value -= L_group.data[factor_base + i * {n_dofs} + k] * column[k];
+        const float diagonal = L_group.data[factor_base + i * {n_dofs} + i];
+        column[i] = diagonal != 0.0f ? value / diagonal : 0.0f;
+    }}
+#pragma unroll
+    for (int reverse = 0; reverse < {n_dofs}; ++reverse) {{
+        const int i = {n_dofs} - 1 - reverse;
+        float value = column[i];
+#pragma unroll
+        for (int k = i + 1; k < {n_dofs}; ++k)
+            value -= L_group.data[factor_base + k * {n_dofs} + i] * column[k];
+        const float diagonal = L_group.data[factor_base + i * {n_dofs} + i];
+        column[i] = diagonal != 0.0f ? value / diagonal : 0.0f;
+    }}
+#pragma unroll
+    for (int i = 0; i < {n_dofs}; ++i)
+        Hinv_group.data[factor_base + i * {n_dofs} + lane] = column[i];
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def inverse_cholesky_register_native(
+        tid: int,
+        L_group: wp.array3d[float],
+        group_to_art: wp.array[int],
+        mass_update_mask: wp.array[int],
+        Hinv_group: wp.array3d[float],
+    ): ...
+
+    def inverse_cholesky_register_template(
+        L_group: wp.array3d[float],
+        group_to_art: wp.array[int],
+        mass_update_mask: wp.array[int],
+        Hinv_group: wp.array3d[float],
+    ):
+        inverse_cholesky_register_native(wp.tid(), L_group, group_to_art, mass_update_mask, Hinv_group)
+
+    name = f"inverse_cholesky_register_{n_dofs}"
+    inverse_cholesky_register_template.__name__ = name
+    inverse_cholesky_register_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(inverse_cholesky_register_template)
+
+
+@cache
+def _get_paired_hinv_jt_kernel(
+    primary_dofs: int,
+    secondary_dofs: int,
+    max_constraints: int,
+    max_world_dofs: int,
+    device_arch: str,
+    warps_per_block: int = 4,
+) -> "wp.Kernel":
+    """Build a response kernel with one warp per row and one pair per block."""
+    del device_arch
+    total_dofs = primary_dofs + secondary_dofs
+    if total_dofs > 32:
+        raise ValueError("paired warp response requires at most 32 total DOFs")
+    if warps_per_block <= 0 or warps_per_block > 32:
+        raise ValueError("warps_per_block must be in [1, 32]")
+
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    __shared__ float s_primary_Hinv[{primary_dofs * primary_dofs}];
+    __shared__ float s_secondary_Hinv[{secondary_dofs * secondary_dofs}];
+    const int lane = threadIdx.x & 31;
+    const int row_warp = threadIdx.x >> 5;
+    const unsigned MASK = 0xffffffffu;
+
+    const int secondary_group = secondary_group_by_primary.data[primary_group];
+    const int primary_art = primary_group_to_art.data[primary_group];
+    const int secondary_art = secondary_group_to_art.data[secondary_group];
+    const int world = art_to_world.data[primary_art];
+    int n_constraints = world_constraint_count.data[world];
+    if (n_constraints > {max_constraints}) n_constraints = {max_constraints};
+    const int primary_offset = articulation_world_dof_offset.data[primary_art];
+    const int secondary_offset = articulation_world_dof_offset.data[secondary_art];
+    for (int element = threadIdx.x; element < {primary_dofs * primary_dofs}; element += blockDim.x)
+        s_primary_Hinv[element] = primary_Hinv.data[primary_group * {primary_dofs * primary_dofs} + element];
+    for (int element = threadIdx.x; element < {secondary_dofs * secondary_dofs}; element += blockDim.x)
+        s_secondary_Hinv[element] = secondary_Hinv.data[secondary_group * {secondary_dofs * secondary_dofs} + element];
+    __syncthreads();
+
+    for (int constraint = row_warp; constraint < n_constraints; constraint += {warps_per_block}) {{
+        const int world_row = (world * {max_constraints} + constraint) * {max_world_dofs};
+        float j = 0.0f;
+        if (lane < {primary_dofs}) {{
+            const int row = (primary_group * {max_constraints} + constraint) * {primary_dofs};
+            j = primary_J.data[row + lane];
+        }} else if (lane < {total_dofs}) {{
+            const int secondary_lane = lane - {primary_dofs};
+            const int row = (secondary_group * {max_constraints} + constraint) * {secondary_dofs};
+            j = secondary_J.data[row + secondary_lane];
+        }}
+
+        float y = 0.0f;
+#pragma unroll
+        for (int k = 0; k < {primary_dofs}; ++k) {{
+            const float jk = __shfl_sync(MASK, j, k);
+            if (lane < {primary_dofs}) y += s_primary_Hinv[lane * {primary_dofs} + k] * jk;
+        }}
+#pragma unroll
+        for (int k = 0; k < {secondary_dofs}; ++k) {{
+            const float jk = __shfl_sync(MASK, j, {primary_dofs} + k);
+            if (lane >= {primary_dofs} && lane < {total_dofs})
+                y += s_secondary_Hinv[(lane - {primary_dofs}) * {secondary_dofs} + k] * jk;
+        }}
+
+        if (lane < {primary_dofs}) {{
+            J_world.data[world_row + primary_offset + lane] = j;
+            Y_world.data[world_row + primary_offset + lane] = y;
+        }} else if (lane < {total_dofs}) {{
+            const int secondary_lane = lane - {primary_dofs};
+            J_world.data[world_row + secondary_offset + secondary_lane] = j;
+            Y_world.data[world_row + secondary_offset + secondary_lane] = y;
+        }}
+
+        float diagonal = lane < {total_dofs} ? j * y : 0.0f;
+        diagonal += __shfl_down_sync(MASK, diagonal, 16);
+        diagonal += __shfl_down_sync(MASK, diagonal, 8);
+        diagonal += __shfl_down_sync(MASK, diagonal, 4);
+        diagonal += __shfl_down_sync(MASK, diagonal, 2);
+        diagonal += __shfl_down_sync(MASK, diagonal, 1);
+        if (lane == 0) {{
+            const int diag_index = world * {max_constraints} + constraint;
+            world_diag.data[diag_index] = diagonal + world_row_cfm.data[diag_index];
+        }}
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def paired_hinv_jt_native(
+        primary_group: int,
+        primary_Hinv: wp.array3d[float],
+        primary_J: wp.array3d[float],
+        primary_group_to_art: wp.array[int],
+        secondary_Hinv: wp.array3d[float],
+        secondary_J: wp.array3d[float],
+        secondary_group_to_art: wp.array[int],
+        secondary_group_by_primary: wp.array[int],
+        art_to_world: wp.array[int],
+        articulation_world_dof_offset: wp.array[int],
+        world_constraint_count: wp.array[int],
+        world_row_cfm: wp.array2d[float],
+        J_world: wp.array3d[float],
+        Y_world: wp.array3d[float],
+        world_diag: wp.array2d[float],
+    ): ...
+
+    def paired_hinv_jt_template(
+        primary_Hinv: wp.array3d[float],
+        primary_J: wp.array3d[float],
+        primary_group_to_art: wp.array[int],
+        secondary_Hinv: wp.array3d[float],
+        secondary_J: wp.array3d[float],
+        secondary_group_to_art: wp.array[int],
+        secondary_group_by_primary: wp.array[int],
+        art_to_world: wp.array[int],
+        articulation_world_dof_offset: wp.array[int],
+        world_constraint_count: wp.array[int],
+        world_row_cfm: wp.array2d[float],
+        J_world: wp.array3d[float],
+        Y_world: wp.array3d[float],
+        world_diag: wp.array2d[float],
+    ):
+        primary_group, _lane = wp.tid()
+        paired_hinv_jt_native(
+            primary_group,
+            primary_Hinv,
+            primary_J,
+            primary_group_to_art,
+            secondary_Hinv,
+            secondary_J,
+            secondary_group_to_art,
+            secondary_group_by_primary,
+            art_to_world,
+            articulation_world_dof_offset,
+            world_constraint_count,
+            world_row_cfm,
+            J_world,
+            Y_world,
+            world_diag,
+        )
+
+    block_dim = 32 * warps_per_block
+    name = f"paired_hinv_jt_{primary_dofs}_{secondary_dofs}_{max_constraints}_bd{block_dim}"
+    paired_hinv_jt_template.__name__ = name
+    paired_hinv_jt_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(paired_hinv_jt_template)
 
 
 @cache
