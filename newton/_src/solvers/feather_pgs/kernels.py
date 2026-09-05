@@ -1846,6 +1846,47 @@ def cholesky_loop(
             L_group[group_idx, i, j] = s * inv_s
 
 
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+def factor_diagonal_mass(
+    H_group: wp.array3d[float],
+    R_group: wp.array2d[float],
+    group_to_art: wp.array[int],
+    mass_update_mask: wp.array[int],
+    n_dofs: int,
+    # output
+    L_group: wp.array3d[float],
+):
+    """Factor structurally diagonal generalized mass matrices."""
+    element = wp.tid()
+    group = element // n_dofs
+    dof = element - group * n_dofs
+    art = group_to_art[group]
+    if mass_update_mask[art] != 0:
+        mass = H_group[group, dof, dof] + R_group[group, dof]
+        L_group[group, dof, dof] = wp.sqrt(mass)
+
+
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+def solve_diagonal_mass(
+    L_group: wp.array3d[float],
+    group_to_art: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    n_dofs: int,
+    joint_tau: wp.array[float],
+    # output
+    joint_qdd: wp.array[float],
+):
+    """Solve a structurally diagonal generalized mass system."""
+    element = wp.tid()
+    group = element // n_dofs
+    dof = element - group * n_dofs
+    art = group_to_art[group]
+    global_dof = articulation_dof_start[art] + dof
+    diagonal = L_group[group, dof, dof]
+    value = joint_tau[global_dof] / diagonal
+    joint_qdd[global_dof] = value / diagonal
+
+
 @wp.func
 def dense_subs(
     n: int,
@@ -10114,6 +10155,59 @@ def hinv_jt_par_row(
         for i in range(n_dofs):
             J_world[world, c, dof_offset + i] = J_group[idx, c, i]
             Y_world[world, c, dof_offset + i] = Y_group[idx, c, i]
+
+
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+def hinv_jt_diagonal(
+    L_group: wp.array3d[float],
+    J_group: wp.array3d[float],
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
+    world_constraint_count: wp.array[int],
+    n_dofs: int,
+    max_constraints: int,
+    n_arts: int,
+    write_group: int,
+    write_world: int,
+    compute_diag: int,
+    # outputs
+    Y_group: wp.array3d[float],
+    J_world: wp.array3d[float],
+    Y_world: wp.array3d[float],
+    diag_group: wp.array2d[float],
+):
+    """Apply a structurally diagonal inverse to one Jacobian row."""
+    element = wp.tid()
+    constraint = element % max_constraints
+    group = element // max_constraints
+    if group >= n_arts:
+        return
+
+    art = group_to_art[group]
+    world = art_to_world[art]
+    if constraint >= world_constraint_count[world]:
+        return
+
+    dof_offset = int(0)
+    if write_world != 0:
+        dof_offset = articulation_world_dof_offset[art]
+    diagonal_sum = float(0.0)
+    for dof in range(n_dofs):
+        jacobian = J_group[group, constraint, dof]
+        factor = L_group[group, dof, dof]
+        response = jacobian / factor
+        response = response / factor
+        if write_group != 0:
+            Y_group[group, constraint, dof] = response
+        if write_world != 0:
+            J_world[world, constraint, dof_offset + dof] = jacobian
+            Y_world[world, constraint, dof_offset + dof] = response
+        if compute_diag != 0:
+            diagonal_sum += jacobian * response
+
+    if compute_diag != 0:
+        diag_group[group, constraint] = diagonal_sum
 
 
 @wp.kernel

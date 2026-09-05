@@ -117,6 +117,7 @@ from .kernels import (
     eval_rigid_tau,
     eval_rigid_tau_add,
     eval_rigid_tau_and_augmented_drives,
+    factor_diagonal_mass,
     factor_propagation_tree_for_size,
     finalize_body_dynamics,
     finalize_mf_constraint_counts,
@@ -129,6 +130,7 @@ from .kernels import (
     gather_mf_warmstart,
     gather_propagation_warmstart,
     gather_tau_to_groups,
+    hinv_jt_diagonal,
     hinv_jt_par_row,
     hinv_jt_par_row_contact_fallback,
     integrate_generalized_joints,
@@ -168,6 +170,7 @@ from .kernels import (
     snapshot_mf_prev_slots,
     snapshot_propagation_cache_qd_base,
     snapshot_propagation_prev_slots,
+    solve_diagonal_mass,
     trisolve_loop,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
@@ -488,6 +491,7 @@ def _select_hinv_jt_chunk_size(
 class _FeatherPGSExecutionPlan:
     """Immutable device-resource choices for one solver shape."""
 
+    diagonal_mass_sizes: frozenset[int]
     hinv_jt_tiled_sizes: frozenset[int]
     hinv_jt_chunk_sizes: tuple[tuple[int, int], ...]
     hinv_jt_fused_sizes: frozenset[int]
@@ -502,14 +506,22 @@ class _FeatherPGSExecutionPlan:
         hinv_jt_kernel: str,
         small_dof_threshold: int,
         tile_threads: int,
+        diagonal_mass_sizes: frozenset[int] = frozenset(),
     ) -> "_FeatherPGSExecutionPlan":
         """Resolve H-inverse implementations from solver shape and device limits."""
+        planned_diagonal_sizes = (
+            frozenset(size for size in size_groups if size in diagonal_mass_sizes)
+            if hinv_jt_kernel == "auto"
+            else frozenset()
+        )
         tiled_sizes: set[int] = set()
         chunk_sizes: list[tuple[int, int]] = []
         fused_sizes: set[int] = set()
         if max_constraints <= 0:
-            return cls(frozenset(), (), frozenset())
+            return cls(planned_diagonal_sizes, frozenset(), (), frozenset())
         for size in size_groups:
+            if size in planned_diagonal_sizes:
+                continue
             requested = hinv_jt_kernel == "tiled" or (hinv_jt_kernel == "auto" and size > small_dof_threshold)
             if not requested:
                 continue
@@ -532,7 +544,11 @@ class _FeatherPGSExecutionPlan:
             ):
                 fused_sizes.add(size)
 
-        return cls(frozenset(tiled_sizes), tuple(chunk_sizes), frozenset(fused_sizes))
+        return cls(planned_diagonal_sizes, frozenset(tiled_sizes), tuple(chunk_sizes), frozenset(fused_sizes))
+
+    def use_diagonal_mass(self, size: int) -> bool:
+        """Return whether an articulation group has diagonal generalized inertia."""
+        return size in self.diagonal_mass_sizes
 
     def hinv_jt_chunk_size(self, size: int) -> int | None:
         """Return the tiled H-inverse chunk size for a response group."""
@@ -1476,6 +1492,7 @@ class SolverFeatherPGS(SolverBase):
         # Build the execution plan after dense_max_constraints has been
         # finalized by _select_dense_row_capacity so chunk selection sees the
         # actual row capacity.
+        self._hinv_jt_computes_diag = self.pgs_mode == "matrix_free" and not self._preelim_active
         self._execution_plan = _FeatherPGSExecutionPlan.build(
             self.size_groups,
             max_constraints=self.dense_max_constraints,
@@ -1483,12 +1500,17 @@ class SolverFeatherPGS(SolverBase):
             hinv_jt_kernel=self.hinv_jt_kernel,
             small_dof_threshold=self.small_dof_threshold,
             tile_threads=self.tile_threads,
+            diagonal_mass_sizes=(
+                self._diagonal_mass_sizes
+                if self.cholesky_kernel == "auto" and self.trisolve_kernel == "auto"
+                else frozenset()
+            ),
         )
-        self._hinv_jt_computes_diag = self.pgs_mode == "matrix_free" and not self._preelim_active
         self._hinv_jt_diag_sizes = frozenset(
             size
             for size in self.size_groups
-            if self._hinv_jt_computes_diag and self._execution_plan.use_tiled_hinv_jt(size)
+            if self._hinv_jt_computes_diag
+            and (self._execution_plan.use_diagonal_mass(size) or self._execution_plan.use_tiled_hinv_jt(size))
         )
         self._local_solve_max_rows = min(_LOCAL_SOLVE_MAX_ROWS, self.dense_max_constraints)
         self._local_residual_max_rows = min(_LOCAL_RESIDUAL_MAX_ROWS, self.dense_max_constraints)
@@ -2222,6 +2244,7 @@ class SolverFeatherPGS(SolverBase):
             self._propagation_tree_free_root_by_size = {int(size): False for size in self.size_groups}
             self._propagation_tree_has_non_free_by_size = {int(size): False for size in self.size_groups}
             self._propagation_tree_requires_body_map = False
+        self._setup_crba_topology_schedules(model)
         self._setup_world_size_grouping(model)
 
     def _detect_heterogeneous_world_dofs(self, model) -> "np.ndarray | None":
@@ -3022,6 +3045,68 @@ class SolverFeatherPGS(SolverBase):
             self.world_group_to_art[int(size)] = wp.array(flat_np, dtype=wp.int32, device=device)
             self.world_response_group_art_start[int(size)] = wp.array(response_starts, dtype=wp.int32, device=device)
             self.world_response_group_to_art[int(size)] = wp.array(response_flat_np, dtype=wp.int32, device=device)
+
+    def _setup_crba_topology_schedules(self, model) -> None:
+        """Identify size groups whose generalized inertia is structurally diagonal."""
+        diagonal_mass_sizes: set[int] = set()
+        self._diagonal_mass_sizes = frozenset()
+        if not model.articulation_count or not model.joint_count:
+            return
+
+        articulation_start = model.articulation_start.numpy()
+        articulation_dof_start = self._model_plan.articulation_dof_start
+        response_dof_count = self._model_plan.response_dof_count
+        joint_qd_start = model.joint_qd_start.numpy()
+        joint_ancestor = model.joint_ancestor.numpy()
+
+        for size in self.size_groups:
+            reference_offsets = None
+            reference_parents = None
+            compatible = True
+            for art in np.flatnonzero(response_dof_count == size):
+                joint_start = int(articulation_start[art])
+                joint_end = int(articulation_start[art + 1])
+                dof_start = int(articulation_dof_start[art])
+                offsets = np.full(int(size), -1, dtype=np.int32)
+                for joint in range(joint_start, joint_end):
+                    local_start = max(0, int(joint_qd_start[joint]) - dof_start)
+                    local_end = min(int(size), int(joint_qd_start[joint + 1]) - dof_start)
+                    if local_start < local_end:
+                        offsets[local_start:local_end] = joint - joint_start
+                if np.any(offsets < 0):
+                    compatible = False
+                    break
+                parents = joint_ancestor[joint_start:joint_end].astype(np.int32, copy=True)
+                parents = np.where(parents >= joint_start, parents - joint_start, -1).astype(np.int32, copy=False)
+                if reference_offsets is None:
+                    reference_offsets = offsets
+                    reference_parents = parents
+                elif not (np.array_equal(offsets, reference_offsets) and np.array_equal(parents, reference_parents)):
+                    compatible = False
+                    break
+
+            if not compatible or reference_offsets is None or reference_parents is None:
+                continue
+            ancestor_sets = []
+            for joint_offset in reference_offsets:
+                ancestors = set()
+                current = int(joint_offset)
+                while current >= 0:
+                    ancestors.add(current)
+                    current = int(reference_parents[current])
+                ancestor_sets.append(ancestors)
+            structural_nonzeros = 0
+            for row in range(int(size)):
+                for col in range(int(size)):
+                    if (
+                        int(reference_offsets[row]) in ancestor_sets[col]
+                        or int(reference_offsets[col]) in ancestor_sets[row]
+                    ):
+                        structural_nonzeros += 1
+            if structural_nonzeros == int(size):
+                diagonal_mass_sizes.add(int(size))
+
+        self._diagonal_mass_sizes = frozenset(diagonal_mass_sizes)
 
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:
@@ -4296,9 +4381,12 @@ class SolverFeatherPGS(SolverBase):
         self._delassus_kernels_by_size = {}
 
         for size in self.size_groups:
-            self._cholesky_kernels_by_size[size] = _get_cholesky_kernel(size, device_arch, self.tile_threads)
-            self._triangular_solve_kernels_by_size[size] = _get_triangular_solve_kernel(
-                size, device_arch, self.tile_threads
+            use_diagonal_mass = self._execution_plan.use_diagonal_mass(size)
+            self._cholesky_kernels_by_size[size] = (
+                None if use_diagonal_mass else _get_cholesky_kernel(size, device_arch, self.tile_threads)
+            )
+            self._triangular_solve_kernels_by_size[size] = (
+                None if use_diagonal_mass else _get_triangular_solve_kernel(size, device_arch, self.tile_threads)
             )
             if self.dense_max_constraints <= 0:
                 self._hinv_jt_kernels_by_size[size] = None
@@ -6466,7 +6554,9 @@ class SolverFeatherPGS(SolverBase):
                     use_tiled = (self.cholesky_kernel == "tiled") or (
                         self.cholesky_kernel == "auto" and size > self.small_dof_threshold
                     )
-                    if use_tiled:
+                    if self._execution_plan.use_diagonal_mass(size):
+                        self._stage2_cholesky_diagonal(size)
+                    elif use_tiled:
                         self._stage2_cholesky_tiled(size)
                     else:
                         self._stage2_cholesky_loop(size)
@@ -6482,7 +6572,9 @@ class SolverFeatherPGS(SolverBase):
                     use_tiled = (self.trisolve_kernel == "tiled") or (
                         self.trisolve_kernel == "auto" and size > self.small_dof_threshold
                     )
-                    if use_tiled:
+                    if self._execution_plan.use_diagonal_mass(size):
+                        self._stage3_trisolve_diagonal(size, state_aug)
+                    elif use_tiled:
                         self._stage3_trisolve_tiled(size, state_aug)
                     else:
                         self._stage3_trisolve_loop(size, state_aug)
@@ -6507,7 +6599,9 @@ class SolverFeatherPGS(SolverBase):
             with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                     with ctx:
-                        if self._execution_plan.use_tiled_hinv_jt(size):
+                        if self._execution_plan.use_diagonal_mass(size):
+                            self._stage4_hinv_jt_diagonal(size)
+                        elif self._execution_plan.use_tiled_hinv_jt(size):
                             self._stage4_hinv_jt_tiled(size)
                         else:
                             self._stage4_hinv_jt_par_row(size)
@@ -6576,7 +6670,9 @@ class SolverFeatherPGS(SolverBase):
 
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                     with ctx:
-                        if self._execution_plan.use_tiled_hinv_jt(size):
+                        if self._execution_plan.use_diagonal_mass(size):
+                            self._stage4_hinv_jt_diagonal(size)
+                        elif self._execution_plan.use_tiled_hinv_jt(size):
                             self._stage4_hinv_jt_tiled(size)
                         else:
                             self._stage4_hinv_jt_par_row(size)
@@ -7907,6 +8003,23 @@ class SolverFeatherPGS(SolverBase):
 
         self._force_mass_update = False
 
+    def _stage2_cholesky_diagonal(self, size: int) -> None:
+        """Factor an articulation group known to have diagonal generalized inertia."""
+        n_arts = self.n_arts_by_size[size]
+        wp.launch(
+            factor_diagonal_mass,
+            dim=n_arts * size,
+            inputs=[
+                self.H_by_size[size],
+                self.R_by_size[size],
+                self.group_to_art[size],
+                self.mass_update_mask,
+                size,
+            ],
+            outputs=[self.L_by_size[size]],
+            device=self.model.device,
+        )
+
     def _stage2_cholesky_tiled(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
@@ -7946,6 +8059,22 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage3_zero_qdd(self, state_aug: State):
         state_aug.joint_qdd.zero_()
+
+    def _stage3_trisolve_diagonal(self, size: int, state_aug: State) -> None:
+        """Apply a diagonal generalized inertia inverse to joint forces."""
+        wp.launch(
+            solve_diagonal_mass,
+            dim=self.n_arts_by_size[size] * size,
+            inputs=[
+                self.L_by_size[size],
+                self.group_to_art[size],
+                self.articulation_dof_start,
+                size,
+                state_aug.joint_tau,
+            ],
+            outputs=[state_aug.joint_qdd],
+            device=self.model.device,
+        )
 
     def _stage3_trisolve_tiled(self, size: int, state_aug: State):
         model = self.model
@@ -9195,6 +9324,33 @@ class SolverFeatherPGS(SolverBase):
             outputs=outputs,
             block_dim=self.tile_threads,
             device=model.device,
+        )
+
+    def _stage4_hinv_jt_diagonal(self, size: int) -> None:
+        """Apply diagonal generalized inertia to the active response rows."""
+        n_arts = self.n_arts_by_size[size]
+        J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
+        Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
+        world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
+        wp.launch(
+            hinv_jt_diagonal,
+            dim=n_arts * self.dense_max_constraints,
+            inputs=[
+                self.L_by_size[size],
+                self.J_by_size[size],
+                self.group_to_art[size],
+                self.art_to_world,
+                world_dof_offset,
+                self.constraint_count,
+                size,
+                self.dense_max_constraints,
+                n_arts,
+                int(self._hinv_jt_tiled_writes_group),
+                int(self._hinv_jt_writes_world),
+                int(size in self._hinv_jt_diag_sizes),
+            ],
+            outputs=[self.Y_by_size[size], J_world, Y_world, self.diag_by_size[size]],
+            device=self.model.device,
         )
 
     def _stage4_hinv_jt_tiled_fused(self, size: int):
