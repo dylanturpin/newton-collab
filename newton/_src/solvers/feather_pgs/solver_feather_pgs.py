@@ -366,6 +366,42 @@ class _FeatherPGSModelPlan:
         return cls(*arrays, world_count)
 
 
+@dataclass(frozen=True)
+class _FeatherPGSKinematicsCache:
+    """Solver-owned next-state dynamics, isolated from active step scratch."""
+
+    body_q_com: wp.array[wp.transform]
+    """Center-of-mass poses [m], shape [body_count]."""
+    joint_S_s: wp.array[wp.spatial_vector]
+    """Joint motion subspaces, shape [joint_dof_count]."""
+    body_I_s: wp.array[wp.spatial_matrix]
+    """Body spatial inertias, shape [body_count]."""
+    body_inertia_terms: wp.array2d[float]
+    """Compact body inertia terms, shape [term_count, 12]."""
+    body_v_s: wp.array[wp.spatial_vector]
+    """Body spatial velocities [m/s, rad/s], shape [body_count]."""
+    body_f_s: wp.array[wp.spatial_vector]
+    """Body spatial forces [N, N·m], shape [body_count]."""
+    body_a_s: wp.array[wp.spatial_vector]
+    """Body spatial accelerations [m/s², rad/s²], shape [body_count]."""
+    articulation_origin: wp.array[wp.vec3]
+    """Articulation origins [m], shape [articulation_count]."""
+
+    @classmethod
+    def allocate(cls, model: Model, inertia_term_count: int) -> "_FeatherPGSKinematicsCache":
+        """Allocate the cache arrays for one model."""
+        return cls(
+            body_q_com=wp.empty_like(model.body_q),
+            joint_S_s=wp.empty(model.joint_dof_count, dtype=wp.spatial_vector, device=model.device),
+            body_I_s=wp.empty(model.body_count, dtype=wp.spatial_matrix, device=model.device),
+            body_inertia_terms=wp.empty((inertia_term_count, 12), dtype=wp.float32, device=model.device),
+            body_v_s=wp.empty(model.body_count, dtype=wp.spatial_vector, device=model.device),
+            body_f_s=wp.empty(model.body_count, dtype=wp.spatial_vector, device=model.device),
+            body_a_s=wp.empty(model.body_count, dtype=wp.spatial_vector, device=model.device),
+            articulation_origin=wp.empty(model.articulation_count, dtype=wp.vec3, device=model.device),
+        )
+
+
 _DENSE_META_ROW_TYPE_BITS = 3
 _DENSE_META_ROW_TYPE_MASK = (1 << _DENSE_META_ROW_TYPE_BITS) - 1
 _DENSE_META_MAX_PARENT = ((2**31 - 1) >> _DENSE_META_ROW_TYPE_BITS) - 1
@@ -1381,8 +1417,14 @@ class SolverFeatherPGS(SolverBase):
             and not model.requires_grad
             and not enable_joint_velocity_limits
         )
+        # Split's dense/MF execution exposed a cross-replay lifetime conflict
+        # when stage 7 published next-step dynamics over active solve scratch.
+        # Matrix-free concludes those readers before its validated in-place
+        # publication and keeps the zero-copy path.
+        self._fk_id_cache_uses_snapshot = self._fk_id_cache_enabled and self.pgs_mode == "split"
         self._fk_id_cache_source_state = None
-        self._fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
+        self._fk_id_cache_valid = None
+        self._fk_id_cache = None
 
         self._model_plan: _FeatherPGSModelPlan | None = None
         self._kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
@@ -1686,6 +1728,10 @@ class SolverFeatherPGS(SolverBase):
         # regularization is disabled.
         self._contact_row_w_dummy = wp.full((1, 1), 1.0, dtype=wp.float32, device=model.device)
         self._allocate_common_buffers(model)
+        if self._fk_id_cache_enabled:
+            self._fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
+        if self._fk_id_cache_uses_snapshot:
+            self._fk_id_cache = _FeatherPGSKinematicsCache.allocate(model, self._body_inertia_terms.shape[0])
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
         # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
@@ -7431,6 +7477,16 @@ class SolverFeatherPGS(SolverBase):
             if self._fk_id_cache_source_state is not None and state_in is not self._fk_id_cache_source_state:
                 self._fk_id_cache_valid.zero_()
             self._fk_id_cache_source_state = state_in
+            if self._fk_id_cache_uses_snapshot:
+                cache = self._fk_id_cache
+                wp.copy(state_aug.body_q_com, cache.body_q_com)
+                wp.copy(self.articulation_origin, cache.articulation_origin)
+                wp.copy(state_aug.joint_S_s, cache.joint_S_s)
+                wp.copy(state_aug.body_I_s, cache.body_I_s)
+                wp.copy(self._body_inertia_terms, cache.body_inertia_terms)
+                wp.copy(state_aug.body_v_s, cache.body_v_s)
+                wp.copy(state_aug.body_f_s, cache.body_f_s)
+                wp.copy(state_aug.body_a_s, cache.body_a_s)
         else:
             state_aug.body_f_s.zero_()
         if self.enable_joint_velocity_limits:
@@ -10044,6 +10100,15 @@ class SolverFeatherPGS(SolverBase):
             eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
             return
 
+        cache = self._fk_id_cache
+        body_q_com = cache.body_q_com if cache is not None else state_aug.body_q_com
+        articulation_origin = cache.articulation_origin if cache is not None else self.articulation_origin
+        joint_S_s = cache.joint_S_s if cache is not None else state_aug.joint_S_s
+        body_I_s = cache.body_I_s if cache is not None else state_aug.body_I_s
+        body_inertia_terms = cache.body_inertia_terms if cache is not None else self._body_inertia_terms
+        body_v_s = cache.body_v_s if cache is not None else state_aug.body_v_s
+        body_f_s = cache.body_f_s if cache is not None else state_aug.body_f_s
+        body_a_s = cache.body_a_s if cache is not None else state_aug.body_a_s
         next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
         parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
         wp.launch(
@@ -10068,11 +10133,11 @@ class SolverFeatherPGS(SolverBase):
             ],
             outputs=[
                 state_out.body_q,
-                state_aug.body_q_com,
-                self.articulation_origin,
-                state_aug.joint_S_s,
-                state_aug.body_v_s,
-                state_aug.body_a_s,
+                body_q_com,
+                articulation_origin,
+                joint_S_s,
+                body_v_s,
+                body_a_s,
                 self._fk_id_cache_valid,
             ],
             block_dim=16,
@@ -10084,22 +10149,22 @@ class SolverFeatherPGS(SolverBase):
             inputs=[
                 self.body_to_articulation,
                 state_out.body_q,
-                state_aug.body_q_com,
+                body_q_com,
                 model.body_com,
                 model.body_mass,
                 model.body_inertia,
                 self.is_free_rigid,
-                self.articulation_origin,
+                articulation_origin,
                 int(next_refresh and not parallel_next_refresh),
                 int(parallel_next_refresh),
                 model.gravity,
-                state_aug.body_v_s,
-                state_aug.body_a_s,
+                body_v_s,
+                body_a_s,
             ],
             outputs=[
-                state_aug.body_I_s,
-                self._body_inertia_terms,
-                state_aug.body_f_s,
+                body_I_s,
+                body_inertia_terms,
+                body_f_s,
                 state_out.body_qd,
             ],
             block_dim=128,
