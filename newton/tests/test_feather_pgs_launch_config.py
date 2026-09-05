@@ -8,6 +8,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import kernels as feather_pgs_kernels
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
@@ -52,6 +53,26 @@ def _build_chain_model(num_links=3, num_worlds=2, *, with_free_body=False):
     return main.finalize()
 
 
+def _build_fixed_base_star_model(num_branches=16, num_worlds=2):
+    star = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    base = star.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    joints = [star.add_joint_fixed(parent=-1, child=base)]
+    for branch in range(num_branches):
+        child = star.add_link(mass=1.0 + 0.01 * branch, inertia=wp.mat33(np.eye(3)))
+        joints.append(
+            star.add_joint_prismatic(
+                parent=base,
+                child=child,
+                axis=newton.Axis.Z,
+                parent_xform=wp.transform(wp.vec3(0.02 * branch, 0.0, 0.0), wp.quat_identity()),
+            )
+        )
+    star.add_articulation(joints)
+    main = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    main.replicate(star, num_worlds, spacing=(2.0, 2.0, 0.0))
+    return main.finalize()
+
+
 def _build_heterogeneous_world_model():
     free_template = newton.ModelBuilder()
     free_body = free_template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
@@ -70,6 +91,29 @@ def _build_heterogeneous_world_model():
 
 
 class TestFeatherPGSLaunchConfig(unittest.TestCase):
+    def test_launch_geometry_kernels_use_dedicated_modules(self):
+        """Keep custom-block-dimension kernels out of the general module."""
+        expected_modules = {
+            "update_articulation_origins": "kinematics",
+            "eval_rigid_fk": "kinematics",
+            "eval_rigid_fk_kinematics": "kinematics",
+            "eval_rigid_fk_id": "kinematics",
+            "eval_rigid_id": "kinematics",
+            "eval_rigid_tau": "inverse_dynamics",
+            "eval_rigid_tau_add": "inverse_dynamics",
+            "eval_rigid_tau_and_augmented_drives": "inverse_dynamics",
+            "prepare_augmented_joint_drives": "inverse_dynamics",
+            "finalize_body_dynamics": "mass_dynamics",
+            "compute_composite_inertia": "mass_dynamics",
+            "crba_fill_par_dof": "mass_dynamics",
+        }
+        general_module = feather_pgs_kernels.__name__
+        for kernel_name, module_suffix in expected_modules.items():
+            with self.subTest(kernel=kernel_name):
+                kernel_module = getattr(feather_pgs_kernels, kernel_name).module.name
+                self.assertNotEqual(kernel_module, general_module)
+                self.assertEqual(kernel_module, f"{general_module}.{module_suffix}")
+
     def test_defaults_preserved(self):
         model = newton.ModelBuilder().finalize()
         solver = SolverFeatherPGS(model)
@@ -176,8 +220,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         np.testing.assert_array_equal(indices[1, 1:], np.full(5, -1, dtype=np.int32))
 
     def test_hinv_chunk_selection_respects_shared_memory(self):
+        """Select the largest response chunk that fits shared memory."""
         cases = (
-            (23, 384, 101376, 64),
+            (23, 384, 101376, 32),
             (128, 384, 101376, 16),
             (160, 384, 101376, None),
             (23, 0, 101376, None),
@@ -190,13 +235,14 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 self.assertEqual(_select_hinv_jt_chunk_size(n_dofs, max_constraints, shared_memory, 64), expected)
 
     def test_hinv_chunk_selection_accounts_for_tile_threads(self):
-        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 49152, 64), 64)
-        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 49152, 256), 32)
+        """Include tile scratch space when selecting response chunks."""
+        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 64), 32)
+        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 256), 16)
 
-    def test_hinv_chunk_selection_caps_compact_articulations(self):
-        """Cap compact articulation chunks without restricting larger groups."""
+    def test_hinv_chunk_selection_caps_response_tiles(self):
+        """Cap response chunks at 32 rows across articulation sizes."""
         self.assertEqual(_select_hinv_jt_chunk_size(20, 384, 101376, 64), 32)
-        self.assertEqual(_select_hinv_jt_chunk_size(21, 384, 101376, 64), 64)
+        self.assertEqual(_select_hinv_jt_chunk_size(21, 384, 101376, 64), 32)
 
     def test_dense_metadata_encoding_bounds(self):
         _validate_dense_metadata_encoding(32)
@@ -254,6 +300,42 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         )
         self.assertTrue(fitting.use_fused_hinv_jt(23))
         self.assertFalse(oversized.use_fused_hinv_jt(23))
+
+    def test_fixed_base_sibling_branches_use_diagonal_mass_path(self):
+        """Match the dense reference while selecting independent branch solves."""
+        model = _build_fixed_base_star_model()
+        optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
+        self.assertEqual(optimized._diagonal_mass_sizes, frozenset((16,)))
+        self.assertTrue(optimized._execution_plan.use_diagonal_mass(16))
+        self.assertIsNone(optimized._cholesky_kernels_by_size[16])
+        self.assertIsNone(optimized._triangular_solve_kernels_by_size[16])
+        self.assertIsNone(optimized._hinv_jt_kernels_by_size[16])
+
+        forced = {"cholesky_kernel": "loop", "trisolve_kernel": "loop", "hinv_jt_kernel": "par_row"}
+        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", forced):
+            reference = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
+        self.assertFalse(reference._execution_plan.use_diagonal_mass(16))
+
+        q = np.tile(np.linspace(-0.04, 0.04, 16, dtype=np.float32), 2)
+        qd = np.tile(np.linspace(0.1, -0.1, 16, dtype=np.float32), 2)
+        trajectories = []
+        for solver in (optimized, reference):
+            state_0, state_1 = model.state(), model.state()
+            state_0.joint_q.assign(q)
+            state_0.joint_qd.assign(qd)
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+            control = model.control()
+            history = []
+            for _ in range(5):
+                state_0.clear_forces()
+                solver.step(state_0, state_1, control, None, 1.0 / 120.0)
+                state_0, state_1 = state_1, state_0
+                history.append((state_0.joint_q.numpy().copy(), state_0.joint_qd.numpy().copy()))
+            trajectories.append(history)
+
+        for diagonal, dense in zip(*trajectories, strict=True):
+            np.testing.assert_allclose(diagonal[0], dense[0], rtol=0.0, atol=2.0e-6)
+            np.testing.assert_allclose(diagonal[1], dense[1], rtol=0.0, atol=2.0e-6)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free diagonal fusion requires CUDA")
     def test_matrix_free_diagonal_fusion_requires_nonaliased_world_response(self):
