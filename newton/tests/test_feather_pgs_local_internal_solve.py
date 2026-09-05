@@ -15,9 +15,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_LOCAL_SOLVE_OWNER_PAIR,
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
-    classify_local_solve_worlds,
-    compact_local_pair_candidates,
-    compact_local_residual_candidates,
+    classify_and_dispatch_local_solve_worlds,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_local_owned_kernel
 
@@ -37,7 +35,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             1.0,
         ]
 
-    def test_local_owner_classifier_rejects_unsupported_worlds(self):
+    def test_local_owner_classifier_rejects_unsupported_worlds_and_dispatches_supported_ones(self):
         device = "cpu"
         constraint_count = wp.array([5, 8, 21, 8, 8, 8, 0, 41], dtype=wp.int32, device=device)
         phase_bounds = wp.array(
@@ -55,12 +53,15 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         primary = wp.array([0, 1, 2, 3, 4, 5, 6, 7], dtype=wp.int32, device=device)
         pair = wp.array([-1, 10, 11, 12, 13, -1, 14, 15], dtype=wp.int32, device=device)
         residual_pair = wp.array([-1, 10, 11, 12, 13, -1, 14, 15], dtype=wp.int32, device=device)
+        routes = wp.array(np.tile([1, 2, 3, 4], (8, 1)), dtype=wp.int32, device=device)
+        offsets = wp.array([0, 8, 16, 24, 32], dtype=wp.int32, device=device)
         owner = wp.empty(8, dtype=wp.int32, device=device)
-        general_count = wp.zeros(1, dtype=wp.int32, device=device)
-        general_worlds = wp.empty(8, dtype=wp.int32, device=device)
+        dispatch_counts = wp.zeros(5, dtype=wp.int32, device=device)
+        dispatch_primary = wp.empty(40, dtype=wp.int32, device=device)
+        dispatch_secondary = wp.empty(40, dtype=wp.int32, device=device)
 
         wp.launch(
-            classify_local_solve_worlds,
+            classify_and_dispatch_local_solve_worlds,
             dim=8,
             inputs=[
                 constraint_count,
@@ -73,11 +74,16 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 primary,
                 pair,
                 residual_pair,
+                routes,
+                offsets,
                 20,
                 40,
                 12,
+                32,
+                20,
+                32,
             ],
-            outputs=[owner, general_count, general_worlds],
+            outputs=[owner, dispatch_counts, dispatch_primary, dispatch_secondary],
             device=device,
         )
 
@@ -94,67 +100,72 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 PGS_LOCAL_SOLVE_OWNER_GENERAL,
             ],
         )
-        self.assertEqual(int(general_count.numpy()[0]), 3)
-        np.testing.assert_array_equal(general_worlds.numpy()[:3], [4, 5, 7])
+        np.testing.assert_array_equal(dispatch_counts.numpy(), [3, 1, 1, 1, 0])
+        np.testing.assert_array_equal(np.sort(dispatch_primary.numpy()[:3]), [4, 5, 7])
+        np.testing.assert_array_equal(dispatch_primary.numpy()[8:9], [1])
+        np.testing.assert_array_equal(dispatch_secondary.numpy()[8:9], [10])
+        np.testing.assert_array_equal(dispatch_primary.numpy()[16:17], [2])
+        np.testing.assert_array_equal(dispatch_secondary.numpy()[16:17], [11])
+        np.testing.assert_array_equal(dispatch_primary.numpy()[24:25], [3])
+        np.testing.assert_array_equal(dispatch_secondary.numpy()[24:25], [12])
 
-        active_count = wp.zeros(1, dtype=wp.int32, device=device)
-        active_primary = wp.empty(6, dtype=wp.int32, device=device)
-        active_secondary = wp.empty(6, dtype=wp.int32, device=device)
-        wp.launch(
-            compact_local_pair_candidates,
-            dim=8,
-            inputs=[
-                primary,
-                pair,
-                wp.array(np.arange(16), dtype=wp.int32, device=device),
-                owner,
-                PGS_LOCAL_SOLVE_OWNER_PAIR,
-            ],
-            outputs=[active_count, active_primary, active_secondary],
-            device=device,
-        )
-        self.assertEqual(int(active_count.numpy()[0]), 1)
-        np.testing.assert_array_equal(active_primary.numpy()[:1], [1])
-        np.testing.assert_array_equal(active_secondary.numpy()[:1], [10])
-
-    def test_residual_compaction_partitions_register_and_wide_rows(self):
+    def test_local_owner_dispatch_partitions_register_and_wide_residual_rows(self):
         device = "cpu"
         count = 5
         primary = wp.array(np.arange(count), dtype=wp.int32, device=device)
         secondary = wp.array(np.arange(count, 2 * count), dtype=wp.int32, device=device)
-        articulation_world = wp.array(np.arange(2 * count), dtype=wp.int32, device=device)
-        owner = wp.full(count, PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL, dtype=wp.int32, device=device)
+        phase_bounds = wp.array(np.tile([0, 2], (count, 1)), dtype=wp.int32, device=device)
         dense_count = wp.array([24, 6, 21, 36, 20], dtype=wp.int32, device=device)
         mf_count = wp.array([0, 9, 12, 0, 13], dtype=wp.int32, device=device)
-        active_counts = [wp.zeros(1, dtype=wp.int32, device=device) for _ in range(3)]
-        active_primary = [wp.empty(count, dtype=wp.int32, device=device) for _ in range(3)]
-        active_secondary = [wp.empty(count, dtype=wp.int32, device=device) for _ in range(3)]
+        mf_body_a = wp.full((count, 13), -1, dtype=wp.int32, device=device)
+        mf_body_b_host = np.full((count, 13), -1, dtype=np.int32)
+        for world, world_mf_count in enumerate(mf_count.numpy()):
+            mf_body_b_host[world, :world_mf_count] = world
+        mf_body_b = wp.array(mf_body_b_host, dtype=wp.int32, device=device)
+        body_to_articulation = wp.array(np.arange(count, 2 * count), dtype=wp.int32, device=device)
+        articulation_dof_count = wp.full(2 * count, 20, dtype=wp.int32, device=device)
+        routes = wp.array(np.tile([1, 2, 3, 4], (count, 1)), dtype=wp.int32, device=device)
+        offsets = wp.array([0, 5, 10, 15, 20], dtype=wp.int32, device=device)
+        owner = wp.empty(count, dtype=wp.int32, device=device)
+        dispatch_counts = wp.zeros(5, dtype=wp.int32, device=device)
+        dispatch_primary = wp.empty(25, dtype=wp.int32, device=device)
+        dispatch_secondary = wp.empty(25, dtype=wp.int32, device=device)
 
         wp.launch(
-            compact_local_residual_candidates,
+            classify_and_dispatch_local_solve_worlds,
             dim=count,
-            inputs=[primary, secondary, articulation_world, owner, dense_count, mf_count, 32, 20, 32],
-            outputs=[
-                active_counts[0],
-                active_primary[0],
-                active_secondary[0],
-                active_counts[1],
-                active_primary[1],
-                active_secondary[1],
-                active_counts[2],
-                active_primary[2],
-                active_secondary[2],
+            inputs=[
+                dense_count,
+                phase_bounds,
+                mf_count,
+                mf_body_a,
+                mf_body_b,
+                body_to_articulation,
+                articulation_dof_count,
+                primary,
+                secondary,
+                secondary,
+                routes,
+                offsets,
+                20,
+                40,
+                16,
+                32,
+                20,
+                32,
             ],
+            outputs=[owner, dispatch_counts, dispatch_primary, dispatch_secondary],
             device=device,
         )
 
-        self.assertEqual([int(value.numpy()[0]) for value in active_counts], [1, 1, 3])
-        np.testing.assert_array_equal(active_primary[0].numpy()[:1], [0])
-        np.testing.assert_array_equal(active_primary[1].numpy()[:1], [1])
-        np.testing.assert_array_equal(np.sort(active_primary[2].numpy()[:3]), [2, 3, 4])
-        np.testing.assert_array_equal(active_secondary[0].numpy()[:1], [5])
-        np.testing.assert_array_equal(active_secondary[1].numpy()[:1], [6])
-        np.testing.assert_array_equal(np.sort(active_secondary[2].numpy()[:3]), [7, 8, 9])
+        np.testing.assert_array_equal(owner.numpy(), np.full(count, PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL))
+        np.testing.assert_array_equal(dispatch_counts.numpy(), [0, 0, 1, 1, 3])
+        np.testing.assert_array_equal(dispatch_primary.numpy()[10:11], [0])
+        np.testing.assert_array_equal(dispatch_secondary.numpy()[10:11], [5])
+        np.testing.assert_array_equal(dispatch_primary.numpy()[15:16], [1])
+        np.testing.assert_array_equal(dispatch_secondary.numpy()[15:16], [6])
+        np.testing.assert_array_equal(np.sort(dispatch_primary.numpy()[20:23]), [2, 3, 4])
+        np.testing.assert_array_equal(np.sort(dispatch_secondary.numpy()[20:23]), [7, 8, 9])
 
     @unittest.skipUnless(wp.is_cuda_available(), "local internal solve requires CUDA")
     def test_local_kernel_matches_sequential_pgs_and_respects_world_ownership(self):
@@ -206,6 +217,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 jacobian_group,
                 jacobian_group,
                 wp.array(rhs, dtype=wp.float32, device=device),
+                wp.array(cfm, dtype=wp.float32, device=device),
                 wp.array(row_type, dtype=wp.int32, device=device),
                 wp.full((2, max_constraints), -1, dtype=wp.int32, device=device),
                 wp.zeros((2, max_constraints), dtype=wp.float32, device=device),
@@ -284,6 +296,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                     jacobian_group,
                     jacobian_group,
                     wp.array(rhs, dtype=wp.float32, device=device),
+                    wp.array(cfm, dtype=wp.float32, device=device),
                     wp.array(row_type, dtype=wp.int32, device=device),
                     wp.full((2, max_constraints), -1, dtype=wp.int32, device=device),
                     wp.zeros((2, max_constraints), dtype=wp.float32, device=device),
@@ -374,6 +387,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 lower,
                 jacobian,
                 jacobian,
+                wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
                 wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
                 wp.array(
                     [[PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION]],
@@ -482,6 +496,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 wp.array(secondary_jacobian, device=device),
                 wp.array(secondary_jacobian, device=device),
                 wp.array(dense_rhs, device=device),
+                wp.array(dense_cfm, device=device),
                 wp.array([[PGS_CONSTRAINT_TYPE_MIMIC, 0, 0, 0]], dtype=wp.int32, device=device),
                 wp.full((1, max_constraints), -1, dtype=wp.int32, device=device),
                 wp.zeros((1, max_constraints), dtype=wp.float32, device=device),

@@ -16,6 +16,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     compute_mf_effective_mass_and_rhs,
     compute_propagation_effective_mass_and_rhs,
     compute_world_contact_bias,
+    compute_world_contact_bias_restitution_matrix_free,
     populate_world_J_for_compact_size,
     populate_world_J_for_size,
     prepare_world_contact_rows,
@@ -515,6 +516,49 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
 
 
 class TestFeatherPGSContactControls(unittest.TestCase):
+    def test_matrix_free_bias_and_restitution_share_active_row_ownership(self):
+        """Initialize every row once while preserving one-shot restitution."""
+        device = "cpu"
+        rhs = wp.full((2, 6), -9.0, dtype=wp.float32, device=device)
+        row_w = wp.full((2, 6), -9.0, dtype=wp.float32, device=device)
+        row_type = [[0, 3, 1, 5, 6, 4], [0, 0, 0, 0, 0, 0]]
+        phi = [[-0.1, 0.05, 0.0, 0.2, -0.2, 0.0], [0.0] * 6]
+        beta = [[0.2, 0.2, 0.0, 0.5, 0.25, 0.0], [0.0] * 6]
+        target = [[0.3, 0.1, 1.0, 0.1, -0.1, 0.7], [0.0] * 6]
+        restitution = [[0.0] * 6, [0.5, 0.0, 0.0, 0.0, 0.0, 0.0]]
+        jacobian = np.zeros((2, 6, 1), dtype=np.float32)
+        jacobian[1, 0, 0] = 1.0
+        wp.launch(
+            compute_world_contact_bias_restitution_matrix_free,
+            dim=64,
+            inputs=[
+                wp.array([6, 1], dtype=wp.int32, device=device),
+                wp.array([1, 1], dtype=wp.int32, device=device),
+                wp.array(phi, dtype=wp.float32, device=device),
+                wp.array(beta, dtype=wp.float32, device=device),
+                wp.array(row_type, dtype=wp.int32, device=device),
+                wp.array(target, dtype=wp.float32, device=device),
+                wp.array(restitution, dtype=wp.float32, device=device),
+                wp.array([0.0, -2.0], dtype=wp.float32, device=device),
+                wp.array([[0], [1]], dtype=wp.int32, device=device),
+                wp.array(jacobian, dtype=wp.float32, device=device),
+                0.1,
+                1.0,
+                1.0,
+                1.0,
+                0.8,
+                0.5,
+            ],
+            outputs=[rhs, row_w],
+            block_dim=32,
+            device=device,
+        )
+
+        np.testing.assert_allclose(rhs.numpy()[0], [-0.5, 0.4, 0.0, 0.9, -0.4, -0.7], atol=1.0e-6)
+        self.assertAlmostEqual(float(rhs.numpy()[1, 0]), -1.0, places=6)
+        np.testing.assert_allclose(row_w.numpy()[0], [0.8, 1.0, 1.0, 1.0, 1.0, 1.0], atol=1.0e-6)
+        self.assertAlmostEqual(float(row_w.numpy()[1, 0]), 1.0, places=6)
+
     def test_compact_contact_builder_matches_tree_walk(self):
         """Match dense Jacobians and metadata for a same-articulation contact."""
         serial, compact = _launch_dense_contact_builders()

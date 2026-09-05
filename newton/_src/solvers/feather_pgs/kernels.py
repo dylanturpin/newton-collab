@@ -2168,6 +2168,78 @@ def integrate_generalized_joints(
 
 
 @wp.kernel
+def integrate_generalized_joints_from_velocity(
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    body_com: wp.array[wp.vec3],
+    joint_X_c: wp.array[wp.transform],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    dt: float,
+    inv_dt: float,
+    angular_damping: float,
+    # in/out
+    v_new: wp.array[float],
+    # outputs
+    joint_qdd: wp.array[float],
+    joint_q_new: wp.array[float],
+    joint_qd_new: wp.array[float],
+):
+    """Convert solved velocity to acceleration and integrate each joint."""
+    index = wp.tid()
+    type = joint_type[index]
+    parent = joint_parent[index]
+    child = joint_child[index]
+    coord_start = joint_q_start[index]
+    dof_start = joint_qd_start[index]
+    dof_end = joint_qd_start[index + 1]
+
+    if kinematic_joint_mask[index] != 0:
+        for coord in range(coord_start, joint_q_start[index + 1]):
+            joint_q_new[coord] = joint_q[coord]
+        for dof in range(dof_start, dof_end):
+            v_new[dof] = joint_qd[dof]
+            joint_qdd[dof] = 0.0
+            joint_qd_new[dof] = joint_qd[dof]
+        return
+
+    for dof in range(dof_start, dof_end):
+        joint_qdd[dof] = (v_new[dof] - joint_qd[dof]) * inv_dt
+
+    if (type == JointType.FREE or type == JointType.DISTANCE) and parent < 0:
+        v = wp.vec3(joint_qd[dof_start + 0], joint_qd[dof_start + 1], joint_qd[dof_start + 2])
+        w = wp.vec3(joint_qd[dof_start + 3], joint_qd[dof_start + 4], joint_qd[dof_start + 5])
+        transport = wp.cross(w, v)
+        joint_qdd[dof_start + 0] = joint_qdd[dof_start + 0] - transport[0]
+        joint_qdd[dof_start + 1] = joint_qdd[dof_start + 1] - transport[1]
+        joint_qdd[dof_start + 2] = joint_qdd[dof_start + 2] - transport[2]
+
+    jcalc_integrate(
+        type,
+        child,
+        body_com,
+        joint_X_c[index],
+        joint_q,
+        joint_qd,
+        joint_qdd,
+        coord_start,
+        dof_start,
+        joint_dof_dim[index, 0],
+        joint_dof_dim[index, 1],
+        dt,
+        angular_damping,
+        parent,
+        joint_q_new,
+        joint_qd_new,
+    )
+
+
+@wp.kernel
 def compute_velocity_predictor(
     joint_qd: wp.array[float],
     kinematic_dof_mask: wp.array[int],
@@ -2959,10 +3031,10 @@ def allocate_mimic_slots(
 def populate_mimic_J_for_size(
     articulation_dof_start: wp.array[int],
     art_to_world: wp.array[int],
-    group_to_art: wp.array[int],
+    articulation_group_index: wp.array[int],
+    mimic_indices: wp.array[int],
+    mimic_articulation: wp.array[int],
     mimic_slot: wp.array[int],
-    mimic_art_start: wp.array[int],
-    mimic_art_list: wp.array[int],
     mimic_dof0: wp.array[int],
     mimic_dof1: wp.array[int],
     mimic_q0: wp.array[int],
@@ -2984,39 +3056,36 @@ def populate_mimic_J_for_size(
 ):
     """Populate Jacobian and metadata for mimic constraint rows.
 
-    Launched once per size group with ``dim = n_arts_of_size``, matching the
-    joint-limit populate kernel. Each thread visits only its articulation's
-    range in the precomputed mimic table:
+    Launched once per size group with one thread per valid mimic constraint.
+    ``mimic_indices`` filters the static model table to that response size:
 
     * Jacobian ``J = e_follower - coef1 * e_leader`` — two entries.
     * ``phi = q_follower - coef1 * q_leader - coef0`` — the signed violation.
     """
-    group_idx = wp.tid()
-    art = group_to_art[group_idx]
+    k = mimic_indices[wp.tid()]
+    art = mimic_articulation[k]
+    group_idx = articulation_group_index[art]
     world = art_to_world[art]
     dof_start = articulation_dof_start[art]
+    slot = mimic_slot[k]
+    if slot < 0:
+        return
 
-    for m in range(mimic_art_start[art], mimic_art_start[art + 1]):
-        k = mimic_art_list[m]
-        slot = mimic_slot[k]
-        if slot < 0:
-            continue
+    c0 = mimic_coef0[k]
+    c1 = mimic_coef1[k]
 
-        c0 = mimic_coef0[k]
-        c1 = mimic_coef1[k]
+    # Jacobian: +1 on the follower DOF, -coef1 on the leader DOF. The two
+    # DOFs are guaranteed distinct by the host-side validity mask.
+    J_group[group_idx, slot, mimic_dof0[k] - dof_start] = 1.0
+    J_group[group_idx, slot, mimic_dof1[k] - dof_start] = -c1
 
-        # Jacobian: +1 on the follower DOF, -coef1 on the leader DOF. The two
-        # DOFs are guaranteed distinct by the host-side validity mask.
-        J_group[group_idx, slot, mimic_dof0[k] - dof_start] = 1.0
-        J_group[group_idx, slot, mimic_dof1[k] - dof_start] = -c1
-
-        world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_MIMIC
-        world_row_parent[world, slot] = -1
-        world_row_mu[world, slot] = 0.0
-        world_row_beta[world, slot] = pgs_beta
-        world_row_cfm[world, slot] = pgs_cfm
-        world_phi[world, slot] = joint_q[mimic_q0[k]] - c1 * joint_q[mimic_q1[k]] - c0
-        world_target_velocity[world, slot] = 0.0
+    world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_MIMIC
+    world_row_parent[world, slot] = -1
+    world_row_mu[world, slot] = 0.0
+    world_row_beta[world, slot] = pgs_beta
+    world_row_cfm[world, slot] = pgs_cfm
+    world_phi[world, slot] = joint_q[mimic_q0[k]] - c1 * joint_q[mimic_q1[k]] - c0
+    world_target_velocity[world, slot] = 0.0
 
 
 # =============================================================================
@@ -5286,8 +5355,9 @@ def finalize_world_constraint_counts(
     slots_per_contact: int,
     # outputs
     world_constraint_count: wp.array[int],
+    cleanup_constraint_count: wp.array[int],
 ):
-    """Copy and clamp the slot counter to constraint counts.
+    """Clamp the slot counter and snapshot both row-count consumers.
 
     When the atomic slot counter exceeds ``max_constraints``, clamping can
     leave "gap" slots that were reserved by a rejected contact but never
@@ -5304,6 +5374,7 @@ def finalize_world_constraint_counts(
     if count > max_constraints:
         count = max_constraints
     world_constraint_count[world] = count
+    cleanup_constraint_count[world] = count
 
 
 @wp.kernel
@@ -5535,11 +5606,11 @@ def compute_world_contact_bias(
 
 
 @wp.kernel
-def apply_world_contact_restitution_matrix_free(
+def compute_world_contact_bias_restitution_matrix_free(
     world_constraint_count: wp.array[int],
-    max_constraints: int,
     world_dof_count: wp.array[int],
     world_phi: wp.array2d[float],
+    world_row_beta: wp.array2d[float],
     world_row_type: wp.array2d[int],
     world_target_velocity: wp.array2d[float],
     world_row_restitution: wp.array2d[float],
@@ -5547,38 +5618,69 @@ def apply_world_contact_restitution_matrix_free(
     world_dof_indices: wp.array2d[int],
     world_J: wp.array3d[float],
     dt: float,
+    bias_scale: float,
+    contact_speculative_scale: float,
+    joint_limit_speculative_scale: float,
+    contact_w: float,
     restitution_velocity_threshold: float,
-    write_row_w: int,
-    # in/out
+    # outputs
     world_rhs: wp.array2d[float],
     world_row_w: wp.array2d[float],
 ):
-    """Replace a matrix-free contact bias with a one-shot restitution target."""
+    """Build matrix-free row bias and restitution with one active-row owner."""
     tid = wp.tid()
-    world = tid // max_constraints
-    i = tid - world * max_constraints
-    if i >= world_constraint_count[world]:
+    world = tid // 32
+    lane = tid - world * 32
+    if world >= world_constraint_count.shape[0]:
         return
-    if world_row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
-        return
+    row_count = world_constraint_count[world]
+    inv_dt = 1.0 / dt
+    for i in range(lane, row_count, 32):
+        phi = world_phi[world, i]
+        beta = world_row_beta[world, i]
+        row_type = world_row_type[world, i]
+        target_vel = world_target_velocity[world, i]
+        rhs = -target_vel
+        row_w = float(1.0)
 
-    restitution = world_row_restitution[world, i]
-    if restitution <= 0.0:
-        return
+        if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+            if phi <= 0.0:
+                rhs += bias_scale * beta * phi * inv_dt
+                row_w = contact_w
+            else:
+                rhs += contact_speculative_scale * phi * inv_dt
 
-    phi = world_phi[world, i]
-    target_vel = world_target_velocity[world, i]
-    relative_incident = (
-        world_contact_row_dot(world_dof_count, world_dof_indices, world_J, world_incident_velocity, world, i)
-        - target_vel
-    )
+            restitution = world_row_restitution[world, i]
+            if restitution > 0.0:
+                relative_incident = (
+                    world_contact_row_dot(
+                        world_dof_count,
+                        world_dof_indices,
+                        world_J,
+                        world_incident_velocity,
+                        world,
+                        i,
+                    )
+                    - target_vel
+                )
+                if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
+                    # Matrix-free GS adds live J*v itself, so retain only the
+                    # velocity target and one-shot incident-speed response.
+                    rhs = -target_vel + restitution * relative_incident
+                    row_w = 1.0
+        elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
+            if phi < 0.0:
+                rhs += bias_scale * beta * phi * inv_dt
+            else:
+                rhs += joint_limit_speculative_scale * phi * inv_dt
+        elif row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+            rhs = 0.0
+        elif row_type == PGS_CONSTRAINT_TYPE_MIMIC or row_type == PGS_CONSTRAINT_TYPE_CONNECT:
+            rhs += bias_scale * beta * phi * inv_dt
 
-    if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
-        # Matrix-free GS adds live J*v itself, so store only
-        # -target + e*u_incident as the row bias.
-        world_rhs[world, i] = -target_vel + restitution * relative_incident
-        if write_row_w != 0:
-            world_row_w[world, i] = 1.0
+        world_rhs[world, i] = rhs
+        if contact_w < 1.0:
+            world_row_w[world, i] = row_w
 
 
 @wp.kernel
@@ -5951,7 +6053,6 @@ def gather_JY_to_world(
 @wp.kernel
 def diag_from_JY_world(
     world_constraint_count: wp.array[int],
-    local_solve_owner: wp.array[int],
     world_dof_count: wp.array[int],
     J_world: wp.array3d[float],
     Y_world: wp.array3d[float],
@@ -5965,37 +6066,11 @@ def diag_from_JY_world(
     world = tid // max_constraints
     if row >= world_constraint_count[world]:
         return
-    if local_solve_owner[world] != PGS_LOCAL_SOLVE_OWNER_GENERAL:
-        return
 
     value = float(0.0)
     for dof in range(world_dof_count[world]):
         value += J_world[world, row, dof] * Y_world[world, row, dof]
     world_diag[world, row] = value
-
-
-@wp.kernel
-def finalize_local_owner_world_diag(
-    world_constraint_count: wp.array[int],
-    local_solve_owner: wp.array[int],
-    world_dof_count: wp.array[int],
-    J_world: wp.array3d[float],
-    Y_world: wp.array3d[float],
-    world_row_cfm: wp.array2d[float],
-    # output
-    world_diag: wp.array2d[float],
-):
-    """Finalize each world diagonal according to its selected solve owner."""
-    world = wp.tid()
-    row_count = world_constraint_count[world]
-    dof_count = world_dof_count[world]
-    general = local_solve_owner[world] == PGS_LOCAL_SOLVE_OWNER_GENERAL
-    for row in range(row_count):
-        value = float(0.0)
-        if general:
-            for dof in range(dof_count):
-                value += J_world[world, row, dof] * Y_world[world, row, dof]
-        world_diag[world, row] = value + world_row_cfm[world, row]
 
 
 # =============================================================================
@@ -6044,6 +6119,7 @@ def _build_mf_contact_row(
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
     mf_phi: wp.array2d[float],
+    mf_impulses: wp.array2d[float],
     mf_target_velocity: wp.array2d[float],
     mf_row_restitution: wp.array2d[float],
 ):
@@ -6218,6 +6294,7 @@ def _build_mf_contact_row(
             mf_row_mu[world, row_idx] = mu
         else:
             mf_row_mu[world, row_idx] = friction_mu
+        mf_impulses[world, row_idx] = 0.0
         if has_target_velocity != 0:
             mf_target_velocity[world, row_idx] = prescribed_relative_contact_target(
                 body_a,
@@ -6274,6 +6351,7 @@ def build_mf_contact_rows(
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
     mf_phi: wp.array2d[float],
+    mf_impulses: wp.array2d[float],
     mf_target_velocity: wp.array2d[float],
     mf_row_restitution: wp.array2d[float],
 ):
@@ -6319,6 +6397,7 @@ def build_mf_contact_rows(
             mf_row_parent,
             mf_row_mu,
             mf_phi,
+            mf_impulses,
             mf_target_velocity,
             mf_row_restitution,
         )
@@ -6563,10 +6642,10 @@ def gather_mf_warmstart(
     impulses, matched by contact identity.
 
     Runs after ``allocate_world_contact_slots`` + ``build_mf_contact_rows`` (so
-    ``contact_slot`` and ``mf_row_type`` are populated for this step) and after
-    the warm-start branch has zeroed ``mf_impulses``. One thread per contact;
-    each writes only its own disjoint slot range, so unmatched / cold contacts
-    keep the zero left by the memset and no stale slot survives.
+    ``contact_slot`` and ``mf_row_type`` are populated for this step). The row
+    writers cold-start every active impulse slot before this kernel overwrites
+    matched contacts. One thread per contact writes only its own disjoint slot
+    range, so unmatched contacts remain zero and no stale slot survives.
 
     ``dt_scale`` = dt_now / dt_prev rescales carried impulses across step-size
     changes (impulse is proportional to dt for quasi-static loads); 1.0 at fixed dt.
@@ -6982,6 +7061,8 @@ def populate_rigid_velocity_limit_rows(
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
     mf_phi: wp.array2d[float],
+    mf_impulses: wp.array2d[float],
+    mf_target_velocity: wp.array2d[float],
 ):
     """Populate MF rows for rigid-body linear/angular velocity limits."""
     candidate = wp.tid()
@@ -7025,6 +7106,8 @@ def populate_rigid_velocity_limit_rows(
             # For velocity-limit rows mf_phi stores qdot_max; contact rows
             # use it as geometric gap. Row type disambiguates the meaning.
             mf_phi[world, slot] = limit
+            mf_impulses[world, slot] = 0.0
+            mf_target_velocity[world, slot] = 0.0
 
 
 @wp.func
@@ -10174,41 +10257,6 @@ def build_mf_body_map(
 
 
 @wp.kernel
-def compute_mf_world_dof_offsets(
-    mf_constraint_count: wp.array[int],
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    body_to_articulation: wp.array[int],
-    articulation_world_dof_offset: wp.array[int],
-    mf_max_constraints: int,
-    # outputs
-    mf_dof_a: wp.array2d[int],
-    mf_dof_b: wp.array2d[int],
-):
-    """Compute world-relative DOF offsets for each MF contact body.
-
-    For each MF constraint, stores the articulation's compact response
-    offset. The two-phase GS kernel uses these offsets to index its shared
-    velocity vector.
-    """
-    tid = wp.tid()
-    world = tid // mf_max_constraints
-    c = tid % mf_max_constraints
-    if c >= mf_constraint_count[world]:
-        return
-    ba = mf_body_a[world, c]
-    bb = mf_body_b[world, c]
-    if ba >= 0:
-        mf_dof_a[world, c] = articulation_world_dof_offset[body_to_articulation[ba]]
-    else:
-        mf_dof_a[world, c] = -1
-    if bb >= 0:
-        mf_dof_b[world, c] = articulation_world_dof_offset[body_to_articulation[bb]]
-    else:
-        mf_dof_b[world, c] = -1
-
-
-@wp.kernel
 def pgs_solve_loop(
     world_constraint_count: wp.array[int],
     max_constraints: int,
@@ -10670,7 +10718,7 @@ def hinv_jt_par_row_contact_fallback(
 
 
 @wp.kernel
-def classify_local_solve_worlds(
+def classify_and_dispatch_local_solve_worlds(
     world_constraint_count: wp.array[int],
     dense_phase_bounds: wp.array2d[int],
     mf_constraint_count: wp.array[int],
@@ -10681,15 +10729,27 @@ def classify_local_solve_worlds(
     local_primary_articulation: wp.array[int],
     local_pair_articulation: wp.array[int],
     local_residual_pair_articulation: wp.array[int],
+    local_dispatch_routes: wp.array2d[int],
+    local_dispatch_offsets: wp.array[int],
     local_max_constraints: int,
     local_residual_max_constraints: int,
     local_residual_mf_max_constraints: int,
+    dense_register_max_constraints: int,
+    mf_register_dense_max_constraints: int,
+    register_max_constraints: int,
     # outputs
     local_solve_owner: wp.array[int],
-    general_world_count: wp.array[int],
-    general_worlds: wp.array[int],
+    local_dispatch_counts: wp.array[int],
+    local_dispatch_primary: wp.array[int],
+    local_dispatch_secondary: wp.array[int],
 ):
-    """Assign exact solver ownership and compact active general worlds."""
+    """Assign exact ownership and route every dynamic world in one pass.
+
+    Route zero owns the general-world queue. The remaining routes are static
+    topology buckets for paired and residual local solvers; columns in
+    ``local_dispatch_routes`` select pair, dense-residual, MF-residual, and
+    wide-residual routes respectively.
+    """
     world = wp.tid()
     row_count = world_constraint_count[world]
     mf_count = mf_constraint_count[world]
@@ -10725,82 +10785,47 @@ def classify_local_solve_worlds(
         and ((mf_count == 0 and not single_phase) or local_mf)
     ):
         owner = PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL
+
+    route = int(-1)
+    dispatch_primary = primary_articulation
+    dispatch_secondary = int(-1)
+    if owner == PGS_LOCAL_SOLVE_OWNER_GENERAL:
+        if row_count > 0 or mf_count > 0:
+            route = 0
+            dispatch_primary = world
+    elif owner == PGS_LOCAL_SOLVE_OWNER_PAIR:
+        route = local_dispatch_routes[world, 0]
+        dispatch_secondary = pair_articulation
+    elif owner == PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL:
+        route = local_dispatch_routes[world, 3]
+        if mf_count == 0 and row_count <= dense_register_max_constraints:
+            dense_route = local_dispatch_routes[world, 1]
+            if dense_route >= 0:
+                route = dense_route
+        elif (
+            mf_count > 0
+            and row_count <= mf_register_dense_max_constraints
+            and row_count + mf_count <= register_max_constraints
+        ):
+            mf_route = local_dispatch_routes[world, 2]
+            if mf_route >= 0:
+                route = mf_route
+        dispatch_secondary = residual_pair_articulation
+
+    # A missing topology route is an invalid local plan. Keep the world in the
+    # general solver instead of silently losing its constraints.
+    if route < 0 and owner != PGS_LOCAL_SOLVE_OWNER_SINGLE and (row_count > 0 or mf_count > 0):
+        owner = PGS_LOCAL_SOLVE_OWNER_GENERAL
+        route = 0
+        dispatch_primary = world
+        dispatch_secondary = -1
+
     local_solve_owner[world] = owner
-    if owner == PGS_LOCAL_SOLVE_OWNER_GENERAL and (row_count > 0 or mf_count > 0):
-        general_index = wp.atomic_add(general_world_count, 0, 1)
-        general_worlds[general_index] = world
-
-
-@wp.kernel
-def compact_local_pair_candidates(
-    candidate_articulations: wp.array[int],
-    candidate_secondary_articulations: wp.array[int],
-    articulation_world: wp.array[int],
-    local_solve_owner: wp.array[int],
-    expected_owner: int,
-    # outputs
-    active_count: wp.array[int],
-    active_articulations: wp.array[int],
-    active_secondary_articulations: wp.array[int],
-):
-    """Compact topology candidates that selected paired local ownership."""
-    candidate = wp.tid()
-    articulation = candidate_articulations[candidate]
-    world = articulation_world[articulation]
-    if local_solve_owner[world] == expected_owner:
-        active_index = wp.atomic_add(active_count, 0, 1)
-        active_articulations[active_index] = articulation
-        active_secondary_articulations[active_index] = candidate_secondary_articulations[candidate]
-
-
-@wp.kernel
-def compact_local_residual_candidates(
-    candidate_articulations: wp.array[int],
-    candidate_secondary_articulations: wp.array[int],
-    articulation_world: wp.array[int],
-    local_solve_owner: wp.array[int],
-    world_constraint_count: wp.array[int],
-    mf_constraint_count: wp.array[int],
-    dense_register_max_constraints: int,
-    mf_register_dense_max_constraints: int,
-    register_max_constraints: int,
-    # outputs
-    dense_active_count: wp.array[int],
-    dense_active_articulations: wp.array[int],
-    dense_active_secondary_articulations: wp.array[int],
-    mf_active_count: wp.array[int],
-    mf_active_articulations: wp.array[int],
-    mf_active_secondary_articulations: wp.array[int],
-    wide_active_count: wp.array[int],
-    wide_active_articulations: wp.array[int],
-    wide_active_secondary_articulations: wp.array[int],
-):
-    """Compact residual worlds by the row storage required by their solve."""
-    candidate = wp.tid()
-    articulation = candidate_articulations[candidate]
-    world = articulation_world[articulation]
-    if local_solve_owner[world] != PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL:
-        return
-
-    secondary_articulation = candidate_secondary_articulations[candidate]
-    dense_count = world_constraint_count[world]
-    mf_count = mf_constraint_count[world]
-    if mf_count == 0 and dense_count <= dense_register_max_constraints:
-        active_index = wp.atomic_add(dense_active_count, 0, 1)
-        dense_active_articulations[active_index] = articulation
-        dense_active_secondary_articulations[active_index] = secondary_articulation
-    elif (
-        mf_count > 0
-        and dense_count <= mf_register_dense_max_constraints
-        and dense_count + mf_count <= register_max_constraints
-    ):
-        active_index = wp.atomic_add(mf_active_count, 0, 1)
-        mf_active_articulations[active_index] = articulation
-        mf_active_secondary_articulations[active_index] = secondary_articulation
-    else:
-        active_index = wp.atomic_add(wide_active_count, 0, 1)
-        wide_active_articulations[active_index] = articulation
-        wide_active_secondary_articulations[active_index] = secondary_articulation
+    if route >= 0:
+        active_index = wp.atomic_add(local_dispatch_counts, route, 1)
+        dispatch_index = local_dispatch_offsets[route] + active_index
+        local_dispatch_primary[dispatch_index] = dispatch_primary
+        local_dispatch_secondary[dispatch_index] = dispatch_secondary
 
 
 @wp.kernel

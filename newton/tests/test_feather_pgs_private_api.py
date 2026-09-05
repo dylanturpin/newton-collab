@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 _TILED_KERNEL_HELPERS = (
-    "_get_pack_mf_meta_kernel",
+    "_get_prepare_mf_solve_metadata_kernel",
     "_get_pgs_solve_mf_gs_kernel",
     "_get_crba_cholesky_warp_kernel",
     "_get_crba_cholesky_kernel",
@@ -77,6 +77,128 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
                 parameters = {arg.arg for arg in [*helper.args.posonlyargs, *helper.args.args, *helper.args.kwonlyargs]}
                 self.assertIn("cache", decorator_names)
                 self.assertIn("device_arch", parameters)
+
+    def test_mf_solve_metadata_has_one_preparation_owner(self):
+        """Do not restore the redundant DOF-offset handoff kernel."""
+        self.assertNotIn("compute_mf_world_dof_offsets", self.kernel_functions)
+        self.assertIn("_prepare_mf_solve_metadata", self.solver_methods)
+
+    def test_mf_setup_does_not_clear_active_row_outputs(self):
+        """Keep active-row ownership in the setup kernel instead of clearing full capacities."""
+        setup = self.solver_methods["_mf_pgs_setup"]
+        cleared = {
+            call.func.value.attr
+            for call in ast.walk(setup)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "zero_"
+            and isinstance(call.func.value, ast.Attribute)
+            and isinstance(call.func.value.value, ast.Name)
+            and call.func.value.value.id == "self"
+        }
+        self.assertTrue({"mf_rhs", "mf_eff_mass_inv"}.isdisjoint(cleared))
+
+    def test_mf_row_writers_own_active_initialization(self):
+        """Initialize solve state at active row writers instead of sweeping MF capacity."""
+        for kernel_name in ("_build_mf_contact_row", "build_mf_contact_rows", "populate_rigid_velocity_limit_rows"):
+            with self.subTest(kernel_name=kernel_name):
+                parameters = {argument.arg for argument in self.kernel_functions[kernel_name].args.args}
+                self.assertIn("mf_impulses", parameters)
+        velocity_limit_parameters = {
+            argument.arg for argument in self.kernel_functions["populate_rigid_velocity_limit_rows"].args.args
+        }
+        self.assertIn("mf_target_velocity", velocity_limit_parameters)
+
+        build = self.solver_methods["_stage4_build_rows"]
+        cleared = {
+            call.func.value.attr
+            for call in ast.walk(build)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "zero_"
+            and isinstance(call.func.value, ast.Attribute)
+            and isinstance(call.func.value.value, ast.Name)
+            and call.func.value.value.id == "self"
+        }
+        self.assertTrue({"mf_impulses", "mf_target_velocity"}.isdisjoint(cleared))
+
+    def test_world_diag_writer_owns_active_initialization(self):
+        """Let the active-row producer initialize world diagonals without a capacity clear."""
+        method = self.solver_methods["_stage4_compute_matrix_free_diag"]
+        top_level_clears = [
+            call
+            for statement in method.body
+            for call in ast.walk(statement)
+            if isinstance(statement, ast.Expr)
+            and isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "zero_"
+            and isinstance(call.func.value, ast.Attribute)
+            and call.func.value.attr == "diag"
+        ]
+        self.assertFalse(top_level_clears)
+
+        kernel = self.kernel_functions["diag_from_JY_world"]
+        owner_returns = [
+            node
+            for node in ast.walk(kernel)
+            if isinstance(node, ast.If)
+            and any(isinstance(child, ast.Name) and child.id == "local_solve_owner" for child in ast.walk(node.test))
+            and any(isinstance(child, ast.Return) for child in ast.walk(ast.Module(body=node.body, type_ignores=[])))
+        ]
+        self.assertFalse(owner_returns)
+
+    def test_local_solve_owners_build_their_effective_diagonal(self):
+        """Keep local effective diagonals inside the solver that consumes them."""
+        self.assertNotIn("finalize_local_owner_world_diag", self.kernel_functions)
+        for factory_name in ("_get_pgs_solve_local_owned_kernel", "_get_pgs_solve_mf_gs_kernel"):
+            with self.subTest(factory_name=factory_name):
+                nested_functions = [
+                    node
+                    for node in ast.walk(self.top_level_functions[factory_name])
+                    if isinstance(node, ast.FunctionDef)
+                ]
+                parameter_sets = [{argument.arg for argument in node.args.args} for node in nested_functions]
+                self.assertTrue(any("world_row_cfm" in parameters for parameters in parameter_sets))
+
+    def test_matrix_free_rhs_has_one_active_row_owner(self):
+        """Build matrix-free bias and restitution in one active-row pass."""
+        self.assertIn("compute_world_contact_bias_restitution_matrix_free", self.kernel_functions)
+        self.assertNotIn("apply_world_contact_restitution_matrix_free", self.kernel_functions)
+
+    def test_stage7_kinematics_uses_full_warp_blocks(self):
+        """Keep one articulation worker in every lane of a CUDA warp."""
+        method = self.solver_methods["_stage7_update_kinematics"]
+        launch = next(
+            call
+            for call in ast.walk(method)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "launch"
+            and call.args
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id == "eval_rigid_fk_kinematics"
+        )
+        block_dim = next(keyword.value for keyword in launch.keywords if keyword.arg == "block_dim")
+        self.assertIsInstance(block_dim, ast.Constant)
+        self.assertEqual(block_dim.value, 32)
+
+    def test_mimic_row_population_is_constraint_parallel(self):
+        """Keep independent mimic rows out of articulation-serial loops."""
+        kernel = self.kernel_functions["populate_mimic_J_for_size"]
+        parameters = {argument.arg for argument in kernel.args.args}
+        self.assertIn("mimic_indices", parameters)
+        self.assertIn("mimic_articulation", parameters)
+        self.assertIn("articulation_group_index", parameters)
+        self.assertNotIn("mimic_art_start", parameters)
+        self.assertNotIn("mimic_art_list", parameters)
+
+    def test_local_owner_classification_owns_dispatch(self):
+        """Do not restore post-classification candidate rescans."""
+        self.assertIn("classify_and_dispatch_local_solve_worlds", self.kernel_functions)
+        self.assertNotIn("classify_local_solve_worlds", self.kernel_functions)
+        self.assertNotIn("compact_local_pair_candidates", self.kernel_functions)
+        self.assertNotIn("compact_local_residual_candidates", self.kernel_functions)
 
     def test_launch_specific_dynamics_kernels_have_separate_compile_domains(self):
         for kernel_name, expected_module in _DYNAMICS_COMPILE_DOMAINS.items():

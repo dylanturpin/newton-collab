@@ -33,6 +33,7 @@ import newton
 from newton._src.solvers.feather_pgs.kernels import (
     apply_free_root_transport_to_predictor,
     integrate_generalized_joints,
+    integrate_generalized_joints_from_velocity,
     remove_free_root_transport_from_qdd,
 )
 from newton.solvers import SolverFeatherPGS
@@ -355,6 +356,66 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         np.testing.assert_allclose(state_aug.joint_qdd.numpy(), expected_qdd, rtol=1e-6, atol=1e-5)
         solver._stage6_integrate(state_in, state_aug, state_out, DT)
         np.testing.assert_allclose(state_out.joint_qd.numpy(), v_out_np, rtol=1e-6, atol=1e-6)
+
+    def test_velocity_conversion_and_integration_fusion_matches_reference(self):
+        """Match the existing staged handoff for dynamic and kinematic joints."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        inertia = wp.mat33(0.01, 0.0, 0.0, 0.0, 0.012, 0.0, 0.0, 0.0, 0.014)
+        root_body = builder.add_link(mass=1.0, com=wp.vec3(0.03, -0.02, 0.01), inertia=inertia)
+        root_joint = builder.add_joint_free(root_body)
+        builder.add_articulation([root_joint])
+        kinematic_body = builder.add_link(mass=1.0, inertia=inertia)
+        builder.body_flags[kinematic_body] = int(newton.BodyFlags.KINEMATIC)
+        kinematic_joint = builder.add_joint_revolute(
+            parent=-1,
+            child=kinematic_body,
+            axis=wp.vec3(0.0, 0.0, 1.0),
+        )
+        builder.add_articulation([kinematic_joint])
+        model = builder.finalize(device=wp.get_device())
+        solver = SolverFeatherPGS(model, angular_damping=0.03)
+
+        state_in = model.state()
+        reference_out = model.state()
+        reference_aug = solver._prepare_augmented_state(state_in, reference_out, model.control())
+        qd = np.array((0.4, -0.1, 0.2, 0.3, -0.5, 1.2, -0.7), dtype=np.float32)
+        target = np.array((0.2, 0.25, -0.15, -0.4, 0.8, 0.6, 3.0), dtype=np.float32)
+        state_in.joint_qd.assign(qd)
+        solver.v_out.assign(target)
+        solver._stage6_update_qdd(state_in, reference_aug, DT)
+        solver._stage6_integrate(state_in, reference_aug, reference_out, DT)
+
+        fused_velocity = wp.array(target, dtype=wp.float32, device=model.device)
+        fused_qdd = wp.zeros_like(state_in.joint_qd)
+        fused_q = wp.zeros_like(state_in.joint_q)
+        fused_qd = wp.zeros_like(state_in.joint_qd)
+        wp.launch(
+            integrate_generalized_joints_from_velocity,
+            dim=model.joint_count,
+            inputs=[
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                solver._kinematic_joint_mask,
+                model.joint_dof_dim,
+                model.body_com,
+                model.joint_X_c,
+                state_in.joint_q,
+                state_in.joint_qd,
+                DT,
+                1.0 / DT,
+                solver.angular_damping,
+            ],
+            outputs=[fused_velocity, fused_qdd, fused_q, fused_qd],
+            device=model.device,
+        )
+
+        np.testing.assert_allclose(fused_velocity.numpy(), solver.v_out.numpy(), rtol=1e-6, atol=1e-7)
+        np.testing.assert_allclose(fused_qdd.numpy(), reference_aug.joint_qdd.numpy(), rtol=1e-6, atol=1e-5)
+        np.testing.assert_allclose(fused_q.numpy(), reference_out.joint_q.numpy(), rtol=1e-6, atol=1e-7)
+        np.testing.assert_allclose(fused_qd.numpy(), reference_out.joint_qd.numpy(), rtol=1e-6, atol=1e-6)
 
     def test_compact_root_metadata_includes_standalone_joint(self):
         """Keep every world root, but no descendant, in the compact launch."""

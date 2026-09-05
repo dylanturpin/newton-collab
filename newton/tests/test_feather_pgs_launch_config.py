@@ -8,7 +8,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import hinv_jt_diagonal
+from newton._src.solvers.feather_pgs.kernels import finalize_world_constraint_counts, hinv_jt_diagonal
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
@@ -16,6 +16,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _estimate_hinv_jt_shared_memory,
     _FeatherPGSExecutionPlan,
     _get_hinv_jt_diagonal_warp_kernel,
+    _get_prepare_mf_solve_metadata_kernel,
     _get_triangular_solve_kernel,
     _select_hinv_jt_chunk_size,
     _use_resident_mfgs_metadata,
@@ -95,12 +96,116 @@ def _build_heterogeneous_world_model():
 
 
 class TestFeatherPGSLaunchConfig(unittest.TestCase):
+    def test_constraint_count_finalization_snapshots_cleanup_bounds(self):
+        """Publish identical solve and asynchronous-cleanup row counts."""
+        device = wp.get_device()
+        slot_counter = wp.array((3, 8, 11), dtype=wp.int32, device=device)
+        constraint_count = wp.zeros(3, dtype=wp.int32, device=device)
+        cleanup_count = wp.full(3, -1, dtype=wp.int32, device=device)
+        wp.launch(
+            finalize_world_constraint_counts,
+            dim=3,
+            inputs=[slot_counter, 8, 3],
+            outputs=[constraint_count, cleanup_count],
+            device=device,
+        )
+        expected = np.array((3, 8, 8), dtype=np.int32)
+        np.testing.assert_array_equal(constraint_count.numpy(), expected)
+        np.testing.assert_array_equal(cleanup_count.numpy(), expected)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "packed MF metadata requires CUDA")
+    def test_mf_solve_metadata_preparation_resolves_offsets_and_packs_rows(self):
+        """Resolve each active row once into both scalar and packed layouts."""
+        device = wp.get_device("cuda:0")
+        max_constraints = 64
+        counts = wp.array((2, 1), dtype=wp.int32, device=device)
+        body_a_np = np.full((2, max_constraints), -1, dtype=np.int32)
+        body_b_np = np.full((2, max_constraints), -1, dtype=np.int32)
+        body_a_np[0, :2] = (0, 1)
+        body_a_np[1, 0] = 1
+        body_b_np[0, 0] = 1
+        body_b_np[1, 0] = 0
+        body_a = wp.array(body_a_np, device=device)
+        body_b = wp.array(body_b_np, device=device)
+        body_to_articulation = wp.array((0, 1), dtype=wp.int32, device=device)
+        world_dof_offsets = wp.array((3, 11), dtype=wp.int32, device=device)
+        effective_mass_np = np.zeros((2, max_constraints), dtype=np.float32)
+        rhs_np = np.zeros((2, max_constraints), dtype=np.float32)
+        row_type_np = np.zeros((2, max_constraints), dtype=np.int32)
+        row_parent_np = np.full((2, max_constraints), -1, dtype=np.int32)
+        effective_mass_np[0, :2] = (0.25, 1.5)
+        effective_mass_np[1, 0] = 2.0
+        rhs_np[0, :2] = (-0.5, 4.0)
+        rhs_np[1, 0] = 0.125
+        row_type_np[0, :2] = (2, 3)
+        row_type_np[1, 0] = 4
+        row_parent_np[0, :2] = (0, 1)
+        row_parent_np[1, 0] = 2
+        effective_mass = wp.array(effective_mass_np, device=device)
+        rhs = wp.array(rhs_np, device=device)
+        row_type = wp.array(row_type_np, device=device)
+        row_parent = wp.array(row_parent_np, device=device)
+        dof_a = wp.full((2, max_constraints), -77, dtype=wp.int32, device=device)
+        dof_b = wp.full((2, max_constraints), -77, dtype=wp.int32, device=device)
+        packed = wp.full((2, max_constraints * 4), -99, dtype=wp.int32, device=device)
+
+        kernel = _get_prepare_mf_solve_metadata_kernel(max_constraints, device.arch)
+        wp.launch_tiled(
+            kernel,
+            dim=[2],
+            inputs=[
+                counts,
+                body_a,
+                body_b,
+                body_to_articulation,
+                world_dof_offsets,
+                effective_mass,
+                rhs,
+                row_type,
+                row_parent,
+            ],
+            outputs=[dof_a, dof_b, packed],
+            block_dim=32,
+            device=device,
+        )
+
+        np.testing.assert_array_equal(dof_a.numpy()[:, :2], ((3, 11), (11, -77)))
+        np.testing.assert_array_equal(dof_b.numpy()[:, :2], ((11, -1), (3, -77)))
+        expected = np.full((2, max_constraints * 4), -99, dtype=np.int32)
+        expected[0, :8] = (
+            (3 << 16) | 11,
+            np.float32(0.25).view(np.int32),
+            np.float32(-0.5).view(np.int32),
+            2,
+            (11 << 16) | 0xFFFF,
+            np.float32(1.5).view(np.int32),
+            np.float32(4.0).view(np.int32),
+            3 | (1 << 16),
+        )
+        expected[1, :4] = (
+            (11 << 16) | 3,
+            np.float32(2.0).view(np.int32),
+            np.float32(0.125).view(np.int32),
+            4 | (2 << 16),
+        )
+        np.testing.assert_array_equal(packed.numpy(), expected)
+
     def test_defaults_preserved(self):
         model = newton.ModelBuilder().finalize()
         solver = SolverFeatherPGS(model)
         self.assertEqual(solver.serial_kernel_block_dim, 256)
         self.assertEqual(solver.tile_threads, 64)
         self.assertEqual(solver.articulated_contact_response, "immediate")
+
+    def test_stage3_snapshots_are_debug_only(self):
+        model = _build_chain_model(num_links=1, num_worlds=1)
+        production_solver = SolverFeatherPGS(model)
+        debug_solver = SolverFeatherPGS(model, pgs_debug=True)
+
+        for name in ("_debug_stage3_qd_work", "_debug_stage3_joint_qdd", "_debug_stage3_v_hat"):
+            with self.subTest(name=name):
+                self.assertIsNone(getattr(production_solver, name))
+                self.assertIsNotNone(getattr(debug_solver, name))
 
     def test_articulated_contact_response_validation(self):
         model = _build_chain_model(num_links=2, num_worlds=1)

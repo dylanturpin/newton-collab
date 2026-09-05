@@ -13,10 +13,8 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
     accumulate_group_diag_worlds,
-    finalize_local_owner_world_diag,
     prepare_fused_diagonal_joint_limits,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSExecutionPlan, _get_hinv_jt_kernel
@@ -177,37 +175,6 @@ def _run_mixed_response(
 
 
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
-    @unittest.skipUnless(wp.is_cuda_available(), "local-owner diagonal finalization requires CUDA")
-    def test_local_owner_diagonal_finalization_computes_only_general_response(self):
-        """Add response only for general worlds while preserving every row CFM."""
-        device = wp.get_device("cuda:0")
-        counts = wp.array([2, 2], dtype=wp.int32, device=device)
-        owners = wp.array([PGS_LOCAL_SOLVE_OWNER_PAIR, PGS_LOCAL_SOLVE_OWNER_GENERAL], dtype=wp.int32, device=device)
-        dof_counts = wp.array([2, 2], dtype=wp.int32, device=device)
-        jacobian_np = np.array([[[1.0, 2.0], [3.0, 4.0]], [[0.5, -1.0], [2.0, 0.25]]], dtype=np.float32)
-        response_np = np.array([[[5.0, 6.0], [7.0, 8.0]], [[1.5, 2.0], [-0.5, 4.0]]], dtype=np.float32)
-        cfm_np = np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32)
-        diagonal = wp.zeros((2, 2), dtype=wp.float32, device=device)
-
-        wp.launch(
-            finalize_local_owner_world_diag,
-            dim=2,
-            inputs=[
-                counts,
-                owners,
-                dof_counts,
-                wp.array(jacobian_np, device=device),
-                wp.array(response_np, device=device),
-                wp.array(cfm_np, device=device),
-            ],
-            outputs=[diagonal],
-            device=device,
-        )
-
-        expected = cfm_np.copy()
-        expected[1] += np.sum(jacobian_np[1] * response_np[1], axis=1)
-        np.testing.assert_allclose(diagonal.numpy(), expected, rtol=0.0, atol=1.0e-6)
-
     @unittest.skipUnless(wp.is_cuda_available(), "fused diagonal limits require CUDA")
     def test_fused_diagonal_limits_match_dense_rows(self):
         """Match ordinary lower/upper rows when limits precede a coupled contact."""
@@ -405,6 +372,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     wp.zeros((1, max_world_dofs), dtype=wp.int32, device=device),
                     wp.array(rhs_np, device=device),
                     wp.array(diag_np, device=device),
+                    wp.full((1, max_constraints), cfm, dtype=wp.float32, device=device),
                     float_rows,
                     impulses,
                     wp.array(dense_jacobian_np if sparse else jacobian_np, device=device),
@@ -723,6 +691,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         mf_constraint_count = wp.zeros(1, dtype=wp.int32, device=device)
         mf_contact_rows_end = wp.zeros(1, dtype=wp.int32, device=device)
         world_constraint_count = wp.zeros(1, dtype=wp.int32, device=device)
+        cleanup_constraint_count = wp.zeros(1, dtype=wp.int32, device=device)
         triple_eligible = wp.zeros(1, dtype=wp.int32, device=device)
         mixed_world_count = wp.zeros(1, dtype=wp.int32, device=device)
         mixed_worlds = wp.zeros(1, dtype=wp.int32, device=device)
@@ -743,6 +712,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             ],
             outputs=[
                 world_constraint_count,
+                cleanup_constraint_count,
                 triple_eligible,
                 mixed_world_count,
                 mixed_worlds,
@@ -753,6 +723,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         )
 
         self.assertEqual(int(world_constraint_count.numpy()[0]), 6)
+        self.assertEqual(int(cleanup_constraint_count.numpy()[0]), 6)
         self.assertEqual(int(triple_eligible.numpy()[0]), 0)
         self.assertEqual(int(mixed_world_count.numpy()[0]), 0)
         self.assertEqual(int(fallback_world_count.numpy()[0]), 1)
