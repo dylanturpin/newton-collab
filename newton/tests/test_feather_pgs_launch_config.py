@@ -8,6 +8,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import kernels as feather_pgs_kernels
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
@@ -70,6 +71,23 @@ def _build_heterogeneous_world_model():
 
 
 class TestFeatherPGSLaunchConfig(unittest.TestCase):
+    def test_launch_geometry_kernels_use_dedicated_modules(self):
+        """Keep custom-block-dimension kernels out of the general module."""
+        expected_modules = {
+            "update_articulation_origins": "kinematics",
+            "eval_rigid_fk": "kinematics",
+            "eval_rigid_id": "kinematics",
+            "eval_rigid_tau": "inverse_dynamics",
+            "compute_composite_inertia": "mass_dynamics",
+            "crba_fill_par_dof": "mass_dynamics",
+        }
+        general_module = feather_pgs_kernels.__name__
+        for kernel_name, module_suffix in expected_modules.items():
+            with self.subTest(kernel=kernel_name):
+                kernel_module = getattr(feather_pgs_kernels, kernel_name).module.name
+                self.assertNotEqual(kernel_module, general_module)
+                self.assertEqual(kernel_module, f"{general_module}.{module_suffix}")
+
     def test_defaults_preserved(self):
         model = newton.ModelBuilder().finalize()
         solver = SolverFeatherPGS(model)
