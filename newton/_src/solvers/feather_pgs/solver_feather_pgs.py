@@ -131,6 +131,7 @@ from .kernels import (
     hinv_jt_par_row,
     hinv_jt_par_row_contact_fallback,
     integrate_generalized_joints,
+    invalidate_articulation_fk_id_cache,
     local_solve_launch_gate,
     pack_contact_linear_force_as_spatial,
     pgs_convergence_diagnostic_velocity,
@@ -1373,6 +1374,15 @@ class SolverFeatherPGS(SolverBase):
         # _stage1_crba call; gates the per-step H memsets (see _stage1_crba).
         self._mass_update_global_flag = True
         self._last_step_dt = None
+        self._fk_id_cache_enabled = bool(
+            model.device.is_cuda
+            and model.articulation_count
+            and model.joint_count
+            and not model.requires_grad
+            and not enable_joint_velocity_limits
+        )
+        self._fk_id_cache_source_state = None
+        self._fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
 
         self._model_plan: _FeatherPGSModelPlan | None = None
         self._kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
@@ -1814,6 +1824,14 @@ class SolverFeatherPGS(SolverBase):
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes."""
+        if self._fk_id_cache_enabled and flags & (
+            ModelFlags.JOINT_PROPERTIES
+            | ModelFlags.JOINT_DOF_PROPERTIES
+            | ModelFlags.BODY_PROPERTIES
+            | ModelFlags.BODY_INERTIAL_PROPERTIES
+            | ModelFlags.MODEL_PROPERTIES
+        ):
+            self._fk_id_cache_valid.zero_()
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
             self._update_kinematic_state()
             self._scatter_armature_to_groups()
@@ -1845,17 +1863,18 @@ class SolverFeatherPGS(SolverBase):
         world_mask: wp.array | None = None,
         flags: StateFlags | int | None = None,
     ) -> None:
-        """Clear persistent warm-start state for reset worlds.
+        """Invalidate cached dynamics and clear warm-start state for reset worlds.
 
-        The authored simulation state is preserved. Only solver-owned dense
-        matrix-free, and propagation impulse history is cleared.
+        The authored simulation state is preserved. Solver-owned state derived
+        from it, along with dense, matrix-free, and propagation impulse history,
+        is cleared.
 
         Args:
             state: Simulation state, which is left unchanged.
             world_mask: Optional per-world reset mask. ``None`` resets every world.
             flags: State flags, which do not affect solver-owned impulse history.
         """
-        del state, flags
+        del flags
         if world_mask is not None and world_mask.shape[0] != self.world_count:
             raise ValueError(
                 f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per world)."
@@ -1863,7 +1882,23 @@ class SolverFeatherPGS(SolverBase):
         if self.world_count == 0:
             return
 
+        if self._fk_id_cache_enabled:
+            wp.launch(
+                invalidate_articulation_fk_id_cache,
+                dim=self.model.articulation_count,
+                inputs=[world_mask, self.art_to_world],
+                outputs=[self._fk_id_cache_valid],
+                device=self.model.device,
+            )
+
         prev_mf_impulses = self._ws_prev_mf_impulses
+        if (
+            self._fk_id_cache_enabled
+            and self._fk_id_cache_source_state is not None
+            and state is not self._fk_id_cache_source_state
+        ):
+            self._fk_id_cache_valid.zero_()
+            self._fk_id_cache_source_state = state
         if not self.pgs_warmstart and prev_mf_impulses is None:
             return
 
@@ -6307,6 +6342,8 @@ class SolverFeatherPGS(SolverBase):
             self._last_step_dt = dt
         elif abs(self._last_step_dt - dt) > 1.0e-8:
             self._force_mass_update = True
+            if self._fk_id_cache_enabled:
+                self._fk_id_cache_valid.zero_()
             self._last_step_dt = dt
         else:
             self._last_step_dt = dt
@@ -7377,7 +7414,12 @@ class SolverFeatherPGS(SolverBase):
         model = self.model
 
         # evaluate joint inertias, motion vectors, and forces
-        state_aug.body_f_s.zero_()
+        if self._fk_id_cache_enabled:
+            if self._fk_id_cache_source_state is not None and state_in is not self._fk_id_cache_source_state:
+                self._fk_id_cache_valid.zero_()
+            self._fk_id_cache_source_state = state_in
+        else:
+            state_aug.body_f_s.zero_()
         if self.enable_joint_velocity_limits:
             wp.copy(self.qd_work, state_in.joint_qd)
             wp.launch(
@@ -7427,6 +7469,7 @@ class SolverFeatherPGS(SolverBase):
                 self.is_free_rigid,
                 int(refresh_composite and not parallel_global_refresh),
                 int(parallel_global_refresh),
+                int(self._fk_id_cache_enabled),
                 model.gravity,
             ],
             outputs=[
@@ -7439,6 +7482,7 @@ class SolverFeatherPGS(SolverBase):
                 state_aug.body_v_s,
                 state_aug.body_f_s,
                 state_aug.body_a_s,
+                self._fk_id_cache_valid,
             ],
             block_dim=16,
             device=model.device,
@@ -7452,7 +7496,7 @@ class SolverFeatherPGS(SolverBase):
             global_inertia_ready = inertia_stream.record_event()
         elif self._parallel_composite_inertia and refresh_composite:
             self._launch_parallel_composite_inertia(state_aug.body_I_s)
-        if model.body_count:
+        if model.body_count and not self._fk_id_cache_enabled:
             wp.launch(
                 update_body_qd_from_featherstone,
                 dim=model.body_count,
@@ -9911,8 +9955,7 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-            # FPGS stores state_out.joint_qd in Newton's public COM/world convention.
-            eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+            self._stage7_update_kinematics(state_out, state_aug)
 
         self.integrate_particles(model, state_in, state_out, dt)
 
@@ -9979,7 +10022,73 @@ class SolverFeatherPGS(SolverBase):
             )
             self._remove_free_root_transport(state_in, state_aug)
             wp.copy(state_out.joint_qd, self.v_out)
+            self._stage7_update_kinematics(state_out, state_aug)
+
+    def _stage7_update_kinematics(self, state_out: State, state_aug: State) -> None:
+        """Publish kinematics and prepare reusable inverse dynamics for the next step."""
+        model = self.model
+        if not self._fk_id_cache_enabled:
             eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+            return
+
+        next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
+        parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
+        wp.launch(
+            eval_rigid_fk_id,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self.articulation_joint_end,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_out.joint_q,
+                state_out.joint_qd,
+                model.joint_X_p,
+                model.joint_X_c,
+                self.body_X_com,
+                model.joint_axis,
+                model.joint_dof_dim,
+                model.body_com,
+                model.body_mass,
+                model.body_inertia,
+                self.is_free_rigid,
+                int(next_refresh and not parallel_next_refresh),
+                int(parallel_next_refresh),
+                0,
+                model.gravity,
+            ],
+            outputs=[
+                state_out.body_q,
+                state_aug.body_q_com,
+                self.articulation_origin,
+                state_aug.joint_S_s,
+                state_aug.body_I_s,
+                self._body_inertia_terms,
+                state_aug.body_v_s,
+                state_aug.body_f_s,
+                state_aug.body_a_s,
+                self._fk_id_cache_valid,
+            ],
+            block_dim=16,
+            device=model.device,
+        )
+        wp.launch(
+            update_body_qd_from_featherstone,
+            dim=model.body_count,
+            inputs=[
+                state_aug.body_v_s,
+                state_out.body_q,
+                model.body_com,
+                self.body_to_articulation,
+                self.articulation_origin,
+            ],
+            outputs=[state_out.body_qd],
+            device=model.device,
+        )
+        self._fk_id_cache_source_state = state_out
 
 
 @cache
