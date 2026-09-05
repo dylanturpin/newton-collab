@@ -74,6 +74,47 @@ def _build_fixed_base_star_model(num_branches=16, num_worlds=2):
     return main.finalize()
 
 
+def _build_sparse_diagonal_pair_model(num_branches=16, num_worlds=2, *, device=None):
+    """Build one independent fixed-base star and one compact serial chain per world."""
+    scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    base = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    star_joints = [scene.add_joint_fixed(parent=-1, child=base)]
+    for branch in range(num_branches):
+        child = scene.add_link(mass=1.0 + 0.01 * branch, inertia=wp.mat33(np.eye(3)))
+        star_joints.append(
+            scene.add_joint_prismatic(
+                parent=base,
+                child=child,
+                axis=newton.Axis.Z,
+                parent_xform=wp.transform(wp.vec3(0.03 * branch, 0.0, 0.0), wp.quat_identity()),
+                limit_lower=-0.1,
+                limit_upper=0.1,
+            )
+        )
+    scene.add_articulation(star_joints)
+
+    chain_joints = []
+    parent = -1
+    for _link_index in range(3):
+        child = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        chain_joints.append(
+            scene.add_joint_revolute(
+                parent=parent,
+                child=child,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+                limit_lower=-0.2,
+                limit_upper=0.2,
+            )
+        )
+        parent = child
+    scene.add_articulation(chain_joints)
+
+    replicated = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    replicated.replicate(scene, num_worlds, spacing=(3.0, 3.0, 0.0))
+    return replicated.finalize(device=device)
+
+
 def _build_heterogeneous_world_model():
     free_template = newton.ModelBuilder()
     free_body = free_template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
@@ -368,6 +409,60 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         for diagonal, dense in zip(*trajectories, strict=True):
             np.testing.assert_allclose(diagonal[0], dense[0], rtol=0.0, atol=2.0e-6)
             np.testing.assert_allclose(diagonal[1], dense[1], rtol=0.0, atol=2.0e-6)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal response requires CUDA")
+    def test_sparse_diagonal_response_matches_dense_joint_limits(self):
+        """Match dense position-limit rows while removing the wide response storage."""
+        model = _build_sparse_diagonal_pair_model(device="cuda:0")
+        optimized = SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            dense_max_constraints=64,
+            mf_max_constraints=32,
+            pgs_iterations=8,
+            enable_joint_limits=True,
+        )
+        reference = SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            dense_max_constraints=64,
+            mf_max_constraints=32,
+            pgs_iterations=8,
+            enable_joint_limits=True,
+            use_parallel_streams=False,
+        )
+
+        self.assertTrue(optimized._sparse_diagonal_contact_solve)
+        self.assertEqual(optimized._sparse_diagonal_response_size, 16)
+        self.assertEqual(optimized._sparse_diagonal_dense_size, 3)
+        self.assertEqual(optimized.H_by_size[16].shape, (1, 1, 1))
+        self.assertEqual(optimized.J_by_size[16].shape, (1, 1, 1))
+        self.assertEqual(optimized.J_world.shape, (1, 1, 1))
+        self.assertFalse(reference._sparse_diagonal_contact_solve)
+
+        q = np.tile(np.concatenate((np.full(16, -0.105), np.full(3, 0.205))).astype(np.float32), 2)
+        qd = np.tile(np.concatenate((np.full(16, -0.2), np.full(3, 0.1))).astype(np.float32), 2)
+        trajectories = []
+        for solver in (optimized, reference):
+            state_in, state_out = model.state(), model.state()
+            state_in.joint_q.assign(q)
+            state_in.joint_qd.assign(qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            control = model.control()
+            history = []
+            for _ in range(3):
+                state_in.clear_forces()
+                solver.step(state_in, state_out, control, None, 1.0 / 120.0)
+                state_in, state_out = state_out, state_in
+                history.append((state_in.joint_q.numpy().copy(), state_in.joint_qd.numpy().copy()))
+            trajectories.append(history)
+
+        first_q, first_qd = trajectories[0][0]
+        np.testing.assert_allclose(first_q.reshape(2, 19)[:, :16], -0.104, rtol=0.0, atol=2.0e-6)
+        np.testing.assert_allclose(first_qd.reshape(2, 19)[:, :16], 0.12, rtol=0.0, atol=2.0e-6)
+        for sparse, dense in zip(*trajectories, strict=True):
+            np.testing.assert_allclose(sparse[0], dense[0], rtol=2.0e-5, atol=2.0e-6)
+            np.testing.assert_allclose(sparse[1], dense[1], rtol=2.0e-5, atol=2.0e-6)
 
     @unittest.skipUnless(wp.is_cuda_available(), "topology-owned CRBA requires CUDA")
     def test_topology_owned_crba_matches_generic_trajectory(self):

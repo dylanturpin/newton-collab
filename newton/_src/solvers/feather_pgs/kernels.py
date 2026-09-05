@@ -1867,6 +1867,96 @@ def factor_diagonal_mass(
 
 
 @wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+def compute_compact_diagonal_inverse_mass(
+    articulation_start: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    mass_update_mask: wp.array[int],
+    joint_child: wp.array[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_I_c: wp.array[wp.spatial_matrix],
+    group_to_art: wp.array[int],
+    dof_joint_offset: wp.array[int],
+    armature: wp.array2d[float],
+    drive_row_by_dof: wp.array[int],
+    drive_row_K: wp.array[float],
+    n_dofs: int,
+    # output
+    diagonal_inverse_mass: wp.array[float],
+):
+    """Build an inverse diagonal directly from independent articulation branches."""
+    element = wp.tid()
+    group = element // n_dofs
+    dof = element - group * n_dofs
+    art = group_to_art[group]
+    if mass_update_mask[art] == 0:
+        return
+
+    global_dof = articulation_dof_start[art] + dof
+    joint = articulation_start[art] + dof_joint_offset[dof]
+    motion = joint_S_s[global_dof]
+    mass = wp.dot(motion, body_I_c[joint_child[joint]] * motion) + armature[group, dof]
+    drive_row = drive_row_by_dof[global_dof]
+    if drive_row >= 0:
+        stiffness = drive_row_K[drive_row]
+        if stiffness > 0.0:
+            mass += stiffness
+    diagonal_inverse_mass[global_dof] = 1.0 / mass
+
+
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+def prepare_fused_diagonal_joint_limits(
+    world_dof_indices: wp.array2d[int],
+    max_world_dofs: int,
+    fused_limit_dof_mask: wp.array[int],
+    limit_q_index: wp.array[int],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    joint_q: wp.array[float],
+    activation_gap: float,
+    pgs_beta: float,
+    dt: float,
+    # outputs
+    active_sides: wp.array2d[int],
+    lower_rhs: wp.array2d[float],
+    upper_rhs: wp.array2d[float],
+):
+    """Prepare independent diagonal-articulation limit projections per world coordinate."""
+    element = wp.tid()
+    world = element // max_world_dofs
+    local_dof = element - world * max_world_dofs
+    global_dof = world_dof_indices[world, local_dof]
+
+    active = int(0)
+    rhs_lower = float(0.0)
+    rhs_upper = float(0.0)
+    if global_dof >= 0 and fused_limit_dof_mask[global_dof] != 0:
+        q_index = limit_q_index[global_dof]
+        if q_index >= 0:
+            q = joint_q[q_index]
+            lower = joint_limit_lower[global_dof]
+            upper = joint_limit_upper[global_dof]
+            inv_dt = 1.0 / dt
+            if wp.isfinite(lower) and q <= lower + activation_gap:
+                phi = q - lower
+                scale = 1.0
+                if phi < 0.0:
+                    scale = pgs_beta
+                rhs_lower = scale * phi * inv_dt
+                active |= 1
+            if wp.isfinite(upper) and q >= upper - activation_gap:
+                phi = upper - q
+                scale = 1.0
+                if phi < 0.0:
+                    scale = pgs_beta
+                rhs_upper = scale * phi * inv_dt
+                active |= 2
+
+    active_sides[world, local_dof] = active
+    lower_rhs[world, local_dof] = rhs_lower
+    upper_rhs[world, local_dof] = rhs_upper
+
+
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
 def solve_diagonal_mass(
     L_group: wp.array3d[float],
     group_to_art: wp.array[int],
@@ -1885,6 +1975,25 @@ def solve_diagonal_mass(
     diagonal = L_group[group, dof, dof]
     value = joint_tau[global_dof] / diagonal
     joint_qdd[global_dof] = value / diagonal
+
+
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+def solve_compact_diagonal_mass(
+    diagonal_inverse_mass: wp.array[float],
+    group_to_art: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    n_dofs: int,
+    joint_tau: wp.array[float],
+    # output
+    joint_qdd: wp.array[float],
+):
+    """Apply a directly stored inverse diagonal to generalized forces."""
+    element = wp.tid()
+    group = element // n_dofs
+    dof = element - group * n_dofs
+    art = group_to_art[group]
+    global_dof = articulation_dof_start[art] + dof
+    joint_qdd[global_dof] = joint_tau[global_dof] * diagonal_inverse_mass[global_dof]
 
 
 @wp.func
@@ -4351,6 +4460,232 @@ def populate_world_J_for_compact_size(
                 J_group[group_a, slot, local_dof] = value_a
         if group_b >= 0 and group_b != group_a:
             J_group[group_b, slot, local_dof] = value_b
+
+
+@wp.kernel
+def clear_sparse_diagonal_response_prefix(
+    dense_phase_bounds: wp.array2d[int],
+    # in/out
+    sparse_row_dof: wp.array3d[int],
+):
+    """Remove stale sparse entries from the non-contact row prefix."""
+    world = wp.tid()
+    for row in range(dense_phase_bounds[world, 1]):
+        sparse_row_dof[world, row, 0] = -1
+        sparse_row_dof[world, row, 1] = -1
+
+
+@wp.kernel
+def populate_sparse_diagonal_contact_response(
+    contact_count: wp.array[int],
+    total_num_workers: int,
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    target_size: int,
+    articulation_response_dof_count: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    body_single_response_dof: wp.array[int],
+    diagonal_inverse_mass: wp.array[float],
+    joint_S_s: wp.array[wp.spatial_vector],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    contact_friction_shared_anchor: int,
+    contact_shared_anchor: int,
+    # outputs
+    sparse_row_dof: wp.array3d[int],
+    sparse_row_jy: wp.array3d[float],
+):
+    """Build exact ``dense + two sparse`` contact responses for an independent articulation."""
+    worker = wp.tid()
+    total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+    for c in range(worker, total_contacts, total_num_workers):
+        slot = contact_slot[c]
+        if contact_path[c] != 0 or slot < 0:
+            continue
+
+        shape_a = contact_shape0[c]
+        shape_b = contact_shape1[c]
+        body_a = -1
+        body_b = -1
+        if shape_a >= 0:
+            body_a = shape_body[shape_a]
+        if shape_b >= 0:
+            body_b = shape_body[shape_b]
+
+        normal = -contact_normal[c]
+        point_a_world = contact_point0[c] - contact_thickness0[c] * normal
+        point_b_world = contact_point1[c] + contact_thickness1[c] * normal
+        if body_a >= 0:
+            point_a_world = wp.transform_point(body_q[body_a], contact_point0[c]) - contact_thickness0[c] * normal
+        if body_b >= 0:
+            point_b_world = wp.transform_point(body_q[body_b], contact_point1[c]) + contact_thickness1[c] * normal
+
+        tangent0, tangent1 = contact_tangent_basis(normal)
+        contact_anchor_world = 0.5 * (point_a_world + point_b_world)
+        world = contact_world[c]
+        art_a = contact_art_a[c]
+        art_b = contact_art_b[c]
+        rows = contact_slots_needed[c]
+
+        for row in range(3):
+            if row >= rows:
+                continue
+            direction = normal
+            point_a = point_a_world
+            point_b = point_b_world
+            if row == 0:
+                if contact_shared_anchor != 0:
+                    point_a = contact_anchor_world
+                    point_b = contact_anchor_world
+            else:
+                if row == 1:
+                    direction = tangent0
+                else:
+                    direction = tangent1
+                if contact_shared_anchor != 0 or contact_friction_shared_anchor != 0:
+                    point_a = contact_anchor_world
+                    point_b = contact_anchor_world
+
+            dof_a = -1
+            dof_b = -1
+            coord_a = -1
+            coord_b = -1
+            value_a = float(0.0)
+            value_b = float(0.0)
+            if art_a >= 0 and body_a >= 0 and articulation_response_dof_count[art_a] == target_size:
+                dof_a = body_single_response_dof[body_a]
+                if dof_a >= 0:
+                    local_dof_a = dof_a - articulation_dof_start[art_a]
+                    if local_dof_a >= 0 and local_dof_a < target_size:
+                        motion_a = joint_S_s[dof_a]
+                        linear_a = wp.vec3(motion_a[0], motion_a[1], motion_a[2])
+                        angular_a = wp.vec3(motion_a[3], motion_a[4], motion_a[5])
+                        velocity_a = linear_a + wp.cross(angular_a, point_a - articulation_origin[art_a])
+                        value_a = wp.dot(direction, velocity_a)
+                        coord_a = articulation_world_dof_offset[art_a] + local_dof_a
+
+            if art_b >= 0 and body_b >= 0 and articulation_response_dof_count[art_b] == target_size:
+                dof_b = body_single_response_dof[body_b]
+                if dof_b >= 0:
+                    local_dof_b = dof_b - articulation_dof_start[art_b]
+                    if local_dof_b >= 0 and local_dof_b < target_size:
+                        motion_b = joint_S_s[dof_b]
+                        linear_b = wp.vec3(motion_b[0], motion_b[1], motion_b[2])
+                        angular_b = wp.vec3(motion_b[3], motion_b[4], motion_b[5])
+                        velocity_b = linear_b + wp.cross(angular_b, point_b - articulation_origin[art_b])
+                        value_b = -wp.dot(direction, velocity_b)
+                        coord_b = articulation_world_dof_offset[art_b] + local_dof_b
+
+            response_a = float(0.0)
+            response_b = float(0.0)
+            if dof_a >= 0:
+                response_a = value_a * diagonal_inverse_mass[dof_a]
+            if dof_b >= 0:
+                response_b = value_b * diagonal_inverse_mass[dof_b]
+            if coord_a >= 0 and coord_a == coord_b:
+                value_a += value_b
+                response_a += response_b
+                coord_b = -1
+                value_b = 0.0
+                response_b = 0.0
+
+            output_row = slot + row
+            sparse_row_dof[world, output_row, 0] = coord_a
+            sparse_row_dof[world, output_row, 1] = coord_b
+            sparse_row_jy[world, output_row, 0] = value_a
+            sparse_row_jy[world, output_row, 1] = response_a
+            sparse_row_jy[world, output_row, 2] = value_b
+            sparse_row_jy[world, output_row, 3] = response_b
+
+
+@wp.kernel
+def accumulate_sparse_diagonal_response_diag(
+    world_constraint_count: wp.array[int],
+    max_constraints: int,
+    sparse_row_dof: wp.array3d[int],
+    sparse_row_jy: wp.array3d[float],
+    # in/out
+    world_diag: wp.array2d[float],
+):
+    """Accumulate the two sparse response entries into each active row diagonal."""
+    tid = wp.tid()
+    world = tid // max_constraints
+    row = tid - world * max_constraints
+    if row >= world_constraint_count[world]:
+        return
+    value = float(0.0)
+    if sparse_row_dof[world, row, 0] >= 0:
+        value += sparse_row_jy[world, row, 0] * sparse_row_jy[world, row, 1]
+    if sparse_row_dof[world, row, 1] >= 0:
+        value += sparse_row_jy[world, row, 2] * sparse_row_jy[world, row, 3]
+    world_diag[world, row] += value
+
+
+@wp.kernel
+def apply_sparse_diagonal_contact_restitution_matrix_free(
+    world_constraint_count: wp.array[int],
+    max_constraints: int,
+    world_phi: wp.array2d[float],
+    world_row_type: wp.array2d[int],
+    world_target_velocity: wp.array2d[float],
+    world_row_restitution: wp.array2d[float],
+    world_incident_velocity: wp.array[float],
+    world_dof_indices: wp.array2d[int],
+    dense_offsets: wp.array[int],
+    dense_groups: wp.array[int],
+    dense_dofs: int,
+    dense_J: wp.array3d[float],
+    sparse_row_dof: wp.array3d[int],
+    sparse_row_jy: wp.array3d[float],
+    dt: float,
+    restitution_velocity_threshold: float,
+    # in/out
+    world_rhs: wp.array2d[float],
+):
+    """Apply restitution from a compact dense component plus two sparse response coordinates."""
+    tid = wp.tid()
+    world = tid // max_constraints
+    row = tid - world * max_constraints
+    if row >= world_constraint_count[world] or world_row_type[world, row] != PGS_CONSTRAINT_TYPE_CONTACT:
+        return
+
+    restitution = world_row_restitution[world, row]
+    if restitution <= 0.0:
+        return
+
+    relative_incident = float(0.0)
+    dense_offset = dense_offsets[world]
+    dense_group = dense_groups[world]
+    for local_dof in range(dense_dofs):
+        world_dof = dense_offset + local_dof
+        global_dof = world_dof_indices[world, world_dof]
+        if global_dof >= 0:
+            relative_incident += dense_J[dense_group, row, local_dof] * world_incident_velocity[global_dof]
+    for sparse_slot in range(2):
+        world_dof = sparse_row_dof[world, row, sparse_slot]
+        if world_dof >= 0:
+            global_dof = world_dof_indices[world, world_dof]
+            if global_dof >= 0:
+                relative_incident += sparse_row_jy[world, row, sparse_slot * 2] * world_incident_velocity[global_dof]
+
+    target_vel = world_target_velocity[world, row]
+    relative_incident -= target_vel
+    phi = world_phi[world, row]
+    if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
+        world_rhs[world, row] = -target_vel + restitution * relative_incident
 
 
 @wp.func

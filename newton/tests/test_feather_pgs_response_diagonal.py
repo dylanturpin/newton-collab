@@ -9,11 +9,16 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
     accumulate_group_diag_worlds,
 )
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSExecutionPlan, _get_hinv_jt_kernel
+from newton._src.solvers.feather_pgs.solver_feather_pgs import (
+    _FeatherPGSExecutionPlan,
+    _get_hinv_jt_kernel,
+    _get_pgs_solve_sparse_diagonal_kernel,
+)
 from newton.solvers import SolverFeatherPGS
 
 
@@ -141,6 +146,119 @@ def _run_mixed_response(
 
 
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal GS requires CUDA")
+    def test_sparse_diagonal_gs_matches_scalar_reference(self):
+        """Match a scalar PGS reference with coupled limits and friction."""
+        device = wp.get_device("cuda:0")
+        max_constraints, world_dofs, dense_dofs = 8, 4, 2
+        cfm, omega, iterations = 1.0e-6, 1.0, 8
+        inverse_mass = np.array((0.5, 0.25, 0.75, 1.0), dtype=np.float32)
+        initial_velocity = np.array((-0.4, 0.3, -0.2, 0.1), dtype=np.float32)
+        jacobian = np.array(
+            ((0.6, -0.4, 0.2, 0.0), (0.1, 0.5, -0.3, 0.4), (-0.2, 0.25, 0.1, -0.35)),
+            dtype=np.float32,
+        )
+        response = jacobian * inverse_mass
+        rhs = np.zeros((1, max_constraints), dtype=np.float32)
+        rhs[0, :3] = (-0.1, 0.0, 0.0)
+        diag = np.zeros_like(rhs)
+        diag[0, :3] = np.sum(jacobian * response, axis=1) + cfm
+        row_type = np.zeros((1, max_constraints), dtype=np.int32)
+        row_type[0, :3] = (PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION)
+        row_parent = np.full((1, max_constraints), -1, dtype=np.int32)
+        row_parent[0, 1:3] = 0
+        row_mu = np.zeros((1, max_constraints), dtype=np.float32)
+        row_mu[0, 1:3] = 0.7
+        dense_j = np.zeros((1, max_constraints, dense_dofs), dtype=np.float32)
+        dense_y = np.zeros_like(dense_j)
+        dense_j[0, :3] = jacobian[:, :dense_dofs]
+        dense_y[0, :3] = response[:, :dense_dofs]
+        sparse_dof = np.full((1, max_constraints, 2), -1, dtype=np.int32)
+        sparse_jy = np.zeros((1, max_constraints, 4), dtype=np.float32)
+        sparse_dof[0, :3] = (2, 3)
+        sparse_jy[0, :3, 0] = jacobian[:, 2]
+        sparse_jy[0, :3, 1] = response[:, 2]
+        sparse_jy[0, :3, 2] = jacobian[:, 3]
+        sparse_jy[0, :3, 3] = response[:, 3]
+        limit_active = np.zeros((1, world_dofs), dtype=np.int32)
+        limit_active[0, 2] = 1
+        limit_lower_rhs = np.zeros((1, world_dofs), dtype=np.float32)
+        limit_lower_rhs[0, 2] = -0.15
+
+        expected_velocity = initial_velocity.copy()
+        expected_impulses = np.zeros(3, dtype=np.float32)
+        expected_limit_lambda = np.float32(0.0)
+        for _ in range(iterations):
+            old_limit = expected_limit_lambda
+            residual = expected_velocity[2] + limit_lower_rhs[0, 2]
+            expected_limit_lambda = np.maximum(0.0, old_limit - omega * residual / (inverse_mass[2] + cfm))
+            expected_velocity[2] += inverse_mass[2] * (expected_limit_lambda - old_limit)
+            for row in range(3):
+                old_impulse = expected_impulses[row]
+                new_impulse = old_impulse - omega * (jacobian[row] @ expected_velocity + rhs[0, row]) / diag[0, row]
+                if row == 0:
+                    new_impulse = max(new_impulse, 0.0)
+                else:
+                    radius = max(row_mu[0, row] * expected_impulses[0], 0.0)
+                    sibling = 2 if row == 1 else 1
+                    if radius <= 0.0:
+                        new_impulse = 0.0
+                    else:
+                        expected_impulses[row] = new_impulse
+                        sibling_old = expected_impulses[sibling]
+                        magnitude = np.sqrt(new_impulse * new_impulse + sibling_old * sibling_old)
+                        if magnitude > radius:
+                            scale = radius / magnitude
+                            new_impulse *= scale
+                            sibling_new = sibling_old * scale
+                            expected_impulses[sibling] = sibling_new
+                            expected_velocity += response[sibling] * (sibling_new - sibling_old)
+                expected_impulses[row] = new_impulse
+                expected_velocity += response[row] * (new_impulse - old_impulse)
+
+        impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
+        lower_lambda = wp.zeros((1, world_dofs), dtype=wp.float32, device=device)
+        upper_lambda = wp.zeros_like(lower_lambda)
+        velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
+        kernel = _get_pgs_solve_sparse_diagonal_kernel(max_constraints, world_dofs, dense_dofs, str(device.arch))
+        wp.launch_tiled(
+            kernel,
+            dim=[1],
+            inputs=[
+                wp.array((3,), dtype=wp.int32, device=device),
+                wp.array(np.arange(world_dofs, dtype=np.int32)[None, :], device=device),
+                wp.array(rhs, device=device),
+                wp.array(diag, device=device),
+                impulses,
+                wp.array(row_type, device=device),
+                wp.array(row_parent, device=device),
+                wp.array(row_mu, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array(dense_j, device=device),
+                wp.array(dense_y, device=device),
+                wp.array(sparse_dof, device=device),
+                wp.array(sparse_jy, device=device),
+                wp.array(limit_active, device=device),
+                wp.array(limit_lower_rhs, device=device),
+                wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
+                wp.array(inverse_mass, device=device),
+                cfm,
+                iterations,
+                omega,
+                0,
+                0,
+            ],
+            outputs=[lower_lambda, upper_lambda, velocity],
+            block_dim=32,
+            device=device,
+        )
+
+        np.testing.assert_allclose(velocity.numpy(), expected_velocity, rtol=2.0e-5, atol=2.0e-6)
+        np.testing.assert_allclose(impulses.numpy()[0, :3], expected_impulses, rtol=2.0e-5, atol=2.0e-6)
+        np.testing.assert_allclose(lower_lambda.numpy()[0, 2], expected_limit_lambda, rtol=2.0e-5, atol=2.0e-6)
+        self.assertEqual(float(upper_lambda.numpy()[0, 2]), 0.0)
+
     def test_mixed_world_diagonal_map_includes_free_rigid_response(self):
         """Include free rigid articulations in every forced-tiled diagonal group."""
         solver = SolverFeatherPGS(_build_mixed_response_model("cpu", world_count=2), dense_max_constraints=32)
