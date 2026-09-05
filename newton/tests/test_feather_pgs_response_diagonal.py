@@ -8,18 +8,23 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import accumulate_group_diag_worlds
+from newton._src.solvers.feather_pgs.kernels import (
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_LOCAL_SOLVE_OWNER_PAIR,
+    accumulate_group_diag_worlds,
+)
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSExecutionPlan, _get_hinv_jt_kernel
 from newton.solvers import SolverFeatherPGS
 
 
-def _build_mixed_response_model(device, world_count=1):
-    """Build one 13-DOF articulation contacting one free rigid body."""
+def _build_mixed_response_model(device, world_count=1, *, dof_count=13, friction=0.0, restitution=0.0):
+    """Build one serial articulation contacting one free rigid body."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.default_shape_cfg.density = 1000.0
     builder.default_shape_cfg.ke = 1.0e5
     builder.default_shape_cfg.kd = 1.0e3
-    builder.default_shape_cfg.mu = 0.0
+    builder.default_shape_cfg.mu = friction
+    builder.default_shape_cfg.restitution = restitution
     builder.default_shape_cfg.margin = 0.0
     builder.default_shape_cfg.gap = 0.0
 
@@ -35,7 +40,7 @@ def _build_mixed_response_model(device, world_count=1):
         )
     ]
     parent = arm
-    for index in range(12):
+    for index in range(dof_count - 1):
         child = builder.add_link(
             mass=0.05,
             inertia=wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-3),
@@ -62,28 +67,38 @@ def _build_mixed_response_model(device, world_count=1):
     return replicated.finalize(device=device)
 
 
-def _build_mixed_response_solver(model, *, warmstart, preelimination):
-    return SolverFeatherPGS(
-        model,
-        pgs_mode="matrix_free",
-        pgs_warmstart=warmstart,
-        enable_bilateral_preelimination=preelimination,
-        enable_contact_friction=False,
-        pgs_iterations=8,
-        dense_max_constraints=32,
-        mf_max_constraints=32,
-    )
-
-
-def _run_mixed_response(kernel, *, warmstart, preelimination):
+def _run_mixed_response(
+    kernel,
+    *,
+    warmstart,
+    preelimination,
+    dof_count=13,
+    dense_max_constraints=32,
+    inactive_joint_limit_capacity=False,
+    friction=0.0,
+    restitution=0.0,
+    tangential_velocity=0.0,
+):
     """Run a short mixed-contact trajectory with one H-inverse implementation."""
-    model = _build_mixed_response_model("cuda:0")
+    model = _build_mixed_response_model("cuda:0", dof_count=dof_count, friction=friction, restitution=restitution)
     with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": kernel}):
-        solver = _build_mixed_response_solver(model, warmstart=warmstart, preelimination=preelimination)
+        solver = SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            pgs_warmstart=warmstart,
+            enable_bilateral_preelimination=preelimination,
+            enable_contact_friction=friction > 0.0,
+            enable_joint_limits=inactive_joint_limit_capacity,
+            joint_limit_activation_gap=0.0,
+            pgs_iterations=8,
+            dense_max_constraints=dense_max_constraints,
+            mf_max_constraints=32,
+        )
     state_in, state_out = model.state(), model.state()
     joint_qd = state_in.joint_qd.numpy()
     free_articulation = int(np.flatnonzero(solver._model_plan.is_free_rigid)[0])
     free_dof_start = int(solver._model_plan.articulation_dof_start[free_articulation])
+    joint_qd[free_dof_start] = tangential_velocity
     joint_qd[free_dof_start + 2] = -3.0
     state_in.joint_qd.assign(joint_qd)
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
@@ -109,6 +124,8 @@ def _run_mixed_response(kernel, *, warmstart, preelimination):
                 solver.impulses.numpy()[0, :constraint_count].copy(),
                 state_out.joint_q.numpy().copy(),
                 state_out.joint_qd.numpy().copy(),
+                int(solver._local_solve_owner.numpy()[0]),
+                solver.row_type.numpy()[0, :constraint_count].copy(),
             )
         )
         state_in, state_out = state_out, state_in
@@ -152,6 +169,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             solver.size_groups,
             max_constraints=solver.dense_max_constraints,
             max_shared_memory=101376,
+            cholesky_kernel="auto",
             hinv_jt_kernel="tiled",
             small_dof_threshold=12,
             tile_threads=64,
@@ -182,8 +200,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                         self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
                         for label, expected_value, actual_value in zip(
                             ("diagonal", "impulses", "joint_q", "joint_qd"),
-                            expected[1:],
-                            actual[1:],
+                            expected[1:5],
+                            actual[1:5],
                             strict=True,
                         ):
                             np.testing.assert_allclose(
@@ -193,6 +211,120 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                                 atol=2.0e-6,
                                 err_msg=f"{label} differed at step {step}",
                             )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
+    def test_paired_response_matches_general_23_dof_trajectory(self):
+        """Match the general response when one warp owns a robot/free-body pair."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "dof_count": 23,
+            "dense_max_constraints": 96,
+            "inactive_joint_limit_capacity": True,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+        }
+        reference_solver, reference = _run_mixed_response("par_row", **run_kwargs)
+        paired_solver, paired = _run_mixed_response("auto", **run_kwargs)
+
+        self.assertIsNone(reference_solver._paired_response_primary_size)
+        self.assertEqual(paired_solver._paired_response_primary_size, 23)
+        self.assertEqual(paired_solver._paired_response_secondary_size, 6)
+        self.assertIsNotNone(paired_solver._paired_response_kernel)
+        self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
+        for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
+            self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+            np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
+            for label, expected_value, actual_value in zip(
+                ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+            ):
+                np.testing.assert_allclose(
+                    actual_value,
+                    expected_value,
+                    rtol=5.0e-4,
+                    atol=1.0e-5,
+                    err_msg=f"{label} differed at step {step}",
+                )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
+    def test_local_internal_mixed_world_matches_general_response(self):
+        """Match the general response when an articulation contacts a free body."""
+        general_solver, general = _run_mixed_response(
+            "tiled", warmstart=False, preelimination=False, inactive_joint_limit_capacity=True
+        )
+        local_solver, local = _run_mixed_response(
+            "par_row", warmstart=False, preelimination=False, inactive_joint_limit_capacity=True
+        )
+
+        self.assertFalse(general_solver._local_internal_fast_path)
+        self.assertTrue(local_solver._local_internal_fast_path)
+        self.assertEqual(len(general), len(local))
+        self.assertGreater(general[0][0], 0, "mixed scene generated no dense constraint rows")
+        self.assertTrue(
+            any(sample[5] == PGS_LOCAL_SOLVE_OWNER_PAIR for sample in local),
+            "mixed contact never selected the paired local owner",
+        )
+
+        free_articulation = int(np.flatnonzero(general_solver._model_plan.is_free_rigid)[0])
+        free_dof_start = int(general_solver._model_plan.articulation_dof_start[free_articulation])
+        self.assertGreater(
+            abs(float(general[0][4][free_dof_start + 2]) + 3.0),
+            1.0e-4,
+            "general response did not couple the dense contact to the free body",
+        )
+
+        for step, (expected, actual) in enumerate(zip(general, local, strict=True)):
+            self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+            for label, expected_value, actual_value in zip(
+                ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+            ):
+                np.testing.assert_allclose(
+                    actual_value,
+                    expected_value,
+                    rtol=5.0e-4,
+                    atol=2.0e-6,
+                    err_msg=f"{label} differed at step {step}",
+                )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
+    def test_local_pair_matches_general_friction_and_restitution(self):
+        """Preserve paired friction projection and restitution response."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "inactive_joint_limit_capacity": True,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+        }
+        general_solver, general = _run_mixed_response("tiled", **run_kwargs)
+        local_solver, local = _run_mixed_response("par_row", **run_kwargs)
+
+        self.assertFalse(general_solver._local_internal_fast_path)
+        self.assertTrue(local_solver._local_internal_fast_path)
+        pair_samples = [sample for sample in local if sample[5] == PGS_LOCAL_SOLVE_OWNER_PAIR]
+        self.assertTrue(pair_samples, "mixed friction contact never selected the paired local owner")
+        self.assertTrue(
+            any(
+                np.any(np.abs(sample[2][sample[6] == PGS_CONSTRAINT_TYPE_FRICTION]) > 1.0e-5) for sample in pair_samples
+            ),
+            "paired solve produced no nonzero friction impulse",
+        )
+
+        for step, (expected, actual) in enumerate(zip(general, local, strict=True)):
+            self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+            np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
+            for label, expected_value, actual_value in zip(
+                ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+            ):
+                np.testing.assert_allclose(
+                    actual_value,
+                    expected_value,
+                    rtol=5.0e-4,
+                    atol=2.0e-6,
+                    err_msg=f"{label} differed at step {step}",
+                )
 
     @unittest.skipUnless(wp.is_cuda_available(), "tiled H-inverse response requires CUDA")
     def test_tiled_response_diagonal_matches_dense_reference(self):
