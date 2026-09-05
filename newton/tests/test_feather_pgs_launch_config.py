@@ -8,6 +8,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import kernels as feather_pgs_kernels
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
@@ -70,6 +71,24 @@ def _build_heterogeneous_world_model():
 
 
 class TestFeatherPGSLaunchConfig(unittest.TestCase):
+    def test_launch_geometry_kernels_use_dedicated_modules(self):
+        """Keep custom-block-dimension kernels out of the general module."""
+        expected_modules = {
+            "update_articulation_origins": "kinematics",
+            "eval_rigid_fk": "kinematics",
+            "eval_rigid_fk_id": "kinematics",
+            "eval_rigid_id": "kinematics",
+            "eval_rigid_tau": "inverse_dynamics",
+            "compute_composite_inertia": "mass_dynamics",
+            "crba_fill_par_dof": "mass_dynamics",
+        }
+        general_module = feather_pgs_kernels.__name__
+        for kernel_name, module_suffix in expected_modules.items():
+            with self.subTest(kernel=kernel_name):
+                kernel_module = getattr(feather_pgs_kernels, kernel_name).module.name
+                self.assertNotEqual(kernel_module, general_module)
+                self.assertEqual(kernel_module, f"{general_module}.{module_suffix}")
+
     def test_defaults_preserved(self):
         model = newton.ModelBuilder().finalize()
         solver = SolverFeatherPGS(model)
@@ -176,8 +195,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         np.testing.assert_array_equal(indices[1, 1:], np.full(5, -1, dtype=np.int32))
 
     def test_hinv_chunk_selection_respects_shared_memory(self):
+        """Select the largest response chunk that fits shared memory."""
         cases = (
-            (23, 384, 101376, 64),
+            (23, 384, 101376, 32),
             (128, 384, 101376, 16),
             (160, 384, 101376, None),
             (23, 0, 101376, None),
@@ -190,13 +210,14 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 self.assertEqual(_select_hinv_jt_chunk_size(n_dofs, max_constraints, shared_memory, 64), expected)
 
     def test_hinv_chunk_selection_accounts_for_tile_threads(self):
-        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 49152, 64), 64)
-        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 49152, 256), 32)
+        """Include tile scratch space when selecting response chunks."""
+        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 64), 32)
+        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 256), 16)
 
-    def test_hinv_chunk_selection_caps_compact_articulations(self):
-        """Cap compact articulation chunks without restricting larger groups."""
+    def test_hinv_chunk_selection_caps_response_tiles(self):
+        """Cap response chunks at 32 rows across articulation sizes."""
         self.assertEqual(_select_hinv_jt_chunk_size(20, 384, 101376, 64), 32)
-        self.assertEqual(_select_hinv_jt_chunk_size(21, 384, 101376, 64), 64)
+        self.assertEqual(_select_hinv_jt_chunk_size(21, 384, 101376, 64), 32)
 
     def test_dense_metadata_encoding_bounds(self):
         _validate_dense_metadata_encoding(32)
