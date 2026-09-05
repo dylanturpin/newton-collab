@@ -140,6 +140,7 @@ from .kernels import (
     integrate_generalized_joints,
     invalidate_articulation_fk_id_cache,
     local_solve_launch_gate,
+    mul_com_spatial_inertia,
     pack_contact_linear_force_as_spatial,
     pgs_convergence_diagnostic_velocity,
     pgs_ncp_residuals_diagnostic_velocity,
@@ -1904,6 +1905,19 @@ class SolverFeatherPGS(SolverBase):
             if self._sparse_diagonal_contact_solve and self._parallel_augmented_drive_topology
             else None
         )
+        self._direct_compact_diagonal_inertia = bool(
+            self._compact_inertia_refresh and self._compact_diagonal_mass_size in self._direct_diagonal_inertia_sizes
+        )
+        self._direct_compact_diagonal_inertia_kernel = None
+        if self._direct_compact_diagonal_inertia:
+            composite_articulations = np.flatnonzero(
+                response_articulations & ~direct_body_inertia & (response_dof_count != self._compact_diagonal_mass_size)
+            ).astype(np.int32, copy=False)
+            self._composite_articulation_count = int(composite_articulations.size)
+            self._composite_articulations = wp.array(composite_articulations, dtype=wp.int32, device=model.device)
+            self._direct_compact_diagonal_inertia_kernel = _get_direct_diagonal_inverse_mass_kernel(
+                self._compact_diagonal_mass_size, str(getattr(model.device, "arch", ""))
+            )
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
         # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
@@ -3373,7 +3387,9 @@ class SolverFeatherPGS(SolverBase):
         self._crba_dof_joint_offset_by_size = {}
         self._crba_lower_schedule_by_size = {}
         diagonal_mass_sizes: set[int] = set()
+        direct_diagonal_inertia_sizes: set[int] = set()
         self._diagonal_mass_sizes = frozenset()
+        self._direct_diagonal_inertia_sizes = frozenset()
         if not model.articulation_count or not model.joint_count:
             return
 
@@ -3382,6 +3398,11 @@ class SolverFeatherPGS(SolverBase):
         response_dof_count = self._model_plan.response_dof_count
         joint_qd_start = model.joint_qd_start.numpy()
         joint_ancestor = model.joint_ancestor.numpy()
+        joint_child = model.joint_child.numpy()
+        body_single_response_dof = self._body_single_response_dof_host
+        response_body_counts = np.bincount(
+            body_single_response_dof[body_single_response_dof >= 0], minlength=model.joint_dof_count
+        )
 
         for size in self.size_groups:
             reference_offsets = None
@@ -3427,6 +3448,24 @@ class SolverFeatherPGS(SolverBase):
                             sources[row, col] = row
                 if np.count_nonzero(sources >= 0) == int(size) and np.all(np.diag(sources) >= 0):
                     diagonal_mass_sizes.add(int(size))
+                    direct_inertia = True
+                    for art in np.flatnonzero(response_dof_count == size):
+                        joint_start = int(articulation_start[art])
+                        dof_start = int(articulation_dof_start[art])
+                        for local_dof, joint_offset in enumerate(reference_offsets):
+                            child = int(joint_child[joint_start + int(joint_offset)])
+                            global_dof = dof_start + local_dof
+                            if (
+                                child < 0
+                                or int(body_single_response_dof[child]) != global_dof
+                                or int(response_body_counts[global_dof]) != 1
+                            ):
+                                direct_inertia = False
+                                break
+                        if not direct_inertia:
+                            break
+                    if direct_inertia:
+                        direct_diagonal_inertia_sizes.add(int(size))
                 self._crba_dof_joint_offset_by_size[int(size)] = wp.array(
                     reference_offsets, dtype=wp.int32, device=model.device
                 )
@@ -3442,6 +3481,7 @@ class SolverFeatherPGS(SolverBase):
                 )
 
         self._diagonal_mass_sizes = frozenset(diagonal_mass_sizes)
+        self._direct_diagonal_inertia_sizes = frozenset(direct_diagonal_inertia_sizes)
 
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:
@@ -8748,26 +8788,49 @@ class SolverFeatherPGS(SolverBase):
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
             if size == self._compact_diagonal_mass_size:
-                wp.launch(
-                    compute_compact_diagonal_inverse_mass,
-                    dim=n_arts * size,
-                    inputs=[
-                        model.articulation_start,
-                        self.articulation_dof_start,
-                        self.mass_update_mask,
-                        model.joint_child,
-                        state_aug.joint_S_s,
-                        self.body_I_c,
-                        self.group_to_art[size],
-                        self._crba_dof_joint_offset_by_size[size],
-                        self.R_by_size[size],
-                        self._augmented_drive_row_by_dof,
-                        self.aug_row_K,
-                        size,
-                    ],
-                    outputs=[self._diagonal_inverse_mass],
-                    device=model.device,
-                )
+                if self._direct_compact_diagonal_inertia:
+                    wp.launch(
+                        self._direct_compact_diagonal_inertia_kernel,
+                        dim=n_arts * size,
+                        inputs=[
+                            model.articulation_start,
+                            self.articulation_dof_start,
+                            self.mass_update_mask,
+                            model.joint_child,
+                            state_aug.joint_S_s,
+                            model.body_mass,
+                            self._body_inertia_terms,
+                            self.group_to_art[size],
+                            self._crba_dof_joint_offset_by_size[size],
+                            self.R_by_size[size],
+                            self._augmented_drive_row_by_dof,
+                            self.aug_row_K,
+                        ],
+                        outputs=[self._diagonal_inverse_mass],
+                        device=model.device,
+                        block_dim=128,
+                    )
+                else:
+                    wp.launch(
+                        compute_compact_diagonal_inverse_mass,
+                        dim=n_arts * size,
+                        inputs=[
+                            model.articulation_start,
+                            self.articulation_dof_start,
+                            self.mass_update_mask,
+                            model.joint_child,
+                            state_aug.joint_S_s,
+                            self.body_I_c,
+                            self.group_to_art[size],
+                            self._crba_dof_joint_offset_by_size[size],
+                            self.R_by_size[size],
+                            self._augmented_drive_row_by_dof,
+                            self.aug_row_K,
+                            size,
+                        ],
+                        outputs=[self._diagonal_inverse_mass],
+                        device=model.device,
+                    )
                 continue
             fused_crba_cholesky_warp = self._crba_cholesky_warp_kernels_by_size[size]
             if fused_crba_cholesky_warp is not None:
@@ -11679,6 +11742,70 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
     joint_limit_warp_template.__name__ = name
     joint_limit_warp_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(joint_limit_warp_template)
+
+
+@cache
+def _get_direct_diagonal_inverse_mass_kernel(n_dofs: int, device_arch: str) -> "wp.Kernel":
+    """Project one-body diagonal branches without materializing composite spatial inertia."""
+    del device_arch
+    N = int(n_dofs)
+    if N <= 0:
+        raise ValueError("direct diagonal inertia requires a positive DOF count")
+
+    def compute_direct_diagonal_inverse_mass_template(
+        articulation_start: wp.array[int],
+        articulation_dof_start: wp.array[int],
+        mass_update_mask: wp.array[int],
+        joint_child: wp.array[int],
+        joint_S_s: wp.array[wp.spatial_vector],
+        body_mass: wp.array[float],
+        body_inertia_terms: wp.array2d[float],
+        group_to_art: wp.array[int],
+        dof_joint_offset: wp.array[int],
+        armature: wp.array2d[float],
+        drive_row_by_dof: wp.array[int],
+        drive_row_K: wp.array[float],
+        diagonal_inverse_mass: wp.array[float],
+    ):
+        element = wp.tid()
+        group = element // N
+        dof = element - group * N
+        art = group_to_art[group]
+        if mass_update_mask[art] == 0:
+            return
+
+        global_dof = articulation_dof_start[art] + dof
+        joint = articulation_start[art] + dof_joint_offset[dof]
+        body = joint_child[joint]
+        motion = joint_S_s[global_dof]
+        com = wp.vec3(
+            body_inertia_terms[body, 0],
+            body_inertia_terms[body, 1],
+            body_inertia_terms[body, 2],
+        )
+        inertia = wp.mat33(
+            body_inertia_terms[body, 3],
+            body_inertia_terms[body, 4],
+            body_inertia_terms[body, 5],
+            body_inertia_terms[body, 6],
+            body_inertia_terms[body, 7],
+            body_inertia_terms[body, 8],
+            body_inertia_terms[body, 9],
+            body_inertia_terms[body, 10],
+            body_inertia_terms[body, 11],
+        )
+        mass = wp.dot(motion, mul_com_spatial_inertia(body_mass[body], com, inertia, motion)) + armature[group, dof]
+        drive_row = drive_row_by_dof[global_dof]
+        if drive_row >= 0:
+            stiffness = drive_row_K[drive_row]
+            if stiffness > 0.0:
+                mass += stiffness
+        diagonal_inverse_mass[global_dof] = 1.0 / mass
+
+    name = f"compute_direct_diagonal_inverse_mass_{N}"
+    compute_direct_diagonal_inverse_mass_template.__name__ = name
+    compute_direct_diagonal_inverse_mass_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(compute_direct_diagonal_inverse_mass_template)
 
 
 @cache

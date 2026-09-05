@@ -17,6 +17,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _FeatherPGSExecutionPlan,
     _get_build_independent_sparse_contact_groups_kernel,
+    _get_direct_diagonal_inverse_mass_kernel,
     _get_hinv_jt_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
     _get_pgs_solve_sparse_diagonal_kernel,
@@ -370,6 +371,52 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         np.testing.assert_allclose(velocity.numpy(), expected_velocity, rtol=2.0e-5, atol=2.0e-6)
         np.testing.assert_allclose(impulses.numpy()[0], expected_impulses, rtol=2.0e-5, atol=2.0e-6)
         np.testing.assert_array_equal(impulses.numpy()[0, :6], np.zeros(6, dtype=np.float32))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "direct diagonal projection requires CUDA")
+    def test_direct_diagonal_inverse_mass_matches_compact_inertia_terms(self):
+        """Project a one-body branch directly from its compact inertia representation."""
+        device = wp.get_device("cuda:0")
+        mass = np.float32(2.5)
+        com = np.array((0.2, -0.1, 0.3), dtype=np.float32)
+        inertia = np.array(((0.8, 0.1, -0.05), (0.1, 1.1, 0.02), (-0.05, 0.02, 1.4)), dtype=np.float32)
+        motion = np.array((0.3, -0.2, 0.4, 0.5, 0.1, -0.6), dtype=np.float32)
+        armature = np.float32(0.25)
+        drive_stiffness = np.float32(0.75)
+        terms = np.concatenate((com, inertia.reshape(-1)))[None, :]
+        inverse_mass = wp.zeros(1, dtype=wp.float32, device=device)
+        kernel = _get_direct_diagonal_inverse_mass_kernel(1, str(device.arch))
+        wp.launch(
+            kernel,
+            dim=1,
+            inputs=[
+                wp.array((0, 1), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((1,), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((wp.spatial_vector(*motion),), dtype=wp.spatial_vector, device=device),
+                wp.array((mass,), dtype=wp.float32, device=device),
+                wp.array(terms, dtype=wp.float32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array(((armature,),), dtype=wp.float32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((drive_stiffness,), dtype=wp.float32, device=device),
+            ],
+            outputs=[inverse_mass],
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        linear = motion[:3]
+        angular = motion[3:]
+        response = np.concatenate(
+            (
+                mass * (linear - np.cross(com, angular)),
+                mass * np.cross(com, linear) + inertia @ angular,
+            )
+        )
+        expected = np.float32(1.0) / (np.dot(motion, response) + armature + drive_stiffness)
+        np.testing.assert_allclose(inverse_mass.numpy()[0], expected, rtol=2.0e-6, atol=0.0)
 
     @unittest.skipUnless(wp.is_cuda_available(), "independent contact groups require CUDA")
     def test_independent_sparse_contact_groups_exclude_coupled_coordinates(self):
