@@ -20,6 +20,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _get_direct_diagonal_inverse_mass_kernel,
     _get_hinv_jt_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
+    _get_partitioned_inverse_dynamics_kernels,
     _get_pgs_solve_sparse_diagonal_kernel,
 )
 from newton.solvers import SolverFeatherPGS
@@ -417,6 +418,101 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         )
         expected = np.float32(1.0) / (np.dot(motion, response) + armature + drive_stiffness)
         np.testing.assert_allclose(inverse_mass.numpy()[0], expected, rtol=2.0e-6, atol=0.0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "partitioned inverse dynamics requires CUDA")
+    def test_direct_branch_inverse_dynamics_matches_articulation_path(self):
+        """A one-body branch must produce the same torque through either schedule."""
+        device = wp.get_device("cuda:0")
+        spatial = wp.spatial_vector(0.4, -0.2, 0.6, 0.1, 0.3, -0.5)
+        external = wp.spatial_vector(-0.3, 0.5, 0.2, -0.4, 0.1, 0.7)
+        articulation_start = wp.array((0, 1), dtype=wp.int32, device=device)
+        articulation_end = wp.array((1,), dtype=wp.int32, device=device)
+        joint_type = wp.array((int(newton.JointType.PRISMATIC),), dtype=wp.int32, device=device)
+        joint_parent = wp.array((-1,), dtype=wp.int32, device=device)
+        joint_child = wp.array((0,), dtype=wp.int32, device=device)
+        joint_articulation = wp.array((0,), dtype=wp.int32, device=device)
+        starts = wp.array((0, 1), dtype=wp.int32, device=device)
+        dof_dim = wp.array(((1, 0),), dtype=wp.int32, device=device)
+        joint_f = wp.array((0.2,), dtype=wp.float32, device=device)
+        joint_q = wp.array((0.15,), dtype=wp.float32, device=device)
+        joint_qd = wp.array((-0.25,), dtype=wp.float32, device=device)
+        stiffness = wp.array((1.4,), dtype=wp.float32, device=device)
+        spring_ref = wp.array((0.05,), dtype=wp.float32, device=device)
+        damping = wp.array((0.3,), dtype=wp.float32, device=device)
+        joint_S_s = wp.array((spatial,), dtype=wp.spatial_vector, device=device)
+        body_force = wp.array((spatial,), dtype=wp.spatial_vector, device=device)
+        external_force = wp.array((external,), dtype=wp.spatial_vector, device=device)
+        body_flags = wp.zeros(1, dtype=wp.int32, device=device)
+        body_q = wp.array((wp.transform_identity(),), dtype=wp.transform, device=device)
+        body_com = wp.array((wp.vec3(0.2, -0.1, 0.3),), dtype=wp.vec3, device=device)
+        origin = wp.array((wp.vec3(),), dtype=wp.vec3, device=device)
+        selected_tau = wp.array((0.7,), dtype=wp.float32, device=device)
+        direct_tau = wp.clone(selected_tau)
+        body_ft = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+        selected_kernel, direct_kernel = _get_partitioned_inverse_dynamics_kernels(1, str(device.arch))
+        common = [
+            articulation_start,
+            articulation_end,
+            joint_type,
+            joint_parent,
+            joint_child,
+            joint_articulation,
+            starts,
+            starts,
+            dof_dim,
+            joint_f,
+            joint_q,
+            joint_qd,
+            stiffness,
+            spring_ref,
+            damping,
+            joint_S_s,
+            body_force,
+            external_force,
+            body_flags,
+            body_q,
+            body_com,
+            origin,
+        ]
+        wp.launch(
+            selected_kernel,
+            dim=1,
+            inputs=[wp.array((0,), dtype=wp.int32, device=device), *common, 1],
+            outputs=[body_ft, selected_tau],
+            device=device,
+        )
+        wp.launch(
+            direct_kernel,
+            dim=1,
+            inputs=[
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                articulation_start,
+                joint_type,
+                joint_child,
+                starts,
+                starts,
+                dof_dim,
+                joint_f,
+                joint_q,
+                joint_qd,
+                stiffness,
+                spring_ref,
+                damping,
+                joint_S_s,
+                body_force,
+                external_force,
+                body_flags,
+                body_q,
+                body_com,
+                origin,
+                1,
+            ],
+            outputs=[direct_tau],
+            device=device,
+        )
+        wp.synchronize_device(device)
+        np.testing.assert_array_equal(direct_tau.numpy(), selected_tau.numpy())
 
     @unittest.skipUnless(wp.is_cuda_available(), "independent contact groups require CUDA")
     def test_independent_sparse_contact_groups_exclude_coupled_coordinates(self):

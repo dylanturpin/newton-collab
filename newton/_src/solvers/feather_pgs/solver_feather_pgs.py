@@ -59,6 +59,7 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
     PREELIM_MAX_ROWS,
     PROPAGATION_COLOR_TAIL,
+    accumulate_articulation_tau,
     accumulate_group_diag_worlds,
     accumulate_propagation_warmstart_body_impulses,
     accumulate_sparse_diagonal_response_diag,
@@ -139,6 +140,7 @@ from .kernels import (
     hinv_jt_par_row_contact_fallback,
     integrate_generalized_joints,
     invalidate_articulation_fk_id_cache,
+    jcalc_tau,
     local_solve_launch_gate,
     mul_com_spatial_inertia,
     pack_contact_linear_force_as_spatial,
@@ -1909,6 +1911,10 @@ class SolverFeatherPGS(SolverBase):
             self._compact_inertia_refresh and self._compact_diagonal_mass_size in self._direct_diagonal_inertia_sizes
         )
         self._direct_compact_diagonal_inertia_kernel = None
+        self._selected_articulation_tau_kernel = None
+        self._direct_branch_tau_kernel = None
+        self._selected_tau_articulation_count = 0
+        self._selected_tau_articulations = None
         if self._direct_compact_diagonal_inertia:
             composite_articulations = np.flatnonzero(
                 response_articulations & ~direct_body_inertia & (response_dof_count != self._compact_diagonal_mass_size)
@@ -1916,6 +1922,16 @@ class SolverFeatherPGS(SolverBase):
             self._composite_articulation_count = int(composite_articulations.size)
             self._composite_articulations = wp.array(composite_articulations, dtype=wp.int32, device=model.device)
             self._direct_compact_diagonal_inertia_kernel = _get_direct_diagonal_inverse_mass_kernel(
+                self._compact_diagonal_mass_size, str(getattr(model.device, "arch", ""))
+            )
+            direct_tau_articulations = response_dof_count == self._compact_diagonal_mass_size
+            selected_tau_articulations = np.flatnonzero(~direct_tau_articulations).astype(np.int32, copy=False)
+            self._selected_tau_articulation_count = int(selected_tau_articulations.size)
+            self._selected_tau_articulations = wp.array(selected_tau_articulations, dtype=wp.int32, device=model.device)
+            (
+                self._selected_articulation_tau_kernel,
+                self._direct_branch_tau_kernel,
+            ) = _get_partitioned_inverse_dynamics_kernels(
                 self._compact_diagonal_mass_size, str(getattr(model.device, "arch", ""))
             )
         self._allocate_buffers(model)
@@ -8569,16 +8585,60 @@ class SolverFeatherPGS(SolverBase):
         model = self.model
         body_f = state_in.body_f if state_in.body_count else None
         state_aug.body_ft_s.zero_()
+        tau_inputs = [
+            model.articulation_start,
+            self.articulation_joint_end,
+            model.joint_type,
+            model.joint_parent,
+            model.joint_child,
+            model.joint_articulation,
+            model.joint_qd_start,
+            model.joint_q_start,
+            model.joint_dof_dim,
+            control.joint_f,
+            state_in.joint_q,
+            state_in.joint_qd,
+            self._passive_spring_stiffness,
+            self._passive_spring_ref,
+            self._passive_joint_damping,
+            state_aug.joint_S_s,
+            state_aug.body_f_s,
+            body_f,
+            model.body_flags,
+            state_in.body_q,
+            model.body_com,
+            self.articulation_origin,
+        ]
+        if self._direct_branch_tau_kernel is None:
+            wp.launch(
+                eval_rigid_tau_add if add_to_existing else eval_rigid_tau,
+                dim=model.articulation_count,
+                inputs=tau_inputs,
+                outputs=[state_aug.body_ft_s, state_aug.joint_tau],
+                block_dim=self.serial_kernel_block_dim,
+                device=model.device,
+            )
+            return
+
+        if self._selected_tau_articulation_count:
+            wp.launch(
+                self._selected_articulation_tau_kernel,
+                dim=self._selected_tau_articulation_count,
+                inputs=[self._selected_tau_articulations, *tau_inputs, int(add_to_existing)],
+                outputs=[state_aug.body_ft_s, state_aug.joint_tau],
+                block_dim=self.serial_kernel_block_dim,
+                device=model.device,
+            )
+        direct_size = self._compact_diagonal_mass_size
         wp.launch(
-            eval_rigid_tau_add if add_to_existing else eval_rigid_tau,
-            dim=model.articulation_count,
+            self._direct_branch_tau_kernel,
+            dim=self.n_arts_by_size[direct_size] * direct_size,
             inputs=[
+                self.group_to_art[direct_size],
+                self._crba_dof_joint_offset_by_size[direct_size],
                 model.articulation_start,
-                self.articulation_joint_end,
                 model.joint_type,
-                model.joint_parent,
                 model.joint_child,
-                model.joint_articulation,
                 model.joint_qd_start,
                 model.joint_q_start,
                 model.joint_dof_dim,
@@ -8595,9 +8655,10 @@ class SolverFeatherPGS(SolverBase):
                 state_in.body_q,
                 model.body_com,
                 self.articulation_origin,
+                int(add_to_existing),
             ],
-            outputs=[state_aug.body_ft_s, state_aug.joint_tau],
-            block_dim=self.serial_kernel_block_dim,
+            outputs=[state_aug.joint_tau],
+            block_dim=256,
             device=model.device,
         )
 
@@ -11806,6 +11867,146 @@ def _get_direct_diagonal_inverse_mass_kernel(n_dofs: int, device_arch: str) -> "
     compute_direct_diagonal_inverse_mass_template.__name__ = name
     compute_direct_diagonal_inverse_mass_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(compute_direct_diagonal_inverse_mass_template)
+
+
+@cache
+def _get_partitioned_inverse_dynamics_kernels(direct_dofs: int, device_arch: str) -> tuple["wp.Kernel", "wp.Kernel"]:
+    """Build generic-articulation and independent one-body inverse-dynamics kernels."""
+    del device_arch
+    N = int(direct_dofs)
+    if N <= 0:
+        raise ValueError("partitioned inverse dynamics requires a positive direct DOF count")
+
+    def selected_articulation_tau_template(
+        selected_articulations: wp.array[int],
+        articulation_start: wp.array[int],
+        articulation_joint_end: wp.array[int],
+        joint_type: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_articulation: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_q_start: wp.array[int],
+        joint_dof_dim: wp.array2d[int],
+        joint_f: wp.array[float],
+        joint_q: wp.array[float],
+        joint_qd: wp.array[float],
+        joint_spring_stiffness: wp.array[float],
+        joint_spring_ref: wp.array[float],
+        joint_damping: wp.array[float],
+        joint_S_s: wp.array[wp.spatial_vector],
+        body_fb_s: wp.array[wp.spatial_vector],
+        body_f_ext: wp.array[wp.spatial_vector],
+        body_flags: wp.array[int],
+        body_q: wp.array[wp.transform],
+        body_com: wp.array[wp.vec3],
+        articulation_origin: wp.array[wp.vec3],
+        add_existing_tau: int,
+        body_ft_s: wp.array[wp.spatial_vector],
+        tau: wp.array[float],
+    ):
+        articulation = selected_articulations[wp.tid()]
+        accumulate_articulation_tau(
+            articulation,
+            articulation_start,
+            articulation_joint_end,
+            joint_type,
+            joint_parent,
+            joint_child,
+            joint_articulation,
+            joint_qd_start,
+            joint_q_start,
+            joint_dof_dim,
+            joint_f,
+            joint_q,
+            joint_qd,
+            joint_spring_stiffness,
+            joint_spring_ref,
+            joint_damping,
+            joint_S_s,
+            body_fb_s,
+            body_f_ext,
+            body_flags,
+            body_q,
+            body_com,
+            articulation_origin,
+            add_existing_tau,
+            body_ft_s,
+            tau,
+        )
+
+    def direct_branch_tau_template(
+        group_to_art: wp.array[int],
+        dof_joint_offset: wp.array[int],
+        articulation_start: wp.array[int],
+        joint_type: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_q_start: wp.array[int],
+        joint_dof_dim: wp.array2d[int],
+        joint_f: wp.array[float],
+        joint_q: wp.array[float],
+        joint_qd: wp.array[float],
+        joint_spring_stiffness: wp.array[float],
+        joint_spring_ref: wp.array[float],
+        joint_damping: wp.array[float],
+        joint_S_s: wp.array[wp.spatial_vector],
+        body_fb_s: wp.array[wp.spatial_vector],
+        body_f_ext: wp.array[wp.spatial_vector],
+        body_flags: wp.array[int],
+        body_q: wp.array[wp.transform],
+        body_com: wp.array[wp.vec3],
+        articulation_origin: wp.array[wp.vec3],
+        add_existing_tau: int,
+        tau: wp.array[float],
+    ):
+        element = wp.tid()
+        group = element // N
+        local_dof = element - group * N
+        articulation = group_to_art[group]
+        joint = articulation_start[articulation] + dof_joint_offset[local_dof]
+        child = joint_child[joint]
+
+        external_com = wp.spatial_vector()
+        if (body_flags[child] & BodyFlags.KINEMATIC) == 0:
+            external_com = body_f_ext[child]
+        external_force = wp.spatial_bottom(external_com)
+        external_torque = wp.spatial_top(external_com)
+        com_world = wp.transform_point(body_q[child], body_com[child])
+        com_relative = com_world - articulation_origin[articulation]
+        external_origin = wp.spatial_vector(
+            external_torque,
+            external_force + wp.cross(com_relative, external_torque),
+        )
+        body_force = body_fb_s[child] - external_origin
+        jcalc_tau(
+            joint_type[joint],
+            joint_S_s,
+            joint_f,
+            joint_q,
+            joint_qd,
+            joint_spring_stiffness,
+            joint_spring_ref,
+            joint_damping,
+            joint_q_start[joint],
+            joint_qd_start[joint],
+            joint_dof_dim[joint, 0],
+            joint_dof_dim[joint, 1],
+            body_force,
+            add_existing_tau,
+            tau,
+        )
+
+    selected_name = f"selected_articulation_tau_excluding_direct_{N}"
+    selected_articulation_tau_template.__name__ = selected_name
+    selected_articulation_tau_template.__qualname__ = selected_name
+    direct_name = f"direct_branch_tau_{N}"
+    direct_branch_tau_template.__name__ = direct_name
+    direct_branch_tau_template.__qualname__ = direct_name
+    return (
+        wp.kernel(enable_backward=False, module="unique")(selected_articulation_tau_template),
+        wp.kernel(enable_backward=False, module="unique")(direct_branch_tau_template),
+    )
 
 
 @cache

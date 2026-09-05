@@ -438,6 +438,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertEqual(optimized._direct_diagonal_inertia_sizes, frozenset((16,)))
         self.assertTrue(optimized._direct_compact_diagonal_inertia)
         self.assertEqual(optimized._composite_articulation_count, 2)
+        self.assertEqual(optimized._selected_tau_articulation_count, 2)
         self.assertEqual(optimized._sparse_diagonal_response_size, 16)
         self.assertEqual(optimized._sparse_diagonal_dense_size, 3)
         self.assertEqual(optimized.H_by_size[16].shape, (1, 1, 1))
