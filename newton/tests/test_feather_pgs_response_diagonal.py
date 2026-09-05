@@ -16,7 +16,9 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _FeatherPGSExecutionPlan,
+    _get_build_independent_sparse_contact_groups_kernel,
     _get_hinv_jt_kernel,
+    _get_mark_independent_sparse_contact_candidates_kernel,
     _get_pgs_solve_sparse_diagonal_kernel,
 )
 from newton.solvers import SolverFeatherPGS
@@ -220,7 +222,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         lower_lambda = wp.zeros((1, world_dofs), dtype=wp.float32, device=device)
         upper_lambda = wp.zeros_like(lower_lambda)
         velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
-        kernel = _get_pgs_solve_sparse_diagonal_kernel(max_constraints, world_dofs, dense_dofs, str(device.arch))
+        kernel = _get_pgs_solve_sparse_diagonal_kernel(
+            max_constraints, world_dofs, dense_dofs, str(device.arch), contact_triples=True
+        )
         wp.launch_tiled(
             kernel,
             dim=[1],
@@ -233,6 +237,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array(row_type, device=device),
                 wp.array(row_parent, device=device),
                 wp.array(row_mu, device=device),
+                wp.zeros((1, 2), dtype=wp.int32, device=device),
+                wp.zeros(1, dtype=wp.int32, device=device),
+                wp.empty((1, world_dofs), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array(dense_j, device=device),
@@ -258,6 +265,59 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         np.testing.assert_allclose(impulses.numpy()[0, :3], expected_impulses, rtol=2.0e-5, atol=2.0e-6)
         np.testing.assert_allclose(lower_lambda.numpy()[0, 2], expected_limit_lambda, rtol=2.0e-5, atol=2.0e-6)
         self.assertEqual(float(upper_lambda.numpy()[0, 2]), 0.0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "independent contact groups require CUDA")
+    def test_independent_sparse_contact_groups_exclude_coupled_coordinates(self):
+        """Keep scalar contacts serial when a coupled contact shares their coordinate."""
+        device = wp.get_device("cuda:0")
+        max_constraints, max_world_dofs, contact_count = 12, 4, 4
+        sparse_response_dofs = 108
+        sparse_row_dof_np = np.full((1, max_constraints, 2), -1, dtype=np.int32)
+        sparse_row_dof_np[0, 0:3, 0] = 2
+        sparse_row_dof_np[0, 3:6, 0] = 3
+        sparse_row_dof_np[0, 6:9, 0] = 3
+        sparse_row_dof_np[0, 9:12, 0] = 2
+        sparse_row_dof = wp.array(sparse_row_dof_np, device=device)
+        group_count = wp.zeros(1, dtype=wp.int32, device=device)
+        group_heads = wp.empty((1, max_world_dofs), dtype=wp.int32, device=device)
+
+        marker = _get_mark_independent_sparse_contact_candidates_kernel(sparse_response_dofs, str(device.arch))
+        wp.launch(
+            marker,
+            dim=contact_count,
+            inputs=[
+                wp.array((contact_count,), dtype=wp.int32, device=device),
+                contact_count,
+                wp.zeros(contact_count, dtype=wp.int32, device=device),
+                wp.array((0, 3, 6, 9), dtype=wp.int32, device=device),
+                wp.zeros(contact_count, dtype=wp.int32, device=device),
+                wp.array((-1, 1, -1, -1), dtype=wp.int32, device=device),
+                wp.zeros(contact_count, dtype=wp.int32, device=device),
+                wp.full(contact_count, 3, dtype=wp.int32, device=device),
+                wp.array((sparse_response_dofs, 6), dtype=wp.int32, device=device),
+            ],
+            outputs=[sparse_row_dof],
+            device=device,
+        )
+        schedule = _get_build_independent_sparse_contact_groups_kernel(
+            max_constraints, max_world_dofs, str(device.arch)
+        )
+        wp.launch(
+            schedule,
+            dim=32,
+            inputs=[
+                wp.array((max_constraints,), dtype=wp.int32, device=device),
+                wp.zeros((1, 2), dtype=wp.int32, device=device),
+            ],
+            outputs=[sparse_row_dof, group_count, group_heads],
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        self.assertEqual(int(group_count.numpy()[0]), 1)
+        self.assertEqual(int(group_heads.numpy()[0, 0]), 0)
+        normal_links = sparse_row_dof.numpy()[0, ::3, 1]
+        np.testing.assert_array_equal(normal_links, np.array((-12, -1, -1, -2), dtype=np.int32))
 
     def test_mixed_world_diagonal_map_includes_free_rigid_response(self):
         """Include free rigid articulations in every forced-tiled diagonal group."""

@@ -433,12 +433,14 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         )
 
         self.assertTrue(optimized._sparse_diagonal_contact_solve)
+        self.assertTrue(optimized._sparse_diagonal_contact_triples)
         self.assertEqual(optimized._sparse_diagonal_response_size, 16)
         self.assertEqual(optimized._sparse_diagonal_dense_size, 3)
         self.assertEqual(optimized.H_by_size[16].shape, (1, 1, 1))
         self.assertEqual(optimized.J_by_size[16].shape, (1, 1, 1))
         self.assertEqual(optimized.J_world.shape, (1, 1, 1))
         self.assertFalse(reference._sparse_diagonal_contact_solve)
+        self.assertFalse(reference._sparse_diagonal_contact_triples)
 
         q = np.tile(np.concatenate((np.full(16, -0.105), np.full(3, 0.205))).astype(np.float32), 2)
         qd = np.tile(np.concatenate((np.full(16, -0.2), np.full(3, 0.1))).astype(np.float32), 2)
