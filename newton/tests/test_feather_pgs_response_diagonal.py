@@ -8,18 +8,30 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import accumulate_group_diag_worlds
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSExecutionPlan, _get_hinv_jt_kernel
+from newton._src.solvers.feather_pgs.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_LOCAL_SOLVE_OWNER_PAIR,
+    accumulate_group_diag_worlds,
+)
+from newton._src.solvers.feather_pgs.solver_feather_pgs import (
+    _FeatherPGSExecutionPlan,
+    _get_hinv_jt_kernel,
+    _get_pgs_solve_sparse_diagonal_kernel,
+)
 from newton.solvers import SolverFeatherPGS
 
 
-def _build_mixed_response_model(device, world_count=1):
-    """Build one 13-DOF articulation contacting one free rigid body."""
+def _build_mixed_response_model(
+    device, world_count=1, *, dof_count=13, friction=0.0, restitution=0.0, static_plane=False
+):
+    """Build one serial articulation contacting one free rigid body."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.default_shape_cfg.density = 1000.0
     builder.default_shape_cfg.ke = 1.0e5
     builder.default_shape_cfg.kd = 1.0e3
-    builder.default_shape_cfg.mu = 0.0
+    builder.default_shape_cfg.mu = friction
+    builder.default_shape_cfg.restitution = restitution
     builder.default_shape_cfg.margin = 0.0
     builder.default_shape_cfg.gap = 0.0
 
@@ -35,7 +47,7 @@ def _build_mixed_response_model(device, world_count=1):
         )
     ]
     parent = arm
-    for index in range(12):
+    for index in range(dof_count - 1):
         child = builder.add_link(
             mass=0.05,
             inertia=wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-3),
@@ -55,6 +67,8 @@ def _build_mixed_response_model(device, world_count=1):
     box = builder.add_link(xform=wp.transform(wp.vec3(0.7, 0.0, 0.5695), wp.quat_identity()))
     builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05)
     builder.add_articulation([builder.add_joint_free(parent=-1, child=box)])
+    if static_plane:
+        builder.add_shape_plane(plane=(0.0, 0.0, 1.0, -0.53))
     if world_count == 1:
         return builder.finalize(device=device)
     replicated = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -62,28 +76,41 @@ def _build_mixed_response_model(device, world_count=1):
     return replicated.finalize(device=device)
 
 
-def _build_mixed_response_solver(model, *, warmstart, preelimination):
-    return SolverFeatherPGS(
-        model,
-        pgs_mode="matrix_free",
-        pgs_warmstart=warmstart,
-        enable_bilateral_preelimination=preelimination,
-        enable_contact_friction=False,
-        pgs_iterations=8,
-        dense_max_constraints=32,
-        mf_max_constraints=32,
-    )
-
-
-def _run_mixed_response(kernel, *, warmstart, preelimination):
+def _run_mixed_response(
+    kernel,
+    *,
+    warmstart,
+    preelimination,
+    dof_count=13,
+    dense_max_constraints=32,
+    inactive_joint_limit_capacity=False,
+    friction=0.0,
+    restitution=0.0,
+    tangential_velocity=0.0,
+    static_plane=False,
+):
     """Run a short mixed-contact trajectory with one H-inverse implementation."""
-    model = _build_mixed_response_model("cuda:0")
+    model = _build_mixed_response_model(
+        "cuda:0", dof_count=dof_count, friction=friction, restitution=restitution, static_plane=static_plane
+    )
     with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": kernel}):
-        solver = _build_mixed_response_solver(model, warmstart=warmstart, preelimination=preelimination)
+        solver = SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            pgs_warmstart=warmstart,
+            enable_bilateral_preelimination=preelimination,
+            enable_contact_friction=friction > 0.0,
+            enable_joint_limits=inactive_joint_limit_capacity,
+            joint_limit_activation_gap=0.0,
+            pgs_iterations=8,
+            dense_max_constraints=dense_max_constraints,
+            mf_max_constraints=32,
+        )
     state_in, state_out = model.state(), model.state()
     joint_qd = state_in.joint_qd.numpy()
     free_articulation = int(np.flatnonzero(solver._model_plan.is_free_rigid)[0])
     free_dof_start = int(solver._model_plan.articulation_dof_start[free_articulation])
+    joint_qd[free_dof_start] = tangential_velocity
     joint_qd[free_dof_start + 2] = -3.0
     state_in.joint_qd.assign(joint_qd)
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
@@ -109,6 +136,9 @@ def _run_mixed_response(kernel, *, warmstart, preelimination):
                 solver.impulses.numpy()[0, :constraint_count].copy(),
                 state_out.joint_q.numpy().copy(),
                 state_out.joint_qd.numpy().copy(),
+                int(solver._local_solve_owner.numpy()[0]),
+                solver.row_type.numpy()[0, :constraint_count].copy(),
+                int(solver.mf_constraint_count.numpy()[0]),
             )
         )
         state_in, state_out = state_out, state_in
@@ -116,6 +146,119 @@ def _run_mixed_response(kernel, *, warmstart, preelimination):
 
 
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal GS requires CUDA")
+    def test_sparse_diagonal_gs_matches_scalar_reference(self):
+        """Match a scalar PGS reference with coupled limits and friction."""
+        device = wp.get_device("cuda:0")
+        max_constraints, world_dofs, dense_dofs = 8, 4, 2
+        cfm, omega, iterations = 1.0e-6, 1.0, 8
+        inverse_mass = np.array((0.5, 0.25, 0.75, 1.0), dtype=np.float32)
+        initial_velocity = np.array((-0.4, 0.3, -0.2, 0.1), dtype=np.float32)
+        jacobian = np.array(
+            ((0.6, -0.4, 0.2, 0.0), (0.1, 0.5, -0.3, 0.4), (-0.2, 0.25, 0.1, -0.35)),
+            dtype=np.float32,
+        )
+        response = jacobian * inverse_mass
+        rhs = np.zeros((1, max_constraints), dtype=np.float32)
+        rhs[0, :3] = (-0.1, 0.0, 0.0)
+        diag = np.zeros_like(rhs)
+        diag[0, :3] = np.sum(jacobian * response, axis=1) + cfm
+        row_type = np.zeros((1, max_constraints), dtype=np.int32)
+        row_type[0, :3] = (PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION)
+        row_parent = np.full((1, max_constraints), -1, dtype=np.int32)
+        row_parent[0, 1:3] = 0
+        row_mu = np.zeros((1, max_constraints), dtype=np.float32)
+        row_mu[0, 1:3] = 0.7
+        dense_j = np.zeros((1, max_constraints, dense_dofs), dtype=np.float32)
+        dense_y = np.zeros_like(dense_j)
+        dense_j[0, :3] = jacobian[:, :dense_dofs]
+        dense_y[0, :3] = response[:, :dense_dofs]
+        sparse_dof = np.full((1, max_constraints, 2), -1, dtype=np.int32)
+        sparse_jy = np.zeros((1, max_constraints, 4), dtype=np.float32)
+        sparse_dof[0, :3] = (2, 3)
+        sparse_jy[0, :3, 0] = jacobian[:, 2]
+        sparse_jy[0, :3, 1] = response[:, 2]
+        sparse_jy[0, :3, 2] = jacobian[:, 3]
+        sparse_jy[0, :3, 3] = response[:, 3]
+        limit_active = np.zeros((1, world_dofs), dtype=np.int32)
+        limit_active[0, 2] = 1
+        limit_lower_rhs = np.zeros((1, world_dofs), dtype=np.float32)
+        limit_lower_rhs[0, 2] = -0.15
+
+        expected_velocity = initial_velocity.copy()
+        expected_impulses = np.zeros(3, dtype=np.float32)
+        expected_limit_lambda = np.float32(0.0)
+        for _ in range(iterations):
+            old_limit = expected_limit_lambda
+            residual = expected_velocity[2] + limit_lower_rhs[0, 2]
+            expected_limit_lambda = np.maximum(0.0, old_limit - omega * residual / (inverse_mass[2] + cfm))
+            expected_velocity[2] += inverse_mass[2] * (expected_limit_lambda - old_limit)
+            for row in range(3):
+                old_impulse = expected_impulses[row]
+                new_impulse = old_impulse - omega * (jacobian[row] @ expected_velocity + rhs[0, row]) / diag[0, row]
+                if row == 0:
+                    new_impulse = max(new_impulse, 0.0)
+                else:
+                    radius = max(row_mu[0, row] * expected_impulses[0], 0.0)
+                    sibling = 2 if row == 1 else 1
+                    if radius <= 0.0:
+                        new_impulse = 0.0
+                    else:
+                        expected_impulses[row] = new_impulse
+                        sibling_old = expected_impulses[sibling]
+                        magnitude = np.sqrt(new_impulse * new_impulse + sibling_old * sibling_old)
+                        if magnitude > radius:
+                            scale = radius / magnitude
+                            new_impulse *= scale
+                            sibling_new = sibling_old * scale
+                            expected_impulses[sibling] = sibling_new
+                            expected_velocity += response[sibling] * (sibling_new - sibling_old)
+                expected_impulses[row] = new_impulse
+                expected_velocity += response[row] * (new_impulse - old_impulse)
+
+        impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
+        lower_lambda = wp.zeros((1, world_dofs), dtype=wp.float32, device=device)
+        upper_lambda = wp.zeros_like(lower_lambda)
+        velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
+        kernel = _get_pgs_solve_sparse_diagonal_kernel(max_constraints, world_dofs, dense_dofs, str(device.arch))
+        wp.launch_tiled(
+            kernel,
+            dim=[1],
+            inputs=[
+                wp.array((3,), dtype=wp.int32, device=device),
+                wp.array(np.arange(world_dofs, dtype=np.int32)[None, :], device=device),
+                wp.array(rhs, device=device),
+                wp.array(diag, device=device),
+                impulses,
+                wp.array(row_type, device=device),
+                wp.array(row_parent, device=device),
+                wp.array(row_mu, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array(dense_j, device=device),
+                wp.array(dense_y, device=device),
+                wp.array(sparse_dof, device=device),
+                wp.array(sparse_jy, device=device),
+                wp.array(limit_active, device=device),
+                wp.array(limit_lower_rhs, device=device),
+                wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
+                wp.array(inverse_mass, device=device),
+                cfm,
+                iterations,
+                omega,
+                0,
+                0,
+            ],
+            outputs=[lower_lambda, upper_lambda, velocity],
+            block_dim=32,
+            device=device,
+        )
+
+        np.testing.assert_allclose(velocity.numpy(), expected_velocity, rtol=2.0e-5, atol=2.0e-6)
+        np.testing.assert_allclose(impulses.numpy()[0, :3], expected_impulses, rtol=2.0e-5, atol=2.0e-6)
+        np.testing.assert_allclose(lower_lambda.numpy()[0, 2], expected_limit_lambda, rtol=2.0e-5, atol=2.0e-6)
+        self.assertEqual(float(upper_lambda.numpy()[0, 2]), 0.0)
+
     def test_mixed_world_diagonal_map_includes_free_rigid_response(self):
         """Include free rigid articulations in every forced-tiled diagonal group."""
         solver = SolverFeatherPGS(_build_mixed_response_model("cpu", world_count=2), dense_max_constraints=32)
@@ -152,6 +295,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             solver.size_groups,
             max_constraints=solver.dense_max_constraints,
             max_shared_memory=101376,
+            cholesky_kernel="auto",
             hinv_jt_kernel="tiled",
             small_dof_threshold=12,
             tile_threads=64,
@@ -182,8 +326,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                         self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
                         for label, expected_value, actual_value in zip(
                             ("diagonal", "impulses", "joint_q", "joint_qd"),
-                            expected[1:],
-                            actual[1:],
+                            expected[1:5],
+                            actual[1:5],
                             strict=True,
                         ):
                             np.testing.assert_allclose(
@@ -193,6 +337,156 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                                 atol=2.0e-6,
                                 err_msg=f"{label} differed at step {step}",
                             )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
+    def test_paired_response_matches_general_23_dof_trajectory(self):
+        """Match the general response when one warp owns a robot/free-body pair."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "dof_count": 23,
+            "dense_max_constraints": 96,
+            "inactive_joint_limit_capacity": True,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+        }
+        reference_solver, reference = _run_mixed_response("par_row", **run_kwargs)
+        paired_solver, paired = _run_mixed_response("auto", **run_kwargs)
+
+        self.assertIsNone(reference_solver._paired_response_primary_size)
+        self.assertEqual(paired_solver._paired_response_primary_size, 23)
+        self.assertEqual(paired_solver._paired_response_secondary_size, 6)
+        self.assertIsNotNone(paired_solver._paired_response_kernel)
+        self.assertIsNotNone(paired_solver._paired_factor_solve_kernel)
+        self.assertTrue(paired_solver._paired_factor_coordinates)
+        self.assertTrue(paired_solver._factor_coordinate_contact_triples)
+        self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
+        for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
+            self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+            np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
+            for label, expected_value, actual_value in zip(
+                ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+            ):
+                np.testing.assert_allclose(
+                    actual_value,
+                    expected_value,
+                    rtol=5.0e-4,
+                    atol=1.0e-5,
+                    err_msg=f"{label} differed at step {step}",
+                )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response fallback requires CUDA")
+    def test_paired_response_falls_back_for_matrix_free_rows(self):
+        """Keep mixed dense/matrix-free worlds in physical coordinates."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "dof_count": 23,
+            "dense_max_constraints": 96,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+            "static_plane": True,
+        }
+        reference_solver, reference = _run_mixed_response("par_row", **run_kwargs)
+        paired_solver, paired = _run_mixed_response("auto", **run_kwargs)
+
+        self.assertIsNone(reference_solver._paired_response_primary_size)
+        self.assertTrue(paired_solver._paired_factor_coordinates)
+        self.assertTrue(any(sample[7] > 0 for sample in paired), "static contact generated no matrix-free rows")
+        for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
+            self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+            np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
+            for label, expected_value, actual_value in zip(
+                ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+            ):
+                np.testing.assert_allclose(
+                    actual_value,
+                    expected_value,
+                    rtol=5.0e-4,
+                    atol=1.0e-5,
+                    err_msg=f"{label} differed at step {step}",
+                )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
+    def test_local_internal_mixed_world_matches_general_response(self):
+        """Match the general response when an articulation contacts a free body."""
+        general_solver, general = _run_mixed_response(
+            "tiled", warmstart=False, preelimination=False, inactive_joint_limit_capacity=True
+        )
+        local_solver, local = _run_mixed_response(
+            "par_row", warmstart=False, preelimination=False, inactive_joint_limit_capacity=True
+        )
+
+        self.assertFalse(general_solver._local_internal_fast_path)
+        self.assertTrue(local_solver._local_internal_fast_path)
+        self.assertEqual(len(general), len(local))
+        self.assertGreater(general[0][0], 0, "mixed scene generated no dense constraint rows")
+        self.assertTrue(
+            any(sample[5] == PGS_LOCAL_SOLVE_OWNER_PAIR for sample in local),
+            "mixed contact never selected the paired local owner",
+        )
+
+        free_articulation = int(np.flatnonzero(general_solver._model_plan.is_free_rigid)[0])
+        free_dof_start = int(general_solver._model_plan.articulation_dof_start[free_articulation])
+        self.assertGreater(
+            abs(float(general[0][4][free_dof_start + 2]) + 3.0),
+            1.0e-4,
+            "general response did not couple the dense contact to the free body",
+        )
+
+        for step, (expected, actual) in enumerate(zip(general, local, strict=True)):
+            self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+            for label, expected_value, actual_value in zip(
+                ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+            ):
+                np.testing.assert_allclose(
+                    actual_value,
+                    expected_value,
+                    rtol=5.0e-4,
+                    atol=2.0e-6,
+                    err_msg=f"{label} differed at step {step}",
+                )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
+    def test_local_pair_matches_general_friction_and_restitution(self):
+        """Preserve paired friction projection and restitution response."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "inactive_joint_limit_capacity": True,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+        }
+        general_solver, general = _run_mixed_response("tiled", **run_kwargs)
+        local_solver, local = _run_mixed_response("par_row", **run_kwargs)
+
+        self.assertFalse(general_solver._local_internal_fast_path)
+        self.assertTrue(local_solver._local_internal_fast_path)
+        pair_samples = [sample for sample in local if sample[5] == PGS_LOCAL_SOLVE_OWNER_PAIR]
+        self.assertTrue(pair_samples, "mixed friction contact never selected the paired local owner")
+        self.assertTrue(
+            any(
+                np.any(np.abs(sample[2][sample[6] == PGS_CONSTRAINT_TYPE_FRICTION]) > 1.0e-5) for sample in pair_samples
+            ),
+            "paired solve produced no nonzero friction impulse",
+        )
+
+        for step, (expected, actual) in enumerate(zip(general, local, strict=True)):
+            self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+            np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
+            for label, expected_value, actual_value in zip(
+                ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+            ):
+                np.testing.assert_allclose(
+                    actual_value,
+                    expected_value,
+                    rtol=5.0e-4,
+                    atol=2.0e-6,
+                    err_msg=f"{label} differed at step {step}",
+                )
 
     @unittest.skipUnless(wp.is_cuda_available(), "tiled H-inverse response requires CUDA")
     def test_tiled_response_diagonal_matches_dense_reference(self):
