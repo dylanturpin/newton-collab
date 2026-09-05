@@ -77,6 +77,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertEqual(solver.tile_threads, 64)
         self.assertEqual(solver.articulated_contact_response, "immediate")
 
+    @unittest.skipUnless(wp.is_cuda_available(), "articulated response modes require CUDA")
     def test_articulated_contact_response_validation(self):
         model = _build_chain_model(num_links=2, num_worlds=1)
         solver = SolverFeatherPGS(
@@ -370,6 +371,10 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             {"pgs_mode": "matrix_free", "drive_mode": "physx_pgs"},  # no velocity limits
         ):
             with self.subTest(kwargs=kwargs):
+                if kwargs.get("pgs_mode") == "matrix_free" and not wp.is_cuda_available():
+                    with self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
+                        SolverFeatherPGS(model, fuse_joint_velocity_limits=True, **kwargs)
+                    continue
                 solver = SolverFeatherPGS(model, fuse_joint_velocity_limits=True, **kwargs)
                 self.assertFalse(solver.fuse_joint_velocity_limits)
         if wp.is_cuda_available():

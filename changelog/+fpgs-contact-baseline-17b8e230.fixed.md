@@ -1,0 +1,1 @@
+Bound the complete FeatherPGS implicit drive reaction by finite positive effort limits, including CUDA tiled row solves; transport warm-started friction into the current tangent frame and clamp it to the current material's friction cone.

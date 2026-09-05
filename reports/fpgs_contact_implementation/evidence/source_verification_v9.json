@@ -1,0 +1,28 @@
+{
+  "base": "e452daa3a67e008f9dcef06fe1b809b36cfd386a",
+  "snapshot": "/data/home/liinbor/src/fpgs-persistent-contacts-v9",
+  "matches": true,
+  "files": {
+    "newton/_src/geometry/contact_match.py": "69269f9006ad5eb29ea4daa9eab9105273650acb4c92838688d698c8b867f40f",
+    "newton/_src/geometry/contact_reduction_body_pairs.py": "88fa6243411e4cba0619e4d7d23d6312b5cab9ee6c82b9123326571e77b18858",
+    "newton/_src/geometry/contact_sort.py": "9af1a83d84fb53b02ad00a5a61d10ce64aafa7ed291497cfbd0d82343ebf6220",
+    "newton/_src/sim/collide.py": "4a3080f68ad53eb493ecc8b95c46470106e67a4ecc01f71d0085165efb1f82aa",
+    "newton/_src/solvers/feather_pgs/kernels.py": "732065b5f9e371a3dd9a6cf589b6abde2c53cacdb7f0799c325b6754d26c67a2",
+    "newton/_src/solvers/feather_pgs/solver_feather_pgs.py": "b10c331acdafbe3b3d00b12d2c814d7a2d93edb4b884531650232b0f5996f929",
+    "newton/tests/test_contact_reduction_body_pairs.py": "87e6ffc579fe13e7066f20292662828f9daeb393da9a2e5f0ffe8d8f0c2db596",
+    "newton/tests/test_feather_pgs_augmented_drives.py": "36b14d3632e5a8ba0ef134331f9c8ed4782d6c16bbf7ec9481a275290b25256d",
+    "newton/tests/test_feather_pgs_launch_config.py": "0bb2205e392e1893467e1307711b0d63e0e72dca8da1fc0f8d46d8f708d217eb",
+    "newton/tests/test_feather_pgs_local_internal_solve.py": "af58d43c54c4e90a6988c8217d862213dc84bcc981322f71854b3ff516ddc594",
+    "newton/tests/test_feather_pgs_persistent_contacts.py": "124ea204299bdf4e18a107c0cf275a5d40d16d329c241d9a7c6b16238451cc61",
+    "newton/tests/test_feather_pgs_preelim.py": "8bf5dee4b10a32405a5f143b9ec44f151082dc13c80a688b94dead6f8341c440",
+    "newton/tests/test_feather_pgs_propagation_same_articulation.py": "3e1f52f3627810b069cb3963c9713dfb58bdac6a17f4e3a1721f74e571251255",
+    "newton/tests/test_feather_pgs_regularization.py": "cd892d440365a716cbba23db3190c134ad80da8984d289b6ab1d10b3c304b7d9",
+    "newton/tests/test_feather_pgs_reset.py": "ddc702845afd22639d4182adec4a8ac26314365fd8b105bd2a17c4f46ddbf525",
+    "newton/tests/test_feather_pgs_warmstart.py": "609509f29d19612012a5a07abe979a22714aba6e62824c96a7414d9c99fe6a0f",
+    "newton/tests/test_feather_pgs_warmstart_dt.py": "21dbf16ea339c4f7c741aca0eaa28a83bf5edcb31c33727a7dc132d996abea20"
+  },
+  "post_repeat_changes": [
+    "Clarify ContactMatcher.match docstring; no executable code changes."
+  ],
+  "mismatches": []
+}

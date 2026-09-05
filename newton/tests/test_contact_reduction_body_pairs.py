@@ -676,7 +676,7 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         for label, kwargs in cases:
             with self.subTest(configuration=label):
                 solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
-                with self.assertRaisesRegex(ValueError, rf"{label}.*not validated"):
+                with self.assertRaisesRegex(NotImplementedError, "contact_matching"):
                     solver.step(state_0, state_1, model.control(), contacts, DT)
 
     def test_feather_pgs_environment_mf_warmstart_rejected_at_step(self):
@@ -689,7 +689,7 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"IL_NEWTON_FPGS_MF_WARMSTART": "1"}):
             solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split")
         self.assertTrue(solver._mf_warmstart_enabled)
-        with self.assertRaisesRegex(ValueError, r"pgs_warmstart=True.*not validated"):
+        with self.assertRaisesRegex(NotImplementedError, "contact_matching"):
             solver.step(state_0, state_1, model.control(), contacts, DT)
 
 
@@ -1243,6 +1243,24 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
 
 class TestBodyPairReductionTableSizing(unittest.TestCase):
     """The group table is sized from scene topology, not from contact capacity."""
+
+    def test_replicated_compound_feet_do_not_exhaust_default_table(self):
+        """Replication must retain the patch budget without tuning headroom."""
+        template = newton.ModelBuilder()
+        _cylinder_foot(template, wp.vec3(0.0, 0.0, 0.015))
+        builder = newton.ModelBuilder()
+        builder.replicate(template, 512, spacing=(1.0, 0.0, 0.0))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        stats = pipeline.body_pair_reduction_stats()
+        self.assertEqual(stats["fallback_frames"], 0)
+        self.assertEqual(stats["probe_failures"], 0)
+        self.assertLess(stats["max_contacts_kept"], stats["max_contacts_in"])
 
     def _scene(self, n_bodies):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
@@ -1905,19 +1923,15 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         builder.add_ground_plane()
         return builder.finalize(device=wp.get_device())
 
-    def test_contact_matching_rejected_at_construction(self):
-        """Reject body-pair contact reduction together with contact matching.
-
-        Compaction renumbers contacts, which would silently invalidate the
-        matcher's index-based frame-to-frame bookkeeping.
-        """
+    def test_sticky_matching_rejected_at_construction(self):
+        """Reject replay that can change geometry after selecting support extremes."""
         model = self._foot_scene()
         with self.assertRaisesRegex(ValueError, "contact_matching"):
             newton.CollisionPipeline(
                 model,
                 broad_phase="nxn",
                 deterministic=True,
-                contact_matching="latest",
+                contact_matching="sticky",
                 reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True),
             )
 

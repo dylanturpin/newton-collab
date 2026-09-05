@@ -48,6 +48,17 @@ from ..sim.model import Model
 from ..sim.state import State
 
 
+@wp.kernel
+def _reduction_reset_mask_from_matching(
+    mask: wp.array[wp.bool],
+    world_count: int,
+    reduction_mask: wp.array[wp.int32],
+):
+    world = wp.tid()
+    # A changed global collider may participate in every world's patches.
+    reduction_mask[world] = int(mask[world_count] or (world < world_count and mask[world]))
+
+
 def _shape_collide_mask(model: Model, shape_count: int | None = None) -> np.ndarray:
     """Return a host mask for shapes participating in shape-shape collision."""
     shape_flags = getattr(model, "shape_flags", None)
@@ -1231,11 +1242,13 @@ class CollisionPipeline:
             body_pair_hysteresis: Previous-winner preference [m].  Set to zero
                 for memoryless selection.
             body_pair_hashtable_headroom: Multiplier on the group-table capacity
-                derived from the model's own contact-pair topology.  ``1.0``
-                allocates one entry per group pair the model can produce, which
-                over-provisions any scene whose candidate pairs are not all
-                simultaneously in contact and under-provisions one whose pairs
-                spread over many normal bins or spatial cells.  Neither is
+                derived from the model's own contact-pair topology. ``1.0``
+                reserves the larger of one entry per reachable group pair and
+                eight entries per material group. The latter budgets four patch
+                entries at half load so isolated environment replication retains
+                headroom for normal bins and spatial cells. This remains a
+                heuristic: not all candidate pairs contact simultaneously, and
+                individual pairs can span more cells than budgeted. Neither is
                 unsafe: a table too small makes individual frames keep every
                 contact (``fallback_frames``) rather than dropping any, and the
                 request is capped at ``rigid_contact_max`` because a group
@@ -1255,8 +1268,9 @@ class CollisionPipeline:
         contacts with identical packed winner keys may retain additional
         contacts.  It is an approximation with scene-dependent support error
         and possible upward torsional-friction bias; validate tipping- and
-        yaw-sensitive tasks.  It is incompatible with contact matching, active
-        hydroelastic contacts, and FeatherPGS warm start.  Call
+        yaw-sensitive tasks. It supports contact matching and FeatherPGS warm
+        starting with ``contact_matching="latest"``; sticky replay and active
+        hydroelastic contacts remain unsupported. Call
         :meth:`CollisionPipeline.reset_body_pair_reduction_history` after
         episode resets or teleports, and
         :meth:`CollisionPipeline.refresh_body_pair_reduction_groups` after
@@ -1468,8 +1482,8 @@ class CollisionPipeline:
                     The ``"sticky"`` mode may change without prior notice.
             contact_matching_pos_threshold: World-space distance threshold [m]
                 between the previous and current contact midpoints
-                ``0.5 * (world(point0) + world(point1))``.  Contacts whose
-                midpoint moves more than this are considered broken.  Defaults
+                ``0.5 * (world(point0) + world(point1))``. Contacts whose
+                midpoint moves more than this are considered broken. Defaults
                 to ``0.0005``.
             contact_matching_normal_dot_threshold: Minimum dot product between
                 old and new contact normals for a match.
@@ -1525,10 +1539,11 @@ class CollisionPipeline:
         matching_sticky = contact_matching == "sticky"
         if contact_report and not matching_enabled:
             raise ValueError('contact_report=True requires contact_matching != "disabled"')
-        if reduction_config.body_pairs and matching_enabled:
-            # Compaction renumbers contacts, which invalidates the matcher's
-            # index-based frame-to-frame bookkeeping.
-            raise ValueError("body-pair contact reduction is not supported together with contact_matching")
+        if reduction_config.body_pairs and matching_sticky:
+            raise ValueError(
+                'body-pair contact reduction requires contact_matching="latest" or "disabled"; '
+                "sticky replay can replace the geometry used to select support representatives"
+            )
 
         # Any non-disabled matching mode implies deterministic sorting.
         if matching_enabled:
@@ -2024,6 +2039,7 @@ class CollisionPipeline:
                 shape_world=(model.shape_world.numpy() if getattr(model, "shape_world", None) is not None else None),
                 world_count=max(int(getattr(model, "world_count", 1)), 1),
                 borrowed_scratch=(self._contact_sorter.borrow_full_scratch() if self._contact_sorter else None),
+                preserve_sort_keys=deterministic,
                 verify=self.contact_reduction_config.body_pair_verify,
                 hysteresis=self.contact_reduction_config.body_pair_hysteresis,
                 hashtable_headroom=self.contact_reduction_config.body_pair_hashtable_headroom,
@@ -2031,6 +2047,11 @@ class CollisionPipeline:
             )
         else:
             self._body_pair_reducer = None
+        self._reduction_reset_mask = (
+            wp.zeros(max(int(model.world_count), 1), dtype=wp.int32, device=device)
+            if self._body_pair_reducer is not None and matching_enabled
+            else None
+        )
         # A graph-owned lease retains this pipeline (and therefore every
         # reducer array captured by its launches) plus the exact Contacts
         # buffer.  Only one live writer graph is permitted: reducer history,
@@ -2088,6 +2109,8 @@ class CollisionPipeline:
         # Winners recorded under the old classes are not comparable to the new
         # grouping; severing history is the conservative continuation.
         self._body_pair_reducer.reset_history()
+        if self._contact_matcher is not None:
+            self._contact_matcher.reset()
 
     def reset_body_pair_reduction_history(self, world_mask=None):
         """Erase the body-pair reduction's hysteresis history.
@@ -2276,7 +2299,9 @@ class CollisionPipeline:
         """Clear all or reset-selected previous-frame contact history.
 
         Masked selections accumulate until the next :meth:`collide` call
-        consumes them.
+        consumes them. With body-pair reduction, this also clears the selected
+        patch history. Resetting global entities invalidates all patch history.
+        Call the solver's reset method too when starting a new episode.
 
         .. experimental::
 
@@ -2293,6 +2318,17 @@ class CollisionPipeline:
         )
         if self._contact_matcher is not None:
             self._contact_matcher.reset(world_mask)
+            if self._body_pair_reducer is not None:
+                if world_mask is None:
+                    self._body_pair_reducer.reset_history()
+                else:
+                    wp.launch(
+                        _reduction_reset_mask_from_matching,
+                        dim=self._reduction_reset_mask.shape[0],
+                        inputs=[world_mask, int(self.model.world_count), self._reduction_reset_mask],
+                        device=self.device,
+                    )
+                    self._body_pair_reducer.reset_history(self._reduction_reset_mask)
 
     @staticmethod
     def _build_excluded_pairs(model: Model) -> wp.array[wp.vec2i] | None:
@@ -2647,28 +2683,6 @@ class CollisionPipeline:
             device=self.device,
         )
 
-        # Match contacts against previous frame before sorting.
-        if self._contact_matcher is not None:
-            if contacts.rigid_contact_match_index is None:
-                raise ValueError(
-                    "CollisionPipeline has contact_matching enabled but the "
-                    "Contacts buffer was created without contact_matching. "
-                    "Use pipeline.contacts() to create a compatible buffer."
-                )
-            self._contact_matcher.match(
-                sort_keys=self._sort_key_array,
-                contact_count=contacts.rigid_contact_count,
-                point0=contacts.rigid_contact_point0,
-                point1=contacts.rigid_contact_point1,
-                shape0=contacts.rigid_contact_shape0,
-                shape1=contacts.rigid_contact_shape1,
-                normal=contacts.rigid_contact_normal,
-                body_q=state.body_q,
-                shape_body=model.shape_body,
-                match_index_out=contacts.rigid_contact_match_index,
-                device=self.device,
-            )
-
         if self.deterministic and self._contact_sorter is not None:
             self._contact_sorter.sort_full(
                 self._sort_key_array,
@@ -2687,6 +2701,58 @@ class CollisionPipeline:
                 damping=contacts.rigid_contact_damping,
                 friction=contacts.rigid_contact_friction,
                 match_index=contacts.rigid_contact_match_index,
+                device=self.device,
+            )
+
+        # Body-pair contact reduction: compact patch-redundant candidates so
+        # rigid_contact_count reflects the contact structure, not the collider
+        # decomposition. Runs before the differentiable augmentation so the
+        # diff arrays are built from the compacted set.
+        if self._body_pair_reducer is not None:
+            # A different Contacts instance means a different stream of states;
+            # winners recorded for the previous buffer must not bias this one.
+            # Held as a weak reference: a raw id() can be recycled by the
+            # allocator after the old buffer dies, silently inheriting its
+            # history.
+            last = getattr(self, "_last_contacts_ref", None)
+            if last is None or last() is not contacts:
+                self._body_pair_reducer.reset_history()
+                self._last_contacts_ref = weakref.ref(contacts)
+
+        # Provenance is assigned on EVERY collide from the pipeline's mode --
+        # never only set on reduction -- so a buffer reused across pipelines
+        # cannot carry a stale marker (see
+        # SolverBase.supports_body_pair_reduced_contacts).
+        contacts.rigid_contacts_body_pair_reduced = self._body_pair_reducer is not None
+        contacts.rigid_contacts_pair_sorted = bool(self.deterministic)
+        if self._body_pair_reducer is not None:
+            self._body_pair_reducer.reduce(
+                model,
+                state,
+                contacts,
+                sort_keys=self._contact_sorter.sorted_keys_view if self.deterministic else None,
+            )
+
+        # Match and save the retained stream so all indices name solver contacts.
+        # Matching now sees the final retained and sorted stream.
+        if self._contact_matcher is not None:
+            if contacts.rigid_contact_match_index is None:
+                raise ValueError(
+                    "CollisionPipeline has contact_matching enabled but the "
+                    "Contacts buffer was created without contact_matching. "
+                    "Use pipeline.contacts() to create a compatible buffer."
+                )
+            self._contact_matcher.match(
+                sort_keys=self._contact_sorter.sorted_keys_view,
+                contact_count=contacts.rigid_contact_count,
+                point0=contacts.rigid_contact_point0,
+                point1=contacts.rigid_contact_point1,
+                shape0=contacts.rigid_contact_shape0,
+                shape1=contacts.rigid_contact_shape1,
+                normal=contacts.rigid_contact_normal,
+                body_q=state.body_q,
+                shape_body=model.shape_body,
+                match_index_out=contacts.rigid_contact_match_index,
                 device=self.device,
             )
 
@@ -2753,30 +2819,6 @@ class CollisionPipeline:
                 device=self.device,
                 **sticky_offsets,
             )
-
-        # Body-pair contact reduction: compact patch-redundant candidates so
-        # rigid_contact_count reflects the contact structure, not the collider
-        # decomposition. Runs before the differentiable augmentation so the
-        # diff arrays are built from the compacted set.
-        if self._body_pair_reducer is not None:
-            # A different Contacts instance means a different stream of states;
-            # winners recorded for the previous buffer must not bias this one.
-            # Held as a weak reference: a raw id() can be recycled by the
-            # allocator after the old buffer dies, silently inheriting its
-            # history.
-            last = getattr(self, "_last_contacts_ref", None)
-            if last is None or last() is not contacts:
-                self._body_pair_reducer.reset_history()
-                self._last_contacts_ref = weakref.ref(contacts)
-
-        # Provenance is assigned on EVERY collide from the pipeline's mode --
-        # never only set on reduction -- so a buffer reused across pipelines
-        # cannot carry a stale marker (see
-        # SolverBase.supports_body_pair_reduced_contacts).
-        contacts.rigid_contacts_body_pair_reduced = self._body_pair_reducer is not None
-        contacts.rigid_contacts_pair_sorted = bool(self.deterministic)
-        if self._body_pair_reducer is not None:
-            self._body_pair_reducer.reduce(model, state, contacts)
 
         # Differentiable contact augmentation: reconstruct world-space contact
         # quantities through body_q so that gradients flow via wp.Tape.

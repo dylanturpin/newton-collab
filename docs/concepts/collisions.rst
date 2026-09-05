@@ -1216,10 +1216,14 @@ changed at runtime, call
 :meth:`~CollisionPipeline.refresh_body_pair_reduction_groups` so contacts with
 different material laws stop competing in a stale equivalence class.
 
-Body-pair reduction is currently supported only by the default, non-warm-started
-configuration of :class:`~newton.solvers.SolverFeatherPGS`.  It is incompatible
-with active hydroelastic contacts, contact matching, ``pgs_warmstart=True``, and
-``mf_warmstart=True``.  Mesh/heightfield producer reduction must remain enabled
+Body-pair reduction is supported by :class:`~newton.solvers.SolverFeatherPGS`,
+including warm starting with ``contact_matching="latest"``. Sorting precedes
+reduction, and matching saves the retained stream, so cached impulses refer to
+the contacts actually solved. With matching enabled,
+:meth:`~CollisionPipeline.reset_contact_matching` also clears the selected
+reduction history; refreshing material groups invalidates matching history too.
+Sticky matching and active hydroelastic contacts remain incompatible.
+Mesh/heightfield producer reduction must remain enabled
 when the postpass is selected, because a pass after materialization cannot
 recover contacts lost to output-buffer overflow.
 
@@ -2301,16 +2305,14 @@ distance threshold and a normal dot-product threshold.  The sort key encodes
 are compared.
 
 The distance metric is the world-space **contact midpoint**
-``0.5 * (world(point0) + world(point1))`` — symmetric in shape 0 and shape 1
-— which means swapping the two shapes of a pair does not change whether a
-contact matches.  It also means pure changes in penetration depth register
-as motion on both sides of the contact, not just one.
+``0.5 * (world(point0) + world(point1))``, symmetric between the two shapes.
+The normal comparison is also in world space. Matching never transfers an
+impulse between different shape pairs, even when reduction groups them together.
 
 **Thresholds**
 
-- ``contact_matching_pos_threshold`` — maximum world-space distance [m]
-  between the previous and current contact midpoints for a match.  Contacts
-  that moved more than this between frames are considered broken.  Defaults
+- ``contact_matching_pos_threshold`` — maximum world-space distance [m] between
+  the previous and current midpoints. Contacts exceeding it are broken. Defaults
   to ``0.0005`` m.
 - ``contact_matching_normal_dot_threshold`` — minimum dot product between old
   and new contact normals.  Below this the contact is reported as broken even
@@ -2322,12 +2324,11 @@ Replay of the matched previous-frame geometry happens after the deterministic
 sort, so ``match_index`` already addresses the final sorted layout.  Unmatched
 rows are left untouched, so new and threshold-broken contacts keep their fresh
 narrow-phase geometry.  Because
-matching requires both a position delta below the threshold and a normal dot
-product above the threshold, the saved values are guaranteed to be a close
-approximation of the current geometry and are safe to reuse.  The extra
-per-contact buffers (four ``vec3`` columns for the body-frame points and
-offsets) are only allocated when the mode is ``"sticky"``; ``"latest"`` and
-``"disabled"`` pay zero additional memory and launch no additional kernels.
+matching bounds midpoint displacement and normal change, replay uses a nearby
+geometry approximation. Validate its effect on contact forces and stability.
+Both enabled modes own the previous midpoint and normal independently of
+sorter scratch. Sticky mode additionally stores two points and two offsets and runs the replay
+kernel; disabled matching allocates no matching history.
 
 .. _Contact Reports:
 

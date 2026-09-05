@@ -64,6 +64,22 @@ def _assert_worlds(test: unittest.TestCase, specs, reset_worlds: tuple[bool, boo
 
 
 class TestFeatherPGSReset(unittest.TestCase):
+    def test_model_changes_invalidate_impulses_without_clearing_overflow(self):
+        model = _build_two_world_free_model("cpu")
+        solver = _make_solver(model, pgs_mode="split", dense_warmstart=True, mf_warmstart=True)
+        for flags in (
+            newton.ModelFlags.BODY_INERTIAL_PROPERTIES,
+            newton.ModelFlags.JOINT_DOF_PROPERTIES,
+            newton.ModelFlags.SHAPE_PROPERTIES,
+        ):
+            with self.subTest(flags=flags):
+                specs = _history_specs(solver)
+                _poison(specs)
+                solver.constraint_overflow.fill_(True)
+                solver.notify_model_changed(flags)
+                _assert_worlds(self, specs, (True, True))
+                self.assertTrue(solver.constraint_overflow.numpy().all())
+
     def test_reset_clears_enabled_histories_by_scope(self):
         cases = (
             ("dense selected", "split", True, False, (True, False)),

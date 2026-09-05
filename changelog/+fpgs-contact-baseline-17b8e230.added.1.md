@@ -1,0 +1,1 @@
+Expose persistent FeatherPGS `constraint_overflow` device flags and `check_constraint_capacity()` so applications can reject incomplete contact or constraint solves without synchronizing each simulation step.
