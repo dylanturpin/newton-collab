@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -355,6 +356,42 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
 
         self.assertEqual(solver.mass_update_mask.numpy().tolist(), [1, 1])
         self.assertEqual(solver._mass_update_requested.numpy().tolist(), [0])
+
+    def test_teardown_waits_once_for_each_owned_stream(self):
+        """Synchronize current stream owners and tolerate CUDA shutdown."""
+        solver = object.__new__(SolverFeatherPGS)
+        local = object()
+        residual = object()
+        dynamics = object()
+        memset = object()
+        size = object()
+        solver._local_internal_stream = local
+        solver._local_residual_stream = residual
+        solver._local_pair_stream = local
+        solver._global_inertia_stream = None
+        solver._articulation_dynamics_stream = dynamics
+        solver._memset_stream = memset
+        solver._size_streams = {3: local, 6: size}
+
+        def synchronize(stream):
+            if stream is residual:
+                raise RuntimeError("CUDA is shutting down")
+
+        with mock.patch.object(wp, "synchronize_stream", side_effect=synchronize) as synchronize_stream:
+            solver.__del__()
+        self.assertEqual(
+            synchronize_stream.call_args_list,
+            [mock.call(local), mock.call(residual), mock.call(dynamics), mock.call(memset), mock.call(size)],
+        )
+
+        # Prevent a second meaningful synchronization when Python collects the
+        # deliberately uninitialized instance after this regression returns.
+        solver._local_internal_stream = None
+        solver._local_residual_stream = None
+        solver._local_pair_stream = None
+        solver._articulation_dynamics_stream = None
+        solver._memset_stream = None
+        solver._size_streams = {}
 
     def test_mass_refresh_has_no_obsolete_limit_count_state(self):
         solver = SolverFeatherPGS(_build_model(wp.get_device(), ground=False))
