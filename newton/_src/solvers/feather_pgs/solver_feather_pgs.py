@@ -1591,6 +1591,9 @@ class SolverFeatherPGS(SolverBase):
             and self.contact_friction_gap_threshold == math.inf
             and self.contact_friction_anchor_limit == 0
         )
+        self._sparse_diagonal_speculative_contact_batches = bool(
+            self._sparse_diagonal_contact_triples and self._sparse_diagonal_dense_size + 2 <= 8
+        )
         self._sparse_diagonal_dense_offsets = wp.array(
             sparse_diagonal_pair[2] if sparse_diagonal_pair is not None else np.zeros(1, dtype=np.int32),
             dtype=wp.int32,
@@ -2004,6 +2007,17 @@ class SolverFeatherPGS(SolverBase):
             dtype=wp.int32,
             device=model.device,
         )
+        sparse_serial_shape = (
+            (self.world_count, (self.dense_max_constraints + 2) // 3)
+            if self._sparse_diagonal_speculative_contact_batches
+            else (1, 1)
+        )
+        self._sparse_contact_serial_count = wp.zeros(
+            self.world_count if self._sparse_diagonal_speculative_contact_batches else 1,
+            dtype=wp.int32,
+            device=model.device,
+        )
+        self._sparse_contact_serial_normals = wp.empty(sparse_serial_shape, dtype=wp.int32, device=model.device)
         self._allocate_mf_buffers(model)
         self._allocate_propagation_buffers(model)
         self.mf_target_velocity = (
@@ -5134,6 +5148,7 @@ class SolverFeatherPGS(SolverBase):
                 self.dense_max_constraints,
                 self.max_world_dofs,
                 device_arch,
+                build_serial_contacts=self._sparse_diagonal_speculative_contact_batches,
             )
             if self._sparse_diagonal_contact_triples
             else None
@@ -5145,6 +5160,7 @@ class SolverFeatherPGS(SolverBase):
                 self._sparse_diagonal_dense_size,
                 device_arch,
                 contact_triples=self._sparse_diagonal_contact_triples,
+                speculative_contact_batches=self._sparse_diagonal_speculative_contact_batches,
             )
             if self._sparse_diagonal_contact_solve
             else None
@@ -5713,6 +5729,8 @@ class SolverFeatherPGS(SolverBase):
                     self.dense_phase_bounds,
                     self._sparse_contact_group_count,
                     self._sparse_contact_group_heads,
+                    self._sparse_contact_serial_count,
+                    self._sparse_contact_serial_normals,
                     self._sparse_diagonal_dense_offsets,
                     self._sparse_diagonal_dense_groups,
                     self.J_by_size[dense_size],
@@ -10242,6 +10260,8 @@ class SolverFeatherPGS(SolverBase):
                     self._sparse_diagonal_row_dof,
                     self._sparse_contact_group_count,
                     self._sparse_contact_group_heads,
+                    self._sparse_contact_serial_count,
+                    self._sparse_contact_serial_normals,
                 ],
                 device=model.device,
             )
@@ -19467,11 +19487,35 @@ def _get_build_independent_sparse_contact_groups_kernel(
     max_constraints: int,
     max_world_dofs: int,
     device_arch: str,
+    *,
+    build_serial_contacts: bool = False,
 ) -> "wp.Kernel":
-    """Build exact per-coordinate contact schedules for sparse diagonal response."""
+    """Build exact independent and serial contact schedules for sparse diagonal response."""
     del device_arch
     M = int(max_constraints)
     D = int(max_world_dofs)
+    S = (M + 2) // 3
+    serial_schedule = (
+        f"""
+    // Compact the remaining contacts in original row order. The solve may
+    // inspect four normals concurrently, but any active batch is still
+    // applied through this serial list in exact GS order.
+    if (lane == 0) {{
+        int serial_count = 0;
+        for (int normal = contact_start; normal + 2 < contact_end; normal += 3) {{
+            const int sparse_row = sparse_world_base + normal * 2;
+            const bool scheduled_independently = sparse_row_dof.data[sparse_row] < -1
+                || sparse_row_dof.data[sparse_row + 1] < -1;
+            if (!scheduled_independently)
+                serial_normals.data[world * {S} + serial_count++] = normal;
+        }}
+        serial_count_out.data[world] = serial_count;
+    }}
+    __syncwarp(MASK);
+"""
+        if build_serial_contacts
+        else ""
+    )
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -19528,6 +19572,8 @@ def _get_build_independent_sparse_contact_groups_kernel(
     }}
     __syncwarp(MASK);
 
+{serial_schedule}
+
     int count = 0;
     for (int coordinate_base = 0; coordinate_base < {D}; coordinate_base += 32) {{
         const int coordinate = coordinate_base + lane;
@@ -19554,6 +19600,8 @@ def _get_build_independent_sparse_contact_groups_kernel(
         sparse_row_dof: wp.array3d[int],
         group_count: wp.array[int],
         group_heads: wp.array2d[int],
+        serial_count_out: wp.array[int],
+        serial_normals: wp.array2d[int],
     ): ...
 
     def build_independent_sparse_contact_groups_template(
@@ -19562,6 +19610,8 @@ def _get_build_independent_sparse_contact_groups_kernel(
         sparse_row_dof: wp.array3d[int],
         group_count: wp.array[int],
         group_heads: wp.array2d[int],
+        serial_count_out: wp.array[int],
+        serial_normals: wp.array2d[int],
     ):
         thread = wp.tid()
         world = thread // 32
@@ -19574,9 +19624,13 @@ def _get_build_independent_sparse_contact_groups_kernel(
             sparse_row_dof,
             group_count,
             group_heads,
+            serial_count_out,
+            serial_normals,
         )
 
     name = f"build_independent_sparse_contact_groups_{M}_{D}"
+    if build_serial_contacts:
+        name += "_serial_contacts"
     build_independent_sparse_contact_groups_template.__name__ = name
     build_independent_sparse_contact_groups_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(build_independent_sparse_contact_groups_template)
@@ -19590,11 +19644,15 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     device_arch: str,
     *,
     contact_triples: bool = False,
+    speculative_contact_batches: bool = False,
 ) -> "wp.Kernel":
     """Build the persistent ``small dense + two sparse`` GS owner."""
     M = int(max_constraints)
     D = int(max_world_dofs)
     P = int(dense_dofs)
+    S = (M + 2) // 3
+    if speculative_contact_batches and (not contact_triples or P + 2 > 8):
+        raise ValueError("speculative contact batches require an eight-lane sparse contact triple")
     elems_per_lane = (D + 31) // 32
 
     limit_declarations = []
@@ -19655,6 +19713,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     independent_contact_phase = ""
     skip_independent_contact = ""
     skip_inactive_friction = ""
+    serial_loop_open = "        for (int row = 0; row < row_count; ++row) {"
+    serial_loop_close = "        }"
     if contact_triples:
         independent_contact_phase = f"""
         // Independent scalar triples commute with the serial chain because
@@ -19805,6 +19865,80 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 && s_lambda[row + 2] == 0.0f) {
                 row += 2;
             }"""
+        if speculative_contact_batches:
+            skip_independent_contact = ""
+            serial_loop_open = f"""        const int serial_contact_count = sparse_contact_serial_count.data[world];
+        const int serial_row_end = contact_start + serial_contact_count * 3;
+        for (int serial_row = 0; serial_row < serial_row_end; ++serial_row) {{
+            int row = serial_row;
+            int contact_component = -1;
+            if (serial_row >= contact_start) {{
+                int contact_index = (serial_row - contact_start) / 3;
+                contact_component = (serial_row - contact_start) % 3;
+                if (contact_component == 0 && (contact_index & 3) == 0) {{
+                    const int batch_group = lane >> 3;
+                    const int batch_lane = lane & 7;
+                    const int candidate_index = contact_index + batch_group;
+                    const bool candidate_valid = candidate_index < serial_contact_count;
+                    const int candidate_normal = candidate_valid
+                        ? sparse_contact_serial_normals.data[world * {S} + candidate_index] : -1;
+                    int candidate_coord = -1;
+                    float candidate_jacobian = 0.0f;
+                    if (candidate_valid && batch_lane < {P}) {{
+                        candidate_coord = dense_offset + batch_lane;
+                        candidate_jacobian = dense_J.data[
+                            (dense_group * {M} + candidate_normal) * {P} + batch_lane];
+                    }} else if (candidate_valid && batch_lane <= {P + 1}) {{
+                        const int sparse_slot = batch_lane - {P};
+                        const int sparse_row = row_base + candidate_normal;
+                        candidate_coord = sparse_row_dof.data[sparse_row * 2 + sparse_slot];
+                        candidate_jacobian = sparse_row_jy.data[sparse_row * 4 + sparse_slot * 2];
+                    }}
+                    if (candidate_coord < 0) candidate_jacobian = 0.0f;
+                    float candidate_sum = candidate_coord >= 0
+                        ? candidate_jacobian * s_v[candidate_coord] : 0.0f;
+                    const unsigned candidate_mask = 0xffu << (batch_group * 8);
+                    candidate_sum += __shfl_down_sync(candidate_mask, candidate_sum, 4, 8);
+                    candidate_sum += __shfl_down_sync(candidate_mask, candidate_sum, 2, 8);
+                    candidate_sum += __shfl_down_sync(candidate_mask, candidate_sum, 1, 8);
+                    const float candidate_velocity = __shfl_sync(candidate_mask, candidate_sum, 0, 8);
+                    bool candidate_noop = !candidate_valid;
+                    if (candidate_valid) {{
+                        const float old_impulse = s_lambda[candidate_normal];
+                        float new_impulse = old_impulse;
+                        const float denominator = s_diag[candidate_normal];
+                        if (denominator > 0.0f) {{
+                            new_impulse -= omega
+                                * (candidate_velocity + s_rhs[candidate_normal]) / denominator;
+                            if (new_impulse < 0.0f) new_impulse = 0.0f;
+                        }}
+                        candidate_noop = old_impulse == 0.0f && new_impulse == 0.0f
+                            && s_lambda[candidate_normal + 1] == 0.0f
+                            && s_lambda[candidate_normal + 2] == 0.0f;
+                    }}
+                    const unsigned noop_lanes = __ballot_sync(MASK, candidate_noop);
+                    if (noop_lanes == MASK) {{
+                        const int remaining_contacts = serial_contact_count - contact_index;
+                        const int batch_contacts = remaining_contacts < 4 ? remaining_contacts : 4;
+                        serial_row += batch_contacts * 3 - 1;
+                        continue;
+                    }}
+                    const int first_active_contact = (__ffs((int)(~noop_lanes)) - 1) >> 3;
+                    serial_row += first_active_contact * 3;
+                    contact_index += first_active_contact;
+                }}
+                contact_component = (serial_row - contact_start) % 3;
+                contact_index = (serial_row - contact_start) / 3;
+                row = sparse_contact_serial_normals.data[world * {S} + contact_index]
+                    + contact_component;
+            }}"""
+            skip_inactive_friction = """
+            if (contact_component == 0
+                && s_lambda[row] <= 0.0f
+                && s_lambda[row + 1] == 0.0f
+                && s_lambda[row + 2] == 0.0f) {
+                serial_row += 2;
+            }"""
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -19854,7 +19988,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 
 {independent_contact_phase}
 
-        for (int row = 0; row < row_count; ++row) {{
+{serial_loop_open}
 {skip_independent_contact}
             const int row_type = s_meta[row] & {_DENSE_META_ROW_TYPE_MASK};
             if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
@@ -19938,7 +20072,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             }}
             __syncwarp(MASK);
 {skip_inactive_friction}
-        }}
+{serial_loop_close}
 
         if (global_iteration >= friction_start_iteration
             && __ballot_sync(MASK, iteration_changed != 0) == 0u) break;
@@ -19968,6 +20102,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
         dense_phase_bounds: wp.array2d[int],
         sparse_contact_group_count: wp.array[int],
         sparse_contact_group_heads: wp.array2d[int],
+        sparse_contact_serial_count: wp.array[int],
+        sparse_contact_serial_normals: wp.array2d[int],
         dense_offsets: wp.array[int],
         dense_groups: wp.array[int],
         dense_J: wp.array3d[float],
@@ -20000,6 +20136,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
         dense_phase_bounds: wp.array2d[int],
         sparse_contact_group_count: wp.array[int],
         sparse_contact_group_heads: wp.array2d[int],
+        sparse_contact_serial_count: wp.array[int],
+        sparse_contact_serial_normals: wp.array2d[int],
         dense_offsets: wp.array[int],
         dense_groups: wp.array[int],
         dense_J: wp.array3d[float],
@@ -20033,6 +20171,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             dense_phase_bounds,
             sparse_contact_group_count,
             sparse_contact_group_heads,
+            sparse_contact_serial_count,
+            sparse_contact_serial_normals,
             dense_offsets,
             dense_groups,
             dense_J,
@@ -20056,6 +20196,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     name = f"pgs_solve_sparse_diagonal_{M}_{D}_{P}"
     if contact_triples:
         name += "_contact_groups"
+    if speculative_contact_batches:
+        name += "_speculative_batches"
     pgs_solve_sparse_diagonal_template.__name__ = name
     pgs_solve_sparse_diagonal_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_sparse_diagonal_template)

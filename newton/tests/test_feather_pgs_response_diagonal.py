@@ -240,6 +240,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.zeros((1, 2), dtype=wp.int32, device=device),
                 wp.zeros(1, dtype=wp.int32, device=device),
                 wp.empty((1, world_dofs), dtype=wp.int32, device=device),
+                wp.zeros(1, dtype=wp.int32, device=device),
+                wp.empty((1, (max_constraints + 2) // 3), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array(dense_j, device=device),
@@ -266,6 +268,109 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         np.testing.assert_allclose(lower_lambda.numpy()[0, 2], expected_limit_lambda, rtol=2.0e-5, atol=2.0e-6)
         self.assertEqual(float(upper_lambda.numpy()[0, 2]), 0.0)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "speculative contact batches require CUDA")
+    def test_speculative_sparse_contact_batches_match_serial_reference(self):
+        """Skip exact no-op prefixes without changing later serial contact updates."""
+        device = wp.get_device("cuda:0")
+        max_constraints, world_dofs, dense_dofs = 12, 8, 6
+        cfm, omega, iterations = 1.0e-6, 1.0, 2
+        inverse_mass = np.array((0.5, 0.25, 0.75, 1.0, 0.4, 0.6, 0.75, 0.8), dtype=np.float32)
+        initial_velocity = np.array((0.3, -0.2, 0.1, 0.4, -0.1, 0.2, 0.5, 0.25), dtype=np.float32)
+        jacobian = np.zeros((max_constraints, world_dofs), dtype=np.float32)
+        jacobian[0, 6] = 1.0
+        jacobian[3, 7] = 1.0
+        jacobian[6, (0, 6)] = (-0.2, -1.0)
+        jacobian[9, (0, 6)] = (0.3, 1.0)
+        response = jacobian * inverse_mass
+        rhs = np.zeros((1, max_constraints), dtype=np.float32)
+        rhs[0, 6] = -0.1
+        rhs[0, 9] = -0.2
+        diag = np.zeros_like(rhs)
+        normal_rows = np.array((0, 3, 6, 9), dtype=np.int32)
+        diag[0, normal_rows] = np.sum(jacobian[normal_rows] * response[normal_rows], axis=1) + cfm
+        row_type = np.full((1, max_constraints), PGS_CONSTRAINT_TYPE_FRICTION, dtype=np.int32)
+        row_type[0, normal_rows] = PGS_CONSTRAINT_TYPE_CONTACT
+        row_parent = np.full((1, max_constraints), -1, dtype=np.int32)
+        for normal in normal_rows:
+            row_parent[0, normal + 1 : normal + 3] = normal
+        row_mu = np.zeros((1, max_constraints), dtype=np.float32)
+        dense_j = jacobian[:, :dense_dofs][None, ...]
+        dense_y = response[:, :dense_dofs][None, ...]
+        sparse_dof = np.empty((1, max_constraints, 2), dtype=np.int32)
+        sparse_dof[:, :, 0] = 6
+        sparse_dof[:, :, 1] = 7
+        sparse_jy = np.zeros((1, max_constraints, 4), dtype=np.float32)
+        sparse_jy[0, :, 0] = jacobian[:, 6]
+        sparse_jy[0, :, 1] = response[:, 6]
+        sparse_jy[0, :, 2] = jacobian[:, 7]
+        sparse_jy[0, :, 3] = response[:, 7]
+
+        expected_velocity = initial_velocity.copy()
+        expected_impulses = np.zeros(max_constraints, dtype=np.float32)
+        for _ in range(iterations):
+            for row in normal_rows:
+                old_impulse = expected_impulses[row]
+                residual = jacobian[row] @ expected_velocity + rhs[0, row]
+                new_impulse = max(old_impulse - omega * residual / diag[0, row], 0.0)
+                expected_impulses[row] = new_impulse
+                expected_velocity += response[row] * (new_impulse - old_impulse)
+
+        impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
+        velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
+        kernel = _get_pgs_solve_sparse_diagonal_kernel(
+            max_constraints,
+            world_dofs,
+            dense_dofs,
+            str(device.arch),
+            contact_triples=True,
+            speculative_contact_batches=True,
+        )
+        wp.launch_tiled(
+            kernel,
+            dim=[1],
+            inputs=[
+                wp.array((max_constraints,), dtype=wp.int32, device=device),
+                wp.array(np.arange(world_dofs, dtype=np.int32)[None, :], device=device),
+                wp.array(rhs, device=device),
+                wp.array(diag, device=device),
+                impulses,
+                wp.array(row_type, device=device),
+                wp.array(row_parent, device=device),
+                wp.array(row_mu, device=device),
+                wp.zeros((1, 2), dtype=wp.int32, device=device),
+                wp.zeros(1, dtype=wp.int32, device=device),
+                wp.empty((1, world_dofs), dtype=wp.int32, device=device),
+                wp.array((len(normal_rows),), dtype=wp.int32, device=device),
+                wp.array(normal_rows[None, :], device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array(dense_j, device=device),
+                wp.array(dense_y, device=device),
+                wp.array(sparse_dof, device=device),
+                wp.array(sparse_jy, device=device),
+                wp.zeros((1, world_dofs), dtype=wp.int32, device=device),
+                wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
+                wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
+                wp.array(inverse_mass, device=device),
+                cfm,
+                iterations,
+                omega,
+                0,
+                0,
+            ],
+            outputs=[
+                wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
+                wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
+                velocity,
+            ],
+            block_dim=32,
+            device=device,
+        )
+
+        np.testing.assert_allclose(velocity.numpy(), expected_velocity, rtol=2.0e-5, atol=2.0e-6)
+        np.testing.assert_allclose(impulses.numpy()[0], expected_impulses, rtol=2.0e-5, atol=2.0e-6)
+        np.testing.assert_array_equal(impulses.numpy()[0, :6], np.zeros(6, dtype=np.float32))
+
     @unittest.skipUnless(wp.is_cuda_available(), "independent contact groups require CUDA")
     def test_independent_sparse_contact_groups_exclude_coupled_coordinates(self):
         """Keep scalar contacts serial when a coupled contact shares their coordinate."""
@@ -280,6 +385,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         sparse_row_dof = wp.array(sparse_row_dof_np, device=device)
         group_count = wp.zeros(1, dtype=wp.int32, device=device)
         group_heads = wp.empty((1, max_world_dofs), dtype=wp.int32, device=device)
+        serial_count = wp.zeros(1, dtype=wp.int32, device=device)
+        serial_normals = wp.empty((1, (max_constraints + 2) // 3), dtype=wp.int32, device=device)
 
         marker = _get_mark_independent_sparse_contact_candidates_kernel(sparse_response_dofs, str(device.arch))
         wp.launch(
@@ -300,7 +407,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             device=device,
         )
         schedule = _get_build_independent_sparse_contact_groups_kernel(
-            max_constraints, max_world_dofs, str(device.arch)
+            max_constraints, max_world_dofs, str(device.arch), build_serial_contacts=True
         )
         wp.launch(
             schedule,
@@ -309,13 +416,15 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array((max_constraints,), dtype=wp.int32, device=device),
                 wp.zeros((1, 2), dtype=wp.int32, device=device),
             ],
-            outputs=[sparse_row_dof, group_count, group_heads],
+            outputs=[sparse_row_dof, group_count, group_heads, serial_count, serial_normals],
             device=device,
         )
         wp.synchronize_device(device)
 
         self.assertEqual(int(group_count.numpy()[0]), 1)
         self.assertEqual(int(group_heads.numpy()[0, 0]), 0)
+        self.assertEqual(int(serial_count.numpy()[0]), 2)
+        np.testing.assert_array_equal(serial_normals.numpy()[0, :2], np.array((3, 6), dtype=np.int32))
         normal_links = sparse_row_dof.numpy()[0, ::3, 1]
         np.testing.assert_array_equal(normal_links, np.array((-12, -1, -1, -2), dtype=np.int32))
 

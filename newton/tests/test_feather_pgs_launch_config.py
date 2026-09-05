@@ -434,6 +434,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
 
         self.assertTrue(optimized._sparse_diagonal_contact_solve)
         self.assertTrue(optimized._sparse_diagonal_contact_triples)
+        self.assertTrue(optimized._sparse_diagonal_speculative_contact_batches)
         self.assertEqual(optimized._sparse_diagonal_response_size, 16)
         self.assertEqual(optimized._sparse_diagonal_dense_size, 3)
         self.assertEqual(optimized.H_by_size[16].shape, (1, 1, 1))
