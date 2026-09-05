@@ -242,6 +242,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         self.assertIsNotNone(paired_solver._paired_response_kernel)
         self.assertIsNotNone(paired_solver._paired_factor_solve_kernel)
         self.assertTrue(paired_solver._paired_factor_coordinates)
+        self.assertTrue(paired_solver._factor_coordinate_contact_triples)
         self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
         for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
             self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")

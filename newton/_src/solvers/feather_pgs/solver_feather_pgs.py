@@ -1881,6 +1881,12 @@ class SolverFeatherPGS(SolverBase):
             and self.friction_mode == "current"
             and not self.enable_joint_velocity_limits
         )
+        self._factor_coordinate_contact_triples = bool(
+            self._paired_factor_coordinates
+            and self.enable_contact_friction
+            and self.contact_friction_gap_threshold == math.inf
+            and self.contact_friction_anchor_limit == 0
+        )
         self._paired_factor_primary_groups_by_world = None
         self._paired_factor_secondary_groups_by_world = None
         self._paired_factor_primary_offsets_by_world = None
@@ -4784,6 +4790,7 @@ class SolverFeatherPGS(SolverBase):
                     primary_size,
                     secondary_size,
                     device_arch,
+                    contact_triples=self._factor_coordinate_contact_triples,
                 )
                 if self._paired_factor_coordinates
                 else None
@@ -5538,6 +5545,7 @@ class SolverFeatherPGS(SolverBase):
                         inputs=[
                             self.world_count,
                             self.constraint_count,
+                            self.dense_phase_bounds,
                             self.world_dof_indices,
                             dense_rhs,
                             self.diag,
@@ -12207,6 +12215,7 @@ def _get_pgs_solve_paired_factor_kernel(
     primary_dofs: int,
     secondary_dofs: int,
     device_arch: str,
+    contact_triples: bool = False,
 ) -> "wp.Kernel":
     """Build the dense PGS solve for a fixed articulation/free-body pair.
 
@@ -12236,6 +12245,7 @@ def _get_pgs_solve_paired_factor_kernel(
     __shared__ float s_rhs_storage[{W * M}];
     __shared__ float s_diag_storage[{W * M}];
     __shared__ unsigned char s_type_storage[{W * M}];
+    __shared__ float s_contact_mu_storage[{W * ((M + 2) // 3)}];
     constexpr unsigned MASK = 0xffffffffu;
     const int lane = threadIdx.x & 31;
     const int world_slot = threadIdx.x >> 5;
@@ -12257,13 +12267,25 @@ def _get_pgs_solve_paired_factor_kernel(
     float* s_rhs = &s_rhs_storage[world_slot * {M}];
     float* s_diag = &s_diag_storage[world_slot * {M}];
     unsigned char* s_type = &s_type_storage[world_slot * {M}];
+    float* s_contact_mu = &s_contact_mu_storage[world_slot * {((M + 2) // 3)}];
+
+    int contact_start = dense_phase_bounds.data[world * 2 + 1];
+    if (contact_start < 0) contact_start = 0;
+    if (contact_start > m) contact_start = m;
+    const bool triple_layout = {str(bool(contact_triples)).lower()}
+        && dense_phase_bounds.data[world * 2] == contact_start
+        && (m - contact_start) % 3 == 0;
 
     for (int i = lane; i < m; i += 32) {{
         s_lam[i] = world_impulses.data[off + i];
         s_rhs[i] = rhs_bias.data[off + i];
         s_diag[i] = world_diag.data[off + i];
-        s_type[i] = static_cast<unsigned char>(world_row_type.data[off + i]);
+        if (!triple_layout || i < contact_start)
+            s_type[i] = static_cast<unsigned char>(world_row_type.data[off + i]);
     }}
+    const int contact_count = (m - contact_start) / 3;
+    for (int contact = lane; contact < contact_count; contact += 32)
+        s_contact_mu[contact] = world_row_mu.data[off + contact_start + contact * 3 + 1];
 
     const int global_dof = lane < {D} ? world_dof_indices.data[dof_map_base + lane] : -1;
     const float physical_velocity = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
@@ -12289,6 +12311,163 @@ def _get_pgs_solve_paired_factor_kernel(
     for (int iter = 0; iter < iterations; ++iter) {{
         const int global_iter = iteration_offset + iter;
         int iteration_changed = 0;
+
+        if (triple_layout) {{
+            // The prefix contains equality and unilateral joint-limit rows;
+            // contacts then own exact normal/tangent/tangent triples. Consume
+            // the trailing structural contract directly instead of decoding
+            // parent, sibling, and friction metadata for every contact row.
+            for (int i = 0; i < contact_start; ++i) {{
+                const float row_factor = lane < {D}
+                    ? factor_rows.data[row_base + i * {D} + lane] : 0.0f;
+                const float denom = s_diag[i];
+                if (denom <= 0.0f) continue;
+                float sum = lane < {D} ? row_factor * factor_velocity : 0.0f;
+                sum += __shfl_down_sync(MASK, sum, 16);
+                sum += __shfl_down_sync(MASK, sum, 8);
+                sum += __shfl_down_sync(MASK, sum, 4);
+                sum += __shfl_down_sync(MASK, sum, 2);
+                sum += __shfl_down_sync(MASK, sum, 1);
+                const float old_impulse = s_lam[i];
+                float new_impulse = old_impulse
+                    + omega * (-( __shfl_sync(MASK, sum, 0) + s_rhs[i]) / denom);
+                const int row_type = static_cast<int>(s_type[i]);
+                if ((row_type == {contact_type} || row_type == {joint_limit_type}) && new_impulse < 0.0f)
+                    new_impulse = 0.0f;
+                const float delta = new_impulse - old_impulse;
+                s_lam[i] = new_impulse;
+                if (delta != 0.0f) {{
+                    iteration_changed = 1;
+                    factor_velocity += row_factor * delta;
+                }}
+                __syncwarp(MASK);
+            }}
+
+            for (int contact = 0; contact < contact_count; ++contact) {{
+                const int normal = contact_start + contact * 3;
+                const int tangent1 = normal + 1;
+                const int tangent2 = normal + 2;
+                const float normal_factor = lane < {D}
+                    ? factor_rows.data[row_base + normal * {D} + lane] : 0.0f;
+                float normal_sum = lane < {D} ? normal_factor * factor_velocity : 0.0f;
+                normal_sum += __shfl_down_sync(MASK, normal_sum, 16);
+                normal_sum += __shfl_down_sync(MASK, normal_sum, 8);
+                normal_sum += __shfl_down_sync(MASK, normal_sum, 4);
+                normal_sum += __shfl_down_sync(MASK, normal_sum, 2);
+                normal_sum += __shfl_down_sync(MASK, normal_sum, 1);
+                const float normal_denom = s_diag[normal];
+                if (normal_denom > 0.0f) {{
+                    const float old_normal = s_lam[normal];
+                    float new_normal = old_normal
+                        + omega * (-( __shfl_sync(MASK, normal_sum, 0) + s_rhs[normal]) / normal_denom);
+                    if (new_normal < 0.0f) new_normal = 0.0f;
+                    const float normal_delta = new_normal - old_normal;
+                    s_lam[normal] = new_normal;
+                    if (normal_delta != 0.0f) {{
+                        iteration_changed = 1;
+                        factor_velocity += normal_factor * normal_delta;
+                    }}
+                }}
+                __syncwarp(MASK);
+
+                if (s_lam[normal] <= 0.0f && s_lam[tangent1] == 0.0f && s_lam[tangent2] == 0.0f) {{
+                    __syncwarp(MASK);
+                    continue;
+                }}
+                if (global_iter < friction_start_iteration) {{
+                    s_lam[tangent1] = 0.0f;
+                    s_lam[tangent2] = 0.0f;
+                    __syncwarp(MASK);
+                    continue;
+                }}
+
+                const float tangent1_factor = lane < {D}
+                    ? factor_rows.data[row_base + tangent1 * {D} + lane] : 0.0f;
+                const float tangent2_factor = lane < {D}
+                    ? factor_rows.data[row_base + tangent2 * {D} + lane] : 0.0f;
+                float tangent1_sum = lane < {D} ? tangent1_factor * factor_velocity : 0.0f;
+                tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, 16);
+                tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, 8);
+                tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, 4);
+                tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, 2);
+                tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, 1);
+                const float tangent1_denom = s_diag[tangent1];
+                if (tangent1_denom > 0.0f) {{
+                    const float old_tangent1 = s_lam[tangent1];
+                    float new_tangent1 = old_tangent1
+                        + omega * (-( __shfl_sync(MASK, tangent1_sum, 0) + s_rhs[tangent1]) / tangent1_denom);
+                    const float radius = fmaxf(s_contact_mu[contact] * s_lam[normal], 0.0f);
+                    float sibling_delta = 0.0f;
+                    if (radius <= 0.0f) {{
+                        new_tangent1 = 0.0f;
+                    }} else {{
+                        s_lam[tangent1] = new_tangent1;
+                        const float old_tangent2 = s_lam[tangent2];
+                        const float magnitude = sqrtf(
+                            new_tangent1 * new_tangent1 + old_tangent2 * old_tangent2);
+                        if (magnitude > radius) {{
+                            const float scale = radius / magnitude;
+                            new_tangent1 *= scale;
+                            const float new_tangent2 = old_tangent2 * scale;
+                            sibling_delta = new_tangent2 - old_tangent2;
+                            s_lam[tangent2] = new_tangent2;
+                        }}
+                    }}
+                    if (sibling_delta != 0.0f) {{
+                        iteration_changed = 1;
+                        factor_velocity += tangent2_factor * sibling_delta;
+                    }}
+                    const float tangent1_delta = new_tangent1 - old_tangent1;
+                    s_lam[tangent1] = new_tangent1;
+                    if (tangent1_delta != 0.0f) {{
+                        iteration_changed = 1;
+                        factor_velocity += tangent1_factor * tangent1_delta;
+                    }}
+                }}
+                __syncwarp(MASK);
+
+                float tangent2_sum = lane < {D} ? tangent2_factor * factor_velocity : 0.0f;
+                tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, 16);
+                tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, 8);
+                tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, 4);
+                tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, 2);
+                tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, 1);
+                const float tangent2_denom = s_diag[tangent2];
+                if (tangent2_denom > 0.0f) {{
+                    const float old_tangent2 = s_lam[tangent2];
+                    float new_tangent2 = old_tangent2
+                        + omega * (-( __shfl_sync(MASK, tangent2_sum, 0) + s_rhs[tangent2]) / tangent2_denom);
+                    const float radius = fmaxf(s_contact_mu[contact] * s_lam[normal], 0.0f);
+                    float sibling_delta = 0.0f;
+                    if (radius <= 0.0f) {{
+                        new_tangent2 = 0.0f;
+                    }} else {{
+                        s_lam[tangent2] = new_tangent2;
+                        const float old_tangent1 = s_lam[tangent1];
+                        const float magnitude = sqrtf(
+                            new_tangent2 * new_tangent2 + old_tangent1 * old_tangent1);
+                        if (magnitude > radius) {{
+                            const float scale = radius / magnitude;
+                            new_tangent2 *= scale;
+                            const float new_tangent1 = old_tangent1 * scale;
+                            sibling_delta = new_tangent1 - old_tangent1;
+                            s_lam[tangent1] = new_tangent1;
+                        }}
+                    }}
+                    if (sibling_delta != 0.0f) {{
+                        iteration_changed = 1;
+                        factor_velocity += tangent1_factor * sibling_delta;
+                    }}
+                    const float tangent2_delta = new_tangent2 - old_tangent2;
+                    s_lam[tangent2] = new_tangent2;
+                    if (tangent2_delta != 0.0f) {{
+                        iteration_changed = 1;
+                        factor_velocity += tangent2_factor * tangent2_delta;
+                    }}
+                }}
+                __syncwarp(MASK);
+            }}
+        }} else {{
         float prefetched_factor = lane < {D} ? factor_rows.data[row_base + lane] : 0.0f;
 
         for (int i = 0; i < m; ++i) {{
@@ -12379,6 +12558,7 @@ def _get_pgs_solve_paired_factor_kernel(
             }}
             __syncwarp(MASK);
         }}
+        }}
 
         const unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
         if (global_iter >= friction_start_iteration && changed == 0u) break;
@@ -12408,6 +12588,7 @@ def _get_pgs_solve_paired_factor_kernel(
     def pgs_solve_paired_factor_native(
         world: int,
         world_constraint_count: wp.array[int],
+        dense_phase_bounds: wp.array2d[int],
         world_dof_indices: wp.array2d[int],
         rhs_bias: wp.array2d[float],
         world_diag: wp.array2d[float],
@@ -12435,6 +12616,7 @@ def _get_pgs_solve_paired_factor_kernel(
     def pgs_solve_paired_factor_template(
         world_count: int,
         world_constraint_count: wp.array[int],
+        dense_phase_bounds: wp.array2d[int],
         world_dof_indices: wp.array2d[int],
         rhs_bias: wp.array2d[float],
         world_diag: wp.array2d[float],
@@ -12464,6 +12646,7 @@ def _get_pgs_solve_paired_factor_kernel(
             pgs_solve_paired_factor_native(
                 world,
                 world_constraint_count,
+                dense_phase_bounds,
                 world_dof_indices,
                 rhs_bias,
                 world_diag,
@@ -12489,6 +12672,8 @@ def _get_pgs_solve_paired_factor_kernel(
             )
 
     name = f"pgs_solve_paired_factor_{M}_{D}_{P}_{S}_w{W}"
+    if contact_triples:
+        name += "_contact3"
     pgs_solve_paired_factor_template.__name__ = name
     pgs_solve_paired_factor_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_paired_factor_template)
