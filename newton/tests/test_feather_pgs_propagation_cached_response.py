@@ -27,10 +27,8 @@ These tests gate that claim:
 3. Scenes: a multi-contact-body chain (three collision spheres per
    articulation, so cross blocks B_ab with a != b carry real impulses), a
    two-articulations-per-world scene producing a second articulation
-   DOF-size group (per-world DOF totals stay homogeneous, which the
-   propagation modes require), the serial "propagation" mode, and a
-   cache-capacity overflow that must take the per-world device-side
-   tree-walk fallback.
+   DOF-size group, the serial "propagation" mode, and a cache-capacity
+   overflow that must take the per-world device-side tree-walk fallback.
 """
 
 from __future__ import annotations
@@ -144,8 +142,7 @@ def _build_model(
     """N_WORLDS identical worlds, each holding one chain per entry of ``chains``.
 
     Multiple chain lengths inside one world create several articulation
-    DOF-size groups while keeping per-world DOF totals homogeneous (the
-    propagation modes reject heterogeneous per-world DOF counts).
+    DOF-size groups while keeping per-world DOF totals homogeneous.
     ``fixed_base`` swaps the floating chains for world-anchored ones.
     """
     scene = newton.ModelBuilder()

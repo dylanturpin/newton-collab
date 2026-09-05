@@ -1,0 +1,1 @@
+Support heterogeneous multi-world models with serial and colored FeatherPGS propagation contact responses; use immediate, serial propagation, colored propagation, or split mode when per-world DOF counts differ because fused propagation remains unsupported.

@@ -888,9 +888,10 @@ class SolverFeatherPGS(SolverBase):
                 scheduling changes — while ``"propagation-fused"`` keeps free/free rows
                 on the matrix-free family (its measured-best configuration).
                 Velocity-limit rows stay on the matrix-free family in all modes.
-                Passing any propagation-family value with a heterogeneous multi-world
-                model (worlds whose per-world DOF counts differ) raises ``ValueError``;
-                use ``"immediate"`` (or ``pgs_mode="split"``) for such models.
+                ``"propagation"`` and ``"propagation-colored"`` support heterogeneous
+                multi-world models (worlds whose per-world DOF counts differ).
+                ``"propagation-fused"`` requires homogeneous per-world DOF counts and
+                raises :class:`ValueError` otherwise.
             propagation_same_articulation_rows (bool, optional): Route contacts between two
                 links of the same articulation to propagation rows instead of dense generalized
                 rows. Their effective mass is recomputed with exact cross operational-space
@@ -1970,28 +1971,25 @@ class SolverFeatherPGS(SolverBase):
     def _validate_heterogeneous_world_support(self, model) -> None:
         """Reject solver configurations known to be unsafe on heterogeneous worlds.
 
-        Heterogeneous multi-world models (worlds whose per-world DOF counts
-        differ) are only supported on the ``pgs_mode="matrix_free"`` and
-        ``pgs_mode="split"`` paths with the default
-        ``articulated_contact_response="immediate"``. The dense path produces
-        deterministic wrong trajectories on such models, and the
-        propagation-family contact responses still use fixed-width per-world
-        velocity windows that silently corrupt velocities across world
-        boundaries.
+        Serial and colored propagation operate on body-space response buffers
+        plus the compact world-DOF map and therefore support differing
+        per-world DOF counts.  The full-iteration fused kernel still addresses
+        ``v_out`` through a fixed-width contiguous per-world window, which can
+        cross world boundaries when the counts differ.
         """
         hetero_counts = self._detect_heterogeneous_world_dofs(model)
         if hetero_counts is None:
             return
         counts_str = ", ".join(str(int(c)) for c in hetero_counts)
-        if self.articulated_contact_response != "immediate":
+        if self.articulated_contact_response == "propagation-fused":
             raise ValueError(
                 f"articulated_contact_response={self.articulated_contact_response!r} does not "
                 "support heterogeneous multi-world models "
-                f"(found per-world DOF counts [{counts_str}]): the propagation-family contact "
-                "response uses fixed-width per-world velocity windows that silently corrupt "
+                f"(found per-world DOF counts [{counts_str}]): the fused propagation contact "
+                "response uses a fixed-width per-world velocity window that can corrupt "
                 "velocities across world boundaries when worlds have differing DOF counts. "
-                "Use articulated_contact_response='immediate' with pgs_mode='matrix_free', "
-                "or pgs_mode='split', instead."
+                "Use articulated_contact_response='immediate', 'propagation', or "
+                "'propagation-colored' with pgs_mode='matrix_free', or use pgs_mode='split'."
             )
 
     def _select_dense_row_capacity(self, model) -> int:
@@ -2864,16 +2862,12 @@ class SolverFeatherPGS(SolverBase):
         self.world_dof_count = wp.array(world_dof_count, dtype=wp.int32, device=model.device)
         self.world_dof_indices = wp.array(padded_indices, dtype=wp.int32, device=model.device)
 
-        # --- Legacy contiguous per-world DOF window (propagation family) ---
-        # The propagation contact-response kernels address the global velocity
-        # array through a contiguous [world_dof_start, world_dof_start + D)
-        # window and consult world_deferred_dof_mask in that physical-local
-        # domain. Keep both alive alongside the compact response mapping above.
-        # In every configuration that can reach the propagation kernels
-        # (homogeneous worlds enforced by _validate_heterogeneous_world_support
-        # and prescribed-response elision disabled for propagation modes), the
-        # compact mapping coincides exactly with this physical window, i.e.
-        # world_dof_indices[w, d] == world_dof_start[w] + d for d < count.
+        # --- Legacy contiguous per-world DOF window (fused propagation) ---
+        # The full-iteration fused propagation kernel addresses the global
+        # velocity array through [world_dof_start, world_dof_start + D).  It is
+        # guarded to homogeneous worlds by _validate_heterogeneous_world_support.
+        # Serial and colored propagation use body-space buffers and the compact
+        # world_dof_indices mapping above, so differing world widths are safe.
         art_to_world_np = self.art_to_world.numpy()
         art_dof_start_np = self.articulation_dof_start.numpy()
         art_H_rows_np = self.articulation_H_rows.numpy()
