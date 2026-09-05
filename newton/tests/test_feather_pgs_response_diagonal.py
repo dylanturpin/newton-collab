@@ -28,6 +28,7 @@ def _build_mixed_response_model(
     dof_count=13,
     friction=0.0,
     restitution=0.0,
+    static_plane=False,
     static_support=False,
     free_body_first=False,
     free_body_velocity_limit=None,
@@ -38,6 +39,7 @@ def _build_mixed_response_model(
     produces matrix-free contact rows. ``free_body_first`` builds the free body before the articulation,
     which packs the world DOFs free-body first. ``free_body_velocity_limit`` caps the free body's linear
     and angular velocity [m/s, rad/s], producing matrix-free velocity-limit rows once exceeded.
+    ``static_plane`` adds a ground plane under the free body.
     """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     if free_body_velocity_limit is not None:
@@ -104,6 +106,8 @@ def _build_mixed_response_model(
 
     if not free_body_first:
         add_free_body()
+    if static_plane:
+        builder.add_shape_plane(plane=(0.0, 0.0, 1.0, -0.53))
     if world_count == 1:
         return builder.finalize(device=device)
     replicated = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -122,12 +126,18 @@ def _run_mixed_response(
     friction=0.0,
     restitution=0.0,
     tangential_velocity=0.0,
+    static_plane=False,
     contact_regularization=0.0,
     model_kwargs=None,
 ):
     """Run a short mixed-contact trajectory with one H-inverse implementation."""
     model = _build_mixed_response_model(
-        "cuda:0", dof_count=dof_count, friction=friction, restitution=restitution, **(model_kwargs or {})
+        "cuda:0",
+        dof_count=dof_count,
+        friction=friction,
+        restitution=restitution,
+        static_plane=static_plane,
+        **(model_kwargs or {}),
     )
     with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": kernel}):
         solver = SolverFeatherPGS(
@@ -314,7 +324,42 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         self.assertEqual(paired_solver._paired_response_primary_size, 23)
         self.assertEqual(paired_solver._paired_response_secondary_size, 6)
         self.assertIsNotNone(paired_solver._paired_response_kernel)
+        self.assertIsNotNone(paired_solver._paired_factor_solve_kernel)
+        self.assertTrue(paired_solver._paired_factor_coordinates)
         self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
+        for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
+            self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+            np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
+            for label, expected_value, actual_value in zip(
+                ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+            ):
+                np.testing.assert_allclose(
+                    actual_value,
+                    expected_value,
+                    rtol=5.0e-4,
+                    atol=1.0e-5,
+                    err_msg=f"{label} differed at step {step}",
+                )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response fallback requires CUDA")
+    def test_paired_response_falls_back_for_matrix_free_rows(self):
+        """Keep mixed dense/matrix-free worlds in physical coordinates."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "dof_count": 23,
+            "dense_max_constraints": 96,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+            "static_plane": True,
+        }
+        reference_solver, reference = _run_mixed_response("par_row", **run_kwargs)
+        paired_solver, paired = _run_mixed_response("auto", **run_kwargs)
+
+        self.assertIsNone(reference_solver._paired_response_primary_size)
+        self.assertTrue(paired_solver._paired_factor_coordinates)
+        self.assertTrue(any(sample[7] > 0 for sample in paired), "static contact generated no matrix-free rows")
         for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
             self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
             np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
