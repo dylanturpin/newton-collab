@@ -4290,9 +4290,7 @@ class SolverFeatherPGS(SolverBase):
                     worlds_per_warp = 32 // lanes_per_world
                     warps_per_block = 2 if count % (2 * worlds_per_warp) == 0 else 1
                     self._pgs_solve_local_internal_warps_per_block[size] = warps_per_block
-                    self._pgs_solve_local_internal_worlds_per_block[size] = (
-                        warps_per_block * 32 // lanes_per_world
-                    )
+                    self._pgs_solve_local_internal_worlds_per_block[size] = warps_per_block * 32 // lanes_per_world
                     self._pgs_solve_local_internal_kernels[size] = _get_pgs_solve_local_owned_kernel(
                         self.dense_max_constraints,
                         min(self._local_solve_max_rows, size),
@@ -4795,7 +4793,7 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_MiJt_a,
                     self.mf_MiJt_b,
                     self.mf_row_mu,
-                    self._pgs_contact_regularization_w,
+                    self._contact_w,
                     iterations,
                     omega,
                     friction_start_iteration,
@@ -16101,9 +16099,7 @@ def _get_pgs_solve_local_owned_kernel(
         row_masks = ""
         row_setup = """            if (s_active[row] == 0) continue;
             const int row_type = s_type[row];"""
-        joint_limit_projection = (
-            f"row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)} && new_impulse < 0.0f"
-        )
+        joint_limit_projection = f"row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)} && new_impulse < 0.0f"
         impulse_active = "s_active[row] != 0"
     elif lanes_per_world < 32:
         lane_metadata = ""
@@ -16356,8 +16352,8 @@ def _get_pgs_solve_local_owned_kernel(
         else f"if (lane < {total_dofs}) s_v[lane] += s_Y[row * {total_dofs} + lane] * delta_impulse;"
     )
     mf_velocity_commit = (
-        f"""
-            for (int mf_row = 0; mf_row < mf_count; ++mf_row) {{
+        """
+            for (int mf_row = 0; mf_row < mf_count; ++mf_row) {
                 const int packed_dofs = mf_meta.data[mf_meta_offset + mf_row * 4];
                 const int dof_a = packed_dofs >> 16;
                 const int dof_b = (packed_dofs << 16) >> 16;
@@ -16367,7 +16363,7 @@ def _get_pgs_solve_local_owned_kernel(
                     velocity += mf_MiJt_a.data[mf6 + velocity_dof - dof_a] * applied_delta;
                 if (dof_b >= 0 && velocity_dof >= dof_b && velocity_dof < dof_b + 6)
                     velocity += mf_MiJt_b.data[mf6 + velocity_dof - dof_b] * applied_delta;
-            }}"""
+            }"""
         if local_mf_rows
         else ""
     )
