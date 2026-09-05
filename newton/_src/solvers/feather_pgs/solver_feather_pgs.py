@@ -1425,7 +1425,7 @@ class SolverFeatherPGS(SolverBase):
         # publication and keeps the zero-copy path.
         self._fk_id_cache_uses_snapshot = self._fk_id_cache_enabled and self.pgs_mode == "split"
         self._fk_id_cache_source_state = None
-        self._fk_id_cache_valid = None
+        self._fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
         self._fk_id_cache = None
 
         self._model_plan: _FeatherPGSModelPlan | None = None
@@ -1737,8 +1737,6 @@ class SolverFeatherPGS(SolverBase):
         # regularization is disabled.
         self._contact_row_w_dummy = wp.full((1, 1), 1.0, dtype=wp.float32, device=model.device)
         self._allocate_common_buffers(model)
-        if self._fk_id_cache_enabled:
-            self._fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
         if self._fk_id_cache_uses_snapshot:
             self._fk_id_cache = _FeatherPGSKinematicsCache.allocate(model, self._body_inertia_terms.shape[0])
         self._allocate_buffers(model)
