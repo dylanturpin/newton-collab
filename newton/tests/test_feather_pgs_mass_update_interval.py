@@ -195,6 +195,19 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         self.assertFalse(solver._fk_id_cache_uses_snapshot)
         self.assertIsNone(solver._fk_id_cache)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "FK/ID launch requires CUDA")
+    def test_fk_id_launch_storage_exists_when_reuse_is_disabled(self):
+        """Keep the unconditional FK/ID launch output valid without reuse."""
+        model = _build_model("cuda:0", num_worlds=1, ground=False)
+        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_velocity_limits=True)
+        self.assertFalse(solver._fk_id_cache_enabled)
+        self.assertEqual(solver._fk_id_cache_valid.shape[0], model.articulation_count)
+
+        state_in = _make_initial_state(model)
+        state_out = model.state()
+        solver.step(state_in, state_out, model.control(), None, DT)
+        wp.synchronize()
+
     @unittest.skipUnless(wp.is_cuda_available(), "FK/ID reuse requires CUDA")
     def test_cached_fk_id_matches_forced_recomputation(self):
         """Match forced recomputation across cached fixed-base steps."""
