@@ -48,6 +48,17 @@ from ..sim.model import Model
 from ..sim.state import State
 
 
+@wp.kernel
+def _reduction_reset_mask_from_matching(
+    mask: wp.array[wp.bool],
+    world_count: int,
+    reduction_mask: wp.array[wp.int32],
+):
+    world = wp.tid()
+    # A changed global collider may participate in every world's patches.
+    reduction_mask[world] = int(mask[world_count] or (world < world_count and mask[world]))
+
+
 def _shape_collide_mask(model: Model, shape_count: int | None = None) -> np.ndarray:
     """Return a host mask for shapes participating in shape-shape collision."""
     shape_flags = getattr(model, "shape_flags", None)
@@ -287,6 +298,13 @@ def write_contact_speculative(
         index = wp.atomic_add(writer_data.contact_count, 0, 1)
 
     _write_contact_at_index(contact_data, writer_data, index, point_a_world, point_b_world, normal)
+
+
+@wp.kernel(enable_backward=False)
+def _record_reduction_overflow(
+    insert_failures: wp.array[int], buffer_overflows: wp.array[int], overflow: wp.array[int]
+):
+    overflow[0] = int(insert_failures[0] > 0 or buffer_overflows[0] > 0)
 
 
 @wp.kernel(enable_backward=False)
@@ -1257,8 +1275,8 @@ class CollisionPipeline:
         and possible upward torsional-friction bias; validate tipping- and
         yaw-sensitive tasks.  It is incompatible with contact matching, active
         hydroelastic contacts, and FeatherPGS warm start.  Call
-        :meth:`CollisionPipeline.reset_body_pair_reduction_history` after
-        episode resets or teleports, and
+        :meth:`CollisionPipeline.reset_contact_matching` and the solver's
+        reset method after episode resets or teleports, and
         :meth:`CollisionPipeline.refresh_body_pair_reduction_groups` after
         runtime material changes.  CUDA graph capture requires one ordinary
         warm-up collide on the exact buffer before capture and only one live
@@ -2031,6 +2049,11 @@ class CollisionPipeline:
             )
         else:
             self._body_pair_reducer = None
+        self._reduction_reset_mask = (
+            wp.zeros(max(int(model.world_count), 1), dtype=wp.int32, device=device)
+            if self._body_pair_reducer is not None
+            else None
+        )
         # A graph-owned lease retains this pipeline (and therefore every
         # reducer array captured by its launches) plus the exact Contacts
         # buffer.  Only one live writer graph is permitted: reducer history,
@@ -2088,15 +2111,18 @@ class CollisionPipeline:
         # Winners recorded under the old classes are not comparable to the new
         # grouping; severing history is the conservative continuation.
         self._body_pair_reducer.reset_history()
+        if self._contact_matcher is not None:
+            self._contact_matcher.reset()
 
     def reset_body_pair_reduction_history(self, world_mask=None):
         """Erase the body-pair reduction's hysteresis history.
 
         With ``ContactReductionConfig.body_pair_hysteresis > 0`` the pipeline carries
-        last step's slot winners between :meth:`collide` calls.  Call this at
-        episode resets, teleports, or scene reloads so no incumbency bonus
-        crosses trajectory boundaries.  No-op when reduction or hysteresis is
-        disabled.
+        last step's slot winners between :meth:`collide` calls. This method
+        clears only that reduction history. For episode resets, teleports or
+        scene reloads, call :meth:`reset_contact_matching` and the solver's
+        reset method to also invalidate matched contacts and cached impulses.
+        No-op when reduction or hysteresis is disabled.
 
         Args:
             world_mask: ``None`` erases everything (host-side; call outside
@@ -2276,7 +2302,9 @@ class CollisionPipeline:
         """Clear all or reset-selected previous-frame contact history.
 
         Masked selections accumulate until the next :meth:`collide` call
-        consumes them.
+        consumes them. With body-pair reduction, this also clears the selected
+        patch history. Resetting global entities invalidates all patch history.
+        Call the solver's reset method too when starting a new episode.
 
         .. experimental::
 
@@ -2293,6 +2321,17 @@ class CollisionPipeline:
         )
         if self._contact_matcher is not None:
             self._contact_matcher.reset(world_mask)
+        if self._body_pair_reducer is not None:
+            if world_mask is None:
+                self._body_pair_reducer.reset_history()
+            else:
+                wp.launch(
+                    _reduction_reset_mask_from_matching,
+                    dim=self._reduction_reset_mask.shape[0],
+                    inputs=[world_mask, int(self.model.world_count), self._reduction_reset_mask],
+                    device=self.device,
+                )
+                self._body_pair_reducer.reset_history(self._reduction_reset_mask)
 
     @staticmethod
     def _build_excluded_pairs(model: Model) -> wp.array[wp.vec2i] | None:
@@ -2647,6 +2686,16 @@ class CollisionPipeline:
             device=self.device,
         )
 
+        reducer = self.narrow_phase.global_contact_reducer
+        if reducer is not None:
+            wp.launch(
+                _record_reduction_overflow,
+                dim=1,
+                inputs=[reducer.ht_insert_failures, reducer.buffer_overflows, contacts._reduction_overflow],
+                device=self.device,
+                record_tape=False,
+            )
+
         # Match contacts against previous frame before sorting.
         if self._contact_matcher is not None:
             if contacts.rigid_contact_match_index is None:
@@ -2668,6 +2717,10 @@ class CollisionPipeline:
                 match_index_out=contacts.rigid_contact_match_index,
                 device=self.device,
             )
+
+        elif contacts.rigid_contact_match_index is not None:
+            # The current producer cannot validate identity from another pipeline.
+            contacts.rigid_contact_match_index.fill_(-1)
 
         if self.deterministic and self._contact_sorter is not None:
             self._contact_sorter.sort_full(
