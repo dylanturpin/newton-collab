@@ -45,6 +45,12 @@ PGS_CONSTRAINT_TYPE_MIMIC = 5
 PGS_CONSTRAINT_TYPE_CONNECT = 6
 PGS_CONSTRAINT_TYPE_COUNT = 7
 
+# Keep launch-geometry-specific dynamics kernels out of the large general
+# kernel module. Warp compiles one whole module variant per block dimension.
+_KINEMATICS_KERNEL_MODULE = wp.Module(f"{__name__}.kinematics")
+_INVERSE_DYNAMICS_KERNEL_MODULE = wp.Module(f"{__name__}.inverse_dynamics")
+_MASS_DYNAMICS_KERNEL_MODULE = wp.Module(f"{__name__}.mass_dynamics")
+
 
 # Numeric IDs for the ``friction_mode`` argument passed to the matrix-free
 # PGS solver kernels.  Mirrors the Python-side string enum on
@@ -129,7 +135,7 @@ def compute_com_transforms(
     body_X_com[tid] = wp.transform(com, wp.quat_identity())
 
 
-@wp.kernel
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE)
 def update_articulation_origins(
     articulation_start: wp.array[int],
     joint_child: wp.array[int],
@@ -840,7 +846,7 @@ def compute_link_transform(
     body_q_com[child] = X_sm
 
 
-@wp.kernel
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE)
 def eval_rigid_fk(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -1039,7 +1045,7 @@ def compute_link_velocity(
 
 
 # Inverse dynamics via Recursive Newton-Euler algorithm (Featherstone Table 5.1)
-@wp.kernel
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE)
 def eval_rigid_id(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -1097,7 +1103,7 @@ def eval_rigid_id(
         )
 
 
-@wp.kernel
+@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE)
 def eval_rigid_tau(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -1194,7 +1200,7 @@ def eval_rigid_tau(
             body_ft_s[parent] = body_ft_s[parent] + f_s
 
 
-@wp.kernel
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
 def compute_composite_inertia(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -9572,7 +9578,7 @@ def delassus_par_row_col(
 # =============================================================================
 
 
-@wp.kernel
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
 def crba_fill_par_dof(
     articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
