@@ -2162,25 +2162,6 @@ def pack_contact_linear_force_as_spatial(
 
 
 @wp.func
-def compute_augmented_drive_terms(
-    ke: float,
-    kd: float,
-    q: float,
-    qd: float,
-    target_pos: float,
-    target_vel: float,
-    effort_limit: float,
-    dt: float,
-) -> wp.vec2:
-    """Return the implicit diagonal ``K`` and clamped explicit force ``u0``."""
-    K = ke * dt * dt + kd * dt
-    u0 = -(ke * (q - target_pos + dt * qd) + kd * (qd - target_vel))
-    if effort_limit > 0.0:
-        u0 = wp.clamp(u0, -effort_limit, effort_limit)
-    return wp.vec2(K, u0)
-
-
-@wp.func
 def prepare_articulation_augmented_drives(
     articulation: int,
     articulation_start: wp.array[int],
@@ -2236,26 +2217,24 @@ def prepare_articulation_augmented_drives(
             if ke <= 0.0 and kd <= 0.0:
                 continue
 
-            terms = compute_augmented_drive_terms(
-                ke,
-                kd,
-                joint_q[coord_start + axis],
-                joint_qd[dof_index],
-                joint_target_pos[dof_index],
-                joint_target_vel[dof_index],
-                joint_effort_limit[dof_index],
-                dt,
-            )
-            if terms[0] <= 0.0:
+            K = ke * dt * dt + kd * dt
+            if K <= 0.0:
                 continue
+
+            q = joint_q[coord_start + axis]
+            qd = joint_qd[dof_index]
+            u0 = -(ke * (q - joint_target_pos[dof_index] + dt * qd) + kd * (qd - joint_target_vel[dof_index]))
+            effort_limit = joint_effort_limit[dof_index]
+            if effort_limit > 0.0:
+                u0 = wp.clamp(u0, -effort_limit, effort_limit)
 
             row_index = articulation * max_dofs + slot
             row_dof_index[row_index] = dof_index
-            row_K[row_index] = terms[0]
+            row_K[row_index] = K
             if reset_tau != 0:
-                tau[dof_index] = terms[1]
+                tau[dof_index] = u0
             else:
-                tau[dof_index] = tau[dof_index] + terms[1]
+                tau[dof_index] = tau[dof_index] + u0
             slot += 1
             if slot >= max_dofs:
                 break

@@ -7782,8 +7782,8 @@ class SolverFeatherPGS(SolverBase):
     def _stage1_crba(
         self,
         state_aug: State,
-        global_inertia_ready: wp.Event | None = None,
-        drive_rows_ready: wp.Event | None = None,
+        global_inertia_ready: wp.Event | None,
+        drive_rows_ready: wp.Event | None,
     ):
         model = self.model
         global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
