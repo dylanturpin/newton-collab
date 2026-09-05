@@ -341,7 +341,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         state_in.joint_qd.assign(qd_np)
         solver.qd_work.assign(qd_np)
         state_aug.joint_qdd.assign(qdd_np)
-        solver._stage3_compute_v_hat(state_in, state_aug, DT)
+        solver._stage3_compute_v_hat(state_in, state_aug, DT, solver.qd_work)
         transport = np.cross(qd_np[3:6], qd_np[0:3])
         expected_v_hat = qd_np + qdd_np * DT
         expected_v_hat[0:3] += transport * DT
