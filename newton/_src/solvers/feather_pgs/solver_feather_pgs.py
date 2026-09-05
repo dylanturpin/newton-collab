@@ -10034,7 +10034,7 @@ class SolverFeatherPGS(SolverBase):
         next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
         parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
         wp.launch(
-            eval_rigid_fk_id,
+            eval_rigid_fk_kinematics,
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start,
@@ -10052,23 +10052,13 @@ class SolverFeatherPGS(SolverBase):
                 model.joint_axis,
                 model.joint_dof_dim,
                 model.body_com,
-                model.body_mass,
-                model.body_inertia,
-                self.is_free_rigid,
-                int(next_refresh and not parallel_next_refresh),
-                int(parallel_next_refresh),
-                0,
-                model.gravity,
             ],
             outputs=[
                 state_out.body_q,
                 state_aug.body_q_com,
                 self.articulation_origin,
                 state_aug.joint_S_s,
-                state_aug.body_I_s,
-                self._body_inertia_terms,
                 state_aug.body_v_s,
-                state_aug.body_f_s,
                 state_aug.body_a_s,
                 self._fk_id_cache_valid,
             ],
@@ -10076,16 +10066,30 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
         wp.launch(
-            update_body_qd_from_featherstone,
+            finalize_body_dynamics,
             dim=model.body_count,
             inputs=[
-                state_aug.body_v_s,
-                state_out.body_q,
-                model.body_com,
                 self.body_to_articulation,
+                state_out.body_q,
+                state_aug.body_q_com,
+                model.body_com,
+                model.body_mass,
+                model.body_inertia,
+                self.is_free_rigid,
                 self.articulation_origin,
+                int(next_refresh and not parallel_next_refresh),
+                int(parallel_next_refresh),
+                model.gravity,
+                state_aug.body_v_s,
+                state_aug.body_a_s,
             ],
-            outputs=[state_out.body_qd],
+            outputs=[
+                state_aug.body_I_s,
+                self._body_inertia_terms,
+                state_aug.body_f_s,
+                state_out.body_qd,
+            ],
+            block_dim=128,
             device=model.device,
         )
         self._fk_id_cache_source_state = state_out
