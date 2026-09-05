@@ -90,6 +90,21 @@ def _run_trajectory(model, solver, num_steps):
 
 
 class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "parallel compact inertia refresh requires CUDA")
+    def test_parallel_compact_refresh_matches_serial_trajectory(self):
+        trajectories = []
+        for use_parallel_streams in (False, True):
+            model = _build_model("cuda:0")
+            solver = SolverFeatherPGS(
+                model,
+                update_mass_matrix_interval=1,
+                double_buffer=False,
+                use_parallel_streams=use_parallel_streams,
+            )
+            trajectories.append(_run_trajectory(model, solver, num_steps=20))
+
+        np.testing.assert_allclose(trajectories[1], trajectories[0], rtol=0.0, atol=2.0e-6)
+
     def test_interval_two_contact_trajectory_stays_close_to_reference(self):
         device = wp.get_device()
         history = {}
@@ -128,64 +143,28 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
                 f"unexpected mass_update_mask after step {step_index}",
             )
 
-    def test_limit_change_refresh_on_skipped_step_matches_full_rebuild(self):
-        """A limit-count change on a global_flag=0 step must refresh that articulation's mass factor.
+    def test_model_change_request_refreshes_a_reuse_step(self):
+        model = _build_model(wp.get_device(), ground=False)
+        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
+        state_0 = _make_initial_state(model)
+        state_1 = model.state()
+        contacts = model.contacts()
+        control = model.control()
 
-        At this base revision ``build_augmented_joint_rows_and_apply_tau`` always writes
-        ``aug_limit_counts = 0`` (the device-side producer is inert), so a joint
-        crossing the limit activation gap cannot change the count yet. We emulate
-        the crossing by perturbing ``aug_prev_limit_counts``, which is exactly the
-        signal ``detect_limit_count_changes`` consumes. The refreshed Cholesky
-        factor must match an interval=1 reference bitwise-closely even though the
-        masked rebuild writes into a stale (non-zeroed) H buffer.
-        """
-        device = wp.get_device()
-        model_a = _build_model(device, ground=False)
-        model_b = _build_model(device, ground=False)
-        solver_a = SolverFeatherPGS(
-            model_a, update_mass_matrix_interval=2, double_buffer=False, use_parallel_streams=False
-        )
-        solver_b = SolverFeatherPGS(
-            model_b, update_mass_matrix_interval=1, double_buffer=False, use_parallel_streams=False
-        )
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, DT)
+        state_0, state_1 = state_1, state_0
+        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, DT)
 
-        runs = []
-        for model, solver in ((model_a, solver_a), (model_b, solver_b)):
-            state_0 = _make_initial_state(model)
-            state_1 = model.state()
-            contacts = model.contacts()
-            control = model.control()
-            runs.append((model, solver, state_0, state_1, contacts, control))
+        self.assertEqual(solver.mass_update_mask.numpy().tolist(), [1, 1])
+        self.assertEqual(solver._mass_update_requested.numpy().tolist(), [0])
 
-        def step_once(run):
-            model, solver, state_0, state_1, contacts, control = run
-            model.collide(state_0, contacts)
-            solver.step(state_0, state_1, control, contacts, DT)
-            return (model, solver, state_1, state_0, contacts, control)
-
-        # Step 0: global flag is 1 for both solvers; identical full updates.
-        runs = [step_once(run) for run in runs]
-        np.testing.assert_array_equal(runs[0][2].joint_q.numpy(), runs[1][2].joint_q.numpy())
-
-        # Emulate articulation 0 crossing a joint-limit activation gap before
-        # the interval=2 solver's flag-0 step.
-        prev_counts = solver_a.aug_prev_limit_counts.numpy()
-        prev_counts[0] = 1
-        solver_a.aug_prev_limit_counts.assign(prev_counts)
-
-        # Step 1: solver_a global flag is 0; only articulation 0 must refresh.
-        runs = [step_once(run) for run in runs]
-        self.assertEqual(solver_a.mass_update_mask.numpy().tolist(), [1, 0])
-        self.assertEqual(solver_b.mass_update_mask.numpy().tolist(), [1, 1])
-
-        size = next(iter(solver_a.size_groups))
-        L_a = solver_a.L_by_size[size].numpy()
-        L_b = solver_b.L_by_size[size].numpy()
-        # Refreshed articulation: masked rebuild into the stale H buffer must
-        # reproduce the full-rebuild factorization.
-        np.testing.assert_allclose(L_a[0], L_b[0], rtol=0.0, atol=1.0e-6)
-        # Skipped articulation: still carries the step-0 factorization.
-        self.assertFalse(np.array_equal(L_a[1], L_b[1]))
+    def test_mass_refresh_has_no_obsolete_limit_count_state(self):
+        solver = SolverFeatherPGS(_build_model(wp.get_device(), ground=False))
+        for attribute in ("aug_limit_counts", "aug_prev_limit_counts", "limit_change_mask"):
+            self.assertFalse(hasattr(solver, attribute), f"obsolete mass-refresh state {attribute!r} was restored")
 
 
 if __name__ == "__main__":
