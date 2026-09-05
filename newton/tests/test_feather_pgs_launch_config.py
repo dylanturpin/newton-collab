@@ -12,6 +12,7 @@ from newton._src.solvers.feather_pgs import kernels as feather_pgs_kernels
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
+    _estimate_cholesky_shared_memory,
     _FeatherPGSExecutionPlan,
     _select_hinv_jt_chunk_size,
     _use_resident_mfgs_metadata,
@@ -255,6 +256,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             [160],
             max_constraints=384,
             max_shared_memory=101376,
+            cholesky_kernel="auto",
             hinv_jt_kernel="auto",
             small_dof_threshold=12,
             tile_threads=64,
@@ -265,6 +267,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             [23],
             max_constraints=0,
             max_shared_memory=101376,
+            cholesky_kernel="auto",
             hinv_jt_kernel="tiled",
             small_dof_threshold=12,
             tile_threads=64,
@@ -276,6 +279,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 [160],
                 max_constraints=384,
                 max_shared_memory=101376,
+                cholesky_kernel="auto",
                 hinv_jt_kernel="tiled",
                 small_dof_threshold=12,
                 tile_threads=64,
@@ -286,6 +290,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             [23],
             max_constraints=64,
             max_shared_memory=101376,
+            cholesky_kernel="auto",
             hinv_jt_kernel="auto",
             small_dof_threshold=12,
             tile_threads=64,
@@ -294,12 +299,39 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             [23],
             max_constraints=384,
             max_shared_memory=101376,
+            cholesky_kernel="auto",
             hinv_jt_kernel="auto",
             small_dof_threshold=12,
             tile_threads=64,
         )
         self.assertTrue(fitting.use_fused_hinv_jt(23))
         self.assertFalse(oversized.use_fused_hinv_jt(23))
+
+    def test_cholesky_execution_plan_respects_shared_memory(self):
+        """Fall back for oversized auto tiles and reject forced invalid launches."""
+        self.assertEqual(_estimate_cholesky_shared_memory(108), 140400)
+        automatic = _FeatherPGSExecutionPlan.build(
+            [23, 108],
+            max_constraints=0,
+            max_shared_memory=101376,
+            cholesky_kernel="auto",
+            hinv_jt_kernel="auto",
+            small_dof_threshold=12,
+            tile_threads=64,
+        )
+        self.assertTrue(automatic.use_tiled_cholesky(23))
+        self.assertFalse(automatic.use_tiled_cholesky(108))
+
+        with self.assertRaisesRegex(ValueError, "cholesky_kernel='tiled'.*140400.*101376"):
+            _FeatherPGSExecutionPlan.build(
+                [108],
+                max_constraints=0,
+                max_shared_memory=101376,
+                cholesky_kernel="tiled",
+                hinv_jt_kernel="auto",
+                small_dof_threshold=12,
+                tile_threads=64,
+            )
 
     def test_fixed_base_sibling_branches_use_diagonal_mass_path(self):
         """Match the dense reference while selecting independent branch solves."""

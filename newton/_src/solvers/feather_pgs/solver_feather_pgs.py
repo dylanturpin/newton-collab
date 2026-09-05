@@ -452,6 +452,13 @@ def _align_shared_memory(size: int) -> int:
     return (size + 15) // 16 * 16
 
 
+def _estimate_cholesky_shared_memory(n_dofs: int) -> int:
+    """Estimate the complete tiled Cholesky shared-memory footprint [B]."""
+    matrix_bytes = _align_shared_memory(4 * n_dofs * n_dofs)
+    vector_bytes = _align_shared_memory(4 * n_dofs)
+    return 3 * matrix_bytes + vector_bytes
+
+
 def _estimate_hinv_jt_shared_memory(n_dofs: int, constraint_count: int, *, fused: bool, tile_threads: int) -> int:
     """Estimate the complete tiled H-inverse shared-memory footprint [B]."""
     footprint = _align_shared_memory(4 * n_dofs * n_dofs)
@@ -492,6 +499,7 @@ class _FeatherPGSExecutionPlan:
     """Immutable device-resource choices for one solver shape."""
 
     diagonal_mass_sizes: frozenset[int]
+    cholesky_tiled_sizes: frozenset[int]
     hinv_jt_tiled_sizes: frozenset[int]
     hinv_jt_chunk_sizes: tuple[tuple[int, int], ...]
     hinv_jt_fused_sizes: frozenset[int]
@@ -503,6 +511,7 @@ class _FeatherPGSExecutionPlan:
         *,
         max_constraints: int,
         max_shared_memory: int,
+        cholesky_kernel: str,
         hinv_jt_kernel: str,
         small_dof_threshold: int,
         tile_threads: int,
@@ -514,13 +523,27 @@ class _FeatherPGSExecutionPlan:
             if hinv_jt_kernel == "auto"
             else frozenset()
         )
+        cholesky_tiled_sizes: set[int] = set()
         tiled_sizes: set[int] = set()
         chunk_sizes: list[tuple[int, int]] = []
         fused_sizes: set[int] = set()
-        if max_constraints <= 0:
-            return cls(planned_diagonal_sizes, frozenset(), (), frozenset())
         for size in size_groups:
             if size in planned_diagonal_sizes:
+                continue
+            cholesky_requested = cholesky_kernel == "tiled" or (
+                cholesky_kernel == "auto" and size > small_dof_threshold
+            )
+            if cholesky_requested:
+                required = _estimate_cholesky_shared_memory(size)
+                if required <= max_shared_memory:
+                    cholesky_tiled_sizes.add(size)
+                elif cholesky_kernel == "tiled":
+                    raise ValueError(
+                        f"cholesky_kernel='tiled' requires {required} bytes of shared memory for DOF size {size}, "
+                        f"but the device exposes {max_shared_memory} bytes; use cholesky_kernel='auto' or 'loop'."
+                    )
+
+            if max_constraints <= 0:
                 continue
             requested = hinv_jt_kernel == "tiled" or (hinv_jt_kernel == "auto" and size > small_dof_threshold)
             if not requested:
@@ -544,11 +567,21 @@ class _FeatherPGSExecutionPlan:
             ):
                 fused_sizes.add(size)
 
-        return cls(planned_diagonal_sizes, frozenset(tiled_sizes), tuple(chunk_sizes), frozenset(fused_sizes))
+        return cls(
+            planned_diagonal_sizes,
+            frozenset(cholesky_tiled_sizes),
+            frozenset(tiled_sizes),
+            tuple(chunk_sizes),
+            frozenset(fused_sizes),
+        )
 
     def use_diagonal_mass(self, size: int) -> bool:
         """Return whether an articulation group has diagonal generalized inertia."""
         return size in self.diagonal_mass_sizes
+
+    def use_tiled_cholesky(self, size: int) -> bool:
+        """Return whether an articulation group uses tiled Cholesky."""
+        return size in self.cholesky_tiled_sizes
 
     def hinv_jt_chunk_size(self, size: int) -> int | None:
         """Return the tiled H-inverse chunk size for a response group."""
@@ -1497,6 +1530,7 @@ class SolverFeatherPGS(SolverBase):
             self.size_groups,
             max_constraints=self.dense_max_constraints,
             max_shared_memory=int(getattr(model.device, "max_shared_memory_per_block", 0)),
+            cholesky_kernel=self.cholesky_kernel,
             hinv_jt_kernel=self.hinv_jt_kernel,
             small_dof_threshold=self.small_dof_threshold,
             tile_threads=self.tile_threads,
@@ -4383,7 +4417,9 @@ class SolverFeatherPGS(SolverBase):
         for size in self.size_groups:
             use_diagonal_mass = self._execution_plan.use_diagonal_mass(size)
             self._cholesky_kernels_by_size[size] = (
-                None if use_diagonal_mass else _get_cholesky_kernel(size, device_arch, self.tile_threads)
+                _get_cholesky_kernel(size, device_arch, self.tile_threads)
+                if self._execution_plan.use_tiled_cholesky(size)
+                else None
             )
             self._triangular_solve_kernels_by_size[size] = (
                 None if use_diagonal_mass else _get_triangular_solve_kernel(size, device_arch, self.tile_threads)
@@ -6551,12 +6587,9 @@ class SolverFeatherPGS(SolverBase):
         with wp.ScopedTimer("S2_Cholesky", print=False, use_nvtx=self._nvtx, synchronize=False):
             for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                 with ctx:
-                    use_tiled = (self.cholesky_kernel == "tiled") or (
-                        self.cholesky_kernel == "auto" and size > self.small_dof_threshold
-                    )
                     if self._execution_plan.use_diagonal_mass(size):
                         self._stage2_cholesky_diagonal(size)
-                    elif use_tiled:
+                    elif self._execution_plan.use_tiled_cholesky(size):
                         self._stage2_cholesky_tiled(size)
                     else:
                         self._stage2_cholesky_loop(size)
