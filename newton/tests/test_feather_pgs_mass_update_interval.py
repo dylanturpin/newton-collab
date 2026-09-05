@@ -66,6 +66,62 @@ def _build_model(device, num_worlds=2, ground=True):
     return builder.finalize(device=device)
 
 
+def _build_floating_model(device, num_worlds=2):
+    """Floating two-link articulation with nonzero root and joint motion."""
+    env = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    root = env.add_link(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+        mass=2.0,
+        com=wp.vec3(0.07, -0.03, 0.02),
+        inertia=wp.mat33(0.03, 0.0, 0.0, 0.0, 0.04, 0.0, 0.0, 0.0, 0.05),
+    )
+    child = env.add_link(
+        xform=wp.transform(wp.vec3(0.3, 0.0, 1.0), wp.quat_identity()),
+        mass=1.0,
+        com=wp.vec3(0.04, 0.01, -0.02),
+        inertia=wp.mat33(0.01, 0.0, 0.0, 0.0, 0.012, 0.0, 0.0, 0.0, 0.014),
+    )
+    free = env.add_joint_free(root)
+    hinge = env.add_joint_revolute(
+        root,
+        child,
+        parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.1, 0.0, 0.0), wp.quat_identity()),
+        axis=newton.Axis.Y,
+    )
+    env.add_articulation([free, hinge])
+    builder = newton.ModelBuilder()
+    builder.replicate(env, num_worlds)
+    return builder.finalize(device=device)
+
+
+def _make_floating_state(model):
+    state = model.state()
+    qd = state.joint_qd.numpy()
+    for articulation in range(model.articulation_count):
+        start = articulation * 7
+        qd[start : start + 7] = (0.4, -0.2, 0.1, 0.5, -0.7, 0.3, 0.8)
+    state.joint_qd.assign(qd)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    return state
+
+
+def _run_floating_trajectory(model, solver, num_steps, *, reset_each_step):
+    state_0 = _make_floating_state(model)
+    state_1 = model.state()
+    contacts = model.contacts()
+    control = model.control()
+    history = {name: [] for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
+    for _ in range(num_steps):
+        if reset_each_step:
+            solver.reset(state_0)
+        solver.step(state_0, state_1, control, contacts, DT)
+        state_0, state_1 = state_1, state_0
+        for name, values in history.items():
+            values.append(getattr(state_0, name).numpy().copy())
+    return {name: np.stack(values) for name, values in history.items()}
+
+
 def _make_initial_state(model):
     state = model.state()
     num_arts = model.articulation_count
@@ -108,12 +164,59 @@ def _run_state_trajectory(model, solver, num_steps, *, reset_each_step):
 
 class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "FK/ID reuse requires CUDA")
+    def test_split_fk_id_cache_does_not_alias_active_step_state(self):
+        """Keep split-mode cached dynamics isolated from active solve scratch."""
+        model = _build_floating_model("cuda:0")
+        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, pgs_mode="split")
+        state_in = _make_floating_state(model)
+        state_aug = solver._prepare_augmented_state(state_in, model.state(), model.control())
+        cache = solver._fk_id_cache
+
+        active_cache_pairs = (
+            (state_aug.body_q_com, cache.body_q_com),
+            (state_aug.joint_S_s, cache.joint_S_s),
+            (state_aug.body_I_s, cache.body_I_s),
+            (solver._body_inertia_terms, cache.body_inertia_terms),
+            (state_aug.body_v_s, cache.body_v_s),
+            (state_aug.body_f_s, cache.body_f_s),
+            (state_aug.body_a_s, cache.body_a_s),
+            (solver.articulation_origin, cache.articulation_origin),
+        )
+        for active, cached in active_cache_pairs:
+            self.assertNotEqual(active.ptr, cached.ptr)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free PGS requires CUDA")
+    def test_matrix_free_fk_id_cache_keeps_zero_copy_path(self):
+        """Keep matrix-free dynamics publication on its validated zero-copy path."""
+        model = _build_floating_model("cuda:0")
+        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
+
+        self.assertTrue(solver._fk_id_cache_enabled)
+        self.assertFalse(solver._fk_id_cache_uses_snapshot)
+        self.assertIsNone(solver._fk_id_cache)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "FK/ID reuse requires CUDA")
     def test_cached_fk_id_matches_forced_recomputation(self):
+        """Match forced recomputation across cached fixed-base steps."""
         trajectories = []
         for reset_each_step in (False, True):
             model = _build_model("cuda:0", ground=False)
             solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
             trajectories.append(_run_state_trajectory(model, solver, num_steps=20, reset_each_step=reset_each_step))
+
+        for name in trajectories[0]:
+            np.testing.assert_allclose(
+                trajectories[0][name], trajectories[1][name], rtol=0.0, atol=2.0e-6, err_msg=name
+            )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "FK/ID reuse requires CUDA")
+    def test_cached_fk_id_matches_forced_recomputation_for_floating_base(self):
+        """Match forced recomputation across cached floating-base steps."""
+        trajectories = []
+        for reset_each_step in (False, True):
+            model = _build_floating_model("cuda:0")
+            solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
+            trajectories.append(_run_floating_trajectory(model, solver, num_steps=20, reset_each_step=reset_each_step))
 
         for name in trajectories[0]:
             np.testing.assert_allclose(
