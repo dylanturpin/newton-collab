@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -66,6 +67,62 @@ def _build_model(device, num_worlds=2, ground=True):
     return builder.finalize(device=device)
 
 
+def _build_floating_model(device, num_worlds=2):
+    """Floating two-link articulation with nonzero root and joint motion."""
+    env = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    root = env.add_link(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+        mass=2.0,
+        com=wp.vec3(0.07, -0.03, 0.02),
+        inertia=wp.mat33(0.03, 0.0, 0.0, 0.0, 0.04, 0.0, 0.0, 0.0, 0.05),
+    )
+    child = env.add_link(
+        xform=wp.transform(wp.vec3(0.3, 0.0, 1.0), wp.quat_identity()),
+        mass=1.0,
+        com=wp.vec3(0.04, 0.01, -0.02),
+        inertia=wp.mat33(0.01, 0.0, 0.0, 0.0, 0.012, 0.0, 0.0, 0.0, 0.014),
+    )
+    free = env.add_joint_free(root)
+    hinge = env.add_joint_revolute(
+        root,
+        child,
+        parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.1, 0.0, 0.0), wp.quat_identity()),
+        axis=newton.Axis.Y,
+    )
+    env.add_articulation([free, hinge])
+    builder = newton.ModelBuilder()
+    builder.replicate(env, num_worlds)
+    return builder.finalize(device=device)
+
+
+def _make_floating_state(model):
+    state = model.state()
+    qd = state.joint_qd.numpy()
+    for articulation in range(model.articulation_count):
+        start = articulation * 7
+        qd[start : start + 7] = (0.4, -0.2, 0.1, 0.5, -0.7, 0.3, 0.8)
+    state.joint_qd.assign(qd)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    return state
+
+
+def _run_floating_trajectory(model, solver, num_steps, *, reset_each_step):
+    state_0 = _make_floating_state(model)
+    state_1 = model.state()
+    contacts = model.contacts()
+    control = model.control()
+    history = {name: [] for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
+    for _ in range(num_steps):
+        if reset_each_step:
+            solver.reset(state_0)
+        solver.step(state_0, state_1, control, contacts, DT)
+        state_0, state_1 = state_1, state_0
+        for name, values in history.items():
+            values.append(getattr(state_0, name).numpy().copy())
+    return {name: np.stack(values) for name, values in history.items()}
+
+
 def _make_initial_state(model):
     state = model.state()
     num_arts = model.articulation_count
@@ -89,7 +146,161 @@ def _run_trajectory(model, solver, num_steps):
     return np.stack(joint_q_history)
 
 
+def _run_state_trajectory(model, solver, num_steps, *, reset_each_step):
+    state_0 = _make_initial_state(model)
+    state_1 = model.state()
+    contacts = model.contacts()
+    control = model.control()
+    history = {name: [] for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
+    for _ in range(num_steps):
+        if reset_each_step:
+            solver.reset(state_0)
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, DT)
+        state_0, state_1 = state_1, state_0
+        for name, values in history.items():
+            values.append(getattr(state_0, name).numpy().copy())
+    return {name: np.stack(values) for name, values in history.items()}
+
+
 class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "FK/ID reuse requires CUDA")
+    def test_split_fk_id_cache_does_not_alias_active_step_state(self):
+        """Keep split-mode cached dynamics isolated from active solve scratch."""
+        model = _build_floating_model("cuda:0")
+        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, pgs_mode="split")
+        state_in = _make_floating_state(model)
+        state_aug = solver._prepare_augmented_state(state_in, model.state(), model.control())
+        cache = solver._fk_id_cache
+
+        active_cache_pairs = (
+            (state_aug.body_q_com, cache.body_q_com),
+            (state_aug.joint_S_s, cache.joint_S_s),
+            (state_aug.body_I_s, cache.body_I_s),
+            (solver._body_inertia_terms, cache.body_inertia_terms),
+            (state_aug.body_v_s, cache.body_v_s),
+            (state_aug.body_f_s, cache.body_f_s),
+            (state_aug.body_a_s, cache.body_a_s),
+            (solver.articulation_origin, cache.articulation_origin),
+        )
+        for active, cached in active_cache_pairs:
+            self.assertNotEqual(active.ptr, cached.ptr)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free PGS requires CUDA")
+    def test_matrix_free_fk_id_cache_keeps_zero_copy_path(self):
+        """Keep matrix-free dynamics publication on its validated zero-copy path."""
+        model = _build_floating_model("cuda:0")
+        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
+
+        self.assertTrue(solver._fk_id_cache_enabled)
+        self.assertFalse(solver._fk_id_cache_uses_snapshot)
+        self.assertIsNone(solver._fk_id_cache)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "FK/ID launch requires CUDA")
+    def test_fk_id_launch_storage_exists_when_reuse_is_disabled(self):
+        """Keep the unconditional FK/ID launch output valid without reuse."""
+        model = _build_model("cuda:0", num_worlds=1, ground=False)
+        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_velocity_limits=True)
+        self.assertFalse(solver._fk_id_cache_enabled)
+        self.assertEqual(solver._fk_id_cache_valid.shape[0], model.articulation_count)
+
+        state_in = _make_initial_state(model)
+        state_out = model.state()
+        solver.step(state_in, state_out, model.control(), None, DT)
+        wp.synchronize()
+
+    @unittest.skipUnless(wp.is_cuda_available(), "FK/ID reuse requires CUDA")
+    def test_cached_fk_id_matches_forced_recomputation(self):
+        """Match forced recomputation across cached fixed-base steps."""
+        trajectories = []
+        for reset_each_step in (False, True):
+            model = _build_model("cuda:0", ground=False)
+            solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
+            trajectories.append(_run_state_trajectory(model, solver, num_steps=20, reset_each_step=reset_each_step))
+
+        for name in trajectories[0]:
+            np.testing.assert_allclose(
+                trajectories[0][name], trajectories[1][name], rtol=0.0, atol=2.0e-6, err_msg=name
+            )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "FK/ID reuse requires CUDA")
+    def test_cached_fk_id_matches_forced_recomputation_for_floating_base(self):
+        """Match forced recomputation across cached floating-base steps."""
+        trajectories = []
+        for reset_each_step in (False, True):
+            model = _build_floating_model("cuda:0")
+            solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
+            trajectories.append(_run_floating_trajectory(model, solver, num_steps=20, reset_each_step=reset_each_step))
+
+        for name in trajectories[0]:
+            np.testing.assert_allclose(
+                trajectories[0][name], trajectories[1][name], rtol=0.0, atol=2.0e-6, err_msg=name
+            )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "parallel compact inertia refresh requires CUDA")
+    def test_parallel_compact_refresh_matches_serial_trajectory(self):
+        trajectories = []
+        for use_parallel_streams in (False, True):
+            model = _build_model("cuda:0")
+            solver = SolverFeatherPGS(
+                model,
+                update_mass_matrix_interval=1,
+                double_buffer=False,
+                use_parallel_streams=use_parallel_streams,
+            )
+            trajectories.append(_run_trajectory(model, solver, num_steps=20))
+
+        np.testing.assert_allclose(trajectories[1], trajectories[0], rtol=0.0, atol=2.0e-6)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires CUDA")
+    def test_captured_parallel_dynamics_matches_fused_trajectory(self):
+        """Match captured parallel dynamics against eager fused execution."""
+        graph_model = _build_model("cuda:0", ground=False)
+        eager_model = _build_model("cuda:0", ground=False)
+        graph_solver = SolverFeatherPGS(
+            graph_model,
+            update_mass_matrix_interval=1,
+            double_buffer=False,
+            use_parallel_streams=True,
+        )
+        eager_solver = SolverFeatherPGS(
+            eager_model,
+            update_mass_matrix_interval=1,
+            double_buffer=False,
+            use_parallel_streams=False,
+        )
+        graph_state, graph_out = _make_initial_state(graph_model), graph_model.state()
+        eager_state, eager_out = _make_initial_state(eager_model), eager_model.state()
+        graph_control, eager_control = graph_model.control(), eager_model.control()
+        graph_pipeline = newton.CollisionPipeline(graph_model)
+        eager_pipeline = newton.CollisionPipeline(eager_model)
+        graph_contacts, eager_contacts = graph_pipeline.contacts(), eager_pipeline.contacts()
+
+        def one_step(solver, state_in, state_out, control, contacts):
+            solver.step(state_in, state_out, control, contacts, DT)
+            wp.copy(state_in.body_q, state_out.body_q)
+            wp.copy(state_in.body_qd, state_out.body_qd)
+            wp.copy(state_in.joint_q, state_out.joint_q)
+            wp.copy(state_in.joint_qd, state_out.joint_qd)
+
+        one_step(graph_solver, graph_state, graph_out, graph_control, graph_contacts)
+        one_step(eager_solver, eager_state, eager_out, eager_control, eager_contacts)
+        with wp.ScopedCapture("cuda:0") as capture:
+            one_step(graph_solver, graph_state, graph_out, graph_control, graph_contacts)
+
+        for _ in range(20):
+            wp.capture_launch(capture.graph)
+            one_step(eager_solver, eager_state, eager_out, eager_control, eager_contacts)
+
+        for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+            np.testing.assert_allclose(
+                getattr(graph_state, name).numpy(),
+                getattr(eager_state, name).numpy(),
+                rtol=0.0,
+                atol=2.0e-6,
+                err_msg=name,
+            )
+
     def test_interval_two_contact_trajectory_stays_close_to_reference(self):
         device = wp.get_device()
         history = {}
@@ -128,64 +339,64 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
                 f"unexpected mass_update_mask after step {step_index}",
             )
 
-    def test_limit_change_refresh_on_skipped_step_matches_full_rebuild(self):
-        """A limit-count change on a global_flag=0 step must refresh that articulation's mass factor.
+    def test_model_change_request_refreshes_a_reuse_step(self):
+        model = _build_model(wp.get_device(), ground=False)
+        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
+        state_0 = _make_initial_state(model)
+        state_1 = model.state()
+        contacts = model.contacts()
+        control = model.control()
 
-        At this base revision ``build_augmented_joint_rows_and_apply_tau`` always writes
-        ``aug_limit_counts = 0`` (the device-side producer is inert), so a joint
-        crossing the limit activation gap cannot change the count yet. We emulate
-        the crossing by perturbing ``aug_prev_limit_counts``, which is exactly the
-        signal ``detect_limit_count_changes`` consumes. The refreshed Cholesky
-        factor must match an interval=1 reference bitwise-closely even though the
-        masked rebuild writes into a stale (non-zeroed) H buffer.
-        """
-        device = wp.get_device()
-        model_a = _build_model(device, ground=False)
-        model_b = _build_model(device, ground=False)
-        solver_a = SolverFeatherPGS(
-            model_a, update_mass_matrix_interval=2, double_buffer=False, use_parallel_streams=False
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, DT)
+        state_0, state_1 = state_1, state_0
+        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, DT)
+
+        self.assertEqual(solver.mass_update_mask.numpy().tolist(), [1, 1])
+        self.assertEqual(solver._mass_update_requested.numpy().tolist(), [0])
+
+    def test_teardown_waits_once_for_each_owned_stream(self):
+        """Synchronize current stream owners and tolerate CUDA shutdown."""
+        solver = object.__new__(SolverFeatherPGS)
+        local = object()
+        residual = object()
+        dynamics = object()
+        memset = object()
+        size = object()
+        solver._local_internal_stream = local
+        solver._local_residual_stream = residual
+        solver._local_pair_stream = local
+        solver._global_inertia_stream = None
+        solver._articulation_dynamics_stream = dynamics
+        solver._memset_stream = memset
+        solver._size_streams = {3: local, 6: size}
+
+        def synchronize(stream):
+            if stream is residual:
+                raise RuntimeError("CUDA is shutting down")
+
+        with mock.patch.object(wp, "synchronize_stream", side_effect=synchronize) as synchronize_stream:
+            solver.__del__()
+        self.assertEqual(
+            synchronize_stream.call_args_list,
+            [mock.call(local), mock.call(residual), mock.call(dynamics), mock.call(memset), mock.call(size)],
         )
-        solver_b = SolverFeatherPGS(
-            model_b, update_mass_matrix_interval=1, double_buffer=False, use_parallel_streams=False
-        )
 
-        runs = []
-        for model, solver in ((model_a, solver_a), (model_b, solver_b)):
-            state_0 = _make_initial_state(model)
-            state_1 = model.state()
-            contacts = model.contacts()
-            control = model.control()
-            runs.append((model, solver, state_0, state_1, contacts, control))
+        # Prevent a second meaningful synchronization when Python collects the
+        # deliberately uninitialized instance after this regression returns.
+        solver._local_internal_stream = None
+        solver._local_residual_stream = None
+        solver._local_pair_stream = None
+        solver._articulation_dynamics_stream = None
+        solver._memset_stream = None
+        solver._size_streams = {}
 
-        def step_once(run):
-            model, solver, state_0, state_1, contacts, control = run
-            model.collide(state_0, contacts)
-            solver.step(state_0, state_1, control, contacts, DT)
-            return (model, solver, state_1, state_0, contacts, control)
-
-        # Step 0: global flag is 1 for both solvers; identical full updates.
-        runs = [step_once(run) for run in runs]
-        np.testing.assert_array_equal(runs[0][2].joint_q.numpy(), runs[1][2].joint_q.numpy())
-
-        # Emulate articulation 0 crossing a joint-limit activation gap before
-        # the interval=2 solver's flag-0 step.
-        prev_counts = solver_a.aug_prev_limit_counts.numpy()
-        prev_counts[0] = 1
-        solver_a.aug_prev_limit_counts.assign(prev_counts)
-
-        # Step 1: solver_a global flag is 0; only articulation 0 must refresh.
-        runs = [step_once(run) for run in runs]
-        self.assertEqual(solver_a.mass_update_mask.numpy().tolist(), [1, 0])
-        self.assertEqual(solver_b.mass_update_mask.numpy().tolist(), [1, 1])
-
-        size = next(iter(solver_a.size_groups))
-        L_a = solver_a.L_by_size[size].numpy()
-        L_b = solver_b.L_by_size[size].numpy()
-        # Refreshed articulation: masked rebuild into the stale H buffer must
-        # reproduce the full-rebuild factorization.
-        np.testing.assert_allclose(L_a[0], L_b[0], rtol=0.0, atol=1.0e-6)
-        # Skipped articulation: still carries the step-0 factorization.
-        self.assertFalse(np.array_equal(L_a[1], L_b[1]))
+    def test_mass_refresh_has_no_obsolete_limit_count_state(self):
+        solver = SolverFeatherPGS(_build_model(wp.get_device(), ground=False))
+        for attribute in ("aug_limit_counts", "aug_prev_limit_counts", "limit_change_mask"):
+            self.assertFalse(hasattr(solver, attribute), f"obsolete mass-refresh state {attribute!r} was restored")
 
 
 if __name__ == "__main__":
