@@ -643,7 +643,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_omega: float = 1.0,
         pgs_contact_regularization: float = 0.0,
         pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
-        dense_max_constraints: int = 32,
+        dense_max_constraints: int | None = None,
         pgs_warmstart: bool = False,
         mf_warmstart: bool = False,
         mf_warmstart_decay: float = 1.0,
@@ -843,9 +843,13 @@ class SolverFeatherPGS(SolverBase):
                 solve and lets only contacts, friction, and limits clean up velocity residuals;
                 ``"active"`` continues updating drive rows during the velocity-only pass.
                 Defaults to ``"freeze"``.
-            dense_max_constraints (int, optional): Maximum number of dense (articulation) contact constraint
-                rows stored per world. Free rigid body contacts are stored separately, bounded by
-                mf_max_constraints. Defaults to 32.
+            dense_max_constraints (int, optional): Total dense constraint rows per world,
+                including drives, limits, loop closures and articulated contacts.
+                ``None`` reserves 32 contact rows plus the largest authored internal-row
+                census of any world. An explicit integer remains a fixed total budget.
+                Runtime changes that add rows may require a larger budget. Use
+                ``row_watermark=True`` to inspect row demand. Free-body contacts
+                use ``mf_max_constraints``.
             pgs_warmstart (bool, optional): Re-use dense, matrix-free, and propagation contact
                 impulses from the previous frame. Contact and friction rows always carry by
                 contact identity through the collision pipeline's ``rigid_contact_match_index``;
@@ -958,8 +962,17 @@ class SolverFeatherPGS(SolverBase):
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
             drive_mode (str, optional): Joint target drive implementation.
-                ``"augmented"`` keeps the legacy FeatherPGS implicit-PD path
-                that folds drive stiffness into the articulated mass matrix.
+                ``"augmented"`` folds unlimited drive stiffness into the
+                articulated mass matrix. Finite positive effort limits instead
+                use bounded implicit rows, so contact and external loads cannot
+                bypass actuator saturation. Nonpositive limits retain the
+                established unlimited-effort convention.
+                The builder's default effort limit (1e6) is finite: its drives
+                therefore use rows too. These rows cold-start each step and
+                depend on ``pgs_iterations`` for convergence; zero iterations
+                applies no bounded drive impulse. Compared with the former
+                unrestricted augmented fold, this changes default robot behavior
+                and can increase runtime even when limits do not bind.
                 ``"physx_pgs"`` creates one dense PGS constraint row per
                 driven scalar DOF and updates its drive impulse with PhysX's
                 force-drive PGS formula each Gauss-Seidel iteration. The
@@ -1083,7 +1096,8 @@ class SolverFeatherPGS(SolverBase):
         if pgs_velocity_drive_mode not in ("active", "freeze"):
             raise ValueError(f"pgs_velocity_drive_mode must be 'active' or 'freeze', got {pgs_velocity_drive_mode!r}")
         self.pgs_velocity_drive_mode = pgs_velocity_drive_mode
-        self._requested_dense_max_constraints = int(dense_max_constraints)
+        self._auto_dense_max_constraints = dense_max_constraints is None
+        self._requested_dense_max_constraints = 32 if dense_max_constraints is None else int(dense_max_constraints)
         if articulated_contact_response not in (
             "immediate",
             "propagation",
@@ -1190,6 +1204,15 @@ class SolverFeatherPGS(SolverBase):
         if drive_mode == "physx_pgs" and self.pgs_mode != "matrix_free":
             raise NotImplementedError("drive_mode='physx_pgs' currently requires pgs_mode='matrix_free'")
         self.drive_mode = drive_mode
+        self._has_drive_rows = bool(
+            model.joint_dof_count
+            and np.isin(model.joint_type.numpy(), [JointType.PRISMATIC, JointType.REVOLUTE, JointType.D6]).any()
+        )
+        if self._has_drive_rows and pgs_kernel in ("tiled_contact", "streaming"):
+            raise ValueError(
+                "Models with drive-capable joints require pgs_kernel='tiled_row' or 'loop'; "
+                f"{pgs_kernel!r} is contact-only and does not implement bounded drive rows."
+            )
         # fuse_joint_velocity_limits is an engage-where-applicable request,
         # not a demand: the fused clamp only exists in the matrix_free +
         # physx_pgs + velocity-limits formulation (and needs
@@ -1401,6 +1424,8 @@ class SolverFeatherPGS(SolverBase):
         self._build_preelimination_plan(model)
         self._setup_passive_joint_forces(model)
         self._dense_internal_max_rows = self._estimate_dense_internal_rows_per_world(model)
+        if self._auto_dense_max_constraints:
+            self._requested_dense_max_constraints += self._dense_internal_max_rows
         self.dense_max_constraints = self._select_dense_row_capacity(model)
         self._propagation_full_fused_size = self._select_propagation_full_fused_size()
         # Build the execution plan after dense_max_constraints has been
@@ -1502,6 +1527,7 @@ class SolverFeatherPGS(SolverBase):
         self._dummy_mf_slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=model.device)
         self._dummy_contact_count = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_contact_row_type = wp.zeros((1, 1), dtype=wp.int32, device=model.device)
+        self._drive_desc_J_dummy = wp.zeros((1, 1, 1), dtype=wp.float32, device=model.device)
         # Dedicated row-type sink for reset(): reset_world_warmstart_buffers
         # writes -1 into its prev_mf_row_type argument, which would violate the
         # all-zeros invariant of the shared _dummy_contact_row_type buffer that
@@ -1798,7 +1824,7 @@ class SolverFeatherPGS(SolverBase):
         """
 
         if row_phase == 3:
-            has_drive_rows = self.drive_mode == "physx_pgs" and getattr(self, "drive_slot", None) is not None
+            has_drive_rows = self._has_drive_rows and getattr(self, "drive_slot", None) is not None
             has_position_limit_rows = self.enable_joint_limits and bool(self._joint_limit_sizes)
             has_mimic_rows = getattr(self, "_mimic_count", 0) > 0
             has_connect_rows = getattr(self, "_connect_count", 0) > 0
@@ -2378,7 +2404,7 @@ class SolverFeatherPGS(SolverBase):
         if not model.articulation_count or not model.joint_count or self.art_to_world is None:
             return 0
 
-        has_drive_rows = self.drive_mode == "physx_pgs" and model.joint_dof_count > 0
+        has_drive_rows = self._has_drive_rows and model.joint_dof_count > 0
         has_position_limit_rows = self.enable_joint_limits and model.joint_dof_count > 0
         has_velocity_limit_rows = (
             self.enable_joint_velocity_limits
@@ -2421,10 +2447,11 @@ class SolverFeatherPGS(SolverBase):
         if has_velocity_limit_rows and joint_velocity_limit_arr is None:
             has_velocity_limit_rows = False
         if not (has_drive_rows or has_position_limit_rows or has_velocity_limit_rows):
-            return 0
+            return int(np.max(per_world))
 
         joint_target_ke = joint_target_ke_arr.numpy() if has_drive_rows else None
         joint_target_kd = joint_target_kd_arr.numpy() if has_drive_rows else None
+        joint_effort_limit = model.joint_effort_limit.numpy() if has_drive_rows else None
         joint_limit_lower = joint_limit_lower_arr.numpy() if has_position_limit_rows else None
         joint_limit_upper = joint_limit_upper_arr.numpy() if has_position_limit_rows else None
         joint_velocity_limit = joint_velocity_limit_arr.numpy() if has_velocity_limit_rows else None
@@ -2454,6 +2481,7 @@ class SolverFeatherPGS(SolverBase):
                         and joint_target_ke is not None
                         and joint_target_kd is not None
                         and (joint_target_ke[dof] > 0.0 or joint_target_kd[dof] > 0.0)
+                        and (self.drive_mode == "physx_pgs" or 0.0 < joint_effort_limit[dof] < float("inf"))
                     ):
                         per_world[world] += 1
                     if has_position_limit_rows and joint_limit_lower is not None and joint_limit_upper is not None:
@@ -3218,7 +3246,7 @@ class SolverFeatherPGS(SolverBase):
             self.velocity_limit_slot = None
             self.velocity_limit_sign = None
 
-        if self.drive_mode == "physx_pgs" and model.joint_dof_count > 0:
+        if self._has_drive_rows and model.joint_dof_count > 0:
             self.drive_slot = wp.full(
                 (model.joint_dof_count,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
             )
@@ -4088,7 +4116,7 @@ class SolverFeatherPGS(SolverBase):
             and getattr(self, "max_world_dofs", 0) > 0
             and self.mf_max_constraints > 0
         ):
-            has_drive_rows = self.drive_mode == "physx_pgs"
+            has_drive_rows = self._has_drive_rows
             shared_metadata = _use_resident_mfgs_metadata(
                 self.dense_max_constraints,
                 self.mf_max_constraints,
@@ -4481,6 +4509,12 @@ class SolverFeatherPGS(SolverBase):
                     self.row_cfm,
                     self.impulses,
                     self.row_type,
+                    self.drive_stiffness,
+                    self.drive_damping,
+                    self.drive_geom_error,
+                    self.drive_max_force,
+                    self.target_velocity,
+                    self._last_step_dt,
                     iterations,
                     omega,
                 ],
@@ -4557,7 +4591,7 @@ class SolverFeatherPGS(SolverBase):
                             "mf_max_constraints": int(self.mf_max_constraints),
                             "max_world_dofs": int(self.max_world_dofs),
                             "friction_mode": str(self.friction_mode),
-                            "has_drive_rows": self.drive_mode == "physx_pgs",
+                            "has_drive_rows": self._has_drive_rows,
                             "has_dense_velocity_limit_rows": bool(self.enable_joint_velocity_limits),
                             "fuse_vel_limits": bool(self.fuse_joint_velocity_limits),
                             "device_arch": int(self.model.device.arch),  # INT warp arch code
@@ -6038,6 +6072,7 @@ class SolverFeatherPGS(SolverBase):
 
                 self._stage4_finalize_world_diag_cfm()
 
+            self._stage4_compute_physx_drive_desc(dt)
             self._stage4_compute_rhs_world(dt, contact_speculative_scale=self.contact_speculative_scale)
 
             for size in self.size_groups:
@@ -7041,21 +7076,15 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def _stage1_drives(self, state_in: State, state_aug: State, control: Control, dt: float):
-        """Populate ``state_aug.joint_tau`` and apply the effort-limit clamp.
+        """Assemble external/passive forces and unlimited augmented drives.
 
-        Torque-bucket ownership after this routine returns:
-
-        - ``state_aug.joint_tau`` holds the rigid / passive / Coriolis /
-          gravity / external / :attr:`~newton.Control.joint_f` contribution
-          summed with the clamped explicit-PD drive contribution ``u0``.
-        - The implicit-PD drive response is carried by ``self.aug_row_K``
-          and realized through ``H_tilde^{-1}`` during the linear solve.
-
-        :attr:`~newton.Model.joint_effort_limit` is always applied as
-        an **actuator-only** clamp on ``u0`` *before* it is added to
-        ``joint_tau``; the rigid / passive / external bucket is left uncapped
-        (MuJoCo ``actuatorfrcrange`` / PhysX drive ``maxForce`` convention).
-
+        Finite positive effort limits use bounded implicit constraint rows in
+        stage 4. Both the predictor and its response omit those drives here,
+        so external loading cannot bypass their force/torque bound. Unlimited
+        drives retain the augmented explicit term and implicit mass response.
+        External and passive forces are independent of the actuator bound.
+        As in the existing force-drive convention, nonpositive limits mean
+        unlimited effort.
         """
         model = self.model
 
@@ -7108,7 +7137,7 @@ class SolverFeatherPGS(SolverBase):
                     self.limit_change_mask.zero_()
                 return
 
-            # Build augmented rows, clamp the actuator-drive bucket, and add
+            # Build unlimited augmented rows and add
             # it to joint_tau in the same articulation pass.
             self.build_augmented_joint_targets(state_in, state_aug, control, dt)
 
@@ -7463,7 +7492,7 @@ class SolverFeatherPGS(SolverBase):
         propagation_dropped_rows = self._row_dropped_propagation if self._row_watermark else self._dummy_mf_slot_counter
         j_buffers_zeroed = False
 
-        drive_active = self.drive_mode == "physx_pgs" and self.drive_slot is not None
+        drive_active = self._has_drive_rows and self.drive_slot is not None
         if drive_active:
             wp.launch(
                 allocate_physx_drive_slots,
@@ -7477,6 +7506,8 @@ class SolverFeatherPGS(SolverBase):
                     model.joint_dof_dim,
                     model.joint_target_ke,
                     model.joint_target_kd,
+                    model.joint_effort_limit,
+                    int(self.drive_mode == "augmented"),
                     self.art_to_world,
                     max_constraints,
                 ],
@@ -8641,7 +8672,7 @@ class SolverFeatherPGS(SolverBase):
         position_delta_velocity=None,
         position_delta_scale: float = 0.0,
     ):
-        if self.drive_mode != "physx_pgs":
+        if not self._has_drive_rows:
             return
 
         if position_delta_velocity is None:
@@ -8653,11 +8684,11 @@ class SolverFeatherPGS(SolverBase):
             inputs=[
                 self.constraint_count,
                 self.dense_max_constraints,
-                self.world_dof_indices,
-                self.max_world_dofs,
+                getattr(self, "world_dof_indices", self._dummy_contact_row_type),
+                getattr(self, "max_world_dofs", 0),
                 self.row_type,
                 self.diag,
-                self.J_world,
+                getattr(self, "J_world", self._drive_desc_J_dummy),
                 position_delta_velocity,
                 self.target_velocity,
                 self.drive_stiffness,
@@ -8928,6 +8959,10 @@ class SolverFeatherPGS(SolverBase):
                 self.row_mu,
                 self._pgs_friction_start_iteration,
                 self._pgs_iteration_offset,
+                self.drive_target_vel_bias,
+                self.drive_vel_multiplier,
+                self.drive_impulse_multiplier,
+                self.drive_max_impulse,
             ],
             block_dim=32,
             device=self.model.device,
@@ -8951,6 +8986,10 @@ class SolverFeatherPGS(SolverBase):
                 self.row_mu,
                 self._pgs_friction_start_iteration,
                 self._pgs_iteration_offset,
+                self.drive_target_vel_bias,
+                self.drive_vel_multiplier,
+                self.drive_impulse_multiplier,
+                self.drive_max_impulse,
             ],
             device=self.model.device,
         )
@@ -10087,13 +10126,12 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
     ELEMS_PER_THREAD_1D = (TILE_M + 31) // 32
 
     def gen_load_1d(dst, src):
-        return "\n".join(
-            [
-                f"    {dst}[lane + {k * 32}] = {src}.data[off1 + lane + {k * 32}];"
-                for k in range(ELEMS_PER_THREAD_1D)
-                if (k * 32) < TILE_M
-            ]
-        )
+        lines = []
+        for k in range(ELEMS_PER_THREAD_1D):
+            offset = k * 32
+            guard = f"if (lane + {offset} < TILE_M) " if offset + 32 > TILE_M else ""
+            lines.append(f"    {guard}{dst}[lane + {offset}] = {src}.data[off1 + lane + {offset}];")
+        return "\n".join(lines)
 
     # Build a deterministic packed-lower-tri index order: row-major over (i, j<=i)
     # idx = i*(i+1)/2 + j
@@ -10139,13 +10177,12 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
             )
     dot_code = "\n".join(["float my_sum = 0.0f;", "int base_i = (i * (i + 1)) >> 1;", *dot_terms])
 
-    store_code = "\n".join(
-        [
-            f"    world_impulses.data[off1 + lane + {k * 32}] = s_lam[lane + {k * 32}];"
-            for k in range(ELEMS_PER_THREAD_1D)
-            if (k * 32) < TILE_M
-        ]
-    )
+    store_lines = []
+    for k in range(ELEMS_PER_THREAD_1D):
+        offset = k * 32
+        guard = f"if (lane + {offset} < TILE_M) " if offset + 32 > TILE_M else ""
+        store_lines.append(f"    {guard}world_impulses.data[off1 + lane + {offset}] = s_lam[lane + {offset}];")
+    store_code = "\n".join(store_lines)
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -10202,6 +10239,16 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
             my_sum += __shfl_down_sync(MASK, my_sum, 2);
             my_sum += __shfl_down_sync(MASK, my_sum, 1);
             float dot_sum = __shfl_sync(MASK, my_sum, 0);
+
+            if (s_rtype[i] == {int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)}) {{
+                const int slot = off1 + i;
+                const float drive = drive_bias.data[slot]
+                    + drive_velocity_multiplier.data[slot] * (s_rhs[i] + dot_sum)
+                    + drive_impulse_multiplier.data[slot] * s_lam[i];
+                const float bound = drive_max_impulse.data[slot];
+                s_lam[i] = fminf(bound, fmaxf(-bound, drive));
+                continue;
+            }}
 
             float denom = s_diag[i];
             if (denom <= 0.0f) continue;
@@ -10267,6 +10314,10 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
         world_row_mu: wp.array2d[float],
         friction_start_iteration: int,
         iteration_offset: int,
+        drive_bias: wp.array2d[float],
+        drive_velocity_multiplier: wp.array2d[float],
+        drive_impulse_multiplier: wp.array2d[float],
+        drive_max_impulse: wp.array2d[float],
     ): ...
 
     def pgs_solve_tiled_template(
@@ -10282,6 +10333,10 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
         world_row_mu: wp.array2d[float],
         friction_start_iteration: int,
         iteration_offset: int,
+        drive_bias: wp.array2d[float],
+        drive_velocity_multiplier: wp.array2d[float],
+        drive_impulse_multiplier: wp.array2d[float],
+        drive_max_impulse: wp.array2d[float],
     ):
         world, _lane = wp.tid()
         pgs_solve_native(
@@ -10298,6 +10353,10 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
             world_row_mu,
             friction_start_iteration,
             iteration_offset,
+            drive_bias,
+            drive_velocity_multiplier,
+            drive_impulse_multiplier,
+            drive_max_impulse,
         )
 
     pgs_solve_tiled_template.__name__ = f"pgs_solve_tiled_row_{max_constraints}"
@@ -15414,6 +15473,19 @@ def _get_pgs_solve_local_internal_kernel(
             if ((row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}
                 || row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)})
                 && new_impulse < 0.0f) new_impulse = 0.0f;
+            if (row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)}) {{
+                const int slot = world_row_base + row;
+                const float ke = drive_stiffness.data[slot];
+                const float kd = drive_damping.data[slot];
+                const float a = dt * (dt * ke + kd);
+                const float x = 1.0f / (1.0f + a * denominator);
+                const float bias = x * dt * (kd * target_velocity.data[slot]
+                    + ke * drive_geom_error.data[slot]);
+                const float force = drive_max_force.data[slot];
+                const float bound = force > 0.0f && isfinite(force) ? dt * force : 1.0e20f;
+                new_impulse = fminf(bound, fmaxf(-bound,
+                    bias - x * a * velocity + (1.0f - x) * old_impulse));
+            }}
             const float delta_impulse = new_impulse - old_impulse;
             s_lambda[row] = new_impulse;
             if (delta_impulse != 0.0f) {{
@@ -15451,6 +15523,12 @@ def _get_pgs_solve_local_internal_kernel(
         world_row_cfm: wp.array2d[float],
         world_impulses: wp.array2d[float],
         world_row_type: wp.array2d[int],
+        drive_stiffness: wp.array2d[float],
+        drive_damping: wp.array2d[float],
+        drive_geom_error: wp.array2d[float],
+        drive_max_force: wp.array2d[float],
+        target_velocity: wp.array2d[float],
+        dt: float,
         iterations: int,
         omega: float,
         v_out: wp.array[float],
@@ -15470,6 +15548,12 @@ def _get_pgs_solve_local_internal_kernel(
         world_row_cfm: wp.array2d[float],
         world_impulses: wp.array2d[float],
         world_row_type: wp.array2d[int],
+        drive_stiffness: wp.array2d[float],
+        drive_damping: wp.array2d[float],
+        drive_geom_error: wp.array2d[float],
+        drive_max_force: wp.array2d[float],
+        target_velocity: wp.array2d[float],
+        dt: float,
         iterations: int,
         omega: float,
         v_out: wp.array[float],
@@ -15490,6 +15574,12 @@ def _get_pgs_solve_local_internal_kernel(
             world_row_cfm,
             world_impulses,
             world_row_type,
+            drive_stiffness,
+            drive_damping,
+            drive_geom_error,
+            drive_max_force,
+            target_velocity,
+            dt,
             iterations,
             omega,
             v_out,
