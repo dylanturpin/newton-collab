@@ -203,6 +203,8 @@ _CONTACT_JACOBIAN_WORKER_CAP = 4096
 _CONTACT_JACOBIAN_MAX_DOF = 10
 _COMPOSITE_INERTIA_WARPS_PER_BLOCK = 4
 _JOINT_LIMIT_WARPS_PER_BLOCK = 4
+_FACTOR_DENSE_MAX_DOF = 64
+_CRBA_CHOLESKY_WARPS_PER_BLOCK = 4
 # A persistent queue avoids launching one expensive general-solver block for
 # every mostly local world. Eight blocks per SM preserves general-only latency.
 _LOCAL_GENERAL_BLOCKS_PER_SM = 8
@@ -212,6 +214,46 @@ _LOCAL_INTERNAL_MAX_DOF = 16
 _LOCAL_SOLVE_MAX_ROWS = 20
 _LOCAL_RESIDUAL_MAX_ROWS = 40
 _LOCAL_RESIDUAL_MF_MAX_ROWS = 12
+
+
+@wp.kernel
+def _prepare_augmented_joint_drives_by_dof(
+    drive_row_by_dof: wp.array[int],
+    drive_q_index_by_dof: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_target_ke: wp.array[float],
+    joint_target_kd: wp.array[float],
+    joint_target_pos: wp.array[float],
+    joint_target_vel: wp.array[float],
+    joint_effort_limit: wp.array[float],
+    dt: float,
+    row_K: wp.array[float],
+    drive_tau: wp.array[float],
+):
+    """Evaluate dynamic drive terms from an immutable DOF-to-row topology."""
+    dof = wp.tid()
+    drive_tau[dof] = 0.0
+
+    row = drive_row_by_dof[dof]
+    if row < 0:
+        return
+
+    ke = joint_target_ke[dof]
+    kd = joint_target_kd[dof]
+    K = ke * dt * dt + kd * dt
+    if K <= 0.0:
+        row_K[row] = 0.0
+        return
+
+    q = joint_q[drive_q_index_by_dof[dof]]
+    qd = joint_qd[dof]
+    u0 = -(ke * (q - joint_target_pos[dof] + dt * qd) + kd * (qd - joint_target_vel[dof]))
+    effort_limit = joint_effort_limit[dof]
+    if effort_limit > 0.0:
+        u0 = wp.clamp(u0, -effort_limit, effort_limit)
+    row_K[row] = K
+    drive_tau[dof] = u0
 
 
 @wp.kernel
@@ -1795,6 +1837,7 @@ class SolverFeatherPGS(SolverBase):
         self._allocate_common_buffers(model)
         if self._fk_id_cache_uses_snapshot:
             self._fk_id_cache = _FeatherPGSKinematicsCache.allocate(model, self._body_inertia_terms.shape[0])
+        self._setup_parallel_augmented_drive_topology(model)
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
         # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
@@ -3081,7 +3124,10 @@ class SolverFeatherPGS(SolverBase):
             self.world_response_group_to_art[int(size)] = wp.array(response_flat_np, dtype=wp.int32, device=device)
 
     def _setup_crba_topology_schedules(self, model) -> None:
-        """Identify size groups whose generalized inertia is structurally diagonal."""
+        """Build immutable mass-matrix schedules for topology-homogeneous size groups."""
+        self._crba_source_dof_by_size = {}
+        self._crba_dof_joint_offset_by_size = {}
+        self._crba_lower_schedule_by_size = {}
         diagonal_mass_sizes: set[int] = set()
         self._diagonal_mass_sizes = frozenset()
         if not model.articulation_count or not model.joint_count:
@@ -3119,26 +3165,37 @@ class SolverFeatherPGS(SolverBase):
                     compatible = False
                     break
 
-            if not compatible or reference_offsets is None or reference_parents is None:
-                continue
-            ancestor_sets = []
-            for joint_offset in reference_offsets:
-                ancestors = set()
-                current = int(joint_offset)
-                while current >= 0:
-                    ancestors.add(current)
-                    current = int(reference_parents[current])
-                ancestor_sets.append(ancestors)
-            structural_nonzeros = 0
-            for row in range(int(size)):
-                for col in range(int(size)):
-                    if (
-                        int(reference_offsets[row]) in ancestor_sets[col]
-                        or int(reference_offsets[col]) in ancestor_sets[row]
-                    ):
-                        structural_nonzeros += 1
-            if structural_nonzeros == int(size):
-                diagonal_mass_sizes.add(int(size))
+            if compatible and reference_offsets is not None and reference_parents is not None:
+                ancestor_sets = []
+                for joint_offset in reference_offsets:
+                    ancestors = set()
+                    current = int(joint_offset)
+                    while current >= 0:
+                        ancestors.add(current)
+                        current = int(reference_parents[current])
+                    ancestor_sets.append(ancestors)
+                sources = np.full((int(size), int(size)), -1, dtype=np.int32)
+                for row in range(int(size)):
+                    for col in range(int(size)):
+                        if int(reference_offsets[row]) in ancestor_sets[col]:
+                            sources[row, col] = col
+                        elif int(reference_offsets[col]) in ancestor_sets[row]:
+                            sources[row, col] = row
+                if np.count_nonzero(sources >= 0) == int(size) and np.all(np.diag(sources) >= 0):
+                    diagonal_mass_sizes.add(int(size))
+                self._crba_dof_joint_offset_by_size[int(size)] = wp.array(
+                    reference_offsets, dtype=wp.int32, device=model.device
+                )
+                self._crba_source_dof_by_size[int(size)] = wp.array(sources, dtype=wp.int32, device=model.device)
+                lower_schedule = []
+                for row in range(int(size)):
+                    for col in range(row + 1):
+                        source = int(sources[row, col])
+                        projection = row if source == col else col
+                        lower_schedule.append(row * int(size) + col | (source + 1) << 8 | projection << 16)
+                self._crba_lower_schedule_by_size[int(size)] = wp.array(
+                    np.asarray(lower_schedule, dtype=np.int32), dtype=wp.int32, device=model.device
+                )
 
         self._diagonal_mass_sizes = frozenset(diagonal_mass_sizes)
 
@@ -3426,6 +3483,64 @@ class SolverFeatherPGS(SolverBase):
         )
         self.aug_row_dof_index = wp.zeros((total_rows,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.aug_row_K = wp.zeros((total_rows,), dtype=wp.float32, device=device, requires_grad=requires_grad)
+
+    def _setup_parallel_augmented_drive_topology(self, model) -> None:
+        """Separate immutable augmented-drive row ownership from per-step coefficients."""
+        self._parallel_augmented_drive_topology = False
+        self._augmented_drive_row_by_dof = wp.full(
+            (max(1, int(model.joint_dof_count)),), -1, dtype=wp.int32, device=model.device
+        )
+        self._augmented_drive_q_index_by_dof = None
+        if not self._async_augmented_drives or self._has_loop_joints or not model.joint_dof_count:
+            return
+
+        dof_count = int(model.joint_dof_count)
+        ownership = np.zeros(dof_count, dtype=np.int32)
+        for start, count in zip(
+            self._model_plan.articulation_dof_start,
+            self._model_plan.articulation_dof_count,
+            strict=True,
+        ):
+            ownership[int(start) : int(start + count)] += 1
+        if np.any(ownership != 1):
+            return
+
+        joint_type = model.joint_type.numpy()
+        joint_q_start = model.joint_q_start.numpy()
+        joint_qd_start = model.joint_qd_start.numpy()
+        joint_dof_dim = model.joint_dof_dim.numpy()
+        articulation_start = model.articulation_start.numpy()
+        max_dofs = self.articulation_max_dofs
+
+        drive_row_by_dof = np.full(dof_count, -1, dtype=np.int32)
+        drive_q_index_by_dof = np.full(dof_count, -1, dtype=np.int32)
+        row_counts = np.zeros(model.articulation_count, dtype=np.int32)
+        row_dof_index = np.zeros(model.articulation_count * max_dofs, dtype=np.int32)
+        supported = (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
+        for articulation in range(model.articulation_count):
+            slot = 0
+            for joint in range(int(articulation_start[articulation]), int(articulation_start[articulation + 1])):
+                if int(joint_type[joint]) not in supported:
+                    continue
+                axis_count = int(joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1])
+                for axis in range(axis_count):
+                    if slot >= max_dofs:
+                        break
+                    dof = int(joint_qd_start[joint] + axis)
+                    row = articulation * max_dofs + slot
+                    drive_row_by_dof[dof] = row
+                    drive_q_index_by_dof[dof] = int(joint_q_start[joint] + axis)
+                    row_dof_index[row] = dof
+                    slot += 1
+                if slot >= max_dofs:
+                    break
+            row_counts[articulation] = slot
+
+        self._augmented_drive_row_by_dof = wp.array(drive_row_by_dof, dtype=wp.int32, device=model.device)
+        self._augmented_drive_q_index_by_dof = wp.array(drive_q_index_by_dof, dtype=wp.int32, device=model.device)
+        self.aug_row_counts.assign(row_counts)
+        self.aug_row_dof_index.assign(row_dof_index)
+        self._parallel_augmented_drive_topology = True
 
     def _allocate_buffers(self, model):
         if not self.size_groups:
@@ -4408,6 +4523,8 @@ class SolverFeatherPGS(SolverBase):
         """Resolve size-specialized Warp kernels once for this solver shape."""
         device_arch = model.device.arch
         self._cholesky_kernels_by_size = {}
+        self._crba_cholesky_kernels_by_size = {}
+        self._crba_cholesky_warp_kernels_by_size = {}
         self._triangular_solve_kernels_by_size = {}
         self._hinv_jt_kernels_by_size = {}
         self._hinv_jt_chunk_count_by_size = {}
@@ -4416,9 +4533,36 @@ class SolverFeatherPGS(SolverBase):
 
         for size in self.size_groups:
             use_diagonal_mass = self._execution_plan.use_diagonal_mass(size)
+            use_tiled_cholesky = self._execution_plan.use_tiled_cholesky(size)
+            fuse_crba_cholesky = bool(
+                model.device.is_cuda
+                and not model.requires_grad
+                and self._parallel_augmented_drive_topology
+                and use_tiled_cholesky
+                and size <= _FACTOR_DENSE_MAX_DOF
+                and size in self._crba_source_dof_by_size
+            )
+            fuse_crba_cholesky_warp = bool(
+                model.device.is_cuda
+                and not model.requires_grad
+                and self._parallel_augmented_drive_topology
+                and self.cholesky_kernel == "auto"
+                and not use_diagonal_mass
+                and size <= self.small_dof_threshold
+                and size in self._crba_source_dof_by_size
+                and size in self._crba_lower_schedule_by_size
+            )
+            self._crba_cholesky_kernels_by_size[size] = (
+                _get_crba_cholesky_kernel(size, device_arch, self.tile_threads) if fuse_crba_cholesky else None
+            )
+            self._crba_cholesky_warp_kernels_by_size[size] = (
+                _get_crba_cholesky_warp_kernel(size, device_arch, warps_per_block=_CRBA_CHOLESKY_WARPS_PER_BLOCK)
+                if fuse_crba_cholesky_warp
+                else None
+            )
             self._cholesky_kernels_by_size[size] = (
                 _get_cholesky_kernel(size, device_arch, self.tile_threads)
-                if self._execution_plan.use_tiled_cholesky(size)
+                if use_tiled_cholesky and not fuse_crba_cholesky
                 else None
             )
             self._triangular_solve_kernels_by_size[size] = (
@@ -7736,35 +7880,56 @@ class SolverFeatherPGS(SolverBase):
         dynamics_stream = self._articulation_dynamics_stream
         dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
         with wp.ScopedStream(dynamics_stream, sync_enter=False):
-            wp.launch(
-                prepare_augmented_joint_drives,
-                dim=model.articulation_count,
-                inputs=[
-                    model.articulation_start,
-                    self.articulation_H_rows,
-                    model.joint_type,
-                    model.joint_qd_start,
-                    model.joint_q_start,
-                    model.joint_dof_dim,
-                    state_in.joint_q,
-                    state_in.joint_qd,
-                    model.joint_target_ke,
-                    model.joint_target_kd,
-                    control.joint_target_q,
-                    control.joint_target_qd,
-                    model.joint_effort_limit,
-                    self.articulation_max_dofs,
-                    dt,
-                ],
-                outputs=[
-                    self.aug_row_counts,
-                    self.aug_row_dof_index,
-                    self.aug_row_K,
-                    state_aug.joint_tau,
-                ],
-                block_dim=self.serial_kernel_block_dim,
-                device=model.device,
-            )
+            if self._parallel_augmented_drive_topology:
+                wp.launch(
+                    _prepare_augmented_joint_drives_by_dof,
+                    dim=model.joint_dof_count,
+                    inputs=[
+                        self._augmented_drive_row_by_dof,
+                        self._augmented_drive_q_index_by_dof,
+                        state_in.joint_q,
+                        state_in.joint_qd,
+                        model.joint_target_ke,
+                        model.joint_target_kd,
+                        control.joint_target_q,
+                        control.joint_target_qd,
+                        model.joint_effort_limit,
+                        dt,
+                    ],
+                    outputs=[self.aug_row_K, state_aug.joint_tau],
+                    block_dim=256,
+                    device=model.device,
+                )
+            else:
+                wp.launch(
+                    prepare_augmented_joint_drives,
+                    dim=model.articulation_count,
+                    inputs=[
+                        model.articulation_start,
+                        self.articulation_H_rows,
+                        model.joint_type,
+                        model.joint_qd_start,
+                        model.joint_q_start,
+                        model.joint_dof_dim,
+                        state_in.joint_q,
+                        state_in.joint_qd,
+                        model.joint_target_ke,
+                        model.joint_target_kd,
+                        control.joint_target_q,
+                        control.joint_target_qd,
+                        model.joint_effort_limit,
+                        self.articulation_max_dofs,
+                        dt,
+                    ],
+                    outputs=[
+                        self.aug_row_counts,
+                        self.aug_row_dof_index,
+                        self.aug_row_K,
+                        state_aug.joint_tau,
+                    ],
+                    block_dim=self.serial_kernel_block_dim,
+                    device=model.device,
+                )
         return dynamics_stream.record_event()
 
     def _launch_rigid_tau(
@@ -7955,6 +8120,11 @@ class SolverFeatherPGS(SolverBase):
         if global_inertia_ready is not None:
             wp.get_stream(model.device).wait_event(global_inertia_ready)
 
+        # The immutable drive layout gives CRBA direct DOF-to-row ownership.
+        # Make the dynamic coefficients visible before any fused mass write.
+        if drive_rows_ready is not None and self._parallel_augmented_drive_topology:
+            wp.get_stream(model.device).wait_event(drive_rows_ready)
+
         # Global refreshes were accumulated by the warp-parallel launch next
         # to inverse dynamics, while the link inertias were still hot. Keep the
         # masked scalar path for device-selected limit changes on reuse steps.
@@ -7987,6 +8157,57 @@ class SolverFeatherPGS(SolverBase):
         # the per-step memset.
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
+            fused_crba_cholesky_warp = self._crba_cholesky_warp_kernels_by_size[size]
+            if fused_crba_cholesky_warp is not None:
+                wp.launch(
+                    fused_crba_cholesky_warp,
+                    dim=n_arts * 32,
+                    inputs=[
+                        n_arts,
+                        model.articulation_start,
+                        self.articulation_dof_start,
+                        self.mass_update_mask,
+                        model.joint_child,
+                        state_aug.joint_S_s,
+                        state_aug.body_I_s if size in self._free_body_inertia_sizes else self.body_I_c,
+                        self.group_to_art[size],
+                        self.R_by_size[size],
+                        self._crba_dof_joint_offset_by_size[size],
+                        self._crba_lower_schedule_by_size[size],
+                        1,
+                        self._augmented_drive_row_by_dof,
+                        self.aug_row_K,
+                    ],
+                    outputs=[self.L_by_size[size]],
+                    block_dim=_CRBA_CHOLESKY_WARPS_PER_BLOCK * 32,
+                    device=model.device,
+                )
+                continue
+            fused_crba_cholesky = self._crba_cholesky_kernels_by_size[size]
+            if fused_crba_cholesky is not None:
+                wp.launch_tiled(
+                    fused_crba_cholesky,
+                    dim=[n_arts],
+                    inputs=[
+                        model.articulation_start,
+                        self.articulation_dof_start,
+                        self.mass_update_mask,
+                        model.joint_child,
+                        state_aug.joint_S_s,
+                        state_aug.body_I_s if size in self._free_body_inertia_sizes else self.body_I_c,
+                        self.group_to_art[size],
+                        self.R_by_size[size],
+                        self._crba_dof_joint_offset_by_size[size],
+                        self._crba_source_dof_by_size[size],
+                        1,
+                        self._augmented_drive_row_by_dof,
+                        self.aug_row_K,
+                    ],
+                    outputs=[self.L_by_size[size]],
+                    block_dim=self.tile_threads,
+                    device=model.device,
+                )
+                continue
             if self._H_bufs is None and global_flag:  # not double-buffered
                 self.H_by_size[size].zero_()
             wp.launch(
@@ -8004,33 +8225,37 @@ class SolverFeatherPGS(SolverBase):
                     state_aug.body_I_s if size in self._free_body_inertia_sizes else self.body_I_c,
                     self.group_to_art[size],
                     size,
+                    int(self._parallel_augmented_drive_topology),
+                    self._augmented_drive_row_by_dof,
+                    self.aug_row_K,
                 ],
                 outputs=[self.H_by_size[size]],
                 device=model.device,
                 block_dim=128,
             )
 
-        if drive_rows_ready is not None:
+        if drive_rows_ready is not None and not self._parallel_augmented_drive_topology:
             wp.get_stream(model.device).wait_event(drive_rows_ready)
 
-        for size in self.size_groups:
-            n_arts = self.n_arts_by_size[size]
-            wp.launch(
-                apply_augmented_mass_diagonal_grouped,
-                dim=n_arts,
-                inputs=[
-                    self.group_to_art[size],
-                    self.articulation_dof_start,
-                    size,
-                    self.articulation_max_dofs,
-                    self.mass_update_mask,
-                    self.aug_row_counts,
-                    self.aug_row_dof_index,
-                    self.aug_row_K,
-                ],
-                outputs=[self.H_by_size[size]],
-                device=model.device,
-            )
+        if not self._parallel_augmented_drive_topology:
+            for size in self.size_groups:
+                n_arts = self.n_arts_by_size[size]
+                wp.launch(
+                    apply_augmented_mass_diagonal_grouped,
+                    dim=n_arts,
+                    inputs=[
+                        self.group_to_art[size],
+                        self.articulation_dof_start,
+                        size,
+                        self.articulation_max_dofs,
+                        self.mass_update_mask,
+                        self.aug_row_counts,
+                        self.aug_row_dof_index,
+                        self.aug_row_K,
+                    ],
+                    outputs=[self.H_by_size[size]],
+                    device=model.device,
+                )
 
         self._mass_update_requested.zero_()
 
@@ -8056,6 +8281,8 @@ class SolverFeatherPGS(SolverBase):
     def _stage2_cholesky_tiled(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
+        if self._crba_cholesky_kernels_by_size[size] is not None:
+            return
         cholesky_kernel = self._cholesky_kernels_by_size[size]
         if cholesky_kernel is None:
             raise RuntimeError(f"Cholesky tiled kernel is unavailable for DOF size {size}")
@@ -8074,6 +8301,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage2_cholesky_loop(self, size: int):
+        if self._crba_cholesky_warp_kernels_by_size[size] is not None:
+            return
         model = self.model
         n_arts = self.n_arts_by_size[size]
         wp.launch(
@@ -11059,6 +11288,237 @@ for (int ci = 0; ci < num_chunks; ci++) {{
     delassus_template.__name__ = f"delassus_streaming_{n_dofs}_{max_constraints}_chunk{CHUNK}"
     delassus_template.__qualname__ = f"delassus_streaming_{n_dofs}_{max_constraints}_chunk{CHUNK}"
     return wp.kernel(enable_backward=False, module="unique")(delassus_template)
+
+
+@cache
+def _get_crba_cholesky_warp_kernel(n_dofs: int, device_arch: str, *, warps_per_block: int = 4) -> "wp.Kernel":
+    """Build and factor several small articulation mass matrices per block."""
+    del device_arch
+    matrix_elements = int(n_dofs) * int(n_dofs)
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int lane = tid & 31;
+    const int group = tid >> 5;
+    if (group >= n_arts) return;
+
+    const int articulation = group_to_art.data[group];
+    if (mass_update_mask.data[articulation] == 0) return;
+
+    const int warp = threadIdx.x >> 5;
+    __shared__ float factors[{int(warps_per_block) * matrix_elements}];
+    __shared__ float forces[{int(warps_per_block) * int(n_dofs) * 6}];
+    float* factor = factors + warp * {matrix_elements};
+    float* force_components = forces + warp * {int(n_dofs) * 6};
+
+    const int dof_start = articulation_dof_start.data[articulation];
+    if (lane < {int(n_dofs)}) {{
+        const int joint = articulation_start.data[articulation] + dof_joint_offset.data[lane];
+        const auto force = wp::mul(body_I_c.data[joint_child.data[joint]], joint_S_s.data[dof_start + lane]);
+        #pragma unroll
+        for (int component = 0; component < 6; ++component)
+            force_components[lane * 6 + component] = force.c[component];
+    }}
+    __syncwarp();
+
+    for (int schedule_index = lane; schedule_index < {int(n_dofs) * (int(n_dofs) + 1) // 2}; schedule_index += 32) {{
+        const int packed = lower_schedule.data[schedule_index];
+        const int element = packed & 255;
+        const int row = element / {int(n_dofs)};
+        const int col = element - row * {int(n_dofs)};
+        const int source_code = (packed >> 8) & 255;
+        float value = 0.0f;
+        if (source_code != 0) {{
+            const int source = source_code - 1;
+            const int projection = (packed >> 16) & 255;
+            const auto motion = joint_S_s.data[dof_start + projection];
+#pragma unroll
+            for (int component = 0; component < 6; ++component)
+                value += motion.c[component] * force_components[source * 6 + component];
+        }}
+        if (row == col) {{
+            value += R_group.data[group * {int(n_dofs)} + row];
+            if (fused_augmented_drive != 0) {{
+                const int drive_row = drive_row_by_dof.data[dof_start + row];
+                if (drive_row >= 0) {{
+                    const float K = row_K.data[drive_row];
+                    if (K > 0.0f) value += K;
+                }}
+            }}
+        }}
+        factor[element] = value;
+    }}
+    __syncwarp();
+
+    if (lane == 0) {{
+#pragma unroll
+        for (int col = 0; col < {int(n_dofs)}; ++col) {{
+            float diagonal = factor[col * {int(n_dofs)} + col];
+#pragma unroll
+            for (int k = 0; k < col; ++k) {{
+                const float value = factor[col * {int(n_dofs)} + k];
+                diagonal -= value * value;
+            }}
+            diagonal = sqrtf(diagonal);
+            factor[col * {int(n_dofs)} + col] = diagonal;
+            const float inverse_diagonal = 1.0f / diagonal;
+#pragma unroll
+            for (int row = col + 1; row < {int(n_dofs)}; ++row) {{
+                float value = factor[row * {int(n_dofs)} + col];
+#pragma unroll
+                for (int k = 0; k < col; ++k)
+                    value -= factor[row * {int(n_dofs)} + k] * factor[col * {int(n_dofs)} + k];
+                factor[row * {int(n_dofs)} + col] = value * inverse_diagonal;
+            }}
+        }}
+    }}
+    __syncwarp();
+
+    if (lane < {int(n_dofs)}) {{
+        const int factor_base = group * {matrix_elements};
+#pragma unroll
+        for (int col = 0; col <= lane; ++col)
+            L_group.data[factor_base + lane * {int(n_dofs)} + col] = factor[lane * {int(n_dofs)} + col];
+    }}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def crba_cholesky_warp_native(
+        tid: int,
+        n_arts: int,
+        articulation_start: wp.array[int],
+        articulation_dof_start: wp.array[int],
+        mass_update_mask: wp.array[int],
+        joint_child: wp.array[int],
+        joint_S_s: wp.array[wp.spatial_vector],
+        body_I_c: wp.array[wp.spatial_matrix],
+        group_to_art: wp.array[int],
+        R_group: wp.array2d[float],
+        dof_joint_offset: wp.array[int],
+        lower_schedule: wp.array[int],
+        fused_augmented_drive: int,
+        drive_row_by_dof: wp.array[int],
+        row_K: wp.array[float],
+        L_group: wp.array3d[float],
+    ): ...
+
+    def crba_cholesky_warp_template(
+        n_arts: int,
+        articulation_start: wp.array[int],
+        articulation_dof_start: wp.array[int],
+        mass_update_mask: wp.array[int],
+        joint_child: wp.array[int],
+        joint_S_s: wp.array[wp.spatial_vector],
+        body_I_c: wp.array[wp.spatial_matrix],
+        group_to_art: wp.array[int],
+        R_group: wp.array2d[float],
+        dof_joint_offset: wp.array[int],
+        lower_schedule: wp.array[int],
+        fused_augmented_drive: int,
+        drive_row_by_dof: wp.array[int],
+        row_K: wp.array[float],
+        L_group: wp.array3d[float],
+    ):
+        crba_cholesky_warp_native(
+            wp.tid(),
+            n_arts,
+            articulation_start,
+            articulation_dof_start,
+            mass_update_mask,
+            joint_child,
+            joint_S_s,
+            body_I_c,
+            group_to_art,
+            R_group,
+            dof_joint_offset,
+            lower_schedule,
+            fused_augmented_drive,
+            drive_row_by_dof,
+            row_K,
+            L_group,
+        )
+
+    name = f"crba_cholesky_warp{int(warps_per_block)}_{int(n_dofs)}"
+    crba_cholesky_warp_template.__name__ = name
+    crba_cholesky_warp_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(crba_cholesky_warp_template)
+
+
+@cache
+def _get_crba_cholesky_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) -> "wp.Kernel":
+    """Build an articulation-owned mass-matrix assembly and factorization kernel."""
+    del device_arch
+    dofs = wp.constant(int(n_dofs))
+    element_rounds = (int(n_dofs) * int(n_dofs) + int(tile_threads) - 1) // int(tile_threads)
+    tile_stride = wp.constant(int(tile_threads))
+
+    def crba_cholesky_template(
+        articulation_start: wp.array[int],
+        articulation_dof_start: wp.array[int],
+        mass_update_mask: wp.array[int],
+        joint_child: wp.array[int],
+        joint_S_s: wp.array[wp.spatial_vector],
+        body_I_c: wp.array[wp.spatial_matrix],
+        group_to_art: wp.array[int],
+        R_group: wp.array2d[float],
+        dof_joint_offset: wp.array[int],
+        source_dof: wp.array2d[int],
+        fused_augmented_drive: int,
+        drive_row_by_dof: wp.array[int],
+        row_K: wp.array[float],
+        L_group: wp.array3d[float],
+    ):
+        group, lane = wp.tid()
+        art = group_to_art[group]
+        if mass_update_mask[art] == 0:
+            return
+
+        H_tile = wp.tile_zeros(shape=(dofs, dofs), dtype=wp.float32, storage="shared")
+        force_tile = wp.tile_zeros(shape=(dofs,), dtype=wp.spatial_vector, storage="shared")
+        dof_start = articulation_dof_start[art]
+        force = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        lane_has_dof = lane < dofs
+        if lane_has_dof:
+            joint = articulation_start[art] + dof_joint_offset[lane]
+            force = body_I_c[joint_child[joint]] * joint_S_s[dof_start + lane]
+        wp.tile_scatter_masked(force_tile, lane, force, lane_has_dof)
+
+        # Every lane executes the same fixed number of cooperative scatters.
+        # The immutable source map turns tree ancestry into direct indexing:
+        # H[row, col] projects the deeper DOF's composite force onto the
+        # ancestor DOF, or remains zero for unrelated branches.
+        for element_round in range(element_rounds):
+            element = lane + element_round * tile_stride
+            row = int(0)
+            col = int(0)
+            value = float(0.0)
+            has_value = element < dofs * dofs
+            if has_value:
+                row = element // dofs
+                col = element - row * dofs
+                source = source_dof[row, col]
+                has_value = source >= 0
+                if has_value:
+                    projection = col
+                    if source == col:
+                        projection = row
+                    value = wp.dot(joint_S_s[dof_start + projection], wp.tile_extract(force_tile, source))
+                    if fused_augmented_drive != 0 and row == col:
+                        drive_row = drive_row_by_dof[dof_start + row]
+                        if drive_row >= 0:
+                            K = row_K[drive_row]
+                            if K > 0.0:
+                                value += K
+            wp.tile_scatter_masked(H_tile, row, col, value, has_value)
+
+        armature = wp.tile_load(R_group[group], shape=(dofs,), bounds_check=False)
+        L_tile = wp.tile_cholesky(wp.tile_diag_add(H_tile, armature))
+        wp.tile_store(L_group[group], L_tile, bounds_check=False)
+
+    name = f"crba_cholesky_{int(n_dofs)}_bd{int(tile_threads)}"
+    crba_cholesky_template.__name__ = name
+    crba_cholesky_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(crba_cholesky_template)
 
 
 @cache

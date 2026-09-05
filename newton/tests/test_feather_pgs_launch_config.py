@@ -369,6 +369,43 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             np.testing.assert_allclose(diagonal[0], dense[0], rtol=0.0, atol=2.0e-6)
             np.testing.assert_allclose(diagonal[1], dense[1], rtol=0.0, atol=2.0e-6)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "topology-owned CRBA requires CUDA")
+    def test_topology_owned_crba_matches_generic_trajectory(self):
+        """Match the generic mass pipeline while fusing topology-known factorization."""
+        model = _build_chain_model(num_links=3, num_worlds=2)
+        optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
+        reference = SolverFeatherPGS(
+            model,
+            enable_joint_limits=False,
+            dense_max_constraints=16,
+            use_parallel_streams=False,
+        )
+        self.assertTrue(optimized._parallel_augmented_drive_topology)
+        self.assertIsNotNone(optimized._crba_cholesky_warp_kernels_by_size[3])
+        self.assertFalse(reference._parallel_augmented_drive_topology)
+
+        q = np.tile(np.array([0.15, -0.2, 0.3], dtype=np.float32), 2)
+        qd = np.tile(np.array([0.1, -0.05, 0.2], dtype=np.float32), 2)
+        trajectories = []
+        for solver in (optimized, reference):
+            state_0, state_1 = model.state(), model.state()
+            state_0.joint_q.assign(q)
+            state_0.joint_qd.assign(qd)
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+            control = model.control()
+            control.joint_target_q.assign(np.tile(np.array([0.1, -0.1, 0.2], dtype=np.float32), 2))
+            history = []
+            for _ in range(5):
+                state_0.clear_forces()
+                solver.step(state_0, state_1, control, None, 1.0 / 120.0)
+                state_0, state_1 = state_1, state_0
+                history.append((state_0.joint_q.numpy().copy(), state_0.joint_qd.numpy().copy()))
+            trajectories.append(history)
+
+        for fused, generic in zip(*trajectories, strict=True):
+            np.testing.assert_allclose(fused[0], generic[0], rtol=0.0, atol=2.0e-6)
+            np.testing.assert_allclose(fused[1], generic[1], rtol=0.0, atol=2.0e-6)
+
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free diagonal fusion requires CUDA")
     def test_matrix_free_diagonal_fusion_requires_nonaliased_world_response(self):
         """Keep the extra tiled reduction off response buffers that already alias world storage."""

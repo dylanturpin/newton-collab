@@ -10465,6 +10465,9 @@ def crba_fill_par_dof(
     # Size-group parameters
     group_to_art: wp.array[int],
     n_dofs: int,  # = TILE_DOF for tiled path
+    fused_augmented_drive: int,
+    drive_row_by_dof: wp.array[int],
+    row_K: wp.array[float],
     # outputs
     H_group: wp.array3d[float],  # [n_arts_of_size, n_dofs, n_dofs]
 ):
@@ -10534,6 +10537,16 @@ def crba_fill_par_dof(
 
             S_row = joint_S_s[q_start + k]
             val = wp.dot(S_row, F)
+
+            # The column thread uniquely owns its diagonal. Fold the
+            # augmented-drive inertia into that write so the immutable drive
+            # topology does not require a second read/modify/write pass over H.
+            if fused_augmented_drive != 0 and row_idx == col_idx:
+                drive_row = drive_row_by_dof[target_dof_global]
+                if drive_row >= 0:
+                    K = row_K[drive_row]
+                    if K > 0.0:
+                        val += K
 
             # Write to grouped 3D array
             H_group[group_idx, row_idx, col_idx] = val
