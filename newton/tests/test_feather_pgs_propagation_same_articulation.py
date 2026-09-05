@@ -76,7 +76,7 @@ def _zero_iteration_step(model: newton.Model, solver: SolverFeatherPGS):
     state_in.clear_forces()
     model.collide(state_in, contacts)
     solver.step(state_in, state_out, control, contacts, 1.0 / 200.0)
-    wp.synchronize()
+    solver._test_live_contact_count = int(contacts.rigid_contact_count.numpy()[0])
     return state_in
 
 
@@ -96,13 +96,15 @@ def _make_solver(model: newton.Model, mode: str, **kwargs) -> SolverFeatherPGS:
     )
 
 
-def _contact_rows(solver: SolverFeatherPGS, path_id: int) -> dict[int, int]:
+def _contact_rows(solver: SolverFeatherPGS, path_id: int, contact_count: int | None = None) -> dict[int, int]:
     """contact index -> row slot for contacts routed to the given path."""
     contact_path = solver.contact_path.numpy().astype(np.int32)
     contact_slot = solver.contact_slot.numpy().astype(np.int32)
     contact_world = solver.contact_world.numpy().astype(np.int32)
     out = {}
-    for c in range(contact_slot.shape[0]):
+    if contact_count is None:
+        contact_count = solver._test_live_contact_count
+    for c in range(contact_count):
         if int(contact_world[c]) == 0 and int(contact_path[c]) == path_id and int(contact_slot[c]) >= 0:
             out[c] = int(contact_slot[c])
     return out

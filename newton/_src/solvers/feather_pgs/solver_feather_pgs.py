@@ -152,11 +152,9 @@ from .kernels import (
     reset_world_warmstart_buffers,
     rhs_accum_world_par_art,
     scatter_qdd_from_groups,
+    snapshot_contact_warmstart,
     snapshot_dense_phase_bound,
-    snapshot_dense_prev_slots,
-    snapshot_mf_prev_slots,
     snapshot_propagation_cache_qd_base,
-    snapshot_propagation_prev_slots,
     trisolve_loop,
     update_articulation_origins,
     update_body_qd_from_featherstone,
@@ -851,8 +849,10 @@ class SolverFeatherPGS(SolverBase):
                 contact identity through the collision pipeline's ``rigid_contact_match_index``;
                 non-contact dense rows cold-start because their runtime allocation does not
                 provide an identity contract. A non-``None`` Contacts buffer therefore requires
-                contact matching. This currently remains incompatible with body-pair contact
-                reduction. Defaults to False.
+                contact matching. Body-pair reduction is supported with
+                ``contact_matching="latest"``. Carried friction is transported into
+                the current tangent frame and clamped to the current friction cone.
+                Defaults to False.
             pgs_warmstart_decay (float, optional): Finite non-negative scale applied to
                 contact impulses carried from the previous frame. This option is appended to
                 the constructor to preserve its established positional layout. Defaults to 1.0.
@@ -1221,9 +1221,7 @@ class SolverFeatherPGS(SolverBase):
             self.rigid_body_max_linear_velocity is not None and self.rigid_body_max_angular_velocity is not None
         )
 
-        # ``friction_mode`` is the selector for the per-row Coulomb step used by the
-        # matrix-free PGS kernel. Only ``"current"`` is wired today; the other three
-        # names are reserved for the upcoming FPGS Friction Modes strategy issues.
+        # Select the contact update once, when specializing the matrix-free kernel.
         _valid_friction_modes = ("current", "bisection", "bisection_desaxce", "coulomb_newton")
         if friction_mode not in _valid_friction_modes:
             raise ValueError(f"friction_mode must be one of {list(_valid_friction_modes)}, got {friction_mode!r}")
@@ -1239,10 +1237,6 @@ class SolverFeatherPGS(SolverBase):
                     f"articulated_contact_response={articulated_contact_response!r} currently supports "
                     "friction_mode='current' only"
                 )
-            # pgs_mode == "matrix_free" with a non-baseline friction mode.
-            # ``"bisection"`` was wired in FPGS Friction Modes 5/13,
-            # ``"bisection_desaxce"`` in 6/13, and ``"coulomb_newton"``
-            # is wired here in 7/13.
         self.friction_mode = friction_mode
         # Numeric id consumed by the matrix-free PGS kernels.  Mirrors the
         # :data:`FRICTION_MODE_*` constants in ``feather_pgs/kernels.py``
@@ -3114,6 +3108,9 @@ class SolverFeatherPGS(SolverBase):
             max_contacts = int(_estimate_rigid_contact_max(model))
         max_contacts = max(max_contacts, 1)
         self._max_contacts_alloc = max_contacts
+        self._ws_prev_contact_normal = (
+            wp.zeros(max_contacts, dtype=wp.vec3, device=device) if self.pgs_warmstart else None
+        )
         self.contact_world = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_slot = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_slots_needed = wp.zeros(
@@ -5842,14 +5839,14 @@ class SolverFeatherPGS(SolverBase):
                 f"{self._max_contacts_alloc}. Set model.rigid_contact_max before constructing the solver."
             )
         if self.pgs_warmstart:
-            # Every contact family carries by identity, but that contract has
-            # not yet been validated with body-pair compaction. Use the shared
-            # helper so a captured warm-start
-            # solver also holds the unreduced-reader lease that blocks a later
-            # reducer graph from changing its rows behind replay.
+            # A reduced stream is valid when it carries retained identities.
+            # Preserve the reader lease for an unreduced captured stream: a
+            # later producer must not change its layout behind graph replay.
             self._require_unreduced_contacts(
                 contacts,
-                supports_body_pair_reduced_contacts=False,
+                supports_body_pair_reduced_contacts=bool(
+                    contacts is not None and contacts.rigid_contacts_body_pair_reduced
+                ),
                 configuration="pgs_warmstart=True",
             )
             if contacts is not None and getattr(contacts, "rigid_contact_match_index", None) is None:
@@ -6067,6 +6064,9 @@ class SolverFeatherPGS(SolverBase):
                         self.constraint_count,
                         self.row_type,
                         self.row_parent,
+                        contacts.rigid_contact_normal,
+                        self._ws_prev_contact_normal,
+                        self.row_mu,
                         self.pgs_warmstart_decay,
                         dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
                         self.dense_max_constraints,
@@ -6464,15 +6464,7 @@ class SolverFeatherPGS(SolverBase):
                 wp.copy(self._ws_prev_dense_impulses, self.impulses)
                 wp.copy(self._ws_prev_dense_row_type, self.row_type)
                 wp.copy(self._ws_prev_dense_row_parent, self.row_parent)
-                if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
-                    wp.launch(
-                        snapshot_dense_prev_slots,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[contacts.rigid_contact_count, self.contact_path, self.contact_slot],
-                        outputs=[self._ws_prev_dense_slot_sorted],
-                        device=model.device,
-                    )
-                else:
+                if contacts is None:
                     self._ws_prev_dense_row_type.fill_(-1)
                     self._ws_prev_dense_row_parent.fill_(-1)
 
@@ -6481,19 +6473,7 @@ class SolverFeatherPGS(SolverBase):
                 wp.copy(self._ws_prev_mf_impulses, self.mf_impulses)
                 wp.copy(self._ws_prev_mf_row_type, self.mf_row_type)
                 wp.copy(self._ws_prev_mf_row_parent, self.mf_row_parent)
-                if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
-                    wp.launch(
-                        snapshot_mf_prev_slots,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[
-                            contacts.rigid_contact_count,
-                            self.contact_path,
-                            self.contact_slot,
-                        ],
-                        outputs=[self._ws_prev_slot_sorted],
-                        device=model.device,
-                    )
-                else:
+                if contacts is None:
                     self._ws_prev_mf_row_type.fill_(-1)
                     self._ws_prev_mf_row_parent.fill_(-1)
 
@@ -6504,19 +6484,29 @@ class SolverFeatherPGS(SolverBase):
                 wp.copy(self._ws_prev_propagation_impulses, self.propagation_impulses)
                 wp.copy(self._ws_prev_propagation_row_type, self.propagation_row_type)
                 wp.copy(self._ws_prev_propagation_row_parent, self.propagation_row_parent)
-                if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
-                    wp.launch(
-                        snapshot_propagation_prev_slots,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[contacts.rigid_contact_count, self.contact_path, self.contact_slot],
-                        outputs=[self._ws_prev_propagation_slot_sorted],
-                        device=model.device,
-                    )
-                else:
+                if contacts is None:
                     self._ws_prev_propagation_row_type.fill_(-1)
                     self._ws_prev_propagation_row_parent.fill_(-1)
 
         if self.pgs_warmstart:
+            if contacts is not None:
+                wp.launch(
+                    snapshot_contact_warmstart,
+                    dim=contacts.rigid_contact_max,
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        self.contact_path,
+                        self.contact_slot,
+                        contacts.rigid_contact_normal,
+                    ],
+                    outputs=[
+                        self._ws_prev_dense_slot_sorted,
+                        self._ws_prev_slot_sorted,
+                        self._ws_prev_propagation_slot_sorted,
+                        self._ws_prev_contact_normal,
+                    ],
+                    device=model.device,
+                )
             self._ws_prev_dt = float(dt)
 
         # Double-buffer: fork the maintenance stream to clear the current
@@ -8243,6 +8233,9 @@ class SolverFeatherPGS(SolverBase):
                             self.propagation_constraint_count,
                             self.propagation_row_type,
                             self.propagation_row_parent,
+                            contacts.rigid_contact_normal,
+                            self._ws_prev_contact_normal,
+                            self.propagation_row_mu,
                             self.pgs_warmstart_decay,
                             dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
                             self.propagation_max_constraints,
@@ -8366,6 +8359,9 @@ class SolverFeatherPGS(SolverBase):
                             self.mf_constraint_count,
                             self.mf_row_type,
                             self.mf_row_parent,
+                            contacts.rigid_contact_normal,
+                            self._ws_prev_contact_normal,
+                            self.mf_row_mu,
                             self._mf_warmstart_decay,
                             # Carried support impulses are proportional to dt, so
                             # rescale by the exact step-size ratio (1 at fixed dt).

@@ -1651,6 +1651,42 @@ def _write_reduced_count_kernel(
         stats64[wp.static(STAT64_SUM_CONTACTS_KEPT)] = stats64[wp.static(STAT64_SUM_CONTACTS_KEPT)] + wp.int64(kept)
 
 
+@wp.kernel(enable_backward=False)
+def _gather_reduced_sort_keys(
+    frame_state: wp.array[wp.int32],
+    keep_flags: wp.array[wp.int32],
+    keep_scan: wp.array[wp.int32],
+    source: wp.array[wp.int64],
+    destination: wp.array[wp.int64],
+    num_threads: int,
+):
+    """Compact identity keys with precisely the same selection as the contacts."""
+    if frame_state[wp.static(FRAME_IDENTITY)] != 0 or frame_state[wp.static(FRAME_FALLBACK)] != 0:
+        return
+    for i in range(wp.tid(), frame_state[wp.static(FRAME_WORK_COUNT)], num_threads):
+        if keep_flags[i] != 0:
+            destination[keep_scan[i] - 1] = source[i]
+
+
+@wp.kernel(enable_backward=False)
+def _scatter_reduced_sort_keys(
+    frame_state: wp.array[wp.int32],
+    contact_count: wp.array[wp.int32],
+    source: wp.array[wp.int64],
+    destination: wp.array[wp.int64],
+    num_threads: int,
+):
+    """Install compacted identity keys without an in-place gather race."""
+    if (
+        frame_state[wp.static(FRAME_IDENTITY)] != 0
+        or frame_state[wp.static(FRAME_FALLBACK)] != 0
+        or frame_state[wp.static(FRAME_INPUT_OVERFLOW)] != 0
+    ):
+        return
+    for i in range(wp.tid(), contact_count[0], num_threads):
+        destination[i] = source[i]
+
+
 class BodyPairContactReducer:
     """Owns the buffers and launch sequence for body-pair contact reduction.
 
@@ -1689,6 +1725,7 @@ class BodyPairContactReducer:
         hashtable_headroom: float = 1.0,
         group_pair_bound: int | None = None,
         borrowed_scratch: dict | None = None,
+        preserve_sort_keys: bool = False,
         verify: bool = False,
         hysteresis: float = 0.001,
         shape_world=None,
@@ -1722,6 +1759,9 @@ class BodyPairContactReducer:
         # reducer allocates its own lazily on first rich-buffer use. In either
         # case the exact buffer must see a warm-up collide before capture.
         self._borrowed_scratch = borrowed_scratch
+        self._sort_key_scratch = (
+            wp.zeros(rigid_contact_max, dtype=wp.int64, device=device) if preserve_sort_keys else None
+        )
         self.verify = bool(verify)
         # Telemetry storage: int32 watermarks/per-frame atomic scratch plus
         # int64 lifetime totals; see stats() for the public meanings.
@@ -1746,7 +1786,14 @@ class BodyPairContactReducer:
         # without a contact to create it. Tune with hashtable_headroom against
         # the fallback_frames / max_hashtable_entries telemetry.
         if group_pair_bound is not None and group_pair_bound > 0:
-            capacity_request = int(group_pair_bound * hashtable_headroom)
+            # A replicated scene can have only one reachable pair per body,
+            # yet each pair occupies several normal bins / spatial cells.
+            # Reserve a linear budget of four patch entries per material group
+            # at half load, in addition to the reachable-pair estimate. This
+            # preserves headroom as isolated environments are replicated without
+            # multiplying a dense candidate-pair graph by the same factor.
+            group_budget = 8 * len(np.unique(shape_group))
+            capacity_request = int(max(group_pair_bound, group_budget) * hashtable_headroom)
         else:
             # No precomputed pair list to derive from; fall back to the old
             # contact-anchored heuristic rather than guessing.
@@ -1860,13 +1907,16 @@ class BodyPairContactReducer:
                     arr if arr is not None and arr.shape[0] >= n else wp.zeros(n, dtype=wp.float32, device=self.device)
                 )
 
-    def reduce(self, model, state, contacts):
+    def reduce(self, model, state, contacts, *, sort_keys=None):
         """Compact ``contacts`` in place, dropping patch-redundant candidates.
 
         Args:
             model: The simulation model.
             state: Current state (body transforms for witness-point math).
             contacts: The contacts buffer to compact.
+            sort_keys: Optional keys aligned with the input contact records.
+                Compact them with the same stable selection; requires
+                ``preserve_sort_keys=True`` at construction.
         """
         has_material = contacts.rigid_contact_stiffness is not None
         self._ensure_scratch(has_material)
@@ -2138,6 +2188,37 @@ class BodyPairContactReducer:
             record_tape=False,
         )
 
+        if sort_keys is not None:
+            if self._sort_key_scratch is None:
+                raise ValueError("sort-key compaction requires preserve_sort_keys at construction")
+            wp.launch(
+                _gather_reduced_sort_keys,
+                dim=self.stride_threads,
+                inputs=[
+                    self._frame_state,
+                    self.keep_flags,
+                    self.keep_scan,
+                    sort_keys,
+                    self._sort_key_scratch,
+                    self.stride_threads,
+                ],
+                device=self.device,
+                record_tape=False,
+            )
+            wp.launch(
+                _scatter_reduced_sort_keys,
+                dim=self.stride_threads,
+                inputs=[
+                    self._frame_state,
+                    contacts.rigid_contact_count,
+                    self._sort_key_scratch,
+                    sort_keys,
+                    self.stride_threads,
+                ],
+                device=self.device,
+                record_tape=False,
+            )
+
     def reset_history(self, world_mask=None):
         """Erase hysteresis history globally or for selected worlds.
 
@@ -2379,4 +2460,5 @@ class BodyPairContactReducer:
             ),
             "gather_scratch_owned_bytes": owned,
             "gather_scratch_borrowed_bytes": borrowed,
+            "sort_key_scratch_bytes": 0 if self._sort_key_scratch is None else self._sort_key_scratch.size * 8,
         }
