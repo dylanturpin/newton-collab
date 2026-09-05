@@ -66,6 +66,7 @@ from .kernels import (
     apply_augmented_mass_diagonal_grouped,
     apply_contact_regularization,
     apply_free_root_transport_to_predictor,
+    apply_free_root_velocity_corrections,
     apply_impulses_world_par_dof,
     apply_mf_warmstart_impulses,
     apply_world_contact_restitution_accumulated,
@@ -580,6 +581,13 @@ class SolverFeatherPGS(SolverBase):
     rebound velocity is used for the whole step; this gives the intended
     post-impact velocity but a first-order, impact-phase-dependent position
     offset. Reduce the timestep when substep impact position matters.
+
+    Single-body FREE-joint articulations use an energy-preserving local
+    gyroscopic update to prevent explicit angular-bias runaway. Fast rotation
+    can trigger bounded gyro microsteps inside the velocity predictor, without
+    additional collision or contact-solver passes. Pose integration remains
+    first-order; accurate rotational trajectories still require a suitable
+    simulation timestep.
 
     ``constraint_overflow`` is a device boolean array with one entry per solver
     world. It records contact-buffer overflow or dropped constraint rows even
@@ -7508,19 +7516,42 @@ class SolverFeatherPGS(SolverBase):
         # runtime kinematic changes without changing graph topology.
         if not self._free_root_joint_count:
             return
-        wp.launch(
-            apply_free_root_transport_to_predictor,
-            dim=self._free_root_joint_count,
-            inputs=[
-                self._free_root_joint_indices,
-                model.joint_qd_start,
-                self._kinematic_joint_mask,
-                self.qd_work,
-                dt,
-            ],
-            outputs=[self.v_hat],
-            device=model.device,
-        )
+        if self._free_rigid_body_count:
+            wp.launch(
+                apply_free_root_velocity_corrections,
+                dim=self._free_root_joint_count,
+                inputs=[
+                    self._free_root_joint_indices,
+                    model.joint_qd_start,
+                    model.joint_child,
+                    self.body_to_articulation,
+                    self.is_free_rigid,
+                    self.art_group_idx,
+                    self._kinematic_joint_mask,
+                    state_in.body_q,
+                    model.body_inertia,
+                    self.L_by_size[6],
+                    self.qd_work,
+                    dt,
+                    model.requires_grad,
+                ],
+                outputs=[self.v_hat],
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                apply_free_root_transport_to_predictor,
+                dim=self._free_root_joint_count,
+                inputs=[
+                    self._free_root_joint_indices,
+                    model.joint_qd_start,
+                    self._kinematic_joint_mask,
+                    self.qd_work,
+                    dt,
+                ],
+                outputs=[self.v_hat],
+                device=model.device,
+            )
 
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
         model = self.model
