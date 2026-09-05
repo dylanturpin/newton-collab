@@ -89,7 +89,37 @@ def _run_trajectory(model, solver, num_steps):
     return np.stack(joint_q_history)
 
 
+def _run_state_trajectory(model, solver, num_steps, *, reset_each_step):
+    state_0 = _make_initial_state(model)
+    state_1 = model.state()
+    contacts = model.contacts()
+    control = model.control()
+    history = {name: [] for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
+    for _ in range(num_steps):
+        if reset_each_step:
+            solver.reset(state_0)
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, DT)
+        state_0, state_1 = state_1, state_0
+        for name, values in history.items():
+            values.append(getattr(state_0, name).numpy().copy())
+    return {name: np.stack(values) for name, values in history.items()}
+
+
 class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "FK/ID reuse requires CUDA")
+    def test_cached_fk_id_matches_forced_recomputation(self):
+        trajectories = []
+        for reset_each_step in (False, True):
+            model = _build_model("cuda:0", ground=False)
+            solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
+            trajectories.append(_run_state_trajectory(model, solver, num_steps=20, reset_each_step=reset_each_step))
+
+        for name in trajectories[0]:
+            np.testing.assert_allclose(
+                trajectories[0][name], trajectories[1][name], rtol=0.0, atol=2.0e-6, err_msg=name
+            )
+
     @unittest.skipUnless(wp.is_cuda_available(), "parallel compact inertia refresh requires CUDA")
     def test_parallel_compact_refresh_matches_serial_trajectory(self):
         trajectories = []
