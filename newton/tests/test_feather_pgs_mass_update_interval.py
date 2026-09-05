@@ -238,6 +238,55 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
 
         np.testing.assert_allclose(trajectories[1], trajectories[0], rtol=0.0, atol=2.0e-6)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires CUDA")
+    def test_captured_parallel_dynamics_matches_fused_trajectory(self):
+        """Match captured parallel dynamics against eager fused execution."""
+        graph_model = _build_model("cuda:0", ground=False)
+        eager_model = _build_model("cuda:0", ground=False)
+        graph_solver = SolverFeatherPGS(
+            graph_model,
+            update_mass_matrix_interval=1,
+            double_buffer=False,
+            use_parallel_streams=True,
+        )
+        eager_solver = SolverFeatherPGS(
+            eager_model,
+            update_mass_matrix_interval=1,
+            double_buffer=False,
+            use_parallel_streams=False,
+        )
+        graph_state, graph_out = _make_initial_state(graph_model), graph_model.state()
+        eager_state, eager_out = _make_initial_state(eager_model), eager_model.state()
+        graph_control, eager_control = graph_model.control(), eager_model.control()
+        graph_pipeline = newton.CollisionPipeline(graph_model)
+        eager_pipeline = newton.CollisionPipeline(eager_model)
+        graph_contacts, eager_contacts = graph_pipeline.contacts(), eager_pipeline.contacts()
+
+        def one_step(solver, state_in, state_out, control, contacts):
+            solver.step(state_in, state_out, control, contacts, DT)
+            wp.copy(state_in.body_q, state_out.body_q)
+            wp.copy(state_in.body_qd, state_out.body_qd)
+            wp.copy(state_in.joint_q, state_out.joint_q)
+            wp.copy(state_in.joint_qd, state_out.joint_qd)
+
+        one_step(graph_solver, graph_state, graph_out, graph_control, graph_contacts)
+        one_step(eager_solver, eager_state, eager_out, eager_control, eager_contacts)
+        with wp.ScopedCapture("cuda:0") as capture:
+            one_step(graph_solver, graph_state, graph_out, graph_control, graph_contacts)
+
+        for _ in range(20):
+            wp.capture_launch(capture.graph)
+            one_step(eager_solver, eager_state, eager_out, eager_control, eager_contacts)
+
+        for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+            np.testing.assert_allclose(
+                getattr(graph_state, name).numpy(),
+                getattr(eager_state, name).numpy(),
+                rtol=0.0,
+                atol=2.0e-6,
+                err_msg=name,
+            )
+
     def test_interval_two_contact_trajectory_stays_close_to_reference(self):
         device = wp.get_device()
         history = {}
