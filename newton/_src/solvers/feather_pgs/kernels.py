@@ -1692,6 +1692,12 @@ def build_augmented_joint_rows_and_apply_tau(
             if ke <= 0.0 and kd <= 0.0:
                 continue
 
+            # Finite-effort drives are solved as bounded implicit rows. Leaving
+            # their K in H would let external/contact loads bypass saturation.
+            effort_limit = joint_effort_limit[dof_index]
+            if effort_limit > 0.0 and wp.isfinite(effort_limit):
+                continue
+
             K = ke * dt * dt + kd * dt
             if K <= 0.0:
                 continue
@@ -1703,9 +1709,6 @@ def build_augmented_joint_rows_and_apply_tau(
             target_pos = joint_target_pos[dof_index]
             target_vel = joint_target_vel[dof_index]
             u0 = -(ke * (q - target_pos + dt * qd_val) + kd * (qd_val - target_vel))
-            effort_limit = joint_effort_limit[dof_index]
-            if effort_limit > 0.0:
-                u0 = wp.clamp(u0, -effort_limit, effort_limit)
             row_K[row_index] = K
             joint_tau[dof_index] = joint_tau[dof_index] + u0
 
@@ -1727,6 +1730,8 @@ def allocate_physx_drive_slots(
     joint_dof_dim: wp.array2d[int],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
+    joint_effort_limit: wp.array[float],
+    finite_effort_only: int,
     art_to_world: wp.array[int],
     max_constraints: int,
     # outputs
@@ -1760,6 +1765,10 @@ def allocate_physx_drive_slots(
             stiffness = joint_target_ke[dof]
             damping = joint_target_kd[dof]
             if stiffness <= 0.0 and damping <= 0.0:
+                continue
+
+            effort = joint_effort_limit[dof]
+            if finite_effort_only != 0 and (effort <= 0.0 or not wp.isfinite(effort)):
                 continue
 
             slot = wp.atomic_add(world_slot_counter, world, 1)
@@ -9119,6 +9128,10 @@ def pgs_solve_loop(
     world_row_mu: wp.array2d[float],
     friction_start_iteration: int,
     iteration_offset: int,
+    drive_bias: wp.array2d[float],
+    drive_velocity_multiplier: wp.array2d[float],
+    drive_impulse_multiplier: wp.array2d[float],
+    drive_max_impulse: wp.array2d[float],
 ):
     """
     World-level Projected Gauss-Seidel solver.
@@ -9142,6 +9155,16 @@ def pgs_solve_loop(
             w = world_rhs[world, i]
             for j in range(m):
                 w += world_C[world, i, j] * world_impulses[world, j]
+
+            if row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+                drive = (
+                    drive_bias[world, i]
+                    + drive_velocity_multiplier[world, i] * w
+                    + drive_impulse_multiplier[world, i] * world_impulses[world, i]
+                )
+                bound = drive_max_impulse[world, i]
+                world_impulses[world, i] = wp.clamp(drive, -bound, bound)
+                continue
 
             denom = world_diag[world, i]
             if denom <= 0.0:
