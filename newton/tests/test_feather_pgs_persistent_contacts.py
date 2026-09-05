@@ -160,7 +160,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
                 self.assertLessEqual(abs(reaction), 1.05)
                 self.assertAlmostEqual(reaction, -np.sign(force), delta=0.05)
 
-    def _seed_rotating_contact(self, friction, *, oblique=False, device="cpu"):
+    def _seed_rotating_contact(self, friction, *, oblique=False, rotated=False, device="cpu"):
         """Prepare a cached friction impulse and move its normal across a basis seam."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.X, gravity=wp.vec3(0.0))
         builder.add_ground_plane()
@@ -181,6 +181,9 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         if oblique:
             old_normal = wp.normalize(wp.vec3(0.2, 0.3, 0.93))
             new_normal = wp.normalize(wp.vec3(0.3, 0.2, 0.93))
+        if rotated:
+            old_normal = wp.vec3(0.0, 0.0, 1.0)
+            new_normal = wp.vec3(0.5 / np.sqrt(2.0), 0.5 / np.sqrt(2.0), np.sqrt(3.0) / 2.0)
         normals = contacts.rigid_contact_normal.numpy()
         normals[0] = old_normal
         contacts.rigid_contact_normal.assign(normals)
@@ -227,6 +230,16 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         impulses, world_tangent, old_direction = self._seed_rotating_contact(0.1)
         self.assertLessEqual(float(np.linalg.norm(impulses[1:])), 0.1 * impulses[0] + 1.0e-6)
         np.testing.assert_allclose(world_tangent, 0.1 * old_direction, atol=1.0e-6)
+
+    def test_rotating_contact_clamps_the_projected_friction_cone(self):
+        """Project through a 30-degree normal change and saturate the current cone."""
+        devices = ["cpu", wp.get_cuda_device()] if wp.is_cuda_available() else ["cpu"]
+        for device in devices:
+            with self.subTest(device=str(device)):
+                impulses, tangent, projected = self._seed_rotating_contact(0.1, rotated=True, device=device)
+                expected = 0.1 * projected / np.linalg.norm(projected)
+                np.testing.assert_allclose(tangent, expected, atol=1.0e-6)
+                self.assertAlmostEqual(float(np.linalg.norm(impulses[1:])), 0.1 * impulses[0], delta=1.0e-6)
 
     def test_matching_retains_world_distance_policy(self):
         """Moving beyond the existing world-distance threshold must cold-start."""

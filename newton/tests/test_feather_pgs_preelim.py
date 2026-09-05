@@ -63,8 +63,11 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertLess(gap_on, 0.01 * gap_off, f"expected >100x tightening, got {gap_off / max(gap_on, 1e-12):.1f}x")
 
     def test_dense_warmstart_preserves_projected_closure(self):
-        """Preserve loop closure when carrying real loaded contact impulses."""
+        """Project loaded contact history and an unsaturated drive kick at zero sweeps."""
         builder = _build_four_bar()
+        # An unlimited drive stays in the augmented predictor, so reversing it
+        # still changes velocity in the final step with no PGS drive sweeps.
+        builder.joint_effort_limit[0] = float("inf")
         builder.add_shape_box(
             -1,
             xform=wp.transform(wp.vec3(-0.04, 0.0, 0.5), wp.quat_identity()),
@@ -76,7 +79,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         solver = newton.solvers.SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",
-            pgs_iterations=16,
+            pgs_iterations=2,
             pgs_beta=0.1,
             dense_max_constraints=128,
             enable_bilateral_preelimination=True,
@@ -100,6 +103,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertTrue(contact_rows.any())
         cache_peak = np.max(solver.impulses.numpy()[0, :count][contact_rows])
         self.assertGreater(cache_peak, 1.0e-4, "loaded contact cache stayed empty")
+        previous_predictor = solver.v_hat.numpy().copy()
         targets[0] = -0.6
         control.joint_target_q.assign(targets)
         solver.pgs_iterations = 0
@@ -110,6 +114,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertTrue(solver._preelim_active)
         self.assertTrue(np.isfinite(state_1.body_q.numpy()).all())
         self.assertGreater(np.max(solver.impulses.numpy()), 1.0e-4)
+        self.assertGreater(np.linalg.norm(solver.v_hat.numpy() - previous_predictor), 1.0e-3)
         self.assertLess(gap, 2.0e-5, f"warm-started projection left a {gap:.2e} m closure gap")
 
     def test_propagation_uses_iterative_bilateral_fallback(self):

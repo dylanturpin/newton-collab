@@ -301,6 +301,13 @@ def write_contact_speculative(
 
 
 @wp.kernel(enable_backward=False)
+def _record_reduction_overflow(
+    insert_failures: wp.array[int], buffer_overflows: wp.array[int], overflow: wp.array[int]
+):
+    overflow[0] = int(insert_failures[0] > 0 or buffer_overflows[0] > 0)
+
+
+@wp.kernel(enable_backward=False)
 def compute_shape_aabbs(
     body_q: wp.array[wp.transform],
     shape_transform: wp.array[wp.transform],
@@ -1271,8 +1278,8 @@ class CollisionPipeline:
         yaw-sensitive tasks. It supports contact matching and FeatherPGS warm
         starting with ``contact_matching="latest"``; sticky replay and active
         hydroelastic contacts remain unsupported. Call
-        :meth:`CollisionPipeline.reset_body_pair_reduction_history` after
-        episode resets or teleports, and
+        :meth:`CollisionPipeline.reset_contact_matching` and the solver's
+        reset method after episode resets or teleports, and
         :meth:`CollisionPipeline.refresh_body_pair_reduction_groups` after
         runtime material changes.  CUDA graph capture requires one ordinary
         warm-up collide on the exact buffer before capture and only one live
@@ -2039,7 +2046,7 @@ class CollisionPipeline:
                 shape_world=(model.shape_world.numpy() if getattr(model, "shape_world", None) is not None else None),
                 world_count=max(int(getattr(model, "world_count", 1)), 1),
                 borrowed_scratch=(self._contact_sorter.borrow_full_scratch() if self._contact_sorter else None),
-                preserve_sort_keys=deterministic,
+                preserve_sort_keys=deterministic and matching_enabled,
                 verify=self.contact_reduction_config.body_pair_verify,
                 hysteresis=self.contact_reduction_config.body_pair_hysteresis,
                 hashtable_headroom=self.contact_reduction_config.body_pair_hashtable_headroom,
@@ -2049,7 +2056,7 @@ class CollisionPipeline:
             self._body_pair_reducer = None
         self._reduction_reset_mask = (
             wp.zeros(max(int(model.world_count), 1), dtype=wp.int32, device=device)
-            if self._body_pair_reducer is not None and matching_enabled
+            if self._body_pair_reducer is not None
             else None
         )
         # A graph-owned lease retains this pipeline (and therefore every
@@ -2116,10 +2123,11 @@ class CollisionPipeline:
         """Erase the body-pair reduction's hysteresis history.
 
         With ``ContactReductionConfig.body_pair_hysteresis > 0`` the pipeline carries
-        last step's slot winners between :meth:`collide` calls.  Call this at
-        episode resets, teleports, or scene reloads so no incumbency bonus
-        crosses trajectory boundaries.  No-op when reduction or hysteresis is
-        disabled.
+        last step's slot winners between :meth:`collide` calls. This method
+        clears only that reduction history. For episode resets, teleports or
+        scene reloads, call :meth:`reset_contact_matching` and the solver's
+        reset method to also invalidate matched contacts and cached impulses.
+        No-op when reduction or hysteresis is disabled.
 
         Args:
             world_mask: ``None`` erases everything (host-side; call outside
@@ -2318,17 +2326,17 @@ class CollisionPipeline:
         )
         if self._contact_matcher is not None:
             self._contact_matcher.reset(world_mask)
-            if self._body_pair_reducer is not None:
-                if world_mask is None:
-                    self._body_pair_reducer.reset_history()
-                else:
-                    wp.launch(
-                        _reduction_reset_mask_from_matching,
-                        dim=self._reduction_reset_mask.shape[0],
-                        inputs=[world_mask, int(self.model.world_count), self._reduction_reset_mask],
-                        device=self.device,
-                    )
-                    self._body_pair_reducer.reset_history(self._reduction_reset_mask)
+        if self._body_pair_reducer is not None:
+            if world_mask is None:
+                self._body_pair_reducer.reset_history()
+            else:
+                wp.launch(
+                    _reduction_reset_mask_from_matching,
+                    dim=self._reduction_reset_mask.shape[0],
+                    inputs=[world_mask, int(self.model.world_count), self._reduction_reset_mask],
+                    device=self.device,
+                )
+                self._body_pair_reducer.reset_history(self._reduction_reset_mask)
 
     @staticmethod
     def _build_excluded_pairs(model: Model) -> wp.array[wp.vec2i] | None:
@@ -2683,6 +2691,16 @@ class CollisionPipeline:
             device=self.device,
         )
 
+        reducer = self.narrow_phase.global_contact_reducer
+        if reducer is not None:
+            wp.launch(
+                _record_reduction_overflow,
+                dim=1,
+                inputs=[reducer.ht_insert_failures, reducer.buffer_overflows, contacts._reduction_overflow],
+                device=self.device,
+                record_tape=False,
+            )
+
         if self.deterministic and self._contact_sorter is not None:
             self._contact_sorter.sort_full(
                 self._sort_key_array,
@@ -2730,7 +2748,7 @@ class CollisionPipeline:
                 model,
                 state,
                 contacts,
-                sort_keys=self._contact_sorter.sorted_keys_view if self.deterministic else None,
+                sort_keys=self._contact_sorter.sorted_keys_view if self._contact_matcher is not None else None,
             )
 
         # Match and save the retained stream so all indices name solver contacts.
@@ -2755,6 +2773,10 @@ class CollisionPipeline:
                 match_index_out=contacts.rigid_contact_match_index,
                 device=self.device,
             )
+        elif contacts.rigid_contact_match_index is not None:
+            # A buffer may come from a matching pipeline. Its current producer
+            # cannot validate that previous identity, including on graph replay.
+            contacts.rigid_contact_match_index.fill_(-1)
 
         # Sticky mode: overwrite matched rows with the saved previous-frame
         # contact geometry.  Must run after sort_full (so match_index points at

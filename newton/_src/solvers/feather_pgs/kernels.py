@@ -92,8 +92,7 @@ def commit_mass_updates(
     tid = wp.tid()
     if mask[tid] != 0:
         dst[tid] = src[tid]
-    if tid == 0:
-        mass_update_requested[0] = 0
+    mass_update_requested[tid] = 0
 
 
 @wp.kernel
@@ -2116,7 +2115,7 @@ def build_mass_update_mask(
 ):
     tid = wp.tid()
     flag = 1 if global_flag != 0 else 0
-    if limit_change_mask[tid] != 0 or mass_update_requested[0] != 0:
+    if limit_change_mask[tid] != 0 or mass_update_requested[tid] != 0:
         flag = 1
     mass_update_mask[tid] = flag
 
