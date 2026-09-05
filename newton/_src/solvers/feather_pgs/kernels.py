@@ -45,6 +45,9 @@ PGS_CONSTRAINT_TYPE_MIMIC = 5
 PGS_CONSTRAINT_TYPE_CONNECT = 6
 PGS_CONSTRAINT_TYPE_COUNT = 7
 
+PGS_LOCAL_SOLVE_OWNER_GENERAL = 0
+PGS_LOCAL_SOLVE_OWNER_SINGLE = 1
+PGS_LOCAL_SOLVE_OWNER_PAIR = 2
 
 # Numeric IDs for the ``friction_mode`` argument passed to the matrix-free
 # PGS solver kernels.  Mirrors the Python-side string enum on
@@ -937,10 +940,13 @@ def dense_index(stride: int, i: int, j: int):
 @wp.func
 def compute_link_velocity(
     i: int,
+    parent: int,
+    child: int,
+    parent_v_s: wp.spatial_vector,
+    parent_a_s: wp.spatial_vector,
+    origin: wp.vec3,
+    gravity: wp.vec3,
     joint_type: wp.array[int],
-    joint_parent: wp.array[int],
-    joint_child: wp.array[int],
-    joint_articulation: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_qd: wp.array[float],
     joint_axis: wp.array[wp.vec3],
@@ -949,8 +955,6 @@ def compute_link_velocity(
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
     joint_X_p: wp.array[wp.transform],
-    articulation_origin: wp.array[wp.vec3],
-    gravity: wp.array[wp.vec3],
     # outputs
     joint_S_s: wp.array[wp.spatial_vector],
     body_I_s: wp.array[wp.spatial_matrix],
@@ -959,13 +963,7 @@ def compute_link_velocity(
     body_a_s: wp.array[wp.spatial_vector],
 ):
     type = joint_type[i]
-    child = joint_child[i]
-    parent = joint_parent[i]
-    articulation = joint_articulation[i]
     qd_start = joint_qd_start[i]
-    origin = wp.vec3()
-    if articulation >= 0:
-        origin = articulation_origin[articulation]
 
     X_pj = joint_X_p[i]
     # X_cj = joint_X_c[i]
@@ -994,17 +992,9 @@ def compute_link_velocity(
         joint_S_s,
     )
 
-    # parent velocity
-    v_parent_s = wp.spatial_vector()
-    a_parent_s = wp.spatial_vector()
-
-    if parent >= 0:
-        v_parent_s = body_v_s[parent]
-        a_parent_s = body_a_s[parent]
-
     # body velocity, acceleration
-    v_s = v_parent_s + v_j_s
-    a_s = a_parent_s + spatial_cross(v_s, v_j_s)
+    v_s = parent_v_s + v_j_s
+    a_s = parent_a_s + spatial_cross(v_s, v_j_s)
 
     # compute body forces
     X_sm = body_q_com[child]
@@ -1017,7 +1007,7 @@ def compute_link_velocity(
     # gravity and external forces (expressed in frame aligned with s but centered at body mass)
     m = I_m[0, 0]
 
-    f_g = m * gravity[0]
+    f_g = m * gravity
     r_com = wp.transform_get_translation(X_sm_local)
     f_g_s = wp.spatial_vector(f_g, wp.cross(r_com, f_g))
 
@@ -1036,6 +1026,108 @@ def compute_link_velocity(
     body_a_s[child] = a_s
     body_f_s[child] = f_b_s - f_g_s
     body_I_s[child] = I_s
+    return v_s, a_s
+
+
+@wp.kernel
+def eval_rigid_fk_id(
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_X_com: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    body_com: wp.array[wp.vec3],
+    body_I_m: wp.array[wp.spatial_matrix],
+    gravity: wp.array[wp.vec3],
+    # outputs
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    articulation_origin: wp.array[wp.vec3],
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_I_s: wp.array[wp.spatial_matrix],
+    body_v_s: wp.array[wp.spatial_vector],
+    body_f_s: wp.array[wp.spatial_vector],
+    body_a_s: wp.array[wp.spatial_vector],
+):
+    """Evaluate articulation poses and inverse dynamics in one serial traversal pipeline."""
+    index = wp.tid()
+    start = articulation_start[index]
+    end = articulation_joint_end[index]
+
+    for i in range(start, end):
+        compute_link_transform(
+            i,
+            joint_type,
+            joint_parent,
+            joint_child,
+            joint_q_start,
+            joint_qd_start,
+            joint_q,
+            joint_X_p,
+            joint_X_c,
+            body_X_com,
+            joint_axis,
+            joint_dof_dim,
+            body_q,
+            body_q_com,
+        )
+
+    origin = wp.vec3()
+    if start < articulation_start[index + 1]:
+        root_body = joint_child[start]
+        if root_body >= 0:
+            origin = wp.transform_point(body_q[root_body], body_com[root_body])
+    articulation_origin[index] = origin
+
+    gravity_s = gravity[0]
+    cached_child = int(-1)
+    cached_v_s = wp.spatial_vector()
+    cached_a_s = wp.spatial_vector()
+    for i in range(start, end):
+        parent = joint_parent[i]
+        child = joint_child[i]
+        parent_v_s = wp.spatial_vector()
+        parent_a_s = wp.spatial_vector()
+        if parent >= 0:
+            if parent == cached_child:
+                parent_v_s = cached_v_s
+                parent_a_s = cached_a_s
+            else:
+                parent_v_s = body_v_s[parent]
+                parent_a_s = body_a_s[parent]
+        cached_v_s, cached_a_s = compute_link_velocity(
+            i,
+            parent,
+            child,
+            parent_v_s,
+            parent_a_s,
+            origin,
+            gravity_s,
+            joint_type,
+            joint_qd_start,
+            joint_qd,
+            joint_axis,
+            joint_dof_dim,
+            body_I_m,
+            body_q,
+            body_q_com,
+            joint_X_p,
+            joint_S_s,
+            body_I_s,
+            body_v_s,
+            body_f_s,
+            body_a_s,
+        )
+        cached_child = child
 
 
 # Inverse dynamics via Recursive Newton-Euler algorithm (Featherstone Table 5.1)
@@ -1046,7 +1138,6 @@ def eval_rigid_id(
     joint_type: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
-    joint_articulation: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_qd: wp.array[float],
     joint_axis: wp.array[wp.vec3],
@@ -1070,15 +1161,34 @@ def eval_rigid_id(
     start = articulation_start[index]
     # Tree prefix only: trailing loop-closing joints carry no motion subspaces.
     end = articulation_joint_end[index]
+    origin = articulation_origin[index]
+    gravity_s = gravity[0]
+    cached_child = int(-1)
+    cached_v_s = wp.spatial_vector()
+    cached_a_s = wp.spatial_vector()
 
     # compute link velocities and coriolis forces
     for i in range(start, end):
-        compute_link_velocity(
+        parent = joint_parent[i]
+        child = joint_child[i]
+        parent_v_s = wp.spatial_vector()
+        parent_a_s = wp.spatial_vector()
+        if parent >= 0:
+            if parent == cached_child:
+                parent_v_s = cached_v_s
+                parent_a_s = cached_a_s
+            else:
+                parent_v_s = body_v_s[parent]
+                parent_a_s = body_a_s[parent]
+        cached_v_s, cached_a_s = compute_link_velocity(
             i,
+            parent,
+            child,
+            parent_v_s,
+            parent_a_s,
+            origin,
+            gravity_s,
             joint_type,
-            joint_parent,
-            joint_child,
-            joint_articulation,
             joint_qd_start,
             joint_qd,
             joint_axis,
@@ -1087,14 +1197,13 @@ def eval_rigid_id(
             body_q,
             body_q_com,
             joint_X_p,
-            articulation_origin,
-            gravity,
             joint_S_s,
             body_I_s,
             body_v_s,
             body_f_s,
             body_a_s,
         )
+        cached_child = child
 
 
 @wp.kernel
@@ -4874,6 +4983,7 @@ def gather_JY_to_world(
 @wp.kernel
 def diag_from_JY_world(
     world_constraint_count: wp.array[int],
+    local_solve_owner: wp.array[int],
     world_dof_count: wp.array[int],
     J_world: wp.array3d[float],
     Y_world: wp.array3d[float],
@@ -4886,6 +4996,8 @@ def diag_from_JY_world(
     row = tid % max_constraints
     world = tid // max_constraints
     if row >= world_constraint_count[world]:
+        return
+    if local_solve_owner[world] != PGS_LOCAL_SOLVE_OWNER_GENERAL:
         return
 
     value = float(0.0)
@@ -9445,11 +9557,10 @@ def hinv_jt_par_row_contact_fallback(
     art_to_world: wp.array[int],
     articulation_world_dof_offset: wp.array[int],
     world_constraint_count: wp.array[int],
-    dense_phase_bounds: wp.array2d[int],
-    mf_constraint_count: wp.array[int],
+    local_solve_owner: wp.array[int],
+    world_row_restitution: wp.array2d[float],
     n_dofs: int,
     max_constraints: int,
-    local_internal_max_constraints: int,
     n_arts: int,
     write_world: int,
     Y_group: wp.array3d[float],
@@ -9466,11 +9577,18 @@ def hinv_jt_par_row_contact_fallback(
     art = group_to_art[group_index]
     world = art_to_world[art]
     constraint_count = world_constraint_count[world]
-    if (
-        constraint_count <= local_internal_max_constraints
-        and dense_phase_bounds[world, 1] == constraint_count
-        and mf_constraint_count[world] == 0
-    ):
+    if local_solve_owner[world] != PGS_LOCAL_SOLVE_OWNER_GENERAL:
+        # Local owners construct response in their fused solver.  Only impact
+        # rows need a world Jacobian for the separate restitution target pass;
+        # keep every other local row in articulation-local storage.
+        if write_world != 0:
+            dof_offset = articulation_world_dof_offset[art]
+            constraint = lane
+            while constraint < constraint_count:
+                if world_row_restitution[world, constraint] > 0.0:
+                    for i in range(n_dofs):
+                        J_world[world, constraint, dof_offset + i] = J_group[group_index, constraint, i]
+                constraint += 32
         return
 
     constraint = lane
@@ -9504,6 +9622,76 @@ def hinv_jt_par_row_contact_fallback(
                 J_world[world, constraint, dof_offset + i] = J_group[group_index, constraint, i]
                 Y_world[world, constraint, dof_offset + i] = Y_group[group_index, constraint, i]
         constraint += 32
+
+
+@wp.kernel
+def classify_local_solve_worlds(
+    world_constraint_count: wp.array[int],
+    dense_phase_bounds: wp.array2d[int],
+    mf_constraint_count: wp.array[int],
+    local_primary_articulation: wp.array[int],
+    local_pair_articulation: wp.array[int],
+    local_max_constraints: int,
+    # outputs
+    local_solve_owner: wp.array[int],
+    general_world_count: wp.array[int],
+    general_worlds: wp.array[int],
+):
+    """Assign exact solver ownership and compact active general worlds."""
+    world = wp.tid()
+    row_count = world_constraint_count[world]
+    owner = PGS_LOCAL_SOLVE_OWNER_GENERAL
+    if (
+        row_count > 0
+        and row_count <= local_max_constraints
+        and mf_constraint_count[world] == 0
+        and local_primary_articulation[world] >= 0
+    ):
+        if dense_phase_bounds[world, 1] == row_count:
+            owner = PGS_LOCAL_SOLVE_OWNER_SINGLE
+        elif local_pair_articulation[world] >= 0:
+            owner = PGS_LOCAL_SOLVE_OWNER_PAIR
+    local_solve_owner[world] = owner
+    if owner == PGS_LOCAL_SOLVE_OWNER_GENERAL and (row_count > 0 or mf_constraint_count[world] > 0):
+        general_index = wp.atomic_add(general_world_count, 0, 1)
+        general_worlds[general_index] = world
+
+
+@wp.kernel
+def compact_local_pair_candidates(
+    candidate_articulations: wp.array[int],
+    candidate_secondary_articulations: wp.array[int],
+    articulation_world: wp.array[int],
+    local_solve_owner: wp.array[int],
+    # outputs
+    active_count: wp.array[int],
+    active_articulations: wp.array[int],
+    active_secondary_articulations: wp.array[int],
+):
+    """Compact topology candidates that selected paired local ownership."""
+    candidate = wp.tid()
+    articulation = candidate_articulations[candidate]
+    world = articulation_world[articulation]
+    if local_solve_owner[world] == PGS_LOCAL_SOLVE_OWNER_PAIR:
+        active_index = wp.atomic_add(active_count, 0, 1)
+        active_articulations[active_index] = articulation
+        active_secondary_articulations[active_index] = candidate_secondary_articulations[candidate]
+
+
+@wp.kernel
+def clear_local_solve_diag(
+    world_constraint_count: wp.array[int],
+    local_solve_owner: wp.array[int],
+    max_constraints: int,
+    # output
+    world_diag: wp.array2d[float],
+):
+    """Discard stale response diagonals for locally owned worlds."""
+    tid = wp.tid()
+    row = tid % max_constraints
+    world = tid // max_constraints
+    if local_solve_owner[world] != PGS_LOCAL_SOLVE_OWNER_GENERAL and row < world_constraint_count[world]:
+        world_diag[world, row] = 0.0
 
 
 @wp.kernel
