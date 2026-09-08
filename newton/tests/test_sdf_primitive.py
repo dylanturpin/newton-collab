@@ -17,6 +17,8 @@ PRIMITIVE_CYLINDER = wp.constant(3)
 PRIMITIVE_ELLIPSOID = wp.constant(4)
 PRIMITIVE_CONE = wp.constant(5)
 PRIMITIVE_PLANE = wp.constant(6)
+# cylinder with a distinct top radius: the tapered capped-cone branch
+PRIMITIVE_TRUNCATED_CONE = wp.constant(7)
 
 
 @wp.func
@@ -42,6 +44,8 @@ def _eval_sdf(primitive: int, point: wp.vec3, p0: float, p1: float, p2: float, u
         return kernels.sdf_ellipsoid(point, wp.vec3(p0, p1, p2))
     if primitive == PRIMITIVE_CONE:
         return kernels.sdf_cone(point, p0, p1, up_axis)
+    if primitive == PRIMITIVE_TRUNCATED_CONE:
+        return kernels.sdf_cylinder(point, p0, p1, up_axis, p2, 0.0)
     return kernels.sdf_plane(point, p0, p1)
 
 
@@ -59,7 +63,23 @@ def _eval_grad(primitive: int, point: wp.vec3, p0: float, p1: float, p2: float, 
         return kernels.sdf_ellipsoid_grad(point, wp.vec3(p0, p1, p2))
     if primitive == PRIMITIVE_CONE:
         return kernels.sdf_cone_grad(point, p0, p1, up_axis)
+    if primitive == PRIMITIVE_TRUNCATED_CONE:
+        return kernels.sdf_cylinder_grad(point, p0, p1, up_axis, p2, 0.0)
     return kernels.sdf_plane_grad(point, p0, p1)
+
+
+@wp.kernel
+def evaluate_gradient_kernel(
+    primitive: int,
+    points: wp.array[wp.vec3],
+    p0: float,
+    p1: float,
+    p2: float,
+    up_axis: int,
+    gradient: wp.array[wp.vec3],
+):
+    tid = wp.tid()
+    gradient[tid] = _eval_grad(primitive, points[tid], p0, p1, p2, up_axis)
 
 
 @wp.kernel
@@ -112,6 +132,7 @@ def _assert_gradient_matches_fd(
     p2: float,
     up_axis: int,
     dot_tol: float = 0.995,
+    eps: float = 1.0e-4,
 ):
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
     dot_alignment_wp = wp.zeros(points_np.shape[0], dtype=float, device=device)
@@ -127,7 +148,7 @@ def _assert_gradient_matches_fd(
             p1,
             p2,
             up_axis,
-            1.0e-4,
+            eps,
             dot_alignment_wp,
             analytic_norm_wp,
         ],
@@ -138,7 +159,10 @@ def _assert_gradient_matches_fd(
     analytic_norm = analytic_norm_wp.numpy()
     test.assertTrue(
         np.all(dot_alignment > dot_tol),
-        msg=f"Gradient alignment below tolerance {dot_tol}: min={dot_alignment.min():.6f}",
+        msg=(
+            f"Gradient alignment below tolerance {dot_tol}: min={dot_alignment.min():.6f} "
+            f"at {points_np[int(np.argmin(dot_alignment))]} (params {p0}, {p1}, {p2}, eps {eps})"
+        ),
     )
     test.assertTrue(
         np.allclose(analytic_norm, np.ones_like(analytic_norm), atol=1.0e-5, rtol=0.0),
@@ -237,6 +261,96 @@ def test_sdf_cone_grad_matches_finite_difference(test, device):
         _assert_gradient_matches_fd(test, device, PRIMITIVE_CONE, points, 1.0, 1.5, 0.0, int(axis), dot_tol=0.99)
 
 
+def _cone_rim_ring(radius, half_height):
+    """Points around the base rim, inside and outside its plane, where the rim is closest."""
+    angles = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
+    rings = []
+    for radial_offset in (0.15, 0.4, 1.0):
+        for axial_offset in (-0.4, -0.12, 0.12, 0.4):
+            ring_radius = radius * (1.0 + radial_offset)
+            rings.append(
+                np.stack(
+                    [
+                        ring_radius * np.cos(angles),
+                        ring_radius * np.sin(angles),
+                        np.full_like(angles, -half_height * (1.0 + axial_offset)),
+                    ],
+                    axis=-1,
+                )
+            )
+    return np.concatenate(rings).astype(np.float32)
+
+
+def test_sdf_cone_grad_near_base_rim_across_scales(test, device):
+    """Verify the cone gradient beside the base rim over several aspect ratios and shape scales."""
+    for radius, half_height in ((1.0, 1.5), (1.0, 0.1), (0.1, 1.0), (1.0, 1.0)):
+        for scale in (1.0e-3, 1.0, 1.0e3):
+            r = radius * scale
+            h = half_height * scale
+            _assert_gradient_matches_fd(
+                test,
+                device,
+                PRIMITIVE_CONE,
+                _cone_rim_ring(r, h),
+                r,
+                h,
+                0.0,
+                int(Axis.Z),
+                dot_tol=0.999,
+                eps=1.0e-3 * max(r, h),
+            )
+
+
+def test_sdf_truncated_cone_grad_matches_finite_difference(test, device):
+    """Verify the tapered cylinder gradient at both rims over several tapers and shape scales."""
+    for bottom, top, half_height in ((1.0, 0.4, 1.0), (0.4, 1.0, 1.0), (1.0, 0.05, 0.2)):
+        for scale in (1.0e-3, 1.0, 1.0e3):
+            r0 = bottom * scale
+            r1 = top * scale
+            h = half_height * scale
+            points = np.concatenate([_cone_rim_ring(r0, h), _cone_rim_ring(r1, -h)]).astype(np.float32)
+            _assert_gradient_matches_fd(
+                test,
+                device,
+                PRIMITIVE_TRUNCATED_CONE,
+                points,
+                r0,
+                h,
+                r1,
+                int(Axis.Z),
+                dot_tol=0.999,
+                eps=1.0e-3 * max(r0, r1, h),
+            )
+
+
+def test_sdf_cone_grad_known_normals(test, device):
+    """Verify the cone gradient against directions known without differencing."""
+    radius = 1.0
+    half_height = 1.5
+    slant = np.array([2.0 * half_height, 0.0, radius])
+    slant /= np.linalg.norm(slant)
+    cases = (
+        ("above apex", (0.0, 0.0, half_height + 0.7), (0.0, 0.0, 1.0)),
+        ("below base", (0.0, 0.0, -half_height - 0.7), (0.0, 0.0, -1.0)),
+        ("beside rim", (radius + 0.3, 0.0, -half_height - 0.4), (0.6, 0.0, -0.8)),
+        ("beside lateral face", (radius + 0.25, 0.0, 0.0), tuple(slant)),
+    )
+    points = np.array([c[1] for c in cases], dtype=np.float32)
+    expected = np.array([c[2] for c in cases], dtype=np.float64)
+    points_wp = wp.array(points, dtype=wp.vec3, device=device)
+    gradient_wp = wp.zeros(len(cases), dtype=wp.vec3, device=device)
+    wp.launch(
+        evaluate_gradient_kernel,
+        dim=len(cases),
+        inputs=[PRIMITIVE_CONE, points_wp, radius, half_height, 0.0, int(Axis.Z), gradient_wp],
+        device=device,
+    )
+    gradient = gradient_wp.numpy()
+    for (name, _point, _want), got, want in zip(cases, gradient, expected, strict=True):
+        test.assertAlmostEqual(float(np.linalg.norm(got)), 1.0, delta=1.0e-5, msg=name)
+        test.assertGreater(float(np.dot(got, want)), 0.9999, msg=f"{name}: got {got}, expected {want}")
+
+
 def test_sdf_plane_grad_matches_finite_difference_for_infinite_plane(test, device):
     points = np.array(
         [
@@ -294,6 +408,24 @@ add_function_test(
     TestSdfPrimitive,
     "test_sdf_cone_grad_matches_finite_difference",
     test_sdf_cone_grad_matches_finite_difference,
+    devices=_devices,
+)
+add_function_test(
+    TestSdfPrimitive,
+    "test_sdf_cone_grad_near_base_rim_across_scales",
+    test_sdf_cone_grad_near_base_rim_across_scales,
+    devices=_devices,
+)
+add_function_test(
+    TestSdfPrimitive,
+    "test_sdf_truncated_cone_grad_matches_finite_difference",
+    test_sdf_truncated_cone_grad_matches_finite_difference,
+    devices=_devices,
+)
+add_function_test(
+    TestSdfPrimitive,
+    "test_sdf_cone_grad_known_normals",
+    test_sdf_cone_grad_known_normals,
     devices=_devices,
 )
 add_function_test(
