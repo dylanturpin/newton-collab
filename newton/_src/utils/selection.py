@@ -33,6 +33,36 @@ AttributeFrequency = Model.AttributeFrequency
 
 
 @wp.kernel
+def _gather_shape_attribute(source: wp.array[Any], indices: wp.array3d[int], output: wp.array3d[Any]):
+    w, a, s = wp.tid()
+    output[w, a, s] = source[indices[w, a, s]]
+
+
+@wp.kernel
+def _gather_shape_attribute_2d(source: wp.array2d[Any], indices: wp.array3d[int], output: wp.array4d[Any]):
+    w, a, s, k = wp.tid()
+    output[w, a, s, k] = source[indices[w, a, s], k]
+
+
+@wp.kernel
+def _scatter_shape_attribute(
+    values: wp.array3d[Any], indices: wp.array3d[int], mask: wp.array2d[bool], target: wp.array[Any]
+):
+    w, a, s = wp.tid()
+    if mask[w, a]:
+        target[indices[w, a, s]] = values[w, a, s]
+
+
+@wp.kernel
+def _scatter_shape_attribute_2d(
+    values: wp.array4d[Any], indices: wp.array3d[int], mask: wp.array2d[bool], target: wp.array2d[Any]
+):
+    w, a, s, k = wp.tid()
+    if mask[w, a]:
+        target[indices[w, a, s], k] = values[w, a, s, k]
+
+
+@wp.kernel
 def set_model_articulation_mask_kernel(
     world_arti_mask: wp.array2d[bool],  # (world, arti) mask in ArticulationView
     view_to_model_map: wp.array2d[int],  # map (world, arti) indices to Model articulation id
@@ -701,6 +731,7 @@ class ArticulationView:
         link_counts = list_of_lists(world_count)
         shape_starts = list_of_lists(world_count)
         shape_counts = list_of_lists(world_count)
+        shape_ids_by_articulation = list_of_lists(world_count)
         for world_id in range(world_count):
             for arti_id in articulation_ids[world_id]:
                 # joints
@@ -741,6 +772,7 @@ class ArticulationView:
                 else:
                     shape_starts[world_id].append(-1)
                 shape_counts[world_id].append(num_shapes)
+                shape_ids_by_articulation[world_id].append(sorted(shape_ids))
 
         # make sure counts are the same for all articulations
         if not (
@@ -972,6 +1004,22 @@ class ArticulationView:
         self.joint_coord_count = len(selected_joint_coord_indices)
         self.link_count = len(selected_link_indices)
         self.shape_count = len(selected_shape_indices)
+
+        # Decomposition can append shapes after other articulations/worlds. Rank in
+        # an articulation's sorted shape list is then not an offset into the model.
+        # Preserve the zero-copy path only when every selected ID fits its layout.
+        actual_shape_ids = [
+            [[ids[i] for i in selected_shape_indices] for ids in world_ids] for world_ids in shape_ids_by_articulation
+        ]
+        shape_layout_is_affine = all(
+            shape_id == shape_offset + w * outer_shape_stride + a * inner_shape_stride + selected_shape_indices[s]
+            for w, world_ids in enumerate(actual_shape_ids)
+            for a, ids in enumerate(world_ids)
+            for s, shape_id in enumerate(ids)
+        )
+        self._shape_indices_global = None
+        if not shape_layout_is_affine:
+            self._shape_indices_global = wp.array(actual_shape_ids, dtype=int, device=self.device)
 
         # TODO: document the layout conventions and requirements
         #
@@ -1356,7 +1404,33 @@ class ArticulationView:
 
         return attrib
 
+    def _mapped_shape_attribute(self, name: str, source: Model | State | Control):
+        if self._shape_indices_global is None:
+            return None
+        if self.model.get_attribute_frequency(name.replace(".", ":")) != AttributeFrequency.SHAPE:
+            return None
+        attribute = source
+        for part in name.split("."):
+            attribute = getattr(attribute, part)
+        if attribute.ndim not in (1, 2):
+            raise NotImplementedError("Mapped shape attributes support one or two source dimensions")
+        return attribute
+
     def _get_attribute_values(self, name: str, source: Model | State | Control, _slice: slice | None = None):
+        source_array = self._mapped_shape_attribute(name, source)
+        if source_array is not None:
+            if _slice is not None:
+                raise NotImplementedError("Mapped shape attributes do not support internal slicing")
+            indices = self._shape_indices_global
+            values = wp.empty(
+                (*indices.shape, *source_array.shape[1:]),
+                dtype=source_array.dtype,
+                device=self.device,
+                requires_grad=source_array.requires_grad,
+            )
+            kernel = _gather_shape_attribute if source_array.ndim == 1 else _gather_shape_attribute_2d
+            wp.launch(kernel, dim=values.shape, inputs=[source_array, indices], outputs=[values])
+            return values
         attrib = self._get_attribute_array(name, source, _slice=_slice)
         if hasattr(attrib, "_staging_array"):
             if hasattr(attrib, "_gather_src"):
@@ -1380,6 +1454,29 @@ class ArticulationView:
     def _set_attribute_values(
         self, name: str, target: Model | State | Control, values, mask=None, _slice: slice | None = None
     ):
+        target_array = self._mapped_shape_attribute(name, target)
+        if target_array is not None:
+            if _slice is not None:
+                raise NotImplementedError("Mapped shape attributes do not support internal slicing")
+            indices = self._shape_indices_global
+            expected_shape = (*indices.shape, *target_array.shape[1:])
+            if not is_array(values) or values.dtype != target_array.dtype:
+                values = wp.array(values, dtype=target_array.dtype, shape=expected_shape, device=self.device)
+            if values.shape != expected_shape:
+                raise ValueError(f"Expected shape {expected_shape}, got {values.shape}")
+            resolved_mask = self.full_mask if mask is None else self._resolve_mask(mask)
+            if resolved_mask.ndim == 1:
+                resolved_mask = wp.array(
+                    ptr=resolved_mask.ptr,
+                    dtype=bool,
+                    shape=(self.world_count, self.count_per_world),
+                    strides=(resolved_mask.strides[0], 0),
+                    device=self.device,
+                    copy=False,
+                )
+            kernel = _scatter_shape_attribute if target_array.ndim == 1 else _scatter_shape_attribute_2d
+            wp.launch(kernel, dim=values.shape, inputs=[values, indices, resolved_mask], outputs=[target_array])
+            return
         attrib = self._get_attribute_array(name, target, _slice=_slice)
 
         if not is_array(values) or values.dtype != attrib.dtype:
