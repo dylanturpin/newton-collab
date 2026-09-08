@@ -5435,6 +5435,49 @@ def build_propagation_contact_rows(
             propagation_row_restitution[world, row_idx] = 0.0
 
 
+@wp.func
+def _transport_warmstart_contact(
+    normal: wp.vec3,
+    previous_normal: wp.vec3,
+    world: int,
+    slot: int,
+    count: int,
+    row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    row_mu: wp.array2d[float],
+    impulses: wp.array2d[float],
+):
+    """Transport the cached tangent frame and enforce the current contact cone."""
+    normal_impulse = impulses[world, slot]
+    if not wp.isfinite(normal_impulse) or wp.dot(normal, previous_normal) <= 0.0:
+        normal_impulse = 0.0
+    normal_impulse = wp.max(normal_impulse, 0.0)
+    impulses[world, slot] = normal_impulse
+    if slot + 2 >= count:
+        return
+    if (
+        row_type[world, slot + 1] != PGS_CONSTRAINT_TYPE_FRICTION
+        or row_type[world, slot + 2] != PGS_CONSTRAINT_TYPE_FRICTION
+        or row_parent[world, slot + 1] != slot
+        or row_parent[world, slot + 2] != slot
+    ):
+        return
+
+    # Collision normals are A-to-B; every contact Jacobian uses B-to-A.
+    old_t0, old_t1 = contact_tangent_basis(-previous_normal)
+    new_t0, new_t1 = contact_tangent_basis(-normal)
+    tangent_world = impulses[world, slot + 1] * old_t0 + impulses[world, slot + 2] * old_t1
+    tangent = wp.vec2(wp.dot(tangent_world, new_t0), wp.dot(tangent_world, new_t1))
+    magnitude = wp.length(tangent)
+    radius = wp.max(row_mu[world, slot + 1] * normal_impulse, 0.0)
+    if not wp.isfinite(magnitude) or radius <= 0.0:
+        tangent = wp.vec2(0.0)
+    elif magnitude > radius:
+        tangent *= radius / magnitude
+    impulses[world, slot + 1] = tangent[0]
+    impulses[world, slot + 2] = tangent[1]
+
+
 @wp.kernel
 def gather_mf_warmstart(
     contact_count: wp.array[int],
@@ -5449,6 +5492,9 @@ def gather_mf_warmstart(
     mf_constraint_count: wp.array[int],
     mf_row_type: wp.array2d[int],  # THIS step's row types (already built)
     mf_row_parent: wp.array2d[int],
+    contact_normal: wp.array[wp.vec3],
+    previous_normal: wp.array[wp.vec3],
+    mf_row_mu: wp.array2d[float],
     decay: float,
     dt_scale: float,
     mf_max_c: int,
@@ -5521,6 +5567,48 @@ def gather_mf_warmstart(
                 ):
                     mf_impulses[world, new_r] = decay * dt_scale * prev_mf_impulses[world, prev_r]
                 # else: leave 0
+
+    if mi >= 0 and prev_slot >= 0 and prev_slot < mf_max_c:
+        _transport_warmstart_contact(
+            contact_normal[c],
+            previous_normal[mi],
+            world,
+            new_slot,
+            count,
+            mf_row_type,
+            mf_row_parent,
+            mf_row_mu,
+            mf_impulses,
+        )
+
+
+@wp.kernel
+def snapshot_contact_warmstart(
+    contact_count: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_normal: wp.array[wp.vec3],
+    previous_dense_slot: wp.array[int],
+    previous_mf_slot: wp.array[int],
+    previous_propagation_slot: wp.array[int],
+    previous_normal: wp.array[wp.vec3],
+):
+    """Save all contact routes and live normals in one launch."""
+    contact = wp.tid()
+    count = contact_count[0]
+    active = contact < count and count <= contact_normal.shape[0]
+    path = int(-1)
+    slot = int(-1)
+    if active:
+        path = contact_path[contact]
+        slot = contact_slot[contact]
+        previous_normal[contact] = contact_normal[contact]
+    if contact < previous_dense_slot.shape[0]:
+        previous_dense_slot[contact] = wp.where(path == 0, slot, -1)
+    if contact < previous_mf_slot.shape[0]:
+        previous_mf_slot[contact] = wp.where(path == 1, slot, -1)
+    if contact < previous_propagation_slot.shape[0]:
+        previous_propagation_slot[contact] = wp.where(path == 2, slot, -1)
 
 
 @wp.kernel
@@ -5607,6 +5695,9 @@ def gather_dense_warmstart(
     world_constraint_count: wp.array[int],
     world_row_type: wp.array2d[int],  # THIS step's dense row types (already built)
     world_row_parent: wp.array2d[int],
+    contact_normal: wp.array[wp.vec3],
+    previous_normal: wp.array[wp.vec3],
+    world_row_mu: wp.array2d[float],
     decay: float,
     dt_scale: float,
     max_constraints: int,
@@ -5674,6 +5765,19 @@ def gather_dense_warmstart(
                 ):
                     world_impulses[world, new_r] = decay * dt_scale * prev_dense_impulses[world, prev_r]
 
+    if mi >= 0 and prev_slot >= 0 and prev_slot < max_constraints:
+        _transport_warmstart_contact(
+            contact_normal[c],
+            previous_normal[mi],
+            world,
+            new_slot,
+            count,
+            world_row_type,
+            world_row_parent,
+            world_row_mu,
+            world_impulses,
+        )
+
 
 @wp.kernel
 def gather_propagation_warmstart(
@@ -5689,6 +5793,9 @@ def gather_propagation_warmstart(
     constraint_count: wp.array[int],
     row_type: wp.array2d[int],
     row_parent: wp.array2d[int],
+    contact_normal: wp.array[wp.vec3],
+    previous_normal: wp.array[wp.vec3],
+    row_mu: wp.array2d[float],
     decay: float,
     dt_scale: float,
     max_constraints: int,
@@ -5734,6 +5841,19 @@ def gather_propagation_warmstart(
             and prev_row_parent[world, prev_r] == prev_slot
         ):
             impulses[world, new_r] = decay * dt_scale * prev_impulses[world, prev_r]
+
+    if mi >= 0 and prev_slot >= 0 and prev_slot < max_constraints:
+        _transport_warmstart_contact(
+            contact_normal[c],
+            previous_normal[mi],
+            world,
+            new_slot,
+            count,
+            row_type,
+            row_parent,
+            row_mu,
+            impulses,
+        )
 
 
 @wp.kernel
