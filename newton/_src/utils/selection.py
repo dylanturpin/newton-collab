@@ -1429,7 +1429,7 @@ class ArticulationView:
                 requires_grad=source_array.requires_grad,
             )
             kernel = _gather_shape_attribute if source_array.ndim == 1 else _gather_shape_attribute_2d
-            wp.launch(kernel, dim=values.shape, inputs=[source_array, indices], outputs=[values])
+            wp.launch(kernel, dim=values.shape, inputs=[source_array, indices], outputs=[values], device=self.device)
             return values
         attrib = self._get_attribute_array(name, source, _slice=_slice)
         if hasattr(attrib, "_staging_array"):
@@ -1475,7 +1475,13 @@ class ArticulationView:
                     copy=False,
                 )
             kernel = _scatter_shape_attribute if target_array.ndim == 1 else _scatter_shape_attribute_2d
-            wp.launch(kernel, dim=values.shape, inputs=[values, indices, resolved_mask], outputs=[target_array])
+            wp.launch(
+                kernel,
+                dim=values.shape,
+                inputs=[values, indices, resolved_mask],
+                outputs=[target_array],
+                device=self.device,
+            )
             return
         attrib = self._get_attribute_array(name, target, _slice=_slice)
 
