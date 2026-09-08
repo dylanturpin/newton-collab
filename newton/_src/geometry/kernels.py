@@ -327,7 +327,9 @@ def sdf_box_grad(point: wp.vec3, hx: float, hy: float, hz: float):
         hz [m]: Half-extent along Z.
 
     Returns:
-        Unit-length (or axis-aligned) outward gradient direction.
+        Unit-length (or axis-aligned) outward gradient direction. Where the gradient is
+        not unique (inside on the medial surface, equidistant from several faces) the
+        normal of a nearest face is returned, ties resolving to X, then Y, then Z.
     """
     qx = abs(point[0]) - hx
     qy = abs(point[1]) - hy
@@ -341,19 +343,17 @@ def sdf_box_grad(point: wp.vec3, hx: float, hy: float, hz: float):
 
         return wp.normalize(point - wp.vec3(x, y, z))
 
-    sx = wp.sign(point[0])
-    sy = wp.sign(point[1])
-    sz = wp.sign(point[2])
+    # interior: the outward gradient is the normal of a nearest face, an axis attaining
+    # max(qx, qy, qz). Any tied axis is valid, so ties resolve to X, then Y; a strict
+    # cascade would instead fall through to a strictly farther face on qx == qy > qz.
+    sx = wp.where(point[0] >= 0.0, 1.0, -1.0)
+    sy = wp.where(point[1] >= 0.0, 1.0, -1.0)
+    sz = wp.where(point[2] >= 0.0, 1.0, -1.0)
 
-    # x projection
-    if (qx > qy and qx > qz) or (qy == 0.0 and qz == 0.0):
+    if qx >= qy and qx >= qz:
         return wp.vec3(sx, 0.0, 0.0)
-
-    # y projection
-    if (qy > qx and qy > qz) or (qx == 0.0 and qz == 0.0):
+    if qy >= qz:
         return wp.vec3(0.0, sy, 0.0)
-
-    # z projection
     return wp.vec3(0.0, 0.0, sz)
 
 

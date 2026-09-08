@@ -271,6 +271,50 @@ def test_box_manifold_is_supporting_corners_only(test, device):
     test.assertAlmostEqual(float(sep[0]), -PEN, delta=1.0e-4)
 
 
+def test_box_face_tie_reacts_along_nearest_face(test, device):
+    """Verify a vertex equidistant from two box faces reacts along one of them.
+
+    The box SDF gradient used to fall through to the strictly farther Z face on a
+    ``qx == qy > qz`` tie, emitting a contact whose box witness sat strictly inside
+    the box and whose normal pushed along Z although X and Y are the nearest faces.
+    """
+    builder = newton.ModelBuilder()
+    cfg = newton.ModelBuilder.ShapeConfig(gap=1.0e-3)
+    # the first vertex is 10 mm inside the box, exactly equidistant from the +X and
+    # +Y faces and 95 mm from the +Z face; the others rest on the +X and +Y faces
+    verts = np.array([[0.09, 0.09, 0.005], [0.1, 0.08, 0.02], [0.08, 0.1, -0.02]], dtype=np.float32)
+    tris = np.array([0, 2, 1], dtype=np.int32)
+    builder.add_shape_mesh(body=-1, mesh=newton.Mesh(verts, tris, compute_inertia=False), cfg=cfg)
+    body = builder.add_body(xform=wp.transform_identity())
+    box_shape = builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(
+        model, broad_phase="nxn", rigid_contact_max=64, reduce_contacts=False, _analytic_mesh_features=EXACT
+    )
+    state = model.state()
+    contacts = pipeline.contacts()
+    n, sep, normal = _contacts(pipeline, state, contacts)
+
+    test.assertGreater(n, 0)
+    test.assertAlmostEqual(float(np.min(sep)), -0.01, delta=1.0e-4)
+    test.assertTrue(
+        np.all(np.abs(normal[:, 2]) < 1.0e-4),
+        msg=f"every reaction must be along a nearest X or Y face, got normals {normal}",
+    )
+
+    # every box witness lies on the box surface (the box body sits at the world origin)
+    shape0 = contacts.rigid_contact_shape0.numpy()[:n]
+    p0 = contacts.rigid_contact_point0.numpy()[:n]
+    p1 = contacts.rigid_contact_point1.numpy()[:n]
+    box_witness = np.where((shape0 == box_shape)[:, None], p0, p1)
+    np.testing.assert_allclose(
+        np.max(np.abs(box_witness), axis=1),
+        0.1,
+        atol=1.0e-4,
+        err_msg=f"box witnesses must lie on the surface, got {box_witness}",
+    )
+
+
 def _cube_on_primitive(device, geo, scale, features, subdiv, reduce_contacts=True):
     """A closed mesh cube resting ``PEN`` on the primitive's topmost point."""
     builder = newton.ModelBuilder()
