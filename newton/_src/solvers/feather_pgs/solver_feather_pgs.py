@@ -3231,6 +3231,7 @@ class SolverFeatherPGS(SolverBase):
             self._fa_prev_anchor_b = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
             self._fa_prev_valid = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
             self._fa_prev_world = wp.full((max_contacts,), -1, dtype=wp.int32, device=device)
+            self._fa_last_collide_serial: int | None = None
         else:
             self._fa_anchor_a = self._fa_anchor_b = self._fa_valid = None
             self._fa_prev_anchor_a = self._fa_prev_anchor_b = self._fa_prev_valid = self._fa_prev_world = None
@@ -8106,7 +8107,16 @@ class SolverFeatherPGS(SolverBase):
 
             if self._friction_anchors_enabled:
                 # Carry anchors by contact identity and compute this step's tangential
-                # anchor separation before any row builder reads ``_fa_phi``.
+                # anchor separation before any row builder reads ``_fa_phi``. A solve that
+                # reuses the previous collide's contacts (Isaac Lab collides once per
+                # environment step and substeps on the same buffer) must not re-apply
+                # ``rigid_contact_match_index``: the carried anchors are already in this
+                # frame's contact order. The host-side serial is baked at capture time,
+                # like the mass-update cadence, so a graph over whole environment steps
+                # replays the right pattern.
+                serial = getattr(contacts, "collide_serial", None)
+                use_match_index = 1 if serial is None or serial != self._fa_last_collide_serial else 0
+                self._fa_last_collide_serial = serial
                 wp.launch(
                     update_friction_anchors,
                     dim=contacts.rigid_contact_max,
@@ -8126,6 +8136,7 @@ class SolverFeatherPGS(SolverBase):
                         self._fa_prev_anchor_b,
                         self._fa_prev_valid,
                         model.shape_gap,
+                        use_match_index,
                     ],
                     outputs=[self._fa_anchor_a, self._fa_anchor_b, self._fa_valid, self._fa_phi],
                     device=model.device,

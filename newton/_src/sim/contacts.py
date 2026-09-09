@@ -483,6 +483,15 @@ class Contacts:
         self.rigid_contact_max = rigid_contact_max
         self.soft_contact_max = soft_contact_max
 
+        self.collide_serial = 0
+        """Host-side count of :meth:`CollisionPipeline.collide` calls that wrote this buffer.
+
+        Solvers that carry per-contact state across steps by ``rigid_contact_match_index``
+        use it to recognize a solver substep that reuses the previous collide's contacts
+        (e.g. Isaac Lab collides once per environment step): the match indices then still
+        refer to the frame *before* that collide, while the carried state is already in
+        this frame's contact order, so the identity mapping is the exact one."""
+
         self.rigid_contacts_pair_sorted = False
         """Provenance: whether the pipeline that last wrote this buffer sorts
         contacts into contiguous same-shape-pair runs (deterministic sort or

@@ -90,7 +90,9 @@ _SQUEEZE_SOLVER = {
 }
 
 
-def _run_squeeze(tilt_deg: float, steps: int, dt: float = 0.005, matching: str = "latest", **solver_kwargs):
+def _run_squeeze(
+    tilt_deg: float, steps: int, dt: float = 0.005, matching: str = "latest", substeps: int = 1, **solver_kwargs
+):
     """Return the box's z drift relative to the jaws (m, positive = up) and the solver."""
     model, jaws, box = _build_v_jaws(tilt_deg)
     kwargs = dict(_SQUEEZE_SOLVER)
@@ -103,10 +105,11 @@ def _run_squeeze(tilt_deg: float, steps: int, dt: float = 0.005, matching: str =
     newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
     rel = []
     for _ in range(steps):
-        pipeline.collide(s0, contacts)
-        s0.clear_forces()
-        solver.step(s0, s1, control, contacts, dt)
-        s0, s1 = s1, s0
+        pipeline.collide(s0, contacts)  # once per environment step; substeps reuse the buffer
+        for _sub in range(substeps):
+            s0.clear_forces()
+            solver.step(s0, s1, control, contacts, dt / substeps)
+            s0, s1 = s1, s0
         bq = s0.body_q.numpy()
         rel.append(bq[box][2] - bq[jaws[0]][2])
     rel = np.asarray(rel)
@@ -214,6 +217,10 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         # sticky matching replays body-local witness points; anchors must still hold
         drift_sticky, _, _ = _run_squeeze(5.0, steps, matching="sticky", friction_anchor_beta=0.2)
         self.assertLess(abs(drift_sticky), 1.0e-4, f"anchored pinch (sticky matching) drifted {drift_sticky:.2e} m")
+        # two solver substeps on one collide per environment step (Isaac Lab's loop): anchors
+        # must map 1:1 on the reused buffer, not through the stale match index
+        drift_sub, _, _ = _run_squeeze(5.0, steps, substeps=2, friction_anchor_beta=0.2)
+        self.assertLess(abs(drift_sub), 1.0e-4, f"anchored pinch with 2 substeps per collide drifted {drift_sub:.2e} m")
         flat_on, _, _ = _run_squeeze(0.0, steps, friction_anchor_beta=0.05)
         self.assertLess(abs(flat_on), 1.0e-4)
         self.assertLess(abs(flat_off), 1.0e-4)
@@ -333,6 +340,7 @@ def _launch_anchor_update(
     body_q=None,
     normal=(0.0, 0.0, -1.0),
     shape_gap=(0.0025, 0.0025),
+    use_match_index=1,
 ):
     """Drive ``update_friction_anchors`` on ``len(point0)`` contacts between shape 0 (body 0) and
     shape 1 (body 1); returns (anchor_a, anchor_b, valid, phi) arrays."""
@@ -365,6 +373,7 @@ def _launch_anchor_update(
             prev_b,
             prev_valid,
             wp.array(list(shape_gap), dtype=wp.float32, device=device),
+            int(use_match_index),
         ],
         outputs=list(outs),
         device=device,
@@ -639,6 +648,34 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
         )
         np.testing.assert_array_equal(valid_lost.numpy(), [1, 1, 1])
         np.testing.assert_allclose(phi_lost.numpy(), 0.0, atol=1.0e-9)
+
+    def test_substep_reuse_maps_anchors_one_to_one(self):
+        """On a solve that reuses the previous collide's buffer the match index is stale; the
+        carried anchors are already in this frame's order and must be read 1:1."""
+        device = "cpu"
+        aligned = [(0.0, 0.0, 0.0)] * 3, [(0.0, 0.0, -1.0e-3)] * 3
+        prev = _anchor_pairs(device, [1.0e-4, 3.0e-4, 2.0e-4])
+        stale = [2, 0, 1]  # would scramble the pairs if applied
+        _, _, _, phi_id = _launch_anchor_update(
+            device, point0=aligned[0], point1=aligned[1], match_index=stale, prev=prev, use_match_index=0
+        )
+        np.testing.assert_allclose(np.linalg.norm(phi_id.numpy(), axis=1), [1.0e-4, 3.0e-4, 2.0e-4], atol=1.0e-9)
+        _, _, _, phi_m = _launch_anchor_update(
+            device, point0=aligned[0], point1=aligned[1], match_index=stale, prev=prev, use_match_index=1
+        )
+        np.testing.assert_allclose(np.linalg.norm(phi_m.numpy(), axis=1), [2.0e-4, 1.0e-4, 3.0e-4], atol=1.0e-9)
+
+    def test_collide_serial_advances_per_collide(self):
+        """The pipeline stamps every collide so a solver can tell a reused buffer from a new frame."""
+        model, _, _ = _build_v_jaws(0.0)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, broad_phase="nxn", contact_matching="latest")
+        contacts = pipeline.contacts()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        self.assertEqual(contacts.collide_serial, 0)
+        pipeline.collide(state, contacts)
+        pipeline.collide(state, contacts)
+        self.assertEqual(contacts.collide_serial, 2)
 
     def test_separation_beyond_contact_detection_distance_reanchors(self):
         """The stale-anchor guard is the pair's contact detection distance (``shape_gap[a] +

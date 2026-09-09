@@ -1659,6 +1659,7 @@ def update_friction_anchors(
     prev_anchor_b: wp.array[wp.vec3],
     prev_valid: wp.array[int],
     shape_gap: wp.array[float],
+    use_match_index: int,
     # outputs
     anchor_a: wp.array[wp.vec3],
     anchor_b: wp.array[wp.vec3],
@@ -1683,7 +1684,10 @@ def update_friction_anchors(
     is pulled back next step, bounding the error at roughly one step's leak.
 
     Identity comes from the collision pipeline's ``rigid_contact_match_index``
-    (current sorted contact -> previous sorted contact). Unmatched contacts,
+    (current sorted contact -> previous sorted contact); a substep that reuses the
+    previous collide's buffer (``use_match_index == 0``) keeps the 1:1 mapping
+    instead, because the match indices still refer to the frame before that
+    collide while the carried anchors are already in this frame's order. Unmatched contacts,
     contacts whose previous anchor was invalidated (see
     :func:`mark_sliding_friction_anchors`), and anchors whose tangential
     separation exceeds the pair's contact detection distance
@@ -1720,7 +1724,11 @@ def update_friction_anchors(
     if shape_b >= 0:
         reset_distance += shape_gap[shape_b]
 
-    mi = match_index[c]
+    # ``use_match_index == 0``: this solve reuses the previous collide's contact buffer (a
+    # substep), so the carried state is already in this frame's order and maps 1:1.
+    mi = int(c)
+    if use_match_index != 0:
+        mi = match_index[c]
     if mi >= 0 and mi < prev_valid.shape[0]:
         if prev_valid[mi] != 0:
             anchor_a_local = prev_anchor_a[mi]
