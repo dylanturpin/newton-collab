@@ -1386,6 +1386,124 @@ def apply_free_root_transport_to_predictor(
     v_hat[d + 2] = v_hat[d + 2] + c[2] * dt
 
 
+@wp.func
+def _gyro_skew(v: wp.vec3):
+    return wp.mat33(0.0, -v[2], v[1], v[2], 0.0, -v[0], -v[1], v[0], 0.0)
+
+
+@wp.func
+def _gyroscopic_velocity(inertia: wp.mat33, effective_inertia: wp.mat33, omega: wp.vec3, predicted: wp.vec3, dt: float):
+    """Replace the explicit gyroscopic kick with energy-preserving Cayley updates.
+
+    Every solve has the form ``(A-S) w = (A+S) u``, with symmetric positive
+    definite ``A`` and skew ``S``. Thus ``w.T A w == u.T A u`` independently
+    of fixed-point convergence. Updating S from the midpoint approximates
+    implicit midpoint without an unconverged Newton step injecting energy.
+    External torque remains in u; only the gyroscopic kick is replaced.
+    """
+    scale = wp.max(effective_inertia[0, 0], wp.max(effective_inertia[1, 1], effective_inertia[2, 2]))
+    a = effective_inertia / scale
+    physical = inertia / scale
+    inverse = wp.inverse(a)
+    u = predicted + dt * (inverse * wp.cross(omega, physical * omega))
+    # An energy bound on angular speed chooses inexpensive local gyro
+    # microsteps. Geometry and the constraint solver still run once per step.
+    # The fixed cap bounds work; energy preservation does not depend on it.
+    speed_bound = wp.sqrt(wp.max(wp.dot(u, a * u) * wp.trace(inverse), 0.0))
+    microsteps = wp.int32(wp.clamp(wp.ceil(2.0 * wp.abs(dt) * speed_bound), 1.0, 32.0))
+    h = dt / float(microsteps)
+    w = u
+    for _ in range(microsteps):
+        u = w
+        energy = wp.dot(u, a * u)
+        for _iteration in range(8):
+            s = (0.5 * h) * _gyro_skew(physical * (0.5 * (u + w)))
+            candidate = wp.inverse(a - s) * ((a + s) * u)
+            delta = candidate - w
+            w = candidate
+            if wp.dot(delta, a * delta) <= 1.0e-12 * energy:
+                break
+    return w
+
+
+@wp.kernel
+def apply_free_root_velocity_corrections(
+    free_root_joint_indices: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_child: wp.array[int],
+    body_to_articulation: wp.array[int],
+    is_free_rigid: wp.array[int],
+    art_group_index: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_inertia: wp.array[wp.mat33],
+    cholesky: wp.array3d[float],
+    joint_qd: wp.array[float],
+    dt: float,
+    requires_grad: bool,
+    v_hat: wp.array[float],
+):
+    """Fuse free-root transport with the isolated rigid-body gyroscopic update."""
+    root_index = wp.tid()
+    d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, root_index)
+    if d < 0:
+        return
+    v = wp.vec3(joint_qd[d + 0], joint_qd[d + 1], joint_qd[d + 2])
+    w = wp.vec3(joint_qd[d + 3], joint_qd[d + 4], joint_qd[d + 5])
+    c = wp.cross(w, v)
+    v_hat[d + 0] = v_hat[d + 0] + c[0] * dt
+    v_hat[d + 1] = v_hat[d + 1] + c[1] * dt
+    v_hat[d + 2] = v_hat[d + 2] + c[2] * dt
+
+    body = joint_child[free_root_joint_indices[root_index]]
+    art = body_to_articulation[body]
+    if is_free_rigid[art] == 0:
+        return
+    predicted_world = wp.vec3(v_hat[d + 3], v_hat[d + 4], v_hat[d + 5])
+    if not requires_grad:
+        # A stationary angular predictor has no gyroscopic work to do.
+        if (
+            w[0] == 0.0
+            and w[1] == 0.0
+            and w[2] == 0.0
+            and predicted_world[0] == 0.0
+            and predicted_world[1] == 0.0
+            and predicted_world[2] == 0.0
+        ):
+            return
+    inertia = body_inertia[body]
+    if not requires_grad:
+        # Isotropic inertia has identically zero gyroscopic bias. Preserve
+        # its predictor exactly and avoid local solves for spheres and cubes.
+        # The derivative with respect to inertia need not vanish here.
+        if (
+            inertia[0, 0] == inertia[1, 1]
+            and inertia[1, 1] == inertia[2, 2]
+            and inertia[0, 1] == 0.0
+            and inertia[0, 2] == 0.0
+            and inertia[1, 0] == 0.0
+            and inertia[1, 2] == 0.0
+            and inertia[2, 0] == 0.0
+            and inertia[2, 1] == 0.0
+        ):
+            return
+    group = art_group_index[art]
+    # At the root COM, translation and rotation decouple. The angular
+    # Cholesky block includes armature and the factorization's pivot floor.
+    lower = wp.mat33(0.0)
+    for r in range(3):
+        for c in range(r + 1):
+            lower[r, c] = cholesky[group, r + 3, c + 3]
+    rotation = wp.transform_get_rotation(body_q[body])
+    basis = wp.quat_to_matrix(rotation)
+    effective = wp.transpose(basis) * (lower * wp.transpose(lower)) * basis
+    omega = wp.quat_rotate_inv(rotation, w)
+    predicted = wp.quat_rotate_inv(rotation, predicted_world)
+    corrected = wp.quat_rotate(rotation, _gyroscopic_velocity(inertia, effective, omega, predicted, dt))
+    for k in range(3):
+        v_hat[d + 3 + k] = corrected[k]
+
+
 @wp.kernel
 def remove_free_root_transport_from_qdd(
     free_root_joint_indices: wp.array[int],
