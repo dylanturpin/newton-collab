@@ -6,7 +6,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION, update_friction_anchors
 
 _MU_JAW, _MU_BOX = 5.0, 0.5
 _BOX_HALF, _JAW_HALF_T, _GAP0 = 0.02, 0.005, 0.001
@@ -80,13 +80,13 @@ _SQUEEZE_SOLVER = {
 }
 
 
-def _run_squeeze(tilt_deg: float, steps: int, dt: float = 0.005, **solver_kwargs):
+def _run_squeeze(tilt_deg: float, steps: int, dt: float = 0.005, matching: str = "latest", **solver_kwargs):
     """Return the box's z drift relative to the jaws (m, positive = up) and the solver."""
     model, jaws, box = _build_v_jaws(tilt_deg)
     kwargs = dict(_SQUEEZE_SOLVER)
     kwargs.update(solver_kwargs)
     solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn", contact_matching="latest")
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn", contact_matching=matching)
     contacts = pipeline.contacts()
     s0, s1 = model.state(), model.state()
     control = model.control()
@@ -201,6 +201,9 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         valid = solver_on._fa_valid.numpy()
         self.assertGreater(int(valid.sum()), 0)
         flat_off, _, _ = _run_squeeze(0.0, steps)
+        # sticky matching replays body-local witness points; anchors must still hold
+        drift_sticky, _, _ = _run_squeeze(5.0, steps, matching="sticky", friction_anchor_beta=0.2)
+        self.assertLess(abs(drift_sticky), 1.0e-4, f"anchored pinch (sticky matching) drifted {drift_sticky:.2e} m")
         flat_on, _, _ = _run_squeeze(0.0, steps, friction_anchor_beta=0.05)
         self.assertLess(abs(flat_on), 1.0e-4)
         self.assertLess(abs(flat_off), 1.0e-4)
@@ -249,6 +252,113 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         bq = s0.body_q.numpy()
         self.assertTrue(np.all(np.isfinite(bq)))
         self.assertLess(abs(bq[box][2] - bq[jaws[0]][2]), 0.01)
+
+
+def _launch_anchor_update(device, *, point0, point1, match_index, prev, shape_body=(0, 1), body_q=None):
+    """Drive ``update_friction_anchors`` on one contact; returns (anchor_a, anchor_b, valid, phi) arrays."""
+    if body_q is None:
+        body_q = [wp.transform_identity(), wp.transform_identity()]
+    n = 1
+    outs = (
+        wp.zeros(n, dtype=wp.vec3, device=device),
+        wp.zeros(n, dtype=wp.vec3, device=device),
+        wp.zeros(n, dtype=wp.int32, device=device),
+        wp.zeros(n, dtype=wp.vec2, device=device),
+    )
+    prev_a, prev_b, prev_valid = prev
+    wp.launch(
+        update_friction_anchors,
+        dim=n,
+        inputs=[
+            wp.array([n], dtype=wp.int32, device=device),
+            wp.array([wp.vec3(*point0)], dtype=wp.vec3, device=device),
+            wp.array([wp.vec3(*point1)], dtype=wp.vec3, device=device),
+            wp.array([wp.vec3(0.0, 0.0, -1.0)], dtype=wp.vec3, device=device),  # A-to-B; solver normal = +z
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([1], dtype=wp.int32, device=device),
+            wp.zeros(n, dtype=wp.float32, device=device),
+            wp.zeros(n, dtype=wp.float32, device=device),
+            wp.array([match_index], dtype=wp.int32, device=device),
+            wp.array(list(shape_body), dtype=wp.int32, device=device),
+            wp.array(body_q, dtype=wp.transform, device=device),
+            prev_a,
+            prev_b,
+            prev_valid,
+            0.005,
+        ],
+        outputs=list(outs),
+        device=device,
+    )
+    return outs
+
+
+def _build_two_world_free_model(device):
+    template = newton.ModelBuilder(gravity=0.0)
+    body = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    joint = template.add_joint_free(parent=-1, child=body)
+    template.add_articulation([joint])
+    builder = newton.ModelBuilder(gravity=0.0)
+    builder.replicate(template, 2)
+    return builder.finalize(device=device)
+
+
+class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
+    """Device-agnostic checks of the anchor bookkeeping (run on CPU)."""
+
+    def test_reanchor_is_tangentially_aligned_for_replayed_witness_points(self):
+        """Sticky matching replays body-local witness points, so after a slip the pair carries the
+        old tangential offset. Re-anchoring must not save that offset: a re-anchored contact held
+        stationary reports zero tangential separation on the next step."""
+        device = "cpu"
+        # witness points 0.1 mm apart tangentially (x) and 1 mm apart along the normal (z)
+        point0, point1 = (1.0e-4, 0.0, 0.0), (0.0, 0.0, -1.0e-3)
+        empty = (
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=wp.int32, device=device),  # previous anchor invalidated
+        )
+        a, b, valid, phi = _launch_anchor_update(device, point0=point0, point1=point1, match_index=0, prev=empty)
+        self.assertEqual(int(valid.numpy()[0]), 1)
+        np.testing.assert_allclose(phi.numpy()[0], 0.0, atol=1.0e-9)
+        # the stored pair is aligned along the normal: no tangential separation
+        sep = a.numpy()[0] - b.numpy()[0]
+        np.testing.assert_allclose(sep[:2], 0.0, atol=1.0e-9)
+        # next step, same replayed points, matched to the pair just stored -> still zero
+        _, _, valid2, phi2 = _launch_anchor_update(
+            device, point0=point0, point1=point1, match_index=0, prev=(a, b, valid)
+        )
+        self.assertEqual(int(valid2.numpy()[0]), 1)
+        np.testing.assert_allclose(phi2.numpy()[0], 0.0, atol=1.0e-9)
+        # a genuine 0.2 mm tangential move of body A after anchoring is reported
+        moved = [wp.transform(wp.vec3(2.0e-4, 0.0, 0.0), wp.quat_identity()), wp.transform_identity()]
+        _, _, _, phi3 = _launch_anchor_update(
+            device, point0=point0, point1=point1, match_index=0, prev=(a, b, valid), body_q=moved
+        )
+        self.assertAlmostEqual(float(np.linalg.norm(phi3.numpy()[0])), 2.0e-4, places=9)
+
+    def test_reset_clears_anchor_history_full_and_masked(self):
+        """``reset()`` drops carried anchors of the selected worlds even with warm start disabled."""
+        device = "cpu"
+        model = _build_two_world_free_model(device)
+        solver = newton.solvers.SolverFeatherPGS(
+            model, pgs_mode="split", friction_anchor_beta=0.2, dense_max_constraints=4, mf_max_constraints=4
+        )
+        self.assertFalse(solver.pgs_warmstart)
+        n = solver._fa_prev_valid.shape[0]
+        worlds = np.arange(n, dtype=np.int32) % 2
+        for mask, expect_cleared in (
+            (None, (True, True)),
+            ((True, False), (True, False)),
+            ((False, True), (False, True)),
+        ):
+            solver._fa_prev_valid.fill_(1)
+            solver._fa_prev_world.assign(worlds)
+            wm = None if mask is None else wp.array(mask, dtype=wp.bool, device=device)
+            solver.reset(model.state(), wm)
+            valid = solver._fa_prev_valid.numpy()
+            for world, cleared in enumerate(expect_cleared):
+                sel = valid[worlds == world]
+                np.testing.assert_array_equal(sel, 0 if cleared else 1, err_msg=f"mask={mask} world={world}")
 
 
 if __name__ == "__main__":

@@ -1726,17 +1726,36 @@ def update_friction_anchors(
                 friction_phi[c] = wp.vec2(wp.dot(t0, d_t), wp.dot(t1, d_t))
                 return
 
-    # (Re)anchor at the current witness points: zero tangential error this step.
-    a_local = point_a_world
+    # (Re)anchor with zero tangential separation. The two witness points are not
+    # necessarily tangentially aligned -- ``contact_matching="sticky"`` replays the
+    # previous frame's body-local points, so after a slip they carry the old offset
+    # -- so anchor A is projected onto the normal line through anchor B.
+    a_aligned = point_b_world + normal * wp.dot(normal, point_a_world - point_b_world)
+    a_local = a_aligned
     b_local = point_b_world
     if body_a >= 0:
-        a_local = wp.transform_point(wp.transform_inverse(body_q[body_a]), point_a_world)
+        a_local = wp.transform_point(wp.transform_inverse(body_q[body_a]), a_aligned)
     if body_b >= 0:
         b_local = wp.transform_point(wp.transform_inverse(body_q[body_b]), point_b_world)
     anchor_a[c] = a_local
     anchor_b[c] = b_local
     anchor_valid[c] = 1
     friction_phi[c] = wp.vec2(0.0, 0.0)
+
+
+@wp.kernel
+def reset_friction_anchor_history(
+    world_mask: wp.array[wp.bool],
+    prev_world: wp.array[int],
+    prev_valid: wp.array[int],
+):
+    """Drop the carried friction anchors of reset worlds (all worlds for an empty mask)."""
+    c = wp.tid()
+    if world_mask:
+        w = prev_world[c]
+        if w >= 0 and w < world_mask.shape[0] and not world_mask[w]:
+            return
+    prev_valid[c] = 0
 
 
 @wp.kernel

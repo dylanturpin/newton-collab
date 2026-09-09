@@ -151,6 +151,7 @@ from .kernels import (
     refresh_propagation_free_body_qd_from_vout,
     refresh_propagation_tree_body_qd_for_size,
     remove_free_root_transport_from_qdd,
+    reset_friction_anchor_history,
     reset_world_warmstart_buffers,
     rhs_accum_world_par_art,
     scatter_qdd_from_groups,
@@ -1752,10 +1753,11 @@ class SolverFeatherPGS(SolverBase):
         world_mask: wp.array | None = None,
         flags: StateFlags | int | None = None,
     ) -> None:
-        """Clear persistent warm-start state for reset worlds.
+        """Clear persistent warm-start state and friction-anchor history for reset worlds.
 
-        The authored simulation state is preserved. Only solver-owned dense
-        matrix-free, and propagation impulse history is cleared.
+        The authored simulation state is preserved. Only solver-owned dense,
+        matrix-free, and propagation impulse history and the carried friction
+        anchors are cleared.
 
         Args:
             state: Simulation state, which is left unchanged.
@@ -1769,6 +1771,16 @@ class SolverFeatherPGS(SolverBase):
             )
         if self.world_count == 0:
             return
+
+        if self._friction_anchors_enabled:
+            # Anchor history is keyed by previous sorted contact, so the per-world
+            # selection goes through the world each carried contact belonged to.
+            wp.launch(
+                reset_friction_anchor_history,
+                dim=self._fa_prev_valid.shape[0],
+                inputs=[world_mask, self._fa_prev_world, self._fa_prev_valid],
+                device=self.model.device,
+            )
 
         prev_mf_impulses = self._ws_prev_mf_impulses
         if not self.pgs_warmstart and prev_mf_impulses is None:
@@ -3229,9 +3241,10 @@ class SolverFeatherPGS(SolverBase):
             self._fa_prev_anchor_a = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
             self._fa_prev_anchor_b = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
             self._fa_prev_valid = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
+            self._fa_prev_world = wp.full((max_contacts,), -1, dtype=wp.int32, device=device)
         else:
             self._fa_anchor_a = self._fa_anchor_b = self._fa_valid = None
-            self._fa_prev_anchor_a = self._fa_prev_anchor_b = self._fa_prev_valid = None
+            self._fa_prev_anchor_a = self._fa_prev_anchor_b = self._fa_prev_valid = self._fa_prev_world = None
         self._ws_prev_contact_normal = (
             wp.zeros(max_contacts, dtype=wp.vec3, device=device) if self.pgs_warmstart else None
         )
@@ -6637,6 +6650,7 @@ class SolverFeatherPGS(SolverBase):
                     wp.copy(self._fa_prev_anchor_a, self._fa_anchor_a)
                     wp.copy(self._fa_prev_anchor_b, self._fa_anchor_b)
                     wp.copy(self._fa_prev_valid, self._fa_valid)
+                    wp.copy(self._fa_prev_world, self.contact_world)
                 else:
                     self._fa_prev_valid.fill_(0)
 
