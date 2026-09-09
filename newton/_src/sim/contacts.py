@@ -290,15 +290,18 @@ class Contacts:
         self.clear_buffers = clear_buffers
         self._contact_matching_mode: Literal["disabled", "latest", "sticky"] = "disabled"
         with wp.ScopedDevice(device):
-            # One int32[2] array holding two independent contact counts: [0] rigid, [1] soft.
+            # One array holding rigid/soft counts and an internal reduction-loss flag.
             # rigid_contact_count (the [0:1] view) and soft_contact_count (the [1:2] view) index
             # into this same array, so each remains a separate count; they share one array only so
             # a single kernel can reset both to zero in one launch instead of two. The reset
             # happens at the start of every collision pass -- folded into the first kernel that
             # runs, compute_shape_aabbs -- and clear() resets them as well.
-            self.contact_counters = wp.zeros(2, dtype=wp.int32)
+            self.contact_counters = wp.zeros(3, dtype=wp.int32)
             # Sliced view for the rigid counter (no additional allocation)
             self.rigid_contact_count = self.contact_counters[0:1]
+            # Owned by this contact stream, rather than aliased to a pipeline's
+            # mutable reducer counters. Cleared by the ordinary fused reset.
+            self._reduction_overflow = self.contact_counters[2:3]
 
             self.contact_generation = wp.zeros(1, dtype=wp.int32)
             """Device-side generation counter, incremented each time :meth:`clear` is called.

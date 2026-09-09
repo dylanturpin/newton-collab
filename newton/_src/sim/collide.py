@@ -301,6 +301,13 @@ def write_contact_speculative(
 
 
 @wp.kernel(enable_backward=False)
+def _record_reduction_overflow(
+    insert_failures: wp.array[int], buffer_overflows: wp.array[int], overflow: wp.array[int]
+):
+    overflow[0] = int(insert_failures[0] > 0 or buffer_overflows[0] > 0)
+
+
+@wp.kernel(enable_backward=False)
 def compute_shape_aabbs(
     body_q: wp.array[wp.transform],
     shape_transform: wp.array[wp.transform],
@@ -2701,6 +2708,16 @@ class CollisionPipeline:
             max_speculative_extension=max_speculative_extension,
             device=self.device,
         )
+
+        reducer = self.narrow_phase.global_contact_reducer
+        if reducer is not None:
+            wp.launch(
+                _record_reduction_overflow,
+                dim=1,
+                inputs=[reducer.ht_insert_failures, reducer.buffer_overflows, contacts._reduction_overflow],
+                device=self.device,
+                record_tape=False,
+            )
 
         if self.deterministic and self._contact_sorter is not None:
             self._contact_sorter.sort_full(

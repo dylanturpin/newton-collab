@@ -3074,6 +3074,8 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
                 raw_state_0, raw_state_1 = raw_state_1, raw_state_0
                 peak_raw = max(peak_raw, float(np.abs(raw_state_0.body_qd.numpy()).max()))
 
+            solver.check_constraint_capacity()
+            raw_solver.check_constraint_capacity()
             stats = pipe_red._body_pair_reducer.stats()
             self.assertEqual(stats["invariant_violations"], 0, f"trial {trial}")
             self.assertEqual(raw_not_less, 150, f"trial {trial}: reduction increased a count")
