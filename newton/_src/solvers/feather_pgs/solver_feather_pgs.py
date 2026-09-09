@@ -677,6 +677,7 @@ class SolverFeatherPGS(SolverBase):
         same_articulation_contact_gap_gate: float = 0.0,
         articulation_pair_contact_gap_gate: float = 0.0,
         pgs_warmstart_decay: float = 1.0,
+        debug_record_residuals: bool = False,
     ):
         """
         Args:
@@ -986,6 +987,18 @@ class SolverFeatherPGS(SolverBase):
                 Restitution coefficients are averaged across the two shapes after clamping finite values to
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
+            debug_record_residuals (bool, optional): Debug telemetry: record every dense
+                constraint row's pre-update residual ``J.v + rhs`` at each Gauss-Seidel
+                visit into :attr:`pgs_residual_log`, a float32 array of shape
+                ``[world_count * pgs_iterations * dense_max_constraints]`` indexed as
+                ``(world, global_iteration, row)`` and zeroed at the start of every
+                velocity solve. The logged value is the raw residual [m/s or rad/s,
+                depending on the row's Jacobian], taken before contact regularization
+                scales the update. Only the fused GS route records: requires
+                ``pgs_mode="matrix_free"``, and matrix-free (body-pair) rows are not
+                recorded — the log covers dense rows only. Adds a per-visit global store
+                and rebuilds the GS kernel under a distinct name; intended for probe
+                instrumentation, not production runs. Defaults to False.
         """
         super().__init__(model)
 
@@ -1034,6 +1047,7 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError("contact_friction_anchor_limit must be non-negative")
         self.enable_joint_limits = enable_joint_limits
         self.enable_bilateral_preelimination = bool(enable_bilateral_preelimination)
+        self.debug_record_residuals = bool(debug_record_residuals)
         try:
             self.joint_limit_activation_gap = float(joint_limit_activation_gap)
         except (TypeError, ValueError) as exc:
@@ -4081,6 +4095,12 @@ class SolverFeatherPGS(SolverBase):
                     )
 
         self._pgs_solve_mf_gs_kernel = None
+        # Debug telemetry (debug_record_residuals): per-visit dense-row residuals, one
+        # slot per (world, global GS iteration, dense row). Always defined so readers can
+        # test the cap without a hasattr dance; the real buffer is allocated below only
+        # when the flag is on.
+        self._resid_iter_cap = 0
+        self.pgs_residual_log = wp.zeros(1, dtype=wp.float32, device=model.device)
         if (
             self.pgs_mode == "matrix_free"
             and hasattr(self, "mf_meta_packed")
@@ -4109,7 +4129,15 @@ class SolverFeatherPGS(SolverBase):
                 shared_metadata=shared_metadata,
                 skip_local_internal_worlds=self._local_internal_fast_path,
                 local_internal_max_constraints=self._dense_internal_max_rows,
+                record_residuals=self.debug_record_residuals,
             )
+            if self.debug_record_residuals:
+                self._resid_iter_cap = int(self.pgs_iterations)
+                self.pgs_residual_log = wp.zeros(
+                    self.world_count * self._resid_iter_cap * self.dense_max_constraints,
+                    dtype=wp.float32,
+                    device=model.device,
+                )
 
         self._pgs_solve_mf_kernel = None
         if model.device.is_cuda and hasattr(self, "max_mf_bodies") and self.mf_max_constraints > 0:
@@ -4510,6 +4538,10 @@ class SolverFeatherPGS(SolverBase):
         mf_gs_kernel = self._pgs_solve_mf_gs_kernel
         if mf_gs_kernel is None:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
+        if self._resid_iter_cap > 0:
+            # Fresh telemetry per solve: rows skipped this solve must not carry
+            # stale residuals from the previous step into the readback.
+            self.pgs_residual_log.zero_()
 
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
             if (
@@ -4621,6 +4653,8 @@ class SolverFeatherPGS(SolverBase):
                         int(phase_iteration_offset),
                         int(freeze_drive_rows),
                         int(defer_dense_response),
+                        self.pgs_residual_log,
+                        int(self._resid_iter_cap),
                     ],
                     outputs=[self.v_out],
                     block_dim=32,
@@ -15516,6 +15550,7 @@ def _get_pgs_solve_mf_gs_kernel(
     fuse_vel_limits: bool = False,
     skip_local_internal_worlds: bool = False,
     local_internal_max_constraints: int = 0,
+    record_residuals: bool = False,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -16552,6 +16587,18 @@ def _get_pgs_solve_mf_gs_kernel(
     )
     dense_load_start = "load_lo" if fuse_vel_limits else "dense_lo"
 
+    # Optional per-visit residual telemetry (debug_record_residuals): store the
+    # pre-update dense-row residual J.v + rhs into a (world, global_iter, row)
+    # log. Emission-gated so the default generated source carries no extra work.
+    resid_store_code = (
+        f"""
+            if (lane == 0 && global_iter < resid_iter_cap) {{
+                resid_log.data[((size_t)world * (size_t)resid_iter_cap + (size_t)global_iter) * {M_D} + i] = residual;
+            }}"""
+        if record_residuals
+        else ""
+    )
+
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
@@ -16695,7 +16742,7 @@ def _get_pgs_solve_mf_gs_kernel(
 
             float old_impulse = s_lam_dense[i];
             float w = regularize ? world_row_w.data[off_dense + i] : 1.0f;
-            float residual = jv + s_rhs_dense[i];
+            float residual = jv + s_rhs_dense[i];{resid_store_code}
             float delta = -residual / denom * w - (1.0f - w) * old_impulse;
             float new_impulse = old_impulse + omega * delta;
             float delta_impulse = 0.0f;
@@ -17075,6 +17122,8 @@ def _get_pgs_solve_mf_gs_kernel(
         iteration_offset: int,
         freeze_drive_rows: int,
         defer_dense_response: int,
+        resid_log: wp.array[float],
+        resid_iter_cap: int,
         # Output
         v_out: wp.array[float],
     ): ...
@@ -17119,6 +17168,8 @@ def _get_pgs_solve_mf_gs_kernel(
         iteration_offset: int,
         freeze_drive_rows: int,
         defer_dense_response: int,
+        resid_log: wp.array[float],
+        resid_iter_cap: int,
         # Output
         v_out: wp.array[float],
     ):
@@ -17161,6 +17212,8 @@ def _get_pgs_solve_mf_gs_kernel(
             iteration_offset,
             freeze_drive_rows,
             defer_dense_response,
+            resid_log,
+            resid_iter_cap,
             v_out,
         )
 
@@ -17170,6 +17223,8 @@ def _get_pgs_solve_mf_gs_kernel(
     )
     if fuse_vel_limits:
         name += "_fvl"
+    if record_residuals:
+        name += "_resid"
     if not software_pipeline:
         name += "_nopipe"
     if not shared_metadata:

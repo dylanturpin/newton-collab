@@ -4,7 +4,7 @@
 
 ### Added
 
-
+- Add opt-in, behavior-neutral `debug_record_residuals` telemetry to `SolverFeatherPGS`: records every dense constraint row's pre-update residual ``J.v + rhs`` at each Gauss-Seidel visit into `SolverFeatherPGS.pgs_residual_log`, a float32 array indexed `(world, global_iteration, row)` and zeroed at the start of every velocity solve. The value logged is the raw residual, taken before contact regularization scales the update. Requires `pgs_mode="matrix_free"` and covers dense rows only; matrix-free (body-pair) rows are not recorded. Disabled by default; when off, no buffer is allocated, the generated Gauss-Seidel source carries no extra work, and numerics are unchanged. Intended for probe instrumentation rather than production runs — the recording kernel is cached under a distinct name, so enabling it triggers a one-time recompile.
 
 - Add opt-in ``pgs_contact_regularization`` parameter to `SolverFeatherPGS`: a dimensionless proximal regularizer on matrix-free contact rows (position iterations only, never the velocity pass) that makes statically indeterminate normal-force splits unique. A determined support carries ``1/(1+g)`` of the rigid impulse, so nonzero values trade a small predictable resting sag for stable force distributions. Applies to the matrix-free contact routes of ``articulated_contact_response`` "immediate" and "propagation-fused"; pure propagation routings reject a nonzero value. Default 0 is the exact rigid law with an unchanged update.
 - `SolverFeatherPGS` matrix-free warm-start impulses now rescale by the exact step-size ratio ``dt_now/dt_prev`` when the timestep changes between steps (support impulses are proportional to dt); exactly 1 at fixed dt, leaving fixed-timestep behavior unchanged.
