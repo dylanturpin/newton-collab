@@ -6,7 +6,17 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION, update_friction_anchors
+from newton._src.solvers.feather_pgs.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    compute_mf_effective_mass_and_rhs,
+    compute_mf_rhs_bias,
+    compute_propagation_effective_mass_and_rhs,
+    compute_propagation_rhs_bias,
+    compute_world_contact_bias,
+    mark_sliding_friction_anchors,
+    update_friction_anchors,
+)
 
 _MU_JAW, _MU_BOX = 5.0, 0.5
 _BOX_HALF, _JAW_HALF_T, _GAP0 = 0.02, 0.005, 0.001
@@ -224,6 +234,64 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         if n > 0:
             self.assertEqual(int(solver._fa_valid.numpy()[:n].sum()), 0)
 
+    def test_row_builders_store_anchor_separation_per_route(self):
+        """Dense rows: ``phi`` = raw separation, ``row_beta`` = gain. Matrix-free and propagation
+        rows: ``phi`` = gain * separation. Checked against the per-contact anchor state on the
+        dense (immediate), matrix-free (free body) and propagation routes."""
+        beta = 0.3
+
+        def check(model, solver_kwargs, matching="latest", steps=120):
+            solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=beta, **solver_kwargs)
+            pipeline = newton.CollisionPipeline(
+                model, rigid_contact_max=256, broad_phase="nxn", contact_matching=matching
+            )
+            contacts = pipeline.contacts()
+            s0, s1 = model.state(), model.state()
+            control = model.control()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+            for _ in range(steps):
+                pipeline.collide(s0, contacts)
+                s0.clear_forces()
+                solver.step(s0, s1, control, contacts, 0.005)
+                s0, s1 = s1, s0
+            n = int(contacts.rigid_contact_count.numpy()[0])
+            self.assertGreater(n, 0)
+            fa = solver._fa_phi.numpy()[:n]
+            slot = solver.contact_slot.numpy()[:n]
+            path = solver.contact_path.numpy()[:n]
+            checked = {0: 0, 1: 0, 2: 0}
+            for c in range(n):
+                if slot[c] < 0 or path[c] < 0:
+                    continue
+                if path[c] == 0:
+                    rt, ph, rb = solver.row_type.numpy()[0], solver.phi.numpy()[0], solver.row_beta.numpy()[0]
+                    if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
+                        continue
+                    np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], fa[c], rtol=1.0e-6, atol=1.0e-9)
+                    np.testing.assert_allclose(rb[slot[c] + 1 : slot[c] + 3], beta)
+                else:
+                    ph = (solver.mf_phi if path[c] == 1 else solver.propagation_phi).numpy()[0]
+                    rt = (solver.mf_row_type if path[c] == 1 else solver.propagation_row_type).numpy()[0]
+                    if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
+                        continue
+                    np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], beta * fa[c], rtol=1.0e-5, atol=1.0e-9)
+                checked[int(path[c])] += 1
+            return checked
+
+        # dense route: articulated jaws vs free box under immediate response
+        model, _, _ = _build_v_jaws(5.0)
+        c_dense = check(model, _SQUEEZE_SOLVER)
+        self.assertGreater(c_dense[0], 0)
+        # propagation route: same scene, contacts routed to propagation rows
+        model, _, _ = _build_v_jaws(5.0)
+        prop_kwargs = dict(_SQUEEZE_SOLVER, articulated_contact_response="propagation", pgs_contact_regularization=0.0)
+        c_prop = check(model, prop_kwargs)
+        self.assertGreater(c_prop[2], 0)
+        # matrix-free route: free box resting on a static slab
+        model, _, _ = _build_incline(0.0, 0.5)
+        c_mf = check(model, {"pgs_mode": "matrix_free", "pgs_iterations": 16, "pgs_beta": 0.05})
+        self.assertGreater(c_mf[1], 0)
+
     def test_graph_capture_replays(self):
         """Anchor carry is device-side only: two steps capture and replay under a CUDA graph."""
         model, jaws, box = _build_v_jaws(5.0)
@@ -254,11 +322,23 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         self.assertLess(abs(bq[box][2] - bq[jaws[0]][2]), 0.01)
 
 
-def _launch_anchor_update(device, *, point0, point1, match_index, prev, shape_body=(0, 1), body_q=None):
-    """Drive ``update_friction_anchors`` on one contact; returns (anchor_a, anchor_b, valid, phi) arrays."""
+def _launch_anchor_update(
+    device,
+    *,
+    point0,
+    point1,
+    match_index,
+    prev,
+    shape_body=(0, 1),
+    body_q=None,
+    normal=(0.0, 0.0, -1.0),
+    reset_distance=0.005,
+):
+    """Drive ``update_friction_anchors`` on ``len(point0)`` contacts between shape 0 (body 0) and
+    shape 1 (body 1); returns (anchor_a, anchor_b, valid, phi) arrays."""
+    n = len(point0)
     if body_q is None:
         body_q = [wp.transform_identity(), wp.transform_identity()]
-    n = 1
     outs = (
         wp.zeros(n, dtype=wp.vec3, device=device),
         wp.zeros(n, dtype=wp.vec3, device=device),
@@ -271,25 +351,228 @@ def _launch_anchor_update(device, *, point0, point1, match_index, prev, shape_bo
         dim=n,
         inputs=[
             wp.array([n], dtype=wp.int32, device=device),
-            wp.array([wp.vec3(*point0)], dtype=wp.vec3, device=device),
-            wp.array([wp.vec3(*point1)], dtype=wp.vec3, device=device),
-            wp.array([wp.vec3(0.0, 0.0, -1.0)], dtype=wp.vec3, device=device),  # A-to-B; solver normal = +z
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([1], dtype=wp.int32, device=device),
+            wp.array([wp.vec3(*p) for p in point0], dtype=wp.vec3, device=device),
+            wp.array([wp.vec3(*p) for p in point1], dtype=wp.vec3, device=device),
+            wp.array([wp.vec3(*normal)] * n, dtype=wp.vec3, device=device),  # A-to-B; solver uses -normal
+            wp.zeros(n, dtype=wp.int32, device=device),
+            wp.ones(n, dtype=wp.int32, device=device),
             wp.zeros(n, dtype=wp.float32, device=device),
             wp.zeros(n, dtype=wp.float32, device=device),
-            wp.array([match_index], dtype=wp.int32, device=device),
+            wp.array(list(match_index), dtype=wp.int32, device=device),
             wp.array(list(shape_body), dtype=wp.int32, device=device),
             wp.array(body_q, dtype=wp.transform, device=device),
             prev_a,
             prev_b,
             prev_valid,
-            0.005,
+            float(reset_distance),
         ],
         outputs=list(outs),
         device=device,
     )
     return outs
+
+
+def _anchor_pairs(device, offsets):
+    """Previous-frame anchor state: pair ``i`` is body-local ``(offset_i, 0, 0)`` on A and the origin
+    on B (both bodies at identity), i.e. a tangential separation of ``offset_i`` along x."""
+    a = wp.array([wp.vec3(o, 0.0, 0.0) for o in offsets], dtype=wp.vec3, device=device)
+    b = wp.array([wp.vec3(0.0, 0.0, -1.0e-3)] * len(offsets), dtype=wp.vec3, device=device)
+    valid = wp.ones(len(offsets), dtype=wp.int32, device=device)
+    return a, b, valid
+
+
+def _launch_mark_sliding(device, *, slots, paths, impulses, row_type, row_parent, row_mu, valid):
+    """Drive ``mark_sliding_friction_anchors`` on dense-path contacts in one world."""
+    n = len(slots)
+    dummy_f = wp.zeros((1, 1), dtype=wp.float32, device=device)
+    dummy_i = wp.zeros((1, 1), dtype=wp.int32, device=device)
+    dummy_c = wp.zeros((1,), dtype=wp.int32, device=device)
+    wp.launch(
+        mark_sliding_friction_anchors,
+        dim=n,
+        inputs=[
+            wp.array([n], dtype=wp.int32, device=device),
+            wp.zeros(n, dtype=wp.int32, device=device),
+            wp.array(list(slots), dtype=wp.int32, device=device),
+            wp.array(list(paths), dtype=wp.int32, device=device),
+            wp.array([impulses], dtype=wp.float32, device=device),
+            dummy_f,
+            dummy_f,
+            wp.array([len(impulses)], dtype=wp.int32, device=device),
+            dummy_c,
+            dummy_c,
+            wp.array([row_type], dtype=wp.int32, device=device),
+            wp.array([row_parent], dtype=wp.int32, device=device),
+            wp.array([row_mu], dtype=wp.float32, device=device),
+            dummy_i,
+            dummy_i,
+            dummy_f,
+            dummy_i,
+            dummy_i,
+            dummy_f,
+            0.98,
+        ],
+        outputs=[valid],
+        device=device,
+    )
+    return valid.numpy()
+
+
+def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, device="cpu"):
+    """RHS of one world with rows [CONTACT, FRICTION, FRICTION] for one RHS kernel family.
+
+    ``phi`` holds what the row builders store: raw separation for dense rows (paired with
+    ``row_beta``), gain-premultiplied separation for matrix-free and propagation rows.
+    """
+    contact, friction = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+    count = wp.array([3], dtype=wp.int32, device=device)
+    row_type = wp.array([[contact, friction, friction]], dtype=wp.int32, device=device)
+    phi_arr = wp.array([list(phi)], dtype=wp.float32, device=device)
+    zeros3 = lambda: wp.zeros((1, 3), dtype=wp.float32, device=device)  # noqa: E731
+    neg1 = wp.full((1, 3), -1, dtype=wp.int32, device=device)
+    zJ = lambda: wp.zeros((1, 3, 6), dtype=wp.float32, device=device)  # noqa: E731
+    inf = wp.array([float("inf")], dtype=wp.float32, device=device)
+    rhs = zeros3()
+    if family == "dense":
+        wp.launch(
+            compute_world_contact_bias,
+            dim=1,
+            inputs=[
+                count,
+                3,
+                phi_arr,
+                wp.array([list(row_beta)], dtype=wp.float32, device=device),
+                row_type,
+                zeros3(),
+                dt,
+                bias_scale,
+                1.0,
+                1.0,
+                1.0,
+            ],
+            outputs=[rhs, zeros3()],
+            device=device,
+        )
+    elif family == "mf_setup":
+        wp.launch(
+            compute_mf_effective_mass_and_rhs,
+            dim=3,
+            inputs=[
+                count,
+                neg1,
+                neg1,
+                zJ(),
+                zJ(),
+                wp.zeros((1,), dtype=wp.spatial_matrix, device=device),
+                phi_arr,
+                row_type,
+                zeros3(),
+                zeros3(),
+                0,
+                wp.array([-1], dtype=wp.int32, device=device),
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.zeros((1,), dtype=wp.float32, device=device),
+                inf,
+                1.0e-6,
+                pgs_beta,
+                1.0,
+                dt,
+                1.0,
+                0.5,
+                3,
+            ],
+            outputs=[zeros3(), zJ(), zJ(), rhs, zeros3()],
+            device=device,
+        )
+    elif family == "mf_velocity":
+        wp.launch(
+            compute_mf_rhs_bias,
+            dim=3,
+            inputs=[
+                count,
+                neg1,
+                neg1,
+                neg1,
+                neg1,
+                zJ(),
+                zJ(),
+                wp.zeros((1, 1), dtype=wp.int32, device=device),
+                phi_arr,
+                row_type,
+                zeros3(),
+                zeros3(),
+                0,
+                inf,
+                pgs_beta,
+                dt,
+                bias_scale,
+                1.0,
+                wp.zeros((1,), dtype=wp.float32, device=device),
+                wp.zeros((1,), dtype=wp.float32, device=device),
+                0,
+                0,
+                0.5,
+                3,
+            ],
+            outputs=[rhs],
+            device=device,
+        )
+    elif family == "propagation_setup":
+        wp.launch(
+            compute_propagation_effective_mass_and_rhs,
+            dim=3,
+            inputs=[
+                count,
+                neg1,
+                neg1,
+                zJ(),
+                zJ(),
+                wp.zeros((1, 6, 6), dtype=wp.float32, device=device),
+                phi_arr,
+                row_type,
+                zeros3(),
+                wp.zeros((1, 6), dtype=wp.float32, device=device),
+                inf,
+                1.0e-6,
+                pgs_beta,
+                1.0,
+                dt,
+                1.0,
+                0.5,
+                3,
+            ],
+            outputs=[zeros3(), zJ(), zJ(), rhs, zeros3(), zeros3()],
+            device=device,
+        )
+    elif family == "propagation_velocity":
+        wp.launch(
+            compute_propagation_rhs_bias,
+            dim=3,
+            inputs=[
+                count,
+                neg1,
+                neg1,
+                zJ(),
+                zJ(),
+                phi_arr,
+                row_type,
+                zeros3(),
+                inf,
+                pgs_beta,
+                dt,
+                bias_scale,
+                1.0,
+                wp.zeros((1, 6), dtype=wp.float32, device=device),
+                0,
+                0,
+                3,
+            ],
+            outputs=[rhs],
+            device=device,
+        )
+    else:
+        raise ValueError(family)
+    return rhs.numpy()[0]
 
 
 def _build_two_world_free_model(device):
@@ -311,13 +594,13 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
         stationary reports zero tangential separation on the next step."""
         device = "cpu"
         # witness points 0.1 mm apart tangentially (x) and 1 mm apart along the normal (z)
-        point0, point1 = (1.0e-4, 0.0, 0.0), (0.0, 0.0, -1.0e-3)
+        point0, point1 = [(1.0e-4, 0.0, 0.0)], [(0.0, 0.0, -1.0e-3)]
         empty = (
             wp.zeros(1, dtype=wp.vec3, device=device),
             wp.zeros(1, dtype=wp.vec3, device=device),
             wp.zeros(1, dtype=wp.int32, device=device),  # previous anchor invalidated
         )
-        a, b, valid, phi = _launch_anchor_update(device, point0=point0, point1=point1, match_index=0, prev=empty)
+        a, b, valid, phi = _launch_anchor_update(device, point0=point0, point1=point1, match_index=[0], prev=empty)
         self.assertEqual(int(valid.numpy()[0]), 1)
         np.testing.assert_allclose(phi.numpy()[0], 0.0, atol=1.0e-9)
         # the stored pair is aligned along the normal: no tangential separation
@@ -325,16 +608,100 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
         np.testing.assert_allclose(sep[:2], 0.0, atol=1.0e-9)
         # next step, same replayed points, matched to the pair just stored -> still zero
         _, _, valid2, phi2 = _launch_anchor_update(
-            device, point0=point0, point1=point1, match_index=0, prev=(a, b, valid)
+            device, point0=point0, point1=point1, match_index=[0], prev=(a, b, valid)
         )
         self.assertEqual(int(valid2.numpy()[0]), 1)
         np.testing.assert_allclose(phi2.numpy()[0], 0.0, atol=1.0e-9)
         # a genuine 0.2 mm tangential move of body A after anchoring is reported
         moved = [wp.transform(wp.vec3(2.0e-4, 0.0, 0.0), wp.quat_identity()), wp.transform_identity()]
         _, _, _, phi3 = _launch_anchor_update(
-            device, point0=point0, point1=point1, match_index=0, prev=(a, b, valid), body_q=moved
+            device, point0=point0, point1=point1, match_index=[0], prev=(a, b, valid), body_q=moved
         )
         self.assertAlmostEqual(float(np.linalg.norm(phi3.numpy()[0])), 2.0e-4, places=9)
+
+    def test_identity_reordering_lost_match_and_invalidated_anchor(self):
+        """Anchors follow ``rigid_contact_match_index`` (previous *sorted* index), not the row
+        position; an unmatched or invalidated contact re-anchors with zero separation."""
+        device = "cpu"
+        aligned = [(0.0, 0.0, 0.0)] * 3, [(0.0, 0.0, -1.0e-3)] * 3
+        prev_a, prev_b, prev_valid = _anchor_pairs(device, [1.0e-4, 3.0e-4, 2.0e-4])
+        prev_valid.assign(np.array([1, 1, 0], dtype=np.int32))  # pair 2 was invalidated (slid)
+        # current contacts 0, 1, 2 match previous 1, 0, 2
+        _, _, valid, phi = _launch_anchor_update(
+            device, point0=aligned[0], point1=aligned[1], match_index=[1, 0, 2], prev=(prev_a, prev_b, prev_valid)
+        )
+        np.testing.assert_array_equal(valid.numpy(), [1, 1, 1])
+        got = phi.numpy()
+        # (the row tangent basis for a +z normal is t0 = +y, t1 = -x; compare magnitudes)
+        np.testing.assert_allclose(np.linalg.norm(got, axis=1), [3.0e-4, 1.0e-4, 0.0], atol=1.0e-9)
+        # lost identity: re-anchor with zero separation
+        _, _, valid_lost, phi_lost = _launch_anchor_update(
+            device, point0=aligned[0], point1=aligned[1], match_index=[-1, -1, -1], prev=(prev_a, prev_b, prev_valid)
+        )
+        np.testing.assert_array_equal(valid_lost.numpy(), [1, 1, 1])
+        np.testing.assert_allclose(phi_lost.numpy(), 0.0, atol=1.0e-9)
+
+    def test_reset_distance_threshold_reanchors_large_separations(self):
+        device = "cpu"
+        aligned = [(0.0, 0.0, 0.0)] * 2, [(0.0, 0.0, -1.0e-3)] * 2
+        prev = _anchor_pairs(device, [4.0e-3, 6.0e-3])  # below / above the 5 mm default
+        _, _, valid, phi = _launch_anchor_update(
+            device, point0=aligned[0], point1=aligned[1], match_index=[0, 1], prev=prev, reset_distance=0.005
+        )
+        np.testing.assert_array_equal(valid.numpy(), [1, 1])
+        self.assertAlmostEqual(float(np.linalg.norm(phi.numpy()[0])), 4.0e-3, places=9)  # carried
+        self.assertEqual(float(np.abs(phi.numpy()[1]).max()), 0.0)  # re-anchored
+
+    def test_mark_sliding_drops_saturated_and_rejected_keeps_unloaded(self):
+        """Only a loaded contact at its Coulomb cone loses its anchor; unloaded, frictionless and
+        normal-only contacts keep it, a contact without rows drops it."""
+        device = "cpu"
+        c, f = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+        mu = 0.5
+        # contact 0: saturated (|lam_t| = 0.99 mu lam_n)  -> drop
+        # contact 1: loaded, well inside the cone           -> keep
+        # contact 2: friction rows present, no normal load   -> keep
+        # contact 3: rejected (slot -1)                      -> drop
+        # contact 4: normal row only (no friction rows)      -> keep
+        row_type = [c, f, f, c, f, f, c, f, f, c, c, c, c]
+        row_parent = [-1, 0, 0, -1, 3, 3, -1, 6, 6, -1, -1, -1, -1]
+        row_mu = [mu] * 13
+        impulses = [1.0, 0.99 * mu, 0.0, 1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        valid = wp.ones(5, dtype=wp.int32, device=device)
+        got = _launch_mark_sliding(
+            device,
+            slots=[0, 3, 6, -1, 9],
+            paths=[0, 0, 0, -1, 0],
+            impulses=impulses,
+            row_type=row_type,
+            row_parent=row_parent,
+            row_mu=row_mu,
+            valid=valid,
+        )
+        np.testing.assert_array_equal(got, [0, 1, 1, 0, 1])
+
+    def test_rhs_bias_matches_on_every_row_family_and_vanishes_in_velocity_pass(self):
+        """Friction rows carry ``friction_anchor_beta * separation / dt`` on the dense, matrix-free
+        and propagation routes alike, and the velocity-only pass (``bias_scale = 0``) drops it.
+        Dense rows store the raw separation with ``row_beta``; matrix-free and propagation rows
+        store the gain-premultiplied separation, so both spellings are exercised."""
+        pgs_beta, fa_beta, dt = 0.05, 0.3, 0.005
+        phi_n, e0, e1 = -2.0e-3, 1.0e-4, -2.5e-4
+        expect_pos = np.array([pgs_beta * phi_n / dt, fa_beta * e0 / dt, fa_beta * e1 / dt], dtype=np.float32)
+        dense = lambda s: _rhs_for_family(  # noqa: E731
+            "dense", phi=[phi_n, e0, e1], row_beta=[pgs_beta, fa_beta, fa_beta], pgs_beta=pgs_beta, dt=dt, bias_scale=s
+        )
+        pre = [phi_n, fa_beta * e0, fa_beta * e1]
+        np.testing.assert_allclose(dense(1.0), expect_pos, rtol=1.0e-5)
+        np.testing.assert_allclose(dense(0.0), 0.0, atol=1.0e-9)
+        for family in ("mf_setup", "propagation_setup"):
+            got = _rhs_for_family(family, phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=1.0)
+            np.testing.assert_allclose(got, expect_pos, rtol=1.0e-5, err_msg=family)
+        for family in ("mf_velocity", "propagation_velocity"):
+            got = _rhs_for_family(family, phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=1.0)
+            np.testing.assert_allclose(got, expect_pos, rtol=1.0e-5, err_msg=family)
+            got0 = _rhs_for_family(family, phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=0.0)
+            np.testing.assert_allclose(got0, 0.0, atol=1.0e-9, err_msg=family)
 
     def test_reset_clears_anchor_history_full_and_masked(self):
         """``reset()`` drops carried anchors of the selected worlds even with warm start disabled."""
