@@ -126,6 +126,7 @@ from .kernels import (
     hinv_jt_par_row,
     hinv_jt_par_row_contact_fallback,
     integrate_generalized_joints,
+    mark_sliding_friction_anchors,
     pack_contact_linear_force_as_spatial,
     pgs_convergence_diagnostic_velocity,
     pgs_ncp_residuals_diagnostic_velocity,
@@ -159,6 +160,7 @@ from .kernels import (
     trisolve_loop,
     update_articulation_origins,
     update_body_qd_from_featherstone,
+    update_friction_anchors,
     update_qdd_from_velocity,
     vector_add_inplace,
 )
@@ -742,6 +744,9 @@ class SolverFeatherPGS(SolverBase):
         articulation_pair_contact_gap_gate: float = 0.0,
         pgs_warmstart_decay: float = 1.0,
         warn_constraint_overflow: bool = True,
+        friction_anchor_beta: float = 0.0,
+        friction_anchor_reset_distance: float = 0.005,
+        friction_anchor_slip_fraction: float = 0.98,
     ):
         """
         Args:
@@ -785,6 +790,23 @@ class SolverFeatherPGS(SolverBase):
                 used by generated friction rows. This is a diagnostic hook for matching solver-prep
                 semantics such as PhysX's per-friction-anchor scaling; it does not affect normal
                 contact rows. Defaults to 1.0.
+            friction_anchor_beta (float, optional): Baumgarte factor of the positional friction
+                anchors. ``0`` (default) keeps friction rows as pure velocity constraints. When
+                positive, every persistent contact remembers the material point pair it had when
+                it formed (or last slid) and the two friction rows carry
+                ``friction_anchor_beta * (tangential anchor separation) / dt`` in their RHS, so
+                tangential drift that leaks through an unconverged sweep or through the normal
+                row's depenetration bias on tilted contact normals is pulled back the next step
+                instead of integrating without bound (PhysX friction anchors). Requires a
+                Contacts buffer built with ``contact_matching`` enabled; a good value is the same
+                order as ``pgs_beta``. Defaults to 0.0.
+            friction_anchor_reset_distance (float, optional): Tangential anchor separation [m]
+                above which a contact is re-anchored at its current witness points instead of
+                being pulled back (guards against teleports and stale identities). Defaults to
+                0.005.
+            friction_anchor_slip_fraction (float, optional): A contact whose solved friction
+                impulse reaches this fraction of its Coulomb cone is treated as sliding and drops
+                its anchor, so anchors never oppose genuine sliding. Defaults to 0.98.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
                 for normal contact rows on the dense, matrix-free free-rigid, and propagation
                 paths. A value of 0.0 removes speculative closing allowance without changing
@@ -1069,6 +1091,16 @@ class SolverFeatherPGS(SolverBase):
         self.contact_friction_anchor_limit = int(contact_friction_anchor_limit)
         self.contact_friction_articulation_pairs_only = bool(contact_friction_articulation_pairs_only)
         self.contact_friction_scale = float(contact_friction_scale)
+        self.friction_anchor_beta = float(friction_anchor_beta)
+        if not np.isfinite(self.friction_anchor_beta) or self.friction_anchor_beta < 0.0:
+            raise ValueError("friction_anchor_beta must be finite and non-negative")
+        self.friction_anchor_reset_distance = float(friction_anchor_reset_distance)
+        if not np.isfinite(self.friction_anchor_reset_distance) or self.friction_anchor_reset_distance <= 0.0:
+            raise ValueError("friction_anchor_reset_distance must be finite and positive")
+        self.friction_anchor_slip_fraction = float(friction_anchor_slip_fraction)
+        if not 0.0 < self.friction_anchor_slip_fraction <= 1.0:
+            raise ValueError("friction_anchor_slip_fraction must be in (0, 1]")
+        self._friction_anchors_enabled = self.friction_anchor_beta > 0.0
         try:
             self.contact_speculative_scale = float(contact_speculative_scale)
         except (TypeError, ValueError) as exc:
@@ -3184,6 +3216,22 @@ class SolverFeatherPGS(SolverBase):
             max_contacts = int(_estimate_rigid_contact_max(model))
         max_contacts = max(max_contacts, 1)
         self._max_contacts_alloc = max_contacts
+        # Positional friction anchors (off by default). ``_fa_phi`` is read by every
+        # row builder, so it always exists (zero when the feature is off); the anchor
+        # state itself is allocated only when enabled so the default path has no
+        # extra launches or memory. Keyed by sorted contact index like the warm-start
+        # tables above; ``prev_*`` hold last step's values for ``rigid_contact_match_index``.
+        self._fa_phi = wp.zeros((max_contacts,), dtype=wp.vec2, device=device)
+        if self._friction_anchors_enabled:
+            self._fa_anchor_a = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
+            self._fa_anchor_b = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
+            self._fa_valid = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
+            self._fa_prev_anchor_a = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
+            self._fa_prev_anchor_b = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
+            self._fa_prev_valid = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
+        else:
+            self._fa_anchor_a = self._fa_anchor_b = self._fa_valid = None
+            self._fa_prev_anchor_a = self._fa_prev_anchor_b = self._fa_prev_valid = None
         self._ws_prev_contact_normal = (
             wp.zeros(max_contacts, dtype=wp.vec3, device=device) if self.pgs_warmstart else None
         )
@@ -5931,6 +5979,16 @@ class SolverFeatherPGS(SolverBase):
                     "contact_matching enabled (rigid_contact_match_index is None). Build the "
                     'CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
                 )
+        if (
+            self._friction_anchors_enabled
+            and contacts is not None
+            and getattr(contacts, "rigid_contact_match_index", None) is None
+        ):
+            raise NotImplementedError(
+                "FeatherPGS friction anchors (friction_anchor_beta > 0) require a Contacts buffer created "
+                "with contact_matching enabled (rigid_contact_match_index is None). Build the "
+                'CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
+            )
         if _FPGS_CAPTURE:
             self._fpgs_step_n = getattr(self, "_fpgs_step_n", -1) + 1
         if self._last_step_dt is None:
@@ -6535,6 +6593,53 @@ class SolverFeatherPGS(SolverBase):
         # Dense identity-matched carry: snapshot this step's converged dense
         # impulses + row types + per-(sorted)-contact dense-slot map (mirror of
         # the MF carry below).
+        if self._friction_anchors_enabled:
+            with wp.ScopedTimer("S7_Friction_Anchor_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+                if contacts is not None:
+                    mf_impulses = getattr(self, "mf_impulses", None)
+                    mf_count = getattr(self, "mf_constraint_count", None)
+                    mf_row_type = getattr(self, "mf_row_type", None)
+                    mf_row_parent = getattr(self, "mf_row_parent", None)
+                    mf_row_mu = getattr(self, "mf_row_mu", None)
+                    prop_impulses = getattr(self, "propagation_impulses", None)
+                    prop_count = getattr(self, "propagation_constraint_count", None)
+                    prop_row_type = getattr(self, "propagation_row_type", None)
+                    prop_row_parent = getattr(self, "propagation_row_parent", None)
+                    prop_row_mu = getattr(self, "propagation_row_mu", None)
+                    wp.launch(
+                        mark_sliding_friction_anchors,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            self.contact_world,
+                            self.contact_slot,
+                            self.contact_path,
+                            self.impulses,
+                            mf_impulses if mf_impulses is not None else self._dummy_contact_impulses,
+                            prop_impulses if prop_impulses is not None else self._dummy_contact_impulses,
+                            self.constraint_count,
+                            mf_count if mf_count is not None else self._dummy_contact_count,
+                            prop_count if prop_count is not None else self._dummy_contact_count,
+                            self.row_type,
+                            self.row_parent,
+                            self.row_mu,
+                            mf_row_type if mf_row_type is not None else self._dummy_contact_row_type,
+                            mf_row_parent if mf_row_parent is not None else self._dummy_contact_row_parent,
+                            mf_row_mu if mf_row_mu is not None else self._dummy_contact_impulses,
+                            prop_row_type if prop_row_type is not None else self._dummy_contact_row_type,
+                            prop_row_parent if prop_row_parent is not None else self._dummy_contact_row_parent,
+                            prop_row_mu if prop_row_mu is not None else self._dummy_contact_impulses,
+                            self.friction_anchor_slip_fraction,
+                        ],
+                        outputs=[self._fa_valid],
+                        device=model.device,
+                    )
+                    wp.copy(self._fa_prev_anchor_a, self._fa_anchor_a)
+                    wp.copy(self._fa_prev_anchor_b, self._fa_anchor_b)
+                    wp.copy(self._fa_prev_valid, self._fa_valid)
+                else:
+                    self._fa_prev_valid.fill_(0)
+
         if self.pgs_warmstart and self._ws_prev_dense_impulses is not None:
             with wp.ScopedTimer("S7_Dense_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
                 wp.copy(self._ws_prev_dense_impulses, self.impulses)
@@ -7997,6 +8102,32 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
+            if self._friction_anchors_enabled:
+                # Carry anchors by contact identity and compute this step's tangential
+                # anchor separation before any row builder reads ``_fa_phi``.
+                wp.launch(
+                    update_friction_anchors,
+                    dim=contacts.rigid_contact_max,
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        contacts.rigid_contact_point0,
+                        contacts.rigid_contact_point1,
+                        contacts.rigid_contact_normal,
+                        contacts.rigid_contact_shape0,
+                        contacts.rigid_contact_shape1,
+                        contacts.rigid_contact_margin0,
+                        contacts.rigid_contact_margin1,
+                        contacts.rigid_contact_match_index,
+                        model.shape_body,
+                        state_in.body_q,
+                        self._fa_prev_anchor_a,
+                        self._fa_prev_anchor_b,
+                        self._fa_prev_valid,
+                        self.friction_anchor_reset_distance,
+                    ],
+                    outputs=[self._fa_anchor_a, self._fa_anchor_b, self._fa_valid, self._fa_phi],
+                    device=model.device,
+                )
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self.size_groups:
                     self.J_by_size[size].zero_()
@@ -8038,6 +8169,8 @@ class SolverFeatherPGS(SolverBase):
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
                         self.pgs_cfm,
+                        self._fa_phi,
+                        self.friction_anchor_beta,
                     ],
                     outputs=[
                         self.row_type,
@@ -8132,6 +8265,8 @@ class SolverFeatherPGS(SolverBase):
                             int(self.contact_shared_anchor),
                             self.pgs_beta,
                             self.pgs_cfm,
+                            self._fa_phi,
+                            self.friction_anchor_beta,
                         ],
                         outputs=[
                             self.J_by_size[size],
@@ -8183,6 +8318,8 @@ class SolverFeatherPGS(SolverBase):
                         1 if self.contact_friction_articulation_pairs_only else 0,
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
+                        self._fa_phi,
+                        self.friction_anchor_beta,
                     ],
                     outputs=[
                         self.mf_body_a,
@@ -8289,6 +8426,8 @@ class SolverFeatherPGS(SolverBase):
                         1 if self.contact_friction_articulation_pairs_only else 0,
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
+                        self._fa_phi,
+                        self.friction_anchor_beta,
                         builder_unit_order,
                         builder_unit_count,
                         self.propagation_max_constraints,

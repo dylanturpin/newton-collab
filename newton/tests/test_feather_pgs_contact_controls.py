@@ -444,6 +444,8 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             0,
             0.05,
             1.0e-6,
+            wp.zeros((1,), dtype=wp.vec2, device=device),  # friction_anchor_phi (anchors off)
+            0.0,  # friction_anchor_beta
         ],
         outputs=list(serial.values()),
         device=device,
@@ -479,6 +481,8 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             0,
             0.05,
             1.0e-6,
+            wp.zeros((1,), dtype=wp.vec2, device=device),  # friction_anchor_phi (anchors off)
+            0.0,  # friction_anchor_beta
         ],
         outputs=list(compact.values())[1:],
         device=device,

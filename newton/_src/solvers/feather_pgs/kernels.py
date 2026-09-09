@@ -1636,6 +1636,212 @@ def contact_tangent_basis(n: wp.vec3):
 
 
 @wp.kernel
+def update_friction_anchors(
+    contact_count: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    match_index: wp.array[int],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    prev_anchor_a: wp.array[wp.vec3],
+    prev_anchor_b: wp.array[wp.vec3],
+    prev_valid: wp.array[int],
+    reset_distance: float,
+    # outputs
+    anchor_a: wp.array[wp.vec3],
+    anchor_b: wp.array[wp.vec3],
+    anchor_valid: wp.array[int],
+    friction_phi: wp.array[wp.vec2],
+):
+    """Carry positional friction anchors across steps by contact identity.
+
+    A friction anchor is the pair of material points (stored in each body's local
+    frame) that a persistent contact had when it first formed, or when it last
+    slid. Each step the tangential separation of that pair is written to
+    ``friction_phi[c]`` in the row tangent basis of :func:`contact_tangent_basis`
+    (the same basis the friction rows use), and the RHS kernels turn it into a
+    Baumgarte-style restoring velocity ``friction_anchor_beta * phi / dt`` on the
+    two friction rows (dense rows keep the raw separation in ``phi`` with
+    ``row_beta = friction_anchor_beta``; matrix-free and propagation rows, which
+    have no per-row beta, store the gain-premultiplied value). Without this term
+    friction rows are pure velocity
+    constraints: every per-step residual (unconverged Gauss-Seidel sweeps, the
+    tangential component of the normal-row depenetration bias on tilted contact
+    normals, ...) integrates into permanent tangential drift. With it the drift
+    is pulled back next step, bounding the error at roughly one step's leak.
+
+    Identity comes from the collision pipeline's ``rigid_contact_match_index``
+    (current sorted contact -> previous sorted contact). Unmatched contacts,
+    contacts whose previous anchor was invalidated (see
+    :func:`mark_sliding_friction_anchors`), and anchors separated by more than
+    ``reset_distance`` tangentially are re-anchored at the current witness
+    points, i.e. with zero tangential error. One thread per contact; each writes
+    only its own index, so the kernel is CUDA-graph safe.
+    """
+    c = wp.tid()
+    if c >= contact_count[0] or c >= contact_point0.shape[0]:
+        if c < anchor_valid.shape[0]:
+            anchor_valid[c] = 0
+            friction_phi[c] = wp.vec2(0.0, 0.0)
+        return
+    normal = -contact_normal[c]
+    shape_a = contact_shape0[c]
+    shape_b = contact_shape1[c]
+    body_a = -1
+    body_b = -1
+    if shape_a >= 0:
+        body_a = shape_body[shape_a]
+    if shape_b >= 0:
+        body_b = shape_body[shape_b]
+    point_a_world = contact_point0[c] - contact_thickness0[c] * normal
+    point_b_world = contact_point1[c] + contact_thickness1[c] * normal
+    if body_a >= 0:
+        point_a_world = wp.transform_point(body_q[body_a], contact_point0[c]) - contact_thickness0[c] * normal
+    if body_b >= 0:
+        point_b_world = wp.transform_point(body_q[body_b], contact_point1[c]) + contact_thickness1[c] * normal
+
+    mi = match_index[c]
+    if mi >= 0 and mi < prev_valid.shape[0]:
+        if prev_valid[mi] != 0:
+            anchor_a_local = prev_anchor_a[mi]
+            anchor_b_local = prev_anchor_b[mi]
+            anchor_a_world = anchor_a_local
+            anchor_b_world = anchor_b_local
+            if body_a >= 0:
+                anchor_a_world = wp.transform_point(body_q[body_a], anchor_a_local)
+            if body_b >= 0:
+                anchor_b_world = wp.transform_point(body_q[body_b], anchor_b_local)
+            d = anchor_a_world - anchor_b_world
+            d_t = d - normal * wp.dot(normal, d)
+            if wp.length(d_t) <= reset_distance:
+                t0, t1 = contact_tangent_basis(normal)
+                anchor_a[c] = anchor_a_local
+                anchor_b[c] = anchor_b_local
+                anchor_valid[c] = 1
+                friction_phi[c] = wp.vec2(wp.dot(t0, d_t), wp.dot(t1, d_t))
+                return
+
+    # (Re)anchor at the current witness points: zero tangential error this step.
+    a_local = point_a_world
+    b_local = point_b_world
+    if body_a >= 0:
+        a_local = wp.transform_point(wp.transform_inverse(body_q[body_a]), point_a_world)
+    if body_b >= 0:
+        b_local = wp.transform_point(wp.transform_inverse(body_q[body_b]), point_b_world)
+    anchor_a[c] = a_local
+    anchor_b[c] = b_local
+    anchor_valid[c] = 1
+    friction_phi[c] = wp.vec2(0.0, 0.0)
+
+
+@wp.kernel
+def mark_sliding_friction_anchors(
+    contact_count: wp.array[int],
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_path: wp.array[int],
+    world_impulses: wp.array2d[float],
+    mf_impulses: wp.array2d[float],
+    propagation_impulses: wp.array2d[float],
+    world_constraint_count: wp.array[int],
+    mf_constraint_count: wp.array[int],
+    propagation_constraint_count: wp.array[int],
+    world_row_type: wp.array2d[int],
+    world_row_parent: wp.array2d[int],
+    world_row_mu: wp.array2d[float],
+    mf_row_type: wp.array2d[int],
+    mf_row_parent: wp.array2d[int],
+    mf_row_mu: wp.array2d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
+    slip_fraction: float,
+    # in-out
+    anchor_valid: wp.array[int],
+):
+    """Invalidate the friction anchor of every contact that slid this step.
+
+    A contact whose solved friction impulse reached ``slip_fraction`` of its
+    Coulomb cone is sliding: its anchor must not keep pulling it back, so the
+    anchor is dropped and :func:`update_friction_anchors` re-anchors it next step
+    at the new witness points (PhysX resets its friction anchors the same way).
+    Contacts with no friction rows or no normal load this step keep their anchor
+    (they cannot be shown to slide, and on a many-shape contact patch the normal
+    load hops between redundant contacts from step to step).
+    """
+    c = wp.tid()
+    if c >= contact_count[0]:
+        return
+    slot = contact_slot[c]
+    path = contact_path[c]
+    if slot < 0 or path < 0:
+        anchor_valid[c] = 0
+        return
+    world = contact_world[c]
+    lam_n = float(0.0)
+    lam_t0 = float(0.0)
+    lam_t1 = float(0.0)
+    mu = float(0.0)
+    has_friction = int(0)
+    if path == 0:
+        count = world_constraint_count[world]
+        if (
+            slot + 2 < count
+            and world_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+            and world_row_parent[world, slot + 1] == slot
+            and world_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+            and world_row_parent[world, slot + 2] == slot
+        ):
+            has_friction = 1
+            lam_n = world_impulses[world, slot]
+            lam_t0 = world_impulses[world, slot + 1]
+            lam_t1 = world_impulses[world, slot + 2]
+            mu = world_row_mu[world, slot + 1]
+    elif path == 1:
+        count = mf_constraint_count[world]
+        if (
+            slot + 2 < count
+            and mf_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+            and mf_row_parent[world, slot + 1] == slot
+            and mf_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+            and mf_row_parent[world, slot + 2] == slot
+        ):
+            has_friction = 1
+            lam_n = mf_impulses[world, slot]
+            lam_t0 = mf_impulses[world, slot + 1]
+            lam_t1 = mf_impulses[world, slot + 2]
+            mu = mf_row_mu[world, slot + 1]
+    elif path == 2:
+        count = propagation_constraint_count[world]
+        if (
+            slot + 2 < count
+            and propagation_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+            and propagation_row_parent[world, slot + 1] == slot
+            and propagation_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+            and propagation_row_parent[world, slot + 2] == slot
+        ):
+            has_friction = 1
+            lam_n = propagation_impulses[world, slot]
+            lam_t0 = propagation_impulses[world, slot + 1]
+            lam_t1 = propagation_impulses[world, slot + 2]
+            mu = propagation_row_mu[world, slot + 1]
+    # Only a *loaded* contact can be shown to slide. Contacts without friction rows
+    # this step, or without normal load (redundant contacts on a many-shape patch
+    # trade the load among themselves from step to step), keep their anchor: the
+    # pair identity is still valid and re-anchoring them would forget the drift.
+    if has_friction == 0 or lam_n <= 0.0:
+        return
+    lam_t = wp.sqrt(lam_t0 * lam_t0 + lam_t1 * lam_t1)
+    if lam_t >= slip_fraction * mu * lam_n:
+        anchor_valid[c] = 0
+
+
+@wp.kernel
 def compute_contact_linear_force_from_impulses(
     contact_count: wp.array[wp.int32],
     contact_normal: wp.array[wp.vec3],
@@ -3485,6 +3691,8 @@ def prepare_world_contact_rows(
     contact_shared_anchor: int,
     pgs_beta: float,
     pgs_cfm: float,
+    friction_anchor_phi: wp.array[wp.vec2],
+    friction_anchor_beta: float,
     # outputs
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
@@ -3637,18 +3845,18 @@ def prepare_world_contact_rows(
             world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 1] = slot
             world_row_mu[world, slot + 1] = friction_mu
-            world_row_beta[world, slot + 1] = 0.0
+            world_row_beta[world, slot + 1] = friction_anchor_beta
             world_row_cfm[world, slot + 1] = pgs_cfm
-            world_phi[world, slot + 1] = 0.0
+            world_phi[world, slot + 1] = friction_anchor_phi[c][0]
             world_target_velocity[world, slot + 1] = friction0_target
             world_row_restitution[world, slot + 1] = 0.0
 
             world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 2] = slot
             world_row_mu[world, slot + 2] = friction_mu
-            world_row_beta[world, slot + 2] = 0.0
+            world_row_beta[world, slot + 2] = friction_anchor_beta
             world_row_cfm[world, slot + 2] = pgs_cfm
-            world_phi[world, slot + 2] = 0.0
+            world_phi[world, slot + 2] = friction_anchor_phi[c][1]
             world_target_velocity[world, slot + 2] = friction1_target
             world_row_restitution[world, slot + 2] = 0.0
 
@@ -3919,6 +4127,8 @@ def _populate_world_J_for_size_contact(
     contact_shared_anchor: int,
     pgs_beta: float,
     pgs_cfm: float,
+    friction_anchor_phi: wp.array[wp.vec2],
+    friction_anchor_beta: float,
     # outputs
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
@@ -4232,9 +4442,9 @@ def _populate_world_J_for_size_contact(
             world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 1] = slot
             world_row_mu[world, slot + 1] = friction_mu
-            world_row_beta[world, slot + 1] = 0.0
+            world_row_beta[world, slot + 1] = friction_anchor_beta
             world_row_cfm[world, slot + 1] = pgs_cfm
-            world_phi[world, slot + 1] = 0.0
+            world_phi[world, slot + 1] = friction_anchor_phi[c][0]
             world_target_velocity[world, slot + 1] = friction0_target
             world_row_restitution[world, slot + 1] = 0.0
 
@@ -4242,9 +4452,9 @@ def _populate_world_J_for_size_contact(
             world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 2] = slot
             world_row_mu[world, slot + 2] = friction_mu
-            world_row_beta[world, slot + 2] = 0.0
+            world_row_beta[world, slot + 2] = friction_anchor_beta
             world_row_cfm[world, slot + 2] = pgs_cfm
-            world_phi[world, slot + 2] = 0.0
+            world_phi[world, slot + 2] = friction_anchor_phi[c][1]
             world_row_restitution[world, slot + 2] = 0.0
             world_target_velocity[world, slot + 2] = friction1_target
 
@@ -4263,18 +4473,18 @@ def _populate_world_J_for_size_contact(
             world_row_type[world, slot + 1] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 1] = slot
             world_row_mu[world, slot + 1] = friction_mu
-            world_row_beta[world, slot + 1] = 0.0
+            world_row_beta[world, slot + 1] = friction_anchor_beta
             world_row_cfm[world, slot + 1] = pgs_cfm
-            world_phi[world, slot + 1] = 0.0
+            world_phi[world, slot + 1] = friction_anchor_phi[c][0]
             world_target_velocity[world, slot + 1] = friction0_target
             world_row_restitution[world, slot + 1] = 0.0
 
             world_row_type[world, slot + 2] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, slot + 2] = slot
             world_row_mu[world, slot + 2] = friction_mu
-            world_row_beta[world, slot + 2] = 0.0
+            world_row_beta[world, slot + 2] = friction_anchor_beta
             world_row_cfm[world, slot + 2] = pgs_cfm
-            world_phi[world, slot + 2] = 0.0
+            world_phi[world, slot + 2] = friction_anchor_phi[c][1]
             world_target_velocity[world, slot + 2] = friction1_target
             world_row_restitution[world, slot + 2] = 0.0
 
@@ -4321,6 +4531,8 @@ def populate_world_J_for_size(
     contact_shared_anchor: int,
     pgs_beta: float,
     pgs_cfm: float,
+    friction_anchor_phi: wp.array[wp.vec2],
+    friction_anchor_beta: float,
     # outputs
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
@@ -4376,6 +4588,8 @@ def populate_world_J_for_size(
             contact_shared_anchor,
             pgs_beta,
             pgs_cfm,
+            friction_anchor_phi,
+            friction_anchor_beta,
             J_group,
             world_row_type,
             world_row_parent,
@@ -4616,6 +4830,10 @@ def compute_world_contact_bias(
                 row_w = contact_w
             else:
                 rhs += contact_speculative_scale * phi * inv_dt
+        elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+            # Positional friction anchor (``phi`` = tangential anchor separation,
+            # ``beta`` = friction_anchor_beta; both zero when anchors are off).
+            rhs += bias_scale * beta * phi * inv_dt
         elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
             if phi < 0.0:
                 rhs += bias_scale * beta * phi * inv_dt  # Negative for violation
@@ -5049,6 +5267,8 @@ def _build_mf_contact_row(
     contact_friction_articulation_pairs_only: int,
     contact_friction_scale: float,
     contact_shared_anchor: int,
+    friction_anchor_phi: wp.array[wp.vec2],
+    friction_anchor_beta: float,
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -5226,7 +5446,10 @@ def _build_mf_contact_row(
         else:
             mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
             mf_row_parent[world, row_idx] = slot
-            mf_phi[world, row_idx] = 0.0
+            if row_offset == 1:
+                mf_phi[world, row_idx] = friction_anchor_beta * friction_anchor_phi[c][0]
+            else:
+                mf_phi[world, row_idx] = friction_anchor_beta * friction_anchor_phi[c][1]
             mf_row_restitution[world, row_idx] = 0.0
         if row_offset == 0:
             mf_row_mu[world, row_idx] = mu
@@ -5279,6 +5502,8 @@ def build_mf_contact_rows(
     contact_friction_articulation_pairs_only: int,
     contact_friction_scale: float,
     contact_shared_anchor: int,
+    friction_anchor_phi: wp.array[wp.vec2],
+    friction_anchor_beta: float,
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -5325,6 +5550,8 @@ def build_mf_contact_rows(
             contact_friction_articulation_pairs_only,
             contact_friction_scale,
             contact_shared_anchor,
+            friction_anchor_phi,
+            friction_anchor_beta,
             mf_body_a,
             mf_body_b,
             mf_J_a,
@@ -5366,6 +5593,8 @@ def build_propagation_contact_rows(
     contact_friction_articulation_pairs_only: int,
     contact_friction_scale: float,
     contact_shared_anchor: int,
+    friction_anchor_phi: wp.array[wp.vec2],
+    friction_anchor_beta: float,
     unit_order: wp.array[int],
     world_unit_count: wp.array[int],
     unit_capacity: int,
@@ -5548,7 +5777,10 @@ def build_propagation_contact_rows(
         else:
             propagation_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
             propagation_row_parent[world, row_idx] = slot
-            propagation_phi[world, row_idx] = 0.0
+            if row_offset == 1:
+                propagation_phi[world, row_idx] = friction_anchor_beta * friction_anchor_phi[c][0]
+            else:
+                propagation_phi[world, row_idx] = friction_anchor_beta * friction_anchor_phi[c][1]
             propagation_row_mu[world, row_idx] = friction_mu
             propagation_row_restitution[world, row_idx] = 0.0
 
@@ -6471,6 +6703,8 @@ def compute_mf_effective_mass_and_rhs(
                 bias = restitution * relative_incident
                 # An impact is impulsive, not a spring: keep the rebound exact.
                 row_w = 1.0
+    elif rtype == PGS_CONSTRAINT_TYPE_FRICTION:
+        bias = mf_phi[world, i] / dt  # anchor gain pre-multiplied by the row builder
     elif rtype == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         bias = mf_phi[world, i]
 
@@ -6576,6 +6810,8 @@ def compute_mf_rhs_bias(
                 bias = phi_val / dt
             else:
                 bias = speculative_scale * phi_val / dt
+    elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+        bias = bias_scale * mf_phi[world, i] / dt  # anchor gain pre-multiplied by the row builder
     elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         bias = mf_phi[world, i]
 
@@ -6680,6 +6916,8 @@ def compute_propagation_effective_mass_and_rhs(
                 # Baumgarte geometry for a qualifying impact.
                 bias = -restitution_target
                 row_w = 1.0
+    if row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+        bias = propagation_phi[world, i] / dt  # anchor gain pre-multiplied by the row builder
     propagation_rhs[world, i] = bias
     propagation_restitution_target[world, i] = restitution_target
     if contact_w < 1.0:
@@ -6760,6 +6998,8 @@ def compute_propagation_rhs_bias(
             bias = -restitution_target
         elif apply_restitution != 0 and reached != 0:
             bias -= propagation_restitution_target[world, i]
+    if row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+        bias = bias_scale * propagation_phi[world, i] / dt  # anchor gain pre-multiplied by the row builder
     propagation_rhs[world, i] = bias
 
 
