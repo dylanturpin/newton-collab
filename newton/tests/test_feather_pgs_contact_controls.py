@@ -514,6 +514,47 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
     return serial, compact
 
 
+def _drive_row_scene(record_residuals, iterations=8, device=None):
+    """One revolute joint on a PhysX-PGS drive row: a deterministic dense-row solve."""
+    builder = newton.ModelBuilder()
+    base = builder.add_body(xform=wp.transform_identity(), mass=0.0)
+    builder.add_joint_fixed(parent=-1, child=base)
+    link = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, -0.2), wp.quat_identity()))
+    builder.add_shape_box(link, hx=0.02, hy=0.02, hz=0.2)
+    builder.add_joint_revolute(
+        parent=base,
+        child=link,
+        axis=wp.vec3(0.0, 1.0, 0.0),
+        limit_lower=-0.3,
+        limit_upper=0.3,
+        target_ke=50.0,
+        target_kd=1.0,
+    )
+    model = builder.finalize(device=device)
+    solver = SolverFeatherPGS(
+        model,
+        pgs_mode="matrix_free",
+        pgs_iterations=iterations,
+        drive_mode="physx_pgs",
+        debug_record_residuals=record_residuals,
+    )
+    return model, solver
+
+
+def _run_drive_row_scene(record_residuals, frames=20, iterations=8, device=None):
+    """Step the drive-row scene and return the solver plus its final joint state."""
+    model, solver = _drive_row_scene(record_residuals, iterations=iterations, device=device)
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    control.joint_target_q.assign(np.full(model.joint_dof_count, 2.0, dtype=np.float32))
+    for _ in range(frames):
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    return solver, state_0.joint_q.numpy().copy()
+
+
 class TestFeatherPGSContactControls(unittest.TestCase):
     def test_compact_contact_builder_matches_tree_walk(self):
         """Match dense Jacobians and metadata for a same-articulation contact."""
@@ -760,6 +801,41 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         self.assertEqual(result["slot"], -1)
         self.assertEqual(result["path"], -1)
         self.assertEqual(result["dense_count"], 0)
+
+
+@unittest.skipUnless(wp.get_device().is_cuda, "SolverFeatherPGS matrix-free mode requires CUDA")
+class TestFeatherPGSResidualTelemetry(unittest.TestCase):
+    """Opt-in per-visit dense-row residual telemetry (debug_record_residuals)."""
+
+    def test_residual_telemetry_off_allocates_nothing(self):
+        """Leave the log unallocated and the GS kernel unrenamed when the flag is off."""
+        solver, _ = _run_drive_row_scene(False)
+
+        self.assertEqual(solver._resid_iter_cap, 0)
+        self.assertEqual(solver.pgs_residual_log.size, 1)
+        self.assertNotIn("_resid", solver._pgs_solve_mf_gs_kernel.key)
+
+    def test_residual_telemetry_records_every_dense_row_visit(self):
+        """Record one residual per (world, iteration, dense row) when the flag is on."""
+        iterations = 8
+        solver, _ = _run_drive_row_scene(True, iterations=iterations)
+        rows = int(solver.constraint_count.numpy()[0])
+
+        self.assertEqual(solver._resid_iter_cap, iterations)
+        self.assertIn("_resid", solver._pgs_solve_mf_gs_kernel.key)
+        self.assertGreater(rows, 0)
+
+        log = solver.pgs_residual_log.numpy().reshape(solver.world_count, iterations, solver.dense_max_constraints)
+        # Every GS visit of an allocated row writes; rows past constraint_count never do.
+        self.assertTrue(np.all(log[0, :, :rows] != 0.0))
+        self.assertTrue(np.all(log[0, :, rows:] == 0.0))
+
+    def test_residual_telemetry_does_not_change_the_solve(self):
+        """Keep the recorded solve bit-identical to the unrecorded one."""
+        _, q_off = _run_drive_row_scene(False)
+        _, q_on = _run_drive_row_scene(True)
+
+        np.testing.assert_array_equal(q_off, q_on)
 
 
 if __name__ == "__main__":
