@@ -457,25 +457,21 @@ class ContactSorter:
 
     @property
     def scratch_pos_world(self) -> wp.array:
-        """Shared scratch buffer for external cross-frame world-space positions.
+        """Transient position scratch available to sequential pipeline stages.
 
-        Sized ``capacity`` :class:`wp.vec3`.  Reserved for use by
-        :class:`~newton._src.geometry.contact_match.ContactMatcher`, which
-        repurposes the sorter's unused ``point0`` scratch between frames to
-        store the previous frame's world-space contact positions.
+        Sized ``capacity`` :class:`wp.vec3`. Sorting and body-pair reduction
+        overwrite this storage. Persistent contact matching owns separate
+        history and must not alias this buffer.
 
         .. note::
-            The buffer is **only idle between frames** — i.e. between the end
-            of one :meth:`sort_full` call and the start of the next.  Writes
-            outside that window will corrupt the next sort.  Do not write to
-            this buffer unless you are implementing cross-frame state that
-            coordinates with the pipeline's per-frame call order.
+            Borrow only when no sorting or reduction pass is using it, and
+            coordinate ownership with the pipeline's per-frame call order.
         """
         return self._full_point0_buf
 
     @property
     def scratch_normal(self) -> wp.array:
-        """Shared scratch buffer for external cross-frame world-space normals.
+        """Transient normal scratch available to sequential pipeline stages.
 
         Sized ``capacity`` :class:`wp.vec3`.  Companion to
         :attr:`scratch_pos_world`; see that property for usage constraints.

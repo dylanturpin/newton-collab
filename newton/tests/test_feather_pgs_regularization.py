@@ -275,7 +275,10 @@ def test_velocity_pass_rigid_on_propagation_schedules(test: unittest.TestCase, d
         model.collide(state_in, contacts)
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 200.0)
         wp.synchronize()
-        test.assertTrue(_contact_rows(solver, PATH_DENSE), f"{response}: scene produced no dense self-contact row")
+        test.assertTrue(
+            _contact_rows(solver, PATH_DENSE, int(contacts.rigid_contact_count.numpy()[0])),
+            f"{response}: scene produced no dense self-contact row",
+        )
         return calls, state_out.joint_qd.numpy().copy()
 
     with wp.ScopedDevice(device):
@@ -456,7 +459,7 @@ def test_assembled_dense_regularization_scales_diagonal(test: unittest.TestCase,
         model.collide(state_in, contacts)
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 200.0)
         wp.synchronize()
-        rows = _contact_rows(solver, PATH_DENSE)
+        rows = _contact_rows(solver, PATH_DENSE, int(contacts.rigid_contact_count.numpy()[0]))
         test.assertGreater(len(rows), 0)
         base_diag = unregularized_diag["value"]
         regularized_diag = solver.diag.numpy()[0]
@@ -494,7 +497,7 @@ def test_regularized_propagation_rows_execute(test: unittest.TestCase, device):
             model.collide(state_in, contacts)
             solver.step(state_in, state_out, model.control(), contacts, 1.0 / 200.0)
             wp.synchronize()
-            rows = _contact_rows(solver, 2)
+            rows = _contact_rows(solver, 2, int(contacts.rigid_contact_count.numpy()[0]))
             test.assertGreater(len(rows), 0, f"{response}: no propagation rows")
             weights = solver.propagation_row_w.numpy()[0]
             for slot in rows.values():

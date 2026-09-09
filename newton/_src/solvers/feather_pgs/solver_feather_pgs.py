@@ -66,6 +66,7 @@ from .kernels import (
     apply_augmented_mass_diagonal_grouped,
     apply_contact_regularization,
     apply_free_root_transport_to_predictor,
+    apply_free_root_velocity_corrections,
     apply_impulses_world_par_dof,
     apply_mf_warmstart_impulses,
     apply_world_contact_restitution_accumulated,
@@ -152,11 +153,9 @@ from .kernels import (
     reset_world_warmstart_buffers,
     rhs_accum_world_par_art,
     scatter_qdd_from_groups,
+    snapshot_contact_warmstart,
     snapshot_dense_phase_bound,
-    snapshot_dense_prev_slots,
-    snapshot_mf_prev_slots,
     snapshot_propagation_cache_qd_base,
-    snapshot_propagation_prev_slots,
     trisolve_loop,
     update_articulation_origins,
     update_body_qd_from_featherstone,
@@ -226,6 +225,64 @@ def _accumulate_row_capacity_telemetry(
     if excess > 0:
         wp.atomic_max(overflow_excess_watermark, 0, excess)
         wp.atomic_add(overflow_world_steps, 0, 1)
+
+
+@wp.kernel
+def _warn_constraint_row_overflow(
+    dense_raw_counts: wp.array[wp.int32],
+    dense_dropped_contact_rows: wp.array[wp.int32],
+    dense_capacity: int,
+    mf_raw_counts: wp.array[wp.int32],
+    mf_dropped_contact_rows: wp.array[wp.int32],
+    mf_capacity: int,
+    mf_active: int,
+    propagation_raw_counts: wp.array[wp.int32],
+    propagation_dropped_contact_rows: wp.array[wp.int32],
+    propagation_capacity: int,
+    propagation_active: int,
+    warning_emitted: wp.array[wp.int32],
+):
+    """Emit one device-side warning per overflowing FeatherPGS row family."""
+    world = wp.tid()
+
+    dense_dropped = dense_dropped_contact_rows[world]
+    dense_requested = dense_raw_counts[world] + dense_dropped
+    if dense_requested > dense_capacity and wp.atomic_exch(warning_emitted, 0, 1) == 0:
+        wp.printf(
+            "Warning: FeatherPGS dense constraint-row overflow in world %d: requested %d rows, limit %d; "
+            "dropped %d contact/friction rows. Increase dense_max_constraints.\n",
+            world,
+            dense_requested,
+            dense_capacity,
+            dense_dropped,
+        )
+
+    if mf_active != 0:
+        mf_dropped = mf_dropped_contact_rows[world]
+        mf_requested = mf_raw_counts[world] + mf_dropped
+        if mf_requested > mf_capacity and wp.atomic_exch(warning_emitted, 1, 1) == 0:
+            wp.printf(
+                "Warning: FeatherPGS matrix-free constraint-row overflow in world %d: requested %d rows, "
+                "limit %d; dropped %d contact/friction rows. Increase mf_max_constraints.\n",
+                world,
+                mf_requested,
+                mf_capacity,
+                mf_dropped,
+            )
+
+    if propagation_active != 0:
+        propagation_dropped = propagation_dropped_contact_rows[world]
+        propagation_requested = propagation_raw_counts[world] + propagation_dropped
+        if propagation_requested > propagation_capacity and wp.atomic_exch(warning_emitted, 2, 1) == 0:
+            wp.printf(
+                "Warning: FeatherPGS propagation constraint-row overflow in world %d: requested %d rows, "
+                "limit %d; dropped %d contact/friction rows. Increase dense_max_constraints or "
+                "mf_max_constraints.\n",
+                world,
+                propagation_requested,
+                propagation_capacity,
+                propagation_dropped,
+            )
 
 
 @dataclass(frozen=True)
@@ -516,9 +573,9 @@ class SolverFeatherPGS(SolverBase):
         Floating-base systems require an explicit free joint with which the body is connected to the world,
         see :meth:`newton.ModelBuilder.add_joint_free`.
 
-    Semi-implicit time integration is a variational integrator that
-    preserves energy, however it not unconditionally stable, and requires a time-step
-    small enough to support the required stiffness and damping forces.
+    Semi-implicit integration is not unconditionally stable. Accuracy and
+    stability depend on the timestep, inertia conditioning and constraint
+    convergence; contact and friction also exchange and dissipate energy.
 
     See: https://en.wikipedia.org/wiki/Semi-implicit_Euler_method
 
@@ -547,6 +604,13 @@ class SolverFeatherPGS(SolverBase):
     rebound velocity is used for the whole step; this gives the intended
     post-impact velocity but a first-order, impact-phase-dependent position
     offset. Reduce the timestep when substep impact position matters.
+
+    Single-body FREE-joint articulations use an energy-preserving local
+    gyroscopic update to prevent explicit angular-bias runaway. Fast rotation
+    can trigger bounded gyro microsteps inside the velocity predictor, without
+    additional collision or contact-solver passes. Pose integration remains
+    first-order; accurate rotational trajectories still require a suitable
+    simulation timestep.
 
     """
 
@@ -677,6 +741,7 @@ class SolverFeatherPGS(SolverBase):
         same_articulation_contact_gap_gate: float = 0.0,
         articulation_pair_contact_gap_gate: float = 0.0,
         pgs_warmstart_decay: float = 1.0,
+        warn_constraint_overflow: bool = True,
     ):
         """
         Args:
@@ -851,11 +916,17 @@ class SolverFeatherPGS(SolverBase):
                 contact identity through the collision pipeline's ``rigid_contact_match_index``;
                 non-contact dense rows cold-start because their runtime allocation does not
                 provide an identity contract. A non-``None`` Contacts buffer therefore requires
-                contact matching. This currently remains incompatible with body-pair contact
-                reduction. Defaults to False.
+                contact matching. Body-pair reduction is supported with
+                ``contact_matching="latest"``. Carried friction is transported into
+                the current tangent frame and clamped to the current friction cone.
+                Defaults to False.
             pgs_warmstart_decay (float, optional): Finite non-negative scale applied to
                 contact impulses carried from the previous frame. This option is appended to
                 the constructor to preserve its established positional layout. Defaults to 1.0.
+            warn_constraint_overflow (bool, optional): Emit a device-side warning the first time each dense,
+                matrix-free, or propagation row family exceeds its configured per-world capacity. The warning
+                reports the world, requested rows, row limit, and dropped contact/friction rows without a host
+                synchronization, so it remains compatible with CUDA graph capture. Defaults to True.
             mf_warmstart (bool, optional): Legacy compatibility alias for ``pgs_warmstart``
                 (this option was historically matrix-free-only). New callers should use
                 ``pgs_warmstart``. Defaults to False.
@@ -1084,6 +1155,7 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(f"pgs_velocity_drive_mode must be 'active' or 'freeze', got {pgs_velocity_drive_mode!r}")
         self.pgs_velocity_drive_mode = pgs_velocity_drive_mode
         self._requested_dense_max_constraints = int(dense_max_constraints)
+        self.warn_constraint_overflow = bool(warn_constraint_overflow)
         if articulated_contact_response not in (
             "immediate",
             "propagation",
@@ -1221,9 +1293,7 @@ class SolverFeatherPGS(SolverBase):
             self.rigid_body_max_linear_velocity is not None and self.rigid_body_max_angular_velocity is not None
         )
 
-        # ``friction_mode`` is the selector for the per-row Coulomb step used by the
-        # matrix-free PGS kernel. Only ``"current"`` is wired today; the other three
-        # names are reserved for the upcoming FPGS Friction Modes strategy issues.
+        # Select the contact update once, when specializing the matrix-free kernel.
         _valid_friction_modes = ("current", "bisection", "bisection_desaxce", "coulomb_newton")
         if friction_mode not in _valid_friction_modes:
             raise ValueError(f"friction_mode must be one of {list(_valid_friction_modes)}, got {friction_mode!r}")
@@ -1239,10 +1309,6 @@ class SolverFeatherPGS(SolverBase):
                     f"articulated_contact_response={articulated_contact_response!r} currently supports "
                     "friction_mode='current' only"
                 )
-            # pgs_mode == "matrix_free" with a non-baseline friction mode.
-            # ``"bisection"`` was wired in FPGS Friction Modes 5/13,
-            # ``"bisection_desaxce"`` in 6/13, and ``"coulomb_newton"``
-            # is wired here in 7/13.
         self.friction_mode = friction_mode
         # Numeric id consumed by the matrix-free PGS kernels.  Mirrors the
         # :data:`FRICTION_MODE_*` constants in ``feather_pgs/kernels.py``
@@ -1514,15 +1580,25 @@ class SolverFeatherPGS(SolverBase):
         # allocate_world_contact_slots when the MF path is inactive (the
         # kernel never writes it when has_free_rigid == 0).
 
-        # Opt-in, behavior-neutral constraint/contact row telemetry. Allocate
-        # every scalar ONCE before CUDA-graph capture and accumulate at the end
-        # of every solver step. In addition to the clamped retained-row maxima,
-        # preserve the raw allocator demand before finalization clamps it to the
-        # configured capacity. This is the only reliable way to distinguish a
-        # full buffer from an actual overflow after a long captured rollout.
+        # Constraint-capacity diagnostics are allocated once before CUDA graph
+        # capture. The warning path tracks only current-step dropped rows and a
+        # three-family one-shot flag; row_watermark additionally accumulates
+        # whole-run high-water telemetry for explicit readback.
         self._row_watermark = bool(row_watermark)
+        self._track_row_capacity = self._row_watermark or self.warn_constraint_overflow
+        wm_device = model.device
+        if self._track_row_capacity:
+            self._row_dropped_dense = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
+            self._row_dropped_mf = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
+            self._row_dropped_propagation = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
+        else:
+            self._row_dropped_dense = None
+            self._row_dropped_mf = None
+            self._row_dropped_propagation = None
+        self._row_overflow_warning_emitted = (
+            wp.zeros(3, dtype=wp.int32, device=wm_device) if self.warn_constraint_overflow else None
+        )
         if self._row_watermark:
-            wm_device = self.constraint_count.device
             self._row_watermark_dense = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_mf = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_propagation = wp.zeros(1, dtype=wp.int32, device=wm_device)
@@ -1530,9 +1606,6 @@ class SolverFeatherPGS(SolverBase):
             self._row_watermark_dense_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_mf_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_watermark_propagation_raw = wp.zeros(1, dtype=wp.int32, device=wm_device)
-            self._row_dropped_dense = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
-            self._row_dropped_mf = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
-            self._row_dropped_propagation = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
             self._row_dropped_dense_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_dropped_mf_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
             self._row_dropped_propagation_high_water = wp.zeros(1, dtype=wp.int32, device=wm_device)
@@ -1550,9 +1623,6 @@ class SolverFeatherPGS(SolverBase):
             self._row_watermark_dense_raw = None
             self._row_watermark_mf_raw = None
             self._row_watermark_propagation_raw = None
-            self._row_dropped_dense = None
-            self._row_dropped_mf = None
-            self._row_dropped_propagation = None
             self._row_dropped_dense_high_water = None
             self._row_dropped_mf_high_water = None
             self._row_dropped_propagation_high_water = None
@@ -3121,6 +3191,9 @@ class SolverFeatherPGS(SolverBase):
             max_contacts = int(_estimate_rigid_contact_max(model))
         max_contacts = max(max_contacts, 1)
         self._max_contacts_alloc = max_contacts
+        self._ws_prev_contact_normal = (
+            wp.zeros(max_contacts, dtype=wp.vec3, device=device) if self.pgs_warmstart else None
+        )
         self.contact_world = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_slot = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_slots_needed = wp.zeros(
@@ -5849,14 +5922,14 @@ class SolverFeatherPGS(SolverBase):
                 f"{self._max_contacts_alloc}. Set model.rigid_contact_max before constructing the solver."
             )
         if self.pgs_warmstart:
-            # Every contact family carries by identity, but that contract has
-            # not yet been validated with body-pair compaction. Use the shared
-            # helper so a captured warm-start
-            # solver also holds the unreduced-reader lease that blocks a later
-            # reducer graph from changing its rows behind replay.
+            # A reduced stream is valid when it carries retained identities.
+            # Preserve the reader lease for an unreduced captured stream: a
+            # later producer must not change its layout behind graph replay.
             self._require_unreduced_contacts(
                 contacts,
-                supports_body_pair_reduced_contacts=False,
+                supports_body_pair_reduced_contacts=bool(
+                    contacts is not None and contacts.rigid_contacts_body_pair_reduced
+                ),
                 configuration="pgs_warmstart=True",
             )
             if contacts is not None and getattr(contacts, "rigid_contact_match_index", None) is None:
@@ -6074,6 +6147,9 @@ class SolverFeatherPGS(SolverBase):
                         self.constraint_count,
                         self.row_type,
                         self.row_parent,
+                        contacts.rigid_contact_normal,
+                        self._ws_prev_contact_normal,
+                        self.row_mu,
                         self.pgs_warmstart_decay,
                         dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
                         self.dense_max_constraints,
@@ -6471,15 +6547,7 @@ class SolverFeatherPGS(SolverBase):
                 wp.copy(self._ws_prev_dense_impulses, self.impulses)
                 wp.copy(self._ws_prev_dense_row_type, self.row_type)
                 wp.copy(self._ws_prev_dense_row_parent, self.row_parent)
-                if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
-                    wp.launch(
-                        snapshot_dense_prev_slots,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[contacts.rigid_contact_count, self.contact_path, self.contact_slot],
-                        outputs=[self._ws_prev_dense_slot_sorted],
-                        device=model.device,
-                    )
-                else:
+                if contacts is None:
                     self._ws_prev_dense_row_type.fill_(-1)
                     self._ws_prev_dense_row_parent.fill_(-1)
 
@@ -6488,19 +6556,7 @@ class SolverFeatherPGS(SolverBase):
                 wp.copy(self._ws_prev_mf_impulses, self.mf_impulses)
                 wp.copy(self._ws_prev_mf_row_type, self.mf_row_type)
                 wp.copy(self._ws_prev_mf_row_parent, self.mf_row_parent)
-                if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
-                    wp.launch(
-                        snapshot_mf_prev_slots,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[
-                            contacts.rigid_contact_count,
-                            self.contact_path,
-                            self.contact_slot,
-                        ],
-                        outputs=[self._ws_prev_slot_sorted],
-                        device=model.device,
-                    )
-                else:
+                if contacts is None:
                     self._ws_prev_mf_row_type.fill_(-1)
                     self._ws_prev_mf_row_parent.fill_(-1)
 
@@ -6511,19 +6567,29 @@ class SolverFeatherPGS(SolverBase):
                 wp.copy(self._ws_prev_propagation_impulses, self.propagation_impulses)
                 wp.copy(self._ws_prev_propagation_row_type, self.propagation_row_type)
                 wp.copy(self._ws_prev_propagation_row_parent, self.propagation_row_parent)
-                if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
-                    wp.launch(
-                        snapshot_propagation_prev_slots,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[contacts.rigid_contact_count, self.contact_path, self.contact_slot],
-                        outputs=[self._ws_prev_propagation_slot_sorted],
-                        device=model.device,
-                    )
-                else:
+                if contacts is None:
                     self._ws_prev_propagation_row_type.fill_(-1)
                     self._ws_prev_propagation_row_parent.fill_(-1)
 
         if self.pgs_warmstart:
+            if contacts is not None:
+                wp.launch(
+                    snapshot_contact_warmstart,
+                    dim=contacts.rigid_contact_max,
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        self.contact_path,
+                        self.contact_slot,
+                        contacts.rigid_contact_normal,
+                    ],
+                    outputs=[
+                        self._ws_prev_dense_slot_sorted,
+                        self._ws_prev_slot_sorted,
+                        self._ws_prev_propagation_slot_sorted,
+                        self._ws_prev_contact_normal,
+                    ],
+                    device=model.device,
+                )
             self._ws_prev_dt = float(dt)
 
         # Double-buffer: fork the maintenance stream to clear the current
@@ -7401,19 +7467,42 @@ class SolverFeatherPGS(SolverBase):
         # runtime kinematic changes without changing graph topology.
         if not self._free_root_joint_count:
             return
-        wp.launch(
-            apply_free_root_transport_to_predictor,
-            dim=self._free_root_joint_count,
-            inputs=[
-                self._free_root_joint_indices,
-                model.joint_qd_start,
-                self._kinematic_joint_mask,
-                self.qd_work,
-                dt,
-            ],
-            outputs=[self.v_hat],
-            device=model.device,
-        )
+        if self._free_rigid_body_count:
+            wp.launch(
+                apply_free_root_velocity_corrections,
+                dim=self._free_root_joint_count,
+                inputs=[
+                    self._free_root_joint_indices,
+                    model.joint_qd_start,
+                    model.joint_child,
+                    self.body_to_articulation,
+                    self.is_free_rigid,
+                    self.art_group_idx,
+                    self._kinematic_joint_mask,
+                    state_in.body_q,
+                    model.body_inertia,
+                    self.L_by_size[6],
+                    self.qd_work,
+                    dt,
+                    model.requires_grad,
+                ],
+                outputs=[self.v_hat],
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                apply_free_root_transport_to_predictor,
+                dim=self._free_root_joint_count,
+                inputs=[
+                    self._free_root_joint_indices,
+                    model.joint_qd_start,
+                    self._kinematic_joint_mask,
+                    self.qd_work,
+                    dt,
+                ],
+                outputs=[self.v_hat],
+                device=model.device,
+            )
 
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
         model = self.model
@@ -7426,7 +7515,7 @@ class SolverFeatherPGS(SolverBase):
         # Zero world-level buffers (only arrays that require it)
         self.slot_counter.zero_()  # atomic-add counter
         self.dense_contact_world_flag.zero_()
-        if self._row_watermark:
+        if self._track_row_capacity:
             self._row_dropped_dense.zero_()
             self._row_dropped_mf.zero_()
             self._row_dropped_propagation.zero_()
@@ -7465,9 +7554,11 @@ class SolverFeatherPGS(SolverBase):
         is_free_rigid = self.is_free_rigid if self.is_free_rigid is not None else self._dummy_is_free_rigid
         mf_slot_counter = self.mf_slot_counter if mf_active else self._dummy_mf_slot_counter
         propagation_slot_counter = self.propagation_slot_counter if propagation_active else self._dummy_mf_slot_counter
-        dense_dropped_rows = self._row_dropped_dense if self._row_watermark else self._dummy_mf_slot_counter
-        mf_dropped_rows = self._row_dropped_mf if self._row_watermark else self._dummy_mf_slot_counter
-        propagation_dropped_rows = self._row_dropped_propagation if self._row_watermark else self._dummy_mf_slot_counter
+        dense_dropped_rows = self._row_dropped_dense if self._track_row_capacity else self._dummy_mf_slot_counter
+        mf_dropped_rows = self._row_dropped_mf if self._track_row_capacity else self._dummy_mf_slot_counter
+        propagation_dropped_rows = (
+            self._row_dropped_propagation if self._track_row_capacity else self._dummy_mf_slot_counter
+        )
         j_buffers_zeroed = False
 
         drive_active = self.drive_mode == "physx_pgs" and self.drive_slot is not None
@@ -7893,7 +7984,7 @@ class SolverFeatherPGS(SolverBase):
                     self.contact_friction_gap_threshold,
                     self.contact_friction_anchor_limit,
                     1 if self.contact_friction_articulation_pairs_only else 0,
-                    1 if self._row_watermark else 0,
+                    1 if self._track_row_capacity else 0,
                 ],
                 outputs=[
                     self.contact_world,
@@ -8250,6 +8341,9 @@ class SolverFeatherPGS(SolverBase):
                             self.propagation_constraint_count,
                             self.propagation_row_type,
                             self.propagation_row_parent,
+                            contacts.rigid_contact_normal,
+                            self._ws_prev_contact_normal,
+                            self.propagation_row_mu,
                             self.pgs_warmstart_decay,
                             dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
                             self.propagation_max_constraints,
@@ -8373,6 +8467,9 @@ class SolverFeatherPGS(SolverBase):
                             self.mf_constraint_count,
                             self.mf_row_type,
                             self.mf_row_parent,
+                            contacts.rigid_contact_normal,
+                            self._ws_prev_contact_normal,
+                            self.mf_row_mu,
                             self._mf_warmstart_decay,
                             # Carried support impulses are proportional to dt, so
                             # rescale by the exact step-size ratio (1 at fixed dt).
@@ -8467,6 +8564,29 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.constraint_count],
             device=model.device,
         )
+
+        if self.warn_constraint_overflow:
+            mf_raw_counts = self.mf_slot_counter if mf_active else self.slot_counter
+            propagation_raw_counts = self.propagation_slot_counter if propagation_active else self.slot_counter
+            wp.launch(
+                _warn_constraint_row_overflow,
+                dim=self.world_count,
+                inputs=[
+                    self.slot_counter,
+                    self._row_dropped_dense,
+                    self.dense_max_constraints,
+                    mf_raw_counts,
+                    self._row_dropped_mf,
+                    self.mf_max_constraints,
+                    1 if mf_active else 0,
+                    propagation_raw_counts,
+                    self._row_dropped_propagation,
+                    self.propagation_max_constraints,
+                    1 if propagation_active else 0,
+                    self._row_overflow_warning_emitted,
+                ],
+                device=model.device,
+            )
 
     def _stage4_zero_world_C(self):
         self.C.zero_()
