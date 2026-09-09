@@ -12368,10 +12368,7 @@ class ModelBuilder:
             # compute joint ancestors
             child_to_joint = {}
             for i, child in enumerate(self.joint_child):
-                # The first inbound joint defines the articulation tree. Later
-                # inbound joints close loops and must not replace that tree edge,
-                # otherwise ancestor walks can cycle indefinitely.
-                child_to_joint.setdefault(child, i)
+                child_to_joint[child] = i
             parent_joint = []
             for parent in self.joint_parent:
                 parent_joint.append(child_to_joint.get(parent, -1))
