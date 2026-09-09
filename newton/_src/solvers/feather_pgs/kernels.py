@@ -1635,6 +1635,13 @@ def contact_tangent_basis(n: wp.vec3):
     return tangent0, tangent1
 
 
+# A friction row that the last Gauss-Seidel sweep projected onto its Coulomb cone is left exactly on
+# the cone surface (``|lambda_t| = mu * lambda_n`` up to the rounding of ``radius / mag``); an
+# unprojected update lands strictly inside. This relative tolerance recovers that projection event
+# from the converged impulses without adding state to the solve kernels.
+FRICTION_ANCHOR_CONE_TOLERANCE = wp.constant(1.0e-4)
+
+
 @wp.kernel
 def update_friction_anchors(
     contact_count: wp.array[int],
@@ -1651,7 +1658,7 @@ def update_friction_anchors(
     prev_anchor_a: wp.array[wp.vec3],
     prev_anchor_b: wp.array[wp.vec3],
     prev_valid: wp.array[int],
-    reset_distance: float,
+    shape_gap: wp.array[float],
     # outputs
     anchor_a: wp.array[wp.vec3],
     anchor_b: wp.array[wp.vec3],
@@ -1678,10 +1685,12 @@ def update_friction_anchors(
     Identity comes from the collision pipeline's ``rigid_contact_match_index``
     (current sorted contact -> previous sorted contact). Unmatched contacts,
     contacts whose previous anchor was invalidated (see
-    :func:`mark_sliding_friction_anchors`), and anchors separated by more than
-    ``reset_distance`` tangentially are re-anchored at the current witness
-    points, i.e. with zero tangential error. One thread per contact; each writes
-    only its own index, so the kernel is CUDA-graph safe.
+    :func:`mark_sliding_friction_anchors`), and anchors whose tangential
+    separation exceeds the pair's contact detection distance
+    (``shape_gap[a] + shape_gap[b]``, the model's own contact length scale) are
+    re-anchored at the current witness points, i.e. with zero tangential error.
+    One thread per contact; each writes only its own index, so the kernel is
+    CUDA-graph safe.
     """
     c = wp.tid()
     if c >= contact_count[0] or c >= contact_point0.shape[0]:
@@ -1704,6 +1713,12 @@ def update_friction_anchors(
         point_a_world = wp.transform_point(body_q[body_a], contact_point0[c]) - contact_thickness0[c] * normal
     if body_b >= 0:
         point_b_world = wp.transform_point(body_q[body_b], contact_point1[c]) + contact_thickness1[c] * normal
+
+    reset_distance = float(0.0)
+    if shape_a >= 0:
+        reset_distance += shape_gap[shape_a]
+    if shape_b >= 0:
+        reset_distance += shape_gap[shape_b]
 
     mi = match_index[c]
     if mi >= 0 and mi < prev_valid.shape[0]:
@@ -1779,16 +1794,16 @@ def mark_sliding_friction_anchors(
     propagation_row_type: wp.array2d[int],
     propagation_row_parent: wp.array2d[int],
     propagation_row_mu: wp.array2d[float],
-    slip_fraction: float,
     # in-out
     anchor_valid: wp.array[int],
 ):
     """Invalidate the friction anchor of every contact that slid this step.
 
-    A contact whose solved friction impulse reached ``slip_fraction`` of its
-    Coulomb cone is sliding: its anchor must not keep pulling it back, so the
-    anchor is dropped and :func:`update_friction_anchors` re-anchors it next step
-    at the new witness points (PhysX resets its friction anchors the same way).
+    A contact whose final friction impulse was projected onto its Coulomb cone by
+    the last sweep (see :data:`FRICTION_ANCHOR_CONE_TOLERANCE`) is sliding: its
+    anchor must not keep pulling it back, so the anchor is dropped and
+    :func:`update_friction_anchors` re-anchors it next step at the new witness
+    points (PhysX resets its friction anchors the same way).
     Contacts with no friction rows or no normal load this step keep their anchor
     (they cannot be shown to slide, and on a many-shape contact patch the normal
     load hops between redundant contacts from step to step).
@@ -1856,7 +1871,7 @@ def mark_sliding_friction_anchors(
     if has_friction == 0 or lam_n <= 0.0:
         return
     lam_t = wp.sqrt(lam_t0 * lam_t0 + lam_t1 * lam_t1)
-    if lam_t >= slip_fraction * mu * lam_n:
+    if lam_t >= (1.0 - FRICTION_ANCHOR_CONE_TOLERANCE) * mu * lam_n:
         anchor_valid[c] = 0
 
 

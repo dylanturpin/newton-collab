@@ -332,7 +332,7 @@ def _launch_anchor_update(
     shape_body=(0, 1),
     body_q=None,
     normal=(0.0, 0.0, -1.0),
-    reset_distance=0.005,
+    shape_gap=(0.0025, 0.0025),
 ):
     """Drive ``update_friction_anchors`` on ``len(point0)`` contacts between shape 0 (body 0) and
     shape 1 (body 1); returns (anchor_a, anchor_b, valid, phi) arrays."""
@@ -364,7 +364,7 @@ def _launch_anchor_update(
             prev_a,
             prev_b,
             prev_valid,
-            float(reset_distance),
+            wp.array(list(shape_gap), dtype=wp.float32, device=device),
         ],
         outputs=list(outs),
         device=device,
@@ -410,7 +410,6 @@ def _launch_mark_sliding(device, *, slots, paths, impulses, row_type, row_parent
             dummy_i,
             dummy_i,
             dummy_f,
-            0.98,
         ],
         outputs=[valid],
         device=device,
@@ -641,32 +640,50 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
         np.testing.assert_array_equal(valid_lost.numpy(), [1, 1, 1])
         np.testing.assert_allclose(phi_lost.numpy(), 0.0, atol=1.0e-9)
 
-    def test_reset_distance_threshold_reanchors_large_separations(self):
+    def test_separation_beyond_contact_detection_distance_reanchors(self):
+        """The stale-anchor guard is the pair's contact detection distance (``shape_gap[a] +
+        shape_gap[b]``): a carried separation inside it is kept, beyond it the pair re-anchors."""
         device = "cpu"
         aligned = [(0.0, 0.0, 0.0)] * 2, [(0.0, 0.0, -1.0e-3)] * 2
-        prev = _anchor_pairs(device, [4.0e-3, 6.0e-3])  # below / above the 5 mm default
+        prev = _anchor_pairs(device, [4.0e-3, 6.0e-3])  # below / above 2 mm + 3 mm
         _, _, valid, phi = _launch_anchor_update(
-            device, point0=aligned[0], point1=aligned[1], match_index=[0, 1], prev=prev, reset_distance=0.005
+            device, point0=aligned[0], point1=aligned[1], match_index=[0, 1], prev=prev, shape_gap=(0.002, 0.003)
         )
         np.testing.assert_array_equal(valid.numpy(), [1, 1])
         self.assertAlmostEqual(float(np.linalg.norm(phi.numpy()[0])), 4.0e-3, places=9)  # carried
         self.assertEqual(float(np.abs(phi.numpy()[1]).max()), 0.0)  # re-anchored
 
-    def test_mark_sliding_drops_saturated_and_rejected_keeps_unloaded(self):
-        """Only a loaded contact at its Coulomb cone loses its anchor; unloaded, frictionless and
-        normal-only contacts keep it, a contact without rows drops it."""
+    def test_mark_sliding_drops_projected_and_rejected_keeps_unloaded(self):
+        """Only a contact whose final friction impulse sits on its Coulomb cone (the last sweep
+        projected it) loses its anchor; a loaded contact inside the cone, an unloaded contact and
+        a normal-only contact keep it, a contact without rows drops it."""
         device = "cpu"
         c, f = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
         mu = 0.5
-        # contact 0: saturated (|lam_t| = 0.99 mu lam_n)  -> drop
-        # contact 1: loaded, well inside the cone           -> keep
-        # contact 2: friction rows present, no normal load   -> keep
-        # contact 3: rejected (slot -1)                      -> drop
-        # contact 4: normal row only (no friction rows)      -> keep
+        # contact 0: projected onto the cone (|lam_t| = mu lam_n as the clamp leaves it) -> drop
+        # contact 1: loaded, 99% of the cone (never projected)                          -> keep
+        # contact 2: friction rows present, no normal load                               -> keep
+        # contact 3: rejected (slot -1)                                                  -> drop
+        # contact 4: normal row only (no friction rows)                                  -> keep
         row_type = [c, f, f, c, f, f, c, f, f, c, c, c, c]
         row_parent = [-1, 0, 0, -1, 3, 3, -1, 6, 6, -1, -1, -1, -1]
         row_mu = [mu] * 13
-        impulses = [1.0, 0.99 * mu, 0.0, 1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        projected = np.float32(mu) * np.float32(0.6) / np.float32(np.hypot(0.6, 0.8))
+        impulses = [
+            1.0,
+            float(projected),
+            float(projected * np.float32(0.8 / 0.6)),
+            1.0,
+            0.99 * mu,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+        ]
         valid = wp.ones(5, dtype=wp.int32, device=device)
         got = _launch_mark_sliding(
             device,

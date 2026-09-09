@@ -746,8 +746,6 @@ class SolverFeatherPGS(SolverBase):
         pgs_warmstart_decay: float = 1.0,
         warn_constraint_overflow: bool = True,
         friction_anchor_beta: float = 0.0,
-        friction_anchor_reset_distance: float = 0.005,
-        friction_anchor_slip_fraction: float = 0.98,
     ):
         """
         Args:
@@ -798,16 +796,13 @@ class SolverFeatherPGS(SolverBase):
                 ``friction_anchor_beta * (tangential anchor separation) / dt`` in their RHS, so
                 tangential drift that leaks through an unconverged sweep or through the normal
                 row's depenetration bias on tilted contact normals is pulled back the next step
-                instead of integrating without bound (PhysX friction anchors). Requires a
-                Contacts buffer built with ``contact_matching`` enabled; a good value is the same
-                order as ``pgs_beta``. Defaults to 0.0.
-            friction_anchor_reset_distance (float, optional): Tangential anchor separation [m]
-                above which a contact is re-anchored at its current witness points instead of
-                being pulled back (guards against teleports and stale identities). Defaults to
-                0.005.
-            friction_anchor_slip_fraction (float, optional): A contact whose solved friction
-                impulse reaches this fraction of its Coulomb cone is treated as sliding and drops
-                its anchor, so anchors never oppose genuine sliding. Defaults to 0.98.
+                instead of integrating without bound (PhysX friction anchors). Anchor state is
+                managed by the solver: a contact whose final friction impulse was projected onto
+                its Coulomb cone is sliding and drops its anchor; anchors also reset on lost
+                contact identity, on :meth:`reset`, and when the pair separates tangentially by
+                more than its contact detection distance (``shape_gap[a] + shape_gap[b]``).
+                Requires a Contacts buffer built with ``contact_matching`` enabled; a good value
+                is a few times ``pgs_beta`` (0.2 on the Robotiq 2F-85 hold). Defaults to 0.0.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
                 for normal contact rows on the dense, matrix-free free-rigid, and propagation
                 paths. A value of 0.0 removes speculative closing allowance without changing
@@ -1095,12 +1090,6 @@ class SolverFeatherPGS(SolverBase):
         self.friction_anchor_beta = float(friction_anchor_beta)
         if not np.isfinite(self.friction_anchor_beta) or self.friction_anchor_beta < 0.0:
             raise ValueError("friction_anchor_beta must be finite and non-negative")
-        self.friction_anchor_reset_distance = float(friction_anchor_reset_distance)
-        if not np.isfinite(self.friction_anchor_reset_distance) or self.friction_anchor_reset_distance <= 0.0:
-            raise ValueError("friction_anchor_reset_distance must be finite and positive")
-        self.friction_anchor_slip_fraction = float(friction_anchor_slip_fraction)
-        if not 0.0 < self.friction_anchor_slip_fraction <= 1.0:
-            raise ValueError("friction_anchor_slip_fraction must be in (0, 1]")
         self._friction_anchors_enabled = self.friction_anchor_beta > 0.0
         try:
             self.contact_speculative_scale = float(contact_speculative_scale)
@@ -6642,7 +6631,6 @@ class SolverFeatherPGS(SolverBase):
                             prop_row_type if prop_row_type is not None else self._dummy_contact_row_type,
                             prop_row_parent if prop_row_parent is not None else self._dummy_contact_row_parent,
                             prop_row_mu if prop_row_mu is not None else self._dummy_contact_impulses,
-                            self.friction_anchor_slip_fraction,
                         ],
                         outputs=[self._fa_valid],
                         device=model.device,
@@ -8137,7 +8125,7 @@ class SolverFeatherPGS(SolverBase):
                         self._fa_prev_anchor_a,
                         self._fa_prev_anchor_b,
                         self._fa_prev_valid,
-                        self.friction_anchor_reset_distance,
+                        model.shape_gap,
                     ],
                     outputs=[self._fa_anchor_a, self._fa_anchor_b, self._fa_valid, self._fa_phi],
                     device=model.device,
