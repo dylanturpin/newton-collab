@@ -42,6 +42,7 @@ from ..semi_implicit.kernels_particle import (
     eval_triangle_forces,
 )
 from ..solver import SolverBase
+from .contact_torsion import configure_contact_torsion, prepare_torsion_rows, torque_sweep_source
 from .kernels import (
     FRICTION_MODE_BISECTION,
     FRICTION_MODE_BISECTION_DESAXCE,
@@ -742,10 +743,32 @@ class SolverFeatherPGS(SolverBase):
         articulation_pair_contact_gap_gate: float = 0.0,
         pgs_warmstart_decay: float = 1.0,
         warn_constraint_overflow: bool = True,
+        *,
+        contact_torsion_radius: float = 0.0,
+        contact_torsion_shape_indices: tuple[int, ...] | None = None,
+        contact_torsion_shape_patterns: tuple[str, ...] | None = None,
     ):
         """
         Args:
             model (Model): the model to be simulated.
+            contact_torsion_radius: Experimental effective spin radius [m], zero disables.
+                Explicit material/footprint assumption: for uniform pressure on a disk
+                of radius R, the effective radius is 2*R/3. Does not consume the generic
+                material torsion default. Sliding and spin share one Coulomb budget.
+                Currently supports dense articulated contacts in CUDA matrix-free,
+                immediate/current/interleaved mode without warmstarting, graph capture,
+                hydroelastic contact, regularization, or velocity post-passes. Host
+                grouping is diagnostic, not optimized for throughput. This experimental
+                parameter may change without the normal deprecation policy.
+            contact_torsion_shape_indices: Optional global shape indices selecting
+                contacts with at least one selected collider. None selects all shapes;
+                an empty tuple selects none. Mutually exclusive with shape patterns.
+                Experimental, with the same compatibility limitations as the radius.
+            contact_torsion_shape_patterns: Optional regex patterns, full-matched against
+                finalized model.shape_label at construction. For substring matching use
+                an explicit pattern such as ".*fingertip.*". Empty tuple selects none;
+                unmatched nonempty patterns raise ValueError. Experimental, with the
+                same compatibility limitations as the radius.
             angular_damping (float, optional): Angular damping factor. Defaults to 0.05.
             update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the
                 :meth:`step` function gets called). The cadence flag is evaluated on the host each step, so under
@@ -1541,6 +1564,9 @@ class SolverFeatherPGS(SolverBase):
         # kernels skip stores and their consumer kernels skip reads when
         # regularization is disabled.
         self._contact_row_w_dummy = wp.full((1, 1), 1.0, dtype=wp.float32, device=model.device)
+        configure_contact_torsion(
+            self, contact_torsion_radius, contact_torsion_shape_indices, contact_torsion_shape_patterns
+        )
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
@@ -4182,6 +4208,7 @@ class SolverFeatherPGS(SolverBase):
                 shared_metadata=shared_metadata,
                 skip_local_internal_worlds=self._local_internal_fast_path,
                 local_internal_max_constraints=self._dense_internal_max_rows,
+                contact_torsion=self.contact_torsion_radius > 0.0,
             )
 
         self._pgs_solve_mf_kernel = None
@@ -6022,6 +6049,8 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self._nvtx, synchronize=False):
             self._stage4_build_rows(state_in, state_aug, control, contacts, dt)
+            if self.contact_torsion_radius > 0.0:
+                prepare_torsion_rows(self, state_in, state_aug, contacts)
 
         if self.pgs_mode == "matrix_free":
             # Compute Y = H^-1 * J^T only (no Delassus C)
@@ -15636,6 +15665,7 @@ def _get_pgs_solve_mf_gs_kernel(
     fuse_vel_limits: bool = False,
     skip_local_internal_worlds: bool = False,
     local_internal_max_constraints: int = 0,
+    contact_torsion: bool = False,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -17067,6 +17097,17 @@ def _get_pgs_solve_mf_gs_kernel(
 #endif
 """
 
+    if contact_torsion:
+        # Spin rows use their group's residual friction budget, never a bilateral solve.
+        snippet = snippet.replace(
+            "            // row_phase 0: all rows.",
+            "            if (row_type == 7) continue;\n            // row_phase 0: all rows.",
+        )
+        snippet = snippet.replace(
+            "        // Friction rows may intentionally remain inactive",
+            torque_sweep_source(D) + "\n        // Friction rows may intentionally remain inactive",
+        )
+
     # ncu occupancy fix (opt-in): stream the matrix-free impulse vector from global
     # (mf_impulses) instead of holding it resident as s_lam_mf[M_MF] in shared memory.
     # s_lam_mf is the dominant smem consumer (M_MF*4 bytes); the GS coupling runs through
@@ -17296,6 +17337,8 @@ def _get_pgs_solve_mf_gs_kernel(
         name += "_gmeta"
     if skip_local_internal_worlds:
         name += f"_contact_fallback{local_internal_max_constraints}"
+    if contact_torsion:
+        name += "_torsion"
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
