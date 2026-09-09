@@ -676,7 +676,7 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         for label, kwargs in cases:
             with self.subTest(configuration=label):
                 solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
-                with self.assertRaisesRegex(ValueError, rf"{label}.*not validated"):
+                with self.assertRaisesRegex(NotImplementedError, "contact_matching"):
                     solver.step(state_0, state_1, model.control(), contacts, DT)
 
     def test_feather_pgs_environment_mf_warmstart_rejected_at_step(self):
@@ -689,7 +689,7 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"IL_NEWTON_FPGS_MF_WARMSTART": "1"}):
             solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split")
         self.assertTrue(solver._mf_warmstart_enabled)
-        with self.assertRaisesRegex(ValueError, r"pgs_warmstart=True.*not validated"):
+        with self.assertRaisesRegex(NotImplementedError, "contact_matching"):
             solver.step(state_0, state_1, model.control(), contacts, DT)
 
 
@@ -924,6 +924,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         self.assertGreater(rows["dense_raw_high_water"], rows["dense_high_water"])
         self.assertEqual(rows["dense_overflow_world_steps"], 1)
         self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
+        self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
 
     def test_row_watermark_includes_rolled_back_contact_rows(self):
         """Count contact bundles rejected and rolled back by the allocator."""
@@ -955,6 +956,65 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         )
         self.assertEqual(rows["dense_overflow_world_steps"], 1)
         self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
+
+    def test_constraint_overflow_warning_does_not_require_row_watermark(self):
+        """Keep the default warning active without full high-water telemetry."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        _prismatic_jointed_foot(builder, (0.0, 0.0, 0.02))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        pipeline = _make_pipeline(model, False)
+        contacts = pipeline.contacts()
+        pipeline.collide(state_0, contacts)
+
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            angular_damping=0.0,
+            dense_max_constraints=4,
+        )
+        solver.step(state_0, state_1, model.control(), contacts, DT)
+
+        self.assertFalse(solver._row_watermark)
+        self.assertTrue(solver._track_row_capacity)
+        self.assertGreater(int(solver._row_dropped_dense.numpy().max()), 0)
+        self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
+
+    def test_constraint_overflow_warning_covers_matrix_free_and_propagation_rows(self):
+        """Identify overflows on both non-dense contact row families."""
+        if not wp.get_device().is_cuda:
+            self.skipTest("matrix-free FeatherPGS overflow coverage is CUDA-only")
+
+        cases = (
+            ("immediate", _free_jointed_foot, 1, "_row_dropped_mf"),
+            ("propagation", _prismatic_jointed_foot, 2, "_row_dropped_propagation"),
+        )
+        for response, build_foot, warning_index, dropped_attribute in cases:
+            with self.subTest(response=response):
+                builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                build_foot(builder, (0.0, 0.0, 0.02))
+                builder.add_ground_plane()
+                model = builder.finalize(device=wp.get_device())
+                state_0, state_1 = model.state(), model.state()
+                newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+                pipeline = _make_pipeline(model, False)
+                contacts = pipeline.contacts()
+                pipeline.collide(state_0, contacts)
+
+                solver = newton.solvers.SolverFeatherPGS(
+                    model,
+                    angular_damping=0.0,
+                    pgs_mode="matrix_free",
+                    articulated_contact_response=response,
+                    dense_max_constraints=4,
+                    mf_max_constraints=4,
+                )
+                solver.step(state_0, state_1, model.control(), contacts, DT)
+
+                dropped_rows = getattr(solver, dropped_attribute)
+                self.assertGreater(int(dropped_rows.numpy().max()), 0)
+                self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[warning_index]), 1)
 
     def test_feather_pgs_conformance(self):
         """SolverFeatherPGS rests a free-jointed foot at the same height on/off.
@@ -1243,6 +1303,24 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
 
 class TestBodyPairReductionTableSizing(unittest.TestCase):
     """The group table is sized from scene topology, not from contact capacity."""
+
+    def test_replicated_compound_feet_do_not_exhaust_default_table(self):
+        """Replication must retain the patch budget without tuning headroom."""
+        template = newton.ModelBuilder()
+        _cylinder_foot(template, wp.vec3(0.0, 0.0, 0.015))
+        builder = newton.ModelBuilder()
+        builder.replicate(template, 512, spacing=(1.0, 0.0, 0.0))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state = model.state()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        stats = pipeline.body_pair_reduction_stats()
+        self.assertEqual(stats["fallback_frames"], 0)
+        self.assertEqual(stats["probe_failures"], 0)
+        self.assertLess(stats["max_contacts_kept"], stats["max_contacts_in"])
 
     def _scene(self, n_bodies):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
@@ -1905,19 +1983,15 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         builder.add_ground_plane()
         return builder.finalize(device=wp.get_device())
 
-    def test_contact_matching_rejected_at_construction(self):
-        """Reject body-pair contact reduction together with contact matching.
-
-        Compaction renumbers contacts, which would silently invalidate the
-        matcher's index-based frame-to-frame bookkeeping.
-        """
+    def test_sticky_matching_rejected_at_construction(self):
+        """Reject replay that can change geometry after selecting support extremes."""
         model = self._foot_scene()
         with self.assertRaisesRegex(ValueError, "contact_matching"):
             newton.CollisionPipeline(
                 model,
                 broad_phase="nxn",
                 deterministic=True,
-                contact_matching="latest",
+                contact_matching="sticky",
                 reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True),
             )
 
@@ -2966,7 +3040,10 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
             pipe_red = _make_pipeline(model, True, body_pair_verify=True)
             pipe_raw = newton.CollisionPipeline(model, broad_phase="nxn")
             c_red, c_raw = pipe_red.contacts(), pipe_raw.contacts()
-            solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+            # Seven colliders per body generate thousands of speculative rows.
+            # Both consumers must retain them for this to test reduction stability.
+            mf_capacity = 3 * max(c_red.rigid_contact_max, c_raw.rigid_contact_max)
+            solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, mf_max_constraints=mf_capacity)
             raw_not_less, strict_reduction_frames, peak_red = 0, 0, 0.0
             for _ in range(150):
                 pipe_raw.collide(state_0, c_raw)
@@ -2988,7 +3065,7 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
             raw_control = model.control()
             raw_dynamics_pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
             raw_dynamics_contacts = raw_dynamics_pipeline.contacts()
-            raw_solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+            raw_solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, mf_max_constraints=mf_capacity)
             peak_raw = 0.0
             for _ in range(150):
                 raw_dynamics_pipeline.collide(raw_state_0, raw_dynamics_contacts)

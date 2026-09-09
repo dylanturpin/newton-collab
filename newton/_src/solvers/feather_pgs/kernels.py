@@ -45,6 +45,7 @@ PGS_CONSTRAINT_TYPE_MIMIC = 5
 PGS_CONSTRAINT_TYPE_CONNECT = 6
 PGS_CONSTRAINT_TYPE_COUNT = 7
 
+
 # Numeric IDs for the ``friction_mode`` argument passed to the matrix-free
 # PGS solver kernels.  Mirrors the Python-side string enum on
 # :class:`~newton.solvers.SolverFeatherPGS` (``"current"`` /
@@ -1383,6 +1384,124 @@ def apply_free_root_transport_to_predictor(
     v_hat[d + 0] = v_hat[d + 0] + c[0] * dt
     v_hat[d + 1] = v_hat[d + 1] + c[1] * dt
     v_hat[d + 2] = v_hat[d + 2] + c[2] * dt
+
+
+@wp.func
+def _gyro_skew(v: wp.vec3):
+    return wp.mat33(0.0, -v[2], v[1], v[2], 0.0, -v[0], -v[1], v[0], 0.0)
+
+
+@wp.func
+def _gyroscopic_velocity(inertia: wp.mat33, effective_inertia: wp.mat33, omega: wp.vec3, predicted: wp.vec3, dt: float):
+    """Replace the explicit gyroscopic kick with energy-preserving Cayley updates.
+
+    Every solve has the form ``(A-S) w = (A+S) u``, with symmetric positive
+    definite ``A`` and skew ``S``. Thus ``w.T A w == u.T A u`` independently
+    of fixed-point convergence. Updating S from the midpoint approximates
+    implicit midpoint without an unconverged Newton step injecting energy.
+    External torque remains in u; only the gyroscopic kick is replaced.
+    """
+    scale = wp.max(effective_inertia[0, 0], wp.max(effective_inertia[1, 1], effective_inertia[2, 2]))
+    a = effective_inertia / scale
+    physical = inertia / scale
+    inverse = wp.inverse(a)
+    u = predicted + dt * (inverse * wp.cross(omega, physical * omega))
+    # An energy bound on angular speed chooses inexpensive local gyro
+    # microsteps. Geometry and the constraint solver still run once per step.
+    # The fixed cap bounds work; energy preservation does not depend on it.
+    speed_bound = wp.sqrt(wp.max(wp.dot(u, a * u) * wp.trace(inverse), 0.0))
+    microsteps = wp.int32(wp.clamp(wp.ceil(2.0 * wp.abs(dt) * speed_bound), 1.0, 32.0))
+    h = dt / float(microsteps)
+    w = u
+    for _ in range(microsteps):
+        u = w
+        energy = wp.dot(u, a * u)
+        for _iteration in range(8):
+            s = (0.5 * h) * _gyro_skew(physical * (0.5 * (u + w)))
+            candidate = wp.inverse(a - s) * ((a + s) * u)
+            delta = candidate - w
+            w = candidate
+            if wp.dot(delta, a * delta) <= 1.0e-12 * energy:
+                break
+    return w
+
+
+@wp.kernel
+def apply_free_root_velocity_corrections(
+    free_root_joint_indices: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_child: wp.array[int],
+    body_to_articulation: wp.array[int],
+    is_free_rigid: wp.array[int],
+    art_group_index: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_inertia: wp.array[wp.mat33],
+    cholesky: wp.array3d[float],
+    joint_qd: wp.array[float],
+    dt: float,
+    requires_grad: bool,
+    v_hat: wp.array[float],
+):
+    """Fuse free-root transport with the isolated rigid-body gyroscopic update."""
+    root_index = wp.tid()
+    d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, root_index)
+    if d < 0:
+        return
+    v = wp.vec3(joint_qd[d + 0], joint_qd[d + 1], joint_qd[d + 2])
+    w = wp.vec3(joint_qd[d + 3], joint_qd[d + 4], joint_qd[d + 5])
+    c = wp.cross(w, v)
+    v_hat[d + 0] = v_hat[d + 0] + c[0] * dt
+    v_hat[d + 1] = v_hat[d + 1] + c[1] * dt
+    v_hat[d + 2] = v_hat[d + 2] + c[2] * dt
+
+    body = joint_child[free_root_joint_indices[root_index]]
+    art = body_to_articulation[body]
+    if is_free_rigid[art] == 0:
+        return
+    predicted_world = wp.vec3(v_hat[d + 3], v_hat[d + 4], v_hat[d + 5])
+    if not requires_grad:
+        # A stationary angular predictor has no gyroscopic work to do.
+        if (
+            w[0] == 0.0
+            and w[1] == 0.0
+            and w[2] == 0.0
+            and predicted_world[0] == 0.0
+            and predicted_world[1] == 0.0
+            and predicted_world[2] == 0.0
+        ):
+            return
+    inertia = body_inertia[body]
+    if not requires_grad:
+        # Isotropic inertia has identically zero gyroscopic bias. Preserve
+        # its predictor exactly and avoid local solves for spheres and cubes.
+        # The derivative with respect to inertia need not vanish here.
+        if (
+            inertia[0, 0] == inertia[1, 1]
+            and inertia[1, 1] == inertia[2, 2]
+            and inertia[0, 1] == 0.0
+            and inertia[0, 2] == 0.0
+            and inertia[1, 0] == 0.0
+            and inertia[1, 2] == 0.0
+            and inertia[2, 0] == 0.0
+            and inertia[2, 1] == 0.0
+        ):
+            return
+    group = art_group_index[art]
+    # At the root COM, translation and rotation decouple. The angular
+    # Cholesky block includes armature and the factorization's pivot floor.
+    lower = wp.mat33(0.0)
+    for r in range(3):
+        for c in range(r + 1):
+            lower[r, c] = cholesky[group, r + 3, c + 3]
+    rotation = wp.transform_get_rotation(body_q[body])
+    basis = wp.quat_to_matrix(rotation)
+    effective = wp.transpose(basis) * (lower * wp.transpose(lower)) * basis
+    omega = wp.quat_rotate_inv(rotation, w)
+    predicted = wp.quat_rotate_inv(rotation, predicted_world)
+    corrected = wp.quat_rotate(rotation, _gyroscopic_velocity(inertia, effective, omega, predicted, dt))
+    for k in range(3):
+        v_hat[d + 3 + k] = corrected[k]
 
 
 @wp.kernel
@@ -4461,8 +4580,10 @@ def compute_world_contact_bias(
     bias_scale: float,
     contact_speculative_scale: float,
     joint_limit_speculative_scale: float,
+    contact_w: float,
     # outputs
     world_rhs: wp.array2d[float],
+    world_row_w: wp.array2d[float],
 ):
     """Compute the RHS bias term for world-level PGS solve.
 
@@ -4483,14 +4604,16 @@ def compute_world_contact_bias(
 
         # Initialize with -target_velocity (will add J*v later)
         rhs = -target_vel
+        row_w = float(1.0)
 
         # Contacts inside the speculative gap should not become sticky ghost
         # contacts.  For separation (phi > 0), allow closing by the current gap
         # over this substep: Jv + phi / dt >= 0.  For penetration, keep the
         # Baumgarte correction and let velocity-only passes scale it to zero.
         if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-            if phi < 0.0:
+            if phi <= 0.0:
                 rhs += bias_scale * beta * phi * inv_dt  # Negative for penetration
+                row_w = contact_w
             else:
                 rhs += contact_speculative_scale * phi * inv_dt
         elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
@@ -4516,6 +4639,8 @@ def compute_world_contact_bias(
         # ``J*v_hat`` term added by ``rhs_accum_world_par_art``.
 
         world_rhs[world, i] = rhs
+        if contact_w < 1.0:
+            world_row_w[world, i] = row_w
 
 
 @wp.kernel
@@ -4532,8 +4657,10 @@ def apply_world_contact_restitution_matrix_free(
     world_J: wp.array3d[float],
     dt: float,
     restitution_velocity_threshold: float,
+    write_row_w: int,
     # in/out
     world_rhs: wp.array2d[float],
+    world_row_w: wp.array2d[float],
 ):
     """Replace a matrix-free contact bias with a one-shot restitution target."""
     tid = wp.tid()
@@ -4559,6 +4686,8 @@ def apply_world_contact_restitution_matrix_free(
         # Matrix-free GS adds live J*v itself, so store only
         # -target + e*u_incident as the row bias.
         world_rhs[world, i] = -target_vel + restitution * relative_incident
+        if write_row_w != 0:
+            world_row_w[world, i] = 1.0
 
 
 @wp.kernel
@@ -4572,8 +4701,10 @@ def apply_world_contact_restitution_accumulated(
     dt: float,
     contact_speculative_scale: float,
     restitution_velocity_threshold: float,
+    write_row_w: int,
     # in/out
     world_rhs: wp.array2d[float],
+    world_row_w: wp.array2d[float],
 ):
     """Replace an accumulated impulse-space contact RHS with restitution."""
     tid = wp.tid()
@@ -4597,6 +4728,8 @@ def apply_world_contact_restitution_accumulated(
         # Impulse-space RHS contains u_incident already.  Replacing geometric
         # bias with the Newton target yields (1+e)*u_incident.
         world_rhs[world, i] = (1.0 + restitution) * relative_incident
+        if write_row_w != 0:
+            world_row_w[world, i] = 1.0
 
 
 @wp.kernel
@@ -4916,7 +5049,6 @@ def _build_mf_contact_row(
     contact_friction_articulation_pairs_only: int,
     contact_friction_scale: float,
     contact_shared_anchor: int,
-    pgs_beta: float,
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -5147,7 +5279,6 @@ def build_mf_contact_rows(
     contact_friction_articulation_pairs_only: int,
     contact_friction_scale: float,
     contact_shared_anchor: int,
-    pgs_beta: float,
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -5194,7 +5325,6 @@ def build_mf_contact_rows(
             contact_friction_articulation_pairs_only,
             contact_friction_scale,
             contact_shared_anchor,
-            pgs_beta,
             mf_body_a,
             mf_body_b,
             mf_J_a,
@@ -5423,6 +5553,49 @@ def build_propagation_contact_rows(
             propagation_row_restitution[world, row_idx] = 0.0
 
 
+@wp.func
+def _transport_warmstart_contact(
+    normal: wp.vec3,
+    previous_normal: wp.vec3,
+    world: int,
+    slot: int,
+    count: int,
+    row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    row_mu: wp.array2d[float],
+    impulses: wp.array2d[float],
+):
+    """Transport the cached tangent frame and enforce the current contact cone."""
+    normal_impulse = impulses[world, slot]
+    if not wp.isfinite(normal_impulse) or wp.dot(normal, previous_normal) <= 0.0:
+        normal_impulse = 0.0
+    normal_impulse = wp.max(normal_impulse, 0.0)
+    impulses[world, slot] = normal_impulse
+    if slot + 2 >= count:
+        return
+    if (
+        row_type[world, slot + 1] != PGS_CONSTRAINT_TYPE_FRICTION
+        or row_type[world, slot + 2] != PGS_CONSTRAINT_TYPE_FRICTION
+        or row_parent[world, slot + 1] != slot
+        or row_parent[world, slot + 2] != slot
+    ):
+        return
+
+    # Collision normals are A-to-B; every contact Jacobian uses B-to-A.
+    old_t0, old_t1 = contact_tangent_basis(-previous_normal)
+    new_t0, new_t1 = contact_tangent_basis(-normal)
+    tangent_world = impulses[world, slot + 1] * old_t0 + impulses[world, slot + 2] * old_t1
+    tangent = wp.vec2(wp.dot(tangent_world, new_t0), wp.dot(tangent_world, new_t1))
+    magnitude = wp.length(tangent)
+    radius = wp.max(row_mu[world, slot + 1] * normal_impulse, 0.0)
+    if not wp.isfinite(magnitude) or radius <= 0.0:
+        tangent = wp.vec2(0.0)
+    elif magnitude > radius:
+        tangent *= radius / magnitude
+    impulses[world, slot + 1] = tangent[0]
+    impulses[world, slot + 2] = tangent[1]
+
+
 @wp.kernel
 def gather_mf_warmstart(
     contact_count: wp.array[int],
@@ -5437,6 +5610,9 @@ def gather_mf_warmstart(
     mf_constraint_count: wp.array[int],
     mf_row_type: wp.array2d[int],  # THIS step's row types (already built)
     mf_row_parent: wp.array2d[int],
+    contact_normal: wp.array[wp.vec3],
+    previous_normal: wp.array[wp.vec3],
+    mf_row_mu: wp.array2d[float],
     decay: float,
     dt_scale: float,
     mf_max_c: int,
@@ -5509,6 +5685,48 @@ def gather_mf_warmstart(
                 ):
                     mf_impulses[world, new_r] = decay * dt_scale * prev_mf_impulses[world, prev_r]
                 # else: leave 0
+
+    if mi >= 0 and prev_slot >= 0 and prev_slot < mf_max_c:
+        _transport_warmstart_contact(
+            contact_normal[c],
+            previous_normal[mi],
+            world,
+            new_slot,
+            count,
+            mf_row_type,
+            mf_row_parent,
+            mf_row_mu,
+            mf_impulses,
+        )
+
+
+@wp.kernel
+def snapshot_contact_warmstart(
+    contact_count: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_normal: wp.array[wp.vec3],
+    previous_dense_slot: wp.array[int],
+    previous_mf_slot: wp.array[int],
+    previous_propagation_slot: wp.array[int],
+    previous_normal: wp.array[wp.vec3],
+):
+    """Save all contact routes and live normals in one launch."""
+    contact = wp.tid()
+    count = contact_count[0]
+    active = contact < count and count <= contact_normal.shape[0]
+    path = int(-1)
+    slot = int(-1)
+    if active:
+        path = contact_path[contact]
+        slot = contact_slot[contact]
+        previous_normal[contact] = contact_normal[contact]
+    if contact < previous_dense_slot.shape[0]:
+        previous_dense_slot[contact] = wp.where(path == 0, slot, -1)
+    if contact < previous_mf_slot.shape[0]:
+        previous_mf_slot[contact] = wp.where(path == 1, slot, -1)
+    if contact < previous_propagation_slot.shape[0]:
+        previous_propagation_slot[contact] = wp.where(path == 2, slot, -1)
 
 
 @wp.kernel
@@ -5595,6 +5813,9 @@ def gather_dense_warmstart(
     world_constraint_count: wp.array[int],
     world_row_type: wp.array2d[int],  # THIS step's dense row types (already built)
     world_row_parent: wp.array2d[int],
+    contact_normal: wp.array[wp.vec3],
+    previous_normal: wp.array[wp.vec3],
+    world_row_mu: wp.array2d[float],
     decay: float,
     dt_scale: float,
     max_constraints: int,
@@ -5662,6 +5883,19 @@ def gather_dense_warmstart(
                 ):
                     world_impulses[world, new_r] = decay * dt_scale * prev_dense_impulses[world, prev_r]
 
+    if mi >= 0 and prev_slot >= 0 and prev_slot < max_constraints:
+        _transport_warmstart_contact(
+            contact_normal[c],
+            previous_normal[mi],
+            world,
+            new_slot,
+            count,
+            world_row_type,
+            world_row_parent,
+            world_row_mu,
+            world_impulses,
+        )
+
 
 @wp.kernel
 def gather_propagation_warmstart(
@@ -5677,6 +5911,9 @@ def gather_propagation_warmstart(
     constraint_count: wp.array[int],
     row_type: wp.array2d[int],
     row_parent: wp.array2d[int],
+    contact_normal: wp.array[wp.vec3],
+    previous_normal: wp.array[wp.vec3],
+    row_mu: wp.array2d[float],
     decay: float,
     dt_scale: float,
     max_constraints: int,
@@ -5722,6 +5959,19 @@ def gather_propagation_warmstart(
             and prev_row_parent[world, prev_r] == prev_slot
         ):
             impulses[world, new_r] = decay * dt_scale * prev_impulses[world, prev_r]
+
+    if mi >= 0 and prev_slot >= 0 and prev_slot < max_constraints:
+        _transport_warmstart_contact(
+            contact_normal[c],
+            previous_normal[mi],
+            world,
+            new_slot,
+            count,
+            row_type,
+            row_parent,
+            row_mu,
+            impulses,
+        )
 
 
 @wp.kernel
@@ -6095,6 +6345,7 @@ def compute_mf_effective_mass_and_rhs(
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_cfm: float,
     pgs_beta: float,
+    contact_w: float,
     dt: float,
     contact_speculative_scale: float,
     restitution_velocity_threshold: float,
@@ -6104,6 +6355,7 @@ def compute_mf_effective_mass_and_rhs(
     mf_MiJt_a: wp.array3d[float],
     mf_MiJt_b: wp.array3d[float],
     mf_rhs: wp.array2d[float],
+    mf_row_w: wp.array2d[float],
 ):
     """Compute effective mass diagonal, H^-1*J^T, and RHS bias for MF constraints.
 
@@ -6178,9 +6430,14 @@ def compute_mf_effective_mass_and_rhs(
     # contacts use Baumgarte stabilization; separated speculative contacts
     # allow closing by the current positive gap over this substep.
     bias = float(0.0)
+    row_w = float(1.0)
     rtype = mf_row_type[world, i]
     if rtype == PGS_CONSTRAINT_TYPE_CONTACT:
         phi_val = mf_phi[world, i]
+        if phi_val <= 0.0:
+            # Positive-gap (speculative) rows stay rigid so a closing contact
+            # reaches the surface instead of leaking closing speed into penetration.
+            row_w = contact_w
         if phi_val < 0.0:
             bias = pgs_beta * phi_val / dt
             max_depen = 1.0e20
@@ -6212,12 +6469,16 @@ def compute_mf_effective_mass_and_rhs(
             relative_incident -= target_vel
             if contact_restitution_fires(phi_val, relative_incident, dt, restitution_velocity_threshold):
                 bias = restitution * relative_incident
+                # An impact is impulsive, not a spring: keep the rebound exact.
+                row_w = 1.0
     elif rtype == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         bias = mf_phi[world, i]
 
     if has_target_velocity != 0:
         bias -= mf_target_velocity[world, i]
     mf_rhs[world, i] = bias
+    if contact_w < 1.0:
+        mf_row_w[world, i] = row_w
 
 
 @wp.kernel
@@ -6279,10 +6540,10 @@ def compute_mf_rhs_bias(
         if bounce != 0:
             bias = restitution * relative_incident
         elif phi_val < 0.0:
-            bias = bias_scale * pgs_beta * phi_val / dt
-            max_depen = 1.0e20
             ba = mf_body_a[world, i]
             bb = mf_body_b[world, i]
+            bias = bias_scale * pgs_beta * phi_val / dt
+            max_depen = 1.0e20
             if ba >= 0:
                 max_depen = rigid_body_max_depenetration_velocity[ba]
             if bb >= 0:
@@ -6338,8 +6599,7 @@ def compute_propagation_effective_mass_and_rhs(
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_cfm: float,
     pgs_beta: float,
-    dense_contact_compliance: float,
-    speculative_dense_contact_compliance: float,
+    contact_w: float,
     dt: float,
     contact_speculative_scale: float,
     restitution_velocity_threshold: float,
@@ -6350,6 +6610,7 @@ def compute_propagation_effective_mass_and_rhs(
     propagation_MiJt_b: wp.array3d[float],
     propagation_rhs: wp.array2d[float],
     propagation_restitution_target: wp.array2d[float],
+    propagation_row_w: wp.array2d[float],
 ):
     tid = wp.tid()
     world = tid // propagation_max_constraints
@@ -6379,13 +6640,6 @@ def compute_propagation_effective_mass_and_rhs(
             propagation_MiJt_b[world, i, r] = value
             d += propagation_J_b[world, i, r] * value
 
-    if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        compliance = dense_contact_compliance
-        if propagation_phi[world, i] > 0.0:
-            compliance += speculative_dense_contact_compliance
-        if compliance != 0.0 and dt > 0.0:
-            d += compliance / (dt * dt)
-
     if d > 0.0:
         propagation_eff_mass_inv[world, i] = 1.0 / d
     else:
@@ -6393,8 +6647,13 @@ def compute_propagation_effective_mass_and_rhs(
 
     bias = float(0.0)
     restitution_target = float(0.0)
+    row_w = float(1.0)
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
         phi_val = propagation_phi[world, i]
+        if phi_val <= 0.0:
+            # Positive-gap (speculative) rows stay rigid so a closing contact
+            # reaches the surface instead of leaking closing speed into penetration.
+            row_w = contact_w
         if phi_val < 0.0:
             bias = pgs_beta * phi_val / dt
             max_depen = 1.0e20
@@ -6420,8 +6679,11 @@ def compute_propagation_effective_mass_and_rhs(
                 # Newton target replaces (rather than augments) speculative or
                 # Baumgarte geometry for a qualifying impact.
                 bias = -restitution_target
+                row_w = 1.0
     propagation_rhs[world, i] = bias
     propagation_restitution_target[world, i] = restitution_target
+    if contact_w < 1.0:
+        propagation_row_w[world, i] = row_w
 
 
 @wp.kernel
@@ -6458,9 +6720,9 @@ def compute_propagation_rhs_bias(
         reached = int(1)
         phi_val = propagation_phi[world, i]
         if phi_val < 0.0:
-            bias = bias_scale * pgs_beta * phi_val / dt
             ba = propagation_body_a[world, i]
             bb = propagation_body_b[world, i]
+            bias = bias_scale * pgs_beta * phi_val / dt
             max_depen = 1.0e20
             if ba >= 0:
                 max_depen = rigid_body_max_depenetration_velocity[ba]
@@ -6957,8 +7219,6 @@ def refine_same_articulation_propagation_rows(
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
     pgs_cfm: float,
-    dense_contact_compliance: float,
-    speculative_dense_contact_compliance: float,
     dt: float,
     propagation_max_constraints: int,
     # scratch
@@ -7122,13 +7382,6 @@ def refine_same_articulation_propagation_rows(
             propagation_MiJt_b[world, i, r] = mi_b
             d += propagation_J_a[world, i, r] * mi_a
             d += propagation_J_b[world, i, r] * mi_b
-
-        if propagation_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
-            compliance = dense_contact_compliance
-            if propagation_phi[world, i] > 0.0:
-                compliance += speculative_dense_contact_compliance
-            if compliance != 0.0 and dt > 0.0:
-                d += compliance / (dt * dt)
 
         if d > 0.0:
             propagation_eff_mass_inv[world, i] = 1.0 / d
@@ -7850,12 +8103,14 @@ def pgs_solve_propagation_contact_loop(
     propagation_J_b: wp.array3d[float],
     propagation_eff_mass_inv: wp.array2d[float],
     propagation_rhs: wp.array2d[float],
+    propagation_row_w: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
     propagation_row_parent: wp.array2d[int],
     propagation_row_mu: wp.array2d[float],
     propagation_max_constraints: int,
     iterations: int,
     omega: float,
+    regularize: int,
     friction_start_iteration: int,
     iteration_offset: int,
     # in/out
@@ -7895,8 +8150,11 @@ def pgs_solve_propagation_contact_loop(
                     jv += propagation_J_b[world, i, k] * propagation_body_qd[bb, k]
 
             residual = jv + propagation_rhs[world, i]
-            delta = -residual * eff_inv
             old_impulse = propagation_impulses[world, i]
+            w = float(1.0)
+            if regularize != 0:
+                w = propagation_row_w[world, i]
+            delta = -residual * eff_inv * w - (1.0 - w) * old_impulse
             new_impulse = old_impulse + omega * delta
 
             if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
@@ -8792,11 +9050,12 @@ def pgs_solve_mf_loop(
     mf_row_type: wp.array2d[int],
     mf_row_parent: wp.array2d[int],
     mf_row_mu: wp.array2d[float],
-    contact_regularization_w: float,
+    mf_row_w: wp.array2d[float],
     body_to_articulation: wp.array[int],
     art_dof_start: wp.array[int],
     iterations: int,
     omega: float,
+    regularize: int,
     friction_mode: int,
     friction_start_iteration: int,
     iteration_offset: int,
@@ -8861,7 +9120,10 @@ def pgs_solve_mf_loop(
                 # Proximal regularization in w-form (w = 1/(1+g)): identical
                 # algebra, but no g*lambda product that could overflow for
                 # extreme finite g; w = 1 (g = 0) is the exact hard update.
-                delta = -residual * eff_inv * contact_regularization_w - (1.0 - contact_regularization_w) * old_impulse
+                w = float(1.0)
+                if regularize != 0:
+                    w = mf_row_w[world, i]
+                delta = -residual * eff_inv * w - (1.0 - w) * old_impulse
             new_impulse = old_impulse + omega * delta
             delta_impulse = float(0.0)
 
@@ -9279,31 +9541,30 @@ def finalize_world_diag_cfm(
 
 
 @wp.kernel
-def add_dense_contact_compliance_to_diag(
+def apply_contact_regularization(
     world_constraint_count: wp.array[int],
     world_row_type: wp.array2d[int],
-    world_phi: wp.array2d[float],
-    contact_alpha: float,
-    speculative_contact_alpha: float,
+    world_row_w: wp.array2d[float],
     # in/out
     world_diag: wp.array2d[float],
+    world_C: wp.array3d[float],
 ):
-    """Add normal-contact compliance to the dense PGS diagonal.
+    """Fold the per-row weight of dense contact rows into the assembled Delassus system.
 
-    The dense articulated contact path uses a Delassus diagonal in impulse
-    space. A compliance ``alpha = compliance / dt^2`` contributes an additional
-    diagonal term for normal contact rows only, yielding a softer normal
-    response without changing friction or joint-limit rows. A separate
-    speculative term applies only while ``phi > 0``.
+    Adding ``reg = (1/w - 1) * d`` to the matrix diagonal and the divisor is the
+    w-form update ``delta = -w*r/d - (1-w)*lambda`` used by every other route.
+    Only the split mode, which solves with the assembled matrix, needs this; the
+    fused velocity-residual routes read ``world_row_w`` directly.
     """
     world = wp.tid()
     m = world_constraint_count[world]
-
     for i in range(m):
         if world_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
-            world_diag[world, i] += contact_alpha
-            if world_phi[world, i] > 0.0:
-                world_diag[world, i] += speculative_contact_alpha
+            w = world_row_w[world, i]
+            if w < 1.0:
+                reg = (1.0 / w - 1.0) * world_diag[world, i]
+                world_diag[world, i] += reg
+                world_C[world, i, i] += reg
 
 
 # =============================================================================

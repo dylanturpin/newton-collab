@@ -219,8 +219,9 @@ def _dense_speculative_rhs(scale: float) -> float:
             1.0,
             scale,
             1.0,
+            1.0,
         ],
-        outputs=[rhs],
+        outputs=[rhs, wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
         device="cpu",
     )
     return float(rhs.numpy()[0, 0])
@@ -250,6 +251,7 @@ def _mf_speculative_rhs(scale: float) -> float:
             wp.array([float("inf")], dtype=wp.float32, device="cpu"),
             1.0,
             0.2,
+            1.0,
             0.5,
             scale,
             0.5,
@@ -260,6 +262,7 @@ def _mf_speculative_rhs(scale: float) -> float:
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             rhs,
+            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
         ],
         device="cpu",
     )
@@ -286,8 +289,7 @@ def _propagation_speculative_rhs(scale: float) -> float:
             wp.array([float("inf")], dtype=wp.float32, device="cpu"),
             1.0,
             0.2,
-            0.0,
-            0.0,
+            1.0,
             0.5,
             scale,
             0.5,
@@ -298,6 +300,7 @@ def _propagation_speculative_rhs(scale: float) -> float:
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             rhs,
+            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
         ],
         device="cpu",
@@ -321,8 +324,9 @@ def _dense_restitution_rhs(scale: float) -> float:
             1.0,
             scale,
             0.0,
+            0,
         ],
-        outputs=[rhs],
+        outputs=[rhs, wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
         device="cpu",
     )
     return float(rhs.numpy()[0, 0])
@@ -528,6 +532,16 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         self.assertEqual(solver.same_articulation_contact_gap_gate, 0.0)
         self.assertEqual(solver.articulation_pair_contact_gap_gate, 0.0)
         self.assertFalse(solver.contact_friction_articulation_pairs_only)
+        self.assertTrue(solver.warn_constraint_overflow)
+        self.assertTrue(solver._track_row_capacity)
+        self.assertFalse(solver._row_watermark)
+        quiet_solver = SolverFeatherPGS(
+            newton.ModelBuilder().finalize(device="cpu"),
+            warn_constraint_overflow=False,
+        )
+        self.assertFalse(quiet_solver.warn_constraint_overflow)
+        self.assertFalse(quiet_solver._track_row_capacity)
+        self.assertIsNone(quiet_solver._row_overflow_warning_emitted)
         parameters = tuple(inspect.signature(SolverFeatherPGS).parameters)
         self.assertIn("same_articulation_contact_gap_gate", parameters)
         self.assertIn("contact_friction_articulation_pairs_only", parameters)
@@ -548,6 +562,7 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             "enable_restitution",
             "same_articulation_contact_gap_gate",
             "articulation_pair_contact_gap_gate",
+            "warn_constraint_overflow",
         ):
             self.assertGreater(parameters.index(name), legacy_tail)
 
