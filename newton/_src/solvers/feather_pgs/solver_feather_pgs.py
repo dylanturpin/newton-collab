@@ -42,6 +42,7 @@ from ..semi_implicit.kernels_particle import (
     eval_triangle_forces,
 )
 from ..solver import SolverBase
+from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
     FRICTION_MODE_BISECTION,
     FRICTION_MODE_BISECTION_DESAXCE,
@@ -126,7 +127,6 @@ from .kernels import (
     hinv_jt_par_row,
     hinv_jt_par_row_contact_fallback,
     integrate_generalized_joints,
-    mark_sliding_friction_anchors,
     pack_contact_linear_force_as_spatial,
     pgs_convergence_diagnostic_velocity,
     pgs_ncp_residuals_diagnostic_velocity,
@@ -161,7 +161,6 @@ from .kernels import (
     trisolve_loop,
     update_articulation_origins,
     update_body_qd_from_featherstone,
-    update_friction_anchors,
     update_qdd_from_velocity,
     vector_add_inplace,
 )
@@ -775,34 +774,28 @@ class SolverFeatherPGS(SolverBase):
                 between the two contact witness points as the Jacobian point on both bodies. Normal
                 rows keep their original witness points. This avoids a tangential force couple when
                 the witnesses are separated along the contact normal. Defaults to False.
-            contact_friction_anchor_limit (int, optional): Experimental PhysX-style patch-friction
-                approximation. If positive, only this many contacts in a contiguous same-shape contact
-                run receive friction rows; normal rows are still created for every contact. When a
-                contiguous patch has more than one selected friction anchor, the effective Coulomb
-                coefficient is halved to mimic PhysX's two-anchor friction scaling. Defaults to 0
-                (disabled).
+            contact_friction_anchor_limit (int, optional): Deprecated compatibility argument.
+                A positive value enables persistent patch friction; the old contact-index
+                approximation has been removed. Use ``friction_anchor_beta`` instead.
             contact_friction_articulation_pairs_only (bool, optional): Apply
-                ``contact_friction_gap_threshold`` and ``contact_friction_anchor_limit`` only when
+                ``contact_friction_gap_threshold`` only when
                 both contact bodies belong to non-free articulations. Contacts involving ground or a
                 free rigid body retain the legacy unbounded friction-row behavior. Defaults to False.
             contact_friction_scale (float, optional): Multiplies the effective Coulomb coefficient
                 used by generated friction rows. This is a diagnostic hook for matching solver-prep
                 semantics such as PhysX's per-friction-anchor scaling; it does not affect normal
                 contact rows. Defaults to 1.0.
-            friction_anchor_beta (float, optional): Baumgarte factor of the positional friction
-                anchors. ``0`` (default) keeps friction rows as pure velocity constraints. When
-                positive, every persistent contact remembers the material point pair it had when
-                it formed (or last slid) and the two friction rows carry
-                ``friction_anchor_beta * (tangential anchor separation) / dt`` in their RHS, so
-                tangential drift that leaks through an unconverged sweep or through the normal
-                row's depenetration bias on tilted contact normals is pulled back the next step
-                instead of integrating without bound (PhysX friction anchors). Anchor state is
-                managed by the solver: a contact whose final friction impulse was projected onto
-                its Coulomb cone is sliding and drops its anchor; anchors also reset on lost
-                contact identity, on :meth:`reset`, and when the pair separates tangentially by
-                more than its contact detection distance (``shape_gap[a] + shape_gap[b]``).
-                Requires a Contacts buffer built with ``contact_matching`` enabled; a good value
-                is a few times ``pgs_beta`` (0.2 on the Robotiq 2F-85 hold). Defaults to 0.0.
+            friction_anchor_beta (float, optional): Enable persistent patch friction and set
+                its positional correction strength. Zero (default) uses velocity-only point
+                friction. Positive values group compatible contacts on a body pair into regions,
+                retain up to two body-local friction anchors per region, and share the total
+                normal impulse equally between those anchors. Normal contacts are preserved.
+                Anchor history is independent of collision contact matching, including across
+                convex shapes on the same body. Geometry-scaled correlation and detected
+                sliding determine when anchors are replaced; they do not require user tuning.
+                The tangent RHS includes ``friction_anchor_beta * separation / dt``.
+                Requires ``friction_mode="current"`` and ``pgs_kernel="loop"`` or ``"tiled_row"``.
+                Defaults to 0.0.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
                 for normal contact rows on the dense, matrix-free free-rigid, and propagation
                 paths. A value of 0.0 removes speculative closing allowance without changing
@@ -1090,7 +1083,22 @@ class SolverFeatherPGS(SolverBase):
         self.friction_anchor_beta = float(friction_anchor_beta)
         if not np.isfinite(self.friction_anchor_beta) or self.friction_anchor_beta < 0.0:
             raise ValueError("friction_anchor_beta must be finite and non-negative")
+        if self.contact_friction_anchor_limit > 0:
+            warnings.warn(
+                "contact_friction_anchor_limit is deprecated; use friction_anchor_beta for persistent patch friction. "
+                "The old contact-index limit is replaced by up to two anchors per region.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.friction_anchor_beta == 0.0:
+                self.friction_anchor_beta = max(float(pgs_beta), 0.2)
         self._friction_anchors_enabled = self.friction_anchor_beta > 0.0
+        if self._friction_anchors_enabled and friction_mode != "current":
+            raise ValueError(
+                "Patch friction requires friction_mode='current'; coupled point-contact solves are incompatible."
+            )
+        if self._friction_anchors_enabled and pgs_kernel in ("tiled_contact", "streaming"):
+            raise ValueError("Patch friction requires pgs_kernel='tiled_row' or 'loop'.")
         try:
             self.contact_speculative_scale = float(contact_speculative_scale)
         except (TypeError, ValueError) as exc:
@@ -1711,6 +1719,9 @@ class SolverFeatherPGS(SolverBase):
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes."""
+        if self._friction_anchors_enabled and flags & ModelFlags.SHAPE_PROPERTIES:
+            self._friction_patches.update_geometry(self.model)
+            self._friction_patches.previous.valid.zero_()
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
             self._update_kinematic_state()
             self._scatter_armature_to_groups()
@@ -1762,12 +1773,11 @@ class SolverFeatherPGS(SolverBase):
             return
 
         if self._friction_anchors_enabled:
-            # Anchor history is keyed by previous sorted contact, so the per-world
-            # selection goes through the world each carried contact belonged to.
+            # Use the world associated with each stored patch anchor.
             wp.launch(
                 reset_friction_anchor_history,
-                dim=self._fa_prev_valid.shape[0],
-                inputs=[world_mask, self._fa_prev_world, self._fa_prev_valid],
+                dim=self._friction_patches.previous.valid.shape[0],
+                inputs=[world_mask, self._friction_patches.previous_world, self._friction_patches.previous.valid],
                 device=self.model.device,
             )
 
@@ -3217,23 +3227,15 @@ class SolverFeatherPGS(SolverBase):
             max_contacts = int(_estimate_rigid_contact_max(model))
         max_contacts = max(max_contacts, 1)
         self._max_contacts_alloc = max_contacts
-        # Positional friction anchors (off by default). ``_fa_phi`` is read by every
-        # row builder, so it always exists (zero when the feature is off); the anchor
-        # state itself is allocated only when enabled so the default path has no
-        # extra launches or memory. Keyed by sorted contact index like the warm-start
-        # tables above; ``prev_*`` hold last step's values for ``rigid_contact_match_index``.
-        self._fa_phi = wp.zeros((max_contacts,), dtype=wp.vec2, device=device)
-        if self._friction_anchors_enabled:
-            self._fa_anchor_a = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
-            self._fa_anchor_b = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
-            self._fa_valid = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
-            self._fa_prev_anchor_a = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
-            self._fa_prev_anchor_b = wp.zeros((max_contacts,), dtype=wp.vec3, device=device)
-            self._fa_prev_valid = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
-            self._fa_prev_world = wp.full((max_contacts,), -1, dtype=wp.int32, device=device)
-        else:
-            self._fa_anchor_a = self._fa_anchor_b = self._fa_valid = None
-            self._fa_prev_anchor_a = self._fa_prev_anchor_b = self._fa_prev_valid = self._fa_prev_world = None
+        # Row builders always receive a zero phi view when patch friction is off.
+        # Persistent state is owned by the body-pair patch builder, independently
+        # of collision matching and the contact warm-start tables.
+        self._friction_patches = _FrictionPatchState(
+            model,
+            max_contacts,
+            self._friction_anchors_enabled,
+            wp.zeros(max_contacts, dtype=wp.vec2, device=device),
+        )
         self._ws_prev_contact_normal = (
             wp.zeros(max_contacts, dtype=wp.vec3, device=device) if self.pgs_warmstart else None
         )
@@ -5981,16 +5983,6 @@ class SolverFeatherPGS(SolverBase):
                     "contact_matching enabled (rigid_contact_match_index is None). Build the "
                     'CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
                 )
-        if (
-            self._friction_anchors_enabled
-            and contacts is not None
-            and getattr(contacts, "rigid_contact_match_index", None) is None
-        ):
-            raise NotImplementedError(
-                "FeatherPGS friction anchors (friction_anchor_beta > 0) require a Contacts buffer created "
-                "with contact_matching enabled (rigid_contact_match_index is None). Build the "
-                'CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
-            )
         if _FPGS_CAPTURE:
             self._fpgs_step_n = getattr(self, "_fpgs_step_n", -1) + 1
         if self._last_step_dt is None:
@@ -6210,6 +6202,30 @@ class SolverFeatherPGS(SolverBase):
                     outputs=[self.impulses],
                     device=self.model.device,
                 )
+
+        if self._friction_anchors_enabled and contacts is not None:
+            for route, parents, mu, impulses, decay in self._patch_row_arrays():
+                if decay > 0.0:
+                    wp.launch(
+                        seed_patch_impulses,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            self._friction_patches.current,
+                            self._friction_patches.previous,
+                            state_in.body_q,
+                            self.contact_world,
+                            self.contact_slot,
+                            self.contact_path,
+                            self.contact_slots_needed,
+                            route,
+                            parents,
+                            mu,
+                            impulses,
+                            decay * (dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0),
+                        ],
+                        device=model.device,
+                    )
 
         if self.pgs_mode != "matrix_free":
             self._stage6_apply_contact_regularization()
@@ -6596,51 +6612,35 @@ class SolverFeatherPGS(SolverBase):
         # impulses + row types + per-(sorted)-contact dense-slot map (mirror of
         # the MF carry below).
         if self._friction_anchors_enabled:
-            with wp.ScopedTimer("S7_Friction_Anchor_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
+            with wp.ScopedTimer("S7_Friction_Patch_Carry", print=False, use_nvtx=self._nvtx, synchronize=False):
                 if contacts is not None:
-                    mf_impulses = getattr(self, "mf_impulses", None)
-                    mf_count = getattr(self, "mf_constraint_count", None)
-                    mf_row_type = getattr(self, "mf_row_type", None)
-                    mf_row_parent = getattr(self, "mf_row_parent", None)
-                    mf_row_mu = getattr(self, "mf_row_mu", None)
-                    prop_impulses = getattr(self, "propagation_impulses", None)
-                    prop_count = getattr(self, "propagation_constraint_count", None)
-                    prop_row_type = getattr(self, "propagation_row_type", None)
-                    prop_row_parent = getattr(self, "propagation_row_parent", None)
-                    prop_row_mu = getattr(self, "propagation_row_mu", None)
-                    wp.launch(
-                        mark_sliding_friction_anchors,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[
-                            contacts.rigid_contact_count,
-                            self.contact_world,
-                            self.contact_slot,
-                            self.contact_path,
-                            self.impulses,
-                            mf_impulses if mf_impulses is not None else self._dummy_contact_impulses,
-                            prop_impulses if prop_impulses is not None else self._dummy_contact_impulses,
-                            self.constraint_count,
-                            mf_count if mf_count is not None else self._dummy_contact_count,
-                            prop_count if prop_count is not None else self._dummy_contact_count,
-                            self.row_type,
-                            self.row_parent,
-                            self.row_mu,
-                            mf_row_type if mf_row_type is not None else self._dummy_contact_row_type,
-                            mf_row_parent if mf_row_parent is not None else self._dummy_contact_row_parent,
-                            mf_row_mu if mf_row_mu is not None else self._dummy_contact_impulses,
-                            prop_row_type if prop_row_type is not None else self._dummy_contact_row_type,
-                            prop_row_parent if prop_row_parent is not None else self._dummy_contact_row_parent,
-                            prop_row_mu if prop_row_mu is not None else self._dummy_contact_impulses,
-                        ],
-                        outputs=[self._fa_valid],
-                        device=model.device,
-                    )
-                    wp.copy(self._fa_prev_anchor_a, self._fa_anchor_a)
-                    wp.copy(self._fa_prev_anchor_b, self._fa_anchor_b)
-                    wp.copy(self._fa_prev_valid, self._fa_valid)
-                    wp.copy(self._fa_prev_world, self.contact_world)
+                    for route, parents, mu, impulses, _decay in self._patch_row_arrays():
+                        wp.launch(
+                            finish_patch_impulses,
+                            dim=contacts.rigid_contact_max,
+                            inputs=[
+                                contacts.rigid_contact_count,
+                                self._friction_patches.current,
+                                state_in.body_q,
+                                state_out.body_q,
+                                state_out.body_qd,
+                                model.body_com,
+                                self.contact_world,
+                                self.contact_slot,
+                                self.contact_path,
+                                self.contact_slots_needed,
+                                route,
+                                parents,
+                                mu,
+                                impulses,
+                                dt,
+                            ],
+                            device=model.device,
+                        )
+                    self._friction_patches.store(state_in)
+                    wp.copy(self._friction_patches.previous_world, self.contact_world)
                 else:
-                    self._fa_prev_valid.fill_(0)
+                    self._friction_patches.previous.valid.zero_()
 
         if self.pgs_warmstart and self._ws_prev_dense_impulses is not None:
             with wp.ScopedTimer("S7_Dense_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
@@ -7604,6 +7604,26 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
+    def _patch_row_arrays(self):
+        """Allocated solver routes and their configured warm-start decay."""
+        yield 0, self.row_parent, self.row_mu, self.impulses, self.pgs_warmstart_decay if self.pgs_warmstart else 0.0
+        if self.mf_row_parent is not None:
+            yield (
+                1,
+                self.mf_row_parent,
+                self.mf_row_mu,
+                self.mf_impulses,
+                self._mf_warmstart_decay if self._mf_warmstart_enabled else 0.0,
+            )
+        if self.propagation_row_parent is not None:
+            yield (
+                2,
+                self.propagation_row_parent,
+                self.propagation_row_mu,
+                self.propagation_impulses,
+                self.pgs_warmstart_decay if self.pgs_warmstart else 0.0,
+            )
+
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
         model = self.model
         max_constraints = self.dense_max_constraints
@@ -8043,6 +8063,20 @@ class SolverFeatherPGS(SolverBase):
             enable_friction_flag = 1 if self.enable_contact_friction else 0
             contact_build_threads = min(contacts.rigid_contact_max, _CONTACT_BUILD_THREAD_CAP)
 
+            if self._friction_anchors_enabled:
+                self._friction_patches.build(
+                    model,
+                    state_in,
+                    contacts,
+                    body_to_articulation=self.body_to_articulation,
+                    is_free_rigid=is_free_rigid,
+                    contact_gap_gate=self.contact_gap_gate,
+                    same_articulation_gap_gate=self.same_articulation_contact_gap_gate,
+                    articulation_pair_gap_gate=self.articulation_pair_contact_gap_gate,
+                    friction_gap=self.contact_friction_gap_threshold,
+                    friction_articulation_pairs_only=self.contact_friction_articulation_pairs_only,
+                )
+
             wp.launch(
                 allocate_world_contact_slots,
                 dim=contact_build_threads,
@@ -8082,9 +8116,9 @@ class SolverFeatherPGS(SolverBase):
                     self.propagation_max_constraints,
                     enable_friction_flag,
                     self.contact_friction_gap_threshold,
-                    self.contact_friction_anchor_limit,
                     1 if self.contact_friction_articulation_pairs_only else 0,
                     1 if self._track_row_capacity else 0,
+                    self._friction_patches.view,
                 ],
                 outputs=[
                     self.contact_world,
@@ -8104,32 +8138,6 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-            if self._friction_anchors_enabled:
-                # Carry anchors by contact identity and compute this step's tangential
-                # anchor separation before any row builder reads ``_fa_phi``.
-                wp.launch(
-                    update_friction_anchors,
-                    dim=contacts.rigid_contact_max,
-                    inputs=[
-                        contacts.rigid_contact_count,
-                        contacts.rigid_contact_point0,
-                        contacts.rigid_contact_point1,
-                        contacts.rigid_contact_normal,
-                        contacts.rigid_contact_shape0,
-                        contacts.rigid_contact_shape1,
-                        contacts.rigid_contact_margin0,
-                        contacts.rigid_contact_margin1,
-                        contacts.rigid_contact_match_index,
-                        model.shape_body,
-                        state_in.body_q,
-                        self._fa_prev_anchor_a,
-                        self._fa_prev_anchor_b,
-                        self._fa_prev_valid,
-                        model.shape_gap,
-                    ],
-                    outputs=[self._fa_anchor_a, self._fa_anchor_b, self._fa_valid, self._fa_phi],
-                    device=model.device,
-                )
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self.size_groups:
                     self.J_by_size[size].zero_()
@@ -8164,14 +8172,13 @@ class SolverFeatherPGS(SolverBase):
                         enable_friction_flag,
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
-                        self.contact_friction_anchor_limit,
                         1 if self.contact_friction_articulation_pairs_only else 0,
                         is_free_rigid,
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
                         self.pgs_cfm,
-                        self._fa_phi,
+                        self._friction_patches.view,
                         self.friction_anchor_beta,
                     ],
                     outputs=[
@@ -8216,6 +8223,7 @@ class SolverFeatherPGS(SolverBase):
                             model.shape_body,
                             state_in.body_q,
                             int(self.contact_friction_shared_anchor),
+                            self._friction_patches.view,
                             int(self.contact_shared_anchor),
                         ],
                         outputs=[self.J_by_size[size]],
@@ -8260,14 +8268,13 @@ class SolverFeatherPGS(SolverBase):
                             enable_friction_flag,
                             self.contact_friction_gap_threshold,
                             int(self.contact_friction_shared_anchor),
-                            self.contact_friction_anchor_limit,
                             1 if self.contact_friction_articulation_pairs_only else 0,
                             is_free_rigid,
                             self.contact_friction_scale,
                             int(self.contact_shared_anchor),
                             self.pgs_beta,
                             self.pgs_cfm,
-                            self._fa_phi,
+                            self._friction_patches.view,
                             self.friction_anchor_beta,
                         ],
                         outputs=[
@@ -8316,11 +8323,10 @@ class SolverFeatherPGS(SolverBase):
                         enable_friction_flag,
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
-                        self.contact_friction_anchor_limit,
                         1 if self.contact_friction_articulation_pairs_only else 0,
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
-                        self._fa_phi,
+                        self._friction_patches.view,
                         self.friction_anchor_beta,
                     ],
                     outputs=[
@@ -8424,11 +8430,10 @@ class SolverFeatherPGS(SolverBase):
                         enable_friction_flag,
                         self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
-                        self.contact_friction_anchor_limit,
                         1 if self.contact_friction_articulation_pairs_only else 0,
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
-                        self._fa_phi,
+                        self._friction_patches.view,
                         self.friction_anchor_beta,
                         builder_unit_order,
                         builder_unit_count,
@@ -8611,6 +8616,26 @@ class SolverFeatherPGS(SolverBase):
                             self.mf_max_constraints,
                         ],
                         outputs=[self.mf_impulses],
+                        device=model.device,
+                    )
+
+        if self._friction_anchors_enabled and contacts is not None:
+            for route, parents, mu, _impulses, _decay in self._patch_row_arrays():
+                if parents is not None:
+                    wp.launch(
+                        link_patch_rows,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            self._friction_patches.view,
+                            self.contact_world,
+                            self.contact_slot,
+                            self.contact_path,
+                            self.contact_slots_needed,
+                            route,
+                            parents,
+                            mu,
+                        ],
                         device=model.device,
                     )
 
@@ -10486,6 +10511,8 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
             }} else if (row_type == 2) {{
                 int parent_idx = s_parent[i];
                 float lambda_n = s_lam[parent_idx];
+                for (int patch_row = s_parent[parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = s_parent[patch_row])
+                    lambda_n += s_lam[patch_row];
                 float mu = s_mu[i];
                 float radius = fmaxf(mu * lambda_n, 0.0f);
 
@@ -11207,6 +11234,8 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
                 else if (row_type == 2) {{
                     int parent_idx = mf_row_parent.data[c_off + i];
                     float lambda_n = s_impulse[parent_idx];
+                    for (int patch_row = mf_row_parent.data[c_off + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = mf_row_parent.data[c_off + patch_row])
+                        lambda_n += s_impulse[patch_row];
                     float mu = mf_row_mu.data[c_off + i];
                     float radius = fmaxf(mu * lambda_n, 0.0f);
 
@@ -11745,7 +11774,9 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                         if (new_impulse < 0.0f) new_impulse = 0.0f;
                     }} else if (row_type == {friction_type}) {{
                         const int parent_idx = propagation_row_parent.data[off];
-                        const float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                        float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                        for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
+                            lambda_n += propagation_impulses.data[world_base + patch_row];
                         const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
                         if (radius <= 0.0f) {{
                             new_impulse = 0.0f;
@@ -11830,7 +11861,9 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                 }} else if (row_type == {friction_type}) {{
                     const int parent_idx = propagation_row_parent.data[off];
-                    const float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
+                        lambda_n += propagation_impulses.data[world_base + patch_row];
                     const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
                     if (radius <= 0.0f) {{
                         new_impulse = 0.0f;
@@ -12102,7 +12135,9 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                 }} else if (row_type == {friction_type}) {{
                     const int parent_idx = propagation_row_parent.data[off];
-                    const float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
+                        lambda_n += propagation_impulses.data[world_base + patch_row];
                     const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
                     if (radius <= 0.0f) {{
                         new_impulse = 0.0f;
@@ -12219,7 +12254,9 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                 }} else if (row_type == {friction_type}) {{
                     const int parent_idx = propagation_row_parent.data[off];
-                    const float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
+                        lambda_n += propagation_impulses.data[world_base + patch_row];
                     const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
                     if (radius <= 0.0f) {{
                         new_impulse = 0.0f;
@@ -12582,7 +12619,9 @@ def _get_pgs_solve_propagation_contact_kernel(
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                 }} else if (row_type == {friction_type}) {{
                     const int parent_idx = propagation_row_parent.data[off];
-                    const float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    float lambda_n = propagation_impulses.data[world_base + parent_idx];
+                    for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
+                        lambda_n += propagation_impulses.data[world_base + patch_row];
                     const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
                     if (radius <= 0.0f) {{
                         new_impulse = 0.0f;
@@ -12969,7 +13008,9 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     delta_impulse = new_impulse - old_impulse;
                 } else if (row_type == 2) {
                     const int parent_idx = s_parent_dense[i];
-                    const float lambda_n = s_lam_dense[parent_idx];
+                    float lambda_n = s_lam_dense[parent_idx];
+                    for (int patch_row = s_parent_dense[parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = s_parent_dense[patch_row])
+                        lambda_n += s_lam_dense[patch_row];
                     const float radius = fmaxf(s_mu_dense[i] * lambda_n, 0.0f);
                     if (radius <= 0.0f) {
                         new_impulse = 0.0f;
@@ -13087,7 +13128,9 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                         }
                     } else if (mf_rt == 2) {
                         const int mf_par = packed_tp >> 16;
-                        const float lambda_n = s_lam_mf[mf_par];
+                        float lambda_n = s_lam_mf[mf_par];
+                        for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> 16); patch_row >= 0 && patch_row != mf_par; patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
+                            lambda_n += s_lam_mf[patch_row];
                         const float radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
                         if (radius <= 0.0f) {
                             new_impulse = 0.0f;
@@ -13259,7 +13302,9 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                             if (new_impulse < 0.0f) new_impulse = 0.0f;
                         } else if (row_type == __FRICTION_TYPE__) {
                             const int parent_idx = propagation_row_parent.data[off];
-                            const float lambda_n = propagation_impulses.data[prop_world_base + parent_idx];
+                            float lambda_n = propagation_impulses.data[prop_world_base + parent_idx];
+                            for (int patch_row = propagation_row_parent.data[prop_world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[prop_world_base + patch_row])
+                                lambda_n += propagation_impulses.data[prop_world_base + patch_row];
                             const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
                             if (radius <= 0.0f) {
                                 new_impulse = 0.0f;
@@ -16091,6 +16136,8 @@ def _get_pgs_solve_mf_gs_kernel(
         dense_friction_block = f"""
                 int parent_idx = (s_meta_dense[i] >> __DENSE_META_ROW_TYPE_BITS__) - 1;
                 float lambda_n = s_lam_dense[parent_idx];
+                for (int patch_row = ((s_meta_dense[parent_idx] >> __DENSE_META_ROW_TYPE_BITS__) - 1); patch_row >= 0 && patch_row != parent_idx; patch_row = ((s_meta_dense[patch_row] >> __DENSE_META_ROW_TYPE_BITS__) - 1))
+                    lambda_n += s_lam_dense[patch_row];
                 float mu = s_mu_dense[i];
                 float radius = fmaxf(mu * lambda_n, 0.0f);
 
@@ -16638,6 +16685,8 @@ def _get_pgs_solve_mf_gs_kernel(
                 // friction_mode="current": isotropic Coulomb cone clamp.
                 int mf_par = packed_tp >> 16;
                 float lambda_n = s_lam_mf[mf_par];
+                for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> 16); patch_row >= 0 && patch_row != mf_par; patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
+                    lambda_n += s_lam_mf[patch_row];
                 float mu = mf_row_mu.data[off_mf + i];
                 float radius = fmaxf(mu * lambda_n, 0.0f);
 
@@ -17262,6 +17311,11 @@ def _get_pgs_solve_mf_gs_kernel(
         snippet = re.sub(
             r"int parent_idx = \(s_meta_dense\[i\] >> \d+\) - 1;",
             "int parent_idx = world_row_parent.data[off_dense + i];",
+            snippet,
+        )
+        snippet = re.sub(
+            r"\(\(s_meta_dense\[(\w+)\] >> \d+\) - 1\)",
+            r"world_row_parent.data[off_dense + \1]",
             snippet,
         )
         snippet = re.sub(

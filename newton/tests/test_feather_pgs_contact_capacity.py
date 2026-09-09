@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import allocate_world_contact_slots, collect_propagation_units
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_color_propagation_prebuild_kernel
 from newton.solvers import SolverFeatherPGS
@@ -31,7 +32,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
         *,
         contact_phi: tuple[float, ...],
         friction_gap_threshold: float,
-        friction_anchor_limit: int,
+        patch_friction: bool,
     ):
         """Build and color a row-capacity-filling mixture of contact units."""
         device = wp.get_device("cuda:0")
@@ -57,6 +58,11 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
         contact_world = wp.zeros((contact_count,), dtype=wp.int32, device=device)
         contact_slots_needed = wp.zeros((contact_count,), dtype=wp.int32, device=device)
         propagation_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
+
+        patches = FrictionPatches()
+        if patch_friction:
+            patches.enabled = 1
+            patches.weight = wp.array([1.0] + [0.0] * (contact_count - 1), dtype=float, device=device)
 
         wp.launch(
             allocate_world_contact_slots,
@@ -92,9 +98,9 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 row_capacity,
                 1,
                 friction_gap_threshold,
-                friction_anchor_limit,
                 0,
                 0,
+                patches,
             ],
             outputs=[
                 contact_world,
@@ -232,7 +238,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 0.0,
                 0,
                 0,
-                0,
+                FrictionPatches(),
             ],
             outputs=[
                 wp.zeros((capacity,), dtype=wp.int32, device=device),
@@ -267,17 +273,17 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "propagation-colored prebuild requires CUDA")
     def test_colored_prebuild_preserves_mixed_contact_units(self):
-        """Route friction-gap and anchor-limited one-row units through the serial tail."""
+        """Route friction-gap and patch-selected one-row units through the serial tail."""
         scenarios = {
             "friction_gap": ((-0.01, 0.01, 0.02, 0.03), 0.0, 0),
-            "friction_anchor_limit": ((-0.01, -0.01, -0.01, -0.01), float("inf"), 1),
+            "patch_friction": ((-0.01, -0.01, -0.01, -0.01), float("inf"), 1),
         }
-        for name, (contact_phi, friction_gap_threshold, friction_anchor_limit) in scenarios.items():
+        for name, (contact_phi, friction_gap_threshold, patch_friction) in scenarios.items():
             with self.subTest(name=name):
                 self._assert_mixed_units_reach_colored_tail(
                     contact_phi=contact_phi,
                     friction_gap_threshold=friction_gap_threshold,
-                    friction_anchor_limit=friction_anchor_limit,
+                    patch_friction=patch_friction,
                 )
 
 

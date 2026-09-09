@@ -14,8 +14,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     compute_propagation_effective_mass_and_rhs,
     compute_propagation_rhs_bias,
     compute_world_contact_bias,
-    mark_sliding_friction_anchors,
-    update_friction_anchors,
 )
 
 _MU_JAW, _MU_BOX = 5.0, 0.5
@@ -162,7 +160,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         model, _jaws, _box = _build_v_jaws(5.0)
         solver = newton.solvers.SolverFeatherPGS(model, **_SQUEEZE_SOLVER)
         self.assertFalse(solver._friction_anchors_enabled)
-        self.assertIsNone(solver._fa_anchor_a)
+        self.assertFalse(hasattr(solver._friction_patches, "current"))
         pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn")  # no matching needed
         contacts = pipeline.contacts()
         s0, s1 = model.state(), model.state()
@@ -173,23 +171,23 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
             s0.clear_forces()
             solver.step(s0, s1, control, contacts, 0.005)
             s0, s1 = s1, s0
-        self.assertEqual(float(np.abs(solver._fa_phi.numpy()).max()), 0.0)
+        self.assertEqual(float(np.abs(solver._friction_patches.view.phi.numpy()).max()), 0.0)
         row_type = solver.row_type.numpy()
         friction = row_type == PGS_CONSTRAINT_TYPE_FRICTION
         self.assertGreater(int(friction.sum()), 0)
         self.assertEqual(float(np.abs(solver.phi.numpy()[friction]).max()), 0.0)
         self.assertEqual(float(np.abs(solver.row_beta.numpy()[friction]).max()), 0.0)
 
-    def test_requires_contact_matching(self):
+    def test_anchors_do_not_require_contact_matching(self):
+        """Patch history belongs to the solver, independently of collision matching."""
         model, _jaws, _box = _build_v_jaws(5.0)
-        solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.05, **_SQUEEZE_SOLVER)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn")
+        solver = newton.solvers.SolverFeatherPGS(model, **_SQUEEZE_SOLVER, friction_anchor_beta=0.2)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         contacts = pipeline.contacts()
-        s0, s1 = model.state(), model.state()
-        control = model.control()
-        pipeline.collide(s0, contacts)
-        with self.assertRaises(NotImplementedError):
-            solver.step(s0, s1, control, contacts, 0.005)
+        pipeline.collide(state, contacts)
+        solver.step(state, model.state(), model.control(), contacts, 0.005)
 
     def test_anchors_stop_tangential_drift_of_a_held_box(self):
         """A V-tilted pinch leaks tangential drift through velocity-only friction rows; positional
@@ -208,7 +206,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         )
         self.assertLess(abs(drift_on_02), 5.0e-5, f"anchored pinch (beta 0.2) drifted {drift_on_02:.2e} m")
         # the held contacts are anchored (not sliding) at the end of the hold
-        valid = solver_on._fa_valid.numpy()
+        valid = solver_on._friction_patches.current.valid.numpy()
         self.assertGreater(int(valid.sum()), 0)
         flat_off, _, _ = _run_squeeze(0.0, steps)
         # sticky matching replays body-local witness points; anchors must still hold
@@ -232,7 +230,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         # every loaded contact slid this step, so its anchor was dropped
         n = int(contacts.rigid_contact_count.numpy()[0])
         if n > 0:
-            self.assertEqual(int(solver._fa_valid.numpy()[:n].sum()), 0)
+            self.assertEqual(int(solver._friction_patches.current.valid.numpy()[:n].sum()), 0)
 
     def test_row_builders_store_anchor_separation_per_route(self):
         """Dense rows: ``phi`` = raw separation, ``row_beta`` = gain. Matrix-free and propagation
@@ -256,7 +254,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
                 s0, s1 = s1, s0
             n = int(contacts.rigid_contact_count.numpy()[0])
             self.assertGreater(n, 0)
-            fa = solver._fa_phi.numpy()[:n]
+            fa = solver._friction_patches.view.phi.numpy()[:n]
             slot = solver.contact_slot.numpy()[:n]
             path = solver.contact_path.numpy()[:n]
             checked = {0: 0, 1: 0, 2: 0}
@@ -320,101 +318,6 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         bq = s0.body_q.numpy()
         self.assertTrue(np.all(np.isfinite(bq)))
         self.assertLess(abs(bq[box][2] - bq[jaws[0]][2]), 0.01)
-
-
-def _launch_anchor_update(
-    device,
-    *,
-    point0,
-    point1,
-    match_index,
-    prev,
-    shape_body=(0, 1),
-    body_q=None,
-    normal=(0.0, 0.0, -1.0),
-    shape_gap=(0.0025, 0.0025),
-):
-    """Drive ``update_friction_anchors`` on ``len(point0)`` contacts between shape 0 (body 0) and
-    shape 1 (body 1); returns (anchor_a, anchor_b, valid, phi) arrays."""
-    n = len(point0)
-    if body_q is None:
-        body_q = [wp.transform_identity(), wp.transform_identity()]
-    outs = (
-        wp.zeros(n, dtype=wp.vec3, device=device),
-        wp.zeros(n, dtype=wp.vec3, device=device),
-        wp.zeros(n, dtype=wp.int32, device=device),
-        wp.zeros(n, dtype=wp.vec2, device=device),
-    )
-    prev_a, prev_b, prev_valid = prev
-    wp.launch(
-        update_friction_anchors,
-        dim=n,
-        inputs=[
-            wp.array([n], dtype=wp.int32, device=device),
-            wp.array([wp.vec3(*p) for p in point0], dtype=wp.vec3, device=device),
-            wp.array([wp.vec3(*p) for p in point1], dtype=wp.vec3, device=device),
-            wp.array([wp.vec3(*normal)] * n, dtype=wp.vec3, device=device),  # A-to-B; solver uses -normal
-            wp.zeros(n, dtype=wp.int32, device=device),
-            wp.ones(n, dtype=wp.int32, device=device),
-            wp.zeros(n, dtype=wp.float32, device=device),
-            wp.zeros(n, dtype=wp.float32, device=device),
-            wp.array(list(match_index), dtype=wp.int32, device=device),
-            wp.array(list(shape_body), dtype=wp.int32, device=device),
-            wp.array(body_q, dtype=wp.transform, device=device),
-            prev_a,
-            prev_b,
-            prev_valid,
-            wp.array(list(shape_gap), dtype=wp.float32, device=device),
-        ],
-        outputs=list(outs),
-        device=device,
-    )
-    return outs
-
-
-def _anchor_pairs(device, offsets):
-    """Previous-frame anchor state: pair ``i`` is body-local ``(offset_i, 0, 0)`` on A and the origin
-    on B (both bodies at identity), i.e. a tangential separation of ``offset_i`` along x."""
-    a = wp.array([wp.vec3(o, 0.0, 0.0) for o in offsets], dtype=wp.vec3, device=device)
-    b = wp.array([wp.vec3(0.0, 0.0, -1.0e-3)] * len(offsets), dtype=wp.vec3, device=device)
-    valid = wp.ones(len(offsets), dtype=wp.int32, device=device)
-    return a, b, valid
-
-
-def _launch_mark_sliding(device, *, slots, paths, impulses, row_type, row_parent, row_mu, valid):
-    """Drive ``mark_sliding_friction_anchors`` on dense-path contacts in one world."""
-    n = len(slots)
-    dummy_f = wp.zeros((1, 1), dtype=wp.float32, device=device)
-    dummy_i = wp.zeros((1, 1), dtype=wp.int32, device=device)
-    dummy_c = wp.zeros((1,), dtype=wp.int32, device=device)
-    wp.launch(
-        mark_sliding_friction_anchors,
-        dim=n,
-        inputs=[
-            wp.array([n], dtype=wp.int32, device=device),
-            wp.zeros(n, dtype=wp.int32, device=device),
-            wp.array(list(slots), dtype=wp.int32, device=device),
-            wp.array(list(paths), dtype=wp.int32, device=device),
-            wp.array([impulses], dtype=wp.float32, device=device),
-            dummy_f,
-            dummy_f,
-            wp.array([len(impulses)], dtype=wp.int32, device=device),
-            dummy_c,
-            dummy_c,
-            wp.array([row_type], dtype=wp.int32, device=device),
-            wp.array([row_parent], dtype=wp.int32, device=device),
-            wp.array([row_mu], dtype=wp.float32, device=device),
-            dummy_i,
-            dummy_i,
-            dummy_f,
-            dummy_i,
-            dummy_i,
-            dummy_f,
-        ],
-        outputs=[valid],
-        device=device,
-    )
-    return valid.numpy()
 
 
 def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, device="cpu"):
@@ -587,116 +490,6 @@ def _build_two_world_free_model(device):
 class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
     """Device-agnostic checks of the anchor bookkeeping (run on CPU)."""
 
-    def test_reanchor_is_tangentially_aligned_for_replayed_witness_points(self):
-        """Sticky matching replays body-local witness points, so after a slip the pair carries the
-        old tangential offset. Re-anchoring must not save that offset: a re-anchored contact held
-        stationary reports zero tangential separation on the next step."""
-        device = "cpu"
-        # witness points 0.1 mm apart tangentially (x) and 1 mm apart along the normal (z)
-        point0, point1 = [(1.0e-4, 0.0, 0.0)], [(0.0, 0.0, -1.0e-3)]
-        empty = (
-            wp.zeros(1, dtype=wp.vec3, device=device),
-            wp.zeros(1, dtype=wp.vec3, device=device),
-            wp.zeros(1, dtype=wp.int32, device=device),  # previous anchor invalidated
-        )
-        a, b, valid, phi = _launch_anchor_update(device, point0=point0, point1=point1, match_index=[0], prev=empty)
-        self.assertEqual(int(valid.numpy()[0]), 1)
-        np.testing.assert_allclose(phi.numpy()[0], 0.0, atol=1.0e-9)
-        # the stored pair is aligned along the normal: no tangential separation
-        sep = a.numpy()[0] - b.numpy()[0]
-        np.testing.assert_allclose(sep[:2], 0.0, atol=1.0e-9)
-        # next step, same replayed points, matched to the pair just stored -> still zero
-        _, _, valid2, phi2 = _launch_anchor_update(
-            device, point0=point0, point1=point1, match_index=[0], prev=(a, b, valid)
-        )
-        self.assertEqual(int(valid2.numpy()[0]), 1)
-        np.testing.assert_allclose(phi2.numpy()[0], 0.0, atol=1.0e-9)
-        # a genuine 0.2 mm tangential move of body A after anchoring is reported
-        moved = [wp.transform(wp.vec3(2.0e-4, 0.0, 0.0), wp.quat_identity()), wp.transform_identity()]
-        _, _, _, phi3 = _launch_anchor_update(
-            device, point0=point0, point1=point1, match_index=[0], prev=(a, b, valid), body_q=moved
-        )
-        self.assertAlmostEqual(float(np.linalg.norm(phi3.numpy()[0])), 2.0e-4, places=9)
-
-    def test_identity_reordering_lost_match_and_invalidated_anchor(self):
-        """Anchors follow ``rigid_contact_match_index`` (previous *sorted* index), not the row
-        position; an unmatched or invalidated contact re-anchors with zero separation."""
-        device = "cpu"
-        aligned = [(0.0, 0.0, 0.0)] * 3, [(0.0, 0.0, -1.0e-3)] * 3
-        prev_a, prev_b, prev_valid = _anchor_pairs(device, [1.0e-4, 3.0e-4, 2.0e-4])
-        prev_valid.assign(np.array([1, 1, 0], dtype=np.int32))  # pair 2 was invalidated (slid)
-        # current contacts 0, 1, 2 match previous 1, 0, 2
-        _, _, valid, phi = _launch_anchor_update(
-            device, point0=aligned[0], point1=aligned[1], match_index=[1, 0, 2], prev=(prev_a, prev_b, prev_valid)
-        )
-        np.testing.assert_array_equal(valid.numpy(), [1, 1, 1])
-        got = phi.numpy()
-        # (the row tangent basis for a +z normal is t0 = +y, t1 = -x; compare magnitudes)
-        np.testing.assert_allclose(np.linalg.norm(got, axis=1), [3.0e-4, 1.0e-4, 0.0], atol=1.0e-9)
-        # lost identity: re-anchor with zero separation
-        _, _, valid_lost, phi_lost = _launch_anchor_update(
-            device, point0=aligned[0], point1=aligned[1], match_index=[-1, -1, -1], prev=(prev_a, prev_b, prev_valid)
-        )
-        np.testing.assert_array_equal(valid_lost.numpy(), [1, 1, 1])
-        np.testing.assert_allclose(phi_lost.numpy(), 0.0, atol=1.0e-9)
-
-    def test_separation_beyond_contact_detection_distance_reanchors(self):
-        """The stale-anchor guard is the pair's contact detection distance (``shape_gap[a] +
-        shape_gap[b]``): a carried separation inside it is kept, beyond it the pair re-anchors."""
-        device = "cpu"
-        aligned = [(0.0, 0.0, 0.0)] * 2, [(0.0, 0.0, -1.0e-3)] * 2
-        prev = _anchor_pairs(device, [4.0e-3, 6.0e-3])  # below / above 2 mm + 3 mm
-        _, _, valid, phi = _launch_anchor_update(
-            device, point0=aligned[0], point1=aligned[1], match_index=[0, 1], prev=prev, shape_gap=(0.002, 0.003)
-        )
-        np.testing.assert_array_equal(valid.numpy(), [1, 1])
-        self.assertAlmostEqual(float(np.linalg.norm(phi.numpy()[0])), 4.0e-3, places=9)  # carried
-        self.assertEqual(float(np.abs(phi.numpy()[1]).max()), 0.0)  # re-anchored
-
-    def test_mark_sliding_drops_projected_and_rejected_keeps_unloaded(self):
-        """Only a contact whose final friction impulse sits on its Coulomb cone (the last sweep
-        projected it) loses its anchor; a loaded contact inside the cone, an unloaded contact and
-        a normal-only contact keep it, a contact without rows drops it."""
-        device = "cpu"
-        c, f = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
-        mu = 0.5
-        # contact 0: projected onto the cone (|lam_t| = mu lam_n as the clamp leaves it) -> drop
-        # contact 1: loaded, 99% of the cone (never projected)                          -> keep
-        # contact 2: friction rows present, no normal load                               -> keep
-        # contact 3: rejected (slot -1)                                                  -> drop
-        # contact 4: normal row only (no friction rows)                                  -> keep
-        row_type = [c, f, f, c, f, f, c, f, f, c, c, c, c]
-        row_parent = [-1, 0, 0, -1, 3, 3, -1, 6, 6, -1, -1, -1, -1]
-        row_mu = [mu] * 13
-        projected = np.float32(mu) * np.float32(0.6) / np.float32(np.hypot(0.6, 0.8))
-        impulses = [
-            1.0,
-            float(projected),
-            float(projected * np.float32(0.8 / 0.6)),
-            1.0,
-            0.99 * mu,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
-            0.0,
-        ]
-        valid = wp.ones(5, dtype=wp.int32, device=device)
-        got = _launch_mark_sliding(
-            device,
-            slots=[0, 3, 6, -1, 9],
-            paths=[0, 0, 0, -1, 0],
-            impulses=impulses,
-            row_type=row_type,
-            row_parent=row_parent,
-            row_mu=row_mu,
-            valid=valid,
-        )
-        np.testing.assert_array_equal(got, [0, 1, 1, 0, 1])
-
     def test_rhs_bias_matches_on_every_row_family_and_vanishes_in_velocity_pass(self):
         """Friction rows carry ``friction_anchor_beta * separation / dt`` on the dense, matrix-free
         and propagation routes alike, and the velocity-only pass (``bias_scale = 0``) drops it.
@@ -728,18 +521,18 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
             model, pgs_mode="split", friction_anchor_beta=0.2, dense_max_constraints=4, mf_max_constraints=4
         )
         self.assertFalse(solver.pgs_warmstart)
-        n = solver._fa_prev_valid.shape[0]
+        n = solver._friction_patches.previous.valid.shape[0]
         worlds = np.arange(n, dtype=np.int32) % 2
         for mask, expect_cleared in (
             (None, (True, True)),
             ((True, False), (True, False)),
             ((False, True), (False, True)),
         ):
-            solver._fa_prev_valid.fill_(1)
-            solver._fa_prev_world.assign(worlds)
+            solver._friction_patches.previous.valid.fill_(1)
+            solver._friction_patches.previous_world.assign(worlds)
             wm = None if mask is None else wp.array(mask, dtype=wp.bool, device=device)
             solver.reset(model.state(), wm)
-            valid = solver._fa_prev_valid.numpy()
+            valid = solver._friction_patches.previous.valid.numpy()
             for world, cleared in enumerate(expect_cleared):
                 sel = valid[worlds == world]
                 np.testing.assert_array_equal(sel, 0 if cleared else 1, err_msg=f"mask={mask} world={world}")

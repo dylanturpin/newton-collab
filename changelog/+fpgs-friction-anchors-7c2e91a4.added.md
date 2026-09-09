@@ -1,1 +1,4 @@
-Add positional friction anchors to FeatherPGS (`friction_anchor_beta`): persistent contacts remember the material point pair they formed with and the friction rows Baumgarte-correct its tangential separation, so per-step tangential residuals no longer integrate into unbounded drift of held objects. Anchors drop when the friction solve projects the contact onto its Coulomb cone, on lost identity, on `reset()`, and beyond the pair's contact detection distance. Off by default; requires `contact_matching`.
+Add positional friction anchors to FeatherPGS (`friction_anchor_beta`): compatible
+contact regions retain body-local material point pairs and the friction rows
+correct their tangential separation, bounding accumulated drift of held objects.
+Off by default; anchor history is independent of collision contact matching.
