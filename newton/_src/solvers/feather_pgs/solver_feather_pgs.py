@@ -775,8 +775,10 @@ class SolverFeatherPGS(SolverBase):
                 rows keep their original witness points. This avoids a tangential force couple when
                 the witnesses are separated along the contact normal. Defaults to False.
             contact_friction_anchor_limit (int, optional): Deprecated compatibility argument.
-                A positive value enables persistent patch friction; the old contact-index
-                approximation has been removed. Use ``friction_anchor_beta`` instead.
+                The old contact-index approximation has been removed. When ``friction_anchor_beta``
+                is zero and the friction mode and PGS kernel support patch friction, a positive value
+                enables persistent patch friction with ``friction_anchor_beta = max(pgs_beta, 0.2)``
+                and warns; otherwise it warns and has no effect. Use ``friction_anchor_beta`` instead.
             contact_friction_articulation_pairs_only (bool, optional): Apply
                 ``contact_friction_gap_threshold`` only when
                 both contact bodies belong to non-free articulations. Contacts involving ground or a
@@ -793,7 +795,12 @@ class SolverFeatherPGS(SolverBase):
                 Anchor history is independent of collision contact matching, including across
                 convex shapes on the same body. Geometry-scaled correlation and detected
                 sliding determine when anchors are replaced; they do not require user tuning.
-                The tangent RHS includes ``friction_anchor_beta * separation / dt``.
+                The tangent RHS includes ``friction_anchor_beta * separation / dt``. Anchors whose
+                region carries no friction rows for a step (gap filters or row capacity) keep their
+                history. Patch anchors define the friction row points: the body-local material
+                points must stay fixed on their bodies for the anchored rows to warm start, so
+                ``contact_shared_anchor`` and ``contact_friction_shared_anchor`` apply only to normal
+                rows and to velocity-only friction rows.
                 Requires ``friction_mode="current"`` and ``pgs_kernel="loop"`` or ``"tiled_row"``.
                 Defaults to 0.0.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
@@ -1083,21 +1090,39 @@ class SolverFeatherPGS(SolverBase):
         self.friction_anchor_beta = float(friction_anchor_beta)
         if not np.isfinite(self.friction_anchor_beta) or self.friction_anchor_beta < 0.0:
             raise ValueError("friction_anchor_beta must be finite and non-negative")
+        # Native tiled kernels are CUDA-only and every CPU selector resolves to
+        # the scalar suite below, so validate against the kernel that will run.
+        effective_pgs_kernel = "loop" if model.device.is_cpu else pgs_kernel
+        patch_friction_supported = friction_mode == "current" and effective_pgs_kernel not in (
+            "tiled_contact",
+            "streaming",
+        )
         if self.contact_friction_anchor_limit > 0:
-            warnings.warn(
-                "contact_friction_anchor_limit is deprecated; use friction_anchor_beta for persistent patch friction. "
-                "The old contact-index limit is replaced by up to two anchors per region.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if self.friction_anchor_beta == 0.0:
+            if self.friction_anchor_beta > 0.0:
+                message = "contact_friction_anchor_limit is deprecated and ignored because friction_anchor_beta is set."
+            elif patch_friction_supported:
+                # Legacy callers asked for patch friction; the removed contact-index
+                # approximation maps onto persistent patches with an explicit gain.
                 self.friction_anchor_beta = max(float(pgs_beta), 0.2)
+                message = (
+                    "contact_friction_anchor_limit is deprecated; use friction_anchor_beta for persistent patch "
+                    f"friction. Enabling patch friction with friction_anchor_beta={self.friction_anchor_beta:g} "
+                    "(the larger of pgs_beta and 0.2) in place of the removed contact-index approximation."
+                )
+            else:
+                message = (
+                    "contact_friction_anchor_limit is deprecated and has no effect with "
+                    f"friction_mode={friction_mode!r} and pgs_kernel={pgs_kernel!r}; persistent patch friction "
+                    "requires friction_anchor_beta > 0 with friction_mode='current' and pgs_kernel='loop' or "
+                    "'tiled_row'."
+                )
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
         self._friction_anchors_enabled = self.friction_anchor_beta > 0.0
         if self._friction_anchors_enabled and friction_mode != "current":
             raise ValueError(
                 "Patch friction requires friction_mode='current'; coupled point-contact solves are incompatible."
             )
-        if self._friction_anchors_enabled and pgs_kernel in ("tiled_contact", "streaming"):
+        if self._friction_anchors_enabled and effective_pgs_kernel in ("tiled_contact", "streaming"):
             raise ValueError("Patch friction requires pgs_kernel='tiled_row' or 'loop'.")
         try:
             self.contact_speculative_scale = float(contact_speculative_scale)
@@ -1720,8 +1745,10 @@ class SolverFeatherPGS(SolverBase):
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes."""
         if self._friction_anchors_enabled and flags & ModelFlags.SHAPE_PROPERTIES:
+            # Refresh the cached body radii only. Carried anchors are re-validated
+            # against the live materials, transforms, and radii every step, so a
+            # shape update does not need to discard held objects' anchor history.
             self._friction_patches.update_geometry(self.model)
-            self._friction_patches.previous.valid.zero_()
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
             self._update_kinematic_state()
             self._scatter_armature_to_groups()

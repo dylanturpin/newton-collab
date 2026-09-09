@@ -33,6 +33,35 @@ def _friction_residual_probe(result: wp.array[wp.vec4]):
     result[2] = contact_friction_residuals(2.0, 2.0, 0.5, -0.1, wp.vec2(0.0), wp.vec2(0.0))
 
 
+def _ground_box(device, **solver_kwargs):
+    """Return a resting 1 kg box on the ground with patch friction enabled."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+    body = builder.add_body(xform=wp.transform(wp.vec3(0, 0, 0.1), wp.quat_identity()))
+    builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=newton.ModelBuilder.ShapeConfig(density=125, mu=0.5))
+    model = builder.finalize(device=device)
+    kwargs = {
+        "friction_anchor_beta": 0.2,
+        "pgs_iterations": 32,
+        "pgs_mode": "matrix_free" if model.device.is_cuda else "split",
+    }
+    kwargs.update(solver_kwargs)
+    solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    contacts = pipeline.contacts()
+    states = [model.state(), model.state()]
+    control = model.control()
+
+    def step():
+        s0, s1 = states
+        s0.clear_forces()
+        pipeline.collide(s0, contacts)
+        solver.step(s0, s1, control, contacts, 0.005)
+        states.reverse()
+
+    return model, solver, contacts, step
+
+
 def _patch_fixture(
     points, *, shape0=None, normals=None, materials=(0.5, 0.5, 0.5), shape_bodies=(0, 1, 0), device="cpu"
 ):
@@ -66,7 +95,7 @@ def _patch_fixture(
 
 class TestFrictionPatchHistory(unittest.TestCase):
     def test_connected_convex_chain_forms_one_region(self):
-        """Connectivity joins a chain even when the two end shapes do not overlap."""
+        """Join a chain into one friction region even when the two end shapes do not overlap."""
         model, state, contacts, patches = _patch_fixture(
             [[-0.15, 0, 0], [0.15, 0, 0], [-0.05, 0, 0], [0.05, 0, 0]],
             shape0=[0, 4, 2, 3],
@@ -83,7 +112,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         np.testing.assert_allclose(patches.view.weight.numpy()[:4], [0.5, 0.5, 0, 0])
 
     def test_disconnected_convex_shapes_form_separate_regions(self):
-        """Two separated pads on one body must not pool friction through empty space."""
+        """Keep two separated pads on one body from pooling friction through empty space."""
         model, state, contacts, patches = _patch_fixture([[-0.15, 0, 0], [0.15, 0, 0]], shape0=[0, 2])
         model.shape_transform.assign(
             [
@@ -99,7 +128,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         np.testing.assert_allclose(patches.view.weight.numpy()[:2], [1, 1])
 
     def test_residuals_use_patch_support_and_keep_normal_terms_local(self):
-        """Diagnostics distinguish supported friction, a cone violation, and normal error."""
+        """Distinguish supported friction, a cone violation, and normal error in the residual diagnostics."""
         residuals = wp.zeros(3, dtype=wp.vec4, device="cpu")
         wp.launch(_friction_residual_probe, dim=1, inputs=[residuals], device="cpu")
         np.testing.assert_allclose(residuals.numpy(), [[0, 0, 0, 0], [1.5, 1.5, 0, 1.5], [0, 0.2, 0.1, 0]], atol=1e-7)
@@ -113,7 +142,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         self.assertEqual(np.count_nonzero(patches.view.weight.numpy()), 0)
 
     def test_reversed_contact_orientation_uses_same_patch(self):
-        """A body pair has one identity regardless of collision shape ordering."""
+        """Give a body pair one identity regardless of collision shape ordering."""
         model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]])
         contacts.rigid_contact_shape0.assign([0, 1])
         contacts.rigid_contact_shape1.assign([1, 0])
@@ -123,7 +152,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         np.testing.assert_allclose(patches.view.weight.numpy()[:2], [0.5, 0.5])
 
     def test_saturation_only_releases_an_anchor_with_sliding_motion(self):
-        """Impending slip keeps history; motion against saturated friction releases it."""
+        """Keep history under impending slip, and release it under motion against saturated friction."""
         _, state, contacts, patches = _patch_fixture([[0, 0, 0]])
         zeros = wp.zeros(1, dtype=int, device="cpu")
         lengths = wp.array([3], dtype=int, device="cpu")
@@ -155,7 +184,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         self.assertEqual(patches.current.valid.numpy()[0], 0)
 
     def test_convex_shapes_share_one_body_patch(self):
-        """Adjacent convex pieces with compatible materials pool their friction load."""
+        """Pool friction load across adjacent convex pieces with compatible materials."""
         _, _, _, patches = _patch_fixture(
             [[-0.1, -0.1, 0], [0.1, -0.1, 0], [-0.1, 0.1, 0], [0.1, 0.1, 0]], shape0=[0, 2, 0, 2]
         )
@@ -164,7 +193,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         self.assertAlmostEqual(float(patches.view.weight.numpy().sum()), 1.0)
 
     def test_material_normal_and_disconnected_regions_stay_separate(self):
-        """Friction is not pooled across incompatible or spatially separate regions."""
+        """Keep friction from pooling across incompatible or spatially separate regions."""
         cases = (
             {"points": [[0, 0, 0], [0.01, 0, 0]], "shape0": [0, 2], "materials": (0.5, 0.5, 0.8)},
             {"points": [[0, 0, 0], [0.01, 0, 0]], "normals": [[0, 0, -1], [0, -1, 0]]},
@@ -178,7 +207,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
                 np.testing.assert_array_equal(patches.view.weight.numpy()[:2], [1, 1])
 
     def test_contact_churn_preserves_material_points_and_error(self):
-        """Changing every contact sample does not erase a sticking region's history."""
+        """Preserve a sticking region's history even when every contact sample changes."""
         points = np.array([[-0.1, -0.1, 0], [0.1, -0.1, 0], [-0.1, 0.1, 0], [0.1, 0.1, 0]], dtype=np.float32)
         model, state, contacts, patches = _patch_fixture(points)
         previous = patches.current.anchor_a.numpy()[patches.current.valid.numpy() != 0].copy()
@@ -195,13 +224,13 @@ class TestFrictionPatchHistory(unittest.TestCase):
         self.assertTrue(np.all(patches.current.source.numpy()[active] >= 0))
 
     def test_coincident_contacts_use_one_anchor(self):
-        """Duplicate witnesses must not create two coincident friction constraints."""
+        """Reject duplicate witnesses that would create two coincident friction constraints."""
         _, _, _, patches = _patch_fixture([[0, 0, 0]] * 4)
         self.assertEqual(np.count_nonzero(patches.view.weight.numpy()), 1)
         self.assertEqual(float(patches.view.weight.numpy().sum()), 1.0)
 
     def test_warmstart_uses_patch_load_when_anchor_normal_is_unloaded(self):
-        """A cached tangent remains supported when other normals carry the load."""
+        """Keep a cached tangent supported when other normals carry the load."""
         model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0, 0, 0], [0.1, 0, 0]])
         patches.current.tangent_impulse.assign([[0.8, 0, 0], [0, 0, 0], [0.8, 0, 0]] + [[0, 0, 0]] * 5)
         patches.store(state)
@@ -211,7 +240,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         paths = wp.zeros(3, dtype=int, device="cpu")
         lengths = wp.array([3, 1, 3], dtype=int, device="cpu")
         parents = wp.array([[-1, 0, 0, -1, -1, 4, 4]], dtype=int, device="cpu")
-        mu = wp.array([[0.5, 0.25, 0.25, 0.5, 0.5, 0.25, 0.25]], dtype=float, device="cpu")
+        mu = wp.array([[0.5] * 7], dtype=float, device="cpu")
         impulses = wp.array([[0, 0, 0, 4, 0, 0, 0]], dtype=float, device="cpu")
         wp.launch(
             link_patch_rows,
@@ -243,20 +272,151 @@ class TestFrictionPatchHistory(unittest.TestCase):
         self.assertAlmostEqual(float(np.linalg.norm(result[1:3])), 0.8)
         self.assertAlmostEqual(float(np.linalg.norm(result[5:7])), 0.8)
 
+    def test_seed_keeps_matched_warmstart_without_patch_history(self):
+        """Keep the contact-matched friction warm start on an anchor that has no patch history yet."""
+        _model, state, contacts, patches = _patch_fixture([[0, 0, 0]])
+        self.assertEqual(int(patches.current.source.numpy()[0]), -1)
+        slots = wp.zeros(1, dtype=int, device="cpu")
+        lengths = wp.array([3], dtype=int, device="cpu")
+        parents = wp.array([[-1] * 8], dtype=int, device="cpu")
+        mu = wp.array([[0.5, 0.25, 0.25] + [0.0] * 5], dtype=float, device="cpu")
+        seeded = [1.0, 0.3, -0.2] + [0.0] * 5
+        impulses = wp.array([seeded], dtype=float, device="cpu")
+        wp.launch(
+            seed_patch_impulses,
+            dim=1,
+            inputs=[
+                contacts.rigid_contact_count,
+                patches.current,
+                patches.previous,
+                state.body_q,
+                slots,
+                slots,
+                slots,
+                lengths,
+                0,
+                parents,
+                mu,
+                impulses,
+                1.0,
+            ],
+            device="cpu",
+        )
+        np.testing.assert_array_equal(impulses.numpy()[0], np.array(seeded, dtype=np.float32))
+
+    def test_anchors_without_rows_keep_history(self):
+        """Keep a valid anchor and its cached impulse when its region gets no friction rows this step."""
+        _model, state, contacts, patches = _patch_fixture([[0, 0, 0]])
+        cached = [[0.1, 0.2, 0.0]] + [[0.0, 0.0, 0.0]] * 7
+        zeros = wp.zeros(1, dtype=int, device="cpu")
+        parents = wp.array([[-1] * 8], dtype=int, device="cpu")
+        mu = wp.zeros((1, 8), dtype=float, device="cpu")
+        impulses = wp.zeros((1, 8), dtype=float, device="cpu")
+        qd = wp.zeros(2, dtype=wp.spatial_vector, device="cpu")
+        com = wp.zeros(2, dtype=wp.vec3, device="cpu")
+        for slot, length in ((-1, 3), (0, 1)):
+            with self.subTest(slot=slot, slots_needed=length):
+                patches.current.valid.assign([1] + [0] * 7)
+                patches.current.tangent_impulse.assign(cached)
+                wp.launch(
+                    finish_patch_impulses,
+                    dim=1,
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        patches.current,
+                        state.body_q,
+                        state.body_q,
+                        qd,
+                        com,
+                        zeros,
+                        wp.array([slot], dtype=int, device="cpu"),
+                        zeros,
+                        wp.array([length], dtype=int, device="cpu"),
+                        0,
+                        parents,
+                        mu,
+                        impulses,
+                        0.005,
+                    ],
+                    device="cpu",
+                )
+                self.assertEqual(int(patches.current.valid.numpy()[0]), 1)
+                np.testing.assert_array_equal(
+                    patches.current.tangent_impulse.numpy()[0], np.asarray(cached[0], dtype=np.float32)
+                )
+
+    def test_carried_anchors_copy_stored_material_points(self):
+        """Carry stored body-local anchors verbatim instead of round-tripping them through world space."""
+        model, state, contacts, patches = _patch_fixture([[0.02, -0.03, 0.0]])
+        rotation = wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 0.5, 0.8)), 1.1)
+        state.body_q.assign([wp.transform(wp.vec3(1.3, -0.7, 2.1), rotation), wp.transform_identity()])
+        patches.build(model, state, contacts)
+        patches.store(state)
+        patches.build(model, state, contacts)
+        source = int(patches.current.source.numpy()[0])
+        self.assertGreaterEqual(source, 0)
+        np.testing.assert_array_equal(patches.current.anchor_a.numpy()[0], patches.previous.anchor_a.numpy()[source])
+        np.testing.assert_array_equal(patches.current.anchor_b.numpy()[0], patches.previous.anchor_b.numpy()[source])
+
+    def test_filtered_members_carry_history_without_starting_it(self):
+        """Carry existing anchors through a friction-filtered step with zero weight, and never create new ones."""
+        model, state, contacts, patches = _patch_fixture([[-0.05, 0, 0], [0.05, 0, 0]])
+        patches.store(state)
+        patches.build(model, state, contacts, friction_gap=-1.0)
+        self.assertEqual(int(patches.current.valid.numpy().sum()), 2)
+        self.assertTrue((patches.current.source.numpy()[:2] >= 0).all())
+        self.assertEqual(float(patches.view.weight.numpy().max()), 0.0)
+        patches.previous.valid.zero_()
+        patches.build(model, state, contacts, friction_gap=-1.0)
+        self.assertEqual(int(patches.current.valid.numpy().sum()), 0)
+        self.assertEqual(float(patches.view.weight.numpy().max()), 0.0)
+
 
 class TestFeatherPGSFrictionPatches(unittest.TestCase):
     def test_incompatible_point_solvers_are_rejected(self):
-        """Coupled point solves cannot silently consume a patch's shared normal load."""
+        """Reject coupled point solves that would silently consume a patch's shared normal load."""
         builder = newton.ModelBuilder()
         body = builder.add_body()
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
         model = builder.finalize(device="cpu")
-        for config in ({"friction_mode": "bisection"}, {"pgs_kernel": "tiled_contact"}, {"pgs_kernel": "streaming"}):
-            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "Patch friction requires"):
-                newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, **config)
+        with self.assertRaisesRegex(ValueError, "Patch friction requires"):
+            newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, friction_mode="bisection")
+        # CPU resolves every native kernel selector to the scalar loop, so only CUDA rejects them.
+        solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_kernel="tiled_contact")
+        self.assertEqual(solver.pgs_kernel, "loop")
+        if wp.is_cuda_available():
+            cuda_model = builder.finalize(device="cuda:0")
+            for kernel in ("tiled_contact", "streaming"):
+                with self.subTest(pgs_kernel=kernel), self.assertRaisesRegex(ValueError, "Patch friction requires"):
+                    newton.solvers.SolverFeatherPGS(cuda_model, friction_anchor_beta=0.2, pgs_kernel=kernel)
+
+    def test_deprecated_anchor_limit_warns_instead_of_raising(self):
+        """Map the deprecated anchor limit onto patch friction when supported and otherwise warn and ignore it."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device="cpu")
+        with self.assertWarns(DeprecationWarning):
+            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2)
+        self.assertTrue(solver._friction_anchors_enabled)
+        self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
+        if wp.is_cuda_available():
+            # Coupled friction modes need the CUDA matrix-free route; the shim must warn and stay off there.
+            cuda_model = builder.finalize(device="cuda:0")
+            with self.assertWarns(DeprecationWarning):
+                solver = newton.solvers.SolverFeatherPGS(
+                    cuda_model, contact_friction_anchor_limit=2, friction_mode="bisection", pgs_mode="matrix_free"
+                )
+            self.assertFalse(solver._friction_anchors_enabled)
+        with self.assertWarns(DeprecationWarning):
+            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, pgs_kernel="tiled_contact")
+        self.assertTrue(solver._friction_anchors_enabled)
+        with self.assertWarns(DeprecationWarning):
+            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, friction_anchor_beta=0.3)
+        self.assertAlmostEqual(solver.friction_anchor_beta, 0.3)
 
     def test_anchor_selection_respects_contact_gap_filters(self):
-        """Filtered extreme points cannot remove friction from a loaded middle contact."""
+        """Keep filtered extreme points from removing friction from a loaded middle contact."""
         for gate in ("contact_friction_gap_threshold", "contact_gap_gate"):
             with self.subTest(gate=gate), wp.ScopedDevice("cpu"):
                 builder = newton.ModelBuilder()
@@ -279,7 +439,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_propagation_variants_preserve_a_warmstarted_patch(self):
-        """Cached, fused, and colored propagation retain a sticking articulated grasp."""
+        """Retain a sticking articulated grasp across cached, fused, and colored propagation."""
         for response in ("propagation", "propagation-fused", "propagation-colored"):
             with self.subTest(response=response):
                 drift, solver, state = _run_squeeze(
@@ -295,8 +455,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 self.assertLess(abs(drift), 2.0e-4)
                 self.assertGreater(np.count_nonzero(solver._friction_patches.current.valid.numpy()), 0)
 
-    def test_shape_updates_refresh_geometry_and_clear_history(self):
-        """Explicit shape edits cannot retain anchors correlated with old geometry."""
+    def test_shape_updates_refresh_geometry_and_keep_history(self):
+        """Refresh cached body radii after shape edits without discarding anchor history."""
         builder = newton.ModelBuilder()
         body = builder.add_body()
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
@@ -308,10 +468,10 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         model.shape_collision_radius.assign(model.shape_collision_radius.numpy() * 2)
         solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
         np.testing.assert_allclose(patches.body_radius.numpy(), 2 * radius)
-        self.assertEqual(np.count_nonzero(patches.previous.valid.numpy()), 0)
+        self.assertEqual(np.count_nonzero(patches.previous.valid.numpy()), patches.previous.valid.shape[0])
 
     def test_patch_resists_twist_and_releases_above_its_limit(self):
-        """Separated anchors resist a static yaw torque but permit a larger torque to spin."""
+        """Resist a static yaw torque with separated anchors, but permit a larger torque to spin."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         for torque in (0.2, 1.0):
             with self.subTest(torque=torque), wp.ScopedDevice(device):
@@ -346,12 +506,12 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                     self.assertGreater(angular_speed, 1.0)
 
     def test_pooled_coulomb_budget(self):
-        """Two unloaded anchor normals share the loaded middle normal's budget."""
+        """Share the loaded middle normal's budget across two unloaded anchor normals."""
         self._check_pooled_projection("cpu", native=False)
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_native_pooled_coulomb_budget(self):
-        """Native CUDA projection uses the complete patch's normal load."""
+        """Use the complete patch's normal load in native CUDA projection."""
         self._check_pooled_projection("cuda:0", native=True)
 
     def _check_pooled_projection(self, device, native):
@@ -373,12 +533,12 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         np.testing.assert_allclose(impulses.numpy()[0], [0, 1, 0, 4, 0, 1, 0] + [0] * 25, atol=1.0e-6)
 
     def test_planar_patch_reduces_friction_rows(self):
-        """A box face retains its four normals and uses only two friction anchors."""
+        """Retain a box face's four normals while using only two friction anchors."""
         self._check_planar_patch("cpu", "split")
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_cuda_planar_patch_reduces_friction_rows(self):
-        """Native split and fused kernels solve the same patch layout."""
+        """Solve the same patch layout with native split and fused kernels."""
         for mode in ("split", "matrix_free"):
             with self.subTest(mode=mode):
                 self._check_planar_patch("cuda:0", mode)
@@ -408,6 +568,40 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             friction = int(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_FRICTION))
             self.assertEqual(normals, 4)
             self.assertEqual(friction, 4)
+
+    def test_contact_forces_report_per_row_normal_load(self):
+        """Report each contact's own normal force so a resting box's contact forces sum to its weight."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        with wp.ScopedDevice(device):
+            model, solver, contacts, step = _ground_box(device)
+            for _ in range(100):
+                step()
+            solver.update_contacts(contacts)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            forces = contacts.rigid_contact_force.numpy()[:count]
+        weight = float(model.body_mass.numpy()[0]) * 9.81
+        self.assertGreaterEqual(count, 3)
+        self.assertAlmostEqual(float(abs(forces[:, 2].sum())), weight, delta=0.05 * weight)
+        self.assertLess(float(np.abs(forces[:, 2]).max()), weight)
+
+    def test_gap_filtered_step_keeps_anchor_history(self):
+        """Carry a region's anchors through a step in which the gap filter removes every friction row."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        with wp.ScopedDevice(device):
+            _model, solver, _contacts, step = _ground_box(device, contact_friction_gap_threshold=0.001)
+            patches = solver._friction_patches
+            for _ in range(40):
+                step()
+            self.assertGreater(int((patches.current.source.numpy() >= 0).sum()), 0)
+            solver.contact_friction_gap_threshold = -1.0
+            step()
+            self.assertEqual(float(patches.view.weight.numpy().max()), 0.0)
+            self.assertGreater(int(patches.previous.valid.numpy().sum()), 0)
+            solver.contact_friction_gap_threshold = 0.001
+            step()
+            weights = patches.view.weight.numpy()
+            sources = patches.current.source.numpy()
+            self.assertGreater(int(((weights > 0) & (sources >= 0)).sum()), 0)
 
 
 if __name__ == "__main__":

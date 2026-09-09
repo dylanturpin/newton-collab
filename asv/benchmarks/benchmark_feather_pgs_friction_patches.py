@@ -15,14 +15,11 @@ patch anchors themselves do not require it. Compilation and warmup are excluded.
 
 import argparse
 import json
-import os
 import time
 
 import numpy as np
 import warp as wp
 
-if "FPGS_PATCH_CACHE" in os.environ:
-    wp.config.kernel_cache_dir = os.environ["FPGS_PATCH_CACHE"]
 import newton
 
 
@@ -84,7 +81,6 @@ def run(worlds: int, tiles: int, beta: float, steps: int):
         solver.seed_double_buffer_events()
         step(s0, s1)
         step(s1, s0)
-    wp.synchronize()
     before = s0.body_q.numpy().copy()
     start = time.perf_counter()
     for _ in range(steps // 2):

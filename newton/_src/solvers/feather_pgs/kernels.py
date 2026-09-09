@@ -21,7 +21,7 @@ from ...sim.articulation import (
     compute_2d_rotational_dofs,
     compute_3d_rotational_dofs,
 )
-from .friction_patches import FrictionPatches, patch_normal_load
+from .friction_patches import FrictionPatches, contact_tangent_basis, patch_normal_load
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 PGS_CONSTRAINT_TYPE_JOINT_TARGET = 1
@@ -1625,17 +1625,6 @@ def update_qdd_from_velocity(
         joint_qdd[tid] = (v_new[tid] - joint_qd[tid]) * inv_dt
 
 
-@wp.func
-def contact_tangent_basis(n: wp.vec3):
-    # pick an arbitrary perpendicular vector and orthonormalize
-    tangent0 = wp.cross(n, wp.vec3(1.0, 0.0, 0.0))
-    if wp.length_sq(tangent0) < 1.0e-12:
-        tangent0 = wp.cross(n, wp.vec3(0.0, 1.0, 0.0))
-    tangent0 = wp.normalize(tangent0)
-    tangent1 = wp.normalize(wp.cross(n, tangent0))
-    return tangent0, tangent1
-
-
 @wp.kernel
 def reset_friction_anchor_history(
     world_mask: wp.array[wp.bool],
@@ -1696,7 +1685,7 @@ def compute_contact_linear_force_from_impulses(
         lam_t0 = 0.0
         lam_t1 = 0.0
         if path == 0:
-            lam_n = patch_normal_load(world_row_parent, world_impulses, world, slot)
+            lam_n = world_impulses[world, slot]
             count = world_constraint_count[world]
             if (
                 enable_friction != 0
@@ -1709,7 +1698,7 @@ def compute_contact_linear_force_from_impulses(
                 lam_t0 = world_impulses[world, slot + 1]
                 lam_t1 = world_impulses[world, slot + 2]
         elif path == 1:
-            lam_n = patch_normal_load(mf_row_parent, mf_impulses, world, slot)
+            lam_n = mf_impulses[world, slot]
             count = mf_constraint_count[world]
             if (
                 enable_friction != 0
@@ -1722,7 +1711,7 @@ def compute_contact_linear_force_from_impulses(
                 lam_t0 = mf_impulses[world, slot + 1]
                 lam_t1 = mf_impulses[world, slot + 2]
         elif path == 2:
-            lam_n = patch_normal_load(propagation_row_parent, propagation_impulses, world, slot)
+            lam_n = propagation_impulses[world, slot]
             count = propagation_constraint_count[world]
             if (
                 enable_friction != 0
@@ -3543,8 +3532,6 @@ def prepare_world_contact_rows(
         b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
         apply_friction_filter = contact_friction_articulation_pairs_only == 0 or (a_non_free and b_non_free)
         friction_mu = mu * contact_friction_scale
-        if friction_patches.enabled != 0:
-            friction_mu *= friction_patches.weight[c]
 
         tangent0, tangent1 = contact_tangent_basis(normal)
         add_friction = enable_friction != 0 and (not apply_friction_filter or phi <= contact_friction_gap_threshold)
@@ -3985,8 +3972,6 @@ def _populate_world_J_for_size_contact(
     b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
     apply_friction_filter = contact_friction_articulation_pairs_only == 0 or (a_non_free and b_non_free)
     friction_mu = mu * contact_friction_scale
-    if friction_patches.enabled != 0:
-        friction_mu *= friction_patches.weight[c]
 
     # Compute tangent basis for friction
     t0, t1 = contact_tangent_basis(normal)
@@ -5112,8 +5097,6 @@ def _build_mf_contact_row(
     restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
     apply_friction_filter = contact_friction_articulation_pairs_only == 0
     friction_mu = mu * contact_friction_scale
-    if friction_patches.enabled != 0:
-        friction_mu *= friction_patches.weight[c]
 
     # Tangent basis
     t0, t1 = contact_tangent_basis(normal)
@@ -5422,8 +5405,6 @@ def build_propagation_contact_rows(
     b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
     apply_friction_filter = contact_friction_articulation_pairs_only == 0 or (a_non_free and b_non_free)
     friction_mu = mu * contact_friction_scale
-    if friction_patches.enabled != 0:
-        friction_mu *= friction_patches.weight[c]
 
     t0, t1 = contact_tangent_basis(normal)
     will_add_friction = enable_friction != 0 and (not apply_friction_filter or phi <= contact_friction_gap_threshold)

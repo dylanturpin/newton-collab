@@ -179,7 +179,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         self.assertEqual(float(np.abs(solver.row_beta.numpy()[friction]).max()), 0.0)
 
     def test_anchors_do_not_require_contact_matching(self):
-        """Patch history belongs to the solver, independently of collision matching."""
+        """Keep patch history owned by the solver, independently of collision matching."""
         model, _jaws, _box = _build_v_jaws(5.0)
         solver = newton.solvers.SolverFeatherPGS(model, **_SQUEEZE_SOLVER, friction_anchor_beta=0.2)
         pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
@@ -215,6 +215,14 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         flat_on, _, _ = _run_squeeze(0.0, steps, friction_anchor_beta=0.05)
         self.assertLess(abs(flat_on), 1.0e-4)
         self.assertLess(abs(flat_off), 1.0e-4)
+
+    def test_anchors_hold_a_pinched_box_at_a_coarse_timestep(self):
+        """Hold the tilted pinch at 60 Hz without re-anchoring below the Baumgarte equilibrium separation."""
+        dt = 1.0 / 60.0
+        drift, solver, _ = _run_squeeze(5.0, int(3.0 / dt), dt=dt, friction_anchor_beta=0.05)
+        self.assertLess(abs(drift), 1.0e-3, f"anchored pinch at 60 Hz drifted {drift:.2e} m")
+        sources = solver._friction_patches.current.source.numpy()
+        self.assertGreater(int((sources >= 0).sum()), 0, "anchors were re-created instead of carried")
 
     def test_anchors_do_not_oppose_genuine_sliding(self):
         """A box on a 30 deg incline with mu=0.3 (< tan 30) slides at g (sin - mu cos); anchors

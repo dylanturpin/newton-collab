@@ -24,6 +24,8 @@ capture: all buffers and the radix-sort workspace have fixed capacity.
 import numpy as np
 import warp as wp
 
+from ...math.spatial import velocity_at_point
+
 
 @wp.struct
 class FrictionPatches:
@@ -297,13 +299,18 @@ def _build(
                 expanded_b = sb
             cursor = patches.next_contact[cursor]
         patches.next_contact[tail] = seed
+        carry_only = int(0)
         if first < 0:
-            continue
+            # No member may carry friction rows this step (gap filters). Keep the
+            # region's anchor history on its members with zero weight so a single
+            # filtered step does not forget the accumulated positional correction.
+            carry_only = int(1)
+            first = seed
         second = first
         separation = float(0.0)
         for j in range(index, stop):
             c = frame.indices[j]
-            if frame.owner[c] == seed and frame.eligible[c] != 0:
+            if frame.owner[c] == seed and (carry_only != 0 or frame.eligible[c] != 0):
                 distance = wp.length_sq(frame.center[c] - frame.center[first])
                 if distance > separation:
                     separation = distance
@@ -330,6 +337,28 @@ def _build(
                     or prev.mu[p][1] != frame.mu[c][1]
                 ):
                     continue
+                old_n = prev.normal[p]
+                if a >= 0:
+                    old_n = wp.transform_vector(q[a], old_n)
+                pa = _world_point(q, a, prev.anchor_a[p])
+                pb = _world_point(q, b, prev.anchor_b[p])
+                delta = pa - pb
+                tangent_delta = delta - n * wp.dot(delta, n)
+                distance = wp.length_sq(0.5 * (pa + pb) - frame.center[c])
+                # The tangential gate bounds uncorrected slip of a carried pair at a
+                # tenth of the smaller body's radius, about three times the measured
+                # Baumgarte equilibrium separation of a held box at 60 Hz. Tighter
+                # gates re-anchor below that equilibrium and turn the correction
+                # into creep; genuine sliding is released by ``finish_patch_impulses``.
+                if not (
+                    wp.dot(old_n, n) >= 0.995
+                    and wp.length_sq(tangent_delta) <= 0.01 * r * r
+                    and wp.abs(wp.dot(delta, n)) <= 0.1 * r
+                    and wp.abs(wp.dot(0.5 * (pa + pb) - frame.center[c], n)) <= 0.05 * r
+                    and distance <= 4.0 * r * r
+                    and distance < nearest
+                ):
+                    continue
                 connected = _geometry_adjacent(
                     prev.shape_a[p], prev.shape_b[p], frame.shape_a[c], frame.shape_b[c], shape_transform, shape_radius
                 )
@@ -346,37 +375,37 @@ def _build(
                         ):
                             connected = True
                             break
-                if not connected:
-                    continue
-                old_n = prev.normal[p]
-                if a >= 0:
-                    old_n = wp.transform_vector(q[a], old_n)
-                pa = _world_point(q, a, prev.anchor_a[p])
-                pb = _world_point(q, b, prev.anchor_b[p])
-                delta = pa - pb
-                tangent_delta = delta - n * wp.dot(delta, n)
-                distance = wp.length_sq(0.5 * (pa + pb) - frame.center[c])
-                if (
-                    wp.dot(old_n, n) >= 0.995
-                    and wp.length_sq(tangent_delta) <= 0.0004 * r * r
-                    and wp.abs(wp.dot(delta, n)) <= 0.1 * r
-                    and wp.abs(wp.dot(0.5 * (pa + pb) - frame.center[c], n)) <= 0.05 * r
-                    and distance <= 4.0 * r * r
-                    and distance < nearest
-                ):
+                if connected:
                     chosen = p
                     nearest = distance
             pa = frame.center[c]
             pb = pa
+            anchor_a = _local_point(q, a, pa)
+            anchor_b = _local_point(q, b, pb)
+            carried_impulse = wp.vec3(0.0)
             if chosen >= 0:
                 prev.used[chosen] = 1
-                pa = _world_point(q, a, prev.anchor_a[chosen])
-                pb = _world_point(q, b, prev.anchor_b[chosen])
+                # Copy the stored material points verbatim; a world round trip
+                # would random-walk a stuck anchor by float32 rounding each step.
+                anchor_a = prev.anchor_a[chosen]
+                anchor_b = prev.anchor_b[chosen]
+                pa = _world_point(q, a, anchor_a)
+                pb = _world_point(q, b, anchor_b)
+                carried_impulse = prev.tangent_impulse[chosen]
             frame.source[c] = chosen
-            frame.anchor_a[c] = _local_point(q, a, pa)
-            frame.anchor_b[c] = _local_point(q, b, pb)
+            if carry_only != 0 and chosen < 0:
+                # Filtered members only carry existing history; they never start
+                # it, because no friction row held the pair during this step.
+                continue
+            frame.anchor_a[c] = anchor_a
+            frame.anchor_b[c] = anchor_b
+            # Default for anchors without friction rows this step; solved rows
+            # overwrite it in ``finish_patch_impulses``.
+            frame.tangent_impulse[c] = carried_impulse
             frame.valid[c] = 1
             patches.weight[c] = 1.0 / float(anchors)
+            if carry_only != 0:
+                patches.weight[c] = 0.0
             if frame.flipped[c] != 0:
                 temp = pa
                 pa = pb
@@ -384,11 +413,7 @@ def _build(
                 n = -n
             patches.point_a[c] = pa
             patches.point_b[c] = pb
-            t0 = wp.cross(n, wp.vec3(1.0, 0.0, 0.0))
-            if wp.length_sq(t0) < 1.0e-12:
-                t0 = wp.cross(n, wp.vec3(0.0, 1.0, 0.0))
-            t0 = wp.normalize(t0)
-            t1 = wp.normalize(wp.cross(n, t0))
+            t0, t1 = contact_tangent_basis(n)
             patches.phi[c] = wp.vec2(wp.dot(t0, pa - pb), wp.dot(t1, pa - pb))
 
 
@@ -562,7 +587,12 @@ def link_patch_rows(
     parents: wp.array2d[int],
     mu: wp.array2d[float],
 ):
-    """Link only allocated rows and divide the load among surviving anchors."""
+    """Link only allocated rows and divide the Coulomb budget among surviving anchors.
+
+    Row builders write the unscaled friction coefficient; this kernel divides it by
+    the number of anchors that actually received rows, so the pooled normal load
+    is shared exactly once.
+    """
     c = wp.tid()
     if c >= count[0] or slot[c] < 0 or path[c] != route:
         return
@@ -583,16 +613,18 @@ def link_patch_rows(
     parents[world[c], slot[c]] = next_slot
     if patches.weight[c] > 0.0 and slots_needed[c] == 3 and anchors > 0:
         for t in range(1, 3):
-            mu[world[c], slot[c] + t] /= patches.weight[c] * float(anchors)
+            mu[world[c], slot[c] + t] /= float(anchors)
 
 
 @wp.func
-def _tangents(n: wp.vec3):
-    t0 = wp.cross(n, wp.vec3(1.0, 0.0, 0.0))
-    if wp.length_sq(t0) < 1.0e-12:
-        t0 = wp.cross(n, wp.vec3(0.0, 1.0, 0.0))
-    t0 = wp.normalize(t0)
-    return t0, wp.normalize(wp.cross(n, t0))
+def contact_tangent_basis(n: wp.vec3):
+    """Return the deterministic tangent pair every FeatherPGS friction row uses for ``n``."""
+    tangent0 = wp.cross(n, wp.vec3(1.0, 0.0, 0.0))
+    if wp.length_sq(tangent0) < 1.0e-12:
+        tangent0 = wp.cross(n, wp.vec3(0.0, 1.0, 0.0))
+    tangent0 = wp.normalize(tangent0)
+    tangent1 = wp.normalize(wp.cross(n, tangent0))
+    return tangent0, tangent1
 
 
 @wp.kernel(enable_backward=False)
@@ -611,21 +643,25 @@ def seed_patch_impulses(
     impulses: wp.array2d[float],
     scale: float,
 ):
-    """Transport cached patch impulses after all contact normals have been seeded."""
+    """Transport cached patch impulses after all contact normals have been seeded.
+
+    Anchors without patch history keep whatever the contact-matched warm start
+    seeded; only carried anchors overwrite their friction rows.
+    """
     c = wp.tid()
     if c >= count[0] or path[c] != route or slot[c] < 0 or slots_needed[c] != 3:
         return
-    tangent = wp.vec3(0.0)
     source = frame.source[c]
-    if source >= 0:
-        tangent = prev.tangent_impulse[source] * scale
-        if frame.body_a[c] >= 0:
-            tangent = wp.transform_vector(q[frame.body_a[c]], tangent)
+    if source < 0:
+        return
+    tangent = prev.tangent_impulse[source] * scale
+    if frame.body_a[c] >= 0:
+        tangent = wp.transform_vector(q[frame.body_a[c]], tangent)
     n = frame.normal[c]
     if frame.flipped[c] != 0:
         n = -n
         tangent = -tangent
-    t0, t1 = _tangents(n)
+    t0, t1 = contact_tangent_basis(n)
     value = wp.vec2(wp.dot(tangent, t0), wp.dot(tangent, t1))
     w = world[c]
     s = slot[c]
@@ -643,8 +679,7 @@ def _point_velocity(
 ):
     velocity = wp.vec3(0.0)
     if body >= 0:
-        offset = wp.transform_vector(q[body], anchor - com[body])
-        velocity = wp.spatial_top(qd[body]) + wp.cross(wp.spatial_bottom(qd[body]), offset)
+        velocity = velocity_at_point(qd[body], wp.transform_vector(q[body], anchor - com[body]))
     return velocity
 
 
@@ -675,16 +710,18 @@ def finish_patch_impulses(
     if c >= count[0] or frame.valid[c] == 0:
         return
     if slot[c] < 0 or slots_needed[c] != 3:
-        frame.valid[c] = 0
+        # Carried without rows (gap-filtered member or capacity-rejected unit):
+        # ``_build`` already stored the carried tangent impulse, so keep the
+        # history and let the next step re-select anchors.
         return
     if path[c] != route:
         return
     w = world[c]
     s = slot[c]
     n = frame.normal[c]
-    t0, t1 = _tangents(n)
+    t0, t1 = contact_tangent_basis(n)
     if frame.flipped[c] != 0:
-        t0, t1 = _tangents(-n)
+        t0, t1 = contact_tangent_basis(-n)
     tangent = impulses[w, s + 1] * t0 + impulses[w, s + 2] * t1
     if frame.flipped[c] != 0:
         tangent = -tangent
