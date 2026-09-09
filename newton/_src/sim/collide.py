@@ -1344,6 +1344,7 @@ class CollisionPipeline:
         shape_pairs_max: int | None = None,
         deterministic: bool = False,
         box_box_sat: bool = False,
+        _analytic_mesh_features: int = 2,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
         contact_matching_pos_threshold: float = 0.0005,
         contact_matching_normal_dot_threshold: float = 0.995,
@@ -1418,6 +1419,11 @@ class CollisionPipeline:
                 4-slot manifold. Stable multi-point box manifolds (no witness-
                 point teleports). Cannot be combined with a prebuilt
                 ``narrow_phase``. Defaults to False.
+            _analytic_mesh_features: Internal. 2 routes triangle-mesh vs exact analytic
+                primitive pairs (box, sphere, capsule, cylinder, cone) through closed-form
+                feature contacts and narrows the midphase to the contact band; 1 keeps only
+                the band cull; 0 restores the plain GJK/MPR path. Present so the benchmark
+                and the parity tests can compare the paths, not part of the supported API.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
                 Its effective ``reduce_contacts`` state is authoritative for
@@ -1851,6 +1857,7 @@ class CollisionPipeline:
                 has_heightfields=has_heightfields,
                 use_lean_gjk_mpr=use_lean_gjk_mpr,
                 box_box_sat=box_box_sat,
+                _analytic_mesh_features=_analytic_mesh_features,
                 has_generic_convex_pairs=has_generic_convex_pairs,
                 split_gjk_mpr=split_gjk_mpr,
                 candidate_pair_work_estimate=candidate_pair_work_estimate,

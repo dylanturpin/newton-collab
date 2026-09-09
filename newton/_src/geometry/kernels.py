@@ -327,7 +327,9 @@ def sdf_box_grad(point: wp.vec3, hx: float, hy: float, hz: float):
         hz [m]: Half-extent along Z.
 
     Returns:
-        Unit-length (or axis-aligned) outward gradient direction.
+        Unit-length (or axis-aligned) outward gradient direction. Where the gradient is
+        not unique (inside on the medial surface, equidistant from several faces) the
+        normal of a nearest face is returned, ties resolving to X, then Y, then Z.
     """
     qx = abs(point[0]) - hx
     qy = abs(point[1]) - hy
@@ -341,19 +343,17 @@ def sdf_box_grad(point: wp.vec3, hx: float, hy: float, hz: float):
 
         return wp.normalize(point - wp.vec3(x, y, z))
 
-    sx = wp.sign(point[0])
-    sy = wp.sign(point[1])
-    sz = wp.sign(point[2])
+    # interior: the outward gradient is the normal of a nearest face, an axis attaining
+    # max(qx, qy, qz). Any tied axis is valid, so ties resolve to X, then Y; a strict
+    # cascade would instead fall through to a strictly farther face on qx == qy > qz.
+    sx = wp.where(point[0] >= 0.0, 1.0, -1.0)
+    sy = wp.where(point[1] >= 0.0, 1.0, -1.0)
+    sz = wp.where(point[2] >= 0.0, 1.0, -1.0)
 
-    # x projection
-    if (qx > qy and qx > qz) or (qy == 0.0 and qz == 0.0):
+    if qx >= qy and qx >= qz:
         return wp.vec3(sx, 0.0, 0.0)
-
-    # y projection
-    if (qy > qx and qy > qz) or (qx == 0.0 and qz == 0.0):
+    if qy >= qz:
         return wp.vec3(0.0, sy, 0.0)
-
-    # z projection
     return wp.vec3(0.0, 0.0, sz)
 
 
@@ -689,6 +689,72 @@ def sdf_cone_grad(point: wp.vec3, radius: float, half_height: float, up_axis: in
     # Gradient for cone with apex at +half_height and base at -half_height
     grad_z_up = _sdf_capped_cone_grad_z(radius, 0.0, half_height, point_z_up)
     return _sdf_vector_from_z_up(grad_z_up, up_axis)
+
+
+@wp.func
+def is_analytic_sdf_primitive(geo: int) -> bool:
+    """Shape types with a closed-form signed distance; the ellipsoid's is approximate."""
+    return (
+        geo == GeoType.BOX
+        or geo == GeoType.SPHERE
+        or geo == GeoType.CAPSULE
+        or geo == GeoType.CYLINDER
+        or geo == GeoType.CONE
+        or geo == GeoType.ELLIPSOID
+    )
+
+
+@wp.func
+def is_exact_analytic_sdf_primitive(geo: int) -> bool:
+    """Analytic primitives whose signed distance is exact and 1-Lipschitz: all but the ellipsoid."""
+    return (
+        geo == GeoType.BOX
+        or geo == GeoType.SPHERE
+        or geo == GeoType.CAPSULE
+        or geo == GeoType.CYLINDER
+        or geo == GeoType.CONE
+    )
+
+
+@wp.func
+def eval_analytic_sdf(geo: int, scale: wp.vec3, p: wp.vec3) -> float:
+    """Signed distance of an analytic primitive at shape-local ``p``.
+
+    ``scale`` holds the primitive parameters as ``shape_scale`` stores them; axial shapes are Z-up.
+    """
+    if geo == GeoType.BOX:
+        return sdf_box(p, scale[0], scale[1], scale[2])
+    if geo == GeoType.SPHERE:
+        return sdf_sphere(p, scale[0])
+    if geo == GeoType.CAPSULE:
+        return sdf_capsule(p, scale[0], scale[1], int(Axis.Z))
+    if geo == GeoType.CYLINDER:
+        return sdf_cylinder(p, scale[0], scale[1], int(Axis.Z), -1.0, scale[2])
+    if geo == GeoType.CONE:
+        return sdf_cone(p, scale[0], scale[1], int(Axis.Z))
+    return sdf_ellipsoid(p, scale)
+
+
+@wp.func
+def eval_analytic_sdf_grad(geo: int, scale: wp.vec3, p: wp.vec3) -> tuple[float, wp.vec3]:
+    """Signed distance and unit outward gradient of an analytic primitive at shape-local ``p``."""
+    if geo == GeoType.BOX:
+        return sdf_box(p, scale[0], scale[1], scale[2]), sdf_box_grad(p, scale[0], scale[1], scale[2])
+    if geo == GeoType.SPHERE:
+        return sdf_sphere(p, scale[0]), sdf_sphere_grad(p, scale[0])
+    if geo == GeoType.CAPSULE:
+        return (
+            sdf_capsule(p, scale[0], scale[1], int(Axis.Z)),
+            sdf_capsule_grad(p, scale[0], scale[1], int(Axis.Z)),
+        )
+    if geo == GeoType.CYLINDER:
+        return (
+            sdf_cylinder(p, scale[0], scale[1], int(Axis.Z), -1.0, scale[2]),
+            sdf_cylinder_grad(p, scale[0], scale[1], int(Axis.Z), -1.0, scale[2]),
+        )
+    if geo == GeoType.CONE:
+        return sdf_cone(p, scale[0], scale[1], int(Axis.Z)), sdf_cone_grad(p, scale[0], scale[1], int(Axis.Z))
+    return sdf_ellipsoid(p, scale), sdf_ellipsoid_grad(p, scale)
 
 
 @wp.func

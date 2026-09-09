@@ -9,6 +9,7 @@ from typing import Any
 import warp as wp
 
 from ..core.types import MAXVAL, Devicelike
+from ..geometry.analytic_mesh_contacts import create_triangle_analytic_contacts
 from ..geometry.collision_convex import ConvexQueryResult, create_write_convex_query_result
 from ..geometry.collision_core import (
     ENABLE_TILE_BVH_QUERY,
@@ -57,6 +58,7 @@ from ..geometry.contact_reduction_global import (
 )
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.flags import ShapeFlags
+from ..geometry.kernels import is_exact_analytic_sdf_primitive
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
@@ -1584,6 +1586,7 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
     shape_pairs_mesh: wp.array[wp.vec2i],
     shape_pairs_mesh_count: wp.array[int],
     total_num_threads: int,
+    analytic_band_cull: int,
     # outputs
     triangle_pairs: wp.array[wp.vec3i],  # (shape_a, shape_b, triangle_idx)
     triangle_pairs_count: wp.array[int],
@@ -1682,6 +1685,7 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
             contact_threshold,
             triangle_pairs,
             triangle_pairs_count,
+            analytic_band_cull,
         )
 
 
@@ -1702,6 +1706,7 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func: Any):
         triangle_pairs_count: wp.array[int],
         writer_data: Any,
         total_num_threads: int,
+        analytic_features: int,
     ):
         """
         Process triangle pairs to generate contacts using GJK/MPR.
@@ -1762,6 +1767,28 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func: Any):
             gap_a = shape_gap[shape_a]
             gap_b = shape_gap[shape_b]
             gap_sum = gap_a + gap_b
+
+            type_b = shape_types[shape_b]
+            if analytic_features != 0 and type_a == GeoType.MESH and is_exact_analytic_sdf_primitive(type_b):
+                X_prim_ws = shape_transform[shape_b]
+                X_ws_prim = wp.transform_inverse(X_prim_ws)
+                prim_scale = wp.vec3(shape_data[shape_b][0], shape_data[shape_b][1], shape_data[shape_b][2])
+                wp.static(create_triangle_analytic_contacts(writer_func))(
+                    wp.transform_point(X_ws_prim, pos_a),
+                    wp.transform_point(X_ws_prim, pos_a + shape_data_a.scale),
+                    wp.transform_point(X_ws_prim, pos_a + shape_data_a.auxiliary),
+                    type_b,
+                    prim_scale,
+                    X_prim_ws,
+                    gap_sum,
+                    margin_offset_a,
+                    margin_offset_b,
+                    shape_a,
+                    shape_b,
+                    tri_idx,
+                    writer_data,
+                )
+                continue
 
             wp.static(
                 create_compute_gjk_mpr_contacts(
@@ -2262,6 +2289,7 @@ class NarrowPhase:
         shape_voxel_resolution: wp.array[wp.vec3i] | None = None,
         contact_writer_warp_func: Any | None = None,
         box_box_sat: bool = False,
+        _analytic_mesh_features: int = 2,
         hydroelastic_sdf: HydroelasticSDF | None = None,
         has_meshes: bool = True,
         has_heightfields: bool = False,
@@ -2287,6 +2315,11 @@ class NarrowPhase:
             max_candidate_pairs: Maximum number of candidate pairs from broad phase
             max_triangle_pairs: Maximum number of triangle pairs for mesh and
                 heightfield collisions (conservative estimate).
+            _analytic_mesh_features: Internal. 2 routes mesh vs exact analytic primitive
+                pairs through closed-form feature contacts and narrows the midphase to the
+                contact band; 1 keeps only the band cull; 0 restores the plain GJK/MPR
+                path. Present so the benchmark and the parity tests can compare the paths,
+                not part of the supported API.
             max_mesh_mesh_pairs: Maximum number of routed mesh-SDF pairs. Defaults
                 to ``max_candidate_pairs``.
             max_mesh_plane_pairs: Maximum number of routed mesh-plane pairs. Defaults
@@ -2380,6 +2413,9 @@ class NarrowPhase:
         self.sdf_texture_paired_samples = sdf_texture_paired_samples
         self.mesh_sdf_identity_scale_only = mesh_sdf_identity_scale_only
         self.deterministic = deterministic
+        self._analytic_mesh_features = int(_analytic_mesh_features)
+        self._analytic_band_cull = 1 if self._analytic_mesh_features >= 1 else 0
+        self._analytic_feature_contacts = 1 if self._analytic_mesh_features >= 2 else 0
         self.verify_buffers = verify_buffers
         self.speculative = speculative
         if speculative and contact_writer_warp_func is not None and not contact_writer_supports_speculative:
@@ -3002,6 +3038,7 @@ class NarrowPhase:
                     self.shape_pairs_mesh,
                     self.shape_pairs_mesh_count,
                     self.num_tile_blocks,
+                    self._analytic_band_cull,
                 ],
                 outputs=[
                     self.triangle_pairs,
@@ -3072,6 +3109,7 @@ class NarrowPhase:
                         self.triangle_pairs_count,
                         reducer_data,
                         self.total_num_threads,
+                        self._analytic_feature_contacts,
                     ],
                     device=device,
                     block_dim=self.mesh_triangle_block_dim,
@@ -3095,6 +3133,7 @@ class NarrowPhase:
                         self.triangle_pairs_count,
                         writer_data,
                         self.total_num_threads,
+                        self._analytic_feature_contacts,
                     ],
                     device=device,
                     block_dim=self.mesh_triangle_block_dim,

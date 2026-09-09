@@ -12,6 +12,7 @@ from ..core.types import vec5
 from .broad_phase_common import binary_search
 from .collision_convex import create_solve_convex_multi_contact, create_solve_convex_single_contact
 from .contact_data import ContactData
+from .kernels import eval_analytic_sdf, is_exact_analytic_sdf_primitive
 from .support_function import (
     GenericShapeData,
     GeoTypeEx,
@@ -1024,6 +1025,30 @@ def _mesh_triangle_is_front_facing_local(
 
 
 @wp.func
+def mesh_triangle_reaches_analytic_primitive(
+    mesh_id: wp.uint64,
+    tri_idx: int,
+    mesh_scale: wp.vec3,
+    X_bvh_to_prim: wp.transform,
+    geo: int,
+    prim_scale: wp.vec3,
+    contact_threshold: float,
+) -> bool:
+    """Conservative test: can any point of the triangle be within ``contact_threshold`` of the primitive?
+
+    Centroid distance minus the centroid's reach to the farthest vertex; valid because the exact
+    analytic distances are 1-Lipschitz.
+    """
+    mesh = wp.mesh_get(mesh_id)
+    v0 = wp.transform_point(X_bvh_to_prim, wp.cw_mul(mesh.points[mesh.indices[tri_idx * 3 + 0]], mesh_scale))
+    v1 = wp.transform_point(X_bvh_to_prim, wp.cw_mul(mesh.points[mesh.indices[tri_idx * 3 + 1]], mesh_scale))
+    v2 = wp.transform_point(X_bvh_to_prim, wp.cw_mul(mesh.points[mesh.indices[tri_idx * 3 + 2]], mesh_scale))
+    centroid = (v0 + v1 + v2) / 3.0
+    reach = wp.max(wp.length(v0 - centroid), wp.max(wp.length(v1 - centroid), wp.length(v2 - centroid)))
+    return eval_analytic_sdf(geo, prim_scale, centroid) <= contact_threshold + reach
+
+
+@wp.func
 def mesh_vs_convex_midphase(
     idx_in_thread_block: int,
     mesh_shape: int,
@@ -1037,6 +1062,7 @@ def mesh_vs_convex_midphase(
     contact_threshold: float,
     triangle_pairs: wp.array[wp.vec3i],
     triangle_pairs_count: wp.array[int],
+    analytic_band_cull: int,
 ):
     """
     Perform mesh vs convex shape midphase collision detection.
@@ -1058,7 +1084,16 @@ def mesh_vs_convex_midphase(
         contact_threshold: Contact candidate distance [m], including margin and gap
         triangle_pairs: Output array for triangle pairs (mesh_shape, non_mesh_shape, tri_index)
         triangle_pairs_count: Counter for triangle pairs
+        analytic_band_cull: Nonzero narrows the emitted candidates to the contact band
+            when the convex shape is an exact analytic primitive, instead of everything
+            inside its threshold-expanded AABB. See
+            :func:`mesh_triangle_reaches_analytic_primitive`.
     """
+    band_geo = shape_type[non_mesh_shape]
+    band_cull = analytic_band_cull != 0 and is_exact_analytic_sdf_primitive(band_geo)
+    band_scale = wp.vec3(shape_data[non_mesh_shape][0], shape_data[non_mesh_shape][1], shape_data[non_mesh_shape][2])
+    band_mesh_scale = wp.vec3(shape_data[mesh_shape][0], shape_data[mesh_shape][1], shape_data[mesh_shape][2])
+    X_bvh_to_prim = wp.transform_multiply(wp.transform_inverse(X_ws), X_mesh_ws)
     aabb_lower = wp.vec3(0.0)
     aabb_upper = wp.vec3(0.0)
     center_in_bvh = wp.vec3(0.0)
@@ -1113,6 +1148,11 @@ def mesh_vs_convex_midphase(
             tri_index = wp.untile(result_tile)
             if tri_index >= 0 and not _mesh_triangle_is_front_facing_local(mesh_id, center_in_bvh, tri_index):
                 tri_index = -1
+            if tri_index >= 0 and band_cull:
+                if not mesh_triangle_reaches_analytic_primitive(
+                    mesh_id, tri_index, band_mesh_scale, X_bvh_to_prim, band_geo, band_scale, contact_threshold
+                ):
+                    tri_index = -1
 
             # Add this triangle pair to the output buffer if valid
             # Store (mesh_shape, non_mesh_shape, tri_index) to guarantee mesh is always first
@@ -1137,7 +1177,12 @@ def mesh_vs_convex_midphase(
         while wp.mesh_query_aabb_next(query, tri_index):
             # Add this triangle pair to the output buffer if valid
             # Store (mesh_shape, non_mesh_shape, tri_index) to guarantee mesh is always first
-            if tri_index >= 0 and _mesh_triangle_is_front_facing_local(mesh_id, center_in_bvh, tri_index):
+            keep = tri_index >= 0 and _mesh_triangle_is_front_facing_local(mesh_id, center_in_bvh, tri_index)
+            if keep and band_cull:
+                keep = mesh_triangle_reaches_analytic_primitive(
+                    mesh_id, tri_index, band_mesh_scale, X_bvh_to_prim, band_geo, band_scale, contact_threshold
+                )
+            if keep:
                 out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
                 if out_idx < triangle_pairs.shape[0]:
                     triangle_pairs[out_idx] = wp.vec3i(mesh_shape, non_mesh_shape, tri_index)

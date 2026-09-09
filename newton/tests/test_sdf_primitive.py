@@ -83,6 +83,26 @@ def evaluate_gradient_kernel(
 
 
 @wp.kernel
+def evaluate_projection_residual_kernel(
+    primitive: int,
+    points: wp.array[wp.vec3],
+    p0: float,
+    p1: float,
+    p2: float,
+    up_axis: int,
+    gradient: wp.array[wp.vec3],
+    residual: wp.array[float],
+):
+    """Distance of ``point - grad * sdf(point)`` to the surface: zero iff the gradient reaches a nearest face."""
+    tid = wp.tid()
+    point = points[tid]
+    grad = _eval_grad(primitive, point, p0, p1, p2, up_axis)
+    dist = _eval_sdf(primitive, point, p0, p1, p2, up_axis)
+    gradient[tid] = grad
+    residual[tid] = _eval_sdf(primitive, point - grad * dist, p0, p1, p2, up_axis)
+
+
+@wp.kernel
 def evaluate_gradient_error_kernel(
     primitive: int,
     points: wp.array[wp.vec3],
@@ -193,6 +213,67 @@ def test_sdf_box_grad_matches_finite_difference(test, device):
         dtype=np.float32,
     )
     _assert_gradient_matches_fd(test, device, PRIMITIVE_BOX, points, 0.9, 1.2, 0.7, int(Axis.Y))
+
+
+def _assert_box_grad_reaches_nearest_face(test, device, points_np, hx, hy, hz):
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    gradient_wp = wp.zeros(points_np.shape[0], dtype=wp.vec3, device=device)
+    residual_wp = wp.zeros(points_np.shape[0], dtype=float, device=device)
+    wp.launch(
+        evaluate_projection_residual_kernel,
+        dim=points_np.shape[0],
+        inputs=[PRIMITIVE_BOX, points_wp, hx, hy, hz, int(Axis.Y), gradient_wp, residual_wp],
+        device=device,
+    )
+    gradient = gradient_wp.numpy()
+    residual = residual_wp.numpy()
+    norms = np.linalg.norm(gradient, axis=1)
+    test.assertTrue(
+        np.allclose(norms, 1.0, atol=1.0e-5),
+        msg=f"Interior gradients must be unit face normals, got norms {norms}",
+    )
+    for point, grad, res in zip(points_np, gradient, residual, strict=True):
+        test.assertAlmostEqual(
+            float(res),
+            0.0,
+            delta=1.0e-6,
+            msg=f"Gradient {grad} at {point} does not reach a nearest face of box ({hx}, {hy}, {hz})",
+        )
+
+
+def test_sdf_box_grad_interior_ties_reach_nearest_face(test, device):
+    """Verify interior gradients on equidistant-face ties select a nearest face.
+
+    The strict-comparison cascade used to fall through to the Z face on a
+    ``qx == qy > qz`` tie, reporting a strictly farther face as the gradient.
+    """
+    cube_points = np.array(
+        [
+            [0.09, 0.09, 0.005],  # qx == qy > qz: reacted along the farther Z face before the fix
+            [0.09, -0.09, 0.005],
+            [-0.09, 0.09, -0.005],
+            [0.09, 0.005, 0.09],  # qx == qz > qy
+            [0.005, 0.09, 0.09],  # qy == qz > qx
+            [0.1, 0.1, 0.0],  # on the edge shared by the +X and +Y faces
+            [0.1, 0.1, 0.1],  # corner: every face ties at distance zero
+            [0.0, 0.0, 0.0],  # center of a cube: every face ties
+        ],
+        dtype=np.float32,
+    )
+    _assert_box_grad_reaches_nearest_face(test, device, cube_points, 0.1, 0.1, 0.1)
+
+    # distinct half-extents so an axis mix-up cannot hide behind the cube's symmetry;
+    # binary-exact coordinates keep the face distances exactly tied in float32
+    box_points = np.array(
+        [
+            [0.375, 0.125, 0.25],  # qx == qy > qz
+            [0.0, 0.125, 0.875],  # qy == qz > qx
+            [0.375, 0.0625, 0.875],  # qx == qz > qy
+            [-0.375, -0.125, 0.25],
+        ],
+        dtype=np.float32,
+    )
+    _assert_box_grad_reaches_nearest_face(test, device, box_points, 0.5, 0.25, 1.0)
 
 
 def test_sdf_capsule_grad_matches_finite_difference(test, device):
@@ -378,6 +459,12 @@ add_function_test(
     TestSdfPrimitive,
     "test_sdf_box_grad_matches_finite_difference",
     test_sdf_box_grad_matches_finite_difference,
+    devices=_devices,
+)
+add_function_test(
+    TestSdfPrimitive,
+    "test_sdf_box_grad_interior_ties_reach_nearest_face",
+    test_sdf_box_grad_interior_ties_reach_nearest_face,
     devices=_devices,
 )
 add_function_test(
