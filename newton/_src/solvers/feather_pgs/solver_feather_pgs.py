@@ -42,6 +42,7 @@ from ..semi_implicit.kernels_particle import (
     eval_triangle_forces,
 )
 from ..solver import SolverBase
+from . import contact_compliance as _contact_compliance
 from .kernels import (
     FRICTION_MODE_BISECTION,
     FRICTION_MODE_BISECTION_DESAXCE,
@@ -742,10 +743,27 @@ class SolverFeatherPGS(SolverBase):
         articulation_pair_contact_gap_gate: float = 0.0,
         pgs_warmstart_decay: float = 1.0,
         warn_constraint_overflow: bool = True,
+        *,
+        contact_compliance: bool = False,
     ):
         """
         Args:
             model (Model): the model to be simulated.
+            contact_compliance: Experimental opt-in implicit unilateral contact material response.
+                Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
+                zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and
+                applies exported friction quadrature weighting once to the existing pair friction.
+                Requires CUDA matrix-free/immediate/interleaved solving, full position friction,
+                no warm start, restitution, global contact regularization, debug, shared normal
+                anchors, or friction-anchor reduction. CUDA graph capture is rejected. This
+                host-synchronizing experimental implementation is not a performance path and may
+                change without the normal deprecation period. Defaults to False.
+
+                .. experimental::
+
+                    The ``contact_compliance=True`` material response and its supported combinations
+                    may change without prior notice.
+
             angular_damping (float, optional): Angular damping factor. Defaults to 0.05.
             update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the
                 :meth:`step` function gets called). The cadence flag is evaluated on the host each step, so under
@@ -1058,6 +1076,12 @@ class SolverFeatherPGS(SolverBase):
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
         """
+        if contact_compliance:
+            _contact_compliance.validate_configuration(model, locals())
+        self.contact_compliance = bool(contact_compliance)
+        self.compliance_contact_count = 0
+        self._compliant_contacts = None
+        self._compliant_prepared = False
         super().__init__(model)
 
         self.angular_damping = angular_damping
@@ -1731,6 +1755,10 @@ class SolverFeatherPGS(SolverBase):
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del state, flags
+        if self.contact_compliance:
+            self._compliant_contacts = None
+            self._compliant_prepared = False
+            self.compliance_contact_count = 0
         if world_mask is not None and world_mask.shape[0] != self.world_count:
             raise ValueError(
                 f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per world)."
@@ -5750,6 +5778,14 @@ class SolverFeatherPGS(SolverBase):
         friction_start_iteration: int | None = None,
         iteration_offset: int = 0,
     ) -> None:
+        if self.contact_compliance:
+            _contact_compliance.solve(
+                self,
+                iterations=iterations,
+                friction_start_iteration=friction_start_iteration,
+                iteration_offset=iteration_offset,
+            )
+            return
         if self._propagation_contacts_enabled():
             self._launch_matrix_free_gs_solve_propagation_tree(
                 dense_rhs=self.rhs,
@@ -7498,6 +7534,8 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
+        if self.contact_compliance:
+            _contact_compliance.start_step(self, contacts, dt)
         model = self.model
         max_constraints = self.dense_max_constraints
         mf_active = self._has_free_rigid_bodies
