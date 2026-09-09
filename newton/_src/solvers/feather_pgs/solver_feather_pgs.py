@@ -1745,9 +1745,8 @@ class SolverFeatherPGS(SolverBase):
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes."""
         if self._friction_anchors_enabled and flags & ModelFlags.SHAPE_PROPERTIES:
-            # Refresh the cached body radii only. Carried anchors are re-validated
-            # against the live materials, transforms, and radii every step, so a
-            # shape update does not need to discard held objects' anchor history.
+            # Geometry edits retire affected material points; unrelated shape
+            # properties keep their history and live materials are checked per step.
             self._friction_patches.update_geometry(self.model)
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
             self._update_kinematic_state()
@@ -6665,7 +6664,6 @@ class SolverFeatherPGS(SolverBase):
                             device=model.device,
                         )
                     self._friction_patches.store(state_in)
-                    wp.copy(self._friction_patches.previous_world, self.contact_world)
                 else:
                     self._friction_patches.previous.valid.zero_()
 

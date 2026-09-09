@@ -2912,3 +2912,4 @@ class CollisionPipeline:
 
         # Preserve the previous provenance if validation or collision setup fails.
         contacts._contact_matching_mode = self.contact_matching
+        contacts.collide_serial = getattr(contacts, "collide_serial", 0) + 1

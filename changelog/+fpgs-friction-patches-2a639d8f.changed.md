@@ -4,3 +4,7 @@ per compatible region, sharing the region's normal load while preserving every
 normal contact. Collision contact matching is no longer required for anchor
 history. The existing `friction_anchor_beta` remains the single anchor control;
 correlation and release use geometry-scaled internal tolerances.
+
+Patch history survives reused contact buffers across solver substeps. Masked
+resets track world ownership even when contact rows are rejected. Shape geometry
+updates retire affected anchors while preserving unrelated bodies' history.

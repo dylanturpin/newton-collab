@@ -67,15 +67,22 @@ def _patch_fixture(
 ):
     """Construct patch geometry without a collision matcher or a solver step."""
     n = len(points)
+    body_count = max(shape_bodies) + 1
     model = SimpleNamespace(
         device=wp.get_device(device),
-        body_count=2,
+        body_count=body_count,
+        body_world=wp.zeros(body_count, dtype=int, device=device),
         shape_body=wp.array(shape_bodies, dtype=int, device=device),
         shape_collision_radius=wp.array([0.2] * len(shape_bodies), dtype=float, device=device),
         shape_transform=wp.array([wp.transform_identity()] * len(shape_bodies), dtype=wp.transform, device=device),
+        shape_scale=wp.ones(len(shape_bodies), dtype=wp.vec3, device=device),
+        shape_type=wp.zeros(len(shape_bodies), dtype=int, device=device),
+        shape_source_ptr=wp.zeros(len(shape_bodies), dtype=wp.uint64, device=device),
+        shape_margin=wp.zeros(len(shape_bodies), dtype=float, device=device),
+        shape_is_solid=wp.ones(len(shape_bodies), dtype=bool, device=device),
         shape_material_mu=wp.array(materials, dtype=float, device=device),
     )
-    state = SimpleNamespace(body_q=wp.array([wp.transform_identity()] * 2, dtype=wp.transform, device=device))
+    state = SimpleNamespace(body_q=wp.array([wp.transform_identity()] * body_count, dtype=wp.transform, device=device))
     contacts = SimpleNamespace(
         rigid_contact_count=wp.array([n], dtype=int, device=device),
         rigid_contact_shape0=wp.array(shape0 if shape0 is not None else [0] * n, dtype=int, device=device),
@@ -94,6 +101,68 @@ def _patch_fixture(
 
 
 class TestFrictionPatchHistory(unittest.TestCase):
+    def test_geometry_edits_retire_only_affected_history(self):
+        """Invalidate edited surfaces across carrier seams while preserving unrelated patches."""
+        for field in ("shape_transform", "shape_scale", "shape_margin", "shape_source_ptr"):
+            for static in (False, True):
+                with self.subTest(field=field, static=static):
+                    model, state, contacts, patches = _patch_fixture(
+                        [[0, 0, 0], [0, 0, 0]],
+                        shape0=[0, 3],
+                        shape_bodies=(0, -1 if static else 1, 0, 2, 3),
+                        materials=(0.5,) * 5,
+                    )
+                    contacts.rigid_contact_shape1.assign([1, 4])
+                    patches.build(model, state, contacts)
+                    patches.store(state)
+                    np.testing.assert_array_equal(patches.previous.valid.numpy()[:2], [1, 1])
+                    # Static geometry is identified by shape. A dynamic edit on
+                    # shape 2 must also retire shape 0's anchor on the same body.
+                    edited = 1 if static else 2
+                    values = getattr(model, field).numpy()
+                    if field == "shape_transform":
+                        values[edited, 0] += 1
+                    else:
+                        values[edited] += 1
+                    getattr(model, field).assign(values)
+                    patches.update_geometry(model)
+                    np.testing.assert_array_equal(patches.previous.valid.numpy()[:2], [0, 1])
+
+    def test_geometry_updates_allow_contacts_without_a_shape(self):
+        """Preserve implicit static contacts when an unrelated shape changes."""
+        model, state, contacts, patches = _patch_fixture([[0, 0, 0]], shape_bodies=(0, 1, 1))
+        contacts.rigid_contact_shape1.assign([-1])
+        patches.build(model, state, contacts)
+        patches.store(state)
+        self.assertEqual(int(patches.previous.valid.numpy()[0]), 1)
+        # Editing the last shape must not alias the contact's -1 sentinel.
+        transforms = model.shape_transform.numpy()
+        transforms[-1, 0] = 1.0
+        model.shape_transform.assign(transforms)
+        patches.update_geometry(model)
+        self.assertEqual(int(patches.previous.valid.numpy()[0]), 1)
+
+    def test_reused_contacts_keep_anchors_across_substeps(self):
+        """Preserve material points across substeps regardless of stale collision match indices."""
+        model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]])
+        contacts.rigid_contact_match_index = wp.array([1, 0], dtype=int, device=model.device)
+        active = patches.current.valid.numpy() != 0
+        anchors = patches.current.anchor_a.numpy()[active].copy()
+        patches.store(state)
+        for substep in range(1, 4):
+            displacement = substep * 0.001
+            state.body_q.assign(
+                [wp.transform(wp.vec3(displacement, 0, 0), wp.quat_identity()), wp.transform_identity()]
+            )
+            patches.build(model, state, contacts)
+            active = patches.current.valid.numpy() != 0
+            np.testing.assert_array_equal(patches.current.anchor_a.numpy()[active], anchors)
+            np.testing.assert_allclose(
+                np.linalg.norm(patches.view.phi.numpy()[active], axis=1), displacement, atol=1.0e-7
+            )
+            self.assertTrue(np.all(patches.current.source.numpy()[active] >= 0))
+            patches.store(state)
+
     def test_connected_convex_chain_forms_one_region(self):
         """Join a chain into one friction region even when the two end shapes do not overlap."""
         model, state, contacts, patches = _patch_fixture(
@@ -373,6 +442,73 @@ class TestFrictionPatchHistory(unittest.TestCase):
 
 
 class TestFeatherPGSFrictionPatches(unittest.TestCase):
+    def test_shape_translation_retires_anchors_outside_new_geometry(self):
+        """Retire the old contact footprint after changing a shape's local transform."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        builder = newton.ModelBuilder(gravity=wp.vec3(0, 0, 0))
+        builder.add_ground_plane()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0, 0, 0.1), wp.quat_identity()))
+        box = builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device=device)
+        solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+        contacts = pipeline.contacts()
+        s0, s1 = model.state(), model.state()
+        pipeline.collide(s0, contacts)
+        solver.step(s0, s1, model.control(), contacts, 0.005)
+        patches = solver._friction_patches
+        self.assertGreater(np.count_nonzero(patches.previous.valid.numpy()), 0)
+
+        transforms = model.shape_transform.numpy()
+        transforms[box, 0] = 1.0
+        model.shape_transform.assign(transforms)
+        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+        pipeline.collide(s1, contacts)
+        patches.build(model, s1, contacts)
+        active = patches.current.valid.numpy() != 0
+        self.assertEqual(np.count_nonzero(active), 2)
+        np.testing.assert_array_equal(patches.current.source.numpy()[active], [-1, -1])
+        local_x = patches.current.anchor_a.numpy()[active, 0]
+        self.assertTrue(np.all(local_x >= 0.89), "friction still acts on the removed x=-0.1..0.1 footprint")
+
+    def test_rejected_contact_history_keeps_correct_reset_world(self):
+        """Keep world ownership valid when contact order changes and normal gates reject rows."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        template = newton.ModelBuilder(gravity=wp.vec3(0, 0, 0))
+        template.add_ground_plane()
+        body = template.add_body()
+        template.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder = newton.ModelBuilder(gravity=wp.vec3(0, 0, 0))
+        builder.replicate(template, 2)
+        model = builder.finalize(device=device)
+        solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, contact_gap_gate=0.001)
+        contacts = newton.CollisionPipeline(model, rigid_contact_max=2).contacts()
+        shape_body = model.shape_body.numpy()
+        boxes = np.flatnonzero(shape_body >= 0)
+        grounds = np.flatnonzero(shape_body < 0)
+        contacts.rigid_contact_count.assign([2])
+        contacts.rigid_contact_shape0.assign(boxes)
+        contacts.rigid_contact_shape1.assign(grounds)
+        contacts.rigid_contact_normal.assign([[0, 0, -1]] * 2)
+        contacts.rigid_contact_point0.zero_()
+        contacts.rigid_contact_point1.zero_()
+        s0, s1 = model.state(), model.state()
+        solver.step(s0, s1, model.control(), contacts, 0.005)
+        patches = solver._friction_patches
+        self.assertEqual(int(patches.previous.valid.numpy().sum()), 2)
+
+        contacts.rigid_contact_shape0.assign(boxes[::-1].copy())
+        contacts.rigid_contact_shape1.assign(grounds[::-1].copy())
+        contacts.rigid_contact_point0.assign([[0, 0, 0.002]] * 2)
+        solver.step(s1, s0, model.control(), contacts, 0.005)
+        self.assertTrue((solver.contact_slot.numpy()[:2] == -1).all())
+        bodies = patches.current.body_a.numpy()[:2]
+        worlds = model.body_world.numpy()[bodies]
+        np.testing.assert_array_equal(patches.previous_world.numpy()[:2], worlds)
+        solver.reset(s0, wp.array([True, False], dtype=bool, device=device))
+        valid = patches.previous.valid.numpy()[:2]
+        np.testing.assert_array_equal(valid, (worlds != 0).astype(np.int32))
+
     def test_incompatible_point_solvers_are_rejected(self):
         """Reject coupled point solves that would silently consume a patch's shared normal load."""
         builder = newton.ModelBuilder()
@@ -456,7 +592,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 self.assertGreater(np.count_nonzero(solver._friction_patches.current.valid.numpy()), 0)
 
     def test_shape_updates_refresh_geometry_and_keep_history(self):
-        """Refresh cached body radii after shape edits without discarding anchor history."""
+        """Refresh broadphase bounds without discarding anchors on unchanged geometry."""
         builder = newton.ModelBuilder()
         body = builder.add_body()
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)

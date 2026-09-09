@@ -418,7 +418,13 @@ def _build(
 
 
 @wp.kernel(enable_backward=False)
-def _store_history(q: wp.array[wp.transform], frame: _PatchFrame, prev: _PatchFrame):
+def _store_history(
+    q: wp.array[wp.transform],
+    body_world: wp.array[int],
+    frame: _PatchFrame,
+    prev: _PatchFrame,
+    previous_world: wp.array[int],
+):
     """Carry fixed-capacity history in one launch, including its sorted pair index."""
     c = wp.tid()
     normal = frame.normal[c]
@@ -428,12 +434,42 @@ def _store_history(q: wp.array[wp.transform], frame: _PatchFrame, prev: _PatchFr
     prev.indices[c] = frame.indices[c]
     prev.normal[c] = normal
     prev.mu[c] = frame.mu[c]
+    prev.body_a[c] = frame.body_a[c]
+    prev.body_b[c] = frame.body_b[c]
     prev.shape_a[c] = frame.shape_a[c]
     prev.shape_b[c] = frame.shape_b[c]
     prev.anchor_a[c] = frame.anchor_a[c]
     prev.anchor_b[c] = frame.anchor_b[c]
     prev.valid[c] = frame.valid[c]
     prev.tangent_impulse[c] = frame.tangent_impulse[c]
+    world = int(-1)
+    if frame.valid[c] != 0:
+        if frame.body_a[c] >= 0:
+            world = body_world[frame.body_a[c]]
+        if world < 0 and frame.body_b[c] >= 0:
+            world = body_world[frame.body_b[c]]
+        # The solver maps the default, unpartitioned world (-1) to world zero.
+        world = wp.max(world, 0)
+    previous_world[c] = world
+
+
+@wp.kernel(enable_backward=False)
+def _invalidate_geometry_history(prev: _PatchFrame, bodies: wp.array[int], shapes: wp.array[int]):
+    """Discard material points whose supporting geometry changed."""
+    c = wp.tid()
+    if prev.valid[c] == 0:
+        return
+    changed = bool(False)
+    if prev.shape_a[c] >= 0:
+        changed = shapes[prev.shape_a[c]] != 0
+    if prev.shape_b[c] >= 0:
+        changed = changed or shapes[prev.shape_b[c]] != 0
+    if prev.body_a[c] >= 0:
+        changed = changed or bodies[prev.body_a[c]] != 0
+    if prev.body_b[c] >= 0:
+        changed = changed or bodies[prev.body_b[c]] != 0
+    if changed:
+        prev.valid[c] = 0
 
 
 class _FrictionPatchState:
@@ -452,6 +488,7 @@ class _FrictionPatchState:
         self.view.point_b = wp.zeros(n, dtype=wp.vec3, device=device)
         if not enabled:
             return
+        self.body_world = model.body_world
         self.body_radius = wp.zeros(model.body_count, dtype=float, device=device)
         self.update_geometry(model)
         self.current = self._frame(capacity, device)
@@ -459,14 +496,52 @@ class _FrictionPatchState:
         self.previous_world = wp.full(capacity, -1, dtype=int, device=device)
 
     def update_geometry(self, model):
-        """Refresh geometry scales after explicit shape-property updates."""
+        """Refresh scales and retire affected history after explicit geometry edits."""
+        geometry = {
+            name: getattr(model, name).numpy().copy()
+            for name in (
+                "shape_body",
+                "shape_transform",
+                "shape_scale",
+                "shape_type",
+                "shape_source_ptr",
+                "shape_margin",
+                "shape_is_solid",
+            )
+        }
         radii = np.zeros(model.body_count, dtype=np.float32)
         for body, radius, transform in zip(
-            model.shape_body.numpy(), model.shape_collision_radius.numpy(), model.shape_transform.numpy(), strict=True
+            geometry["shape_body"], model.shape_collision_radius.numpy(), geometry["shape_transform"], strict=True
         ):
             if body >= 0:
                 radii[body] = max(radii[body], radius + np.linalg.norm(transform[:3]))
         self.body_radius.assign(radii)
+        if hasattr(self, "_geometry"):
+            changed = np.zeros(len(geometry["shape_body"]), dtype=bool)
+            for name, values in geometry.items():
+                difference = values != self._geometry[name]
+                if difference.ndim > 1:
+                    difference = np.any(difference, axis=tuple(range(1, difference.ndim)))
+                changed |= difference
+            if np.any(changed):
+                # An anchor may have crossed a convex seam since it was created.
+                # Invalidate the affected body's history, including other carrier
+                # shapes, while keeping unrelated bodies and static shapes intact.
+                bodies = np.zeros(model.body_count, dtype=np.int32)
+                for shape_body in (self._geometry["shape_body"], geometry["shape_body"]):
+                    affected = shape_body[changed]
+                    bodies[affected[affected >= 0]] = 1
+                wp.launch(
+                    _invalidate_geometry_history,
+                    dim=self.capacity,
+                    inputs=[
+                        self.previous,
+                        wp.array(bodies, dtype=int, device=model.device),
+                        wp.array(changed, dtype=int, device=model.device),
+                    ],
+                    device=model.device,
+                )
+        self._geometry = geometry
 
     @staticmethod
     def _frame(n, device):
@@ -554,7 +629,7 @@ class _FrictionPatchState:
         wp.launch(
             _store_history,
             dim=self.capacity,
-            inputs=[state.body_q, self.current, self.previous],
+            inputs=[state.body_q, self.body_world, self.current, self.previous, self.previous_world],
             device=state.body_q.device,
         )
 

@@ -88,7 +88,9 @@ _SQUEEZE_SOLVER = {
 }
 
 
-def _run_squeeze(tilt_deg: float, steps: int, dt: float = 0.005, matching: str = "latest", **solver_kwargs):
+def _run_squeeze(
+    tilt_deg: float, steps: int, dt: float = 0.005, matching: str = "latest", substeps: int = 1, **solver_kwargs
+):
     """Return the box's z drift relative to the jaws (m, positive = up) and the solver."""
     model, jaws, box = _build_v_jaws(tilt_deg)
     kwargs = dict(_SQUEEZE_SOLVER)
@@ -101,10 +103,11 @@ def _run_squeeze(tilt_deg: float, steps: int, dt: float = 0.005, matching: str =
     newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
     rel = []
     for _ in range(steps):
-        pipeline.collide(s0, contacts)
-        s0.clear_forces()
-        solver.step(s0, s1, control, contacts, dt)
-        s0, s1 = s1, s0
+        pipeline.collide(s0, contacts)  # once per environment step; substeps reuse the buffer
+        for _sub in range(substeps):
+            s0.clear_forces()
+            solver.step(s0, s1, control, contacts, dt / substeps)
+            s0, s1 = s1, s0
         bq = s0.body_q.numpy()
         rel.append(bq[box][2] - bq[jaws[0]][2])
     rel = np.asarray(rel)
@@ -212,6 +215,10 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         # sticky matching replays body-local witness points; anchors must still hold
         drift_sticky, _, _ = _run_squeeze(5.0, steps, matching="sticky", friction_anchor_beta=0.2)
         self.assertLess(abs(drift_sticky), 1.0e-4, f"anchored pinch (sticky matching) drifted {drift_sticky:.2e} m")
+        # two solver substeps on one collide per environment step (Isaac Lab's loop): anchors
+        # must map 1:1 on the reused buffer, not through the stale match index
+        drift_sub, _, _ = _run_squeeze(5.0, steps, substeps=2, friction_anchor_beta=0.2)
+        self.assertLess(abs(drift_sub), 1.0e-4, f"anchored pinch with 2 substeps per collide drifted {drift_sub:.2e} m")
         flat_on, _, _ = _run_squeeze(0.0, steps, friction_anchor_beta=0.05)
         self.assertLess(abs(flat_on), 1.0e-4)
         self.assertLess(abs(flat_off), 1.0e-4)
@@ -497,6 +504,18 @@ def _build_two_world_free_model(device):
 
 class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
     """Device-agnostic checks of the anchor bookkeeping (run on CPU)."""
+
+    def test_collide_serial_advances_per_collide(self):
+        """Stamp every collide so solvers can distinguish a reused buffer from a new frame."""
+        model, _, _ = _build_v_jaws(0.0)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, broad_phase="nxn", contact_matching="latest")
+        contacts = pipeline.contacts()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        self.assertEqual(contacts.collide_serial, 0)
+        pipeline.collide(state, contacts)
+        pipeline.collide(state, contacts)
+        self.assertEqual(contacts.collide_serial, 2)
 
     def test_rhs_bias_matches_on_every_row_family_and_vanishes_in_velocity_pass(self):
         """Friction rows carry ``friction_anchor_beta * separation / dt`` on the dense, matrix-free
