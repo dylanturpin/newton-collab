@@ -15,14 +15,18 @@ patch anchors themselves do not require it. Compilation and warmup are excluded.
 Use ``--profile-stages`` to collect a separate uncaptured CUDA activity timeline
 after the throughput measurement, with warm starts independently controlled by
 ``--warmstart``. The timeline includes prepare/build/link/seed/finish/store kernel
-names, radix-sort activity, and copies; it measures device work, not host dispatch
-overhead. ``--tiles 13 --worlds 1`` is a synthetic 169-shape stress case, not the
-175-hull Robotiq asset or evidence of that gripper's performance.
+names and copies. Native patch radix sort is measured separately with CUDA
+events because it is absent from Warp's kernel activity list. Event spans include
+any stream gaps within the native call; neither measure is host wall-clock cost.
+``--tiles 13 --worlds 1`` is a synthetic 169-shape stress case, not the 175-hull
+Robotiq asset or evidence of that gripper's performance.
 """
 
 import argparse
 import json
 import time
+from contextlib import contextmanager
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -34,6 +38,28 @@ import newton
 def _apply_load(body_f: wp.array[wp.spatial_vector]):
     i = wp.tid()
     body_f[i] = wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.03)
+
+
+@contextmanager
+def _time_patch_sort(patches):
+    """Record CUDA event spans for native patch sorts outside the throughput measurement."""
+    original = wp.utils.radix_sort_pairs
+    spans = []
+
+    def timed_sort(keys, values, count, *args, **kwargs):
+        if not patches.view.enabled or keys.ptr != patches.current.keys.ptr:
+            return original(keys, values, count, *args, **kwargs)
+        start = wp.Event(device=keys.device, enable_timing=True)
+        end = wp.Event(device=keys.device, enable_timing=True)
+        with wp.ScopedDevice(keys.device):
+            wp.record_event(start)
+            result = original(keys, values, count, *args, **kwargs)
+            wp.record_event(end)
+        spans.append((start, end))
+        return result
+
+    with mock.patch.object(wp.utils, "radix_sort_pairs", timed_sort):
+        yield spans
 
 
 def run(
@@ -124,9 +150,13 @@ def run(
     if profile_stages:
         # Keep instrumentation and its synchronization out of the captured
         # throughput measurement. Two steps exercise both state buffers.
-        with wp.ScopedTimer("contact_stages", cuda_filter=wp.TIMING_ALL, print=False) as timer:
-            step(s0, s1)
-            step(s1, s0)
+        with _time_patch_sort(solver._friction_patches) as sort_spans:
+            with wp.ScopedTimer("contact_stages", cuda_filter=wp.TIMING_ALL, print=False) as timer:
+                step(s0, s1)
+                step(s1, s0)
+        result["patch_sort_cuda_event_milliseconds_per_step"] = (
+            sum(wp.get_event_elapsed_time(start, end) for start, end in sort_spans) / 2
+        )
         activity = {}
         for timing in timer.timing_results:
             entry = activity.setdefault(timing.name, {"calls_per_step": 0.0, "milliseconds_per_step": 0.0})

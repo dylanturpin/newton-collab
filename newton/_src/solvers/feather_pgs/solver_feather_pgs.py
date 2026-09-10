@@ -7718,8 +7718,18 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def _patch_row_arrays(self):
-        """Allocated solver routes and their configured warm-start decay."""
-        yield 0, self.row_parent, self.row_mu, self.impulses, self.pgs_warmstart_decay if self.pgs_warmstart else 0.0
+        """Yield possible contact routes and their configured warm-start decay."""
+        # With only free response bodies, the allocator routes every responsive
+        # contact through matrix-free (or free/free propagation) rows. Dense
+        # bilateral rows can still exist, but have no patch links or impulses.
+        if self._has_non_free_articulations or not self._has_free_rigid_bodies:
+            yield (
+                0,
+                self.row_parent,
+                self.row_mu,
+                self.impulses,
+                self.pgs_warmstart_decay if self.pgs_warmstart else 0.0,
+            )
         if self._has_free_rigid_bodies:
             yield (
                 1,
