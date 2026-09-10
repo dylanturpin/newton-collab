@@ -499,6 +499,12 @@ class SchemaResolverMjc(SchemaResolver):
             # "damping" key, so it resolves through the _per_rad variant.
             "damping_per_rad": SchemaAttribute("mjc:damping", None),
             "friction": SchemaAttribute("mjc:frictionloss", 0.0),
+            # Passive joint spring (MjcJointAPI). mjc:stiffness is always per-radian
+            # (MuJoCo never expresses stiffness per-degree); mjc:springref follows the
+            # source spec's compiler angle units, recorded in the scene-level
+            # mjc:compiler:angle token — parse_usd handles that conversion.
+            "spring_stiffness": SchemaAttribute("mjc:stiffness", None),
+            "spring_ref": SchemaAttribute("mjc:springref", None),
             # Per-axis aliases mapped to solreflimit (MjcJointAPI authors joint limit solref here)
             "limit_transX_ke": SchemaAttribute("mjc:solreflimit", [0.02, 1.0], solref_to_stiffness),
             "limit_transY_ke": SchemaAttribute("mjc:solreflimit", [0.02, 1.0], solref_to_stiffness),
