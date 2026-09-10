@@ -86,12 +86,20 @@ def validate_configuration(model, settings):
         raise ValueError("contact_compliance currently requires CUDA")
 
 
-def start_step(solver, contacts, dt):
-    """Reset step-local material bindings before row construction."""
+def validate_step(solver):
+    """Reject unqualified combinations before any contact preprocessing."""
     if wp.get_stream(solver.model.device).is_capturing:
         raise RuntimeError("contact_compliance does not support CUDA graph capture")
     if getattr(solver, "contact_torsion_radius", 0.0) > 0:
         raise ValueError("contact_compliance is not validated with contact_torsion_radius > 0")
+    # The persistent-patch implementation allocates a dummy buffer even when OFF.
+    if getattr(solver, "friction_anchor_beta", 0.0) > 0 or getattr(solver, "_friction_anchors_enabled", False):
+        raise ValueError("contact_compliance is not validated with friction_anchor_beta > 0")
+
+
+def start_step(solver, contacts, dt):
+    """Reset step-local material bindings before row construction."""
+    validate_step(solver)
     if not math.isfinite(dt) or dt <= 0:
         raise ValueError("contact_compliance requires a finite positive dt")
     if contacts is None or any(
@@ -108,6 +116,7 @@ def start_step(solver, contacts, dt):
     solver._compliant_dt = dt
     solver._compliant_prepared = False
     solver.compliance_contact_count = 0
+    solver.compliance_skipped_contact_count = 0
 
 
 def _prepare_compliant_rows(self):
@@ -116,14 +125,20 @@ def _prepare_compliant_rows(self):
     count = int(contacts.rigid_contact_count.numpy()[0])
     if count > contacts.rigid_contact_max:
         raise RuntimeError("contact_compliance rejects overflowing contact input")
-    if np.any(self.constraint_count.numpy() > self.dense_max_constraints) or np.any(
-        self.mf_constraint_count.numpy() > self.mf_max_constraints
-    ):
+    dense_counts, mf_counts = self.constraint_count.numpy(), self.mf_constraint_count.numpy()
+    # Failed contact reservations roll back the live row count. Check loss counters
+    # even when warning output and watermark diagnostics are disabled.
+    dropped = sum(
+        int(rows.numpy().sum())
+        for rows in (self._row_dropped_dense, self._row_dropped_mf, self._row_dropped_propagation)
+    )
+    if dropped or np.any(dense_counts > self.dense_max_constraints) or np.any(mf_counts > self.mf_max_constraints):
         raise RuntimeError("contact_compliance rejects overflowing solver rows")
     stiffness = contacts.rigid_contact_stiffness.numpy()[:count]
     damping = contacts.rigid_contact_damping.numpy()[:count]
     scale = contacts.rigid_contact_friction.numpy()[:count]
     paths, slots, worlds = (x.numpy()[:count] for x in (self.contact_path, self.contact_slot, self.contact_world))
+    slots_needed = self.contact_slots_needed.numpy()[:count]
     dense_diag, mf_inv = self.diag.numpy(), self.mf_eff_mass_inv.numpy()
     self._compliant_dense_base, self._compliant_mf_base = self.rhs.numpy(), self.mf_rhs.numpy()
     self._compliant_dense_gamma, self._compliant_mf_gamma = np.zeros_like(dense_diag), np.zeros_like(mf_inv)
@@ -134,6 +149,7 @@ def _prepare_compliant_rows(self):
     dense_cfm = self.row_cfm.numpy()
     dense_target, mf_target = self.target_velocity.numpy(), self.mf_target_velocity.numpy()
     active = 0
+    skipped = 0
     seen_rows = set()
     for contact, k in enumerate(stiffness):
         if not np.isfinite(k) or k < 0:
@@ -141,9 +157,16 @@ def _prepare_compliant_rows(self):
         if k == 0:
             continue
         path, slot, world = int(paths[contact]), int(slots[contact]), int(worlds[contact])
+        # No capacity request means the allocator intentionally excluded this pair
+        # (nonresponding bodies, world filtering, or a positive-gap gate).
+        if path == -1 and slot == -1 and slots_needed[contact] == 0:
+            skipped += 1
+            continue
         shape = dense_diag.shape if path == 0 else mf_inv.shape
         if path not in (0, 1) or not 0 <= world < shape[0] or not 0 <= slot < shape[1]:
             raise RuntimeError(f"Compliant contact was dropped or routed to unsupported path {path}, slot {slot}")
+        if slot >= (dense_counts if path == 0 else mf_counts)[world]:
+            raise RuntimeError("Compliant contact was dropped or mapped beyond active solver rows")
         row = (path, world, slot)
         if row in seen_rows:
             raise RuntimeError("Compliant contacts must map one-to-one to normal rows")
@@ -184,6 +207,7 @@ def _prepare_compliant_rows(self):
     self._compliant_dense_gamma_gpu = wp.array(self._compliant_dense_gamma, device=self.model.device)
     self._compliant_mf_gamma_gpu = wp.array(self._compliant_mf_gamma, device=self.model.device)
     self.compliance_contact_count = active
+    self.compliance_skipped_contact_count = skipped
     self._compliant_prepared = True
 
 

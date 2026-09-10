@@ -15,7 +15,19 @@ from newton.solvers import SolverFeatherPGS
 
 
 def run_fixture(
-    *, articulated, enabled, steps=200, dt=0.005, iterations=8, stock=False, lateral_force=0.0, friction_scale=1.0
+    *,
+    articulated,
+    enabled,
+    steps=200,
+    dt=0.005,
+    iterations=8,
+    stock=False,
+    lateral_force=0.0,
+    friction_scale=1.0,
+    stiffness=3000.0,
+    height=0.05,
+    kinematic=False,
+    solver_options=None,
 ):
     """Run actual Newton sphere/plane contacts through one physical step per tick."""
     device = os.environ.get("HYDRO_TEST_DEVICE", "cuda:0")
@@ -23,7 +35,7 @@ def run_fixture(
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
         builder.rigid_gap = 0.005
         builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
-        xform = wp.transform(wp.vec3(0, 0, 0.05), wp.quat_identity())
+        xform = wp.transform(wp.vec3(0, 0, height), wp.quat_identity())
         if articulated:
             body = builder.add_link(xform=xform)
             if lateral_force:
@@ -45,15 +57,17 @@ def run_fixture(
             body, radius=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=0.3 / (4 / 3 * np.pi * 0.05**3), mu=0.5)
         )
         model = builder.finalize()
+        if kinematic:
+            flags = model.body_flags.numpy()
+            flags[body] |= int(newton.BodyFlags.KINEMATIC)
+            model.body_flags.assign(flags)
         pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
         model.rigid_contact_max = 32
         contacts = pipeline.contacts()
         for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
             setattr(contacts, name, wp.zeros(32, dtype=float))
-        solver_type = newton.solvers.SolverFeatherPGS if stock else SolverFeatherPGS
         extra = {} if stock else {"contact_compliance": enabled}
-        solver = solver_type(
-            model,
+        options = dict(
             pgs_mode="matrix_free",
             pgs_schedule="interleaved",
             articulated_contact_response="immediate",
@@ -65,6 +79,8 @@ def run_fixture(
             pgs_beta=0.05,
             **extra,
         )
+        options.update(solver_options or {})
+        solver = SolverFeatherPGS(model, **options)
         state, next_state = model.state(), model.state()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         trace = []
@@ -74,7 +90,7 @@ def run_fixture(
             state.clear_forces()
             pipeline.collide(state, contacts)
             count = int(contacts.rigid_contact_count.numpy()[0])
-            contacts.rigid_contact_stiffness.fill_(3000.0)
+            contacts.rigid_contact_stiffness.fill_(stiffness)
             contacts.rigid_contact_damping.fill_(20.0)
             contacts.rigid_contact_friction.fill_(friction_scale)
             if lateral_force and step >= steps // 2:
@@ -201,11 +217,20 @@ class TestContactComplianceIntegration(unittest.TestCase):
         self.assertLess(abs(trace[-1, 2] - (0.05 - mass * 9.81 / 3000)), 2e-6)
 
     def test_default_off_exact_state(self):
-        """Match original solver state bitwise when the experimental switch is off."""
+        """Match an omitted option to explicit OFF, not to a separate pristine solver."""
         for articulated in (False, True):
             original, _, _, _ = run_fixture(articulated=articulated, enabled=False, stock=True, steps=30)
             disabled, _, _, _ = run_fixture(articulated=articulated, enabled=False, steps=30)
             np.testing.assert_array_equal(original, disabled)
+
+    def test_enabled_zero_stiffness_preserves_hard_contacts(self):
+        """Preserve hard-contact motion with zero stiffness even when compliance is ON."""
+        for articulated in (False, True):
+            hard, paths, _, _ = run_fixture(articulated=articulated, enabled=False, stiffness=0, steps=60)
+            noop, actual_paths, solver, _ = run_fixture(articulated=articulated, enabled=True, stiffness=0, steps=60)
+            self.assertEqual(actual_paths, paths)
+            self.assertEqual(solver.compliance_contact_count, 0)
+            np.testing.assert_array_equal(hard, noop)
 
     def test_friction_uses_compliant_load_and_reducer_weight(self):
         """Hold below mu*mg and slip after reducing the exported friction weight."""

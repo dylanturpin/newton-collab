@@ -755,9 +755,14 @@ class SolverFeatherPGS(SolverBase):
                 applies exported friction quadrature weighting once to the existing pair friction.
                 Requires CUDA matrix-free/immediate/interleaved solving, full position friction,
                 no warm start, restitution, global contact regularization, debug, shared normal
-                anchors, or friction-anchor reduction. CUDA graph capture is rejected. This
+                anchors, persistent-patch friction, or friction-anchor reduction. Intentional
+                allocator exclusions are counted in ``compliance_skipped_contact_count``;
+                contact/row capacity loss remains an error even with warnings disabled.
+                CUDA graph capture is rejected. This
                 host-synchronizing experimental implementation is not a performance path and may
                 change without the normal deprecation period. Defaults to False.
+                Enabling this option with zero stiffness preserves the hard-contact law, not
+                the runtime cost of the default-OFF path.
 
                 .. experimental::
 
@@ -1077,9 +1082,29 @@ class SolverFeatherPGS(SolverBase):
                 to every closing impact. Defaults to 0.5 m/s.
         """
         if contact_compliance:
-            _contact_compliance.validate_configuration(model, locals())
+            _contact_compliance.validate_configuration(
+                model,
+                {
+                    "pgs_mode": pgs_mode,
+                    "articulated_contact_response": articulated_contact_response,
+                    "pgs_schedule": pgs_schedule,
+                    "pgs_iterations": pgs_iterations,
+                    "pgs_velocity_iterations": pgs_velocity_iterations,
+                    "pgs_warmstart": pgs_warmstart,
+                    "mf_warmstart": mf_warmstart,
+                    "enable_restitution": enable_restitution,
+                    "pgs_contact_regularization": pgs_contact_regularization,
+                    "pgs_debug": pgs_debug,
+                    "contact_friction_position_iterations": contact_friction_position_iterations,
+                    "friction_mode": friction_mode,
+                    "contact_friction_anchor_limit": contact_friction_anchor_limit,
+                    "contact_friction_shared_anchor": contact_friction_shared_anchor,
+                    "contact_shared_anchor": contact_shared_anchor,
+                },
+            )
         self.contact_compliance = bool(contact_compliance)
         self.compliance_contact_count = 0
+        self.compliance_skipped_contact_count = 0
         self._compliant_contacts = None
         self._compliant_prepared = False
         super().__init__(model)
@@ -1609,7 +1634,7 @@ class SolverFeatherPGS(SolverBase):
         # three-family one-shot flag; row_watermark additionally accumulates
         # whole-run high-water telemetry for explicit readback.
         self._row_watermark = bool(row_watermark)
-        self._track_row_capacity = self._row_watermark or self.warn_constraint_overflow
+        self._track_row_capacity = self._row_watermark or self.warn_constraint_overflow or self.contact_compliance
         wm_device = model.device
         if self._track_row_capacity:
             self._row_dropped_dense = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
@@ -1759,6 +1784,7 @@ class SolverFeatherPGS(SolverBase):
             self._compliant_contacts = None
             self._compliant_prepared = False
             self.compliance_contact_count = 0
+            self.compliance_skipped_contact_count = 0
         if world_mask is not None and world_mask.shape[0] != self.world_count:
             raise ValueError(
                 f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per world)."
@@ -5944,6 +5970,9 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        if self.contact_compliance:
+            # Reject incompatible contact preprocessing before it can mutate the stream.
+            _contact_compliance.validate_step(self)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
             raise ValueError(
                 "FeatherPGS contact capacity mismatch: received "
@@ -7536,6 +7565,9 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
         if self.contact_compliance:
             _contact_compliance.start_step(self, contacts, dt)
+            # The allocator writes slots_needed only after intentional skip gates.
+            # Clear prior-step requests so an excluded contact cannot look overflowed.
+            self.contact_slots_needed.zero_()
         model = self.model
         max_constraints = self.dense_max_constraints
         mf_active = self._has_free_rigid_bodies

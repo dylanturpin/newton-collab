@@ -65,6 +65,55 @@ class TestContactComplianceSafety(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "dt"):
                 start_step(solver, contacts, dt)
 
+    def test_persistent_patch_guard(self):
+        """Reject positive persistent-anchor bias but permit a disabled dummy patch buffer."""
+        solver = SimpleNamespace(
+            model=SimpleNamespace(device=self.device), friction_anchor_beta=0.0, _friction_patches=object()
+        )
+        start_step(solver, self.contacts(), 0.005)
+        solver.friction_anchor_beta = 0.2
+        with self.assertRaisesRegex(ValueError, "friction_anchor_beta"):
+            start_step(solver, self.contacts(), 0.005)
+        solver.contact_compliance = True
+        with self.assertRaisesRegex(ValueError, "friction_anchor_beta"):
+            SolverFeatherPGS.step(solver, None, None, None, None, 0.005)
+
+    def test_filtered_speculative_contacts_are_skipped(self):
+        """Honor the normal allocator's positive-gap exclusion for compliant contacts."""
+        for articulated in (False, True):
+            _, paths, solver, _ = run_fixture(
+                articulated=articulated,
+                enabled=True,
+                steps=1,
+                height=0.052,
+                solver_options={"contact_gap_gate": 0.001},
+            )
+            self.assertEqual(paths, {-1})
+            self.assertEqual(solver.compliance_contact_count, 0)
+            self.assertEqual(solver.compliance_skipped_contact_count, 1)
+
+    def test_nonresponding_contact_is_skipped(self):
+        """Ignore a kinematic-ground pair without treating it as lost capacity."""
+        _, paths, solver, _ = run_fixture(articulated=True, enabled=True, steps=1, kinematic=True)
+        self.assertEqual(paths, {-1})
+        self.assertEqual(solver.compliance_contact_count, 0)
+        self.assertEqual(solver.compliance_skipped_contact_count, 1)
+
+    def test_rolled_back_capacity_fails_without_warnings(self):
+        """Reject an actual failed reservation even when its counter was rolled back."""
+        for articulated in (False, True):
+            with self.assertRaisesRegex(RuntimeError, "overflowing solver rows"):
+                run_fixture(
+                    articulated=articulated,
+                    enabled=True,
+                    steps=1,
+                    solver_options={
+                        "dense_max_constraints": 1,
+                        "mf_max_constraints": 1,
+                        "warn_constraint_overflow": False,
+                    },
+                )
+
     def test_solver_overflow_and_dropped_contact_rejected(self):
         """Reject overflowing rows and missing mappings for positive stiffness."""
         _, _, solver, _ = run_fixture(articulated=True, enabled=True, steps=1)
@@ -88,6 +137,7 @@ class TestContactComplianceSafety(unittest.TestCase):
         solver.reset(state)
         self.assertIsNone(solver._compliant_contacts)
         self.assertEqual(solver.compliance_contact_count, 0)
+        self.assertEqual(solver.compliance_skipped_contact_count, 0)
         for name, value in before.items():
             np.testing.assert_array_equal(getattr(state, name).numpy(), value)
         pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
