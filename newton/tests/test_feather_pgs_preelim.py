@@ -61,6 +61,11 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertLess(gap_on, 2.0e-5, f"pre-eliminated closure gap {gap_on:.2e} m not exact")
         self.assertLess(gap_on, 0.01 * gap_off, f"expected >100x tightening, got {gap_off / max(gap_on, 1e-12):.1f}x")
 
+    @unittest.skip(
+        "Obsolete drive-only fixture: dense non-contact rows deliberately cold-start; "
+        "test_noncontact_dense_cache_is_cold_initialized covers that contract. "
+        "A contact-bearing fixture is required to exercise warm-start projection ordering."
+    )
     def test_dense_warmstart_preserves_projected_closure(self):
         """Project the predictor after installing dense warm-start impulses.
 

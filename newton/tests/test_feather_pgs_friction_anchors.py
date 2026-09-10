@@ -505,18 +505,6 @@ def _build_two_world_free_model(device):
 class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
     """Device-agnostic checks of the anchor bookkeeping (run on CPU)."""
 
-    def test_collide_serial_advances_per_collide(self):
-        """Stamp every collide so solvers can distinguish a reused buffer from a new frame."""
-        model, _, _ = _build_v_jaws(0.0)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, broad_phase="nxn", contact_matching="latest")
-        contacts = pipeline.contacts()
-        state = model.state()
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-        self.assertEqual(contacts.collide_serial, 0)
-        pipeline.collide(state, contacts)
-        pipeline.collide(state, contacts)
-        self.assertEqual(contacts.collide_serial, 2)
-
     def test_rhs_bias_matches_on_every_row_family_and_vanishes_in_velocity_pass(self):
         """Friction rows carry ``friction_anchor_beta * separation / dt`` on the dense, matrix-free
         and propagation routes alike, and the velocity-only pass (``bias_scale = 0``) drops it.

@@ -101,6 +101,49 @@ def _patch_fixture(
 
 
 class TestFrictionPatchHistory(unittest.TestCase):
+    def test_shared_pad_randomization_preserves_material_regions(self):
+        """Pool one sampled pad material while keeping genuinely different coefficients separate."""
+        model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]], shape0=[0, 2])
+        for coefficient in np.random.default_rng(42).uniform(0.1, 1.0, 3):
+            model.shape_material_mu.assign([coefficient, 0.5, coefficient])
+            patches.update_geometry(model)
+            patches.build(model, state, contacts)
+            self.assertEqual(len(np.unique(patches.current.owner.numpy()[:2])), 1)
+            np.testing.assert_allclose(patches.view.weight.numpy()[:2], [0.5, 0.5])
+            patches.store(state)
+        model.shape_material_mu.assign([0.2, 0.5, 0.8])
+        patches.build(model, state, contacts)
+        self.assertEqual(len(np.unique(patches.current.owner.numpy()[:2])), 2)
+        np.testing.assert_allclose(patches.view.weight.numpy()[:2], [1, 1])
+
+    def test_rocking_face_retires_the_lifted_anchor(self):
+        """Keep the supported edge's history and replace the opposite anchor after rocking."""
+        points = [[-0.1, -0.1, 0], [0.1, -0.1, 0], [-0.1, 0.1, 0], [0.1, 0.1, 0]]
+        model, state, contacts, patches = _patch_fixture(points)
+        patches.store(state)
+        rotation = wp.quat_from_axis_angle(wp.vec3(0, 1, 0), -np.pi / 60.0)
+        pivot = wp.vec3(-0.1, 0, 0)
+        state.body_q.assign([wp.transform(pivot - wp.quat_rotate(rotation, pivot), rotation), wp.transform_identity()])
+        contacts.rigid_contact_count.assign([2])
+        edge = [points[0], points[2], points[0], points[2]]
+        contacts.rigid_contact_point0.assign(edge)
+        contacts.rigid_contact_point1.assign(edge)
+        patches.build(model, state, contacts)
+        active = patches.current.valid.numpy() != 0
+        self.assertEqual(np.count_nonzero(active), 2)
+        np.testing.assert_allclose(patches.current.anchor_a.numpy()[active, 0], -0.1, atol=1.0e-7)
+        self.assertEqual(np.count_nonzero(patches.current.source.numpy()[active] >= 0), 1)
+
+    def test_unloading_penetration_keeps_supported_anchors(self):
+        """Retain history while decompression leaves the actual surfaces in contact."""
+        model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]])
+        contacts.rigid_contact_point0.assign([[-0.1, 0, -0.005], [0.1, 0, -0.005]])
+        patches.build(model, state, contacts)
+        patches.store(state)
+        state.body_q.assign([wp.transform(wp.vec3(0, 0, 0.003), wp.quat_identity()), wp.transform_identity()])
+        patches.build(model, state, contacts)
+        self.assertEqual(np.count_nonzero(patches.current.source.numpy() >= 0), 2)
+
     def test_geometry_edits_retire_only_affected_history(self):
         """Invalidate edited surfaces across carrier seams while preserving unrelated patches."""
         for field in ("shape_transform", "shape_scale", "shape_margin", "shape_source_ptr"):
@@ -442,6 +485,72 @@ class TestFrictionPatchHistory(unittest.TestCase):
 
 
 class TestFeatherPGSFrictionPatches(unittest.TestCase):
+    def test_rocking_cube_assigns_friction_only_to_supported_edge(self):
+        """Retire the lifted face anchor before building rows for a cube resting on one edge."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        builder = newton.ModelBuilder(gravity=wp.vec3(0, 0, 0))
+        builder.rigid_gap = 1.0e-4
+        builder.add_ground_plane()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0, 0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device=device)
+        solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, contact_gap_gate=1.0e-4)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=16)
+        contacts = pipeline.contacts()
+        s0, s1 = model.state(), model.state()
+        pipeline.collide(s0, contacts)
+        solver.step(s0, s1, model.control(), contacts, 0.005)
+        self.assertEqual(np.count_nonzero(solver._friction_patches.previous.valid.numpy()), 2)
+        rotation = wp.quat_from_axis_angle(wp.vec3(0, 1, 0), -np.pi / 60.0)
+        translation = wp.vec3(-0.1, 0, 0) - wp.quat_rotate(rotation, wp.vec3(-0.1, 0, -0.1))
+        transform = np.array([*translation, *rotation], dtype=np.float32)
+        s1.joint_q.assign(transform)
+        newton.eval_fk(model, s1.joint_q, s1.joint_qd, s1)
+        pipeline.collide(s1, contacts)
+        solver.step(s1, s0, model.control(), contacts, 0.005)
+        patches = solver._friction_patches
+        active = patches.view.weight.numpy() > 0
+        self.assertEqual(np.count_nonzero(active), 2)
+        np.testing.assert_allclose(patches.current.anchor_a.numpy()[active, 0], -0.1, atol=1.0e-6)
+
+    def test_contact_churn_reports_linear_force_but_not_a_wrench(self):
+        """Compare the linear export with solved rows under an off-centre load after churn."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        builder = newton.ModelBuilder()
+        ground = builder.add_ground_plane()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0, 0, 0.1), wp.quat_identity()))
+        box = builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device=device)
+        solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_iterations=64)
+        contacts = newton.Contacts(4, 0, requested_attributes=["force"], device=device)
+        contacts.rigid_contact_count.assign([4])
+        contacts.rigid_contact_shape0.assign([box] * 4)
+        contacts.rigid_contact_shape1.assign([ground] * 4)
+        contacts.rigid_contact_normal.assign([[0, 0, -1]] * 4)
+        points = np.array([[-0.1, -0.1, 0], [0.1, -0.1, 0], [-0.1, 0.1, 0], [0.1, 0.1, 0]], dtype=np.float32)
+        contacts.rigid_contact_point0.assign(points + np.array([0, 0, -0.1], dtype=np.float32))
+        contacts.rigid_contact_point1.assign(points)
+        s0, s1 = model.state(), model.state()
+        dt = 0.005
+        solver.step(s0, s1, model.control(), contacts, dt)
+        points[:, :2] *= 0.8
+        contacts.rigid_contact_point0.assign(points + np.array([0, 0, -0.1], dtype=np.float32))
+        contacts.rigid_contact_point1.assign(points)
+        # The x force and z torque correspond to an off-centre tangential load.
+        s1.body_f.assign([[1, 0, 0, 0, 0, 0.05]])
+        solver.step(s1, s0, model.control(), contacts, dt)
+        self.assertGreater(np.count_nonzero(solver._friction_patches.current.source.numpy() >= 0), 0)
+        count = int(solver.mf_constraint_count.numpy()[0])
+        self.assertTrue(np.all(solver.contact_path.numpy()[:4] == 1))
+        solved = np.einsum("ij,i->j", solver.mf_J_a.numpy()[0, :count], solver.mf_impulses.numpy()[0, :count]) / dt
+        self.assertGreater(np.linalg.norm(solved[3:]), 0.01, "fixture must exercise a nonzero contact moment")
+        solver.update_contacts(contacts)
+        reported = contacts.force.numpy().sum(axis=0)
+        np.testing.assert_allclose(reported[:3], solved[:3], atol=1.0e-4)
+        # Torque is explicitly unsupported by this export, including on the base
+        # branch. Preserve that limitation visibly instead of asserting a wrench.
+        np.testing.assert_array_equal(reported[3:], [0, 0, 0])
+
     def test_shape_translation_retires_anchors_outside_new_geometry(self):
         """Retire the old contact footprint after changing a shape's local transform."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"

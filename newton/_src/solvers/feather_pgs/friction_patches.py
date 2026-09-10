@@ -55,6 +55,8 @@ class _PatchFrame:
     owner: wp.array[int]
     anchor_a: wp.array[wp.vec3]
     anchor_b: wp.array[wp.vec3]
+    surface_a: wp.array[wp.vec3]
+    surface_b: wp.array[wp.vec3]
     valid: wp.array[int]
     used: wp.array[int]
     source: wp.array[int]
@@ -170,6 +172,8 @@ def _prepare(
     frame.shape_a[c] = sa
     frame.shape_b[c] = sb
     frame.flipped[c] = flip
+    frame.surface_a[c] = _local_point(q, a, pb if flip != 0 else pa)
+    frame.surface_b[c] = _local_point(q, b, pa if flip != 0 else pb)
     frame.center[c] = 0.5 * (pa + pb)
     frame.normal[c] = n
     mu_a = float(0.0)
@@ -326,6 +330,9 @@ def _build(
             b = frame.body_b[c]
             n = frame.normal[c]
             r = frame.radius[c]
+            surface_a = frame.surface_a[c]
+            surface_b = frame.surface_b[c]
+            current_gap = wp.dot(_world_point(q, a, surface_a) - _world_point(q, b, surface_b), n)
             chosen = int(-1)
             nearest = float(1.0e30)
             for j in range(prev_start, prev_stop):
@@ -343,6 +350,7 @@ def _build(
                 pa = _world_point(q, a, prev.anchor_a[p])
                 pb = _world_point(q, b, prev.anchor_b[p])
                 delta = pa - pb
+                support_gap = wp.dot(_world_point(q, a, prev.surface_a[p]) - _world_point(q, b, prev.surface_b[p]), n)
                 tangent_delta = delta - n * wp.dot(delta, n)
                 distance = wp.length_sq(0.5 * (pa + pb) - frame.center[c])
                 # The tangential gate bounds uncorrected slip of a carried pair at a
@@ -352,6 +360,10 @@ def _build(
                 # into creep; genuine sliding is released by ``finish_patch_impulses``.
                 if not (
                     wp.dot(old_n, n) >= 0.995
+                    # Support witnesses preserve the original penetration. A
+                    # midpoint anchor's separation alone mistakes decompression
+                    # for release, while a diameter-based gate accepts rocking.
+                    and support_gap <= wp.max(current_gap, 0.0) + 1.0e-5 * r
                     and wp.length_sq(tangent_delta) <= 0.01 * r * r
                     and wp.abs(wp.dot(delta, n)) <= 0.1 * r
                     and wp.abs(wp.dot(0.5 * (pa + pb) - frame.center[c], n)) <= 0.05 * r
@@ -389,6 +401,8 @@ def _build(
                 # would random-walk a stuck anchor by float32 rounding each step.
                 anchor_a = prev.anchor_a[chosen]
                 anchor_b = prev.anchor_b[chosen]
+                surface_a = prev.surface_a[chosen]
+                surface_b = prev.surface_b[chosen]
                 pa = _world_point(q, a, anchor_a)
                 pb = _world_point(q, b, anchor_b)
                 carried_impulse = prev.tangent_impulse[chosen]
@@ -399,6 +413,8 @@ def _build(
                 continue
             frame.anchor_a[c] = anchor_a
             frame.anchor_b[c] = anchor_b
+            frame.surface_a[c] = surface_a
+            frame.surface_b[c] = surface_b
             # Default for anchors without friction rows this step; solved rows
             # overwrite it in ``finish_patch_impulses``.
             frame.tangent_impulse[c] = carried_impulse
@@ -440,6 +456,8 @@ def _store_history(
     prev.shape_b[c] = frame.shape_b[c]
     prev.anchor_a[c] = frame.anchor_a[c]
     prev.anchor_b[c] = frame.anchor_b[c]
+    prev.surface_a[c] = frame.surface_a[c]
+    prev.surface_b[c] = frame.surface_b[c]
     prev.valid[c] = frame.valid[c]
     prev.tangent_impulse[c] = frame.tangent_impulse[c]
     world = int(-1)
@@ -548,7 +566,7 @@ class _FrictionPatchState:
         frame = _PatchFrame()
         frame.keys = wp.full(2 * n, 0x7FFFFFFFFFFFFFFF, dtype=wp.int64, device=device)
         frame.indices = wp.zeros(2 * n, dtype=int, device=device)
-        for field in ("center", "normal", "anchor_a", "anchor_b", "tangent_impulse"):
+        for field in ("center", "normal", "anchor_a", "anchor_b", "surface_a", "surface_b", "tangent_impulse"):
             setattr(frame, field, wp.zeros(n, dtype=wp.vec3, device=device))
         frame.mu = wp.zeros(n, dtype=wp.vec2, device=device)
         frame.radius = wp.zeros(n, dtype=float, device=device)

@@ -472,6 +472,10 @@ class Contacts:
             First three entries: linear force [N]; last three entries: torque (moment) [N·m].
             When both rigid and soft contacts are present, soft contact forces follow rigid contact forces.
 
+            Solver support varies: :meth:`newton.solvers.SolverFeatherPGS.update_contacts`
+            currently exports only the linear components and leaves torque zero.
+            Its output cannot be used as a complete contact wrench.
+
             This is an extended contact attribute; see :ref:`extended_contact_attributes` for more information.
             """
             if requested_attributes and "force" in requested_attributes:
@@ -482,15 +486,6 @@ class Contacts:
 
         self.rigid_contact_max = rigid_contact_max
         self.soft_contact_max = soft_contact_max
-
-        self.collide_serial = 0
-        """Host-side count of :meth:`CollisionPipeline.collide` calls that wrote this buffer.
-
-        Solvers that carry per-contact state across steps by ``rigid_contact_match_index``
-        use it to recognize a solver substep that reuses the previous collide's contacts
-        (e.g. Isaac Lab collides once per environment step): the match indices then still
-        refer to the frame *before* that collide, while the carried state is already in
-        this frame's contact order, so the identity mapping is the exact one."""
 
         self.rigid_contacts_pair_sorted = False
         """Provenance: whether the pipeline that last wrote this buffer sorts

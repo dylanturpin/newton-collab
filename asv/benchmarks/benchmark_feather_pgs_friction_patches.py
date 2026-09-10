@@ -11,6 +11,13 @@ Each one-kilogram body is assembled from ``tiles ** 2`` touching boxes. Its
 footprint, total mass, and applied load stay fixed as contact density increases.
 Both revisions use contact matching for a like-for-like comparison; persistent
 patch anchors themselves do not require it. Compilation and warmup are excluded.
+
+Use ``--profile-stages`` to collect a separate uncaptured CUDA activity timeline
+after the throughput measurement, with warm starts independently controlled by
+``--warmstart``. The timeline includes prepare/build/link/seed/finish/store kernel
+names, radix-sort activity, and copies; it measures device work, not host dispatch
+overhead. ``--tiles 13 --worlds 1`` is a synthetic 169-shape stress case, not the
+175-hull Robotiq asset or evidence of that gripper's performance.
 """
 
 import argparse
@@ -29,10 +36,10 @@ def _apply_load(body_f: wp.array[wp.spatial_vector]):
     body_f[i] = wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.03)
 
 
-def run(worlds: int, tiles: int, beta: float, steps: int):
+def run(worlds: int, tiles: int, beta: float, steps: int, *, warmstart: bool = False, profile_stages: bool = False):
     """Measure an even number of captured steps and report row counts and motion."""
-    if worlds < 1 or tiles < 1 or tiles > 4 or steps < 2 or steps % 2:
-        raise ValueError("Require worlds >= 1, 1 <= tiles <= 4, and an even steps >= 2")
+    if worlds < 1 or tiles < 1 or tiles > 16 or steps < 2 or steps % 2:
+        raise ValueError("Require worlds >= 1, 1 <= tiles <= 16, and an even steps >= 2")
     template = newton.ModelBuilder()
     template.add_ground_plane()
     body = template.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0999), wp.quat_identity()))
@@ -56,9 +63,11 @@ def run(worlds: int, tiles: int, beta: float, steps: int):
         pgs_mode="matrix_free",
         pgs_iterations=32,
         pgs_beta=0.05,
+        pgs_warmstart=warmstart,
+        mf_warmstart=warmstart,
         friction_anchor_beta=beta,
         dense_max_constraints=32,
-        mf_max_constraints=256,
+        mf_max_constraints=max(256, 12 * tiles * tiles),
         warn_constraint_overflow=True,
     )
     pipeline = newton.CollisionPipeline(
@@ -99,6 +108,7 @@ def run(worlds: int, tiles: int, beta: float, steps: int):
         "tiles": tiles,
         "beta": beta,
         "steps": steps,
+        "warmstart": warmstart,
         "milliseconds_per_step": elapsed * 1000 / steps,
         "contacts": int(contacts.rigid_contact_count.numpy()[0]),
         "normal_rows": normal_rows,
@@ -107,9 +117,21 @@ def run(worlds: int, tiles: int, beta: float, steps: int):
         "max_quaternion_change": float(np.linalg.norm(after[:, 3:] - before[:, 3:], axis=1).max()),
         "finite": bool(np.isfinite(after).all()),
     }
-    print("RESULT " + json.dumps(result), flush=True)
     assert result["finite"]
     assert normal_rows > 0
+    if profile_stages:
+        # Keep instrumentation and its synchronization out of the captured
+        # throughput measurement. Two steps exercise both state buffers.
+        with wp.ScopedTimer("contact_stages", cuda_filter=wp.TIMING_ALL, print=False) as timer:
+            step(s0, s1)
+            step(s1, s0)
+        activity = {}
+        for timing in timer.timing_results:
+            entry = activity.setdefault(timing.name, {"calls_per_step": 0.0, "milliseconds_per_step": 0.0})
+            entry["calls_per_step"] += 0.5
+            entry["milliseconds_per_step"] += timing.elapsed * 0.5
+        result["uncaptured_cuda_activity"] = activity
+    print("RESULT " + json.dumps(result), flush=True)
     return result
 
 
@@ -119,5 +141,7 @@ if __name__ == "__main__":
     parser.add_argument("--tiles", type=int, default=4)
     parser.add_argument("--beta", type=float, default=0.2)
     parser.add_argument("--steps", type=int, default=400)
+    parser.add_argument("--warmstart", action="store_true")
+    parser.add_argument("--profile-stages", action="store_true")
     args = parser.parse_args()
-    run(args.worlds, args.tiles, args.beta, args.steps)
+    run(args.worlds, args.tiles, args.beta, args.steps, warmstart=args.warmstart, profile_stages=args.profile_stages)

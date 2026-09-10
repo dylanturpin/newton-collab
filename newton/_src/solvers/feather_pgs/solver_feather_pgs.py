@@ -792,6 +792,11 @@ class SolverFeatherPGS(SolverBase):
                 friction. Positive values group compatible contacts on a body pair into regions,
                 retain up to two body-local friction anchors per region, and share the total
                 normal impulse equally between those anchors. Normal contacts are preserved.
+                Twisting resistance comes only from the separation between the anchors;
+                a single-anchor region has no independent torsional stiction constraint.
+                For uniform pad-friction randomization, sample one coefficient per pad
+                and assign it to all constituent convex shapes. Different coefficients
+                define separate regions and are not pooled across material boundaries.
                 Anchor history is independent of collision contact matching, including across
                 convex shapes on the same body. Geometry-scaled correlation and detected
                 sliding determine when anchors are replaced; they do not require user tuning.
@@ -1743,7 +1748,12 @@ class SolverFeatherPGS(SolverBase):
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
-        """Refresh cached solver data after supported model changes."""
+        """Refresh cached solver data after supported model changes.
+
+        With patch friction enabled, shape-property notifications copy geometry
+        to the host and synchronize with the device; issue them outside CUDA graph
+        capture. Ordinary simulation steps do not perform those host copies.
+        """
         if self._friction_anchors_enabled and flags & ModelFlags.SHAPE_PROPERTIES:
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
@@ -6908,7 +6918,15 @@ class SolverFeatherPGS(SolverBase):
 
     @override
     def update_contacts(self, contacts: Contacts) -> None:
-        """Populate Newton contact-force buffers from the last FeatherPGS solve."""
+        """Populate linear contact forces from the last FeatherPGS solve.
+
+        This path reports linear force only: the torque components of
+        ``contacts.force`` are zero placeholders, not a solved wrench about
+        body0's center of mass. With persistent patches, normal and friction
+        rows can act at different points, so crossing the current contact point
+        with the combined force does not recover the solved torque. This export
+        is not suitable for contact-wrench sensing.
+        """
         if contacts is None or contacts.rigid_contact_count is None:
             return
 
