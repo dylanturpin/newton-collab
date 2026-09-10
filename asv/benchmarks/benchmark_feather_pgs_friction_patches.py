@@ -36,7 +36,9 @@ def _apply_load(body_f: wp.array[wp.spatial_vector]):
     body_f[i] = wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.03)
 
 
-def run(worlds: int, tiles: int, beta: float, steps: int, *, warmstart: bool = False, profile_stages: bool = False):
+def run(
+    worlds: int, tiles: int, beta: float | None, steps: int, *, warmstart: bool = False, profile_stages: bool = False
+):
     """Measure an even number of captured steps and report row counts and motion."""
     if worlds < 1 or tiles < 1 or tiles > 16 or steps < 2 or steps % 2:
         raise ValueError("Require worlds >= 1, 1 <= tiles <= 16, and an even steps >= 2")
@@ -65,7 +67,7 @@ def run(worlds: int, tiles: int, beta: float, steps: int, *, warmstart: bool = F
         pgs_beta=0.05,
         pgs_warmstart=warmstart,
         mf_warmstart=warmstart,
-        friction_anchor_beta=beta,
+        **({"friction_anchor_beta": beta} if beta is not None else {}),
         dense_max_constraints=32,
         mf_max_constraints=max(256, 12 * tiles * tiles),
         warn_constraint_overflow=True,
@@ -106,7 +108,7 @@ def run(worlds: int, tiles: int, beta: float, steps: int, *, warmstart: bool = F
         "warp": wp.__version__,
         "worlds": worlds,
         "tiles": tiles,
-        "beta": beta,
+        "beta": solver.friction_anchor_beta,
         "steps": steps,
         "warmstart": warmstart,
         "milliseconds_per_step": elapsed * 1000 / steps,
@@ -139,7 +141,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--worlds", type=int, default=64)
     parser.add_argument("--tiles", type=int, default=4)
-    parser.add_argument("--beta", type=float, default=0.2)
+    parser.add_argument(
+        "--beta", type=float, default=None, help="Override the default patch gain; zero disables patches"
+    )
     parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--warmstart", action="store_true")
     parser.add_argument("--profile-stages", action="store_true")

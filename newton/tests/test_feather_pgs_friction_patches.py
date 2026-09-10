@@ -41,7 +41,6 @@ def _ground_box(device, **solver_kwargs):
     builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=newton.ModelBuilder.ShapeConfig(density=125, mu=0.5))
     model = builder.finalize(device=device)
     kwargs = {
-        "friction_anchor_beta": 0.2,
         "pgs_iterations": 32,
         "pgs_mode": "matrix_free" if model.device.is_cuda else "split",
     }
@@ -504,6 +503,76 @@ class TestFrictionPatchHistory(unittest.TestCase):
 
 
 class TestFeatherPGSFrictionPatches(unittest.TestCase):
+    def test_default_friction_allows_a_sphere_to_keep_rolling(self):
+        """Keep a freely rolling sphere moving without pinning its changing contact footprint."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0, 0, 0.05), wp.quat_identity()))
+        builder.add_shape_sphere(body, radius=0.05)
+        model = builder.finalize(device=device)
+        solver = newton.solvers.SolverFeatherPGS(model)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        s0, s1 = model.state(), model.state()
+        s0.joint_qd.assign([1, 0, 0, 0, 20, 0])
+        newton.eval_fk(model, s0.joint_q, s0.joint_qd, s0)
+        control = model.control()
+        for _ in range(240):
+            s0.clear_forces()
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, control, contacts, 1.0 / 240.0)
+            s0, s1 = s1, s0
+        pose, velocity = s0.body_q.numpy()[0], s0.body_qd.numpy()[0]
+        self.assertTrue(np.isfinite(pose).all() and np.isfinite(velocity).all())
+        # This is a no-pinning smoke test, not a claim of energy-conserving
+        # rolling: finite-step patch friction can dissipate rolling motion.
+        self.assertAlmostEqual(float(pose[0]), 1.0, delta=0.1)
+        self.assertGreater(float(velocity[0]), 0.85)
+        self.assertLess(abs(float(velocity[0] - 0.05 * velocity[4])), 0.15)
+        self.assertAlmostEqual(float(pose[2]), 0.05, delta=0.002)
+
+    def test_default_friction_keeps_a_box_stack_at_rest(self):
+        """Settle an ordinary stack without grasp-specific settings or anchor opt-in."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        for height in (0.05, 0.151, 0.252):
+            body = builder.add_body(xform=wp.transform(wp.vec3(0, 0, height), wp.quat_identity()))
+            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+        model = builder.finalize(device=device)
+        solver = newton.solvers.SolverFeatherPGS(model)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        s0, s1 = model.state(), model.state()
+        control = model.control()
+        for _ in range(240):
+            s0.clear_forces()
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, control, contacts, 1.0 / 240.0)
+            s0, s1 = s1, s0
+        poses, velocities = s0.body_q.numpy(), s0.body_qd.numpy()
+        self.assertTrue(np.isfinite(poses).all() and np.isfinite(velocities).all())
+        np.testing.assert_allclose(poses[:, 2], [0.05, 0.15, 0.25], atol=0.005)
+        self.assertLess(float(np.max(np.abs(poses[:, :2]))), 0.005)
+        self.assertLess(float(np.max(np.linalg.norm(velocities[:, :3], axis=1))), 0.05)
+        self.assertGreater(np.count_nonzero(solver._friction_patches.previous.valid.numpy()), 0)
+
+    def test_default_patch_friction_and_explicit_opt_out(self):
+        """Build persistent patches by default while retaining an explicit velocity-only opt-out."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        for kwargs, enabled in (({}, True), ({"friction_anchor_beta": 0.0}, False)):
+            with self.subTest(enabled=enabled):
+                _, solver, _, step = _ground_box(device, **kwargs)
+                for _ in range(3):
+                    step()
+                self.assertEqual(solver._friction_anchors_enabled, enabled)
+                if enabled:
+                    self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
+                    self.assertEqual(np.count_nonzero(solver._friction_patches.current.source.numpy() >= 0), 2)
+                else:
+                    self.assertFalse(hasattr(solver._friction_patches, "current"))
+
     def test_rocking_cube_assigns_friction_only_to_supported_edge(self):
         """Retire the lifted face anchor before building rows for a cube resting on one edge."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
@@ -655,7 +724,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                     newton.solvers.SolverFeatherPGS(cuda_model, friction_anchor_beta=0.2, pgs_kernel=kernel)
 
     def test_deprecated_anchor_limit_warns_instead_of_raising(self):
-        """Map the deprecated anchor limit onto patch friction when supported and otherwise warn and ignore it."""
+        """Ignore the deprecated anchor limit without overriding the default or explicit opt-out."""
         builder = newton.ModelBuilder()
         body = builder.add_body()
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
@@ -669,7 +738,11 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             cuda_model = builder.finalize(device="cuda:0")
             with self.assertWarns(DeprecationWarning):
                 solver = newton.solvers.SolverFeatherPGS(
-                    cuda_model, contact_friction_anchor_limit=2, friction_mode="bisection", pgs_mode="matrix_free"
+                    cuda_model,
+                    contact_friction_anchor_limit=2,
+                    friction_mode="bisection",
+                    pgs_mode="matrix_free",
+                    friction_anchor_beta=0.0,
                 )
             self.assertFalse(solver._friction_anchors_enabled)
         with self.assertWarns(DeprecationWarning):
@@ -678,6 +751,9 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         with self.assertWarns(DeprecationWarning):
             solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, friction_anchor_beta=0.3)
         self.assertAlmostEqual(solver.friction_anchor_beta, 0.3)
+        with self.assertWarns(DeprecationWarning):
+            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, friction_anchor_beta=0.0)
+        self.assertFalse(solver._friction_anchors_enabled)
 
     def test_anchor_selection_respects_contact_gap_filters(self):
         """Keep filtered extreme points from removing friction from a loaded middle contact."""

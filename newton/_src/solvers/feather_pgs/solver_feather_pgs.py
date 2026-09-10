@@ -744,7 +744,7 @@ class SolverFeatherPGS(SolverBase):
         articulation_pair_contact_gap_gate: float = 0.0,
         pgs_warmstart_decay: float = 1.0,
         warn_constraint_overflow: bool = True,
-        friction_anchor_beta: float = 0.0,
+        friction_anchor_beta: float = 0.2,
     ):
         """
         Args:
@@ -775,10 +775,9 @@ class SolverFeatherPGS(SolverBase):
                 rows keep their original witness points. This avoids a tangential force couple when
                 the witnesses are separated along the contact normal. Defaults to False.
             contact_friction_anchor_limit (int, optional): Deprecated compatibility argument.
-                The old contact-index approximation has been removed. When ``friction_anchor_beta``
-                is zero and the friction mode and PGS kernel support patch friction, a positive value
-                enables persistent patch friction with ``friction_anchor_beta = max(pgs_beta, 0.2)``
-                and warns; otherwise it warns and has no effect. Use ``friction_anchor_beta`` instead.
+                The old contact-index approximation has been removed. A positive value warns
+                and has no effect. Patch friction is enabled by default; use
+                ``friction_anchor_beta=0`` to explicitly select velocity-only point friction.
             contact_friction_articulation_pairs_only (bool, optional): Apply
                 ``contact_friction_gap_threshold`` only when
                 both contact bodies belong to non-free articulations. Contacts involving ground or a
@@ -788,7 +787,7 @@ class SolverFeatherPGS(SolverBase):
                 semantics such as PhysX's per-friction-anchor scaling; it does not affect normal
                 contact rows. Defaults to 1.0.
             friction_anchor_beta (float, optional): Enable persistent patch friction and set
-                its positional correction strength. Zero (default) uses velocity-only point
+                its positional correction strength. Enabled by default at 0.2. Zero uses velocity-only point
                 friction. Positive values group compatible contacts on a body pair into regions,
                 retain up to two body-local friction anchors per region, and share the total
                 normal impulse equally between those anchors. Normal contacts are preserved.
@@ -807,7 +806,8 @@ class SolverFeatherPGS(SolverBase):
                 ``contact_shared_anchor`` and ``contact_friction_shared_anchor`` apply only to normal
                 rows and to velocity-only friction rows.
                 Requires ``friction_mode="current"`` and ``pgs_kernel="loop"`` or ``"tiled_row"``.
-                Defaults to 0.0.
+                Explicitly set zero when selecting an alternative point-contact solver.
+                Defaults to 0.2.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
                 for normal contact rows on the dense, matrix-free free-rigid, and propagation
                 paths. A value of 0.0 removes speculative closing allowance without changing
@@ -1098,37 +1098,22 @@ class SolverFeatherPGS(SolverBase):
         # Native tiled kernels are CUDA-only and every CPU selector resolves to
         # the scalar suite below, so validate against the kernel that will run.
         effective_pgs_kernel = "loop" if model.device.is_cpu else pgs_kernel
-        patch_friction_supported = friction_mode == "current" and effective_pgs_kernel not in (
-            "tiled_contact",
-            "streaming",
-        )
         if self.contact_friction_anchor_limit > 0:
-            if self.friction_anchor_beta > 0.0:
-                message = "contact_friction_anchor_limit is deprecated and ignored because friction_anchor_beta is set."
-            elif patch_friction_supported:
-                # Legacy callers asked for patch friction; the removed contact-index
-                # approximation maps onto persistent patches with an explicit gain.
-                self.friction_anchor_beta = max(float(pgs_beta), 0.2)
-                message = (
-                    "contact_friction_anchor_limit is deprecated; use friction_anchor_beta for persistent patch "
-                    f"friction. Enabling patch friction with friction_anchor_beta={self.friction_anchor_beta:g} "
-                    "(the larger of pgs_beta and 0.2) in place of the removed contact-index approximation."
-                )
-            else:
-                message = (
-                    "contact_friction_anchor_limit is deprecated and has no effect with "
-                    f"friction_mode={friction_mode!r} and pgs_kernel={pgs_kernel!r}; persistent patch friction "
-                    "requires friction_anchor_beta > 0 with friction_mode='current' and pgs_kernel='loop' or "
-                    "'tiled_row'."
-                )
-            warnings.warn(message, DeprecationWarning, stacklevel=2)
+            warnings.warn(
+                "contact_friction_anchor_limit is deprecated and ignored. Patch friction is enabled by default; "
+                "use friction_anchor_beta to adjust it or explicitly set zero to disable it.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._friction_anchors_enabled = self.friction_anchor_beta > 0.0
         if self._friction_anchors_enabled and friction_mode != "current":
             raise ValueError(
-                "Patch friction requires friction_mode='current'; coupled point-contact solves are incompatible."
+                "Patch friction requires friction_mode='current'; set friction_anchor_beta=0 for a coupled point-contact solve."
             )
         if self._friction_anchors_enabled and effective_pgs_kernel in ("tiled_contact", "streaming"):
-            raise ValueError("Patch friction requires pgs_kernel='tiled_row' or 'loop'.")
+            raise ValueError(
+                "Patch friction requires pgs_kernel='tiled_row' or 'loop'; set friction_anchor_beta=0 for a point-contact kernel."
+            )
         try:
             self.contact_speculative_scale = float(contact_speculative_scale)
         except (TypeError, ValueError) as exc:
@@ -7650,7 +7635,7 @@ class SolverFeatherPGS(SolverBase):
     def _patch_row_arrays(self):
         """Allocated solver routes and their configured warm-start decay."""
         yield 0, self.row_parent, self.row_mu, self.impulses, self.pgs_warmstart_decay if self.pgs_warmstart else 0.0
-        if self.mf_row_parent is not None:
+        if self._has_free_rigid_bodies:
             yield (
                 1,
                 self.mf_row_parent,
