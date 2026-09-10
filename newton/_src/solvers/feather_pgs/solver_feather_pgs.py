@@ -42,7 +42,7 @@ from ..semi_implicit.kernels_particle import (
     eval_triangle_forces,
 )
 from ..solver import SolverBase
-from .contact_torsion import configure_contact_torsion, prepare_torsion_rows, torque_sweep_source
+from .contact_torsion import configure_contact_torsion, prepare_torsion_rows, torque_sweep_source, validate_torsion_step
 from .kernels import (
     FRICTION_MODE_BISECTION,
     FRICTION_MODE_BISECTION_DESAXCE,
@@ -5970,6 +5970,8 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        if self._contact_torsion_enabled:
+            validate_torsion_step(self)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
             raise ValueError(
                 "FeatherPGS contact capacity mismatch: received "

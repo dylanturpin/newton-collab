@@ -201,12 +201,17 @@ def _contact_groups(solver, state, contacts):
     return [cluster for clusters in groups.values() for cluster in clusters]
 
 
-def prepare_torsion_rows(solver, state, augmented_state, contacts):
-    """Append current touching-group angular rows before H-inverse/J response."""
+def validate_torsion_step(solver):
+    """Reject incompatible runtime state before any solver stage consumes it."""
     if getattr(solver, "friction_anchor_beta", 0.0) > 0.0 or getattr(solver, "_friction_anchors_enabled", False):
         raise ValueError("Contact torsion combined with persistent friction patches is not supported")
     if wp.get_stream(solver.model.device).is_capturing:
         raise RuntimeError("Experimental torsion host grouping does not support CUDA graph capture")
+
+
+def prepare_torsion_rows(solver, state, augmented_state, contacts):
+    """Append current touching-group angular rows before H-inverse/J response."""
+    validate_torsion_step(solver)
     solver._torsion_stats = {"rows": 0, "groups": []}
     if contacts is None:
         return
