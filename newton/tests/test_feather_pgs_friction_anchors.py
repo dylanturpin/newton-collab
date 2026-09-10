@@ -20,7 +20,7 @@ _MU_JAW, _MU_BOX = 5.0, 0.5
 _BOX_HALF, _JAW_HALF_T, _GAP0 = 0.02, 0.005, 0.001
 
 
-def _build_v_jaws(tilt_deg: float):
+def _build_v_jaws(tilt_deg: float, geometry: str = "box"):
     """Fixed base, two prismatic jaws (left driven, right slaved through a mimic row) pinching a
     free 0.1 kg box. Both jaw faces tilt toward +z by ``tilt_deg`` so the two normal rows'
     depenetration biases share a +z tangential component: the geometry that leaks tangential
@@ -63,13 +63,30 @@ def _build_v_jaws(tilt_deg: float):
     for dof in range(len(b.joint_effort_limit)):
         b.joint_effort_limit[dof] = 10.0
     box = b.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), label="box")
-    b.add_shape_box(
-        box,
-        hx=_BOX_HALF,
-        hy=_BOX_HALF,
-        hz=_BOX_HALF,
-        cfg=newton.ModelBuilder.ShapeConfig(density=0.1 / (2 * _BOX_HALF) ** 3, mu=_MU_BOX),
-    )
+    if geometry == "sphere":
+        b.add_shape_sphere(
+            box,
+            radius=_BOX_HALF,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.1 / (4.0 / 3.0 * np.pi * _BOX_HALF**3), mu=_MU_BOX),
+        )
+    elif geometry == "capsule":
+        b.add_shape_capsule(
+            box,
+            radius=_BOX_HALF,
+            half_height=_BOX_HALF,
+            xform=wp.transform(wp.vec3(0), wp.quat_from_axis_angle(wp.vec3(1, 0, 0), np.pi / 2)),
+            cfg=newton.ModelBuilder.ShapeConfig(
+                density=0.1 / (np.pi * _BOX_HALF**2 * 2 * _BOX_HALF + 4.0 / 3.0 * np.pi * _BOX_HALF**3), mu=_MU_BOX
+            ),
+        )
+    else:
+        b.add_shape_box(
+            box,
+            hx=_BOX_HALF,
+            hy=_BOX_HALF,
+            hz=_BOX_HALF,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.1 / (2 * _BOX_HALF) ** 3, mu=_MU_BOX),
+        )
     return b.finalize(), jaws, box
 
 

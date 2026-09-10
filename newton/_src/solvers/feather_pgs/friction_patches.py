@@ -11,11 +11,15 @@ is a conservative test across convex seams, not an exact surface-connectivity
 query. Length tolerances scale with the smaller body's bounding radius; angular
 tolerance is about six degrees. Normals remain individual unilateral rows.
 
-Only body-local anchors and their tangent impulses persist across frames. Pair
-identity and geometric compatibility correlate them without a collision matcher.
-Saturated friction with opposing slip releases history; saturation alone does
-not. All matching tolerances are internal so correction strength is the only
-new user control.
+Tangential displacement and impulses persist across frames; friction locations
+follow the current contact region. Displacement accumulates incremental rigid
+motion at those locations, using the pose increment's SE(3) logarithm rather
+than a rotating material point's chord. Saved poses also capture externally
+imposed motion and position-only solver passes. Pair identity and geometric
+compatibility correlate history without a collision matcher or shape-type rules.
+Unloaded regions and saturated friction with opposing slip release history;
+saturation alone does not. All matching tolerances are internal so correction
+strength is the only new user control.
 
 Sorting body pairs makes construction local to a pair and preserves CUDA graph
 capture: all buffers and the radix-sort workspace have fixed capacity.
@@ -24,7 +28,6 @@ capture: all buffers and the radix-sort workspace have fixed capacity.
 import numpy as np
 import warp as wp
 
-from ...geometry.types import GeoType
 from ...math.spatial import velocity_at_point
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 
@@ -47,7 +50,7 @@ class _PatchFrame:
     indices: wp.array[int]
     center: wp.array[wp.vec3]
     normal: wp.array[wp.vec3]
-    normal_b: wp.array[wp.vec3]
+    displacement: wp.array[wp.vec3]
     mu: wp.array[wp.vec2]
     radius: wp.array[float]
     body_a: wp.array[int]
@@ -238,26 +241,63 @@ def _geometry_adjacent(sa: int, sb: int, ta: int, tb: int, transforms: wp.array[
 
 
 @wp.func
-def _curved_shape(shape: int, types: wp.array[int]):
-    if shape < 0:
-        return False
-    kind = types[shape]
-    return (
-        kind == GeoType.SPHERE
-        or kind == GeoType.CAPSULE
-        or kind == GeoType.CYLINDER
-        or kind == GeoType.ELLIPSOID
-        or kind == GeoType.CONE
-    )
+def _pose_motion(q: wp.array[wp.transform], previous_q: wp.array[wp.transform], body: int, point: wp.vec3):
+    """Evaluate the rigid pose increment's SE(3) logarithm at a world point.
+
+    The midpoint form avoids subtracting large world-origin moments. It is
+    exact for a constant screw motion: a fixed pivot has zero displacement,
+    and rolling does not mistake a material point's chord for tangential slip.
+    """
+    motion = wp.vec3(0.0)
+    if body >= 0:
+        current = q[body]
+        previous = previous_q[body]
+        x0 = wp.transform_get_translation(previous)
+        x1 = wp.transform_get_translation(current)
+        rotation = wp.transform_get_rotation(current) * wp.quat_inverse(wp.transform_get_rotation(previous))
+        if rotation[3] < 0.0:
+            rotation = -rotation
+        vector = wp.vec3(rotation[0], rotation[1], rotation[2])
+        sine = wp.length(vector)
+        angular = 2.0 * vector
+        translation = x1 - x0
+        linear = translation
+        if sine > 1.0e-6:
+            half_angle = wp.atan2(sine, rotation[3])
+            axis = vector / sine
+            angular = (2.0 * half_angle) * axis
+            scale = half_angle * rotation[3] / sine
+            linear = scale * translation + (1.0 - scale) * wp.dot(axis, translation) * axis
+        motion = linear + wp.cross(angular, point - 0.5 * (x0 + x1))
+    return motion
+
+
+@wp.func
+def _carried_displacement(q: wp.array[wp.transform], prev: _PatchFrame, p: int, normal: wp.vec3):
+    """Rotate stored spring displacement into the current tangent plane."""
+    a = prev.body_a[p]
+    error = prev.displacement[p]
+    old_normal = prev.normal[p]
+    if a >= 0:
+        error = wp.transform_vector(q[a], error)
+        old_normal = wp.transform_vector(q[a], old_normal)
+    # Parallel transport preserves spring length when the tangent plane turns;
+    # projection alone would dissipate history on every small rocking motion.
+    cosine = wp.dot(old_normal, normal)
+    if cosine > 0.0:
+        axis = wp.cross(old_normal, normal)
+        cross_error = wp.cross(axis, error)
+        error += cross_error + wp.cross(axis, cross_error) / (1.0 + cosine)
+    return error
 
 
 @wp.kernel(enable_backward=False)
 def _build(
     count: wp.array[int],
     q: wp.array[wp.transform],
+    previous_q: wp.array[wp.transform],
     shape_transform: wp.array[wp.transform],
     shape_radius: wp.array[float],
-    shape_type: wp.array[int],
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
@@ -366,6 +406,11 @@ def _build(
             current_gap = wp.dot(_world_point(q, a, surface_a) - _world_point(q, b, surface_b), n)
             chosen = int(-1)
             nearest = float(1.0e30)
+            motion = wp.vec3(0.0)
+            if prev_start < prev_stop:
+                motion = _pose_motion(q, previous_q, a, frame.center[c]) - _pose_motion(
+                    q, previous_q, b, frame.center[c]
+                )
             for j in range(prev_start, prev_stop):
                 p = prev.indices[j]
                 if (
@@ -378,22 +423,13 @@ def _build(
                 old_n = prev.normal[p]
                 if a >= 0:
                     old_n = wp.transform_vector(q[a], old_n)
-                old_n_b = prev.normal_b[p]
-                if b >= 0:
-                    old_n_b = wp.transform_vector(q[b], old_n_b)
-                # Rolling changes the supporting material point on a curved
-                # surface. Keeping that old point creates a rearward position
-                # bias and an incorrect friction moment arm. Only retain it
-                # while the material-frame normal is unchanged to roundoff.
-                if _curved_shape(prev.shape_a[p], shape_type) and wp.length_sq(old_n - n) > 1.0e-10:
-                    continue
-                if _curved_shape(prev.shape_b[p], shape_type) and wp.length_sq(old_n_b - n) > 1.0e-10:
-                    continue
                 pa = _world_point(q, a, prev.anchor_a[p])
                 pb = _world_point(q, b, prev.anchor_b[p])
                 delta = pa - pb
                 support_gap = wp.dot(_world_point(q, a, prev.surface_a[p]) - _world_point(q, b, prev.surface_b[p]), n)
-                tangent_delta = delta - n * wp.dot(delta, n)
+                error = _carried_displacement(q, prev, p, n)
+                error += motion
+                tangent_delta = error - n * wp.dot(error, n)
                 distance = wp.length_sq(0.5 * (pa + pb) - frame.center[c])
                 # The tangential gate bounds uncorrected slip of a carried pair at a
                 # tenth of the smaller body's radius, about three times the measured
@@ -438,17 +474,51 @@ def _build(
             anchor_a = _local_point(q, a, pa)
             anchor_b = _local_point(q, b, pb)
             carried_impulse = wp.vec3(0.0)
+            error = wp.vec3(0.0)
             if chosen >= 0:
                 prev.used[chosen] = 1
-                # Copy the stored material points verbatim; a world round trip
-                # would random-walk a stuck anchor by float32 rounding each step.
-                anchor_a = prev.anchor_a[chosen]
-                anchor_b = prev.anchor_b[chosen]
-                surface_a = prev.surface_a[chosen]
-                surface_b = prev.surface_b[chosen]
-                pa = _world_point(q, a, anchor_a)
-                pb = _world_point(q, b, anchor_b)
+                error = _carried_displacement(q, prev, chosen, n)
+                old_center = 0.5 * (
+                    _world_point(q, a, prev.anchor_a[chosen]) + _world_point(q, b, prev.anchor_b[chosen])
+                )
+                # The two spring samples describe a planar rigid displacement:
+                # translation plus twist. Evaluate that field at the new points
+                # instead of transferring old lever-arm errors independently.
+                # A one-point region carries translation only.
+                for j in range(prev_start, prev_stop):
+                    partner = prev.indices[j]
+                    if partner != chosen and prev.valid[partner] != 0 and prev.owner[partner] == prev.owner[chosen]:
+                        other_normal = prev.normal[partner]
+                        if a >= 0:
+                            other_normal = wp.transform_vector(q[a], other_normal)
+                        other_gap = wp.dot(
+                            _world_point(q, a, prev.surface_a[partner]) - _world_point(q, b, prev.surface_b[partner]), n
+                        )
+                        if (
+                            wp.dot(other_normal, n) < 0.995
+                            or other_gap > wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r
+                        ):
+                            break
+                        other_center = 0.5 * (
+                            _world_point(q, a, prev.anchor_a[partner]) + _world_point(q, b, prev.anchor_b[partner])
+                        )
+                        span = other_center - old_center
+                        span -= n * wp.dot(span, n)
+                        span_sq = wp.length_sq(span)
+                        if span_sq > 1.0e-8 * r * r:
+                            other_error = _carried_displacement(q, prev, partner, n)
+                            spin = wp.dot(other_error - error, wp.cross(n, span)) / span_sq
+                            error = 0.5 * (error + other_error) + spin * wp.cross(
+                                n, pa - 0.5 * (old_center + other_center)
+                            )
+                        break
+                error += motion
+                error -= n * wp.dot(error, n)
                 carried_impulse = prev.tangent_impulse[chosen]
+            stored_error = error
+            if a >= 0:
+                stored_error = wp.transform_vector(wp.transform_inverse(q[a]), error)
+            frame.displacement[c] = stored_error
             frame.source[c] = chosen
             if carry_only != 0 and chosen < 0:
                 # Filtered members only carry existing history; they never start
@@ -473,7 +543,9 @@ def _build(
             patches.point_a[c] = pa
             patches.point_b[c] = pb
             t0, t1 = contact_tangent_basis(n)
-            patches.phi[c] = wp.vec2(wp.dot(t0, pa - pb), wp.dot(t1, pa - pb))
+            if frame.flipped[c] != 0:
+                error = -error
+            patches.phi[c] = wp.vec2(wp.dot(t0, error), wp.dot(t1, error))
 
 
 @wp.kernel(enable_backward=False)
@@ -483,22 +555,25 @@ def _store_history(
     frame: _PatchFrame,
     prev: _PatchFrame,
     previous_world: wp.array[int],
+    previous_q: wp.array[wp.transform],
 ):
-    """Carry fixed-capacity history in one launch, including its sorted pair index."""
+    """Carry contact history and input poses, independent of solver velocity passes."""
     c = wp.tid()
+    if c < previous_q.shape[0]:
+        previous_q[c] = q[c]
+    if c >= frame.valid.shape[0]:
+        return
     normal = frame.normal[c]
-    normal_b = normal
     if frame.valid[c] != 0 and frame.body_a[c] >= 0:
         normal = wp.transform_vector(wp.transform_inverse(q[frame.body_a[c]]), normal)
-    if frame.valid[c] != 0 and frame.body_b[c] >= 0:
-        normal_b = wp.transform_vector(wp.transform_inverse(q[frame.body_b[c]]), normal_b)
     prev.keys[c] = frame.keys[c]
     prev.indices[c] = frame.indices[c]
     prev.normal[c] = normal
-    prev.normal_b[c] = normal_b
+    prev.displacement[c] = frame.displacement[c]
     prev.mu[c] = frame.mu[c]
     prev.body_a[c] = frame.body_a[c]
     prev.body_b[c] = frame.body_b[c]
+    prev.owner[c] = frame.owner[c]
     prev.shape_a[c] = frame.shape_a[c]
     prev.shape_b[c] = frame.shape_b[c]
     prev.anchor_a[c] = frame.anchor_a[c]
@@ -559,6 +634,7 @@ class _FrictionPatchState:
         self.current = self._frame(capacity, device)
         self.previous = self._frame(capacity, device)
         self.previous_world = wp.full(capacity, -1, dtype=int, device=device)
+        self.previous_q = wp.zeros(model.body_count, dtype=wp.transform, device=device)
 
     def update_geometry(self, model):
         """Refresh scales and retire affected history after explicit geometry edits."""
@@ -616,7 +692,7 @@ class _FrictionPatchState:
         for field in (
             "center",
             "normal",
-            "normal_b",
+            "displacement",
             "anchor_a",
             "anchor_b",
             "surface_a",
@@ -692,9 +768,9 @@ class _FrictionPatchState:
             inputs=[
                 contacts.rigid_contact_count,
                 state.body_q,
+                self.previous_q,
                 model.shape_transform,
                 model.shape_collision_radius,
-                model.shape_type,
                 self.current,
                 self.previous,
                 self.view,
@@ -705,8 +781,15 @@ class _FrictionPatchState:
     def store(self, state):
         wp.launch(
             _store_history,
-            dim=self.capacity,
-            inputs=[state.body_q, self.body_world, self.current, self.previous, self.previous_world],
+            dim=max(self.capacity, self.previous_q.shape[0]),
+            inputs=[
+                state.body_q,
+                self.body_world,
+                self.current,
+                self.previous,
+                self.previous_world,
+                self.previous_q,
+            ],
             device=state.body_q.device,
         )
 
@@ -861,15 +944,23 @@ def finish_patch_impulses(
     c = wp.tid()
     if c >= count[0] or frame.valid[c] == 0:
         return
-    if slot[c] < 0 or slots_needed[c] != 3:
-        # Carried without rows (gap-filtered member or capacity-rejected unit):
-        # ``_build`` already stored the carried tangent impulse, so keep the
-        # history and let the next step re-select anchors.
+    if slot[c] < 0:
+        # Capacity rejection provides no solved normal load; preserve the
+        # geometrically supported history until rows are available again.
         return
     if path[c] != route:
         return
     w = world[c]
     s = slot[c]
+    load = patch_normal_load(parents, impulses, w, s)
+    if load <= 0.0:
+        # A speculative region cannot accumulate a spring while unsupported
+        # and apply that error when it later lands (common on curved meshes).
+        frame.valid[c] = 0
+        return
+    if slots_needed[c] != 3:
+        # Friction was filtered, but its normal rows still prove support.
+        return
     n = frame.normal[c]
     t0, t1 = contact_tangent_basis(n)
     if frame.flipped[c] != 0:
@@ -883,7 +974,7 @@ def finish_patch_impulses(
     if a >= 0:
         stored = wp.transform_vector(wp.transform_inverse(q[a]), tangent)
     frame.tangent_impulse[c] = stored
-    radius = wp.max(mu[w, s + 1] * patch_normal_load(parents, impulses, w, s), 0.0)
+    radius = wp.max(mu[w, s + 1] * load, 0.0)
     speed = _point_velocity(q_out, qd_out, com, a, frame.anchor_a[c]) - _point_velocity(
         q_out, qd_out, com, b, frame.anchor_b[c]
     )

@@ -837,7 +837,7 @@ class SolverFeatherPGS(SolverBase):
                 an explicitly selected point-contact algorithm instead retains velocity-only friction
                 and warns. Zero explicitly selects velocity-only point friction. Positive values
                 group compatible contacts on a body pair into regions,
-                retain up to two body-local friction anchors per region, and share the total
+                select up to two friction locations per region, and share the total
                 normal impulse equally between those anchors. Normal contacts are preserved.
                 Twisting resistance comes only from the separation between the anchors;
                 a single-anchor region has no independent torsional stiction constraint.
@@ -847,14 +847,16 @@ class SolverFeatherPGS(SolverBase):
                 Anchor history is independent of collision contact matching, including across
                 convex shapes on the same body. Geometry-scaled correlation and detected
                 sliding determine when anchors are replaced; they do not require user tuning.
-                Analytic curved surfaces refresh anchors when their material normal turns during
-                rolling, preventing a retained footprint from adding artificial rolling resistance.
-                The tangent RHS includes ``friction_anchor_beta * separation / dt``. Anchors whose
-                region carries no friction rows for a step (gap filters or row capacity) keep their
-                history. Patch anchors define the friction row points: the body-local material
-                points must stay fixed on their bodies for the anchored rows to warm start, so
-                ``contact_shared_anchor`` and ``contact_friction_shared_anchor`` apply only to normal
-                rows and to velocity-only friction rows.
+                Friction locations follow the current contact region while tangential displacement
+                and impulses persist. The displacement follows pose increments at the current row points,
+                including externally imposed motion and position-only solver passes; it does not tether rolling objects to
+                an old footprint. This applies equally to analytic shapes, convex hulls, and meshes.
+                The tangent RHS includes ``friction_anchor_beta * displacement / dt``. Unloaded
+                regions discard history. Regions with no friction rows for a step (gap filters or
+                row capacity) retain supported history. Patch reduction approximates the friction
+                wrench with two locations; faceted wheels still experience facet-impact losses.
+                Patch locations define the friction row points, so ``contact_shared_anchor`` and
+                ``contact_friction_shared_anchor`` apply only to normal rows and velocity-only friction.
                 Requires ``friction_mode="current"`` and ``pgs_kernel="loop"`` or ``"tiled_row"``.
                 Explicit positive gains with an incompatible point algorithm raise an error.
                 Defaults to None.
@@ -1181,7 +1183,7 @@ class SolverFeatherPGS(SolverBase):
             )
         if self._friction_anchors_enabled and (contact_shared_anchor or contact_friction_shared_anchor):
             warnings.warn(
-                "Patch friction uses persistent material anchors instead of a shared friction point. "
+                "Patch friction selects its own friction locations and carries tangential displacement. "
                 "contact_shared_anchor still applies to normal rows; set friction_anchor_beta=0 "
                 "to apply shared-anchor flags to point friction rows as well.",
                 UserWarning,
