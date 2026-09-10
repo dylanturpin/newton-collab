@@ -107,7 +107,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 pgs_mode="matrix_free",
                 articulated_contact_response="propagation",
                 friction_mode="bisection",
-                friction_anchor_beta=0.0,
             )
         propagation_debug = SolverFeatherPGS(
             model,
@@ -134,7 +133,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                         model,
                         pgs_mode="split",
                         pgs_kernel=pgs_kernel,
-                        friction_anchor_beta=0.0,
                         enable_joint_limits=True,
                     )
 

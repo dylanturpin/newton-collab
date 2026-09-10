@@ -788,7 +788,7 @@ class SolverFeatherPGS(SolverBase):
         articulation_pair_contact_gap_gate: float = 0.0,
         pgs_warmstart_decay: float = 1.0,
         warn_constraint_overflow: bool = True,
-        friction_anchor_beta: float = 0.2,
+        friction_anchor_beta: float | None = None,
     ):
         """
         Args:
@@ -817,7 +817,9 @@ class SolverFeatherPGS(SolverBase):
             contact_friction_shared_anchor (bool, optional): If true, friction rows use the midpoint
                 between the two contact witness points as the Jacobian point on both bodies. Normal
                 rows keep their original witness points. This avoids a tangential force couple when
-                the witnesses are separated along the contact normal. Defaults to False.
+                the witnesses are separated along the contact normal. Applies to velocity-only point
+                friction (``friction_anchor_beta=0``); patch friction warns and uses its persistent
+                material anchors instead. Defaults to False.
             contact_friction_anchor_limit (int, optional): Deprecated compatibility argument.
                 The old contact-index approximation has been removed. A positive value warns
                 and has no effect. Patch friction is enabled by default; use
@@ -830,9 +832,11 @@ class SolverFeatherPGS(SolverBase):
                 used by generated friction rows. This is a diagnostic hook for matching solver-prep
                 semantics such as PhysX's per-friction-anchor scaling; it does not affect normal
                 contact rows. Defaults to 1.0.
-            friction_anchor_beta (float, optional): Enable persistent patch friction and set
-                its positional correction strength. Enabled by default at 0.2. Zero uses velocity-only point
-                friction. Positive values group compatible contacts on a body pair into regions,
+            friction_anchor_beta (float | None, optional): Set the positional correction strength
+                for persistent patch friction. ``None`` enables it at 0.2 for the default solver;
+                an explicitly selected point-contact algorithm instead retains velocity-only friction
+                and warns. Zero explicitly selects velocity-only point friction. Positive values
+                group compatible contacts on a body pair into regions,
                 retain up to two body-local friction anchors per region, and share the total
                 normal impulse equally between those anchors. Normal contacts are preserved.
                 Twisting resistance comes only from the separation between the anchors;
@@ -843,6 +847,8 @@ class SolverFeatherPGS(SolverBase):
                 Anchor history is independent of collision contact matching, including across
                 convex shapes on the same body. Geometry-scaled correlation and detected
                 sliding determine when anchors are replaced; they do not require user tuning.
+                Analytic curved surfaces refresh anchors when their material normal turns during
+                rolling, preventing a retained footprint from adding artificial rolling resistance.
                 The tangent RHS includes ``friction_anchor_beta * separation / dt``. Anchors whose
                 region carries no friction rows for a step (gap filters or row capacity) keep their
                 history. Patch anchors define the friction row points: the body-local material
@@ -850,8 +856,8 @@ class SolverFeatherPGS(SolverBase):
                 ``contact_shared_anchor`` and ``contact_friction_shared_anchor`` apply only to normal
                 rows and to velocity-only friction rows.
                 Requires ``friction_mode="current"`` and ``pgs_kernel="loop"`` or ``"tiled_row"``.
-                Explicitly set zero when selecting an alternative point-contact solver.
-                Defaults to 0.2.
+                Explicit positive gains with an incompatible point algorithm raise an error.
+                Defaults to None.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
                 for normal contact rows on the dense, matrix-free free-rigid, and propagation
                 paths. A value of 0.0 removes speculative closing allowance without changing
@@ -874,7 +880,8 @@ class SolverFeatherPGS(SolverBase):
             contact_shared_anchor (bool, optional): If true, all contact rows use the midpoint between
                 the two witness points as the Jacobian point on both bodies, matching PhysX contact
                 prep's single ``contact.point`` lever arm. ``phi`` is still computed from the original
-                witness points. Defaults to False.
+                witness points. With patch friction, only normal rows use this midpoint; a warning
+                explains how to select point friction for the original all-row behavior. Defaults to False.
             enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
                 constraints. Each active limit side adds one constraint row. Supported with
                 ``pgs_kernel="loop"`` and ``pgs_kernel="tiled_row"``; the ``"tiled_contact"``
@@ -1136,12 +1143,26 @@ class SolverFeatherPGS(SolverBase):
         self.contact_friction_anchor_limit = int(contact_friction_anchor_limit)
         self.contact_friction_articulation_pairs_only = bool(contact_friction_articulation_pairs_only)
         self.contact_friction_scale = float(contact_friction_scale)
-        self.friction_anchor_beta = float(friction_anchor_beta)
-        if not np.isfinite(self.friction_anchor_beta) or self.friction_anchor_beta < 0.0:
-            raise ValueError("friction_anchor_beta must be finite and non-negative")
         # Native tiled kernels are CUDA-only and every CPU selector resolves to
         # the scalar suite below, so validate against the kernel that will run.
         effective_pgs_kernel = "loop" if model.device.is_cpu else pgs_kernel
+        if friction_anchor_beta is None:
+            # An explicit point algorithm remains a valid way to select point
+            # friction. The ordinary constructor enables persistent patches.
+            if friction_mode != "current" or effective_pgs_kernel in ("tiled_contact", "streaming"):
+                friction_anchor_beta = 0.0
+                warnings.warn(
+                    "The selected point-contact solver uses velocity-only friction. "
+                    "Omit the point solver selection to use default patch friction, or set "
+                    "friction_anchor_beta=0 explicitly to keep point friction without this warning.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            else:
+                friction_anchor_beta = 0.2
+        self.friction_anchor_beta = float(friction_anchor_beta)
+        if not np.isfinite(self.friction_anchor_beta) or self.friction_anchor_beta < 0.0:
+            raise ValueError("friction_anchor_beta must be finite and non-negative")
         if self.contact_friction_anchor_limit > 0:
             warnings.warn(
                 "contact_friction_anchor_limit is deprecated and ignored. Patch friction is enabled by default; "
@@ -1157,6 +1178,14 @@ class SolverFeatherPGS(SolverBase):
         if self._friction_anchors_enabled and effective_pgs_kernel in ("tiled_contact", "streaming"):
             raise ValueError(
                 "Patch friction requires pgs_kernel='tiled_row' or 'loop'; set friction_anchor_beta=0 for a point-contact kernel."
+            )
+        if self._friction_anchors_enabled and (contact_shared_anchor or contact_friction_shared_anchor):
+            warnings.warn(
+                "Patch friction uses persistent material anchors instead of a shared friction point. "
+                "contact_shared_anchor still applies to normal rows; set friction_anchor_beta=0 "
+                "to apply shared-anchor flags to point friction rows as well.",
+                UserWarning,
+                stacklevel=2,
             )
         try:
             self.contact_speculative_scale = float(contact_speculative_scale)

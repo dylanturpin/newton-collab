@@ -1,0 +1,1 @@
+Add persistent friction patches to FeatherPGS with up to two body-local anchors per compatible contact region, sharing its normal load while preserving all normal contacts. Use `friction_anchor_beta` to control positional drift correction independently of collision contact matching.

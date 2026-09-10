@@ -101,6 +101,25 @@ def _patch_fixture(
 
 
 class TestFrictionPatchHistory(unittest.TestCase):
+    def test_curved_surface_refreshes_only_when_its_normal_turns(self):
+        """Refresh either rolling surface while retaining stationary and normal-axis spin history."""
+        for body in (0, 1):
+            for axis, retained in ((wp.vec3(0, 1, 0), False), (wp.vec3(0, 0, 1), True)):
+                with self.subTest(body=body, axis=axis):
+                    model, state, contacts, patches = _patch_fixture([[0, 0, 0]])
+                    types = model.shape_type.numpy()
+                    types[body] = int(newton.GeoType.SPHERE)
+                    model.shape_type.assign(types)
+                    patches.build(model, state, contacts)
+                    patches.store(state)
+                    patches.build(model, state, contacts)
+                    self.assertGreaterEqual(int(patches.current.source.numpy()[0]), 0)
+                    transforms = [wp.transform_identity(), wp.transform_identity()]
+                    transforms[body] = wp.transform(wp.vec3(0), wp.quat_from_axis_angle(axis, 0.01))
+                    state.body_q.assign(transforms)
+                    patches.build(model, state, contacts)
+                    self.assertEqual(int(patches.current.source.numpy()[0]) >= 0, retained)
+
     def test_shared_pad_randomization_preserves_material_regions(self):
         """Pool one sampled pad material while keeping genuinely different coefficients separate."""
         model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]], shape0=[0, 2])
@@ -503,34 +522,44 @@ class TestFrictionPatchHistory(unittest.TestCase):
 
 
 class TestFeatherPGSFrictionPatches(unittest.TestCase):
-    def test_default_friction_allows_a_sphere_to_keep_rolling(self):
-        """Keep a freely rolling sphere moving without pinning its changing contact footprint."""
+    def test_default_friction_preserves_free_rolling(self):
+        """Match velocity-only free rolling without adding a persistent rearward friction force."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
-        builder = newton.ModelBuilder()
-        builder.add_ground_plane()
-        body = builder.add_body(xform=wp.transform(wp.vec3(0, 0, 0.05), wp.quat_identity()))
-        builder.add_shape_sphere(body, radius=0.05)
-        model = builder.finalize(device=device)
-        solver = newton.solvers.SolverFeatherPGS(model)
-        pipeline = newton.CollisionPipeline(model)
-        contacts = pipeline.contacts()
-        s0, s1 = model.state(), model.state()
-        s0.joint_qd.assign([1, 0, 0, 0, 20, 0])
-        newton.eval_fk(model, s0.joint_q, s0.joint_qd, s0)
-        control = model.control()
-        for _ in range(240):
-            s0.clear_forces()
-            pipeline.collide(s0, contacts)
-            solver.step(s0, s1, control, contacts, 1.0 / 240.0)
-            s0, s1 = s1, s0
-        pose, velocity = s0.body_q.numpy()[0], s0.body_qd.numpy()[0]
-        self.assertTrue(np.isfinite(pose).all() and np.isfinite(velocity).all())
-        # This is a no-pinning smoke test, not a claim of energy-conserving
-        # rolling: finite-step patch friction can dissipate rolling motion.
-        self.assertAlmostEqual(float(pose[0]), 1.0, delta=0.1)
-        self.assertGreater(float(velocity[0]), 0.85)
-        self.assertLess(abs(float(velocity[0] - 0.05 * velocity[4])), 0.15)
-        self.assertAlmostEqual(float(pose[2]), 0.05, delta=0.002)
+        for geometry in ("sphere", "capsule", "cylinder"):
+            results = []
+            for kwargs in ({"friction_anchor_beta": 0.0}, {}):
+                builder = newton.ModelBuilder()
+                builder.add_ground_plane()
+                body = builder.add_body(xform=wp.transform(wp.vec3(0, 0, 0.05), wp.quat_identity()))
+                if geometry == "sphere":
+                    builder.add_shape_sphere(body, radius=0.05)
+                else:
+                    rotation = wp.quat_from_axis_angle(wp.vec3(1, 0, 0), np.pi / 2)
+                    add_shape = getattr(builder, "add_shape_" + geometry)
+                    add_shape(body, radius=0.05, half_height=0.025, xform=wp.transform(wp.vec3(0), rotation))
+                model = builder.finalize(device=device)
+                solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
+                pipeline = newton.CollisionPipeline(model)
+                contacts = pipeline.contacts()
+                s0, s1 = model.state(), model.state()
+                s0.joint_qd.assign([1, 0, 0, 0, 20, 0])
+                newton.eval_fk(model, s0.joint_q, s0.joint_qd, s0)
+                control = model.control()
+                for _ in range(240):
+                    s0.clear_forces()
+                    pipeline.collide(s0, contacts)
+                    solver.step(s0, s1, control, contacts, 1.0 / 240.0)
+                    s0, s1 = s1, s0
+                pose, velocity = s0.body_q.numpy()[0], s0.body_qd.numpy()[0]
+                self.assertTrue(np.isfinite(pose).all() and np.isfinite(velocity).all())
+                results.append((pose, velocity))
+            with self.subTest(geometry=geometry):
+                reference, actual = results
+                self.assertAlmostEqual(float(actual[0][0]), float(reference[0][0]), delta=0.01)
+                self.assertAlmostEqual(float(actual[1][0]), float(reference[1][0]), delta=0.01)
+                self.assertAlmostEqual(float(actual[1][4]), float(reference[1][4]), delta=0.2)
+                self.assertGreater(float(actual[1][0]), 0.9)
+                self.assertLess(abs(float(actual[1][0] - 0.05 * actual[1][4])), 0.01)
 
     def test_default_friction_keeps_a_box_stack_at_rest(self):
         """Settle an ordinary stack without grasp-specific settings or anchor opt-in."""
@@ -705,6 +734,30 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         solver.reset(s0, wp.array([True, False], dtype=bool, device=device))
         valid = patches.previous.valid.numpy()[:2]
         np.testing.assert_array_equal(valid, (worlds != 0).astype(np.int32))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "explicit point kernels require CUDA")
+    def test_explicit_point_solver_defaults_remain_compatible(self):
+        """Honor existing point-solver selections without requiring a new opt-out argument."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device="cuda:0")
+        for kwargs in (
+            {"pgs_mode": "matrix_free", "friction_mode": "bisection"},
+            {"pgs_mode": "matrix_free", "pgs_kernel": "tiled_contact"},
+            {"pgs_mode": "matrix_free", "pgs_kernel": "streaming"},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertWarnsRegex(UserWarning, "point-contact"):
+                solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
+                self.assertFalse(solver._friction_anchors_enabled)
+                self.assertEqual(solver.friction_anchor_beta, 0.0)
+
+    def test_shared_point_flags_warn_with_patch_friction(self):
+        """Explain when patch anchors override an explicitly requested shared friction point."""
+        model = newton.ModelBuilder().finalize(device="cpu")
+        for flag in ("contact_shared_anchor", "contact_friction_shared_anchor"):
+            with self.subTest(flag=flag), self.assertWarnsRegex(UserWarning, "friction_anchor_beta=0"):
+                newton.solvers.SolverFeatherPGS(model, **{flag: True})
 
     def test_incompatible_point_solvers_are_rejected(self):
         """Reject coupled point solves that would silently consume a patch's shared normal load."""

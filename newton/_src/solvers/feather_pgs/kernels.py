@@ -21,6 +21,7 @@ from ...sim.articulation import (
     compute_2d_rotational_dofs,
     compute_3d_rotational_dofs,
 )
+from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 from .friction_patches import FrictionPatches, contact_tangent_basis, patch_normal_load
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
@@ -3094,34 +3095,18 @@ def _allocate_world_contact_slot(
         point_b_world = point_b_local + thickness_b * normal
     phi = wp.dot(normal, point_a_world - point_b_world)
 
-    # A zero gate preserves every collision-generated contact. A positive gate
-    # drops wider speculative contacts before any route reserves row storage.
-    if contact_gap_gate > 0.0 and phi > contact_gap_gate:
-        contact_slot[c] = -1
-        contact_path[c] = -1
-        return
-
-    # Preserve the full predictive horizon for free-body contacts (notably fast
-    # balls), while allowing callers to bound distant speculative self-contact
-    # rows on one articulation. Penetrating and near-contact self-collisions are
-    # unchanged because only positive gaps above the opt-in threshold are cut.
+    # Use the same eligibility as patch selection before reserving row storage.
     a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
     b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
-    same_non_free_articulation = a_non_free and b_non_free and art_a == art_b
-    if (
-        same_articulation_contact_gap_gate > 0.0
-        and same_non_free_articulation
-        and phi > same_articulation_contact_gap_gate
-    ):
-        contact_slot[c] = -1
-        contact_path[c] = -1
-        return
-    if (
-        articulation_pair_contact_gap_gate > 0.0
-        and a_non_free
-        and b_non_free
-        and phi > articulation_pair_contact_gap_gate
-    ):
+    normal_gap_limit = contact_normal_gap_limit(
+        a_non_free,
+        b_non_free,
+        art_a == art_b,
+        contact_gap_gate,
+        articulation_pair_contact_gap_gate,
+        same_articulation_contact_gap_gate,
+    )
+    if phi > normal_gap_limit:
         contact_slot[c] = -1
         contact_path[c] = -1
         return
@@ -3157,10 +3142,11 @@ def _allocate_world_contact_slot(
             if propagation_same_articulation != 0 or not same_non_free_articulation:
                 is_propagation = 1
 
-    apply_friction_filter = contact_friction_articulation_pairs_only == 0 or (a_non_free and b_non_free)
     # Every normal survives; only the selected patch anchors receive tangent rows.
     slots_needed = 1
-    add_friction = enable_friction != 0 and (not apply_friction_filter or phi <= contact_friction_gap_threshold)
+    add_friction = enable_friction != 0 and contact_friction_eligible(
+        phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
+    )
     if friction_patches.enabled != 0:
         add_friction = add_friction and friction_patches.weight[c] > 0.0
     if add_friction:
@@ -3530,11 +3516,12 @@ def prepare_world_contact_rows(
 
         a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
         b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
-        apply_friction_filter = contact_friction_articulation_pairs_only == 0 or (a_non_free and b_non_free)
         friction_mu = mu * contact_friction_scale
 
         tangent0, tangent1 = contact_tangent_basis(normal)
-        add_friction = enable_friction != 0 and (not apply_friction_filter or phi <= contact_friction_gap_threshold)
+        add_friction = enable_friction != 0 and contact_friction_eligible(
+            phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
+        )
         if friction_patches.enabled != 0:
             add_friction = add_friction and friction_patches.weight[c] > 0.0
 
@@ -3970,12 +3957,13 @@ def _populate_world_J_for_size_contact(
     restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
     a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
     b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
-    apply_friction_filter = contact_friction_articulation_pairs_only == 0 or (a_non_free and b_non_free)
     friction_mu = mu * contact_friction_scale
 
     # Compute tangent basis for friction
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = enable_friction != 0 and (not apply_friction_filter or phi <= contact_friction_gap_threshold)
+    will_add_friction = enable_friction != 0 and contact_friction_eligible(
+        phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
+    )
     if friction_patches.enabled != 0:
         will_add_friction = will_add_friction and friction_patches.weight[c] > 0.0
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
@@ -5095,12 +5083,15 @@ def _build_mf_contact_row(
     if mat_count > 0:
         mu /= float(mat_count)
     restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
-    apply_friction_filter = contact_friction_articulation_pairs_only == 0
+    a_non_free = False
+    b_non_free = False
     friction_mu = mu * contact_friction_scale
 
     # Tangent basis
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = enable_friction != 0 and (not apply_friction_filter or phi <= contact_friction_gap_threshold)
+    will_add_friction = enable_friction != 0 and contact_friction_eligible(
+        phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
+    )
     if friction_patches.enabled != 0:
         will_add_friction = will_add_friction and friction_patches.weight[c] > 0.0
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
@@ -5403,11 +5394,12 @@ def build_propagation_contact_rows(
     art_b = contact_art_b[c]
     a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
     b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
-    apply_friction_filter = contact_friction_articulation_pairs_only == 0 or (a_non_free and b_non_free)
     friction_mu = mu * contact_friction_scale
 
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = enable_friction != 0 and (not apply_friction_filter or phi <= contact_friction_gap_threshold)
+    will_add_friction = enable_friction != 0 and contact_friction_eligible(
+        phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
+    )
     if friction_patches.enabled != 0:
         will_add_friction = will_add_friction and friction_patches.weight[c] > 0.0
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)

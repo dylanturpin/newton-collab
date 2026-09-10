@@ -158,8 +158,7 @@ def _run_incline(steps: int, dt: float, **solver_kwargs):
 @unittest.skipUnless(wp.get_device().is_cuda, "SolverFeatherPGS matrix-free mode requires CUDA")
 class TestFeatherPGSFrictionAnchors(unittest.TestCase):
     def test_explicit_opt_out_keeps_friction_rows_velocity_only(self):
-        """With explicit ``friction_anchor_beta=0`` no anchor state exists and every friction
-        row keeps ``phi = 0`` / ``beta = 0``: the legacy row layout is untouched."""
+        """Preserve velocity-only rows and omit anchor state with ``friction_anchor_beta=0``."""
         model, _jaws, _box = _build_v_jaws(5.0)
         solver = newton.solvers.SolverFeatherPGS(model, **_SQUEEZE_SOLVER, friction_anchor_beta=0.0)
         self.assertFalse(solver._friction_anchors_enabled)
@@ -193,8 +192,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         solver.step(state, model.state(), model.control(), contacts, 0.005)
 
     def test_anchors_stop_tangential_drift_of_a_held_box(self):
-        """A V-tilted pinch leaks tangential drift through velocity-only friction rows; positional
-        anchors bound it. Flat jaws (no leak) must stay unaffected."""
+        """Bound tangential drift in a tilted pinch while leaving flat-jaw behavior unaffected."""
         steps = int(3.0 / 0.005)
         drift_off, _, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.0)
         drift_on, solver_on, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.05)
@@ -232,8 +230,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         self.assertGreater(int((sources >= 0).sum()), 0, "anchors were re-created instead of carried")
 
     def test_anchors_do_not_oppose_genuine_sliding(self):
-        """A box on a 30 deg incline with mu=0.3 (< tan 30) slides at g (sin - mu cos); anchors
-        must reset on the saturated cone and leave the sliding speed unchanged."""
+        """Release saturated anchors on a 30-degree incline and preserve sliding acceleration."""
         dt, steps = 0.005, 200
         v_off, _lat_off, _, _ = _run_incline(steps, dt, friction_anchor_beta=0.0)
         v_on, lat_on, solver, contacts = _run_incline(steps, dt, friction_anchor_beta=0.2)
@@ -248,9 +245,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
             self.assertEqual(int(solver._friction_patches.current.valid.numpy()[:n].sum()), 0)
 
     def test_row_builders_store_anchor_separation_per_route(self):
-        """Dense rows: ``phi`` = raw separation, ``row_beta`` = gain. Matrix-free and propagation
-        rows: ``phi`` = gain * separation. Checked against the per-contact anchor state on the
-        dense (immediate), matrix-free (free body) and propagation routes."""
+        """Store raw separation in dense rows and gain-scaled separation in the other routes."""
         beta = 0.3
 
         def check(model, solver_kwargs, matching="latest", steps=120):
@@ -306,7 +301,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         self.assertGreater(c_mf[1], 0)
 
     def test_graph_capture_replays(self):
-        """Anchor carry is device-side only: two steps capture and replay under a CUDA graph."""
+        """Capture and replay two steps with device-side anchor history under a CUDA graph."""
         model, jaws, box = _build_v_jaws(5.0)
         solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.05, **_SQUEEZE_SOLVER)
         pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn", contact_matching="latest")
@@ -506,10 +501,7 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
     """Device-agnostic checks of the anchor bookkeeping (run on CPU)."""
 
     def test_rhs_bias_matches_on_every_row_family_and_vanishes_in_velocity_pass(self):
-        """Friction rows carry ``friction_anchor_beta * separation / dt`` on the dense, matrix-free
-        and propagation routes alike, and the velocity-only pass (``bias_scale = 0``) drops it.
-        Dense rows store the raw separation with ``row_beta``; matrix-free and propagation rows
-        store the gain-premultiplied separation, so both spellings are exercised."""
+        """Apply equal positional bias on all row families and drop it in velocity-only passes."""
         pgs_beta, fa_beta, dt = 0.05, 0.3, 0.005
         phi_n, e0, e1 = -2.0e-3, 1.0e-4, -2.5e-4
         expect_pos = np.array([pgs_beta * phi_n / dt, fa_beta * e0 / dt, fa_beta * e1 / dt], dtype=np.float32)
@@ -529,7 +521,7 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
             np.testing.assert_allclose(got0, 0.0, atol=1.0e-9, err_msg=family)
 
     def test_reset_clears_anchor_history_full_and_masked(self):
-        """``reset()`` drops carried anchors of the selected worlds even with warm start disabled."""
+        """Drop carried anchors of selected worlds on reset, including without warm starting."""
         device = "cpu"
         model = _build_two_world_free_model(device)
         solver = newton.solvers.SolverFeatherPGS(

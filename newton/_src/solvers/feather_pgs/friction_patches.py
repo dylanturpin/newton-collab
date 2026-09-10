@@ -24,7 +24,9 @@ capture: all buffers and the radix-sort workspace have fixed capacity.
 import numpy as np
 import warp as wp
 
+from ...geometry.types import GeoType
 from ...math.spatial import velocity_at_point
+from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 
 
 @wp.struct
@@ -45,6 +47,7 @@ class _PatchFrame:
     indices: wp.array[int]
     center: wp.array[wp.vec3]
     normal: wp.array[wp.vec3]
+    normal_b: wp.array[wp.vec3]
     mu: wp.array[wp.vec2]
     radius: wp.array[float]
     body_a: wp.array[int]
@@ -151,21 +154,18 @@ def _prepare(
         support_gap_limit += shape_gap[sa]
     if sb >= 0:
         support_gap_limit += shape_gap[sb]
-    if contact_gap_gate > 0.0:
-        support_gap_limit = wp.min(support_gap_limit, contact_gap_gate)
-    # Match the allocator's gap filters before choosing anchors. Normals that
-    # remain eligible can still support the patch without carrying an anchor.
-    eligible = contact_gap_gate <= 0.0 or gap <= contact_gap_gate
-    if a_non_free and b_non_free:
-        if articulation_pair_gap_gate > 0.0:
-            support_gap_limit = wp.min(support_gap_limit, articulation_pair_gap_gate)
-        eligible = eligible and (articulation_pair_gap_gate <= 0.0 or gap <= articulation_pair_gap_gate)
-        if art_a == art_b:
-            if same_articulation_gap_gate > 0.0:
-                support_gap_limit = wp.min(support_gap_limit, same_articulation_gap_gate)
-            eligible = eligible and (same_articulation_gap_gate <= 0.0 or gap <= same_articulation_gap_gate)
-    if friction_articulation_pairs_only == 0 or (a_non_free and b_non_free):
-        eligible = eligible and gap <= friction_gap
+    normal_gap_limit = contact_normal_gap_limit(
+        a_non_free,
+        b_non_free,
+        art_a == art_b,
+        contact_gap_gate,
+        articulation_pair_gap_gate,
+        same_articulation_gap_gate,
+    )
+    support_gap_limit = wp.min(support_gap_limit, normal_gap_limit)
+    eligible = gap <= normal_gap_limit and contact_friction_eligible(
+        gap, a_non_free, b_non_free, friction_articulation_pairs_only, friction_gap
+    )
     # Friction-only filters suppress rows without ending contact support;
     # filtered regions must still be able to carry their anchor history.
     frame.support_gap_limit[c] = wp.max(support_gap_limit, 0.0)
@@ -237,12 +237,27 @@ def _geometry_adjacent(sa: int, sb: int, ta: int, tb: int, transforms: wp.array[
     return _shapes_adjacent(sa, ta, transforms, radii) and _shapes_adjacent(sb, tb, transforms, radii)
 
 
+@wp.func
+def _curved_shape(shape: int, types: wp.array[int]):
+    if shape < 0:
+        return False
+    kind = types[shape]
+    return (
+        kind == GeoType.SPHERE
+        or kind == GeoType.CAPSULE
+        or kind == GeoType.CYLINDER
+        or kind == GeoType.ELLIPSOID
+        or kind == GeoType.CONE
+    )
+
+
 @wp.kernel(enable_backward=False)
 def _build(
     count: wp.array[int],
     q: wp.array[wp.transform],
     shape_transform: wp.array[wp.transform],
     shape_radius: wp.array[float],
+    shape_type: wp.array[int],
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
@@ -363,6 +378,17 @@ def _build(
                 old_n = prev.normal[p]
                 if a >= 0:
                     old_n = wp.transform_vector(q[a], old_n)
+                old_n_b = prev.normal_b[p]
+                if b >= 0:
+                    old_n_b = wp.transform_vector(q[b], old_n_b)
+                # Rolling changes the supporting material point on a curved
+                # surface. Keeping that old point creates a rearward position
+                # bias and an incorrect friction moment arm. Only retain it
+                # while the material-frame normal is unchanged to roundoff.
+                if _curved_shape(prev.shape_a[p], shape_type) and wp.length_sq(old_n - n) > 1.0e-10:
+                    continue
+                if _curved_shape(prev.shape_b[p], shape_type) and wp.length_sq(old_n_b - n) > 1.0e-10:
+                    continue
                 pa = _world_point(q, a, prev.anchor_a[p])
                 pb = _world_point(q, b, prev.anchor_b[p])
                 delta = pa - pb
@@ -461,11 +487,15 @@ def _store_history(
     """Carry fixed-capacity history in one launch, including its sorted pair index."""
     c = wp.tid()
     normal = frame.normal[c]
+    normal_b = normal
     if frame.valid[c] != 0 and frame.body_a[c] >= 0:
         normal = wp.transform_vector(wp.transform_inverse(q[frame.body_a[c]]), normal)
+    if frame.valid[c] != 0 and frame.body_b[c] >= 0:
+        normal_b = wp.transform_vector(wp.transform_inverse(q[frame.body_b[c]]), normal_b)
     prev.keys[c] = frame.keys[c]
     prev.indices[c] = frame.indices[c]
     prev.normal[c] = normal
+    prev.normal_b[c] = normal_b
     prev.mu[c] = frame.mu[c]
     prev.body_a[c] = frame.body_a[c]
     prev.body_b[c] = frame.body_b[c]
@@ -583,7 +613,16 @@ class _FrictionPatchState:
         frame = _PatchFrame()
         frame.keys = wp.full(2 * n, 0x7FFFFFFFFFFFFFFF, dtype=wp.int64, device=device)
         frame.indices = wp.zeros(2 * n, dtype=int, device=device)
-        for field in ("center", "normal", "anchor_a", "anchor_b", "surface_a", "surface_b", "tangent_impulse"):
+        for field in (
+            "center",
+            "normal",
+            "normal_b",
+            "anchor_a",
+            "anchor_b",
+            "surface_a",
+            "surface_b",
+            "tangent_impulse",
+        ):
             setattr(frame, field, wp.zeros(n, dtype=wp.vec3, device=device))
         frame.mu = wp.zeros(n, dtype=wp.vec2, device=device)
         frame.radius = wp.zeros(n, dtype=float, device=device)
@@ -655,6 +694,7 @@ class _FrictionPatchState:
                 state.body_q,
                 model.shape_transform,
                 model.shape_collision_radius,
+                model.shape_type,
                 self.current,
                 self.previous,
                 self.view,

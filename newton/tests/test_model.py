@@ -2256,6 +2256,7 @@ class TestModelJoints(unittest.TestCase):
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
         assert_np_equal(state.body_q.numpy()[child], np.array(child_body_xform), tol=1.0e-5)
 
+    @mock.patch("newton.use_coord_layout_targets", True)
     def test_joint_target_q_qd_shape_with_free_and_ball_joints(self):
         """``joint_target_q`` follows ``joint_q`` (coord) under
         ``use_coord_layout_targets``; ``joint_target_qd`` always follows
@@ -2337,6 +2338,7 @@ class TestModelJoints(unittest.TestCase):
         finally:
             newton.use_coord_layout_targets = previous_flag
 
+    @mock.patch("newton.use_coord_layout_targets", True)
     def test_ball_free_per_axis_target_pos_preserved(self):
         """``JointDofConfig.target_pos`` on BALL/FREE angular axes must flow
         into the ``joint_target_q`` coord slice: the 3 angular scalars are
