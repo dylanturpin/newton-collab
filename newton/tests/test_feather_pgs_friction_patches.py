@@ -79,6 +79,7 @@ def _patch_fixture(
         shape_type=wp.zeros(len(shape_bodies), dtype=int, device=device),
         shape_source_ptr=wp.zeros(len(shape_bodies), dtype=wp.uint64, device=device),
         shape_margin=wp.zeros(len(shape_bodies), dtype=float, device=device),
+        shape_gap=wp.zeros(len(shape_bodies), dtype=float, device=device),
         shape_is_solid=wp.ones(len(shape_bodies), dtype=bool, device=device),
         shape_material_mu=wp.array(materials, dtype=float, device=device),
     )
@@ -143,6 +144,24 @@ class TestFrictionPatchHistory(unittest.TestCase):
         state.body_q.assign([wp.transform(wp.vec3(0, 0, 0.003), wp.quat_identity()), wp.transform_identity()])
         patches.build(model, state, contacts)
         self.assertEqual(np.count_nonzero(patches.current.source.numpy() >= 0), 2)
+
+    def test_support_witnesses_use_existing_contact_gap_limits(self):
+        """Keep supported history within the contact envelope and respect tighter solver gates."""
+        for limits, carried in (({}, True), ({"contact_gap_gate": 0.0001}, False), ({"friction_gap": 0.0001}, True)):
+            with self.subTest(limits=limits):
+                model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]])
+                model.shape_gap.fill_(0.0005)
+                patches.store(state)
+                state.body_q.assign([wp.transform(wp.vec3(0, 0, 0.0002), wp.quat_identity()), wp.transform_identity()])
+                contacts.rigid_contact_point0.assign([[-0.1, 0, -0.0004], [0.1, 0, -0.0004]])
+                patches.build(model, state, contacts, **limits)
+                self.assertEqual(np.count_nonzero(patches.current.source.numpy() >= 0), 2 if carried else 0)
+                # A fresh sample on the supported region cannot retain history
+                # whose old footprint has lifted beyond the shape gap envelope.
+                state.body_q.assign([wp.transform(wp.vec3(0, 0, 0.0012), wp.quat_identity()), wp.transform_identity()])
+                contacts.rigid_contact_point0.assign([[-0.1, 0, -0.0014], [0.1, 0, -0.0014]])
+                patches.build(model, state, contacts, **limits)
+                self.assertEqual(np.count_nonzero(patches.current.source.numpy() >= 0), 0)
 
     def test_geometry_edits_retire_only_affected_history(self):
         """Invalidate edited surfaces across carrier seams while preserving unrelated patches."""

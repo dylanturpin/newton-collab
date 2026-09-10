@@ -61,6 +61,7 @@ class _PatchFrame:
     used: wp.array[int]
     source: wp.array[int]
     eligible: wp.array[int]
+    support_gap_limit: wp.array[float]
     tangent_impulse: wp.array[wp.vec3]
 
 
@@ -92,6 +93,7 @@ def _prepare(
     margin1: wp.array[float],
     shape_body: wp.array[int],
     shape_mu: wp.array[float],
+    shape_gap: wp.array[float],
     body_radius: wp.array[float],
     q: wp.array[wp.transform],
     body_to_articulation: wp.array[int],
@@ -144,15 +146,29 @@ def _prepare(
         art_b = body_to_articulation[b]
     a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
     b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
+    support_gap_limit = float(0.0)
+    if sa >= 0:
+        support_gap_limit += shape_gap[sa]
+    if sb >= 0:
+        support_gap_limit += shape_gap[sb]
+    if contact_gap_gate > 0.0:
+        support_gap_limit = wp.min(support_gap_limit, contact_gap_gate)
     # Match the allocator's gap filters before choosing anchors. Normals that
     # remain eligible can still support the patch without carrying an anchor.
     eligible = contact_gap_gate <= 0.0 or gap <= contact_gap_gate
     if a_non_free and b_non_free:
+        if articulation_pair_gap_gate > 0.0:
+            support_gap_limit = wp.min(support_gap_limit, articulation_pair_gap_gate)
         eligible = eligible and (articulation_pair_gap_gate <= 0.0 or gap <= articulation_pair_gap_gate)
         if art_a == art_b:
+            if same_articulation_gap_gate > 0.0:
+                support_gap_limit = wp.min(support_gap_limit, same_articulation_gap_gate)
             eligible = eligible and (same_articulation_gap_gate <= 0.0 or gap <= same_articulation_gap_gate)
     if friction_articulation_pairs_only == 0 or (a_non_free and b_non_free):
         eligible = eligible and gap <= friction_gap
+    # Friction-only filters suppress rows without ending contact support;
+    # filtered regions must still be able to carry their anchor history.
+    frame.support_gap_limit[c] = wp.max(support_gap_limit, 0.0)
     frame.eligible[c] = int(eligible)
     flip = int(ka > kb)
     if flip != 0:
@@ -360,10 +376,11 @@ def _build(
                 # into creep; genuine sliding is released by ``finish_patch_impulses``.
                 if not (
                     wp.dot(old_n, n) >= 0.995
-                    # Support witnesses preserve the original penetration. A
-                    # midpoint anchor's separation alone mistakes decompression
-                    # for release, while a diameter-based gate accepts rocking.
-                    and support_gap <= wp.max(current_gap, 0.0) + 1.0e-5 * r
+                    # Honor the existing contact envelope: a zero-gap test drops
+                    # valid speculative contacts during a squeeze. Surface
+                    # witnesses retain penetration during decompression and
+                    # reject rocking beyond the same envelope as fresh contacts.
+                    and support_gap <= wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r
                     and wp.length_sq(tangent_delta) <= 0.01 * r * r
                     and wp.abs(wp.dot(delta, n)) <= 0.1 * r
                     and wp.abs(wp.dot(0.5 * (pa + pb) - frame.center[c], n)) <= 0.05 * r
@@ -570,6 +587,7 @@ class _FrictionPatchState:
             setattr(frame, field, wp.zeros(n, dtype=wp.vec3, device=device))
         frame.mu = wp.zeros(n, dtype=wp.vec2, device=device)
         frame.radius = wp.zeros(n, dtype=float, device=device)
+        frame.support_gap_limit = wp.zeros(n, dtype=float, device=device)
         for field in (
             "body_a",
             "body_b",
@@ -613,6 +631,7 @@ class _FrictionPatchState:
                 contacts.rigid_contact_margin1,
                 model.shape_body,
                 model.shape_material_mu,
+                model.shape_gap,
                 self.body_radius,
                 state.body_q,
                 body_to_articulation,

@@ -10,6 +10,8 @@ resets track world ownership even when contact rows are rejected. Shape geometry
 updates retire affected anchors while preserving unrelated bodies' history.
 Carried surface witnesses also retire anchors lifted by rocking or partial
 release, without discarding history during decompression that remains in contact.
+Support uses the existing shape contact gaps and tighter normal-contact gap filters,
+preserving speculative grasp contacts without introducing another tuning control.
 
 Uniform pad-friction randomization should assign one sampled coefficient to all
 of the pad's convex shapes; genuinely different coefficients define separate
