@@ -107,8 +107,8 @@ class TestContactTorsion(unittest.TestCase):
 
     def test_default_off_equivalent(self):
         """Keep the zero-radius option exactly equivalent to prefeature output."""
-        reference, *_ = fixture()
-        actual, *_ = fixture(0.0)
+        reference, *_ = fixture(0.0)
+        actual, *_ = fixture(0.01, contact_torsion_shape_indices=())
         for key in reference:
             np.testing.assert_array_equal(actual[key], reference[key], err_msg=key)
 
@@ -123,7 +123,11 @@ class TestContactTorsion(unittest.TestCase):
     def test_zero_friction_and_zero_load(self):
         """Apply no torsion when friction or compressive normal load vanishes."""
         for options in ({"mu": 0.0}, {"closing": 0.0}, {"separation": 0.004}):
-            actual, _solver, *_ = fixture(0.01, **options)
+            actual, solver, *_ = fixture(0.01, **options)
+            if "closing" in options:
+                self.assertGreater(solver._torsion_stats["rows"], 0)
+            else:
+                self.assertEqual(solver._torsion_stats["rows"], 0)
             active = actual["row_type"] == 7
             self.assertLess(np.abs(actual["impulses"][active]).max(initial=0), 1e-9)
 
@@ -197,8 +201,9 @@ class TestContactTorsion(unittest.TestCase):
             self.assertLessEqual(int(solver.constraint_count.numpy().max()), solver.dense_max_constraints)
         for velocity in velocities[1:]:
             np.testing.assert_allclose(velocity, velocities[0], atol=2e-5)
+        baseline, *_ = fixture(0.0, center_only=True)
         with self.assertRaisesRegex(RuntimeError, "capacity exceeded"):
-            fixture(0.01, center_only=True, row_limit=27)
+            fixture(0.01, center_only=True, row_limit=int(baseline["count"][0]))
 
     def test_public_shape_selection(self):
         """Resolve public index and regex scopes without private model patches."""
@@ -242,11 +247,11 @@ class TestContactTorsion(unittest.TestCase):
             with wp.ScopedCapture():
                 solver.step(initial, output, model.control(), contacts, 0.0025)
 
-    def test_compliance_combination_is_rejected(self):
-        """Reject a separately enabled compliant response before combining mechanisms."""
+    def test_hydro_combination_is_rejected(self):
+        """Reject actual hydro contact stiffness before combining contact mechanisms."""
         _, solver, model, initial, contacts = fixture(0.01)
-        solver.contact_compliance = True
-        with self.assertRaisesRegex(ValueError, "compliance"):
+        contacts.rigid_contact_stiffness = wp.ones(contacts.rigid_contact_max, device=model.device)
+        with self.assertRaisesRegex(ValueError, "hydroelastic"):
             solver.step(initial, model.state(), model.control(), contacts, 0.0025)
 
 

@@ -17,10 +17,22 @@ import numpy as np
 import warp as wp
 
 from ...geometry import GeoType
+from ...utils.selection import match_labels
+from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 
 _TOUCH_TOLERANCE = 1.0e-5
 _NORMAL_COSINE = 0.999
 _MAX_GROUP_CONTACTS = 4096
+_SUPPORTED_TYPES = (
+    GeoType.SPHERE,
+    GeoType.BOX,
+    GeoType.CAPSULE,
+    GeoType.CYLINDER,
+    GeoType.CONE,
+    GeoType.ELLIPSOID,
+    GeoType.PLANE,
+    GeoType.CONVEX_MESH,
+)
 
 
 def configure_contact_torsion(solver, radius, indices, patterns):
@@ -52,14 +64,20 @@ def configure_contact_torsion(solver, radius, indices, patterns):
                 regex = re.compile(pattern)
             except re.error as error:
                 raise ValueError("Invalid contact_torsion_shape_patterns regex") from error
-            matches = {i for i, label in enumerate(solver.model.shape_label) if regex.fullmatch(label)}
+            matches = set(match_labels(solver.model.shape_label, regex))
             if not matches:
                 raise ValueError(f"contact_torsion_shape_patterns matched no shapes: {pattern!r}")
             selected.update(matches)
         selected = frozenset(selected)
-    solver.contact_torsion_radius = radius
-    solver.contact_torsion_shape_indices = indices
-    solver.contact_torsion_shape_patterns = patterns
+    if radius > 0 and selected is not None:
+        types = solver.model.shape_type.numpy()
+        unsupported = [i for i in selected if types[i] not in _SUPPORTED_TYPES]
+        if unsupported:
+            raise ValueError(f"Unsupported contact torsion shape indices: {unsupported}")
+    solver._contact_torsion_radius = radius
+    solver._contact_torsion_enabled = radius > 0
+    solver._contact_torsion_shape_indices = indices
+    solver._contact_torsion_shape_patterns = patterns
     solver._contact_torsion_shape_set = selected
     solver._torsion_stats = {}
     if radius > 0 and (
@@ -74,10 +92,11 @@ def configure_contact_torsion(solver, radius, indices, patterns):
         or solver.pgs_debug
         or solver.pgs_contact_regularization != 0.0
         or not solver.enable_contact_friction
+        or getattr(solver, "friction_anchor_beta", 0.0) > 0.0
     ):
         raise ValueError(
             "Contact torsion requires CUDA non-differentiable matrix_free/immediate/current/"
-            "interleaved, without warmstart, regularization, debug, or velocity post-passes"
+            "interleaved, without warmstart, regularization, debug, persistent friction patches, or velocity post-passes"
         )
 
 
@@ -108,6 +127,8 @@ def _contact_groups(solver, state, contacts):
     count = int(contacts.rigid_contact_count.numpy()[0])
     if count > contacts.rigid_contact_max:
         raise RuntimeError("Contact input overflow before contact torsion")
+    if count == 0:
+        return []
     stiffness = contacts.rigid_contact_stiffness
     if stiffness is not None and np.any(stiffness.numpy()[:count] > 0):
         raise ValueError("Contact torsion does not support hydroelastic contacts")
@@ -126,16 +147,7 @@ def _contact_groups(solver, state, contacts):
     poses = state.body_q.numpy()
     row_types = solver.row_type.numpy()
     parents = solver.row_parent.numpy()
-    supported = (
-        GeoType.SPHERE,
-        GeoType.BOX,
-        GeoType.CAPSULE,
-        GeoType.CYLINDER,
-        GeoType.CONE,
-        GeoType.ELLIPSOID,
-        GeoType.PLANE,
-        GeoType.CONVEX_MESH,
-    )
+    row_counts = solver.constraint_count.numpy()
     groups = {}
     selected = solver._contact_torsion_shape_set
     admitted = 0
@@ -146,9 +158,19 @@ def _contact_groups(solver, state, contacts):
             continue
         if paths[c] != 0 or slot < 0:
             continue
-        if shape_types[a] not in supported or shape_types[b] not in supported:
+        if shape_types[a] not in _SUPPORTED_TYPES or shape_types[b] not in _SUPPORTED_TYPES:
             continue
-        if slot + 2 >= row_types.shape[1] or row_types[world, slot + 1] != 2 or parents[world, slot + 1] != slot:
+        if (
+            world < 0
+            or world >= len(row_counts)
+            or slot + 2 >= row_counts[world]
+            or slot + 2 >= row_types.shape[1]
+            or row_types[world, slot] != PGS_CONSTRAINT_TYPE_CONTACT
+            or any(
+                row_types[world, slot + k] != PGS_CONSTRAINT_TYPE_FRICTION or parents[world, slot + k] != slot
+                for k in (1, 2)
+            )
+        ):
             continue
         ba, bb = int(shape_body[a]), int(shape_body[b])
         pa, pb = points_a[c].copy(), points_b[c].copy()
@@ -181,18 +203,22 @@ def _contact_groups(solver, state, contacts):
 
 def prepare_torsion_rows(solver, state, augmented_state, contacts):
     """Append current touching-group angular rows before H-inverse/J response."""
-    if getattr(solver, "contact_compliance", False):
-        raise ValueError("Contact torsion combined with contact compliance is not supported")
+    if getattr(solver, "friction_anchor_beta", 0.0) > 0.0 or getattr(solver, "_friction_anchors_enabled", False):
+        raise ValueError("Contact torsion combined with persistent friction patches is not supported")
     if wp.get_stream(solver.model.device).is_capturing:
         raise RuntimeError("Experimental torsion host grouping does not support CUDA graph capture")
     solver._torsion_stats = {"rows": 0, "groups": []}
     if contacts is None:
         return
+    # The allocator rolls counters back on failure; count <= capacity cannot
+    # prove that every contact was retained. Tracking is mandatory for torsion.
+    if np.any(solver._row_dropped_dense.numpy()):
+        raise RuntimeError("Dense contact row overflow before contact torsion; refusing dropped rows")
     groups = _contact_groups(solver, state, contacts)
+    if not groups:
+        return
     count = solver.constraint_count.numpy()
-    raw_count = solver.slot_counter.numpy()
-    if np.any(raw_count > solver.dense_max_constraints):
-        raise RuntimeError("Dense input overflow before experimental torsion; refusing lost rows")
+    membership = np.full(solver._contact_torsion_group.shape, -1, dtype=np.int32)
     fields = {
         key: getattr(solver, key).numpy()
         for key in (
@@ -228,11 +254,11 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
         count[world] += 1
         for field in fields.values():
             field[world, row] = 0
-        fields["row_type"][world, row] = 7
+        fields["row_type"][world, row] = PGS_CONSTRAINT_TYPE_TORSION
         fields["row_parent"][world, row] = group[0].slot
-        fields["row_mu"][world, row] = solver.contact_torsion_radius
+        fields["row_cfm"][world, row] = solver.pgs_cfm
         for witness in group:
-            fields["row_parent"][world, witness.slot] = row
+            membership[world, witness.slot] = row
         normal = group[0].normal
         for body, sign in ((group[0].body_a, 1.0), (group[0].body_b, -1.0)):
             if body < 0:
@@ -271,6 +297,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
         solver.J_by_size[size].assign(values)
     solver.constraint_count.assign(count)
     solver.slot_counter.assign(count)
+    solver._contact_torsion_group.assign(membership)
 
 
 def torque_sweep_source(dofs):
@@ -278,13 +305,13 @@ def torque_sweep_source(dofs):
     return f"""
         if (row_phase == 0 || row_phase == 1 || row_phase == 4) {{
             for (int spin = 0; spin < m_dense; ++spin) {{
-                if (world_row_type.data[off_dense + spin] != 7) continue;
-                float radius = world_row_mu.data[off_dense + spin];
+                if (world_row_type.data[off_dense + spin] != {PGS_CONSTRAINT_TYPE_TORSION}) continue;
+                float radius = contact_torsion_radius;
                 float normal_budget = 0.0f;
                 float sliding_used = 0.0f;
                 for (int n = 0; n + 2 < m_dense; ++n) {{
-                    if (world_row_type.data[off_dense + n] != 0 ||
-                        world_row_parent.data[off_dense + n] != spin) continue;
+                    if (world_row_type.data[off_dense + n] != {PGS_CONSTRAINT_TYPE_CONTACT} ||
+                        world_torsion_group.data[off_dense + n] != spin) continue;
                     float mu = fmaxf(world_row_mu.data[off_dense + n + 1], 0.0f);
                     normal_budget += mu * fmaxf(s_lam_dense[n], 0.0f);
                     float a = s_lam_dense[n + 1], b = s_lam_dense[n + 2];
@@ -303,7 +330,7 @@ def torque_sweep_source(dofs):
                 float residual = __shfl_sync(MASK, dot, 0) + rhs_bias.data[off_dense + spin];
                 float old = s_lam_dense[spin];
                 float diagonal = world_diag.data[off_dense + spin];
-                float trial = diagonal > 0.0f ? old - residual / diagonal : 0.0f;
+                float trial = diagonal > 0.0f ? old - omega * residual / diagonal : 0.0f;
                 float next = fminf(fmaxf(trial, -bound), bound);
                 float delta = next - old;
                 if (delta != 0.0f) {{

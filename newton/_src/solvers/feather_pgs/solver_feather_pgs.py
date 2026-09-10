@@ -54,6 +54,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_CONSTRAINT_TYPE_TORSION,
     PREELIM_MAX_ROWS,
     PROPAGATION_COLOR_TAIL,
     accumulate_group_diag_worlds,
@@ -683,6 +684,21 @@ class SolverFeatherPGS(SolverBase):
             )
         )
 
+    @property
+    def contact_torsion_radius(self) -> float:
+        """Experimental construction-only effective spin radius [m]."""
+        return self._contact_torsion_radius
+
+    @property
+    def contact_torsion_shape_indices(self) -> tuple[int, ...] | None:
+        """Experimental construction-only global shape selection."""
+        return self._contact_torsion_shape_indices
+
+    @property
+    def contact_torsion_shape_patterns(self) -> tuple[str, ...] | None:
+        """Experimental construction-only shape-label regular expressions."""
+        return self._contact_torsion_shape_patterns
+
     def __init__(
         self,
         model: Model,
@@ -757,11 +773,17 @@ class SolverFeatherPGS(SolverBase):
                 material torsion default. Sliding and spin share one Coulomb budget.
                 Currently supports dense articulated contacts in CUDA matrix-free,
                 immediate/current/interleaved mode without warmstarting, graph capture,
-                hydroelastic contact, regularization, or velocity post-passes. Host
+                hydroelastic contact, persistent friction patches, regularization,
+                debug mode, or velocity post-passes. Radius and selectors are
+                construction-only; recreate the solver to change them. Capacity
+                exhaustion raises even when optional overflow diagnostics are off. Host
                 grouping is diagnostic, not optimized for throughput. This experimental
                 parameter may change without the normal deprecation policy.
             contact_torsion_shape_indices: Optional global shape indices selecting
-                contacts with at least one selected collider. None selects all shapes;
+                contacts with at least one selected collider. Supported geometry is
+                sphere, box, capsule, cylinder, cone, ellipsoid, plane, and convex mesh.
+                Explicitly selecting unsupported geometry raises; without selectors,
+                contacts involving unsupported geometry are skipped. None selects all shapes;
                 an empty tuple selects none. Mutually exclusive with shape patterns.
                 Experimental, with the same compatibility limitations as the radius.
             contact_torsion_shape_patterns: Optional regex patterns, full-matched against
@@ -1570,6 +1592,14 @@ class SolverFeatherPGS(SolverBase):
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
+        # CONTACT row_parent belongs to ordinary friction/patch load linkage.
+        # Torsion must never reinterpret it, including when patch PRs are merged.
+        self._contact_torsion_group = wp.full(
+            self.row_parent.shape if self._contact_torsion_enabled else (1, 1),
+            -1,
+            dtype=wp.int32,
+            device=model.device,
+        )
         # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
         # so that path must retain the existing post-correction world gather.
         self._hinv_jt_writes_world = (
@@ -1611,7 +1641,7 @@ class SolverFeatherPGS(SolverBase):
         # three-family one-shot flag; row_watermark additionally accumulates
         # whole-run high-water telemetry for explicit readback.
         self._row_watermark = bool(row_watermark)
-        self._track_row_capacity = self._row_watermark or self.warn_constraint_overflow
+        self._track_row_capacity = self._row_watermark or self.warn_constraint_overflow or self._contact_torsion_enabled
         wm_device = model.device
         if self._track_row_capacity:
             self._row_dropped_dense = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
@@ -4208,7 +4238,7 @@ class SolverFeatherPGS(SolverBase):
                 shared_metadata=shared_metadata,
                 skip_local_internal_worlds=self._local_internal_fast_path,
                 local_internal_max_constraints=self._dense_internal_max_rows,
-                contact_torsion=self.contact_torsion_radius > 0.0,
+                contact_torsion=self._contact_torsion_enabled,
             )
 
         self._pgs_solve_mf_kernel = None
@@ -4630,6 +4660,7 @@ class SolverFeatherPGS(SolverBase):
                     "row_type": self.row_type,
                     "row_parent": self.row_parent,
                     "row_mu": self.row_mu,
+                    "contact_torsion_group": self._contact_torsion_group,
                     "drive_target_vel_bias": self.drive_target_vel_bias,
                     "drive_vel_multiplier": self.drive_vel_multiplier,
                     "drive_impulse_multiplier": self.drive_impulse_multiplier,
@@ -4657,6 +4688,8 @@ class SolverFeatherPGS(SolverBase):
                             "mf_max_constraints": int(self.mf_max_constraints),
                             "max_world_dofs": int(self.max_world_dofs),
                             "friction_mode": str(self.friction_mode),
+                            "contact_torsion": self._contact_torsion_enabled,
+                            "contact_torsion_radius": self._contact_torsion_radius,
                             "has_drive_rows": self.drive_mode == "physx_pgs",
                             "has_dense_velocity_limit_rows": bool(self.enable_joint_velocity_limits),
                             "fuse_vel_limits": bool(self.fuse_joint_velocity_limits),
@@ -4696,6 +4729,8 @@ class SolverFeatherPGS(SolverBase):
                         self.row_type,
                         self.row_parent,
                         self.row_mu,
+                        self._contact_torsion_group,
+                        self._contact_torsion_radius,
                         self.drive_target_vel_bias,
                         self.drive_vel_multiplier,
                         self.drive_impulse_multiplier,
@@ -6049,7 +6084,7 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self._nvtx, synchronize=False):
             self._stage4_build_rows(state_in, state_aug, control, contacts, dt)
-            if self.contact_torsion_radius > 0.0:
+            if self._contact_torsion_enabled:
                 prepare_torsion_rows(self, state_in, state_aug, contacts)
 
         if self.pgs_mode == "matrix_free":
@@ -16701,6 +16736,8 @@ def _get_pgs_solve_mf_gs_kernel(
         else ""
     )
     dense_load_start = "load_lo" if fuse_vel_limits else "dense_lo"
+    torsion_skip = f"if (row_type == {PGS_CONSTRAINT_TYPE_TORSION}) continue;" if contact_torsion else ""
+    torsion_sweep = torque_sweep_source(D) if contact_torsion else ""
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -16810,6 +16847,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
 
             int row_type = s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK};
+            {torsion_skip}
             // row_phase 0: all rows.
             // row_phase 1: contact/friction rows.
             // row_phase 2: internal articulation rows.
@@ -17070,6 +17108,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
         }}
 
+        {torsion_sweep}
         // Friction rows may intentionally remain inactive until a later
         // iteration. Once they are active, an exactly stationary full sweep
         // is a fixed point, so subsequent sweeps are redundant.
@@ -17096,17 +17135,6 @@ def _get_pgs_solve_mf_gs_kernel(
     }}
 #endif
 """
-
-    if contact_torsion:
-        # Spin rows use their group's residual friction budget, never a bilateral solve.
-        snippet = snippet.replace(
-            "            // row_phase 0: all rows.",
-            "            if (row_type == 7) continue;\n            // row_phase 0: all rows.",
-        )
-        snippet = snippet.replace(
-            "        // Friction rows may intentionally remain inactive",
-            torque_sweep_source(D) + "\n        // Friction rows may intentionally remain inactive",
-        )
 
     # ncu occupancy fix (opt-in): stream the matrix-free impulse vector from global
     # (mf_impulses) instead of holding it resident as s_lam_mf[M_MF] in shared memory.
@@ -17211,6 +17239,8 @@ def _get_pgs_solve_mf_gs_kernel(
         world_row_type: wp.array2d[int],
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
+        world_torsion_group: wp.array2d[int],
+        contact_torsion_radius: float,
         world_drive_target_vel_bias: wp.array2d[float],
         world_drive_vel_multiplier: wp.array2d[float],
         world_drive_impulse_multiplier: wp.array2d[float],
@@ -17255,6 +17285,8 @@ def _get_pgs_solve_mf_gs_kernel(
         world_row_type: wp.array2d[int],
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
+        world_torsion_group: wp.array2d[int],
+        contact_torsion_radius: float,
         world_drive_target_vel_bias: wp.array2d[float],
         world_drive_vel_multiplier: wp.array2d[float],
         world_drive_impulse_multiplier: wp.array2d[float],
@@ -17299,6 +17331,8 @@ def _get_pgs_solve_mf_gs_kernel(
             world_row_type,
             world_row_parent,
             world_row_mu,
+            world_torsion_group,
+            contact_torsion_radius,
             world_drive_target_vel_bias,
             world_drive_vel_multiplier,
             world_drive_impulse_multiplier,
