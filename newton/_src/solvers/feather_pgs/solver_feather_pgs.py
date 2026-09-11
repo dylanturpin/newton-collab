@@ -851,6 +851,9 @@ class SolverFeatherPGS(SolverBase):
                 and impulses persist. The displacement follows pose increments at the current row points,
                 including externally imposed motion and position-only solver passes; it does not tether rolling objects to
                 an old footprint. This applies equally to analytic shapes, convex hulls, and meshes.
+                After teleporting a body, call ``reset(state)`` (optionally with ``world_mask``)
+                to discard history, since jumps within the correlation limits contribute to
+                displacement correction instead of automatically re-anchoring.
                 The tangent RHS includes ``friction_anchor_beta * displacement / dt``. Unloaded
                 regions discard history. Regions with no friction rows for a step (gap filters or
                 row capacity) retain supported history. Patch reduction approximates the friction
