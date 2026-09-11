@@ -1321,5 +1321,25 @@ add_example_test(
 )
 
 
+class TestFeatherPGSExamples(NewtonTestCase):
+    pass
+
+
+for example_name in (
+    "feather_pgs.example_fpgs_dominoes",
+    "feather_pgs.example_fpgs_wrecking_ball",
+    "feather_pgs.example_fpgs_pyramid",
+    "feather_pgs.example_fpgs_jenga",
+    "feather_pgs.example_fpgs_galton",
+):
+    add_example_test(
+        TestFeatherPGSExamples,
+        name=example_name,
+        devices=cuda_test_devices,
+        use_viewer=True,
+        allow_output_regexes=_CONTACT_EXAMPLE_ALLOW_OUTPUT_REGEXES,
+    )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

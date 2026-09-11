@@ -813,6 +813,61 @@ If you run the examples from a source checkout with uv, use
     </td>
   </tr>
   <tr>
+    <td colspan="3"><h3>FeatherPGS Examples</h3></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/feather_pgs/example_fpgs_dominoes.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fpgs_dominoes.jpg" alt="FeatherPGS Dominoes">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/feather_pgs/example_fpgs_wrecking_ball.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fpgs_wrecking_ball.jpg" alt="FeatherPGS Wrecking Ball">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/feather_pgs/example_fpgs_pyramid.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fpgs_pyramid.jpg" alt="FeatherPGS Pyramid">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fpgs_dominoes</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fpgs_wrecking_ball</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fpgs_pyramid</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/feather_pgs/example_fpgs_jenga.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fpgs_jenga.jpg" alt="FeatherPGS Jenga">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/feather_pgs/example_fpgs_galton.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_fpgs_galton.jpg" alt="FeatherPGS Galton Board">
+      </a>
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fpgs_jenga</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples fpgs_galton</code>
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
     <td colspan="3"><h3>Softbody Examples</h3></td>
   </tr>
   <tr>
