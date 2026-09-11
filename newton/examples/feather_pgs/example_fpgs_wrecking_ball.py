@@ -4,8 +4,8 @@
 ###########################################################################
 # Example FeatherPGS Wrecking Ball
 #
-# A seventeen-tonne ball hangs from a crane on a twelve-link ball-jointed chain
-# and swings into an open three-storey building: stacked-block concrete
+# A seventeen-tonne ball hangs from a crane on a sixteen-link ball-jointed chain
+# and swings into an open six-storey building: stacked-block concrete
 # columns, slab segments and furnished floors, with no walls so the collapse
 # stays visible. Nothing is glued: every column block, slab and piece of
 # furniture is a free body held in place by friction. The chain is a Featherstone articulation with
@@ -27,15 +27,17 @@ import newton
 import newton.examples
 from newton.examples.feather_pgs._showreel import Stepper, assert_finite, make_solver
 
-FLOORS = 3
+FLOORS = 6
 WIDTH, DEPTH = 14.0, 10.0
 FLOOR_H, SLAB_T, COLUMN = 2.7, 0.3, 0.55
 EAVE = 0.4  # slab overhang past the outer column faces
 MU_CONCRETE = 0.6
 SLAB_DENSITY = 2400.0
 BAYS = 4
-COLUMN_SEGMENTS = 3  # stacked blocks per storey column
-LINKS = 12
+HIT_FLOOR = 1  # storey the ball strikes at mid-height
+STATIC_BASE = True  # ground-floor columns are fixed foundations
+COLUMN_SEGMENTS = 2  # stacked blocks per column on the struck storey
+LINKS = 16
 # A 17:1 ball-to-link mass ratio keeps the articulated chain free of velocity
 # spikes on secondary impacts; thinner links or a heavier ball spike past 60 m/s.
 LINK_HALF, LINK_R = 0.5, 0.18
@@ -43,7 +45,13 @@ BALL_RADIUS = 0.8
 # The bottom of the swing puts the ball centre mid-height on the first floor, clear
 # of the slabs above and below it, so the impact takes out columns rather than
 # wedging the ball under a slab edge.
-ANCHOR = (-WIDTH / 2 - 0.3, 0.0, FLOOR_H * 1.5 - 0.15 + 2 * LINKS * LINK_HALF + BALL_RADIUS)
+# The anchor sits just outside the slab overhang so the hanging chain clears the
+# floors above the hit and the ball still reaches 0.4 m into the column face.
+ANCHOR = (
+    -WIDTH / 2 - EAVE - LINK_R - 0.1,
+    0.0,
+    FLOOR_H * (HIT_FLOOR + 0.5) - 0.15 + 2 * LINKS * LINK_HALF + BALL_RADIUS,
+)
 RELEASE_ANGLE = math.radians(60.0)
 SOLVER_OVERRIDES = {
     "pgs_iterations": 8,
@@ -98,7 +106,7 @@ class Example:
         self.release()
 
         self.viewer.set_model(self.model)
-        self.viewer.set_camera(pos=wp.vec3(-21.0, -27.0, 11.0), pitch=-15.0, yaw=52.0)
+        self.viewer.set_camera(pos=wp.vec3(-30.0, -38.0, 15.0), pitch=-12.0, yaw=52.0)
 
     def _box(self, builder, cfg, color, center, half, yaw=0.0):
         body = builder.add_body(
@@ -164,16 +172,33 @@ class Example:
         bay = WIDTH / BAYS
         for floor in range(FLOORS):
             z0 = floor * FLOOR_H
-            # Columns: corners, mid-edges, and interior bays, each a stack of short
-            # blocks. A monolithic column wedged between two slabs can only slide,
-            # and sliding under the building's weight is a friction brake that eats
-            # the ball's energy without dropping anything. A knocked-out block leaves
-            # the blocks above it unsupported instead.
-            seg_h = col_h / COLUMN_SEGMENTS
+            # Columns: corners, mid-edges, and interior bays. On the struck storey each
+            # column is a stack of short blocks: a monolithic column wedged between two
+            # slabs can only slide, and sliding under the building's weight is a
+            # friction brake that eats the ball's energy without dropping anything,
+            # whereas a knocked-out block leaves the blocks above it unsupported.
+            # Every other storey keeps one block per column, because a velocity-level
+            # PGS stack creeps and sways once it is much more than a dozen bodies tall;
+            # three blocks on the struck storey already topple under five floors of load.
+            segments = COLUMN_SEGMENTS if floor == HIT_FLOOR else 1
+            seg_h = col_h / segments
             for gx in range(BAYS + 1):
                 for gy in (-DEPTH / 2, 0.0, DEPTH / 2):
                     x = -WIDTH / 2 + gx * bay
-                    for k in range(COLUMN_SEGMENTS):
+                    if floor == 0 and STATIC_BASE:
+                        # Ground-floor columns are foundations: fixing them removes the
+                        # base slide of the whole stack, the largest creep mode.
+                        builder.add_shape_box(
+                            -1,
+                            xform=wp.transform(wp.vec3(x, gy, z0 + col_h / 2), wp.quat_identity()),
+                            hx=COLUMN / 2,
+                            hy=COLUMN / 2,
+                            hz=col_h / 2 - 0.002,
+                            cfg=self.concrete,
+                            color=CONCRETE,
+                        )
+                        continue
+                    for k in range(segments):
                         self._box(
                             builder,
                             self.concrete,
@@ -291,7 +316,9 @@ class Example:
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
-        parser.set_defaults(num_frames=600)
+        # The first swing knocks out the struck storey's mid column and the second swing,
+        # about four seconds later, brings the tower down; twelve seconds covers both.
+        parser.set_defaults(num_frames=720)
         return parser
 
 
