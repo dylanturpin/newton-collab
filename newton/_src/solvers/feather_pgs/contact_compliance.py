@@ -147,7 +147,9 @@ def _prepare_compliant_rows(self):
     dense_parent, mf_parent = self.row_parent.numpy(), self.mf_row_parent.numpy()
     dense_type, mf_type = self.row_type.numpy(), self.mf_row_type.numpy()
     dense_cfm = self.row_cfm.numpy()
-    dense_target, mf_target = self.target_velocity.numpy(), self.mf_target_velocity.numpy()
+    dense_target = self.target_velocity.numpy()
+    # Without prescribed bodies Newton allocates only a (1, 1) placeholder.
+    mf_target = self.mf_target_velocity.numpy() if self._has_prescribed_response else None
     active = 0
     skipped = 0
     seen_rows = set()
@@ -193,7 +195,7 @@ def _prepare_compliant_rows(self):
             if mf_type[world, slot] != 0 or mf_inv[world, slot] <= 0:
                 raise RuntimeError("Contact map no longer points to an effective MF normal row")
             self._compliant_mf_gamma[world, slot] = gamma
-            self._compliant_mf_base[world, slot] = bias - mf_target[world, slot]
+            self._compliant_mf_base[world, slot] = bias - (mf_target[world, slot] if mf_target is not None else 0.0)
             mf_inv[world, slot] = 1.0 / (1.0 / mf_inv[world, slot] - self.pgs_cfm + gamma)
             children = (mf_parent[world] == slot) & (mf_type[world] == 2)
             mf_mu[world, children] *= friction_weight

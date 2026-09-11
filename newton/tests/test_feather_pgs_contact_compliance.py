@@ -102,8 +102,8 @@ def run_fixture(
         return np.asarray(trace), seen_paths, solver, float(model.body_mass.numpy()[body])
 
 
-def run_native_hydro_fixture():
-    """Consume emitted SDF hydro coefficients unchanged on an articulated sphere."""
+def run_native_hydro_fixture(*, articulated=True):
+    """Consume emitted SDF hydro coefficients unchanged on dense or MF sphere rows."""
     with wp.ScopedDevice(os.environ.get("HYDRO_TEST_DEVICE", "cuda:0")):
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
         builder.default_shape_cfg = newton.ModelBuilder.ShapeConfig(
@@ -119,9 +119,12 @@ def run_native_hydro_fixture():
             body=-1, hx=0.1, hy=0.1, hz=0.025, xform=wp.transform(wp.vec3(0, 0, -0.025), wp.quat_identity())
         )
         transform = wp.transform(wp.vec3(0, 0, 0.048), wp.quat_identity())
-        body = builder.add_link(xform=transform)
-        joint = builder.add_joint_prismatic(parent=-1, child=body, axis=newton.Axis.Z, parent_xform=transform)
-        builder.add_articulation([joint])
+        if articulated:
+            body = builder.add_link(xform=transform)
+            joint = builder.add_joint_prismatic(parent=-1, child=body, axis=newton.Axis.Z, parent_xform=transform)
+            builder.add_articulation([joint])
+        else:
+            body = builder.add_body(xform=transform)
         cfg = builder.default_shape_cfg.copy()
         cfg.density = 0.3 / (4 / 3 * np.pi * 0.05**3)
         builder.add_shape_sphere(body, radius=0.05, cfg=cfg)
@@ -161,7 +164,7 @@ def run_native_hydro_fixture():
                 pgs_iterations=128,
                 pgs_contact_regularization=0.0,
                 dense_max_constraints=2048,
-                mf_max_constraints=32,
+                mf_max_constraints=32 if articulated else 2048,
                 pgs_beta=0.05,
             )
             output = model.state()
@@ -172,12 +175,14 @@ def run_native_hydro_fixture():
             step_input.clear_forces()
             solver.step(step_input, output, model.control(), contacts, 0.0025)
             paths = solver.contact_path.numpy()[:count]
-            if not np.all(paths == 0):
-                raise AssertionError("Native hydro fixture did not use dense articulated rows")
+            if not np.all(paths == (0 if articulated else 1)):
+                raise AssertionError("Native hydro fixture did not use the requested contact route")
+            impulses = solver.impulses if articulated else solver.mf_impulses
+            row_types = solver.row_type if articulated else solver.mf_row_type
             results["compliant" if enabled else "stock_law"] = {
                 "body_z_m": float(output.body_q.numpy()[body, 2]),
                 "joint_velocity_m_s": float(output.joint_qd.numpy()[0]),
-                "normal_impulse_N_s": float(solver.impulses.numpy()[0, solver.row_type.numpy()[0] == 0].sum()),
+                "normal_impulse_N_s": float(impulses.numpy()[0, row_types.numpy()[0] == 0].sum()),
                 "consumed_compliant_contacts": solver.compliance_contact_count,
             }
         for before, after in zip(inertia, (model.body_mass, model.body_com, model.body_inertia), strict=True):
@@ -256,6 +261,15 @@ class TestContactComplianceIntegration(unittest.TestCase):
         self.assertTrue(
             all(np.isfinite(list(result[key].values())).all() for key in ("compliant", "stock_law", "native_material"))
         )
+
+    def test_native_hydro_free_body_manifold(self):
+        """Handle multiple MF hydro normals without indexing a dummy prescribed-target buffer."""
+        result = run_native_hydro_fixture(articulated=False)
+        self.assertGreater(result["native_material"]["positive_stiffness_contacts"], 1)
+        self.assertEqual(
+            result["compliant"]["consumed_compliant_contacts"], result["native_material"]["positive_stiffness_contacts"]
+        )
+        self.assertTrue(np.isfinite(list(result["compliant"].values())).all())
 
 
 if __name__ == "__main__":
