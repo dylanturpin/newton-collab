@@ -5,10 +5,10 @@
 # Example FeatherPGS Wrecking Ball
 #
 # A seventeen-tonne ball hangs from a crane on a twelve-link ball-jointed chain
-# and swings into a three-storey building: concrete columns and slabs,
-# brick facade panels with glass strips, and furnished floors. Nothing is
-# glued: every column, panel, pane and piece of furniture is a free body
-# held in place by friction. The chain is a Featherstone articulation with
+# and swings into an open three-storey building: stacked-block concrete
+# columns, slab segments and furnished floors, with no walls so the collapse
+# stays visible. Nothing is glued: every column block, slab and piece of
+# furniture is a free body held in place by friction. The chain is a Featherstone articulation with
 # a seventeen-to-one mass ratio between the bob and its links.
 #
 # Command: python -m newton.examples fpgs_wrecking_ball
@@ -31,8 +31,7 @@ FLOORS = 3
 WIDTH, DEPTH = 14.0, 10.0
 FLOOR_H, SLAB_T, COLUMN = 2.7, 0.3, 0.55
 EAVE = 0.4  # slab overhang past the outer column faces
-MU_CONCRETE, MU_BRICK = 0.6, 0.6
-CLAD_GAP = 0.06  # clearance between cladding tops and the slab above
+MU_CONCRETE = 0.6
 SLAB_DENSITY = 2400.0
 BAYS = 4
 COLUMN_SEGMENTS = 3  # stacked blocks per storey column
@@ -55,8 +54,6 @@ SOLVER_OVERRIDES = {
 
 CONCRETE = wp.vec3(0.72, 0.70, 0.66)
 SLAB = wp.vec3(0.58, 0.58, 0.6)
-BRICK = wp.vec3(0.62, 0.26, 0.18)
-GLASS = wp.vec3(0.55, 0.8, 0.95)
 STEEL = wp.vec3(0.25, 0.26, 0.28)
 
 
@@ -66,9 +63,10 @@ class Example:
         self.viewer = viewer
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        # Two substeps at eight iterations with a small proximal regularization keep
-        # the seventeen-tonne impact finite; six iterations blow up in the debris pile.
-        self.sim_substeps = 2
+        # Four substeps at eight iterations with a small proximal regularization keep
+        # the seventeen-tonne ball finite once it sits in the debris pile; at two
+        # substeps it spikes past 20 m/s against the column blocks and goes non-finite.
+        self.sim_substeps = 4
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
         self.release_angle = RELEASE_ANGLE
@@ -80,8 +78,6 @@ class Example:
         # which velocity-level PGS handles; lighter debris blows up on impact.
         self.concrete = newton.ModelBuilder.ShapeConfig(density=2400.0, mu=MU_CONCRETE, restitution=0.0)
         self.slab_cfg = newton.ModelBuilder.ShapeConfig(density=SLAB_DENSITY, mu=MU_CONCRETE, restitution=0.0)
-        self.brick = newton.ModelBuilder.ShapeConfig(density=1800.0, mu=MU_BRICK, restitution=0.0)
-        self.glass = newton.ModelBuilder.ShapeConfig(density=2500.0, mu=0.4, restitution=0.0)
         self.wood = newton.ModelBuilder.ShapeConfig(density=700.0, mu=0.7, restitution=0.0)
         self.building = []
         self.slabs = []
@@ -185,26 +181,6 @@ class Example:
                             (x, gy, z0 + (k + 0.5) * seg_h),
                             (COLUMN / 2, COLUMN / 2, seg_h / 2 - 0.002),
                         )
-            # Facade: brick spandrel, glass strip and parapet stacked per bay on the front
-            # and back. The stack stops CLAD_GAP short of the slab above so the columns
-            # alone carry the floors and a knocked-out column actually drops something.
-            for gy, sign in ((-DEPTH / 2, 1.0), (DEPTH / 2, -1.0)):
-                for gx in range(BAYS):
-                    x = -WIDTH / 2 + (gx + 0.5) * bay
-                    y = gy + sign * 0.15
-                    self._box(builder, self.brick, BRICK, (x, y, z0 + 0.45), (bay / 2 - COLUMN / 2 - 0.02, 0.12, 0.45))
-                    self._box(builder, self.brick, BRICK, (x, y, z0 + 2.07), (bay / 2 - COLUMN / 2 - 0.02, 0.12, 0.27))
-                    self._box(builder, self.glass, GLASS, (x, y, z0 + 1.35), (bay / 2 - COLUMN / 2 - 0.04, 0.03, 0.44))
-            # Side walls: brick panels between the end columns.
-            for gx in (-WIDTH / 2, WIDTH / 2):
-                for gy in (-DEPTH / 4, DEPTH / 4):
-                    self._box(
-                        builder,
-                        self.brick,
-                        BRICK,
-                        (gx, gy, z0 + (col_h - CLAD_GAP) / 2),
-                        (0.12, DEPTH / 4 - COLUMN / 2 - 0.02, (col_h - CLAD_GAP) / 2 - 0.005),
-                    )
             # Furniture on every floor.
             self._sofa(builder, (-3.5, -1.5, z0), yaw=0.4)
             self._table(builder, (-3.5, 1.8, z0), yaw=0.2)
