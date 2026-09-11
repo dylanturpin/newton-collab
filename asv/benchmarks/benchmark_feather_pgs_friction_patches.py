@@ -12,6 +12,13 @@ footprint, total mass, and applied load stay fixed as contact density increases.
 Both revisions use contact matching for a like-for-like comparison; persistent
 patch anchors themselves do not require it. Compilation and warmup are excluded.
 
+Use ``--frozen-contacts`` to generate contacts once and restore the same input
+poses and velocities before every solve. Compare ``--beta 0`` with ``--beta 0.2``
+on the same revision to isolate patch construction plus solving from collision
+and trajectory differences. The JSON contact hash must match across that pair.
+State restoration costs are included in both runs. This mode measures solver
+cost on fixed contacts, not stability or end-to-end collision performance.
+
 Use ``--profile-stages`` to collect a separate uncaptured CUDA activity timeline
 after the throughput measurement, with warm starts independently controlled by
 ``--warmstart``. The timeline includes prepare/build/link/seed/finish/store kernel
@@ -23,6 +30,7 @@ Robotiq asset or evidence of that gripper's performance.
 """
 
 import argparse
+import hashlib
 import json
 import time
 from contextlib import contextmanager
@@ -63,7 +71,14 @@ def _time_patch_sort(patches):
 
 
 def run(
-    worlds: int, tiles: int, beta: float | None, steps: int, *, warmstart: bool = False, profile_stages: bool = False
+    worlds: int,
+    tiles: int,
+    beta: float | None,
+    steps: int,
+    *,
+    warmstart: bool = False,
+    profile_stages: bool = False,
+    frozen_contacts: bool = False,
 ):
     """Measure an even number of captured steps and report row counts and motion."""
     if worlds < 1 or tiles < 1 or tiles > 16 or steps < 2 or steps % 2:
@@ -105,10 +120,30 @@ def run(
     s0, s1 = model.state(), model.state()
     control = model.control()
 
+    frozen_inputs = []
+    contact_hash = None
+    if frozen_contacts:
+        pipeline.collide(s0, contacts)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        columns = []
+        for name in ("shape0", "shape1", "point0", "point1", "normal", "offset0", "offset1", "margin0", "margin1"):
+            values = getattr(contacts, "rigid_contact_" + name).numpy()[:count]
+            columns.append(values.reshape(count, -1))
+        packet = np.concatenate(columns, axis=1)
+        order = np.lexsort(tuple(packet[:, i] for i in range(packet.shape[1])))
+        contact_hash = hashlib.sha256(packet[order].tobytes()).hexdigest()
+        for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
+            value = getattr(s0, name)
+            if value is not None and value.size:
+                frozen_inputs.append((name, wp.clone(value)))
+
     def step(source, dest):
+        for name, snapshot in frozen_inputs:
+            wp.copy(getattr(source, name), snapshot)
         source.clear_forces()
         wp.launch(_apply_load, dim=model.body_count, inputs=[source.body_f], device=model.device)
-        pipeline.collide(source, contacts)
+        if not frozen_contacts:
+            pipeline.collide(source, contacts)
         solver.step(source, dest, control, contacts, 0.005)
 
     for _ in range(10):
@@ -137,6 +172,8 @@ def run(
         "beta": solver.friction_anchor_beta,
         "steps": steps,
         "warmstart": warmstart,
+        "frozen_contacts": frozen_contacts,
+        "contact_input_sha256": contact_hash,
         "milliseconds_per_step": elapsed * 1000 / steps,
         "contacts": int(contacts.rigid_contact_count.numpy()[0]),
         "normal_rows": normal_rows,
@@ -177,5 +214,14 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--warmstart", action="store_true")
     parser.add_argument("--profile-stages", action="store_true")
+    parser.add_argument("--frozen-contacts", action="store_true")
     args = parser.parse_args()
-    run(args.worlds, args.tiles, args.beta, args.steps, warmstart=args.warmstart, profile_stages=args.profile_stages)
+    run(
+        args.worlds,
+        args.tiles,
+        args.beta,
+        args.steps,
+        warmstart=args.warmstart,
+        profile_stages=args.profile_stages,
+        frozen_contacts=args.frozen_contacts,
+    )
