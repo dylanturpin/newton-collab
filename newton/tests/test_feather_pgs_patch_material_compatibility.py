@@ -44,7 +44,7 @@ class TestPatchMaterialCompatibility(unittest.TestCase):
         """Keep dense and MF material responses identical to explicit point friction."""
         for articulated in (False, True):
             with self.subTest(articulated=articulated):
-                options = dict(articulated=articulated, enabled=True, steps=20, friction_scale=0.4)
+                options = {"articulated": articulated, "enabled": True, "steps": 20, "friction_scale": 0.4}
                 with self.assertWarnsRegex(UserWarning, "velocity-only point friction"):
                     actual, paths, solver, _ = run_fixture(**options, solver_options={"friction_anchor_beta": None})
                 reference, reference_paths, _, _ = run_fixture(**options, solver_options={"friction_anchor_beta": 0.0})
