@@ -157,6 +157,23 @@ class TestParallelJointWarning(unittest.TestCase):
         with self.assertWarnsRegex(UserWarning, "undefined semantics"):
             builder.add_joint_prismatic(parent=body_b, child=body_a)
 
+    def test_loop_closing_joint_does_not_replace_tree_ancestor(self):
+        """A trailing loop edge must not create a cycle in the tree ancestry."""
+        builder = ModelBuilder()
+        body_a = builder.add_link(mass=1.0, label="A")
+        body_b = builder.add_link(mass=1.0, label="B")
+        root_joint = builder.add_joint_revolute(parent=-1, child=body_a)
+        tree_joint = builder.add_joint_revolute(parent=body_a, child=body_b)
+        with self.assertWarnsRegex(UserWarning, "undefined semantics"):
+            builder.add_joint_revolute(parent=body_b, child=body_a)
+        # Importers may retain loop-closing joints outside the articulation's
+        # kinematic tree range while they remain in the model joint arrays.
+        builder.add_articulation([root_joint, tree_joint])
+
+        model = builder.finalize(device="cpu")
+
+        assert_np_equal(model.joint_ancestor.numpy(), [-1, root_joint, tree_joint])
+
 
 class TestModelBuilderBvhConstructor(unittest.TestCase):
     def test_model_builder_forwards_bvh_constructors(self):

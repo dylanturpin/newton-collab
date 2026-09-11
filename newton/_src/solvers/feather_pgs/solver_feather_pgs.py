@@ -42,6 +42,7 @@ from ..semi_implicit.kernels_particle import (
     eval_triangle_forces,
 )
 from ..solver import SolverBase
+from . import contact_compliance as _contact_compliance
 from .contact_torsion import configure_contact_torsion, prepare_torsion_rows, torque_sweep_source, validate_torsion_step
 from .kernels import (
     FRICTION_MODE_BISECTION,
@@ -299,6 +300,7 @@ class _FeatherPGSModelPlan:
     prescribed_articulation: np.ndarray
     response_dof_count: np.ndarray
     articulation_joint_end: np.ndarray
+    loop_joint_articulation: np.ndarray
     world_count: int
 
     @classmethod
@@ -321,6 +323,7 @@ class _FeatherPGSModelPlan:
                 articulation_world[articulation_world < 0] = 0
 
         articulation_joint_end = np.zeros(articulation_count, dtype=np.int32)
+        loop_joint_articulation = np.full(model.joint_count, -1, dtype=np.int32)
         if articulation_count and model.joint_count:
             articulation_start = model.articulation_start.numpy()
             joint_parent = model.joint_parent.numpy()
@@ -328,32 +331,73 @@ class _FeatherPGSModelPlan:
             joint_type = model.joint_type.numpy()
             joint_child = model.joint_child.numpy()
 
+            joint_articulation_arr = getattr(model, "joint_articulation", None)
+            joint_articulation = joint_articulation_arr.numpy() if joint_articulation_arr is not None else None
+
+            if joint_articulation is not None:
+                # An unowned joint is a closure only when its child body already
+                # belongs to an articulation through a different, tree-owned joint.
+                # Standalone world-root joints are also unowned, but their child has
+                # no articulation owner and must remain outside the solver plan.
+                body_articulation = np.full(model.body_count, -1, dtype=np.int32)
+                for j in range(model.joint_count):
+                    art = int(joint_articulation[j])
+                    child = int(joint_child[j])
+                    if art >= 0 and child >= 0:
+                        body_articulation[child] = art
+                for j in range(model.joint_count):
+                    if int(joint_articulation[j]) < 0:
+                        child = int(joint_child[j])
+                        if child >= 0:
+                            loop_joint_articulation[j] = body_articulation[child]
+
             for art in range(articulation_count):
                 first_joint = int(articulation_start[art])
                 last_joint = int(articulation_start[art + 1])
 
-                # Loop-closing joints (a second inbound joint on a body whose tree joint
-                # came earlier — how the MJCF importer closes `connect`/`weld` equalities)
-                # live INSIDE the articulation's joint range but are not part of the
-                # kinematic tree. Excluding them here keeps their DOFs out of the mass
-                # matrix (garbage motion subspaces made H singular -> instant NaN) and out
-                # of the FK walk (they would overwrite their child's tree pose). They are
-                # consumed as CONNECT constraint rows instead.
-                seen_children: set[int] = set()
-                tree_end = first_joint
-                for j in range(first_joint, last_joint):
-                    child = int(joint_child[j])
-                    if child in seen_children:
-                        break  # first loop joint; the rest of the range must be loops too
-                    seen_children.add(child)
-                    tree_end = j + 1
-                for j in range(tree_end, last_joint):
-                    if int(joint_child[j]) not in seen_children:
-                        raise ValueError(
-                            "SolverFeatherPGS: articulation joint range mixes tree joints after "
-                            f"loop joints (articulation {art}, joint {j}). Loop-closing joints "
-                            "must be trailing."
-                        )
+                # Loop-closing joints (how the MJCF/USD importers close `connect`/`weld`
+                # equalities) are not part of the kinematic tree. Excluding them here
+                # keeps their DOFs out of the mass matrix (garbage motion subspaces made
+                # H singular -> instant NaN) and out of the FK walk (they would overwrite
+                # their child's tree pose). They are consumed as CONNECT rows instead.
+                #
+                # Model.joint_articulation identifies the articulation's own contiguous
+                # tree joints; the body-ownership pass above separately distinguishes
+                # closures from other unowned joints. The prefix range derived from
+                # articulation_start may contain foreign entries after the tree — e.g.
+                # multi-source add_builder defers loop joints past a later articulation's
+                # free joint — so never adopt range members by position.
+                if joint_articulation is not None:
+                    tree_end = first_joint
+                    for j in range(first_joint, last_joint):
+                        if int(joint_articulation[j]) == art:
+                            if j != tree_end:
+                                raise ValueError(
+                                    f"SolverFeatherPGS: articulation {art}'s joints are not "
+                                    f"contiguous (joint {j} follows a foreign joint at "
+                                    f"{tree_end}). The ModelBuilder guarantees contiguity; "
+                                    "this model is malformed."
+                                )
+                            tree_end = j + 1
+                else:
+                    # Legacy models without joint_articulation: fall back to the
+                    # second-inbound-joint heuristic (loop joints must be trailing).
+                    seen_children: set[int] = set()
+                    tree_end = first_joint
+                    for j in range(first_joint, last_joint):
+                        child = int(joint_child[j])
+                        if child in seen_children:
+                            break  # first loop joint; the rest of the range must be loops too
+                        seen_children.add(child)
+                        tree_end = j + 1
+                    for j in range(tree_end, last_joint):
+                        if int(joint_child[j]) not in seen_children:
+                            raise ValueError(
+                                "SolverFeatherPGS: articulation joint range mixes tree joints "
+                                f"after loop joints (articulation {art}, joint {j}). "
+                                "Loop-closing joints must be trailing."
+                            )
+                        loop_joint_articulation[j] = art
                 articulation_joint_end[art] = tree_end
 
                 first_dof = int(joint_qd_start[first_joint])
@@ -404,6 +448,7 @@ class _FeatherPGSModelPlan:
             prescribed,
             response_dof_count,
             articulation_joint_end,
+            loop_joint_articulation,
         )
         for array in arrays:
             array.setflags(write=False)
@@ -763,6 +808,7 @@ class SolverFeatherPGS(SolverBase):
         contact_torsion_radius: float = 0.0,
         contact_torsion_shape_indices: tuple[int, ...] | None = None,
         contact_torsion_shape_patterns: tuple[str, ...] | None = None,
+        contact_compliance: bool = False,
     ):
         """
         Args:
@@ -791,6 +837,25 @@ class SolverFeatherPGS(SolverBase):
                 an explicit pattern such as ".*fingertip.*". Empty tuple selects none;
                 unmatched nonempty patterns raise ValueError. Experimental, with the
                 same compatibility limitations as the radius.
+            contact_compliance: Experimental opt-in implicit unilateral contact material response.
+                Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
+                zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and
+                applies exported friction quadrature weighting once to the existing pair friction.
+                Requires CUDA matrix-free/immediate/interleaved solving, full position friction,
+                no warm start, restitution, global contact regularization, debug, shared normal
+                anchors, persistent-patch friction, or friction-anchor reduction. Intentional
+                allocator exclusions are counted in ``compliance_skipped_contact_count``;
+                contact/row capacity loss remains an error even with warnings disabled.
+                CUDA graph capture is rejected. This
+                host-synchronizing experimental implementation is not a performance path and may
+                change without the normal deprecation period. Defaults to False.
+                Enabling this option with zero stiffness preserves the hard-contact law, not
+                the runtime cost of the default-OFF path.
+
+                .. experimental::
+
+                    The ``contact_compliance=True`` material response and its supported combinations
+                    may change without prior notice.
             angular_damping (float, optional): Angular damping factor. Defaults to 0.05.
             update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the
                 :meth:`step` function gets called). The cadence flag is evaluated on the host each step, so under
@@ -1103,6 +1168,32 @@ class SolverFeatherPGS(SolverBase):
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
         """
+        if contact_compliance:
+            _contact_compliance.validate_configuration(
+                model,
+                {
+                    "pgs_mode": pgs_mode,
+                    "articulated_contact_response": articulated_contact_response,
+                    "pgs_schedule": pgs_schedule,
+                    "pgs_iterations": pgs_iterations,
+                    "pgs_velocity_iterations": pgs_velocity_iterations,
+                    "pgs_warmstart": pgs_warmstart,
+                    "mf_warmstart": mf_warmstart,
+                    "enable_restitution": enable_restitution,
+                    "pgs_contact_regularization": pgs_contact_regularization,
+                    "pgs_debug": pgs_debug,
+                    "contact_friction_position_iterations": contact_friction_position_iterations,
+                    "friction_mode": friction_mode,
+                    "contact_friction_anchor_limit": contact_friction_anchor_limit,
+                    "contact_friction_shared_anchor": contact_friction_shared_anchor,
+                    "contact_shared_anchor": contact_shared_anchor,
+                },
+            )
+        self.contact_compliance = bool(contact_compliance)
+        self.compliance_contact_count = 0
+        self.compliance_skipped_contact_count = 0
+        self._compliant_contacts = None
+        self._compliant_prepared = False
         super().__init__(model)
 
         self.angular_damping = angular_damping
@@ -1495,10 +1586,7 @@ class SolverFeatherPGS(SolverBase):
         # Loop-closing joints are excluded from the tree (see _FeatherPGSModelPlan.build)
         # and enforced as CONNECT rows; the propagation-family kernels still iterate full
         # articulation joint ranges, so gate that mode rather than corrupt silently.
-        self._has_loop_joints = bool(
-            model.articulation_count
-            and np.any(self._model_plan.articulation_joint_end < model.articulation_start.numpy()[1:])
-        )
+        self._has_loop_joints = bool(np.any(self._model_plan.loop_joint_articulation >= 0))
         if self._has_loop_joints and self.articulated_contact_response != "immediate":
             raise ValueError(
                 "SolverFeatherPGS: loop-closing joints (imported connect/weld equalities) are "
@@ -1641,7 +1729,12 @@ class SolverFeatherPGS(SolverBase):
         # three-family one-shot flag; row_watermark additionally accumulates
         # whole-run high-water telemetry for explicit readback.
         self._row_watermark = bool(row_watermark)
-        self._track_row_capacity = self._row_watermark or self.warn_constraint_overflow or self._contact_torsion_enabled
+        self._track_row_capacity = (
+            self._row_watermark
+            or self.warn_constraint_overflow
+            or self._contact_torsion_enabled
+            or self.contact_compliance
+        )
         wm_device = model.device
         if self._track_row_capacity:
             self._row_dropped_dense = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
@@ -1787,6 +1880,11 @@ class SolverFeatherPGS(SolverBase):
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del state, flags
+        if self.contact_compliance:
+            self._compliant_contacts = None
+            self._compliant_prepared = False
+            self.compliance_contact_count = 0
+            self.compliance_skipped_contact_count = 0
         if world_mask is not None and world_mask.shape[0] != self.world_count:
             raise ValueError(
                 f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per world)."
@@ -2238,12 +2336,12 @@ class SolverFeatherPGS(SolverBase):
     def _build_connect_plan(self, model) -> None:
         """Precompute the static per-closure lookup tables for the CONNECT row family.
 
-        Loop-closing joints (BALL joints trailing an articulation's tree prefix — how the
-        MJCF importer realizes ``connect`` equalities) are excluded from FK/ID by
+        Loop-closing BALL joints are excluded from FK/ID by
         :meth:`_FeatherPGSModelPlan.build` and enforced here as three bilateral rows
-        pinning the joint's parent/child anchors together. FIXED (weld) loop joints warn
-        and are ignored for now. All buffers are allocated once (CUDA-graph-safe);
-        ``joint_enabled`` is snapshotted at init.
+        pinning the joint's parent/child anchors together. Their stored owner comes from
+        the child body's tree articulation, independent of joint ordering. FIXED (weld)
+        loop joints warn and are ignored for now. All buffers are allocated once
+        (CUDA-graph-safe); ``joint_enabled`` is snapshotted at init.
         """
         self._connect_count = 0
         self.connect_slot = None
@@ -2251,8 +2349,6 @@ class SolverFeatherPGS(SolverBase):
             self._connect_world_np = None
             return
         device = model.device
-        articulation_start = model.articulation_start.numpy()
-        joint_end = self._model_plan.articulation_joint_end
         joint_type = model.joint_type.numpy()
         joint_parent = model.joint_parent.numpy()
         joint_child = model.joint_child.numpy()
@@ -2261,24 +2357,34 @@ class SolverFeatherPGS(SolverBase):
         joint_enabled_arr = getattr(model, "joint_enabled", None)
         joint_enabled = joint_enabled_arr.numpy() if joint_enabled_arr is not None else None
         articulation_world = self._model_plan.articulation_world
+        loop_joint_articulation = self._model_plan.loop_joint_articulation
+        body_articulation = self.body_to_articulation.numpy() if self.body_to_articulation is not None else None
 
         art_l, body_p, body_c, anchors_p, anchors_c, world_l, enab = [], [], [], [], [], [], []
-        for art in range(model.articulation_count):
-            for j in range(int(joint_end[art]), int(articulation_start[art + 1])):
-                if int(joint_type[j]) != int(JointType.BALL):
-                    warnings.warn(
-                        f"SolverFeatherPGS: loop joint {j} has unsupported type "
-                        f"{int(joint_type[j])} (only BALL/connect closures are enforced); ignored.",
-                        stacklevel=2,
-                    )
-                    continue
-                art_l.append(art)
-                body_p.append(int(joint_parent[j]))
-                body_c.append(int(joint_child[j]))
-                anchors_p.append(joint_X_p[j][:3])
-                anchors_c.append(joint_X_c[j][:3])
-                world_l.append(int(articulation_world[art]))
-                enab.append(1 if (joint_enabled is None or joint_enabled[j]) else 0)
+        for j in np.flatnonzero(loop_joint_articulation >= 0):
+            art = int(loop_joint_articulation[j])
+            if int(joint_type[j]) != int(JointType.BALL):
+                warnings.warn(
+                    f"SolverFeatherPGS: loop joint {j} has unsupported type "
+                    f"{int(joint_type[j])} (only BALL/connect closures are enforced); ignored.",
+                    stacklevel=2,
+                )
+                continue
+            parent = int(joint_parent[j])
+            parent_art = int(body_articulation[parent]) if parent >= 0 and body_articulation is not None else -1
+            if parent_art >= 0 and parent_art != art:
+                warnings.warn(
+                    f"SolverFeatherPGS: loop joint {j} closes across articulations ({parent_art} vs {art}); ignored.",
+                    stacklevel=2,
+                )
+                continue
+            art_l.append(art)
+            body_p.append(parent)
+            body_c.append(int(joint_child[j]))
+            anchors_p.append(joint_X_p[j][:3])
+            anchors_c.append(joint_X_c[j][:3])
+            world_l.append(int(articulation_world[art]))
+            enab.append(1 if (joint_enabled is None or joint_enabled[j]) else 0)
 
         n = len(art_l)
         if n == 0:
@@ -2898,7 +3004,14 @@ class SolverFeatherPGS(SolverBase):
             response_start = int(articulation_dof_start[articulation])
             response_end = response_start + int(response_dof_count[articulation])
             ancestor_joint = joint
+            visited_joints: set[int] = set()
             while ancestor_joint >= 0:
+                if ancestor_joint in visited_joints:
+                    raise ValueError(
+                        "SolverFeatherPGS: cyclic joint ancestry while building body response maps "
+                        f"(body {body}, articulation {articulation}, joint {ancestor_joint})."
+                    )
+                visited_joints.add(ancestor_joint)
                 joint_dof_start = int(joint_qd_start[ancestor_joint])
                 joint_dof_end = int(joint_qd_start[ancestor_joint + 1])
                 overlap_start = max(joint_dof_start, response_start)
@@ -5812,6 +5925,14 @@ class SolverFeatherPGS(SolverBase):
         friction_start_iteration: int | None = None,
         iteration_offset: int = 0,
     ) -> None:
+        if self.contact_compliance:
+            _contact_compliance.solve(
+                self,
+                iterations=iterations,
+                friction_start_iteration=friction_start_iteration,
+                iteration_offset=iteration_offset,
+            )
+            return
         if self._propagation_contacts_enabled():
             self._launch_matrix_free_gs_solve_propagation_tree(
                 dense_rhs=self.rhs,
@@ -5972,6 +6093,9 @@ class SolverFeatherPGS(SolverBase):
     ):
         if self._contact_torsion_enabled:
             validate_torsion_step(self)
+        if self.contact_compliance:
+            # Reject incompatible contact preprocessing before it can mutate the stream.
+            _contact_compliance.validate_step(self)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
             raise ValueError(
                 "FeatherPGS contact capacity mismatch: received "
@@ -7564,6 +7688,11 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
+        if self.contact_compliance:
+            _contact_compliance.start_step(self, contacts, dt)
+            # The allocator writes slots_needed only after intentional skip gates.
+            # Clear prior-step requests so an excluded contact cannot look overflowed.
+            self.contact_slots_needed.zero_()
         model = self.model
         max_constraints = self.dense_max_constraints
         mf_active = self._has_free_rigid_bodies

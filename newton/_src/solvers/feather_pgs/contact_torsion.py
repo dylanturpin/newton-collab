@@ -40,6 +40,8 @@ def configure_contact_torsion(solver, radius, indices, patterns):
     radius = float(radius)
     if not np.isfinite(radius) or radius < 0:
         raise ValueError("contact_torsion_radius must be finite and non-negative [m]")
+    if radius > 0 and solver.contact_compliance:
+        raise ValueError("contact_torsion_radius > 0 is not validated with contact_compliance")
     if indices is not None and patterns is not None:
         raise ValueError("Use either contact_torsion_shape_indices or contact_torsion_shape_patterns")
     selected = None

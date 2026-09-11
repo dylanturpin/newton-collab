@@ -239,6 +239,17 @@ class TestContactTorsion(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fixture(0.01)
 
+    def test_compliance_combination_rejected_at_construction(self):
+        """Fail before stepping when both experimental responses are requested."""
+        with self.assertRaisesRegex(ValueError, "contact_torsion_radius.*contact_compliance"):
+            fixture(
+                0.01,
+                contact_compliance=True,
+                enable_restitution=False,
+                contact_shared_anchor=False,
+                contact_friction_shared_anchor=False,
+            )
+
     def test_capture_is_explicitly_rejected(self):
         """Reject capture before host contact grouping is attempted."""
         _, solver, model, initial, contacts = fixture(0.01)
