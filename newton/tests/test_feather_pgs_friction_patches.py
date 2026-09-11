@@ -113,6 +113,21 @@ def _patch_fixture(
 
 
 class TestFrictionPatchHistory(unittest.TestCase):
+    def test_narrow_patch_preserves_footprint_reflection_symmetry(self):
+        """Avoid a diagonal friction couple on a symmetric narrow contact footprint."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        for angle in (0.0, 0.37, 1.1):
+            axis = np.array([np.sin(angle), np.cos(angle), 0.0])
+            across = np.array([np.cos(angle), -np.sin(angle), 0.0])
+            points = [x * across + y * axis for x in (-0.001, 0.001) for y in (-0.025, 0.025)]
+            with self.subTest(angle=angle):
+                _, _, _, patches = _patch_fixture(points, device=device)
+                active = patches.view.weight.numpy() > 0.0
+                locations = patches.view.point_a.numpy()[active]
+                self.assertEqual(len(locations), 2)
+                np.testing.assert_allclose(locations @ across, 0.0, atol=1.0e-7)
+                np.testing.assert_allclose(np.sort(locations @ axis), [-0.025, 0.025], atol=1.0e-7)
+
     def test_pose_increment_preserves_fixed_pivots_and_no_slip_rolling(self):
         """Distinguish rigid rotation from slip without querying the collision shape."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"

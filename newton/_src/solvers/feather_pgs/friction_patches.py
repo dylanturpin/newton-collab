@@ -5,6 +5,9 @@
 
 Normal contacts are never reduced here. Each compatible region selects up to two
 friction locations, with an equal share of the region's total normal impulse.
+Locations average the support edges along the footprint's principal extent,
+avoiding a diagonal friction couple on symmetric narrow footprints. Isotropic
+footprints retain a canonical farthest pair because they have no unique axis.
 Regions require matching friction materials, nearly aligned normals, nearby
 contact planes, and connected shape bounding spheres on each body. The latter
 is a conservative test across convex seams, not an exact surface-connectivity
@@ -393,10 +396,81 @@ def _build(
         anchors = int(1)
         if separation > 1.0e-8 * frame.radius[seed] * frame.radius[seed]:
             anchors = 2
+        location0 = frame.center[first]
+        location1 = frame.center[second]
+        if anchors == 2 and carry_only == 0:
+            # Use the footprint's principal extent, averaging its support edges.
+            # Picking opposite corners of a narrow rectangle introduces an
+            # artificial diagonal friction couple even when the footprint is symmetric.
+            origin = location0
+            mean = wp.vec3(0.0)
+            members = int(0)
+            for j in range(index, stop):
+                c = frame.indices[j]
+                if frame.owner[c] == seed and frame.eligible[c] != 0:
+                    mean += frame.center[c] - origin
+                    members += 1
+            mean /= float(members)
+            t0, t1 = contact_tangent_basis(frame.normal[seed])
+            xx = float(0.0)
+            xy = float(0.0)
+            yy = float(0.0)
+            for j in range(index, stop):
+                c = frame.indices[j]
+                if frame.owner[c] == seed and frame.eligible[c] != 0:
+                    offset = frame.center[c] - origin - mean
+                    x = wp.dot(offset, t0)
+                    y = wp.dot(offset, t1)
+                    xx += x * x
+                    xy += x * y
+                    yy += y * y
+            spread = wp.sqrt((xx - yy) * (xx - yy) + 4.0 * xy * xy)
+            # An isotropic footprint has no distinguished axis; retain its
+            # canonical farthest pair instead of amplifying roundoff.
+            if spread > 1.0e-6 * (xx + yy):
+                largest = 0.5 * (xx + yy + spread)
+                axis2 = wp.vec2(xy, largest - xx)
+                if xx >= yy:
+                    axis2 = wp.vec2(largest - yy, xy)
+                axis2 = wp.normalize(axis2)
+                axis = axis2[0] * t0 + axis2[1] * t1
+                low = float(1.0e30)
+                high = float(-1.0e30)
+                for j in range(index, stop):
+                    c = frame.indices[j]
+                    if frame.owner[c] == seed and frame.eligible[c] != 0:
+                        projection = wp.dot(frame.center[c] - origin, axis)
+                        if projection < low:
+                            low = projection
+                            first = c
+                        if projection > high:
+                            high = projection
+                            second = c
+                sum0 = wp.vec3(0.0)
+                sum1 = wp.vec3(0.0)
+                count0 = int(0)
+                count1 = int(0)
+                edge_tolerance = 1.0e-5 * frame.radius[seed]
+                for j in range(index, stop):
+                    c = frame.indices[j]
+                    if frame.owner[c] == seed and frame.eligible[c] != 0:
+                        offset = frame.center[c] - origin
+                        projection = wp.dot(offset, axis)
+                        if projection <= low + edge_tolerance:
+                            sum0 += offset
+                            count0 += 1
+                        if projection >= high - edge_tolerance:
+                            sum1 += offset
+                            count1 += 1
+                location0 = origin + sum0 / float(count0)
+                location1 = origin + sum1 / float(count1)
         for aidx in range(anchors):
             c = first
             if aidx == 1:
                 c = second
+            location = location0
+            if aidx == 1:
+                location = location1
             a = frame.body_a[c]
             b = frame.body_b[c]
             n = frame.normal[c]
@@ -408,9 +482,7 @@ def _build(
             nearest = float(1.0e30)
             motion = wp.vec3(0.0)
             if prev_start < prev_stop:
-                motion = _pose_motion(q, previous_q, a, frame.center[c]) - _pose_motion(
-                    q, previous_q, b, frame.center[c]
-                )
+                motion = _pose_motion(q, previous_q, a, location) - _pose_motion(q, previous_q, b, location)
             for j in range(prev_start, prev_stop):
                 p = prev.indices[j]
                 if (
@@ -430,7 +502,7 @@ def _build(
                 error = _carried_displacement(q, prev, p, n)
                 error += motion
                 tangent_delta = error - n * wp.dot(error, n)
-                distance = wp.length_sq(0.5 * (pa + pb) - frame.center[c])
+                distance = wp.length_sq(0.5 * (pa + pb) - location)
                 # The tangential gate bounds uncorrected slip of a carried pair at a
                 # tenth of the smaller body's radius, about three times the measured
                 # Baumgarte equilibrium separation of a held box at 60 Hz. Tighter
@@ -445,7 +517,7 @@ def _build(
                     and support_gap <= wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r
                     and wp.length_sq(tangent_delta) <= 0.01 * r * r
                     and wp.abs(wp.dot(delta, n)) <= 0.1 * r
-                    and wp.abs(wp.dot(0.5 * (pa + pb) - frame.center[c], n)) <= 0.05 * r
+                    and wp.abs(wp.dot(0.5 * (pa + pb) - location, n)) <= 0.05 * r
                     and distance <= 4.0 * r * r
                     and distance < nearest
                 ):
@@ -469,7 +541,7 @@ def _build(
                 if connected:
                     chosen = p
                     nearest = distance
-            pa = frame.center[c]
+            pa = location
             pb = pa
             anchor_a = _local_point(q, a, pa)
             anchor_b = _local_point(q, b, pb)

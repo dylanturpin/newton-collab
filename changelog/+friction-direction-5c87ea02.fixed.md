@@ -1,0 +1,1 @@
+Fix direction-dependent sliding in FeatherPGS's default friction solver by updating both tangential impulses together before projection, including persistent patches and articulated contacts. Preserve narrow contact-footprint symmetry by centering patch friction locations on their extreme edges instead of choosing diagonal corners.

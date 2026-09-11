@@ -44,6 +44,7 @@ from ..semi_implicit.kernels_particle import (
 from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
 from .contact_torsion import configure_contact_torsion, prepare_torsion_rows, torque_sweep_source, validate_torsion_step
+from .friction import FRICTION_PAIR_CUDA
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
     FRICTION_MODE_BISECTION,
@@ -1147,10 +1148,13 @@ class SolverFeatherPGS(SolverBase):
                 limits, joint velocity limits). ``"physx_grasp"`` approximates PhysX's two-pass
                 grabbing order by solving drive/position-limit rows first, then contacts/friction,
                 then joint velocity limits. Defaults to ``"interleaved"``.
-            friction_mode (str, optional): Per-row Coulomb friction strategy used by the
-                ``pgs_mode="matrix_free"`` path. ``"current"`` (default) is the baseline
-                isotropic Coulomb cone projection that has been the FeatherPGS behavior
-                to date. ``"bisection"`` runs a RAISim-style bisection on the normal
+            friction_mode (str, optional): Coulomb friction strategy used by the
+                ``pgs_mode="matrix_free"`` path. ``"current"`` (default) jointly updates
+                both tangential impulses by solving their full 2x2 block on the friction disk.
+                Sticking uses the block inverse; sliding uses a bounded scalar solve to
+                preserve isotropic maximum dissipation, with the current normal load
+                held fixed during the tangent update.
+                ``"bisection"`` runs a RAISim-style bisection on the normal
                 impulse λ_n with the 2x2 tangential sub-problem re-solved at each
                 probe — ported from Miles Macklin's ``raisim/kernels.py``; wired in
                 the FPGS Friction Modes 5/13 slice.
@@ -10772,16 +10776,18 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
             float dot_sum = __shfl_sync(MASK, my_sum, 0);
 
             float denom = s_diag[i];
-            if (denom <= 0.0f) continue;
+            if (denom <= 0.0f && s_rtype[i] != 2) continue;
 
             float w_val = s_rhs[i] + dot_sum;
-            float delta = -w_val / denom;
+            float delta = denom > 0.0f ? -w_val / denom : 0.0f;
             float new_impulse = s_lam[i] + omega * delta;
             int row_type = s_rtype[i];
             if (row_type == 2 && global_iter < friction_start_iteration) {{
                 s_lam[i] = 0.0f;
                 continue;
             }}
+
+            if (row_type == 2 && i != s_parent[i] + 1) continue;
 
             // row_type 0=CONTACT, 3=JOINT_LIMIT, 4=JOINT_VELOCITY_LIMIT:
             // unilateral lambda >= 0 projector. The velocity-limit row
@@ -10798,20 +10804,25 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
                 float mu = s_mu[i];
                 float radius = fmaxf(mu * lambda_n, 0.0f);
 
-                if (radius <= 0.0f) {{
-                    s_lam[i] = 0.0f;
-                }} else {{
-                    s_lam[i] = new_impulse;
-                    int sib = (i == parent_idx + 1) ? (parent_idx + 2) : (parent_idx + 1);
-                    float a = s_lam[i];
-                    float b = s_lam[sib];
-                    float mag = sqrtf(a * a + b * b);
-                    if (mag > radius) {{
-                        float scale = radius / mag;
-                        s_lam[i] = a * scale;
-                        s_lam[sib] = b * scale;
-                    }}
+                if (i != parent_idx + 1) continue;
+                int sib = parent_idx + 2;
+                float sibling_residual = 0.0f;
+                int sib_base = (sib * (sib + 1)) >> 1;
+                for (int j = lane; j < m; j += 32) {{
+                    float c = j <= sib ? s_Ctri[sib_base + j] : s_Ctri[((j * (j + 1)) >> 1) + sib];
+                    sibling_residual += c * s_lam[j];
                 }}
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
+                sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs[sib];
+                float2 pair = friction_pair_candidate(denom, s_Ctri[sib_base + i], s_diag[sib],
+                    w_val, sibling_residual, s_lam[i], s_lam[sib], radius, omega);
+                float a = pair.x;
+                float b = pair.y;
+                float mag = sqrtf(a * a + b * b);
+                float scale = mag > radius ? radius / mag : 1.0f;
+                s_lam[i] = a * scale;
+                s_lam[sib] = b * scale;
             }} else {{
                 s_lam[i] = new_impulse;
             }}
@@ -10821,6 +10832,8 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
 {store_code}
 #endif
 """
+
+    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
 
     @wp.func_native(snippet)
     def pgs_solve_native(
@@ -11463,7 +11476,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
                 }}
 
                 float eff_inv = mf_eff_mass_inv.data[c_off + i];
-                if (eff_inv <= 0.0f) continue;
+                if (eff_inv <= 0.0f && row_type != 2) continue;
 
                 int lba = mf_local_body_a.data[c_off + i];
                 int lbb = mf_local_body_b.data[c_off + i];
@@ -11521,44 +11534,54 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
                     float mu = mf_row_mu.data[c_off + i];
                     float radius = fmaxf(mu * lambda_n, 0.0f);
 
-                    if (radius <= 0.0f) {{
-                        new_impulse = 0.0f;
+                    if (i != parent_idx + 1) {{
+                        new_impulse = old_impulse;
                     }} else {{
-                        int sib = (i == parent_idx + 1) ? parent_idx + 2 : parent_idx + 1;
-
-                        s_impulse[i] = new_impulse;
-                        float a_val = new_impulse;
-                        float b_val = s_impulse[sib];
+                        int sib = parent_idx + 2;
+                        int sib_base = (c_off + sib) * 6;
+                        float sibling_residual = mf_rhs.data[c_off + sib];
+                        for (int k = 0; k < 6; ++k) {{
+                            if (lba >= 0) sibling_residual += mf_J_a.data[sib_base + k] * s_vel[lba * 6 + k];
+                            if (lbb >= 0) sibling_residual += mf_J_b.data[sib_base + k] * s_vel[lbb * 6 + k];
+                        }}
+                        float inv_sib = mf_eff_mass_inv.data[c_off + sib];
+                        float cross = 0.0f;
+                        for (int k = 0; k < 6; ++k) {{
+                            if (lba >= 0) cross += mf_J_a.data[j_base + k] * mf_MiJt_a.data[sib_base + k];
+                            if (lbb >= 0) cross += mf_J_b.data[j_base + k] * mf_MiJt_b.data[sib_base + k];
+                        }}
+                        float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                            jv + rhs_i, sibling_residual, old_impulse, s_impulse[sib], radius, omega);
+                        float a_val = pair.x;
+                        float b_val = pair.y;
                         float mag = sqrtf(a_val * a_val + b_val * b_val);
-                        if (mag > radius) {{
-                            float scale = radius / mag;
-                            new_impulse = a_val * scale;
-                            float sib_new = b_val * scale;
-                            float sib_delta = sib_new - b_val;
-                            s_impulse[sib] = sib_new;
+                        float scale = mag > radius ? radius / mag : 1.0f;
+                        new_impulse = a_val * scale;
+                        float sib_new = b_val * scale;
+                        float sib_delta = sib_new - s_impulse[sib];
+                        s_impulse[sib] = sib_new;
 
-                            // Apply sibling correction to body velocities
-                            int sib_lba = mf_local_body_a.data[c_off + sib];
-                            int sib_lbb = mf_local_body_b.data[c_off + sib];
-                            int sib_j_base = (c_off + sib) * 6;
-                            if (sib_lba >= 0) {{
-                                int sva = sib_lba * 6;
-                                s_vel[sva+0] += mf_MiJt_a.data[sib_j_base+0] * sib_delta;
-                                s_vel[sva+1] += mf_MiJt_a.data[sib_j_base+1] * sib_delta;
-                                s_vel[sva+2] += mf_MiJt_a.data[sib_j_base+2] * sib_delta;
-                                s_vel[sva+3] += mf_MiJt_a.data[sib_j_base+3] * sib_delta;
-                                s_vel[sva+4] += mf_MiJt_a.data[sib_j_base+4] * sib_delta;
-                                s_vel[sva+5] += mf_MiJt_a.data[sib_j_base+5] * sib_delta;
-                            }}
-                            if (sib_lbb >= 0) {{
-                                int svb = sib_lbb * 6;
-                                s_vel[svb+0] += mf_MiJt_b.data[sib_j_base+0] * sib_delta;
-                                s_vel[svb+1] += mf_MiJt_b.data[sib_j_base+1] * sib_delta;
-                                s_vel[svb+2] += mf_MiJt_b.data[sib_j_base+2] * sib_delta;
-                                s_vel[svb+3] += mf_MiJt_b.data[sib_j_base+3] * sib_delta;
-                                s_vel[svb+4] += mf_MiJt_b.data[sib_j_base+4] * sib_delta;
-                                s_vel[svb+5] += mf_MiJt_b.data[sib_j_base+5] * sib_delta;
-                            }}
+                        // Apply sibling correction to body velocities
+                        int sib_lba = mf_local_body_a.data[c_off + sib];
+                        int sib_lbb = mf_local_body_b.data[c_off + sib];
+                        int sib_j_base = (c_off + sib) * 6;
+                        if (sib_lba >= 0) {{
+                            int sva = sib_lba * 6;
+                            s_vel[sva+0] += mf_MiJt_a.data[sib_j_base+0] * sib_delta;
+                            s_vel[sva+1] += mf_MiJt_a.data[sib_j_base+1] * sib_delta;
+                            s_vel[sva+2] += mf_MiJt_a.data[sib_j_base+2] * sib_delta;
+                            s_vel[sva+3] += mf_MiJt_a.data[sib_j_base+3] * sib_delta;
+                            s_vel[sva+4] += mf_MiJt_a.data[sib_j_base+4] * sib_delta;
+                            s_vel[sva+5] += mf_MiJt_a.data[sib_j_base+5] * sib_delta;
+                        }}
+                        if (sib_lbb >= 0) {{
+                            int svb = sib_lbb * 6;
+                            s_vel[svb+0] += mf_MiJt_b.data[sib_j_base+0] * sib_delta;
+                            s_vel[svb+1] += mf_MiJt_b.data[sib_j_base+1] * sib_delta;
+                            s_vel[svb+2] += mf_MiJt_b.data[sib_j_base+2] * sib_delta;
+                            s_vel[svb+3] += mf_MiJt_b.data[sib_j_base+3] * sib_delta;
+                            s_vel[svb+4] += mf_MiJt_b.data[sib_j_base+4] * sib_delta;
+                            s_vel[svb+5] += mf_MiJt_b.data[sib_j_base+5] * sib_delta;
                         }}
                     }}
                 }}
@@ -11609,6 +11632,8 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
     }}
 #endif
 """
+
+    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
 
     @wp.func_native(snippet)
     def pgs_solve_mf_native(
@@ -12028,7 +12053,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                     continue;
                 }}
                 const float eff_inv = __ldg(&propagation_eff_mass_inv.data[off]);
-                if (eff_inv <= 0.0f) continue;
+                if (eff_inv <= 0.0f && row_type != 2) continue;
                 const int ba = __ldg(&propagation_body_a.data[off]);
                 const int bb = __ldg(&propagation_body_b.data[off]);
                 const int la = (ba >= 0) ? __ldg(&propagation_body_local_slot.data[ba]) : -1;
@@ -12060,24 +12085,31 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                         for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
                             lambda_n += propagation_impulses.data[world_base + patch_row];
                         const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
-                        if (radius <= 0.0f) {{
-                            new_impulse = 0.0f;
+                        if (slot != parent_idx + 1) {{
+                            new_impulse = old_impulse;
                         }} else {{
-                            sib = parent_idx + 1;
-                            if (slot == parent_idx + 1) sib = parent_idx + 2;
-                            propagation_impulses.data[off] = new_impulse;
+                            sib = parent_idx + 2;
                             const int sib_off = world_base + sib;
                             const float other = propagation_impulses.data[sib_off];
-                            const float mag = sqrtf(new_impulse * new_impulse + other * other);
-                            if (mag > radius) {{
-                                const float scale = radius / mag;
-                                new_impulse *= scale;
-                                const float sib_new = other * scale;
-                                sib_delta = sib_new - other;
-                                propagation_impulses.data[sib_off] = sib_new;
-                            }} else {{
-                                sib = -1;
+                            float sibling_residual = propagation_rhs.data[sib_off];
+                            float cross = 0.0f;
+                            for (int k = 0; k < 6; ++k) {{
+                                if (la >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * s_qd[la * 6 + k];
+                                if (la >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
+                                if (lb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * s_qd[lb * 6 + k];
+                                if (lb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
                             }}
+                            const float inv_sib = propagation_eff_mass_inv.data[sib_off];
+                            float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                                residual, sibling_residual, old_impulse, other, radius, omega);
+                            new_impulse = pair.x;
+                            const float trial_sib = pair.y;
+                            const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
+                            const float scale = mag > radius ? radius / mag : 1.0f;
+                            new_impulse *= scale;
+                            const float sib_new = trial_sib * scale;
+                            sib_delta = sib_new - other;
+                            propagation_impulses.data[sib_off] = sib_new;
                         }}
                     }}
                     delta_impulse = new_impulse - old_impulse;
@@ -12127,7 +12159,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                     continue;
                 }}
                 const float eff_inv = propagation_eff_mass_inv.data[off];
-                if (eff_inv <= 0.0f) continue;
+                if (eff_inv <= 0.0f && row_type != 2) continue;
                 const int ba = propagation_body_a.data[off];
                 const int bb = propagation_body_b.data[off];
                 const int la = (ba >= 0) ? propagation_body_local_slot.data[ba] : -1;
@@ -12147,30 +12179,39 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
                     for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
                         lambda_n += propagation_impulses.data[world_base + patch_row];
                     const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
-                    if (radius <= 0.0f) {{
-                        new_impulse = 0.0f;
+                    if (slot != parent_idx + 1) {{
+                        new_impulse = old_impulse;
                     }} else {{
-                        int sib = parent_idx + 1;
-                        if (slot == parent_idx + 1) sib = parent_idx + 2;
-                        propagation_impulses.data[off] = new_impulse;
+                        int sib = parent_idx + 2;
                         const int sib_off = world_base + sib;
                         const float other = propagation_impulses.data[sib_off];
-                        const float mag = sqrtf(new_impulse * new_impulse + other * other);
-                        if (mag > radius) {{
-                            const float scale = radius / mag;
-                            new_impulse *= scale;
-                            const float sib_new = other * scale;
-                            const float sib_delta = sib_new - other;
-                            propagation_impulses.data[sib_off] = sib_new;
-                            for (int e = 0; e < 6; ++e) {{
-                                if (la >= 0) {{
-                                    s_qd[la * 6 + e] += propagation_MiJt_a.data[sib_off * 6 + e] * sib_delta;
-                                    s_imp[la * 6 + e] += propagation_J_a.data[sib_off * 6 + e] * sib_delta;
-                                }}
-                                if (lb >= 0) {{
-                                    s_qd[lb * 6 + e] += propagation_MiJt_b.data[sib_off * 6 + e] * sib_delta;
-                                    s_imp[lb * 6 + e] += propagation_J_b.data[sib_off * 6 + e] * sib_delta;
-                                }}
+                        float sibling_residual = propagation_rhs.data[sib_off];
+                        float cross = 0.0f;
+                        for (int k = 0; k < 6; ++k) {{
+                            if (la >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * s_qd[la * 6 + k];
+                            if (la >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
+                            if (lb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * s_qd[lb * 6 + k];
+                            if (lb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
+                        }}
+                        const float inv_sib = propagation_eff_mass_inv.data[sib_off];
+                        float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                            residual, sibling_residual, old_impulse, other, radius, omega);
+                        new_impulse = pair.x;
+                        const float trial_sib = pair.y;
+                        const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
+                        const float scale = mag > radius ? radius / mag : 1.0f;
+                        new_impulse *= scale;
+                        const float sib_new = trial_sib * scale;
+                        const float sib_delta = sib_new - other;
+                        propagation_impulses.data[sib_off] = sib_new;
+                        for (int e = 0; e < 6; ++e) {{
+                            if (la >= 0) {{
+                                s_qd[la * 6 + e] += propagation_MiJt_a.data[sib_off * 6 + e] * sib_delta;
+                                s_imp[la * 6 + e] += propagation_J_a.data[sib_off * 6 + e] * sib_delta;
+                            }}
+                            if (lb >= 0) {{
+                                s_qd[lb * 6 + e] += propagation_MiJt_b.data[sib_off * 6 + e] * sib_delta;
+                                s_imp[lb * 6 + e] += propagation_J_b.data[sib_off * 6 + e] * sib_delta;
                             }}
                         }}
                     }}
@@ -12247,6 +12288,8 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     }}
 #endif
 """
+
+    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_colored_warp_native(
@@ -12385,7 +12428,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     continue;
                 }}
                 const float eff_inv = __ldg(&propagation_eff_mass_inv.data[off]);
-                if (eff_inv <= 0.0f) continue;
+                if (eff_inv <= 0.0f && row_type != 2) continue;
                 const int ba = __ldg(&propagation_body_a.data[off]);
                 const int bb = __ldg(&propagation_body_b.data[off]);
                 float jv = 0.0f;
@@ -12421,34 +12464,43 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
                         lambda_n += propagation_impulses.data[world_base + patch_row];
                     const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
-                    if (radius <= 0.0f) {{
-                        new_impulse = 0.0f;
+                    if (slot != parent_idx + 1) {{
+                        new_impulse = old_impulse;
                     }} else {{
-                        int sib = parent_idx + 1;
-                        if (slot == parent_idx + 1) sib = parent_idx + 2;
-                        propagation_impulses.data[off] = new_impulse;
+                        int sib = parent_idx + 2;
                         const int sib_off = world_base + sib;
                         const float other = propagation_impulses.data[sib_off];
-                        const float mag = sqrtf(new_impulse * new_impulse + other * other);
-                        if (mag > radius) {{
-                            const float scale = radius / mag;
-                            new_impulse *= scale;
-                            const float sib_new = other * scale;
-                            const float sib_delta = sib_new - other;
-                            propagation_impulses.data[sib_off] = sib_new;
-                            const int sib_ba = propagation_body_a.data[sib_off];
-                            const int sib_bb = propagation_body_b.data[sib_off];
-                            if (sib_ba >= 0) {{
-                                for (int k = 0; k < 6; ++k) {{
-                                    propagation_body_qd.data[sib_ba * 6 + k] += propagation_MiJt_a.data[sib_off * 6 + k] * sib_delta;
-                                    propagation_body_impulses.data[sib_ba * 6 + k] += propagation_J_a.data[sib_off * 6 + k] * sib_delta;
-                                }}
+                        float sibling_residual = propagation_rhs.data[sib_off];
+                        float cross = 0.0f;
+                        for (int k = 0; k < 6; ++k) {{
+                            if (ba >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * propagation_body_qd.data[ba * 6 + k];
+                            if (ba >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
+                            if (bb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * propagation_body_qd.data[bb * 6 + k];
+                            if (bb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
+                        }}
+                        const float inv_sib = propagation_eff_mass_inv.data[sib_off];
+                        float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                            residual, sibling_residual, old_impulse, other, radius, omega);
+                        new_impulse = pair.x;
+                        const float trial_sib = pair.y;
+                        const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
+                        const float scale = mag > radius ? radius / mag : 1.0f;
+                        new_impulse *= scale;
+                        const float sib_new = trial_sib * scale;
+                        const float sib_delta = sib_new - other;
+                        propagation_impulses.data[sib_off] = sib_new;
+                        const int sib_ba = propagation_body_a.data[sib_off];
+                        const int sib_bb = propagation_body_b.data[sib_off];
+                        if (sib_ba >= 0) {{
+                            for (int k = 0; k < 6; ++k) {{
+                                propagation_body_qd.data[sib_ba * 6 + k] += propagation_MiJt_a.data[sib_off * 6 + k] * sib_delta;
+                                propagation_body_impulses.data[sib_ba * 6 + k] += propagation_J_a.data[sib_off * 6 + k] * sib_delta;
                             }}
-                            if (sib_bb >= 0) {{
-                                for (int k = 0; k < 6; ++k) {{
-                                    propagation_body_qd.data[sib_bb * 6 + k] += propagation_MiJt_b.data[sib_off * 6 + k] * sib_delta;
-                                    propagation_body_impulses.data[sib_bb * 6 + k] += propagation_J_b.data[sib_off * 6 + k] * sib_delta;
-                                }}
+                        }}
+                        if (sib_bb >= 0) {{
+                            for (int k = 0; k < 6; ++k) {{
+                                propagation_body_qd.data[sib_bb * 6 + k] += propagation_MiJt_b.data[sib_off * 6 + k] * sib_delta;
+                                propagation_body_impulses.data[sib_bb * 6 + k] += propagation_J_b.data[sib_off * 6 + k] * sib_delta;
                             }}
                         }}
                     }}
@@ -12506,7 +12558,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     continue;
                 }}
                 const float eff_inv = __ldg(&propagation_eff_mass_inv.data[off]);
-                if (eff_inv <= 0.0f) continue;
+                if (eff_inv <= 0.0f && row_type != 2) continue;
                 const int ba = __ldg(&propagation_body_a.data[off]);
                 const int bb = __ldg(&propagation_body_b.data[off]);
                 const int la = (ba >= 0) ? __ldg(&propagation_body_local_slot.data[ba]) : -1;
@@ -12540,47 +12592,56 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                     for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
                         lambda_n += propagation_impulses.data[world_base + patch_row];
                     const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
-                    if (radius <= 0.0f) {{
-                        new_impulse = 0.0f;
+                    if (slot != parent_idx + 1) {{
+                        new_impulse = old_impulse;
                     }} else {{
-                        int sib = parent_idx + 1;
-                        if (slot == parent_idx + 1) sib = parent_idx + 2;
-                        propagation_impulses.data[off] = new_impulse;
+                        int sib = parent_idx + 2;
                         const int sib_off = world_base + sib;
                         const float other = propagation_impulses.data[sib_off];
-                        const float mag = sqrtf(new_impulse * new_impulse + other * other);
-                        if (mag > radius) {{
-                            const float scale = radius / mag;
-                            new_impulse *= scale;
-                            const float sib_new = other * scale;
-                            const float sib_delta = sib_new - other;
-                            propagation_impulses.data[sib_off] = sib_new;
-                            // sibling shares this unit's bodies: locals la/lb
-                            if (la >= 0) {{
-                                const float2* M2 = (const float2*)(propagation_MiJt_a.data + (size_t)sib_off * 6);
-                                const float2* J2 = (const float2*)(propagation_J_a.data + (size_t)sib_off * 6);
-                                #pragma unroll
-                                for (int k = 0; k < 3; ++k) {{
-                                    const float2 mi = __ldg(&M2[k]);
-                                    const float2 jj = __ldg(&J2[k]);
-                                    s_qd[la * 6 + 2 * k] += mi.x * sib_delta;
-                                    s_qd[la * 6 + 2 * k + 1] += mi.y * sib_delta;
-                                    s_imp[la * 6 + 2 * k] += jj.x * sib_delta;
-                                    s_imp[la * 6 + 2 * k + 1] += jj.y * sib_delta;
-                                }}
+                        float sibling_residual = propagation_rhs.data[sib_off];
+                        float cross = 0.0f;
+                        for (int k = 0; k < 6; ++k) {{
+                            if (la >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * s_qd[la * 6 + k];
+                            if (la >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
+                            if (lb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * s_qd[lb * 6 + k];
+                            if (lb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
+                        }}
+                        const float inv_sib = propagation_eff_mass_inv.data[sib_off];
+                        float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                            residual, sibling_residual, old_impulse, other, radius, omega);
+                        new_impulse = pair.x;
+                        const float trial_sib = pair.y;
+                        const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
+                        const float scale = mag > radius ? radius / mag : 1.0f;
+                        new_impulse *= scale;
+                        const float sib_new = trial_sib * scale;
+                        const float sib_delta = sib_new - other;
+                        propagation_impulses.data[sib_off] = sib_new;
+                        // sibling shares this unit's bodies: locals la/lb
+                        if (la >= 0) {{
+                            const float2* M2 = (const float2*)(propagation_MiJt_a.data + (size_t)sib_off * 6);
+                            const float2* J2 = (const float2*)(propagation_J_a.data + (size_t)sib_off * 6);
+                            #pragma unroll
+                            for (int k = 0; k < 3; ++k) {{
+                                const float2 mi = __ldg(&M2[k]);
+                                const float2 jj = __ldg(&J2[k]);
+                                s_qd[la * 6 + 2 * k] += mi.x * sib_delta;
+                                s_qd[la * 6 + 2 * k + 1] += mi.y * sib_delta;
+                                s_imp[la * 6 + 2 * k] += jj.x * sib_delta;
+                                s_imp[la * 6 + 2 * k + 1] += jj.y * sib_delta;
                             }}
-                            if (lb >= 0) {{
-                                const float2* M2 = (const float2*)(propagation_MiJt_b.data + (size_t)sib_off * 6);
-                                const float2* J2 = (const float2*)(propagation_J_b.data + (size_t)sib_off * 6);
-                                #pragma unroll
-                                for (int k = 0; k < 3; ++k) {{
-                                    const float2 mi = __ldg(&M2[k]);
-                                    const float2 jj = __ldg(&J2[k]);
-                                    s_qd[lb * 6 + 2 * k] += mi.x * sib_delta;
-                                    s_qd[lb * 6 + 2 * k + 1] += mi.y * sib_delta;
-                                    s_imp[lb * 6 + 2 * k] += jj.x * sib_delta;
-                                    s_imp[lb * 6 + 2 * k + 1] += jj.y * sib_delta;
-                                }}
+                        }}
+                        if (lb >= 0) {{
+                            const float2* M2 = (const float2*)(propagation_MiJt_b.data + (size_t)sib_off * 6);
+                            const float2* J2 = (const float2*)(propagation_J_b.data + (size_t)sib_off * 6);
+                            #pragma unroll
+                            for (int k = 0; k < 3; ++k) {{
+                                const float2 mi = __ldg(&M2[k]);
+                                const float2 jj = __ldg(&J2[k]);
+                                s_qd[lb * 6 + 2 * k] += mi.x * sib_delta;
+                                s_qd[lb * 6 + 2 * k + 1] += mi.y * sib_delta;
+                                s_imp[lb * 6 + 2 * k] += jj.x * sib_delta;
+                                s_imp[lb * 6 + 2 * k + 1] += jj.y * sib_delta;
                             }}
                         }}
                     }}
@@ -12676,6 +12737,8 @@ def _get_pgs_solve_propagation_colored_block_kernel(
 {stage_epilogue}
 #endif
 """
+
+    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_colored_block_native(
@@ -12860,7 +12923,7 @@ def _get_pgs_solve_propagation_contact_kernel(
                 continue;
             }}
 
-            if (eff_inv <= 0.0f) {{
+            if (eff_inv <= 0.0f && row_type != 2) {{
                 __syncwarp();
                 continue;
             }}
@@ -12905,22 +12968,31 @@ def _get_pgs_solve_propagation_contact_kernel(
                     for (int patch_row = propagation_row_parent.data[world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[world_base + patch_row])
                         lambda_n += propagation_impulses.data[world_base + patch_row];
                     const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
-                    if (radius <= 0.0f) {{
-                        new_impulse = 0.0f;
+                    if (i != parent_idx + 1) {{
+                        new_impulse = old_impulse;
                     }} else {{
-                        sib = parent_idx + 1;
-                        if (i == parent_idx + 1) sib = parent_idx + 2;
-                        propagation_impulses.data[off] = new_impulse;
+                        sib = parent_idx + 2;
                         const int sib_off = world_base + sib;
                         const float other = propagation_impulses.data[sib_off];
-                        const float mag = sqrtf(new_impulse * new_impulse + other * other);
-                        if (mag > radius) {{
-                            const float scale = radius / mag;
-                            new_impulse *= scale;
-                            const float sib_new = other * scale;
-                            sib_delta = sib_new - other;
-                            propagation_impulses.data[sib_off] = sib_new;
+                        float sibling_residual = propagation_rhs.data[sib_off];
+                        float cross = 0.0f;
+                        for (int k = 0; k < 6; ++k) {{
+                            if (ba >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * propagation_body_qd.data[ba * 6 + k];
+                            if (ba >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
+                            if (bb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * propagation_body_qd.data[bb * 6 + k];
+                            if (bb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
                         }}
+                        const float inv_sib = propagation_eff_mass_inv.data[sib_off];
+                        float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                            residual, sibling_residual, old_impulse, other, radius, omega);
+                        new_impulse = pair.x;
+                        const float trial_sib = pair.y;
+                        const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
+                        const float scale = mag > radius ? radius / mag : 1.0f;
+                        new_impulse *= scale;
+                        const float sib_new = trial_sib * scale;
+                        sib_delta = sib_new - other;
+                        propagation_impulses.data[sib_off] = sib_new;
                     }}
                 }}
 
@@ -12955,6 +13027,8 @@ def _get_pgs_solve_propagation_contact_kernel(
 
 #endif
 """
+
+    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_native(
@@ -13247,7 +13321,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                 }
 
                 const float denom = s_diag_dense[i];
-                if (denom <= 0.0f) {
+                if (denom <= 0.0f && row_type != 2) {
                     __syncwarp(MASK);
                     continue;
                 }
@@ -13265,7 +13339,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                 const float old_impulse = s_lam_dense[i];
                 const float w = regularize ? world_row_w.data[off_dense + i] : 1.0f;
                 const float residual = jv + s_rhs_dense[i];
-                const float delta = -residual / denom * w - (1.0f - w) * old_impulse;
+                const float delta = denom > 0.0f ? -residual / denom * w - (1.0f - w) * old_impulse : 0.0f;
                 float new_impulse = old_impulse + omega * delta;
                 float delta_impulse = 0.0f;
 
@@ -13294,24 +13368,34 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     for (int patch_row = s_parent_dense[parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = s_parent_dense[patch_row])
                         lambda_n += s_lam_dense[patch_row];
                     const float radius = fmaxf(s_mu_dense[i] * lambda_n, 0.0f);
-                    if (radius <= 0.0f) {
-                        new_impulse = 0.0f;
+                    if (i != parent_idx + 1) {
+                        new_impulse = old_impulse;
                     } else {
-                        const int sib = (i == parent_idx + 1) ? parent_idx + 2 : parent_idx + 1;
-                        s_lam_dense[i] = new_impulse;
-                        const float other = s_lam_dense[sib];
-                        const float mag = sqrtf(new_impulse * new_impulse + other * other);
-                        if (mag > radius) {
-                            const float scale = radius / mag;
-                            new_impulse *= scale;
-                            const float sib_new = other * scale;
-                            const float sib_delta = sib_new - other;
-                            s_lam_dense[sib] = sib_new;
-                            const int sib_row_base = jy_world_base + sib * __D__;
-                            for (int d = lane; d < __D__; d += 32) {
-                                s_v[d] += Y_world.data[sib_row_base + d] * sib_delta;
-                            }
-                        }
+                        const int sib = parent_idx + 2;
+                        const int sib_row_base = jy_world_base + sib * __D__;
+                        float sibling_residual = 0.0f;
+                        for (int d = lane; d < __D__; d += 32)
+                            sibling_residual += J_world.data[sib_row_base + d] * s_v[d];
+                        for (int offset = 16; offset > 0; offset >>= 1)
+                            sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
+                        sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs_dense[sib];
+                        float cross = 0.0f;
+                        for (int d = lane; d < __D__; d += 32)
+                            cross += J_world.data[jy_world_base + i * __D__ + d] * Y_world.data[sib_row_base + d];
+                        for (int offset = 16; offset > 0; offset >>= 1)
+                            cross += __shfl_down_sync(MASK, cross, offset);
+                        cross = __shfl_sync(MASK, cross, 0);
+                        float2 pair = friction_pair_candidate(denom, cross, s_diag_dense[sib],
+                            residual, sibling_residual, old_impulse, s_lam_dense[sib], radius, omega);
+                        float a = pair.x;
+                        float b = pair.y;
+                        float mag = sqrtf(a * a + b * b);
+                        float scale = mag > radius ? radius / mag : 1.0f;
+                        new_impulse = a * scale;
+                        float sib_delta = b * scale - s_lam_dense[sib];
+                        s_lam_dense[sib] = b * scale;
+                        for (int d = lane; d < __D__; d += 32)
+                            s_v[d] += Y_world.data[sib_row_base + d] * sib_delta;
                     }
                     delta_impulse = new_impulse - old_impulse;
                 } else {
@@ -13368,7 +13452,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                         __syncwarp(MASK);
                         continue;
                     }
-                    if (mf_diag <= 0.0f) {
+                    if (mf_diag <= 0.0f && mf_rt != 2) {
                         __syncwarp(MASK);
                         continue;
                     }
@@ -13409,37 +13493,47 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                             new_impulse = 0.0f;
                         }
                     } else if (mf_rt == 2) {
-                        const int mf_par = packed_tp >> 16;
-                        float lambda_n = s_lam_mf[mf_par];
-                        for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> 16); patch_row >= 0 && patch_row != mf_par; patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
-                            lambda_n += s_lam_mf[patch_row];
-                        const float radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
-                        if (radius <= 0.0f) {
-                            new_impulse = 0.0f;
+                        int mf_par = packed_tp >> 16;
+                        if (i != mf_par + 1) {
+                            new_impulse = old_impulse;
                         } else {
-                            const int sib = (i == mf_par + 1) ? mf_par + 2 : mf_par + 1;
-                            s_lam_mf[i] = new_impulse;
-                            const float other = s_lam_mf[sib];
-                            const float mag = sqrtf(new_impulse * new_impulse + other * other);
-                            if (mag > radius) {
-                                const float scale = radius / mag;
-                                new_impulse *= scale;
-                                const float sib_new = other * scale;
-                                const float sib_delta = sib_new - other;
-                                s_lam_mf[sib] = sib_new;
-
-                                const int sib_packed_dofs = mf_meta.data[off_meta + sib * 4];
-                                const int sib_dof_a = sib_packed_dofs >> 16;
-                                const int sib_dof_b = (sib_packed_dofs << 16) >> 16;
-                                const int sib_mf6 = mf6_base + sib * 6;
-                                if (lane < 6 && sib_dof_a >= 0) {
-                                    s_v[sib_dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
-                                }
-                                if (lane >= 6 && lane < 12 && sib_dof_b >= 0) {
-                                    const int k = lane - 6;
-                                    s_v[sib_dof_b + k] += mf_MiJt_b.data[sib_mf6 + k] * sib_delta;
-                                }
-                            }
+                            int sib = mf_par + 2;
+                            int sib_mf6 = mf6_base + sib * 6;
+                            float lambda_n = s_lam_mf[mf_par];
+                            for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> 16); patch_row >= 0 && patch_row != mf_par; patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
+                                lambda_n += s_lam_mf[patch_row];
+                            float radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
+                            float sibling_residual = 0.0f;
+                            if (lane < 6 && dof_a >= 0)
+                                sibling_residual = mf_J_a.data[sib_mf6 + lane] * s_v[dof_a + lane];
+                            if (lane >= 6 && lane < 12 && dof_b >= 0)
+                                sibling_residual = mf_J_b.data[sib_mf6 + lane - 6] * s_v[dof_b + lane - 6];
+                            for (int offset = 16; offset > 0; offset >>= 1)
+                                sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
+                            sibling_residual = __shfl_sync(MASK, sibling_residual, 0)
+                                + __int_as_float(mf_meta.data[off_meta + sib * 4 + 2]);
+                            float inv_sib = __int_as_float(mf_meta.data[off_meta + sib * 4 + 1]);
+                            float cross = 0.0f;
+                            if (lane < 6 && dof_a >= 0)
+                                cross = mf_J_a.data[mf6_base + i * 6 + lane] * mf_MiJt_a.data[sib_mf6 + lane];
+                            if (lane >= 6 && lane < 12 && dof_b >= 0)
+                                cross = mf_J_b.data[mf6_base + i * 6 + lane - 6] * mf_MiJt_b.data[sib_mf6 + lane - 6];
+                            for (int offset = 16; offset > 0; offset >>= 1)
+                                cross += __shfl_down_sync(MASK, cross, offset);
+                            cross = __shfl_sync(MASK, cross, 0);
+                            float2 pair = friction_pair_candidate(mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                                residual, sibling_residual, old_impulse, s_lam_mf[sib], radius, omega);
+                            float a = pair.x;
+                            float b = pair.y;
+                            float mag = sqrtf(a * a + b * b);
+                            float scale = mag > radius ? radius / mag : 1.0f;
+                            new_impulse = a * scale;
+                            float sib_delta = b * scale - s_lam_mf[sib];
+                            s_lam_mf[sib] = b * scale;
+                            if (lane < 6 && dof_a >= 0)
+                                s_v[dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
+                            if (lane >= 6 && lane < 12 && dof_b >= 0)
+                                s_v[dof_b + lane - 6] += mf_MiJt_b.data[sib_mf6 + lane - 6] * sib_delta;
                         }
                     }
 
@@ -13539,7 +13633,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     }
 
                     const float eff_inv = propagation_eff_mass_inv.data[off];
-                    if (eff_inv <= 0.0f) {
+                    if (eff_inv <= 0.0f && row_type != 2) {
                         __syncwarp(MASK);
                         continue;
                     }
@@ -13588,22 +13682,31 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                             for (int patch_row = propagation_row_parent.data[prop_world_base + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = propagation_row_parent.data[prop_world_base + patch_row])
                                 lambda_n += propagation_impulses.data[prop_world_base + patch_row];
                             const float radius = fmaxf(propagation_row_mu.data[off] * lambda_n, 0.0f);
-                            if (radius <= 0.0f) {
-                                new_impulse = 0.0f;
+                            if (i != parent_idx + 1) {
+                                new_impulse = old_impulse;
                             } else {
-                                sib = parent_idx + 1;
-                                if (i == parent_idx + 1) sib = parent_idx + 2;
-                                propagation_impulses.data[off] = new_impulse;
+                                sib = parent_idx + 2;
                                 const int sib_off = prop_world_base + sib;
                                 const float other = propagation_impulses.data[sib_off];
-                                const float mag = sqrtf(new_impulse * new_impulse + other * other);
-                                if (mag > radius) {
-                                    const float scale = radius / mag;
-                                    new_impulse *= scale;
-                                    const float sib_new = other * scale;
-                                    sib_delta = sib_new - other;
-                                    propagation_impulses.data[sib_off] = sib_new;
+                                float sibling_residual = propagation_rhs.data[sib_off];
+                                float cross = 0.0f;
+                                for (int k = 0; k < 6; ++k) {
+                                    if (ba >= 0) sibling_residual += propagation_J_a.data[sib_off * 6 + k] * propagation_body_qd.data[ba * 6 + k];
+                                    if (ba >= 0) cross += propagation_J_a.data[off * 6 + k] * propagation_MiJt_a.data[sib_off * 6 + k];
+                                    if (bb >= 0) sibling_residual += propagation_J_b.data[sib_off * 6 + k] * propagation_body_qd.data[bb * 6 + k];
+                                    if (bb >= 0) cross += propagation_J_b.data[off * 6 + k] * propagation_MiJt_b.data[sib_off * 6 + k];
                                 }
+                                const float inv_sib = propagation_eff_mass_inv.data[sib_off];
+                                float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                                    residual, sibling_residual, old_impulse, other, radius, omega);
+                                new_impulse = pair.x;
+                                const float trial_sib = pair.y;
+                                const float mag = sqrtf(new_impulse * new_impulse + trial_sib * trial_sib);
+                                const float scale = mag > radius ? radius / mag : 1.0f;
+                                new_impulse *= scale;
+                                const float sib_new = trial_sib * scale;
+                                sib_delta = sib_new - other;
+                                propagation_impulses.data[sib_off] = sib_new;
                             }
                         }
 
@@ -13891,6 +13994,8 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     # always a parameter; launch sites pass the solver's drive_vel_limit
     # array — a (1, 1) dummy when the fused clamp is off — and
     # fuse_vel_limits only gates the clamp code emission above.
+
+    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_full_iteration_native(
@@ -16418,39 +16523,46 @@ def _get_pgs_solve_mf_gs_kernel(
     else:
         dense_friction_block = f"""
                 int parent_idx = (s_meta_dense[i] >> __DENSE_META_ROW_TYPE_BITS__) - 1;
-                float lambda_n = s_lam_dense[parent_idx];
-                for (int patch_row = ((s_meta_dense[parent_idx] >> __DENSE_META_ROW_TYPE_BITS__) - 1); patch_row >= 0 && patch_row != parent_idx; patch_row = ((s_meta_dense[patch_row] >> __DENSE_META_ROW_TYPE_BITS__) - 1))
-                    lambda_n += s_lam_dense[patch_row];
-                float mu = s_mu_dense[i];
-                float radius = fmaxf(mu * lambda_n, 0.0f);
-
-                if (radius <= 0.0f) {{
-                    new_impulse = 0.0f;
+                if (i != parent_idx + 1) {{
+                    new_impulse = old_impulse;
                 }} else {{
-                    int sib = (i == parent_idx + 1) ? parent_idx + 2 : parent_idx + 1;
-                    s_lam_dense[i] = new_impulse;
-                    float a_val = new_impulse;
-                    float b_val = s_lam_dense[sib];
-                    float mag = sqrtf(a_val * a_val + b_val * b_val);
-                    if (mag > radius) {{
-                        float scale = radius / mag;
-                        new_impulse = a_val * scale;
-                        float sib_new = b_val * scale;
-                        float sib_delta = sib_new - b_val;
-                        if (sib_delta != 0.0f) iteration_changed = 1;
-                        s_lam_dense[sib] = sib_new;
-
-                        int sib_row_base = jy_world_base + sib * {D};
-                        {dense_sib_v_code}
-                    }}
+                    int sib = parent_idx + 2;
+                    int sib_row_base = jy_world_base + sib * {D};
+                    float lambda_n = s_lam_dense[parent_idx];
+                    for (int patch_row = ((s_meta_dense[parent_idx] >> __DENSE_META_ROW_TYPE_BITS__) - 1); patch_row >= 0 && patch_row != parent_idx; patch_row = ((s_meta_dense[patch_row] >> __DENSE_META_ROW_TYPE_BITS__) - 1))
+                        lambda_n += s_lam_dense[patch_row];
+                    float radius = fmaxf(s_mu_dense[i] * lambda_n, 0.0f);
+                    float sibling_residual = 0.0f;
+                    for (int d = lane; d < {D}; d += 32)
+                        sibling_residual += J_world.data[sib_row_base + d] * s_v[d];
+                    for (int offset = 16; offset > 0; offset >>= 1)
+                        sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
+                    sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs_dense[sib];
+                    float cross = 0.0f;
+                    for (int d = lane; d < {D}; d += 32)
+                        cross += J_world.data[jy_world_base + i * {D} + d] * Y_world.data[sib_row_base + d];
+                    for (int offset = 16; offset > 0; offset >>= 1)
+                        cross += __shfl_down_sync(MASK, cross, offset);
+                    cross = __shfl_sync(MASK, cross, 0);
+                    float2 pair = friction_pair_candidate(denom, cross, s_diag_dense[sib],
+                        residual, sibling_residual, old_impulse, s_lam_dense[sib], radius, omega);
+                    float a = pair.x;
+                    float b = pair.y;
+                    float mag = sqrtf(a * a + b * b);
+                    float scale = mag > radius ? radius / mag : 1.0f;
+                    new_impulse = a * scale;
+                    float sib_delta = b * scale - s_lam_dense[sib];
+                    s_lam_dense[sib] = b * scale;
+                    if (sib_delta != 0.0f) iteration_changed = 1;
+                    {dense_sib_v_code}
                 }}
 """
 
     dense_friction_block = dense_friction_block.replace("__DENSE_META_ROW_TYPE_BITS__", str(_DENSE_META_ROW_TYPE_BITS))
 
     # --- MF friction-row projection -------------------------------------
-    # ``friction_mode="current"`` keeps the legacy isotropic Coulomb
-    # cone projection (matches :func:`friction_step_current`).
+    # ``friction_mode="current"`` solves the tangent block on its friction
+    # disk at fixed normal load (matches :func:`friction_step_current`).
     # ``friction_mode="bisection"`` runs the RAISim bisection on λ_n
     # (matches :func:`friction_step_bisection`).
     # ``friction_mode="bisection_desaxce"`` runs the same bisection
@@ -16965,42 +17077,48 @@ def _get_pgs_solve_mf_gs_kernel(
 """
     else:
         mf_friction_block = """
-                // friction_mode="current": isotropic Coulomb cone clamp.
                 int mf_par = packed_tp >> 16;
-                float lambda_n = s_lam_mf[mf_par];
-                for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> 16); patch_row >= 0 && patch_row != mf_par; patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
-                    lambda_n += s_lam_mf[patch_row];
-                float mu = mf_row_mu.data[off_mf + i];
-                float radius = fmaxf(mu * lambda_n, 0.0f);
-
-                if (radius <= 0.0f) {
-                    new_impulse = 0.0f;
+                if (i != mf_par + 1) {
+                    new_impulse = old_impulse;
                 } else {
-                    int sib = (i == mf_par + 1) ? mf_par + 2 : mf_par + 1;
-                    s_lam_mf[i] = new_impulse;
-                    float a_val = new_impulse;
-                    float b_val = s_lam_mf[sib];
-                    float mag = sqrtf(a_val * a_val + b_val * b_val);
-                    if (mag > radius) {
-                        float scale = radius / mag;
-                        new_impulse = a_val * scale;
-                        float sib_new = b_val * scale;
-                        float sib_delta = sib_new - b_val;
-                        if (sib_delta != 0.0f) iteration_changed = 1;
-                        s_lam_mf[sib] = sib_new;
-
-                        // Sibling v update (can't prefetch — random sib index)
-                        int sib_packed_dofs = mf_meta.data[off_meta + sib * 4];
-                        int sib_dof_a = sib_packed_dofs >> 16;
-                        int sib_dof_b = (sib_packed_dofs << 16) >> 16;
-                        int sib_mf6 = mf6_base + sib * 6;
-                        if (lane < 6 && sib_dof_a >= 0) {
-                            s_v[sib_dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
-                        }
-                        if (lane >= 6 && lane < 12 && sib_dof_b >= 0) {
-                            s_v[sib_dof_b + lane - 6] += mf_MiJt_b.data[sib_mf6 + lane - 6] * sib_delta;
-                        }
-                    }
+                    int sib = mf_par + 2;
+                    int sib_mf6 = mf6_base + sib * 6;
+                    float lambda_n = s_lam_mf[mf_par];
+                    for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> 16); patch_row >= 0 && patch_row != mf_par; patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
+                        lambda_n += s_lam_mf[patch_row];
+                    float radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
+                    float sibling_residual = 0.0f;
+                    if (lane < 6 && dof_a >= 0)
+                        sibling_residual = mf_J_a.data[sib_mf6 + lane] * s_v[dof_a + lane];
+                    if (lane >= 6 && lane < 12 && dof_b >= 0)
+                        sibling_residual = mf_J_b.data[sib_mf6 + lane - 6] * s_v[dof_b + lane - 6];
+                    for (int offset = 16; offset > 0; offset >>= 1)
+                        sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
+                    sibling_residual = __shfl_sync(MASK, sibling_residual, 0)
+                        + __int_as_float(mf_meta.data[off_meta + sib * 4 + 2]);
+                    float inv_sib = __int_as_float(mf_meta.data[off_meta + sib * 4 + 1]);
+                    float cross = 0.0f;
+                    if (lane < 6 && dof_a >= 0)
+                        cross = mf_J_a.data[mf6_base + i * 6 + lane] * mf_MiJt_a.data[sib_mf6 + lane];
+                    if (lane >= 6 && lane < 12 && dof_b >= 0)
+                        cross = mf_J_b.data[mf6_base + i * 6 + lane - 6] * mf_MiJt_b.data[sib_mf6 + lane - 6];
+                    for (int offset = 16; offset > 0; offset >>= 1)
+                        cross += __shfl_down_sync(MASK, cross, offset);
+                    cross = __shfl_sync(MASK, cross, 0);
+                    float2 pair = friction_pair_candidate(mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                        residual, sibling_residual, old_impulse, s_lam_mf[sib], radius, omega);
+                    float a = pair.x;
+                    float b = pair.y;
+                    float mag = sqrtf(a * a + b * b);
+                    float scale = mag > radius ? radius / mag : 1.0f;
+                    new_impulse = a * scale;
+                    float sib_delta = b * scale - s_lam_mf[sib];
+                    s_lam_mf[sib] = b * scale;
+                    if (sib_delta != 0.0f) iteration_changed = 1;
+                    if (lane < 6 && dof_a >= 0)
+                        s_v[dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
+                    if (lane >= 6 && lane < 12 && dof_b >= 0)
+                        s_v[dof_b + lane - 6] += mf_MiJt_b.data[sib_mf6 + lane - 6] * sib_delta;
                 }
 """
 
@@ -17276,7 +17394,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
 
             float denom = s_diag_dense[i];
-            if (denom <= 0.0f) continue;
+            if (denom <= 0.0f{" && row_type != 2" if friction_mode == "current" else ""}) continue;
 
             // J_i · v (using prefetched J)
             {dense_dot_code}
@@ -17292,7 +17410,7 @@ def _get_pgs_solve_mf_gs_kernel(
             float old_impulse = s_lam_dense[i];
             float w = regularize ? world_row_w.data[off_dense + i] : 1.0f;
             float residual = jv + s_rhs_dense[i];
-            float delta = -residual / denom * w - (1.0f - w) * old_impulse;
+            float delta = denom > 0.0f ? -residual / denom * w - (1.0f - w) * old_impulse : 0.0f;
             float new_impulse = old_impulse + omega * delta;
             float delta_impulse = 0.0f;
 
@@ -17401,7 +17519,8 @@ def _get_pgs_solve_mf_gs_kernel(
                 continue;
             }}
 
-            if (mf_diag <= 0.0f) continue;
+            if (mf_rt == 2 && i != (packed_tp >> 16) + 1) continue;
+            if (mf_diag <= 0.0f{" && mf_rt != 2" if friction_mode == "current" else ""}) continue;
 
             // J · v using prefetched J values
             float my_sum = 0.0f;
@@ -17634,6 +17753,8 @@ def _get_pgs_solve_mf_gs_kernel(
     # always a parameter; launch sites pass the solver's drive_vel_limit
     # array — a (1, 1) dummy when the fused clamp is off — and
     # fuse_vel_limits only gates the clamp code emission above.
+
+    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
 
     @wp.func_native(snippet)
     def pgs_solve_mf_gs_native(

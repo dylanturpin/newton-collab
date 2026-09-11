@@ -22,6 +22,7 @@ from ...sim.articulation import (
     compute_3d_rotational_dofs,
 )
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
+from .friction import friction_pair_candidate
 from .friction_patches import FrictionPatches, contact_tangent_basis, patch_normal_load
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
@@ -8065,7 +8066,7 @@ def pgs_solve_propagation_contact_loop(
                 continue
 
             eff_inv = propagation_eff_mass_inv[world, i]
-            if eff_inv <= 0.0:
+            if eff_inv <= 0.0 and row_type != PGS_CONSTRAINT_TYPE_FRICTION:
                 continue
 
             ba = propagation_body_a[world, i]
@@ -8096,23 +8097,43 @@ def pgs_solve_propagation_contact_loop(
                 mu_val = propagation_row_mu[world, i]
                 radius = wp.max(mu_val * lambda_n, 0.0)
 
-                if radius <= 0.0:
-                    new_impulse = 0.0
+                if i != parent_idx + 1:
+                    new_impulse = old_impulse
                 else:
-                    sib = parent_idx + 1
-                    if i == parent_idx + 1:
-                        sib = parent_idx + 2
-                    propagation_impulses[world, i] = new_impulse
-                    a = new_impulse
-                    b = propagation_impulses[world, sib]
-                    mag = wp.sqrt(a * a + b * b)
-                    if mag > radius:
-                        scale = radius / mag
-                        new_impulse = a * scale
-                        sib_new = b * scale
-                        sib_delta = sib_new - b
-                        propagation_impulses[world, sib] = sib_new
-
+                    sib = parent_idx + 2
+                    other = propagation_impulses[world, sib]
+                    sibling_residual = propagation_rhs[world, sib]
+                    cross = float(0.0)
+                    for k in range(6):
+                        if ba >= 0:
+                            sibling_residual += propagation_J_a[world, sib, k] * propagation_body_qd[ba, k]
+                            cross += propagation_J_a[world, i, k] * propagation_MiJt_a[world, sib, k]
+                        if bb >= 0:
+                            sibling_residual += propagation_J_b[world, sib, k] * propagation_body_qd[bb, k]
+                            cross += propagation_J_b[world, i, k] * propagation_MiJt_b[world, sib, k]
+                    inv_sib = propagation_eff_mass_inv[world, sib]
+                    sibling_diag = float(0.0)
+                    if inv_sib > 0.0:
+                        sibling_diag = 1.0 / inv_sib
+                    first_diag = float(0.0)
+                    if eff_inv > 0.0:
+                        first_diag = 1.0 / eff_inv
+                    trial = friction_pair_candidate(
+                        first_diag,
+                        cross,
+                        sibling_diag,
+                        wp.vec2(residual, sibling_residual),
+                        wp.vec2(old_impulse, other),
+                        radius,
+                        omega,
+                    )
+                    magnitude = wp.length(trial)
+                    if magnitude > radius:
+                        trial *= radius / magnitude
+                    new_impulse = trial[0]
+                    sib_delta = trial[1] - other
+                    propagation_impulses[world, sib] = trial[1]
+                    if sib_delta != 0.0:
                         sib_ba = propagation_body_a[world, sib]
                         sib_bb = propagation_body_b[world, sib]
                         if sib_ba >= 0:
@@ -8336,7 +8357,11 @@ def solve_coulomb_row(W: wp.mat33, b: wp.vec3, mu: float) -> FPGSCoulombNewtonRe
 def friction_step_current(
     world: int,
     i: int,
-    new_impulse: float,
+    omega: float,
+    mf_eff_mass_inv: wp.array2d[float],
+    mf_rhs: wp.array2d[float],
+    mf_J_a: wp.array3d[float],
+    mf_J_b: wp.array3d[float],
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
     mf_MiJt_a: wp.array3d[float],
@@ -8348,83 +8373,62 @@ def friction_step_current(
     mf_impulses: wp.array2d[float],
     v_out: wp.array[float],
 ):
-    """Baseline (``friction_mode="current"``) per-row Coulomb friction step.
+    """Solve the tangent pair at the current patch or point normal load.
 
-    Performs the isotropic Coulomb cone projection for the matrix-free PGS
-    friction row at ``(world, i)``.  When the combined friction impulse
-    magnitude exceeds the cone radius ``mu * lambda_n``, this function
-    rescales both the current row and its sibling friction row onto the
-    cone boundary and applies the resulting sibling-row velocity correction
-    to ``v_out``.  It is the factored seam that future friction strategies
-    (RAISim bisection, bisection + de Saxce, Daviet 1D Newton) will replace;
-    see the FPGS Friction Modes issue series.
-
-    Args:
-        world: World index for the current row.
-        i: Constraint row index within the world.
-        new_impulse: Candidate friction impulse for row ``i`` prior to
-            projection.
-        mf_body_a: Matrix-free body-a indices [shape: world_count,
-            mf_max_constraints].
-        mf_body_b: Matrix-free body-b indices [shape: world_count,
-            mf_max_constraints].
-        mf_MiJt_a: ``H^{-1} J^T`` for body a per row [shape: world_count,
-            mf_max_constraints, 6].
-        mf_MiJt_b: ``H^{-1} J^T`` for body b per row [shape: world_count,
-            mf_max_constraints, 6].
-        mf_row_parent: Parent normal-row index for each friction row
-            [shape: world_count, mf_max_constraints].
-        mf_row_mu: Coulomb friction coefficient per row [shape:
-            world_count, mf_max_constraints].
-        body_to_articulation: Body-to-articulation index map.
-        art_dof_start: First DOF index per articulation.
-        mf_impulses: Current matrix-free impulses; updated in place for
-            the sibling friction row when the cone clamp fires [shape:
-            world_count, mf_max_constraints].
-        v_out: Generalized velocity buffer; updated in place with the
-            sibling-row velocity correction [N].
-
-    Returns:
-        The projected friction impulse for row ``i`` [N·s].
+    The caller applies the first tangent's velocity change; this function
+    applies the second and makes its subsequent row visit a no-op.
     """
     parent_idx = mf_row_parent[world, i]
+    if i != parent_idx + 1:
+        return mf_impulses[world, i]
+    sib = parent_idx + 2
     lambda_n = patch_normal_load(mf_row_parent, mf_impulses, world, parent_idx)
-    mu_val = mf_row_mu[world, i]
-    radius = wp.max(mu_val * lambda_n, 0.0)
-
-    if radius <= 0.0:
-        return float(0.0)
-
-    # Sibling friction row
-    if i == parent_idx + 1:
-        sib = parent_idx + 2
-    else:
-        sib = parent_idx + 1
-
-    mf_impulses[world, i] = new_impulse
-    a = new_impulse
-    b = mf_impulses[world, sib]
-    mag = wp.sqrt(a * a + b * b)
-    projected = new_impulse
-    if mag > radius:
-        scale = radius / mag
-        projected = a * scale
-        mf_impulses[world, sib] = b * scale
-        # Apply sibling correction to velocities
-        sib_delta = b * scale - b
-        sib_ba = mf_body_a[world, sib]
-        sib_bb = mf_body_b[world, sib]
-        if sib_ba >= 0:
-            sib_art_a = body_to_articulation[sib_ba]
-            sib_ds_a = art_dof_start[sib_art_a]
-            for k in range(6):
-                v_out[sib_ds_a + k] = v_out[sib_ds_a + k] + mf_MiJt_a[world, sib, k] * sib_delta
-        if sib_bb >= 0:
-            sib_art_b = body_to_articulation[sib_bb]
-            sib_ds_b = art_dof_start[sib_art_b]
-            for k in range(6):
-                v_out[sib_ds_b + k] = v_out[sib_ds_b + k] + mf_MiJt_b[world, sib, k] * sib_delta
-    return projected
+    radius = wp.max(mf_row_mu[world, i] * lambda_n, 0.0)
+    residual = wp.vec2(mf_rhs[world, i], mf_rhs[world, sib])
+    ba = mf_body_a[world, i]
+    bb = mf_body_b[world, i]
+    cross = float(0.0)
+    for k in range(6):
+        if ba >= 0:
+            ds = art_dof_start[body_to_articulation[ba]]
+            residual[0] += mf_J_a[world, i, k] * v_out[ds + k]
+            residual[1] += mf_J_a[world, sib, k] * v_out[ds + k]
+            cross += mf_J_a[world, i, k] * mf_MiJt_a[world, sib, k]
+        if bb >= 0:
+            ds = art_dof_start[body_to_articulation[bb]]
+            residual[0] += mf_J_b[world, i, k] * v_out[ds + k]
+            residual[1] += mf_J_b[world, sib, k] * v_out[ds + k]
+            cross += mf_J_b[world, i, k] * mf_MiJt_b[world, sib, k]
+    inv0 = mf_eff_mass_inv[world, i]
+    inv1 = mf_eff_mass_inv[world, sib]
+    sibling_diag = float(0.0)
+    if inv1 > 0.0:
+        sibling_diag = 1.0 / inv1
+    first_diag = float(0.0)
+    if inv0 > 0.0:
+        first_diag = 1.0 / inv0
+    trial = friction_pair_candidate(
+        first_diag,
+        cross,
+        sibling_diag,
+        residual,
+        wp.vec2(mf_impulses[world, i], mf_impulses[world, sib]),
+        radius,
+        omega,
+    )
+    magnitude = wp.length(trial)
+    if magnitude > radius:
+        trial *= radius / magnitude
+    sibling_delta = trial[1] - mf_impulses[world, sib]
+    mf_impulses[world, sib] = trial[1]
+    for k in range(6):
+        if ba >= 0:
+            ds = art_dof_start[body_to_articulation[ba]]
+            v_out[ds + k] += mf_MiJt_a[world, sib, k] * sibling_delta
+        if bb >= 0:
+            ds = art_dof_start[body_to_articulation[bb]]
+            v_out[ds + k] += mf_MiJt_b[world, sib, k] * sibling_delta
+    return trial[0]
 
 
 @wp.func
@@ -9023,7 +9027,9 @@ def pgs_solve_mf_loop(
                 continue
 
             eff_inv = mf_eff_mass_inv[world, i]
-            if eff_inv <= 0.0:
+            if eff_inv <= 0.0 and not (
+                row_type == PGS_CONSTRAINT_TYPE_FRICTION and friction_mode == FRICTION_MODE_CURRENT
+            ):
                 continue
 
             ba = mf_body_a[world, i]
@@ -9118,7 +9124,11 @@ def pgs_solve_mf_loop(
                     new_impulse = friction_step_current(
                         world,
                         i,
-                        new_impulse,
+                        omega,
+                        mf_eff_mass_inv,
+                        mf_rhs,
+                        mf_J_a,
+                        mf_J_b,
                         mf_body_a,
                         mf_body_b,
                         mf_MiJt_a,
@@ -9305,6 +9315,8 @@ def pgs_solve_loop(
             if row_type == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + it < friction_start_iteration:
                 world_impulses[world, i] = 0.0
                 continue
+            if row_type == PGS_CONSTRAINT_TYPE_FRICTION and i != world_row_parent[world, i] + 1:
+                continue
 
             # Compute residual: w = rhs_i + sum_j C_ij * lambda_j
             w = world_rhs[world, i]
@@ -9312,10 +9324,12 @@ def pgs_solve_loop(
                 w += world_C[world, i, j] * world_impulses[world, j]
 
             denom = world_diag[world, i]
-            if denom <= 0.0:
+            if denom <= 0.0 and row_type != PGS_CONSTRAINT_TYPE_FRICTION:
                 continue
 
-            delta = -w / denom
+            delta = float(0.0)
+            if denom > 0.0:
+                delta = -w / denom
             new_impulse = world_impulses[world, i] + omega * delta
 
             # --- Normal contact, joint limit, or joint velocity limit:
@@ -9340,26 +9354,35 @@ def pgs_solve_loop(
 
                 if radius <= 0.0:
                     world_impulses[world, i] = 0.0
+                    world_impulses[world, i + 1] = 0.0
                     continue
 
-                world_impulses[world, i] = new_impulse
+                if i != parent_idx + 1:
+                    continue
+                sib = parent_idx + 2
+                sibling_residual = world_rhs[world, sib]
+                for j in range(m):
+                    sibling_residual += world_C[world, sib, j] * world_impulses[world, j]
 
-                # Sibling friction row: constraints are laid out as [normal, friction1, friction2]
-                # so friction rows are at parent_idx+1 and parent_idx+2
-                if i == parent_idx + 1:
-                    sib = parent_idx + 2
-                else:
-                    sib = parent_idx + 1
-
-                # Project tangent impulses onto friction disk
-                a = world_impulses[world, i]
-                b = world_impulses[world, sib]
+                trial = friction_pair_candidate(
+                    denom,
+                    world_C[world, i, sib],
+                    world_diag[world, sib],
+                    wp.vec2(w, sibling_residual),
+                    wp.vec2(world_impulses[world, i], world_impulses[world, sib]),
+                    radius,
+                    omega,
+                )
+                a = trial[0]
+                b = trial[1]
 
                 mag = wp.sqrt(a * a + b * b)
                 if mag > radius:
                     scale = radius / mag
-                    world_impulses[world, i] = a * scale
-                    world_impulses[world, sib] = b * scale
+                    a *= scale
+                    b *= scale
+                world_impulses[world, i] = a
+                world_impulses[world, sib] = b
 
             else:
                 world_impulses[world, i] = new_impulse
