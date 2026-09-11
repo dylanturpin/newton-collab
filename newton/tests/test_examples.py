@@ -1331,6 +1331,7 @@ for example_name in (
     "feather_pgs.example_fpgs_pyramid",
     "feather_pgs.example_fpgs_jenga",
     "feather_pgs.example_fpgs_galton",
+    "feather_pgs.example_fpgs_mesh_grasp",
 ):
     add_example_test(
         TestFeatherPGSExamples,

@@ -20,12 +20,13 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.feather_pgs._showreel import assert_finite, make_solver
+from newton.examples.feather_pgs._showreel import Stepper, assert_finite, make_solver
 
 BASE = 12
 BOX = 0.5
 CANNONBALL_RADIUS = 0.35
 FIRE_AT = 1.5
+SOLVER_OVERRIDES = {"pgs_iterations": 12, "mf_max_constraints": 8192}
 
 
 class Example:
@@ -34,7 +35,7 @@ class Example:
         self.viewer = viewer
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 4
+        self.sim_substeps = 2
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
         self.test_mode = bool(getattr(args, "test", False))
@@ -73,7 +74,7 @@ class Example:
 
         self.model = builder.finalize()
         self.model.rigid_contact_max = 48 * (len(self.boxes) + 1)
-        self.solver = make_solver(self.model, pgs_iterations=32, mf_max_constraints=8192)
+        self.solver = make_solver(self.model, **SOLVER_OVERRIDES)
         self.collision_pipeline = newton.examples.create_collision_pipeline(
             self.model, args, broad_phase="sap", rigid_contact_max=self.model.rigid_contact_max
         )
@@ -81,6 +82,7 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
+        self.stepper = Stepper(self, solver_overrides=SOLVER_OVERRIDES)
         self.initial_top = float(self.state_0.body_q.numpy()[self.boxes[-1], 2])
 
         self.viewer.set_model(self.model)
@@ -100,13 +102,14 @@ class Example:
     def step(self):
         if self.test_mode and not self.fired and self.sim_time >= FIRE_AT:
             self.fire()
-        for _ in range(self.sim_substeps):
-            self.state_0.clear_forces()
-            self.viewer.apply_forces(self.state_0)
-            self.collision_pipeline.collide(self.state_0, self.contacts)
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-            self.state_0, self.state_1 = self.state_1, self.state_0
-        self.sim_time += self.frame_dt
+        self.stepper.step()
+
+    def substep(self):
+        self.state_0.clear_forces()
+        self.viewer.apply_forces(self.state_0)
+        self.collision_pipeline.collide(self.state_0, self.contacts)
+        self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+        self.state_0, self.state_1 = self.state_1, self.state_0
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -123,6 +126,7 @@ class Example:
             self.fire()
         q = self.state_0.body_q.numpy()
         ui.text(f"top box height {float(q[self.boxes, 2].max()):.2f} m (settled: {self.initial_top:.2f})")
+        self.stepper.gui(ui)
 
     def test_final(self):
         assert_finite(self.state_0.body_q, self.state_0.body_qd)

@@ -21,7 +21,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.feather_pgs._showreel import assert_finite, make_solver
+from newton.examples.feather_pgs._showreel import Stepper, assert_finite, make_solver
 
 BALL_RADIUS = 0.01
 PEG_RADIUS = 0.006
@@ -32,6 +32,7 @@ BIN_HEIGHT = 0.35
 TOP_ROW_Z = 1.2
 SLOT_HALF = 0.011
 BALLS = 300
+SOLVER_OVERRIDES = {"pgs_iterations": 8, "mf_max_constraints": 8192}
 
 
 class Example:
@@ -115,7 +116,7 @@ class Example:
 
         self.model = builder.finalize()
         self.model.rigid_contact_max = 12 * BALLS
-        self.solver = make_solver(self.model, pgs_iterations=16, mf_max_constraints=8192)
+        self.solver = make_solver(self.model, **SOLVER_OVERRIDES)
         self.collision_pipeline = newton.examples.create_collision_pipeline(
             self.model, args, broad_phase="sap", rigid_contact_max=12 * BALLS
         )
@@ -123,18 +124,20 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
+        self.stepper = Stepper(self, solver_overrides=SOLVER_OVERRIDES)
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(pos=wp.vec3(0.0, -2.4, 0.9), pitch=-8.0, yaw=90.0)
 
     def step(self):
-        for _ in range(self.sim_substeps):
-            self.state_0.clear_forces()
-            self.viewer.apply_forces(self.state_0)
-            self.collision_pipeline.collide(self.state_0, self.contacts)
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-            self.state_0, self.state_1 = self.state_1, self.state_0
-        self.sim_time += self.frame_dt
+        self.stepper.step()
+
+    def substep(self):
+        self.state_0.clear_forces()
+        self.viewer.apply_forces(self.state_0)
+        self.collision_pipeline.collide(self.state_0, self.contacts)
+        self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+        self.state_0, self.state_1 = self.state_1, self.state_0
 
     def bin_counts(self) -> np.ndarray:
         q = self.state_0.body_q.numpy()[self.balls]
@@ -158,6 +161,7 @@ class Example:
             peak = max(int(counts.max()), 1)
             for k, c in enumerate(counts):
                 ui.text(f"{k:2d} {'#' * int(24 * c / peak):24s} {int(c)}")
+        self.stepper.gui(ui)
 
     def test_final(self):
         assert_finite(self.state_0.body_q, self.state_0.body_qd)
