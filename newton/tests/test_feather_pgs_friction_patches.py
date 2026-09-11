@@ -113,6 +113,21 @@ def _patch_fixture(
 
 
 class TestFrictionPatchHistory(unittest.TestCase):
+    def test_support_edge_centers_ignore_contact_order(self):
+        """Keep identical edge centers when contact ordering changes at rest."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        points = np.array(
+            [[x, y, 0.0] for x in np.linspace(-0.001, 0.001, 128) for y in (-0.05, 0.05)], dtype=np.float32
+        )
+        expected = np.array([[0.0, -0.05, 0.0], [0.0, 0.05, 0.0]], dtype=np.float32)
+        for seed in (0, 1, 2):
+            with self.subTest(seed=seed):
+                order = np.random.default_rng(seed).permutation(len(points))
+                _, _, _, patches = _patch_fixture(points[order], device=device)
+                locations = patches.view.point_a.numpy()[patches.view.weight.numpy() > 0.0]
+                locations = locations[np.argsort(locations[:, 1])]
+                np.testing.assert_array_equal(locations, expected)
+
     def test_narrow_patch_preserves_footprint_reflection_symmetry(self):
         """Avoid a diagonal friction couple on a symmetric narrow contact footprint."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"

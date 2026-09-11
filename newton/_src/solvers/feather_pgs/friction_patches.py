@@ -403,27 +403,32 @@ def _build(
             # Picking opposite corners of a narrow rectangle introduces an
             # artificial diagonal friction couple even when the footprint is symmetric.
             origin = location0
-            mean = wp.vec3(0.0)
+            t0, t1 = contact_tangent_basis(frame.normal[seed])
+            # Accumulate moments in double precision: contact-order roundoff
+            # must not give an isotropic footprint a spurious principal axis.
+            # Raw moments also avoid a separate pass to compute the centroid.
+            sum_x = wp.float64(0.0)
+            sum_y = wp.float64(0.0)
+            sum_xx = wp.float64(0.0)
+            sum_xy = wp.float64(0.0)
+            sum_yy = wp.float64(0.0)
             members = int(0)
             for j in range(index, stop):
                 c = frame.indices[j]
                 if frame.owner[c] == seed and frame.eligible[c] != 0:
-                    mean += frame.center[c] - origin
+                    offset = frame.center[c] - origin
+                    x = wp.float64(wp.dot(offset, t0))
+                    y = wp.float64(wp.dot(offset, t1))
+                    sum_x += x
+                    sum_y += y
+                    sum_xx += x * x
+                    sum_xy += x * y
+                    sum_yy += y * y
                     members += 1
-            mean /= float(members)
-            t0, t1 = contact_tangent_basis(frame.normal[seed])
-            xx = float(0.0)
-            xy = float(0.0)
-            yy = float(0.0)
-            for j in range(index, stop):
-                c = frame.indices[j]
-                if frame.owner[c] == seed and frame.eligible[c] != 0:
-                    offset = frame.center[c] - origin - mean
-                    x = wp.dot(offset, t0)
-                    y = wp.dot(offset, t1)
-                    xx += x * x
-                    xy += x * y
-                    yy += y * y
+            member_count = wp.float64(members)
+            xx = float(sum_xx - sum_x * sum_x / member_count)
+            xy = float(sum_xy - sum_x * sum_y / member_count)
+            yy = float(sum_yy - sum_y * sum_y / member_count)
             spread = wp.sqrt((xx - yy) * (xx - yy) + 4.0 * xy * xy)
             # An isotropic footprint has no distinguished axis; retain its
             # canonical farthest pair instead of amplifying roundoff.
@@ -446,24 +451,30 @@ def _build(
                         if projection > high:
                             high = projection
                             second = c
-                sum0 = wp.vec3(0.0)
-                sum1 = wp.vec3(0.0)
+                sum0 = wp.vec3d(0.0)
+                sum1 = wp.vec3d(0.0)
                 count0 = int(0)
                 count1 = int(0)
                 edge_tolerance = 1.0e-5 * frame.radius[seed]
                 for j in range(index, stop):
                     c = frame.indices[j]
                     if frame.owner[c] == seed and frame.eligible[c] != 0:
-                        offset = frame.center[c] - origin
+                        point = frame.center[c]
+                        offset = point - origin
                         projection = wp.dot(offset, axis)
+                        precise_point = wp.vec3d(wp.float64(point[0]), wp.float64(point[1]), wp.float64(point[2]))
                         if projection <= low + edge_tolerance:
-                            sum0 += offset
+                            sum0 += precise_point
                             count0 += 1
                         if projection >= high - edge_tolerance:
-                            sum1 += offset
+                            sum1 += precise_point
                             count1 += 1
-                location0 = origin + sum0 / float(count0)
-                location1 = origin + sum1 / float(count1)
+                # Preserve constant coordinates and single-point edges exactly;
+                # avoid subtracting and adding the origin around their average.
+                mean0 = sum0 / wp.float64(count0)
+                mean1 = sum1 / wp.float64(count1)
+                location0 = wp.vec3(float(mean0[0]), float(mean0[1]), float(mean0[2]))
+                location1 = wp.vec3(float(mean1[0]), float(mean1[1]), float(mean1[2]))
         for aidx in range(anchors):
             c = first
             if aidx == 1:
