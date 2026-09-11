@@ -70,6 +70,8 @@ class _PatchFrame:
     used: wp.array[int]
     source: wp.array[int]
     eligible: wp.array[int]
+    # Scratch indices: patch members in the current frame, valid anchors in the previous frame.
+    members: wp.array[int]
     support_gap_limit: wp.array[float]
     tangent_impulse: wp.array[wp.vec3]
 
@@ -328,10 +330,18 @@ def _build(
             hi = mid
     prev_start = lo
     prev_stop = lo
+    # Index valid history once per pair rather than rescanning all old contacts
+    # for every new friction location. Keep sorted order for matching ties.
+    prev_anchor_stop = prev_start
     while prev_stop < prev.center.shape[0] and prev.keys[prev_stop] == key:
-        prev.used[prev.indices[prev_stop]] = 0
+        p = prev.indices[prev_stop]
+        prev.used[p] = 0
+        if prev.valid[p] != 0:
+            prev.members[prev_anchor_stop] = p
+            prev_anchor_stop += 1
         prev_stop += 1
 
+    member_stop = start
     remaining = stop - start
     for index in range(start, stop):
         seed = frame.indices[index]
@@ -386,9 +396,16 @@ def _build(
             first = seed
         second = first
         separation = float(0.0)
+        member_start = member_stop
+        # Preserve sorted contact order for footprint sums and tie breaking.
+        # The collision list follows flood order and must remain unchanged.
         for j in range(index, stop):
             c = frame.indices[j]
-            if frame.owner[c] == seed and (carry_only != 0 or frame.eligible[c] != 0):
+            if frame.owner[c] != seed:
+                continue
+            frame.members[member_stop] = c
+            member_stop += 1
+            if carry_only != 0 or frame.eligible[c] != 0:
                 distance = wp.length_sq(frame.center[c] - frame.center[first])
                 if distance > separation:
                     separation = distance
@@ -413,9 +430,9 @@ def _build(
             sum_xy = wp.float64(0.0)
             sum_yy = wp.float64(0.0)
             members = int(0)
-            for j in range(index, stop):
-                c = frame.indices[j]
-                if frame.owner[c] == seed and frame.eligible[c] != 0:
+            for j in range(member_start, member_stop):
+                c = frame.members[j]
+                if frame.eligible[c] != 0:
                     offset = frame.center[c] - origin
                     x = wp.float64(wp.dot(offset, t0))
                     y = wp.float64(wp.dot(offset, t1))
@@ -441,9 +458,9 @@ def _build(
                 axis = axis2[0] * t0 + axis2[1] * t1
                 low = float(1.0e30)
                 high = float(-1.0e30)
-                for j in range(index, stop):
-                    c = frame.indices[j]
-                    if frame.owner[c] == seed and frame.eligible[c] != 0:
+                for j in range(member_start, member_stop):
+                    c = frame.members[j]
+                    if frame.eligible[c] != 0:
                         projection = wp.dot(frame.center[c] - origin, axis)
                         if projection < low:
                             low = projection
@@ -456,9 +473,9 @@ def _build(
                 count0 = int(0)
                 count1 = int(0)
                 edge_tolerance = 1.0e-5 * frame.radius[seed]
-                for j in range(index, stop):
-                    c = frame.indices[j]
-                    if frame.owner[c] == seed and frame.eligible[c] != 0:
+                for j in range(member_start, member_stop):
+                    c = frame.members[j]
+                    if frame.eligible[c] != 0:
                         point = frame.center[c]
                         offset = point - origin
                         projection = wp.dot(offset, axis)
@@ -494,8 +511,8 @@ def _build(
             motion = wp.vec3(0.0)
             if prev_start < prev_stop:
                 motion = _pose_motion(q, previous_q, a, location) - _pose_motion(q, previous_q, b, location)
-            for j in range(prev_start, prev_stop):
-                p = prev.indices[j]
+            for j in range(prev_start, prev_anchor_stop):
+                p = prev.members[j]
                 if (
                     prev.valid[p] == 0
                     or prev.used[p] != 0
@@ -506,40 +523,47 @@ def _build(
                 old_n = prev.normal[p]
                 if a >= 0:
                     old_n = wp.transform_vector(q[a], old_n)
+                # Reject incompatible normals and positions before transporting
+                # the spring or evaluating support witnesses. These are the same
+                # gates as below, ordered to avoid work for rejected history.
+                if not (wp.dot(old_n, n) >= 0.995):
+                    continue
                 pa = _world_point(q, a, prev.anchor_a[p])
                 pb = _world_point(q, b, prev.anchor_b[p])
                 delta = pa - pb
+                offset = 0.5 * (pa + pb) - location
+                distance = wp.length_sq(offset)
+                if not (
+                    distance < nearest
+                    and distance <= 4.0 * r * r
+                    and wp.abs(wp.dot(delta, n)) <= 0.1 * r
+                    and wp.abs(wp.dot(offset, n)) <= 0.05 * r
+                ):
+                    continue
+                # Honor the existing contact envelope: a zero-gap test drops
+                # valid speculative contacts during a squeeze. Surface
+                # witnesses retain penetration during decompression and
+                # reject rocking beyond the same envelope as fresh contacts.
                 support_gap = wp.dot(_world_point(q, a, prev.surface_a[p]) - _world_point(q, b, prev.surface_b[p]), n)
+                if not (support_gap <= wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r):
+                    continue
                 error = _carried_displacement(q, prev, p, n)
                 error += motion
                 tangent_delta = error - n * wp.dot(error, n)
-                distance = wp.length_sq(0.5 * (pa + pb) - location)
                 # The tangential gate bounds uncorrected slip of a carried pair at a
                 # tenth of the smaller body's radius, about three times the measured
                 # Baumgarte equilibrium separation of a held box at 60 Hz. Tighter
                 # gates re-anchor below that equilibrium and turn the correction
                 # into creep; genuine sliding is released by ``finish_patch_impulses``.
-                if not (
-                    wp.dot(old_n, n) >= 0.995
-                    # Honor the existing contact envelope: a zero-gap test drops
-                    # valid speculative contacts during a squeeze. Surface
-                    # witnesses retain penetration during decompression and
-                    # reject rocking beyond the same envelope as fresh contacts.
-                    and support_gap <= wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r
-                    and wp.length_sq(tangent_delta) <= 0.01 * r * r
-                    and wp.abs(wp.dot(delta, n)) <= 0.1 * r
-                    and wp.abs(wp.dot(0.5 * (pa + pb) - location, n)) <= 0.05 * r
-                    and distance <= 4.0 * r * r
-                    and distance < nearest
-                ):
+                if not (wp.length_sq(tangent_delta) <= 0.01 * r * r):
                     continue
                 connected = _geometry_adjacent(
                     prev.shape_a[p], prev.shape_b[p], frame.shape_a[c], frame.shape_b[c], shape_transform, shape_radius
                 )
                 if not connected:
-                    for k in range(index, stop):
-                        member = frame.indices[k]
-                        if frame.owner[member] == seed and _geometry_adjacent(
+                    for k in range(member_start, member_stop):
+                        member = frame.members[k]
+                        if _geometry_adjacent(
                             prev.shape_a[p],
                             prev.shape_b[p],
                             frame.shape_a[member],
@@ -568,8 +592,8 @@ def _build(
                 # translation plus twist. Evaluate that field at the new points
                 # instead of transferring old lever-arm errors independently.
                 # A one-point region carries translation only.
-                for j in range(prev_start, prev_stop):
-                    partner = prev.indices[j]
+                for j in range(prev_start, prev_anchor_stop):
+                    partner = prev.members[j]
                     if partner != chosen and prev.valid[partner] != 0 and prev.owner[partner] == prev.owner[chosen]:
                         other_normal = prev.normal[partner]
                         if a >= 0:
@@ -797,6 +821,7 @@ class _FrictionPatchState:
             "used",
             "source",
             "eligible",
+            "members",
         ):
             setattr(frame, field, wp.zeros(n, dtype=int, device=device))
         return frame
