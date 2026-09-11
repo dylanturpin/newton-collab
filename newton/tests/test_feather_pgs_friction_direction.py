@@ -96,9 +96,20 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
         devices = ["cpu", "cuda:0"] if wp.is_cuda_available() else ["cpu"]
         capacity = 32
         for device in devices:
-            for angle, small_eigenvalue in ((0.0, 1.0), (0.37, 1.0), (1.1, 1.0), (0.37, 0.0), (0.0, 0.0)):
-                for regime in ("sticking", "sliding", "fixed"):
-                    sliding = regime == "sliding"
+            for angle, small_eigenvalue in (
+                (0.0, 1.0),
+                (0.37, 1.0),
+                (1.1, 1.0),
+                (0.37, 0.0),
+                (0.0, 0.0),
+                (0.0, 1.0e-4),
+                (0.0, 1.0e-6),
+                (0.0, 1.0e-8),
+            ):
+                for regime in ("sticking", "sliding", "fixed", "weak_sliding", "sliding_fixed"):
+                    if regime == "weak_sliding" and small_eigenvalue == 0.0:
+                        continue
+                    sliding = regime in ("sliding", "weak_sliding", "sliding_fixed")
                     with self.subTest(device=device, angle=angle, small_eigenvalue=small_eigenvalue, regime=regime):
                         rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
                         tangent_mass = rotation @ np.diag([small_eigenvalue, 7.0]) @ rotation.T
@@ -107,6 +118,10 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
                         if regime == "fixed":
                             expected = np.array([0.125, 0.0])
                         velocity = 2.0 * direction if sliding else np.zeros(2)
+                        if regime == "weak_sliding":
+                            # A tiny positive KKT multiplier still requires a boundary impulse.
+                            # Absolute bisection resolution loses the weak direction here.
+                            velocity = small_eigenvalue * direction
                         matrix = np.eye(capacity, dtype=np.float32)
                         matrix[1:3, 1:3] = tangent_mass
                         rhs = np.zeros((1, capacity), dtype=np.float32)
@@ -119,7 +134,7 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
                         parents = np.full((1, capacity), -1, dtype=np.int32)
                         parents[0, 1:3] = 0
                         initial = np.zeros((1, capacity), dtype=np.float32)
-                        if regime == "fixed":
+                        if regime in ("fixed", "sliding_fixed"):
                             initial[0, :3] = [1.0, *expected]
                         impulses = wp.array(initial, dtype=float, device=device)
                         args = [
@@ -142,8 +157,8 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
                             kernel = _get_pgs_solve_tiled_row_kernel(capacity, str(wp.get_device(device).arch))
                             wp.launch_tiled(kernel, dim=[1], inputs=args, block_dim=32, device=device)
                         actual = impulses.numpy()[0, :3]
-                        if regime == "fixed":
-                            np.testing.assert_array_equal(actual, [1.0, *expected])
+                        if regime in ("fixed", "sliding_fixed"):
+                            np.testing.assert_array_equal(actual, initial[0, :3])
                         elif small_eigenvalue == 0.0 and not sliding:
                             # A singular sticking block has multiple impulse solutions.
                             np.testing.assert_allclose(tangent_mass @ actual[1:] + rhs[0, 1:3], 0.0, atol=1.0e-6)
