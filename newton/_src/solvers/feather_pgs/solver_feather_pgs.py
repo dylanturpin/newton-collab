@@ -42,6 +42,8 @@ from ..semi_implicit.kernels_particle import (
     eval_triangle_forces,
 )
 from ..solver import SolverBase
+from . import contact_compliance as _contact_compliance
+from .contact_torsion import configure_contact_torsion, prepare_torsion_rows, torque_sweep_source, validate_torsion_step
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
     FRICTION_MODE_BISECTION,
@@ -54,6 +56,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_CONSTRAINT_TYPE_TORSION,
     PREELIM_MAX_ROWS,
     PROPAGATION_COLOR_TAIL,
     accumulate_group_diag_worlds,
@@ -728,6 +731,21 @@ class SolverFeatherPGS(SolverBase):
             )
         )
 
+    @property
+    def contact_torsion_radius(self) -> float:
+        """Experimental construction-only effective spin radius [m]."""
+        return self._contact_torsion_radius
+
+    @property
+    def contact_torsion_shape_indices(self) -> tuple[int, ...] | None:
+        """Experimental construction-only global shape selection."""
+        return self._contact_torsion_shape_indices
+
+    @property
+    def contact_torsion_shape_patterns(self) -> tuple[str, ...] | None:
+        """Experimental construction-only shape-label regular expressions."""
+        return self._contact_torsion_shape_patterns
+
     def __init__(
         self,
         model: Model,
@@ -789,10 +807,62 @@ class SolverFeatherPGS(SolverBase):
         pgs_warmstart_decay: float = 1.0,
         warn_constraint_overflow: bool = True,
         friction_anchor_beta: float | None = None,
+        *,
+        contact_torsion_radius: float = 0.0,
+        contact_torsion_shape_indices: tuple[int, ...] | None = None,
+        contact_torsion_shape_patterns: tuple[str, ...] | None = None,
+        contact_compliance: bool = False,
     ):
         """
         Args:
             model (Model): the model to be simulated.
+            contact_torsion_radius: Experimental effective spin radius [m], zero disables.
+                Explicit material/footprint assumption: for uniform pressure on a disk
+                of radius R, the effective radius is 2*R/3. Does not consume the generic
+                material torsion default. Sliding and spin share one Coulomb budget.
+                Currently supports dense articulated contacts in CUDA matrix-free,
+                immediate/current/interleaved mode without warmstarting, graph capture,
+                hydroelastic contact, persistent friction patches, regularization,
+                debug mode, or velocity post-passes. Radius and selectors are
+                construction-only; recreate the solver to change them. A positive radius
+                with omitted ``friction_anchor_beta`` selects point friction and warns;
+                an explicit positive patch gain is rejected. Capacity
+                exhaustion raises even when optional overflow diagnostics are off. Host
+                grouping is diagnostic, not optimized for throughput. This experimental
+                parameter may change without the normal deprecation policy.
+            contact_torsion_shape_indices: Optional global shape indices selecting
+                contacts with at least one selected collider. Supported geometry is
+                sphere, box, capsule, cylinder, cone, ellipsoid, plane, and convex mesh.
+                Explicitly selecting unsupported geometry raises; without selectors,
+                contacts involving unsupported geometry are skipped. None selects all shapes;
+                an empty tuple selects none. Mutually exclusive with shape patterns.
+                Experimental, with the same compatibility limitations as the radius.
+            contact_torsion_shape_patterns: Optional regex patterns, full-matched against
+                finalized model.shape_label at construction. For substring matching use
+                an explicit pattern such as ".*fingertip.*". Empty tuple selects none;
+                unmatched nonempty patterns raise ValueError. Experimental, with the
+                same compatibility limitations as the radius.
+            contact_compliance: Experimental opt-in implicit unilateral contact material response.
+                Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
+                zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and
+                applies exported friction quadrature weighting once to the existing pair friction.
+                Requires CUDA matrix-free/immediate/interleaved solving, full position friction,
+                no warm start, restitution, global contact regularization, debug, shared normal
+                anchors, persistent-patch friction, or friction-anchor reduction. Intentional
+                allocator exclusions are counted in ``compliance_skipped_contact_count``;
+                contact/row capacity loss remains an error even with warnings disabled.
+                With omitted ``friction_anchor_beta``, enabling compliance selects point friction
+                and warns; an explicit positive patch gain is rejected at construction.
+                CUDA graph capture is rejected. This
+                host-synchronizing experimental implementation is not a performance path and may
+                change without the normal deprecation period. Defaults to False.
+                Enabling this option with zero stiffness preserves the hard-contact law, not
+                the runtime cost of the default-OFF path.
+
+                .. experimental::
+
+                    The ``contact_compliance=True`` material response and its supported combinations
+                    may change without prior notice.
             angular_damping (float, optional): Angular damping factor. Defaults to 0.05.
             update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the
                 :meth:`step` function gets called). The cadence flag is evaluated on the host each step, so under
@@ -834,8 +904,8 @@ class SolverFeatherPGS(SolverBase):
                 contact rows. Defaults to 1.0.
             friction_anchor_beta (float | None, optional): Set the positional correction strength
                 for persistent patch friction. ``None`` enables it at 0.2 for the default solver;
-                an explicitly selected point-contact algorithm instead retains velocity-only friction
-                and warns. Zero explicitly selects velocity-only point friction. Positive values
+                an explicitly selected point-contact algorithm or experimental contact material law
+                instead retains velocity-only point friction and warns. Zero explicitly selects velocity-only point friction. Positive values
                 group compatible contacts on a body pair into regions,
                 select up to two friction locations per region, and share the total
                 normal impulse equally between those anchors. Normal contacts are preserved.
@@ -1137,6 +1207,32 @@ class SolverFeatherPGS(SolverBase):
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
         """
+        if contact_compliance:
+            _contact_compliance.validate_configuration(
+                model,
+                {
+                    "pgs_mode": pgs_mode,
+                    "articulated_contact_response": articulated_contact_response,
+                    "pgs_schedule": pgs_schedule,
+                    "pgs_iterations": pgs_iterations,
+                    "pgs_velocity_iterations": pgs_velocity_iterations,
+                    "pgs_warmstart": pgs_warmstart,
+                    "mf_warmstart": mf_warmstart,
+                    "enable_restitution": enable_restitution,
+                    "pgs_contact_regularization": pgs_contact_regularization,
+                    "pgs_debug": pgs_debug,
+                    "contact_friction_position_iterations": contact_friction_position_iterations,
+                    "friction_mode": friction_mode,
+                    "contact_friction_anchor_limit": contact_friction_anchor_limit,
+                    "contact_friction_shared_anchor": contact_friction_shared_anchor,
+                    "contact_shared_anchor": contact_shared_anchor,
+                },
+            )
+        self.contact_compliance = bool(contact_compliance)
+        self.compliance_contact_count = 0
+        self.compliance_skipped_contact_count = 0
+        self._compliant_contacts = None
+        self._compliant_prepared = False
         super().__init__(model)
 
         self.angular_damping = angular_damping
@@ -1154,7 +1250,16 @@ class SolverFeatherPGS(SolverBase):
         if friction_anchor_beta is None:
             # An explicit point algorithm remains a valid way to select point
             # friction. The ordinary constructor enables persistent patches.
-            if friction_mode != "current" or effective_pgs_kernel in ("tiled_contact", "streaming"):
+            if contact_compliance or float(contact_torsion_radius) > 0.0:
+                friction_anchor_beta = 0.0
+                warnings.warn(
+                    "The selected contact material law uses velocity-only point friction; "
+                    "contact_compliance and contact torsion do not support persistent friction patches. "
+                    "Set friction_anchor_beta=0 explicitly to retain this law without the warning.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            elif friction_mode != "current" or effective_pgs_kernel in ("tiled_contact", "streaming"):
                 friction_anchor_beta = 0.0
                 warnings.warn(
                     "The selected point-contact solver uses velocity-only friction. "
@@ -1176,6 +1281,8 @@ class SolverFeatherPGS(SolverBase):
                 stacklevel=2,
             )
         self._friction_anchors_enabled = self.friction_anchor_beta > 0.0
+        if self.contact_compliance and self._friction_anchors_enabled:
+            raise ValueError("contact_compliance is not validated with friction_anchor_beta > 0")
         if self._friction_anchors_enabled and friction_mode != "current":
             raise ValueError(
                 "Patch friction requires friction_mode='current'; set friction_anchor_beta=0 for a coupled point-contact solve."
@@ -1661,9 +1768,20 @@ class SolverFeatherPGS(SolverBase):
         # kernels skip stores and their consumer kernels skip reads when
         # regularization is disabled.
         self._contact_row_w_dummy = wp.full((1, 1), 1.0, dtype=wp.float32, device=model.device)
+        configure_contact_torsion(
+            self, contact_torsion_radius, contact_torsion_shape_indices, contact_torsion_shape_patterns
+        )
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
+        # CONTACT row_parent belongs to ordinary friction/patch load linkage.
+        # Torsion must never reinterpret it, including when patch PRs are merged.
+        self._contact_torsion_group = wp.full(
+            self.row_parent.shape if self._contact_torsion_enabled else (1, 1),
+            -1,
+            dtype=wp.int32,
+            device=model.device,
+        )
         # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
         # so that path must retain the existing post-correction world gather.
         self._hinv_jt_writes_world = (
@@ -1705,7 +1823,12 @@ class SolverFeatherPGS(SolverBase):
         # three-family one-shot flag; row_watermark additionally accumulates
         # whole-run high-water telemetry for explicit readback.
         self._row_watermark = bool(row_watermark)
-        self._track_row_capacity = self._row_watermark or self.warn_constraint_overflow
+        self._track_row_capacity = (
+            self._row_watermark
+            or self.warn_constraint_overflow
+            or self._contact_torsion_enabled
+            or self.contact_compliance
+        )
         wm_device = model.device
         if self._track_row_capacity:
             self._row_dropped_dense = wp.zeros(self.world_count, dtype=wp.int32, device=wm_device)
@@ -1861,6 +1984,11 @@ class SolverFeatherPGS(SolverBase):
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del state, flags
+        if self.contact_compliance:
+            self._compliant_contacts = None
+            self._compliant_prepared = False
+            self.compliance_contact_count = 0
+            self.compliance_skipped_contact_count = 0
         if world_mask is not None and world_mask.shape[0] != self.world_count:
             raise ValueError(
                 f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per world)."
@@ -4345,6 +4473,7 @@ class SolverFeatherPGS(SolverBase):
                 shared_metadata=shared_metadata,
                 skip_local_internal_worlds=self._local_internal_fast_path,
                 local_internal_max_constraints=self._dense_internal_max_rows,
+                contact_torsion=self._contact_torsion_enabled,
             )
 
         self._pgs_solve_mf_kernel = None
@@ -4766,6 +4895,7 @@ class SolverFeatherPGS(SolverBase):
                     "row_type": self.row_type,
                     "row_parent": self.row_parent,
                     "row_mu": self.row_mu,
+                    "contact_torsion_group": self._contact_torsion_group,
                     "drive_target_vel_bias": self.drive_target_vel_bias,
                     "drive_vel_multiplier": self.drive_vel_multiplier,
                     "drive_impulse_multiplier": self.drive_impulse_multiplier,
@@ -4793,6 +4923,8 @@ class SolverFeatherPGS(SolverBase):
                             "mf_max_constraints": int(self.mf_max_constraints),
                             "max_world_dofs": int(self.max_world_dofs),
                             "friction_mode": str(self.friction_mode),
+                            "contact_torsion": self._contact_torsion_enabled,
+                            "contact_torsion_radius": self._contact_torsion_radius,
                             "has_drive_rows": self.drive_mode == "physx_pgs",
                             "has_dense_velocity_limit_rows": bool(self.enable_joint_velocity_limits),
                             "fuse_vel_limits": bool(self.fuse_joint_velocity_limits),
@@ -4832,6 +4964,8 @@ class SolverFeatherPGS(SolverBase):
                         self.row_type,
                         self.row_parent,
                         self.row_mu,
+                        self._contact_torsion_group,
+                        self._contact_torsion_radius,
                         self.drive_target_vel_bias,
                         self.drive_vel_multiplier,
                         self.drive_impulse_multiplier,
@@ -5913,6 +6047,14 @@ class SolverFeatherPGS(SolverBase):
         friction_start_iteration: int | None = None,
         iteration_offset: int = 0,
     ) -> None:
+        if self.contact_compliance:
+            _contact_compliance.solve(
+                self,
+                iterations=iterations,
+                friction_start_iteration=friction_start_iteration,
+                iteration_offset=iteration_offset,
+            )
+            return
         if self._propagation_contacts_enabled():
             self._launch_matrix_free_gs_solve_propagation_tree(
                 dense_rhs=self.rhs,
@@ -6071,6 +6213,11 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        if self._contact_torsion_enabled:
+            validate_torsion_step(self)
+        if self.contact_compliance:
+            # Reject incompatible contact preprocessing before it can mutate the stream.
+            _contact_compliance.validate_step(self)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
             raise ValueError(
                 "FeatherPGS contact capacity mismatch: received "
@@ -6185,6 +6332,8 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self._nvtx, synchronize=False):
             self._stage4_build_rows(state_in, state_aug, control, contacts, dt)
+            if self._contact_torsion_enabled:
+                prepare_torsion_rows(self, state_in, state_aug, contacts)
 
         if self.pgs_mode == "matrix_free":
             # Compute Y = H^-1 * J^T only (no Delassus C)
@@ -7753,6 +7902,11 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
+        if self.contact_compliance:
+            _contact_compliance.start_step(self, contacts, dt)
+            # The allocator writes slots_needed only after intentional skip gates.
+            # Clear prior-step requests so an excluded contact cannot look overflowed.
+            self.contact_slots_needed.zero_()
         model = self.model
         max_constraints = self.dense_max_constraints
         mf_active = self._has_free_rigid_bodies
@@ -15950,6 +16104,7 @@ def _get_pgs_solve_mf_gs_kernel(
     fuse_vel_limits: bool = False,
     skip_local_internal_worlds: bool = False,
     local_internal_max_constraints: int = 0,
+    contact_torsion: bool = False,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -16989,6 +17144,8 @@ def _get_pgs_solve_mf_gs_kernel(
         else ""
     )
     dense_load_start = "load_lo" if fuse_vel_limits else "dense_lo"
+    torsion_skip = f"if (row_type == {PGS_CONSTRAINT_TYPE_TORSION}) continue;" if contact_torsion else ""
+    torsion_sweep = torque_sweep_source(D) if contact_torsion else ""
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -17098,6 +17255,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
 
             int row_type = s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK};
+            {torsion_skip}
             // row_phase 0: all rows.
             // row_phase 1: contact/friction rows.
             // row_phase 2: internal articulation rows.
@@ -17358,6 +17516,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
         }}
 
+        {torsion_sweep}
         // Friction rows may intentionally remain inactive until a later
         // iteration. Once they are active, an exactly stationary full sweep
         // is a fixed point, so subsequent sweeps are redundant.
@@ -17493,6 +17652,8 @@ def _get_pgs_solve_mf_gs_kernel(
         world_row_type: wp.array2d[int],
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
+        world_torsion_group: wp.array2d[int],
+        contact_torsion_radius: float,
         world_drive_target_vel_bias: wp.array2d[float],
         world_drive_vel_multiplier: wp.array2d[float],
         world_drive_impulse_multiplier: wp.array2d[float],
@@ -17537,6 +17698,8 @@ def _get_pgs_solve_mf_gs_kernel(
         world_row_type: wp.array2d[int],
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
+        world_torsion_group: wp.array2d[int],
+        contact_torsion_radius: float,
         world_drive_target_vel_bias: wp.array2d[float],
         world_drive_vel_multiplier: wp.array2d[float],
         world_drive_impulse_multiplier: wp.array2d[float],
@@ -17581,6 +17744,8 @@ def _get_pgs_solve_mf_gs_kernel(
             world_row_type,
             world_row_parent,
             world_row_mu,
+            world_torsion_group,
+            contact_torsion_radius,
             world_drive_target_vel_bias,
             world_drive_vel_multiplier,
             world_drive_impulse_multiplier,
@@ -17619,6 +17784,8 @@ def _get_pgs_solve_mf_gs_kernel(
         name += "_gmeta"
     if skip_local_internal_worlds:
         name += f"_contact_fallback{local_internal_max_constraints}"
+    if contact_torsion:
+        name += "_torsion"
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)

@@ -45,7 +45,8 @@ PGS_CONSTRAINT_TYPE_MIMIC = 5
 # joints; see ``_FeatherPGSModelPlan.build``). Three rows per closure, world-axis
 # directions, unbounded lambda, Baumgarte drift correction.
 PGS_CONSTRAINT_TYPE_CONNECT = 6
-PGS_CONSTRAINT_TYPE_COUNT = 7
+PGS_CONSTRAINT_TYPE_TORSION = 7
+PGS_CONSTRAINT_TYPE_COUNT = 8
 
 
 # Numeric IDs for the ``friction_mode`` argument passed to the matrix-free
