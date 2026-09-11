@@ -68,7 +68,10 @@ class TestContactComplianceSafety(unittest.TestCase):
     def test_persistent_patch_guard(self):
         """Reject positive persistent-anchor bias but permit a disabled dummy patch buffer."""
         solver = SimpleNamespace(
-            model=SimpleNamespace(device=self.device), friction_anchor_beta=0.0, _friction_patches=object()
+            model=SimpleNamespace(device=self.device),
+            friction_anchor_beta=0.0,
+            _friction_patches=object(),
+            _contact_torsion_enabled=False,
         )
         start_step(solver, self.contacts(), 0.005)
         solver.friction_anchor_beta = 0.2
