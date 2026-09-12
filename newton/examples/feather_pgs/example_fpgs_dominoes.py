@@ -35,7 +35,7 @@ RADIUS0, RADIUS_GROWTH = 7.8, -0.07
 # tiles along at ankle height; the latter only sometimes converts into a running chain.
 BALL_RADIUS = 0.5
 BALL_EXIT_ANGLE = math.radians(35.0)
-SOLVER_OVERRIDES = {"pgs_iterations": 16, "mf_max_constraints": 4096}
+SOLVER_OVERRIDES = {"pgs_iterations": 4, "mf_max_constraints": 4096}
 
 
 class Example:

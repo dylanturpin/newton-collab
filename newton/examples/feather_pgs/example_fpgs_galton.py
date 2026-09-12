@@ -32,7 +32,7 @@ BIN_HEIGHT = 0.35
 TOP_ROW_Z = 1.2
 SLOT_HALF = 0.011
 BALLS = 300
-SOLVER_OVERRIDES = {"pgs_iterations": 8, "mf_max_constraints": 8192}
+SOLVER_OVERRIDES = {"pgs_iterations": 4, "mf_max_constraints": 8192}
 
 
 class Example:

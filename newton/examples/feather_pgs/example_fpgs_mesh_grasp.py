@@ -29,7 +29,7 @@ import newton.examples
 from newton.examples.feather_pgs._showreel import Stepper, assert_finite, make_solver
 
 SOLVER_OVERRIDES = {
-    "pgs_iterations": 16,
+    "pgs_iterations": 4,
     "dense_max_constraints": 2048,
     "mf_max_constraints": 4096,
     # Finger travel is bounded by joint limits, and contacts between links of one

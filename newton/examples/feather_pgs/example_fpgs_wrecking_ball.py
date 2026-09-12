@@ -49,7 +49,7 @@ LINK_DENSITY = 7800.0
 LINKS = max(3, round(CHAIN_LEN / (2 * LINK_HALF)))
 BALL_DENSITY = 7800.0
 SOLVER_OVERRIDES = {
-    "pgs_iterations": 8,
+    "pgs_iterations": 4,
     "pgs_contact_regularization": 0.01,
     "dense_max_constraints": 4096,
     "mf_max_constraints": 8192,
@@ -67,7 +67,7 @@ class Example:
         self.viewer = viewer
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        # Four substeps at eight iterations with a small proximal regularization keep
+        # Four substeps at four iterations with a small proximal regularization keep
         # the two-hundred-tonne ball finite in the debris pile.
         self.sim_substeps = 4
         self.sim_dt = self.frame_dt / self.sim_substeps

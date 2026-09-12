@@ -26,9 +26,10 @@ BASE = 12
 BOX = 0.5
 CANNONBALL_RADIUS = 0.35
 FIRE_AT = 1.5
-# With persistent friction patches six iterations hold the stack better than twelve
-# did with point friction (top-box drift 31 mm vs 103 mm over six seconds at rest).
-SOLVER_OVERRIDES = {"pgs_iterations": 6, "mf_max_constraints": 8192}
+# With persistent friction patches four iterations at four substeps hold the stack
+# better than twelve did with point friction (top-box drift 20 mm vs 103 mm over six
+# seconds at rest).
+SOLVER_OVERRIDES = {"pgs_iterations": 4, "mf_max_constraints": 8192}
 
 
 class Example:
@@ -37,7 +38,7 @@ class Example:
         self.viewer = viewer
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 2
+        self.sim_substeps = 4
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
         self.test_mode = bool(getattr(args, "test", False))

@@ -24,12 +24,12 @@ import newton.examples
 from newton.examples.feather_pgs._showreel import Stepper, assert_finite, make_solver, push_body
 
 LEVELS = 18
-# Three times real Jenga size, exact-fit blocks. A velocity-level PGS stack creeps
-# and slowly tips unless the iteration count is a couple of times the stack height;
-# at real size and sixteen iterations the tower falls over on its own in seconds,
-# at this size and 32 iterations it leans about a percent of its height per second.
+# Three times real Jenga size, exact-fit blocks. With point friction a PGS stack
+# creeps and slowly tips unless the iteration count is a couple of times the stack
+# height; persistent friction patches anchor the seams, and four iterations at four
+# substeps now hold the top within a few centimetres over six seconds.
 BLOCK_L, BLOCK_W, BLOCK_H = 0.90, 0.30, 0.18
-SOLVER_OVERRIDES = {"pgs_iterations": 32, "mf_max_constraints": 4096}
+SOLVER_OVERRIDES = {"pgs_iterations": 4, "mf_max_constraints": 4096}
 
 
 class Example:
@@ -38,7 +38,7 @@ class Example:
         self.viewer = viewer
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 1
+        self.sim_substeps = 4
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
         self.test_mode = bool(getattr(args, "test", False))
