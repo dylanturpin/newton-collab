@@ -300,6 +300,50 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
                 err_msg=name,
             )
 
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires CUDA")
+    def test_captured_two_substep_fk_id_reuse_matches_eager(self):
+        """Replay two captured substeps without erasing the cached body forces.
+
+        The solver allocates its augmented dynamics buffers on the first step. When that first step runs inside a
+        CUDA graph capture, a zero-initialised allocation records a memset that replays before every frame; the
+        FK/ID reuse path then consumes cleared body forces while its cache still reads valid.
+        """
+        warm_model = _build_model("cuda:0", ground=False)
+        warm_solver = SolverFeatherPGS(warm_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
+        warm_solver.step(_make_initial_state(warm_model), warm_model.state(), warm_model.control(), None, DT)
+        wp.synchronize_device("cuda:0")
+
+        graph_model = _build_model("cuda:0", ground=False)
+        eager_model = _build_model("cuda:0", ground=False)
+        # matrix_free keeps the zero-copy FK/ID reuse path; split restores its snapshot and would mask the defect.
+        graph_solver = SolverFeatherPGS(graph_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
+        eager_solver = SolverFeatherPGS(eager_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
+        self.assertTrue(graph_solver._fk_id_cache_enabled)
+        self.assertFalse(graph_solver._fk_id_cache_uses_snapshot)
+        graph_a, graph_b = _make_initial_state(graph_model), graph_model.state()
+        eager_a, eager_b = _make_initial_state(eager_model), eager_model.state()
+        graph_control, eager_control = graph_model.control(), eager_model.control()
+
+        def two_substeps(solver, state_in, state_out, control):
+            # Keep one input state object so the FK/ID cache stays valid across substeps and frames.
+            for _ in range(2):
+                solver.step(state_in, state_out, control, None, DT)
+                for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                    wp.copy(getattr(state_in, name), getattr(state_out, name))
+
+        # The very first launches of graph_solver happen inside the capture.
+        with wp.ScopedCapture("cuda:0") as capture:
+            two_substeps(graph_solver, graph_a, graph_b, graph_control)
+        for _ in range(64):
+            wp.capture_launch(capture.graph)
+            two_substeps(eager_solver, eager_a, eager_b, eager_control)
+        wp.synchronize_device("cuda:0")
+
+        for name in ("joint_q", "joint_qd"):
+            captured = getattr(graph_a, name).numpy()
+            self.assertTrue(np.isfinite(captured).all(), f"{name} became non-finite under graph replay")
+            np.testing.assert_allclose(captured, getattr(eager_a, name).numpy(), rtol=0.0, atol=2.0e-6, err_msg=name)
+
     def test_interval_two_contact_trajectory_stays_close_to_reference(self):
         device = wp.get_device()
         history = {}
