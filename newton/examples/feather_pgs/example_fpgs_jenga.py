@@ -26,8 +26,9 @@ from newton.examples.feather_pgs._showreel import Stepper, assert_finite, make_s
 LEVELS = 18
 # Three times real Jenga size, exact-fit blocks. With point friction a PGS stack
 # creeps and slowly tips unless the iteration count is a couple of times the stack
-# height; persistent friction patches anchor the seams, and four iterations at four
-# substeps now hold the top within a few centimetres over six seconds.
+# height; persistent friction patches anchor the seams, and with their correction
+# gain raised in make_solver four iterations at four substeps hold the top within a
+# few centimetres for the better part of a minute.
 BLOCK_L, BLOCK_W, BLOCK_H = 0.90, 0.30, 0.18
 SOLVER_OVERRIDES = {"pgs_iterations": 4, "mf_max_constraints": 4096}
 

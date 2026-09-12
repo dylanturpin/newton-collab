@@ -30,7 +30,11 @@ def make_solver(model: newton.Model, *, route: str = ROUTES[0], **overrides) -> 
     a single large world needs; ``"immediate"`` is the serial per-world sweep.
     CPU falls back to the split mode, the only CPU-capable mode.
     """
-    kwargs = {"pgs_iterations": 4, "pgs_beta": 0.2, "angular_damping": 0.0}
+    # friction_anchor_beta is the positional correction gain of the persistent friction
+    # patches. At 1.0 a resting eighteen-level jenga tower leans 56 mm after forty
+    # seconds at four iterations; at the solver default of 0.2 it leans 195 mm after
+    # twenty and eventually topples. No scene pays anything for it.
+    kwargs = {"pgs_iterations": 4, "pgs_beta": 0.2, "angular_damping": 0.0, "friction_anchor_beta": 1.0}
     if model.device.is_cuda:
         kwargs["pgs_mode"] = "matrix_free"
         kwargs["articulated_contact_response"] = route
