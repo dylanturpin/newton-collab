@@ -2199,12 +2199,17 @@ class SolverFeatherPGS(SolverBase):
             and self.drive_mode == "augmented"
             and self.friction_mode == "current"
             and not self.enable_joint_velocity_limits
+            # The factor-coordinate owner does not solve the appended torsion row.
+            and not self._contact_torsion_enabled
         )
+        # Persistent patches allocate one tangent pair per surviving anchor, so their contact rows are not
+        # uniform normal/tangent/tangent triples; the generic row path pools the patch load through the linked
+        # normal rows instead.
         self._factor_coordinate_contact_triples = bool(
             self._paired_factor_coordinates
             and self.enable_contact_friction
             and self.contact_friction_gap_threshold == math.inf
-            and self.contact_friction_anchor_limit == 0
+            and not self._friction_anchors_enabled
         )
         self._paired_factor_primary_groups_by_world = None
         self._paired_factor_secondary_groups_by_world = None
