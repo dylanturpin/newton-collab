@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared helpers for the FeatherPGS rigid-body showreel examples.
+"""Shared helpers for the rigid-body showreel examples.
 
 Every scene drives its substeps through :class:`Stepper`, which captures the
 collide-and-solve loop into one CUDA graph (re-captured whenever a solver
-setting changes) and exposes a common solver panel: iterations, substeps,
-contact route, graph capture, and the measured frame time.
+setting changes) and exposes a common solver panel: the solver itself
+(FeatherPGS, VBD or MuJoCo), its iteration count, substeps, graph capture, and
+the measured frame time. Each scene supplies per-solver settings through
+``SOLVERS``; :func:`solver_configs` fills in the shared defaults.
 """
 
 from __future__ import annotations
@@ -20,57 +22,183 @@ import warp as wp
 import newton
 
 ROUTES = ("propagation-colored", "immediate")
+SOLVERS = ("feather_pgs", "mujoco")
+#: Solvers that run their own broad and narrow phase and ignore a Contacts buffer.
+NATIVE_CONTACT_SOLVERS = frozenset({"mujoco"})
+#: Name of each solver's iteration count, for the shared panel slider.
+ITERATION_ARG = {"feather_pgs": "pgs_iterations", "mujoco": "iterations"}
 
-
-def make_solver(model: newton.Model, *, route: str = ROUTES[0], **overrides) -> newton.solvers.SolverFeatherPGS:
-    """Build a FeatherPGS solver with showreel defaults for the model's device.
-
-    On CUDA the matrix-free mode is used. ``"propagation-colored"`` places every
-    contact row on graph-colored batches that solve thread-per-row, which is what
-    a single large world needs; ``"immediate"`` is the serial per-world sweep.
-    CPU falls back to the split mode, the only CPU-capable mode.
-    """
+# Shared per-solver defaults. A scene's SOLVERS table overrides any of these and
+# adds "substeps"; everything else is passed to the solver constructor.
+_DEFAULTS = {
     # friction_anchor_beta is the positional correction gain of the persistent friction
     # patches. At 1.0 a resting eighteen-level jenga tower leans 56 mm after forty
     # seconds at four iterations; at the solver default of 0.2 it leans 195 mm after
     # twenty and eventually topples. No scene pays anything for it.
-    kwargs = {"pgs_iterations": 4, "pgs_beta": 0.2, "angular_damping": 0.0, "friction_anchor_beta": 1.0}
+    "feather_pgs": {
+        "pgs_iterations": 4,
+        "pgs_beta": 0.2,
+        "angular_damping": 0.0,
+        "friction_anchor_beta": 1.0,
+        "shape_ke": 2.5e3,
+        "shape_kd": 100.0,
+    },
+    # An elliptic cone matches Coulomb friction; the pyramidal default over-grips
+    # along the cone's corners, which is visible as boxes that refuse to slide.
+    "mujoco": {
+        "cone": "elliptic",
+        "iterations": 20,
+        "ls_iterations": 10,
+        "njmax": 4096,
+        "nconmax": 2048,
+        "shape_ke": 2.5e3,
+        "shape_kd": 100.0,
+    },
+}
+
+
+def solver_configs(scene: dict[str, dict]) -> dict[str, dict]:
+    """Merge a scene's per-solver settings onto the shared defaults."""
+    return {name: {**_DEFAULTS[name], **scene.get(name, {})} for name in SOLVERS}
+
+
+def make_solver(model: newton.Model, *, solver: str = SOLVERS[0], route: str = ROUTES[0], **overrides):
+    """Build one of the showreel's solvers with defaults suited to the model's device.
+
+    FeatherPGS runs matrix-free on CUDA. ``"propagation-colored"`` places every
+    contact row on graph-colored batches that solve thread-per-row, which is what
+    a single large world needs; ``"immediate"`` is the serial per-world sweep.
+    CPU falls back to the split mode, the only CPU-capable mode.
+    """
+    kwargs = {**_DEFAULTS[solver], **overrides}
+    for key in ("substeps", "shape_ke", "shape_kd"):
+        kwargs.pop(key, None)
+    if solver == "mujoco":
+        return newton.solvers.SolverMuJoCo(model, **kwargs)
     if model.device.is_cuda:
         kwargs["pgs_mode"] = "matrix_free"
         kwargs["articulated_contact_response"] = route
     else:
         kwargs["pgs_mode"] = "split"
-    kwargs.update(overrides)
     return newton.solvers.SolverFeatherPGS(model, **kwargs)
 
 
 class Stepper:
     """Run a scene's substeps, through a CUDA graph when possible, and own the solver panel.
 
-    The example provides ``substep()`` (clear forces, collide, solve, swap states).
-    The captured loop must leave the newest state in the buffer it read from, so
-    an odd ``sim_substeps`` ends with a device copy back into that buffer.
+    The example provides ``substep()``, which clears forces, calls :meth:`collide`
+    and :meth:`solve`, and nothing else that depends on the solver. The captured
+    loop must leave the newest state in the buffer it read from, so an odd
+    ``sim_substeps`` ends with a device copy back into that buffer.
     """
 
-    def __init__(self, example, *, solver_overrides: dict | None = None):
+    def __init__(self, example, *, solver_overrides: dict | None = None, solver: str = SOLVERS[0]):
         self.example = example
-        self.solver_overrides = dict(solver_overrides or {})
+        self.configs = solver_configs(solver_overrides or {})
+        self.solver_name = solver
         self.route = ROUTES[0] if example.model.device.is_cuda else "split"
         self.use_graph = example.model.device.is_cuda
         self.graph = None
         self.frame_ms = 0.0
-        self.iterations = int(example.solver.pgs_iterations)
+        self.error = ""
+        self.rebuild()
+
+    @property
+    def config(self) -> dict:
+        return self.configs[self.solver_name]
+
+    @property
+    def iterations(self) -> int:
+        return int(self.config[ITERATION_ARG[self.solver_name]])
+
+    @property
+    def substeps(self) -> int:
+        return int(self.config.get("substeps", 4))
+
+    @property
+    def native_contacts(self) -> bool:
+        return self.solver_name in NATIVE_CONTACT_SOLVERS
 
     def invalidate(self):
         self.graph = None
+
+    def rebuild(self):
+        """Recreate the solver from the current configuration."""
+        ex = self.example
+        ex.sim_substeps = self.substeps
+        ex.sim_dt = ex.frame_dt / ex.sim_substeps
+        # Contact stiffness lives on the model and the solvers read it differently:
+        # MuJoCo turns it into solref, FeatherPGS ignores it unless compliance is
+        # enabled. Rewrite it so a switch takes the new value.
+        for key, attr in (("shape_ke", "shape_material_ke"), ("shape_kd", "shape_material_kd")):
+            value = self.config.get(key)
+            array = getattr(ex.model, attr, None)
+            if value is not None and array is not None:
+                array.fill_(float(value))
+        try:
+            ex.solver = make_solver(ex.model, solver=self.solver_name, route=self.route, **self.config)
+            self.error = ""
+        except Exception as err:
+            self.error = f"{self.solver_name}: {type(err).__name__}: {err}"[:200]
+        self.invalidate()
+
+    def set_solver(self, name: str):
+        if name == self.solver_name:
+            return
+        self.solver_name = name
+        self.rebuild()
 
     def set_route(self, route: str):
         if route == self.route:
             return
         self.route = route
+        if self.solver_name == "feather_pgs":
+            self.rebuild()
+
+    def reset_scene(self):
+        """Put the scene back to its built pose so a trigger can be tried again.
+
+        The scene's ``on_reset`` re-arms whatever it scripts (a shot, a poke, the
+        crane's release); everything else comes from the model's own defaults.
+        """
         ex = self.example
-        ex.solver = make_solver(ex.model, route=route, **{**self.solver_overrides, "pgs_iterations": self.iterations})
-        self.invalidate()
+        for state in (ex.state_0, ex.state_1):
+            for name in ("body_q", "joint_q"):
+                array, default = getattr(state, name, None), getattr(ex.model, name, None)
+                if array is not None and default is not None:
+                    wp.copy(array, default)
+            for name in ("body_qd", "joint_qd", "body_f"):
+                array = getattr(state, name, None)
+                if array is not None:
+                    array.zero_()
+        ex.sim_time = 0.0
+        if hasattr(ex, "on_reset"):
+            ex.on_reset()
+        self.notify_state_edit()
+
+    def notify_state_edit(self):
+        """Tell the solver the state was teleported, not integrated.
+
+        A solver that keeps the previous body pose to difference velocities from
+        otherwise reads an edit such as firing a cannonball as a displacement over
+        one substep, which is a velocity of hundreds of metres per second.
+        ``flags=0`` keeps the pose that was just authored and clears only history.
+        """
+        ex = self.example
+        ex.solver.reset(ex.state_0, flags=0)
+
+    def collide(self):
+        """Refresh the contact buffer, unless the solver finds its own contacts."""
+        ex = self.example
+        if not self.native_contacts:
+            ex.collision_pipeline.collide(ex.state_0, ex.contacts)
+
+    def solve(self):
+        """Advance one substep and swap the state pair."""
+        ex = self.example
+        contacts = None if self.native_contacts else ex.contacts
+        ex.solver.step(ex.state_0, ex.state_1, ex.control, contacts, ex.sim_dt)
+        ex.state_0, ex.state_1 = ex.state_1, ex.state_0
 
     def _capture(self):
         ex = self.example
@@ -81,7 +209,8 @@ class Stepper:
             ex.substep()
         wp.synchronize_device(ex.model.device)
         with wp.ScopedCapture(device=ex.model.device) as capture:
-            ex.solver.seed_double_buffer_events()
+            if hasattr(ex.solver, "seed_double_buffer_events"):
+                ex.solver.seed_double_buffer_events()
             for _ in range(ex.sim_substeps):
                 ex.substep()
             if ex.sim_substeps % 2:
@@ -115,27 +244,62 @@ class Stepper:
         ui.separator()
         ui.text("Solver")
         ui.text(f"{self.frame_ms:5.2f} ms / frame  ({(1000.0 / self.frame_ms) if self.frame_ms else 0.0:5.1f} fps)")
-        contacts = int(ex.contacts.rigid_contact_count.numpy()[0]) if ex.contacts is not None else 0
-        ui.text(f"{ex.model.body_count} bodies, {contacts} contacts, dt = 1/{round(1.0 / ex.sim_dt)} s")
-        changed, iterations = ui.slider_int("PGS iterations", self.iterations, 2, 128)
+        contacts = 0 if ex.contacts is None or self.native_contacts else int(ex.contacts.rigid_contact_count.numpy()[0])
+        detail = "solver contacts" if self.native_contacts else f"{contacts} contacts"
+        ui.text(f"{ex.model.body_count} bodies, {detail}, dt = 1/{round(1.0 / ex.sim_dt)} s")
+        if self.error:
+            ui.text(f"! {self.error}")
+        index = SOLVERS.index(self.solver_name)
+        changed, index = ui.combo("Solver", index, list(SOLVERS))
         if changed:
-            self.iterations = iterations
-            ex.solver.pgs_iterations = iterations
-            self.invalidate()
+            self.set_solver(SOLVERS[index])
+        changed, iterations = ui.slider_int("Iterations", self.iterations, 1, 64)
+        if changed:
+            self.config[ITERATION_ARG[self.solver_name]] = iterations
+            if self.solver_name == "feather_pgs":
+                ex.solver.pgs_iterations = iterations
+                self.invalidate()
+            else:
+                # MuJoCo bakes the count into its model, so rebuild the solver.
+                self.rebuild()
+        if self.solver_name == "mujoco":
+            for label, key, lo, hi in (("Line-search iters", "ls_iterations", 1, 50),):
+                changed, value = ui.slider_int(label, int(self.config[key]), lo, hi)
+                if changed:
+                    self.config[key] = value
+                    self.rebuild()
+            changed, impratio = ui.slider_float("Friction impedance", float(self.config["impratio"]), 0.1, 100.0)
+            if changed:
+                self.config["impratio"] = impratio
+                self.rebuild()
+            cones = ["elliptic", "pyramidal"]
+            index = cones.index(str(self.config["cone"]))
+            changed, index = ui.combo("Friction cone", index, cones)
+            if changed:
+                self.config["cone"] = cones[index]
+                self.rebuild()
+        changed, ke = ui.slider_float("Contact stiffness", float(self.config["shape_ke"]), 1.0e2, 1.0e7)
+        if changed:
+            self.config["shape_ke"] = ke
+            self.rebuild()
         changed, substeps = ui.slider_int("Substeps / frame", ex.sim_substeps, 1, 32)
         if changed:
-            ex.sim_substeps = max(1, substeps)
+            self.config["substeps"] = max(1, substeps)
+            ex.sim_substeps = self.substeps
             ex.sim_dt = ex.frame_dt / ex.sim_substeps
             self.invalidate()
-        if ex.model.device.is_cuda:
+        if ex.model.device.is_cuda and self.solver_name == "feather_pgs":
             index = ROUTES.index(self.route) if self.route in ROUTES else 0
             changed, index = ui.combo("Contact route", index, list(ROUTES))
             if changed:
                 self.set_route(ROUTES[index])
+        if ex.model.device.is_cuda:
             changed, use_graph = ui.checkbox("CUDA graph capture", self.use_graph)
             if changed:
                 self.use_graph = use_graph
                 self.invalidate()
+        if ui.button("Reset scene"):
+            self.reset_scene()
 
 
 def circle_segments(center, radius: float, segments: int = 96, axis: str = "z"):

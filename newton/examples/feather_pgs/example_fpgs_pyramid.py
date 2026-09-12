@@ -20,7 +20,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.feather_pgs._showreel import Stepper, assert_finite, make_solver
+from newton.examples.feather_pgs._showreel import Stepper, assert_finite
 
 BASE = 12
 BOX = 0.5
@@ -29,7 +29,10 @@ FIRE_AT = 1.5
 # With persistent friction patches four iterations at four substeps hold the stack
 # better than twelve did with point friction (top-box drift 20 mm vs 103 mm over six
 # seconds at rest).
-SOLVER_OVERRIDES = {"pgs_iterations": 4, "mf_max_constraints": 8192}
+SOLVERS = {
+    "feather_pgs": {"pgs_iterations": 4, "mf_max_constraints": 8192, "substeps": 4},
+    "mujoco": {},
+}
 
 
 class Example:
@@ -71,13 +74,15 @@ class Example:
                 )
                 self.boxes.append(body)
         iron = newton.ModelBuilder.ShapeConfig(density=7800.0, mu=0.5, restitution=0.0)
-        self.shot_start = np.array([-15.0, 0.0, 1.5])
+        # The ball waits at its resting height, so firing is a velocity change and not
+        # a teleport; solvers that difference velocities from the previous pose would
+        # read a 1 m jump between two substeps as hundreds of metres per second.
+        self.shot_start = np.array([-15.0, 0.0, CANNONBALL_RADIUS])
         self.ball = builder.add_body(xform=wp.transform(wp.vec3(*self.shot_start), wp.quat_identity()))
         builder.add_shape_sphere(self.ball, radius=CANNONBALL_RADIUS, cfg=iron, color=wp.vec3(0.1, 0.1, 0.12))
 
         self.model = builder.finalize()
         self.model.rigid_contact_max = 48 * (len(self.boxes) + 1)
-        self.solver = make_solver(self.model, **SOLVER_OVERRIDES)
         self.collision_pipeline = newton.examples.create_collision_pipeline(
             self.model, args, broad_phase="sap", rigid_contact_max=self.model.rigid_contact_max
         )
@@ -85,7 +90,7 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.stepper = Stepper(self, solver_overrides=SOLVER_OVERRIDES)
+        self.stepper = Stepper(self, solver_overrides=SOLVERS, solver=str(getattr(args, "solver", "feather_pgs")))
         self.initial_top = float(self.state_0.body_q.numpy()[self.boxes[-1], 2])
 
         self.viewer.set_model(self.model)
@@ -99,8 +104,14 @@ class Example:
         self.state_0.body_q.assign(q)
         self.state_0.body_qd.assign(qd)
         newton.eval_ik(self.model, self.state_0, self.state_0.joint_q, self.state_0.joint_qd)
+        self.stepper.notify_state_edit()
         self.pre_shot_top = float(self.state_0.body_q.numpy()[self.boxes, 2].max())
         self.fired = True
+
+    def on_reset(self):
+        """Re-arm the shot after the panel resets the scene."""
+        self.fired = False
+        self.pre_shot_top = None
 
     def step(self):
         if self.test_mode and not self.fired and self.sim_time >= FIRE_AT:
@@ -110,9 +121,8 @@ class Example:
     def substep(self):
         self.state_0.clear_forces()
         self.viewer.apply_forces(self.state_0)
-        self.collision_pipeline.collide(self.state_0, self.contacts)
-        self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-        self.state_0, self.state_1 = self.state_1, self.state_0
+        self.stepper.collide()
+        self.stepper.solve()
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -144,6 +154,7 @@ class Example:
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
+        parser.add_argument("--solver", default="feather_pgs", choices=list(SOLVERS), help="Rigid-body solver.")
         parser.set_defaults(num_frames=480)
         return parser
 

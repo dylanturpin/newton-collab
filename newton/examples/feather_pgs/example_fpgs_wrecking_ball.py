@@ -25,7 +25,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.feather_pgs._showreel import Stepper, assert_finite, make_solver
+from newton.examples.feather_pgs._showreel import Stepper, assert_finite
 
 FLOORS = 6
 WIDTH, DEPTH = 14.0, 10.0
@@ -48,11 +48,17 @@ LINK_HALF, LINK_R = 0.5, 0.3
 LINK_DENSITY = 7800.0
 LINKS = max(3, round(CHAIN_LEN / (2 * LINK_HALF)))
 BALL_DENSITY = 7800.0
-SOLVER_OVERRIDES = {
-    "pgs_iterations": 4,
-    "pgs_contact_regularization": 0.01,
-    "dense_max_constraints": 4096,
-    "mf_max_constraints": 8192,
+# Four substeps at four iterations with a small proximal regularization keep the
+# two-hundred-tonne ball finite in the debris pile.
+SOLVERS = {
+    "feather_pgs": {
+        "pgs_iterations": 4,
+        "pgs_contact_regularization": 0.01,
+        "dense_max_constraints": 4096,
+        "mf_max_constraints": 8192,
+        "substeps": 4,
+    },
+    "mujoco": {"njmax": 8192, "nconmax": 4096},
 }
 
 CONCRETE = wp.vec3(0.72, 0.70, 0.66)
@@ -67,8 +73,6 @@ class Example:
         self.viewer = viewer
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        # Four substeps at four iterations with a small proximal regularization keep
-        # the two-hundred-tonne ball finite in the debris pile.
         self.sim_substeps = 4
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
@@ -86,7 +90,6 @@ class Example:
 
         self.model = builder.finalize()
         self.model.rigid_contact_max = 64 * (len(self.building) + LINKS + 1)
-        self.solver = make_solver(self.model, **SOLVER_OVERRIDES)
         self.collision_pipeline = newton.examples.create_collision_pipeline(
             self.model, args, broad_phase="sap", rigid_contact_max=self.model.rigid_contact_max
         )
@@ -94,7 +97,7 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.stepper = Stepper(self, solver_overrides=SOLVER_OVERRIDES)
+        self.stepper = Stepper(self, solver_overrides=SOLVERS, solver=str(getattr(args, "solver", "feather_pgs")))
         self.release()
 
         self.viewer.set_model(self.model)
@@ -317,17 +320,21 @@ class Example:
         self.state_0.joint_q.assign(q)
         self.state_0.joint_qd.zero_()
         newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
+        self.stepper.notify_state_edit()
 
     # ------------------------------------------------------------------- loop
+    def on_reset(self):
+        """Hoist the ball again after the panel resets the scene."""
+        self.release()
+
     def step(self):
         self.stepper.step()
 
     def substep(self):
         self.state_0.clear_forces()
         self.viewer.apply_forces(self.state_0)
-        self.collision_pipeline.collide(self.state_0, self.contacts)
-        self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-        self.state_0, self.state_1 = self.state_1, self.state_0
+        self.stepper.collide()
+        self.stepper.solve()
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -360,6 +367,7 @@ class Example:
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
+        parser.add_argument("--solver", default="feather_pgs", choices=list(SOLVERS), help="Rigid-body solver.")
         parser.set_defaults(num_frames=600)
         return parser
 
