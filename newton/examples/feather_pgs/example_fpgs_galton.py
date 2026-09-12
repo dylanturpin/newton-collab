@@ -21,7 +21,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.feather_pgs._showreel import Stepper, assert_finite, make_solver
+from newton.examples.feather_pgs._showreel import Stepper, assert_finite
 
 BALL_RADIUS = 0.01
 PEG_RADIUS = 0.006
@@ -32,7 +32,10 @@ BIN_HEIGHT = 0.35
 TOP_ROW_Z = 1.2
 SLOT_HALF = 0.011
 BALLS = 300
-SOLVER_OVERRIDES = {"pgs_iterations": 4, "mf_max_constraints": 8192}
+SOLVERS = {
+    "feather_pgs": {"pgs_iterations": 4, "mf_max_constraints": 8192, "substeps": 4},
+    "mujoco": {"njmax": 8192, "nconmax": 4096},
+}
 
 
 class Example:
@@ -116,7 +119,6 @@ class Example:
 
         self.model = builder.finalize()
         self.model.rigid_contact_max = 12 * BALLS
-        self.solver = make_solver(self.model, **SOLVER_OVERRIDES)
         self.collision_pipeline = newton.examples.create_collision_pipeline(
             self.model, args, broad_phase="sap", rigid_contact_max=12 * BALLS
         )
@@ -124,7 +126,7 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.stepper = Stepper(self, solver_overrides=SOLVER_OVERRIDES)
+        self.stepper = Stepper(self, solver_overrides=SOLVERS, solver=str(getattr(args, "solver", "feather_pgs")))
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(pos=wp.vec3(0.0, -2.4, 0.9), pitch=-8.0, yaw=90.0)
@@ -135,9 +137,8 @@ class Example:
     def substep(self):
         self.state_0.clear_forces()
         self.viewer.apply_forces(self.state_0)
-        self.collision_pipeline.collide(self.state_0, self.contacts)
-        self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-        self.state_0, self.state_1 = self.state_1, self.state_0
+        self.stepper.collide()
+        self.stepper.solve()
 
     def bin_counts(self) -> np.ndarray:
         q = self.state_0.body_q.numpy()[self.balls]
@@ -177,6 +178,7 @@ class Example:
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
+        parser.add_argument("--solver", default="feather_pgs", choices=list(SOLVERS), help="Rigid-body solver.")
         parser.set_defaults(num_frames=600)
         return parser
 

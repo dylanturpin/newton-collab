@@ -21,7 +21,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.feather_pgs._showreel import Stepper, assert_finite, make_solver, push_body
+from newton.examples.feather_pgs._showreel import Stepper, assert_finite, push_body
 
 LEVELS = 18
 # Three times real Jenga size, exact-fit blocks. With point friction a PGS stack
@@ -30,7 +30,10 @@ LEVELS = 18
 # gain raised in make_solver four iterations at four substeps hold the top within a
 # few centimetres for the better part of a minute.
 BLOCK_L, BLOCK_W, BLOCK_H = 0.90, 0.30, 0.18
-SOLVER_OVERRIDES = {"pgs_iterations": 4, "mf_max_constraints": 4096}
+SOLVERS = {
+    "feather_pgs": {"pgs_iterations": 4, "mf_max_constraints": 4096, "substeps": 4},
+    "mujoco": {},
+}
 
 
 class Example:
@@ -71,7 +74,6 @@ class Example:
 
         self.model = builder.finalize()
         self.model.rigid_contact_max = 32 * len(self.blocks)
-        self.solver = make_solver(self.model, **SOLVER_OVERRIDES)
         self.collision_pipeline = newton.examples.create_collision_pipeline(
             self.model, args, broad_phase="sap", rigid_contact_max=self.model.rigid_contact_max
         )
@@ -79,7 +81,7 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.stepper = Stepper(self, solver_overrides=SOLVER_OVERRIDES)
+        self.stepper = Stepper(self, solver_overrides=SOLVERS, solver=str(getattr(args, "solver", "feather_pgs")))
         self.initial_q = self.state_0.body_q.numpy().copy()
         # [body, dir xyz, force, speed cap, travel cap, start xyz]; body -1 disables the push.
         self.push_params = wp.array([-1.0] + [0.0] * 9, dtype=float, device=self.model.device)
@@ -108,6 +110,11 @@ class Example:
         top = self.blocks[-3:]
         return float(1.0e3 * np.linalg.norm((q[top, :2] - self.initial_q[top, :2]).mean(axis=0)))
 
+    def on_reset(self):
+        """Re-arm the finger after the panel resets the scene."""
+        self.poked = False
+        self.push_params.assign([-1.0] + [0.0] * 9)
+
     def step(self):
         if self.test_mode and not self.poked and self.sim_time >= 2.0:
             self.poke(self.poke_level)
@@ -122,9 +129,8 @@ class Example:
             device=self.model.device,
         )
         self.viewer.apply_forces(self.state_0)
-        self.collision_pipeline.collide(self.state_0, self.contacts)
-        self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-        self.state_0, self.state_1 = self.state_1, self.state_0
+        self.stepper.collide()
+        self.stepper.solve()
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -160,6 +166,7 @@ class Example:
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
+        parser.add_argument("--solver", default="feather_pgs", choices=list(SOLVERS), help="Rigid-body solver.")
         parser.set_defaults(num_frames=360)
         return parser
 
