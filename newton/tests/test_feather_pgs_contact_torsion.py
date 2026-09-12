@@ -66,6 +66,9 @@ def fixture(
             getattr(contacts, name).assign(values)
         contacts.rigid_contact_count.assign(np.array([center_count], np.int32))
     kwargs = {
+        # Keep this material-law control on the same point-friction baseline
+        # whether the optional spin radius is zero or positive.
+        "friction_anchor_beta": 0.0,
         "pgs_mode": "matrix_free",
         "articulated_contact_response": "immediate",
         "pgs_iterations": 128,

@@ -472,6 +472,10 @@ class Contacts:
             First three entries: linear force [N]; last three entries: torque (moment) [N·m].
             When both rigid and soft contacts are present, soft contact forces follow rigid contact forces.
 
+            Solver support varies: :meth:`newton.solvers.SolverFeatherPGS.update_contacts`
+            currently exports only the linear components and leaves torque zero.
+            Its output cannot be used as a complete contact wrench.
+
             This is an extended contact attribute; see :ref:`extended_contact_attributes` for more information.
             """
             if requested_attributes and "force" in requested_attributes:

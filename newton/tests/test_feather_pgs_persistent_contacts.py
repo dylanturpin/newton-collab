@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.friction_patches import contact_tangent_basis
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_contact_reduction_body_pairs import _cylinder_foot
 
@@ -98,6 +99,21 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         previous = solver._ws_prev_mf_impulses.numpy()
         previous[0, slot : slot + 3] = (1.0, 0.5, 0.0)
         solver._ws_prev_mf_impulses.assign(previous)
+        # Seed both owners of the previous solve's tangent impulse. Persistent
+        # anchors take precedence over the contact-matched cache when carried.
+        patches = solver._friction_patches
+        tangent, _ = contact_tangent_basis(-old_normal)
+        tangent *= 0.5
+        if patches.current.flipped.numpy()[0]:
+            tangent = -tangent
+        anchor_body = int(patches.current.body_a.numpy()[0])
+        if anchor_body >= 0:
+            pose = state_in.body_q.numpy()[anchor_body]
+            transform = wp.transform(wp.vec3(*pose[:3]), wp.quat(*pose[3:]))
+            tangent = wp.transform_vector(wp.transform_inverse(transform), tangent)
+        cached = patches.previous.tangent_impulse.numpy()
+        cached[0] = tangent
+        patches.previous.tangent_impulse.assign(cached)
         normals[0] = new_normal
         contacts.rigid_contact_normal.assign(normals)
         contacts.rigid_contact_match_index.fill_(-1)
