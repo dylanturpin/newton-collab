@@ -74,6 +74,110 @@ def _build_fixed_base_star_model(num_branches=16, num_worlds=2):
     return main.finalize()
 
 
+def _build_sparse_diagonal_pair_model(num_branches=16, num_worlds=2, *, device=None, revolute_branches=False):
+    """Build one independent fixed-base star and one compact serial chain per world.
+
+    ``revolute_branches`` hinges the star branches about Y instead of sliding them along Z, so the branch
+    response depends on the link inertia and center of mass rather than on the mass alone.
+    """
+    scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    base = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    star_joints = [scene.add_joint_fixed(parent=-1, child=base)]
+    add_branch_joint = scene.add_joint_revolute if revolute_branches else scene.add_joint_prismatic
+    for branch in range(num_branches):
+        child = scene.add_link(mass=1.0 + 0.01 * branch, inertia=wp.mat33(np.eye(3)))
+        star_joints.append(
+            add_branch_joint(
+                parent=base,
+                child=child,
+                axis=newton.Axis.Y if revolute_branches else newton.Axis.Z,
+                parent_xform=wp.transform(wp.vec3(0.03 * branch, 0.0, 0.0), wp.quat_identity()),
+                limit_lower=-0.1,
+                limit_upper=0.1,
+            )
+        )
+    scene.add_articulation(star_joints)
+
+    chain_joints = []
+    parent = -1
+    for _link_index in range(3):
+        child = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        chain_joints.append(
+            scene.add_joint_revolute(
+                parent=parent,
+                child=child,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+                limit_lower=-0.2,
+                limit_upper=0.2,
+            )
+        )
+        parent = child
+    scene.add_articulation(chain_joints)
+
+    replicated = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    replicated.replicate(scene, num_worlds, spacing=(3.0, 3.0, 0.0))
+    return replicated.finalize(device=device)
+
+
+def _build_sparse_contact_friction_model(num_branches=16, num_worlds=2, *, device=None):
+    """Build the sparse pair model with tilted sliding branches resting on a static ground plane.
+
+    Each branch slides along ``(1, 0, 1) / sqrt(2)`` and carries a small box that touches the ground, so every
+    contact normal and tangent row acts on that branch's single coordinate and friction is active.
+    """
+    scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    scene.default_shape_cfg.ke = 1.0e5
+    scene.default_shape_cfg.kd = 1.0e3
+    scene.default_shape_cfg.mu = 0.8
+    scene.default_shape_cfg.margin = 0.0
+    scene.default_shape_cfg.gap = 0.0
+    scene.add_ground_plane()
+    base = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    star_joints = [
+        scene.add_joint_fixed(
+            parent=-1, child=base, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity())
+        )
+    ]
+    for branch in range(num_branches):
+        child = scene.add_link(mass=1.0 + 0.01 * branch, inertia=wp.mat33(np.eye(3)))
+        # Four boxes keep the four-point patches within the dense row capacity of the test solvers.
+        if branch % 4 == 0:
+            scene.add_shape_box(child, hx=0.01, hy=0.01, hz=0.01)
+        star_joints.append(
+            scene.add_joint_prismatic(
+                parent=base,
+                child=child,
+                axis=wp.normalize(wp.vec3(1.0, 0.0, 1.0)),
+                parent_xform=wp.transform(wp.vec3(0.05 * branch, 0.0, -0.4905), wp.quat_identity()),
+                limit_lower=-0.1,
+                limit_upper=0.1,
+            )
+        )
+    scene.add_articulation(star_joints)
+
+    chain_joints = []
+    parent = -1
+    for _link_index in range(3):
+        child = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        chain_joints.append(
+            scene.add_joint_revolute(
+                parent=parent,
+                child=child,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform(wp.vec3(0.0, 1.0, 1.0), wp.quat_identity()),
+                limit_lower=-0.2,
+                limit_upper=0.2,
+            )
+        )
+        parent = child
+    scene.add_articulation(chain_joints)
+
+    replicated = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    replicated.replicate(scene, num_worlds, spacing=(3.0, 3.0, 0.0))
+    return replicated.finalize(device=device)
+
+
 def _build_heterogeneous_world_model():
     free_template = newton.ModelBuilder()
     free_body = free_template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
@@ -363,6 +467,218 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         for diagonal, dense in zip(*trajectories, strict=True):
             np.testing.assert_allclose(diagonal[0], dense[0], rtol=0.0, atol=2.0e-6)
             np.testing.assert_allclose(diagonal[1], dense[1], rtol=0.0, atol=2.0e-6)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal response requires CUDA")
+    def test_sparse_diagonal_response_matches_dense_joint_limits(self):
+        """Match dense position-limit rows while removing the wide response storage."""
+        model = _build_sparse_diagonal_pair_model(device="cuda:0")
+        optimized = SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            dense_max_constraints=64,
+            mf_max_constraints=32,
+            pgs_iterations=8,
+            enable_joint_limits=True,
+            # Point friction keeps the contact-triple schedule under test; patch rows are not uniform triples.
+            friction_anchor_beta=0.0,
+        )
+        reference = SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            dense_max_constraints=64,
+            mf_max_constraints=32,
+            pgs_iterations=8,
+            enable_joint_limits=True,
+            # Point friction keeps the contact-triple schedule under test; patch rows are not uniform triples.
+            friction_anchor_beta=0.0,
+            use_parallel_streams=False,
+        )
+
+        self.assertTrue(optimized._sparse_diagonal_contact_solve)
+        self.assertTrue(optimized._sparse_diagonal_contact_triples)
+        self.assertTrue(optimized._sparse_diagonal_speculative_contact_batches)
+        self.assertEqual(optimized._direct_diagonal_inertia_sizes, frozenset((16,)))
+        self.assertTrue(optimized._direct_compact_diagonal_inertia)
+        self.assertEqual(optimized._composite_articulation_count, 2)
+        self.assertEqual(optimized._selected_tau_articulation_count, 2)
+        self.assertEqual(optimized._sparse_diagonal_response_size, 16)
+        self.assertEqual(optimized._sparse_diagonal_dense_size, 3)
+        self.assertEqual(optimized.H_by_size[16].shape, (1, 1, 1))
+        self.assertEqual(optimized.J_by_size[16].shape, (1, 1, 1))
+        self.assertEqual(optimized.J_world.shape, (1, 1, 1))
+        self.assertFalse(reference._sparse_diagonal_contact_solve)
+        self.assertFalse(reference._sparse_diagonal_contact_triples)
+
+        q = np.tile(np.concatenate((np.full(16, -0.105), np.full(3, 0.205))).astype(np.float32), 2)
+        qd = np.tile(np.concatenate((np.full(16, -0.2), np.full(3, 0.1))).astype(np.float32), 2)
+        trajectories = []
+        for solver in (optimized, reference):
+            state_in, state_out = model.state(), model.state()
+            state_in.joint_q.assign(q)
+            state_in.joint_qd.assign(qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            control = model.control()
+            history = []
+            for _ in range(3):
+                state_in.clear_forces()
+                solver.step(state_in, state_out, control, None, 1.0 / 120.0)
+                state_in, state_out = state_out, state_in
+                history.append((state_in.joint_q.numpy().copy(), state_in.joint_qd.numpy().copy()))
+            trajectories.append(history)
+
+        first_q, first_qd = trajectories[0][0]
+        np.testing.assert_allclose(first_q.reshape(2, 19)[:, :16], -0.104, rtol=0.0, atol=2.0e-6)
+        np.testing.assert_allclose(first_qd.reshape(2, 19)[:, :16], 0.12, rtol=0.0, atol=2.0e-6)
+        for sparse, dense in zip(*trajectories, strict=True):
+            np.testing.assert_allclose(sparse[0], dense[0], rtol=2.0e-5, atol=2.0e-6)
+            np.testing.assert_allclose(sparse[1], dense[1], rtol=2.0e-5, atol=2.0e-6)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal contact response requires CUDA")
+    def test_sparse_diagonal_contact_friction_matches_general_owner(self):
+        """Match the general owner's paired friction on sparse contacts with patch and point friction."""
+        model = _build_sparse_contact_friction_model(device="cuda:0")
+
+        def make_solver(**kwargs):
+            return SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                dense_max_constraints=96,
+                mf_max_constraints=32,
+                pgs_iterations=8,
+                enable_joint_limits=True,
+                **kwargs,
+            )
+
+        def run(solver):
+            state_in, state_out = model.state(), model.state()
+            joint_qd = state_in.joint_qd.numpy()
+            for art in np.flatnonzero(solver._model_plan.response_dof_count == 16):
+                start = int(solver._model_plan.articulation_dof_start[art])
+                joint_qd[start : start + 16] = -0.3
+            state_in.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+            contacts = pipeline.contacts()
+            control = model.control()
+            history = []
+            for _ in range(4):
+                state_in.clear_forces()
+                pipeline.collide(state_in, contacts)
+                solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+                state_in, state_out = state_out, state_in
+                history.append((state_in.joint_q.numpy().copy(), state_in.joint_qd.numpy().copy()))
+            return history
+
+        slick = run(make_solver(enable_contact_friction=False))
+        for label, friction_kwargs, triples in (("patch", {}, False), ("point", {"friction_anchor_beta": 0.0}, True)):
+            with self.subTest(friction=label):
+                optimized = make_solver(**friction_kwargs)
+                reference = make_solver(use_parallel_streams=False, **friction_kwargs)
+                self.assertTrue(optimized._sparse_diagonal_contact_solve)
+                self.assertEqual(optimized._friction_anchors_enabled, label == "patch")
+                self.assertEqual(optimized._sparse_diagonal_contact_triples, triples)
+                self.assertEqual(optimized._sparse_diagonal_speculative_contact_batches, triples)
+                self.assertFalse(reference._sparse_diagonal_contact_solve)
+
+                sparse = run(optimized)
+                general = run(reference)
+                self.assertGreater(int(optimized.constraint_count.numpy().max()), 0, "no contact rows were generated")
+                self.assertGreater(
+                    float(np.abs(sparse[-1][1] - slick[-1][1]).max()),
+                    1.0e-3,
+                    "friction did not change the sparse response",
+                )
+                for step, ((sparse_q, sparse_qd), (general_q, general_qd)) in enumerate(
+                    zip(sparse, general, strict=True)
+                ):
+                    np.testing.assert_allclose(
+                        sparse_q, general_q, rtol=2.0e-5, atol=2.0e-6, err_msg=f"joint_q step {step}"
+                    )
+                    np.testing.assert_allclose(
+                        sparse_qd, general_qd, rtol=2.0e-5, atol=2.0e-6, err_msg=f"joint_qd step {step}"
+                    )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal contact response requires CUDA")
+    def test_sparse_diagonal_owner_yields_to_contact_torsion(self):
+        """Keep torsion-enabled worlds on the general owner, which solves the appended torsion row."""
+        model = _build_sparse_diagonal_pair_model(device="cuda:0")
+        solvers = {
+            radius: SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                dense_max_constraints=64,
+                mf_max_constraints=32,
+                pgs_iterations=8,
+                enable_joint_limits=True,
+                contact_torsion_radius=radius,
+            )
+            for radius in (0.0, 0.01)
+        }
+        self.assertTrue(solvers[0.0]._sparse_diagonal_contact_solve)
+        self.assertTrue(solvers[0.01]._contact_torsion_enabled)
+        self.assertFalse(solvers[0.01]._sparse_diagonal_contact_solve)
+        self.assertFalse(solvers[0.01]._sparse_diagonal_contact_triples)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "direct compact diagonal inertia requires CUDA")
+    def test_direct_diagonal_inertia_refreshes_masked_inertial_changes(self):
+        """Refresh the compact inertia terms when an inertial model change lands on a mass-reuse step."""
+        model = _build_sparse_diagonal_pair_model(device="cuda:0", revolute_branches=True)
+        solver = SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            dense_max_constraints=64,
+            mf_max_constraints=32,
+            pgs_iterations=8,
+            enable_joint_limits=True,
+            update_mass_matrix_interval=4,
+        )
+        self.assertTrue(solver._direct_compact_diagonal_inertia)
+        self.assertEqual(solver._compact_diagonal_mass_size, 16)
+
+        # Star branch joints and their child links (skip the fixed root joint of each star).
+        articulation_start = model.articulation_start.numpy()
+        star_articulations = np.flatnonzero(solver._model_plan.response_dof_count == 16)
+        branch_joints = np.concatenate(
+            [np.arange(articulation_start[art] + 1, articulation_start[art + 1]) for art in star_articulations]
+        )
+        branch_bodies = model.joint_child.numpy()[branch_joints]
+        branch_dofs = model.joint_qd_start.numpy()[branch_joints]
+
+        state_in, state_out = model.state(), model.state()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        control = model.control()
+
+        def step():
+            nonlocal state_in, state_out
+            state_in.clear_forces()
+            solver.step(state_in, state_out, control, None, 1.0 / 120.0)
+            state_in, state_out = state_out, state_in
+            return solver._diagonal_inverse_mass.numpy()[branch_dofs].copy()
+
+        body_mass = model.body_mass.numpy()
+        armature = model.joint_armature.numpy()[branch_dofs]
+        # Unit inertia hinged about an axis through the COM: the response is 1 / (1 + armature).
+        np.testing.assert_allclose(step(), 1.0 / (1.0 + armature), rtol=1.0e-6, atol=0.0)
+
+        # Double the branch inertia and move the COM 0.1 m off the hinge axis on a mass-reuse step.
+        body_inertia = model.body_inertia.numpy()
+        body_com = model.body_com.numpy()
+        body_inertia[branch_bodies] *= 2.0
+        body_com[branch_bodies, 0] += 0.1
+        model.body_inertia.assign(body_inertia)
+        model.body_com.assign(body_com)
+        solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+        self.assertFalse(solver._step % solver.update_mass_matrix_interval == 0)
+        masked = step()
+
+        # Parallel-axis inertia about the hinge: 2 + m * 0.1^2 (+ armature).
+        expected = 1.0 / (2.0 + body_mass[branch_bodies] * 0.1**2 + armature)
+        np.testing.assert_allclose(masked, expected, rtol=1.0e-5, atol=0.0)
+        # The next global refresh must agree with the masked refresh.
+        for _ in range(2):
+            step()
+        self.assertTrue(solver._step % solver.update_mass_matrix_interval == 0)
+        np.testing.assert_allclose(step(), masked, rtol=1.0e-6, atol=0.0)
 
     @unittest.skipUnless(wp.is_cuda_available(), "topology-owned CRBA requires CUDA")
     def test_topology_owned_crba_matches_generic_trajectory(self):

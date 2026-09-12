@@ -8,6 +8,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.friction import friction_pair_candidate
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -17,7 +18,15 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     accumulate_group_diag_worlds,
 )
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSExecutionPlan, _get_hinv_jt_kernel
+from newton._src.solvers.feather_pgs.solver_feather_pgs import (
+    _FeatherPGSExecutionPlan,
+    _get_build_independent_sparse_contact_groups_kernel,
+    _get_direct_diagonal_inverse_mass_kernel,
+    _get_hinv_jt_kernel,
+    _get_mark_independent_sparse_contact_candidates_kernel,
+    _get_partitioned_inverse_dynamics_kernels,
+    _get_pgs_solve_sparse_diagonal_kernel,
+)
 from newton.solvers import SolverFeatherPGS
 
 
@@ -227,6 +236,430 @@ def _assert_owner_parity(test, general, local):
 
 
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal GS requires CUDA")
+    def test_sparse_diagonal_gs_matches_scalar_reference(self):
+        """Match a scalar PGS reference with coupled limits and friction."""
+        device = wp.get_device("cuda:0")
+        max_constraints, world_dofs, dense_dofs = 8, 4, 2
+        cfm, omega, iterations = 1.0e-6, 1.0, 8
+        inverse_mass = np.array((0.5, 0.25, 0.75, 1.0), dtype=np.float32)
+        initial_velocity = np.array((-0.4, 0.3, -0.2, 0.1), dtype=np.float32)
+        jacobian = np.array(
+            ((0.6, -0.4, 0.2, 0.0), (0.1, 0.5, -0.3, 0.4), (-0.2, 0.25, 0.1, -0.35)),
+            dtype=np.float32,
+        )
+        response = jacobian * inverse_mass
+        rhs = np.zeros((1, max_constraints), dtype=np.float32)
+        rhs[0, :3] = (-0.1, 0.0, 0.0)
+        diag = np.zeros_like(rhs)
+        diag[0, :3] = np.sum(jacobian * response, axis=1) + cfm
+        row_type = np.zeros((1, max_constraints), dtype=np.int32)
+        row_type[0, :3] = (PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION)
+        row_parent = np.full((1, max_constraints), -1, dtype=np.int32)
+        row_parent[0, 1:3] = 0
+        row_mu = np.zeros((1, max_constraints), dtype=np.float32)
+        row_mu[0, 1:3] = 0.7
+        dense_j = np.zeros((1, max_constraints, dense_dofs), dtype=np.float32)
+        dense_y = np.zeros_like(dense_j)
+        dense_j[0, :3] = jacobian[:, :dense_dofs]
+        dense_y[0, :3] = response[:, :dense_dofs]
+        sparse_dof = np.full((1, max_constraints, 2), -1, dtype=np.int32)
+        sparse_jy = np.zeros((1, max_constraints, 4), dtype=np.float32)
+        sparse_dof[0, :3] = (2, 3)
+        sparse_jy[0, :3, 0] = jacobian[:, 2]
+        sparse_jy[0, :3, 1] = response[:, 2]
+        sparse_jy[0, :3, 2] = jacobian[:, 3]
+        sparse_jy[0, :3, 3] = response[:, 3]
+        limit_active = np.zeros((1, world_dofs), dtype=np.int32)
+        limit_active[0, 2] = 1
+        limit_lower_rhs = np.zeros((1, world_dofs), dtype=np.float32)
+        limit_lower_rhs[0, 2] = -0.15
+
+        expected_velocity = initial_velocity.copy()
+        expected_impulses = np.zeros(3, dtype=np.float32)
+        expected_limit_lambda = np.float32(0.0)
+        for _ in range(iterations):
+            old_limit = expected_limit_lambda
+            residual = expected_velocity[2] + limit_lower_rhs[0, 2]
+            expected_limit_lambda = np.maximum(0.0, old_limit - omega * residual / (inverse_mass[2] + cfm))
+            expected_velocity[2] += inverse_mass[2] * (expected_limit_lambda - old_limit)
+            old_impulse = expected_impulses[0]
+            new_impulse = old_impulse - omega * (jacobian[0] @ expected_velocity + rhs[0, 0]) / diag[0, 0]
+            new_impulse = max(new_impulse, 0.0)
+            expected_impulses[0] = new_impulse
+            expected_velocity += response[0] * (new_impulse - old_impulse)
+            # The general owner solves both tangent rows together on the friction disk at the current normal
+            # load (friction_pair_candidate); the second tangent visit is a no-op.
+            radius = max(row_mu[0, 1] * expected_impulses[0], 0.0)
+            pair = friction_pair_candidate(
+                float(diag[0, 1]),
+                float(jacobian[1] @ response[2]),
+                float(diag[0, 2]),
+                wp.vec2(
+                    float(jacobian[1] @ expected_velocity + rhs[0, 1]),
+                    float(jacobian[2] @ expected_velocity + rhs[0, 2]),
+                ),
+                wp.vec2(float(expected_impulses[1]), float(expected_impulses[2])),
+                float(radius),
+                omega,
+            )
+            magnitude = np.sqrt(pair[0] * pair[0] + pair[1] * pair[1])
+            scale = radius / magnitude if magnitude > radius else 1.0
+            for tangent, value in ((1, pair[0] * scale), (2, pair[1] * scale)):
+                expected_velocity += response[tangent] * (value - expected_impulses[tangent])
+                expected_impulses[tangent] = np.float32(value)
+
+        impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
+        lower_lambda = wp.zeros((1, world_dofs), dtype=wp.float32, device=device)
+        upper_lambda = wp.zeros_like(lower_lambda)
+        velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
+        kernel = _get_pgs_solve_sparse_diagonal_kernel(
+            max_constraints, world_dofs, dense_dofs, str(device.arch), contact_triples=True
+        )
+        wp.launch_tiled(
+            kernel,
+            dim=[1],
+            inputs=[
+                wp.array((3,), dtype=wp.int32, device=device),
+                wp.array(np.arange(world_dofs, dtype=np.int32)[None, :], device=device),
+                wp.array(rhs, device=device),
+                wp.array(diag, device=device),
+                impulses,
+                wp.array(row_type, device=device),
+                wp.array(row_parent, device=device),
+                wp.array(row_mu, device=device),
+                wp.zeros((1, 2), dtype=wp.int32, device=device),
+                wp.zeros(1, dtype=wp.int32, device=device),
+                wp.empty((1, world_dofs), dtype=wp.int32, device=device),
+                wp.zeros(1, dtype=wp.int32, device=device),
+                wp.empty((1, (max_constraints + 2) // 3), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array(dense_j, device=device),
+                wp.array(dense_y, device=device),
+                wp.array(sparse_dof, device=device),
+                wp.array(sparse_jy, device=device),
+                wp.array(limit_active, device=device),
+                wp.array(limit_lower_rhs, device=device),
+                wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
+                wp.array(inverse_mass, device=device),
+                cfm,
+                iterations,
+                omega,
+                0,
+                0,
+            ],
+            outputs=[lower_lambda, upper_lambda, velocity],
+            block_dim=32,
+            device=device,
+        )
+
+        np.testing.assert_allclose(velocity.numpy(), expected_velocity, rtol=2.0e-5, atol=2.0e-6)
+        np.testing.assert_allclose(impulses.numpy()[0, :3], expected_impulses, rtol=2.0e-5, atol=2.0e-6)
+        np.testing.assert_allclose(lower_lambda.numpy()[0, 2], expected_limit_lambda, rtol=2.0e-5, atol=2.0e-6)
+        self.assertEqual(float(upper_lambda.numpy()[0, 2]), 0.0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "speculative contact batches require CUDA")
+    def test_speculative_sparse_contact_batches_match_serial_reference(self):
+        """Skip exact no-op prefixes without changing later serial contact updates."""
+        device = wp.get_device("cuda:0")
+        max_constraints, world_dofs, dense_dofs = 12, 8, 6
+        cfm, omega, iterations = 1.0e-6, 1.0, 2
+        inverse_mass = np.array((0.5, 0.25, 0.75, 1.0, 0.4, 0.6, 0.75, 0.8), dtype=np.float32)
+        initial_velocity = np.array((0.3, -0.2, 0.1, 0.4, -0.1, 0.2, 0.5, 0.25), dtype=np.float32)
+        jacobian = np.zeros((max_constraints, world_dofs), dtype=np.float32)
+        jacobian[0, 6] = 1.0
+        jacobian[3, 7] = 1.0
+        jacobian[6, (0, 6)] = (-0.2, -1.0)
+        jacobian[9, (0, 6)] = (0.3, 1.0)
+        response = jacobian * inverse_mass
+        rhs = np.zeros((1, max_constraints), dtype=np.float32)
+        rhs[0, 6] = -0.1
+        rhs[0, 9] = -0.2
+        diag = np.zeros_like(rhs)
+        normal_rows = np.array((0, 3, 6, 9), dtype=np.int32)
+        diag[0, normal_rows] = np.sum(jacobian[normal_rows] * response[normal_rows], axis=1) + cfm
+        row_type = np.full((1, max_constraints), PGS_CONSTRAINT_TYPE_FRICTION, dtype=np.int32)
+        row_type[0, normal_rows] = PGS_CONSTRAINT_TYPE_CONTACT
+        row_parent = np.full((1, max_constraints), -1, dtype=np.int32)
+        for normal in normal_rows:
+            row_parent[0, normal + 1 : normal + 3] = normal
+        row_mu = np.zeros((1, max_constraints), dtype=np.float32)
+        dense_j = jacobian[:, :dense_dofs][None, ...]
+        dense_y = response[:, :dense_dofs][None, ...]
+        sparse_dof = np.empty((1, max_constraints, 2), dtype=np.int32)
+        sparse_dof[:, :, 0] = 6
+        sparse_dof[:, :, 1] = 7
+        sparse_jy = np.zeros((1, max_constraints, 4), dtype=np.float32)
+        sparse_jy[0, :, 0] = jacobian[:, 6]
+        sparse_jy[0, :, 1] = response[:, 6]
+        sparse_jy[0, :, 2] = jacobian[:, 7]
+        sparse_jy[0, :, 3] = response[:, 7]
+
+        expected_velocity = initial_velocity.copy()
+        expected_impulses = np.zeros(max_constraints, dtype=np.float32)
+        for _ in range(iterations):
+            for row in normal_rows:
+                old_impulse = expected_impulses[row]
+                residual = jacobian[row] @ expected_velocity + rhs[0, row]
+                new_impulse = max(old_impulse - omega * residual / diag[0, row], 0.0)
+                expected_impulses[row] = new_impulse
+                expected_velocity += response[row] * (new_impulse - old_impulse)
+
+        impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
+        velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
+        kernel = _get_pgs_solve_sparse_diagonal_kernel(
+            max_constraints,
+            world_dofs,
+            dense_dofs,
+            str(device.arch),
+            contact_triples=True,
+            speculative_contact_batches=True,
+        )
+        wp.launch_tiled(
+            kernel,
+            dim=[1],
+            inputs=[
+                wp.array((max_constraints,), dtype=wp.int32, device=device),
+                wp.array(np.arange(world_dofs, dtype=np.int32)[None, :], device=device),
+                wp.array(rhs, device=device),
+                wp.array(diag, device=device),
+                impulses,
+                wp.array(row_type, device=device),
+                wp.array(row_parent, device=device),
+                wp.array(row_mu, device=device),
+                wp.zeros((1, 2), dtype=wp.int32, device=device),
+                wp.zeros(1, dtype=wp.int32, device=device),
+                wp.empty((1, world_dofs), dtype=wp.int32, device=device),
+                wp.array((len(normal_rows),), dtype=wp.int32, device=device),
+                wp.array(normal_rows[None, :], device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array(dense_j, device=device),
+                wp.array(dense_y, device=device),
+                wp.array(sparse_dof, device=device),
+                wp.array(sparse_jy, device=device),
+                wp.zeros((1, world_dofs), dtype=wp.int32, device=device),
+                wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
+                wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
+                wp.array(inverse_mass, device=device),
+                cfm,
+                iterations,
+                omega,
+                0,
+                0,
+            ],
+            outputs=[
+                wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
+                wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
+                velocity,
+            ],
+            block_dim=32,
+            device=device,
+        )
+
+        np.testing.assert_allclose(velocity.numpy(), expected_velocity, rtol=2.0e-5, atol=2.0e-6)
+        np.testing.assert_allclose(impulses.numpy()[0], expected_impulses, rtol=2.0e-5, atol=2.0e-6)
+        np.testing.assert_array_equal(impulses.numpy()[0, :6], np.zeros(6, dtype=np.float32))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "direct diagonal projection requires CUDA")
+    def test_direct_diagonal_inverse_mass_matches_compact_inertia_terms(self):
+        """Project a one-body branch directly from its compact inertia representation."""
+        device = wp.get_device("cuda:0")
+        mass = np.float32(2.5)
+        com = np.array((0.2, -0.1, 0.3), dtype=np.float32)
+        inertia = np.array(((0.8, 0.1, -0.05), (0.1, 1.1, 0.02), (-0.05, 0.02, 1.4)), dtype=np.float32)
+        motion = np.array((0.3, -0.2, 0.4, 0.5, 0.1, -0.6), dtype=np.float32)
+        armature = np.float32(0.25)
+        drive_stiffness = np.float32(0.75)
+        terms = np.concatenate((com, inertia.reshape(-1)))[None, :]
+        inverse_mass = wp.zeros(1, dtype=wp.float32, device=device)
+        kernel = _get_direct_diagonal_inverse_mass_kernel(1, str(device.arch))
+        wp.launch(
+            kernel,
+            dim=1,
+            inputs=[
+                wp.array((0, 1), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((1,), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((wp.spatial_vector(*motion),), dtype=wp.spatial_vector, device=device),
+                wp.array((mass,), dtype=wp.float32, device=device),
+                wp.array(terms, dtype=wp.float32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array(((armature,),), dtype=wp.float32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((drive_stiffness,), dtype=wp.float32, device=device),
+            ],
+            outputs=[inverse_mass],
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        linear = motion[:3]
+        angular = motion[3:]
+        response = np.concatenate(
+            (
+                mass * (linear - np.cross(com, angular)),
+                mass * np.cross(com, linear) + inertia @ angular,
+            )
+        )
+        expected = np.float32(1.0) / (np.dot(motion, response) + armature + drive_stiffness)
+        np.testing.assert_allclose(inverse_mass.numpy()[0], expected, rtol=2.0e-6, atol=0.0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "partitioned inverse dynamics requires CUDA")
+    def test_direct_branch_inverse_dynamics_matches_articulation_path(self):
+        """A one-body branch must produce the same torque through either schedule."""
+        device = wp.get_device("cuda:0")
+        spatial = wp.spatial_vector(0.4, -0.2, 0.6, 0.1, 0.3, -0.5)
+        external = wp.spatial_vector(-0.3, 0.5, 0.2, -0.4, 0.1, 0.7)
+        articulation_start = wp.array((0, 1), dtype=wp.int32, device=device)
+        articulation_end = wp.array((1,), dtype=wp.int32, device=device)
+        joint_type = wp.array((int(newton.JointType.PRISMATIC),), dtype=wp.int32, device=device)
+        joint_parent = wp.array((-1,), dtype=wp.int32, device=device)
+        joint_child = wp.array((0,), dtype=wp.int32, device=device)
+        joint_articulation = wp.array((0,), dtype=wp.int32, device=device)
+        starts = wp.array((0, 1), dtype=wp.int32, device=device)
+        dof_dim = wp.array(((1, 0),), dtype=wp.int32, device=device)
+        joint_f = wp.array((0.2,), dtype=wp.float32, device=device)
+        joint_q = wp.array((0.15,), dtype=wp.float32, device=device)
+        joint_qd = wp.array((-0.25,), dtype=wp.float32, device=device)
+        stiffness = wp.array((1.4,), dtype=wp.float32, device=device)
+        spring_ref = wp.array((0.05,), dtype=wp.float32, device=device)
+        damping = wp.array((0.3,), dtype=wp.float32, device=device)
+        joint_S_s = wp.array((spatial,), dtype=wp.spatial_vector, device=device)
+        body_force = wp.array((spatial,), dtype=wp.spatial_vector, device=device)
+        external_force = wp.array((external,), dtype=wp.spatial_vector, device=device)
+        body_flags = wp.zeros(1, dtype=wp.int32, device=device)
+        body_q = wp.array((wp.transform_identity(),), dtype=wp.transform, device=device)
+        body_com = wp.array((wp.vec3(0.2, -0.1, 0.3),), dtype=wp.vec3, device=device)
+        origin = wp.array((wp.vec3(),), dtype=wp.vec3, device=device)
+        selected_tau = wp.array((0.7,), dtype=wp.float32, device=device)
+        direct_tau = wp.clone(selected_tau)
+        body_ft = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+        selected_kernel, direct_kernel = _get_partitioned_inverse_dynamics_kernels(1, str(device.arch))
+        common = [
+            articulation_start,
+            articulation_end,
+            joint_type,
+            joint_parent,
+            joint_child,
+            joint_articulation,
+            starts,
+            starts,
+            dof_dim,
+            joint_f,
+            joint_q,
+            joint_qd,
+            stiffness,
+            spring_ref,
+            damping,
+            joint_S_s,
+            body_force,
+            external_force,
+            body_flags,
+            body_q,
+            body_com,
+            origin,
+        ]
+        wp.launch(
+            selected_kernel,
+            dim=1,
+            inputs=[wp.array((0,), dtype=wp.int32, device=device), *common, 1],
+            outputs=[body_ft, selected_tau],
+            device=device,
+        )
+        wp.launch(
+            direct_kernel,
+            dim=1,
+            inputs=[
+                wp.array((0,), dtype=wp.int32, device=device),
+                wp.array((0,), dtype=wp.int32, device=device),
+                articulation_start,
+                joint_type,
+                joint_child,
+                starts,
+                starts,
+                dof_dim,
+                joint_f,
+                joint_q,
+                joint_qd,
+                stiffness,
+                spring_ref,
+                damping,
+                joint_S_s,
+                body_force,
+                external_force,
+                body_flags,
+                body_q,
+                body_com,
+                origin,
+                1,
+            ],
+            outputs=[direct_tau],
+            device=device,
+        )
+        wp.synchronize_device(device)
+        np.testing.assert_array_equal(direct_tau.numpy(), selected_tau.numpy())
+
+    @unittest.skipUnless(wp.is_cuda_available(), "independent contact groups require CUDA")
+    def test_independent_sparse_contact_groups_exclude_coupled_coordinates(self):
+        """Keep scalar contacts serial when a coupled contact shares their coordinate."""
+        device = wp.get_device("cuda:0")
+        max_constraints, max_world_dofs, contact_count = 12, 4, 4
+        sparse_response_dofs = 108
+        sparse_row_dof_np = np.full((1, max_constraints, 2), -1, dtype=np.int32)
+        sparse_row_dof_np[0, 0:3, 0] = 2
+        sparse_row_dof_np[0, 3:6, 0] = 3
+        sparse_row_dof_np[0, 6:9, 0] = 3
+        sparse_row_dof_np[0, 9:12, 0] = 2
+        sparse_row_dof = wp.array(sparse_row_dof_np, device=device)
+        group_count = wp.zeros(1, dtype=wp.int32, device=device)
+        group_heads = wp.empty((1, max_world_dofs), dtype=wp.int32, device=device)
+        serial_count = wp.zeros(1, dtype=wp.int32, device=device)
+        serial_normals = wp.empty((1, (max_constraints + 2) // 3), dtype=wp.int32, device=device)
+
+        marker = _get_mark_independent_sparse_contact_candidates_kernel(sparse_response_dofs, str(device.arch))
+        wp.launch(
+            marker,
+            dim=contact_count,
+            inputs=[
+                wp.array((contact_count,), dtype=wp.int32, device=device),
+                contact_count,
+                wp.zeros(contact_count, dtype=wp.int32, device=device),
+                wp.array((0, 3, 6, 9), dtype=wp.int32, device=device),
+                wp.zeros(contact_count, dtype=wp.int32, device=device),
+                wp.array((-1, 1, -1, -1), dtype=wp.int32, device=device),
+                wp.zeros(contact_count, dtype=wp.int32, device=device),
+                wp.full(contact_count, 3, dtype=wp.int32, device=device),
+                wp.array((sparse_response_dofs, 6), dtype=wp.int32, device=device),
+            ],
+            outputs=[sparse_row_dof],
+            device=device,
+        )
+        schedule = _get_build_independent_sparse_contact_groups_kernel(
+            max_constraints, max_world_dofs, str(device.arch), build_serial_contacts=True
+        )
+        wp.launch(
+            schedule,
+            dim=32,
+            inputs=[
+                wp.array((max_constraints,), dtype=wp.int32, device=device),
+                wp.zeros((1, 2), dtype=wp.int32, device=device),
+            ],
+            outputs=[sparse_row_dof, group_count, group_heads, serial_count, serial_normals],
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        self.assertEqual(int(group_count.numpy()[0]), 1)
+        self.assertEqual(int(group_heads.numpy()[0, 0]), 0)
+        self.assertEqual(int(serial_count.numpy()[0]), 2)
+        np.testing.assert_array_equal(serial_normals.numpy()[0, :2], np.array((3, 6), dtype=np.int32))
+        normal_links = sparse_row_dof.numpy()[0, ::3, 1]
+        np.testing.assert_array_equal(normal_links, np.array((-12, -1, -1, -2), dtype=np.int32))
+
     def test_mixed_world_diagonal_map_includes_free_rigid_response(self):
         """Include free rigid articulations in every forced-tiled diagonal group."""
         solver = SolverFeatherPGS(_build_mixed_response_model("cpu", world_count=2), dense_max_constraints=32)
