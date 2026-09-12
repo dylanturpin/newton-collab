@@ -17083,30 +17083,31 @@ def _get_pgs_solve_mf_gs_kernel(
                 } else {
                     int sib = mf_par + 2;
                     int sib_mf6 = mf6_base + sib * 6;
-                    float lambda_n = s_lam_mf[mf_par];
-                    for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> 16); patch_row >= 0 && patch_row != mf_par; patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
-                        lambda_n += s_lam_mf[patch_row];
-                    float radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
-                    float sibling_residual = 0.0f;
-                    if (lane < 6 && dof_a >= 0)
-                        sibling_residual = mf_J_a.data[sib_mf6 + lane] * s_v[dof_a + lane];
-                    if (lane >= 6 && lane < 12 && dof_b >= 0)
-                        sibling_residual = mf_J_b.data[sib_mf6 + lane - 6] * s_v[dof_b + lane - 6];
-                    for (int offset = 16; offset > 0; offset >>= 1)
-                        sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
-                    sibling_residual = __shfl_sync(MASK, sibling_residual, 0)
-                        + __int_as_float(mf_meta.data[off_meta + sib * 4 + 2]);
-                    float inv_sib = __int_as_float(mf_meta.data[off_meta + sib * 4 + 1]);
-                    float cross = 0.0f;
-                    if (lane < 6 && dof_a >= 0)
-                        cross = mf_J_a.data[mf6_base + i * 6 + lane] * mf_MiJt_a.data[sib_mf6 + lane];
-                    if (lane >= 6 && lane < 12 && dof_b >= 0)
-                        cross = mf_J_b.data[mf6_base + i * 6 + lane - 6] * mf_MiJt_b.data[sib_mf6 + lane - 6];
-                    for (int offset = 16; offset > 0; offset >>= 1)
-                        cross += __shfl_down_sync(MASK, cross, offset);
-                    cross = __shfl_sync(MASK, cross, 0);
-                    float2 pair = friction_pair_candidate(mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
-                        residual, sibling_residual, old_impulse, s_lam_mf[sib], radius, omega);
+                    float radius = mf_friction_radius;
+                    float2 pair = make_float2(0.0f, 0.0f);
+                    // Zero load gives a zero disk; avoid unused tangent reductions.
+                    if (radius > 0.0f) {
+                        float sibling_residual = 0.0f;
+                        if (lane < 6 && dof_a >= 0)
+                            sibling_residual = mf_J_a.data[sib_mf6 + lane] * s_v[dof_a + lane];
+                        if (lane >= 6 && lane < 12 && dof_b >= 0)
+                            sibling_residual = mf_J_b.data[sib_mf6 + lane - 6] * s_v[dof_b + lane - 6];
+                        for (int offset = 16; offset > 0; offset >>= 1)
+                            sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
+                        sibling_residual = __shfl_sync(MASK, sibling_residual, 0)
+                            + __int_as_float(mf_meta.data[off_meta + sib * 4 + 2]);
+                        float inv_sib = __int_as_float(mf_meta.data[off_meta + sib * 4 + 1]);
+                        float cross = 0.0f;
+                        if (lane < 6 && dof_a >= 0)
+                            cross = mf_J_a.data[mf6_base + i * 6 + lane] * mf_MiJt_a.data[sib_mf6 + lane];
+                        if (lane >= 6 && lane < 12 && dof_b >= 0)
+                            cross = mf_J_b.data[mf6_base + i * 6 + lane - 6] * mf_MiJt_b.data[sib_mf6 + lane - 6];
+                        for (int offset = 16; offset > 0; offset >>= 1)
+                            cross += __shfl_down_sync(MASK, cross, offset);
+                        cross = __shfl_sync(MASK, cross, 0);
+                        pair = friction_pair_candidate(mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                            residual, sibling_residual, old_impulse, s_lam_mf[sib], radius, omega);
+                    }
                     float a = pair.x;
                     float b = pair.y;
                     float mag = sqrtf(a * a + b * b);
@@ -17121,6 +17122,24 @@ def _get_pgs_solve_mf_gs_kernel(
                         s_v[dof_b + lane - 6] += mf_MiJt_b.data[sib_mf6 + lane - 6] * sib_delta;
                 }
 """
+
+    mf_friction_precheck = (
+        """
+            float mf_friction_radius = 0.0f;
+            if (mf_rt == 2) {
+                int parent = packed_tp >> 16;
+                float lambda_n = s_lam_mf[parent];
+                for (int patch_row = (mf_meta.data[off_meta + parent * 4 + 3] >> 16); patch_row >= 0 && patch_row != parent; patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
+                    lambda_n += s_lam_mf[patch_row];
+                mf_friction_radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
+                // A zero disk with no carried impulse cannot change velocity.
+                if (mf_friction_radius == 0.0f && s_lam_mf[i] == 0.0f && s_lam_mf[i + 1] == 0.0f)
+                    continue;
+            }
+"""
+        if friction_mode == "current"
+        else ""
+    )
 
     drive_shared_declarations = (
         f"""
@@ -17521,6 +17540,8 @@ def _get_pgs_solve_mf_gs_kernel(
 
             if (mf_rt == 2 && i != (packed_tp >> 16) + 1) continue;
             if (mf_diag <= 0.0f{" && mf_rt != 2" if friction_mode == "current" else ""}) continue;
+
+            {mf_friction_precheck}
 
             // J · v using prefetched J values
             float my_sum = 0.0f;
