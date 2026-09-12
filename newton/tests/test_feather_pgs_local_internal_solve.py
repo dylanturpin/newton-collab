@@ -33,7 +33,9 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             wp.zeros((world_count, 1, 6), dtype=wp.float32, device=device),
             wp.zeros((world_count, 1, 6), dtype=wp.float32, device=device),
             wp.zeros((world_count, 1), dtype=wp.float32, device=device),
-            1.0,
+            0,
+            wp.zeros((world_count, 1), dtype=wp.float32, device=device),
+            wp.zeros((world_count, 1), dtype=wp.float32, device=device),
         ]
 
     def test_local_owner_classifier_rejects_unsupported_worlds(self):
@@ -47,6 +49,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         mf_count = wp.array([0, 0, 0, 1, 1, 0, 0, 0], dtype=wp.int32, device=device)
         mf_body_a = wp.full((8, 1), -1, dtype=wp.int32, device=device)
         mf_body_b = wp.array([[-1], [-1], [-1], [0], [1], [-1], [-1], [-1]], dtype=wp.int32, device=device)
+        mf_row_type = wp.full((8, 1), PGS_CONSTRAINT_TYPE_CONTACT, dtype=wp.int32, device=device)
         body_to_articulation = wp.array([12, 99], dtype=wp.int32, device=device)
         articulation_dof_count_host = np.full(16, 20, dtype=np.int32)
         articulation_dof_count_host[5] = 7
@@ -67,6 +70,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 mf_count,
                 mf_body_a,
                 mf_body_b,
+                mf_row_type,
                 body_to_articulation,
                 articulation_dof_count,
                 primary,
@@ -440,7 +444,9 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 wp.zeros_like(wp.array(mf_response, device=device)),
                 wp.array(mf_response, device=device),
                 wp.array([np.pad(mf_mu, (0, 1))], device=device),
-                1.0,
+                0,
+                wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
+                wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
                 iterations,
                 1.0,
                 0,

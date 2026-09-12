@@ -10,16 +10,36 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
+    PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     accumulate_group_diag_worlds,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSExecutionPlan, _get_hinv_jt_kernel
 from newton.solvers import SolverFeatherPGS
 
 
-def _build_mixed_response_model(device, world_count=1, *, friction=0.0, restitution=0.0):
-    """Build one 13-DOF articulation contacting one free rigid body."""
+def _build_mixed_response_model(
+    device,
+    world_count=1,
+    *,
+    friction=0.0,
+    restitution=0.0,
+    static_support=False,
+    free_body_first=False,
+    free_body_velocity_limit=None,
+):
+    """Build one 13-DOF articulation contacting one free rigid body.
+
+    ``static_support`` rests the free body on a static ledge that clears the arm, so the free body also
+    produces matrix-free contact rows. ``free_body_first`` builds the free body before the articulation,
+    which packs the world DOFs free-body first. ``free_body_velocity_limit`` caps the free body's linear
+    and angular velocity [m/s, rad/s], producing matrix-free velocity-limit rows once exceeded.
+    """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    if free_body_velocity_limit is not None:
+        SolverFeatherPGS.register_custom_attributes(builder)
     builder.default_shape_cfg.density = 1000.0
     builder.default_shape_cfg.ke = 1.0e5
     builder.default_shape_cfg.kd = 1.0e3
@@ -28,6 +48,29 @@ def _build_mixed_response_model(device, world_count=1, *, friction=0.0, restitut
     builder.default_shape_cfg.margin = 0.0
     builder.default_shape_cfg.gap = 0.0
 
+    def add_free_body():
+        custom_attributes = None
+        if free_body_velocity_limit is not None:
+            custom_attributes = {
+                "rigid_body_max_linear_velocity": free_body_velocity_limit,
+                "rigid_body_max_angular_velocity": free_body_velocity_limit,
+            }
+        box = builder.add_link(
+            xform=wp.transform(wp.vec3(0.7, 0.0, 0.5695), wp.quat_identity()), custom_attributes=custom_attributes
+        )
+        builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05)
+        builder.add_articulation([builder.add_joint_free(parent=-1, child=box)])
+        if static_support:
+            builder.add_shape_box(
+                -1,
+                xform=wp.transform(wp.vec3(0.7, 0.11, 0.47), wp.quat_identity()),
+                hx=0.05,
+                hy=0.05,
+                hz=0.05,
+            )
+
+    if free_body_first:
+        add_free_body()
     arm = builder.add_link()
     builder.add_shape_box(arm, hx=0.4, hy=0.05, hz=0.02)
     joints = [
@@ -57,9 +100,8 @@ def _build_mixed_response_model(device, world_count=1, *, friction=0.0, restitut
     builder.add_articulation(joints)
     builder.add_constraint_mimic(joint0=joints[1], joint1=joints[0], coef0=0.0, coef1=1.0)
 
-    box = builder.add_link(xform=wp.transform(wp.vec3(0.7, 0.0, 0.5695), wp.quat_identity()))
-    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05)
-    builder.add_articulation([builder.add_joint_free(parent=-1, child=box)])
+    if not free_body_first:
+        add_free_body()
     if world_count == 1:
         return builder.finalize(device=device)
     replicated = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -76,9 +118,11 @@ def _run_mixed_response(
     friction=0.0,
     restitution=0.0,
     tangential_velocity=0.0,
+    contact_regularization=0.0,
+    model_kwargs=None,
 ):
     """Run a short mixed-contact trajectory with one H-inverse implementation."""
-    model = _build_mixed_response_model("cuda:0", friction=friction, restitution=restitution)
+    model = _build_mixed_response_model("cuda:0", friction=friction, restitution=restitution, **(model_kwargs or {}))
     with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": kernel}):
         solver = SolverFeatherPGS(
             model,
@@ -89,6 +133,7 @@ def _run_mixed_response(
             enable_joint_limits=inactive_joint_limit_capacity,
             joint_limit_activation_gap=0.0,
             pgs_iterations=8,
+            pgs_contact_regularization=contact_regularization,
             dense_max_constraints=32,
             mf_max_constraints=32,
         )
@@ -115,6 +160,7 @@ def _run_mixed_response(
         pipeline.collide(state_in, contacts)
         solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
         constraint_count = int(solver.constraint_count.numpy()[0])
+        mf_count = int(solver.mf_constraint_count.numpy()[0])
         samples.append(
             (
                 constraint_count,
@@ -124,10 +170,37 @@ def _run_mixed_response(
                 state_out.joint_qd.numpy().copy(),
                 int(solver._local_solve_owner.numpy()[0]),
                 solver.row_type.numpy()[0, :constraint_count].copy(),
+                mf_count,
+                solver.mf_impulses.numpy()[0, :mf_count].copy(),
+                solver.mf_row_type.numpy()[0, :mf_count].copy(),
             )
         )
         state_in, state_out = state_out, state_in
     return solver, samples
+
+
+def _assert_owner_parity(test, general, local):
+    """Assert the local owner trajectory matches the general owner row for row."""
+    test.assertEqual(len(general), len(local))
+    test.assertGreater(general[0][0], 0, "mixed scene generated no dense constraint rows")
+    for step, (expected, actual) in enumerate(zip(general, local, strict=True)):
+        test.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+        test.assertEqual(actual[7], expected[7], f"matrix-free row count differed at step {step}")
+        np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
+        np.testing.assert_array_equal(actual[9], expected[9], err_msg=f"matrix-free row types differed at step {step}")
+        for label, expected_value, actual_value in zip(
+            ("diagonal", "impulses", "joint_q", "joint_qd", "mf_impulses"),
+            (*expected[1:5], expected[8]),
+            (*actual[1:5], actual[8]),
+            strict=True,
+        ):
+            np.testing.assert_allclose(
+                actual_value,
+                expected_value,
+                rtol=5.0e-4,
+                atol=2.0e-6,
+                err_msg=f"{label} differed at step {step}",
+            )
 
 
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
@@ -287,6 +360,84 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     atol=2.0e-6,
                     err_msg=f"{label} differed at step {step}",
                 )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
+    def test_local_owners_match_general_contact_regularization(self):
+        """Apply the general owner's per-row regularization weights in the local owners."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "inactive_joint_limit_capacity": True,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+            "contact_regularization": 1.0,
+            "model_kwargs": {"static_support": True},
+        }
+        general_solver, general = _run_mixed_response("tiled", **run_kwargs)
+        local_solver, local = _run_mixed_response("par_row", **run_kwargs)
+
+        self.assertTrue(general_solver._regularization_enabled)
+        self.assertFalse(general_solver._local_internal_fast_path)
+        self.assertTrue(local_solver._local_internal_fast_path)
+        owners = [sample[5] for sample in local]
+        self.assertIn(
+            PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL, owners, "regularized mixed contact never selected the residual owner"
+        )
+        self.assertTrue(
+            any(sample[7] > 0 and sample[5] != PGS_LOCAL_SOLVE_OWNER_GENERAL for sample in local),
+            "no local owner solved matrix-free rows",
+        )
+        _assert_owner_parity(self, general, local)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
+    def test_free_body_velocity_limit_rows_stay_on_general_owner(self):
+        """Keep worlds with free-body velocity-limit rows on the general owner."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "inactive_joint_limit_capacity": True,
+            "model_kwargs": {"free_body_velocity_limit": 1.0},
+        }
+        general_solver, general = _run_mixed_response("tiled", **run_kwargs)
+        local_solver, local = _run_mixed_response("par_row", **run_kwargs)
+
+        self.assertFalse(general_solver._local_internal_fast_path)
+        self.assertTrue(local_solver._local_internal_fast_path)
+        limited = [sample for sample in local if np.any(sample[9] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)]
+        self.assertTrue(limited, "free body never produced a velocity-limit row")
+        # The residual owner is eligible for this world; only the velocity-limit rows keep it general.
+        self.assertGreaterEqual(int(local_solver._local_residual_pair_articulation.numpy()[0]), 0)
+        for sample in limited:
+            self.assertEqual(sample[5], PGS_LOCAL_SOLVE_OWNER_GENERAL, "velocity-limit rows left the general owner")
+        _assert_owner_parity(self, general, local)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
+    def test_free_body_first_world_layout_matches_general(self):
+        """Reject the residual owner when the world packs the free body before the articulation."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "inactive_joint_limit_capacity": True,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+            "model_kwargs": {"static_support": True, "free_body_first": True},
+        }
+        general_solver, general = _run_mixed_response("tiled", **run_kwargs)
+        local_solver, local = _run_mixed_response("par_row", **run_kwargs)
+
+        free_articulation = int(np.flatnonzero(local_solver._model_plan.is_free_rigid)[0])
+        self.assertEqual(int(local_solver._model_plan.articulation_dof_start[free_articulation]), 0)
+        self.assertFalse(general_solver._local_internal_fast_path)
+        self.assertTrue(local_solver._local_internal_fast_path)
+        np.testing.assert_array_equal(local_solver._local_residual_pair_articulation.numpy(), [-1])
+        self.assertGreaterEqual(int(local_solver._local_pair_articulation.numpy()[0]), 0)
+        self.assertTrue(any(sample[7] > 0 for sample in local), "free body generated no matrix-free rows")
+        for sample in local:
+            if sample[7] > 0:
+                self.assertEqual(sample[5], PGS_LOCAL_SOLVE_OWNER_GENERAL, "matrix-free rows left the general owner")
+        _assert_owner_parity(self, general, local)
 
     @unittest.skipUnless(wp.is_cuda_available(), "tiled H-inverse response requires CUDA")
     def test_tiled_response_diagonal_matches_dense_reference(self):

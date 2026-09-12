@@ -1741,6 +1741,7 @@ class SolverFeatherPGS(SolverBase):
             return 128 + 4 * (factor_words + row_words + total_dofs + mf_rows)
 
         if local_base_supported:
+            articulation_dof_start = self._model_plan.articulation_dof_start
             for world, response_arts in enumerate(response_by_world):
                 nonfree_arts = [art for art in response_arts if self._model_plan.is_free_rigid[art] == 0]
                 if len(nonfree_arts) != 1:
@@ -1781,8 +1782,15 @@ class SolverFeatherPGS(SolverBase):
                 local_pair_articulation[world] = secondary_art
                 local_pair_candidates[primary_dofs].append(primary_art)
                 local_pair_secondaries[primary_dofs].append(secondary_art)
+                # The residual loop reads matrix-free metadata in world-packed DOF offsets while its scratch is
+                # laid out primary-first; the world packing sorts articulations by DOF start, so only worlds where
+                # the primary articulation precedes the free body qualify.
+                primary_first_layout = int(articulation_dof_start[primary_art]) < int(
+                    articulation_dof_start[secondary_art]
+                )
                 if (
-                    local_shared_bytes(
+                    primary_first_layout
+                    and local_shared_bytes(
                         primary_dofs,
                         secondary_dofs,
                         self._local_residual_max_rows,
@@ -5132,7 +5140,9 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_MiJt_a,
                     self.mf_MiJt_b,
                     self.mf_row_mu,
-                    self._contact_w,
+                    int(self._regularization_enabled),
+                    self.row_w,
+                    self.mf_row_w,
                     iterations,
                     omega,
                     friction_start_iteration,
@@ -9400,6 +9410,7 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_constraint_count,
                     self.mf_body_a,
                     self.mf_body_b,
+                    self.mf_row_type,
                     self.body_to_articulation,
                     self.articulation_H_rows,
                     self._local_primary_articulation,
@@ -17066,9 +17077,10 @@ def _get_pgs_solve_local_owned_kernel(
             {mf_row_residual}
             const float old_impulse_mf = s_mf_lambda[mf_row];
             float delta_mf = -residual_mf * inverse_diagonal;
-            if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)})
-                delta_mf = -residual_mf * inverse_diagonal * contact_regularization_w
-                    - (1.0f - contact_regularization_w) * old_impulse_mf;
+            if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}) {{
+                const float w_mf = regularize != 0 ? mf_row_w.data[mf_offset + mf_row] : 1.0f;
+                delta_mf = -residual_mf * inverse_diagonal * w_mf - (1.0f - w_mf) * old_impulse_mf;
+            }}
             float new_impulse_mf = old_impulse_mf + omega * delta_mf;
 
             if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}) {{
@@ -17209,7 +17221,9 @@ def _get_pgs_solve_local_owned_kernel(
 
 {row_residual}
             const float old_impulse = s_lambda[row];
-            float new_impulse = old_impulse + omega * delta;
+            // Per-row relative regularization exactly as the general owner applies it (w = 1 is the hard update).
+            const float w_row = regularize != 0 ? world_row_w.data[world_row_base + row] : 1.0f;
+            float new_impulse = old_impulse + omega * (delta * w_row - (1.0f - w_row) * old_impulse);
 {impulse_projection}
             const float delta_impulse = new_impulse - old_impulse;
             s_lambda[row] = new_impulse;
@@ -17261,7 +17275,9 @@ def _get_pgs_solve_local_owned_kernel(
         mf_MiJt_a: wp.array3d[float],
         mf_MiJt_b: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
-        contact_regularization_w: float,
+        regularize: int,
+        world_row_w: wp.array2d[float],
+        mf_row_w: wp.array2d[float],
         iterations: int,
         omega: float,
         friction_start_iteration: int,
@@ -17296,7 +17312,9 @@ def _get_pgs_solve_local_owned_kernel(
         mf_MiJt_a: wp.array3d[float],
         mf_MiJt_b: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
-        contact_regularization_w: float,
+        regularize: int,
+        world_row_w: wp.array2d[float],
+        mf_row_w: wp.array2d[float],
         iterations: int,
         omega: float,
         friction_start_iteration: int,
@@ -17333,7 +17351,9 @@ def _get_pgs_solve_local_owned_kernel(
             mf_MiJt_a,
             mf_MiJt_b,
             mf_row_mu,
-            contact_regularization_w,
+            regularize,
+            world_row_w,
+            mf_row_w,
             iterations,
             omega,
             friction_start_iteration,
@@ -17370,7 +17390,9 @@ def _get_pgs_solve_local_owned_kernel(
         mf_MiJt_a: wp.array3d[float],
         mf_MiJt_b: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
-        contact_regularization_w: float,
+        regularize: int,
+        world_row_w: wp.array2d[float],
+        mf_row_w: wp.array2d[float],
         iterations: int,
         omega: float,
         friction_start_iteration: int,
@@ -17409,7 +17431,9 @@ def _get_pgs_solve_local_owned_kernel(
                 mf_MiJt_a,
                 mf_MiJt_b,
                 mf_row_mu,
-                contact_regularization_w,
+                regularize,
+                world_row_w,
+                mf_row_w,
                 iterations,
                 omega,
                 friction_start_iteration,
