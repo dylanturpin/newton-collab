@@ -492,6 +492,27 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 self.assertEqual(sample[5], PGS_LOCAL_SOLVE_OWNER_GENERAL, "matrix-free rows left the general owner")
         _assert_owner_parity(self, general, local)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
+    def test_local_owners_stay_general_with_contact_torsion(self):
+        """Keep torsion-eligible worlds on the general owner, which solves the appended torsion row."""
+        model = _build_mixed_response_model("cuda:0", friction=0.7)
+        solvers = {}
+        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": "par_row"}):
+            for radius in (0.0, 0.01):
+                solvers[radius] = SolverFeatherPGS(
+                    model,
+                    pgs_mode="matrix_free",
+                    enable_joint_limits=True,
+                    joint_limit_activation_gap=0.0,
+                    pgs_iterations=8,
+                    dense_max_constraints=32,
+                    mf_max_constraints=32,
+                    contact_torsion_radius=radius,
+                )
+        self.assertTrue(solvers[0.0]._local_internal_fast_path)
+        self.assertTrue(solvers[0.01]._contact_torsion_enabled)
+        self.assertFalse(solvers[0.01]._local_internal_fast_path)
+
     @unittest.skipUnless(wp.is_cuda_available(), "tiled H-inverse response requires CUDA")
     def test_tiled_response_diagonal_matches_dense_reference(self):
         device = wp.get_device("cuda:0")

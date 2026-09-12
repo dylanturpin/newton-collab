@@ -1807,6 +1807,9 @@ class SolverFeatherPGS(SolverBase):
             and not self._preelim_active
             and not self._debug_buffers_enabled
             and self._local_solve_max_rows > 0
+            # The local owners do not solve the appended torsion row; torsion is configured later in
+            # construction, so gate on the requested radius here.
+            and float(contact_torsion_radius) <= 0.0
         )
         local_primary_articulation = np.full(self.world_count, -1, dtype=np.int32)
         local_pair_articulation = np.full(self.world_count, -1, dtype=np.int32)
