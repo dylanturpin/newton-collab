@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import sys
 import time
 import warnings
 from contextlib import contextmanager
@@ -12274,6 +12275,10 @@ class SolverFeatherPGS(SolverBase):
 
     def __del__(self):
         """Wait for solver-owned streams before releasing their buffers."""
+        # Stream waits are only safe while the interpreter and the CUDA runtime are alive; objects
+        # collected during interpreter shutdown skip them (the driver may already be torn down).
+        if sys.is_finalizing():
+            return
         streams = [
             getattr(self, name, None)
             for name in (
