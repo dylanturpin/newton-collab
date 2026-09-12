@@ -10389,6 +10389,7 @@ def classify_local_solve_worlds(
     mf_constraint_count: wp.array[int],
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
+    mf_row_type: wp.array2d[int],
     body_to_articulation: wp.array[int],
     articulation_dof_count: wp.array[int],
     local_primary_articulation: wp.array[int],
@@ -10419,6 +10420,10 @@ def classify_local_solve_worlds(
         if body_a >= 0 and body_to_articulation[body_a] != residual_pair_articulation:
             local_mf = False
         if body_b >= 0 and body_to_articulation[body_b] != residual_pair_articulation:
+            local_mf = False
+        # Free-body velocity-limit rows follow the general owner's stateless unilateral law, which the
+        # residual local loop does not implement: keep such worlds on the general owner.
+        if mf_row_type[world, mf_row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
             local_mf = False
         mf_row += 1
 
