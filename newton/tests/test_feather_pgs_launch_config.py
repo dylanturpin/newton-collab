@@ -432,6 +432,12 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 tile_threads=64,
             )
 
+    def test_fixed_base_sibling_branches_detect_diagonal_mass_topology(self):
+        """Detect independent fixed-base branches on every supported device."""
+        solver = SolverFeatherPGS(_build_fixed_base_star_model(), enable_joint_limits=False, dense_max_constraints=16)
+        self.assertEqual(solver._diagonal_mass_sizes, frozenset((16,)))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "diagonal mass execution-path parity requires CUDA")
     def test_fixed_base_sibling_branches_use_diagonal_mass_path(self):
         """Match the dense reference while selecting independent branch solves."""
         model = _build_fixed_base_star_model()
