@@ -25,18 +25,21 @@ def _build_mixed_response_model(
     device,
     world_count=1,
     *,
+    dof_count=13,
     friction=0.0,
     restitution=0.0,
+    static_plane=False,
     static_support=False,
     free_body_first=False,
     free_body_velocity_limit=None,
 ):
-    """Build one 13-DOF articulation contacting one free rigid body.
+    """Build one serial articulation contacting one free rigid body.
 
     ``static_support`` rests the free body on a static ledge that clears the arm, so the free body also
     produces matrix-free contact rows. ``free_body_first`` builds the free body before the articulation,
     which packs the world DOFs free-body first. ``free_body_velocity_limit`` caps the free body's linear
     and angular velocity [m/s, rad/s], producing matrix-free velocity-limit rows once exceeded.
+    ``static_plane`` adds a ground plane under the free body.
     """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     if free_body_velocity_limit is not None:
@@ -84,7 +87,7 @@ def _build_mixed_response_model(
         )
     ]
     parent = arm
-    for index in range(12):
+    for index in range(dof_count - 1):
         child = builder.add_link(
             mass=0.05,
             inertia=wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-3),
@@ -103,6 +106,8 @@ def _build_mixed_response_model(
 
     if not free_body_first:
         add_free_body()
+    if static_plane:
+        builder.add_shape_plane(plane=(0.0, 0.0, 1.0, -0.53))
     if world_count == 1:
         return builder.finalize(device=device)
     replicated = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -115,15 +120,26 @@ def _run_mixed_response(
     *,
     warmstart,
     preelimination,
+    dof_count=13,
+    dense_max_constraints=32,
     inactive_joint_limit_capacity=False,
     friction=0.0,
     restitution=0.0,
     tangential_velocity=0.0,
+    static_plane=False,
     contact_regularization=0.0,
+    friction_anchor_beta=None,
     model_kwargs=None,
 ):
     """Run a short mixed-contact trajectory with one H-inverse implementation."""
-    model = _build_mixed_response_model("cuda:0", friction=friction, restitution=restitution, **(model_kwargs or {}))
+    model = _build_mixed_response_model(
+        "cuda:0",
+        dof_count=dof_count,
+        friction=friction,
+        restitution=restitution,
+        static_plane=static_plane,
+        **(model_kwargs or {}),
+    )
     with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": kernel}):
         solver = SolverFeatherPGS(
             model,
@@ -135,7 +151,8 @@ def _run_mixed_response(
             joint_limit_activation_gap=0.0,
             pgs_iterations=8,
             pgs_contact_regularization=contact_regularization,
-            dense_max_constraints=32,
+            friction_anchor_beta=friction_anchor_beta,
+            dense_max_constraints=dense_max_constraints,
             mf_max_constraints=32,
         )
     state_in, state_out = model.state(), model.state()
@@ -246,6 +263,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             solver.size_groups,
             max_constraints=solver.dense_max_constraints,
             max_shared_memory=101376,
+            cholesky_kernel="auto",
             hinv_jt_kernel="tiled",
             small_dof_threshold=12,
             tile_threads=64,
@@ -287,6 +305,129 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                                 atol=2.0e-6,
                                 err_msg=f"{label} differed at step {step}",
                             )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
+    def test_paired_response_matches_general_23_dof_trajectory(self):
+        """Match the general response when one warp owns a robot/free-body pair, with patch and point friction."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "dof_count": 23,
+            "dense_max_constraints": 96,
+            "inactive_joint_limit_capacity": True,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+        }
+        # Patch friction rows are not uniform triples, so the generic factor path pools the patch load; point
+        # friction keeps the contact-triple layout.
+        for label, friction_anchor_beta, triples in (("patch", None, False), ("point", 0.0, True)):
+            with self.subTest(friction=label):
+                reference_solver, reference = _run_mixed_response(
+                    "par_row", friction_anchor_beta=friction_anchor_beta, **run_kwargs
+                )
+                paired_solver, paired = _run_mixed_response(
+                    "auto", friction_anchor_beta=friction_anchor_beta, **run_kwargs
+                )
+
+                self.assertIsNone(reference_solver._paired_response_primary_size)
+                self.assertEqual(paired_solver._friction_anchors_enabled, label == "patch")
+                self.assertEqual(paired_solver._paired_response_primary_size, 23)
+                self.assertEqual(paired_solver._paired_response_secondary_size, 6)
+                self.assertIsNotNone(paired_solver._paired_response_kernel)
+                self.assertIsNotNone(paired_solver._paired_factor_solve_kernel)
+                self.assertTrue(paired_solver._paired_factor_coordinates)
+                self.assertEqual(paired_solver._factor_coordinate_contact_triples, triples)
+                self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
+                self.assertTrue(
+                    any(np.any(sample[6] == PGS_CONSTRAINT_TYPE_FRICTION) for sample in paired),
+                    "mixed scene generated no friction rows",
+                )
+                for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
+                    self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+                    np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
+                    for label_value, expected_value, actual_value in zip(
+                        ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+                    ):
+                        np.testing.assert_allclose(
+                            actual_value,
+                            expected_value,
+                            rtol=5.0e-4,
+                            atol=1.0e-5,
+                            err_msg=f"{label_value} differed at step {step}",
+                        )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response fallback requires CUDA")
+    def test_paired_response_falls_back_for_matrix_free_rows(self):
+        """Keep mixed dense/matrix-free worlds in physical coordinates."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "dof_count": 23,
+            "dense_max_constraints": 96,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+            "static_plane": True,
+        }
+        reference_solver, reference = _run_mixed_response("par_row", **run_kwargs)
+        paired_solver, paired = _run_mixed_response("auto", **run_kwargs)
+
+        self.assertIsNone(reference_solver._paired_response_primary_size)
+        self.assertTrue(paired_solver._paired_factor_coordinates)
+        self.assertTrue(any(sample[7] > 0 for sample in paired), "static contact generated no matrix-free rows")
+        for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
+            self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+            np.testing.assert_array_equal(actual[6], expected[6], err_msg=f"row types differed at step {step}")
+            for label, expected_value, actual_value in zip(
+                ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+            ):
+                np.testing.assert_allclose(
+                    actual_value,
+                    expected_value,
+                    rtol=5.0e-4,
+                    atol=1.0e-5,
+                    err_msg=f"{label} differed at step {step}",
+                )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
+    def test_paired_factor_coordinates_follow_patch_friction_and_torsion(self):
+        """Keep factor coordinates with default patch friction and yield them to the general owner for torsion."""
+        model = _build_mixed_response_model("cuda:0", dof_count=23, friction=0.7)
+        solvers = {}
+        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": "auto"}):
+            for radius in (0.0, 0.01):
+                solvers[radius] = SolverFeatherPGS(
+                    model,
+                    pgs_mode="matrix_free",
+                    enable_joint_limits=True,
+                    joint_limit_activation_gap=0.0,
+                    pgs_iterations=8,
+                    dense_max_constraints=96,
+                    mf_max_constraints=32,
+                    contact_torsion_radius=radius,
+                )
+            point = SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                enable_joint_limits=True,
+                joint_limit_activation_gap=0.0,
+                pgs_iterations=8,
+                dense_max_constraints=96,
+                mf_max_constraints=32,
+                friction_anchor_beta=0.0,
+            )
+        self.assertTrue(solvers[0.0]._friction_anchors_enabled)
+        self.assertTrue(solvers[0.0]._paired_factor_coordinates)
+        # Patch rows are not uniform triples; the generic factor path pools the patch load instead.
+        self.assertFalse(solvers[0.0]._factor_coordinate_contact_triples)
+        self.assertFalse(point._friction_anchors_enabled)
+        self.assertTrue(point._paired_factor_coordinates)
+        self.assertTrue(point._factor_coordinate_contact_triples)
+        self.assertTrue(solvers[0.01]._contact_torsion_enabled)
+        self.assertIsNotNone(solvers[0.01]._paired_response_primary_size)
+        self.assertFalse(solvers[0.01]._paired_factor_coordinates)
+        self.assertFalse(solvers[0.01]._factor_coordinate_contact_triples)
 
     @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
     def test_local_internal_mixed_world_matches_general_response(self):

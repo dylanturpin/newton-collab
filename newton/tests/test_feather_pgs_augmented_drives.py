@@ -13,6 +13,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     eval_rigid_tau_and_augmented_drives,
     prepare_augmented_joint_drives,
 )
+from newton._src.solvers.feather_pgs.solver_feather_pgs import _prepare_augmented_joint_drives_by_dof
 
 
 class TestFeatherPGSAugmentedDrives(unittest.TestCase):
@@ -185,6 +186,29 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
         np.testing.assert_array_equal(prepared_indices.numpy(), combined_indices.numpy())
         np.testing.assert_array_equal(prepared_stiffness.numpy(), combined_stiffness.numpy())
         np.testing.assert_allclose(prepared_tau.numpy(), [-1.25, 2.5], rtol=0.0, atol=1.0e-6)
+
+        topology_stiffness = wp.zeros_like(combined_stiffness)
+        topology_tau = wp.zeros_like(combined_tau)
+        wp.launch(
+            _prepare_augmented_joint_drives_by_dof,
+            dim=2,
+            inputs=[
+                wp.array([0, 1], dtype=wp.int32, device=device),
+                wp.array([0, 1], dtype=wp.int32, device=device),
+                joint_q,
+                joint_qd,
+                target_ke,
+                target_kd,
+                target_q,
+                target_qd,
+                effort_limit,
+                0.1,
+            ],
+            outputs=[topology_stiffness, topology_tau],
+            device=device,
+        )
+        np.testing.assert_array_equal(topology_stiffness.numpy(), combined_stiffness.numpy())
+        np.testing.assert_allclose(topology_tau.numpy(), [-1.25, 2.5], rtol=0.0, atol=1.0e-6)
 
         additive_body_ft = wp.zeros_like(combined_body_ft)
         wp.launch(
