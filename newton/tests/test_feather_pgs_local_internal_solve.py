@@ -354,6 +354,78 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         np.testing.assert_allclose(velocity.numpy(), [0.0, 0.5, 0.0], rtol=0.0, atol=1.0e-6)
 
     @unittest.skipUnless(wp.is_cuda_available(), "local internal solve requires CUDA")
+    def test_local_kernel_uses_patch_load_and_coupled_tangent_response(self):
+        """Match the pooled patch load and two-row tangent solve used by the general owner."""
+        device = wp.get_cuda_device()
+        dof_count = 2
+        max_constraints = 4
+        candidate = wp.array([0], dtype=wp.int32, device=device)
+        lower = wp.array(np.eye(dof_count, dtype=np.float32)[None], dtype=wp.float32, device=device)
+        jacobian = wp.array(
+            [[[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.0, 0.0]]],
+            dtype=wp.float32,
+            device=device,
+        )
+        diagonal = wp.array([[1.0, 0.0, 0.0, 1.0]], dtype=wp.float32, device=device)
+        impulses = wp.array([[0.0, 0.0, 0.0, 4.0]], dtype=wp.float32, device=device)
+        velocity = wp.zeros(dof_count, dtype=wp.float32, device=device)
+        kernel = _get_pgs_solve_local_owned_kernel(
+            max_constraints,
+            max_constraints,
+            dof_count,
+            device.arch,
+            dense_response_matrix=True,
+        )
+        wp.launch_tiled(
+            kernel,
+            dim=[1],
+            inputs=[
+                candidate,
+                candidate,
+                PGS_LOCAL_SOLVE_OWNER_SINGLE,
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE], dtype=wp.int32, device=device),
+                wp.array([max_constraints], dtype=wp.int32, device=device),
+                lower,
+                jacobian,
+                lower,
+                jacobian,
+                wp.array([[0.0, -1.0, -2.0, 0.0]], dtype=wp.float32, device=device),
+                wp.array(
+                    [
+                        [
+                            PGS_CONSTRAINT_TYPE_CONTACT,
+                            PGS_CONSTRAINT_TYPE_FRICTION,
+                            PGS_CONSTRAINT_TYPE_FRICTION,
+                            PGS_CONSTRAINT_TYPE_CONTACT,
+                        ]
+                    ],
+                    dtype=wp.int32,
+                    device=device,
+                ),
+                # Normal rows 0 -> 3 -> 0 pool the load. Tangent rows point to row 0.
+                wp.array([[3, 0, 0, 0]], dtype=wp.int32, device=device),
+                wp.array([[0.0, 0.5, 0.5, 0.0]], dtype=wp.float32, device=device),
+                *self._empty_mf_inputs(1, device),
+                1,
+                1.0,
+                0,
+                0,
+            ],
+            outputs=[diagonal, impulses, velocity],
+            block_dim=32,
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        # The pooled normal impulse gives radius 2. The unconstrained coupled
+        # tangent solution of [[1, .5], [.5, 1.25]] x = [1, 2] is [.25, 1.5].
+        np.testing.assert_allclose(impulses.numpy()[0], [0.0, 0.25, 1.5, 4.0], rtol=0.0, atol=2.0e-6)
+        np.testing.assert_allclose(velocity.numpy(), [1.0, 1.5], rtol=0.0, atol=2.0e-6)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "local internal solve requires CUDA")
     def test_local_residual_queue_matches_sequential_dense_and_matrix_free_pgs(self):
         device = wp.get_cuda_device()
         primary_dofs = 3
