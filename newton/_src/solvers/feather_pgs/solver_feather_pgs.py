@@ -12958,7 +12958,21 @@ def _get_pgs_solve_paired_factor_kernel(
                 }}
                 __syncwarp(MASK);
 
-                if (s_lam[normal] <= 0.0f && s_lam[tangent1] == 0.0f && s_lam[tangent2] == 0.0f) {{
+                const float tangent1_factor = lane < {D}
+                    ? factor_rows.data[row_base + tangent1 * {D} + lane] : 0.0f;
+                const float tangent2_factor = lane < {D}
+                    ? factor_rows.data[row_base + tangent2 * {D} + lane] : 0.0f;
+                // Patch normal load: normal rows link the region's next normal (circular list, -1 ends a
+                // point contact). Solve both tangents together on the friction disk at that load.
+                float lambda_n = s_lam[normal];
+                for (int patch_row = world_row_parent.data[off + normal];
+                     patch_row >= 0 && patch_row != normal;
+                     patch_row = world_row_parent.data[off + patch_row])
+                    lambda_n += s_lam[patch_row];
+                const float radius = fmaxf(s_contact_mu[contact] * lambda_n, 0.0f);
+                const float old_tangent1 = s_lam[tangent1];
+                const float old_tangent2 = s_lam[tangent2];
+                if (radius <= 0.0f && old_tangent1 == 0.0f && old_tangent2 == 0.0f) {{
                     __syncwarp(MASK);
                     continue;
                 }}
@@ -12968,90 +12982,37 @@ def _get_pgs_solve_paired_factor_kernel(
                     __syncwarp(MASK);
                     continue;
                 }}
-
-                const float tangent1_factor = lane < {D}
-                    ? factor_rows.data[row_base + tangent1 * {D} + lane] : 0.0f;
-                const float tangent2_factor = lane < {D}
-                    ? factor_rows.data[row_base + tangent2 * {D} + lane] : 0.0f;
-                float tangent1_sum = lane < {D} ? tangent1_factor * factor_velocity : 0.0f;
-                tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, 16);
-                tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, 8);
-                tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, 4);
-                tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, 2);
-                tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, 1);
-                const float tangent1_denom = s_diag[tangent1];
-                if (tangent1_denom > 0.0f) {{
-                    const float old_tangent1 = s_lam[tangent1];
-                    float new_tangent1 = old_tangent1
-                        + omega * (-( __shfl_sync(MASK, tangent1_sum, 0) + s_rhs[tangent1]) / tangent1_denom);
-                    const float radius = fmaxf(s_contact_mu[contact] * s_lam[normal], 0.0f);
-                    float sibling_delta = 0.0f;
-                    if (radius <= 0.0f) {{
-                        new_tangent1 = 0.0f;
-                    }} else {{
-                        s_lam[tangent1] = new_tangent1;
-                        const float old_tangent2 = s_lam[tangent2];
-                        const float magnitude = sqrtf(
-                            new_tangent1 * new_tangent1 + old_tangent2 * old_tangent2);
-                        if (magnitude > radius) {{
-                            const float scale = radius / magnitude;
-                            new_tangent1 *= scale;
-                            const float new_tangent2 = old_tangent2 * scale;
-                            sibling_delta = new_tangent2 - old_tangent2;
-                            s_lam[tangent2] = new_tangent2;
-                        }}
+                float2 pair = make_float2(0.0f, 0.0f);
+                if (radius > 0.0f) {{
+                    float tangent1_sum = lane < {D} ? tangent1_factor * factor_velocity : 0.0f;
+                    float tangent2_sum = lane < {D} ? tangent2_factor * factor_velocity : 0.0f;
+                    float cross_sum = lane < {D} ? tangent1_factor * tangent2_factor : 0.0f;
+                    for (int offset = 16; offset > 0; offset >>= 1) {{
+                        tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, offset);
+                        tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, offset);
+                        cross_sum += __shfl_down_sync(MASK, cross_sum, offset);
                     }}
-                    if (sibling_delta != 0.0f) {{
-                        iteration_changed = 1;
-                        factor_velocity += tangent2_factor * sibling_delta;
-                    }}
-                    const float tangent1_delta = new_tangent1 - old_tangent1;
-                    s_lam[tangent1] = new_tangent1;
-                    if (tangent1_delta != 0.0f) {{
-                        iteration_changed = 1;
-                        factor_velocity += tangent1_factor * tangent1_delta;
-                    }}
+                    const float tangent1_residual = __shfl_sync(MASK, tangent1_sum, 0) + s_rhs[tangent1];
+                    const float tangent2_residual = __shfl_sync(MASK, tangent2_sum, 0) + s_rhs[tangent2];
+                    const float cross = __shfl_sync(MASK, cross_sum, 0);
+                    pair = friction_pair_candidate(s_diag[tangent1], cross, s_diag[tangent2],
+                        tangent1_residual, tangent2_residual, old_tangent1, old_tangent2, radius, omega);
                 }}
-                __syncwarp(MASK);
-
-                float tangent2_sum = lane < {D} ? tangent2_factor * factor_velocity : 0.0f;
-                tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, 16);
-                tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, 8);
-                tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, 4);
-                tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, 2);
-                tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, 1);
-                const float tangent2_denom = s_diag[tangent2];
-                if (tangent2_denom > 0.0f) {{
-                    const float old_tangent2 = s_lam[tangent2];
-                    float new_tangent2 = old_tangent2
-                        + omega * (-( __shfl_sync(MASK, tangent2_sum, 0) + s_rhs[tangent2]) / tangent2_denom);
-                    const float radius = fmaxf(s_contact_mu[contact] * s_lam[normal], 0.0f);
-                    float sibling_delta = 0.0f;
-                    if (radius <= 0.0f) {{
-                        new_tangent2 = 0.0f;
-                    }} else {{
-                        s_lam[tangent2] = new_tangent2;
-                        const float old_tangent1 = s_lam[tangent1];
-                        const float magnitude = sqrtf(
-                            new_tangent2 * new_tangent2 + old_tangent1 * old_tangent1);
-                        if (magnitude > radius) {{
-                            const float scale = radius / magnitude;
-                            new_tangent2 *= scale;
-                            const float new_tangent1 = old_tangent1 * scale;
-                            sibling_delta = new_tangent1 - old_tangent1;
-                            s_lam[tangent1] = new_tangent1;
-                        }}
-                    }}
-                    if (sibling_delta != 0.0f) {{
-                        iteration_changed = 1;
-                        factor_velocity += tangent1_factor * sibling_delta;
-                    }}
-                    const float tangent2_delta = new_tangent2 - old_tangent2;
-                    s_lam[tangent2] = new_tangent2;
-                    if (tangent2_delta != 0.0f) {{
-                        iteration_changed = 1;
-                        factor_velocity += tangent2_factor * tangent2_delta;
-                    }}
+                const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
+                const float scale = magnitude > radius ? radius / magnitude : 1.0f;
+                const float new_tangent1 = pair.x * scale;
+                const float new_tangent2 = pair.y * scale;
+                const float tangent1_delta = new_tangent1 - old_tangent1;
+                const float tangent2_delta = new_tangent2 - old_tangent2;
+                s_lam[tangent1] = new_tangent1;
+                s_lam[tangent2] = new_tangent2;
+                if (tangent2_delta != 0.0f) {{
+                    iteration_changed = 1;
+                    factor_velocity += tangent2_factor * tangent2_delta;
+                }}
+                if (tangent1_delta != 0.0f) {{
+                    iteration_changed = 1;
+                    factor_velocity += tangent1_factor * tangent1_delta;
                 }}
                 __syncwarp(MASK);
             }}
@@ -13072,18 +13033,20 @@ def _get_pgs_solve_paired_factor_kernel(
 
             int parent = -1;
             int sibling = -1;
+            float sibling_factor = 0.0f;
             if (row_type == {friction_type}) {{
-                parent = lane == 0 ? world_row_parent.data[off + i] : 0;
-                parent = __shfl_sync(MASK, parent, 0);
-                sibling = i == parent + 1 ? parent + 2 : parent + 1;
-                if (s_lam[parent] <= 0.0f && s_lam[i] == 0.0f && s_lam[sibling] == 0.0f) {{
+                parent = world_row_parent.data[off + i];
+                if (i != parent + 1) {{
+                    // The first tangent row solved both tangents; the second visit is a no-op.
                     __syncwarp(MASK);
                     continue;
                 }}
+                sibling = parent + 2;
+                sibling_factor = lane < {D} ? factor_rows.data[row_base + sibling * {D} + lane] : 0.0f;
             }}
 
             const float denom = s_diag[i];
-            if (denom <= 0.0f) continue;
+            if (denom <= 0.0f && row_type != {friction_type}) continue;
             float sum = lane < {D} ? row_factor * factor_velocity : 0.0f;
             sum += __shfl_down_sync(MASK, sum, 16);
             sum += __shfl_down_sync(MASK, sum, 8);
@@ -13093,7 +13056,7 @@ def _get_pgs_solve_paired_factor_kernel(
             const float jv = __shfl_sync(MASK, sum, 0);
 
             const float residual = jv + s_rhs[i];
-            const float raw_delta = -residual / denom;
+            const float raw_delta = denom > 0.0f ? -residual / denom : 0.0f;
             const float old_impulse = s_lam[i];
             float new_impulse = old_impulse + omega * raw_delta;
             float delta_impulse = 0.0f;
@@ -13109,25 +13072,33 @@ def _get_pgs_solve_paired_factor_kernel(
                     new_impulse = 0.0f;
                 }}
             }} else if (row_type == {friction_type}) {{
-                const float normal_impulse = s_lam[parent];
-                float mu = lane == 0 ? world_row_mu.data[off + i] : 0.0f;
-                mu = __shfl_sync(MASK, mu, 0);
-                const float radius = fmaxf(mu * normal_impulse, 0.0f);
-                if (radius <= 0.0f) {{
-                    new_impulse = 0.0f;
-                }} else {{
-                    s_lam[i] = new_impulse;
-                    const float sibling_impulse = s_lam[sibling];
-                    const float magnitude = sqrtf(
-                        new_impulse * new_impulse + sibling_impulse * sibling_impulse);
-                    if (magnitude > radius) {{
-                        const float scale = radius / magnitude;
-                        new_impulse *= scale;
-                        const float new_sibling_impulse = sibling_impulse * scale;
-                        sibling_delta = new_sibling_impulse - sibling_impulse;
-                        s_lam[sibling] = new_sibling_impulse;
+                // Paired tangent solve at the patch normal load, matching the general owner.
+                float lambda_n = s_lam[parent];
+                for (int patch_row = world_row_parent.data[off + parent];
+                     patch_row >= 0 && patch_row != parent;
+                     patch_row = world_row_parent.data[off + patch_row])
+                    lambda_n += s_lam[patch_row];
+                const float radius = fmaxf(world_row_mu.data[off + i] * lambda_n, 0.0f);
+                const float sibling_impulse = s_lam[sibling];
+                float2 pair = make_float2(0.0f, 0.0f);
+                if (radius > 0.0f) {{
+                    float sibling_sum = lane < {D} ? sibling_factor * factor_velocity : 0.0f;
+                    float cross_sum = lane < {D} ? row_factor * sibling_factor : 0.0f;
+                    for (int offset = 16; offset > 0; offset >>= 1) {{
+                        sibling_sum += __shfl_down_sync(MASK, sibling_sum, offset);
+                        cross_sum += __shfl_down_sync(MASK, cross_sum, offset);
                     }}
+                    const float sibling_residual = __shfl_sync(MASK, sibling_sum, 0) + s_rhs[sibling];
+                    const float cross = __shfl_sync(MASK, cross_sum, 0);
+                    pair = friction_pair_candidate(denom, cross, s_diag[sibling],
+                        residual, sibling_residual, old_impulse, sibling_impulse, radius, omega);
                 }}
+                const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
+                const float scale = magnitude > radius ? radius / magnitude : 1.0f;
+                new_impulse = pair.x * scale;
+                const float new_sibling_impulse = pair.y * scale;
+                sibling_delta = new_sibling_impulse - sibling_impulse;
+                s_lam[sibling] = new_sibling_impulse;
                 delta_impulse = new_impulse - old_impulse;
             }} else {{
                 delta_impulse = new_impulse - old_impulse;
@@ -13136,8 +13107,6 @@ def _get_pgs_solve_paired_factor_kernel(
 
             if (sibling_delta != 0.0f) {{
                 iteration_changed = 1;
-                const float sibling_factor = lane < {D}
-                    ? factor_rows.data[row_base + sibling * {D} + lane] : 0.0f;
                 factor_velocity += sibling_factor * sibling_delta;
             }}
             if (delta_impulse != 0.0f) {{
@@ -13171,6 +13140,7 @@ def _get_pgs_solve_paired_factor_kernel(
     for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
 #endif
 """
+    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
 
     @wp.func_native(snippet)
     def pgs_solve_paired_factor_native(
