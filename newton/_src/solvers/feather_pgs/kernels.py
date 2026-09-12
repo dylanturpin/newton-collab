@@ -1419,10 +1419,18 @@ def refresh_masked_body_inertia(
     body_q_com: wp.array[wp.transform],
     articulation_origin: wp.array[wp.vec3],
     body_I_m: wp.array[wp.spatial_matrix],
-    # output
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    write_body_inertia_terms: int,
+    # outputs
     body_I_s: wp.array[wp.spatial_matrix],
+    body_inertia_terms: wp.array2d[float],
 ):
-    """Materialize current link inertias selected by a reuse-step mass update mask."""
+    """Materialize current link inertias selected by a reuse-step mass update mask.
+
+    The compact COM terms feed the direct diagonal inertia owner, which bypasses ``body_I_s``; refresh them
+    under the same mask so a masked inertial update reaches every mass consumer.
+    """
     joint = wp.tid()
     articulation = joint_articulation[joint]
     if articulation < 0 or joint >= articulation_joint_end[articulation] or mass_update_mask[articulation] == 0:
@@ -1434,6 +1442,14 @@ def refresh_masked_body_inertia(
         wp.transform_get_rotation(X_sm),
     )
     body_I_s[child] = transform_spatial_inertia(X_sm_local, body_I_m[child])
+    if write_body_inertia_terms != 0:
+        com, inertia_origin = transform_com_inertia_terms(X_sm_local, body_mass[child], body_inertia[child])
+        body_inertia_terms[child, 0] = com[0]
+        body_inertia_terms[child, 1] = com[1]
+        body_inertia_terms[child, 2] = com[2]
+        for row in range(3):
+            for col in range(3):
+                body_inertia_terms[child, 3 + 3 * row + col] = inertia_origin[row, col]
 
 
 # Inverse dynamics via Recursive Newton-Euler algorithm (Featherstone Table 5.1)

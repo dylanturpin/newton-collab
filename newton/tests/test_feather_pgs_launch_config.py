@@ -74,18 +74,23 @@ def _build_fixed_base_star_model(num_branches=16, num_worlds=2):
     return main.finalize()
 
 
-def _build_sparse_diagonal_pair_model(num_branches=16, num_worlds=2, *, device=None):
-    """Build one independent fixed-base star and one compact serial chain per world."""
+def _build_sparse_diagonal_pair_model(num_branches=16, num_worlds=2, *, device=None, revolute_branches=False):
+    """Build one independent fixed-base star and one compact serial chain per world.
+
+    ``revolute_branches`` hinges the star branches about Y instead of sliding them along Z, so the branch
+    response depends on the link inertia and center of mass rather than on the mass alone.
+    """
     scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     base = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
     star_joints = [scene.add_joint_fixed(parent=-1, child=base)]
+    add_branch_joint = scene.add_joint_revolute if revolute_branches else scene.add_joint_prismatic
     for branch in range(num_branches):
         child = scene.add_link(mass=1.0 + 0.01 * branch, inertia=wp.mat33(np.eye(3)))
         star_joints.append(
-            scene.add_joint_prismatic(
+            add_branch_joint(
                 parent=base,
                 child=child,
-                axis=newton.Axis.Z,
+                axis=newton.Axis.Y if revolute_branches else newton.Axis.Z,
                 parent_xform=wp.transform(wp.vec3(0.03 * branch, 0.0, 0.0), wp.quat_identity()),
                 limit_lower=-0.1,
                 limit_upper=0.1,
@@ -465,6 +470,67 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         for sparse, dense in zip(*trajectories, strict=True):
             np.testing.assert_allclose(sparse[0], dense[0], rtol=2.0e-5, atol=2.0e-6)
             np.testing.assert_allclose(sparse[1], dense[1], rtol=2.0e-5, atol=2.0e-6)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "direct compact diagonal inertia requires CUDA")
+    def test_direct_diagonal_inertia_refreshes_masked_inertial_changes(self):
+        """Refresh the compact inertia terms when an inertial model change lands on a mass-reuse step."""
+        model = _build_sparse_diagonal_pair_model(device="cuda:0", revolute_branches=True)
+        solver = SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            dense_max_constraints=64,
+            mf_max_constraints=32,
+            pgs_iterations=8,
+            enable_joint_limits=True,
+            update_mass_matrix_interval=4,
+        )
+        self.assertTrue(solver._direct_compact_diagonal_inertia)
+        self.assertEqual(solver._compact_diagonal_mass_size, 16)
+
+        # Star branch joints and their child links (skip the fixed root joint of each star).
+        articulation_start = model.articulation_start.numpy()
+        star_articulations = np.flatnonzero(solver._model_plan.response_dof_count == 16)
+        branch_joints = np.concatenate(
+            [np.arange(articulation_start[art] + 1, articulation_start[art + 1]) for art in star_articulations]
+        )
+        branch_bodies = model.joint_child.numpy()[branch_joints]
+        branch_dofs = model.joint_qd_start.numpy()[branch_joints]
+
+        state_in, state_out = model.state(), model.state()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        control = model.control()
+
+        def step():
+            nonlocal state_in, state_out
+            state_in.clear_forces()
+            solver.step(state_in, state_out, control, None, 1.0 / 120.0)
+            state_in, state_out = state_out, state_in
+            return solver._diagonal_inverse_mass.numpy()[branch_dofs].copy()
+
+        body_mass = model.body_mass.numpy()
+        armature = model.joint_armature.numpy()[branch_dofs]
+        # Unit inertia hinged about an axis through the COM: the response is 1 / (1 + armature).
+        np.testing.assert_allclose(step(), 1.0 / (1.0 + armature), rtol=1.0e-6, atol=0.0)
+
+        # Double the branch inertia and move the COM 0.1 m off the hinge axis on a mass-reuse step.
+        body_inertia = model.body_inertia.numpy()
+        body_com = model.body_com.numpy()
+        body_inertia[branch_bodies] *= 2.0
+        body_com[branch_bodies, 0] += 0.1
+        model.body_inertia.assign(body_inertia)
+        model.body_com.assign(body_com)
+        solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+        self.assertFalse(solver._step % solver.update_mass_matrix_interval == 0)
+        masked = step()
+
+        # Parallel-axis inertia about the hinge: 2 + m * 0.1^2 (+ armature).
+        expected = 1.0 / (2.0 + body_mass[branch_bodies] * 0.1**2 + armature)
+        np.testing.assert_allclose(masked, expected, rtol=1.0e-5, atol=0.0)
+        # The next global refresh must agree with the masked refresh.
+        for _ in range(2):
+            step()
+        self.assertTrue(solver._step % solver.update_mass_matrix_interval == 0)
+        np.testing.assert_allclose(step(), masked, rtol=1.0e-6, atol=0.0)
 
     @unittest.skipUnless(wp.is_cuda_available(), "topology-owned CRBA requires CUDA")
     def test_topology_owned_crba_matches_generic_trajectory(self):

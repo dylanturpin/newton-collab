@@ -9267,8 +9267,11 @@ class SolverFeatherPGS(SolverBase):
                     state_aug.body_q_com,
                     self.articulation_origin,
                     self.body_I_m,
+                    model.body_mass,
+                    model.body_inertia,
+                    int(self._compact_inertia_refresh),
                 ],
-                outputs=[state_aug.body_I_s],
+                outputs=[state_aug.body_I_s, self._body_inertia_terms],
                 device=model.device,
             )
 
