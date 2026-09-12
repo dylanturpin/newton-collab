@@ -9,6 +9,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
@@ -173,6 +174,11 @@ def _run_mixed_response(
                 mf_count,
                 solver.mf_impulses.numpy()[0, :mf_count].copy(),
                 solver.mf_row_type.numpy()[0, :mf_count].copy(),
+                solver.mf_row_parent.numpy()[0, :mf_count].copy(),
+                solver.mf_J_a.numpy()[0, :mf_count].copy(),
+                solver.mf_J_b.numpy()[0, :mf_count].copy(),
+                solver.mf_MiJt_a.numpy()[0, :mf_count].copy(),
+                solver.mf_MiJt_b.numpy()[0, :mf_count].copy(),
             )
         )
         state_in, state_out = state_out, state_in
@@ -388,6 +394,53 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             any(sample[7] > 0 and sample[5] != PGS_LOCAL_SOLVE_OWNER_GENERAL for sample in local),
             "no local owner solved matrix-free rows",
         )
+        _assert_owner_parity(self, general, local)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
+    def test_local_owner_matches_general_persistent_patch_friction(self):
+        """Preserve pooled normal load and coupled tangent response under local ownership."""
+        run_kwargs = {
+            "warmstart": False,
+            "preelimination": False,
+            "inactive_joint_limit_capacity": True,
+            "friction": 0.7,
+            "restitution": 0.3,
+            "tangential_velocity": 2.0,
+            "model_kwargs": {"static_support": True},
+        }
+        general_solver, general = _run_mixed_response("tiled", **run_kwargs)
+        local_solver, local = _run_mixed_response("par_row", **run_kwargs)
+
+        self.assertTrue(general_solver._friction_anchors_enabled)
+        self.assertTrue(local_solver._friction_anchors_enabled)
+        self.assertFalse(general_solver._local_internal_fast_path)
+        self.assertTrue(local_solver._local_internal_fast_path)
+        self.assertIn(PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL, [sample[5] for sample in local])
+
+        self.assertTrue(
+            any(
+                sample[10][row] >= 0 and sample[10][row] != row
+                for sample in local
+                for row in np.flatnonzero(sample[9] == PGS_CONSTRAINT_TYPE_CONTACT)
+            ),
+            "scene generated no linked multi-normal patch",
+        )
+
+        tangent_cross_terms = []
+        for sample in local:
+            row_type, row_parent = sample[9], sample[10]
+            jacobian_a, jacobian_b = sample[11], sample[12]
+            response_a, response_b = sample[13], sample[14]
+            for row in np.flatnonzero(row_type == PGS_CONSTRAINT_TYPE_FRICTION):
+                parent = row_parent[row]
+                if row != parent + 1:
+                    continue
+                sibling = parent + 2
+                tangent_cross_terms.append(
+                    float(jacobian_a[row] @ response_a[sibling] + jacobian_b[row] @ response_b[sibling])
+                )
+        self.assertTrue(tangent_cross_terms, "scene generated no tangent pair")
+        self.assertGreater(max(abs(value) for value in tangent_cross_terms), 1.0e-3)
         _assert_owner_parity(self, general, local)
 
     @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")

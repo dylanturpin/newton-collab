@@ -17120,30 +17120,72 @@ def _get_pgs_solve_local_owned_kernel(
         else f"""if (lane < {total_dofs})
                                 s_v[lane] += s_Y[sibling * {total_dofs} + lane] * sibling_delta;"""
     )
+    dense_friction_pair_terms = (
+        """const float sibling_residual = s_base_residual[sibling];
+                    const int matrix_hi = sibling > row ? sibling : row;
+                    const int matrix_lo = sibling > row ? row : sibling;
+                    const int matrix_index = matrix_hi * (matrix_hi + 1) / 2 + matrix_lo;
+                    const float tangent_cross = s_A[matrix_index];"""
+        if dense_response_matrix
+        else f"""float sibling_partial = 0.0f;
+                    if (lane < {total_dofs})
+                        sibling_partial = s_J[sibling * {total_dofs} + lane] * s_v[lane];
+                    sibling_partial += __shfl_down_sync(MASK, sibling_partial, 16);
+                    sibling_partial += __shfl_down_sync(MASK, sibling_partial, 8);
+                    sibling_partial += __shfl_down_sync(MASK, sibling_partial, 4);
+                    sibling_partial += __shfl_down_sync(MASK, sibling_partial, 2);
+                    sibling_partial += __shfl_down_sync(MASK, sibling_partial, 1);
+                    const float sibling_residual =
+                        __shfl_sync(MASK, sibling_partial, 0) + s_rhs[sibling];
+                    float cross_partial = 0.0f;
+                    if (lane < {total_dofs})
+                        cross_partial = s_J[row * {total_dofs} + lane]
+                            * s_Y[sibling * {total_dofs} + lane];
+                    cross_partial += __shfl_down_sync(MASK, cross_partial, 16);
+                    cross_partial += __shfl_down_sync(MASK, cross_partial, 8);
+                    cross_partial += __shfl_down_sync(MASK, cross_partial, 4);
+                    cross_partial += __shfl_down_sync(MASK, cross_partial, 2);
+                    cross_partial += __shfl_down_sync(MASK, cross_partial, 1);
+                    const float tangent_cross = __shfl_sync(MASK, cross_partial, 0);"""
+    )
     impulse_projection = (
         f"""            if ((row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}
                 || row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)})
                 && new_impulse < 0.0f) new_impulse = 0.0f;
             else if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
                 const int parent = s_parent[row];
-                const float radius = fmaxf(s_mu[row] * s_lambda[parent], 0.0f);
-                if (radius <= 0.0f) {{
-                    new_impulse = 0.0f;
+                if (row != parent + 1) {{
+                    new_impulse = old_impulse;
                 }} else {{
-                    const int sibling = row == parent + 1 ? parent + 2 : parent + 1;
-                    s_lambda[row] = new_impulse;
+                    float lambda_n = s_lambda[parent];
+                    for (int patch_row = s_parent[parent];
+                         patch_row >= 0 && patch_row != parent;
+                         patch_row = s_parent[patch_row])
+                        lambda_n += s_lambda[patch_row];
+                    const float radius = fmaxf(s_mu[row] * lambda_n, 0.0f);
+                    const int sibling = parent + 2;
+                    {dense_friction_pair_terms}
                     const float sibling_old = s_lambda[sibling];
-                    const float magnitude = sqrtf(new_impulse * new_impulse + sibling_old * sibling_old);
-                    if (magnitude > radius) {{
-                        const float scale = radius / magnitude;
-                        new_impulse *= scale;
-                        const float sibling_new = sibling_old * scale;
-                        const float sibling_delta = sibling_new - sibling_old;
-                        if (sibling_delta != 0.0f) {{
-                            changed = 1;
-                            s_lambda[sibling] = sibling_new;
-                            {sibling_state_update}
-                        }}
+                    const float sibling_inverse_diagonal = s_inverse_diagonal[sibling];
+                    float2 pair = friction_pair_candidate(
+                        1.0f / inverse_diagonal,
+                        tangent_cross,
+                        sibling_inverse_diagonal > 0.0f ? 1.0f / sibling_inverse_diagonal : 0.0f,
+                        residual,
+                        sibling_residual,
+                        old_impulse,
+                        sibling_old,
+                        radius,
+                        omega);
+                    const float pair_magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
+                    const float pair_scale = pair_magnitude > radius ? radius / pair_magnitude : 1.0f;
+                    new_impulse = pair.x * pair_scale;
+                    const float sibling_new = pair.y * pair_scale;
+                    const float sibling_delta = sibling_new - sibling_old;
+                    s_lambda[sibling] = sibling_new;
+                    if (sibling_delta != 0.0f) {{
+                        changed = 1;
+                        {sibling_state_update}
                     }}
                 }}
             }}"""
@@ -17281,9 +17323,9 @@ def _get_pgs_solve_local_owned_kernel(
     else:
         response_matrix_setup = ""
     row_residual = (
-        f"""            float delta = 0.0f;
+        f"""            float residual = 0.0f;
             if ({dense_matrix_condition}) {{
-                delta = -s_base_residual[row] * inverse_diagonal;
+                residual = s_base_residual[row];
             }} else {{
                 float partial = 0.0f;
                 if (lane < {total_dofs}) partial = s_J[row * {total_dofs} + lane] * s_v[lane];
@@ -17293,8 +17335,9 @@ def _get_pgs_solve_local_owned_kernel(
                 partial += __shfl_down_sync(MASK, partial, 2);
                 partial += __shfl_down_sync(MASK, partial, 1);
                 const float velocity = __shfl_sync(MASK, partial, 0);
-                delta = -(velocity + s_rhs[row]) * inverse_diagonal;
-            }}"""
+                residual = velocity + s_rhs[row];
+            }}
+            const float delta = -residual * inverse_diagonal;"""
         if dense_response_matrix
         else f"""            float partial = 0.0f;
             if (lane < {total_dofs}) partial = s_J[row * {total_dofs} + lane] * s_v[lane];
@@ -17304,7 +17347,8 @@ def _get_pgs_solve_local_owned_kernel(
             partial += __shfl_down_sync(MASK, partial, 2);
             partial += __shfl_down_sync(MASK, partial, 1);
             const float velocity = __shfl_sync(MASK, partial, 0);
-            const float delta = -(velocity + s_rhs[row]) * inverse_diagonal;"""
+            const float residual = velocity + s_rhs[row];
+            const float delta = -residual * inverse_diagonal;"""
     )
     main_state_update = (
         f"""if ({dense_matrix_condition}) {{
@@ -17415,6 +17459,70 @@ def _get_pgs_solve_local_owned_kernel(
                                 s_v[sibling_dof_b + lane - 6] +=
                                     mf_MiJt_b.data[sibling_mf6 + lane - 6] * sibling_delta_mf;"""
     )
+    mf_friction_pair_terms = (
+        """const int current_matrix_row = row_count + mf_row;
+                            const int sibling_matrix_row = row_count + sibling_mf;
+                            const float sibling_residual_mf = s_base_residual[sibling_matrix_row];
+                            const int matrix_hi = sibling_matrix_row > current_matrix_row
+                                ? sibling_matrix_row : current_matrix_row;
+                            const int matrix_lo = sibling_matrix_row > current_matrix_row
+                                ? current_matrix_row : sibling_matrix_row;
+                            const int matrix_index = matrix_hi * (matrix_hi + 1) / 2 + matrix_lo;
+                            const float tangent_cross_mf = s_A[matrix_index];"""
+        if dense_response_matrix
+        else """const int sibling_meta_offset = mf_meta_offset + sibling_mf * 4;
+                            const int sibling_packed_dofs = mf_meta.data[sibling_meta_offset];
+                            const int sibling_dof_a = sibling_packed_dofs >> 16;
+                            const int sibling_dof_b = (sibling_packed_dofs << 16) >> 16;
+                            const int sibling_mf6 = mf6_base + sibling_mf * 6;
+                            float sibling_partial_mf = 0.0f;
+                            if (lane < 6 && sibling_dof_a >= 0)
+                                sibling_partial_mf = mf_J_a.data[sibling_mf6 + lane]
+                                    * s_v[sibling_dof_a + lane];
+                            if (lane >= 6 && lane < 12 && sibling_dof_b >= 0)
+                                sibling_partial_mf = mf_J_b.data[sibling_mf6 + lane - 6]
+                                    * s_v[sibling_dof_b + lane - 6];
+                            sibling_partial_mf += __shfl_down_sync(MASK, sibling_partial_mf, 16);
+                            sibling_partial_mf += __shfl_down_sync(MASK, sibling_partial_mf, 8);
+                            sibling_partial_mf += __shfl_down_sync(MASK, sibling_partial_mf, 4);
+                            sibling_partial_mf += __shfl_down_sync(MASK, sibling_partial_mf, 2);
+                            sibling_partial_mf += __shfl_down_sync(MASK, sibling_partial_mf, 1);
+                            const float sibling_residual_mf =
+                                __shfl_sync(MASK, sibling_partial_mf, 0)
+                                + __int_as_float(mf_meta.data[sibling_meta_offset + 2]);
+                            float tangent_cross_partial_mf = 0.0f;
+                            if (lane < 6 && dof_a >= 0) {
+                                float sibling_response = 0.0f;
+                                if (sibling_dof_a == dof_a)
+                                    sibling_response += mf_MiJt_a.data[sibling_mf6 + lane];
+                                if (sibling_dof_b == dof_a)
+                                    sibling_response += mf_MiJt_b.data[sibling_mf6 + lane];
+                                tangent_cross_partial_mf =
+                                    mf_J_a.data[mf6 + lane] * sibling_response;
+                            }
+                            if (lane >= 6 && lane < 12 && dof_b >= 0) {
+                                const int component = lane - 6;
+                                float sibling_response = 0.0f;
+                                if (sibling_dof_a == dof_b)
+                                    sibling_response += mf_MiJt_a.data[sibling_mf6 + component];
+                                if (sibling_dof_b == dof_b)
+                                    sibling_response += mf_MiJt_b.data[sibling_mf6 + component];
+                                tangent_cross_partial_mf =
+                                    mf_J_b.data[mf6 + component] * sibling_response;
+                            }
+                            tangent_cross_partial_mf +=
+                                __shfl_down_sync(MASK, tangent_cross_partial_mf, 16);
+                            tangent_cross_partial_mf +=
+                                __shfl_down_sync(MASK, tangent_cross_partial_mf, 8);
+                            tangent_cross_partial_mf +=
+                                __shfl_down_sync(MASK, tangent_cross_partial_mf, 4);
+                            tangent_cross_partial_mf +=
+                                __shfl_down_sync(MASK, tangent_cross_partial_mf, 2);
+                            tangent_cross_partial_mf +=
+                                __shfl_down_sync(MASK, tangent_cross_partial_mf, 1);
+                            const float tangent_cross_mf =
+                                __shfl_sync(MASK, tangent_cross_partial_mf, 0);"""
+    )
     mf_main_state_update = (
         f"""const int matrix_row = row_count + mf_row;
                 if (lane == 0) s_applied_delta[matrix_row] += delta_impulse_mf;
@@ -17463,26 +17571,45 @@ def _get_pgs_solve_local_owned_kernel(
                 if (new_impulse_mf < 0.0f) new_impulse_mf = 0.0f;
             }} else if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
                 const int parent_mf = packed_type_parent >> 16;
-                const float radius_mf = fmaxf(
-                    mf_row_mu.data[mf_offset + mf_row] * s_mf_lambda[parent_mf], 0.0f);
-                if (radius_mf <= 0.0f) {{
-                    new_impulse_mf = 0.0f;
+                if (mf_row != parent_mf + 1) {{
+                    new_impulse_mf = old_impulse_mf;
                 }} else {{
-                    const int sibling_mf = mf_row == parent_mf + 1 ? parent_mf + 2 : parent_mf + 1;
-                    s_mf_lambda[mf_row] = new_impulse_mf;
+                    float lambda_n_mf = s_mf_lambda[parent_mf];
+                    for (int patch_row =
+                             (mf_meta.data[mf_meta_offset + parent_mf * 4 + 3] >> 16);
+                         patch_row >= 0 && patch_row != parent_mf;
+                         patch_row =
+                             (mf_meta.data[mf_meta_offset + patch_row * 4 + 3] >> 16))
+                        lambda_n_mf += s_mf_lambda[patch_row];
+                    const float radius_mf = fmaxf(
+                        mf_row_mu.data[mf_offset + mf_row] * lambda_n_mf, 0.0f);
+                    const int sibling_mf = parent_mf + 2;
+                    {mf_friction_pair_terms}
                     const float sibling_old_mf = s_mf_lambda[sibling_mf];
-                    const float magnitude_mf = sqrtf(
-                        new_impulse_mf * new_impulse_mf + sibling_old_mf * sibling_old_mf);
-                    if (magnitude_mf > radius_mf) {{
-                        const float scale_mf = radius_mf / magnitude_mf;
-                        new_impulse_mf *= scale_mf;
-                        const float sibling_new_mf = sibling_old_mf * scale_mf;
-                        const float sibling_delta_mf = sibling_new_mf - sibling_old_mf;
-                        if (sibling_delta_mf != 0.0f) {{
-                            changed = 1;
-                            s_mf_lambda[sibling_mf] = sibling_new_mf;
-                            {mf_sibling_state_update}
-                        }}
+                    const float sibling_inverse_diagonal_mf =
+                        __int_as_float(mf_meta.data[mf_meta_offset + sibling_mf * 4 + 1]);
+                    float2 pair_mf = friction_pair_candidate(
+                        1.0f / inverse_diagonal,
+                        tangent_cross_mf,
+                        sibling_inverse_diagonal_mf > 0.0f
+                            ? 1.0f / sibling_inverse_diagonal_mf : 0.0f,
+                        residual_mf,
+                        sibling_residual_mf,
+                        old_impulse_mf,
+                        sibling_old_mf,
+                        radius_mf,
+                        omega);
+                    const float pair_magnitude_mf =
+                        sqrtf(pair_mf.x * pair_mf.x + pair_mf.y * pair_mf.y);
+                    const float pair_scale_mf =
+                        pair_magnitude_mf > radius_mf ? radius_mf / pair_magnitude_mf : 1.0f;
+                    new_impulse_mf = pair_mf.x * pair_scale_mf;
+                    const float sibling_new_mf = pair_mf.y * pair_scale_mf;
+                    const float sibling_delta_mf = sibling_new_mf - sibling_old_mf;
+                    s_mf_lambda[sibling_mf] = sibling_new_mf;
+                    if (sibling_delta_mf != 0.0f) {{
+                        changed = 1;
+                        {mf_sibling_state_update}
                     }}
                 }}
             }}
@@ -17622,6 +17749,8 @@ def _get_pgs_solve_local_owned_kernel(
 {shared_cleanup}
 #endif
 """
+    if contact_capable:
+        snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
     snippet = snippet.replace("__syncwarp();", "__syncwarp(MASK);")
 
     @wp.func_native(snippet)
