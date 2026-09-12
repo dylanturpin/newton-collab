@@ -20934,9 +20934,16 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     }}
                 }}
 
-                if (s_lambda[normal] <= 0.0f
-                    && s_lambda[tangent1] == 0.0f
-                    && s_lambda[tangent2] == 0.0f) {{
+                // Patch normal load over the region's linked normal rows (circular parent list).
+                float lambda_n = s_lambda[normal];
+                for (int patch_row = (s_meta[normal] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
+                     patch_row >= 0 && patch_row != normal;
+                     patch_row = (s_meta[patch_row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1)
+                    lambda_n += s_lambda[patch_row];
+                const float radius = fmaxf(s_mu[tangent1] * lambda_n, 0.0f);
+                const float old_tangent1 = s_lambda[tangent1];
+                const float old_tangent2 = s_lambda[tangent2];
+                if (radius <= 0.0f && old_tangent1 == 0.0f && old_tangent2 == 0.0f) {{
                     normal = next_normal;
                     continue;
                 }}
@@ -20960,70 +20967,31 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 const float tangent2_j = sparse_row_jy.data[tangent2_jy];
                 const float tangent2_y = sparse_row_jy.data[tangent2_jy + 1];
 
-                const float tangent1_denom = s_diag[tangent1];
-                if (tangent1_denom > 0.0f) {{
-                    const float tangent1_jv = __fmul_rn(tangent1_j, s_v[scalar_coord]);
-                    const float residual = __fadd_rn(tangent1_jv, s_rhs[tangent1]);
-                    const float old_impulse = s_lambda[tangent1];
-                    float new_impulse = old_impulse - omega * residual / tangent1_denom;
-                    const float radius = fmaxf(s_mu[tangent1] * s_lambda[normal], 0.0f);
-                    if (radius <= 0.0f) {{
-                        new_impulse = 0.0f;
-                    }} else {{
-                        s_lambda[tangent1] = new_impulse;
-                        const float sibling_old = s_lambda[tangent2];
-                        const float magnitude = sqrtf(new_impulse * new_impulse + sibling_old * sibling_old);
-                        if (magnitude > radius) {{
-                            const float scale = radius / magnitude;
-                            new_impulse *= scale;
-                            const float sibling_new = sibling_old * scale;
-                            s_lambda[tangent2] = sibling_new;
-                            const float sibling_delta = sibling_new - sibling_old;
-                            if (sibling_delta != 0.0f) {{
-                                iteration_changed = 1;
-                                s_v[scalar_coord] += tangent2_y * sibling_delta;
-                            }}
-                        }}
-                    }}
-                    const float delta_impulse = new_impulse - old_impulse;
-                    s_lambda[tangent1] = new_impulse;
-                    if (delta_impulse != 0.0f) {{
-                        iteration_changed = 1;
-                        s_v[scalar_coord] += tangent1_y * delta_impulse;
-                    }}
+                // Both tangents act on the same scalar coordinate: solve them together on the friction disk
+                // at the patch normal load, as the general owner does.
+                float2 pair = make_float2(0.0f, 0.0f);
+                if (radius > 0.0f) {{
+                    const float tangent1_residual = __fadd_rn(__fmul_rn(tangent1_j, s_v[scalar_coord]), s_rhs[tangent1]);
+                    const float tangent2_residual = __fadd_rn(__fmul_rn(tangent2_j, s_v[scalar_coord]), s_rhs[tangent2]);
+                    const float cross = tangent1_j * tangent2_y;
+                    pair = friction_pair_candidate(s_diag[tangent1], cross, s_diag[tangent2],
+                        tangent1_residual, tangent2_residual, old_tangent1, old_tangent2, radius, omega);
                 }}
-
-                const float tangent2_denom = s_diag[tangent2];
-                if (tangent2_denom > 0.0f) {{
-                    const float tangent2_jv = __fmul_rn(tangent2_j, s_v[scalar_coord]);
-                    const float residual = __fadd_rn(tangent2_jv, s_rhs[tangent2]);
-                    const float old_impulse = s_lambda[tangent2];
-                    float new_impulse = old_impulse - omega * residual / tangent2_denom;
-                    const float radius = fmaxf(s_mu[tangent2] * s_lambda[normal], 0.0f);
-                    if (radius <= 0.0f) {{
-                        new_impulse = 0.0f;
-                    }} else {{
-                        s_lambda[tangent2] = new_impulse;
-                        const float sibling_old = s_lambda[tangent1];
-                        const float magnitude = sqrtf(new_impulse * new_impulse + sibling_old * sibling_old);
-                        if (magnitude > radius) {{
-                            const float scale = radius / magnitude;
-                            new_impulse *= scale;
-                            const float sibling_new = sibling_old * scale;
-                            s_lambda[tangent1] = sibling_new;
-                            const float sibling_delta = sibling_new - sibling_old;
-                            if (sibling_delta != 0.0f) {{
-                                iteration_changed = 1;
-                                s_v[scalar_coord] += tangent1_y * sibling_delta;
-                            }}
-                        }}
-                    }}
-                    const float delta_impulse = new_impulse - old_impulse;
-                    s_lambda[tangent2] = new_impulse;
-                    if (delta_impulse != 0.0f) {{
-                        iteration_changed = 1;
-                        s_v[scalar_coord] += tangent2_y * delta_impulse;
-                    }}
+                const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
+                const float scale = magnitude > radius ? radius / magnitude : 1.0f;
+                const float new_tangent1 = pair.x * scale;
+                const float new_tangent2 = pair.y * scale;
+                const float tangent1_delta = new_tangent1 - old_tangent1;
+                const float tangent2_delta = new_tangent2 - old_tangent2;
+                s_lambda[tangent1] = new_tangent1;
+                s_lambda[tangent2] = new_tangent2;
+                if (tangent2_delta != 0.0f) {{
+                    iteration_changed = 1;
+                    s_v[scalar_coord] += tangent2_y * tangent2_delta;
+                }}
+                if (tangent1_delta != 0.0f) {{
+                    iteration_changed = 1;
+                    s_v[scalar_coord] += tangent1_y * tangent1_delta;
                 }}
                 normal = next_normal;
             }}
@@ -21040,13 +21008,17 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     continue;
                 }
             }"""
-        skip_inactive_friction = """
+        skip_inactive_friction = f"""
             if (row >= contact_start && (row - contact_start) % 3 == 0
-                && s_lambda[row] <= 0.0f
                 && s_lambda[row + 1] == 0.0f
-                && s_lambda[row + 2] == 0.0f) {
-                row += 2;
-            }"""
+                && s_lambda[row + 2] == 0.0f) {{
+                float patch_load = s_lambda[row];
+                for (int patch_row = (s_meta[row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
+                     patch_row >= 0 && patch_row != row;
+                     patch_row = (s_meta[patch_row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1)
+                    patch_load += s_lambda[patch_row];
+                if (patch_load <= 0.0f) row += 2;
+            }}"""
         if speculative_contact_batches:
             skip_independent_contact = ""
             serial_loop_open = f"""        const int serial_contact_count = sparse_contact_serial_count.data[world];
@@ -21097,6 +21069,12 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                         candidate_noop = old_impulse == 0.0f && new_impulse == 0.0f
                             && s_lambda[candidate_normal + 1] == 0.0f
                             && s_lambda[candidate_normal + 2] == 0.0f;
+                        if (candidate_noop) {{
+                            for (int patch_row = (s_meta[candidate_normal] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
+                                 patch_row >= 0 && patch_row != candidate_normal;
+                                 patch_row = (s_meta[patch_row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1)
+                                if (s_lambda[patch_row] > 0.0f) candidate_noop = false;
+                        }}
                     }}
                     const unsigned noop_lanes = __ballot_sync(MASK, candidate_noop);
                     if (noop_lanes == MASK) {{
@@ -21114,13 +21092,17 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 row = sparse_contact_serial_normals.data[world * {S} + contact_index]
                     + contact_component;
             }}"""
-            skip_inactive_friction = """
+            skip_inactive_friction = f"""
             if (contact_component == 0
-                && s_lambda[row] <= 0.0f
                 && s_lambda[row + 1] == 0.0f
-                && s_lambda[row + 2] == 0.0f) {
-                serial_row += 2;
-            }"""
+                && s_lambda[row + 2] == 0.0f) {{
+                float patch_load = s_lambda[row];
+                for (int patch_row = (s_meta[row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
+                     patch_row >= 0 && patch_row != row;
+                     patch_row = (s_meta[patch_row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1)
+                    patch_load += s_lambda[patch_row];
+                if (patch_load <= 0.0f) serial_row += 2;
+            }}"""
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -21179,8 +21161,14 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 __syncwarp(MASK);
                 continue;
             }}
+            const int parent = (s_meta[row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
+            if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)} && row != parent + 1) {{
+                // The first tangent row solved both tangents; the second visit is a no-op.
+                __syncwarp(MASK);
+                continue;
+            }}
             const float denominator = s_diag[row];
-            if (denominator <= 0.0f) continue;
+            if (denominator <= 0.0f && row_type != {int(PGS_CONSTRAINT_TYPE_FRICTION)}) continue;
 
             int coord = -1;
             float jacobian = 0.0f;
@@ -21205,44 +21193,71 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             partial += __shfl_down_sync(MASK, partial, 1);
             const float velocity = __shfl_sync(MASK, partial, 0);
 
+            const float residual = velocity + s_rhs[row];
             const float old_impulse = s_lambda[row];
-            float new_impulse = old_impulse - omega * (velocity + s_rhs[row]) / denominator;
+            float new_impulse = old_impulse;
+            if (denominator > 0.0f) new_impulse -= omega * residual / denominator;
             if (row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}
                 || row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)}) {{
                 new_impulse = fmaxf(new_impulse, 0.0f);
             }} else if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
-                const int parent = (s_meta[row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
-                const float radius = fmaxf(s_mu[row] * s_lambda[parent], 0.0f);
-                if (radius <= 0.0f) {{
-                    new_impulse = 0.0f;
-                }} else {{
-                    const int sibling = row == parent + 1 ? parent + 2 : parent + 1;
-                    s_lambda[row] = new_impulse;
-                    const float sibling_old = s_lambda[sibling];
-                    const float magnitude = sqrtf(new_impulse * new_impulse + sibling_old * sibling_old);
-                    if (magnitude > radius) {{
-                        const float scale = radius / magnitude;
-                        new_impulse *= scale;
-                        const float sibling_new = sibling_old * scale;
-                        const float sibling_delta = sibling_new - sibling_old;
-                        s_lambda[sibling] = sibling_new;
-                        if (sibling_delta != 0.0f) {{
-                            iteration_changed = 1;
-                            int sibling_coord = -1;
-                            float sibling_response = 0.0f;
-                            if (lane < {P}) {{
-                                sibling_coord = dense_offset + lane;
-                                sibling_response = dense_Y.data[(dense_group * {M} + sibling) * {P} + lane];
-                            }} else if (lane <= {P + 1}) {{
-                                const int sparse_slot = lane - {P};
-                                const int sparse_row = row_base + sibling;
-                                sibling_coord = sparse_row_dof.data[sparse_row * 2 + sparse_slot];
-                                sibling_response = sparse_row_jy.data[sparse_row * 4 + sparse_slot * 2 + 1];
-                            }}
-                            if (sibling_coord >= 0)
-                                s_v[sibling_coord] += sibling_response * sibling_delta;
-                        }}
+                // Paired tangent solve at the patch normal load, matching the general owner.
+                const int sibling = parent + 2;
+                float lambda_n = s_lambda[parent];
+                for (int patch_row = (s_meta[parent] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
+                     patch_row >= 0 && patch_row != parent;
+                     patch_row = (s_meta[patch_row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1)
+                    lambda_n += s_lambda[patch_row];
+                const float radius = fmaxf(s_mu[row] * lambda_n, 0.0f);
+                const float sibling_old = s_lambda[sibling];
+                // Sibling row entries on this lane's coordinate and its own two sparse slots.
+                int sibling_coord = -1;
+                float sibling_jacobian = 0.0f;
+                float sibling_response = 0.0f;
+                float sibling_response_here = 0.0f;
+                const int sibling_sparse_row = row_base + sibling;
+                if (lane < {P}) {{
+                    sibling_coord = dense_offset + lane;
+                    const int sibling_dense_index = (dense_group * {M} + sibling) * {P} + lane;
+                    sibling_jacobian = dense_J.data[sibling_dense_index];
+                    sibling_response = dense_Y.data[sibling_dense_index];
+                    sibling_response_here = sibling_response;
+                }} else if (lane <= {P + 1}) {{
+                    const int sparse_slot = lane - {P};
+                    sibling_coord = sparse_row_dof.data[sibling_sparse_row * 2 + sparse_slot];
+                    sibling_jacobian = sparse_row_jy.data[sibling_sparse_row * 4 + sparse_slot * 2];
+                    sibling_response = sparse_row_jy.data[sibling_sparse_row * 4 + sparse_slot * 2 + 1];
+                    // The sibling's response at this lane's (row) coordinate, if it carries that coordinate.
+                    const int sibling_coord_0 = sparse_row_dof.data[sibling_sparse_row * 2];
+                    const int sibling_coord_1 = sparse_row_dof.data[sibling_sparse_row * 2 + 1];
+                    if (coord >= 0 && coord == sibling_coord_0)
+                        sibling_response_here = sparse_row_jy.data[sibling_sparse_row * 4 + 1];
+                    else if (coord >= 0 && coord == sibling_coord_1)
+                        sibling_response_here = sparse_row_jy.data[sibling_sparse_row * 4 + 3];
+                }}
+                float2 pair = make_float2(0.0f, 0.0f);
+                if (radius > 0.0f) {{
+                    float partial_sibling = sibling_coord >= 0 ? sibling_jacobian * s_v[sibling_coord] : 0.0f;
+                    float partial_cross = coord >= 0 ? jacobian * sibling_response_here : 0.0f;
+                    for (int offset = 16; offset > 0; offset >>= 1) {{
+                        partial_sibling += __shfl_down_sync(MASK, partial_sibling, offset);
+                        partial_cross += __shfl_down_sync(MASK, partial_cross, offset);
                     }}
+                    const float sibling_residual = __shfl_sync(MASK, partial_sibling, 0) + s_rhs[sibling];
+                    const float cross = __shfl_sync(MASK, partial_cross, 0);
+                    pair = friction_pair_candidate(denominator, cross, s_diag[sibling],
+                        residual, sibling_residual, old_impulse, sibling_old, radius, omega);
+                }}
+                const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
+                const float scale = magnitude > radius ? radius / magnitude : 1.0f;
+                new_impulse = pair.x * scale;
+                const float sibling_new = pair.y * scale;
+                const float sibling_delta = sibling_new - sibling_old;
+                s_lambda[sibling] = sibling_new;
+                if (sibling_delta != 0.0f) {{
+                    iteration_changed = 1;
+                    if (sibling_coord >= 0)
+                        s_v[sibling_coord] += sibling_response * sibling_delta;
                 }}
             }}
 
@@ -21269,6 +21284,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 {chr(10).join(limit_stores)}
 #endif
 """
+    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
 
     @wp.func_native(snippet)
     def pgs_solve_sparse_diagonal_native(
