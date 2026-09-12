@@ -4596,12 +4596,17 @@ def populate_sparse_diagonal_contact_response(
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     contact_friction_shared_anchor: int,
+    friction_patches: FrictionPatches,
     contact_shared_anchor: int,
     # outputs
     sparse_row_dof: wp.array3d[int],
     sparse_row_jy: wp.array3d[float],
 ):
-    """Build exact ``dense + two sparse`` contact responses for an independent articulation."""
+    """Build exact ``dense + two sparse`` contact responses for an independent articulation.
+
+    Tangent rows use the persistent patch anchors when patch friction is enabled, exactly as the dense
+    contact Jacobian builders do, so the sparse coordinates see the same row geometry.
+    """
     worker = wp.tid()
     total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
     for c in range(worker, total_contacts, total_num_workers):
@@ -4651,6 +4656,9 @@ def populate_sparse_diagonal_contact_response(
                 if contact_shared_anchor != 0 or contact_friction_shared_anchor != 0:
                     point_a = contact_anchor_world
                     point_b = contact_anchor_world
+                if friction_patches.enabled != 0:
+                    point_a = friction_patches.point_a[c]
+                    point_b = friction_patches.point_b[c]
 
             dof_a = -1
             dof_b = -1

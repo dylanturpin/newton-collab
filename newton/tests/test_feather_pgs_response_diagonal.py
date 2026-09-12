@@ -8,6 +8,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.friction import friction_pair_candidate
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -282,28 +283,31 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             residual = expected_velocity[2] + limit_lower_rhs[0, 2]
             expected_limit_lambda = np.maximum(0.0, old_limit - omega * residual / (inverse_mass[2] + cfm))
             expected_velocity[2] += inverse_mass[2] * (expected_limit_lambda - old_limit)
-            for row in range(3):
-                old_impulse = expected_impulses[row]
-                new_impulse = old_impulse - omega * (jacobian[row] @ expected_velocity + rhs[0, row]) / diag[0, row]
-                if row == 0:
-                    new_impulse = max(new_impulse, 0.0)
-                else:
-                    radius = max(row_mu[0, row] * expected_impulses[0], 0.0)
-                    sibling = 2 if row == 1 else 1
-                    if radius <= 0.0:
-                        new_impulse = 0.0
-                    else:
-                        expected_impulses[row] = new_impulse
-                        sibling_old = expected_impulses[sibling]
-                        magnitude = np.sqrt(new_impulse * new_impulse + sibling_old * sibling_old)
-                        if magnitude > radius:
-                            scale = radius / magnitude
-                            new_impulse *= scale
-                            sibling_new = sibling_old * scale
-                            expected_impulses[sibling] = sibling_new
-                            expected_velocity += response[sibling] * (sibling_new - sibling_old)
-                expected_impulses[row] = new_impulse
-                expected_velocity += response[row] * (new_impulse - old_impulse)
+            old_impulse = expected_impulses[0]
+            new_impulse = old_impulse - omega * (jacobian[0] @ expected_velocity + rhs[0, 0]) / diag[0, 0]
+            new_impulse = max(new_impulse, 0.0)
+            expected_impulses[0] = new_impulse
+            expected_velocity += response[0] * (new_impulse - old_impulse)
+            # The general owner solves both tangent rows together on the friction disk at the current normal
+            # load (friction_pair_candidate); the second tangent visit is a no-op.
+            radius = max(row_mu[0, 1] * expected_impulses[0], 0.0)
+            pair = friction_pair_candidate(
+                float(diag[0, 1]),
+                float(jacobian[1] @ response[2]),
+                float(diag[0, 2]),
+                wp.vec2(
+                    float(jacobian[1] @ expected_velocity + rhs[0, 1]),
+                    float(jacobian[2] @ expected_velocity + rhs[0, 2]),
+                ),
+                wp.vec2(float(expected_impulses[1]), float(expected_impulses[2])),
+                float(radius),
+                omega,
+            )
+            magnitude = np.sqrt(pair[0] * pair[0] + pair[1] * pair[1])
+            scale = radius / magnitude if magnitude > radius else 1.0
+            for tangent, value in ((1, pair[0] * scale), (2, pair[1] * scale)):
+                expected_velocity += response[tangent] * (value - expected_impulses[tangent])
+                expected_impulses[tangent] = np.float32(value)
 
         impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
         lower_lambda = wp.zeros((1, world_dofs), dtype=wp.float32, device=device)

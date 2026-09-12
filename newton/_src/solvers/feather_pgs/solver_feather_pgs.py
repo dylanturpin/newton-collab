@@ -1873,8 +1873,12 @@ class SolverFeatherPGS(SolverBase):
         if self.pgs_mode == "matrix_free":
             self._compute_world_response_dof_mapping(model)
         self._setup_fused_diagonal_joint_limits(model)
-        sparse_diagonal_pair = self._select_sparse_diagonal_response_pair(
-            factor_dense_contract=self._fused_diagonal_joint_limits
+        # The sparse owner does not solve the appended torsion row; torsion is configured later in
+        # construction, so gate on the requested radius here.
+        sparse_diagonal_pair = (
+            None
+            if float(contact_torsion_radius) > 0.0
+            else self._select_sparse_diagonal_response_pair(factor_dense_contract=self._fused_diagonal_joint_limits)
         )
         self._sparse_diagonal_contact_solve = sparse_diagonal_pair is not None
         if sparse_diagonal_pair is None:
@@ -1885,11 +1889,13 @@ class SolverFeatherPGS(SolverBase):
             self._fused_diagonal_limit_dof_mask_host.fill(0)
         self._sparse_diagonal_response_size = sparse_diagonal_pair[0] if sparse_diagonal_pair is not None else None
         self._sparse_diagonal_dense_size = sparse_diagonal_pair[1] if sparse_diagonal_pair is not None else 0
+        # Persistent patches allocate one tangent pair per surviving anchor, so their contact rows are not
+        # uniform normal/tangent/tangent triples; keep the triple schedule for point friction only.
         self._sparse_diagonal_contact_triples = bool(
             self._sparse_diagonal_contact_solve
             and self.enable_contact_friction
             and self.contact_friction_gap_threshold == math.inf
-            and self.contact_friction_anchor_limit == 0
+            and not self._friction_anchors_enabled
         )
         self._sparse_diagonal_speculative_contact_batches = bool(
             self._sparse_diagonal_contact_triples and self._sparse_diagonal_dense_size + 2 <= 8
@@ -10421,6 +10427,7 @@ class SolverFeatherPGS(SolverBase):
                             model.shape_body,
                             state_in.body_q,
                             int(self.contact_friction_shared_anchor),
+                            self._friction_patches.view,
                             int(self.contact_shared_anchor),
                         ],
                         outputs=[self._sparse_diagonal_row_dof, self._sparse_diagonal_row_jy],
