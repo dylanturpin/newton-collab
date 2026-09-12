@@ -7635,7 +7635,10 @@ class SolverFeatherPGS(SolverBase):
             target.body_a_s = wp.empty(
                 (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
             )
-            target.body_f_s = wp.zeros(
+            # Allocate without a memset: the first step may run inside a CUDA graph capture, and a captured
+            # memset would erase the cached body forces on every replay while the FK/ID cache stays valid.
+            # Stage 1 fully writes body_f_s before it is read.
+            target.body_f_s = wp.empty(
                 (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
             )
             target.body_ft_s = wp.zeros(
