@@ -207,6 +207,8 @@ class _TeleopDriver:
         self.reported_at = 0.0
         self.peer_was_live = False
         self.mirror = None
+        self.trace = None
+        self.driven = 0
         self._streamed: list[int] = []
 
         # The host comes up before the model is built, so the connect code is on
@@ -225,6 +227,12 @@ class _TeleopDriver:
         self.teeth = self.home
         self.orientation = self.home_quat
         self.pitch = self.home_pitch
+        # Write the trace as it happens: a drive that ends in a crash or a kill is
+        # still worth fitting a trajectory to.
+        self.trace_path = pathlib.Path("excavator_demo_trace.csv")
+        self.trace = self.trace_path.open("w")
+        self.trace.write("time,engaged,reach,height,yaw_deg,pitch_deg,teeth_x,teeth_y,teeth_z\n")
+        self.driven = 0
         self._publish_scene()
 
     # ------------------------------------------------------------------ scene
@@ -404,7 +412,15 @@ class _TeleopDriver:
         ex.phase = f"Teleop  bucket {ex.bucket_pitch():+.0f} deg"
         ex.drive_pose(self.teeth, self.orientation)
         x, y, z = self.teeth
-        self.track.append((ex.sim_time, math.hypot(x, y), z, math.degrees(math.atan2(y, x)), self.pitch))
+        engaged = bool(frame and frame.engaged)
+        actual, _ = ex.teeth_pose()
+        row = (ex.sim_time, float(engaged), math.hypot(x, y), z, math.degrees(math.atan2(y, x)), self.pitch, *actual)
+        self.track.append(row)
+        if self.trace is not None:
+            self.trace.write(",".join(f"{v:.4f}" for v in row) + "\n")
+            self.driven += int(engaged)
+            if len(self.track) % 60 == 0:
+                self.trace.flush()
 
     def _report(self, tool):
         """Say whether the phone reaches us at all; silence hides a blocked port."""
@@ -419,29 +435,47 @@ class _TeleopDriver:
         if self.peer_was_live:
             print(
                 f"[teleop] {status['rate_hz']} Hz engaged={status['engaged']} "
-                f"teeth=({tool[0]:+.2f},{tool[1]:+.2f},{tool[2]:+.2f}) bucket={self.pitch:+.0f}",
+                f"teeth=({tool[0]:+.2f},{tool[1]:+.2f},{tool[2]:+.2f}) bucket={self.pitch:+.0f} "
+                f"recorded={self.driven} driven frames",
                 flush=True,
             )
         else:
             # The packet count separates "the phone cannot reach us" - a blocked UDP
             # port, or client isolation on the network - from "packets arrive but the
             # session has not come up".
-            print(f"[teleop] waiting for a phone; {status['packets_received']} packets received", flush=True)
+            print(
+                f"[teleop] waiting for a phone; {status['packets_received']} packets received; "
+                f"{self.driven} driven frames recorded",
+                flush=True,
+            )
 
-    def waypoints(self, count=8):
-        """Read the recorded drive back as a CYCLE-shaped waypoint list."""
-        if not self.track:
+    def waypoints(self, count=10):
+        """The engaged part of the drive, sampled into a CYCLE-shaped waypoint list."""
+        driven = [row for row in self.track if row[1] > 0.5]
+        if not driven:
             return []
-        step = max(1, len(self.track) // count)
+        start = driven[0][0]
+        step = max(1, len(driven) // count)
         return [
-            (f"Recorded {i}", round(row[0], 2), round(row[1], 2), round(row[2], 2), round(row[3], 1), round(row[4], 1))
-            for i, row in enumerate(self.track[::step])
+            (
+                f"Recorded {i}",
+                round(row[0] - start, 2),
+                round(row[2], 2),
+                round(row[3], 2),
+                round(row[4], 1),
+                round(row[5], 1),
+            )
+            for i, row in enumerate(driven[::step])
         ]
 
     def close(self):
         if self.closed:
             return
         self.closed = True
+        if self.trace is not None:
+            self.trace.flush()
+            self.trace.close()
+            print(f"wrote {len(self.track)} frames ({self.driven} driven) to {self.trace_path}", flush=True)
         lines = self.waypoints()
         if lines:
             out = pathlib.Path("excavator_demo_waypoints.py")
