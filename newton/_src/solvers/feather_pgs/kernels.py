@@ -11846,6 +11846,7 @@ def collect_propagation_units(
     contact_shape0: wp.array[int],
     contact_shape1: wp.array[int],
     shape_body: wp.array[int],
+    body_prescribed: wp.array[int],
     contact_slots_needed: wp.array[int],
     propagation_max_constraints: int,
     # in/out
@@ -11856,7 +11857,13 @@ def collect_propagation_units(
     unit_body_b: wp.array[int],
     unit_len: wp.array[int],
 ):
-    """Gather propagation-path contacts into per-world unit lists for pre-build coloring."""
+    """Gather propagation-path contacts into per-world unit lists for pre-build coloring.
+
+    A prescribed (kinematic) body never receives a velocity update from a row, so rows
+    touching it do not conflict: it is recorded as ``-1`` like the world. Otherwise a
+    kinematic hub (a held container full of parts) forces every one of its contacts into
+    a separate color or the serial tail.
+    """
     c = wp.tid()
     if c >= contact_count[0]:
         return
@@ -11873,8 +11880,12 @@ def collect_propagation_units(
     sb = contact_shape1[c]
     if sa >= 0:
         body_a = shape_body[sa]
+        if body_a >= 0 and body_prescribed[body_a] != 0:
+            body_a = -1
     if sb >= 0:
         body_b = shape_body[sb]
+        if body_b >= 0 and body_prescribed[body_b] != 0:
+            body_b = -1
     unit_contact[base + idx] = c
     unit_body_a[base + idx] = body_a
     unit_body_b[base + idx] = body_b

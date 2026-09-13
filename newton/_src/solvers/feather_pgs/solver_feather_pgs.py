@@ -1835,6 +1835,7 @@ class SolverFeatherPGS(SolverBase):
         self._model_plan: _FeatherPGSModelPlan | None = None
         self._kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
         self._kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
+        self._body_prescribed = wp.zeros(max(model.body_count, 1), dtype=wp.int32, device=model.device)
         self._update_kinematic_state()
         # Prescribed-response elision removes fully-kinematic free bases from
         # the compact response mapping, which would desynchronize it from the
@@ -2517,6 +2518,9 @@ class SolverFeatherPGS(SolverBase):
         self._kinematic_dof_mask_host = dof_mask.copy()
         self._kinematic_joint_mask.assign(joint_mask)
         self._kinematic_dof_mask.assign(dof_mask)
+        if model.body_count:
+            body_prescribed = ((model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0).astype(np.int32)
+            self._body_prescribed.assign(body_prescribed)
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
@@ -10586,6 +10590,7 @@ class SolverFeatherPGS(SolverBase):
                         contacts.rigid_contact_shape0,
                         contacts.rigid_contact_shape1,
                         model.shape_body,
+                        self._body_prescribed,
                         self.contact_slots_needed,
                         self.propagation_max_constraints,
                     ],
