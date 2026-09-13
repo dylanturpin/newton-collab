@@ -943,6 +943,8 @@ class SolverFeatherPGS(SolverBase):
         propagation_same_articulation_rows: bool = False,
         propagation_cached_response: bool = True,
         propagation_cached_response_max_bodies: int = 8,
+        propagation_colored_launch: Literal["block", "grid"] = "block",
+        propagation_colored_grid_colors: int = 64,
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
         mf_max_constraints: int = 512,
@@ -1272,6 +1274,15 @@ class SolverFeatherPGS(SolverBase):
                 Passing any propagation-family value with a heterogeneous multi-world
                 model (worlds whose per-world DOF counts differ) raises ``ValueError``;
                 use ``"immediate"`` (or ``pgs_mode="split"``) for such models.
+            propagation_colored_launch (str, optional): How ``"propagation-colored"`` sweeps one
+                iteration. ``"block"`` (default) runs one thread block per world that walks the
+                colors with barriers: right for many small worlds. ``"grid"`` issues one flat
+                launch per color across all worlds (every unit of a color is a thread), then a
+                serial per-world pass over colors beyond ``propagation_colored_grid_colors`` and
+                the overflow tail: right for one large world, where a single block leaves the
+                GPU idle. Both apply the identical Gauss-Seidel order.
+            propagation_colored_grid_colors (int, optional): Per-color launches per iteration in
+                ``"grid"`` mode; colors past it run in the serial pass. Defaults to 64.
             propagation_same_articulation_rows (bool, optional): Route contacts between two
                 links of the same articulation to propagation rows instead of dense generalized
                 rows. Their effective mass is recomputed with exact cross operational-space
@@ -1580,6 +1591,12 @@ class SolverFeatherPGS(SolverBase):
             )
         self.propagation_cached_response = bool(propagation_cached_response)
         self.propagation_cached_response_max_bodies = int(propagation_cached_response_max_bodies)
+        if propagation_colored_launch not in ("block", "grid"):
+            raise ValueError("propagation_colored_launch must be 'block' or 'grid'")
+        self.propagation_colored_launch = propagation_colored_launch
+        self.propagation_colored_grid_colors = int(propagation_colored_grid_colors)
+        if not 1 <= self.propagation_colored_grid_colors <= PROPAGATION_COLOR_TAIL:
+            raise ValueError(f"propagation_colored_grid_colors must be in [1, {PROPAGATION_COLOR_TAIL}]")
         # Contact-row placement is intrinsic to the mode: the serial and colored
         # propagation modes place every contact row (free/free and free/ground
         # included) on the propagation family; the fused mode keeps free/free
@@ -5781,6 +5798,7 @@ class SolverFeatherPGS(SolverBase):
         # kernel, so it keeps one world per block.
         self._propagation_fused_worlds_per_block = 1
         self._pgs_solve_propagation_colored_block_kernel = None
+        self._pgs_solve_propagation_colored_grid_kernels = None
         self._propagation_colored_block_dim = 64
         if model.device.is_cuda and self._propagation_colored and self.propagation_max_constraints > 0:
             # The pre-build colouring kernel stages one short per contact unit in shared
@@ -5803,6 +5821,14 @@ class SolverFeatherPGS(SolverBase):
                 int(getattr(self, "max_propagation_bodies", 0)),
                 device_arch,
             )
+            if self.propagation_colored_launch == "grid":
+                self._pgs_solve_propagation_colored_grid_kernels = _get_pgs_solve_propagation_colored_grid_kernels(
+                    self.propagation_max_constraints,
+                    PROPAGATION_COLOR_TAIL + 2,
+                    self._propagation_color_max_units,
+                    self.propagation_colored_grid_colors,
+                    device_arch,
+                )
             self._pgs_solve_propagation_colored_warp_kernel = None
             mb = int(getattr(self, "max_propagation_bodies", 0))
             lanes = int(os.environ.get("FEATHER_PGS_COLORED_LANES", "1"))
@@ -7046,6 +7072,38 @@ class SolverFeatherPGS(SolverBase):
         regularize: bool = True,
     ) -> None:
         device = self.model.device
+        if self._pgs_solve_propagation_colored_grid_kernels is not None:
+            color_kernel, leftover_kernel = self._pgs_solve_propagation_colored_grid_kernels
+            common = [
+                self.world_count,
+                self.propagation_constraint_count,
+                self.propagation_body_a,
+                self.propagation_body_b,
+                self.propagation_MiJt_a,
+                self.propagation_MiJt_b,
+                self.propagation_J_a,
+                self.propagation_J_b,
+                self.propagation_eff_mass_inv,
+                rhs,
+                self.propagation_row_w,
+                self.propagation_row_type,
+                self.propagation_row_parent,
+                self.propagation_row_mu,
+                self.color_world_row_order,
+                self.color_world_offsets,
+                omega,
+                int(regularize and self._regularization_enabled),
+                int(friction_start_iteration),
+                int(iteration_offset),
+            ]
+            outputs = [self.propagation_impulses, self.propagation_body_qd, self.propagation_body_impulses]
+            units = int(self._propagation_color_max_units)
+            for color in range(self.propagation_colored_grid_colors):
+                wp.launch(
+                    color_kernel, dim=self.world_count * units, inputs=[*common, color], outputs=outputs, device=device
+                )
+            wp.launch(leftover_kernel, dim=self.world_count, inputs=common, outputs=outputs, device=device)
+            return
         if self._pgs_solve_propagation_colored_warp_kernel is not None:
             wpb = self._propagation_colored_worlds_per_block
             wp.launch_tiled(
@@ -16047,35 +16105,14 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
 
 
 @cache
-def _get_pgs_solve_propagation_colored_block_kernel(
-    propagation_max_constraints: int,
-    n_color_entries: int,
-    block_dim: int,
-    max_propagation_bodies: int,
-    device_arch: str,
-) -> "wp.Kernel":
-    """Build the block-local colored propagation solver over contact units.
+def _propagation_unit_solve_body(contact_type: int, friction_type: int) -> str:
+    """CUDA source solving one contact unit (normal + friction rows) in slot order.
 
-    One thread block per world sweeps unit colors sequentially with
-    ``__syncthreads()`` barriers; within a color each thread owns one
-    contact unit (start slot from ``world_row_order``) and solves its rows
-    in slot order — the unit's rows share bodies, so in-thread ordering is
-    exact Gauss-Seidel, while units of one color share no body and write
-    race-free. The tail segment (color-cap overflow) runs ordered on
-    thread 0. One launch per PGS iteration regardless of color count.
+    Expects ``start_slot``, ``m``, ``world_base``, ``global_iter``, ``omega``, ``regularize``
+    and ``friction_start_iteration`` in scope and updates body velocities / impulses in
+    global memory. Shared by the block-per-world and the grid-per-color colored sweeps.
     """
-    M = propagation_max_constraints
-    NE = n_color_entries
-    B = int(block_dim)
-    contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
-    friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
-    # shared staging of per-world body velocity + deferred impulse: 48B/body.
-    # compile-time decision per model; above the cap the kernel keeps the
-    # global-memory path (no per-step behavior switches).
-    MB = max(int(max_propagation_bodies), 1)
-    use_staging = MB <= 384
-
-    unit_solve_body = f"""
+    return f"""
             for (int rr = 0; ; ++rr) {{
                 const int slot = start_slot + rr;
                 if (slot >= m) break;
@@ -16204,6 +16241,277 @@ def _get_pgs_solve_propagation_colored_block_kernel(
                 }}
             }}
 """
+
+
+def _get_pgs_solve_propagation_colored_grid_kernels(
+    propagation_max_constraints: int,
+    n_color_entries: int,
+    max_units: int,
+    grid_colors: int,
+    device_arch: str,
+) -> tuple["wp.Kernel", "wp.Kernel"]:
+    """Build the grid-wide colored sweep: one flat launch per color, then a serial pass.
+
+    The color kernel is launched with ``dim = world_count * max_units`` once per color
+    ``c < grid_colors``: thread ``u`` of world ``w`` solves the ``u``-th unit of color
+    ``c`` (units of one color share no body, so the writes are race-free). The leftover
+    kernel runs one thread per world over the colors ``>= grid_colors`` and the
+    color-cap overflow tail in the order the block kernel uses, so both launch modes
+    apply the identical Gauss-Seidel schedule.
+    """
+    M = int(propagation_max_constraints)
+    NE = int(n_color_entries)
+    U = int(max_units)
+    C = int(grid_colors)
+    body = _propagation_unit_solve_body(int(PGS_CONSTRAINT_TYPE_CONTACT), int(PGS_CONSTRAINT_TYPE_FRICTION))
+
+    color_snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int world = tid / {U};
+    if (world >= world_count) return;
+    int m = propagation_constraint_count.data[world];
+    if (m > {M}) m = {M};
+    if (m == 0) return;
+    const int world_base = world * {M};
+    const int off_base = world * {NE};
+    const int seg_start = world_color_offsets.data[off_base + color];
+    const int seg_end = world_color_offsets.data[off_base + color + 1];
+    const int w = seg_start + (tid - world * {U});
+    if (w >= seg_end) return;
+    const int start_slot = world_row_order.data[world_base + w];
+{body}
+#endif
+"""
+    leftover_snippet = f"""
+#if defined(__CUDA_ARCH__)
+    const int world = tid;
+    if (world >= world_count) return;
+    int m = propagation_constraint_count.data[world];
+    if (m > {M}) m = {M};
+    if (m == 0) return;
+    const int world_base = world * {M};
+    const int off_base = world * {NE};
+    const int n_units = world_color_offsets.data[off_base + {NE} - 1];
+    int seg_start = world_color_offsets.data[off_base + {C}];
+    for (int c = {C}; c + 1 < {NE} && seg_start < n_units; ++c) {{
+        const int seg_end = world_color_offsets.data[off_base + c + 1];
+        for (int w = seg_start; w < seg_end; ++w) {{
+            const int start_slot = world_row_order.data[world_base + w];
+{body}
+        }}
+        seg_start = seg_end;
+    }}
+#endif
+"""
+    header = "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA
+    color_snippet = color_snippet.replace("#if defined(__CUDA_ARCH__)", header, 1)
+    leftover_snippet = leftover_snippet.replace("#if defined(__CUDA_ARCH__)", header, 1)
+
+    @wp.func_native(color_snippet)
+    def colored_grid_color_native(
+        tid: int,
+        world_count: int,
+        propagation_constraint_count: wp.array[int],
+        propagation_body_a: wp.array2d[int],
+        propagation_body_b: wp.array2d[int],
+        propagation_MiJt_a: wp.array3d[float],
+        propagation_MiJt_b: wp.array3d[float],
+        propagation_J_a: wp.array3d[float],
+        propagation_J_b: wp.array3d[float],
+        propagation_eff_mass_inv: wp.array2d[float],
+        propagation_rhs: wp.array2d[float],
+        propagation_row_w: wp.array2d[float],
+        propagation_row_type: wp.array2d[int],
+        propagation_row_parent: wp.array2d[int],
+        propagation_row_mu: wp.array2d[float],
+        world_row_order: wp.array[int],
+        world_color_offsets: wp.array[int],
+        omega: float,
+        regularize: int,
+        friction_start_iteration: int,
+        global_iter: int,
+        color: int,
+        propagation_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        propagation_body_impulses: wp.array2d[float],
+    ): ...
+
+    @wp.func_native(leftover_snippet)
+    def colored_grid_leftover_native(
+        tid: int,
+        world_count: int,
+        propagation_constraint_count: wp.array[int],
+        propagation_body_a: wp.array2d[int],
+        propagation_body_b: wp.array2d[int],
+        propagation_MiJt_a: wp.array3d[float],
+        propagation_MiJt_b: wp.array3d[float],
+        propagation_J_a: wp.array3d[float],
+        propagation_J_b: wp.array3d[float],
+        propagation_eff_mass_inv: wp.array2d[float],
+        propagation_rhs: wp.array2d[float],
+        propagation_row_w: wp.array2d[float],
+        propagation_row_type: wp.array2d[int],
+        propagation_row_parent: wp.array2d[int],
+        propagation_row_mu: wp.array2d[float],
+        world_row_order: wp.array[int],
+        world_color_offsets: wp.array[int],
+        omega: float,
+        regularize: int,
+        friction_start_iteration: int,
+        global_iter: int,
+        propagation_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        propagation_body_impulses: wp.array2d[float],
+    ): ...
+
+    def colored_grid_color_template(
+        world_count: int,
+        propagation_constraint_count: wp.array[int],
+        propagation_body_a: wp.array2d[int],
+        propagation_body_b: wp.array2d[int],
+        propagation_MiJt_a: wp.array3d[float],
+        propagation_MiJt_b: wp.array3d[float],
+        propagation_J_a: wp.array3d[float],
+        propagation_J_b: wp.array3d[float],
+        propagation_eff_mass_inv: wp.array2d[float],
+        propagation_rhs: wp.array2d[float],
+        propagation_row_w: wp.array2d[float],
+        propagation_row_type: wp.array2d[int],
+        propagation_row_parent: wp.array2d[int],
+        propagation_row_mu: wp.array2d[float],
+        world_row_order: wp.array[int],
+        world_color_offsets: wp.array[int],
+        omega: float,
+        regularize: int,
+        friction_start_iteration: int,
+        global_iter: int,
+        color: int,
+        propagation_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        propagation_body_impulses: wp.array2d[float],
+    ):
+        tid = wp.tid()
+        colored_grid_color_native(
+            tid,
+            world_count,
+            propagation_constraint_count,
+            propagation_body_a,
+            propagation_body_b,
+            propagation_MiJt_a,
+            propagation_MiJt_b,
+            propagation_J_a,
+            propagation_J_b,
+            propagation_eff_mass_inv,
+            propagation_rhs,
+            propagation_row_w,
+            propagation_row_type,
+            propagation_row_parent,
+            propagation_row_mu,
+            world_row_order,
+            world_color_offsets,
+            omega,
+            regularize,
+            friction_start_iteration,
+            global_iter,
+            color,
+            propagation_impulses,
+            propagation_body_qd,
+            propagation_body_impulses,
+        )
+
+    def colored_grid_leftover_template(
+        world_count: int,
+        propagation_constraint_count: wp.array[int],
+        propagation_body_a: wp.array2d[int],
+        propagation_body_b: wp.array2d[int],
+        propagation_MiJt_a: wp.array3d[float],
+        propagation_MiJt_b: wp.array3d[float],
+        propagation_J_a: wp.array3d[float],
+        propagation_J_b: wp.array3d[float],
+        propagation_eff_mass_inv: wp.array2d[float],
+        propagation_rhs: wp.array2d[float],
+        propagation_row_w: wp.array2d[float],
+        propagation_row_type: wp.array2d[int],
+        propagation_row_parent: wp.array2d[int],
+        propagation_row_mu: wp.array2d[float],
+        world_row_order: wp.array[int],
+        world_color_offsets: wp.array[int],
+        omega: float,
+        regularize: int,
+        friction_start_iteration: int,
+        global_iter: int,
+        propagation_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        propagation_body_impulses: wp.array2d[float],
+    ):
+        tid = wp.tid()
+        colored_grid_leftover_native(
+            tid,
+            world_count,
+            propagation_constraint_count,
+            propagation_body_a,
+            propagation_body_b,
+            propagation_MiJt_a,
+            propagation_MiJt_b,
+            propagation_J_a,
+            propagation_J_b,
+            propagation_eff_mass_inv,
+            propagation_rhs,
+            propagation_row_w,
+            propagation_row_type,
+            propagation_row_parent,
+            propagation_row_mu,
+            world_row_order,
+            world_color_offsets,
+            omega,
+            regularize,
+            friction_start_iteration,
+            global_iter,
+            propagation_impulses,
+            propagation_body_qd,
+            propagation_body_impulses,
+        )
+
+    name = f"pgs_solve_propagation_colored_grid_{M}_{NE}_u{U}_c{C}"
+    colored_grid_color_template.__name__ = name + "_color"
+    colored_grid_color_template.__qualname__ = name + "_color"
+    colored_grid_leftover_template.__name__ = name + "_leftover"
+    colored_grid_leftover_template.__qualname__ = name + "_leftover"
+    return (
+        wp.kernel(enable_backward=False, module="unique")(colored_grid_color_template),
+        wp.kernel(enable_backward=False, module="unique")(colored_grid_leftover_template),
+    )
+
+
+def _get_pgs_solve_propagation_colored_block_kernel(
+    propagation_max_constraints: int,
+    n_color_entries: int,
+    block_dim: int,
+    max_propagation_bodies: int,
+    device_arch: str,
+) -> "wp.Kernel":
+    """Build the block-local colored propagation solver over contact units.
+
+    One thread block per world sweeps unit colors sequentially with
+    ``__syncthreads()`` barriers; within a color each thread owns one
+    contact unit (start slot from ``world_row_order``) and solves its rows
+    in slot order — the unit's rows share bodies, so in-thread ordering is
+    exact Gauss-Seidel, while units of one color share no body and write
+    race-free. The tail segment (color-cap overflow) runs ordered on
+    thread 0. One launch per PGS iteration regardless of color count.
+    """
+    M = propagation_max_constraints
+    NE = n_color_entries
+    B = int(block_dim)
+    contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
+    friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
+    # shared staging of per-world body velocity + deferred impulse: 48B/body.
+    # compile-time decision per model; above the cap the kernel keeps the
+    # global-memory path (no per-step behavior switches).
+    MB = max(int(max_propagation_bodies), 1)
+    use_staging = MB <= 384
+
+    unit_solve_body = _propagation_unit_solve_body(contact_type, friction_type)
 
     unit_solve_body_staged = f"""
             for (int rr = 0; ; ++rr) {{
