@@ -5284,7 +5284,10 @@ class SolverFeatherPGS(SolverBase):
         if self._propagation_colored:
             total_rows = worlds * propagation_max_c
             n_entries = PROPAGATION_COLOR_TAIL + 2
-            self.color_body_ticket = wp.zeros((body_count,), dtype=wp.int32, device=device)
+            # one 256-bit used-color mask per body for the greedy coloring
+            self.color_body_ticket = wp.zeros(
+                (body_count * ((PROPAGATION_COLOR_TAIL + 31) // 32),), dtype=wp.int32, device=device
+            )
             self.color_world_offsets = wp.zeros((worlds * n_entries,), dtype=wp.int32, device=device)
             self.color_world_row_order = wp.zeros((total_rows,), dtype=wp.int32, device=device)
             self.color_unit_contact = wp.zeros((total_rows,), dtype=wp.int32, device=device)
@@ -15346,9 +15349,9 @@ def _get_color_propagation_prebuild_kernel(
     """Build the pre-build contact-unit coloring kernel (v4 layout).
 
     Runs after contact classification and BEFORE row build: each block colors
-    its world's propagation contacts (round-tagged ticket bidding over a
-    compacted worklist, keys on global contact index for determinism of the
-    coloring), counting-sorts units by color, and rewrites ``contact_slot``
+    its world's propagation contacts (first-fit greedy edge coloring over the
+    unit list with per-body used-color bitmasks), counting-sorts units by
+    color, and rewrites ``contact_slot``
     so the row builder writes every unit's rows at a color-ordered slot.
     Color segments therefore occupy contiguous row memory and the colored
     solve kernel's payload reads are sequential — no post-build permutation,
@@ -15360,6 +15363,7 @@ def _get_color_propagation_prebuild_kernel(
     NE = n_color_entries
     B = int(block_dim)
     cap = NE - 2  # color cap; index NE-2 is the tail bucket
+    WORDS = (cap + 31) // 32  # used-color bitmask words per body
     U = int(max_units) if max_units is not None else M  # contact units staged in shared memory
 
     snippet = f"""
@@ -15377,65 +15381,54 @@ def _get_color_propagation_prebuild_kernel(
     }}
     const int world_base = world * {M};
 
-    __shared__ int s_n_work;
-    __shared__ int s_next_work;
     __shared__ int s_counts[{NE}];
     __shared__ int s_offsets[{NE}];
     __shared__ short s_unit_color[{U}];
-    __shared__ short s_work[{U}];
-    __shared__ short s_work_next[{U}];
     __shared__ short s_sorted[{U}];
 
-    if (t == 0) {{
-        s_n_work = n_units;
-        s_next_work = 0;
-    }}
+    // body_ticket holds one {WORDS}-word used-color bitmask per body
     for (int u = t; u < n_units; u += {B}) {{
         s_unit_color[u] = -1;
-        s_work[u] = (short)u;
         const int ba = unit_body_a.data[world_base + u];
         const int bb = unit_body_b.data[world_base + u];
-        if (ba >= 0) body_ticket.data[ba] = 0;
-        if (bb >= 0) body_ticket.data[bb] = 0;
+        for (int word = 0; word < {WORDS}; ++word) {{
+            if (ba >= 0) body_ticket.data[ba * {WORDS} + word] = 0;
+            if (bb >= 0) body_ticket.data[bb * {WORDS} + word] = 0;
+        }}
     }}
     __syncthreads();
 
-    for (int round_idx = 1; round_idx <= {cap}; ++round_idx) {{
-        const int n_work = s_n_work;
-        if (n_work == 0) break;
-        for (int w = t; w < n_work; w += {B}) {{
-            const int u = (int)s_work[w];
-            // key on the global contact index: deterministic coloring
-            // independent of the atomic list-build order
-            const int key = (round_idx << 23) | (0x7FFFFF - (unit_contact.data[world_base + u] & 0x7FFFFF));
+    // First-fit greedy edge coloring on one thread: a unit takes the lowest color that
+    // neither of its bodies uses yet. Deterministic in unit order, at most 2*degree-1
+    // colors, and every color is a near-maximal matching, so the per-color sweep
+    // parallelism is bounded by the body count. (Round-based ticket bidding only
+    // admitted mutual-minimum units per round and degenerated to ~3 units per color
+    // with half the units in the serial tail on a dense 235-body pile.)
+    if (t == 0) {{
+        for (int u = 0; u < n_units; ++u) {{
             const int ba = unit_body_a.data[world_base + u];
             const int bb = unit_body_b.data[world_base + u];
-            if (ba >= 0) atomicMax(&body_ticket.data[ba], key);
-            if (bb >= 0) atomicMax(&body_ticket.data[bb], key);
-        }}
-        __syncthreads();
-        for (int w = t; w < n_work; w += {B}) {{
-            const int u = (int)s_work[w];
-            const int key = (round_idx << 23) | (0x7FFFFF - (unit_contact.data[world_base + u] & 0x7FFFFF));
-            const int ba = unit_body_a.data[world_base + u];
-            const int bb = unit_body_b.data[world_base + u];
-            if ((ba < 0 || body_ticket.data[ba] == key) && (bb < 0 || body_ticket.data[bb] == key)) {{
-                s_unit_color[u] = (short)(round_idx - 1);
-            }} else {{
-                const int idx = atomicAdd(&s_next_work, 1);
-                s_work_next[idx] = (short)u;
+            int color = {cap};
+            for (int word = 0; word < {WORDS}; ++word) {{
+                unsigned used = 0u;
+                if (ba >= 0) used |= (unsigned)body_ticket.data[ba * {WORDS} + word];
+                if (bb >= 0) used |= (unsigned)body_ticket.data[bb * {WORDS} + word];
+                const unsigned free_bits = ~used;
+                if (free_bits != 0u) {{
+                    const int bit = __ffs(free_bits) - 1;
+                    const int c = word * 32 + bit;
+                    if (c < {cap}) {{
+                        color = c;
+                        if (ba >= 0) body_ticket.data[ba * {WORDS} + word] |= (int)(1u << bit);
+                        if (bb >= 0) body_ticket.data[bb * {WORDS} + word] |= (int)(1u << bit);
+                    }}
+                    break;
+                }}
             }}
+            s_unit_color[u] = (short)color;
         }}
-        __syncthreads();
-        const int n_remaining = s_next_work;
-        __syncthreads();
-        if (t == 0) {{
-            s_n_work = n_remaining;
-            s_next_work = 0;
-        }}
-        for (int w = t; w < n_remaining; w += {B}) s_work[w] = s_work_next[w];
-        __syncthreads();
     }}
+    __syncthreads();
 
     for (int u = t; u < n_units; u += {B}) {{
         if (s_unit_color[u] == -1) s_unit_color[u] = {cap};
