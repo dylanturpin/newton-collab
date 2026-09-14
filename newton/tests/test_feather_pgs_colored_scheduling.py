@@ -1,0 +1,154 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for the contact-unit coloring behind ``articulated_contact_response='propagation-colored'``.
+
+The colored sweep solves one color at a time, in parallel within a color; units that do
+not fit the color budget run in an ordered serial tail. A coloring that produces few units
+per color, or spills into the tail, turns the sweep serial, which is what these tests guard.
+"""
+
+import unittest
+
+import numpy as np
+import warp as wp
+
+import newton
+from newton._src.solvers.feather_pgs.solver_feather_pgs import PROPAGATION_COLOR_TAIL
+
+
+def _heap(nx=6, ny=6, nz=3, pitch=0.042, half=0.02, kinematic_tray=False):
+    """A dense heap of touching boxes on the ground, optionally inside a kinematic tray."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.rigid_gap = 0.002
+    builder.add_ground_plane()
+    tray = -1
+    if kinematic_tray:
+        # One kinematic body under the whole heap: every box rests on it, so it is a hub
+        # touching every contact unit of the bottom layer.
+        tray = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.01), wp.quat_identity()), is_kinematic=True)
+        builder.add_shape_box(tray, hx=nx * pitch, hy=ny * pitch, hz=0.01)
+    z0 = 0.04 if kinematic_tray else 0.021
+    for ix in range(nx):
+        for iy in range(ny):
+            for iz in range(nz):
+                b = builder.add_body(
+                    xform=wp.transform(
+                        wp.vec3((ix - nx / 2) * pitch, (iy - ny / 2) * pitch, z0 + iz * (2 * half + 0.001)),
+                        wp.quat_identity(),
+                    )
+                )
+                builder.add_shape_box(b, hx=half, hy=half, hz=half)
+    return builder.finalize(), tray
+
+
+def _color_counts(solver):
+    """Units per color for world 0; the last live entry is the serial overflow tail."""
+    entries = PROPAGATION_COLOR_TAIL + 2
+    offsets = solver.color_world_offsets.numpy()[:entries].astype(np.int64)
+    counts = np.diff(offsets)
+    return counts[:PROPAGATION_COLOR_TAIL], int(counts[PROPAGATION_COLOR_TAIL])
+
+
+def _settle(model, steps=12, **solver_kwargs):
+    model.rigid_contact_max = 8192  # sizes the solver's contact scratch; set before construction
+    solver = newton.solvers.SolverFeatherPGS(
+        model,
+        pgs_mode="matrix_free",
+        articulated_contact_response="propagation-colored",
+        pgs_iterations=6,
+        mf_max_constraints=8192,
+        dense_max_constraints=64,
+        **solver_kwargs,
+    )
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=8192)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    for _ in range(steps):
+        state_0.clear_forces()
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    return solver, state_0, int(contacts.rigid_contact_count.numpy()[0])
+
+
+@unittest.skipUnless(wp.get_device().is_cuda, "propagation-colored requires CUDA")
+class TestFeatherPGSColoredScheduling(unittest.TestCase):
+    def test_dense_heap_colors_without_a_serial_tail(self):
+        """A dense heap must color into few colors with nothing left for the serial tail.
+
+        Round-based ticket bidding admitted only the units holding the maximum ticket on
+        both of their bodies, which on a heap is a handful per round: it exhausted the
+        color budget and spilled most units into the ordered serial tail, making the
+        sweep serial. First-fit greedy edge coloring is bounded by 2*degree-1 colors.
+        """
+        model, _ = _heap()
+        solver, state, contacts = _settle(model)
+        self.assertTrue(np.isfinite(state.body_q.numpy()).all())
+        self.assertGreater(contacts, 400, "heap did not generate a dense contact set")
+
+        counts, tail = _color_counts(solver)
+        used = int(np.sum(counts > 0))
+        self.assertEqual(tail, 0, f"{tail} units spilled into the serial overflow tail")
+        self.assertLess(used, PROPAGATION_COLOR_TAIL // 2, f"coloring used {used} colors")
+        self.assertGreater(
+            counts[counts > 0].mean(), 8.0, "colors hold too few units each; the sweep is effectively serial"
+        )
+
+    def test_kinematic_hub_does_not_serialize_its_contacts(self):
+        """One kinematic body under the whole heap must not multiply the color count.
+
+        A prescribed body takes no velocity update from a row, so rows touching it cannot
+        conflict with each other. Counting it as a conflicting body gives every contact
+        against the tray its own color, so the count scales with the number of boxes
+        resting on it; exempting it keeps the coloring close to the tray-free heap.
+        """
+        model_free, _ = _heap()
+        solver_free, _, _ = _settle(model_free)
+        counts_free, tail_free = _color_counts(solver_free)
+        colors_free = int(np.sum(counts_free > 0))
+
+        model_hub, tray = _heap(kinematic_tray=True)
+        self.assertGreaterEqual(tray, 0)
+        solver_hub, state, _ = _settle(model_hub)
+        self.assertTrue(np.isfinite(state.body_q.numpy()).all())
+        counts_hub, tail_hub = _color_counts(solver_hub)
+        colors_hub = int(np.sum(counts_hub > 0))
+
+        self.assertEqual(tail_free, 0)
+        self.assertEqual(tail_hub, 0)
+        self.assertLessEqual(
+            colors_hub,
+            1.5 * colors_free + 8,
+            f"a kinematic hub raised the color count from {colors_free} to {colors_hub}",
+        )
+
+    def test_colored_result_matches_the_immediate_response(self):
+        """The colored schedule must settle the heap like the reference row path."""
+        model, _ = _heap(nx=4, ny=4, nz=2)
+        _, colored, _ = _settle(model, steps=24)
+        model_ref, _ = _heap(nx=4, ny=4, nz=2)
+        model_ref.rigid_contact_max = 8192
+        solver = newton.solvers.SolverFeatherPGS(
+            model_ref, pgs_mode="matrix_free", articulated_contact_response="immediate", pgs_iterations=6
+        )
+        pipeline = newton.CollisionPipeline(model_ref, rigid_contact_max=8192)
+        contacts = pipeline.contacts()
+        s0, s1 = model_ref.state(), model_ref.state()
+        control = model_ref.control()
+        for _ in range(24):
+            s0.clear_forces()
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, control, contacts, 1.0 / 240.0)
+            s0, s1 = s1, s0
+
+        a = colored.body_q.numpy()[:, :3]
+        b = s0.body_q.numpy()[:, :3]
+        self.assertTrue(np.isfinite(b).all())
+        # Different sweep order, so not bitwise equal; the heap must still stand.
+        self.assertLess(float(np.max(np.abs(a[:, 2] - b[:, 2]))), 0.01)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -135,6 +135,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 contact_shape0,
                 contact_shape1,
                 wp.zeros((1,), dtype=wp.int32, device=device),
+                wp.zeros((1,), dtype=wp.int32, device=device),  # body_prescribed: none here
                 contact_slots_needed,
                 row_capacity,
             ],
