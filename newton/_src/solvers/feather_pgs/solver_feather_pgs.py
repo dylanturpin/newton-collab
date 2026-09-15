@@ -982,11 +982,14 @@ class SolverFeatherPGS(SolverBase):
                 material torsion default. Sliding and spin share one Coulomb budget.
                 Currently supports dense articulated contacts in CUDA matrix-free,
                 immediate/current/interleaved mode without warmstarting, graph capture,
-                hydroelastic contact, persistent friction patches, regularization,
+                hydroelastic contact, contact compliance, regularization,
                 debug mode, or velocity post-passes. Radius and selectors are
-                construction-only; recreate the solver to change them. A positive radius
-                with omitted ``friction_anchor_beta`` selects point friction and warns;
-                an explicit positive patch gain is rejected. Capacity
+                construction-only; recreate the solver to change them. With point
+                friction, one spin row bounds each coplanar exact-shape-pair group. With
+                persistent friction patches (the default ``friction_anchor_beta``), one
+                spin row bounds each patch region by the region's pooled normal load
+                times the undivided friction coefficient, less the tangent impulses of
+                its anchor rows; normal rows stay independent. Capacity
                 exhaustion raises even when optional overflow diagnostics are off. Host
                 grouping is diagnostic, not optimized for throughput. This experimental
                 parameter may change without the normal deprecation policy.
@@ -1070,7 +1073,8 @@ class SolverFeatherPGS(SolverBase):
                 select up to two friction locations per region, and share the total
                 normal impulse equally between those anchors. Normal contacts are preserved.
                 Twisting resistance comes only from the separation between the anchors;
-                a single-anchor region has no independent torsional stiction constraint.
+                a single-anchor region has no independent torsional stiction constraint
+                unless ``contact_torsion_radius`` adds one bounded spin row per region.
                 For uniform pad-friction randomization, sample one coefficient per pad
                 and assign it to all constituent convex shapes. Different coefficients
                 define separate regions and are not pooled across material boundaries.
@@ -1413,11 +1417,11 @@ class SolverFeatherPGS(SolverBase):
         if friction_anchor_beta is None:
             # An explicit point algorithm remains a valid way to select point
             # friction. The ordinary constructor enables persistent patches.
-            if contact_compliance or float(contact_torsion_radius) > 0.0:
+            if contact_compliance:
                 friction_anchor_beta = 0.0
                 warnings.warn(
                     "The selected contact material law uses velocity-only point friction; "
-                    "contact_compliance and contact torsion do not support persistent friction patches. "
+                    "contact_compliance does not support persistent friction patches. "
                     "Set friction_anchor_beta=0 explicitly to retain this law without the warning.",
                     UserWarning,
                     stacklevel=2,
