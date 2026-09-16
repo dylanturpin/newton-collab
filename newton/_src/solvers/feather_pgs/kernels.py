@@ -11820,22 +11820,24 @@ def pgs_ncp_residuals_diagnostic_velocity(
 # coloring because a row's siblings share its bodies and therefore can never
 # share its color.
 #
-# Coloring is a deterministic parallel greedy (PhysX-style): per round, every
-# uncolored row bids for its bodies with an atomic-min ticket (flat row id);
-# a row that wins the ticket on both of its dynamic bodies commits to the
-# lowest color bit free in both bodies' masks. Winner-per-body uniqueness
-# makes the mask update single-writer, and min-ticket makes the whole
-# coloring deterministic. Rows still uncolored after the round cap go to a
-# serial tail bucket (color PROPAGATION_COLOR_TAIL) processed by a per-world
-# ordered sweep — measured and reported, never silent.
+# Coloring is first-fit greedy edge coloring over the world's contact units taken
+# in global-contact-index order (the pre-build kernel sorts them first, so the
+# schedule is independent of the atomic list-build order): a unit takes the lowest
+# color neither of its bodies uses yet, tracked as one bitmask per body. That uses
+# at most 2*degree-1 colors and makes every color a near-maximal matching. Units
+# that find no free color below the cap go to a serial tail bucket (color
+# PROPAGATION_COLOR_TAIL) processed by a per-world ordered sweep — measured and
+# reported, never silent. A kinematic free rigid body has no response, so it is
+# recorded as -1 like the world and never counts as a conflict.
+#
+# Edge coloring needs at least max-degree colors and first-fit uses up to
+# 2*degree-1. A dense raw-mesh pile (P12: 60 GraspNet meshes, ~7000 contact
+# units on 61 bodies) puts ~230 units on a body, so 256 colors left a quarter of
+# the units in the serial tail; 512 leaves under 2%. Small scenes are unaffected:
+# the solve kernels stop at the last non-empty color.
 
-PROPAGATION_MAX_COLORS = 256
-PROPAGATION_COLOR_TAIL = 256
-# round-tagged ticket key: (round << 23) | (0x7FFFFF - flat_row_id).
-# atomic_max prefers the current round over stale rounds (bigger high bits)
-# and the smallest row id within a round (bigger low bits), so tickets never
-# need re-initialization between rounds. Flat row ids must stay < 2^23.
-PROPAGATION_COLOR_ROW_ID_LIMIT = 1 << 23
+PROPAGATION_MAX_COLORS = 512
+PROPAGATION_COLOR_TAIL = 512
 
 
 @wp.kernel(enable_backward=False)
@@ -11846,6 +11848,7 @@ def collect_propagation_units(
     contact_shape0: wp.array[int],
     contact_shape1: wp.array[int],
     shape_body: wp.array[int],
+    body_prescribed: wp.array[int],
     contact_slots_needed: wp.array[int],
     propagation_max_constraints: int,
     # in/out
@@ -11856,7 +11859,14 @@ def collect_propagation_units(
     unit_body_b: wp.array[int],
     unit_len: wp.array[int],
 ):
-    """Gather propagation-path contacts into per-world unit lists for pre-build coloring."""
+    """Gather propagation-path contacts into per-world unit lists for pre-build coloring.
+
+    A prescribed body (``body_prescribed`` marks kinematic free rigid bodies, whose
+    response is identically zero) never receives a velocity update from a row, so rows
+    touching it do not conflict: it is recorded as ``-1`` like the world. Otherwise a
+    kinematic hub (a tray, a conveyor) forces every one of its contacts into a separate
+    color or the serial tail.
+    """
     c = wp.tid()
     if c >= contact_count[0]:
         return
@@ -11873,8 +11883,12 @@ def collect_propagation_units(
     sb = contact_shape1[c]
     if sa >= 0:
         body_a = shape_body[sa]
+        if body_a >= 0 and body_prescribed[body_a] != 0:
+            body_a = -1
     if sb >= 0:
         body_b = shape_body[sb]
+        if body_b >= 0 and body_prescribed[body_b] != 0:
+            body_b = -1
     unit_contact[base + idx] = c
     unit_body_a[base + idx] = body_a
     unit_body_b[base + idx] = body_b
