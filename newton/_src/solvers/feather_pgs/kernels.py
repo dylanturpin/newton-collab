@@ -11829,9 +11829,15 @@ def pgs_ncp_residuals_diagnostic_velocity(
 # PROPAGATION_COLOR_TAIL) processed by a per-world ordered sweep — measured and
 # reported, never silent. A kinematic free rigid body has no response, so it is
 # recorded as -1 like the world and never counts as a conflict.
+#
+# Edge coloring needs at least max-degree colors and first-fit uses up to
+# 2*degree-1. A dense raw-mesh pile (P12: 60 GraspNet meshes, ~7000 contact
+# units on 61 bodies) puts ~230 units on a body, so 256 colors left a quarter of
+# the units in the serial tail; 512 leaves under 2%. Small scenes are unaffected:
+# the solve kernels stop at the last non-empty color.
 
-PROPAGATION_MAX_COLORS = 256
-PROPAGATION_COLOR_TAIL = 256
+PROPAGATION_MAX_COLORS = 512
+PROPAGATION_COLOR_TAIL = 512
 
 
 @wp.kernel(enable_backward=False)
