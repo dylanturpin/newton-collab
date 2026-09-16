@@ -1257,7 +1257,8 @@ class SolverFeatherPGS(SolverBase):
                 :class:`NotImplementedError` instead of falling back to split propagation.
                 ``"propagation-colored"`` uses the propagation response model but replaces the
                 serial per-world row sweep with graph-colored batches: rows are colored per step
-                so no two rows of a color share a body, and each color solves as one flat
+                so no two rows of a color share a responding body (a kinematic free rigid body
+                has no response and may be shared), and each color solves as one flat
                 thread-per-row launch across all worlds (colors sequential, tree sweep per
                 iteration unchanged). Color-overflow rows run in an ordered serial tail bucket.
                 Defaults to ``"immediate"``.
@@ -1854,6 +1855,7 @@ class SolverFeatherPGS(SolverBase):
             self._model_plan.prescribed_articulation, dtype=wp.int32, device=model.device
         )
         self._has_prescribed_response = bool(np.any(self._model_plan.prescribed_articulation != 0))
+        self._refresh_body_prescribed()
         self._compute_articulation_metadata(model)
         self._validate_heterogeneous_world_support(model)
         # Loop-closing joints are excluded from the tree (see _FeatherPGSModelPlan.build)
@@ -2518,9 +2520,27 @@ class SolverFeatherPGS(SolverBase):
         self._kinematic_dof_mask_host = dof_mask.copy()
         self._kinematic_joint_mask.assign(joint_mask)
         self._kinematic_dof_mask.assign(dof_mask)
-        if model.body_count:
-            body_prescribed = ((model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0).astype(np.int32)
-            self._body_prescribed.assign(body_prescribed)
+        self._refresh_body_prescribed()
+
+    def _refresh_body_prescribed(self) -> None:
+        """Mark bodies whose propagation response is identically zero.
+
+        Only a kinematic free rigid body qualifies: its spatial inverse inertia is
+        zeroed, so no contact row ever updates its velocity and rows sharing it may
+        share a color. The kinematic root of a multi-body articulation still carries the
+        tree response of its joint dofs (the factorization does not read the kinematic
+        flag), so it stays a coloring conflict. Requires the model plan.
+        """
+        model = self.model
+        if not model.body_count or self._model_plan is None:
+            return
+        prescribed = np.zeros(model.body_count, dtype=np.int32)
+        if model.joint_count and model.articulation_count:
+            kinematic = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
+            first_joints = model.articulation_start.numpy()[:-1][self._model_plan.is_free_rigid != 0]
+            free_bodies = model.joint_child.numpy()[first_joints]
+            prescribed[free_bodies] = kinematic[free_bodies]
+        self._body_prescribed.assign(prescribed)
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:

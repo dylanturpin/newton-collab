@@ -11859,10 +11859,11 @@ def collect_propagation_units(
 ):
     """Gather propagation-path contacts into per-world unit lists for pre-build coloring.
 
-    A prescribed (kinematic) body never receives a velocity update from a row, so rows
+    A prescribed body (``body_prescribed`` marks kinematic free rigid bodies, whose
+    response is identically zero) never receives a velocity update from a row, so rows
     touching it do not conflict: it is recorded as ``-1`` like the world. Otherwise a
-    kinematic hub (a held container full of parts) forces every one of its contacts into
-    a separate color or the serial tail.
+    kinematic hub (a tray, a conveyor) forces every one of its contacts into a separate
+    color or the serial tail.
     """
     c = wp.tid()
     if c >= contact_count[0]:

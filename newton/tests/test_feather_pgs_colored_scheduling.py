@@ -149,6 +149,46 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
         # Different sweep order, so not bitwise equal; the heap must still stand.
         self.assertLess(float(np.max(np.abs(a[:, 2] - b[:, 2]))), 0.01)
 
+    def test_prescribed_mask_marks_only_kinematic_free_bodies(self):
+        """Only a kinematic free rigid body has a zero response and may be shared by a color.
+
+        The kinematic root of a multi-body articulation still carries the tree response of
+        its joint dofs (the factorization does not read the kinematic flag), so it must
+        remain a coloring conflict; the builder only allows kinematic bodies at roots.
+        """
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        builder.add_ground_plane()
+        free_kinematic = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), is_kinematic=True
+        )
+        builder.add_shape_box(free_kinematic, hx=0.1, hy=0.1, hz=0.1)
+        free_dynamic = builder.add_body(xform=wp.transform(wp.vec3(1.0, 0.0, 0.5), wp.quat_identity()))
+        builder.add_shape_box(free_dynamic, hx=0.1, hy=0.1, hz=0.1)
+        # add_link, not add_body: add_body wraps each body in its own free-joint articulation.
+        root = builder.add_link(xform=wp.transform(wp.vec3(2.0, 0.0, 0.5), wp.quat_identity()), is_kinematic=True)
+        builder.add_shape_box(root, hx=0.1, hy=0.1, hz=0.1)
+        j_root = builder.add_joint_revolute(parent=-1, child=root, axis=wp.vec3(0.0, 1.0, 0.0))
+        link = builder.add_link(xform=wp.transform(wp.vec3(2.0, 0.0, 0.8), wp.quat_identity()))
+        builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
+        j_link = builder.add_joint_revolute(
+            parent=root,
+            child=link,
+            axis=wp.vec3(0.0, 1.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity()),
+        )
+        builder.add_articulation([j_root, j_link], label="kinematic_root_chain")
+        model = builder.finalize()
+        model.rigid_contact_max = 256
+        solver = newton.solvers.SolverFeatherPGS(
+            model, pgs_mode="matrix_free", articulated_contact_response="propagation-colored", mf_max_constraints=256
+        )
+        prescribed = solver._body_prescribed.numpy()
+        self.assertEqual(int(prescribed[free_kinematic]), 1)
+        self.assertEqual(int(prescribed[free_dynamic]), 0)
+        self.assertEqual(int(prescribed[root]), 0)
+        self.assertEqual(int(prescribed[link]), 0)
+
+
 
 if __name__ == "__main__":
     unittest.main()
