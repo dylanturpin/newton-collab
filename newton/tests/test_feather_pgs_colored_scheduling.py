@@ -149,6 +149,46 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
         # Different sweep order, so not bitwise equal; the heap must still stand.
         self.assertLess(float(np.max(np.abs(a[:, 2] - b[:, 2]))), 0.01)
 
+    def test_coloring_is_deterministic_for_a_fixed_contact_set(self):
+        """Same state and contacts must give the same partition and the same velocities.
+
+        The unit list is gathered with an atomic cursor, so its order differs between
+        launches; the coloring must not inherit that order. The pre-build kernel sorts
+        units by global contact index before the order-dependent greedy pass.
+        """
+        model, _ = _heap()
+        _, state, _ = _settle(model)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=8192)
+        contacts = pipeline.contacts()
+        state.clear_forces()
+        pipeline.collide(state, contacts)
+        control = model.control()
+        results = []
+        for _ in range(3):
+            state_in, state_out = model.state(), model.state()
+            for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
+                getattr(state_in, name).assign(getattr(state, name))
+            trial = newton.solvers.SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                articulated_contact_response="propagation-colored",
+                pgs_iterations=6,
+                pgs_warmstart=False,
+                mf_max_constraints=8192,
+                dense_max_constraints=64,
+            )
+            trial.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+            entries = PROPAGATION_COLOR_TAIL + 2
+            offsets = trial.color_world_offsets.numpy()[:entries].copy()
+            order = trial.color_unit_sorted.numpy()[: offsets[-1]].copy()
+            results.append((offsets, order, state_out.body_qd.numpy().copy()))
+        offsets, order, body_qd = results[0]
+        self.assertGreater(int(offsets[-1]), 400)
+        for other_offsets, other_order, other_qd in results[1:]:
+            np.testing.assert_array_equal(other_offsets, offsets)
+            np.testing.assert_array_equal(other_order, order)
+            np.testing.assert_array_equal(other_qd, body_qd)
+
     def test_prescribed_mask_marks_only_kinematic_free_bodies(self):
         """Only a kinematic free rigid body has a zero response and may be shared by a color.
 
@@ -188,6 +228,18 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
         self.assertEqual(int(prescribed[root]), 0)
         self.assertEqual(int(prescribed[link]), 0)
 
+    def test_colored_accepts_a_large_row_budget(self):
+        """The coloring keeps per-unit state in global scratch, so no staging cap applies."""
+        model, _ = _heap(nx=2, ny=2, nz=1)
+        model.rigid_contact_max = 65536
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            articulated_contact_response="propagation-colored",
+            mf_max_constraints=32768,
+            dense_max_constraints=2048,
+        )
+        self.assertEqual(int(solver.propagation_max_constraints), 32768 + 2048)
 
 
 if __name__ == "__main__":

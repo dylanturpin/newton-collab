@@ -11,7 +11,10 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import allocate_world_contact_slots, collect_propagation_units
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_color_propagation_prebuild_kernel
+from newton._src.solvers.feather_pgs.solver_feather_pgs import (
+    PROPAGATION_COLOR_TAIL,
+    _get_color_propagation_prebuild_kernel,
+)
 from newton.solvers import SolverFeatherPGS
 
 
@@ -27,7 +30,7 @@ def _build_model():
 
 
 class TestFeatherPGSContactCapacity(unittest.TestCase):
-    def _assert_mixed_units_reach_colored_tail(
+    def _assert_mixed_units_are_all_scheduled(
         self,
         *,
         contact_phi: tuple[float, ...],
@@ -38,8 +41,8 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
         device = wp.get_device("cuda:0")
         contact_count = len(contact_phi)
         row_capacity = 6
-        color_entries = 4
-        colored_unit_capacity = (row_capacity + 2) // 3
+        color_entries = contact_count + 2  # one color per unit, plus the tail and total entries
+        order_stride = 8  # power of two >= row_capacity
 
         contact_count_array = wp.array([contact_count], dtype=wp.int32, device=device)
         contact_shape0 = wp.zeros((contact_count,), dtype=wp.int32, device=device)
@@ -150,8 +153,8 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
             row_capacity,
             color_entries,
             64,
+            order_stride,
             str(device.arch),
-            max_units=colored_unit_capacity,
         )
         wp.launch_tiled(
             kernel,
@@ -163,7 +166,9 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 unit_body_a,
                 unit_body_b,
                 unit_len,
-                wp.zeros((1,), dtype=wp.int32, device=device),
+                wp.zeros(((PROPAGATION_COLOR_TAIL + 31) // 32,), dtype=wp.int32, device=device),  # body 0 mask
+                wp.zeros((order_stride,), dtype=wp.int32, device=device),
+                wp.zeros((row_capacity,), dtype=wp.int32, device=device),
                 contact_slot,
                 row_order,
                 color_offsets,
@@ -179,13 +184,15 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
         self.assertEqual(int(propagation_slot_counter.numpy()[0]), row_capacity)
         self.assertEqual(int(unit_cursor.numpy()[0]), contact_count)
 
+        # Every unit is colored (no staging cap, so nothing spills into the tail). All
+        # units share body 0, so each takes its own color, in contact-index order.
         offsets_np = color_offsets.numpy()
         self.assertEqual(int(offsets_np[-1]), contact_count)
-        self.assertEqual(int(offsets_np[-2]), colored_unit_capacity)
-        self.assertEqual(int(offsets_np[-1] - offsets_np[-2]), contact_count - colored_unit_capacity)
+        self.assertEqual(int(offsets_np[-1] - offsets_np[-2]), 0)
+        self.assertEqual(offsets_np[: contact_count + 1].tolist(), list(range(contact_count + 1)))
 
         sorted_contact_np = sorted_contact.numpy()[:contact_count]
-        self.assertEqual(sorted(sorted_contact_np.tolist()), list(range(contact_count)))
+        self.assertEqual(sorted_contact_np.tolist(), list(range(contact_count)))
         contact_slot_np = contact_slot.numpy()
         row_order_np = row_order.numpy()
         row_acc = 0
@@ -274,14 +281,14 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "propagation-colored prebuild requires CUDA")
     def test_colored_prebuild_preserves_mixed_contact_units(self):
-        """Route friction-gap and patch-selected one-row units through the serial tail."""
+        """Schedule friction-gap and patch-selected one-row units alongside three-row units."""
         scenarios = {
             "friction_gap": ((-0.01, 0.01, 0.02, 0.03), 0.0, 0),
             "patch_friction": ((-0.01, -0.01, -0.01, -0.01), float("inf"), 1),
         }
         for name, (contact_phi, friction_gap_threshold, patch_friction) in scenarios.items():
             with self.subTest(name=name):
-                self._assert_mixed_units_reach_colored_tail(
+                self._assert_mixed_units_are_all_scheduled(
                     contact_phi=contact_phi,
                     friction_gap_threshold=friction_gap_threshold,
                     patch_friction=patch_friction,

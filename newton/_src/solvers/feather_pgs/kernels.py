@@ -11820,22 +11820,18 @@ def pgs_ncp_residuals_diagnostic_velocity(
 # coloring because a row's siblings share its bodies and therefore can never
 # share its color.
 #
-# Coloring is a deterministic parallel greedy (PhysX-style): per round, every
-# uncolored row bids for its bodies with an atomic-min ticket (flat row id);
-# a row that wins the ticket on both of its dynamic bodies commits to the
-# lowest color bit free in both bodies' masks. Winner-per-body uniqueness
-# makes the mask update single-writer, and min-ticket makes the whole
-# coloring deterministic. Rows still uncolored after the round cap go to a
-# serial tail bucket (color PROPAGATION_COLOR_TAIL) processed by a per-world
-# ordered sweep — measured and reported, never silent.
+# Coloring is first-fit greedy edge coloring over the world's contact units taken
+# in global-contact-index order (the pre-build kernel sorts them first, so the
+# schedule is independent of the atomic list-build order): a unit takes the lowest
+# color neither of its bodies uses yet, tracked as one bitmask per body. That uses
+# at most 2*degree-1 colors and makes every color a near-maximal matching. Units
+# that find no free color below the cap go to a serial tail bucket (color
+# PROPAGATION_COLOR_TAIL) processed by a per-world ordered sweep — measured and
+# reported, never silent. A kinematic free rigid body has no response, so it is
+# recorded as -1 like the world and never counts as a conflict.
 
 PROPAGATION_MAX_COLORS = 256
 PROPAGATION_COLOR_TAIL = 256
-# round-tagged ticket key: (round << 23) | (0x7FFFFF - flat_row_id).
-# atomic_max prefers the current round over stale rounds (bigger high bits)
-# and the smallest row id within a round (bigger low bits), so tickets never
-# need re-initialization between rounds. Flat row ids must stay < 2^23.
-PROPAGATION_COLOR_ROW_ID_LIMIT = 1 << 23
 
 
 @wp.kernel(enable_backward=False)
