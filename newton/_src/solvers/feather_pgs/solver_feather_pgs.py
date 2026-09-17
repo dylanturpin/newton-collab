@@ -2976,6 +2976,12 @@ class SolverFeatherPGS(SolverBase):
             return requested
         if self.pgs_mode != "matrix_free" or self.articulated_contact_response == "immediate":
             return requested
+        # Contacts between two links of one articulation stay on the dense family unless
+        # propagation_same_articulation_rows routes them to propagation rows. The
+        # internal-row reserve below has no room for them, so keep the requested budget
+        # whenever they can occur (any non-free articulation).
+        if not self.propagation_same_articulation_rows and bool(np.any(self._model_plan.is_free_rigid == 0)):
+            return requested
 
         required_internal = self._dense_internal_max_rows
         if required_internal <= 0:
