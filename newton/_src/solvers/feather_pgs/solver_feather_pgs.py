@@ -214,6 +214,8 @@ _MAX_CONTACT_REGULARIZATION = 1.0e6
 
 _MFGS_TILE_SHARED_STORAGE_BYTES = 128
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
+# Per-world preset of the first rejected row slot: no reservation was rejected.
+_ROW_SLOT_UNBOUNDED = 2**31 - 1
 _CONTACT_BUILD_THREAD_CAP = 65536
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
 _PAIRED_RESPONSE_WARPS_PER_BLOCK = 4
@@ -299,7 +301,7 @@ def _accumulate_row_capacity_telemetry(
     """Accumulate raw row demand and capacity overflow without changing solver state."""
     tid = wp.tid()
     dropped = dropped_contact_rows[tid]
-    count = raw_counts[tid] + dropped
+    count = raw_counts[tid]  # monotone counter: accepted rows plus rejected reservations
     wp.atomic_max(raw_watermark, 0, count)
     wp.atomic_max(dropped_contact_rows_watermark, 0, dropped)
     excess = count - capacity
@@ -327,7 +329,7 @@ def _warn_constraint_row_overflow(
     world = wp.tid()
 
     dense_dropped = dense_dropped_contact_rows[world]
-    dense_requested = dense_raw_counts[world] + dense_dropped
+    dense_requested = dense_raw_counts[world]
     if dense_requested > dense_capacity and wp.atomic_exch(warning_emitted, 0, 1) == 0:
         wp.printf(
             "Warning: FeatherPGS dense constraint-row overflow in world %d: requested %d rows, limit %d; "
@@ -340,7 +342,7 @@ def _warn_constraint_row_overflow(
 
     if mf_active != 0:
         mf_dropped = mf_dropped_contact_rows[world]
-        mf_requested = mf_raw_counts[world] + mf_dropped
+        mf_requested = mf_raw_counts[world]
         if mf_requested > mf_capacity and wp.atomic_exch(warning_emitted, 1, 1) == 0:
             wp.printf(
                 "Warning: FeatherPGS matrix-free constraint-row overflow in world %d: requested %d rows, "
@@ -353,7 +355,7 @@ def _warn_constraint_row_overflow(
 
     if propagation_active != 0:
         propagation_dropped = propagation_dropped_contact_rows[world]
-        propagation_requested = propagation_raw_counts[world] + propagation_dropped
+        propagation_requested = propagation_raw_counts[world]
         if propagation_requested > propagation_capacity and wp.atomic_exch(warning_emitted, 2, 1) == 0:
             wp.printf(
                 "Warning: FeatherPGS propagation constraint-row overflow in world %d: requested %d rows, "
@@ -4495,6 +4497,9 @@ class SolverFeatherPGS(SolverBase):
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self._dense_first_rejected_slot = wp.full(
+            (self.world_count,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device
+        )
         # Per-world dense row-family boundaries, snapshotted from slot_counter
         # each step (allocated once here: per-step allocation is forbidden
         # under CUDA graph capture). The dense slot layout is
@@ -4880,6 +4885,7 @@ class SolverFeatherPGS(SolverBase):
             else None
         )
         self.mf_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self._mf_first_rejected_slot = wp.full((worlds,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device)
 
         self.mf_body_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_body_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
@@ -5059,6 +5065,7 @@ class SolverFeatherPGS(SolverBase):
 
         self.mf_constraint_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self._mf_first_rejected_slot = wp.full((worlds,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device)
 
         for name in ("mf_body_a", "mf_body_b", "mf_dof_a", "mf_dof_b", "mf_row_type"):
             setattr(self, name, wp.zeros((worlds, 1), dtype=wp.int32, device=device, requires_grad=requires_grad))
@@ -5170,6 +5177,7 @@ class SolverFeatherPGS(SolverBase):
             (worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
         self.propagation_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self._propagation_first_rejected_slot = wp.full((worlds,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device)
         self.propagation_body_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.propagation_body_list = wp.full(
             (worlds, self.max_propagation_bodies), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
@@ -9791,6 +9799,7 @@ class SolverFeatherPGS(SolverBase):
 
         # Zero world-level buffers (only arrays that require it)
         self.slot_counter.zero_()  # atomic-add counter
+        self._dense_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
         self.dense_contact_world_flag.zero_()
         if self._track_row_capacity:
             self._row_dropped_dense.zero_()
@@ -9799,6 +9808,7 @@ class SolverFeatherPGS(SolverBase):
 
         if mf_active:
             self.mf_slot_counter.zero_()  # atomic-add counter
+            self._mf_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
             self.mf_constraint_count.zero_()  # finalize only runs when contacts exist
             # Zero unconditionally here. When warm-start is OFF this is the
             # original behavior (bit-identical). When ON this also guarantees a
@@ -9812,6 +9822,7 @@ class SolverFeatherPGS(SolverBase):
             # constraint_count: fully overwritten by finalize_world_constraint_counts
         if propagation_active:
             self.propagation_slot_counter.zero_()
+            self._propagation_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
             self.propagation_constraint_count.zero_()
             self.propagation_impulses.zero_()
             self.propagation_J_a.zero_()
@@ -9835,6 +9846,10 @@ class SolverFeatherPGS(SolverBase):
         mf_dropped_rows = self._row_dropped_mf if self._track_row_capacity else self._dummy_mf_slot_counter
         propagation_dropped_rows = (
             self._row_dropped_propagation if self._track_row_capacity else self._dummy_mf_slot_counter
+        )
+        mf_first_rejected_slot = self._mf_first_rejected_slot if mf_active else self._dummy_mf_slot_counter
+        propagation_first_rejected_slot = (
+            self._propagation_first_rejected_slot if propagation_active else self._dummy_mf_slot_counter
         )
         j_buffers_zeroed = False
 
@@ -10324,6 +10339,9 @@ class SolverFeatherPGS(SolverBase):
                     dense_dropped_rows,
                     mf_dropped_rows,
                     propagation_dropped_rows,
+                    self._dense_first_rejected_slot,
+                    mf_first_rejected_slot,
+                    propagation_first_rejected_slot,
                 ],
                 device=model.device,
             )
@@ -10712,7 +10730,12 @@ class SolverFeatherPGS(SolverBase):
                 wp.launch(
                     finalize_mf_constraint_counts,
                     dim=self.world_count,
-                    inputs=[self.propagation_slot_counter, self.propagation_max_constraints, slots_per_contact],
+                    inputs=[
+                        self.propagation_slot_counter,
+                        self.propagation_max_constraints,
+                        slots_per_contact,
+                        self._propagation_first_rejected_slot,
+                    ],
                     outputs=[self.propagation_constraint_count],
                     device=model.device,
                 )
@@ -10822,7 +10845,12 @@ class SolverFeatherPGS(SolverBase):
                 wp.launch(
                     finalize_mf_constraint_counts,
                     dim=self.world_count,
-                    inputs=[self.mf_slot_counter, self.mf_max_constraints, slots_per_contact],
+                    inputs=[
+                        self.mf_slot_counter,
+                        self.mf_max_constraints,
+                        slots_per_contact,
+                        self._mf_first_rejected_slot,
+                    ],
                     outputs=[self.mf_constraint_count],
                     device=model.device,
                 )
@@ -10963,7 +10991,7 @@ class SolverFeatherPGS(SolverBase):
             wp.launch(
                 finalize_mf_constraint_counts,
                 dim=self.world_count,
-                inputs=[self.mf_slot_counter, self.mf_max_constraints, 1],
+                inputs=[self.mf_slot_counter, self.mf_max_constraints, 1, self._mf_first_rejected_slot],
                 outputs=[self.mf_constraint_count],
                 device=model.device,
             )
@@ -10972,7 +11000,7 @@ class SolverFeatherPGS(SolverBase):
         wp.launch(
             finalize_world_constraint_counts,
             dim=self.world_count,
-            inputs=[self.slot_counter, max_constraints, slots_per_contact_dense],
+            inputs=[self.slot_counter, max_constraints, slots_per_contact_dense, self._dense_first_rejected_slot],
             outputs=[self.constraint_count],
             device=model.device,
         )
