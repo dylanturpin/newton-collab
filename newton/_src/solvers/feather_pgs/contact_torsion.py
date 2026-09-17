@@ -401,7 +401,41 @@ def torque_sweep_source(dofs):
                         sliding_used += sqrtf(a * a + b * b);
                     }}
                 }}
-                float bound = radius * fmaxf(mu * normal_load - sliding_used, 0.0f);
+                float normal_budget = mu * normal_load;
+                // Later normal-only rows can lower a patch's load after its
+                // anchors have been solved. Project against the final load
+                // and apply the velocity response, not just the stored impulses.
+                if (sliding_used > normal_budget) {{
+                    float scale = normal_budget / sliding_used;
+                    sliding_used = 0.0f;
+                    for (int n = 0; n < m_dense; ++n) {{
+                        if (world_row_type.data[off_dense + n] != {PGS_CONSTRAINT_TYPE_CONTACT} ||
+                            world_torsion_group.data[off_dense + n] != spin ||
+                            n + 2 >= m_dense ||
+                            world_row_type.data[off_dense + n + 1] != {PGS_CONSTRAINT_TYPE_FRICTION} ||
+                            world_row_parent.data[off_dense + n + 1] != n ||
+                            world_row_type.data[off_dense + n + 2] != {PGS_CONSTRAINT_TYPE_FRICTION} ||
+                            world_row_parent.data[off_dense + n + 2] != n) continue;
+                        float t1 = s_lam_dense[n + 1] * scale;
+                        float t2 = s_lam_dense[n + 2] * scale;
+                        float delta1 = t1 - s_lam_dense[n + 1];
+                        float delta2 = t2 - s_lam_dense[n + 2];
+                        if (delta1 != 0.0f || delta2 != 0.0f) {{
+                            iteration_changed = 1;
+                            if (lane == 0) {{
+                                s_lam_dense[n + 1] = t1;
+                                s_lam_dense[n + 2] = t2;
+                            }}
+                            for (int d = lane; d < {dofs}; d += 32) {{
+                                s_v[d] += Y_world.data[jy_world_base + (n + 1) * {dofs} + d] * delta1
+                                    + Y_world.data[jy_world_base + (n + 2) * {dofs} + d] * delta2;
+                            }}
+                        }}
+                        sliding_used += sqrtf(t1 * t1 + t2 * t2);
+                        __syncwarp();
+                    }}
+                }}
+                float bound = radius * fmaxf(normal_budget - sliding_used, 0.0f);
                 if (global_iter < friction_start_iteration) bound = 0.0f;
                 float dot = 0.0f;
                 for (int d = lane; d < {dofs}; d += 32)
