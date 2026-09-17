@@ -43,10 +43,12 @@ compacts it in two kernels over the live contact range -- register, then select:
   :func:`_contact_group_key`);
 * every contact enters its group's depth slot and all
   :data:`BODY_PAIR_NUM_DIRECTIONS` spatial-extreme slots, competing on
-  projection alone.  With zero hysteresis each slot holds its instantaneous
-  winner; with hysteresis an incumbent may trail that winner by no more than
-  the configured score margin (see :data:`BODY_PAIR_REDUCTION_SLOTS` for the
-  policies this replaced);
+  projection alone, and touching contacts (separation ``<= 0``) also enter a
+  second family of extreme slots closed to speculative ones (see
+  :data:`TOUCHING_SLOT_OFFSET`).  With zero hysteresis each slot holds its
+  instantaneous winner; with hysteresis an incumbent may trail that winner by
+  no more than the configured score margin (see
+  :data:`BODY_PAIR_REDUCTION_SLOTS` for the policies this replaced);
 * each contact then checks whether any value it submitted won its slot, and the
   survivors are compacted in place so ``rigid_contact_count`` itself drops.
   Everything else is discarded -- typically interior points whose force is a
@@ -64,12 +66,11 @@ want it. Benchmark the complete collision-plus-solver step on the target GPU
 rather than inferring speedup from contact count alone.
 
 Depth is ranked with the canonical signed effective-surface separation
-``dot(normal, point1 - point0) - margin0 - margin1``, but only to choose each
-group's depth representative: depth never gates or biases the spatial slots.
-The memoryless slot-ranking rule therefore introduces no additional depth
-threshold.  The pass still has explicit spatial-cell and temporal-hysteresis
-length scales, and no depth classification can leave a patch without footprint
-support.
+``dot(normal, point1 - point0) - margin0 - margin1``.  It picks the depth
+representative and its sign gates the touching slot family; it never biases
+the ordering inside a spatial slot.  The pass still has explicit spatial-cell
+and temporal-hysteresis length scales, and no depth classification can leave a
+patch without footprint support.
 
 Reduction never crosses a normal bin, so multi-patch configurations (a body
 touching floor and wall at once) keep representatives of every patch.  On
@@ -387,7 +388,13 @@ def _direction_2d(dir_idx: int) -> wp.vec2:
 #   scene, because a patch's load-bearing contacts are already its spatial
 #   extremes; it only doubled the slot memory and clearing work.
 DEEPEST_SLOT = BODY_PAIR_NUM_DIRECTIONS
-BODY_PAIR_REDUCTION_SLOTS = BODY_PAIR_NUM_DIRECTIONS + 1
+# Extremes among TOUCHING contacts only (separation <= 0). The all-candidate
+# extremes can all be speculative (a tumbler's wall hulls hovering inside the
+# gap sit further out than its base disc), which left one touching contact and
+# a rocking body. The touching family keeps the load-bearing support polygon;
+# the first family keeps the speculative envelope.
+TOUCHING_SLOT_OFFSET = BODY_PAIR_NUM_DIRECTIONS + 1
+BODY_PAIR_REDUCTION_SLOTS = 2 * BODY_PAIR_NUM_DIRECTIONS + 1
 
 
 # Bit budget of the 63-bit group key. Group ids are asserted against this at
@@ -756,7 +763,7 @@ def _slot_index(entry_idx: int, slot: int) -> int:
 
     An entry's slots are adjacent, so each pass that touches all slots of one
     entry -- clearing, spatial competition, winner selection -- works on a
-    single contiguous 56-byte run.  Slot-major addressing
+    single contiguous 104-byte run.  Slot-major addressing
     (``slot * capacity + entry``) instead put an entry's slots one whole
     capacity apart, costing one cache line per slot: 33 MB of stride between
     consecutive accesses at G1's 4.2M-entry table.
@@ -884,6 +891,23 @@ def _biased_primary(primary: float, hysteresis: float, mask: int, slot: int) -> 
     if (mask >> slot) & 1 != 0:
         return primary + hysteresis
     return primary
+
+
+@wp.func
+def _touching_eligible(gap: float, hysteresis: float, mask: int) -> bool:
+    """True if the contact may compete for the touching slot family.
+
+    Touching means separation ``<= 0``.  Under hysteresis an incumbent of a
+    touching slot stays eligible while it hovers within the margin above the
+    surface, otherwise contacts rocking through zero on curved support hand the
+    slots back and forth regardless of the score bias.  Same rule in the
+    register, select, and verify passes.
+    """
+    if gap <= 0.0:
+        return True
+    if hysteresis > 0.0 and (mask >> wp.static(TOUCHING_SLOT_OFFSET)) != 0 and gap <= hysteresis:
+        return True
+    return False
 
 
 @wp.kernel(enable_backward=False)
@@ -1078,6 +1102,14 @@ def _register_contact_one(
         dir_slot = _slot_index(entry_idx, dir_i)
         if ht_values[dir_slot] < value:
             wp.atomic_max(ht_values, dir_slot, value)
+    if _touching_eligible(gap, hysteresis, mask):
+        for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
+            slot = wp.static(TOUCHING_SLOT_OFFSET) + dir_i
+            primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), hysteresis, mask, slot)
+            value = _pack_score(primary, pos_key)
+            touch_slot = _slot_index(entry_idx, slot)
+            if ht_values[touch_slot] < value:
+                wp.atomic_max(ht_values, touch_slot, value)
 
 
 @wp.kernel(enable_backward=False)
@@ -1216,6 +1248,12 @@ def _select_winner_one(
         primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), hysteresis, mask, dir_i)
         if ht_values[_slot_index(entry_idx, dir_i)] == _pack_score(primary, pos_key):
             won = True
+    if _touching_eligible(gap, hysteresis, mask):
+        for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
+            slot = wp.static(TOUCHING_SLOT_OFFSET) + dir_i
+            primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), hysteresis, mask, slot)
+            if ht_values[_slot_index(entry_idx, slot)] == _pack_score(primary, pos_key):
+                won = True
     if won:
         keep_flags[i] = 1
 
@@ -1304,6 +1342,16 @@ def _verify_invariant_one(
             matched = True
         elif value > slot_value:
             beaten = True
+    if _touching_eligible(gap, hysteresis, mask):
+        for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
+            slot = wp.static(TOUCHING_SLOT_OFFSET) + dir_i
+            primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), hysteresis, mask, slot)
+            value = _pack_score(primary, pos_key)
+            slot_value = ht_values[_slot_index(entry_idx, slot)]
+            if value == slot_value:
+                matched = True
+            elif value > slot_value:
+                beaten = True
 
     if kept and not matched:
         wp.atomic_add(violations, wp.static(STAT_VIOLATIONS), 1)  # kept without winning: too permissive

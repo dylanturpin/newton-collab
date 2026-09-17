@@ -1196,7 +1196,10 @@ flag:
 
 The postpass groups the *finalized narrow-phase contacts* by body pair,
 material class, normal bin, and spatial cell, then retains one depth
-representative and up to six sampled footprint representatives.  With nonzero
+representative, up to six sampled footprint representatives over all
+candidates, and up to six more over the touching candidates alone (canonical
+separation ``<= 0``), so speculative contacts hovering inside the contact gap
+can never displace the support polygon that carries the body.  With nonzero
 hysteresis, an incumbent may trail the instantaneous slot winner by no more
 than the configured margin; coincident contacts with identical packed winner
 keys can exceed the nominal slot count.  This is a bounded-work spatial
