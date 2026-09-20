@@ -3836,6 +3836,9 @@ def _allocate_world_contact_slot(
     dense_dropped_contact_rows: wp.array[int],
     mf_dropped_contact_rows: wp.array[int],
     propagation_dropped_contact_rows: wp.array[int],
+    dense_first_rejected_slot: wp.array[int],
+    mf_first_rejected_slot: wp.array[int],
+    propagation_first_rejected_slot: wp.array[int],
 ):
     """Classify and allocate rows for one active contact.
 
@@ -3987,8 +3990,7 @@ def _allocate_world_contact_slot(
         # Matrix-free path
         slot = wp.atomic_add(mf_slot_counter, world, slots_needed)
         if slot + slots_needed > mf_max_constraints:
-            # Roll back the counter so finalize sees only filled slots
-            wp.atomic_add(mf_slot_counter, world, -slots_needed)
+            wp.atomic_min(mf_first_rejected_slot, world, slot)
             if row_capacity_telemetry != 0:
                 wp.atomic_add(mf_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -4003,8 +4005,7 @@ def _allocate_world_contact_slot(
         # Propagation articulated matrix-free path
         slot = wp.atomic_add(propagation_slot_counter, world, slots_needed)
         if slot + slots_needed > propagation_max_constraints:
-            # Roll back the counter so finalize sees only filled slots
-            wp.atomic_add(propagation_slot_counter, world, -slots_needed)
+            wp.atomic_min(propagation_first_rejected_slot, world, slot)
             if row_capacity_telemetry != 0:
                 wp.atomic_add(propagation_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -4019,8 +4020,7 @@ def _allocate_world_contact_slot(
         # Dense path
         slot = wp.atomic_add(world_slot_counter, world, slots_needed)
         if slot + slots_needed > max_constraints:
-            # Roll back the counter so finalize sees only filled slots
-            wp.atomic_add(world_slot_counter, world, -slots_needed)
+            wp.atomic_min(dense_first_rejected_slot, world, slot)
             if row_capacity_telemetry != 0:
                 wp.atomic_add(dense_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -4085,12 +4085,23 @@ def allocate_world_contact_slots(
     dense_dropped_contact_rows: wp.array[int],
     mf_dropped_contact_rows: wp.array[int],
     propagation_dropped_contact_rows: wp.array[int],
+    dense_first_rejected_slot: wp.array[int],
+    mf_first_rejected_slot: wp.array[int],
+    propagation_first_rejected_slot: wp.array[int],
 ):
     """Allocate active contacts with work proportional to the materialized prefix.
 
     The narrow phase increments :paramref:`contact_count` before checking its
     output capacity. An overflowed count therefore does not describe a fully
     materialized prefix; clear the routing arrays and reject that frame.
+
+    Slot counters only grow. A contact whose reservation does not fit records its
+    slot in the family's ``*_first_rejected_slot`` (per world, preset to a large
+    value) instead of rolling the counter back: every later reservation starts at
+    or past that slot, so the finalize kernels truncate the row count there and
+    no accepted contact can hold a slot at or beyond the count. Rolling back
+    raced with concurrent reservations and left accepted rows past the count,
+    which the friction patch links then chained into.
     """
     thread = wp.tid()
     total_contacts = contact_count[0]
@@ -4150,6 +4161,9 @@ def allocate_world_contact_slots(
             dense_dropped_contact_rows,
             mf_dropped_contact_rows,
             propagation_dropped_contact_rows,
+            dense_first_rejected_slot,
+            mf_first_rejected_slot,
+            propagation_first_rejected_slot,
         )
 
 
@@ -5401,15 +5415,15 @@ def finalize_world_constraint_counts(
     world_slot_counter: wp.array[int],
     max_constraints: int,
     slots_per_contact: int,
+    first_rejected_slot: wp.array[int],
     # outputs
     world_constraint_count: wp.array[int],
 ):
-    """Copy and clamp the slot counter to constraint counts.
+    """Turn the monotone slot counter into the row count.
 
-    When the atomic slot counter exceeds ``max_constraints``, clamping can
-    leave "gap" slots that were reserved by a rejected contact but never
-    written.  Those gap slots have zero Jacobians and will be harmlessly
-    skipped by PGS (zero diagonal → ``continue``).
+    The count is the counter truncated at the first rejected reservation and at
+    ``max_constraints``: rows at or past the first rejected slot were reserved by
+    contacts the allocator dropped, so every accepted contact lies below it.
 
     The ``slots_per_contact`` argument is accepted for backwards
     compatibility but is no longer used for rounding, because the
@@ -5417,7 +5431,7 @@ def finalize_world_constraint_counts(
     single-row joint-limit constraints.
     """
     world = wp.tid()
-    count = world_slot_counter[world]
+    count = wp.min(world_slot_counter[world], first_rejected_slot[world])
     if count > max_constraints:
         count = max_constraints
     world_constraint_count[world] = count
@@ -10242,17 +10256,20 @@ def finalize_mf_constraint_counts(
     mf_slot_counter: wp.array[int],
     mf_max_constraints: int,
     slots_per_contact: int,
+    first_rejected_slot: wp.array[int],
     # outputs
     mf_constraint_count: wp.array[int],
 ):
-    """Clamp MF slot counter to max and store as constraint count.
+    """Turn the monotone MF slot counter into the row count.
 
-    ``slots_per_contact`` is kept for call-site compatibility.  The MF buffer
-    may contain a mix of 3-row normal+friction contacts and 1-row speculative
-    normal contacts, so rounding to a fixed stride would drop valid rows.
+    Truncates at the first rejected reservation and at ``mf_max_constraints``
+    (see :func:`finalize_world_constraint_counts`). ``slots_per_contact`` is
+    kept for call-site compatibility.  The MF buffer may contain a mix of 3-row
+    normal+friction contacts and 1-row speculative normal contacts, so rounding
+    to a fixed stride would drop valid rows.
     """
     world = wp.tid()
-    count = mf_slot_counter[world]
+    count = wp.min(mf_slot_counter[world], first_rejected_slot[world])
     if count > mf_max_constraints:
         count = mf_max_constraints
     mf_constraint_count[world] = count

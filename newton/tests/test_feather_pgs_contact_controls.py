@@ -64,6 +64,9 @@ def _launch_contact_allocator(
         "dense_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
         "mf_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
         "propagation_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
+        "dense_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+        "mf_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+        "propagation_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
     }
     is_free = route == PATH_MATRIX_FREE
     propagation_enabled = route == PATH_PROPAGATION
@@ -119,6 +122,9 @@ def _launch_contact_allocator(
             counters["dense_dropped"],
             counters["mf_dropped"],
             counters["propagation_dropped"],
+            counters["dense_first_rejected"],
+            counters["mf_first_rejected"],
+            counters["propagation_first_rejected"],
         ],
         device=device,
     )
@@ -199,6 +205,9 @@ def _launch_articulation_pair_contact_allocator(
             dense_dropped,
             mf_dropped,
             propagation_dropped,
+            wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+            wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+            wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
         ],
         device=device,
     )
