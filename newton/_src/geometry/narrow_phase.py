@@ -78,7 +78,6 @@ from ..geometry.support_function import (
 from ..geometry.types import GeoType
 from ..utils.heightfield import (
     HeightfieldData,
-    _heightfield_vs_convex_midphase,
     get_triangle_shape_from_heightfield,
     heightfield_vs_convex_midphase,
 )
@@ -1591,10 +1590,11 @@ def narrow_phase_find_heightfield_triangle_overlaps_kernel(
     for i in range(wp.tid(), shape_pairs_count[0], total_num_threads):
         pair = shape_pairs[i]
         hfd = heightfield_data[shape_heightfield_index[pair[0]]]
-        _heightfield_vs_convex_midphase(
+        heightfield_vs_convex_midphase(
             pair[0],
             pair[1],
             hfd,
+            heightfield_elevations,
             shape_transform,
             shape_collision_aabb_lower,
             shape_collision_aabb_upper,
@@ -1602,7 +1602,6 @@ def narrow_phase_find_heightfield_triangle_overlaps_kernel(
             shape_gap,
             triangle_pairs,
             triangle_pairs_count,
-            heightfield_elevations,
             # Plane local AABBs are not bounds for arbitrary plane extents.
             shape_types[pair[1]] != GeoType.PLANE,
         )
@@ -1620,6 +1619,7 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
     shape_collision_aabb_upper: wp.array[wp.vec3],  # Local-space AABB upper bounds
     shape_heightfield_index: wp.array[wp.int32],
     heightfield_data: wp.array[HeightfieldData],
+    heightfield_elevations: wp.array[wp.float32],
     shape_pairs_mesh: wp.array[wp.vec2i],
     shape_pairs_mesh_count: wp.array[int],
     total_num_threads: int,
@@ -1661,6 +1661,7 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
                 shape_a,
                 shape_b,
                 hfd,
+                heightfield_elevations,
                 shape_transform,
                 shape_collision_aabb_lower,
                 shape_collision_aabb_upper,
@@ -1668,6 +1669,8 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
                 shape_gap,
                 triangle_pairs,
                 triangle_pairs_count,
+                # Plane local AABBs are not bounds for arbitrary plane extents.
+                type_b != GeoType.PLANE,
             )
             continue
 
@@ -3059,6 +3062,7 @@ class NarrowPhase:
                     shape_collision_aabb_upper,
                     shape_heightfield_index,
                     heightfield_data,
+                    heightfield_elevations,
                     self.shape_pairs_mesh,
                     self.shape_pairs_mesh_count,
                     self.num_tile_blocks,

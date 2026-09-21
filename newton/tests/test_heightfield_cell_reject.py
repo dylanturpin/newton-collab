@@ -4,13 +4,84 @@
 """Check conservative terrain rejection against the original triangle pipeline."""
 
 import unittest
+from contextlib import nullcontext
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 import newton
 from newton._src.geometry.narrow_phase import NarrowPhase
-from newton._src.utils.heightfield import HeightfieldData, _heightfield_cell_below_query
+from newton._src.utils.heightfield import (
+    HeightfieldData,
+    _heightfield_cell_below_query,
+    heightfield_vs_convex_midphase,
+)
+
+
+def _create_heightfield_midphase(*, upstream_default):
+    """Exercise the upstream call contract or an unculled reference at the launch boundary."""
+
+    @wp.kernel(enable_backward=False)
+    def midphase(
+        shape_types: wp.array[int],
+        shape_transform: wp.array[wp.transform],
+        shape_source: wp.array[wp.uint64],
+        shape_gap: wp.array[float],
+        shape_data: wp.array[wp.vec4],
+        shape_collision_radius: wp.array[float],
+        shape_collision_aabb_lower: wp.array[wp.vec3],
+        shape_collision_aabb_upper: wp.array[wp.vec3],
+        shape_heightfield_index: wp.array[wp.int32],
+        heightfield_data: wp.array[HeightfieldData],
+        heightfield_elevations: wp.array[wp.float32],
+        shape_pairs_mesh: wp.array[wp.vec2i],
+        shape_pairs_mesh_count: wp.array[int],
+        total_num_threads: int,
+        triangle_pairs: wp.array[wp.vec3i],
+        triangle_pairs_count: wp.array[int],
+    ):
+        tid, lane = wp.tid()
+        if lane != 0:
+            return
+        for i in range(tid, shape_pairs_mesh_count[0], total_num_threads):
+            pair = shape_pairs_mesh[i]
+            hfd = heightfield_data[shape_heightfield_index[pair[0]]]
+            if wp.static(upstream_default):
+                heightfield_vs_convex_midphase(
+                    pair[0],
+                    pair[1],
+                    hfd,
+                    heightfield_elevations,
+                    shape_transform,
+                    shape_collision_aabb_lower,
+                    shape_collision_aabb_upper,
+                    shape_data,
+                    shape_gap,
+                    triangle_pairs,
+                    triangle_pairs_count,
+                )
+            else:
+                heightfield_vs_convex_midphase(
+                    pair[0],
+                    pair[1],
+                    hfd,
+                    heightfield_elevations,
+                    shape_transform,
+                    shape_collision_aabb_lower,
+                    shape_collision_aabb_upper,
+                    shape_data,
+                    shape_gap,
+                    triangle_pairs,
+                    triangle_pairs_count,
+                    False,
+                )
+
+    return midphase
+
+
+_unculled_heightfield_midphase = _create_heightfield_midphase(upstream_default=False)
+_default_heightfield_midphase = _create_heightfield_midphase(upstream_default=True)
 
 
 @wp.kernel
@@ -26,7 +97,15 @@ def _check_cells(lower: wp.array[float], heights: wp.array[float], result: wp.ar
 
 
 def _model(
-    *, device="cpu", z=0.2, rotation=None, reverse=False, shape="box", scale=(1.0, 1.0, 1.0), shape_rotation=None
+    *,
+    device="cpu",
+    z=0.2,
+    rotation=None,
+    reverse=False,
+    shape="box",
+    scale=(1.0, 1.0, 1.0),
+    shape_rotation=None,
+    mixed_mesh=False,
 ):
     builder = newton.ModelBuilder()
     cfg = builder.ShapeConfig(margin=0.01, gap=0.01)
@@ -55,10 +134,16 @@ def _model(
 
     for add in (add_shape, add_terrain) if reverse else (add_terrain, add_shape):
         add()
+    if mixed_mesh:
+        mesh = newton.Mesh(
+            vertices=np.array([[-0.1, -0.1, 0.0], [0.1, -0.1, 0.0], [0.0, 0.1, 0.0]], dtype=np.float32),
+            indices=np.array([0, 1, 2], dtype=np.int32),
+        )
+        builder.add_shape_mesh(-1, mesh=mesh, xform=wp.transform((30.0, -40.0, 10.0), wp.quat_identity()))
     return builder.finalize(device=device)
 
 
-def _collide(model, *, legacy=False, speculative=False):
+def _collide(model, *, legacy=False, speculative=False, packed=None, midphase=None):
     pipeline = newton.CollisionPipeline(
         model,
         reduce_contacts=False,
@@ -69,6 +154,10 @@ def _collide(model, *, legacy=False, speculative=False):
         else None,
     )
     if legacy:
+        midphase = _unculled_heightfield_midphase
+    if packed is not None:
+        pipeline.narrow_phase._heightfield_packed_pairs = packed
+    if midphase is not None:
         pipeline.narrow_phase._heightfield_packed_pairs = False
     contacts = pipeline.contacts()
     state = model.state()
@@ -76,7 +165,13 @@ def _collide(model, *, legacy=False, speculative=False):
         velocity = np.zeros((model.body_count, 6), dtype=np.float32)
         velocity[:, 2] = -20.0
         state.body_qd.assign(velocity)
-    pipeline.collide(state, contacts, dt=0.01 if speculative else None)
+    override = (
+        patch("newton._src.geometry.narrow_phase.narrow_phase_find_mesh_triangle_overlaps_kernel", midphase)
+        if midphase is not None
+        else nullcontext()
+    )
+    with override:
+        pipeline.collide(state, contacts, dt=0.01 if speculative else None)
     count = int(contacts.rigid_contact_count.numpy()[0])
     assert count <= contacts.rigid_contact_max
     assert int(pipeline.narrow_phase.triangle_pairs_count.numpy()[0]) <= pipeline.narrow_phase.max_triangle_pairs
@@ -126,6 +221,54 @@ class TestHeightfieldCellReject(unittest.TestCase):
         self.assertEqual(int(after.narrow_phase.triangle_pairs_count.numpy()[0]), 0)
         self.assertEqual(len(a[0]), 0)
         self.assertEqual(len(b[0]), 0)
+
+    def test_upstream_default_call_contract(self):
+        """Compile the upstream eleven-argument call and retain default cell rejection."""
+        model = _model(device=self.device)
+        reference, _ = _collide(model, legacy=True)
+        default, geometry = _collide(model, midphase=_default_heightfield_midphase)
+        self.assertGreater(int(reference.narrow_phase.triangle_pairs_count.numpy()[0]), 0)
+        self.assertEqual(int(default.narrow_phase.triangle_pairs_count.numpy()[0]), 0)
+        self.assertEqual(len(geometry[0]), 0)
+
+    def test_packed_and_tiled_rejection(self):
+        """Use identical cell rejection and contact geometry in both launch routes."""
+        for z in (0.2, 0.02):
+            with self.subTest(z=z):
+                model = _model(device=self.device, z=z)
+                packed, a = _collide(model, packed=True)
+                tiled, b = _collide(model, packed=False)
+                self.assertEqual(
+                    int(packed.narrow_phase.triangle_pairs_count.numpy()[0]),
+                    int(tiled.narrow_phase.triangle_pairs_count.numpy()[0]),
+                )
+                if z == 0.2:
+                    self.assertEqual(int(tiled.narrow_phase.triangle_pairs_count.numpy()[0]), 0)
+                    self.assertEqual(len(a[0]), 0)
+                    self.assertEqual(len(b[0]), 0)
+                else:
+                    self.assertGreater(len(a[0]), 0)
+                    self.assert_geometry_equal(a, b)
+
+    def test_mixed_mesh_route(self):
+        """Select the tiled route in a real mixed scene without changing terrain results."""
+        for z in (0.2, 0.02):
+            with self.subTest(z=z):
+                packed, a = _collide(_model(device=self.device, z=z))
+                mixed, b = _collide(_model(device=self.device, z=z, mixed_mesh=True))
+                self.assertTrue(packed.narrow_phase._heightfield_packed_pairs)
+                self.assertFalse(mixed.narrow_phase._heightfield_packed_pairs)
+                self.assertEqual(
+                    int(packed.narrow_phase.triangle_pairs_count.numpy()[0]),
+                    int(mixed.narrow_phase.triangle_pairs_count.numpy()[0]),
+                )
+                if z == 0.2:
+                    self.assertEqual(int(mixed.narrow_phase.triangle_pairs_count.numpy()[0]), 0)
+                    self.assertEqual(len(a[0]), 0)
+                    self.assertEqual(len(b[0]), 0)
+                else:
+                    self.assertGreater(len(a[0]), 0)
+                    self.assert_geometry_equal(a, b)
 
     def test_near_below_transformed_and_scaled(self):
         """Keep margin contacts, downward prisms, scaled terrain and reversed endpoints."""
@@ -187,14 +330,16 @@ class TestHeightfieldCellReject(unittest.TestCase):
         )
         model = builder.finalize(device=self.device)
         before, a = _collide(model, legacy=True)
-        after, b = _collide(model)
         self.assertGreater(int(before.narrow_phase.triangle_pairs_count.numpy()[0]), 0)
-        self.assertEqual(
-            int(before.narrow_phase.triangle_pairs_count.numpy()[0]),
-            int(after.narrow_phase.triangle_pairs_count.numpy()[0]),
-        )
         self.assertGreater(len(a[0]), 0)
-        self.assert_geometry_equal(a, b)
+        for packed in (True, False):
+            with self.subTest(packed=packed):
+                after, b = _collide(model, packed=packed)
+                self.assertEqual(
+                    int(before.narrow_phase.triangle_pairs_count.numpy()[0]),
+                    int(after.narrow_phase.triangle_pairs_count.numpy()[0]),
+                )
+                self.assert_geometry_equal(a, b)
 
     def test_current_height_updates(self):
         """Read current elevations instead of retaining a cached empty-cell decision."""

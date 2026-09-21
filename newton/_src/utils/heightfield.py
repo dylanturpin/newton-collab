@@ -391,10 +391,11 @@ def _heightfield_cell_below_query(
 
 
 @wp.func
-def _heightfield_vs_convex_midphase(
+def heightfield_vs_convex_midphase(
     hfield_shape: int,
     other_shape: int,
     hfd: HeightfieldData,
+    elevation_data: wp.array[wp.float32],
     shape_transform: wp.array[wp.transform],
     shape_collision_aabb_lower: wp.array[wp.vec3],
     shape_collision_aabb_upper: wp.array[wp.vec3],
@@ -402,8 +403,7 @@ def _heightfield_vs_convex_midphase(
     shape_gap: wp.array[float],
     triangle_pairs: wp.array[wp.vec3i],
     triangle_pairs_count: wp.array[int],
-    elevations: wp.array[float],
-    reject_cells: bool,
+    reject_cells: bool = True,
 ):
     """Find heightfield triangles that overlap with a convex shape's AABB.
 
@@ -423,6 +423,7 @@ def _heightfield_vs_convex_midphase(
         hfield_shape: Index of the heightfield shape.
         other_shape: Index of the convex shape.
         hfd: Heightfield data struct.
+        elevation_data: Concatenated normalized heightfield samples.
         shape_transform: World-space transforms for all shapes.
         shape_collision_aabb_lower: Local-space AABB lower bounds for each
             shape (scale already baked in).
@@ -432,8 +433,7 @@ def _heightfield_vs_convex_midphase(
         shape_gap: Per-shape contact gaps.
         triangle_pairs: Output buffer for ``(hfield_shape, other_shape, tri_idx)`` triples.
         triangle_pairs_count: Atomic counter for emitted triangle pairs.
-        elevations: Current normalized heights for conservative above-cell rejection.
-        reject_cells: Whether to use elevations to reject separated cells.
+        reject_cells: Disable for planes whose cached local AABB does not bound their surface.
     """
     X_hfield_ws = shape_transform[hfield_shape]
     X_other_ws = shape_transform[other_shape]
@@ -505,42 +505,10 @@ def _heightfield_vs_convex_midphase(
         can_reject = wp.isfinite(aabb_lower[2]) and wp.isfinite(padding)
     for r in range(row_min, row_max + 1):
         for c in range(col_min, col_max + 1):
-            if can_reject and _heightfield_cell_below_query(aabb_lower[2], padding, hfd, elevations, r, c):
+            if can_reject and _heightfield_cell_below_query(aabb_lower[2], padding, hfd, elevation_data, r, c):
                 continue
             for tri_sub in range(2):
                 tri_idx = (r * cols + c) * 2 + tri_sub
                 out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
                 if out_idx < triangle_pairs.shape[0]:
                     triangle_pairs[out_idx] = wp.vec3i(hfield_shape, other_shape, tri_idx)
-
-
-@wp.func
-def heightfield_vs_convex_midphase(
-    hfield_shape: int,
-    other_shape: int,
-    hfd: HeightfieldData,
-    shape_transform: wp.array[wp.transform],
-    shape_collision_aabb_lower: wp.array[wp.vec3],
-    shape_collision_aabb_upper: wp.array[wp.vec3],
-    shape_data: wp.array[wp.vec4],
-    shape_gap: wp.array[float],
-    triangle_pairs: wp.array[wp.vec3i],
-    triangle_pairs_count: wp.array[int],
-):
-    """Emit the original XY-overlapping triangle stream without height rejection."""
-    # The disabled branch never reads elevations; use an existing array to keep
-    # this caller contract unchanged without allocating a dummy device buffer.
-    _heightfield_vs_convex_midphase(
-        hfield_shape,
-        other_shape,
-        hfd,
-        shape_transform,
-        shape_collision_aabb_lower,
-        shape_collision_aabb_upper,
-        shape_data,
-        shape_gap,
-        triangle_pairs,
-        triangle_pairs_count,
-        shape_gap,
-        False,
-    )
