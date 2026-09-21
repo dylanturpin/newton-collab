@@ -66,6 +66,7 @@ from .kernels import (
     PREELIM_MAX_ROWS,
     PROPAGATION_COLOR_TAIL,
     _get_tree_fk_kernel,
+    _get_tree_tau_kernel,
     accumulate_articulation_tau,
     accumulate_group_diag_worlds,
     accumulate_propagation_warmstart_body_impulses,
@@ -547,9 +548,15 @@ class _FeatherPGSTreeGroup:
     articulations: wp.array[int]
     """Global articulation indices."""
     level_offsets: wp.array2d[int]
-    """Joint offsets per articulation and level, shape [count, max_levels + 1]."""
-    level_joints: wp.array[int]
-    """Global joint indices, ordered by articulation and dependency level."""
+    """Segment offsets per articulation and level, shape [count, max_levels + 1]."""
+    segment_offsets: wp.array[int]
+    """Offsets into the joint list for each maximal unary chain."""
+    segment_joints: wp.array[int]
+    """Global joint indices, ordered from each segment's parent to its child."""
+    child_offsets: wp.array[int]
+    """Offsets into the child-segment list for backward reductions."""
+    child_segments: wp.array[int]
+    """Child segments in descending authored joint order, preserving force sums."""
 
 
 @dataclass(frozen=True)
@@ -565,7 +572,7 @@ class _FeatherPGSTreePlan:
 
     @classmethod
     def build(cls, model: Model, articulation_joint_end: wp.array[int]) -> "_FeatherPGSTreePlan | None":
-        """Construct forward levels, retaining the ordinary path for unsafe trees."""
+        """Compress unary chains and schedule forks, retaining unsafe-tree fallback."""
         if not model.articulation_count or not model.joint_count:
             return None
         starts = model.articulation_start.numpy()
@@ -583,26 +590,60 @@ class _FeatherPGSTreePlan:
             return None
         body_owner = np.full(model.body_count, -1, dtype=np.int32)
         body_owner[children] = np.arange(model.joint_count, dtype=np.int32)
-        depth = np.zeros(model.joint_count, dtype=np.int32)
-        grouped = {}
-        has_branches = False
+        joint_children = [[] for _ in range(model.joint_count)]
+        joint_depth = np.zeros(model.joint_count, dtype=np.int32)
         for art in range(model.articulation_count):
             start, end = int(starts[art]), int(ends[art])
-            levels = []
             for joint in range(start, end):
                 parent = int(parents[joint])
                 if parent >= 0:
                     parent_joint = int(body_owner[parent])
                     if not start <= parent_joint < joint:
                         return None
-                    depth[joint] = depth[parent_joint] + 1
-                level = int(depth[joint])
+                    joint_children[parent_joint].append(joint)
+                    joint_depth[joint] = joint_depth[parent_joint] + 1
+
+        def schedule_cost(levels):
+            width = max(map(len, levels), default=1)
+            lanes = min(32, 1 << (width - 1).bit_length())
+            rounds = sum(
+                max(map(len, level[begin : begin + lanes])) for level in levels for begin in range(0, len(level), lanes)
+            )
+            return lanes, rounds
+
+        segment_depth = np.zeros(model.joint_count, dtype=np.int32)
+        grouped = {}
+        has_branches = False
+        for art in range(model.articulation_count):
+            start, end = int(starts[art]), int(ends[art])
+            levels = []
+            joint_levels = []
+            for joint in range(start, end):
+                joint_level = int(joint_depth[joint])
+                if joint_level == len(joint_levels):
+                    joint_levels.append([])
+                joint_levels[joint_level].append([joint])
+                parent = int(parents[joint])
+                level = 0
+                if parent >= 0:
+                    parent_joint = int(body_owner[parent])
+                    if len(joint_children[parent_joint]) == 1:
+                        continue
+                    level = int(segment_depth[parent_joint]) + 1
+                segment = [joint]
+                while len(joint_children[segment[-1]]) == 1:
+                    segment.append(joint_children[segment[-1]][0])
+                segment_depth[segment] = level
                 if level == len(levels):
                     levels.append([])
-                levels[level].append(joint)
-            width = max(map(len, levels), default=1)
-            has_branches |= width > 1
-            lanes = min(32, 1 << (width - 1).bit_length())
+                levels[level].append(segment)
+            lanes, rounds = schedule_cost(levels)
+            joint_lanes, joint_rounds = schedule_cost(joint_levels)
+            # Long chains can hold up unrelated forks. Bound logical joint rounds;
+            # this topology-only span proxy is not a guarantee of GPU runtime.
+            if rounds > joint_rounds:
+                levels, lanes = joint_levels, joint_lanes
+            has_branches |= lanes > 1
             grouped.setdefault(lanes, []).append((art, levels))
         if not has_branches:
             return None
@@ -610,13 +651,21 @@ class _FeatherPGSTreePlan:
         for lanes, trees in sorted(grouped.items()):
             max_levels = max(len(levels) for _, levels in trees)
             offsets = np.empty((len(trees), max_levels + 1), dtype=np.int32)
-            joints = []
+            segments = []
             for row, (_, levels) in enumerate(trees):
-                offsets[row, 0] = len(joints)
+                offsets[row, 0] = len(segments)
                 for level in range(max_levels):
                     if level < len(levels):
-                        joints.extend(levels[level])
-                    offsets[row, level + 1] = len(joints)
+                        segments.extend(levels[level])
+                    offsets[row, level + 1] = len(segments)
+            segment_ids = {segment[0]: index for index, segment in enumerate(segments)}
+            segment_offsets, joints = [0], []
+            child_offsets, child_segments = [0], []
+            for segment in segments:
+                joints.extend(segment)
+                segment_offsets.append(len(joints))
+                child_segments.extend(segment_ids[child] for child in reversed(joint_children[segment[-1]]))
+                child_offsets.append(len(child_segments))
             groups.append(
                 _FeatherPGSTreeGroup(
                     lanes=lanes,
@@ -624,7 +673,10 @@ class _FeatherPGSTreePlan:
                     max_levels=max_levels,
                     articulations=wp.array([art for art, _ in trees], dtype=wp.int32, device=model.device),
                     level_offsets=wp.array(offsets, dtype=wp.int32, device=model.device),
-                    level_joints=wp.array(joints, dtype=wp.int32, device=model.device),
+                    segment_offsets=wp.array(segment_offsets, dtype=wp.int32, device=model.device),
+                    segment_joints=wp.array(joints, dtype=wp.int32, device=model.device),
+                    child_offsets=wp.array(child_offsets, dtype=wp.int32, device=model.device),
+                    child_segments=wp.array(child_segments, dtype=wp.int32, device=model.device),
                 )
             )
         return cls(tuple(groups))
@@ -2583,6 +2635,14 @@ class SolverFeatherPGS(SolverBase):
             _FeatherPGSTreePlan.build(model, self.articulation_joint_end)
             if model.device.is_cuda and not model.requires_grad
             else None
+        )
+        self._tree_net_wrenches = (
+            tuple(
+                wp.empty(group.segment_offsets.size - 1, dtype=wp.spatial_vector, device=model.device)
+                for group in self._tree_plan.groups
+            )
+            if self._tree_plan is not None and self._direct_branch_tau_kernel is None
+            else ()
         )
 
     def _update_kinematic_state(self) -> None:
@@ -8991,7 +9051,8 @@ class SolverFeatherPGS(SolverBase):
                     group.max_levels,
                     group.articulations,
                     group.level_offsets,
-                    group.level_joints,
+                    group.segment_offsets,
+                    group.segment_joints,
                     *inputs,
                 ],
                 outputs=outputs,
@@ -9211,6 +9272,29 @@ class SolverFeatherPGS(SolverBase):
             self.articulation_origin,
         ]
         if self._direct_branch_tau_kernel is None:
+            if self._tree_plan is not None:
+                for group, net_wrench in zip(self._tree_plan.groups, self._tree_net_wrenches, strict=True):
+                    per_warp = 32 // group.lanes
+                    wp.launch(
+                        _get_tree_tau_kernel(group.lanes),
+                        dim=((group.articulation_count + per_warp - 1) // per_warp, 32),
+                        inputs=[
+                            group.articulation_count,
+                            group.max_levels,
+                            group.articulations,
+                            group.level_offsets,
+                            group.segment_offsets,
+                            group.segment_joints,
+                            group.child_offsets,
+                            group.child_segments,
+                            *tau_inputs,
+                            int(add_to_existing),
+                        ],
+                        outputs=[state_aug.body_ft_s, state_aug.joint_tau, net_wrench],
+                        block_dim=32,
+                        device=model.device,
+                    )
+                return
             wp.launch(
                 eval_rigid_tau_add if add_to_existing else eval_rigid_tau,
                 dim=model.articulation_count,
