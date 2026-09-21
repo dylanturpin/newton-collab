@@ -1,0 +1,1 @@
+Parallelize independent kinematic-tree branches in FeatherPGS forward dynamics and state publication, including velocity-limited articulations, without changing joint mathematics or solver budgets. Execution groups are selected from topology without task-specific configuration.

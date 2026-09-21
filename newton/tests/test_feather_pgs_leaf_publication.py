@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check body-parallel publication against the existing articulation traversal."""
+"""Shared fixtures and complete publication controls for parallel FPGS trees."""
 
 import unittest
 
@@ -9,7 +9,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSLeafPlan
 from newton.solvers import SolverFeatherPGS
 
 
@@ -148,7 +147,7 @@ def _build_contact_model(device):
     return model
 
 
-def _solver(model, *, enabled, mode="split"):
+def _solver(model, *, enabled, mode="split", velocity_limits=False):
     solver = SolverFeatherPGS(
         model,
         pgs_mode=mode,
@@ -156,12 +155,15 @@ def _solver(model, *, enabled, mode="split"):
         pgs_iterations=8,
         update_mass_matrix_interval=2,
         use_parallel_streams=False,
+        enable_joint_velocity_limits=velocity_limits,
     )
     if enabled and model.device.is_cuda:
-        assert solver._leaf_publication is not None
-    solver._leaf_publication = _FeatherPGSLeafPlan.build(model, solver.articulation_joint_end) if enabled else None
+        assert solver._tree_plan is not None
+    if not enabled or model.device.is_cpu:
+        solver._tree_plan = None
     # Exercise the production cached Stage 7 on CPU, where it is normally off.
-    solver._fk_id_cache_enabled = True
+    if model.device.is_cpu:
+        solver._fk_id_cache_enabled = True
     # CPU does not normally allocate the optional parallel-refresh terms.
     if model.device.is_cpu:
         solver._body_inertia_terms = wp.empty((model.body_count, 12), dtype=float, device=model.device)
@@ -249,39 +251,12 @@ class TestLeafPublication(unittest.TestCase):
         for name, array in inputs.items():
             np.testing.assert_array_equal(array.numpy(), before[name], err_msg=name)
 
-    def test_exact_topology_and_fallback(self):
-        """Defer star leaves, retaining roots and complete one-leaf chains."""
-        for locked in (False, True):
-            model, joints, leaves = _build_model(locked_d6=locked)
-            baseline = _solver(model, enabled=False)
-            self.assertIsNone(baseline._leaf_publication)
-            plan = _FeatherPGSLeafPlan.build(model, baseline.articulation_joint_end)
-            self.assertEqual(plan.articulation_count, 1)
-            self.assertEqual(plan.body_count, len(leaves))
-            np.testing.assert_array_equal(plan.body_joint.numpy()[leaves], joints[1:])
-            retained = plan.joint_indices.numpy()
-            offsets = plan.joint_start.numpy()
-            self.assertEqual(int(offsets[1] - offsets[0]), 1)
-            self.assertEqual(int(retained[offsets[0]]), joints[0])
-            np.testing.assert_array_equal(retained[offsets[1] :], [len(joints), len(joints) + 1])
-        model, _, _ = _build_model(chain=True)
-        baseline = _solver(model, enabled=False)
-        self.assertIsNone(_FeatherPGSLeafPlan.build(model, baseline.articulation_joint_end))
-
     def test_interleaved_mixed_leaves_and_moving_parents(self):
         """Keep internal joints in order and preserve general moving-parent kinematics."""
         for floating in (False, True):
-            model, joints, bodies = _build_branched_model(floating_root=floating)
+            model, _, bodies = _build_branched_model(floating_root=floating)
             solvers = [_solver(model, enabled=value) for value in (False, True)]
-            plan = solvers[1]._leaf_publication
-            self.assertIsNotNone(plan)
-            self.assertEqual(plan.articulation_count, 1)
-            self.assertEqual(plan.body_count, 5)
-            np.testing.assert_array_equal(plan.joint_indices.numpy(), [joints[0], joints[2]])
-            np.testing.assert_array_equal(plan.joint_start.numpy(), [0, 2])
-            np.testing.assert_array_equal(plan.body_joint.numpy()[[bodies[0], bodies[2]]], -1)
             leaves = [bodies[index] for index in (1, 3, 4, 5, 6)]
-            np.testing.assert_array_equal(plan.body_joint.numpy()[leaves], [joints[index] for index in (1, 3, 4, 5, 6)])
             snapshots = []
             for solver in solvers:
                 state = model.state()
@@ -307,30 +282,11 @@ class TestLeafPublication(unittest.TestCase):
                 atol=3e-6,
             )
 
-    def test_loop_and_aliased_body_fallback(self):
-        """Retain loop articulations and aliased leaves in the ordinary traversal."""
-        model, _, _ = _build_model()
-        solver = _solver(model, enabled=False)
-        ends = solver.articulation_joint_end.numpy().copy()
-        ends[0] -= 1
-        clipped = wp.array(ends, dtype=wp.int32, device=model.device)
-        self.assertIsNone(_FeatherPGSLeafPlan.build(model, clipped))
-        children = model.joint_child.numpy()
-        children[2] = children[1]
-        model.joint_child.assign(children)
-        plan = _FeatherPGSLeafPlan.build(model, solver.articulation_joint_end)
-        self.assertIsNotNone(plan)
-        self.assertEqual(int(plan.body_joint.numpy()[children[1]]), -1)
-        retained = plan.joint_indices.numpy()
-        self.assertIn(1, retained)
-        self.assertIn(2, retained)
-
     def test_complete_canonical_publication_and_held_inertia(self):
         """Match all canonical fields, preserving held I/terms on each cadence arm."""
         model, _, leaves = _build_model(locked_d6=True, leaves=108)
         baseline = _solver(model, enabled=False)
         candidate = _solver(model, enabled=True)
-        self.assertIsNotNone(candidate._leaf_publication)
         for step, compact in ((0, False), (1, False), (1, True)):
             snapshots = []
             for solver in (baseline, candidate):
@@ -359,7 +315,10 @@ class TestLeafPublication(unittest.TestCase):
 
     def test_current_root_frames_and_inertial_notifications(self):
         """Use notified current root/leaf frames, axes, COMs, mass, inertia, and gravity."""
-        model, _, _ = _build_model()
+        self._check_current_frames_and_notifications("cpu")
+
+    def _check_current_frames_and_notifications(self, device):
+        model, _, _ = _build_model(device)
         solvers = [_solver(model, enabled=value) for value in (False, True)]
         before = []
         for solver in solvers:
@@ -410,16 +369,20 @@ class TestLeafPublication(unittest.TestCase):
         if not devices:
             self.skipTest("CUDA full-step coverage requires CUDA")
         for device in devices:
+            self._check_current_frames_and_notifications(device)
             for mode in ("matrix_free", "split"):
                 with self.subTest(device=str(device), mode=mode):
                     self._check_cached_next_step_dynamics_and_reset(device, mode)
                     self._check_cached_next_step_dynamics_and_reset(device, mode, loaded=True)
+            self._check_cached_next_step_dynamics_and_reset(device, "matrix_free", loaded=True, velocity_limits=True)
 
-    def _check_cached_next_step_dynamics_and_reset(self, device, mode, *, loaded=False):
+    def _check_cached_next_step_dynamics_and_reset(self, device, mode, *, loaded=False, velocity_limits=False):
         model = _build_contact_model(device) if loaded else _build_model(device, leaves=4)[0]
         contact_capacity = 32 if loaded else 1
         model.rigid_contact_max = contact_capacity
-        solvers = [_solver(model, enabled=value, mode=mode) for value in (False, True)]
+        if velocity_limits:
+            model.joint_velocity_limit.fill_(0.01)
+        solvers = [_solver(model, enabled=value, mode=mode, velocity_limits=velocity_limits) for value in (False, True)]
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
         pipeline = newton.CollisionPipeline(model, rigid_contact_max=contact_capacity)
@@ -440,6 +403,8 @@ class TestLeafPublication(unittest.TestCase):
                 current.body_f.assign(forces)
                 controls[index].joint_f.assign(np.linspace(-0.1, 0.2, model.joint_dof_count, dtype=np.float32))
                 solver.step(current, following, controls[index], contacts[index], 1.0 / 240.0)
+                if velocity_limits and step == 0:
+                    self.assertGreater(float(np.max(np.abs(solver.qd_work.numpy() - current.joint_qd.numpy()))), 0.01)
                 states[index] = [following, current]
             for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
                 np.testing.assert_allclose(
@@ -459,6 +424,33 @@ class TestLeafPublication(unittest.TestCase):
                 )
         if loaded:
             self.assertTrue(saw_contacts, "The full-step fixture must exercise loaded contact rows")
+        if loaded and model.device.is_cuda:
+            graphs = []
+            for index, solver in enumerate(solvers):
+                pair = states[index]
+                with wp.ScopedCapture(device=model.device) as capture:
+                    solver.seed_double_buffer_events()
+                    for phase in (0, 1):
+                        pipeline.collide(pair[phase], contacts[index])
+                        solver.step(pair[phase], pair[1 - phase], controls[index], contacts[index], 1.0 / 240.0)
+                graphs.append(capture.graph)
+            for replay in range(2):
+                if replay == 1:
+                    model.body_mass.assign(model.body_mass.numpy() * 1.03)
+                    model.body_inertia.assign(model.body_inertia.numpy() * 1.03)
+                    for index, solver in enumerate(solvers):
+                        solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+                        solver.reset(states[index][0])
+                for graph in graphs:
+                    wp.capture_launch(graph)
+                for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                    np.testing.assert_allclose(
+                        getattr(states[1][0], name).numpy(),
+                        getattr(states[0][0], name).numpy(),
+                        rtol=1e-5,
+                        atol=2e-6,
+                        err_msg=f"captured replay {replay}: {name}",
+                    )
 
 
 if __name__ == "__main__":
