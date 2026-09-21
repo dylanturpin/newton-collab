@@ -1227,8 +1227,9 @@ def eval_rigid_fk_kinematics(
     fk_id_cache_valid[index] = 1
 
 
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
-def finalize_body_dynamics(
+@wp.func
+def finalize_body_dynamics_body(
+    body: int,
     body_to_articulation: wp.array[int],
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
@@ -1248,8 +1249,7 @@ def finalize_body_dynamics(
     body_f_s: wp.array[wp.spatial_vector],
     body_qd: wp.array[wp.spatial_vector],
 ):
-    """Build independent body dynamics and publish COM velocity in parallel."""
-    body = wp.tid()
+    """Build one body's dynamics and publish its COM velocity."""
     articulation = body_to_articulation[body]
     v_s = body_v_s[body]
     if articulation < 0:
@@ -1290,6 +1290,49 @@ def finalize_body_dynamics(
     com_rel = com_world - origin
     v_com = wp.spatial_top(v_s) + wp.cross(wp.spatial_bottom(v_s), com_rel)
     body_qd[body] = wp.spatial_vector(v_com, wp.spatial_bottom(v_s))
+
+
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+def finalize_body_dynamics(
+    body_to_articulation: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    is_free_rigid: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    materialize_all_body_inertia: int,
+    materialize_body_inertia_terms: int,
+    gravity: wp.array[wp.vec3],
+    body_v_s: wp.array[wp.spatial_vector],
+    body_a_s: wp.array[wp.spatial_vector],
+    body_I_s: wp.array[wp.spatial_matrix],
+    body_inertia_terms: wp.array2d[float],
+    body_f_s: wp.array[wp.spatial_vector],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Build independent body dynamics and publish COM velocity in parallel."""
+    finalize_body_dynamics_body(
+        wp.tid(),
+        body_to_articulation,
+        body_q,
+        body_q_com,
+        body_com,
+        body_mass,
+        body_inertia,
+        is_free_rigid,
+        articulation_origin,
+        materialize_all_body_inertia,
+        materialize_body_inertia_terms,
+        gravity,
+        body_v_s,
+        body_a_s,
+        body_I_s,
+        body_inertia_terms,
+        body_f_s,
+        body_qd,
+    )
 
 
 @wp.kernel(module=_KINEMATICS_KERNEL_MODULE)

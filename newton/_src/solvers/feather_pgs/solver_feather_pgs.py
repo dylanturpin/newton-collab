@@ -192,6 +192,7 @@ from .kernels import (
     update_qdd_from_velocity,
     vector_add_inplace,
 )
+from .prismatic_publication import PrismaticPublicationPlan, finalize_prismatic_body_dynamics
 
 # --- env-gated capture of pgs_solve_mf_gs kernel inputs, for standalone replay/bench ---
 # Off unless FEATHER_PGS_CAPTURE_KERNEL=1. Snapshots the dominant FPGS contact-solve
@@ -2479,6 +2480,14 @@ class SolverFeatherPGS(SolverBase):
             )
 
         self._init_double_buffer_stream()
+
+        # Independent fixed-root prismatic leaves can publish in the existing
+        # body-parallel pass; other articulations keep their serial traversal.
+        self._prismatic_publication = (
+            PrismaticPublicationPlan.build(model, self.articulation_joint_end)
+            if self._fk_id_cache_enabled and not model.requires_grad
+            else None
+        )
 
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
@@ -10398,12 +10407,14 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
                 if self._sparse_diagonal_contact_solve:
+                    # One scalar worker owns each sparse contact; the adjacent
+                    # Jacobian producer's cap assumes 32 lanes per contact.
                     wp.launch(
                         populate_sparse_diagonal_contact_response,
-                        dim=contact_jacobian_workers,
+                        dim=contacts.rigid_contact_max,
                         inputs=[
                             contacts.rigid_contact_count,
-                            contact_jacobian_workers,
+                            contacts.rigid_contact_max,
                             contacts.rigid_contact_point0,
                             contacts.rigid_contact_point1,
                             contacts.rigid_contact_normal,
@@ -12212,12 +12223,13 @@ class SolverFeatherPGS(SolverBase):
         body_a_s = cache.body_a_s if cache is not None else state_aug.body_a_s
         next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
         parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
+        prismatic = self._prismatic_publication
         wp.launch(
             eval_rigid_fk_kinematics,
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start,
-                self.articulation_joint_end,
+                prismatic.joint_end if prismatic is not None else self.articulation_joint_end,
                 model.joint_type,
                 model.joint_parent,
                 model.joint_child,
@@ -12244,10 +12256,28 @@ class SolverFeatherPGS(SolverBase):
             block_dim=16,
             device=model.device,
         )
+        finalize_kernel = finalize_body_dynamics
+        finalize_prefix = []
+        if prismatic is not None:
+            finalize_kernel = finalize_prismatic_body_dynamics
+            finalize_prefix = [
+                prismatic.body_joint,
+                model.joint_parent,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_out.joint_q,
+                state_out.joint_qd,
+                model.joint_X_p,
+                model.joint_X_c,
+                self.body_X_com,
+                model.joint_axis,
+                joint_S_s,
+            ]
         wp.launch(
-            finalize_body_dynamics,
+            finalize_kernel,
             dim=model.body_count,
             inputs=[
+                *finalize_prefix,
                 self.body_to_articulation,
                 state_out.body_q,
                 body_q_com,
