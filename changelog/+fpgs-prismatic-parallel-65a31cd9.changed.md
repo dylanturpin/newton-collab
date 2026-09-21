@@ -1,1 +1,1 @@
-Parallelize independent fixed-root prismatic state publication and scalar sparse-contact response work in FeatherPGS without changing solver budgets or contact laws.
+Parallelize terminal-link state publication and scalar sparse-contact response work in FeatherPGS without changing joint mathematics, solver budgets or contact laws. No configuration changes are required.

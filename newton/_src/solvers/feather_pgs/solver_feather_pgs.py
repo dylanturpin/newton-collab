@@ -192,7 +192,6 @@ from .kernels import (
     update_qdd_from_velocity,
     vector_add_inplace,
 )
-from .prismatic_publication import PrismaticPublicationPlan, finalize_prismatic_body_dynamics
 
 # --- env-gated capture of pgs_solve_mf_gs kernel inputs, for standalone replay/bench ---
 # Off unless FEATHER_PGS_CAPTURE_KERNEL=1. Snapshots the dominant FPGS contact-solve
@@ -532,6 +531,80 @@ class _FeatherPGSModelPlan:
         for array in arrays:
             array.setflags(write=False)
         return cls(*arrays, world_count)
+
+
+@dataclass(frozen=True)
+class _FeatherPGSLeafPlan:
+    """Partition terminal links from their retained parents for state publication.
+
+    Only topology is cached. Joint frames, motion and inertial properties are
+    read from canonical buffers each step. Rebuild the solver if topology changes.
+    """
+
+    joint_start: wp.array[int]
+    """Compact retained-joint offsets, shape [articulation_count + 1]."""
+    joint_indices: wp.array[int]
+    """Retained joints in their original topological order."""
+    body_joint: wp.array[int]
+    """Deferred joint per body, or -1 for an ordinary body update."""
+    articulation_count: int
+    """Number of articulations with deferred leaves."""
+    body_count: int
+    """Number of deferred terminal bodies."""
+
+    @classmethod
+    def build(cls, model: Model, articulation_joint_end: wp.array[int]) -> "_FeatherPGSLeafPlan | None":
+        """Move independent leaves to the body pass, retaining roots and parents."""
+        if not model.articulation_count or not model.joint_count:
+            return None
+        starts = model.articulation_start.numpy()
+        ends = articulation_joint_end.numpy()
+        parents = model.joint_parent.numpy()
+        children = model.joint_child.numpy()
+        owners = np.bincount(children[children >= 0], minlength=model.body_count)
+        descendants = np.bincount(parents[parents >= 0], minlength=model.body_count)
+        body_owner = np.full(model.body_count, -1, dtype=np.int32)
+        owned = np.flatnonzero(children >= 0)
+        body_owner[children[owned]] = owned
+        body_joint = np.full(model.body_count, -1, dtype=np.int32)
+        retained = []
+        offsets = [0]
+        admitted = 0
+        for art in range(model.articulation_count):
+            start, end = int(starts[art]), int(ends[art])
+            joints = np.arange(start, end, dtype=np.int32)
+            deferred = np.zeros(len(joints), dtype=bool)
+            # Keep loop-closing articulations on their existing traversal.
+            if end == int(starts[art + 1]) and end - start > 2:
+                candidates = joints[(children[joints] >= 0) & (parents[joints] >= 0) & (joints != start)]
+                bodies = children[candidates]
+                parent_bodies = parents[candidates]
+                parent_joints = body_owner[parent_bodies]
+                eligible = (
+                    (owners[bodies] == 1)
+                    & (descendants[bodies] == 0)
+                    & (owners[parent_bodies] == 1)
+                    & (parent_joints >= start)
+                    & (parent_joints < candidates)
+                )
+                leaves = candidates[eligible]
+                # A single terminal link exposes no sibling parallelism; keep
+                # chains on the ordinary path instead of adding index traffic.
+                if len(leaves) > 1:
+                    deferred[leaves - start] = True
+                    body_joint[children[leaves]] = leaves
+                    admitted += 1
+            retained.extend(joints[~deferred])
+            offsets.append(len(retained))
+        if not admitted:
+            return None
+        return cls(
+            joint_start=wp.array(offsets, dtype=wp.int32, device=model.device),
+            joint_indices=wp.array(np.asarray(retained, dtype=np.int32), dtype=wp.int32, device=model.device),
+            body_joint=wp.array(body_joint, dtype=wp.int32, device=model.device),
+            articulation_count=admitted,
+            body_count=int(np.count_nonzero(body_joint >= 0)),
+        )
 
 
 @dataclass(frozen=True)
@@ -2481,10 +2554,10 @@ class SolverFeatherPGS(SolverBase):
 
         self._init_double_buffer_stream()
 
-        # Independent fixed-root prismatic leaves can publish in the existing
-        # body-parallel pass; other articulations keep their serial traversal.
-        self._prismatic_publication = (
-            PrismaticPublicationPlan.build(model, self.articulation_joint_end)
+        # Publish independent terminal links in the existing body-parallel
+        # pass after the ordinary traversal has computed all their parents.
+        self._leaf_publication = (
+            _FeatherPGSLeafPlan.build(model, self.articulation_joint_end)
             if self._fk_id_cache_enabled and not model.requires_grad
             else None
         )
@@ -12223,13 +12296,16 @@ class SolverFeatherPGS(SolverBase):
         body_a_s = cache.body_a_s if cache is not None else state_aug.body_a_s
         next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
         parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
-        prismatic = self._prismatic_publication
+        leaves = self._leaf_publication
         wp.launch(
             eval_rigid_fk_kinematics,
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start,
-                prismatic.joint_end if prismatic is not None else self.articulation_joint_end,
+                self.articulation_joint_end,
+                leaves.joint_start if leaves is not None else model.articulation_start,
+                leaves.joint_indices if leaves is not None else model.joint_child,
+                int(leaves is not None),
                 model.joint_type,
                 model.joint_parent,
                 model.joint_child,
@@ -12256,13 +12332,15 @@ class SolverFeatherPGS(SolverBase):
             block_dim=16,
             device=model.device,
         )
-        finalize_kernel = finalize_body_dynamics
-        finalize_prefix = []
-        if prismatic is not None:
-            finalize_kernel = finalize_prismatic_body_dynamics
-            finalize_prefix = [
-                prismatic.body_joint,
+        wp.launch(
+            finalize_body_dynamics,
+            dim=model.body_count,
+            inputs=[
+                int(leaves is not None),
+                leaves.body_joint if leaves is not None else model.joint_child,
+                model.joint_type,
                 model.joint_parent,
+                model.joint_child,
                 model.joint_q_start,
                 model.joint_qd_start,
                 state_out.joint_q,
@@ -12271,13 +12349,8 @@ class SolverFeatherPGS(SolverBase):
                 model.joint_X_c,
                 self.body_X_com,
                 model.joint_axis,
+                model.joint_dof_dim,
                 joint_S_s,
-            ]
-        wp.launch(
-            finalize_kernel,
-            dim=model.body_count,
-            inputs=[
-                *finalize_prefix,
                 self.body_to_articulation,
                 state_out.body_q,
                 body_q_com,

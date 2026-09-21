@@ -1138,6 +1138,9 @@ def compute_link_velocity(
 def eval_rigid_fk_kinematics(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
+    joint_order_start: wp.array[int],
+    joint_order: wp.array[int],
+    use_joint_order: int,
     joint_type: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
@@ -1164,8 +1167,14 @@ def eval_rigid_fk_kinematics(
     index = wp.tid()
     start = articulation_start[index]
     end = articulation_joint_end[index]
+    if use_joint_order != 0:
+        start = joint_order_start[index]
+        end = joint_order_start[index + 1]
 
-    for i in range(start, end):
+    for entry in range(start, end):
+        i = entry
+        if use_joint_order != 0:
+            i = joint_order[entry]
         compute_link_transform(
             i,
             joint_type,
@@ -1184,8 +1193,8 @@ def eval_rigid_fk_kinematics(
         )
 
     origin = wp.vec3()
-    if start < articulation_start[index + 1]:
-        root_body = joint_child[start]
+    if articulation_start[index] < articulation_start[index + 1]:
+        root_body = joint_child[articulation_start[index]]
         if root_body >= 0:
             origin = wp.transform_point(body_q[root_body], body_com[root_body])
     articulation_origin[index] = origin
@@ -1193,7 +1202,10 @@ def eval_rigid_fk_kinematics(
     cached_child = int(-1)
     cached_v_s = wp.spatial_vector()
     cached_a_s = wp.spatial_vector()
-    for i in range(start, end):
+    for entry in range(start, end):
+        i = entry
+        if use_joint_order != 0:
+            i = joint_order[entry]
         parent = joint_parent[i]
         child = joint_child[i]
         parent_v_s = wp.spatial_vector()
@@ -1227,9 +1239,23 @@ def eval_rigid_fk_kinematics(
     fk_id_cache_valid[index] = 1
 
 
-@wp.func
-def finalize_body_dynamics_body(
-    body: int,
+@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
+def finalize_body_dynamics(
+    leaf_publication: int,
+    body_joint: wp.array[int],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_X_com: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    joint_S_s: wp.array[wp.spatial_vector],
     body_to_articulation: wp.array[int],
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
@@ -1249,8 +1275,49 @@ def finalize_body_dynamics_body(
     body_f_s: wp.array[wp.spatial_vector],
     body_qd: wp.array[wp.spatial_vector],
 ):
-    """Build one body's dynamics and publish its COM velocity."""
+    """Publish terminal links and body dynamics after their parents are current."""
+    body = wp.tid()
     articulation = body_to_articulation[body]
+    if leaf_publication != 0:
+        joint = body_joint[body]
+        if joint >= 0:
+            # The preceding traversal owns every deferred link's parent.
+            # Reuse the ordinary joint law, including moving-parent bias terms.
+            compute_link_transform(
+                joint,
+                joint_type,
+                joint_parent,
+                joint_child,
+                joint_q_start,
+                joint_qd_start,
+                joint_q,
+                joint_X_p,
+                joint_X_c,
+                body_X_com,
+                joint_axis,
+                joint_dof_dim,
+                body_q,
+                body_q_com,
+            )
+            parent = joint_parent[joint]
+            compute_link_kinematics(
+                joint,
+                parent,
+                body,
+                body_v_s[parent],
+                body_a_s[parent],
+                articulation_origin[articulation],
+                joint_type,
+                joint_qd_start,
+                joint_qd,
+                joint_axis,
+                joint_dof_dim,
+                body_q,
+                joint_X_p,
+                joint_S_s,
+                body_v_s,
+                body_a_s,
+            )
     v_s = body_v_s[body]
     if articulation < 0:
         com_world = wp.transform_point(body_q[body], body_com[body])
@@ -1290,49 +1357,6 @@ def finalize_body_dynamics_body(
     com_rel = com_world - origin
     v_com = wp.spatial_top(v_s) + wp.cross(wp.spatial_bottom(v_s), com_rel)
     body_qd[body] = wp.spatial_vector(v_com, wp.spatial_bottom(v_s))
-
-
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
-def finalize_body_dynamics(
-    body_to_articulation: wp.array[int],
-    body_q: wp.array[wp.transform],
-    body_q_com: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    body_mass: wp.array[float],
-    body_inertia: wp.array[wp.mat33],
-    is_free_rigid: wp.array[int],
-    articulation_origin: wp.array[wp.vec3],
-    materialize_all_body_inertia: int,
-    materialize_body_inertia_terms: int,
-    gravity: wp.array[wp.vec3],
-    body_v_s: wp.array[wp.spatial_vector],
-    body_a_s: wp.array[wp.spatial_vector],
-    body_I_s: wp.array[wp.spatial_matrix],
-    body_inertia_terms: wp.array2d[float],
-    body_f_s: wp.array[wp.spatial_vector],
-    body_qd: wp.array[wp.spatial_vector],
-):
-    """Build independent body dynamics and publish COM velocity in parallel."""
-    finalize_body_dynamics_body(
-        wp.tid(),
-        body_to_articulation,
-        body_q,
-        body_q_com,
-        body_com,
-        body_mass,
-        body_inertia,
-        is_free_rigid,
-        articulation_origin,
-        materialize_all_body_inertia,
-        materialize_body_inertia_terms,
-        gravity,
-        body_v_s,
-        body_a_s,
-        body_I_s,
-        body_inertia_terms,
-        body_f_s,
-        body_qd,
-    )
 
 
 @wp.kernel(module=_KINEMATICS_KERNEL_MODULE)

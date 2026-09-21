@@ -9,7 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.prismatic_publication import PrismaticPublicationPlan
+from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSLeafPlan
 from newton.solvers import SolverFeatherPGS
 
 
@@ -39,7 +39,7 @@ def _build_model(device="cpu", *, locked_d6=False, chain=False, leaves=7):
         leaf_bodies.append(child)
         joints.append(
             builder.add_joint_prismatic(
-                parent=leaf_bodies[0] if chain and index == 1 else base,
+                parent=(base if index == 0 else leaf_bodies[index - 1]) if chain else base,
                 child=child,
                 axis=wp.vec3(0.2 + 0.1 * index, 0.5, 0.9),
                 parent_xform=wp.transform(wp.vec3(0.1 * index, -0.05, 0.13), wp.quat_rpy(0.2, -0.1 * index, 0.3)),
@@ -74,6 +74,80 @@ def _build_model(device="cpu", *, locked_d6=False, chain=False, leaves=7):
     return model, joints, leaf_bodies
 
 
+def _build_branched_model(device="cpu", *, floating_root=False):
+    """Interleave terminal joints and internal parents with nonzero parent motion."""
+    builder = newton.ModelBuilder(gravity=(0.7, -1.2, -9.1))
+    bodies = [
+        builder.add_link(
+            mass=0.7 + 0.1 * index,
+            com=wp.vec3(0.03, -0.04, 0.02),
+            inertia=wp.mat33(0.3, 0.02, 0.01, 0.02, 0.4, 0.03, 0.01, 0.03, 0.5),
+        )
+        for index in range(7)
+    ]
+    root_args = {"parent": -1, "child": bodies[0]}
+    root = builder.add_joint_free(**root_args) if floating_root else builder.add_joint_revolute(**root_args)
+    joints = [root]
+    # J1 is terminal despite preceding the internal J2. A prefix cannot express
+    # the retained traversal [J0, J2]; later leaves use both moving parents.
+    for index, kind in enumerate(("revolute", "revolute", "prismatic", "ball", "d6", "fixed"), start=1):
+        args = {
+            "parent": bodies[2] if index in (4, 5) else bodies[0],
+            "child": bodies[index],
+            "parent_xform": wp.transform(wp.vec3(0.1 * index, -0.07, 0.13), wp.quat_rpy(0.2, -0.1, 0.3)),
+            "child_xform": wp.transform(wp.vec3(-0.03, 0.04, 0.02), wp.quat_rpy(-0.1, 0.2, 0.1)),
+        }
+        if kind in ("revolute", "prismatic"):
+            args["axis"] = wp.vec3(0.2, 0.5, 0.9)
+        if kind == "d6":
+            args["linear_axes"] = [newton.ModelBuilder.JointDofConfig(axis=newton.Axis.X)]
+            args["angular_axes"] = [newton.ModelBuilder.JointDofConfig(axis=newton.Axis.Y)]
+        joints.append(getattr(builder, f"add_joint_{kind}")(**args))
+    builder.add_articulation(joints)
+    model = builder.finalize(device=device)
+    q = model.joint_q.numpy()
+    starts = model.joint_q_start.numpy()
+    for joint in (1, 2, 3, 5):
+        q[starts[joint] : starts[joint + 1]] = 0.07 * joint
+    if floating_root:
+        q[:7] = (0.4, -0.2, 0.6, *wp.quat_rpy(0.3, -0.2, 0.1))
+    else:
+        q[0] = 0.31
+    model.joint_q.assign(q)
+    model.joint_qd.assign(np.linspace(-0.9, 0.8, model.joint_dof_count, dtype=np.float32))
+    return model, joints, bodies
+
+
+def _build_contact_model(device):
+    """Load three terminal joints against the ground under a moving root."""
+    builder = newton.ModelBuilder()
+    root = builder.add_link(mass=1.0, inertia=wp.mat33(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1))
+    joints = [
+        builder.add_joint_revolute(
+            parent=-1,
+            child=root,
+            axis=newton.Axis.Z,
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.185), wp.quat_identity()),
+        )
+    ]
+    for index, kind in enumerate(("revolute", "prismatic", "ball")):
+        child = builder.add_link(mass=0.5, inertia=wp.mat33(0.03, 0.0, 0.0, 0.0, 0.03, 0.0, 0.0, 0.0, 0.03))
+        args = {
+            "parent": root,
+            "child": child,
+            "parent_xform": wp.transform(wp.vec3(0.5 * (index - 1), 0.3, 0.0), wp.quat_identity()),
+        }
+        if kind != "ball":
+            args["axis"] = newton.Axis.Y if kind == "revolute" else newton.Axis.Z
+        joints.append(getattr(builder, f"add_joint_{kind}")(**args))
+        builder.add_shape_sphere(child, radius=0.2)
+    builder.add_articulation(joints)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    model.joint_qd.assign(np.linspace(-0.1, 0.15, model.joint_dof_count, dtype=np.float32))
+    return model
+
+
 def _solver(model, *, enabled, mode="split"):
     solver = SolverFeatherPGS(
         model,
@@ -84,10 +158,8 @@ def _solver(model, *, enabled, mode="split"):
         use_parallel_streams=False,
     )
     if enabled and model.device.is_cuda:
-        assert solver._prismatic_publication is not None
-    solver._prismatic_publication = (
-        PrismaticPublicationPlan.build(model, solver.articulation_joint_end) if enabled else None
-    )
+        assert solver._leaf_publication is not None
+    solver._leaf_publication = _FeatherPGSLeafPlan.build(model, solver.articulation_joint_end) if enabled else None
     # Exercise the production cached Stage 7 on CPU, where it is normally off.
     solver._fk_id_cache_enabled = True
     # CPU does not normally allocate the optional parallel-refresh terms.
@@ -115,86 +187,150 @@ def _fields(solver, state):
     }
 
 
-class TestPrismaticPublication(unittest.TestCase):
+class TestLeafPublication(unittest.TestCase):
     def test_cuda_actual_graph_publication(self):
-        """Check the actual matrix-free Stage 7 eager/two-graph outputs and inputs."""
+        """Match poisoned-buffer graph replays for prismatic and mixed moving trees."""
         devices = wp.get_cuda_devices()
         if not devices:
             self.skipTest("CUDA graph replay requires CUDA")
         for device in devices:
-            model, _, _ = _build_model(device, locked_d6=True, leaves=108)
-            solvers = [_solver(model, enabled=value, mode="matrix_free") for value in (False, True)]
-            inputs = {
-                name: getattr(model, name)
-                for name in (
-                    "joint_X_p",
-                    "joint_X_c",
-                    "joint_axis",
-                    "body_com",
-                    "body_mass",
-                    "body_inertia",
-                    "gravity",
-                    "joint_type",
-                    "joint_parent",
-                    "joint_child",
-                    "joint_q_start",
-                    "joint_qd_start",
-                )
-            }
-            before = {name: array.numpy().copy() for name, array in inputs.items()}
-            for step in (0, 1):
-                eager = []
-                for solver in solvers:
-                    state = model.state()
-                    solver._step = step
-                    fields = _fields(solver, state)
-                    q, qd = state.joint_q.numpy().copy(), state.joint_qd.numpy().copy()
+            self._check_graph_publication(_build_model(device, locked_d6=True, leaves=108)[0])
+            self._check_graph_publication(_build_branched_model(device, floating_root=True)[0])
 
-                    def poison(outputs=fields):
-                        for name, array in outputs.items():
-                            array.fill_(-123 if name == "valid" else -123.25)
+    def _check_graph_publication(self, model):
+        device = model.device
+        solvers = [_solver(model, enabled=value, mode="matrix_free") for value in (False, True)]
+        inputs = {
+            name: getattr(model, name)
+            for name in (
+                "joint_X_p",
+                "joint_X_c",
+                "joint_axis",
+                "body_com",
+                "body_mass",
+                "body_inertia",
+                "gravity",
+                "joint_type",
+                "joint_parent",
+                "joint_child",
+                "joint_q_start",
+                "joint_qd_start",
+            )
+        }
+        before = {name: array.numpy().copy() for name, array in inputs.items()}
+        for step in (0, 1):
+            eager = []
+            for solver in solvers:
+                state = model.state()
+                solver._step = step
+                fields = _fields(solver, state)
+                q, qd = state.joint_q.numpy().copy(), state.joint_qd.numpy().copy()
 
-                    poison()
+                def poison(outputs=fields):
+                    for name, array in outputs.items():
+                        array.fill_(-123 if name == "valid" else -123.25)
+
+                poison()
+                solver._stage7_update_kinematics(state, solver)
+                expected = {name: array.numpy().copy() for name, array in fields.items()}
+                self.assertTrue(all(np.isfinite(value).all() for value in expected.values()))
+                with wp.ScopedCapture(device=device) as capture:
                     solver._stage7_update_kinematics(state, solver)
-                    expected = {name: array.numpy().copy() for name, array in fields.items()}
-                    self.assertTrue(all(np.isfinite(value).all() for value in expected.values()))
-                    with wp.ScopedCapture(device=device) as capture:
-                        solver._stage7_update_kinematics(state, solver)
-                    for _ in range(2):
-                        poison()
-                        wp.capture_launch(capture.graph)
-                        for name, array in fields.items():
-                            np.testing.assert_array_equal(array.numpy(), expected[name], err_msg=name)
-                    np.testing.assert_array_equal(state.joint_q.numpy(), q)
-                    np.testing.assert_array_equal(state.joint_qd.numpy(), qd)
-                    eager.append(expected)
-                for name in eager[0]:
-                    np.testing.assert_allclose(eager[1][name], eager[0][name], rtol=3e-6, atol=3e-6, err_msg=name)
-            for name, array in inputs.items():
-                np.testing.assert_array_equal(array.numpy(), before[name], err_msg=name)
+                for _ in range(2):
+                    poison()
+                    wp.capture_launch(capture.graph)
+                    for name, array in fields.items():
+                        np.testing.assert_array_equal(array.numpy(), expected[name], err_msg=name)
+                np.testing.assert_array_equal(state.joint_q.numpy(), q)
+                np.testing.assert_array_equal(state.joint_qd.numpy(), qd)
+                eager.append(expected)
+            for name in eager[0]:
+                np.testing.assert_allclose(eager[1][name], eager[0][name], rtol=3e-6, atol=3e-6, err_msg=name)
+        for name, array in inputs.items():
+            np.testing.assert_array_equal(array.numpy(), before[name], err_msg=name)
 
     def test_exact_topology_and_fallback(self):
-        """Admit zero-DOF fixed/D6 roots and reject a non-star without task names."""
+        """Defer star leaves, retaining roots and complete one-leaf chains."""
         for locked in (False, True):
             model, joints, leaves = _build_model(locked_d6=locked)
             baseline = _solver(model, enabled=False)
-            self.assertIsNone(baseline._prismatic_publication)
-            plan = PrismaticPublicationPlan.build(model, baseline.articulation_joint_end)
+            self.assertIsNone(baseline._leaf_publication)
+            plan = _FeatherPGSLeafPlan.build(model, baseline.articulation_joint_end)
             self.assertEqual(plan.articulation_count, 1)
             self.assertEqual(plan.body_count, len(leaves))
             np.testing.assert_array_equal(plan.body_joint.numpy()[leaves], joints[1:])
-            self.assertEqual(int(plan.joint_end.numpy()[0]), joints[0] + 1)
-            np.testing.assert_array_equal(plan.joint_end.numpy()[1:], baseline.articulation_joint_end.numpy()[1:])
+            retained = plan.joint_indices.numpy()
+            offsets = plan.joint_start.numpy()
+            self.assertEqual(int(offsets[1] - offsets[0]), 1)
+            self.assertEqual(int(retained[offsets[0]]), joints[0])
+            np.testing.assert_array_equal(retained[offsets[1] :], [len(joints), len(joints) + 1])
         model, _, _ = _build_model(chain=True)
         baseline = _solver(model, enabled=False)
-        self.assertIsNone(PrismaticPublicationPlan.build(model, baseline.articulation_joint_end))
+        self.assertIsNone(_FeatherPGSLeafPlan.build(model, baseline.articulation_joint_end))
+
+    def test_interleaved_mixed_leaves_and_moving_parents(self):
+        """Keep internal joints in order and preserve general moving-parent kinematics."""
+        for floating in (False, True):
+            model, joints, bodies = _build_branched_model(floating_root=floating)
+            solvers = [_solver(model, enabled=value) for value in (False, True)]
+            plan = solvers[1]._leaf_publication
+            self.assertIsNotNone(plan)
+            self.assertEqual(plan.articulation_count, 1)
+            self.assertEqual(plan.body_count, 5)
+            np.testing.assert_array_equal(plan.joint_indices.numpy(), [joints[0], joints[2]])
+            np.testing.assert_array_equal(plan.joint_start.numpy(), [0, 2])
+            np.testing.assert_array_equal(plan.body_joint.numpy()[[bodies[0], bodies[2]]], -1)
+            leaves = [bodies[index] for index in (1, 3, 4, 5, 6)]
+            np.testing.assert_array_equal(plan.body_joint.numpy()[leaves], [joints[index] for index in (1, 3, 4, 5, 6)])
+            snapshots = []
+            for solver in solvers:
+                state = model.state()
+                solver._step = 1
+                for name, array in _fields(solver, state).items():
+                    array.fill_(-123 if name == "valid" else -123.25)
+                solver._stage7_update_kinematics(state, solver)
+                snapshots.append({name: array.numpy().copy() for name, array in _fields(solver, state).items()})
+            for name in snapshots[0]:
+                np.testing.assert_allclose(snapshots[1][name], snapshots[0][name], rtol=3e-6, atol=3e-6, err_msg=name)
+            self.assertGreater(float(np.max(np.abs(snapshots[1]["a"][leaves]))), 1e-3)
+            reference = model.state()
+            newton.eval_fk(model, reference.joint_q, reference.joint_qd, reference)
+            np.testing.assert_allclose(snapshots[1]["body_q"], reference.body_q.numpy(), rtol=3e-6, atol=3e-6)
+            # Ordinary FPGS already differs from eval_fk for mixed D6
+            # translation/angular lever arms; its complete fields match above.
+            ordinary_velocity = model.joint_type.numpy() != int(newton.JointType.D6)
+            checked_bodies = model.joint_child.numpy()[ordinary_velocity]
+            np.testing.assert_allclose(
+                snapshots[1]["body_qd"][checked_bodies],
+                reference.body_qd.numpy()[checked_bodies],
+                rtol=3e-6,
+                atol=3e-6,
+            )
+
+    def test_loop_and_aliased_body_fallback(self):
+        """Retain loop articulations and aliased leaves in the ordinary traversal."""
+        model, _, _ = _build_model()
+        solver = _solver(model, enabled=False)
+        ends = solver.articulation_joint_end.numpy().copy()
+        ends[0] -= 1
+        clipped = wp.array(ends, dtype=wp.int32, device=model.device)
+        self.assertIsNone(_FeatherPGSLeafPlan.build(model, clipped))
+        children = model.joint_child.numpy()
+        children[2] = children[1]
+        model.joint_child.assign(children)
+        plan = _FeatherPGSLeafPlan.build(model, solver.articulation_joint_end)
+        self.assertIsNotNone(plan)
+        self.assertEqual(int(plan.body_joint.numpy()[children[1]]), -1)
+        retained = plan.joint_indices.numpy()
+        self.assertIn(1, retained)
+        self.assertIn(2, retained)
 
     def test_complete_canonical_publication_and_held_inertia(self):
         """Match all canonical fields, preserving held I/terms on each cadence arm."""
         model, _, leaves = _build_model(locked_d6=True, leaves=108)
         baseline = _solver(model, enabled=False)
         candidate = _solver(model, enabled=True)
-        self.assertIsNotNone(candidate._prismatic_publication)
+        self.assertIsNotNone(candidate._leaf_publication)
         for step, compact in ((0, False), (1, False), (1, True)):
             snapshots = []
             for solver in (baseline, candidate):
@@ -266,6 +402,7 @@ class TestPrismaticPublication(unittest.TestCase):
     def test_cached_next_step_dynamics_and_reset(self):
         """Feed publication back into original dynamics across refresh/reuse and reset."""
         self._check_cached_next_step_dynamics_and_reset("cpu", "split")
+        self._check_cached_next_step_dynamics_and_reset("cpu", "split", loaded=True)
 
     def test_cuda_cached_next_step_dynamics_and_reset(self):
         """Preserve complete CUDA steps with matrix-free and snapshot-backed publication."""
@@ -276,13 +413,18 @@ class TestPrismaticPublication(unittest.TestCase):
             for mode in ("matrix_free", "split"):
                 with self.subTest(device=str(device), mode=mode):
                     self._check_cached_next_step_dynamics_and_reset(device, mode)
+                    self._check_cached_next_step_dynamics_and_reset(device, mode, loaded=True)
 
-    def _check_cached_next_step_dynamics_and_reset(self, device, mode):
-        model, _, _ = _build_model(device, leaves=4)
+    def _check_cached_next_step_dynamics_and_reset(self, device, mode, *, loaded=False):
+        model = _build_contact_model(device) if loaded else _build_model(device, leaves=4)[0]
+        contact_capacity = 32 if loaded else 1
+        model.rigid_contact_max = contact_capacity
         solvers = [_solver(model, enabled=value, mode=mode) for value in (False, True)]
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
-        contacts = [model.contacts() for _ in solvers]
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=contact_capacity)
+        contacts = [pipeline.contacts() for _ in solvers]
+        saw_contacts = False
         for pair in states:
             newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
         for step in range(6):
@@ -290,6 +432,9 @@ class TestPrismaticPublication(unittest.TestCase):
                 current, following = states[index]
                 if step == 3:
                     solver.reset(current)
+                if loaded:
+                    pipeline.collide(current, contacts[index])
+                    saw_contacts |= int(contacts[index].rigid_contact_count.numpy()[0]) > 0
                 forces = np.zeros((model.body_count, 6), dtype=np.float32)
                 forces[1, :3] = (0.2 * step, -0.1, 0.3)
                 current.body_f.assign(forces)
@@ -312,6 +457,8 @@ class TestPrismaticPublication(unittest.TestCase):
                     rtol=1e-5,
                     atol=2e-6,
                 )
+        if loaded:
+            self.assertTrue(saw_contacts, "The full-step fixture must exercise loaded contact rows")
 
 
 if __name__ == "__main__":
