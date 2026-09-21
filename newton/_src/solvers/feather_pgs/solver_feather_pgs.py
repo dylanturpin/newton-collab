@@ -550,7 +550,7 @@ class _FeatherPGSTreeGroup:
     level_offsets: wp.array2d[int]
     """Segment offsets per articulation and level, shape [count, max_levels + 1]."""
     segment_offsets: wp.array[int]
-    """Offsets into the joint list for each maximal unary chain."""
+    """Offsets into the joint list for each unary-chain or joint-sized segment."""
     segment_joints: wp.array[int]
     """Global joint indices, ordered from each segment's parent to its child."""
     child_offsets: wp.array[int]

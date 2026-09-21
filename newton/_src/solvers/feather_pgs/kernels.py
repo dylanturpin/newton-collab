@@ -1428,7 +1428,8 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
 
     ``id`` and ``kinematics`` share the ordinary FK/ID signature after the six
     schedule arguments. ``public`` instead takes the public FK helper's arrays.
-    Each segment is a maximal unary chain. Launch complete 32-thread warps;
+    Unary chains use joint-sized segments when that shortens the topology span.
+    Launch complete 32-thread warps;
     CPU and differentiable execution stay serial.
     """
     if lanes not in (1, 2, 4, 8, 16, 32):
