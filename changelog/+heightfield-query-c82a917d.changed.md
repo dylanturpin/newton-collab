@@ -1,0 +1,1 @@
+Accelerate heightfield-only collision queries by packing independent pairs across threads and conservatively rejecting cells below the expanded shape AABB, while retaining the existing contact generation and mixed-mesh path.
