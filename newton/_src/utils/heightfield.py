@@ -364,10 +364,38 @@ def get_triangle_shape_from_heightfield(
 
 
 @wp.func
+def _abs_sum(value: wp.vec3) -> float:
+    return wp.abs(value[0]) + wp.abs(value[1]) + wp.abs(value[2])
+
+
+@wp.func
+def _heightfield_cell_below_query(
+    lower_z: float,
+    padding: float,
+    hfd: HeightfieldData,
+    elevations: wp.array[float],
+    row: int,
+    col: int,
+) -> bool:
+    """Reject only above every current corner; retain the entire downward prism."""
+    i = hfd.data_offset + row * hfd.ncol + col
+    height_range = hfd.max_z - hfd.min_z
+    z00 = hfd.min_z + elevations[i] * height_range
+    z10 = hfd.min_z + elevations[i + 1] * height_range
+    z01 = hfd.min_z + elevations[i + hfd.ncol] * height_range
+    z11 = hfd.min_z + elevations[i + hfd.ncol + 1] * height_range
+    if not (wp.isfinite(z00) and wp.isfinite(z10) and wp.isfinite(z01) and wp.isfinite(z11)):
+        return False
+    top = wp.max(wp.max(z00, z10), wp.max(z01, z11))
+    return lower_z > top + padding + (16.0 * 1.1920928955078125e-7) * wp.abs(top)
+
+
+@wp.func
 def heightfield_vs_convex_midphase(
     hfield_shape: int,
     other_shape: int,
     hfd: HeightfieldData,
+    elevation_data: wp.array[wp.float32],
     shape_transform: wp.array[wp.transform],
     shape_collision_aabb_lower: wp.array[wp.vec3],
     shape_collision_aabb_upper: wp.array[wp.vec3],
@@ -375,6 +403,7 @@ def heightfield_vs_convex_midphase(
     shape_gap: wp.array[float],
     triangle_pairs: wp.array[wp.vec3i],
     triangle_pairs_count: wp.array[int],
+    reject_cells: bool = True,
 ):
     """Find heightfield triangles that overlap with a convex shape's AABB.
 
@@ -394,6 +423,7 @@ def heightfield_vs_convex_midphase(
         hfield_shape: Index of the heightfield shape.
         other_shape: Index of the convex shape.
         hfd: Heightfield data struct.
+        elevation_data: Concatenated normalized heightfield samples.
         shape_transform: World-space transforms for all shapes.
         shape_collision_aabb_lower: Local-space AABB lower bounds for each
             shape (scale already baked in).
@@ -403,6 +433,7 @@ def heightfield_vs_convex_midphase(
         shape_gap: Per-shape contact gaps.
         triangle_pairs: Output buffer for ``(hfield_shape, other_shape, tri_idx)`` triples.
         triangle_pairs_count: Atomic counter for emitted triangle pairs.
+        reject_cells: Disable for planes whose cached local AABB does not bound their surface.
     """
     X_hfield_ws = shape_transform[hfield_shape]
     X_other_ws = shape_transform[other_shape]
@@ -453,8 +484,29 @@ def heightfield_vs_convex_midphase(
     row_max = wp.min(wp.int32(wp.floor(row_max_f)), hfd.nrow - 2)
 
     cols = hfd.ncol - 1
+    padding = float(0.0)
+    can_reject = bool(False)
+    if reject_cells:
+        # Retain roundoff from world-coordinate cancellation, transformed
+        # extents and height reconstruction, plus the narrow-phase query shell.
+        scale = (
+            1.0
+            + _abs_sum(wp.transform_get_translation(X_hfield_ws))
+            + _abs_sum(wp.transform_get_translation(X_other_ws))
+            + _abs_sum(local_center)
+            + _abs_sum(local_half)
+            + _abs_sum(center_in_hfield)
+            + _abs_sum(half_in_hfield)
+            + wp.abs(hfd.min_z)
+            + wp.abs(hfd.max_z - hfd.min_z)
+            + wp.abs(contact_threshold)
+        )
+        padding = 0.0002 + (64.0 * 1.1920928955078125e-7) * scale
+        can_reject = wp.isfinite(aabb_lower[2]) and wp.isfinite(padding)
     for r in range(row_min, row_max + 1):
         for c in range(col_min, col_max + 1):
+            if can_reject and _heightfield_cell_below_query(aabb_lower[2], padding, hfd, elevation_data, r, c):
+                continue
             for tri_sub in range(2):
                 tri_idx = (r * cols + c) * 2 + tri_sub
                 out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
