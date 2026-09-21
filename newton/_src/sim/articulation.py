@@ -570,6 +570,9 @@ def eval_fk(
             state.body_qd,
         ],
         device=model.device,
+        # Each thread traverses one articulation serially. Smaller CUDA blocks
+        # distribute batched work; keep the default when no extra block is exposed.
+        block_dim=16 if model.device.is_cuda and num_articulations > 16 else 256,
     )
 
 
