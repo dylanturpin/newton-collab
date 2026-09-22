@@ -6,8 +6,9 @@
 Multi-shape bodies multiply narrow-phase output: a foot approximated by 7
 cylinders emits up to 28 candidate contacts against a plane and up to 49
 against another such foot, even when the underlying physics is one flat patch.
-The pass represents that patch with one depth slot and six sampled footprint
-support slots rather than treating collider decomposition as physical detail.
+The pass represents that patch with one depth slot and two families of six
+sampled footprint slots rather than treating collider decomposition as
+physical detail.
 
 **Approximation, stated precisely.** For contacts RETAINED at the true hull, an
 interior point's normal force is a convex combination of hull-point normal
@@ -45,10 +46,12 @@ compacts it in two kernels over the live contact range -- register, then select:
   :data:`BODY_PAIR_NUM_DIRECTIONS` spatial-extreme slots, competing on
   projection alone, and touching contacts (separation ``<= 0``) also enter a
   second family of extreme slots closed to speculative ones (see
-  :data:`TOUCHING_SLOT_OFFSET`).  With zero hysteresis each slot holds its
-  instantaneous winner; with hysteresis an incumbent may trail that winner by
-  no more than the configured score margin (see
-  :data:`BODY_PAIR_REDUCTION_SLOTS` for the policies this replaced);
+  :data:`TOUCHING_SLOT_OFFSET`); under hysteresis a touching-slot incumbent
+  stays in that family while it hovers within the margin, without its bonus.
+  With zero hysteresis each slot holds its instantaneous winner; with
+  hysteresis an incumbent may trail that winner by no more than the configured
+  score margin (see :data:`BODY_PAIR_REDUCTION_SLOTS` for the policies this
+  replaced);
 * each contact then checks whether any value it submitted won its slot, and the
   survivors are compacted in place so ``rigid_contact_count`` itself drops.
   Everything else is discarded -- typically interior points whose force is a
@@ -374,25 +377,16 @@ def _direction_2d(dir_idx: int) -> wp.vec2:
 
 
 # Value slots per (body pair, normal bin, spatial cell) entry: one spatial
-# extreme per scan direction, plus the group's deepest contact.
+# extreme per scan direction over all contacts, the group's deepest contact,
+# and one extreme per scan direction over touching contacts.
 #
-# Every contact competes for every spatial slot on projection alone. Two richer
-# policies were implemented and measured against both a walking humanoid and
-# randomized primitive piles, and neither earned its cost:
-#
-# * gating slot entry on a depth window starves any patch whose gap spread
-#   exceeds the window -- a tilted box face keeps only its deepest corner,
-#   pivots on that point contact and diverges;
-# * adding a second, depth-gated family of slots alongside this one changed
-#   neither kept counts (p50 300 rows either way) nor trajectories on any
-#   scene, because a patch's load-bearing contacts are already its spatial
-#   extremes; it only doubled the slot memory and clearing work.
+# Gating the all-contact family on a depth window starves any patch whose gap
+# spread exceeds the window: a tilted box face keeps only its deepest corner,
+# pivots on it and diverges. The touching family is a separate set of slots
+# instead, because on a compound body the all-contact extremes can all be
+# speculative (a tumbler's wall hulls hovering inside the gap sit further out
+# than its base), leaving one load-bearing contact and a rocking body.
 DEEPEST_SLOT = BODY_PAIR_NUM_DIRECTIONS
-# Extremes among TOUCHING contacts only (separation <= 0). The all-candidate
-# extremes can all be speculative (a tumbler's wall hulls hovering inside the
-# gap sit further out than its base disc), which left one touching contact and
-# a rocking body. The touching family keeps the load-bearing support polygon;
-# the first family keeps the speculative envelope.
 TOUCHING_SLOT_OFFSET = BODY_PAIR_NUM_DIRECTIONS + 1
 BODY_PAIR_REDUCTION_SLOTS = 2 * BODY_PAIR_NUM_DIRECTIONS + 1
 
@@ -822,7 +816,7 @@ def _detect_noop_kernel(
 
     The group-count test above catches single-contact groups, but the common
     no-benefit regime -- single-collider bodies like plain boxes -- produces
-    groups of up to ~5 contacts that all fit in the 7 slots, so nothing is
+    groups of up to ~5 contacts that all fit in the slots, so nothing is
     discarded even though groups are larger than one. That is only known after
     the keep scan: when the kept count equals the work count, the compaction
     would copy every contact onto itself, so the copy-back is skipped and the
@@ -898,16 +892,28 @@ def _touching_eligible(gap: float, hysteresis: float, mask: int) -> bool:
     """True if the contact may compete for the touching slot family.
 
     Touching means separation ``<= 0``.  Under hysteresis an incumbent of a
-    touching slot stays eligible while it hovers within the margin above the
-    surface, otherwise contacts rocking through zero on curved support hand the
-    slots back and forth regardless of the score bias.  Same rule in the
-    register, select, and verify passes.
+    touching slot stays eligible while it hovers within the margin, so support
+    rocking through zero does not drop it; it competes without its incumbency
+    bonus there (see :func:`_touching_bias`).  Same rule in register, select,
+    and verify.
     """
     if gap <= 0.0:
         return True
     if hysteresis > 0.0 and (mask >> wp.static(TOUCHING_SLOT_OFFSET)) != 0 and gap <= hysteresis:
         return True
     return False
+
+
+@wp.func
+def _touching_bias(gap: float, hysteresis: float) -> float:
+    """Incumbency bonus for the touching family: only while actually touching.
+
+    A lifted-off incumbent may not use the bonus to beat a load-bearing
+    challenger, which is the failure the touching family exists to prevent.
+    """
+    if gap <= 0.0:
+        return hysteresis
+    return 0.0
 
 
 @wp.kernel(enable_backward=False)
@@ -1105,7 +1111,7 @@ def _register_contact_one(
     if _touching_eligible(gap, hysteresis, mask):
         for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
             slot = wp.static(TOUCHING_SLOT_OFFSET) + dir_i
-            primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), hysteresis, mask, slot)
+            primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), _touching_bias(gap, hysteresis), mask, slot)
             value = _pack_score(primary, pos_key)
             touch_slot = _slot_index(entry_idx, slot)
             if ht_values[touch_slot] < value:
@@ -1251,7 +1257,7 @@ def _select_winner_one(
     if _touching_eligible(gap, hysteresis, mask):
         for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
             slot = wp.static(TOUCHING_SLOT_OFFSET) + dir_i
-            primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), hysteresis, mask, slot)
+            primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), _touching_bias(gap, hysteresis), mask, slot)
             if ht_values[_slot_index(entry_idx, slot)] == _pack_score(primary, pos_key):
                 won = True
     if won:
@@ -1345,7 +1351,7 @@ def _verify_invariant_one(
     if _touching_eligible(gap, hysteresis, mask):
         for dir_i in range(wp.static(BODY_PAIR_NUM_DIRECTIONS)):
             slot = wp.static(TOUCHING_SLOT_OFFSET) + dir_i
-            primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), hysteresis, mask, slot)
+            primary = _biased_primary(wp.dot(pos_2d, _direction_2d(dir_i)), _touching_bias(gap, hysteresis), mask, slot)
             value = _pack_score(primary, pos_key)
             slot_value = ht_values[_slot_index(entry_idx, slot)]
             if value == slot_value:

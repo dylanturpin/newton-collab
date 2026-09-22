@@ -1199,7 +1199,9 @@ material class, normal bin, and spatial cell, then retains one depth
 representative, up to six sampled footprint representatives over all
 candidates, and up to six more over the touching candidates alone (canonical
 separation ``<= 0``), so speculative contacts hovering inside the contact gap
-can never displace the support polygon that carries the body.  With nonzero
+can never displace the support polygon that carries the body.  Under
+hysteresis a touching-slot winner that lifts off within the margin keeps
+competing in the touching family, but without the incumbency preference.  With nonzero
 hysteresis, an incumbent may trail the instantaneous slot winner by no more
 than the configured margin; coincident contacts with identical packed winner
 keys can exceed the nominal slot count.  This is a bounded-work spatial
