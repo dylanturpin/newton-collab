@@ -7704,6 +7704,8 @@ class SolverFeatherPGS(SolverBase):
     ):
         if self._contact_torsion_enabled:
             validate_torsion_step(self)
+            if getattr(self, "_device_torsion", None) is not None:
+                self._device_torsion.begin_step(state_in, state_out)
         if self.contact_compliance:
             # Reject incompatible contact preprocessing before it can mutate the stream.
             _contact_compliance.validate_step(self)
@@ -8594,6 +8596,8 @@ class SolverFeatherPGS(SolverBase):
                     device=contact_counts.device,
                 )
 
+        if self._contact_torsion_enabled and getattr(self, "_device_torsion", None) is not None:
+            self._device_torsion.end_step(state_out)
         self._step += 1
         return state_out
 

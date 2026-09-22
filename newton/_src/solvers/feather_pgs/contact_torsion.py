@@ -282,7 +282,9 @@ def validate_torsion_step(solver):
     """Reject incompatible runtime state before any solver stage consumes it."""
     _validate_torsion_mode(solver)
     if wp.get_stream(solver.model.device).is_capturing:
-        raise RuntimeError("Experimental torsion host grouping does not support CUDA graph capture")
+        device = getattr(solver, "_device_torsion", None)
+        if device is None or not device.deferred_errors:
+            raise RuntimeError("Contact torsion graph capture requires device preparation with deferred validation")
 
 
 @wp.kernel
@@ -364,6 +366,9 @@ def prepare_torsion_velocity_pass(solver, dt):
 def prepare_torsion_rows(solver, state, augmented_state, contacts):
     """Append current touching-group angular rows before H-inverse/J response."""
     validate_torsion_step(solver)
+    if getattr(solver, "_device_torsion", None) is not None:
+        solver._device_torsion.prepare(state, augmented_state, contacts)
+        return
     solver._torsion_stats = {"rows": 0, "groups": []}
     if contacts is None:
         return
