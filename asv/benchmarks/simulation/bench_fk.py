@@ -8,11 +8,11 @@ from asv_runner.benchmarks.mark import SkipNotImplemented, skip_benchmark_if
 import newton
 
 
-def _build_fk_model(topology, world_count, device):
-    """Replicate nine-joint chains or a root with four two-joint branches."""
+def _build_fk_model(topology, joint_count, world_count, device):
+    """Replicate chains or a root with up to four two-joint branches."""
     template = newton.ModelBuilder()
     bodies, joints = [], []
-    for index in range(9):
+    for index in range(joint_count):
         body = template.add_link(
             mass=1.0,
             inertia=wp.diag(wp.vec3(1.0, 1.0, 1.0)),
@@ -37,20 +37,20 @@ def _build_fk_model(topology, world_count, device):
 
 
 class FastForwardKinematics:
-    """Time 100 fixed-state public FK evaluations, excluding model construction."""
+    """Time 100 fixed-state public FK calls for tiny and larger articulations."""
 
-    params = (["serial", "branched"], [1, 16, 17, 4096, 65536])
-    param_names = ["topology", "world_count"]
+    params = (["serial", "branched"], [2, 9], [1, 16, 17, 256, 4096, 65536])
+    param_names = ["topology", "joint_count", "world_count"]
     repeat = 8
     number = 1
     rounds = 2
 
-    def setup(self, topology, world_count):
+    def setup(self, topology, joint_count, world_count):
         device = wp.get_device()
         if not device.is_cuda or not wp.is_mempool_enabled(device):
             raise SkipNotImplemented
 
-        self.model = _build_fk_model(topology, world_count, device)
+        self.model = _build_fk_model(topology, joint_count, world_count, device)
         self.state = self.model.state()
         newton.eval_fk(self.model, self.state.joint_q, self.state.joint_qd, self.state)
         with wp.ScopedCapture(device=device) as capture:
@@ -62,10 +62,10 @@ class FastForwardKinematics:
         wp.synchronize_device(device)
 
     @skip_benchmark_if(wp.get_cuda_device_count() == 0)
-    def time_fk(self, topology, world_count):
+    def time_fk(self, topology, joint_count, world_count):
         wp.capture_launch(self.graph)
         wp.synchronize_device(self.model.device)
 
-    def teardown(self, topology, world_count):
+    def teardown(self, topology, joint_count, world_count):
         if not all(np.isfinite(array.numpy()).all() for array in (self.state.body_q, self.state.body_qd)):
             raise RuntimeError("Forward kinematics produced non-finite body state")

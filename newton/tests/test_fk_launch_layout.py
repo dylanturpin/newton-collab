@@ -16,7 +16,7 @@ from newton.tests.test_ik_fk_kernels import _randomize_joint_q
 from newton.tests.test_kinematics import _build_dynamic_and_kinematic_single_joint_model
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
-BLOCKS = (16, 256)
+BLOCKS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 
 
 def _mixed_model(device, *, requires_grad=False):
@@ -76,6 +76,10 @@ def test_fk_layout_selection(test, device):
         choices = (
             ({}, np.ones(model.articulation_count, dtype=bool)),
             ({"mask": wp.array(selected, dtype=wp.bool, device=device)}, selected),
+            (
+                {"indices": wp.empty(0, dtype=wp.int32, device=device)},
+                np.zeros(model.articulation_count, dtype=bool),
+            ),
             (
                 {"indices": wp.array([-1, 100, *np.flatnonzero(selected)[::-1]], dtype=wp.int32, device=device)},
                 selected,
@@ -170,27 +174,103 @@ def test_fk_layout_graph_replay(test, device):
 
 
 class TestFKLaunchLayout(unittest.TestCase):
-    def test_launch_policy_uses_selected_articulation_count(self):
-        """Use narrow CUDA blocks only when selection supplies multiple blocks."""
+    def test_launch_policy_power_of_two_boundaries(self):
+        """Round down at batch-size thresholds and retain CPU, singleton and cap behavior."""
+        for count, expected in ((0, 256), (1, 256), (2, 1), (255, 1), (256, 1), (511, 1), (512, 2)):
+            with self.subTest(count=count, sm_count=128):
+                self.assertEqual(articulation._fk_block_dim(count, 128, 8), expected)
+        for sm_count in (-1, 0):
+            for count in (0, 1, 4096, 1 << 30):
+                self.assertEqual(articulation._fk_block_dim(count, sm_count, 8), 256)
+        for sm_count in (8, 128, 152, 188, 256):
+            for block in (2, 4, 8, 16):
+                threshold = 2 * sm_count * block
+                with self.subTest(sm_count=sm_count, threshold=threshold):
+                    self.assertEqual(articulation._fk_block_dim(threshold - 1, sm_count, 8), block // 2)
+                    self.assertEqual(articulation._fk_block_dim(threshold, sm_count, 8), block)
+                    self.assertEqual(articulation._fk_block_dim(threshold + 1, sm_count, 8), block)
+            self.assertEqual(articulation._fk_block_dim(1 << 30, sm_count, 8), 16)
+        self.assertEqual(articulation._fk_block_dim(4096, 152, 8), 8)
+        self.assertEqual(articulation._fk_block_dim(4096, 188, 8), 8)
+
+    def test_launch_policy_retains_packed_tiny_articulations(self):
+        """Retain the previous layout through four joints and switch policy at five."""
+        for max_joints in (0, 1, 2, 3, 4):
+            for sm_count in (8, 128, 256):
+                for count in (0, 1, 2, 16, 17, 4096, 1 << 30):
+                    with self.subTest(max_joints=max_joints, sm_count=sm_count, count=count):
+                        expected = 16 if count > 16 else 256
+                        self.assertEqual(articulation._fk_block_dim(count, sm_count, max_joints), expected)
+            self.assertEqual(articulation._fk_block_dim(4096, 0, max_joints), 256)
+        for count, expected in ((0, 256), (1, 256), (2, 1), (16, 1), (17, 1), (512, 2), (65536, 16)):
+            with self.subTest(max_joints=5, count=count):
+                self.assertEqual(articulation._fk_block_dim(count, 128, 5), expected)
+
+    def test_launch_policy_scales_with_device_parallelism(self):
+        """Expose more independent blocks for the same batch on a larger GPU."""
         model = _mixed_model("cpu")
         state = model.state()
-        choices = [({}, 35), ({"mask": wp.ones(35, dtype=wp.bool, device="cpu")}, 35)]
+        blocks = []
+        for sm_count in (8, 256):
+            selected_model = SimpleNamespace(**vars(model))
+            selected_model.articulation_count = 4096
+            selected_model.device = SimpleNamespace(is_cuda=True, sm_count=sm_count)
+            # Synthetic launch metadata only: no kernel accesses these CPU arrays.
+            with patch.object(wp, "launch") as launch:
+                newton.eval_fk(selected_model, model.joint_q, model.joint_qd, state)
+            launch.assert_called_once()
+            self.assertEqual(launch.call_args.kwargs["dim"], 4096)
+            blocks.append(launch.call_args.kwargs.get("block_dim", 256))
+        self.assertLess(blocks[1], blocks[0])
+
+    def test_launch_policy_uses_selected_articulation_count(self):
+        """Select layouts deterministically from host metadata without reading array contents."""
+        model = _mixed_model("cpu")
+        state = model.state()
+        choices = [
+            ({}, 35),
+            ({"mask": wp.ones(35, dtype=wp.bool, device="cpu")}, 35),
+            ({"mask": wp.zeros(35, dtype=wp.bool, device="cpu")}, 35),
+        ]
         choices.extend(
-            ({"indices": wp.array(np.arange(count), dtype=wp.int32, device="cpu")}, count) for count in (0, 1, 16, 17)
+            ({"indices": wp.array(np.arange(count), dtype=wp.int32, device="cpu")}, count)
+            for count in (0, 1, 16, 17, 35)
         )
-        for is_cuda in (False, True):
+        for sm_count in (0, 8, 80, 148, 192):
             # Only host dispatch is inspected; all arrays remain on CPU and no
             # kernel launches against this stand-in device.
             selected_model = SimpleNamespace(**vars(model))
-            selected_model.device = SimpleNamespace(is_cuda=is_cuda)
+            selected_model.device = SimpleNamespace(is_cuda=sm_count > 0, sm_count=sm_count)
+            observed = {}
             for selection, count in choices:
-                with self.subTest(cuda=is_cuda, selection=tuple(selection), count=count):
-                    with patch.object(wp, "launch") as launch:
-                        newton.eval_fk(selected_model, model.joint_q, model.joint_qd, state, **selection)
-                    launch.assert_called_once()
-                    self.assertEqual(launch.call_args.kwargs["dim"], count)
-                    expected = 16 if is_cuda and count > 16 else 256
-                    self.assertEqual(launch.call_args.kwargs.get("block_dim", 256), expected)
+                with self.subTest(sm_count=sm_count, selection=tuple(selection), count=count):
+                    with (
+                        patch.object(wp.array, "numpy", side_effect=AssertionError("Unexpected array readback")),
+                        patch.object(wp, "Event", side_effect=AssertionError("Unexpected runtime timing")),
+                        patch.object(wp, "capture_launch", side_effect=AssertionError("Unexpected runtime profiling")),
+                        patch.object(
+                            wp, "synchronize_device", side_effect=AssertionError("Unexpected synchronization")
+                        ),
+                        patch.object(wp, "launch") as launch,
+                    ):
+                        for _ in range(2):
+                            newton.eval_fk(selected_model, model.joint_q, model.joint_qd, state, **selection)
+                        # An indexed subset must choose the same layout as a
+                        # full launch of that size, regardless of the loaded count.
+                        same_count_model = SimpleNamespace(**vars(selected_model))
+                        same_count_model.articulation_count = count
+                        newton.eval_fk(same_count_model, model.joint_q, model.joint_qd, state)
+                    self.assertEqual(launch.call_count, 3)
+                    for call in launch.call_args_list:
+                        self.assertEqual(call.kwargs["dim"], count)
+                        block = call.kwargs.get("block_dim", 256)
+                        self.assertIn(block, BLOCKS)
+                        self.assertEqual(
+                            block, articulation._fk_block_dim(count, sm_count, model.max_joints_per_articulation)
+                        )
+                        if sm_count == 0:
+                            self.assertEqual(block, 256)
+                        self.assertEqual(block, observed.setdefault(count, block))
 
 
 for function in (

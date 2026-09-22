@@ -1,1 +1,1 @@
-Distribute batched GPU forward kinematics across smaller thread blocks without changing joint computations.
+Select GPU forward-kinematics block sizes from the articulation workload and GPU multiprocessor count, without changing joint computations or requiring configuration changes.
