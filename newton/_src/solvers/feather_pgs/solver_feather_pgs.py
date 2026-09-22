@@ -44,7 +44,13 @@ from ..semi_implicit.kernels_particle import (
 )
 from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
-from .contact_torsion import configure_contact_torsion, prepare_torsion_rows, torque_sweep_source, validate_torsion_step
+from .contact_torsion import (
+    configure_contact_torsion,
+    prepare_torsion_rows,
+    prepare_torsion_velocity_pass,
+    torque_sweep_source,
+    validate_torsion_step,
+)
 from .friction import FRICTION_PAIR_CUDA
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
@@ -982,14 +988,23 @@ class SolverFeatherPGS(SolverBase):
                 material torsion default. Sliding and spin share one Coulomb budget.
                 Currently supports dense articulated contacts in CUDA matrix-free,
                 immediate/current/interleaved mode without warmstarting, graph capture,
-                hydroelastic contact, contact compliance, regularization,
-                debug mode, or velocity post-passes. Radius and selectors are
+                hydroelastic contact, contact compliance,
+                or debug mode. Velocity post-passes require bilateral preelimination
+                disabled; they preserve accumulated impulses and use the unbiased
+                angular target. Initially touching groups remain eligible through
+                rebound, using the end-gap slop as the initial touching tolerance;
+                groups outside this tolerance use the position solve's end-gap
+                admission test. Final normal load always bounds the friction budget.
+                Radius and selectors are
                 construction-only; recreate the solver to change them. With point
                 friction, one spin row bounds each coplanar exact-shape-pair group. With
                 persistent friction patches (the default ``friction_anchor_beta``), one
                 spin row bounds each patch region by the region's pooled normal load
                 times the undivided friction coefficient, less the tangent impulses of
-                its anchor rows; normal rows stay independent. Capacity
+                its anchor rows; normal rows stay independent. Contact regularization
+                softens the position solve's normal rows; velocity cleanup is
+                unregularized. Spin uses the final solved normal load without
+                applying a second regularization factor. Capacity
                 exhaustion raises even when optional overflow diagnostics are off. Host
                 grouping is diagnostic, not optimized for throughput. This experimental
                 parameter may change without the normal deprecation policy.
@@ -7602,6 +7617,8 @@ class SolverFeatherPGS(SolverBase):
             joint_limit_speculative_scale=1.0,
             output=self.rhs_unbiased,
         )
+        if self._contact_torsion_enabled:
+            prepare_torsion_velocity_pass(self, dt)
         if self._has_free_rigid_bodies:
             self._compute_mf_rhs_bias(
                 dt,

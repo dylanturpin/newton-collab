@@ -23,7 +23,12 @@ import warp as wp
 
 from ...geometry import GeoType
 from ...utils.selection import match_labels
-from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
+from .kernels import (
+    _FPGS_CONTACT_END_GAP_SLOP,
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_TORSION,
+)
 
 _TOUCH_TOLERANCE = 1.0e-5
 _NORMAL_COSINE = 0.999
@@ -87,23 +92,30 @@ def configure_contact_torsion(solver, radius, indices, patterns):
     solver._contact_torsion_shape_patterns = patterns
     solver._contact_torsion_shape_set = selected
     solver._torsion_stats = {}
-    if radius > 0 and (
+    if radius > 0:
+        _validate_torsion_mode(solver)
+
+
+def _validate_torsion_mode(solver):
+    """Reject unsupported construction and runtime mode combinations."""
+    if (
         not solver.model.device.is_cuda
         or solver.model.requires_grad
         or solver.pgs_mode != "matrix_free"
         or solver.articulated_contact_response != "immediate"
         or solver.friction_mode != "current"
         or solver.pgs_schedule != "interleaved"
-        or solver.pgs_velocity_iterations
         or solver.pgs_warmstart
         or solver.pgs_debug
-        or solver.pgs_contact_regularization != 0.0
+        or solver.contact_compliance
         or not solver.enable_contact_friction
     ):
         raise ValueError(
             "Contact torsion requires CUDA non-differentiable matrix_free/immediate/current/"
-            "interleaved, without warmstart, regularization, debug, or velocity post-passes"
+            "interleaved, without warmstart, compliance, or debug"
         )
+    if solver.pgs_velocity_iterations > 0 and solver.enable_bilateral_preelimination:
+        raise ValueError("Contact torsion velocity post-passes require enable_bilateral_preelimination=False")
 
 
 @dataclass
@@ -268,8 +280,85 @@ def _group_budget(solver, group, row_mu):
 
 def validate_torsion_step(solver):
     """Reject incompatible runtime state before any solver stage consumes it."""
+    _validate_torsion_mode(solver)
     if wp.get_stream(solver.model.device).is_capturing:
         raise RuntimeError("Experimental torsion host grouping does not support CUDA graph capture")
+
+
+@wp.kernel
+def _prepare_velocity_torsion_rows(
+    count: wp.array[int],
+    capacity: int,
+    row_type: wp.array2d[int],
+    group: wp.array2d[int],
+    phi: wp.array2d[float],
+    target: wp.array2d[float],
+    position_velocity: wp.array[float],
+    dof_count: wp.array[int],
+    dof_indices: wp.array2d[int],
+    jacobian: wp.array3d[float],
+    dt: float,
+    mu: wp.array2d[float],
+    rhs: wp.array2d[float],
+):
+    """Conclude speculative spin admission without discarding touching support."""
+    tid = wp.tid()
+    world = tid // capacity
+    spin = tid % capacity
+    if spin >= count[world] or row_type[world, spin] != PGS_CONSTRAINT_TYPE_TORSION:
+        return
+    touching = bool(False)
+    for row in range(count[world]):
+        if row_type[world, row] == PGS_CONSTRAINT_TYPE_CONTACT and group[world, row] == spin:
+            speed = float(0.0)
+            for dof in range(dof_count[world]):
+                global_dof = dof_indices[world, dof]
+                if global_dof >= 0:
+                    speed += jacobian[world, row, dof] * position_velocity[global_dof]
+            end_gap = phi[world, row] + dt * (speed - target[world, row])
+            # Retain touching support through rebound, with the existing end-gap
+            # slop as the initial touching tolerance. Otherwise require contact
+            # by the position end. Final normal load still bounds all traction.
+            if phi[world, row] <= _FPGS_CONTACT_END_GAP_SLOP or end_gap <= _FPGS_CONTACT_END_GAP_SLOP:
+                touching = True
+    # The angular row has no positional spring: retain prescribed angular
+    # target motion but not position-solve contact correction or restitution.
+    rhs[world, spin] = -target[world, spin]
+    if not touching:
+        mu[world, spin] = 0.0
+    # Do not zero lambda here. The coupled sweep must apply Y * (new - old)
+    # to refund position-phase spin and tangential impulses coherently.
+
+
+def prepare_torsion_velocity_pass(solver, dt):
+    """Conclude touching eligibility and angular RHS for the unbiased pass.
+
+    Keep accumulated impulses and their velocity response from the position
+    solve. Each velocity sweep then recomputes the shared sliding/spin bound
+    from its final normal load and applies every impulse delta once. Initially
+    touching rows retain admission through rebound, using end-gap slop as the
+    initial touching tolerance. Final normal load remains authoritative, even
+    within this tolerance. Unreached groups refund carried spin.
+    """
+    wp.launch(
+        _prepare_velocity_torsion_rows,
+        dim=solver.world_count * solver.dense_max_constraints,
+        inputs=[
+            solver.constraint_count,
+            solver.dense_max_constraints,
+            solver.row_type,
+            solver._contact_torsion_group,
+            solver.phi,
+            solver.target_velocity,
+            solver.v_out_snap,
+            solver.world_dof_count,
+            solver.world_dof_indices,
+            solver.J_world,
+            dt,
+        ],
+        outputs=[solver.row_mu, solver.rhs_unbiased],
+        device=solver.model.device,
+    )
 
 
 def prepare_torsion_rows(solver, state, augmented_state, contacts):
@@ -401,6 +490,9 @@ def torque_sweep_source(dofs):
                         sliding_used += sqrtf(a * a + b * b);
                     }}
                 }}
+                // Normal rows have already applied their accumulated-impulse
+                // update (regularized positions, unbiased velocity cleanup).
+                // Use the actual final load without a second contact_w factor.
                 float normal_budget = mu * normal_load;
                 // Later normal-only rows can lower a patch's load after its
                 // anchors have been solved. Project against the final load
