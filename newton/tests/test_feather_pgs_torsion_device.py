@@ -3,6 +3,7 @@
 """Compare device torsion preparation against the retained host oracle."""
 
 import unittest
+from inspect import signature
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -173,6 +174,14 @@ def run_oracle(solver, state, augmented, contacts):
 
 
 class TestDeviceTorsionPreparation(unittest.TestCase):
+    def test_public_device_option_is_default_off(self):
+        """Keep public device preparation opt-in and expose explicit graph validation."""
+        self.assertIs(
+            signature(solver_feather_pgs.SolverFeatherPGS).parameters["contact_torsion_device"].default, False
+        )
+        self.assertTrue(callable(getattr(solver_feather_pgs.SolverFeatherPGS, "prepare_contact_torsion_capture", None)))
+        self.assertTrue(callable(getattr(solver_feather_pgs.SolverFeatherPGS, "validate_contact_torsion", None)))
+
     """Exercise portable preparation kernels independently of a full CUDA solve."""
 
     def compare(self, *, device="cpu", modify=None, **options):
@@ -607,29 +616,24 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_cuda_full_solver_graph(self):
-        """Match repeated default-double-buffer captured solves to eager solves."""
-
-        def device_prepare(solver, state, augmented, contacts):
-            device = getattr(solver, "_device_torsion", None)
-            if device is None:
-                device = enable_device_torsion(solver, deferred_errors=True)
-            device.prepare(state, augmented, contacts)
+        """Match captured and eager solves through the default-off public device API."""
 
         for velocity, regularization in ((16, 0.0), (0, 0.01)):
             results = []
             for captured in (False, True):
-                with patch.object(solver_feather_pgs, "prepare_torsion_rows", device_prepare):
-                    _, solver, model, a, contacts = fixture(
-                        0.01,
-                        pgs_iterations=16,
-                        pgs_velocity_iterations=velocity,
-                        pgs_contact_regularization=regularization,
-                        enable_bilateral_preelimination=False,
-                        sliding=0.01,
-                        spin=0.4,
-                        **PATCH_OPTIONS,
-                    )
+                _, solver, model, a, contacts = fixture(
+                    0.01,
+                    contact_torsion_device=True,
+                    pgs_iterations=16,
+                    pgs_velocity_iterations=velocity,
+                    pgs_contact_regularization=regularization,
+                    enable_bilateral_preelimination=False,
+                    sliding=0.01,
+                    spin=0.4,
+                    **PATCH_OPTIONS,
+                )
                 z = model.state()
+                solver.prepare_contact_torsion_capture(a, z)
                 control = model.control()
                 pipeline = newton.CollisionPipeline(
                     model, contact_matching="latest", reduce_contacts=False, broad_phase="nxn", rigid_contact_max=64
@@ -650,11 +654,11 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                         pair()
                     for _ in range(5):
                         wp.capture_launch(capture.graph)
-                        solver._device_torsion.validate()
+                        solver.validate_contact_torsion()
                 else:
                     for _ in range(5):
                         pair()
-                        solver._device_torsion.validate()
+                        solver.validate_contact_torsion()
                 results.append((a.joint_q.numpy(), a.joint_qd.numpy(), a.body_q.numpy()))
             for eager, graph in zip(*results, strict=True):
                 np.testing.assert_allclose(graph, eager, rtol=3e-5, atol=3e-6)

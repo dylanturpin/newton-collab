@@ -977,6 +977,7 @@ class SolverFeatherPGS(SolverBase):
         contact_torsion_radius: float = 0.0,
         contact_torsion_shape_indices: tuple[int, ...] | None = None,
         contact_torsion_shape_patterns: tuple[str, ...] | None = None,
+        contact_torsion_device: bool = False,
         contact_compliance: bool = False,
     ):
         """
@@ -987,7 +988,7 @@ class SolverFeatherPGS(SolverBase):
                 of radius R, the effective radius is 2*R/3. Does not consume the generic
                 material torsion default. Sliding and spin share one Coulomb budget.
                 Currently supports dense articulated contacts in CUDA matrix-free,
-                immediate/current/interleaved mode without warmstarting, graph capture,
+                immediate/current/interleaved mode without warmstarting,
                 hydroelastic contact, contact compliance,
                 or debug mode. Velocity post-passes require bilateral preelimination
                 disabled; they preserve accumulated impulses and use the unbiased
@@ -1020,6 +1021,15 @@ class SolverFeatherPGS(SolverBase):
                 an explicit pattern such as ".*fingertip.*". Empty tuple selects none;
                 unmatched nonempty patterns raise ValueError. Experimental, with the
                 same compatibility limitations as the radius.
+            contact_torsion_device: Experimental opt-in device-resident torsion preparation.
+                False retains the host reference implementation. True preserves the
+                grouping and friction law while using preallocated GPU buffers.
+                Eager stepping checks errors synchronously. For CUDA graph capture,
+                first call :meth:`prepare_contact_torsion_capture` outside capture,
+                then call :meth:`validate_contact_torsion` after every replay batch
+                before consuming results. Errors latch permanently; recreate the
+                solver rather than continuing an invalid graph. No effect when the
+                torsion radius is zero. The host reference cannot be captured.
             contact_compliance: Experimental opt-in implicit unilateral contact material response.
                 Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
                 zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and
@@ -2498,6 +2508,46 @@ class SolverFeatherPGS(SolverBase):
             )
 
         self._init_double_buffer_stream()
+
+        self.contact_torsion_device = bool(contact_torsion_device)
+        if self._contact_torsion_enabled and self.contact_torsion_device:
+            from .contact_torsion_device import enable_device_torsion  # noqa: PLC0415
+
+            enable_device_torsion(self)
+
+    def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
+        """Prepare experimental torsion rollback buffers before CUDA graph capture.
+
+        Requires ``contact_torsion_device=True`` when torsion is active. Call
+        outside capture with the state layouts used by the graph. Subsequent
+        graph replay requires :meth:`validate_contact_torsion` at every batch
+        boundary before results are consumed. Eager steps continue to validate
+        automatically. This method does not advance physics.
+        """
+        if not self._contact_torsion_enabled:
+            return
+        preparation = getattr(self, "_device_torsion", None)
+        if preparation is None:
+            raise RuntimeError("Contact torsion graph capture requires contact_torsion_device=True")
+        if wp.get_stream(self.model.device).is_capturing:
+            raise RuntimeError("Prepare contact torsion buffers outside CUDA graph capture")
+        preparation.validate()
+        preparation.deferred_errors = True
+        preparation.begin_step(state_in, state_out)
+
+    def validate_contact_torsion(self) -> None:
+        """Raise latched torsion errors after every experimental graph replay batch.
+
+        This synchronous status check must run before consuming captured results.
+        Invalid input suppresses incomplete contact solving and restores published
+        dynamic state, but internal caches are not rolled back: recreate the solver
+        after correcting invalid input. No-op without device torsion preparation.
+        """
+        preparation = getattr(self, "_device_torsion", None)
+        if preparation is not None:
+            if wp.get_stream(self.model.device).is_capturing:
+                raise RuntimeError("Validate contact torsion outside CUDA graph capture")
+            preparation.validate()
 
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
@@ -8598,6 +8648,8 @@ class SolverFeatherPGS(SolverBase):
 
         if self._contact_torsion_enabled and getattr(self, "_device_torsion", None) is not None:
             self._device_torsion.end_step(state_out)
+            if self._device_torsion.deferred_errors and not wp.get_stream(self.model.device).is_capturing:
+                self.validate_contact_torsion()
         self._step += 1
         return state_out
 
