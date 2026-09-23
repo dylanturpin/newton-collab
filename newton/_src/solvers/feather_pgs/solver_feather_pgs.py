@@ -214,6 +214,8 @@ _MAX_CONTACT_REGULARIZATION = 1.0e6
 
 _MFGS_TILE_SHARED_STORAGE_BYTES = 128
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
+# Per-world preset of the first rejected row slot: no reservation was rejected.
+_ROW_SLOT_UNBOUNDED = 2**31 - 1
 _CONTACT_BUILD_THREAD_CAP = 65536
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
 _PAIRED_RESPONSE_WARPS_PER_BLOCK = 4
@@ -299,7 +301,7 @@ def _accumulate_row_capacity_telemetry(
     """Accumulate raw row demand and capacity overflow without changing solver state."""
     tid = wp.tid()
     dropped = dropped_contact_rows[tid]
-    count = raw_counts[tid] + dropped
+    count = raw_counts[tid]  # monotone counter: accepted rows plus rejected reservations
     wp.atomic_max(raw_watermark, 0, count)
     wp.atomic_max(dropped_contact_rows_watermark, 0, dropped)
     excess = count - capacity
@@ -327,7 +329,7 @@ def _warn_constraint_row_overflow(
     world = wp.tid()
 
     dense_dropped = dense_dropped_contact_rows[world]
-    dense_requested = dense_raw_counts[world] + dense_dropped
+    dense_requested = dense_raw_counts[world]
     if dense_requested > dense_capacity and wp.atomic_exch(warning_emitted, 0, 1) == 0:
         wp.printf(
             "Warning: FeatherPGS dense constraint-row overflow in world %d: requested %d rows, limit %d; "
@@ -340,7 +342,7 @@ def _warn_constraint_row_overflow(
 
     if mf_active != 0:
         mf_dropped = mf_dropped_contact_rows[world]
-        mf_requested = mf_raw_counts[world] + mf_dropped
+        mf_requested = mf_raw_counts[world]
         if mf_requested > mf_capacity and wp.atomic_exch(warning_emitted, 1, 1) == 0:
             wp.printf(
                 "Warning: FeatherPGS matrix-free constraint-row overflow in world %d: requested %d rows, "
@@ -353,7 +355,7 @@ def _warn_constraint_row_overflow(
 
     if propagation_active != 0:
         propagation_dropped = propagation_dropped_contact_rows[world]
-        propagation_requested = propagation_raw_counts[world] + propagation_dropped
+        propagation_requested = propagation_raw_counts[world]
         if propagation_requested > propagation_capacity and wp.atomic_exch(warning_emitted, 2, 1) == 0:
             wp.printf(
                 "Warning: FeatherPGS propagation constraint-row overflow in world %d: requested %d rows, "
@@ -1257,7 +1259,8 @@ class SolverFeatherPGS(SolverBase):
                 :class:`NotImplementedError` instead of falling back to split propagation.
                 ``"propagation-colored"`` uses the propagation response model but replaces the
                 serial per-world row sweep with graph-colored batches: rows are colored per step
-                so no two rows of a color share a body, and each color solves as one flat
+                so no two rows of a color share a responding body (a kinematic free rigid body
+                has no response and may be shared), and each color solves as one flat
                 thread-per-row launch across all worlds (colors sequential, tree sweep per
                 iteration unchanged). Color-overflow rows run in an ordered serial tail bucket.
                 Defaults to ``"immediate"``.
@@ -1835,6 +1838,7 @@ class SolverFeatherPGS(SolverBase):
         self._model_plan: _FeatherPGSModelPlan | None = None
         self._kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
         self._kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
+        self._body_prescribed = wp.zeros(max(model.body_count, 1), dtype=wp.int32, device=model.device)
         self._update_kinematic_state()
         # Prescribed-response elision removes fully-kinematic free bases from
         # the compact response mapping, which would desynchronize it from the
@@ -1853,6 +1857,7 @@ class SolverFeatherPGS(SolverBase):
             self._model_plan.prescribed_articulation, dtype=wp.int32, device=model.device
         )
         self._has_prescribed_response = bool(np.any(self._model_plan.prescribed_articulation != 0))
+        self._refresh_body_prescribed()
         self._compute_articulation_metadata(model)
         self._validate_heterogeneous_world_support(model)
         # Loop-closing joints are excluded from the tree (see _FeatherPGSModelPlan.build)
@@ -2517,6 +2522,27 @@ class SolverFeatherPGS(SolverBase):
         self._kinematic_dof_mask_host = dof_mask.copy()
         self._kinematic_joint_mask.assign(joint_mask)
         self._kinematic_dof_mask.assign(dof_mask)
+        self._refresh_body_prescribed()
+
+    def _refresh_body_prescribed(self) -> None:
+        """Mark bodies whose propagation response is identically zero.
+
+        Only a kinematic free rigid body qualifies: its spatial inverse inertia is
+        zeroed, so no contact row ever updates its velocity and rows sharing it may
+        share a color. The kinematic root of a multi-body articulation still carries the
+        tree response of its joint dofs (the factorization does not read the kinematic
+        flag), so it stays a coloring conflict. Requires the model plan.
+        """
+        model = self.model
+        if not model.body_count or self._model_plan is None:
+            return
+        prescribed = np.zeros(model.body_count, dtype=np.int32)
+        if model.joint_count and model.articulation_count:
+            kinematic = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
+            first_joints = model.articulation_start.numpy()[:-1][self._model_plan.is_free_rigid != 0]
+            free_bodies = model.joint_child.numpy()[first_joints]
+            prescribed[free_bodies] = kinematic[free_bodies]
+        self._body_prescribed.assign(prescribed)
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
@@ -2949,6 +2975,12 @@ class SolverFeatherPGS(SolverBase):
         if requested <= 0:
             return requested
         if self.pgs_mode != "matrix_free" or self.articulated_contact_response == "immediate":
+            return requested
+        # Contacts between two links of one articulation stay on the dense family unless
+        # propagation_same_articulation_rows routes them to propagation rows. The
+        # internal-row reserve below has no room for them, so keep the requested budget
+        # whenever they can occur (any non-free articulation).
+        if not self.propagation_same_articulation_rows and bool(np.any(self._model_plan.is_free_rigid == 0)):
             return requested
 
         required_internal = self._dense_internal_max_rows
@@ -4471,6 +4503,9 @@ class SolverFeatherPGS(SolverBase):
         self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self._dense_first_rejected_slot = wp.full(
+            (self.world_count,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device
+        )
         # Per-world dense row-family boundaries, snapshotted from slot_counter
         # each step (allocated once here: per-step allocation is forbidden
         # under CUDA graph capture). The dense slot layout is
@@ -4856,6 +4891,7 @@ class SolverFeatherPGS(SolverBase):
             else None
         )
         self.mf_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self._mf_first_rejected_slot = wp.full((worlds,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device)
 
         self.mf_body_a = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_body_b = wp.zeros((worlds, mf_max_c), dtype=wp.int32, device=device, requires_grad=requires_grad)
@@ -5035,6 +5071,7 @@ class SolverFeatherPGS(SolverBase):
 
         self.mf_constraint_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.mf_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self._mf_first_rejected_slot = wp.full((worlds,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device)
 
         for name in ("mf_body_a", "mf_body_b", "mf_dof_a", "mf_dof_b", "mf_row_type"):
             setattr(self, name, wp.zeros((worlds, 1), dtype=wp.int32, device=device, requires_grad=requires_grad))
@@ -5146,6 +5183,7 @@ class SolverFeatherPGS(SolverBase):
             (worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad
         )
         self.propagation_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
+        self._propagation_first_rejected_slot = wp.full((worlds,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device)
         self.propagation_body_count = wp.zeros((worlds,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.propagation_body_list = wp.full(
             (worlds, self.max_propagation_bodies), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
@@ -5280,7 +5318,16 @@ class SolverFeatherPGS(SolverBase):
         if self._propagation_colored:
             total_rows = worlds * propagation_max_c
             n_entries = PROPAGATION_COLOR_TAIL + 2
-            self.color_body_ticket = wp.zeros((body_count,), dtype=wp.int32, device=device)
+            # one used-color bitmask per body for the greedy coloring
+            self.color_body_used_mask = wp.zeros(
+                (body_count * ((PROPAGATION_COLOR_TAIL + 31) // 32),), dtype=wp.int32, device=device
+            )
+            # per-world sort scratch: a power-of-two stride for the bitonic sort padding
+            self._propagation_color_order_stride = 1 << max(int(propagation_max_c) - 1, 0).bit_length()
+            self.color_unit_order = wp.zeros(
+                (worlds * self._propagation_color_order_stride,), dtype=wp.int32, device=device
+            )
+            self.color_unit_color = wp.zeros((total_rows,), dtype=wp.int32, device=device)
             self.color_world_offsets = wp.zeros((worlds * n_entries,), dtype=wp.int32, device=device)
             self.color_world_row_order = wp.zeros((total_rows,), dtype=wp.int32, device=device)
             self.color_unit_contact = wp.zeros((total_rows,), dtype=wp.int32, device=device)
@@ -5662,20 +5709,11 @@ class SolverFeatherPGS(SolverBase):
         self._propagation_fused_worlds_per_block = 1
         self._pgs_solve_propagation_colored_block_kernel = None
         self._propagation_colored_block_dim = 64
+        # The pre-build coloring kernel keeps its per-unit state in global scratch, so the
+        # unit count is bounded only by propagation_max_constraints; it sorts with a wide
+        # block regardless of the solve kernels' block size.
+        self._propagation_color_prebuild_block_dim = 256
         if model.device.is_cuda and self._propagation_colored and self.propagation_max_constraints > 0:
-            # The pre-build colouring kernel stages one short per contact unit in shared
-            # memory (4 arrays). Friction units own 3 rows, so ceil(M/3) is the colored
-            # staging budget; finite gap or anchor filtering can create extra 1-row units,
-            # which the pre-build kernel appends to its ordered serial tail. Without
-            # friction every unit is a single row and must fit the staging budget.
-            m_rows = int(self.propagation_max_constraints)
-            self._propagation_color_max_units = (m_rows + 2) // 3 if self.enable_contact_friction else m_rows
-            if self._propagation_color_max_units > 4096:
-                raise ValueError(
-                    "propagation-colored: the colouring kernel stages up to "
-                    f"{self._propagation_color_max_units} contact units in shared memory (limit 4096). "
-                    "Lower mf_max_constraints/dense_max_constraints or enable contact friction."
-                )
             self._pgs_solve_propagation_colored_block_kernel = _get_pgs_solve_propagation_colored_block_kernel(
                 self.propagation_max_constraints,
                 PROPAGATION_COLOR_TAIL + 2,
@@ -5701,9 +5739,9 @@ class SolverFeatherPGS(SolverBase):
             self._color_propagation_prebuild_kernel = _get_color_propagation_prebuild_kernel(
                 self.propagation_max_constraints,
                 PROPAGATION_COLOR_TAIL + 2,
-                self._propagation_colored_block_dim,
+                self._propagation_color_prebuild_block_dim,
+                self._propagation_color_order_stride,
                 device_arch,
-                max_units=self._propagation_color_max_units,
             )
         if (
             model.device.is_cuda
@@ -9767,6 +9805,7 @@ class SolverFeatherPGS(SolverBase):
 
         # Zero world-level buffers (only arrays that require it)
         self.slot_counter.zero_()  # atomic-add counter
+        self._dense_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
         self.dense_contact_world_flag.zero_()
         if self._track_row_capacity:
             self._row_dropped_dense.zero_()
@@ -9775,6 +9814,7 @@ class SolverFeatherPGS(SolverBase):
 
         if mf_active:
             self.mf_slot_counter.zero_()  # atomic-add counter
+            self._mf_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
             self.mf_constraint_count.zero_()  # finalize only runs when contacts exist
             # Zero unconditionally here. When warm-start is OFF this is the
             # original behavior (bit-identical). When ON this also guarantees a
@@ -9788,6 +9828,7 @@ class SolverFeatherPGS(SolverBase):
             # constraint_count: fully overwritten by finalize_world_constraint_counts
         if propagation_active:
             self.propagation_slot_counter.zero_()
+            self._propagation_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
             self.propagation_constraint_count.zero_()
             self.propagation_impulses.zero_()
             self.propagation_J_a.zero_()
@@ -9811,6 +9852,10 @@ class SolverFeatherPGS(SolverBase):
         mf_dropped_rows = self._row_dropped_mf if self._track_row_capacity else self._dummy_mf_slot_counter
         propagation_dropped_rows = (
             self._row_dropped_propagation if self._track_row_capacity else self._dummy_mf_slot_counter
+        )
+        mf_first_rejected_slot = self._mf_first_rejected_slot if mf_active else self._dummy_mf_slot_counter
+        propagation_first_rejected_slot = (
+            self._propagation_first_rejected_slot if propagation_active else self._dummy_mf_slot_counter
         )
         j_buffers_zeroed = False
 
@@ -10300,6 +10345,9 @@ class SolverFeatherPGS(SolverBase):
                     dense_dropped_rows,
                     mf_dropped_rows,
                     propagation_dropped_rows,
+                    self._dense_first_rejected_slot,
+                    mf_first_rejected_slot,
+                    propagation_first_rejected_slot,
                 ],
                 device=model.device,
             )
@@ -10586,6 +10634,7 @@ class SolverFeatherPGS(SolverBase):
                         contacts.rigid_contact_shape0,
                         contacts.rigid_contact_shape1,
                         model.shape_body,
+                        self._body_prescribed,
                         self.contact_slots_needed,
                         self.propagation_max_constraints,
                     ],
@@ -10608,13 +10657,15 @@ class SolverFeatherPGS(SolverBase):
                         self.color_unit_body_a,
                         self.color_unit_body_b,
                         self.color_unit_len,
-                        self.color_body_ticket,
+                        self.color_body_used_mask,
+                        self.color_unit_order,
+                        self.color_unit_color,
                         self.contact_slot,
                         self.color_world_row_order,
                         self.color_world_offsets,
                         self.color_unit_sorted,
                     ],
-                    block_dim=self._propagation_colored_block_dim,
+                    block_dim=self._propagation_color_prebuild_block_dim,
                     device=model.device,
                 )
 
@@ -10685,7 +10736,12 @@ class SolverFeatherPGS(SolverBase):
                 wp.launch(
                     finalize_mf_constraint_counts,
                     dim=self.world_count,
-                    inputs=[self.propagation_slot_counter, self.propagation_max_constraints, slots_per_contact],
+                    inputs=[
+                        self.propagation_slot_counter,
+                        self.propagation_max_constraints,
+                        slots_per_contact,
+                        self._propagation_first_rejected_slot,
+                    ],
                     outputs=[self.propagation_constraint_count],
                     device=model.device,
                 )
@@ -10795,7 +10851,12 @@ class SolverFeatherPGS(SolverBase):
                 wp.launch(
                     finalize_mf_constraint_counts,
                     dim=self.world_count,
-                    inputs=[self.mf_slot_counter, self.mf_max_constraints, slots_per_contact],
+                    inputs=[
+                        self.mf_slot_counter,
+                        self.mf_max_constraints,
+                        slots_per_contact,
+                        self._mf_first_rejected_slot,
+                    ],
                     outputs=[self.mf_constraint_count],
                     device=model.device,
                 )
@@ -10936,7 +10997,7 @@ class SolverFeatherPGS(SolverBase):
             wp.launch(
                 finalize_mf_constraint_counts,
                 dim=self.world_count,
-                inputs=[self.mf_slot_counter, self.mf_max_constraints, 1],
+                inputs=[self.mf_slot_counter, self.mf_max_constraints, 1, self._mf_first_rejected_slot],
                 outputs=[self.mf_constraint_count],
                 device=model.device,
             )
@@ -10945,7 +11006,7 @@ class SolverFeatherPGS(SolverBase):
         wp.launch(
             finalize_world_constraint_counts,
             dim=self.world_count,
-            inputs=[self.slot_counter, max_constraints, slots_per_contact_dense],
+            inputs=[self.slot_counter, max_constraints, slots_per_contact_dense, self._dense_first_rejected_slot],
             outputs=[self.constraint_count],
             device=model.device,
         )
@@ -15335,157 +15396,146 @@ def _get_color_propagation_prebuild_kernel(
     propagation_max_constraints: int,
     n_color_entries: int,
     block_dim: int,
+    order_stride: int,
     device_arch: str,
-    max_units: int | None = None,
 ) -> "wp.Kernel":
     """Build the pre-build contact-unit coloring kernel (v4 layout).
 
-    Runs after contact classification and BEFORE row build: each block colors
-    its world's propagation contacts (round-tagged ticket bidding over a
-    compacted worklist, keys on global contact index for determinism of the
-    coloring), counting-sorts units by color, and rewrites ``contact_slot``
-    so the row builder writes every unit's rows at a color-ordered slot.
-    Color segments therefore occupy contiguous row memory and the colored
-    solve kernel's payload reads are sequential — no post-build permutation,
-    no staging copies. Units beyond the shared-memory staging capacity are
-    appended to the ordered serial tail. Also emits the unit-start order and
-    per-color unit offsets the solve kernel consumes.
+    Runs after contact classification and BEFORE row build. Each block owns one
+    world: it sorts the world's contact units by global contact index (a bitonic
+    sort over a global scratch permutation, so the schedule does not depend on
+    the atomic order in which ``collect_propagation_units`` gathered the units),
+    colors them by first-fit greedy edge coloring over per-body used-color
+    bitmasks, counting-sorts the units by color in that same order, and rewrites
+    ``contact_slot`` so the row builder writes every unit's rows at a
+    color-ordered slot. Color segments therefore occupy contiguous row memory
+    and the colored solve kernel's payload reads are sequential. It also emits
+    the unit-start order and per-color unit offsets the solve kernel consumes.
+    Given the same contact set, the output is bitwise identical from launch to
+    launch. Per-unit state lives in global scratch, so the unit count is bounded
+    only by ``propagation_max_constraints``.
     """
     M = propagation_max_constraints
     NE = n_color_entries
     B = int(block_dim)
     cap = NE - 2  # color cap; index NE-2 is the tail bucket
-    U = int(max_units) if max_units is not None else M  # contact units staged in shared memory
+    WORDS = (cap + 31) // 32  # used-color bitmask words per body
+    OS = int(order_stride)  # per-world stride of the sort scratch, a power of two >= M
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const int world = tile;
     if (world >= world_count) return;
-    int n_units_total = world_unit_cursor.data[world];
-    if (n_units_total > {M}) n_units_total = {M};
-    int n_units = n_units_total;
-    if (n_units > {U}) n_units = {U};
+    int n_units = world_unit_cursor.data[world];
+    if (n_units > {M}) n_units = {M};
     const int t = threadIdx.x;
-    if (n_units_total == 0) {{
+    if (n_units == 0) {{
         for (int c = t; c < {NE}; c += {B}) world_color_offsets.data[world * {NE} + c] = 0;
         return;
     }}
     const int world_base = world * {M};
+    const int order_base = world * {OS};
+    int n_pad = 1;
+    while (n_pad < n_units) n_pad <<= 1;
 
-    __shared__ int s_n_work;
-    __shared__ int s_next_work;
     __shared__ int s_counts[{NE}];
     __shared__ int s_offsets[{NE}];
-    __shared__ short s_unit_color[{U}];
-    __shared__ short s_work[{U}];
-    __shared__ short s_work_next[{U}];
-    __shared__ short s_sorted[{U}];
 
-    if (t == 0) {{
-        s_n_work = n_units;
-        s_next_work = 0;
-    }}
+    // Sort scratch holds the unit permutation, padded with -1 (sorts last).
+    // body_used_mask holds one {WORDS}-word used-color bitmask per body.
+    for (int i = t; i < n_pad; i += {B}) unit_order.data[order_base + i] = (i < n_units) ? i : -1;
     for (int u = t; u < n_units; u += {B}) {{
-        s_unit_color[u] = -1;
-        s_work[u] = (short)u;
         const int ba = unit_body_a.data[world_base + u];
         const int bb = unit_body_b.data[world_base + u];
-        if (ba >= 0) body_ticket.data[ba] = 0;
-        if (bb >= 0) body_ticket.data[bb] = 0;
-    }}
-    __syncthreads();
-
-    for (int round_idx = 1; round_idx <= {cap}; ++round_idx) {{
-        const int n_work = s_n_work;
-        if (n_work == 0) break;
-        for (int w = t; w < n_work; w += {B}) {{
-            const int u = (int)s_work[w];
-            // key on the global contact index: deterministic coloring
-            // independent of the atomic list-build order
-            const int key = (round_idx << 23) | (0x7FFFFF - (unit_contact.data[world_base + u] & 0x7FFFFF));
-            const int ba = unit_body_a.data[world_base + u];
-            const int bb = unit_body_b.data[world_base + u];
-            if (ba >= 0) atomicMax(&body_ticket.data[ba], key);
-            if (bb >= 0) atomicMax(&body_ticket.data[bb], key);
+        for (int word = 0; word < {WORDS}; ++word) {{
+            if (ba >= 0) body_used_mask.data[ba * {WORDS} + word] = 0;
+            if (bb >= 0) body_used_mask.data[bb * {WORDS} + word] = 0;
         }}
-        __syncthreads();
-        for (int w = t; w < n_work; w += {B}) {{
-            const int u = (int)s_work[w];
-            const int key = (round_idx << 23) | (0x7FFFFF - (unit_contact.data[world_base + u] & 0x7FFFFF));
-            const int ba = unit_body_a.data[world_base + u];
-            const int bb = unit_body_b.data[world_base + u];
-            if ((ba < 0 || body_ticket.data[ba] == key) && (bb < 0 || body_ticket.data[bb] == key)) {{
-                s_unit_color[u] = (short)(round_idx - 1);
-            }} else {{
-                const int idx = atomicAdd(&s_next_work, 1);
-                s_work_next[idx] = (short)u;
-            }}
-        }}
-        __syncthreads();
-        const int n_remaining = s_next_work;
-        __syncthreads();
-        if (t == 0) {{
-            s_n_work = n_remaining;
-            s_next_work = 0;
-        }}
-        for (int w = t; w < n_remaining; w += {B}) s_work[w] = s_work_next[w];
-        __syncthreads();
     }}
-
-    for (int u = t; u < n_units; u += {B}) {{
-        if (s_unit_color[u] == -1) s_unit_color[u] = {cap};
-    }}
-
-    // counting sort of units by color
     for (int c = t; c < {NE}; c += {B}) s_counts[c] = 0;
     __syncthreads();
-    for (int u = t; u < n_units; u += {B}) {{
-        atomicAdd(&s_counts[(int)s_unit_color[u]], 1);
+
+    // Bitonic sort of the permutation by global contact index: the greedy pass below
+    // is order-dependent, and this order is independent of the atomic list build.
+    for (int k = 2; k <= n_pad; k <<= 1) {{
+        for (int j = k >> 1; j > 0; j >>= 1) {{
+            for (int i = t; i < n_pad; i += {B}) {{
+                const int partner = i ^ j;
+                if (partner <= i) continue;
+                const int ui = unit_order.data[order_base + i];
+                const int up = unit_order.data[order_base + partner];
+                const int ki = (ui >= 0) ? unit_contact.data[world_base + ui] : 0x7FFFFFFF;
+                const int kp = (up >= 0) ? unit_contact.data[world_base + up] : 0x7FFFFFFF;
+                const bool ascending = (i & k) == 0;
+                if ((ki > kp) == ascending) {{
+                    unit_order.data[order_base + i] = up;
+                    unit_order.data[order_base + partner] = ui;
+                }}
+            }}
+            __syncthreads();
+        }}
     }}
-    __syncthreads();
+
     if (t == 0) {{
+        // First-fit greedy edge coloring: a unit takes the lowest color neither of its
+        // bodies uses yet. At most 2*degree-1 colors, every color a near-maximal
+        // matching. (Round-based ticket bidding only admitted mutual-minimum units per
+        // round and degenerated to ~3 units per color with half the units in the
+        // serial tail on a dense 235-body pile.)
+        for (int pos = 0; pos < n_units; ++pos) {{
+            const int u = unit_order.data[order_base + pos];
+            const int ba = unit_body_a.data[world_base + u];
+            const int bb = unit_body_b.data[world_base + u];
+            int color = {cap};
+            for (int word = 0; word < {WORDS}; ++word) {{
+                unsigned used = 0u;
+                if (ba >= 0) used |= (unsigned)body_used_mask.data[ba * {WORDS} + word];
+                if (bb >= 0) used |= (unsigned)body_used_mask.data[bb * {WORDS} + word];
+                const unsigned free_bits = ~used;
+                if (free_bits != 0u) {{
+                    const int bit = __ffs(free_bits) - 1;
+                    const int c = word * 32 + bit;
+                    if (c < {cap}) {{
+                        color = c;
+                        if (ba >= 0) body_used_mask.data[ba * {WORDS} + word] |= (int)(1u << bit);
+                        if (bb >= 0) body_used_mask.data[bb * {WORDS} + word] |= (int)(1u << bit);
+                    }}
+                    break;
+                }}
+            }}
+            unit_color.data[world_base + u] = color;
+            ++s_counts[color];
+        }}
+
+        // Per-color unit offsets; entry NE-1 receives the unit total.
         int acc = 0;
         for (int c = 0; c < {NE}; ++c) {{
             s_offsets[c] = acc;
+            world_color_offsets.data[world * {NE} + c] = acc;
             acc += s_counts[c];
         }}
-    }}
-    __syncthreads();
-    for (int c = t; c < {NE}; c += {B}) {{
-        world_color_offsets.data[world * {NE} + c] = s_offsets[c];
-        s_counts[c] = 0;  // reuse as scatter cursor
-    }}
-    __syncthreads();
-    for (int u = t; u < n_units; u += {B}) {{
-        const int c = (int)s_unit_color[u];
-        const int idx = atomicAdd(&s_counts[c], 1);
-        s_sorted[s_offsets[c] + idx] = (short)u;
-    }}
-    __syncthreads();
 
-    // serial slot prefix in color order: rows of consecutive units are
-    // adjacent, so every color segment is contiguous row memory
-    if (t == 0) {{
+        // Stable counting sort by color in sorted-contact order, so the serial tail
+        // keeps a deterministic sweep order. world_row_order temporarily holds the
+        // unit index at each color-ordered position until the slot prefix below.
+        for (int pos = 0; pos < n_units; ++pos) {{
+            const int u = unit_order.data[order_base + pos];
+            const int c = unit_color.data[world_base + u];
+            world_row_order.data[world_base + s_offsets[c]] = u;
+            ++s_offsets[c];
+        }}
+
+        // Serial slot prefix in color order: rows of consecutive units are
+        // adjacent, so every color segment is contiguous row memory.
         int row_acc = 0;
         for (int pos = 0; pos < n_units; ++pos) {{
-            const int u = (int)s_sorted[pos];
+            const int u = world_row_order.data[world_base + pos];
             const int cid = unit_contact.data[world_base + u];
             world_row_order.data[world_base + pos] = row_acc;
             unit_sorted_contact.data[world_base + pos] = cid;
             contact_slot.data[cid] = row_acc;
             row_acc += unit_len.data[world_base + u];
         }}
-        // Mixed friction filtering can produce more units than ceil(M/3).
-        // Keep every unstaged unit in the serial tail instead of silently
-        // omitting it from the row build and solve ordering.
-        for (int u = n_units; u < n_units_total; ++u) {{
-            const int cid = unit_contact.data[world_base + u];
-            world_row_order.data[world_base + u] = row_acc;
-            unit_sorted_contact.data[world_base + u] = cid;
-            contact_slot.data[cid] = row_acc;
-            row_acc += unit_len.data[world_base + u];
-        }}
-        world_color_offsets.data[world * {NE} + {NE} - 1] = n_units_total;
     }}
 #endif
 """
@@ -15499,7 +15549,9 @@ def _get_color_propagation_prebuild_kernel(
         unit_body_a: wp.array[int],
         unit_body_b: wp.array[int],
         unit_len: wp.array[int],
-        body_ticket: wp.array[int],
+        body_used_mask: wp.array[int],
+        unit_order: wp.array[int],
+        unit_color: wp.array[int],
         contact_slot: wp.array[int],
         world_row_order: wp.array[int],
         world_color_offsets: wp.array[int],
@@ -15513,7 +15565,9 @@ def _get_color_propagation_prebuild_kernel(
         unit_body_a: wp.array[int],
         unit_body_b: wp.array[int],
         unit_len: wp.array[int],
-        body_ticket: wp.array[int],
+        body_used_mask: wp.array[int],
+        unit_order: wp.array[int],
+        unit_color: wp.array[int],
         contact_slot: wp.array[int],
         world_row_order: wp.array[int],
         world_color_offsets: wp.array[int],
@@ -15528,14 +15582,16 @@ def _get_color_propagation_prebuild_kernel(
             unit_body_a,
             unit_body_b,
             unit_len,
-            body_ticket,
+            body_used_mask,
+            unit_order,
+            unit_color,
             contact_slot,
             world_row_order,
             world_color_offsets,
             unit_sorted_contact,
         )
 
-    name = f"color_propagation_prebuild_{M}_{NE}_bd{B}"
+    name = f"color_propagation_prebuild_{M}_{NE}_bd{B}_os{OS}"
     color_propagation_prebuild_template.__name__ = name
     color_propagation_prebuild_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(color_propagation_prebuild_template)

@@ -3836,6 +3836,9 @@ def _allocate_world_contact_slot(
     dense_dropped_contact_rows: wp.array[int],
     mf_dropped_contact_rows: wp.array[int],
     propagation_dropped_contact_rows: wp.array[int],
+    dense_first_rejected_slot: wp.array[int],
+    mf_first_rejected_slot: wp.array[int],
+    propagation_first_rejected_slot: wp.array[int],
 ):
     """Classify and allocate rows for one active contact.
 
@@ -3987,8 +3990,7 @@ def _allocate_world_contact_slot(
         # Matrix-free path
         slot = wp.atomic_add(mf_slot_counter, world, slots_needed)
         if slot + slots_needed > mf_max_constraints:
-            # Roll back the counter so finalize sees only filled slots
-            wp.atomic_add(mf_slot_counter, world, -slots_needed)
+            wp.atomic_min(mf_first_rejected_slot, world, slot)
             if row_capacity_telemetry != 0:
                 wp.atomic_add(mf_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -4003,8 +4005,7 @@ def _allocate_world_contact_slot(
         # Propagation articulated matrix-free path
         slot = wp.atomic_add(propagation_slot_counter, world, slots_needed)
         if slot + slots_needed > propagation_max_constraints:
-            # Roll back the counter so finalize sees only filled slots
-            wp.atomic_add(propagation_slot_counter, world, -slots_needed)
+            wp.atomic_min(propagation_first_rejected_slot, world, slot)
             if row_capacity_telemetry != 0:
                 wp.atomic_add(propagation_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -4019,8 +4020,7 @@ def _allocate_world_contact_slot(
         # Dense path
         slot = wp.atomic_add(world_slot_counter, world, slots_needed)
         if slot + slots_needed > max_constraints:
-            # Roll back the counter so finalize sees only filled slots
-            wp.atomic_add(world_slot_counter, world, -slots_needed)
+            wp.atomic_min(dense_first_rejected_slot, world, slot)
             if row_capacity_telemetry != 0:
                 wp.atomic_add(dense_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -4085,12 +4085,23 @@ def allocate_world_contact_slots(
     dense_dropped_contact_rows: wp.array[int],
     mf_dropped_contact_rows: wp.array[int],
     propagation_dropped_contact_rows: wp.array[int],
+    dense_first_rejected_slot: wp.array[int],
+    mf_first_rejected_slot: wp.array[int],
+    propagation_first_rejected_slot: wp.array[int],
 ):
     """Allocate active contacts with work proportional to the materialized prefix.
 
     The narrow phase increments :paramref:`contact_count` before checking its
     output capacity. An overflowed count therefore does not describe a fully
     materialized prefix; clear the routing arrays and reject that frame.
+
+    Slot counters only grow. A contact whose reservation does not fit records its
+    slot in the family's ``*_first_rejected_slot`` (per world, preset to a large
+    value) instead of rolling the counter back: every later reservation starts at
+    or past that slot, so the finalize kernels truncate the row count there and
+    no accepted contact can hold a slot at or beyond the count. Rolling back
+    raced with concurrent reservations and left accepted rows past the count,
+    which the friction patch links then chained into.
     """
     thread = wp.tid()
     total_contacts = contact_count[0]
@@ -4150,6 +4161,9 @@ def allocate_world_contact_slots(
             dense_dropped_contact_rows,
             mf_dropped_contact_rows,
             propagation_dropped_contact_rows,
+            dense_first_rejected_slot,
+            mf_first_rejected_slot,
+            propagation_first_rejected_slot,
         )
 
 
@@ -5401,15 +5415,15 @@ def finalize_world_constraint_counts(
     world_slot_counter: wp.array[int],
     max_constraints: int,
     slots_per_contact: int,
+    first_rejected_slot: wp.array[int],
     # outputs
     world_constraint_count: wp.array[int],
 ):
-    """Copy and clamp the slot counter to constraint counts.
+    """Turn the monotone slot counter into the row count.
 
-    When the atomic slot counter exceeds ``max_constraints``, clamping can
-    leave "gap" slots that were reserved by a rejected contact but never
-    written.  Those gap slots have zero Jacobians and will be harmlessly
-    skipped by PGS (zero diagonal → ``continue``).
+    The count is the counter truncated at the first rejected reservation and at
+    ``max_constraints``: rows at or past the first rejected slot were reserved by
+    contacts the allocator dropped, so every accepted contact lies below it.
 
     The ``slots_per_contact`` argument is accepted for backwards
     compatibility but is no longer used for rounding, because the
@@ -5417,7 +5431,7 @@ def finalize_world_constraint_counts(
     single-row joint-limit constraints.
     """
     world = wp.tid()
-    count = world_slot_counter[world]
+    count = wp.min(world_slot_counter[world], first_rejected_slot[world])
     if count > max_constraints:
         count = max_constraints
     world_constraint_count[world] = count
@@ -10242,17 +10256,20 @@ def finalize_mf_constraint_counts(
     mf_slot_counter: wp.array[int],
     mf_max_constraints: int,
     slots_per_contact: int,
+    first_rejected_slot: wp.array[int],
     # outputs
     mf_constraint_count: wp.array[int],
 ):
-    """Clamp MF slot counter to max and store as constraint count.
+    """Turn the monotone MF slot counter into the row count.
 
-    ``slots_per_contact`` is kept for call-site compatibility.  The MF buffer
-    may contain a mix of 3-row normal+friction contacts and 1-row speculative
-    normal contacts, so rounding to a fixed stride would drop valid rows.
+    Truncates at the first rejected reservation and at ``mf_max_constraints``
+    (see :func:`finalize_world_constraint_counts`). ``slots_per_contact`` is
+    kept for call-site compatibility.  The MF buffer may contain a mix of 3-row
+    normal+friction contacts and 1-row speculative normal contacts, so rounding
+    to a fixed stride would drop valid rows.
     """
     world = wp.tid()
-    count = mf_slot_counter[world]
+    count = wp.min(mf_slot_counter[world], first_rejected_slot[world])
     if count > mf_max_constraints:
         count = mf_max_constraints
     mf_constraint_count[world] = count
@@ -11820,22 +11837,24 @@ def pgs_ncp_residuals_diagnostic_velocity(
 # coloring because a row's siblings share its bodies and therefore can never
 # share its color.
 #
-# Coloring is a deterministic parallel greedy (PhysX-style): per round, every
-# uncolored row bids for its bodies with an atomic-min ticket (flat row id);
-# a row that wins the ticket on both of its dynamic bodies commits to the
-# lowest color bit free in both bodies' masks. Winner-per-body uniqueness
-# makes the mask update single-writer, and min-ticket makes the whole
-# coloring deterministic. Rows still uncolored after the round cap go to a
-# serial tail bucket (color PROPAGATION_COLOR_TAIL) processed by a per-world
-# ordered sweep — measured and reported, never silent.
+# Coloring is first-fit greedy edge coloring over the world's contact units taken
+# in global-contact-index order (the pre-build kernel sorts them first, so the
+# schedule is independent of the atomic list-build order): a unit takes the lowest
+# color neither of its bodies uses yet, tracked as one bitmask per body. That uses
+# at most 2*degree-1 colors and makes every color a near-maximal matching. Units
+# that find no free color below the cap go to a serial tail bucket (color
+# PROPAGATION_COLOR_TAIL) processed by a per-world ordered sweep — measured and
+# reported, never silent. A kinematic free rigid body has no response, so it is
+# recorded as -1 like the world and never counts as a conflict.
+#
+# Edge coloring needs at least max-degree colors and first-fit uses up to
+# 2*degree-1. A dense raw-mesh pile (P12: 60 GraspNet meshes, ~7000 contact
+# units on 61 bodies) puts ~230 units on a body, so 256 colors left a quarter of
+# the units in the serial tail; 512 leaves under 2%. Small scenes are unaffected:
+# the solve kernels stop at the last non-empty color.
 
-PROPAGATION_MAX_COLORS = 256
-PROPAGATION_COLOR_TAIL = 256
-# round-tagged ticket key: (round << 23) | (0x7FFFFF - flat_row_id).
-# atomic_max prefers the current round over stale rounds (bigger high bits)
-# and the smallest row id within a round (bigger low bits), so tickets never
-# need re-initialization between rounds. Flat row ids must stay < 2^23.
-PROPAGATION_COLOR_ROW_ID_LIMIT = 1 << 23
+PROPAGATION_MAX_COLORS = 512
+PROPAGATION_COLOR_TAIL = 512
 
 
 @wp.kernel(enable_backward=False)
@@ -11846,6 +11865,7 @@ def collect_propagation_units(
     contact_shape0: wp.array[int],
     contact_shape1: wp.array[int],
     shape_body: wp.array[int],
+    body_prescribed: wp.array[int],
     contact_slots_needed: wp.array[int],
     propagation_max_constraints: int,
     # in/out
@@ -11856,7 +11876,14 @@ def collect_propagation_units(
     unit_body_b: wp.array[int],
     unit_len: wp.array[int],
 ):
-    """Gather propagation-path contacts into per-world unit lists for pre-build coloring."""
+    """Gather propagation-path contacts into per-world unit lists for pre-build coloring.
+
+    A prescribed body (``body_prescribed`` marks kinematic free rigid bodies, whose
+    response is identically zero) never receives a velocity update from a row, so rows
+    touching it do not conflict: it is recorded as ``-1`` like the world. Otherwise a
+    kinematic hub (a tray, a conveyor) forces every one of its contacts into a separate
+    color or the serial tail.
+    """
     c = wp.tid()
     if c >= contact_count[0]:
         return
@@ -11873,8 +11900,12 @@ def collect_propagation_units(
     sb = contact_shape1[c]
     if sa >= 0:
         body_a = shape_body[sa]
+        if body_a >= 0 and body_prescribed[body_a] != 0:
+            body_a = -1
     if sb >= 0:
         body_b = shape_body[sb]
+        if body_b >= 0 and body_prescribed[body_b] != 0:
+            body_b = -1
     unit_contact[base + idx] = c
     unit_body_a[base + idx] = body_a
     unit_body_b[base + idx] = body_b
