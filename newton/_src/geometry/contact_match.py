@@ -510,6 +510,7 @@ class _ReplayData:
     margin1: wp.array[wp.float32]
     body_q: wp.array[wp.transform]
     shape_body: wp.array[wp.int32]
+    pos_threshold_sq: float
 
 
 @wp.kernel(enable_backward=False)
@@ -532,6 +533,19 @@ def _replay_matched_kernel(data: _ReplayData):
 
     fresh_gap = wp.dot(p1_world - p0_world, data.normal[tid]) - (data.margin0[tid] + data.margin1[tid])
     if fresh_gap > wp.float32(0.0):
+        return
+
+    # The saved witnesses are body-local, so a rotating body carries them off
+    # the contact. Replay only while they still resolve to it.
+    a0_world = data.prev_point0[idx]
+    a1_world = data.prev_point1[idx]
+    if body0 >= wp.int32(0):
+        a0_world = wp.transform_point(data.body_q[body0], a0_world)
+    if body1 >= wp.int32(0):
+        a1_world = wp.transform_point(data.body_q[body1], a1_world)
+    if wp.length_sq(a0_world - p0_world) > data.pos_threshold_sq:
+        return
+    if wp.length_sq(a1_world - p1_world) > data.pos_threshold_sq:
         return
 
     data.point0[tid] = data.prev_point0[idx]
@@ -957,6 +971,7 @@ class ContactMatcher:
         data.margin1 = margin1
         data.body_q = body_q
         data.shape_body = shape_body
+        data.pos_threshold_sq = self._pos_threshold_sq
 
         wp.launch(_replay_matched_kernel, dim=self._capacity, inputs=[data], device=device)
 
