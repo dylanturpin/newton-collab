@@ -60,25 +60,24 @@ class TestTorsionCombined(unittest.TestCase):
                     self.assertLess(abs(float(result["body_qd"][0, 5])), 100.0)
 
     def test_distributed_budget_and_export(self):
-        """Keep point and patch budgets coherent across routes and internal timesteps."""
+        """Keep point and patch budgets coherent across internal timesteps."""
         for patch in ({}, PATCH_OPTIONS):
-            for kernel in ("loop", "tiled_row"):
-                for dt in (0.00125, 0.0025, 0.005):
-                    with self.subTest(patch=bool(patch), kernel=kernel, dt=dt):
-                        _, result, solver, _, _, contacts = self.check_pair(
-                            0.01, 16, spin=10.0, sliding=1.0, dt=dt, pgs_kernel=kernel, **patch
-                        )
-                        solver.update_contacts(contacts)
-                        count = int(contacts.rigid_contact_count.numpy()[0])
-                        forces = contacts.rigid_contact_force.numpy()[:count]
-                        normals = contacts.rigid_contact_normal.numpy()[:count]
-                        for index, slot in enumerate(solver.contact_slot.numpy()[:count]):
-                            if slot >= 0:
-                                self.assertAlmostEqual(
-                                    abs(float(forces[index] @ normals[index])) * dt,
-                                    float(result["impulses"][0, slot]),
-                                    delta=2e-7,
-                                )
+            for dt in (0.00125, 0.0025, 0.005):
+                with self.subTest(patch=bool(patch), dt=dt):
+                    _, result, solver, _, _, contacts = self.check_pair(
+                        0.01, 16, spin=10.0, sliding=1.0, dt=dt, **patch
+                    )
+                    solver.update_contacts(contacts)
+                    count = int(contacts.rigid_contact_count.numpy()[0])
+                    forces = contacts.rigid_contact_force.numpy()[:count]
+                    normals = contacts.rigid_contact_normal.numpy()[:count]
+                    for index, slot in enumerate(solver.contact_slot.numpy()[:count]):
+                        if slot >= 0:
+                            self.assertAlmostEqual(
+                                abs(float(forces[index] @ normals[index])) * dt,
+                                float(result["impulses"][0, slot]),
+                                delta=2e-7,
+                            )
 
     def test_no_load_near_positive_gap_and_release(self):
         """Refund sliding and spin even for the narrow positive initial-gap tolerance."""

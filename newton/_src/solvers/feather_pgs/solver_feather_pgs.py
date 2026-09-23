@@ -1031,6 +1031,11 @@ class SolverFeatherPGS(SolverBase):
                 before consuming results. Errors latch permanently; recreate the
                 solver rather than continuing an invalid graph. No effect when the
                 torsion radius is zero. The host reference cannot be captured.
+                Grouping currently runs serially within each world with worst-case
+                quadratic contact-count cost. Many small worlds can benefit, but
+                a single contact-dense world may be slower than host preparation;
+                CUDA graphs do not remove that device-side work. Benchmark the
+                intended per-world contact distribution before enabling.
             contact_compliance: Experimental opt-in implicit unilateral contact material response.
                 Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
                 zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and

@@ -33,6 +33,10 @@ from .kernels import (
 _TOUCH_TOLERANCE = 1.0e-5
 _NORMAL_COSINE = 0.999
 _MAX_GROUP_CONTACTS = 4096
+# Normal rows store their spin-row index in the membership array. A spin row
+# has no parent membership, so its otherwise-unused cell records admission.
+# Both host and device preparation reset every cell to -1 each step.
+_TORSION_SPIN_RETIRED = -2
 _SUPPORTED_TYPES = (
     GeoType.SPHERE,
     GeoType.BOX,
@@ -135,6 +139,18 @@ class _Witness:
     """Whether this normal row is followed by its own tangent pair."""
 
 
+def _dot3(a, b):
+    """Round three float32 products and sum in float64, independent of BLAS.
+
+    Admission and grouping thresholds must use the same operation order as
+    device preparation. NumPy dot can choose different reductions by platform.
+    """
+    x = float(np.float32(a[0] * b[0]))
+    y = float(np.float32(a[1] * b[1]))
+    z = float(np.float32(a[2] * b[2]))
+    return np.float32((x + y) + z)
+
+
 def _transform_point(pose, point):
     """Transform a body-frame witness using scalar-last quaternion storage."""
     q = pose[3:]
@@ -225,7 +241,7 @@ def _contact_groups(solver, state, contacts):
             pb = _transform_point(poses[bb], pb)
         pa -= margins_a[c] * normals[c]
         pb += margins_b[c] * normals[c]
-        gap = float(np.dot(normals[c], pa - pb))
+        gap = float(_dot3(normals[c], pa - pb))
         if gap > _TOUCH_TOLERANCE and not patches:
             continue
         admitted += 1
@@ -238,8 +254,8 @@ def _contact_groups(solver, state, contacts):
         clusters = groups.setdefault((world, a, b, ba, bb), [])
         for cluster in clusters:
             if all(
-                np.dot(witness.normal, other.normal) >= _NORMAL_COSINE
-                and abs(np.dot(witness.normal, witness.point - other.point)) <= _TOUCH_TOLERANCE
+                _dot3(witness.normal, other.normal) >= _NORMAL_COSINE
+                and abs(_dot3(witness.normal, witness.point - other.point)) <= _TOUCH_TOLERANCE
                 for other in cluster
             ):
                 cluster.append(witness)
@@ -300,7 +316,6 @@ def _prepare_velocity_torsion_rows(
     dof_indices: wp.array2d[int],
     jacobian: wp.array3d[float],
     dt: float,
-    mu: wp.array2d[float],
     rhs: wp.array2d[float],
 ):
     """Conclude speculative spin admission without discarding touching support."""
@@ -326,8 +341,9 @@ def _prepare_velocity_torsion_rows(
     # The angular row has no positional spring: retain prescribed angular
     # target motion but not position-solve contact correction or restitution.
     rhs[world, spin] = -target[world, spin]
-    if not touching:
-        mu[world, spin] = 0.0
+    # Keep the undivided coefficient: still-loaded normal rows retain sliding
+    # friction even when separated support retires the additional spin row.
+    group[world, spin] = -1 if touching else _TORSION_SPIN_RETIRED
     # Do not zero lambda here. The coupled sweep must apply Y * (new - old)
     # to refund position-phase spin and tangential impulses coherently.
 
@@ -358,7 +374,7 @@ def prepare_torsion_velocity_pass(solver, dt):
             solver.J_world,
             dt,
         ],
-        outputs=[solver.row_mu, solver.rhs_unbiased],
+        outputs=[solver.rhs_unbiased],
         device=solver.model.device,
     )
 
@@ -434,7 +450,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
             if art < 0:
                 continue
             if prescribed[art]:
-                fields["target_velocity"][world, row] -= sign * np.dot(normal, body_velocities[body, 3:])
+                fields["target_velocity"][world, row] -= sign * _dot3(normal, body_velocities[body, 3:])
                 continue
             size, index = int(art_size[art]), int(art_group[art])
             joint = int(body_joint[body])
@@ -442,7 +458,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
                 for global_dof in range(int(qd_start[joint]), int(qd_start[joint + 1])):
                     local = global_dof - int(art_start[art])
                     if 0 <= local < size:
-                        jacobians[size][index, row, local] += sign * np.dot(normal, motions[global_dof, 3:])
+                        jacobians[size][index, row, local] += sign * _dot3(normal, motions[global_dof, 3:])
                 joint = int(ancestor[joint])
         solver._torsion_stats["groups"].append(
             {
@@ -533,6 +549,7 @@ def torque_sweep_source(dofs):
                     }}
                 }}
                 float bound = radius * fmaxf(normal_budget - sliding_used, 0.0f);
+                if (world_torsion_group.data[off_dense + spin] == {_TORSION_SPIN_RETIRED}) bound = 0.0f;
                 if (global_iter < friction_start_iteration) bound = 0.0f;
                 float dot = 0.0f;
                 for (int d = lane; d < {dofs}; d += 32)
