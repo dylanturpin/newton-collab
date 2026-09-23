@@ -1570,6 +1570,44 @@ def create_narrow_phase_kernels_gjk_mpr_split(
 
 
 @wp.kernel(enable_backward=False)
+def narrow_phase_find_heightfield_triangle_overlaps_kernel(
+    shape_types: wp.array[int],
+    shape_transform: wp.array[wp.transform],
+    shape_gap: wp.array[float],
+    shape_data: wp.array[wp.vec4],
+    shape_collision_aabb_lower: wp.array[wp.vec3],
+    shape_collision_aabb_upper: wp.array[wp.vec3],
+    shape_heightfield_index: wp.array[int],
+    heightfield_data: wp.array[HeightfieldData],
+    heightfield_elevations: wp.array[float],
+    shape_pairs: wp.array[wp.vec2i],
+    shape_pairs_count: wp.array[int],
+    total_num_threads: int,
+    triangle_pairs: wp.array[wp.vec3i],
+    triangle_pairs_count: wp.array[int],
+):
+    """Pack independent heightfield queries into every lane, without mesh BVH tiles."""
+    for i in range(wp.tid(), shape_pairs_count[0], total_num_threads):
+        pair = shape_pairs[i]
+        hfd = heightfield_data[shape_heightfield_index[pair[0]]]
+        heightfield_vs_convex_midphase(
+            pair[0],
+            pair[1],
+            hfd,
+            heightfield_elevations,
+            shape_transform,
+            shape_collision_aabb_lower,
+            shape_collision_aabb_upper,
+            shape_data,
+            shape_gap,
+            triangle_pairs,
+            triangle_pairs_count,
+            # Plane local AABBs are not bounds for arbitrary plane extents.
+            shape_types[pair[1]] != GeoType.PLANE,
+        )
+
+
+@wp.kernel(enable_backward=False)
 def narrow_phase_find_mesh_triangle_overlaps_kernel(
     shape_types: wp.array[int],
     shape_transform: wp.array[wp.transform],
@@ -1581,6 +1619,7 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
     shape_collision_aabb_upper: wp.array[wp.vec3],  # Local-space AABB upper bounds
     shape_heightfield_index: wp.array[wp.int32],
     heightfield_data: wp.array[HeightfieldData],
+    heightfield_elevations: wp.array[wp.float32],
     shape_pairs_mesh: wp.array[wp.vec2i],
     shape_pairs_mesh_count: wp.array[int],
     total_num_threads: int,
@@ -1622,6 +1661,7 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
                 shape_a,
                 shape_b,
                 hfd,
+                heightfield_elevations,
                 shape_transform,
                 shape_collision_aabb_lower,
                 shape_collision_aabb_upper,
@@ -1629,6 +1669,8 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
                 shape_gap,
                 triangle_pairs,
                 triangle_pairs_count,
+                # Plane local AABBs are not bounds for arbitrary plane extents.
+                type_b != GeoType.PLANE,
             )
             continue
 
@@ -2375,6 +2417,9 @@ class NarrowPhase:
         self.reduce_contacts = reduce_contacts
         self.has_meshes = has_meshes
         self.has_heightfields = has_heightfields
+        # Heightfields enumerate cells serially per pair; the mesh BVH's tiled
+        # dimension otherwise leaves every lane but one idle for these queries.
+        self._heightfield_packed_pairs = has_heightfields and not has_meshes
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
         self.has_generic_convex_pairs = has_generic_convex_pairs
         self.sdf_texture_paired_samples = sdf_texture_paired_samples
@@ -2983,12 +3028,30 @@ class NarrowPhase:
                     record_tape=False,
                 )
 
-            # Launch midphase: finds overlapping triangles for both mesh and heightfield pairs
-            second_dim = self.tile_size_mesh_convex if ENABLE_TILE_BVH_QUERY else 1
-            wp.launch(
-                kernel=narrow_phase_find_mesh_triangle_overlaps_kernel,
-                dim=[self.num_tile_blocks, second_dim],
-                inputs=[
+            # Pure heightfield scenes need scalar cell queries, not tiled BVH
+            # traversal. Mixed mesh scenes retain the existing shared midphase.
+            if self._heightfield_packed_pairs:
+                midphase_kernel = narrow_phase_find_heightfield_triangle_overlaps_kernel
+                midphase_dim = self.total_num_threads
+                midphase_inputs = [
+                    shape_types,
+                    shape_transform,
+                    shape_gap,
+                    shape_data,
+                    shape_collision_aabb_lower,
+                    shape_collision_aabb_upper,
+                    shape_heightfield_index,
+                    heightfield_data,
+                    heightfield_elevations,
+                    self.shape_pairs_mesh,
+                    self.shape_pairs_mesh_count,
+                    self.total_num_threads,
+                ]
+            else:
+                midphase_kernel = narrow_phase_find_mesh_triangle_overlaps_kernel
+                second_dim = self.tile_size_mesh_convex if ENABLE_TILE_BVH_QUERY else 1
+                midphase_dim = [self.num_tile_blocks, second_dim]
+                midphase_inputs = [
                     shape_types,
                     shape_transform,
                     shape_source,
@@ -2999,10 +3062,15 @@ class NarrowPhase:
                     shape_collision_aabb_upper,
                     shape_heightfield_index,
                     heightfield_data,
+                    heightfield_elevations,
                     self.shape_pairs_mesh,
                     self.shape_pairs_mesh_count,
                     self.num_tile_blocks,
-                ],
+                ]
+            wp.launch(
+                kernel=midphase_kernel,
+                dim=midphase_dim,
+                inputs=midphase_inputs,
                 outputs=[
                     self.triangle_pairs,
                     self.triangle_pairs_count,

@@ -9,10 +9,11 @@ then compares the row-to-row Delassus operator:
 
     W = J H^-1 J^T
 
-For the current D-wide path, W is computed directly from ``J_world`` and
-``Y_world``. For the propagation path, each source row is injected as a unit
-body-space row impulse, the actual propagation kernel is run once, and the
-resulting target row velocities are sampled through the body-space row Jacobians.
+For the D-wide reference path, the tiled ``H^-1 J^T`` kernel materializes
+``J_world`` and ``Y_world``, and W is computed directly from those buffers. For
+the propagation path, each source row is injected as a unit body-space row
+impulse, the actual propagation kernel is run once, and the resulting target row
+velocities are sampled through the body-space row Jacobians.
 
 If these operators match, later state differences are solve ordering or
 underconvergence. If they do not match, the propagation math/setup is different from
@@ -147,18 +148,24 @@ def _make_solver(
     mf_capacity = 16
     response_mode = "propagation" if path == "propagation" else "immediate"
 
-    return SolverFeatherPGS(
-        model,
-        pgs_mode="matrix_free",
-        articulated_contact_response=response_mode,
-        pgs_iterations=0,
-        pgs_velocity_iterations=0,
-        enable_contact_friction=enable_contact_friction,
-        dense_max_constraints=dense_capacity,
-        mf_max_constraints=mf_capacity,
-        pgs_warmstart=False,
-        mf_warmstart=False,
-    )
+    previous_overrides = SolverFeatherPGS._kernel_overrides
+    if path == "mf_immediate":
+        SolverFeatherPGS._kernel_overrides = {**previous_overrides, "hinv_jt_kernel": "tiled"}
+    try:
+        return SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            articulated_contact_response=response_mode,
+            pgs_iterations=0,
+            pgs_velocity_iterations=0,
+            enable_contact_friction=enable_contact_friction,
+            dense_max_constraints=dense_capacity,
+            mf_max_constraints=mf_capacity,
+            pgs_warmstart=False,
+            mf_warmstart=False,
+        )
+    finally:
+        SolverFeatherPGS._kernel_overrides = previous_overrides
 
 
 def _run_zero_iteration_setup(
@@ -704,7 +711,7 @@ def _write_summary(path: Path, results: list[OperatorDiagnosticResult], args: ar
     lines = [
         "# FPGS Articulation Operator Diagnostic",
         "",
-        "This compares the old D-wide row operator `J_world @ Y_world.T` with the propagation operator formed by unit row impulse injection plus the actual propagation kernel.",
+        "This compares the tiled D-wide reference row operator `J_world @ Y_world.T` with the propagation operator formed by unit row impulse injection plus the actual propagation kernel.",
         "",
         f"Classification: {'operator mismatch found' if any_mismatch else 'all sampled operators match'}.",
         f"Tolerance: abs_linf <= {args.abs_tol:g} and rel_fro <= {args.rel_tol:g}.",

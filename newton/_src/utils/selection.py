@@ -324,6 +324,92 @@ def _scatter_masked_2d_kernel(
             dst[dst_idx] = values[row, col]
 
 
+# ========================================================================================
+# Sparse-world attribute gather/scatter kernels
+
+
+@wp.kernel
+def _gather_sparse_2d_kernel(src: Any, indices: wp.array2d[int], dst: Any):
+    world, arti = wp.tid()
+    dst[world, arti] = src[indices[world, arti]]
+
+
+@wp.kernel
+def _gather_sparse_3d_kernel(src: Any, indices: wp.array3d[int], dst: Any):
+    world, arti, value = wp.tid()
+    dst[world, arti, value] = src[indices[world, arti, value]]
+
+
+@wp.kernel
+def _gather_sparse_3d_trailing_kernel(src: Any, indices: wp.array2d[int], dst: Any):
+    world, arti, trailing = wp.tid()
+    dst[world, arti, trailing] = src[indices[world, arti], trailing]
+
+
+@wp.kernel
+def _gather_sparse_4d_kernel(src: Any, indices: wp.array3d[int], dst: Any):
+    world, arti, value, trailing = wp.tid()
+    dst[world, arti, value, trailing] = src[indices[world, arti, value], trailing]
+
+
+@wp.kernel
+def _scatter_sparse_2d_world_kernel(values: Any, indices: wp.array2d[int], mask: wp.array[bool], dst: Any):
+    world, arti = wp.tid()
+    if mask[world]:
+        dst[indices[world, arti]] = values[world, arti]
+
+
+@wp.kernel
+def _scatter_sparse_2d_articulation_kernel(values: Any, indices: wp.array2d[int], mask: wp.array2d[bool], dst: Any):
+    world, arti = wp.tid()
+    if mask[world, arti]:
+        dst[indices[world, arti]] = values[world, arti]
+
+
+@wp.kernel
+def _scatter_sparse_3d_world_kernel(values: Any, indices: wp.array3d[int], mask: wp.array[bool], dst: Any):
+    world, arti, value = wp.tid()
+    if mask[world]:
+        dst[indices[world, arti, value]] = values[world, arti, value]
+
+
+@wp.kernel
+def _scatter_sparse_3d_articulation_kernel(values: Any, indices: wp.array3d[int], mask: wp.array2d[bool], dst: Any):
+    world, arti, value = wp.tid()
+    if mask[world, arti]:
+        dst[indices[world, arti, value]] = values[world, arti, value]
+
+
+@wp.kernel
+def _scatter_sparse_3d_trailing_world_kernel(values: Any, indices: wp.array2d[int], mask: wp.array[bool], dst: Any):
+    world, arti, trailing = wp.tid()
+    if mask[world]:
+        dst[indices[world, arti], trailing] = values[world, arti, trailing]
+
+
+@wp.kernel
+def _scatter_sparse_3d_trailing_articulation_kernel(
+    values: Any, indices: wp.array2d[int], mask: wp.array2d[bool], dst: Any
+):
+    world, arti, trailing = wp.tid()
+    if mask[world, arti]:
+        dst[indices[world, arti], trailing] = values[world, arti, trailing]
+
+
+@wp.kernel
+def _scatter_sparse_4d_world_kernel(values: Any, indices: wp.array3d[int], mask: wp.array[bool], dst: Any):
+    world, arti, value, trailing = wp.tid()
+    if mask[world]:
+        dst[indices[world, arti, value], trailing] = values[world, arti, value, trailing]
+
+
+@wp.kernel
+def _scatter_sparse_4d_articulation_kernel(values: Any, indices: wp.array3d[int], mask: wp.array2d[bool], dst: Any):
+    world, arti, value, trailing = wp.tid()
+    if mask[world, arti]:
+        dst[indices[world, arti, value], trailing] = values[world, arti, value, trailing]
+
+
 # NOTE: Python slice objects are not hashable in Python < 3.12, so we use this instead.
 class Slice:
     def __init__(self, start=None, stop=None):
@@ -352,11 +438,16 @@ class FrequencyLayout:
         value_count: int,
         indices: list[int],
         device,
+        model_starts: list[list[int]] | None = None,
     ):
         self.offset = offset  # number of values to skip at the beginning of attribute array
         self.stride_between_worlds = stride_between_worlds
         self.stride_within_worlds = stride_within_worlds
         self.value_count = value_count
+        self._selected_indices = indices
+        self._model_starts = model_starts
+        self._device = device
+        self._model_index_cache = {}
         self.slice = None
         self.indices = None
         if len(indices) == 0:
@@ -376,6 +467,49 @@ class FrequencyLayout:
             return self.slice.stop - self.slice.start
         else:
             return len(self.indices)
+
+    @property
+    def uses_explicit_model_indices(self):
+        """Whether attributes require gather/scatter through absolute model indices."""
+        return self._model_starts is not None
+
+    def get_model_indices(self, value_slice: Slice | int | None = None):
+        """Return absolute model indices for a sparse/non-uniform view layout."""
+        if not self.uses_explicit_model_indices:
+            raise RuntimeError("Explicit model indices are unavailable for this regular layout")
+
+        if isinstance(value_slice, Slice):
+            value_slice = value_slice.get()
+
+        cache_key = value_slice
+        if cache_key in self._model_index_cache:
+            return self._model_index_cache[cache_key]
+
+        if value_slice is None:
+            local_indices = self._selected_indices
+            squeeze_value_axis = False
+        elif isinstance(value_slice, int):
+            local_indices = [value_slice]
+            squeeze_value_axis = True
+        elif isinstance(value_slice, slice):
+            start, stop, step = value_slice.indices(self.value_count)
+            if step != 1:
+                raise ValueError("ArticulationView attribute slices must have step 1")
+            local_indices = list(range(start, stop))
+            squeeze_value_axis = False
+        else:
+            raise ValueError(f"Invalid slice type: expected slice or int, got {type(value_slice)}")
+
+        if squeeze_value_axis:
+            host_indices = [[start + local_indices[0] for start in world_starts] for world_starts in self._model_starts]
+        else:
+            host_indices = [
+                [[start + local_index for local_index in local_indices] for start in world_starts]
+                for world_starts in self._model_starts
+            ]
+        model_indices = wp.array(host_indices, dtype=int, device=self._device)
+        self._model_index_cache[cache_key] = model_indices
+        return model_indices
 
     def __str__(self):
         indices = self.indices if self.indices is not None else self.slice
@@ -608,14 +742,13 @@ class ArticulationView:
             pattern, model.articulation_label, model_articulation_world, model.world_count
         )
 
-        # determine articulation counts per world
-        world_count = model.world_count
-        articulation_count = 0
-        counts_per_world = [0] * world_count
-        for world_id in range(world_count):
-            count = len(articulation_ids[world_id])
-            counts_per_world[world_id] += count
-            articulation_count += count
+        # Determine articulation counts and compact away worlds with no matches. A view's
+        # first dimension is the ordered list of worlds that actually contain the selected
+        # articulation type; ``world_ids`` maps that compact axis back to model worlds.
+        # This is what permits several different articulation types to occupy disjoint sets
+        # of worlds in one heterogeneous model.
+        articulation_count = sum(len(ids) for ids in articulation_ids)
+        selected_world_ids = [world_id for world_id, ids in enumerate(articulation_ids) if ids]
 
         # can't mix global and per-world articulations in the same view
         if articulation_count > 0 and global_articulation_ids:
@@ -625,18 +758,25 @@ class ArticulationView:
 
         # handle scenes with only global articulations
         if articulation_count == 0 and global_articulation_ids:
-            world_count = 1
             articulation_count = len(global_articulation_ids)
-            counts_per_world = [articulation_count]
+            selected_world_ids = [-1]
             articulation_ids = [global_articulation_ids]
+        else:
+            articulation_ids = [articulation_ids[world_id] for world_id in selected_world_ids]
 
         if articulation_count == 0:
             raise KeyError(f"No articulations matching pattern '{pattern}'")
 
+        counts_per_world = [len(ids) for ids in articulation_ids]
         if not all_equal(counts_per_world):
-            raise ValueError("Varying articulation counts per world are not supported")
+            raise ValueError("Varying articulation counts per selected world are not supported")
 
+        world_count = len(selected_world_ids)
         count_per_world = counts_per_world[0]
+        # Preserve the zero-copy strided path whenever matching entities remain regularly
+        # spaced, even if their model-world IDs are sparse. Fall back to explicit absolute
+        # maps only when the actual entity strides are non-uniform.
+        use_explicit_model_indices = False
 
         # use the first articulation as a "template"
         arti_0 = articulation_ids[0][0]
@@ -784,16 +924,17 @@ class ArticulationView:
                 outer_link_strides.append(link_starts[world_id][0] - link_starts[world_id - 1][0])
                 outer_shape_strides.append(shape_starts[world_id][0] - shape_starts[world_id - 1][0])
 
-            # make sure outer strides are uniform
-            if not (
+            outer_strides_are_uniform = (
                 all_equal(outer_joint_strides)
                 and all_equal(outer_joint_dof_strides)
                 and all_equal(outer_joint_coord_strides)
                 and all_equal(outer_link_strides)
                 and all_equal(outer_shape_strides)
-            ):
-                raise ValueError("Non-uniform strides between worlds are not supported")
+            )
+            use_explicit_model_indices |= not outer_strides_are_uniform
 
+            # These values are ignored by explicit layouts. Keeping a concrete value makes
+            # FrequencyLayout backwards compatible for callers that inspect its fields.
             outer_joint_stride = outer_joint_strides[0]
             outer_joint_dof_stride = outer_joint_dof_strides[0]
             outer_joint_coord_stride = outer_joint_coord_strides[0]
@@ -825,15 +966,14 @@ class ArticulationView:
                     inner_link_strides[world_id].append(link_starts[world_id][i] - link_starts[world_id][i - 1])
                     inner_shape_strides[world_id].append(shape_starts[world_id][i] - shape_starts[world_id][i - 1])
 
-            # make sure inner strides are uniform
-            if not (
+            inner_strides_are_uniform = (
                 all_equal(inner_joint_strides)
                 and all_equal(inner_joint_dof_strides)
                 and all_equal(inner_joint_coord_strides)
                 and all_equal(inner_link_strides)
                 and all_equal(inner_shape_strides)
-            ):
-                raise ValueError("Non-uniform strides within worlds are not supported")
+            )
+            use_explicit_model_indices |= not inner_strides_are_uniform
 
             inner_joint_stride = inner_joint_strides[0][0]
             inner_joint_dof_stride = inner_joint_dof_strides[0][0]
@@ -986,6 +1126,7 @@ class ArticulationView:
                 arti_joint_count,
                 selected_joint_indices,
                 self.device,
+                joint_starts if use_explicit_model_indices else None,
             ),
             AttributeFrequency.JOINT_DOF: FrequencyLayout(
                 joint_dof_offset,
@@ -994,6 +1135,7 @@ class ArticulationView:
                 arti_joint_dof_count,
                 selected_joint_dof_indices,
                 self.device,
+                joint_dof_starts if use_explicit_model_indices else None,
             ),
             AttributeFrequency.JOINT_COORD: FrequencyLayout(
                 joint_coord_offset,
@@ -1002,9 +1144,16 @@ class ArticulationView:
                 arti_joint_coord_count,
                 selected_joint_coord_indices,
                 self.device,
+                joint_coord_starts if use_explicit_model_indices else None,
             ),
             AttributeFrequency.BODY: FrequencyLayout(
-                link_offset, outer_link_stride, inner_link_stride, arti_link_count, selected_link_indices, self.device
+                link_offset,
+                outer_link_stride,
+                inner_link_stride,
+                arti_link_count,
+                selected_link_indices,
+                self.device,
+                link_starts if use_explicit_model_indices else None,
             ),
             AttributeFrequency.SHAPE: FrequencyLayout(
                 shape_offset,
@@ -1013,6 +1162,7 @@ class ArticulationView:
                 arti_shape_count,
                 selected_shape_indices,
                 self.device,
+                shape_starts if use_explicit_model_indices else None,
             ),
         }
 
@@ -1113,7 +1263,7 @@ class ArticulationView:
                             if tendon_starts[world_id][0] >= 0 and tendon_starts[world_id - 1][0] >= 0:
                                 outer_tendon_strides.append(tendon_starts[world_id][0] - tendon_starts[world_id - 1][0])
                         if outer_tendon_strides and not all_equal(outer_tendon_strides):
-                            raise ValueError("Non-uniform tendon strides between worlds are not supported")
+                            use_explicit_model_indices = True
                         outer_tendon_stride = outer_tendon_strides[0] if outer_tendon_strides else arti_tendon_count
                     else:
                         outer_tendon_stride = arti_tendon_count
@@ -1130,7 +1280,7 @@ class ArticulationView:
                         # Flatten and check uniformity
                         flat_inner = [s for lst in inner_tendon_strides for s in lst]
                         if flat_inner and not all_equal(flat_inner):
-                            raise ValueError("Non-uniform tendon strides within worlds are not supported")
+                            use_explicit_model_indices = True
                         inner_tendon_stride = flat_inner[0] if flat_inner else arti_tendon_count
                     else:
                         inner_tendon_stride = arti_tendon_count
@@ -1156,6 +1306,7 @@ class ArticulationView:
                         arti_tendon_count,
                         selected_tendon_indices,
                         self.device,
+                        tendon_starts if use_explicit_model_indices else None,
                     )
 
                     self.tendon_count = arti_tendon_count
@@ -1176,6 +1327,11 @@ class ArticulationView:
 
         # articulation ids grouped by world
         self.articulation_ids = wp.array(articulation_ids, dtype=int, device=self.device)
+        # Compact view-world index -> original model-world index. Global articulations
+        # retain the sentinel world ``-1``.
+        self.world_ids = wp.array(selected_world_ids, dtype=int, device=self.device)
+        self.is_sparse = selected_world_ids not in ([-1], list(range(model.world_count)))
+        self.uses_explicit_model_indices = use_explicit_model_indices
 
         # default mask includes all articulations in all worlds
         self.full_mask = wp.full(world_count, True, dtype=bool, device=self.device)
@@ -1280,8 +1436,32 @@ class ArticulationView:
         # handle custom slice
         if isinstance(_slice, Slice):
             _slice = _slice.get()
-        elif not isinstance(_slice, (NoneType, int, slice)):
+        elif not isinstance(_slice, NoneType | int | slice):
             raise ValueError(f"Invalid slice type: expected slice or int, got {type(_slice)}")
+
+        # Sparse heterogeneous views cannot be represented by one pointer plus regular
+        # world/articulation strides. Materialize a compact staging array and attach the
+        # absolute row map used by the getter/setter paths below.
+        if layout.uses_explicit_model_indices:
+            model_indices = layout.get_model_indices(_slice)
+            trailing_shape = attrib.shape[1:]
+            if len(trailing_shape) > 1:
+                raise NotImplementedError(
+                    f"Sparse ArticulationView does not support attributes with {len(trailing_shape)} trailing axes"
+                )
+            if model_indices.ndim == 2:
+                shape = (self.world_count, self.count_per_world, *trailing_shape)
+            else:
+                shape = (self.world_count, self.count_per_world, model_indices.shape[2], *trailing_shape)
+            result = wp.empty(shape, dtype=attrib.dtype, device=attrib.device)
+            if attrib.requires_grad:
+                result.requires_grad = True
+            if attrib.ptr is None:
+                result.ptr = None
+                return result
+            result._sparse_source = attrib
+            result._sparse_model_indices = model_indices
+            return result
 
         if _slice is None:
             value_slice = layout.indices if is_indexed else layout.slice
@@ -1358,6 +1538,23 @@ class ArticulationView:
 
     def _get_attribute_values(self, name: str, source: Model | State | Control, _slice: slice | None = None):
         attrib = self._get_attribute_array(name, source, _slice=_slice)
+        if hasattr(attrib, "_sparse_source"):
+            src = attrib._sparse_source
+            indices = attrib._sparse_model_indices
+            if indices.ndim == 2 and src.ndim == 1:
+                kernel = _gather_sparse_2d_kernel
+            elif indices.ndim == 3 and src.ndim == 1:
+                kernel = _gather_sparse_3d_kernel
+            elif indices.ndim == 2 and src.ndim == 2:
+                kernel = _gather_sparse_3d_trailing_kernel
+            elif indices.ndim == 3 and src.ndim == 2:
+                kernel = _gather_sparse_4d_kernel
+            else:
+                raise NotImplementedError(
+                    f"Unsupported sparse attribute layout: source ndim={src.ndim}, index ndim={indices.ndim}"
+                )
+            wp.launch(kernel, dim=attrib.shape, inputs=[src, indices], outputs=[attrib], device=self.device)
+            return attrib
         if hasattr(attrib, "_staging_array"):
             if hasattr(attrib, "_gather_src"):
                 kernel = _gather_indexed_4d_kernel if attrib.ndim == 4 else _gather_indexed_3d_kernel
@@ -1386,6 +1583,31 @@ class ArticulationView:
             values = wp.array(values, dtype=attrib.dtype, shape=attrib.shape, device=self.device, copy=False)
         assert values.shape == attrib.shape
         assert values.dtype == attrib.dtype
+
+        # Sparse attributes are staging buffers, so writes must scatter through their
+        # absolute model-row maps instead of modifying the staging allocation.
+        if hasattr(attrib, "_sparse_source"):
+            mask = self.full_mask if mask is None else self._resolve_mask(mask)
+            indices = attrib._sparse_model_indices
+            dst = attrib._sparse_source
+            if indices.ndim == 2 and dst.ndim == 1:
+                kernel = _scatter_sparse_2d_world_kernel if mask.ndim == 1 else _scatter_sparse_2d_articulation_kernel
+            elif indices.ndim == 3 and dst.ndim == 1:
+                kernel = _scatter_sparse_3d_world_kernel if mask.ndim == 1 else _scatter_sparse_3d_articulation_kernel
+            elif indices.ndim == 2 and dst.ndim == 2:
+                kernel = (
+                    _scatter_sparse_3d_trailing_world_kernel
+                    if mask.ndim == 1
+                    else _scatter_sparse_3d_trailing_articulation_kernel
+                )
+            elif indices.ndim == 3 and dst.ndim == 2:
+                kernel = _scatter_sparse_4d_world_kernel if mask.ndim == 1 else _scatter_sparse_4d_articulation_kernel
+            else:
+                raise NotImplementedError(
+                    f"Unsupported sparse attribute layout: destination ndim={dst.ndim}, index ndim={indices.ndim}"
+                )
+            wp.launch(kernel, dim=attrib.shape, inputs=[values, indices, mask], outputs=[dst], device=self.device)
+            return
 
         # early out for in-place modifications
         if isinstance(attrib, wp.array) and isinstance(values, wp.array):
@@ -1946,6 +2168,18 @@ class ArticulationView:
             return wp.empty(0, dtype=int, device=self.device)
 
         mapping = wp.full(self.world_count * dofs_per_world, -1, dtype=int, device=self.device)
+
+        if dof_layout.uses_explicit_model_indices:
+            # Sparse views may skip model worlds and their selected DOFs need not have a
+            # regular stride. Build the map by absolute DOF identity instead.
+            actuator_by_dof = {int(dof): index for index, dof in enumerate(actuator.indices.numpy())}
+            selected_model_dofs = dof_layout.get_model_indices().numpy().reshape(-1)
+            mapping = wp.array(
+                [actuator_by_dof.get(int(dof), -1) for dof in selected_model_dofs],
+                dtype=int,
+                device=self.device,
+            )
+            return mapping
 
         if dof_layout.is_contiguous:
             wp.launch(

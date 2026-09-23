@@ -252,6 +252,8 @@ class _DofParams:
 
     armature: float
     friction: float
+    spring_stiffness: float
+    spring_ref: float
     damping: float
     velocity_limit: float | None
     limit_lower: float
@@ -767,6 +769,10 @@ def parse_usd(
     physics_dt = None
     max_solver_iters = None
     particle_scene_prim = None
+    # Angle units for mjc:springref: the MuJoCo USD converter records the source
+    # spec's compiler setting on the scene prim (mjc:compiler:angle); the schema
+    # default is degrees. mjc:stiffness is always per-radian regardless.
+    mjc_angle_is_degree = True
 
     visual_shape_cfg = ModelBuilder.ShapeConfig(
         density=0.0,
@@ -924,6 +930,31 @@ def parse_usd(
         if spec.usd_value_transformer is not None:
             return spec.usd_value_transformer(spec.default)
         return spec.default
+
+    def _resolve_joint_spring(prim: Usd.Prim, is_angular: bool) -> tuple[float, float]:
+        """Resolve an MjcJointAPI passive spring for one DOF, in Newton units.
+
+        ``mjc:stiffness`` is always per-radian (MuJoCo never expresses stiffness
+        per-degree); ``mjc:springref`` follows the source spec's compiler angle
+        units recorded in the scene-level ``mjc:compiler:angle`` token (schema
+        default: degrees).
+        """
+        spring_stiffness = builder.default_joint_cfg.spring_stiffness
+        spring_ref = builder.default_joint_cfg.spring_ref
+        if mjc_resolver is None or not _has_api_schema(prim, "MjcJointAPI"):
+            return spring_stiffness, spring_ref
+
+        resolved_stiffness = mjc_resolver.get_value(prim, PrimType.JOINT, "spring_stiffness")
+        resolved_ref = mjc_resolver.get_value(prim, PrimType.JOINT, "spring_ref")
+        if resolved_stiffness is not None or resolved_ref is not None:
+            R._collect_on_first_use(mjc_resolver, prim)
+        if resolved_stiffness is not None:
+            spring_stiffness = resolved_stiffness
+        if resolved_ref is not None:
+            spring_ref = resolved_ref
+            if is_angular and mjc_angle_is_degree:
+                spring_ref *= DegreesToRadian
+        return spring_stiffness, spring_ref
 
     def _resolve_joint_limit_gain(
         prim: Usd.Prim, key: str, builder_default: float
@@ -1777,6 +1808,8 @@ def parse_usd(
         )
         linear_damping, angular_damping = resolve_joint_damping(jp_prim)
         damping = angular_damping if is_revolute else linear_damping
+        # Already in Newton units; must not pass through the revolute deg->rad block below.
+        spring_stiffness, spring_ref = _resolve_joint_spring(jp_prim, is_revolute)
         velocity_limit = R.get_value(
             jp_prim, prim_type=PrimType.JOINT, key="velocity_limit", default=None, verbose=verbose
         )
@@ -1848,6 +1881,8 @@ def parse_usd(
         return _DofParams(
             armature=armature,
             friction=friction,
+            spring_stiffness=spring_stiffness,
+            spring_ref=spring_ref,
             damping=damping,
             velocity_limit=velocity_limit,
             limit_lower=limit_lower,
@@ -1916,6 +1951,8 @@ def parse_usd(
             joint_params["limit_kd"] = dof.limit_kd
             joint_params["armature"] = dof.armature
             joint_params["friction"] = dof.friction
+            joint_params["spring_stiffness"] = dof.spring_stiffness
+            joint_params["spring_ref"] = dof.spring_ref
             joint_params["damping"] = dof.damping
             joint_params["velocity_limit"] = dof.velocity_limit
             if dof.has_drive:
@@ -1946,6 +1983,9 @@ def parse_usd(
                 joint_prim, prim_type=PrimType.JOINT, key="friction", default=default_joint_friction, verbose=verbose
             )
             joint_linear_damping, joint_angular_damping = resolve_joint_damping(joint_prim)
+            # Per-joint spring values replicated to every axis (like armature/friction above).
+            lin_spring_stiffness, lin_spring_ref = _resolve_joint_spring(joint_prim, is_angular=False)
+            ang_spring_stiffness, ang_spring_ref = _resolve_joint_spring(joint_prim, is_angular=True)
             joint_velocity_limit = R.get_value(
                 joint_prim, prim_type=PrimType.JOINT, key="velocity_limit", default=None, verbose=verbose
             )
@@ -2083,6 +2123,8 @@ def parse_usd(
                             if joint_velocity_limit is not None
                             else default_joint_velocity_limit,
                             friction=joint_friction,
+                            spring_stiffness=lin_spring_stiffness,
+                            spring_ref=lin_spring_ref,
                             actuator_mode=actuator_mode,
                         )
                     )
@@ -2149,6 +2191,8 @@ def parse_usd(
                             if joint_velocity_limit is not None
                             else default_joint_velocity_limit,
                             friction=joint_friction,
+                            spring_stiffness=ang_spring_stiffness,
+                            spring_ref=ang_spring_ref,
                             actuator_mode=actuator_mode,
                         )
                     )
@@ -2374,6 +2418,8 @@ def parse_usd(
                 damping=dof.damping,
                 armature=dof.armature,
                 friction=dof.friction,
+                spring_stiffness=dof.spring_stiffness,
+                spring_ref=dof.spring_ref,
                 effort_limit=dof.effort_limit,
                 velocity_limit=dof.velocity_limit if dof.velocity_limit is not None else default_joint_velocity_limit,
                 actuator_mode=dof.actuator_mode,
@@ -2511,6 +2557,7 @@ def parse_usd(
         max_solver_iters = R.get_value(
             physics_scene_prim, prim_type=PrimType.SCENE, key="max_solver_iterations", default=None, verbose=verbose
         )
+        mjc_angle_is_degree = usd.get_attribute(physics_scene_prim, "mjc:compiler:angle") != "radian"
 
     stage_up_axis = Axis.from_string(str(UsdGeom.GetStageUpAxis(stage)))
 

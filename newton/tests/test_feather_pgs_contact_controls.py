@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
     allocate_world_contact_slots,
     apply_world_contact_restitution_accumulated,
@@ -27,6 +28,12 @@ PATH_MATRIX_FREE = 1
 PATH_PROPAGATION = 2
 
 
+def _disabled_patches(device):
+    patches = FrictionPatches()
+    patches.phi = wp.zeros(1, dtype=wp.vec2, device=device)
+    return patches
+
+
 def _launch_contact_allocator(
     *,
     route: int,
@@ -37,7 +44,6 @@ def _launch_contact_allocator(
     pair_gate: float = 0.0,
     enable_friction: bool = False,
     friction_gap: float = float("inf"),
-    friction_anchors: int = 0,
     friction_pairs_only: bool = False,
 ):
     """Allocate one contact and return its route metadata and counters."""
@@ -58,6 +64,9 @@ def _launch_contact_allocator(
         "dense_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
         "mf_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
         "propagation_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
+        "dense_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+        "mf_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+        "propagation_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
     }
     is_free = route == PATH_MATRIX_FREE
     propagation_enabled = route == PATH_PROPAGATION
@@ -95,9 +104,9 @@ def _launch_contact_allocator(
             8,
             int(enable_friction),
             friction_gap,
-            friction_anchors,
             int(friction_pairs_only),
             0,
+            FrictionPatches(),
         ],
         outputs=[
             outputs["world"],
@@ -113,6 +122,9 @@ def _launch_contact_allocator(
             counters["dense_dropped"],
             counters["mf_dropped"],
             counters["propagation_dropped"],
+            counters["dense_first_rejected"],
+            counters["mf_first_rejected"],
+            counters["propagation_first_rejected"],
         ],
         device=device,
     )
@@ -128,7 +140,6 @@ def _launch_articulation_pair_contact_allocator(
     cross_articulation: bool = False,
     enable_friction: bool = False,
     friction_gap: float = float("inf"),
-    friction_anchors: int = 0,
     friction_pairs_only: bool = False,
 ):
     """Allocate one contact between two non-free articulated links."""
@@ -176,9 +187,9 @@ def _launch_articulation_pair_contact_allocator(
             8,
             int(enable_friction),
             friction_gap,
-            friction_anchors,
             int(friction_pairs_only),
             0,
+            FrictionPatches(),
         ],
         outputs=[
             wp.full((1,), -9, dtype=wp.int32, device=device),
@@ -194,6 +205,9 @@ def _launch_articulation_pair_contact_allocator(
             dense_dropped,
             mf_dropped,
             propagation_dropped,
+            wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+            wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+            wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
         ],
         device=device,
     )
@@ -438,12 +452,13 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             1.0,
             1,
             0,
-            0,
             wp.zeros((1,), dtype=wp.int32, device=device),
             1.0,
             0,
             0.05,
             1.0e-6,
+            _disabled_patches(device),  # patch friction off
+            0.0,  # friction_anchor_beta
         ],
         outputs=list(serial.values()),
         device=device,
@@ -473,12 +488,13 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             1.0,
             1,
             0,
-            0,
             wp.zeros((1,), dtype=wp.int32, device=device),
             1.0,
             0,
             0.05,
             1.0e-6,
+            _disabled_patches(device),  # patch friction off
+            0.0,  # friction_anchor_beta
         ],
         outputs=list(compact.values())[1:],
         device=device,
@@ -505,6 +521,7 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             shape_body,
             body_q,
             1,
+            FrictionPatches(),
             0,
         ],
         outputs=[compact["J"]],
@@ -658,7 +675,6 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                     gate=0.0,
                     enable_friction=True,
                     friction_gap=0.002,
-                    friction_anchors=1,
                     friction_pairs_only=True,
                 )
                 self.assertEqual(result["path"], route)
@@ -673,7 +689,6 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                     cross_articulation=cross_articulation,
                     enable_friction=True,
                     friction_gap=0.002,
-                    friction_anchors=1,
                     friction_pairs_only=True,
                 )
                 self.assertEqual((slot, path, slots_needed), (0, PATH_DENSE, 1))
@@ -684,14 +699,12 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             gap=-0.0005,
             enable_friction=True,
             friction_gap=-0.001,
-            friction_anchors=1,
             friction_pairs_only=True,
         )
         deep_pair = _launch_articulation_pair_contact_allocator(
             gap=-0.002,
             enable_friction=True,
             friction_gap=-0.001,
-            friction_anchors=1,
             friction_pairs_only=True,
         )
         free_body = _launch_contact_allocator(
@@ -700,7 +713,6 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             gate=0.0,
             enable_friction=True,
             friction_gap=-1.0,
-            friction_anchors=1,
             friction_pairs_only=True,
         )
         self.assertEqual(shallow_pair, (0, PATH_DENSE, 1))
