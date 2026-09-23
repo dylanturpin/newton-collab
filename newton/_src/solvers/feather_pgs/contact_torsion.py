@@ -23,11 +23,20 @@ import warp as wp
 
 from ...geometry import GeoType
 from ...utils.selection import match_labels
-from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
+from .kernels import (
+    _FPGS_CONTACT_END_GAP_SLOP,
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_TORSION,
+)
 
 _TOUCH_TOLERANCE = 1.0e-5
 _NORMAL_COSINE = 0.999
 _MAX_GROUP_CONTACTS = 4096
+# Normal rows store their spin-row index in the membership array. A spin row
+# has no parent membership, so its otherwise-unused cell records admission.
+# Both host and device preparation reset every cell to -1 each step.
+_TORSION_SPIN_RETIRED = -2
 _SUPPORTED_TYPES = (
     GeoType.SPHERE,
     GeoType.BOX,
@@ -87,23 +96,30 @@ def configure_contact_torsion(solver, radius, indices, patterns):
     solver._contact_torsion_shape_patterns = patterns
     solver._contact_torsion_shape_set = selected
     solver._torsion_stats = {}
-    if radius > 0 and (
+    if radius > 0:
+        _validate_torsion_mode(solver)
+
+
+def _validate_torsion_mode(solver):
+    """Reject unsupported construction and runtime mode combinations."""
+    if (
         not solver.model.device.is_cuda
         or solver.model.requires_grad
         or solver.pgs_mode != "matrix_free"
         or solver.articulated_contact_response != "immediate"
         or solver.friction_mode != "current"
         or solver.pgs_schedule != "interleaved"
-        or solver.pgs_velocity_iterations
         or solver.pgs_warmstart
         or solver.pgs_debug
-        or solver.pgs_contact_regularization != 0.0
+        or solver.contact_compliance
         or not solver.enable_contact_friction
     ):
         raise ValueError(
             "Contact torsion requires CUDA non-differentiable matrix_free/immediate/current/"
-            "interleaved, without warmstart, regularization, debug, or velocity post-passes"
+            "interleaved, without warmstart, compliance, or debug"
         )
+    if solver.pgs_velocity_iterations > 0 and solver.enable_bilateral_preelimination:
+        raise ValueError("Contact torsion velocity post-passes require enable_bilateral_preelimination=False")
 
 
 @dataclass
@@ -121,6 +137,18 @@ class _Witness:
     gap: float
     anchor: bool
     """Whether this normal row is followed by its own tangent pair."""
+
+
+def _dot3(a, b):
+    """Round three float32 products and sum in float64, independent of BLAS.
+
+    Admission and grouping thresholds must use the same operation order as
+    device preparation. NumPy dot can choose different reductions by platform.
+    """
+    x = float(np.float32(a[0] * b[0]))
+    y = float(np.float32(a[1] * b[1]))
+    z = float(np.float32(a[2] * b[2]))
+    return np.float32((x + y) + z)
 
 
 def _transform_point(pose, point):
@@ -213,7 +241,7 @@ def _contact_groups(solver, state, contacts):
             pb = _transform_point(poses[bb], pb)
         pa -= margins_a[c] * normals[c]
         pb += margins_b[c] * normals[c]
-        gap = float(np.dot(normals[c], pa - pb))
+        gap = float(_dot3(normals[c], pa - pb))
         if gap > _TOUCH_TOLERANCE and not patches:
             continue
         admitted += 1
@@ -226,8 +254,8 @@ def _contact_groups(solver, state, contacts):
         clusters = groups.setdefault((world, a, b, ba, bb), [])
         for cluster in clusters:
             if all(
-                np.dot(witness.normal, other.normal) >= _NORMAL_COSINE
-                and abs(np.dot(witness.normal, witness.point - other.point)) <= _TOUCH_TOLERANCE
+                _dot3(witness.normal, other.normal) >= _NORMAL_COSINE
+                and abs(_dot3(witness.normal, witness.point - other.point)) <= _TOUCH_TOLERANCE
                 for other in cluster
             ):
                 cluster.append(witness)
@@ -268,13 +296,95 @@ def _group_budget(solver, group, row_mu):
 
 def validate_torsion_step(solver):
     """Reject incompatible runtime state before any solver stage consumes it."""
+    _validate_torsion_mode(solver)
     if wp.get_stream(solver.model.device).is_capturing:
-        raise RuntimeError("Experimental torsion host grouping does not support CUDA graph capture")
+        device = getattr(solver, "_device_torsion", None)
+        if device is None or not device.deferred_errors:
+            raise RuntimeError("Contact torsion graph capture requires device preparation with deferred validation")
+
+
+@wp.kernel
+def _prepare_velocity_torsion_rows(
+    count: wp.array[int],
+    capacity: int,
+    row_type: wp.array2d[int],
+    group: wp.array2d[int],
+    phi: wp.array2d[float],
+    target: wp.array2d[float],
+    position_velocity: wp.array[float],
+    dof_count: wp.array[int],
+    dof_indices: wp.array2d[int],
+    jacobian: wp.array3d[float],
+    dt: float,
+    rhs: wp.array2d[float],
+):
+    """Conclude speculative spin admission without discarding touching support."""
+    tid = wp.tid()
+    world = tid // capacity
+    spin = tid % capacity
+    if spin >= count[world] or row_type[world, spin] != PGS_CONSTRAINT_TYPE_TORSION:
+        return
+    touching = bool(False)
+    for row in range(count[world]):
+        if row_type[world, row] == PGS_CONSTRAINT_TYPE_CONTACT and group[world, row] == spin:
+            speed = float(0.0)
+            for dof in range(dof_count[world]):
+                global_dof = dof_indices[world, dof]
+                if global_dof >= 0:
+                    speed += jacobian[world, row, dof] * position_velocity[global_dof]
+            end_gap = phi[world, row] + dt * (speed - target[world, row])
+            # Retain touching support through rebound, with the existing end-gap
+            # slop as the initial touching tolerance. Otherwise require contact
+            # by the position end. Final normal load still bounds all traction.
+            if phi[world, row] <= _FPGS_CONTACT_END_GAP_SLOP or end_gap <= _FPGS_CONTACT_END_GAP_SLOP:
+                touching = True
+    # The angular row has no positional spring: retain prescribed angular
+    # target motion but not position-solve contact correction or restitution.
+    rhs[world, spin] = -target[world, spin]
+    # Keep the undivided coefficient: still-loaded normal rows retain sliding
+    # friction even when separated support retires the additional spin row.
+    group[world, spin] = -1 if touching else _TORSION_SPIN_RETIRED
+    # Do not zero lambda here. The coupled sweep must apply Y * (new - old)
+    # to refund position-phase spin and tangential impulses coherently.
+
+
+def prepare_torsion_velocity_pass(solver, dt):
+    """Conclude touching eligibility and angular RHS for the unbiased pass.
+
+    Keep accumulated impulses and their velocity response from the position
+    solve. Each velocity sweep then recomputes the shared sliding/spin bound
+    from its final normal load and applies every impulse delta once. Initially
+    touching rows retain admission through rebound, using end-gap slop as the
+    initial touching tolerance. Final normal load remains authoritative, even
+    within this tolerance. Unreached groups refund carried spin.
+    """
+    wp.launch(
+        _prepare_velocity_torsion_rows,
+        dim=solver.world_count * solver.dense_max_constraints,
+        inputs=[
+            solver.constraint_count,
+            solver.dense_max_constraints,
+            solver.row_type,
+            solver._contact_torsion_group,
+            solver.phi,
+            solver.target_velocity,
+            solver.v_out_snap,
+            solver.world_dof_count,
+            solver.world_dof_indices,
+            solver.J_world,
+            dt,
+        ],
+        outputs=[solver.rhs_unbiased],
+        device=solver.model.device,
+    )
 
 
 def prepare_torsion_rows(solver, state, augmented_state, contacts):
     """Append current touching-group angular rows before H-inverse/J response."""
     validate_torsion_step(solver)
+    if getattr(solver, "_device_torsion", None) is not None:
+        solver._device_torsion.prepare(state, augmented_state, contacts)
+        return
     solver._torsion_stats = {"rows": 0, "groups": []}
     if contacts is None:
         return
@@ -340,7 +450,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
             if art < 0:
                 continue
             if prescribed[art]:
-                fields["target_velocity"][world, row] -= sign * np.dot(normal, body_velocities[body, 3:])
+                fields["target_velocity"][world, row] -= sign * _dot3(normal, body_velocities[body, 3:])
                 continue
             size, index = int(art_size[art]), int(art_group[art])
             joint = int(body_joint[body])
@@ -348,7 +458,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
                 for global_dof in range(int(qd_start[joint]), int(qd_start[joint + 1])):
                     local = global_dof - int(art_start[art])
                     if 0 <= local < size:
-                        jacobians[size][index, row, local] += sign * np.dot(normal, motions[global_dof, 3:])
+                        jacobians[size][index, row, local] += sign * _dot3(normal, motions[global_dof, 3:])
                 joint = int(ancestor[joint])
         solver._torsion_stats["groups"].append(
             {
@@ -401,6 +511,9 @@ def torque_sweep_source(dofs):
                         sliding_used += sqrtf(a * a + b * b);
                     }}
                 }}
+                // Normal rows have already applied their accumulated-impulse
+                // update (regularized positions, unbiased velocity cleanup).
+                // Use the actual final load without a second contact_w factor.
                 float normal_budget = mu * normal_load;
                 // Later normal-only rows can lower a patch's load after its
                 // anchors have been solved. Project against the final load
@@ -436,6 +549,7 @@ def torque_sweep_source(dofs):
                     }}
                 }}
                 float bound = radius * fmaxf(normal_budget - sliding_used, 0.0f);
+                if (world_torsion_group.data[off_dense + spin] == {_TORSION_SPIN_RETIRED}) bound = 0.0f;
                 if (global_iter < friction_start_iteration) bound = 0.0f;
                 float dot = 0.0f;
                 for (int d = lane; d < {dofs}; d += 32)
