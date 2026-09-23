@@ -139,6 +139,18 @@ class _Witness:
     """Whether this normal row is followed by its own tangent pair."""
 
 
+def _dot3(a, b):
+    """Round three float32 products and sum in float64, independent of BLAS.
+
+    Admission and grouping thresholds must use the same operation order as
+    device preparation. NumPy dot can choose different reductions by platform.
+    """
+    x = float(np.float32(a[0] * b[0]))
+    y = float(np.float32(a[1] * b[1]))
+    z = float(np.float32(a[2] * b[2]))
+    return np.float32((x + y) + z)
+
+
 def _transform_point(pose, point):
     """Transform a body-frame witness using scalar-last quaternion storage."""
     q = pose[3:]
@@ -229,7 +241,7 @@ def _contact_groups(solver, state, contacts):
             pb = _transform_point(poses[bb], pb)
         pa -= margins_a[c] * normals[c]
         pb += margins_b[c] * normals[c]
-        gap = float(np.dot(normals[c], pa - pb))
+        gap = float(_dot3(normals[c], pa - pb))
         if gap > _TOUCH_TOLERANCE and not patches:
             continue
         admitted += 1
@@ -242,8 +254,8 @@ def _contact_groups(solver, state, contacts):
         clusters = groups.setdefault((world, a, b, ba, bb), [])
         for cluster in clusters:
             if all(
-                np.dot(witness.normal, other.normal) >= _NORMAL_COSINE
-                and abs(np.dot(witness.normal, witness.point - other.point)) <= _TOUCH_TOLERANCE
+                _dot3(witness.normal, other.normal) >= _NORMAL_COSINE
+                and abs(_dot3(witness.normal, witness.point - other.point)) <= _TOUCH_TOLERANCE
                 for other in cluster
             ):
                 cluster.append(witness)
@@ -286,7 +298,9 @@ def validate_torsion_step(solver):
     """Reject incompatible runtime state before any solver stage consumes it."""
     _validate_torsion_mode(solver)
     if wp.get_stream(solver.model.device).is_capturing:
-        raise RuntimeError("Experimental torsion host grouping does not support CUDA graph capture")
+        device = getattr(solver, "_device_torsion", None)
+        if device is None or not device.deferred_errors:
+            raise RuntimeError("Contact torsion graph capture requires device preparation with deferred validation")
 
 
 @wp.kernel
@@ -368,6 +382,9 @@ def prepare_torsion_velocity_pass(solver, dt):
 def prepare_torsion_rows(solver, state, augmented_state, contacts):
     """Append current touching-group angular rows before H-inverse/J response."""
     validate_torsion_step(solver)
+    if getattr(solver, "_device_torsion", None) is not None:
+        solver._device_torsion.prepare(state, augmented_state, contacts)
+        return
     solver._torsion_stats = {"rows": 0, "groups": []}
     if contacts is None:
         return
@@ -433,7 +450,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
             if art < 0:
                 continue
             if prescribed[art]:
-                fields["target_velocity"][world, row] -= sign * np.dot(normal, body_velocities[body, 3:])
+                fields["target_velocity"][world, row] -= sign * _dot3(normal, body_velocities[body, 3:])
                 continue
             size, index = int(art_size[art]), int(art_group[art])
             joint = int(body_joint[body])
@@ -441,7 +458,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
                 for global_dof in range(int(qd_start[joint]), int(qd_start[joint + 1])):
                     local = global_dof - int(art_start[art])
                     if 0 <= local < size:
-                        jacobians[size][index, row, local] += sign * np.dot(normal, motions[global_dof, 3:])
+                        jacobians[size][index, row, local] += sign * _dot3(normal, motions[global_dof, 3:])
                 joint = int(ancestor[joint])
         solver._torsion_stats["groups"].append(
             {
