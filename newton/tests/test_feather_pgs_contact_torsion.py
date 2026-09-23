@@ -32,6 +32,7 @@ def fixture(
     separation=0.0,
     center_only=False,
     center_count=1,
+    restitution=0.0,
     dt=0.0025,
     row_limit=None,
     **solver_overrides,
@@ -47,7 +48,11 @@ def fixture(
         joint = b.add_joint_d6(-1, body, parent_xform=pose, linear_axes=axes, angular_axes=axes)
         b.add_articulation([joint])
         b.add_shape_box(
-            body, hx=0.02, hy=0.015, hz=0.025, cfg=newton.ModelBuilder.ShapeConfig(density=0, mu=mu, restitution=0)
+            body,
+            hx=0.02,
+            hy=0.015,
+            hz=0.025,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0, mu=mu, restitution=restitution),
         )
     model = b.finalize(device="cuda:0")
     a, z = model.state(), model.state()
@@ -72,6 +77,7 @@ def fixture(
             values = getattr(contacts, name).numpy()
             body = model.shape_body.numpy()[shapes[side]]
             values[:center_count] = -poses[body, :3]
+            values[:center_count, 2] += np.sign(poses[body, 2]) * separation / 2
             getattr(contacts, name).assign(values)
         contacts.rigid_contact_count.assign(np.array([center_count], np.int32))
     kwargs = {
