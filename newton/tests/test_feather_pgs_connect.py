@@ -4,6 +4,7 @@
 """Tests for connect (loop-closure) constraint rows in SolverFeatherPGS."""
 
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -268,6 +269,192 @@ class TestFeatherPGSConnect(unittest.TestCase):
             gap_max = max(gap_max, _loop_anchor_gap(model, state_0))
         self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
         self.assertLess(gap_max, 2.0e-3, f"loop closure not enforced (anchor gap {gap_max:.4f} m)")
+
+
+# ---------------------------------------------------------------------------
+# Closures with a prescribed (kinematic or world) parent
+# ---------------------------------------------------------------------------
+
+_CHILD_ANCHORS = ((0.0, 0.0, 0.0), (0.05, 0.0, 0.0), (0.0, 0.05, 0.0))
+_REL_P = np.array([0.0, 0.0, -0.2])
+
+
+def _pgs_mode():
+    return "matrix_free" if wp.get_device().is_cuda else "split"
+
+
+def _build_carried_load(*, enabled: bool = True, world_parent: bool = False):
+    """A kinematic carrier holding a dynamic box through three BALL loop joints.
+
+    Three non-collinear point closures pin all six relative degrees of freedom, so the
+    load must follow the carrier as if welded at ``_REL_P`` below it. With
+    ``world_parent`` the carrier is the world and the anchors are world points.
+    """
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    carrier_p = np.array([0.0, 0.0, 1.0])
+    carrier = -1
+    if not world_parent:
+        carrier = b.add_body(xform=wp.transform(wp.vec3(*carrier_p), wp.quat_identity()), is_kinematic=True)
+        b.add_shape_box(carrier, hx=0.03, hy=0.03, hz=0.03)
+    load = b.add_body(xform=wp.transform(wp.vec3(*(carrier_p + _REL_P)), wp.quat_identity()))
+    b.add_shape_box(load, hx=0.04, hy=0.04, hz=0.04, cfg=newton.ModelBuilder.ShapeConfig(density=500.0))
+    joints = []
+    for c in _CHILD_ANCHORS:
+        p = (_REL_P if not world_parent else carrier_p + _REL_P) + np.array(c)
+        joints.append(
+            b.add_joint_ball(
+                parent=carrier,
+                child=load,
+                parent_xform=wp.transform(wp.vec3(*p), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(*c), wp.quat_identity()),
+                enabled=enabled,
+            )
+        )
+    return b, carrier, load, joints
+
+
+def _anchor_gaps(model, state, joints, solver):
+    """World-space parent/child anchor distances [m] using the solver's live anchors."""
+    bq = state.body_q.numpy().astype(np.float64)
+    jp = model.joint_parent.numpy()
+    jc = model.joint_child.numpy()
+
+    def anchor(body, local):
+        if body < 0:
+            return np.asarray(local, dtype=np.float64)
+        t = wp.transform(wp.vec3(*bq[body, :3]), wp.quat(*bq[body, 3:]))
+        w = wp.transform_point(t, wp.vec3(*local))
+        return np.array([w[0], w[1], w[2]])
+
+    gaps = []
+    for j in joints:
+        anchor_p, anchor_c = solver.loop_joint_anchors(j)
+        gaps.append(float(np.linalg.norm(anchor(int(jp[j]), anchor_p) - anchor(int(jc[j]), anchor_c))))
+    return gaps
+
+
+def _prescribe_carrier(model, solver, state, articulation, t, v, omega):
+    """Write the carrier's free-joint pose/velocity for time ``t`` and refresh its FK."""
+    q = state.joint_q.numpy()
+    qd = state.joint_qd.numpy()
+    angle = float(np.linalg.norm(omega)) * t
+    axis = np.asarray(omega, dtype=np.float64) / max(float(np.linalg.norm(omega)), 1.0e-12)
+    rot = wp.quat_from_axis_angle(wp.vec3(*axis), angle)
+    q[0:3] = np.array([0.0, 0.0, 1.0]) + np.asarray(v) * t
+    q[3:7] = [rot[0], rot[1], rot[2], rot[3]]
+    qd[0:3] = v
+    qd[3:6] = omega
+    state.joint_q.assign(q)
+    state.joint_qd.assign(qd)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state, indices=articulation)
+    solver.notify_state_changed(articulation)
+
+
+class TestFeatherPGSPrescribedParentConnect(unittest.TestCase):
+    def test_kinematic_parent_closure_carries_load(self):
+        """A load pinned to a moving kinematic carrier must ride along with it.
+
+        Without prescribed-parent support the closure is ignored (it crosses
+        articulations) and the load free-falls; with it, the three point closures hold
+        the load at its relative pose while the carrier translates and spins.
+        """
+        b, carrier, load, joints = _build_carried_load()
+        model = b.finalize()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=_pgs_mode(), pgs_iterations=16, pgs_beta=0.2)
+        self.assertFalse([w for w in caught if "loop joint" in str(w.message)], [str(w.message) for w in caught])
+        articulation = wp.array([int(solver.body_to_articulation.numpy()[carrier])], dtype=wp.int32)
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        dt = 1.0 / 240.0
+        v = np.array([0.3, 0.0, 0.1])
+        omega = np.array([0.0, 0.0, 1.5])
+        for i in range(240):
+            _prescribe_carrier(model, solver, state_0, articulation, i * dt, v, omega)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, dt)
+            state_0, state_1 = state_1, state_0
+        _prescribe_carrier(model, solver, state_0, articulation, 240 * dt, v, omega)
+
+        bq = state_0.body_q.numpy().astype(np.float64)
+        self.assertTrue(np.isfinite(bq).all())
+        carrier_t = wp.transform(wp.vec3(*bq[carrier, :3]), wp.quat(*bq[carrier, 3:]))
+        expected = wp.transform_point(carrier_t, wp.vec3(*_REL_P))
+        error = np.linalg.norm(bq[load, :3] - np.array([expected[0], expected[1], expected[2]]))
+        self.assertLess(error, 3.0e-3, f"load lagged the carrier by {error:.4f} m")
+        for gap in _anchor_gaps(model, state_0, joints, solver):
+            self.assertLess(gap, 3.0e-3)
+        # The carrier actually moved, so the test exercised a non-trivial target velocity.
+        self.assertGreater(np.linalg.norm(bq[carrier, :3] - np.array([0.0, 0.0, 1.0])), 0.25)
+
+    def test_world_parent_closure_holds_hanging_load(self):
+        b, _, load, joints = _build_carried_load(world_parent=True)
+        model = b.finalize()
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=_pgs_mode(), pgs_iterations=16, pgs_beta=0.2)
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        for _ in range(240):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+        bq = state_0.body_q.numpy().astype(np.float64)
+        self.assertTrue(np.isfinite(bq).all())
+        self.assertLess(np.linalg.norm(bq[load, :3] - (np.array([0.0, 0.0, 1.0]) + _REL_P)), 3.0e-3)
+        for gap in _anchor_gaps(model, state_0, joints, solver):
+            self.assertLess(gap, 3.0e-3)
+
+    def test_runtime_enable_and_anchor_update(self):
+        """Closures can be released, re-targeted at the measured pose and re-engaged."""
+        b, carrier, load, joints = _build_carried_load()
+        model = b.finalize()
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=_pgs_mode(), pgs_iterations=16, pgs_beta=0.2)
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        dt = 1.0 / 240.0
+
+        def run(steps):
+            nonlocal state_0, state_1
+            for _ in range(steps):
+                state_0.clear_forces()
+                solver.step(state_0, state_1, control, None, dt)
+                state_0, state_1 = state_1, state_0
+
+        for j in joints:
+            solver.set_loop_joint_enabled(j, False)
+        z0 = float(state_0.body_q.numpy()[load, 2])
+        run(48)
+        bq = state_0.body_q.numpy().astype(np.float64)
+        dropped = z0 - float(bq[load, 2])
+        self.assertGreater(dropped, 0.15, "released load should free-fall")
+
+        # Re-target the closures at the measured relative pose, then re-engage them.
+        carrier_t = wp.transform(wp.vec3(*bq[carrier, :3]), wp.quat(*bq[carrier, 3:]))
+        load_t = wp.transform(wp.vec3(*bq[load, :3]), wp.quat(*bq[load, 3:]))
+        rel = wp.transform_multiply(wp.transform_inverse(carrier_t), load_t)
+        for j, c in zip(joints, _CHILD_ANCHORS, strict=True):
+            p = wp.transform_point(rel, wp.vec3(*c))
+            solver.set_loop_joint_anchors(j, (p[0], p[1], p[2]), c)
+            solver.set_loop_joint_enabled(j, True)
+        held_z = float(bq[load, 2])
+        run(120)
+        bq = state_0.body_q.numpy().astype(np.float64)
+        self.assertTrue(np.isfinite(bq).all())
+        self.assertLess(abs(float(bq[load, 2]) - held_z), 3.0e-3, "re-engaged closure should hold the load")
+        for gap in _anchor_gaps(model, state_0, joints, solver):
+            self.assertLess(gap, 3.0e-3)
+
+        for j in joints:
+            solver.set_loop_joint_enabled(j, False)
+        run(48)
+        self.assertGreater(held_z - float(state_0.body_q.numpy()[load, 2]), 0.1, "released again: must fall")
+
+    def test_unknown_joint_is_rejected(self):
+        b, _, _, joints = _build_carried_load()
+        model = b.finalize()
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=_pgs_mode())
+        with self.assertRaises(ValueError):
+            solver.set_loop_joint_enabled(joints[0] + 100, False)
 
 
 if __name__ == "__main__":

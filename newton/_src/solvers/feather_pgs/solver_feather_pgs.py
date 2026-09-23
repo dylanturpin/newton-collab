@@ -153,6 +153,7 @@ from .kernels import (
     hinv_jt_par_row_contact_fallback,
     integrate_generalized_joints,
     invalidate_articulation_fk_id_cache,
+    invalidate_fk_id_cache_for_articulations,
     jcalc_tau,
     local_solve_launch_gate,
     mul_com_spatial_inertia,
@@ -3180,10 +3181,18 @@ class SolverFeatherPGS(SolverBase):
         pinning the joint's parent/child anchors together. Their stored owner comes from
         the child body's tree articulation, independent of joint ordering. FIXED (weld)
         loop joints warn and are ignored for now. All buffers are allocated once
-        (CUDA-graph-safe); ``joint_enabled`` is snapshotted at init.
+        (CUDA-graph-safe); ``joint_enabled`` is snapshotted at init and may be changed
+        later through :meth:`set_loop_joint_enabled`.
+
+        A closure's parent may live outside the child's articulation when it is
+        prescribed: a kinematic body (:attr:`~newton.BodyFlags.KINEMATIC`) or the world
+        (``parent == -1``). Such closures contribute no parent DOFs; the parent anchor
+        velocity enters the row target instead (a compliant attachment to a driven hand,
+        for example). Dynamic cross-articulation closures still warn and are ignored.
         """
         self._connect_count = 0
         self.connect_slot = None
+        self._connect_joint_to_index: dict[int, int] = {}
         if not self._has_loop_joints:
             self._connect_world_np = None
             return
@@ -3198,8 +3207,19 @@ class SolverFeatherPGS(SolverBase):
         articulation_world = self._model_plan.articulation_world
         loop_joint_articulation = self._model_plan.loop_joint_articulation
         body_articulation = self.body_to_articulation.numpy() if self.body_to_articulation is not None else None
+        kinematic_bodies = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
 
-        art_l, body_p, body_c, anchors_p, anchors_c, world_l, enab = [], [], [], [], [], [], []
+        art_l, body_p, body_c, anchors_p, anchors_c, world_l, enab, prescribed_l, joint_l = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
         for j in np.flatnonzero(loop_joint_articulation >= 0):
             art = int(loop_joint_articulation[j])
             if int(joint_type[j]) != int(JointType.BALL):
@@ -3211,12 +3231,19 @@ class SolverFeatherPGS(SolverBase):
                 continue
             parent = int(joint_parent[j])
             parent_art = int(body_articulation[parent]) if parent >= 0 and body_articulation is not None else -1
-            if parent_art >= 0 and parent_art != art:
-                warnings.warn(
-                    f"SolverFeatherPGS: loop joint {j} closes across articulations ({parent_art} vs {art}); ignored.",
-                    stacklevel=2,
-                )
-                continue
+            prescribed = 0
+            if parent < 0:
+                prescribed = 1
+            elif parent_art != art:
+                if not kinematic_bodies[parent]:
+                    warnings.warn(
+                        f"SolverFeatherPGS: loop joint {j} closes across articulations ({parent_art} vs {art}) "
+                        "and its parent is not kinematic; ignored.",
+                        stacklevel=2,
+                    )
+                    continue
+                prescribed = 1
+            self._connect_joint_to_index[int(j)] = len(art_l)
             art_l.append(art)
             body_p.append(parent)
             body_c.append(int(joint_child[j]))
@@ -3224,23 +3251,103 @@ class SolverFeatherPGS(SolverBase):
             anchors_c.append(joint_X_c[j][:3])
             world_l.append(int(articulation_world[art]))
             enab.append(1 if (joint_enabled is None or joint_enabled[j]) else 0)
+            prescribed_l.append(prescribed)
+            joint_l.append(int(j))
 
         n = len(art_l)
         if n == 0:
             self._connect_world_np = None
+            self._connect_joint_to_index = {}
             return
         self._connect_world_np = np.asarray(world_l, dtype=np.int32)
         self._connect_valid_np = np.asarray(enab, dtype=np.int32)
+        self._connect_joint_np = np.asarray(joint_l, dtype=np.int32)
+        self._connect_parent_prescribed_np = np.asarray(prescribed_l, dtype=np.int32)
+        self._connect_enabled_np = self._connect_valid_np.copy()
+        self._connect_anchor_p_np = np.asarray(anchors_p, dtype=np.float32).reshape(n, 3)
+        self._connect_anchor_c_np = np.asarray(anchors_c, dtype=np.float32).reshape(n, 3)
         self._connect_art = wp.array(np.asarray(art_l, dtype=np.int32), dtype=wp.int32, device=device)
         self._connect_body_p = wp.array(np.asarray(body_p, dtype=np.int32), dtype=wp.int32, device=device)
         self._connect_body_c = wp.array(np.asarray(body_c, dtype=np.int32), dtype=wp.int32, device=device)
-        self._connect_anchor_p = wp.array(np.asarray(anchors_p, dtype=np.float32), dtype=wp.vec3, device=device)
-        self._connect_anchor_c = wp.array(np.asarray(anchors_c, dtype=np.float32), dtype=wp.vec3, device=device)
+        self._connect_anchor_p = wp.array(self._connect_anchor_p_np, dtype=wp.vec3, device=device)
+        self._connect_anchor_c = wp.array(self._connect_anchor_c_np, dtype=wp.vec3, device=device)
+        self._connect_parent_prescribed = wp.array(self._connect_parent_prescribed_np, dtype=wp.int32, device=device)
         self._connect_world = wp.array(self._connect_world_np, dtype=wp.int32, device=device)
         self._connect_valid = wp.array(np.ones(n, dtype=np.int32), dtype=wp.int32, device=device)
-        self._connect_enabled = wp.array(self._connect_valid_np, dtype=wp.int32, device=device)
+        self._connect_enabled = wp.array(self._connect_enabled_np, dtype=wp.int32, device=device)
         self.connect_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
         self._connect_count = n
+
+    def _connect_index(self, joint: int) -> int:
+        index = getattr(self, "_connect_joint_to_index", {}).get(int(joint))
+        if index is None:
+            raise ValueError(
+                f"SolverFeatherPGS: joint {joint} is not an enforced loop-closing BALL joint of this solver."
+            )
+        return index
+
+    def set_loop_joint_enabled(self, joint: int, enabled: bool) -> None:
+        """Enable or disable the connect rows of a loop-closing BALL joint at runtime.
+
+        The closure keeps its allocated capacity, so toggling is CUDA-graph-safe and
+        takes effect on the next :meth:`step`. Closures disabled through
+        :attr:`~newton.Model.joint_enabled` at construction still count as capacity.
+
+        Args:
+            joint: Model joint index of a loop-closing BALL joint.
+            enabled: ``True`` to enforce the closure, ``False`` to release it.
+        """
+        index = self._connect_index(joint)
+        self._connect_enabled_np[index] = 1 if enabled else 0
+        self._connect_enabled.assign(self._connect_enabled_np)
+
+    def set_loop_joint_anchors(self, joint: int, parent_anchor, child_anchor) -> None:
+        """Move the anchors of a loop-closing BALL joint at runtime.
+
+        Both anchors are body-local points [m] (world-frame for a world parent). Use it
+        to re-target a closure before enabling it, for example to attach a body to a
+        prescribed hand at the relative pose measured at acquisition.
+
+        Args:
+            joint: Model joint index of a loop-closing BALL joint.
+            parent_anchor: Anchor in the parent body frame [m].
+            child_anchor: Anchor in the child body frame [m].
+        """
+        index = self._connect_index(joint)
+        self._connect_anchor_p_np[index] = np.asarray(parent_anchor, dtype=np.float32)
+        self._connect_anchor_c_np[index] = np.asarray(child_anchor, dtype=np.float32)
+        self._connect_anchor_p.assign(self._connect_anchor_p_np)
+        self._connect_anchor_c.assign(self._connect_anchor_c_np)
+
+    def loop_joint_anchors(self, joint: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return the current ``(parent_anchor, child_anchor)`` of a loop-closing BALL joint [m]."""
+        index = self._connect_index(joint)
+        return self._connect_anchor_p_np[index].copy(), self._connect_anchor_c_np[index].copy()
+
+    def notify_state_changed(self, articulations: wp.array | None = None) -> None:
+        """Invalidate cached kinematics after writing joint state outside :meth:`step`.
+
+        The solver caches forward kinematics and inverse dynamics of the state it
+        produced. Overwriting ``joint_q``/``joint_qd`` of the next input state (for
+        example to prescribe kinematic bodies) makes that cache stale; call this so the
+        next step re-derives it from the state.
+
+        Args:
+            articulations: Optional device array of articulation indices whose joint
+                state changed. ``None`` invalidates every articulation.
+        """
+        if not self._fk_id_cache_enabled:
+            return
+        if articulations is None:
+            self._fk_id_cache_valid.zero_()
+            return
+        wp.launch(
+            invalidate_fk_id_cache_for_articulations,
+            dim=articulations.shape[0],
+            inputs=[articulations],
+            outputs=[self._fk_id_cache_valid],
+            device=self.model.device,
+        )
 
     def _build_preelimination_plan(self, model) -> None:
         """Precompute the static tables for bilateral (mimic + connect) pre-elimination.
@@ -3271,6 +3378,15 @@ class SolverFeatherPGS(SolverBase):
                 "SolverFeatherPGS: enable_bilateral_preelimination does not support "
                 "pgs_velocity_iterations > 0 yet (the velocity pass rebuilds v_out "
                 "without the bilateral projection); falling back to iterative rows.",
+                stacklevel=2,
+            )
+            return
+
+        if self._connect_count and np.any(self._connect_parent_prescribed_np != 0):
+            warnings.warn(
+                "SolverFeatherPGS: enable_bilateral_preelimination does not support closures "
+                "with a prescribed (kinematic or world) parent yet; falling back to iterative "
+                "mimic/connect rows.",
                 stacklevel=2,
             )
             return
@@ -10132,7 +10248,10 @@ class SolverFeatherPGS(SolverBase):
                         self._connect_body_c,
                         self._connect_anchor_p,
                         self._connect_anchor_c,
+                        self._connect_parent_prescribed,
                         state_in.body_q,
+                        state_in.body_qd,
+                        model.body_com,
                         self.body_to_joint,
                         self.body_to_articulation,
                         model.joint_ancestor,

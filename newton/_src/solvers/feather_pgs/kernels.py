@@ -3147,6 +3147,19 @@ def populate_mimic_J_for_size(
 
 
 @wp.kernel
+def invalidate_fk_id_cache_for_articulations(
+    articulations: wp.array[int],
+    # outputs
+    fk_id_cache_valid: wp.array[int],
+):
+    """Clear the FK/ID cache flag of the listed articulations only."""
+    k = wp.tid()
+    art = articulations[k]
+    if art >= 0 and art < fk_id_cache_valid.shape[0]:
+        fk_id_cache_valid[art] = 0
+
+
+@wp.kernel
 def allocate_connect_slots(
     connect_valid: wp.array[int],
     connect_enabled: wp.array[int],
@@ -3182,7 +3195,10 @@ def populate_connect_J_for_size(
     connect_body_c: wp.array[int],
     connect_anchor_p: wp.array[wp.vec3],
     connect_anchor_c: wp.array[wp.vec3],
+    connect_parent_prescribed: wp.array[int],
     body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
     body_to_joint: wp.array[int],
     body_to_articulation: wp.array[int],
     joint_ancestor: wp.array[int],
@@ -3209,6 +3225,12 @@ def populate_connect_J_for_size(
     ``J = e_k . (Jpoint(parent, p_A) - Jpoint(child, p_B))`` via the contact ancestor
     walk. One near-redundant axis on planar linkages is expected; its vanishing Delassus
     diagonal makes the sweep skip it.
+
+    A closure whose parent is prescribed (``connect_parent_prescribed[k] != 0``: a
+    kinematic body outside the child's articulation, or the world when
+    ``connect_body_p[k] < 0``) contributes no parent DOFs. Its anchor velocity is
+    instead moved to the row target, ``J v = -(e_k . v_A)``, so the child anchor tracks
+    the moving parent anchor exactly as a same-articulation closure would.
     """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
@@ -3225,7 +3247,19 @@ def populate_connect_J_for_size(
 
         body_p = connect_body_p[k]
         body_c = connect_body_c[k]
-        p_a = wp.transform_point(body_q[body_p], connect_anchor_p[k])
+        prescribed = connect_parent_prescribed[k] != 0
+        p_a = connect_anchor_p[k]
+        v_a = wp.vec3(0.0, 0.0, 0.0)
+        if body_p >= 0:
+            p_a = wp.transform_point(body_q[body_p], connect_anchor_p[k])
+            if prescribed:
+                # Prescribed parent: the anchor velocity comes from the body twist
+                # (v_com_world, omega_world) rather than from tree DOFs.
+                twist = body_qd[body_p]
+                v_com = wp.spatial_top(twist)
+                omega = wp.spatial_bottom(twist)
+                x_com = wp.transform_point(body_q[body_p], body_com[body_p])
+                v_a = v_com + wp.cross(omega, p_a - x_com)
         p_b = wp.transform_point(body_q[body_c], connect_anchor_c[k])
         origin = articulation_origin[art]
         rel_a = p_a - origin
@@ -3240,19 +3274,23 @@ def populate_connect_J_for_size(
                 J_group[group_idx, slot, d] = 0.0
             e = wp.vec3(0.0, 0.0, 0.0)
             e[axis] = 1.0
+            target = float(0.0)
 
             # J = e . (Jpoint(parent, p_a) - Jpoint(child, p_b)): ancestor walks with
             # opposite signs; shared ancestors partially cancel automatically.
-            curr = body_to_joint[body_p]
-            while curr != -1:
-                d0 = joint_qd_start[curr]
-                d1 = joint_qd_start[curr + 1]
-                for d in range(d0, d1):
-                    S = joint_S_s[d]
-                    lin = wp.vec3(S[0], S[1], S[2])
-                    ang = wp.vec3(S[3], S[4], S[5])
-                    J_group[group_idx, slot, d - dof_start] += wp.dot(e, lin + wp.cross(ang, rel_a))
-                curr = joint_ancestor[curr]
+            if prescribed:
+                target = -wp.dot(e, v_a)
+            else:
+                curr = body_to_joint[body_p]
+                while curr != -1:
+                    d0 = joint_qd_start[curr]
+                    d1 = joint_qd_start[curr + 1]
+                    for d in range(d0, d1):
+                        S = joint_S_s[d]
+                        lin = wp.vec3(S[0], S[1], S[2])
+                        ang = wp.vec3(S[3], S[4], S[5])
+                        J_group[group_idx, slot, d - dof_start] += wp.dot(e, lin + wp.cross(ang, rel_a))
+                    curr = joint_ancestor[curr]
             curr = body_to_joint[body_c]
             while curr != -1:
                 d0 = joint_qd_start[curr]
@@ -3279,10 +3317,12 @@ def populate_connect_J_for_size(
                 for d in range(n_dofs):
                     J_group[group_idx, slot, d] *= inv_norm
                 phi_axis *= inv_norm
+                target *= inv_norm
             else:
                 for d in range(n_dofs):
                     J_group[group_idx, slot, d] = 0.0
                 phi_axis = 0.0
+                target = 0.0
 
             world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONNECT
             world_row_parent[world, slot] = -1
@@ -3290,7 +3330,7 @@ def populate_connect_J_for_size(
             world_row_beta[world, slot] = pgs_beta
             world_row_cfm[world, slot] = pgs_cfm
             world_phi[world, slot] = phi_axis
-            world_target_velocity[world, slot] = 0.0
+            world_target_velocity[world, slot] = target
 
 
 # =============================================================================
