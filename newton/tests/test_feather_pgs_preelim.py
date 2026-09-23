@@ -3,6 +3,7 @@
 
 """Tests for bilateral (mimic + connect) pre-elimination in SolverFeatherPGS."""
 
+import inspect
 import unittest
 import warnings
 
@@ -12,6 +13,26 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONNECT, PGS_CONSTRAINT_TYPE_MIMIC
 from newton.tests.test_feather_pgs_connect import _build_four_bar, _loop_anchor_gap
+
+
+class TestPreeliminationSignature(unittest.TestCase):
+    def test_selective_option_is_keyword_only(self):
+        """Keep the new selective option out of the legacy positional API."""
+        parameters = inspect.signature(newton.solvers.SolverFeatherPGS).parameters
+        option = parameters["bilateral_preelimination_include_mimics"]
+        self.assertEqual(option.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(option.default, True)
+
+    def test_legacy_joint_gap_position_is_preserved(self):
+        """Bind a legacy positional gap without silently coercing it to a boolean."""
+        signature = inspect.signature(newton.solvers.SolverFeatherPGS)
+        positional = [p for p in signature.parameters.values() if p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD]
+        self.assertEqual(len(positional), 55)
+        self.assertEqual(positional[12].name, "joint_limit_activation_gap")
+        arguments = [object()] + [p.default for p in positional[1:12]] + [0.123]
+        bound = signature.bind_partial(*arguments, bilateral_preelimination_include_mimics=False)
+        self.assertEqual(bound.arguments["joint_limit_activation_gap"], 0.123)
+        self.assertIs(bound.arguments["bilateral_preelimination_include_mimics"], False)
 
 
 def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: int = 2, **solver_kwargs):
