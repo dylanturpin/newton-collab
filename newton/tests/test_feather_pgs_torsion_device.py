@@ -235,14 +235,22 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                     self.compare(patches=patches, seed=seed)
 
     def test_host_math_rounding(self):
-        """Match NumPy dot and quaternion-transform rounding on CPU and CUDA."""
+        """Match explicit dot and quaternion-transform rounding on CPU and CUDA."""
         rng = np.random.default_rng(84)
         poses = rng.normal(size=(1024, 7)).astype(np.float32)
         poses[:, 3:] /= np.linalg.norm(poses[:, 3:], axis=1, keepdims=True)
         points = rng.normal(size=(1024, 3)).astype(np.float32)
         directions = rng.normal(size=points.shape).astype(np.float32)
         expected_points = np.array([host._transform_point(q, p) for q, p in zip(poses, points, strict=True)])
-        expected_dot = np.array([np.dot(a, b) for a, b in zip(points, directions, strict=True)])
+        # Independent scalar reference: float32 products, sequential float64
+        # sum, one float32 output rounding. Do not consult platform BLAS.
+        expected_dot = np.array(
+            [sum(float(np.float32(a[i] * b[i])) for i in range(3)) for a, b in zip(points, directions, strict=True)],
+            dtype=np.float32,
+        )
+        np.testing.assert_array_equal(
+            np.array([host._dot3(a, b) for a, b in zip(points, directions, strict=True)]), expected_dot
+        )
         for device in ["cpu", "cuda:0"] if wp.is_cuda_available() else ["cpu"]:
             transformed = wp.empty(1024, dtype=wp.vec3, device=device)
             dotted = wp.empty(1024, dtype=float, device=device)
@@ -260,6 +268,13 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
             )
             np.testing.assert_array_equal(transformed.numpy(), expected_points)
             np.testing.assert_array_equal(dotted.numpy(), expected_dot)
+
+    def test_grouping_and_jacobians_do_not_depend_on_blas(self):
+        """Build host groups and rows without platform-dependent NumPy dot."""
+        for patches in (False, True):
+            with self.subTest(patches=patches):
+                with patch.object(host.np, "dot", side_effect=AssertionError("BLAS dot must not decide torsion rows")):
+                    self.compare(patches=patches)
 
     def test_empty_and_larger_preallocated_buffer(self):
         """Keep zero contacts valid and distinguish configured from input capacity."""

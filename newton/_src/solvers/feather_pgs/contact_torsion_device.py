@@ -22,8 +22,8 @@ wp.set_module_options({"fuse_fp": False})
 
 @wp.func
 def _host_dot3(a: wp.vec3, b: wp.vec3):
-    # NumPy's float32 dot rounds products to float32, accumulates those rounded
-    # products in float64, then casts back. Fused or float32-only sums differ.
+    # Match contact_torsion._dot3's explicit arithmetic contract, not NumPy's
+    # platform-dependent BLAS. Fused or float32-only sums differ at thresholds.
     x = wp.float64(a[0] * b[0])
     y = wp.float64(a[1] * b[1])
     z = wp.float64(a[2] * b[2])
