@@ -1121,6 +1121,7 @@ class SolverFeatherPGS(SolverBase):
         contact_torsion_shape_indices: tuple[int, ...] | None = None,
         contact_torsion_shape_patterns: tuple[str, ...] | None = None,
         contact_compliance: bool = False,
+        parallel_tree: bool = False,
     ):
         """
         Args:
@@ -1489,6 +1490,14 @@ class SolverFeatherPGS(SolverBase):
                 at a time). None defaults to 1. Defaults to None.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
+            parallel_tree: Opt in to parallel branches for forward dynamics, backward
+                force reduction and state publication on eligible CUDA trees. Defaults
+                to False, retaining serial traversal and its existing launch layouts
+                without allocating a tree plan or branch-wrench scratch. Broad trees
+                can benefit, but narrow trees and interactions with other kernels can
+                regress; measure the full step before enabling. CPU, differentiable,
+                wholly unbranched and unsupported topologies retain serial execution.
+                Construction-only; recreate the solver to change this selection.
             drive_mode (str, optional): Joint target drive implementation.
                 ``"augmented"`` keeps the legacy FeatherPGS implicit-PD path
                 that folds drive stiffness into the articulated mass matrix.
@@ -2633,7 +2642,7 @@ class SolverFeatherPGS(SolverBase):
         # articulations still expose parallel branches after prescaling.
         self._tree_plan = (
             _FeatherPGSTreePlan.build(model, self.articulation_joint_end)
-            if model.device.is_cuda and not model.requires_grad
+            if parallel_tree and model.device.is_cuda and not model.requires_grad
             else None
         )
         self._tree_net_wrenches = (

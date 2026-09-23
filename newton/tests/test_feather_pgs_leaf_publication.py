@@ -156,11 +156,13 @@ def _solver(model, *, enabled, mode="split", velocity_limits=False):
         update_mass_matrix_interval=2,
         use_parallel_streams=False,
         enable_joint_velocity_limits=velocity_limits,
+        parallel_tree=enabled,
     )
     if enabled and model.device.is_cuda:
         assert solver._tree_plan is not None
     if not enabled or model.device.is_cpu:
-        solver._tree_plan = None
+        assert solver._tree_plan is None
+        assert solver._tree_net_wrenches == ()
     # Exercise the production cached Stage 7 on CPU, where it is normally off.
     if model.device.is_cpu:
         solver._fk_id_cache_enabled = True

@@ -3,7 +3,9 @@
 
 """Check complete level-synchronous FPGS trees against serial dynamics."""
 
+import inspect
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -14,7 +16,7 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_leaf_publication import _build_branched_model, _build_model, _fields, _solver
 
 
-def _build_fingers(device="cpu", *, articulations=3, include_chain=False, ragged=False):
+def _build_fingers(device="cpu", *, articulations=3, include_chain=False, ragged=False, requires_grad=False):
     """Build four four-joint fingers per moving palm, plus an optional serial tree."""
     builder = newton.ModelBuilder(gravity=(0.7, -1.2, -9.1))
     inertia = wp.mat33(0.3, 0.02, 0.01, 0.02, 0.4, 0.03, 0.01, 0.03, 0.5)
@@ -69,13 +71,69 @@ def _build_fingers(device="cpu", *, articulations=3, include_chain=False, ragged
                 )
                 parent = child
         builder.add_articulation(joints)
-    model = builder.finalize(device=device)
+    model = builder.finalize(device=device, requires_grad=requires_grad)
     model.joint_q.assign(np.linspace(-0.3, 0.4, model.joint_coord_count, dtype=np.float32))
     model.joint_qd.assign(np.linspace(-0.7, 0.8, model.joint_dof_count, dtype=np.float32))
     return model
 
 
 class TestFeatherPGSTreePlan(unittest.TestCase):
+    def test_parallel_tree_is_keyword_only_and_defaults_to_serial(self):
+        """Require an explicit construction-only opt-in without shifting positional arguments."""
+        parameters = inspect.signature(SolverFeatherPGS).parameters
+        self.assertIn("parallel_tree", parameters)
+        self.assertIs(parameters["parallel_tree"].default, False)
+        self.assertEqual(parameters["parallel_tree"].kind, inspect.Parameter.KEYWORD_ONLY)
+
+    def test_serial_selection_skips_tree_setup(self):
+        """Keep default and explicit serial execution free of tree plans and scratch."""
+        for device in (wp.get_device("cpu"), *wp.get_cuda_devices()):
+            model = _build_fingers(device, articulations=1)
+            states = []
+            for options in ({}, {"parallel_tree": False}):
+                with self.subTest(device=str(device), options=options):
+                    with patch.object(_FeatherPGSTreePlan, "build", wraps=_FeatherPGSTreePlan.build) as build:
+                        solver = SolverFeatherPGS(model, use_parallel_streams=False, **options)
+                    build.assert_not_called()
+                    self.assertIsNone(solver._tree_plan)
+                    self.assertEqual(solver._tree_net_wrenches, ())
+                    state = model.state()
+                    solver._prepare_augmented_state(state, model.state(), model.control())
+                    solver._stage7_update_kinematics(state, solver)
+                    states.append(state)
+            for name in ("body_q", "body_qd"):
+                np.testing.assert_array_equal(getattr(states[0], name).numpy(), getattr(states[1], name).numpy())
+
+    def test_explicit_parallel_preserves_eligibility_fallback(self):
+        """Admit CUDA branches while retaining CPU, differentiable and serial-tree fallback."""
+        for device in (wp.get_device("cpu"), *wp.get_cuda_devices()):
+            with self.subTest(device=str(device), topology="branched"):
+                model = _build_fingers(device, articulations=1)
+                with patch.object(_FeatherPGSTreePlan, "build", wraps=_FeatherPGSTreePlan.build) as build:
+                    solver = SolverFeatherPGS(model, parallel_tree=True, use_parallel_streams=False)
+                if device.is_cuda:
+                    build.assert_called_once()
+                    self.assertIsNotNone(solver._tree_plan)
+                    self.assertTrue(any(group.lanes > 1 for group in solver._tree_plan.groups))
+                    self.assertEqual(len(solver._tree_net_wrenches), len(solver._tree_plan.groups))
+                else:
+                    build.assert_not_called()
+                    self.assertIsNone(solver._tree_plan)
+                    self.assertEqual(solver._tree_net_wrenches, ())
+            if device.is_cuda:
+                with self.subTest(device=str(device), requires_grad=True):
+                    model = _build_fingers(device, articulations=1, requires_grad=True)
+                    with patch.object(_FeatherPGSTreePlan, "build", wraps=_FeatherPGSTreePlan.build) as build:
+                        solver = SolverFeatherPGS(model, parallel_tree=True, use_parallel_streams=False)
+                    build.assert_not_called()
+                    self.assertIsNone(solver._tree_plan)
+                    self.assertEqual(solver._tree_net_wrenches, ())
+            with self.subTest(device=str(device), topology="chain"):
+                model = _build_model(device, chain=True)[0]
+                solver = SolverFeatherPGS(model, parallel_tree=True, use_parallel_streams=False)
+                self.assertIsNone(solver._tree_plan)
+                self.assertEqual(solver._tree_net_wrenches, ())
+
     def test_complete_finger_levels_and_serial_group(self):
         """Schedule every finger segment and retain serial trees as one-lane groups."""
         model = _build_fingers(include_chain=True)
@@ -270,11 +328,12 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                             pgs_iterations=8,
                             use_parallel_streams=False,
                             enable_joint_velocity_limits=velocity_limits,
+                            parallel_tree=parallel,
                         )
                         if parallel:
                             self.assertIsNotNone(solver._tree_plan)
                         else:
-                            solver._tree_plan = None
+                            self.assertIsNone(solver._tree_plan)
                         state, following = model.state(), model.state()
                         solver._prepare_augmented_state(state, following, model.control())
                         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
