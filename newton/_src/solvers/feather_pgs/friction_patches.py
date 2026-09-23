@@ -583,8 +583,8 @@ def _build(
             carried_impulse = wp.vec3(0.0)
             error = wp.vec3(0.0)
             if chosen >= 0:
-                prev.used[chosen] = 1
                 error = _carried_displacement(q, prev, chosen, n)
+                carried_translation = error
                 old_center = 0.5 * (
                     _world_point(q, a, prev.anchor_a[chosen]) + _world_point(q, b, prev.anchor_b[chosen])
                 )
@@ -621,6 +621,17 @@ def _build(
                         break
                 error += motion
                 error -= n * wp.dot(error, n)
+                # The incoming sample passed the slip gate, but transporting
+                # a narrow two-anchor footprint can amplify its fitted twist
+                # at a distant new point. Apply the same bound to the actual
+                # spring that will be solved, not only its source sample.
+                if not (wp.length_sq(error) <= 0.01 * r * r):
+                    # The nearest sample already passed this same gate.
+                    # Retain its accepted translation rather than dropping
+                    # useful static-friction history with an unreliable twist.
+                    error = carried_translation + motion
+                    error -= n * wp.dot(error, n)
+                prev.used[chosen] = 1
                 carried_impulse = prev.tangent_impulse[chosen]
             stored_error = error
             if a >= 0:

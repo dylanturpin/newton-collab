@@ -513,6 +513,35 @@ class TestFrictionPatchHistory(unittest.TestCase):
         self.assertEqual(np.count_nonzero(patches.view.weight.numpy()), 1)
         self.assertEqual(float(patches.view.weight.numpy().sum()), 1.0)
 
+    def test_widening_footprint_rejects_extrapolated_slip_outside_history_gate(self):
+        """Apply the slip admission bound after transporting a narrow patch's twist."""
+        for device in ("cpu", "cuda:0") if wp.is_cuda_available() else ("cpu",):
+            with self.subTest(device=device):
+                self._check_widening_history(device)
+
+    def _check_widening_history(self, device):
+        """Exercise identical history transport on each available device."""
+        model, state, contacts, patches = _patch_fixture([[-0.0001, 0, 0], [0.0001, 0, 0]], device=device)
+        active = np.flatnonzero(patches.view.weight.numpy() > 0.0)
+        error = patches.current.displacement.numpy()
+        error[active[0]] = [0.0, -0.001, 0.0]
+        error[active[1]] = [0.0, 0.001, 0.0]
+        patches.current.displacement.assign(error)
+        # Each old sample is inside the existing 0.1*radius slip gate, but
+        # extrapolating their twist onto a much wider footprint is not.
+        self.assertTrue(np.all(np.linalg.norm(error[active], axis=1) < 0.1 * patches.current.radius.numpy()[active]))
+        patches.store(state)
+        points = np.array([[-0.1, 0, 0], [0.1, 0, 0]], dtype=np.float32)
+        contacts.rigid_contact_point0.assign(points)
+        contacts.rigid_contact_point1.assign(points)
+        patches.build(model, state, contacts)
+        active = np.flatnonzero(patches.view.weight.numpy() > 0.0)
+        bound = 0.1 * patches.current.radius.numpy()[active]
+        self.assertTrue(np.all(np.linalg.norm(patches.view.phi.numpy()[active], axis=1) <= bound))
+        sources = patches.current.source.numpy()[active]
+        self.assertTrue(np.all(sources >= 0))
+        np.testing.assert_allclose(patches.current.displacement.numpy()[active], error[sources], atol=1.0e-7)
+
     def test_warmstart_uses_patch_load_when_anchor_normal_is_unloaded(self):
         """Keep a cached tangent supported when other normals carry the load."""
         model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0, 0, 0], [0.1, 0, 0]])
