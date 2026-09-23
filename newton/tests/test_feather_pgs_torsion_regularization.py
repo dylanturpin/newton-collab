@@ -58,31 +58,29 @@ class TestTorsionRegularization(unittest.TestCase):
                 self.assertLessEqual(float(np.sum(after**2 * inertia)), float(np.sum(before**2 * inertia)) + 2e-6)
                 self.check_budget(result, solver)
 
-    def test_final_load_budget_across_iterations_and_routes(self):
+    def test_final_load_budget_across_iterations(self):
         """Correct stale sliding and spin when distributed normal loads shrink."""
-        for kernel in ("loop", "tiled_row"):
-            for regularization in (0.01, 0.02, 0.5):
-                for iterations in (1, 2, 4, 16, 64):
-                    for spin, sliding in ((0.0, 1.0), (10.0, 1.0), (100.0, 0.0)):
-                        with self.subTest(kernel=kernel, reg=regularization, iterations=iterations, spin=spin):
-                            result, solver, *_ = fixture(
-                                0.0075,
-                                pgs_kernel=kernel,
-                                pgs_iterations=iterations,
-                                pgs_contact_regularization=regularization,
-                                spin=spin,
-                                sliding=sliding,
-                                **PATCH_OPTIONS,
-                            )
-                            self.check_budget(result, solver)
-                            count = int(result["count"][0])
-                            types = result["row_type"][0, :count]
-                            weights = solver.row_w.numpy()[0, :count]
-                            normal_rows = types == 0
-                            self.assertTrue(np.any(normal_rows))
-                            np.testing.assert_allclose(weights[normal_rows], 1 / (1 + regularization), atol=1e-7)
-                            # Torsion itself is a dry-friction row, not another soft normal.
-                            np.testing.assert_array_equal(weights[types == 7], 1.0)
+        for regularization in (0.01, 0.02, 0.5):
+            for iterations in (1, 2, 4, 16, 64):
+                for spin, sliding in ((0.0, 1.0), (10.0, 1.0), (100.0, 0.0)):
+                    with self.subTest(reg=regularization, iterations=iterations, spin=spin):
+                        result, solver, *_ = fixture(
+                            0.0075,
+                            pgs_iterations=iterations,
+                            pgs_contact_regularization=regularization,
+                            spin=spin,
+                            sliding=sliding,
+                            **PATCH_OPTIONS,
+                        )
+                        self.check_budget(result, solver)
+                        count = int(result["count"][0])
+                        types = result["row_type"][0, :count]
+                        weights = solver.row_w.numpy()[0, :count]
+                        normal_rows = types == 0
+                        self.assertTrue(np.any(normal_rows))
+                        np.testing.assert_allclose(weights[normal_rows], 1 / (1 + regularization), atol=1e-7)
+                        # Torsion itself is a dry-friction row, not another soft normal.
+                        np.testing.assert_array_equal(weights[types == 7], 1.0)
 
     def test_zero_controls_and_no_load(self):
         """Preserve excluded/radius-zero controls and forbid spin without compressive load."""

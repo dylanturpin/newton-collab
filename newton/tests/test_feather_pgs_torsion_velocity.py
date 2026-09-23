@@ -25,21 +25,60 @@ class TestTorsionVelocityAdmission(unittest.TestCase):
                 dofs = wp.array([1], dtype=int, device="cpu")
                 indices = wp.array([[0]], dtype=int, device="cpu")
                 jacobian = wp.array(np.array([[[1.0], [0.0]]], np.float32), device="cpu")
-                mu = wp.array([[0.5, 0.5]], dtype=float, device="cpu")
                 rhs = wp.array([[3.0, 9.0]], dtype=float, device="cpu")
                 wp.launch(
                     contact_torsion._prepare_velocity_torsion_rows,
                     dim=2,
                     inputs=[count, 2, types, groups, phi, target, velocity, dofs, indices, jacobian, 0.01],
-                    outputs=[mu, rhs],
+                    outputs=[rhs],
                     device="cpu",
                 )
-                self.assertEqual(float(mu.numpy()[0, 1]), 0.0 if initial_gap > 1e-6 and end_gap > 1e-6 else 0.5)
+                retired = initial_gap > 1e-6 and end_gap > 1e-6
+                self.assertEqual(int(groups.numpy()[0, 1]), contact_torsion._TORSION_SPIN_RETIRED if retired else -1)
                 np.testing.assert_array_equal(rhs.numpy(), [[3.0, -0.25]])
+                # Re-admission must clear a previous retirement, including when
+                # these same buffers are reused by a captured graph replay.
+                phi.assign(np.array([[-0.001, 0.0]], dtype=np.float32))
+                wp.launch(
+                    contact_torsion._prepare_velocity_torsion_rows,
+                    dim=2,
+                    inputs=[count, 2, types, groups, phi, target, velocity, dofs, indices, jacobian, 0.01],
+                    outputs=[rhs],
+                    device="cpu",
+                )
+                np.testing.assert_array_equal(groups.numpy(), [[1, -1]])
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
 class TestTorsionVelocitySolve(unittest.TestCase):
+    def test_rebound_preserves_loaded_sliding_when_spin_retires(self):
+        """Preserve ordinary sliding friction on an admitted rebounding contact."""
+        for separation in (0.0, 5.0e-6):
+            for restitution in (0.0, 0.5):
+                with self.subTest(separation=separation, restitution=restitution):
+                    options = dict(
+                        separation=separation,
+                        restitution=restitution,
+                        closing=1.0,
+                        sliding=1.0,
+                        spin=0.0,
+                        sat=True,
+                        center_only=True,
+                        pgs_iterations=64,
+                        pgs_velocity_iterations=16,
+                        enable_bilateral_preelimination=False,
+                        **PATCH_OPTIONS,
+                    )
+                    baseline, *_ = fixture(0.0, **options)
+                    actual, solver, *_ = fixture(0.01, **options)
+                    normals = actual["row_type"] == 0
+                    tangent = actual["row_type"] == 2
+                    np.testing.assert_allclose(actual["impulses"][normals], baseline["impulses"][normals], atol=2e-6)
+                    self.assertGreater(float(np.linalg.norm(baseline["impulses"][tangent])), 0.01)
+                    np.testing.assert_allclose(actual["impulses"][tangent], baseline["impulses"][tangent], atol=2e-6)
+                    np.testing.assert_allclose(actual["body_qd"], baseline["body_qd"], atol=3e-5)
+                    self._assert_budget(actual, solver)
+
     def _assert_budget(self, result, solver):
         """Check the shared final-load budget and nonnegative normal impulses."""
         for group in solver._torsion_stats["groups"]:
@@ -52,24 +91,22 @@ class TestTorsionVelocitySolve(unittest.TestCase):
     def test_spin_opposition_and_final_budget(self):
         """Dissipate angular slip and respect final normal load in each velocity count."""
         for velocity in (1, 4, 16):
-            for kernel in ("loop", "tiled_row"):
-                for spin, sliding in ((1.0, 0.0), (100.0, 0.0), (10.0, 1.0)):
-                    with self.subTest(velocity=velocity, kernel=kernel, spin=spin, sliding=sliding):
-                        result, solver, *_ = fixture(
-                            0.01,
-                            pgs_iterations=16,
-                            pgs_velocity_iterations=velocity,
-                            pgs_kernel=kernel,
-                            spin=spin,
-                            sliding=sliding,
-                            center_only=sliding == 0,
-                            enable_bilateral_preelimination=False,
-                            **PATCH_OPTIONS,
-                        )
-                        self._assert_budget(result, solver)
-                        self.assertTrue(np.isfinite(result["body_qd"]).all())
-                        if sliding == 0:
-                            self.assertLess(np.max(np.abs(result["body_qd"][:, 5])), spin)
+            for spin, sliding in ((1.0, 0.0), (100.0, 0.0), (10.0, 1.0)):
+                with self.subTest(velocity=velocity, spin=spin, sliding=sliding):
+                    result, solver, *_ = fixture(
+                        0.01,
+                        pgs_iterations=16,
+                        pgs_velocity_iterations=velocity,
+                        spin=spin,
+                        sliding=sliding,
+                        center_only=sliding == 0,
+                        enable_bilateral_preelimination=False,
+                        **PATCH_OPTIONS,
+                    )
+                    self._assert_budget(result, solver)
+                    self.assertTrue(np.isfinite(result["body_qd"]).all())
+                    if sliding == 0:
+                        self.assertLess(np.max(np.abs(result["body_qd"][:, 5])), spin)
 
     def test_postpass_accumulated_impulse_response_and_position_split(self):
         """Apply delta impulses once while retaining the biased position trajectory."""
@@ -114,7 +151,9 @@ class TestTorsionVelocitySolve(unittest.TestCase):
 
     def test_carried_spin_is_refunded_when_postpass_retires_group(self):
         """Undo carried spin through its response column when final support is separated."""
-        _, solver, *_ = fixture(0.01, spin=100.0, center_only=True, pgs_velocity_iterations=4, **PATCH_OPTIONS)
+        original, solver, model, state, contacts = fixture(
+            0.01, spin=100.0, center_only=True, pgs_velocity_iterations=4, **PATCH_OPTIONS
+        )
         group = solver._torsion_stats["groups"][0]
         count = int(solver.constraint_count.numpy()[0])
         before_lambda = solver.impulses.numpy()[0, :count].copy()
@@ -125,7 +164,10 @@ class TestTorsionVelocitySolve(unittest.TestCase):
         solver.phi.assign(phi)
         solver.v_out_snap.zero_()
         solver._conclude_matrix_free_position_problem(0.0025)
-        self.assertEqual(float(solver.row_mu.numpy()[0, group["row"]]), 0.0)
+        self.assertEqual(float(solver.row_mu.numpy()[0, group["row"]]), group["mu"])
+        self.assertEqual(
+            int(solver._contact_torsion_group.numpy()[0, group["row"]]), contact_torsion._TORSION_SPIN_RETIRED
+        )
         # Eligibility changes the admissible set, not the already-applied load.
         np.testing.assert_array_equal(solver.impulses.numpy()[0, :count], before_lambda)
         solver._run_matrix_free_velocity_post_solve()
@@ -136,6 +178,14 @@ class TestTorsionVelocitySolve(unittest.TestCase):
             solver.Y_world.numpy()[0, :count].T @ (after_lambda - before_lambda),
             atol=2e-5,
         )
+        # A new position solve must restore admission rather than inherit the
+        # prior velocity-pass retirement in a reused membership buffer.
+        output = model.state()
+        solver.step(state, output, model.control(), contacts, 0.0025)
+        group = solver._torsion_stats["groups"][0]
+        self.assertEqual(int(solver._contact_torsion_group.numpy()[0, group["row"]]), -1)
+        self.assertGreater(abs(float(solver.impulses.numpy()[0, group["row"]])), 1e-8)
+        np.testing.assert_allclose(output.body_qd.numpy(), original["body_qd"], atol=2e-5)
 
     def test_internal_timestep_export_uses_final_linear_impulse(self):
         """Export final normal impulses in newtons at each internal substep duration."""

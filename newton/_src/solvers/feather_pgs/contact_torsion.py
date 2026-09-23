@@ -33,6 +33,10 @@ from .kernels import (
 _TOUCH_TOLERANCE = 1.0e-5
 _NORMAL_COSINE = 0.999
 _MAX_GROUP_CONTACTS = 4096
+# Normal rows store their spin-row index in the membership array. A spin row
+# has no parent membership, so its otherwise-unused cell records admission.
+# Both host and device preparation reset every cell to -1 each step.
+_TORSION_SPIN_RETIRED = -2
 _SUPPORTED_TYPES = (
     GeoType.SPHERE,
     GeoType.BOX,
@@ -312,7 +316,6 @@ def _prepare_velocity_torsion_rows(
     dof_indices: wp.array2d[int],
     jacobian: wp.array3d[float],
     dt: float,
-    mu: wp.array2d[float],
     rhs: wp.array2d[float],
 ):
     """Conclude speculative spin admission without discarding touching support."""
@@ -338,8 +341,9 @@ def _prepare_velocity_torsion_rows(
     # The angular row has no positional spring: retain prescribed angular
     # target motion but not position-solve contact correction or restitution.
     rhs[world, spin] = -target[world, spin]
-    if not touching:
-        mu[world, spin] = 0.0
+    # Keep the undivided coefficient: still-loaded normal rows retain sliding
+    # friction even when separated support retires the additional spin row.
+    group[world, spin] = -1 if touching else _TORSION_SPIN_RETIRED
     # Do not zero lambda here. The coupled sweep must apply Y * (new - old)
     # to refund position-phase spin and tangential impulses coherently.
 
@@ -370,7 +374,7 @@ def prepare_torsion_velocity_pass(solver, dt):
             solver.J_world,
             dt,
         ],
-        outputs=[solver.row_mu, solver.rhs_unbiased],
+        outputs=[solver.rhs_unbiased],
         device=solver.model.device,
     )
 
@@ -545,6 +549,7 @@ def torque_sweep_source(dofs):
                     }}
                 }}
                 float bound = radius * fmaxf(normal_budget - sliding_used, 0.0f);
+                if (world_torsion_group.data[off_dense + spin] == {_TORSION_SPIN_RETIRED}) bound = 0.0f;
                 if (global_iter < friction_start_iteration) bound = 0.0f;
                 float dot = 0.0f;
                 for (int d = lane; d < {dofs}; d += 32)
