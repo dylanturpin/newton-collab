@@ -44,7 +44,13 @@ from ..semi_implicit.kernels_particle import (
 )
 from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
-from .contact_torsion import configure_contact_torsion, prepare_torsion_rows, torque_sweep_source, validate_torsion_step
+from .contact_torsion import (
+    configure_contact_torsion,
+    prepare_torsion_rows,
+    prepare_torsion_velocity_pass,
+    torque_sweep_source,
+    validate_torsion_step,
+)
 from .friction import FRICTION_PAIR_CUDA
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
@@ -970,9 +976,11 @@ class SolverFeatherPGS(SolverBase):
         warn_constraint_overflow: bool = True,
         friction_anchor_beta: float | None = None,
         *,
+        bilateral_preelimination_include_mimics: bool = True,
         contact_torsion_radius: float = 0.0,
         contact_torsion_shape_indices: tuple[int, ...] | None = None,
         contact_torsion_shape_patterns: tuple[str, ...] | None = None,
+        contact_torsion_device: bool = False,
         contact_compliance: bool = False,
     ):
         """
@@ -983,12 +991,24 @@ class SolverFeatherPGS(SolverBase):
                 of radius R, the effective radius is 2*R/3. Does not consume the generic
                 material torsion default. Sliding and spin share one Coulomb budget.
                 Currently supports dense articulated contacts in CUDA matrix-free,
-                immediate/current/interleaved mode without warmstarting, graph capture,
-                hydroelastic contact, persistent friction patches, regularization,
-                debug mode, or velocity post-passes. Radius and selectors are
-                construction-only; recreate the solver to change them. A positive radius
-                with omitted ``friction_anchor_beta`` selects point friction and warns;
-                an explicit positive patch gain is rejected. Capacity
+                immediate/current/interleaved mode without warmstarting,
+                hydroelastic contact, contact compliance,
+                or debug mode. Velocity post-passes require bilateral preelimination
+                disabled; they preserve accumulated impulses and use the unbiased
+                angular target. Initially touching groups remain eligible through
+                rebound, using the end-gap slop as the initial touching tolerance;
+                groups outside this tolerance use the position solve's end-gap
+                admission test. Final normal load always bounds the friction budget.
+                Radius and selectors are
+                construction-only; recreate the solver to change them. With point
+                friction, one spin row bounds each coplanar exact-shape-pair group. With
+                persistent friction patches (the default ``friction_anchor_beta``), one
+                spin row bounds each patch region by the region's pooled normal load
+                times the undivided friction coefficient, less the tangent impulses of
+                its anchor rows; normal rows stay independent. Contact regularization
+                softens the position solve's normal rows; velocity cleanup is
+                unregularized. Spin uses the final solved normal load without
+                applying a second regularization factor. Capacity
                 exhaustion raises even when optional overflow diagnostics are off. Host
                 grouping is diagnostic, not optimized for throughput. This experimental
                 parameter may change without the normal deprecation policy.
@@ -1004,6 +1024,20 @@ class SolverFeatherPGS(SolverBase):
                 an explicit pattern such as ".*fingertip.*". Empty tuple selects none;
                 unmatched nonempty patterns raise ValueError. Experimental, with the
                 same compatibility limitations as the radius.
+            contact_torsion_device: Experimental opt-in device-resident torsion preparation.
+                False retains the host reference implementation. True preserves the
+                grouping and friction law while using preallocated GPU buffers.
+                Eager stepping checks errors synchronously. For CUDA graph capture,
+                first call :meth:`prepare_contact_torsion_capture` outside capture,
+                then call :meth:`validate_contact_torsion` after every replay batch
+                before consuming results. Errors latch permanently; recreate the
+                solver rather than continuing an invalid graph. No effect when the
+                torsion radius is zero. The host reference cannot be captured.
+                Grouping currently runs serially within each world with worst-case
+                quadratic contact-count cost. Many small worlds can benefit, but
+                a single contact-dense world may be slower than host preparation;
+                CUDA graphs do not remove that device-side work. Benchmark the
+                intended per-world contact distribution before enabling.
             contact_compliance: Experimental opt-in implicit unilateral contact material response.
                 Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
                 zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and
@@ -1072,7 +1106,8 @@ class SolverFeatherPGS(SolverBase):
                 select up to two friction locations per region, and share the total
                 normal impulse equally between those anchors. Normal contacts are preserved.
                 Twisting resistance comes only from the separation between the anchors;
-                a single-anchor region has no independent torsional stiction constraint.
+                a single-anchor region has no independent torsional stiction constraint
+                unless ``contact_torsion_radius`` adds one bounded spin row per region.
                 For uniform pad-friction randomization, sample one coefficient per pad
                 and assign it to all constituent convex shapes. Different coefficients
                 define separate regions and are not pooled across material boundaries.
@@ -1132,6 +1167,11 @@ class SolverFeatherPGS(SolverBase):
                 ``pgs_velocity_iterations == 0`` and at most 8 bilateral rows per
                 articulation; unsupported configurations warn and fall back to iterative
                 rows. Defaults to False.
+            bilateral_preelimination_include_mimics (bool, optional): Include mimic rows
+                in the pre-eliminated bilateral block. When False, only connect rows are
+                pre-eliminated and mimic rows remain in the iterative sweep. This avoids
+                making the Schur block singular when a mimic row is nearly dependent on
+                the loop-closure rows. Defaults to True.
             joint_limit_activation_gap (float, optional): Distance from a finite lower or upper
                 position limit at which a joint-limit PGS row becomes active. A lower row is
                 allocated when ``q <= lower + gap``; an upper row is allocated when
@@ -1416,11 +1456,11 @@ class SolverFeatherPGS(SolverBase):
         if friction_anchor_beta is None:
             # An explicit point algorithm remains a valid way to select point
             # friction. The ordinary constructor enables persistent patches.
-            if contact_compliance or float(contact_torsion_radius) > 0.0:
+            if contact_compliance:
                 friction_anchor_beta = 0.0
                 warnings.warn(
                     "The selected contact material law uses velocity-only point friction; "
-                    "contact_compliance and contact torsion do not support persistent friction patches. "
+                    "contact_compliance does not support persistent friction patches. "
                     "Set friction_anchor_beta=0 explicitly to retain this law without the warning.",
                     UserWarning,
                     stacklevel=2,
@@ -1501,6 +1541,7 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError("contact_friction_anchor_limit must be non-negative")
         self.enable_joint_limits = enable_joint_limits
         self.enable_bilateral_preelimination = bool(enable_bilateral_preelimination)
+        self.bilateral_preelimination_include_mimics = bool(bilateral_preelimination_include_mimics)
         try:
             self.joint_limit_activation_gap = float(joint_limit_activation_gap)
         except (TypeError, ValueError) as exc:
@@ -2485,6 +2526,46 @@ class SolverFeatherPGS(SolverBase):
 
         self._init_double_buffer_stream()
 
+        self.contact_torsion_device = bool(contact_torsion_device)
+        if self._contact_torsion_enabled and self.contact_torsion_device:
+            from .contact_torsion_device import enable_device_torsion  # noqa: PLC0415
+
+            enable_device_torsion(self)
+
+    def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
+        """Prepare experimental torsion rollback buffers before CUDA graph capture.
+
+        Requires ``contact_torsion_device=True`` when torsion is active. Call
+        outside capture with the state layouts used by the graph. Subsequent
+        graph replay requires :meth:`validate_contact_torsion` at every batch
+        boundary before results are consumed. Eager steps continue to validate
+        automatically. This method does not advance physics.
+        """
+        if not self._contact_torsion_enabled:
+            return
+        preparation = getattr(self, "_device_torsion", None)
+        if preparation is None:
+            raise RuntimeError("Contact torsion graph capture requires contact_torsion_device=True")
+        if wp.get_stream(self.model.device).is_capturing:
+            raise RuntimeError("Prepare contact torsion buffers outside CUDA graph capture")
+        preparation.validate()
+        preparation.deferred_errors = True
+        preparation.begin_step(state_in, state_out)
+
+    def validate_contact_torsion(self) -> None:
+        """Raise latched torsion errors after every experimental graph replay batch.
+
+        This synchronous status check must run before consuming captured results.
+        Invalid input suppresses incomplete contact solving and restores published
+        dynamic state, but internal caches are not rolled back: recreate the solver
+        after correcting invalid input. No-op without device torsion preparation.
+        """
+        preparation = getattr(self, "_device_torsion", None)
+        if preparation is not None:
+            if wp.get_stream(self.model.device).is_capturing:
+                raise RuntimeError("Validate contact torsion outside CUDA graph capture")
+            preparation.validate()
+
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
         model = self.model
@@ -3172,7 +3253,9 @@ class SolverFeatherPGS(SolverBase):
         """
         self._preelim_count = 0
         self._preelim_active = False
-        n_bilateral = int(self._mimic_count or 0) + int(self._connect_count or 0)
+        n_bilateral = int(self._connect_count or 0)
+        if self.bilateral_preelimination_include_mimics:
+            n_bilateral += int(self._mimic_count or 0)
         if not self.enable_bilateral_preelimination or n_bilateral == 0:
             return
         if self.pgs_mode != "matrix_free":
@@ -3194,7 +3277,7 @@ class SolverFeatherPGS(SolverBase):
 
         # Per-articulation bilateral row capacity (upper bound: every valid constraint).
         counts: dict[int, int] = {}
-        if self._mimic_count:
+        if self._mimic_count and self.bilateral_preelimination_include_mimics:
             for art, count in enumerate(np.diff(self._mimic_art_start_np)):
                 if count:
                     counts[art] = int(count)
@@ -3250,7 +3333,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mimic_slot if self.mimic_slot is not None else self._dummy_is_free_rigid,
                 self._mimic_art_start if self._mimic_count else self._dummy_is_free_rigid,
                 self._mimic_art_list if self._mimic_count else self._dummy_is_free_rigid,
-                int(self._mimic_count or 0),
+                int(self._mimic_count or 0) if self.bilateral_preelimination_include_mimics else 0,
                 self.connect_slot if self.connect_slot is not None else self._dummy_is_free_rigid,
                 self._connect_art if self._connect_count else self._dummy_is_free_rigid,
                 int(self._connect_count or 0),
@@ -7636,6 +7719,8 @@ class SolverFeatherPGS(SolverBase):
             joint_limit_speculative_scale=1.0,
             output=self.rhs_unbiased,
         )
+        if self._contact_torsion_enabled:
+            prepare_torsion_velocity_pass(self, dt)
         if self._has_free_rigid_bodies:
             self._compute_mf_rhs_bias(
                 dt,
@@ -7721,6 +7806,8 @@ class SolverFeatherPGS(SolverBase):
     ):
         if self._contact_torsion_enabled:
             validate_torsion_step(self)
+            if getattr(self, "_device_torsion", None) is not None:
+                self._device_torsion.begin_step(state_in, state_out)
         if self.contact_compliance:
             # Reject incompatible contact preprocessing before it can mutate the stream.
             _contact_compliance.validate_step(self)
@@ -8611,6 +8698,10 @@ class SolverFeatherPGS(SolverBase):
                     device=contact_counts.device,
                 )
 
+        if self._contact_torsion_enabled and getattr(self, "_device_torsion", None) is not None:
+            self._device_torsion.end_step(state_out)
+            if self._device_torsion.deferred_errors and not wp.get_stream(self.model.device).is_capturing:
+                self.validate_contact_torsion()
         self._step += 1
         return state_out
 

@@ -57,13 +57,6 @@ class TestContactTorsionRegressions(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(AttributeError):
                 setattr(solver, name, ())
 
-    def test_persistent_patch_state_is_explicitly_rejected(self):
-        """Reject active patch state before touching its normal-parent load rings."""
-        _, solver, model, initial, contacts = fixture(0.01, center_only=True)
-        solver._friction_anchors_enabled = True
-        with self.assertRaisesRegex(ValueError, "persistent friction patches"):
-            solver.step(initial, model.state(), model.control(), contacts, 0.0025)
-
     def test_normal_parent_metadata_is_preserved(self):
         """Keep CONTACT parents available for pooled friction-patch load rings."""
         result, _solver, *_ = fixture(0.01, center_only=True)
