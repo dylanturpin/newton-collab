@@ -247,6 +247,7 @@ _PERSISTENT_HINV_JT_MIN_DOF = 17
 def _prepare_augmented_joint_drives_by_dof(
     drive_row_by_dof: wp.array[int],
     drive_q_index_by_dof: wp.array[int],
+    drive_target_index_by_dof: wp.array[int],
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
     joint_target_ke: wp.array[float],
@@ -275,7 +276,7 @@ def _prepare_augmented_joint_drives_by_dof(
 
     q = joint_q[drive_q_index_by_dof[dof]]
     qd = joint_qd[dof]
-    u0 = -(ke * (q - joint_target_pos[dof] + dt * qd) + kd * (qd - joint_target_vel[dof]))
+    u0 = -(ke * (q - joint_target_pos[drive_target_index_by_dof[dof]] + dt * qd) + kd * (qd - joint_target_vel[dof]))
     effort_limit = joint_effort_limit[dof]
     if effort_limit > 0.0:
         u0 = wp.clamp(u0, -effort_limit, effort_limit)
@@ -4553,6 +4554,7 @@ class SolverFeatherPGS(SolverBase):
             (max(1, int(model.joint_dof_count)),), -1, dtype=wp.int32, device=model.device
         )
         self._augmented_drive_q_index_by_dof = None
+        self._augmented_drive_target_index_by_dof = None
         if not self._async_augmented_drives or self._has_loop_joints or not model.joint_dof_count:
             return
 
@@ -4570,12 +4572,14 @@ class SolverFeatherPGS(SolverBase):
         joint_type = model.joint_type.numpy()
         joint_q_start = model.joint_q_start.numpy()
         joint_qd_start = model.joint_qd_start.numpy()
+        joint_target_q_start = model.joint_target_q_start.numpy()
         joint_dof_dim = model.joint_dof_dim.numpy()
         articulation_start = model.articulation_start.numpy()
         max_dofs = self.articulation_max_dofs
 
         drive_row_by_dof = np.full(dof_count, -1, dtype=np.int32)
         drive_q_index_by_dof = np.full(dof_count, -1, dtype=np.int32)
+        drive_target_index_by_dof = np.full(dof_count, -1, dtype=np.int32)
         row_counts = np.zeros(model.articulation_count, dtype=np.int32)
         row_dof_index = np.zeros(model.articulation_count * max_dofs, dtype=np.int32)
         supported = (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
@@ -4592,6 +4596,7 @@ class SolverFeatherPGS(SolverBase):
                     row = articulation * max_dofs + slot
                     drive_row_by_dof[dof] = row
                     drive_q_index_by_dof[dof] = int(joint_q_start[joint] + axis)
+                    drive_target_index_by_dof[dof] = int(joint_target_q_start[joint] + axis)
                     row_dof_index[row] = dof
                     slot += 1
                 if slot >= max_dofs:
@@ -4600,6 +4605,9 @@ class SolverFeatherPGS(SolverBase):
 
         self._augmented_drive_row_by_dof = wp.array(drive_row_by_dof, dtype=wp.int32, device=model.device)
         self._augmented_drive_q_index_by_dof = wp.array(drive_q_index_by_dof, dtype=wp.int32, device=model.device)
+        self._augmented_drive_target_index_by_dof = wp.array(
+            drive_target_index_by_dof, dtype=wp.int32, device=model.device
+        )
         self.aug_row_counts.assign(row_counts)
         self.aug_row_dof_index.assign(row_dof_index)
         self._parallel_augmented_drive_topology = True
@@ -9299,6 +9307,7 @@ class SolverFeatherPGS(SolverBase):
                     inputs=[
                         self._augmented_drive_row_by_dof,
                         self._augmented_drive_q_index_by_dof,
+                        self._augmented_drive_target_index_by_dof,
                         state_in.joint_q,
                         state_in.joint_qd,
                         model.joint_target_ke,
@@ -9328,6 +9337,7 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_target_ke,
                         model.joint_target_kd,
                         control.joint_target_q,
+                        model.joint_target_q_start,
                         control.joint_target_qd,
                         model.joint_effort_limit,
                         self.articulation_max_dofs,
@@ -9501,6 +9511,7 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_target_ke,
                         model.joint_target_kd,
                         control.joint_target_q,
+                        model.joint_target_q_start,
                         control.joint_target_qd,
                         model.joint_effort_limit,
                         self.articulation_max_dofs,
@@ -10162,6 +10173,7 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_effort_limit,
                         state_in.joint_q,
                         control.joint_target_q,
+                        model.joint_target_q_start,
                         control.joint_target_qd,
                         self._drive_vel_limit_src_arg,
                         # Equals int(fuse_joint_velocity_limits) here: this

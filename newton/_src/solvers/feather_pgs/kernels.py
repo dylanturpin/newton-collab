@@ -2473,6 +2473,7 @@ def prepare_articulation_augmented_drives(
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
     joint_target_pos: wp.array[float],
+    joint_target_q_start: wp.array[int],
     joint_target_vel: wp.array[float],
     joint_effort_limit: wp.array[float],
     max_dofs: int,
@@ -2521,7 +2522,8 @@ def prepare_articulation_augmented_drives(
 
             q = joint_q[coord_start + axis]
             qd = joint_qd[dof_index]
-            u0 = -(ke * (q - joint_target_pos[dof_index] + dt * qd) + kd * (qd - joint_target_vel[dof_index]))
+            target_pos = joint_target_pos[joint_target_q_start[joint_index] + axis]
+            u0 = -(ke * (q - target_pos + dt * qd) + kd * (qd - joint_target_vel[dof_index]))
             effort_limit = joint_effort_limit[dof_index]
             if effort_limit > 0.0:
                 u0 = wp.clamp(u0, -effort_limit, effort_limit)
@@ -2568,6 +2570,7 @@ def eval_rigid_tau_and_augmented_drives(
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
     joint_target_pos: wp.array[float],
+    joint_target_q_start: wp.array[int],
     joint_target_vel: wp.array[float],
     joint_effort_limit: wp.array[float],
     max_dofs: int,
@@ -2623,6 +2626,7 @@ def eval_rigid_tau_and_augmented_drives(
         joint_target_ke,
         joint_target_kd,
         joint_target_pos,
+        joint_target_q_start,
         joint_target_vel,
         joint_effort_limit,
         max_dofs,
@@ -2648,6 +2652,7 @@ def prepare_augmented_joint_drives(
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
     joint_target_pos: wp.array[float],
+    joint_target_q_start: wp.array[int],
     joint_target_vel: wp.array[float],
     joint_effort_limit: wp.array[float],
     max_dofs: int,
@@ -2672,6 +2677,7 @@ def prepare_augmented_joint_drives(
         joint_target_ke,
         joint_target_kd,
         joint_target_pos,
+        joint_target_q_start,
         joint_target_vel,
         joint_effort_limit,
         max_dofs,
@@ -2779,6 +2785,7 @@ def populate_physx_drive_J_for_size(
     joint_effort_limit: wp.array[float],
     joint_q: wp.array[float],
     joint_target_pos: wp.array[float],
+    joint_target_q_start: wp.array[int],
     joint_target_vel: wp.array[float],
     joint_velocity_limit: wp.array[float],
     fuse_vel_limits: int,
@@ -2841,7 +2848,7 @@ def populate_physx_drive_J_for_size(
 
             stiffness = joint_target_ke[dof]
             damping = joint_target_kd[dof]
-            target_pos = joint_target_pos[dof]
+            target_pos = joint_target_pos[joint_target_q_start[j] + axis]
             target_vel = joint_target_vel[dof]
             q = joint_q[q_start + axis]
 
