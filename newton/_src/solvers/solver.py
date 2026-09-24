@@ -631,6 +631,9 @@ class SolverBase:
                     "with supports_body_pair_reduced_contacts=True"
                 )
             raise ValueError(f"{subject} is not validated for body-pair-reduced contacts; {remedy}")
+        if not isinstance(contacts, Contacts):
+            # Duck-typed wrappers around pipeline buffers (IsaacLab) carry no reducer lease state.
+            return
         graph = contacts._current_warp_capture_graph()
         if graph is None and contacts.device.is_cuda and wp.get_stream(contacts.device).is_capturing:
             raise RuntimeError(
