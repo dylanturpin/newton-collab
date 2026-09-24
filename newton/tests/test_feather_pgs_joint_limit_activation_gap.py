@@ -80,7 +80,7 @@ def _make_phase_layout_run(
     enable_joint_velocity_limits=True,
 ):
     """Build a deterministic scene containing every phase-bounded row family."""
-    builder = newton.ModelBuilder(gravity=0.0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     SolverFeatherPGS.register_custom_attributes(builder)
     builder.default_shape_cfg.density = 1000.0
     builder.default_shape_cfg.mu = 0.5

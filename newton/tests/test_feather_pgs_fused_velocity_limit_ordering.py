@@ -42,7 +42,7 @@ def _build_arm_and_box_model(device) -> newton.Model:
     contact impulse into the arm tip is the only thing fighting the velocity
     limit — fully deterministic.
     """
-    builder = newton.ModelBuilder(gravity=0.0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.default_shape_cfg.density = 1000.0
     builder.default_shape_cfg.ke = 1.0e5
     builder.default_shape_cfg.kd = 1.0e3

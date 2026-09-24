@@ -108,12 +108,12 @@ def _build_model(case: TempCase, world_count: int, device: str, gravity: float) 
     # links instead of the deep spawn overlap ejecting them.
     spawn_penetration = 0.0005 if gravity != 0.0 else 0.012
     template, spacing = _build_articulated_free_builder(_bench_case(case, world_count, spawn_penetration))
+    gravity_vector = (0.0, 0.0, gravity)
     if gravity != 0.0:
-        # ModelBuilder gravity is a scalar z-acceleration.
-        template.gravity = gravity
+        template.gravity = gravity_vector
     if world_count <= 1:
         return template.finalize(device=device)
-    builder = newton.ModelBuilder(gravity=gravity)
+    builder = newton.ModelBuilder(gravity=gravity_vector)
     _configure_shape_defaults(builder)
     builder.replicate(template, world_count, spacing=spacing)
     return builder.finalize(device=device)

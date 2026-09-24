@@ -44,7 +44,7 @@ def _require_cuda(reason: str):
 
 
 def _build_d6_articulated_free_contact_model(device: str):
-    builder = newton.ModelBuilder(gravity=0.0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     cfg = newton.ModelBuilder.JointDofConfig
 
     link = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), mass=1.0)
