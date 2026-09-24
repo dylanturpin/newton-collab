@@ -110,7 +110,8 @@ def _make_floating_state(model):
 def _run_floating_trajectory(model, solver, num_steps, *, reset_each_step):
     state_0 = _make_floating_state(model)
     state_1 = model.state()
-    contacts = model.contacts()
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
     control = model.control()
     history = {name: [] for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
     for _ in range(num_steps):
@@ -135,11 +136,12 @@ def _make_initial_state(model):
 def _run_trajectory(model, solver, num_steps):
     state_0 = _make_initial_state(model)
     state_1 = model.state()
-    contacts = model.contacts()
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
     control = model.control()
     joint_q_history = []
     for _ in range(num_steps):
-        model.collide(state_0, contacts)
+        collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
         state_0, state_1 = state_1, state_0
         joint_q_history.append(state_0.joint_q.numpy().copy())
@@ -149,13 +151,14 @@ def _run_trajectory(model, solver, num_steps):
 def _run_state_trajectory(model, solver, num_steps, *, reset_each_step):
     state_0 = _make_initial_state(model)
     state_1 = model.state()
-    contacts = model.contacts()
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
     control = model.control()
     history = {name: [] for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
     for _ in range(num_steps):
         if reset_each_step:
             solver.reset(state_0)
-        model.collide(state_0, contacts)
+        collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
         state_0, state_1 = state_1, state_0
         for name, values in history.items():
@@ -369,12 +372,13 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
         state_0 = _make_initial_state(model)
         state_1 = model.state()
-        contacts = model.contacts()
+        collision_pipeline = newton.CollisionPipeline(model)
+        contacts = collision_pipeline.contacts()
         control = model.control()
 
         expected_masks = ([1, 1], [0, 0], [1, 1], [0, 0])
         for step_index, expected in enumerate(expected_masks):
-            model.collide(state_0, contacts)
+            collision_pipeline.collide(state_0, contacts)
             solver.step(state_0, state_1, control, contacts, DT)
             state_0, state_1 = state_1, state_0
             self.assertEqual(
@@ -388,14 +392,15 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
         state_0 = _make_initial_state(model)
         state_1 = model.state()
-        contacts = model.contacts()
+        collision_pipeline = newton.CollisionPipeline(model)
+        contacts = collision_pipeline.contacts()
         control = model.control()
 
-        model.collide(state_0, contacts)
+        collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
         state_0, state_1 = state_1, state_0
         solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
-        model.collide(state_0, contacts)
+        collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
 
         self.assertEqual(solver.mass_update_mask.numpy().tolist(), [1, 1])

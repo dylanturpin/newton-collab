@@ -1075,7 +1075,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
     def test_propagation_variants_preserve_a_warmstarted_patch(self):
         """Retain a sticking articulated grasp across cached, fused, and colored propagation."""
         for response in ("propagation", "propagation-fused", "propagation-colored"):
-            with self.subTest(response=response):
+            with self.subTest(response=response), self.assertWarnsRegex(UserWarning, "Patch friction selects"):
                 drift, solver, state = _run_squeeze(
                     5.0,
                     220,

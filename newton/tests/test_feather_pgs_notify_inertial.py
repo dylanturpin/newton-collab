@@ -46,11 +46,12 @@ def _run_trajectory(model, solver, num_steps):
     state_0 = model.state()
     state_1 = model.state()
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-    contacts = model.contacts()
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
     control = model.control()
     joint_q_history = []
     for _ in range(num_steps):
-        model.collide(state_0, contacts)
+        collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
         state_0, state_1 = state_1, state_0
         joint_q_history.append(state_0.joint_q.numpy().copy())

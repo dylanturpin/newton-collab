@@ -1504,7 +1504,7 @@ def parse_usd(
     def _material_for_path(material_path: str):
         """Resolve a bound material, including an absolute target outside ``root_path``.
 
-        ``LoadUsdPhysicsFromRange`` reports collider material relationship targets even
+        The native physics parser reports collider material relationship targets even
         when the material prim itself is outside the selected source subtree. Load that
         one target on demand so clone sources can bind shared global materials without
         forcing every material under every replicated environment.
@@ -1512,7 +1512,7 @@ def parse_usd(
         if material_path in material_specs:
             return material_specs[material_path]
 
-        external_results = UsdPhysics.LoadUsdPhysicsFromRange(stage, [material_path])
+        external_results = usd.load_physics_from_range(stage, [material_path])
         for sdf_path, desc in data_for_key(external_results, UsdPhysics.ObjectType.RigidBodyMaterial):
             key = str(sdf_path)
             if key != material_path or warn_invalid_desc(sdf_path, desc):
