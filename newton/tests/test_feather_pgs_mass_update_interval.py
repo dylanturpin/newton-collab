@@ -107,7 +107,7 @@ def _make_floating_state(model):
     return state
 
 
-def _run_floating_trajectory(model, solver, num_steps, *, reset_each_step):
+def _run_floating_trajectory(model, solver, num_steps, *, invalidate_fk_id_each_step):
     state_0 = _make_floating_state(model)
     state_1 = model.state()
     collision_pipeline = newton.CollisionPipeline(model)
@@ -115,8 +115,9 @@ def _run_floating_trajectory(model, solver, num_steps, *, reset_each_step):
     control = model.control()
     history = {name: [] for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
     for _ in range(num_steps):
-        if reset_each_step:
-            solver.reset(state_0)
+        if invalidate_fk_id_each_step:
+            # Reset also forces a mass refresh, changing the comparison's cadence.
+            solver.notify_state_changed()
         solver.step(state_0, state_1, control, contacts, DT)
         state_0, state_1 = state_1, state_0
         for name, values in history.items():
@@ -148,7 +149,7 @@ def _run_trajectory(model, solver, num_steps):
     return np.stack(joint_q_history)
 
 
-def _run_state_trajectory(model, solver, num_steps, *, reset_each_step):
+def _run_state_trajectory(model, solver, num_steps, *, invalidate_fk_id_each_step):
     state_0 = _make_initial_state(model)
     state_1 = model.state()
     collision_pipeline = newton.CollisionPipeline(model)
@@ -156,8 +157,9 @@ def _run_state_trajectory(model, solver, num_steps, *, reset_each_step):
     control = model.control()
     history = {name: [] for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
     for _ in range(num_steps):
-        if reset_each_step:
-            solver.reset(state_0)
+        if invalidate_fk_id_each_step:
+            # Isolate FK/ID reuse while preserving mass factors and warm starts.
+            solver.notify_state_changed()
         collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
         state_0, state_1 = state_1, state_0
@@ -216,10 +218,14 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_cached_fk_id_matches_forced_recomputation(self):
         """Match forced recomputation across cached fixed-base steps."""
         trajectories = []
-        for reset_each_step in (False, True):
+        for invalidate_fk_id_each_step in (False, True):
             model = _build_model("cuda:0", ground=False)
             solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
-            trajectories.append(_run_state_trajectory(model, solver, num_steps=20, reset_each_step=reset_each_step))
+            trajectories.append(
+                _run_state_trajectory(
+                    model, solver, num_steps=20, invalidate_fk_id_each_step=invalidate_fk_id_each_step
+                )
+            )
 
         for name in trajectories[0]:
             np.testing.assert_allclose(
@@ -230,10 +236,14 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_cached_fk_id_matches_forced_recomputation_for_floating_base(self):
         """Match forced recomputation across cached floating-base steps."""
         trajectories = []
-        for reset_each_step in (False, True):
+        for invalidate_fk_id_each_step in (False, True):
             model = _build_floating_model("cuda:0")
             solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
-            trajectories.append(_run_floating_trajectory(model, solver, num_steps=20, reset_each_step=reset_each_step))
+            trajectories.append(
+                _run_floating_trajectory(
+                    model, solver, num_steps=20, invalidate_fk_id_each_step=invalidate_fk_id_each_step
+                )
+            )
 
         for name in trajectories[0]:
             np.testing.assert_allclose(
@@ -388,6 +398,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
             )
 
     def test_model_change_request_refreshes_a_reuse_step(self):
+        """Refresh every articulation after notification and consume each request."""
         model = _build_model(wp.get_device(), ground=False)
         solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
         state_0 = _make_initial_state(model)
@@ -404,7 +415,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         solver.step(state_0, state_1, control, contacts, DT)
 
         self.assertEqual(solver.mass_update_mask.numpy().tolist(), [1, 1])
-        self.assertEqual(solver._mass_update_requested.numpy().tolist(), [0])
+        self.assertEqual(solver._mass_update_requested.numpy().tolist(), [0] * model.articulation_count)
 
     def test_teardown_waits_once_for_each_owned_stream(self):
         """Synchronize current stream owners and tolerate CUDA shutdown."""

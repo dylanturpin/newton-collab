@@ -538,7 +538,6 @@ class Contacts:
         self.rigid_contact_max = rigid_contact_max
         self.soft_contact_max = soft_contact_max
 
-
         self.rigid_contacts_body_pair_reduced = False
         """Provenance: whether the pipeline that last wrote this buffer runs
         body-pair contact reduction.  Assigned on every

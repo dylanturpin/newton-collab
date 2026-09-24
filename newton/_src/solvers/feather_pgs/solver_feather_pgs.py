@@ -8123,7 +8123,6 @@ class SolverFeatherPGS(SolverBase):
         if control is None:
             control = model.control(clone_variables=False)
         state_aug = self._prepare_augmented_state(state_in, state_out, control)
-        self._last_debug_state_aug = state_aug
 
         if collide_done_event is not None and state_in.particle_count > 0:
             wp.get_stream(self.model.device).wait_event(collide_done_event)
