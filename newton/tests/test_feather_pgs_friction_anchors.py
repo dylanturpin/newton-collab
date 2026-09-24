@@ -183,6 +183,12 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         warnings.filterwarnings(
             "ignore", message=r"Patch friction selects its own friction locations", category=UserWarning
         )
+        # The per-route row-builder check runs propagation routes with the default pre-elimination.
+        warnings.filterwarnings(
+            "ignore",
+            message=r"SolverFeatherPGS: bilateral pre-elimination does not support propagation",
+            category=UserWarning,
+        )
 
     def test_explicit_opt_out_keeps_friction_rows_velocity_only(self):
         """Preserve velocity-only rows and omit anchor state with ``friction_anchor_beta=0``."""

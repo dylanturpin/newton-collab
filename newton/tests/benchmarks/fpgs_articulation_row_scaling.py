@@ -525,8 +525,9 @@ def _prepare_case_run(case: BenchCase, device: str) -> tuple[newton.Model, dict[
     newton.eval_fk(model, initial_state.joint_q, initial_state.joint_qd, initial_state)
     initial_state.clear_forces()
     initial = _snapshot_state(initial_state)
-    contacts = model.contacts()
-    model.collide(initial_state, contacts)
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
+    collision_pipeline.collide(initial_state, contacts)
     wp.synchronize()
     return model, initial, contacts
 
