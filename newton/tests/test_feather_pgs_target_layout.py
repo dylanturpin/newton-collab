@@ -14,7 +14,7 @@ from newton.tests.unittest_utils import add_function_test, get_selected_cuda_tes
 
 def _floating_base_arm():
     """A free-floating base with one position-driven revolute joint, no gravity."""
-    builder = newton.ModelBuilder(gravity=0.0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     base = builder.add_link(mass=5.0, inertia=wp.mat33(np.eye(3) * 0.1))
     builder.add_shape_box(base, hx=0.1, hy=0.1, hz=0.1)
     free = builder.add_joint_free(child=base)
