@@ -106,8 +106,9 @@ class TestFpgsArticulationRowScalingBench(unittest.TestCase):
 
         initial = model.state()
         newton.eval_fk(model, initial.joint_q, initial.joint_qd, initial)
-        contacts = model.contacts()
-        model.collide(initial, contacts)
+        collision_pipeline = newton.CollisionPipeline(model)
+        contacts = collision_pipeline.contacts()
+        collision_pipeline.collide(initial, contacts)
         wp.synchronize()
         self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 

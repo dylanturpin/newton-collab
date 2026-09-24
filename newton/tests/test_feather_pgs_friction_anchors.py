@@ -1,6 +1,7 @@
 """Tests for FeatherPGS positional friction anchors (``friction_anchor_beta``)."""
 
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -174,6 +175,15 @@ def _run_incline(steps: int, dt: float, **solver_kwargs):
 
 @unittest.skipUnless(wp.get_device().is_cuda, "SolverFeatherPGS matrix-free mode requires CUDA")
 class TestFeatherPGSFrictionAnchors(unittest.TestCase):
+    def setUp(self):
+        # The shared-anchor squeeze fixture intentionally combines contact_shared_anchor with patch friction.
+        filters = warnings.catch_warnings()
+        filters.__enter__()
+        self.addCleanup(filters.__exit__, None, None, None)
+        warnings.filterwarnings(
+            "ignore", message=r"Patch friction selects its own friction locations", category=UserWarning
+        )
+
     def test_explicit_opt_out_keeps_friction_rows_velocity_only(self):
         """Preserve velocity-only rows and omit anchor state with ``friction_anchor_beta=0``."""
         model, _jaws, _box = _build_v_jaws(5.0)

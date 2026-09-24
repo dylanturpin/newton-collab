@@ -72,9 +72,10 @@ def _zero_iteration_step(model: newton.Model, solver: SolverFeatherPGS):
     state_out = model.state()
     control = model.control()
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-    contacts = model.contacts()
+    collision_pipeline = newton.CollisionPipeline(model)
+    contacts = collision_pipeline.contacts()
     state_in.clear_forces()
-    model.collide(state_in, contacts)
+    collision_pipeline.collide(state_in, contacts)
     solver.step(state_in, state_out, control, contacts, 1.0 / 200.0)
     solver._test_live_contact_count = int(contacts.rigid_contact_count.numpy()[0])
     return state_in
