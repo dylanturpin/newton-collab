@@ -2950,7 +2950,7 @@ def build_mass_update_mask(
 ):
     tid = wp.tid()
     flag = 1 if global_flag != 0 else 0
-    if mass_update_requested[0] != 0:
+    if mass_update_requested[tid] != 0:
         flag = 1
     mass_update_mask[tid] = flag
 
