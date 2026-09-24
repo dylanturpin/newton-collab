@@ -31,6 +31,7 @@ from newton._src.geometry.narrow_phase import (
     NarrowPhase,
     _append_pair_compacted,
     _append_work_index_compacted,
+    _is_ratio_at_or_above_percent,
 )
 from newton._src.geometry.types import GeoType
 
@@ -49,6 +50,38 @@ def append_compacted_test_kernel(
     predicate = tid % 3 != 1
     _append_work_index_compacted(predicate, tid, work_items, work_count)
     _append_pair_compacted(predicate, wp.vec2i(tid, -tid), pair_items, pair_count)
+
+
+@wp.kernel(enable_backward=False)
+def ratio_threshold_test_kernel(
+    active_count: int,
+    capacity: int,
+    percent: int,
+    result: wp.array[int],
+):
+    result[0] = int(_is_ratio_at_or_above_percent(active_count, capacity, percent))
+
+
+class TestRatioThreshold(unittest.TestCase):
+    """Test fill-ratio comparisons beyond the signed 32-bit product range."""
+
+    def test_large_capacity_does_not_overflow(self):
+        result = wp.zeros(1, dtype=int, device="cpu")
+        wp.launch(
+            ratio_threshold_test_kernel,
+            dim=1,
+            inputs=[274434, 268435456, 80, result],
+            device="cpu",
+        )
+        self.assertEqual(int(result.numpy()[0]), 0)
+
+        wp.launch(
+            ratio_threshold_test_kernel,
+            dim=1,
+            inputs=[214748365, 268435456, 80, result],
+            device="cpu",
+        )
+        self.assertEqual(int(result.numpy()[0]), 1)
 
 
 class TestCompactedAppend(unittest.TestCase):
