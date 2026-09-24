@@ -177,6 +177,75 @@ def _sphere_grid_body(builder, pos, n=5, spacing=0.05, radius=0.01, mass=1.0):
     return body
 
 
+def _speculative_ring_body(
+    builder,
+    pos,
+    *,
+    base_half=0.015,
+    base_hz=0.0015,
+    ring_radius=0.028,
+    ring_n=8,
+    ring_lift=0.002,
+    ring_half=0.003,
+    ring_hz=0.01,
+    mass=0.04,
+):
+    """Thin base slab ringed by boxes raised ``ring_lift`` above it: a tumbler.
+
+    The ring emits speculative candidates further out than every touching base
+    contact.  The touching face is at ``pos.z - base_hz``.
+    """
+    body = builder.add_body(xform=wp.transform(wp.vec3(*pos), wp.quat_identity()), mass=mass)
+    builder.add_shape_box(body, hx=base_half, hy=base_half, hz=base_hz)
+    for k in range(ring_n):
+        a = 2.0 * np.pi * (k + 0.5) / ring_n
+        z = -base_hz + ring_lift + ring_hz
+        builder.add_shape_box(
+            body,
+            xform=wp.transform(wp.vec3(ring_radius * np.cos(a), ring_radius * np.sin(a), z), wp.quat_identity()),
+            hx=ring_half,
+            hy=ring_half,
+            hz=ring_hz,
+        )
+    return body
+
+
+def _world_gaps(model, state, contacts):
+    """Canonical signed separation of every live contact (positive = speculative)."""
+    n = int(contacts.rigid_contact_count.numpy()[0])
+    s0 = contacts.rigid_contact_shape0.numpy()[:n]
+    s1 = contacts.rigid_contact_shape1.numpy()[:n]
+    p0 = contacts.rigid_contact_point0.numpy()[:n]
+    p1 = contacts.rigid_contact_point1.numpy()[:n]
+    nrm = contacts.rigid_contact_normal.numpy()[:n]
+    m0 = contacts.rigid_contact_margin0.numpy()[:n]
+    m1 = contacts.rigid_contact_margin1.numpy()[:n]
+    shape_body = model.shape_body.numpy()
+    body_q = state.body_q.numpy()
+
+    def to_world(shape, p):
+        b = shape_body[shape]
+        if b < 0:
+            return p
+        pos, quat = body_q[b][:3], body_q[b][3:7]
+        u = np.array(quat[:3])
+        return pos + p + 2.0 * np.cross(u, np.cross(u, p) + quat[3] * p)
+
+    w0 = np.array([to_world(s0[k], p0[k]) for k in range(n)]).reshape(n, 3)
+    w1 = np.array([to_world(s1[k], p1[k]) for k in range(n)]).reshape(n, 3)
+    gaps = np.einsum("ij,ij->i", nrm, w1 - w0) - m0 - m1
+    return gaps, 0.5 * (w0 + w1)
+
+
+def _max_angular_hole(points_xy, center_xy):
+    """Largest angular gap [rad] between consecutive points seen from ``center_xy``."""
+    if len(points_xy) < 2:
+        return 2.0 * np.pi
+    ang = np.sort(np.arctan2(points_xy[:, 1] - center_xy[1], points_xy[:, 0] - center_xy[0]))
+    holes = np.diff(np.concatenate([ang, [ang[0] + 2.0 * np.pi]]))
+    return float(holes.max())
+
+
 def _make_pipeline(model, reduce_body_pairs, *, reduce_mesh_contacts=True, **kwargs):
     config_fields = {
         "body_pair_cell_size",
@@ -3074,6 +3143,8 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
                 raw_state_0, raw_state_1 = raw_state_1, raw_state_0
                 peak_raw = max(peak_raw, float(np.abs(raw_state_0.body_qd.numpy()).max()))
 
+            solver.check_constraint_capacity()
+            raw_solver.check_constraint_capacity()
             stats = pipe_red._body_pair_reducer.stats()
             self.assertEqual(stats["invariant_violations"], 0, f"trial {trial}")
             self.assertEqual(raw_not_less, 150, f"trial {trial}: reduction increased a count")
@@ -3083,6 +3154,118 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
             self.assertTrue(np.isfinite(body_q).all() and np.isfinite(qd).all())
             self.assertLess(peak_red, max(3.0 * peak_raw, 10.0), f"trial {trial}: pile blew up")
             self.assertGreater(float(body_q[bodies, 2].min()), -0.06, f"trial {trial}: body tunneled")
+
+
+class TestBodyPairReductionTouchingFootprint(unittest.TestCase):
+    """Speculative candidates must not displace the touching support polygon."""
+
+    GAP = 0.005
+
+    def _model(self, *, device, penetration=0.0005):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        builder.rigid_gap = self.GAP
+        body = _speculative_ring_body(builder, (0.0, 0.0, 0.0015 - penetration))
+        builder.add_ground_plane()
+        model = builder.finalize(device=device)
+        return model, body
+
+    def test_touching_footprint_survives_speculative_ring(self):
+        """Keep at least three spanning touching contacts next to the speculative ring."""
+        model, body = self._model(device=wp.get_device())
+        state = model.state()
+        raw = _collide_once(model, state, False)
+        red = _collide_once(model, state, True)
+        n_raw = int(raw.rigid_contact_count.numpy()[0])
+        n_red = int(red.rigid_contact_count.numpy()[0])
+        center = state.body_q.numpy()[body][:2]
+
+        raw_gaps, raw_mid = _world_gaps(model, state, raw)
+        raw_touch = raw_mid[raw_gaps <= 0.0]
+        raw_spec = raw_mid[raw_gaps > 0.0]
+        self.assertGreaterEqual(len(raw_touch), 3, "scene has no touching footprint; the probe is vacuous")
+        self.assertGreaterEqual(len(raw_spec), 6, "scene has no speculative ring; the probe is vacuous")
+        self.assertLess(_max_angular_hole(raw_touch[:, :2], center), np.pi)
+        self.assertGreater(
+            float(np.linalg.norm(raw_spec[:, :2] - center, axis=1).min()),
+            float(np.linalg.norm(raw_touch[:, :2] - center, axis=1).max()),
+            "speculative ring must lie outside the touching footprint for this probe to bite",
+        )
+
+        self.assertLess(n_red, n_raw, "reducer removed nothing")
+        red_gaps, red_mid = _world_gaps(model, state, red)
+        red_touch = red_mid[red_gaps <= 0.0]
+        red_spec = red_mid[red_gaps > 0.0]
+        self.assertGreaterEqual(len(red_touch), 3, f"touching footprint collapsed to {len(red_touch)} contact(s)")
+        self.assertLess(
+            _max_angular_hole(red_touch[:, :2], center),
+            np.pi,
+            "kept touching contacts do not surround the body: it would tip",
+        )
+        self.assertGreaterEqual(len(red_spec), 1, "speculative envelope must stay represented")
+
+    def test_touching_footprint_kept_set_is_stable_at_rest(self):
+        """Repeat collides of the resting body keep the same touching representatives."""
+        model, _ = self._model(device=wp.get_device())
+        state = model.state()
+        pipeline = _make_pipeline(model, True)
+        contacts = pipeline.contacts()
+        previous = None
+        for _ in range(5):
+            pipeline.collide(state, contacts)
+            gaps, mid = _world_gaps(model, state, contacts)
+            touch = np.round(mid[gaps <= 0.0][:, :2] * 1.0e4).astype(int)
+            rows = sorted(map(tuple, touch.tolist()))
+            if previous is not None:
+                self.assertEqual(rows, previous, "touching representatives changed on an unchanged state")
+            previous = rows
+
+    @unittest.skipUnless(wp.is_cuda_available(), "FeatherPGS matrix-free solve requires CUDA")
+    def test_speculative_ring_body_rests_still_with_feather_pgs(self):
+        """Rest the ring body under 4 x 16 FeatherPGS: reduced must be as still as unreduced."""
+        device = wp.get_cuda_device()
+        dt, substeps, steps = 0.05, 4, 60
+
+        def settle(reduce_on):
+            model, body = self._model(device=device, penetration=-0.0005)
+            state_0, state_1 = model.state(), model.state()
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+            control = model.control()
+            pipeline = _make_pipeline(model, reduce_on, contact_matching="latest")
+            contacts = pipeline.contacts()
+            solver = newton.solvers.SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                pgs_iterations=16,
+                pgs_beta=0.2,
+                pgs_contact_regularization=0.01,
+                pgs_warmstart=True,
+                friction_anchor_beta=0.2,
+                contact_friction_gap_threshold=0.001,
+            )
+            speeds, rots = [], []
+            q_ref = None
+            for k in range(steps):
+                for _ in range(substeps):
+                    pipeline.collide(state_0, contacts)
+                    solver.step(state_0, state_1, control, contacts, dt / substeps)
+                    state_0, state_1 = state_1, state_0
+                if k == steps // 3:
+                    q_ref = state_0.body_q.numpy()[body][3:7].copy()
+                if k > steps // 3:
+                    qd = state_0.body_qd.numpy()[body]
+                    speeds.append(float(np.linalg.norm(qd[:3])))
+                    q = state_0.body_q.numpy()[body][3:7]
+                    cos_half = min(1.0, abs(float(np.dot(q, q_ref))))
+                    rots.append(float(np.degrees(2.0 * np.arccos(cos_half))))
+            stats = pipeline.body_pair_reduction_stats() if reduce_on else None
+            return float(np.mean(speeds)), float(np.max(rots)), stats
+
+        v_off, rot_off, _ = settle(False)
+        v_on, rot_on, stats = settle(True)
+        self.assertLess(stats["sum_contacts_kept"], stats["sum_contacts_in"], "ring body contacts were never reduced")
+        self.assertLess(v_off, 0.002, f"unreduced reference body is not at rest ({v_off * 1000:.1f} mm/s)")
+        self.assertLess(v_on, 0.002, f"reduced body rocks at {v_on * 1000:.1f} mm/s (unreduced {v_off * 1000:.2f})")
+        self.assertLess(rot_on, 0.5, f"reduced body drifted {rot_on:.2f} deg (unreduced {rot_off:.3f})")
 
 
 if __name__ == "__main__":

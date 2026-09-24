@@ -151,7 +151,10 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
         normal = wp.cross(u, w)
 
         t = wp.length_sq(normal)
-        degenerate = t < EPSILON
+        # Squared area has units of length^4. An absolute cutoff rejects
+        # ordinary small triangles and can stall GJK on an unchanged edge.
+        # Compare sin(angle)^2 instead, including zero-length edges.
+        degenerate = t <= EPSILON * wp.length_sq(u) * wp.length_sq(w)
         # Guard division by zero in degenerate cases
         denom = t
         if degenerate:
@@ -205,7 +208,9 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
         bc[i2] = lambda2
 
         mask = (wp.uint32(1) << wp.uint32(i0)) | (wp.uint32(1) << wp.uint32(i1)) | (wp.uint32(1) << wp.uint32(i2))
-        return lambda0 * a + lambda1 * b + lambda2 * c, bc, mask
+        # Project onto the face directly. Summing large weighted vertices can
+        # introduce tangential cancellation error that dominates a small gap.
+        return normal * (wp.dot(normal, a) * it), bc, mask
 
     @wp.func
     def determinant(a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3) -> float:
@@ -376,16 +381,39 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
         dist_sq = wp.length_sq(v)
 
         last_search_dir = wp.vec3(1.0, 0.0, 0.0)
+        certified_near = bool(False)
 
         while iter_count > 0:
             iter_count -= 1
+            convergence_epsilon = COLLIDE_EPSILON
 
             if dist_sq < COLLIDE_EPSILON * COLLIDE_EPSILON:
-                # Shapes are overlapping
-                distance = 0.0
-                normal = wp.vec3(0.0, 0.0, 0.0)
-                point_a, point_b = simplex_get_closest(simplex_v, simplex_barycentric, simplex_usage_mask)
-                return False, point_a, point_b, normal, distance
+                # A small simplex distance is not proof of overlap. Preserve
+                # the witness gap and normal when a support plane certifies
+                # separation, even below the distance convergence tolerance.
+                if simplex_usage_mask != wp.uint32(0):
+                    near_direction = last_search_dir
+                    if dist_sq > EPSILON * EPSILON:
+                        near_direction = -v
+                    if wp.length_sq(near_direction) > EPSILON * EPSILON:
+                        near_normal = wp.normalize(near_direction)
+                        support = minkowski_support(
+                            geom_a, geom_b, near_normal, orientation_b, position_b, extend, data_provider
+                        )
+                        support_plane = wp.dot(near_normal, support.BtoA)
+                        if support_plane < 0.0 and dist_sq > EPSILON * EPSILON:
+                            certified_near = True
+                            break
+                        if support_plane <= 0.0 and dist_sq <= EPSILON * EPSILON:
+                            point_a, point_b = simplex_get_closest(simplex_v, simplex_barycentric, simplex_usage_mask)
+                            return False, point_a, point_b, near_normal, 0.0
+                if dist_sq <= EPSILON * EPSILON:
+                    # Origin reached without a separating/supporting plane.
+                    point_a, point_b = simplex_get_closest(simplex_v, simplex_barycentric, simplex_usage_mask)
+                    return False, point_a, point_b, wp.vec3(0.0), 0.0
+                # The simplex is close but its direction has not certified
+                # separation. Refine rather than declaring an overlap.
+                convergence_epsilon = EPSILON
 
             search_dir = -v
             # Track last search direction for robust normal fallback
@@ -406,7 +434,7 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
             if max_dist > 0.0 and wp.dot(v, w_v) > max_dist * wp.sqrt(dist_sq):
                 break
             delta_dist = wp.dot(v, v - w_v)
-            if delta_dist <= 0.0 or delta_dist * delta_dist < (COLLIDE_EPSILON * COLLIDE_EPSILON * dist_sq):
+            if delta_dist <= 0.0 or delta_dist * delta_dist < (convergence_epsilon * convergence_epsilon * dist_sq):
                 break
 
             # Check for duplicate vertex (numerical stalling)
@@ -414,7 +442,7 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
             for i in range(4):
                 if (simplex_usage_mask & (wp.uint32(1) << wp.uint32(i))) != wp.uint32(0):
                     # Compare BtoA vectors directly
-                    if wp.length_sq(simplex_v[2 * i + 1] - w_v) < COLLIDE_EPSILON * COLLIDE_EPSILON:
+                    if wp.length_sq(simplex_v[2 * i + 1] - w_v) < convergence_epsilon * convergence_epsilon:
                         is_duplicate = bool(True)
                         break
             if is_duplicate:
@@ -486,6 +514,19 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
 
         # Compute closest points first
         point_a, point_b = simplex_get_closest(simplex_v, simplex_barycentric, simplex_usage_mask)
+
+        if dist_sq < COLLIDE_EPSILON * COLLIDE_EPSILON:
+            near_normal = wp.normalize(-v)
+            support = minkowski_support(geom_a, geom_b, near_normal, orientation_b, position_b, extend, data_provider)
+            if wp.dot(near_normal, support.BtoA) >= 0.0:
+                return False, point_a, point_b, wp.vec3(0.0), 0.0
+            certified_near = True
+
+        if certified_near:
+            # Preserve the certified direction rather than subtracting two
+            # large witness coordinates to reconstruct a tiny separation.
+            normal = wp.normalize(-v)
+            return True, point_a, point_b, normal, wp.dot(point_b - point_a, normal)
 
         # Prefer A->B vector if reliable; otherwise fall back to -v or last search dir
         delta = point_b - point_a

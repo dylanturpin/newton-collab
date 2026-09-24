@@ -773,6 +773,77 @@ def test_sticky_matched_rows_replayed(test, device):
             )
 
 
+def _build_rolling_cylinder_scene(device):
+    """A cylinder lying on the ground plane, axis along x so it can roll."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+    builder.add_shape_cylinder(
+        body=body,
+        radius=0.1,
+        half_height=0.1,
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), wp.pi / 2.0)),
+    )
+    model = builder.finalize(device=device)
+    return model, model.state()
+
+
+def test_sticky_rotated_anchor_falls_back_to_fresh(test, device):
+    """STICKY: replay must stop once the stored witness leaves the contact.
+
+    The saved witness is body-local, so a rolling body carries it away from
+    the contact while the contact point itself stays put.  Replaying it then
+    places the normal constraint a lever arm from the true contact, which
+    torques the body instead of supporting it.
+
+    Only shapes whose narrow phase returns a moving surface point are
+    affected; spheres store a centre and boxes a corner, so they are immune.
+    A cylinder rolling about its own axis moves the witness by r*theta.
+    """
+    with wp.ScopedDevice(device):
+        model, state = _build_rolling_cylinder_scene(device)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="sticky")
+        contacts = pipeline.contacts()
+
+        count1 = _collide_once(pipeline, state, contacts)
+        test.assertGreater(count1, 0)
+        snap_point1 = contacts.rigid_contact_point1.numpy()[:count1].copy()
+
+        # Roll in place by 0.1 rad about the cylinder axis: the contact line
+        # does not move, but the material witness travels r*theta = 10 mm,
+        # twenty times the 0.5 mm match threshold.
+        q = state.body_q.numpy()
+        rot = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.1)
+        for i in range(len(q)):
+            q[i] = wp.transform(wp.vec3(float(q[i][0]), float(q[i][1]), float(q[i][2])), rot)
+        state.body_q = wp.array(q, dtype=wp.transform, device=device)
+
+        pipeline_fresh = newton.CollisionPipeline(model, broad_phase="nxn")
+        contacts_fresh = pipeline_fresh.contacts()
+        count_fresh = _collide_once(pipeline_fresh, state, contacts_fresh)
+        test.assertEqual(count1, count_fresh)
+        fresh_point1 = contacts_fresh.rigid_contact_point1.numpy()[:count_fresh].copy()
+
+        count2 = _collide_once(pipeline, state, contacts)
+        test.assertEqual(count1, count2)
+        match_idx = contacts.rigid_contact_match_index.numpy()[:count2]
+        test.assertTrue(
+            np.all(match_idx >= 0),
+            f"Rolling in place must still match the same contacts. Unique: {np.unique(match_idx)}",
+        )
+
+        # Precondition: the stored witness really did leave the contact.
+        drift = np.linalg.norm(snap_point1 - fresh_point1, axis=1).max()
+        test.assertGreater(drift, 0.0005, "Precondition: rolling must move the witness past the match threshold")
+
+        np.testing.assert_allclose(
+            contacts.rigid_contact_point1.numpy()[:count2],
+            fresh_point1,
+            atol=1.0e-6,
+            err_msg="Sticky replay must be rejected once the stored witness leaves the contact",
+        )
+
+
 def test_sticky_unmatched_rows_pass_through(test, device):
     """STICKY mode: unmatched rows keep the current frame's narrow-phase data.
 
@@ -946,6 +1017,12 @@ add_function_test(
 
 add_function_test(
     TestContactMatchingSticky, "test_sticky_matched_rows_replayed", test_sticky_matched_rows_replayed, devices=devices
+)
+add_function_test(
+    TestContactMatchingSticky,
+    "test_sticky_rotated_anchor_falls_back_to_fresh",
+    test_sticky_rotated_anchor_falls_back_to_fresh,
+    devices=devices,
 )
 add_function_test(
     TestContactMatchingSticky,

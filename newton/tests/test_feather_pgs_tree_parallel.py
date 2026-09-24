@@ -13,7 +13,13 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSTreePlan
 from newton.solvers import SolverFeatherPGS
-from newton.tests.test_feather_pgs_leaf_publication import _build_branched_model, _build_model, _fields, _solver
+from newton.tests.test_feather_pgs_leaf_publication import (
+    _build_branched_model,
+    _build_contact_model,
+    _build_model,
+    _fields,
+    _solver,
+)
 
 
 def _build_fingers(device="cpu", *, articulations=3, include_chain=False, ragged=False, requires_grad=False):
@@ -240,6 +246,29 @@ class TestFeatherPGSTreePlan(unittest.TestCase):
 
 
 class TestFeatherPGSTreeExecution(unittest.TestCase):
+    def test_cuda_tree_and_device_torsion_initialize_together(self):
+        """Retain both opt-in initializers and torsion capture preparation after merging."""
+        devices = wp.get_cuda_devices()
+        if not devices:
+            self.skipTest("Device torsion and parallel trees require CUDA")
+        for device in devices:
+            with self.subTest(device=str(device)):
+                model = _build_contact_model(device)
+                solver = SolverFeatherPGS(
+                    model,
+                    pgs_mode="matrix_free",
+                    parallel_tree=True,
+                    contact_torsion_device=True,
+                    contact_torsion_radius=0.01,
+                    friction_anchor_beta=0.0,
+                    use_parallel_streams=False,
+                )
+                self.assertIsNotNone(solver._tree_plan)
+                self.assertEqual(len(solver._tree_net_wrenches), len(solver._tree_plan.groups))
+                self.assertIsNotNone(getattr(solver, "_device_torsion", None))
+                solver.prepare_contact_torsion_capture(model.state(), model.state())
+                solver.validate_contact_torsion()
+
     def test_cuda_backward_torques_with_live_forces_and_passive_terms(self):
         """Preserve child reductions, additive torque and original-velocity damping."""
         devices = wp.get_cuda_devices()
@@ -353,7 +382,12 @@ class TestFeatherPGSTreeExecution(unittest.TestCase):
                                 q0, q1 = model.joint_q_start.numpy()[[start, end]]
                                 q[q0:q1] += 0.1
                                 state.joint_q.assign(q)
-                                solver._fk_id_cache_valid.assign(np.array([1, 0, 1], dtype=np.int32))
+                                solver._fk_id_cache_valid.fill_(1)
+                                solver.notify_state_changed(wp.array([1], dtype=wp.int32, device=device))
+                                np.testing.assert_array_equal(
+                                    solver._fk_id_cache_valid.numpy(),
+                                    [1, 0, 1] if solver._fk_id_cache_enabled else [1, 1, 1],
+                                )
                             elif phase == "warm":
                                 solver._fk_id_cache_valid.fill_(1)
                             _, predictor_qd = solver._stage1_fk_id(state, solver, following)

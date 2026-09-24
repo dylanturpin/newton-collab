@@ -301,6 +301,13 @@ def write_contact_speculative(
 
 
 @wp.kernel(enable_backward=False)
+def _record_reduction_overflow(
+    insert_failures: wp.array[int], buffer_overflows: wp.array[int], overflow: wp.array[int]
+):
+    overflow[0] = int(insert_failures[0] > 0 or buffer_overflows[0] > 0)
+
+
+@wp.kernel(enable_backward=False)
 def compute_shape_aabbs(
     body_q: wp.array[wp.transform],
     shape_transform: wp.array[wp.transform],
@@ -1239,8 +1246,10 @@ class CollisionPipeline:
                 same-normal patches independently represented.
             body_pair_verify: Recheck reducer implementation invariants each
                 frame.  Intended for tests and debugging.
-            body_pair_hysteresis: Previous-winner preference [m].  Set to zero
-                for memoryless selection.
+            body_pair_hysteresis: Previous-winner preference [m].  Also how far
+                a touching-slot winner may lift off and still compete in the
+                touching family, without the preference.  Set to zero for
+                memoryless selection.
             body_pair_hashtable_headroom: Multiplier on the group-table capacity
                 derived from the model's own contact-pair topology. ``1.0``
                 reserves the larger of one entry per reachable group pair and
@@ -1261,9 +1270,10 @@ class CollisionPipeline:
         pressure, area, and moment data that ordinary contact reducers do not
         carry.
 
-        Body-pair reduction keeps one depth representative and up to six sampled
-        footprint representatives per group among contacts already delivered by
-        the narrow phase.  With nonzero hysteresis, an incumbent may trail the
+        Body-pair reduction keeps one depth representative, up to six sampled
+        footprint representatives over all contacts, and up to six more over the
+        touching contacts (canonical separation ``<= 0``) per group among
+        contacts already delivered by the narrow phase.  With nonzero hysteresis, an incumbent may trail the
         instantaneous slot winner by no more than the configured margin;
         contacts with identical packed winner keys may retain additional
         contacts.  It is an approximation with scene-dependent support error
@@ -2701,6 +2711,16 @@ class CollisionPipeline:
             max_speculative_extension=max_speculative_extension,
             device=self.device,
         )
+
+        reducer = self.narrow_phase.global_contact_reducer
+        if reducer is not None:
+            wp.launch(
+                _record_reduction_overflow,
+                dim=1,
+                inputs=[reducer.ht_insert_failures, reducer.buffer_overflows, contacts._reduction_overflow],
+                device=self.device,
+                record_tape=False,
+            )
 
         if self.deterministic and self._contact_sorter is not None:
             self._contact_sorter.sort_full(
