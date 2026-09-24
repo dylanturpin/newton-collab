@@ -3032,7 +3032,8 @@ def build_joint_limit_rows_for_size(
 # Mimic (Joint Coupling) Constraint Kernels
 # =============================================================================
 # Bilateral equality rows enforcing ``q_follower = coef0 + coef1 * q_leader``
-# between two 1-DoF joints of the same articulation, sourced from
+# between two DOFs of the same articulation, sourced from joint-owned
+# ``Model.joint_mimic_*`` (one row per coordinate) or the deprecated
 # ``Model.constraint_mimic_*``. This is the FeatherPGS analogue of PhysX's
 # ``PxArticulationMimicJoint`` (``qA + gearRatio*qB + offset = 0`` with
 # ``gearRatio = -coef1``, ``offset = -coef0``): a joint-space row with two
@@ -3049,6 +3050,7 @@ def build_joint_limit_rows_for_size(
 @wp.kernel
 def allocate_mimic_slots(
     mimic_valid: wp.array[int],
+    mimic_legacy: wp.array[int],
     mimic_enabled: wp.array[wp.bool],
     mimic_world: wp.array[int],
     max_constraints: int,
@@ -3058,14 +3060,15 @@ def allocate_mimic_slots(
 ):
     """Allocate one dense constraint slot per enabled, valid mimic constraint.
 
-    Launched with ``dim = constraint_mimic_count``. Disabled or invalid mimics
-    get ``mimic_slot = -1`` and consume no slot.
+    Launched with one thread per mimic row. Disabled or invalid rows get
+    ``mimic_slot = -1`` and consume no slot; joint-owned rows are always enabled.
     """
     k = wp.tid()
     mimic_slot[k] = -1
     if mimic_valid[k] == 0:
         return
-    if not mimic_enabled[k]:
+    legacy = mimic_legacy[k]
+    if legacy >= 0 and not mimic_enabled[legacy]:
         return
     slot = wp.atomic_add(world_slot_counter, mimic_world[k], 1)
     if slot < max_constraints:
@@ -3084,8 +3087,11 @@ def populate_mimic_J_for_size(
     mimic_dof1: wp.array[int],
     mimic_q0: wp.array[int],
     mimic_q1: wp.array[int],
+    mimic_legacy: wp.array[int],
+    mimic_owner: wp.array[int],
     mimic_coef0: wp.array[float],
     mimic_coef1: wp.array[float],
+    joint_mimic_coeffs: wp.array[wp.vec2],
     joint_q: wp.array[float],
     pgs_beta: float,
     pgs_cfm: float,
@@ -3119,8 +3125,14 @@ def populate_mimic_J_for_size(
         if slot < 0:
             continue
 
-        c0 = mimic_coef0[k]
-        c1 = mimic_coef1[k]
+        legacy = mimic_legacy[k]
+        if legacy >= 0:
+            c0 = mimic_coef0[legacy]
+            c1 = mimic_coef1[legacy]
+        else:
+            coeffs = joint_mimic_coeffs[mimic_owner[k]]
+            c0 = coeffs[0]
+            c1 = coeffs[1]
 
         # Jacobian: +1 on the follower DOF, -coef1 on the leader DOF. The two
         # DOFs are guaranteed distinct by the host-side validity mask.

@@ -59,7 +59,7 @@ def _build_v_jaws(tilt_deg: float, geometry: str = "box"):
         )
         jaws.append(body)
     b.add_articulation([root, *joints], label="gripper")
-    b.add_constraint_mimic(joints[1], joints[0], coef0=0.0, coef1=-1.0)
+    b.set_joint_mimic(joints[1], joints[0], coeffs=(0.0, -1.0))
     for dof in range(len(b.joint_effort_limit)):
         b.joint_effort_limit[dof] = 10.0
     box = b.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), label="box")
