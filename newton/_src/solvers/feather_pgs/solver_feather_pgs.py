@@ -247,6 +247,7 @@ _PERSISTENT_HINV_JT_MIN_DOF = 17
 def _prepare_augmented_joint_drives_by_dof(
     drive_row_by_dof: wp.array[int],
     drive_q_index_by_dof: wp.array[int],
+    drive_target_index_by_dof: wp.array[int],
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
     joint_target_ke: wp.array[float],
@@ -275,7 +276,7 @@ def _prepare_augmented_joint_drives_by_dof(
 
     q = joint_q[drive_q_index_by_dof[dof]]
     qd = joint_qd[dof]
-    u0 = -(ke * (q - joint_target_pos[dof] + dt * qd) + kd * (qd - joint_target_vel[dof]))
+    u0 = -(ke * (q - joint_target_pos[drive_target_index_by_dof[dof]] + dt * qd) + kd * (qd - joint_target_vel[dof]))
     effort_limit = joint_effort_limit[dof]
     if effort_limit > 0.0:
         u0 = wp.clamp(u0, -effort_limit, effort_limit)
@@ -3166,15 +3167,16 @@ class SolverFeatherPGS(SolverBase):
         return min(requested, max(_PROPAGATION_DENSE_INTERNAL_ROW_RESERVE, int(rounded)))
 
     def _build_mimic_plan(self, model) -> None:
-        """Precompute the static per-mimic lookup tables for the MIMIC row family.
+        """Precompute the static per-row lookup tables for the MIMIC row family.
 
-        Resolves ``Model.constraint_mimic_*`` joint indices into articulation / DOF /
-        coordinate indices and validates the supported subset: both joints 1-DoF
-        (REVOLUTE or PRISMATIC), both in the same articulation, distinct DOFs — matching
-        SolverMuJoCo's own restriction. Invalid entries are warned about and masked off;
-        ``coef0``/``coef1``/``enabled`` stay live reads from the model arrays so runtime
-        mutation needs no re-initialization. All buffers are allocated here, once, so the
-        per-step launches are CUDA-graph-safe.
+        Rows come from joint-owned mimics (``Model.joint_mimic_joint``, one row per
+        follower coordinate) and the deprecated ``Model.constraint_mimic_*`` entries,
+        which take precedence for their follower joint as in SolverMuJoCo. Both joints
+        of a row must share an articulation and have distinct DOFs; legacy entries must
+        be 1-DoF REVOLUTE or PRISMATIC. Invalid entries warn and are masked off.
+        Coefficients and ``constraint_mimic_enabled`` stay live reads from the model, so
+        runtime mutation needs no re-initialization. All buffers are allocated here,
+        once, so the per-step launches are CUDA-graph-safe.
         """
         self._mimic_count = 0
         self._mimic_valid_np = None
@@ -3184,19 +3186,25 @@ class SolverFeatherPGS(SolverBase):
         self._mimic_art_list = None
         self._mimic_sizes = frozenset()
         self.mimic_slot = None
-        n = int(getattr(model, "constraint_mimic_count", 0) or 0)
-        if n == 0 or not model.articulation_count or self.art_to_world is None:
+        if not model.articulation_count or self.art_to_world is None:
+            return
+
+        legacy_count = int(getattr(model, "constraint_mimic_count", 0) or 0)
+        joint_mimic_joint = getattr(model, "joint_mimic_joint", None)
+        joint_mimic = (
+            joint_mimic_joint.numpy().astype(np.int32, copy=False)
+            if joint_mimic_joint is not None and model.joint_count
+            else np.full(model.joint_count, -1, dtype=np.int32)
+        )
+        if legacy_count == 0 and not np.any(joint_mimic >= 0):
             return
 
         device = model.device
-        j0 = model.constraint_mimic_joint0.numpy().astype(np.int32, copy=False)
-        j1 = model.constraint_mimic_joint1.numpy().astype(np.int32, copy=False)
-        mimic_world = model.constraint_mimic_world.numpy().astype(np.int32, copy=False)
         articulation_start = model.articulation_start.numpy().astype(np.int64, copy=False)
         joint_type = model.joint_type.numpy().astype(np.int32, copy=False)
         joint_qd_start = model.joint_qd_start.numpy().astype(np.int32, copy=False)
         joint_q_start = model.joint_q_start.numpy().astype(np.int32, copy=False)
-        labels = list(getattr(model, "constraint_mimic_label", []) or [])
+        joint_world = model.joint_world.numpy().astype(np.int32, copy=False)
 
         def art_of(j: int) -> int:
             a = int(np.searchsorted(articulation_start, j, side="right")) - 1
@@ -3206,61 +3214,104 @@ class SolverFeatherPGS(SolverBase):
                 return -1
             return a
 
-        one_dof = (int(JointType.REVOLUTE), int(JointType.PRISMATIC))
+        # Per row: follower/leader DOF and coordinate, articulation, world, and the
+        # coefficient source (legacy constraint index, or follower joint for joint-owned).
+        dof0, dof1, q0, q1, art, world, legacy, owner, labels = [], [], [], [], [], [], [], [], []
+
+        legacy_followers = set()
+        if legacy_count:
+            j0 = model.constraint_mimic_joint0.numpy().astype(np.int32, copy=False)
+            j1 = model.constraint_mimic_joint1.numpy().astype(np.int32, copy=False)
+            legacy_world = model.constraint_mimic_world.numpy().astype(np.int32, copy=False)
+            legacy_labels = list(getattr(model, "constraint_mimic_label", []) or [])
+            legacy_followers = {int(j) for j in j0}
+            one_dof = (int(JointType.REVOLUTE), int(JointType.PRISMATIC))
+            for k in range(legacy_count):
+                name = legacy_labels[k] if k < len(legacy_labels) else f"mimic_{k}"
+                if int(joint_type[j0[k]]) not in one_dof or int(joint_type[j1[k]]) not in one_dof:
+                    warnings.warn(
+                        f"SolverFeatherPGS: mimic constraint '{name}' references a non-1-DoF "
+                        "joint (only REVOLUTE/PRISMATIC are supported); the constraint is ignored.",
+                        stacklevel=3,
+                    )
+                    a = -1
+                else:
+                    a = art_of(int(j0[k]))
+                dof0.append(int(joint_qd_start[j0[k]]))
+                dof1.append(int(joint_qd_start[j1[k]]))
+                q0.append(int(joint_q_start[j0[k]]))
+                q1.append(int(joint_q_start[j1[k]]))
+                art.append((a, art_of(int(j1[k]))))
+                world.append(int(legacy_world[k]))
+                legacy.append(k)
+                owner.append(-1)
+                labels.append(name)
+
+        joint_qd_end = np.append(joint_qd_start[1:], model.joint_dof_count)
+        for follower in np.flatnonzero(joint_mimic >= 0).tolist():
+            if follower in legacy_followers:
+                continue
+            leader = int(joint_mimic[follower])
+            dims = int(joint_qd_end[follower] - joint_qd_start[follower])
+            for i in range(dims):
+                dof0.append(int(joint_qd_start[follower]) + i)
+                dof1.append(int(joint_qd_start[leader]) + i)
+                q0.append(int(joint_q_start[follower]) + i)
+                q1.append(int(joint_q_start[leader]) + i)
+                art.append((art_of(follower), art_of(leader)))
+                world.append(int(joint_world[follower]))
+                legacy.append(-1)
+                owner.append(follower)
+                labels.append(f"joint_mimic_{follower}[{i}]")
+
+        n = len(dof0)
         valid = np.zeros(n, dtype=np.int32)
-        art = np.full(n, -1, dtype=np.int32)
+        row_art = np.full(n, -1, dtype=np.int32)
         for k in range(n):
-            a0, a1 = art_of(int(j0[k])), art_of(int(j1[k]))
-            name = labels[k] if k < len(labels) else f"mimic_{k}"
+            a0, a1 = art[k]
             if a0 < 0 or a1 < 0 or a0 != a1:
-                warnings.warn(
-                    f"SolverFeatherPGS: mimic constraint '{name}' spans articulations "
-                    f"({a0} vs {a1}); cross-articulation mimic is unsupported and the "
-                    "constraint is ignored.",
-                    stacklevel=2,
-                )
+                if a0 >= 0 or legacy[k] < 0:
+                    warnings.warn(
+                        f"SolverFeatherPGS: mimic '{labels[k]}' spans articulations ({a0} vs {a1}); "
+                        "cross-articulation mimic is unsupported and the row is ignored.",
+                        stacklevel=3,
+                    )
                 continue
-            if int(joint_type[j0[k]]) not in one_dof or int(joint_type[j1[k]]) not in one_dof:
-                warnings.warn(
-                    f"SolverFeatherPGS: mimic constraint '{name}' references a non-1-DoF "
-                    "joint (only REVOLUTE/PRISMATIC are supported); the constraint is ignored.",
-                    stacklevel=2,
-                )
-                continue
-            if joint_qd_start[j0[k]] == joint_qd_start[j1[k]]:
-                warnings.warn(
-                    f"SolverFeatherPGS: mimic constraint '{name}' couples a DOF to itself; ignored.", stacklevel=2
-                )
+            if dof0[k] == dof1[k]:
+                warnings.warn(f"SolverFeatherPGS: mimic '{labels[k]}' couples a DOF to itself; ignored.", stacklevel=3)
                 continue
             valid[k] = 1
-            art[k] = a0
+            row_art[k] = a0
 
         valid_indices = np.flatnonzero(valid).astype(np.int32, copy=False)
         if valid_indices.size:
-            order = valid_indices[np.argsort(art[valid_indices], kind="stable")]
-            counts = np.bincount(art[order], minlength=model.articulation_count)
+            order = valid_indices[np.argsort(row_art[valid_indices], kind="stable")]
+            counts = np.bincount(row_art[order], minlength=model.articulation_count)
         else:
             order = np.empty(0, dtype=np.int32)
             counts = np.zeros(model.articulation_count, dtype=np.int64)
         art_start = np.zeros(model.articulation_count + 1, dtype=np.int32)
         art_start[1:] = np.cumsum(counts, dtype=np.int64).astype(np.int32)
 
+        world_np = np.asarray(world, dtype=np.int32)
         self._mimic_valid_np = valid
-        self._mimic_world_np = mimic_world
+        self._mimic_world_np = world_np
         self._mimic_art_start_np = art_start
         self._mimic_sizes = frozenset(
             int(self._model_plan.response_dof_count[a])
-            for a in np.unique(art[valid_indices])
+            for a in np.unique(row_art[valid_indices])
             if self._model_plan.response_dof_count[a] > 0
         )
         self._mimic_art_start = wp.array(art_start, dtype=wp.int32, device=device)
         self._mimic_art_list = wp.array(order, dtype=wp.int32, device=device)
         self._mimic_valid = wp.array(valid, dtype=wp.int32, device=device)
-        self._mimic_world = wp.array(mimic_world, dtype=wp.int32, device=device)
-        self._mimic_dof0 = wp.array(joint_qd_start[j0], dtype=wp.int32, device=device)
-        self._mimic_dof1 = wp.array(joint_qd_start[j1], dtype=wp.int32, device=device)
-        self._mimic_q0 = wp.array(joint_q_start[j0], dtype=wp.int32, device=device)
-        self._mimic_q1 = wp.array(joint_q_start[j1], dtype=wp.int32, device=device)
+        self._mimic_world = wp.array(world_np, dtype=wp.int32, device=device)
+        self._mimic_dof0 = wp.array(dof0, dtype=wp.int32, device=device)
+        self._mimic_dof1 = wp.array(dof1, dtype=wp.int32, device=device)
+        self._mimic_q0 = wp.array(q0, dtype=wp.int32, device=device)
+        self._mimic_q1 = wp.array(q1, dtype=wp.int32, device=device)
+        self._mimic_legacy = wp.array(legacy, dtype=wp.int32, device=device)
+        self._mimic_owner = wp.array(owner, dtype=wp.int32, device=device)
         self.mimic_slot = wp.full((n,), -1, dtype=wp.int32, device=device)
         self._mimic_count = n
 
@@ -4601,6 +4652,7 @@ class SolverFeatherPGS(SolverBase):
             (max(1, int(model.joint_dof_count)),), -1, dtype=wp.int32, device=model.device
         )
         self._augmented_drive_q_index_by_dof = None
+        self._augmented_drive_target_index_by_dof = None
         if not self._async_augmented_drives or self._has_loop_joints or not model.joint_dof_count:
             return
 
@@ -4618,12 +4670,14 @@ class SolverFeatherPGS(SolverBase):
         joint_type = model.joint_type.numpy()
         joint_q_start = model.joint_q_start.numpy()
         joint_qd_start = model.joint_qd_start.numpy()
+        joint_target_q_start = model.joint_target_q_start.numpy()
         joint_dof_dim = model.joint_dof_dim.numpy()
         articulation_start = model.articulation_start.numpy()
         max_dofs = self.articulation_max_dofs
 
         drive_row_by_dof = np.full(dof_count, -1, dtype=np.int32)
         drive_q_index_by_dof = np.full(dof_count, -1, dtype=np.int32)
+        drive_target_index_by_dof = np.full(dof_count, -1, dtype=np.int32)
         row_counts = np.zeros(model.articulation_count, dtype=np.int32)
         row_dof_index = np.zeros(model.articulation_count * max_dofs, dtype=np.int32)
         supported = (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
@@ -4640,6 +4694,7 @@ class SolverFeatherPGS(SolverBase):
                     row = articulation * max_dofs + slot
                     drive_row_by_dof[dof] = row
                     drive_q_index_by_dof[dof] = int(joint_q_start[joint] + axis)
+                    drive_target_index_by_dof[dof] = int(joint_target_q_start[joint] + axis)
                     row_dof_index[row] = dof
                     slot += 1
                 if slot >= max_dofs:
@@ -4648,6 +4703,9 @@ class SolverFeatherPGS(SolverBase):
 
         self._augmented_drive_row_by_dof = wp.array(drive_row_by_dof, dtype=wp.int32, device=model.device)
         self._augmented_drive_q_index_by_dof = wp.array(drive_q_index_by_dof, dtype=wp.int32, device=model.device)
+        self._augmented_drive_target_index_by_dof = wp.array(
+            drive_target_index_by_dof, dtype=wp.int32, device=model.device
+        )
         self.aug_row_counts.assign(row_counts)
         self.aug_row_dof_index.assign(row_dof_index)
         self._parallel_augmented_drive_topology = True
@@ -9367,6 +9425,7 @@ class SolverFeatherPGS(SolverBase):
                     inputs=[
                         self._augmented_drive_row_by_dof,
                         self._augmented_drive_q_index_by_dof,
+                        self._augmented_drive_target_index_by_dof,
                         state_in.joint_q,
                         state_in.joint_qd,
                         model.joint_target_ke,
@@ -9396,6 +9455,7 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_target_ke,
                         model.joint_target_kd,
                         control.joint_target_q,
+                        model.joint_target_q_start,
                         control.joint_target_qd,
                         model.joint_effort_limit,
                         self.articulation_max_dofs,
@@ -9569,6 +9629,7 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_target_ke,
                         model.joint_target_kd,
                         control.joint_target_q,
+                        model.joint_target_q_start,
                         control.joint_target_qd,
                         model.joint_effort_limit,
                         self.articulation_max_dofs,
@@ -10228,6 +10289,7 @@ class SolverFeatherPGS(SolverBase):
                         model.joint_effort_limit,
                         state_in.joint_q,
                         control.joint_target_q,
+                        model.joint_target_q_start,
                         control.joint_target_qd,
                         self._drive_vel_limit_src_arg,
                         # Equals int(fuse_joint_velocity_limits) here: this
@@ -10276,6 +10338,7 @@ class SolverFeatherPGS(SolverBase):
                 dim=self._mimic_count,
                 inputs=[
                     self._mimic_valid,
+                    self._mimic_legacy,
                     model.constraint_mimic_enabled,
                     self._mimic_world,
                     max_constraints,
@@ -10308,8 +10371,11 @@ class SolverFeatherPGS(SolverBase):
                         self._mimic_dof1,
                         self._mimic_q0,
                         self._mimic_q1,
+                        self._mimic_legacy,
+                        self._mimic_owner,
                         model.constraint_mimic_coef0,
                         model.constraint_mimic_coef1,
+                        model.joint_mimic_coeffs,
                         state_in.joint_q,
                         self.pgs_beta,
                         self.pgs_cfm,
