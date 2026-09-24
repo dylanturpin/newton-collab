@@ -31,6 +31,67 @@ def origin_velocity_from_body_qd(model, body_q, body_qd, body_idx):
 
 
 class TestSelection(unittest.TestCase):
+    def test_appended_articulation_shapes(self):
+        """Read and write actual shape IDs after pieces are appended across articulations."""
+        builder = newton.ModelBuilder()
+        bodies = []
+        expected = []
+        for i in range(3):
+            body = builder.add_link(label=f"robot_{i}/body")
+            joint = builder.add_joint_free(child=body)
+            builder.add_articulation([joint], label=f"robot_{i}")
+            bodies.append(body)
+            expected.append([builder.add_shape_sphere(body=body, radius=0.01)])
+        # ModelBuilder.approximate_meshes can append pieces after all original shapes.
+        for i, body in enumerate(bodies):
+            expected[i].append(builder.add_shape_sphere(body=body, radius=0.01))
+            expected[i].append(builder.add_shape_sphere(body=body, radius=0.01))
+        model = builder.finalize(device="cpu")
+        original = np.arange(model.shape_count, dtype=np.float32) + 0.25
+        model.shape_material_mu.assign(original)
+        view = ArticulationView(model, "robot_*")
+        values = view.get_attribute("shape_material_mu", model)
+        np.testing.assert_array_equal(values.numpy(), original[np.array(expected)][None])
+        values.fill_(5.0)
+        mask = wp.array([[False, True, False]], dtype=bool, device="cpu")
+        view.set_attribute("shape_material_mu", model, values, mask=mask)
+        original[expected[1]] = 5.0
+        np.testing.assert_array_equal(model.shape_material_mu.numpy(), original)
+        single = ArticulationView(model, "robot_2")
+        np.testing.assert_array_equal(
+            single.get_attribute("shape_material_mu", model).numpy(), original[expected[2]][None, None]
+        )
+
+    def test_appended_shapes_world_mask_and_gradients(self):
+        """Preserve world masks, vector shape attributes, and gather gradients."""
+        template = newton.ModelBuilder()
+        bodies = []
+        for i in range(2):
+            body = template.add_link(label=f"robot_{i}/body")
+            joint = template.add_joint_free(child=body)
+            template.add_articulation([joint], label=f"robot_{i}")
+            template.add_shape_sphere(body=body, radius=0.01)
+            bodies.append(body)
+        for body in bodies:
+            template.add_shape_sphere(body=body, radius=0.02)
+        builder = newton.ModelBuilder()
+        for _ in range(2):
+            builder.add_world(template)
+        model = builder.finalize(device="cpu", requires_grad=True)
+        view = ArticulationView(model, "*")
+        original = model.shape_scale.numpy().copy()
+        values = view.get_attribute("shape_scale", model)
+        expected = original[np.array([[[0, 2], [1, 3]], [[4, 6], [5, 7]]])]
+        np.testing.assert_array_equal(values.numpy(), expected)
+        values.fill_(wp.vec3(0.03))
+        view.set_attribute("shape_scale", model, values, mask=wp.array([False, True], dtype=bool, device="cpu"))
+        original[4:] = 0.03
+        np.testing.assert_array_equal(model.shape_scale.numpy(), original)
+        with wp.Tape() as tape:
+            mu = view.get_attribute("shape_material_mu", model)
+        tape.backward(grads={mu: wp.ones_like(mu)})
+        np.testing.assert_array_equal(model.shape_material_mu.grad.numpy(), np.ones(model.shape_count))
+
     def test_compiled_regex_selectors(self):
         builder = newton.ModelBuilder()
         articulation_labels = [
