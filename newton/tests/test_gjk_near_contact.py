@@ -109,6 +109,42 @@ class TestGJKNearContact(unittest.TestCase):
                 cosine = np.clip(np.sum(actual[:, 1:] * expected[:, 1:], axis=1), -1.0, 1.0)
                 self.assertLess(np.degrees(np.arccos(cosine)).max(), 1.0)
 
+    def test_distant_small_shapes_return_witnesses_on_both_shapes(self):
+        """Populate the simplex before accepting convergence, so far-apart witnesses lie on the shapes."""
+        radius, center_b = 0.001, np.array([100.0, 0.0, 0.0])
+        for device in wp.get_devices():
+            with self.subTest(device=str(device)):
+                output = wp.zeros(7, dtype=float, device=device)
+                wp.launch(
+                    _query_distant_spheres,
+                    dim=1,
+                    inputs=[radius, wp.vec3(*center_b)],
+                    outputs=[output],
+                    device=device,
+                )
+                actual = output.numpy()
+                self.assertAlmostEqual(float(actual[0]), 100.0 - 2.0 * radius, delta=2e-5)
+                self.assertAlmostEqual(float(np.linalg.norm(actual[1:4])), radius, delta=1e-5)
+                self.assertAlmostEqual(float(np.linalg.norm(actual[4:7] - center_b)), radius, delta=1e-5)
+
+
+@wp.kernel
+def _query_distant_spheres(radius: float, center_b: wp.vec3, output: wp.array[float]):
+    """Query two small spheres far enough apart that the center offset alone satisfies the relative gap."""
+    a = GenericShapeData()
+    a.shape_type = int(GeoType.SPHERE)
+    a.scale = wp.vec3(radius, 0.0, 0.0)
+    b = GenericShapeData()
+    b.shape_type = int(GeoType.SPHERE)
+    b.scale = wp.vec3(radius, 0.0, 0.0)
+    _separated, point_a, point_b, _normal, distance = wp.static(create_solve_closest_distance(support_map).core)(
+        a, b, wp.quat_identity(), center_b, 0.0, SupportMapDataProvider()
+    )
+    output[0] = distance
+    for axis in range(3):
+        output[1 + axis] = point_a[axis]
+        output[4 + axis] = point_b[axis]
+
 
 @wp.kernel
 def _query_rotated_box(output: wp.array2d[float]):

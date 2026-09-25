@@ -434,8 +434,9 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
             if max_dist > 0.0 and wp.dot(v, w_v) > max_dist * wp.sqrt(dist_sq):
                 break
             # Relative duality gap; an absolute cutoff is too loose at millimeter gaps.
+            # Before the first vertex, v is the center offset and the witnesses would be empty.
             delta_dist = wp.dot(v, v - w_v)
-            if delta_dist <= 0.0 or delta_dist < COLLIDE_EPSILON * dist_sq:
+            if simplex_usage_mask != wp.uint32(0) and (delta_dist <= 0.0 or delta_dist < COLLIDE_EPSILON * dist_sq):
                 break
 
             # Check for duplicate vertex (numerical stalling)
