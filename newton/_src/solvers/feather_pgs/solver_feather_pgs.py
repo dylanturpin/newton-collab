@@ -9365,6 +9365,8 @@ class SolverFeatherPGS(SolverBase):
                 int(refresh_composite and not parallel_global_refresh),
                 int(parallel_global_refresh),
                 int(self._fk_id_cache_enabled),
+                model.body_world,
+                model.body_disable_gravity,
                 model.gravity,
             ],
             outputs=[
@@ -12729,6 +12731,8 @@ class SolverFeatherPGS(SolverBase):
                 articulation_origin,
                 int(next_refresh and not parallel_next_refresh),
                 int(parallel_next_refresh),
+                model.body_world,
+                model.body_disable_gravity,
                 model.gravity,
                 body_v_s,
                 body_a_s,
