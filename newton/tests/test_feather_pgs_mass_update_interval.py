@@ -4,6 +4,7 @@
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -455,16 +456,45 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         solver._memset_stream = None
         solver._size_streams = {}
 
+    def test_teardown_waits_once_for_finalized_stream_device(self):
+        """Synchronize each finalized-stream device while retaining live-stream waits."""
+        device = wp.get_device()
+        first = SimpleNamespace(device=device)
+        second = SimpleNamespace(device=device)
+        live = object()
+        solver = object.__new__(SolverFeatherPGS)
+        solver._local_internal_stream = first
+        solver._local_residual_stream = second
+        solver._local_pair_stream = live
+        solver._size_streams = {3: first}
+        try:
+            with (
+                mock.patch("gc.is_finalized", side_effect=lambda stream: stream is not live),
+                mock.patch.object(wp, "synchronize_device") as synchronize_device,
+                mock.patch.object(wp, "synchronize_stream") as synchronize_stream,
+            ):
+                solver.__del__()
+            synchronize_device.assert_called_once_with(device)
+            synchronize_stream.assert_called_once_with(live)
+        finally:
+            solver._local_internal_stream = None
+            solver._local_residual_stream = None
+            solver._local_pair_stream = None
+            solver._size_streams = {}
+
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA stream cleanup requires a GPU")
     def test_teardown_handles_already_finalized_stream_in_cycle(self):
         """Cyclic GC can finalize a stream before its solver without crashing cleanup."""
         # Isolate the native crash so a failure cannot abort the enclosing suite.
         code = """
 import gc
+import sys
 import weakref
 import warp as wp
 from newton.solvers import SolverFeatherPGS
 wp.init()
+unraisable = []
+sys.unraisablehook = unraisable.append
 stream = wp.Stream("cuda:0")
 solver = object.__new__(SolverFeatherPGS)
 solver._local_internal_stream = stream
@@ -472,6 +502,7 @@ stream.solver_owner = solver
 reference = weakref.ref(solver)
 del stream, solver
 gc.collect()
+assert not unraisable, [str(error.exc_value) for error in unraisable]
 assert reference() is None
 print("CYCLE_CLEANUP_COMPLETE", flush=True)
 """

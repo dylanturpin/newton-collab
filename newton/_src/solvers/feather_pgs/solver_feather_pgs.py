@@ -12763,7 +12763,7 @@ class SolverFeatherPGS(SolverBase):
         ]
         streams.extend(getattr(self, "_size_streams", {}).values())
         synchronized = set()
-        synchronized_devices = set()
+        synchronized_devices = []
         for stream in streams:
             if stream is None or id(stream) in synchronized:
                 continue
@@ -12774,7 +12774,7 @@ class SolverFeatherPGS(SolverBase):
                     # Wait on the device without dereferencing the stale native handle.
                     if stream.device not in synchronized_devices:
                         wp.synchronize_device(stream.device)
-                        synchronized_devices.add(stream.device)
+                        synchronized_devices.append(stream.device)
                 else:
                     wp.synchronize_stream(stream)
             except (AttributeError, RuntimeError):
