@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import json
 import math
 import os
@@ -12762,12 +12763,20 @@ class SolverFeatherPGS(SolverBase):
         ]
         streams.extend(getattr(self, "_size_streams", {}).values())
         synchronized = set()
+        synchronized_devices = set()
         for stream in streams:
             if stream is None or id(stream) in synchronized:
                 continue
             synchronized.add(id(stream))
             try:
-                wp.synchronize_stream(stream)
+                if gc.is_finalized(stream):
+                    # Cyclic GC may destroy a stream before finalizing its solver.
+                    # Wait on the device without dereferencing the stale native handle.
+                    if stream.device not in synchronized_devices:
+                        wp.synchronize_device(stream.device)
+                        synchronized_devices.add(stream.device)
+                else:
+                    wp.synchronize_stream(stream)
             except (AttributeError, RuntimeError):
                 # CUDA may already be shutting down during interpreter teardown.
                 pass

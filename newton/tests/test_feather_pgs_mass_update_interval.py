@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -452,6 +454,31 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         solver._articulation_dynamics_stream = None
         solver._memset_stream = None
         solver._size_streams = {}
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA stream cleanup requires a GPU")
+    def test_teardown_handles_already_finalized_stream_in_cycle(self):
+        """Cyclic GC can finalize a stream before its solver without crashing cleanup."""
+        # Isolate the native crash so a failure cannot abort the enclosing suite.
+        code = """
+import gc
+import weakref
+import warp as wp
+from newton.solvers import SolverFeatherPGS
+wp.init()
+stream = wp.Stream("cuda:0")
+solver = object.__new__(SolverFeatherPGS)
+solver._local_internal_stream = stream
+stream.solver_owner = solver
+reference = weakref.ref(solver)
+del stream, solver
+gc.collect()
+assert reference() is None
+print("CYCLE_CLEANUP_COMPLETE", flush=True)
+"""
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("CYCLE_CLEANUP_COMPLETE", result.stdout)
+        self.assertNotIn("Warp CUDA error", result.stderr)
 
     def test_mass_refresh_has_no_obsolete_limit_count_state(self):
         solver = SolverFeatherPGS(_build_model(wp.get_device(), ground=False))
