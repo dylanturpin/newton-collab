@@ -38,6 +38,23 @@ def _query_box_gap(gap: float, direction: float, output: wp.array[float]):
 class TestGJKNearContact(unittest.TestCase):
     """Preserve geometric separation independently of convergence tolerance."""
 
+    def test_early_exit_preserves_separated_sphere_witnesses(self):
+        """Return surface witnesses even when tiny distant spheres converge immediately."""
+        for device in wp.get_devices():
+            for cutoff in (0.0, 1.0):
+                with self.subTest(device=str(device), cutoff=cutoff):
+                    output = wp.zeros(11, dtype=float, device=device)
+                    wp.launch(_query_distant_spheres, dim=1, inputs=[cutoff], outputs=[output], device=device)
+                    actual = output.numpy()
+                    self.assertEqual(actual[0], 1.0)
+                    np.testing.assert_allclose(actual[1:4], [0.001, 0.0, 0.0], atol=8e-6, rtol=0.0)
+                    np.testing.assert_allclose(actual[4:7], [99.999, 0.0, 0.0], atol=8e-6, rtol=0.0)
+                    np.testing.assert_allclose(actual[7:10], [1.0, 0.0, 0.0], atol=1e-6)
+                    self.assertAlmostEqual(float(actual[10]), 99.998, delta=8e-6)
+                    self.assertAlmostEqual(
+                        float(actual[10]), float(np.linalg.norm(actual[4:7] - actual[1:4])), delta=8e-6
+                    )
+
     def test_positive_sub_tolerance_gap(self):
         """Return actual positive gaps and oriented unit normals below 100 micrometers."""
         for device in wp.get_devices():
@@ -108,6 +125,23 @@ class TestGJKNearContact(unittest.TestCase):
                 np.testing.assert_allclose(actual[:, 0], expected[:, 0], atol=2e-6, rtol=0.0)
                 cosine = np.clip(np.sum(actual[:, 1:] * expected[:, 1:], axis=1), -1.0, 1.0)
                 self.assertLess(np.degrees(np.arccos(cosine)).max(), 1.0)
+
+
+@wp.kernel
+def _query_distant_spheres(cutoff: float, output: wp.array[float]):
+    """Query tiny spheres separated by much more than their radius."""
+    a = GenericShapeData()
+    a.shape_type = int(GeoType.SPHERE)
+    a.scale = wp.vec3(0.001, 0.0, 0.0)
+    separated, pa, pb, normal, distance = wp.static(create_solve_closest_distance(support_map).core)(
+        a, a, wp.quat_identity(), wp.vec3(100.0, 0.0, 0.0), 0.0, SupportMapDataProvider(), cutoff
+    )
+    output[0] = float(separated)
+    for axis in range(3):
+        output[1 + axis] = pa[axis]
+        output[4 + axis] = pb[axis]
+        output[7 + axis] = normal[axis]
+    output[10] = distance
 
 
 @wp.kernel
