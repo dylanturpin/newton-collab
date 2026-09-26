@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1000" height="848" viewBox="0 0 1000 848" role="img" aria-labelledby="title desc">
+  <title id="title">Sparse dynamics inside FPGS: change the representation, preserve the solve</title>
+  <desc id="desc">Before and after comparison of the matrix-free FPGS path. A seven-DOF tree has one root and three two-joint limbs. The current path stores dense mass factors and full-width Jacobian and inverse-mass response rows. The candidate uses leaf-first packed factors and sparse factor-coordinate rows, retaining the shared root coordinates and therefore coupling between limbs. Both use the same serial PGS ordering, paired friction law, iteration budget, collision inputs, integration and state publication. No performance result is claimed.</desc>
+  <defs>
+    <style>
+      text { font-family: Inter, "Segoe UI", Arial, sans-serif; fill: #192738; }
+      .eyebrow { font-size: 14px; font-weight: 700; letter-spacing: 1.5px; }
+      .heading { font-size: 30px; font-weight: 700; letter-spacing: -.7px; }
+      .label { font-size: 17px; font-weight: 650; }
+      .body { font-size: 16px; }
+      .small { font-size: 14px; fill: #536274; }
+      .muted { fill: #536274; }
+      .center { text-anchor: middle; }
+      .root { fill: #253c58; }
+      .limb-a { fill: #167d8d; }
+      .limb-b { fill: #7b6aaa; }
+      .limb-c { fill: #bc6e3d; }
+      .empty { fill: #e9edf2; }
+      .dense { fill: #9babbc; }
+      .flow { fill: none; stroke: #8391a1; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M1 1 L7 4 L1 7" fill="none" stroke="#8391a1" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <rect id="cell" width="12" height="12" rx="2"/>
+    <g id="row-7">
+      <use xlink:href="#cell"/><use xlink:href="#cell" x="15"/><use xlink:href="#cell" x="30"/><use xlink:href="#cell" x="45"/><use xlink:href="#cell" x="60"/><use xlink:href="#cell" x="75"/><use xlink:href="#cell" x="90"/>
+    </g>
+    <g id="grid-7">
+      <use xlink:href="#row-7"/><use xlink:href="#row-7" y="15"/><use xlink:href="#row-7" y="30"/><use xlink:href="#row-7" y="45"/><use xlink:href="#row-7" y="60"/><use xlink:href="#row-7" y="75"/><use xlink:href="#row-7" y="90"/>
+    </g>
+    <g id="block-2">
+      <use xlink:href="#cell"/><use xlink:href="#cell" x="15"/><use xlink:href="#cell" y="15"/><use xlink:href="#cell" x="15" y="15"/>
+    </g>
+    <g id="lower-2">
+      <use xlink:href="#cell"/><use xlink:href="#cell" y="15"/><use xlink:href="#cell" x="15" y="15"/>
+    </g>
+    <clipPath id="lower-7"><path d="M0 0 H12 V15 H27 V30 H42 V45 H57 V60 H72 V75 H87 V90 H102 V102 H0 Z"/></clipPath>
+    <g id="three-sparse-rows">
+      <g class="limb-a"><use xlink:href="#cell"/><use xlink:href="#cell" x="15"/></g>
+      <use xlink:href="#cell" x="30" class="root"/>
+      <g transform="translate(0 15)"><g class="limb-a"><use xlink:href="#cell"/><use xlink:href="#cell" x="15"/></g><use xlink:href="#cell" x="30" class="root"/></g>
+      <g transform="translate(0 30)"><g class="limb-a"><use xlink:href="#cell"/><use xlink:href="#cell" x="15"/></g><use xlink:href="#cell" x="30" class="root"/></g>
+    </g>
+  </defs>
+
+  <rect width="1000" height="848" rx="18" fill="#ffffff"/>
+  <text x="38" y="37" class="eyebrow" style="fill:#167d8d">FPGS · REPRESENTATION REDESIGN</text>
+  <text x="38" y="78" class="heading">Keep the physics. Remove the dense intermediates.</text>
+  <text x="38" y="107" class="body muted">A topology-derived sparse path inside the existing matrix-free solver.</text>
+
+  <rect x="38" y="129" width="924" height="43" rx="10" fill="#f1f5f9"/>
+  <text x="500" y="156" class="label center">Same collision contacts · same poses · same generalized forces</text>
+  <path d="M500 173 V186" class="flow"/>
+
+  <rect x="38" y="192" width="924" height="98" rx="12" fill="#fafbfc" stroke="#e1e7ee"/>
+  <g stroke="#aab6c3" stroke-width="2.2" fill="none" stroke-linecap="round">
+    <path d="M153 212 V226 H93 V241 M153 226 V241 M153 226 H213 V241"/>
+    <path d="M93 249 V271 M153 249 V271 M213 249 V271"/>
+  </g>
+  <circle cx="153" cy="212" r="8" class="root"/>
+  <g class="limb-a"><circle cx="93" cy="245" r="6.5"/><circle cx="93" cy="272" r="6.5"/></g>
+  <g class="limb-b"><circle cx="153" cy="245" r="6.5"/><circle cx="153" cy="272" r="6.5"/></g>
+  <g class="limb-c"><circle cx="213" cy="245" r="6.5"/><circle cx="213" cy="272" r="6.5"/></g>
+  <text x="175" y="216" class="small">root</text>
+  <text x="278" y="221" class="label">Three limbs. One coupled system.</text>
+  <text x="278" y="247" class="body muted">Root coordinates stay in the sparse representation.</text>
+  <text x="278" y="272" class="small">The limbs are not treated as independent robots. Illustration: 7 DOFs.</text>
+
+  <path d="M269 291 V307" class="flow"/>
+  <path d="M731 291 V307" class="flow"/>
+  <rect x="38" y="316" width="447" height="324" rx="14" fill="#ffffff" stroke="#d7e0e9" stroke-width="1.5"/>
+  <rect x="515" y="316" width="447" height="324" rx="14" fill="#f7fbfb" stroke="#99c8cd" stroke-width="1.5"/>
+  <path d="M53 360 H470 M530 360 H947" stroke="#e1e7ee"/>
+  <text x="61" y="344" class="eyebrow muted">BEFORE · DENSE STORAGE</text>
+  <text x="538" y="344" class="eyebrow" style="fill:#126877">AFTER · SPARSE FACTOR SPACE</text>
+
+  <!-- Root-first mass layout: H is sparse, but its array and factor are dense. -->
+  <g transform="translate(67 382)">
+    <use xlink:href="#grid-7" class="empty"/>
+    <use xlink:href="#row-7" class="root"/>
+    <g class="root"><use xlink:href="#cell" y="15"/><use xlink:href="#cell" y="30"/><use xlink:href="#cell" y="45"/><use xlink:href="#cell" y="60"/><use xlink:href="#cell" y="75"/><use xlink:href="#cell" y="90"/></g>
+    <use xlink:href="#block-2" x="15" y="15" class="limb-a"/>
+    <use xlink:href="#block-2" x="45" y="45" class="limb-b"/>
+    <use xlink:href="#block-2" x="75" y="75" class="limb-c"/>
+  </g>
+  <path d="M184 431 H207" class="flow"/>
+  <g transform="translate(223 382)">
+    <use xlink:href="#grid-7" class="empty"/>
+    <use xlink:href="#grid-7" class="dense" clip-path="url(#lower-7)"/>
+  </g>
+  <text x="118" y="507" class="small center">H, if materialized</text>
+  <text x="274" y="507" class="small center">Dense L</text>
+  <text x="349" y="410" class="small">Full-width</text>
+  <text x="349" y="431" class="small">arrays</text>
+  <text x="349" y="466" class="small">Pale slots:</text>
+  <text x="349" y="487" class="small">stored zeros</text>
+
+  <!-- Leaf-first order A2,A1,B2,B1,C2,C1,root: inverse has the same support. -->
+  <g transform="translate(547 382)">
+    <use xlink:href="#lower-2" class="limb-a"/>
+    <use xlink:href="#lower-2" x="30" y="30" class="limb-b"/>
+    <use xlink:href="#lower-2" x="60" y="60" class="limb-c"/>
+    <use xlink:href="#row-7" y="90" class="root"/>
+  </g>
+  <text x="598" y="507" class="small center">Packed L, L⁻¹</text>
+  <text x="686" y="406" class="label">Eliminate leaves first.</text>
+  <text x="686" y="433" class="body muted">Store structural entries only.</text>
+  <text x="686" y="461" class="small">The full root row remains.</text>
+  <path d="M683 468 L665 478 H652" class="flow"/>
+  <text x="686" y="504" class="small">No dense H or L allocation.</text>
+
+  <path d="M61 523 H462 M538 523 H939" stroke="#e1e7ee"/>
+  <text x="61" y="550" class="label">Full-width J and H⁻¹Jᵀ rows</text>
+  <g transform="translate(67 569)">
+    <use xlink:href="#row-7" class="empty"/><use xlink:href="#row-7" y="15" class="empty"/><use xlink:href="#row-7" y="30" class="empty"/>
+    <g class="root"><use xlink:href="#cell"/><use xlink:href="#cell" y="15"/><use xlink:href="#cell" y="30"/></g>
+    <g class="limb-a"><use xlink:href="#block-2" x="15"/><use xlink:href="#cell" x="15" y="30"/><use xlink:href="#cell" x="30" y="30"/></g>
+  </g>
+  <path d="M184 590 H207" class="flow"/>
+  <g transform="translate(223 569)" class="dense"><use xlink:href="#row-7"/><use xlink:href="#row-7" y="15"/><use xlink:href="#row-7" y="30"/></g>
+  <text x="349" y="583" class="small">Across all</text>
+  <text x="349" y="604" class="small">world DOFs</text>
+
+  <text x="538" y="550" class="label">Sparse factor rows · Z = JPᵀL⁻ᵀ</text>
+  <use xlink:href="#three-sparse-rows" x="565" y="569"/>
+  <text x="686" y="583" class="body muted">Contact limb + shared root.</text>
+  <text x="686" y="608" class="small">No full-width response rows.</text>
+
+  <path d="M261 641 V657 M739 641 V657" class="flow"/>
+  <rect x="38" y="666" width="924" height="68" rx="12" fill="#edf5f6" stroke="#bdd9dc"/>
+  <text x="500" y="694" class="label center" style="fill:#145f6a">UNCHANGED PGS</text>
+  <text x="500" y="718" class="body center">Same serial row order · same 2×2 friction projection · same iteration budget</text>
+  <path d="M500 735 V771" class="flow"/>
+  <text x="524" y="757" class="small">Sparse path decodes velocity once after the sweeps.</text>
+  <rect x="38" y="780" width="924" height="42" rx="10" fill="#f1f5f9"/>
+  <text x="500" y="807" class="label center">Unchanged integration · unchanged state interface</text>
+</svg>
