@@ -44,6 +44,9 @@ def populate_sparse_contact_response(
     contact_path: wp.array[int],
     contact_slots_needed: wp.array[int],
     art_group_idx: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    is_free_rigid: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
     articulation_dof_start: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
     body_dof_mask: wp.array[wp.uint64],
@@ -57,9 +60,11 @@ def populate_sparse_contact_response(
     factor_row_offsets: wp.array[int],
     factor_columns: wp.array[int],
     inverse_factor: wp.array2d[float],
+    free_inverse_factor: wp.array3d[float],
     v_hat: wp.array[float],
     row_dof: wp.array3d[int],
     row_factor: wp.array3d[float],
+    row_free_response: wp.array3d[float],
     row_incident: wp.array2d[float],
     diagonal: wp.array2d[float],
 ):
@@ -77,18 +82,14 @@ def populate_sparse_contact_response(
             body_b = shape_body[contact_shape1[c]]
         art_a = contact_art_a[c]
         art_b = contact_art_b[c]
-        art = wp.max(art_a, art_b)
-        group = art_group_idx[art]
         world = contact_world[c]
         slot = contact_slot[c] + row
-        dof_start = articulation_dof_start[art]
         mask_a = wp.uint64(0)
         mask_b = wp.uint64(0)
         if body_a >= 0 and art_a >= 0:
             mask_a = body_dof_mask[body_a]
         if body_b >= 0 and art_b >= 0:
             mask_b = body_dof_mask[body_b]
-        mask = mask_a | mask_b
 
         normal = -contact_normal[c]
         point_a = contact_point0[c] - contact_thickness0[c] * normal
@@ -117,34 +118,89 @@ def populate_sparse_contact_response(
         count = int(0)
         norm = float(0.0)
         incident = float(0.0)
-        for node in range(permutation.shape[0]):
-            bit = wp.uint64(1) << wp.uint64(node)
-            if (mask & bit) == wp.uint64(0):
+        # Physical blocks precede factor blocks, so only the short physical
+        # prefix needs a separate response vector. Ordinary rows have at most
+        # one free endpoint; free/free rows keep the native MF representation.
+        first_endpoint = int(0)
+        if art_b >= 0 and is_free_rigid[art_b] != 0:
+            if art_a < 0 or is_free_rigid[art_a] == 0:
+                first_endpoint = 1
+        for endpoint in range(2):
+            side = (first_endpoint + endpoint) % 2
+            art = art_a
+            if side == 1:
+                art = art_b
+            if art < 0 or (side == 1 and art == art_a):
                 continue
-            value = float(0.0)
-            for entry in range(factor_row_offsets[node], factor_row_offsets[node + 1]):
-                column = factor_columns[entry]
-                column_bit = wp.uint64(1) << wp.uint64(column)
-                if (mask & column_bit) == wp.uint64(0):
+            if articulation_response_dof_count[art] <= 0:
+                continue
+            group = art_group_idx[art]
+            dof_start = articulation_dof_start[art]
+            offset = articulation_world_dof_offset[art]
+            free = is_free_rigid[art] != 0
+            if free:
+                jacobian_free = wp.spatial_vector()
+                factor_free = wp.spatial_vector()
+                for node in range(6):
+                    motion = joint_S_s[dof_start + node]
+                    if art == art_a:
+                        jacobian_free[node] += _contact_jacobian_value(
+                            motion, point_a, articulation_origin[art], direction
+                        )
+                    if art == art_b:
+                        jacobian_free[node] -= _contact_jacobian_value(
+                            motion, point_b, articulation_origin[art], direction
+                        )
+                for node in range(6):
+                    for column in range(node + 1):
+                        factor_free[node] += free_inverse_factor[group, node, column] * jacobian_free[column]
+                for node in range(6):
+                    response = float(0.0)
+                    for column in range(node, 6):
+                        response += free_inverse_factor[group, column, node] * factor_free[column]
+                    row_dof[world, slot, count] = offset + node
+                    row_factor[world, slot, count] = jacobian_free[node]
+                    row_free_response[world, slot, count] = response
+                    norm += jacobian_free[node] * response
+                    incident += jacobian_free[node] * v_hat[dof_start + node]
+                    count += 1
+                continue
+            mask = wp.uint64(0)
+            if art == art_a:
+                mask |= mask_a
+            if art == art_b:
+                mask |= mask_b
+            for node in range(permutation.shape[0]):
+                bit = wp.uint64(1) << wp.uint64(node)
+                if (mask & bit) == wp.uint64(0):
                     continue
-                motion = joint_S_s[dof_start + permutation[column]]
+                value = float(0.0)
+                for entry in range(factor_row_offsets[node], factor_row_offsets[node + 1]):
+                    column = factor_columns[entry]
+                    physical_column = permutation[column]
+                    inverse = inverse_factor[group, entry]
+                    column_bit = wp.uint64(1) << wp.uint64(column)
+                    if (mask & column_bit) == wp.uint64(0):
+                        continue
+                    motion = joint_S_s[dof_start + physical_column]
+                    jacobian = float(0.0)
+                    if art == art_a and (mask_a & column_bit) != wp.uint64(0):
+                        jacobian += _contact_jacobian_value(motion, point_a, articulation_origin[art], direction)
+                    if art == art_b and (mask_b & column_bit) != wp.uint64(0):
+                        jacobian -= _contact_jacobian_value(motion, point_b, articulation_origin[art], direction)
+                    value += inverse * jacobian
+                row_dof[world, slot, count] = offset + node
+                row_factor[world, slot, count] = value
+                norm += value * value
+                physical_node = permutation[node]
+                motion = joint_S_s[dof_start + physical_node]
                 jacobian = float(0.0)
-                if (mask_a & column_bit) != wp.uint64(0):
+                if art == art_a and (mask_a & bit) != wp.uint64(0):
                     jacobian += _contact_jacobian_value(motion, point_a, articulation_origin[art], direction)
-                if (mask_b & column_bit) != wp.uint64(0):
+                if art == art_b and (mask_b & bit) != wp.uint64(0):
                     jacobian -= _contact_jacobian_value(motion, point_b, articulation_origin[art], direction)
-                value += inverse_factor[group, entry] * jacobian
-            row_dof[world, slot, count] = node
-            row_factor[world, slot, count] = value
-            norm += value * value
-            motion = joint_S_s[dof_start + permutation[node]]
-            jacobian = float(0.0)
-            if (mask_a & bit) != wp.uint64(0):
-                jacobian += _contact_jacobian_value(motion, point_a, articulation_origin[art], direction)
-            if (mask_b & bit) != wp.uint64(0):
-                jacobian -= _contact_jacobian_value(motion, point_b, articulation_origin[art], direction)
-            incident += jacobian * v_hat[dof_start + permutation[node]]
-            count += 1
+                incident += jacobian * v_hat[dof_start + physical_node]
+                count += 1
         for index in range(count, row_dof.shape[2]):
             row_dof[world, slot, index] = -1
             row_factor[world, slot, index] = 0.0
@@ -237,7 +293,7 @@ def populate_sparse_contact_response(
                 const int index = bit_count(support_mask & (bit - 1ull));
                 const int entry = factor_lookup.data[node * dofs + column];
                 const float value = entry >= 0 ? sign * inverse_factor.data[factor_base + entry] : 0.0f;
-                row_dof.data[response_offset + index] = node;
+                row_dof.data[response_offset + index] = articulation_world_dof_offset.data[art] + node;
                 row_factor.data[response_offset + index] = value;
                 norm += value * value;
             }
@@ -270,6 +326,7 @@ def _build_sparse_joint_limit_rows(
     tid: int,
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
     articulation_dof_start: wp.array[int],
     limit_q_index: wp.array[int],
     joint_limit_lower: wp.array[float],
@@ -302,6 +359,7 @@ def _build_sparse_joint_limit_rows(
 def build_sparse_joint_limit_rows(
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
     articulation_dof_start: wp.array[int],
     limit_q_index: wp.array[int],
     joint_limit_lower: wp.array[float],
@@ -332,12 +390,13 @@ def build_sparse_joint_limit_rows(
 
     Launch ``32 * group_count`` threads in blocks divisible by 32. Active row
     reservations include over-capacity demand; writes stay within row capacity.
-    The admitted topology has one responsive articulation per world.
+    Reservations retain each articulation's lower/upper DOF order.
     """
     _build_sparse_joint_limit_rows(
         wp.tid(),
         group_to_art,
         art_to_world,
+        articulation_world_dof_offset,
         articulation_dof_start,
         limit_q_index,
         joint_limit_lower,
@@ -394,6 +453,7 @@ def apply_sparse_contact_restitution(
 def apply_sparse_factor_velocity(
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
     articulation_dof_start: wp.array[int],
     permutation: wp.array[int],
     factor_lookup: wp.array2d[int],
@@ -410,6 +470,27 @@ def apply_sparse_factor_velocity(
     for row in range(column, permutation.shape[0]):
         entry = factor_lookup[row, column]
         if entry >= 0:
-            delta += inverse_factor[group, entry] * factor_velocity_delta[world, row]
+            delta += (
+                inverse_factor[group, entry] * factor_velocity_delta[world, articulation_world_dof_offset[art] + row]
+            )
     dof = articulation_dof_start[art] + permutation[column]
     v_out[dof] = v_hat[dof] + delta
+
+
+@wp.kernel(enable_backward=False)
+def apply_sparse_free_velocity(
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    factor_velocity_delta: wp.array2d[float],
+    v_hat: wp.array[float],
+    v_out: wp.array[float],
+):
+    """Publish physical free-body deltas without a coordinate conversion."""
+    group, column = wp.tid()
+    art = group_to_art[group]
+    world = art_to_world[art]
+    offset = articulation_world_dof_offset[art]
+    dof = articulation_dof_start[art] + column
+    v_out[dof] = v_hat[dof] + factor_velocity_delta[world, offset + column]

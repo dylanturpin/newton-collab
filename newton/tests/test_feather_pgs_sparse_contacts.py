@@ -18,6 +18,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.sparse_contact import (
     apply_sparse_contact_restitution,
     apply_sparse_factor_velocity,
+    apply_sparse_free_velocity,
     build_sparse_joint_limit_rows,
     populate_sparse_contact_response,
 )
@@ -85,6 +86,158 @@ def _fixture():
 
 
 class TestSparseContacts(unittest.TestCase):
+    def test_mixed_contact_response_matches_independent_mass_oracle(self):
+        """Match robot/object, object/object, ground and self-contact with arbitrary offsets."""
+        f = _fixture()
+        p, indices = f["plan"], f["indices"]
+        rng = np.random.default_rng(500)
+        art_a = np.array([1, 0, 0, 2, 1], dtype=np.int32)
+        art_b = np.array([0, 1, 2, -1, 1], dtype=np.int32)
+        body_a = np.array([1, 4, 4, 5, 1], dtype=np.int32)
+        body_b = np.array([4, 1, 5, -1, 2], dtype=np.int32)
+        start, offset, group = np.array([1, 8, 20]), np.array([0, 6, 12]), np.array([1, 0, 0])
+        free_lower = np.tril(rng.normal(scale=0.1, size=(2, 6, 6))) + 1.4 * np.eye(6)
+        free_inverse = np.linalg.inv(free_lower)
+        origin = rng.normal(size=(3, 3)).astype(np.float32)
+        motion = rng.normal(size=(26, 6)).astype(np.float32)
+        velocity = rng.normal(size=26).astype(np.float32)
+        point_a, point_b = rng.normal(size=(2, 5, 3)).astype(np.float32)
+        normal = rng.normal(size=(5, 3))
+        normal /= np.linalg.norm(normal, axis=1)[:, None]
+        normal = normal.astype(np.float32)
+        # Reverse the first contact without changing its physical row.
+        point_a[1], point_b[1], normal[1] = point_b[0], point_a[0], -normal[0]
+        transforms = [
+            wp.transform(wp.vec3(*position), wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), float(angle)))
+            for position, angle in zip(rng.normal(size=(6, 3)), np.linspace(-0.6, 0.8, 6), strict=True)
+        ]
+        masks = np.concatenate((p.joint_ancestor_mask, np.array([63, 63], dtype=np.uint64)))
+        row_dof, row_factor = _full((1, 5, 12), -9, int), _full((1, 5, 12), -9.0)
+        row_free_response = _full((1, 5, 12), -9.0)
+        incident, diagonal = _full((1, 5), -9.0), _full((1, 5), -9.0)
+        wp.launch(
+            populate_sparse_contact_response,
+            dim=(1, 1),
+            inputs=[
+                _array([5], int),
+                1,
+                _array(point_a, wp.vec3),
+                _array(point_b, wp.vec3),
+                _array(normal, wp.vec3),
+                _array(body_a, int),
+                _array(np.where(body_b < 0, 6, body_b), int),
+                _full(5, 0.0),
+                _full(5, 0.0),
+                _full(5, 0, int),
+                _array(np.arange(5), int),
+                _array(art_a, int),
+                _array(art_b, int),
+                _full(5, 0, int),
+                _full(5, 1, int),
+                _array(group, int),
+                _array([6, 6, 6], int),
+                _array([1, 0, 1], int),
+                _array(offset, int),
+                _array(start, int),
+                _array(origin, wp.vec3),
+                _array(masks, wp.uint64),
+                _array(motion, wp.spatial_vector),
+                _array([0, 1, 2, 3, 4, 5, -1], int),
+                _array(transforms, wp.transform),
+                0,
+                f["patches"],
+                0,
+                indices.permutation,
+                indices.row_offsets,
+                indices.columns,
+                f["packed"],
+                _array(free_inverse),
+                _array(velocity),
+            ],
+            outputs=[row_dof, row_factor, row_free_response, incident, diagonal],
+            device="cpu",
+        )
+        mass, transform = np.zeros((18, 18)), np.zeros((18, 18))
+        compact_velocity = np.zeros(18)
+        for art in range(3):
+            block = slice(offset[art], offset[art] + 6)
+            permutation = p.permutation if art == 1 else np.arange(6)
+            inverse = f["inverse"] if art == 1 else free_inverse[group[art]]
+            local_transform = inverse @ np.eye(6)[permutation]
+            transform[block, block] = local_transform if art == 1 else np.eye(6)
+            local_decode = np.linalg.inv(local_transform)
+            mass[block, block] = local_decode @ local_decode.T
+            compact_velocity[block] = velocity[start[art] : start[art] + 6]
+        jacobian = np.zeros((5, 18))
+        for row in range(5):
+            for body, art, point, sign in (
+                (body_a[row], art_a[row], point_a[row], 1.0),
+                (body_b[row], art_b[row], point_b[row], -1.0),
+            ):
+                if body < 0:
+                    continue
+                position = np.asarray(wp.transform_point(transforms[body], wp.vec3(*point)))
+                permutation = p.permutation if art == 1 else np.arange(6)
+                for node, physical in enumerate(permutation):
+                    if not (int(masks[body]) & (1 << node)):
+                        continue
+                    axis = motion[start[art] + physical]
+                    point_velocity = axis[:3] + np.cross(axis[3:], position - origin[art])
+                    jacobian[row, offset[art] + physical] += sign * (-normal[row] @ point_velocity)
+        actual = np.zeros((5, 18))
+        actual_response = np.zeros_like(actual)
+        for row, support in enumerate(row_dof.numpy()[0]):
+            valid = support >= 0
+            self.assertEqual(np.unique(support[valid]).size, np.count_nonzero(valid))
+            actual[row, support[valid]] = row_factor.numpy()[0, row, valid]
+            for entry, coordinate in enumerate(support):
+                if coordinate < 0:
+                    continue
+                actual_response[row, coordinate] = (
+                    row_free_response.numpy()[0, row, entry]
+                    if coordinate < 6 or coordinate >= 12
+                    else row_factor.numpy()[0, row, entry]
+                )
+        expected = jacobian @ transform.T
+        np.testing.assert_allclose(actual, expected, atol=3.0e-6, rtol=3.0e-6)
+        np.testing.assert_allclose(actual[0], actual[1], atol=3.0e-6)
+        np.testing.assert_allclose(incident.numpy()[0], jacobian @ compact_velocity, atol=6.0e-6, rtol=3.0e-6)
+        gram = jacobian @ np.linalg.solve(mass, jacobian.T)
+        expected_response = np.linalg.solve(mass, jacobian.T).T @ np.linalg.inv(transform)
+        np.testing.assert_allclose(actual_response, expected_response, atol=3.0e-6, rtol=3.0e-6)
+        np.testing.assert_allclose(actual @ actual_response.T, gram, atol=1.0e-5, rtol=4.0e-6)
+        np.testing.assert_allclose(diagonal.numpy()[0], np.diag(gram), atol=1.0e-5, rtol=4.0e-6)
+
+    def test_free_velocity_uses_world_offsets(self):
+        """Publish physical free-body deltas without overwriting robot velocities."""
+        rng = np.random.default_rng(502)
+        group_to_art = np.array([4, 0, 3, 2], dtype=np.int32)
+        world = np.array([1, 0, 0, 1, 0], dtype=np.int32)
+        offset = np.array([9, 0, 9, 15, 15], dtype=np.int32)
+        start = np.array([0, 6, 15, 21, 27], dtype=np.int32)
+        delta = rng.normal(size=(2, 21)).astype(np.float32)
+        velocity = rng.normal(size=33).astype(np.float32)
+        out = _array(velocity)
+        wp.launch(
+            apply_sparse_free_velocity,
+            dim=(4, 6),
+            inputs=[
+                _array(group_to_art, int),
+                _array(world, int),
+                _array(offset, int),
+                _array(start, int),
+                _array(delta),
+                _array(velocity),
+            ],
+            outputs=[out],
+            device="cpu",
+        )
+        expected = velocity.copy()
+        for art in group_to_art:
+            expected[start[art] : start[art] + 6] += delta[world[art], offset[art] : offset[art] + 6]
+        np.testing.assert_allclose(out.numpy(), expected, atol=3.0e-7, rtol=2.0e-6)
+        np.testing.assert_array_equal(out.numpy()[6:15], velocity[6:15])
+
     def test_contact_response_matches_dense_jacobian(self):
         """Match dense contact rows for static, same-articulation, and fixed endpoints."""
         f = _fixture()
@@ -141,6 +294,9 @@ class TestSparseContacts(unittest.TestCase):
                         f["path"],
                         f["needed"],
                         f["group"],
+                        _array([6], int),
+                        _array([0], int),
+                        _array([0], int),
                         f["start"],
                         f["origin"],
                         f["sparse_mask"],
@@ -154,9 +310,10 @@ class TestSparseContacts(unittest.TestCase):
                         indices.row_offsets,
                         indices.columns,
                         f["packed"],
+                        _array(np.eye(6)[None]),
                         f["velocity"],
                     ],
-                    outputs=[row_dof, row_factor, incident, diagonal],
+                    outputs=[row_dof, row_factor, _full((1, 9, 12), -9.0), incident, diagonal],
                     device="cpu",
                 )
                 jacobian = dense.numpy()[0, :7]
@@ -246,6 +403,7 @@ class TestSparseContacts(unittest.TestCase):
                     inputs=[
                         f["group"],
                         _array([0], int),
+                        _array([0], int),
                         f["start"],
                         _array([0, 1, -1, 3, 4, 5], int),
                         _array([-1.0, -1.0, -np.inf, -0.5, 0.0, -2.0]),
@@ -327,6 +485,7 @@ class TestSparseContacts(unittest.TestCase):
             inputs=[
                 array(group_to_art, int),
                 array(art_to_world, int),
+                array([0, 0, 0], int),
                 array(start, int),
                 array(q_index, int),
                 array(lower.reshape(-1)),
@@ -454,6 +613,7 @@ class TestSparseContacts(unittest.TestCase):
             dim=(1, 6),
             inputs=[
                 f["group"],
+                _array([0], int),
                 _array([0], int),
                 f["start"],
                 f["indices"].permutation,

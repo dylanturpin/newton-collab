@@ -132,7 +132,7 @@
   <text x="500" y="694" class="label center" style="fill:#145f6a">UNCHANGED PGS</text>
   <text x="500" y="718" class="body center">Same serial row order · same 2×2 friction projection · same iteration budget</text>
   <path d="M500 735 V771" class="flow"/>
-  <text x="524" y="757" class="small">Sparse path decodes velocity once after the sweeps.</text>
+  <text x="524" y="757" class="small">Decode factors once; free-body blocks stay physical.</text>
   <rect x="38" y="780" width="924" height="42" rx="10" fill="#f1f5f9"/>
   <text x="500" y="807" class="label center">Unchanged integration · unchanged state interface</text>
 </svg>
