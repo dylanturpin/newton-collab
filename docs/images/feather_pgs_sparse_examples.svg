@@ -1,0 +1,145 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1320" viewBox="0 0 1200 1320" role="img" aria-labelledby="title desc">
+  <title id="title">Why real scenes benefit differently from sparse FPGS</title>
+  <desc id="desc">Topological schematics and measured whole-PR results for G1 flat, KukaAllegro with a free object, ANYmal-D flat and rough, and Cassie flat. Highlighted paths show contact support, not the only bodies that can move. G1 benefits from a large branching tree and compact rows; Kuka retains its shared arm and physical object response; ANYmal has identical topology but different full-step work on rough terrain; Cassie benefits even with full-width maximum support. Allegro's native velocity limits currently select the original path. All gains compare fpgs-main 5238407d with measured solver a25b4c45 on RTX PRO6000 at 16,384 worlds, graphs on and video off.</desc>
+  <defs>
+    <style>
+      text { font-family: "DejaVu Sans", sans-serif; fill: #172b42; }
+      .title { font-size: 34px; font-weight: 700; letter-spacing: -.6px; }
+      .head { font-size: 27px; font-weight: 700; }
+      .body { font-size: 18px; }
+      .small { font-size: 15px; fill: #526579; }
+      .eyebrow { font-size: 14px; font-weight: 700; letter-spacing: 1px; fill: #087f83; }
+      .gain { font-size: 22px; font-weight: 700; fill: #126862; }
+      .muted { fill: #526579; }
+      .card { fill:#fff; stroke:#d5dee7; stroke-width:1.5; }
+    </style>
+    <marker id="force" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M1 1 L7 4 L1 7" fill="none" stroke="#c56c30" stroke-width="2"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="1320" rx="20" fill="#fff"/>
+  <text x="40" y="40" class="eyebrow" >SAME PR · DIFFERENT TOPOLOGY, CONTACTS AND TOTAL WORK</text>
+  <text x="40" y="85" class="title" >Where the savings appear — and where they do not.</text>
+  <text x="40" y="116" class="body" fill="#526579">RTX PRO6000 · 16,384 environments · CUDA graphs on · video off</text>
+  <circle cx="47" cy="141" r="5" fill="#087f83"/><text x="61" y="147" class="small" >contact ancestry</text>
+  <circle cx="249" cy="141" r="5" fill="#304d70"/><text x="263" y="147" class="small" >shared base</text>
+  <circle cx="420" cy="141" r="5" fill="#c56c30"/><text x="434" y="147" class="small" >contact / free object</text>
+  <text x="692" y="147" class="small" >Schematics, not physical proportions or full joint drawings.</text>
+
+  <rect x="40" y="166" width="540" height="420" rx="16" class="card"/>
+  <text x="64" y="196" class="eyebrow" >MANY BRANCHES · COMPACT CONTACT SUPPORT</text>
+  <text x="64" y="235" class="head" >G1 flat</text>
+  <g transform="translate(76 262)">
+  <polyline points="80,10 80,35 80,75" fill="none" stroke="#d7e0e8" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/><circle cx="80" cy="10" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="80" cy="35" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="80" cy="75" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/>
+  <polyline points="80,35 45,35 18,57 5,80" fill="none" stroke="#d7e0e8" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="80" cy="35" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="45" cy="35" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="18" cy="57" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="5" cy="80" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/>
+  <polyline points="80,35 115,35 142,57 155,80" fill="none" stroke="#d7e0e8" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="80" cy="35" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="115" cy="35" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="142" cy="57" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="155" cy="80" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/>
+  <polyline points="80,75 112,102 121,137 132,161" fill="none" stroke="#d7e0e8" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/><circle cx="80" cy="75" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="112" cy="102" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="121" cy="137" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="132" cy="161" r="4" fill="#d7e0e8" stroke="#fff" stroke-width="1"/>
+  <polyline points="80,75 48,102 39,137 28,161" fill="none" stroke="#087f83" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/><circle cx="80" cy="75" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="48" cy="102" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="39" cy="137" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="28" cy="161" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/>
+  <rect x="57" y="62" width="46" height="24" rx="7" fill="#304d70"/>
+  <circle cx="80" cy="0" r="12" fill="#d7e0e8"/>
+  <path d="M8 165 H39 M121 165 H145 M-4 185 H160" fill="none" stroke="#d7e0e8" stroke-width="4"/>
+  <path d="M19 185 V165" fill="none" stroke="#c56c30" stroke-width="3" marker-end="url(#force)"/>
+  <circle cx="19" cy="165" r="5" fill="#c56c30" stroke="#fff" stroke-width="1"/>
+  <text x="25" y="210" class="small" >foot contact</text>
+</g>
+  <text x="277" y="284" class="body" >43 response DOFs</text>
+  <text x="277" y="317" class="body" >Foot path: 6 base + 6 leg</text>
+  <text x="277" y="350" class="body" >Maximum row width: 18 / 43</text>
+  <text x="277" y="383" class="body" >434 packed factor entries</text>
+  <text x="64" y="488" class="body" >Skip unrelated branches in the contact row,</text>
+  <text x="64" y="514" class="body" >but keep the root that couples all limbs.</text>
+  <rect x="64" y="530" width="488" height="44" rx="8" fill="#e7f4f1"/>
+  <text x="81" y="559" class="gain" >1.61× physics</text>
+  <text x="337" y="559" class="gain" >1.42× env FPS</text>
+
+  <rect x="620" y="166" width="540" height="420" rx="16" class="card"/>
+  <text x="644" y="196" class="eyebrow" >SHARED ARM · BRANCHING FINGERS · FREE OBJECT</text>
+  <text x="644" y="235" class="head" >KukaAllegro lift</text>
+  <g transform="translate(642 262)">
+  <rect x="15" y="162" width="62" height="13" rx="4" fill="#304d70"/>
+  <polyline points="45,157 45,126 75,108 75,75 108,53 135,64 143,86" fill="none" stroke="#087f83" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/><circle cx="45" cy="157" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="45" cy="126" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="75" cy="108" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="75" cy="75" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="108" cy="53" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="135" cy="64" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="143" cy="86" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/>
+  <polyline points="143,86 152,63 169,48 188,43 202,47" fill="none" stroke="#d7e0e8" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="143" cy="86" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="152" cy="63" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="169" cy="48" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="188" cy="43" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="202" cy="47" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/>
+  <polyline points="143,86 170,80 190,76 207,79 216,85" fill="none" stroke="#d7e0e8" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="143" cy="86" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="170" cy="80" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="190" cy="76" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="207" cy="79" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="216" cy="85" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/>
+  <polyline points="143,86 171,99 193,104 212,107 220,114" fill="none" stroke="#d7e0e8" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="143" cy="86" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="171" cy="99" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="193" cy="104" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="212" cy="107" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/><circle cx="220" cy="114" r="3" fill="#d7e0e8" stroke="#fff" stroke-width="1"/>
+  <polyline points="143,86 154,111 171,127 188,140 202,145" fill="none" stroke="#087f83" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="143" cy="86" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="154" cy="111" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="171" cy="127" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="188" cy="140" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="202" cy="145" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/>
+  <path d="M202 149 L221 138 L240 150 L220 163 Z" fill="#f5dac7" stroke="#c56c30" stroke-width="2"/>
+  <path d="M202 149 V170 L220 183 L220 163 M220 183 L240 171 V150" fill="#faeadf" stroke="#c56c30" stroke-width="2"/>
+  <circle cx="205" cy="148" r="5" fill="#c56c30" stroke="#fff" stroke-width="1"/>
+  <text x="203" y="207" class="small" >object</text>
+  <text x="18" y="207" class="small" >shared arm</text>
+</g>
+  <text x="913" y="284" class="body" >23 robot + 6 object DOFs</text>
+  <text x="913" y="315" class="body" >Arm + finger: 7 + 4 = 11</text>
+  <text x="913" y="345" class="body" >Row: 17 of 29 world DOFs</text>
+  <text x="913" y="376" class="body" >Object response stays</text>
+  <text x="913" y="400" class="body" >in physical coordinates.</text>
+  <text x="644" y="488" class="body" >The shared arm still costs work. Ordinary row</text>
+  <text x="644" y="514" class="body" >storage falls 1,392 → 492 MiB (not total VRAM).</text>
+  <rect x="644" y="530" width="488" height="44" rx="8" fill="#e7f4f1"/>
+  <text x="661" y="559" class="gain" >1.18× physics</text>
+  <text x="917" y="559" class="gain" >1.09× env FPS</text>
+
+  <rect x="40" y="612" width="540" height="485" rx="16" class="card"/>
+  <text x="64" y="642" class="eyebrow" >SAME ROBOT · DIFFERENT FULL-STEP WORKLOAD</text>
+  <text x="64" y="681" class="head" >ANYmal-D: flat vs rough</text>
+  <text x="64" y="711" class="small" >Both: 18 DOFs · 117 factor entries · max row width 12</text>
+  <text x="64" y="741" class="small" >Physics ms · same scale</text>
+  <rect x="366" y="732" width="14" height="9" rx="2" fill="#a4b3c2"/>
+  <text x="386" y="741" class="small" >main</text>
+  <rect x="460" y="732" width="14" height="9" rx="2" fill="#087f83"/>
+  <text x="480" y="741" class="small" >PR</text>
+  <g transform="translate(81 768)">
+  <path d="M3 12 H53 M7 12 L0 29 L7 41 M48 12 L58 29 L50 41 M15 12 L12 26 L19 37 M41 12 L39 26 L33 37" fill="none" stroke="#304d70" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="2" y="4" width="52" height="15" rx="5" fill="#cddae8"/>
+  <path d="M-7 53 H67" stroke="#d7e0e8" fill="none" stroke-width="3"/>
+</g>
+  <text x="68" y="763" class="body" >Flat</text>
+  <rect x="182" y="769" width="80.88118776" height="15" rx="3" fill="#a4b3c2"/>
+  <rect x="182" y="791" width="61.133565329999996" height="15" rx="3" fill="#087f83"/>
+  <text x="295" y="792" class="body" >22.47 → 16.98 ms</text>
+  <text x="182" y="834" class="gain" >1.32× physics · 1.20× env FPS</text>
+  <g transform="translate(81 877)">
+  <path d="M3 12 H53 M7 12 L0 29 L7 41 M48 12 L58 29 L50 41 M15 12 L12 26 L19 37 M41 12 L39 26 L33 37" fill="none" stroke="#304d70" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="2" y="4" width="52" height="15" rx="5" fill="#cddae8"/>
+  <path d="M-7 53 L8 48 L21 54 L32 48 L42 56 L55 51 L67 56" stroke="#d7e0e8" fill="none" stroke-width="3"/>
+</g>
+  <text x="68" y="872" class="body" >Rough</text>
+  <rect x="182" y="878" width="328.56284726999996" height="15" rx="3" fill="#a4b3c2"/>
+  <rect x="182" y="900" width="297.49871295" height="15" rx="3" fill="#087f83"/>
+  <text x="182" y="941" class="body" >91.27 → 82.64 ms</text>
+  <text x="182" y="977" class="gain" >1.10× physics · 1.09× env FPS</text>
+  <text x="64" y="1017" class="body" >Rough saves more ms, yet has a smaller ratio.</text>
+  <text x="64" y="1045" class="body" >More total work dilutes the percentage saved.</text>
+  <text x="64" y="1073" class="small" >Scene and row capacities differ; not a collision-only test.</text>
+
+  <rect x="620" y="612" width="540" height="485" rx="16" class="card"/>
+  <text x="644" y="642" class="eyebrow" >COUNTEREXAMPLE · ROWS NEED NOT GET NARROWER</text>
+  <text x="644" y="681" class="head" >Cassie flat</text>
+  <g transform="translate(660 732)">
+  <rect x="63" y="5" width="60" height="26" rx="8" fill="#304d70"/>
+  <polyline points="78,28 54,53 48,82 61,107 43,133 42,157 18,162" fill="none" stroke="#087f83" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><circle cx="78" cy="28" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="54" cy="53" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="48" cy="82" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="61" cy="107" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="43" cy="133" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="42" cy="157" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/><circle cx="18" cy="162" r="4" fill="#087f83" stroke="#fff" stroke-width="1"/>
+  <polyline points="108,28 132,53 138,82 125,107 143,133 144,157 166,162" fill="none" stroke="#8875aa" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><circle cx="108" cy="28" r="4" fill="#8875aa" stroke="#fff" stroke-width="1"/><circle cx="132" cy="53" r="4" fill="#8875aa" stroke="#fff" stroke-width="1"/><circle cx="138" cy="82" r="4" fill="#8875aa" stroke="#fff" stroke-width="1"/><circle cx="125" cy="107" r="4" fill="#8875aa" stroke="#fff" stroke-width="1"/><circle cx="143" cy="133" r="4" fill="#8875aa" stroke="#fff" stroke-width="1"/><circle cx="144" cy="157" r="4" fill="#8875aa" stroke="#fff" stroke-width="1"/><circle cx="166" cy="162" r="4" fill="#8875aa" stroke="#fff" stroke-width="1"/>
+  <path d="M-3 181 H185" fill="none" stroke="#d7e0e8" stroke-width="4"/>
+  <text x="48" y="209" class="small" >6 + 6 + 6 DOFs</text>
+</g>
+  <text x="898" y="761" class="body" >18 response DOFs</text>
+  <text x="898" y="795" class="body" >Maximum row width:</text>
+  <text x="898" y="822" class="body" >18 / 18 world DOFs</text>
+  <text x="898" y="856" class="body" >135 packed factor entries</text>
+  <text x="898" y="899" class="body" >Two branch supports</text>
+  <text x="898" y="926" class="body" >can span every DOF.</text>
+  <text x="644" y="978" class="body" >Factor packing and shared contact construction</text>
+  <text x="644" y="1005" class="body" >still help when maximum row width is unchanged.</text>
+  <rect x="644" y="1030" width="488" height="44" rx="8" fill="#e7f4f1"/>
+  <text x="661" y="1059" class="gain" >1.34× physics</text>
+  <text x="917" y="1059" class="gain" >1.14× env FPS</text>
+
+  <rect x="40" y="1120" width="1120" height="115" rx="14" fill="#f1f4f8"/>
+  <text x="64" y="1155" class="head" >Branching alone does not guarantee admission: Allegro reorient</text>
+  <text x="64" y="1188" class="body" >Native joint-velocity limits keep the existing path: 1.00× physics / 0.99× env FPS.</text>
+  <text x="64" y="1217" class="body" >That is a current supported-feature boundary, not proof that branching fingers cannot benefit.</text>
+
+  <text x="40" y="1264" class="small" >All gains: fpgs-main 5238407d → measured solver a25b4c45. One capture per arm; short random-action workload.</text>
+  <text x="40" y="1287" class="small" >Maximum row width is a topology-derived bound, not average contact width. Packed counts describe one factor pattern.</text>
+  <text x="40" y="1310" class="small" >Highlighted paths show representation support, not the only limbs that move. The coupled physical response is preserved.</text>
+</svg>

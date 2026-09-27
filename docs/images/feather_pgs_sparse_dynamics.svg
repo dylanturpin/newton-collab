@@ -1,141 +1,231 @@
-<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1000" height="848" viewBox="0 0 1000 848" role="img" aria-labelledby="title desc">
-  <title id="title">Sparse dynamics inside FPGS: change the representation, preserve the solve</title>
-  <desc id="desc">Before and after comparison of the matrix-free FPGS path. A seven-DOF tree has one root and three two-joint limbs. The current path stores dense mass factors and full-width Jacobian and inverse-mass response rows. The candidate uses leaf-first packed factors and sparse factor-coordinate rows, retaining the shared root coordinates and therefore coupling between limbs. Normal and tangent rows share contact geometry and factor loads. Both retain serial PGS sweeps, paired friction law, iteration budget, collision inputs, integration and state publication. No performance result is claimed.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1180" viewBox="0 0 1200 1180" role="img" aria-labelledby="title desc">
+  <title id="title">Sparse FPGS: remove intermediates, preserve the coupled solve</title>
+  <desc id="desc">Four changes in one PR: fuse sparse mass assembly and factorization using a leaf-first topology plan; directly construct compact contact and joint-limit responses; solve serial PGS in mixed articulated factor and free-body physical coordinates; decode articulated changes once before existing integration. Contact normal and tangent directions share geometry and factor loads in an eight-lane group. Shared-root coupling, free-body mass response, friction law and numerical budgets remain. The baseline already uses matrix-free PGS. The factor illustration is a toy seven-DOF pattern, not a benchmark.</desc>
   <defs>
     <style>
-      text { font-family: Inter, "Segoe UI", Arial, sans-serif; fill: #192738; }
-      .eyebrow { font-size: 14px; font-weight: 700; letter-spacing: 1.5px; }
-      .heading { font-size: 30px; font-weight: 700; letter-spacing: -.7px; }
-      .label { font-size: 17px; font-weight: 650; }
-      .body { font-size: 16px; }
-      .small { font-size: 14px; fill: #536274; }
-      .muted { fill: #536274; }
+      text { font-family: "DejaVu Sans", sans-serif; fill: #172b42; }
+      .title { font-size: 34px; font-weight: 700; letter-spacing: -.7px; }
+      .head { font-size: 24px; font-weight: 700; }
+      .body { font-size: 19px; }
+      .small { font-size: 16px; fill: #526579; }
+      .eyebrow { font-size: 15px; font-weight: 700; letter-spacing: 1.3px; }
+      .teal { fill: #087f83; }
+      .muted { fill: #526579; }
       .center { text-anchor: middle; }
-      .root { fill: #253c58; }
-      .limb-a { fill: #167d8d; }
-      .limb-b { fill: #7b6aaa; }
-      .limb-c { fill: #bc6e3d; }
-      .empty { fill: #e9edf2; }
-      .dense { fill: #9babbc; }
-      .flow { fill: none; stroke: #8391a1; stroke-width: 2; marker-end: url(#arrow); }
+      .arrow { fill: none; stroke: #8a9bad; stroke-width: 2; marker-end: url(#arrow); }
+      .panel { fill: #fff; stroke: #d5dee7; stroke-width: 1.5; }
+      .new { fill: #f5fbfa; stroke: #a8cfcc; stroke-width: 1.5; }
     </style>
-    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto" markerUnits="userSpaceOnUse">
-      <path d="M1 1 L7 4 L1 7" fill="none" stroke="#8391a1" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M1 1 L7 4 L1 7" fill="none" stroke="#8a9bad" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
     </marker>
-    <rect id="cell" width="12" height="12" rx="2"/>
-    <g id="row-7">
-      <use xlink:href="#cell"/><use xlink:href="#cell" x="15"/><use xlink:href="#cell" x="30"/><use xlink:href="#cell" x="45"/><use xlink:href="#cell" x="60"/><use xlink:href="#cell" x="75"/><use xlink:href="#cell" x="90"/>
-    </g>
-    <g id="grid-7">
-      <use xlink:href="#row-7"/><use xlink:href="#row-7" y="15"/><use xlink:href="#row-7" y="30"/><use xlink:href="#row-7" y="45"/><use xlink:href="#row-7" y="60"/><use xlink:href="#row-7" y="75"/><use xlink:href="#row-7" y="90"/>
-    </g>
-    <g id="block-2">
-      <use xlink:href="#cell"/><use xlink:href="#cell" x="15"/><use xlink:href="#cell" y="15"/><use xlink:href="#cell" x="15" y="15"/>
-    </g>
-    <g id="lower-2">
-      <use xlink:href="#cell"/><use xlink:href="#cell" y="15"/><use xlink:href="#cell" x="15" y="15"/>
-    </g>
-    <clipPath id="lower-7"><path d="M0 0 H12 V15 H27 V30 H42 V45 H57 V60 H72 V75 H87 V90 H102 V102 H0 Z"/></clipPath>
-    <g id="three-sparse-rows">
-      <g class="limb-a"><use xlink:href="#cell"/><use xlink:href="#cell" x="15"/></g>
-      <use xlink:href="#cell" x="30" class="root"/>
-      <g transform="translate(0 15)"><g class="limb-a"><use xlink:href="#cell"/><use xlink:href="#cell" x="15"/></g><use xlink:href="#cell" x="30" class="root"/></g>
-      <g transform="translate(0 30)"><g class="limb-a"><use xlink:href="#cell"/><use xlink:href="#cell" x="15"/></g><use xlink:href="#cell" x="30" class="root"/></g>
-    </g>
   </defs>
 
-  <rect width="1000" height="848" rx="18" fill="#ffffff"/>
-  <text x="38" y="37" class="eyebrow" style="fill:#167d8d">FPGS · REPRESENTATION REDESIGN</text>
-  <text x="38" y="78" class="heading">Keep the physics. Remove the dense intermediates.</text>
-  <text x="38" y="107" class="body muted">A topology-derived sparse path inside the existing matrix-free solver.</text>
+  <rect width="1200" height="1180" rx="20" fill="#fff"/>
+  <text x="40" y="40" class="eyebrow teal">ONE PR · FOUR CONNECTED CHANGES</text>
+  <text x="40" y="85" class="title">Remove intermediates. Preserve the coupled solve.</text>
+  <text x="40" y="116" class="body muted">Both paths use matrix-free PGS. This is not a switch from a dense contact matrix.</text>
+  <rect x="40" y="140" width="1120" height="40" rx="10" fill="#eef2f6"/>
+  <text x="600" y="166" class="body center">Inputs: model topology, current state, forces, contacts and joint limits</text>
 
-  <rect x="38" y="129" width="924" height="43" rx="10" fill="#f1f5f9"/>
-  <text x="500" y="156" class="label center">Same collision contacts · same poses · same generalized forces</text>
-  <path d="M500 173 V186" class="flow"/>
+  <text x="64" y="210" class="eyebrow muted">FPGS-MAIN · REPRESENTATIVE DENSE PATH</text>
+  <text x="652" y="210" class="eyebrow teal">THIS PR · SPARSE FACTOR COORDINATES</text>
 
-  <rect x="38" y="192" width="924" height="98" rx="12" fill="#fafbfc" stroke="#e1e7ee"/>
-  <g stroke="#aab6c3" stroke-width="2.2" fill="none" stroke-linecap="round">
-    <path d="M153 212 V226 H93 V241 M153 226 V241 M153 226 H213 V241"/>
-    <path d="M93 249 V271 M153 249 V271 M213 249 V271"/>
-  </g>
-  <circle cx="153" cy="212" r="8" class="root"/>
-  <g class="limb-a"><circle cx="93" cy="245" r="6.5"/><circle cx="93" cy="272" r="6.5"/></g>
-  <g class="limb-b"><circle cx="153" cy="245" r="6.5"/><circle cx="153" cy="272" r="6.5"/></g>
-  <g class="limb-c"><circle cx="213" cy="245" r="6.5"/><circle cx="213" cy="272" r="6.5"/></g>
-  <text x="175" y="216" class="small">root</text>
-  <text x="278" y="221" class="label">Three limbs. One coupled system.</text>
-  <text x="278" y="247" class="body muted">Root coordinates stay in the sparse representation.</text>
-  <text x="278" y="272" class="small">The limbs are not treated as independent robots. Illustration: 7 DOFs.</text>
+  <rect x="40" y="228" width="532" height="222" rx="14" class="panel"/>
+  <rect x="628" y="228" width="532" height="222" rx="14" class="new"/>
+  <text x="64" y="262" class="head">Dense mass factors</text>
+  <text x="652" y="262" class="head">1  Pack the structural entries</text>
+  <rect x="74" y="282" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="92" y="282" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="110" y="282" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="128" y="282" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="146" y="282" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="164" y="282" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="182" y="282" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="74" y="300" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="92" y="300" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="110" y="300" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="128" y="300" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="146" y="300" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="164" y="300" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="182" y="300" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="74" y="318" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="92" y="318" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="110" y="318" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="128" y="318" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="146" y="318" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="164" y="318" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="182" y="318" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="74" y="336" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="92" y="336" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="110" y="336" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="128" y="336" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="146" y="336" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="164" y="336" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="182" y="336" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="74" y="354" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="92" y="354" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="110" y="354" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="128" y="354" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="146" y="354" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="164" y="354" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="182" y="354" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="74" y="372" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="92" y="372" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="110" y="372" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="128" y="372" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="146" y="372" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="164" y="372" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="182" y="372" width="14" height="14" rx="2" fill="#e9eef3"/>
+<rect x="74" y="390" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="92" y="390" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="110" y="390" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="128" y="390" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="146" y="390" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="164" y="390" width="14" height="14" rx="2" fill="#98aabc"/>
+<rect x="182" y="390" width="14" height="14" rx="2" fill="#98aabc"/>
+  <rect x="661" y="282" width="14" height="14" rx="2" fill="#087f83"/>
+<rect x="679" y="282" width="14" height="14" rx="2" fill="none"/>
+<rect x="697" y="282" width="14" height="14" rx="2" fill="none"/>
+<rect x="715" y="282" width="14" height="14" rx="2" fill="none"/>
+<rect x="733" y="282" width="14" height="14" rx="2" fill="none"/>
+<rect x="751" y="282" width="14" height="14" rx="2" fill="none"/>
+<rect x="769" y="282" width="14" height="14" rx="2" fill="none"/>
+<rect x="661" y="300" width="14" height="14" rx="2" fill="#087f83"/>
+<rect x="679" y="300" width="14" height="14" rx="2" fill="#087f83"/>
+<rect x="697" y="300" width="14" height="14" rx="2" fill="none"/>
+<rect x="715" y="300" width="14" height="14" rx="2" fill="none"/>
+<rect x="733" y="300" width="14" height="14" rx="2" fill="none"/>
+<rect x="751" y="300" width="14" height="14" rx="2" fill="none"/>
+<rect x="769" y="300" width="14" height="14" rx="2" fill="none"/>
+<rect x="661" y="318" width="14" height="14" rx="2" fill="none"/>
+<rect x="679" y="318" width="14" height="14" rx="2" fill="none"/>
+<rect x="697" y="318" width="14" height="14" rx="2" fill="#7868a6"/>
+<rect x="715" y="318" width="14" height="14" rx="2" fill="none"/>
+<rect x="733" y="318" width="14" height="14" rx="2" fill="none"/>
+<rect x="751" y="318" width="14" height="14" rx="2" fill="none"/>
+<rect x="769" y="318" width="14" height="14" rx="2" fill="none"/>
+<rect x="661" y="336" width="14" height="14" rx="2" fill="none"/>
+<rect x="679" y="336" width="14" height="14" rx="2" fill="none"/>
+<rect x="697" y="336" width="14" height="14" rx="2" fill="#7868a6"/>
+<rect x="715" y="336" width="14" height="14" rx="2" fill="#7868a6"/>
+<rect x="733" y="336" width="14" height="14" rx="2" fill="none"/>
+<rect x="751" y="336" width="14" height="14" rx="2" fill="none"/>
+<rect x="769" y="336" width="14" height="14" rx="2" fill="none"/>
+<rect x="661" y="354" width="14" height="14" rx="2" fill="none"/>
+<rect x="679" y="354" width="14" height="14" rx="2" fill="none"/>
+<rect x="697" y="354" width="14" height="14" rx="2" fill="none"/>
+<rect x="715" y="354" width="14" height="14" rx="2" fill="none"/>
+<rect x="733" y="354" width="14" height="14" rx="2" fill="#a47046"/>
+<rect x="751" y="354" width="14" height="14" rx="2" fill="none"/>
+<rect x="769" y="354" width="14" height="14" rx="2" fill="none"/>
+<rect x="661" y="372" width="14" height="14" rx="2" fill="none"/>
+<rect x="679" y="372" width="14" height="14" rx="2" fill="none"/>
+<rect x="697" y="372" width="14" height="14" rx="2" fill="none"/>
+<rect x="715" y="372" width="14" height="14" rx="2" fill="none"/>
+<rect x="733" y="372" width="14" height="14" rx="2" fill="#a47046"/>
+<rect x="751" y="372" width="14" height="14" rx="2" fill="#a47046"/>
+<rect x="769" y="372" width="14" height="14" rx="2" fill="none"/>
+<rect x="661" y="390" width="14" height="14" rx="2" fill="#304d70"/>
+<rect x="679" y="390" width="14" height="14" rx="2" fill="#304d70"/>
+<rect x="697" y="390" width="14" height="14" rx="2" fill="#304d70"/>
+<rect x="715" y="390" width="14" height="14" rx="2" fill="#304d70"/>
+<rect x="733" y="390" width="14" height="14" rx="2" fill="#304d70"/>
+<rect x="751" y="390" width="14" height="14" rx="2" fill="#304d70"/>
+<rect x="769" y="390" width="14" height="14" rx="2" fill="#304d70"/>
+  <text x="234" y="305" class="body">Dense n × n factor layout.</text>
+  <text x="234" y="338" class="body">Root-first elimination</text>
+  <text x="234" y="364" class="body">can fill between branches.</text>
+  <text x="817" y="305" class="body">Leaf-first CRBA → L, L⁻¹.</text>
+  <text x="817" y="338" class="body">Build directly into packed arrays.</text>
+  <text x="817" y="364" class="body">Keep the shared root.</text>
+  <text x="64" y="430" class="small">Toy 7-DOF lower factor, root-first ordering.</text>
+  <text x="652" y="430" class="small">Same toy, leaf-first. Dark blue = shared root.</text>
 
-  <path d="M269 291 V307" class="flow"/>
-  <path d="M731 291 V307" class="flow"/>
-  <rect x="38" y="316" width="447" height="324" rx="14" fill="#ffffff" stroke="#d7e0e9" stroke-width="1.5"/>
-  <rect x="515" y="316" width="447" height="324" rx="14" fill="#f7fbfb" stroke="#99c8cd" stroke-width="1.5"/>
-  <path d="M53 360 H470 M530 360 H947" stroke="#e1e7ee"/>
-  <text x="61" y="344" class="eyebrow muted">BEFORE · DENSE STORAGE</text>
-  <text x="538" y="344" class="eyebrow" style="fill:#126877">AFTER · SPARSE FACTOR SPACE</text>
+  <path d="M306 451 V470 M894 451 V470" class="arrow"/>
+  <rect x="40" y="480" width="532" height="280" rx="14" class="panel"/>
+  <rect x="628" y="480" width="532" height="280" rx="14" class="new"/>
+  <text x="64" y="517" class="head">Full-width row intermediates</text>
+  <text x="64" y="549" class="body muted">J and M⁻¹Jᵀ span the world's DOFs.</text>
+  <text x="96" y="579" class="small">robot A</text>
+  <text x="222" y="579" class="small">robot B</text>
+  <text x="386" y="579" class="small">free body</text>
+  <text x="64" y="607" class="body">J</text>
+  <rect x="96" y="590" width="24" height="20" rx="3" fill="#087f83" opacity="1"/>
+<rect x="125" y="590" width="24" height="20" rx="3" fill="#e9eef3" opacity="1"/>
+<rect x="154" y="590" width="24" height="20" rx="3" fill="#e9eef3" opacity="1"/>
+<rect x="183" y="590" width="24" height="20" rx="3" fill="#087f83" opacity="1"/>
+<rect x="212" y="590" width="24" height="20" rx="3" fill="#e9eef3" opacity="1"/>
+<rect x="241" y="590" width="24" height="20" rx="3" fill="#e9eef3" opacity="1"/>
+<rect x="270" y="590" width="24" height="20" rx="3" fill="#e9eef3" opacity="1"/>
+<rect x="299" y="590" width="24" height="20" rx="3" fill="#e9eef3" opacity="1"/>
+<rect x="328" y="590" width="24" height="20" rx="3" fill="#c56c30" opacity=".85"/>
+<rect x="357" y="590" width="24" height="20" rx="3" fill="#c56c30" opacity=".85"/>
+<rect x="386" y="590" width="24" height="20" rx="3" fill="#c56c30" opacity=".85"/>
+<rect x="415" y="590" width="24" height="20" rx="3" fill="#c56c30" opacity=".85"/>
+<rect x="444" y="590" width="24" height="20" rx="3" fill="#c56c30" opacity=".85"/>
+<rect x="473" y="590" width="24" height="20" rx="3" fill="#c56c30" opacity=".85"/>
+  <text x="64" y="643" class="body">Y</text>
+  <rect x="96" y="626" width="24" height="20" rx="3" fill="#087f83" opacity="1"/>
+<rect x="125" y="626" width="24" height="20" rx="3" fill="#087f83" opacity="1"/>
+<rect x="154" y="626" width="24" height="20" rx="3" fill="#087f83" opacity="1"/>
+<rect x="183" y="626" width="24" height="20" rx="3" fill="#087f83" opacity="1"/>
+<rect x="212" y="626" width="24" height="20" rx="3" fill="#e9eef3" opacity="1"/>
+<rect x="241" y="626" width="24" height="20" rx="3" fill="#e9eef3" opacity="1"/>
+<rect x="270" y="626" width="24" height="20" rx="3" fill="#e9eef3" opacity="1"/>
+<rect x="299" y="626" width="24" height="20" rx="3" fill="#e9eef3" opacity="1"/>
+<rect x="328" y="626" width="24" height="20" rx="3" fill="#c56c30" opacity=".85"/>
+<rect x="357" y="626" width="24" height="20" rx="3" fill="#c56c30" opacity=".85"/>
+<rect x="386" y="626" width="24" height="20" rx="3" fill="#c56c30" opacity=".85"/>
+<rect x="415" y="626" width="24" height="20" rx="3" fill="#c56c30" opacity=".85"/>
+<rect x="444" y="626" width="24" height="20" rx="3" fill="#c56c30" opacity=".85"/>
+<rect x="473" y="626" width="24" height="20" rx="3" fill="#c56c30" opacity=".85"/>
+  <text x="64" y="684" class="body">Allocate full rows, including unused blocks.</text>
+  <text x="64" y="715" class="small">Y = M⁻¹Jᵀ. Pale cells = stored zeros in this row.</text>
+  <text x="64" y="740" class="small">Robot B is independent in this illustrative contact.</text>
 
-  <!-- Root-first mass layout: H is sparse, but its array and factor are dense. -->
-  <g transform="translate(67 382)">
-    <use xlink:href="#grid-7" class="empty"/>
-    <use xlink:href="#row-7" class="root"/>
-    <g class="root"><use xlink:href="#cell" y="15"/><use xlink:href="#cell" y="30"/><use xlink:href="#cell" y="45"/><use xlink:href="#cell" y="60"/><use xlink:href="#cell" y="75"/><use xlink:href="#cell" y="90"/></g>
-    <use xlink:href="#block-2" x="15" y="15" class="limb-a"/>
-    <use xlink:href="#block-2" x="45" y="45" class="limb-b"/>
-    <use xlink:href="#block-2" x="75" y="75" class="limb-c"/>
-  </g>
-  <path d="M184 431 H207" class="flow"/>
-  <g transform="translate(223 382)">
-    <use xlink:href="#grid-7" class="empty"/>
-    <use xlink:href="#grid-7" class="dense" clip-path="url(#lower-7)"/>
-  </g>
-  <text x="118" y="507" class="small center">H, if materialized</text>
-  <text x="274" y="507" class="small center">Dense L</text>
-  <text x="349" y="410" class="small">Full-width</text>
-  <text x="349" y="431" class="small">arrays</text>
-  <text x="349" y="466" class="small">Pale slots:</text>
-  <text x="349" y="487" class="small">stored zeros</text>
+  <text x="652" y="517" class="head">2  Build compact responses directly</text>
+  <text x="652" y="549" class="body muted">Contact N / T₁ / T₂ + joint-limit rows</text>
+  <rect x="652" y="570" width="135" height="40" rx="8" fill="#dff0ed"/>
+  <text x="719" y="596" class="small center" style="fill:#176565">Geometry once</text>
+  <path d="M791 590 H801" class="arrow"/>
+  <rect x="811" y="591" width="12" height="12" rx="2" fill="#087f83"/>
+<rect x="827" y="591" width="12" height="12" rx="2" fill="#087f83"/>
+<rect x="843" y="591" width="12" height="12" rx="2" fill="#087f83"/>
+<rect x="859" y="591" width="12" height="12" rx="2" fill="#087f83"/>
+<rect x="875" y="591" width="12" height="12" rx="2" fill="#087f83"/>
+<rect x="891" y="591" width="12" height="12" rx="2" fill="#087f83"/>
+<rect x="907" y="591" width="12" height="12" rx="2" fill="#087f83"/>
+<rect x="923" y="591" width="12" height="12" rx="2" fill="#087f83"/>
+  <text x="875" y="579" class="small center">8 lanes / contact</text>
+  <path d="M944 590 H958" class="arrow"/>
+  <rect x="967" y="570" width="167" height="40" rx="8" fill="#dff0ed"/>
+  <text x="1050" y="596" class="small center" style="fill:#176565">Share factor loads</text>
+  <rect x="652" y="630" width="228" height="42" rx="8" fill="#dff0ed"/>
+  <text x="766" y="657" class="body center" style="fill:#176565">Robot: factor row Z</text>
+  <rect x="894" y="630" width="240" height="42" rx="8" fill="#fcf0e6"/>
+  <text x="1014" y="657" class="body center" style="fill:#8c4c23">Free body: J + response</text>
+  <text x="652" y="705" class="body">Write compact rows; no dense J/Y staging.</text>
+  <text x="652" y="738" class="small">Z = JPᵀL⁻ᵀ; P reorders the robot's coordinates.</text>
 
-  <!-- Leaf-first order A2,A1,B2,B1,C2,C1,root: inverse has the same support. -->
-  <g transform="translate(547 382)">
-    <use xlink:href="#lower-2" class="limb-a"/>
-    <use xlink:href="#lower-2" x="30" y="30" class="limb-b"/>
-    <use xlink:href="#lower-2" x="60" y="60" class="limb-c"/>
-    <use xlink:href="#row-7" y="90" class="root"/>
-  </g>
-  <text x="598" y="507" class="small center">Packed L, L⁻¹</text>
-  <text x="686" y="406" class="label">Eliminate leaves first.</text>
-  <text x="686" y="433" class="body muted">Store structural entries only.</text>
-  <text x="686" y="461" class="small">The full root row remains.</text>
-  <path d="M683 468 L665 478 H652" class="flow"/>
-  <text x="686" y="504" class="small">No dense H or L allocation.</text>
+  <path d="M306 761 V780 M894 761 V780" class="arrow"/>
+  <rect x="40" y="790" width="532" height="176" rx="14" class="panel"/>
+  <rect x="628" y="790" width="532" height="176" rx="14" class="new"/>
+  <text x="64" y="829" class="head">PGS with full-width responses</text>
+  <text x="64" y="867" class="body">Read J for the residual.</text>
+  <text x="64" y="898" class="body">Apply Y for the velocity change.</text>
+  <text x="64" y="942" class="small">Illustrative route; main also has specialized paths.</text>
+  <text x="652" y="829" class="head">3  PGS with mixed response blocks</text>
+  <text x="652" y="867" class="body">Articulations: reuse Z for both operations.</text>
+  <text x="652" y="898" class="body">Free bodies: retain physical J and M⁻¹Jᵀ.</text>
+  <text x="652" y="942" class="small">One warp / world · serial rows · same paired friction</text>
 
-  <path d="M61 523 H462 M538 523 H939" stroke="#e1e7ee"/>
-  <text x="61" y="550" class="label">Full-width J and H⁻¹Jᵀ rows</text>
-  <g transform="translate(67 569)">
-    <use xlink:href="#row-7" class="empty"/><use xlink:href="#row-7" y="15" class="empty"/><use xlink:href="#row-7" y="30" class="empty"/>
-    <g class="root"><use xlink:href="#cell"/><use xlink:href="#cell" y="15"/><use xlink:href="#cell" y="30"/></g>
-    <g class="limb-a"><use xlink:href="#block-2" x="15"/><use xlink:href="#cell" x="15" y="30"/><use xlink:href="#cell" x="30" y="30"/></g>
-  </g>
-  <path d="M184 590 H207" class="flow"/>
-  <g transform="translate(223 569)" class="dense"><use xlink:href="#row-7"/><use xlink:href="#row-7" y="15"/><use xlink:href="#row-7" y="30"/></g>
-  <text x="349" y="583" class="small">Across all</text>
-  <text x="349" y="604" class="small">world DOFs</text>
+  <path d="M306 967 V985 M894 967 V985" class="arrow"/>
+  <rect x="40" y="998" width="1120" height="116" rx="14" fill="#edf4fa" stroke="#c7d9e9"/>
+  <text x="64" y="1034" class="head">4  Return to physical velocity, then use existing integration</text>
+  <text x="64" y="1067" class="body">PR: decode articulated changes once after the sweeps. Free-body changes are already physical.</text>
+  <text x="64" y="1095" class="small">Shared-root coupling still transmits motion across limbs. Compact rows do not make limbs independent.</text>
 
-  <text x="538" y="550" class="label">Sparse factor rows · Z = JPᵀL⁻ᵀ</text>
-  <text x="551" y="579" class="small" text-anchor="end">N</text>
-  <text x="551" y="594" class="small" text-anchor="end">T₁</text>
-  <text x="551" y="609" class="small" text-anchor="end">T₂</text>
-  <use xlink:href="#three-sparse-rows" x="565" y="569"/>
-  <text x="686" y="583" class="body muted">Contact limb + shared root.</text>
-  <text x="686" y="608" class="small">Share geometry and factor loads.</text>
-
-  <path d="M261 641 V657 M739 641 V657" class="flow"/>
-  <rect x="38" y="666" width="924" height="68" rx="12" fill="#edf5f6" stroke="#bdd9dc"/>
-  <text x="500" y="694" class="label center" style="fill:#145f6a">UNCHANGED PGS</text>
-  <text x="500" y="718" class="body center">Serial PGS sweeps · same 2×2 friction projection · same iteration budget</text>
-  <path d="M500 735 V771" class="flow"/>
-  <text x="524" y="757" class="small">Decode factors once; free-body blocks stay physical.</text>
-  <rect x="38" y="780" width="924" height="42" rx="10" fill="#f1f5f9"/>
-  <text x="500" y="807" class="label center">Unchanged integration · unchanged state interface</text>
+  <text x="40" y="1148" class="body teal">Unchanged: collision · timestep / substeps · iteration budgets · friction law · public state interface</text>
+  <text x="40" y="1173" class="small">Safety: use the allocated normal/tangent row extent; preserve each row's anchor and free-body mass metric.</text>
 </svg>
