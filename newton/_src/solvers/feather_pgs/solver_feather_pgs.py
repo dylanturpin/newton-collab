@@ -4505,8 +4505,7 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_mass_matrix_indices = plan.to_device(model.device)
         self._sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
         group_count = self.n_arts_by_size[size]
-        self._sparse_L = wp.zeros((group_count, plan.nonzero_count), dtype=wp.float32, device=model.device)
-        self._sparse_Linv = wp.zeros_like(self._sparse_L)
+        self._sparse_Linv = wp.zeros((group_count, plan.nonzero_count), dtype=wp.float32, device=model.device)
         self._sparse_mass_matrix_status = wp.zeros(group_count, dtype=wp.int32, device=model.device)
         self._sparse_mass_matrix_scratch = wp.empty((group_count, size), dtype=wp.float32, device=model.device)
         shape = (self.world_count, self.dense_max_constraints, max_support)
@@ -5092,9 +5091,10 @@ class SolverFeatherPGS(SolverBase):
                 (n_arts, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
             )
 
-            # Tau and qdd grouped buffers for tiled triangular solve [n_arts, h_dim, 1]
-            self.tau_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
-            self.qdd_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
+            if not compact_diagonal_mass:
+                # Grouped scratch belongs to the dense triangular solve, not the compact paths.
+                self.tau_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
+                self.qdd_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
 
         if self._H_bufs is not None:
             self.H_by_size = self._H_bufs[0]
@@ -6059,7 +6059,7 @@ class SolverFeatherPGS(SolverBase):
         self._delassus_kernels_by_size = {}
 
         for size in self.size_groups:
-            compact_diagonal_mass = size == self._compact_diagonal_mass_size
+            compact_diagonal_mass = size in (self._compact_diagonal_mass_size, self._sparse_mass_matrix_size)
             sparse_response = self._sparse_mass_matrix_size is not None or (
                 self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size
             )
@@ -10216,7 +10216,7 @@ class SolverFeatherPGS(SolverBase):
                         self.aug_row_K,
                         self._sparse_mass_matrix_indices,
                     ],
-                    outputs=[self._sparse_L, self._sparse_Linv, self._sparse_mass_matrix_status],
+                    outputs=[self._sparse_Linv, self._sparse_mass_matrix_status],
                     block_dim=32 * self._sparse_factor_warps_per_block,
                     device=model.device,
                 )

@@ -133,8 +133,7 @@ class TestSparseMassMatrix(unittest.TestCase):
             return wp.array(value, dtype=dtype, device=device)
 
         indices = plan.to_device(device)
-        factors = wp.full((2, plan.nonzero_count), -97.0, dtype=float, device=device)
-        inverse = wp.full_like(factors, -98.0)
+        inverse = wp.full((2, plan.nonzero_count), -98.0, dtype=float, device=device)
         status = wp.full(2, 17, dtype=int, device=device)
         if mask is None:
             mask = [1, 1]
@@ -159,20 +158,18 @@ class TestSparseMassMatrix(unittest.TestCase):
             _get_crba_sparse_factor_kernel(n, plan.nonzero_count),
             dim=64,
             inputs=inputs,
-            outputs=[factors, inverse, status],
+            outputs=[inverse, status],
             device=device,
             block_dim=128,
         )
-        return plan, dense, factors, inverse, status, inputs
+        return plan, dense, inverse, status, inputs
 
     def test_crba_factor_solve_and_endpoint_response(self):
         """Match dense dynamics and endpoint response for branched multi-DOF forests."""
         for parents, counts in [([-1, 0, 0, 1], [6, 1, 3, 0]), ([2, -1, 1, 2, -1, 4], [2, 3, 0, 1, 1, 2])]:
             for fused_drive in (False, True):
                 with self.subTest(parents=parents, fused_drive=fused_drive):
-                    plan, dense, factors, inverse, status, inputs = self._factor(
-                        parents, counts, fused_drive=fused_drive
-                    )
+                    plan, dense, inverse, status, inputs = self._factor(parents, counts, fused_drive=fused_drive)
                     np.testing.assert_array_equal(status.numpy(), [0, 0])
                     n = plan.dof_count
                     rng = np.random.default_rng(66)
@@ -188,13 +185,12 @@ class TestSparseMassMatrix(unittest.TestCase):
                         block_dim=128,
                     )
                     for group, art in enumerate([1, 0]):
-                        lower = np.zeros((n, n))
                         whiten = np.zeros((n, n))
-                        lower[plan.entry_rows, plan.columns] = factors.numpy()[group]
                         whiten[plan.entry_rows, plan.columns] = inverse.numpy()[group]
                         reordered = dense[art][np.ix_(plan.permutation, plan.permutation)]
-                        np.testing.assert_allclose(lower @ lower.T, reordered, rtol=3.0e-5, atol=5.0e-5)
-                        np.testing.assert_allclose(whiten @ lower, np.eye(n), rtol=2.0e-5, atol=2.0e-5)
+                        np.testing.assert_allclose(
+                            whiten @ np.linalg.cholesky(reordered), np.eye(n), rtol=2.0e-5, atol=2.0e-5
+                        )
                         np.testing.assert_allclose(
                             qdd.numpy()[art * n : (art + 1) * n],
                             np.linalg.solve(dense[art], tau[art * n : (art + 1) * n]),
@@ -221,9 +217,7 @@ class TestSparseMassMatrix(unittest.TestCase):
 
     def _check_branched_factor(self, device):
         """Compare a broad articulated tree with the independent dense oracle."""
-        plan, dense, factors, inverse, status, inputs = self._factor(
-            *_branched_humanoid_topology(), armature=2.0, device=device
-        )
+        plan, dense, inverse, status, inputs = self._factor(*_branched_humanoid_topology(), armature=2.0, device=device)
         np.testing.assert_array_equal(status.numpy(), [0, 0])
         n = plan.dof_count
         tau = np.random.default_rng(521).normal(size=2 * n).astype(np.float32)
@@ -238,12 +232,10 @@ class TestSparseMassMatrix(unittest.TestCase):
             block_dim=128,
         )
         for group, art in enumerate([1, 0]):
-            lower, whiten = np.zeros((n, n)), np.zeros((n, n))
-            lower[plan.entry_rows, plan.columns] = factors.numpy()[group]
+            whiten = np.zeros((n, n))
             whiten[plan.entry_rows, plan.columns] = inverse.numpy()[group]
             expected = dense[art][np.ix_(plan.permutation, plan.permutation)]
-            self.assertLess(np.linalg.norm(lower @ lower.T - expected) / np.linalg.norm(expected), 3.0e-6)
-            np.testing.assert_allclose(whiten @ lower, np.eye(n), atol=1.0e-4, rtol=1.0e-4)
+            np.testing.assert_allclose(whiten @ np.linalg.cholesky(expected), np.eye(n), atol=1.0e-4, rtol=1.0e-4)
             np.testing.assert_allclose(
                 qdd.numpy()[art * n : (art + 1) * n],
                 np.linalg.solve(dense[art], tau[art * n : (art + 1) * n]),
@@ -261,17 +253,15 @@ class TestSparseMassMatrix(unittest.TestCase):
         self._check_branched_factor("cuda:0")
 
     def test_mask_preserves_factor(self):
-        """Retain both packed factors and status when an articulation is not refreshed."""
-        _, _, factors, inverse, status, _ = self._factor([-1, 0, 0], [2, 1, 1], mask=[0, 1])
-        np.testing.assert_array_equal(factors.numpy()[1], -97.0)
+        """Retain the inverse factor and status when an articulation is not refreshed."""
+        _, _, inverse, status, _ = self._factor([-1, 0, 0], [2, 1, 1], mask=[0, 1])
         np.testing.assert_array_equal(inverse.numpy()[1], -98.0)
         np.testing.assert_array_equal(status.numpy(), [0, 17])
 
     def test_invalid_pivot_is_not_regularized(self):
         """Report an invalid factor without adding a new pivot floor."""
-        _, _, factors, inverse, status, _ = self._factor([-1], [1], armature=-1.0e6)
+        _, _, inverse, status, _ = self._factor([-1], [1], armature=-1.0e6)
         np.testing.assert_array_equal(status.numpy(), [1, 1])
-        self.assertTrue(np.isnan(factors.numpy()).all())
         self.assertTrue(np.isnan(inverse.numpy()).all())
 
 

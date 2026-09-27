@@ -133,25 +133,20 @@ class _SparseMassMatrixPlan:
         inverse_permutation = np.argsort(permutation).astype(np.int32)
         dof_joint = np.repeat(np.arange(len(parents), dtype=np.int32), counts)
         joint_masks = [0] * len(parents)
-        ancestors = []
         for joint in range(len(parents)):
-            chain = set()
             ancestor = joint
             while ancestor != -1:
-                chain.add(ancestor)
                 for dof in range(starts[ancestor], starts[ancestor + 1]):
                     joint_masks[joint] |= 1 << int(inverse_permutation[dof])
                 ancestor = int(parents[ancestor])
-            ancestors.append(chain)
         row_offsets = [0]
         columns = []
         entry_rows = []
         lookup = np.full((n, n), -1, dtype=np.int32)
-        for row, physical_row in enumerate(permutation):
-            row_joint = int(dof_joint[physical_row])
+        for row in range(n):
             for col in range(row + 1):
                 col_joint = int(dof_joint[permutation[col]])
-                if row_joint in ancestors[col_joint]:
+                if joint_masks[col_joint] & (1 << row):
                     lookup[row, col] = len(columns)
                     entry_rows.append(row)
                     columns.append(col)
@@ -240,11 +235,11 @@ class _SparseMassMatrixPlan:
 
 @cache
 def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_per_block: int = 4) -> wp.Kernel:
-    """Assemble CRBA and produce packed L and Linv, one warp per articulation.
+    """Assemble CRBA and produce packed Linv, one warp per articulation.
 
     Launch ``group_count * 32`` threads with ``warps_per_block * 32`` threads per
     block. All value arrays must be contiguous. A zero articulation update mask
-    retains both factors and status. Status is zero after a successful refresh,
+    retains the inverse factor and status. Status is zero after a successful refresh,
     or one for a nonpositive/nonfinite pivot; no pivot floor is introduced.
     """
     n, nnz, warps = int(dof_count), int(nonzero_count), int(warps_per_block)
@@ -299,7 +294,6 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
             }}
         }}
         factor[entry] = value;
-        inverse[entry] = 0.0f;
     }}
 #if defined(__CUDA_ARCH__)
     __syncwarp();
@@ -367,9 +361,8 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
 #if defined(__CUDA_ARCH__)
     __syncwarp();
 #endif
+    const bool valid = status.data[group] == 0;
     for (int entry = lane; entry < {nnz}; entry += stride) {{
-        const bool valid = status.data[group] == 0;
-        L_group.data[group * {nnz} + entry] = valid ? factor[entry] : NAN;
         Linv_group.data[group * {nnz} + entry] = valid ? inverse[entry] : NAN;
     }}
 """
@@ -389,7 +382,6 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
         drive_row_by_dof: wp.array[int],
         row_K: wp.array[float],
         indices: _SparseMassMatrixIndices,
-        L_group: wp.array2d[float],
         Linv_group: wp.array2d[float],
         status: wp.array[int],
     ): ...
@@ -407,7 +399,6 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
         drive_row_by_dof: wp.array[int],
         row_K: wp.array[float],
         indices: _SparseMassMatrixIndices,
-        L_group: wp.array2d[float],
         Linv_group: wp.array2d[float],
         status: wp.array[int],
     ):
@@ -425,7 +416,6 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
             drive_row_by_dof,
             row_K,
             indices,
-            L_group,
             Linv_group,
             status,
         )

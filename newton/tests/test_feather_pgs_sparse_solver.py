@@ -221,13 +221,20 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             solver.L_by_size[size],
         ):
             self.assertEqual(array.shape, (1, 1, 1))  # Only argument stand-ins remain.
+        for name in ("tau_by_size", "qdd_by_size"):
+            self.assertNotIn(size, getattr(solver, name))
+        for name in (
+            "_cholesky_kernels_by_size",
+            "_crba_cholesky_kernels_by_size",
+            "_crba_cholesky_warp_kernels_by_size",
+            "_triangular_solve_kernels_by_size",
+        ):
+            self.assertIsNone(getattr(solver, name)[size])
         np.testing.assert_array_equal(solver._sparse_mass_matrix_status.numpy(), 0)
         self.assertFalse(solver.constraint_overflow.numpy().any())
         for name in STATE_FIELDS:
             self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
-        plan = solver._sparse_mass_matrix_plan
         counts, impulses = solver.constraint_count.numpy(), solver.impulses.numpy()
-        row_dof, values = solver._sparse_row_dof.numpy(), solver._sparse_row_factor.numpy()
         incidence, rhs = solver._sparse_row_incident.numpy(), solver.rhs.numpy()
         v_hat, v_out = solver.v_hat.numpy(), solver.v_out.numpy()
         for world in range(solver.world_count):
@@ -237,28 +244,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             kinds = solver.row_type.numpy()[world, :count]
             unilateral = (kinds == PGS_CONSTRAINT_TYPE_CONTACT) | (kinds == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
             self.assertTrue(np.all(impulses[world, :count][unilateral] >= -1.0e-7))
-            z = np.zeros((count, solver.max_world_dofs))
-            for row in range(count):
-                support = row_dof[world, row]
-                valid = support >= 0
-                self.assertTrue(np.all(support[valid] < solver.max_world_dofs))
-                self.assertEqual(len(set(support[valid])), int(valid.sum()))
-                z[row, support[valid]] = values[world, row, valid]
-            physical_j = np.zeros_like(z)
-            for group, art in enumerate(solver.group_to_art[size].numpy()):
-                if solver.art_to_world.numpy()[art] != world:
-                    continue
-                lower = np.zeros((size, size))
-                lower[plan.entry_rows, plan.columns] = solver._sparse_L.numpy()[group]
-                offset = int(solver.articulation_world_dof_offset.numpy()[art])
-                physical_j[:, offset + plan.permutation] = z[:, offset : offset + size] @ lower.T
-            if solver._has_free_rigid_bodies:
-                for free_art in solver.group_to_art[6].numpy():
-                    if solver.art_to_world.numpy()[free_art] != world:
-                        continue
-                    free_offset = int(solver.articulation_world_dof_offset.numpy()[free_art])
-                    block = slice(free_offset, free_offset + 6)
-                    physical_j[:, block] = z[:, block]
+            z, physical_j = self._sparse_rows_physical(solver, world, count)
             velocity = solver.world_dof_indices.numpy()[world]
             np.testing.assert_allclose(physical_j @ v_hat[velocity], incidence[world, :count], atol=2.0e-5, rtol=2.0e-5)
             factor_residual = (
@@ -268,16 +254,109 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                 physical_j @ v_out[velocity] + rhs[world, :count], factor_residual, atol=3.0e-5, rtol=3.0e-5
             )
 
+    def _sparse_rows_physical(self, solver, world, count):
+        """Recover physical Jacobians independently from the stored inverse factors."""
+        plan = solver._sparse_mass_matrix_plan
+        size = plan.dof_count
+        row_dof, values = solver._sparse_row_dof.numpy(), solver._sparse_row_factor.numpy()
+        z = np.zeros((count, solver.max_world_dofs))
+        for row in range(count):
+            support = row_dof[world, row]
+            valid = support >= 0
+            self.assertTrue(np.all(support[valid] < solver.max_world_dofs))
+            self.assertEqual(len(set(support[valid])), int(valid.sum()))
+            z[row, support[valid]] = values[world, row, valid]
+        physical_j = np.zeros_like(z)
+        for group, art in enumerate(solver.group_to_art[size].numpy()):
+            if solver.art_to_world.numpy()[art] != world:
+                continue
+            inverse = np.zeros((size, size))
+            inverse[plan.entry_rows, plan.columns] = solver._sparse_Linv.numpy()[group]
+            offset = int(solver.articulation_world_dof_offset.numpy()[art])
+            physical_j[:, offset + plan.permutation] = np.linalg.solve(inverse, z[:, offset : offset + size].T).T
+        if solver._has_free_rigid_bodies:
+            for art in solver.group_to_art[6].numpy():
+                if solver.art_to_world.numpy()[art] == world:
+                    offset = int(solver.articulation_world_dof_offset.numpy()[art])
+                    physical_j[:, offset : offset + 6] = z[:, offset : offset + 6]
+        return z, physical_j
+
+    def _order_multi_articulation_rows(self, case):
+        """Give this fixture identical semantic row order without changing production allocation."""
+        _, solver, _, _, _, _, contacts = case
+        sparse = solver._sparse_mass_matrix_size is not None
+        names = [
+            "rhs",
+            "diag",
+            "impulses",
+            "row_type",
+            "row_parent",
+            "row_mu",
+            "row_beta",
+            "row_cfm",
+            "phi",
+            "target_velocity",
+            "row_restitution",
+        ]
+        names += ["_sparse_row_dof", "_sparse_row_factor", "_sparse_row_incident"] if sparse else ["J_world", "Y_world"]
+        arrays = {name: getattr(solver, name).numpy() for name in names}
+        worlds, slots, needed = (
+            getattr(solver, name).numpy() for name in ("contact_world", "contact_slot", "contact_slots_needed")
+        )
+        shape_a, shape_b = contacts.rigid_contact_shape0.numpy(), contacts.rigid_contact_shape1.numpy()
+        identities = []
+        for world, count in enumerate(solver.constraint_count.numpy()):
+            jacobian = (
+                self._sparse_rows_physical(solver, world, count)[1] if sparse else arrays["J_world"][world, :count]
+            )
+            bundles = []
+            for row in np.flatnonzero(arrays["row_type"][world, :count] == PGS_CONSTRAINT_TYPE_JOINT_LIMIT):
+                dof = int(np.argmax(np.abs(jacobian[row])))
+                bundles.append(((0, dof, int(np.sign(jacobian[row, dof]))), [row]))
+            active = [
+                c for c in range(int(contacts.rigid_contact_count.numpy()[0])) if worlds[c] == world and slots[c] >= 0
+            ]
+            for c in active:
+                bundles.append(((1, int(shape_a[c]), int(shape_b[c])), list(range(slots[c], slots[c] + needed[c]))))
+            bundles.sort(key=lambda item: item[0])
+            keys = [key for key, _ in bundles]
+            self.assertEqual(len(keys), len(set(keys)), "Fixture must have unique limits and shape-pair contacts")
+            order = np.array([row for _, rows in bundles for row in rows], dtype=int)
+            np.testing.assert_array_equal(np.sort(order), np.arange(count))
+            inverse = np.argsort(order)
+            for values in arrays.values():
+                values[world, :count] = values[world, order]
+            parent = arrays["row_parent"][world, :count]
+            parent[parent >= 0] = inverse[parent[parent >= 0]]
+            slots[active] = inverse[slots[active]]
+            identities.append([(key, len(rows)) for key, rows in bundles])
+        for name, values in arrays.items():
+            getattr(solver, name).assign(values)
+        solver.contact_slot.assign(slots)
+        return identities
+
     def test_two_articulations_share_contact_solve(self):
         """Distinguish factor groups from worlds when two branched robots contact each other."""
         dense, sparse = _case(False, robot_count=2), _case(True, robot_count=2)
         self.assertEqual(sparse[1]._sparse_mass_matrix_size, 9)
-        self.assertEqual(sparse[1]._sparse_L.shape[0], 4)
+        self.assertEqual(sparse[1]._sparse_Linv.shape[0], 4)
         self.assertEqual(sparse[1].world_count, 2)
         contact_seen = False
         for _ in range(16):
+            row_orders = []
             for case in (dense, sparse):
-                _step(case)
+                solve = case[1]._launch_matrix_free_gs_solve
+
+                def ordered_solve(*args, _case=case, _solve=solve, _orders=row_orders, **kwargs):
+                    # Both production GPU paths solve the same semantic order;
+                    # atomic allocation order is not a physics-equivalence invariant.
+                    _orders.append(self._order_multi_articulation_rows(_case))
+                    return _solve(*args, **kwargs)
+
+                with mock.patch.object(case[1], "_launch_matrix_free_gs_solve", side_effect=ordered_solve):
+                    _step(case)
+            self.assertEqual(len(row_orders), 2)
+            self.assertEqual(*row_orders)
             self.assert_states_close(dense[2], sparse[2])
             model, solver, _, _, _, _, contacts = sparse
             active = int(contacts.rigid_contact_count.numpy()[0])

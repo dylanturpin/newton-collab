@@ -237,19 +237,13 @@ def _get_pgs_solve_sparse_kernel(
                 __syncwarp(MASK);
                 continue;
             }}
-            int parent = -1;
-            int sibling = -1;
-            if (friction) {{
-                parent = world_row_parent.data[offset + row];
-                if (row != parent + 1) continue;
-                sibling = parent + 2;
-            }}
+            const int parent = friction ? world_row_parent.data[offset + row] : -1;
+            if (friction && row != parent + 1) continue;
+            const int sibling = friction ? parent + 2 : -1;
             const float denominator = diagonal[row];
             if (!friction && denominator <= 0.0f) continue;
 
             int indices[{Q}];
-            float values[{Q}];
-            float sibling_values[{Q}];
             float responses[{Q}];
             float sibling_responses[{Q}];
             float dot = 0.0f;
@@ -271,8 +265,6 @@ def _get_pgs_solve_sparse_kernel(
                         sibling_response = row_free_response.data[(offset + sibling) * width + entry];
                 }}
                 indices[q] = index;
-                values[q] = value;
-                sibling_values[q] = sibling_value;
                 responses[q] = response;
                 sibling_responses[q] = sibling_response;
                 if (index >= 0) {{

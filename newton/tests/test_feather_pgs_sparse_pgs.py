@@ -4,6 +4,7 @@
 """Compare sparse factor-coordinate sweeps with physical-coordinate PGS."""
 
 import unittest
+from itertools import product
 
 import numpy as np
 import warp as wp
@@ -17,12 +18,28 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
 
+_SWEEP_CASES = ((0, 0, 1.0), (3, 1, 0.7), (3, 4, 1.2))
 
-def _sweep(jacobian, response, velocity, bias, diagonal, types, parents, mu, impulses, friction_start=0):
+
+def _sweep(
+    jacobian,
+    response,
+    velocity,
+    bias,
+    diagonal,
+    types,
+    parents,
+    mu,
+    impulses,
+    *,
+    friction_start=0,
+    iteration_offset=0,
+    omega=1.0,
+):
     velocity, impulses = velocity.copy(), impulses.copy()
     for iteration in range(8):
         for row, kind in enumerate(types):
-            if kind == PGS_CONSTRAINT_TYPE_FRICTION and iteration < friction_start:
+            if kind == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + iteration < friction_start:
                 impulses[row] = 0.0
                 continue
             if kind == PGS_CONSTRAINT_TYPE_FRICTION and row != parents[row] + 1:
@@ -44,7 +61,7 @@ def _sweep(jacobian, response, velocity, bias, diagonal, types, parents, mu, imp
                     wp.vec2(float(residual), float(jacobian[sibling] @ velocity + bias[sibling])),
                     wp.vec2(float(old), float(impulses[sibling])),
                     float(radius),
-                    1.0,
+                    omega,
                 )
                 pair = np.asarray(pair, dtype=np.float64)
                 magnitude = np.linalg.norm(pair)
@@ -54,7 +71,7 @@ def _sweep(jacobian, response, velocity, bias, diagonal, types, parents, mu, imp
                 impulses[sibling] = pair[1]
                 value = pair[0]
             else:
-                value = old - residual / diagonal[row]
+                value = old - omega * residual / diagonal[row]
                 if kind in (PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT):
                     value = max(value, 0.0)
             velocity += response[row] * (value - old)
@@ -206,23 +223,41 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         """Preserve dense-then-MF row order and distinct free-body responses."""
         factor, z, r, jacobian, response, initial, bias, types, parents, mu, diagonal = _mixed_problem()
         impulses = np.zeros(len(types))
-        expected, expected_impulses = _sweep(jacobian, response, initial, bias, diagonal, types, parents, mu, impulses)
-        delta, actual_impulses = _sweep(
-            z, r, np.zeros_like(initial), jacobian @ initial + bias, diagonal, types, parents, mu, impulses
-        )
         np.testing.assert_allclose(z @ r.T, jacobian @ response.T, atol=1.0e-12)
-        np.testing.assert_allclose(initial + np.linalg.solve(factor.T, delta), expected, atol=3.0e-6, rtol=3.0e-5)
-        np.testing.assert_allclose(actual_impulses, expected_impulses, atol=3.0e-6, rtol=3.0e-5)
         self.assertGreater(np.linalg.norm(z[8:] - r[8:]), 0.1)
+        for friction_start, iteration_offset, omega in _SWEEP_CASES:
+            with self.subTest(friction_start=friction_start, iteration_offset=iteration_offset, omega=omega):
+                settings = {"friction_start": friction_start, "iteration_offset": iteration_offset, "omega": omega}
+                expected, expected_impulses = _sweep(
+                    jacobian, response, initial, bias, diagonal, types, parents, mu, impulses, **settings
+                )
+                delta, actual_impulses = _sweep(
+                    z,
+                    r,
+                    np.zeros_like(initial),
+                    jacobian @ initial + bias,
+                    diagonal,
+                    types,
+                    parents,
+                    mu,
+                    impulses,
+                    **settings,
+                )
+                np.testing.assert_allclose(
+                    initial + np.linalg.solve(factor.T, delta), expected, atol=3.0e-6, rtol=3.0e-5
+                )
+                np.testing.assert_allclose(actual_impulses, expected_impulses, atol=3.0e-6, rtol=3.0e-5)
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_mixed_sweeps_match_physical_reference(self):
-        """Solve mixed rows with independent MF capacity, padding and empty worlds."""
-        for include_mf in (False, True):
-            with self.subTest(include_mf=include_mf):
-                self._check_cuda_mixed_sweeps(include_mf)
+        """Preserve mixed rows, capacities, friction timing and relaxation across empty worlds."""
+        for include_mf, (friction_start, iteration_offset, omega) in product((False, True), _SWEEP_CASES):
+            with self.subTest(
+                include_mf=include_mf, friction_start=friction_start, iteration_offset=iteration_offset, omega=omega
+            ):
+                self._check_cuda_mixed_sweeps(include_mf, friction_start, iteration_offset, omega)
 
-    def _check_cuda_mixed_sweeps(self, include_mf):
+    def _check_cuda_mixed_sweeps(self, include_mf, friction_start, iteration_offset, omega):
         """Compare physical output while independently toggling the native free/free family."""
         factor, z, r, jacobian, response, initial, bias, types, parents, mu, diagonal = _mixed_problem()
         count = 14 if include_mf else 8
@@ -236,6 +271,9 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
             parents[:count],
             mu[:count],
             np.zeros(count),
+            friction_start=friction_start,
+            iteration_offset=iteration_offset,
+            omega=omega,
         )
         device, worlds, capacity, mf_capacity, support = "cuda:0", 3, 10, 8, 21
 
@@ -307,9 +345,9 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                 padded(mf_r[:, 6:], mf_capacity),
                 padded(mu[8:], mf_capacity),
                 8,
-                1.0,
-                0,
-                0,
+                omega,
+                friction_start,
+                iteration_offset,
             ],
             outputs=[delta],
             block_dim=64,
@@ -340,16 +378,42 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
 
     def test_factor_sweeps_match_physical_sweeps(self):
         """Preserve joint limits, pooled friction loads and seeded-impulse semantics."""
-        for seeded in (False, True):
-            for friction_start in (0, 2):
-                with self.subTest(seeded=seeded, friction_start=friction_start):
-                    factor, _, rows, initial, bias, types, parents, mu, impulses, jacobian, response, incident, diag = (
-                        _problem(seeded=seeded)
+        for seeded, (friction_start, iteration_offset, omega) in product((False, True), _SWEEP_CASES):
+            with self.subTest(
+                seeded=seeded, friction_start=friction_start, iteration_offset=iteration_offset, omega=omega
+            ):
+                factor, _, rows, initial, bias, types, parents, mu, impulses, jacobian, response, incident, diag = (
+                    _problem(seeded=seeded)
+                )
+                settings = {"friction_start": friction_start, "iteration_offset": iteration_offset, "omega": omega}
+                expected, expected_impulses = _sweep(
+                    jacobian, response, initial, bias, diag, types, parents, mu, impulses, **settings
+                )
+                delta, actual_impulses = _sweep(
+                    rows, rows, np.zeros_like(initial), incident + bias, diag, types, parents, mu, impulses, **settings
+                )
+                actual = initial + np.linalg.solve(factor.T, delta)
+                np.testing.assert_allclose(actual, expected, atol=2.0e-6, rtol=2.0e-5)
+                np.testing.assert_allclose(actual_impulses, expected_impulses, atol=2.0e-6, rtol=2.0e-5)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
+    def test_cuda_sparse_sweeps_match_reference(self):
+        """Match delayed and relaxed serial sweeps, including padding and zero-row worlds."""
+        device = wp.get_device("cuda:0")
+        for dofs, support in ((43, 18), (75, 39)):
+            for seeded, (friction_start, iteration_offset, omega) in product((False, True), _SWEEP_CASES):
+                with self.subTest(
+                    dofs=dofs,
+                    support=support,
+                    seeded=seeded,
+                    friction_start=friction_start,
+                    iteration_offset=iteration_offset,
+                    omega=omega,
+                ):
+                    _, indices, rows, initial, bias, types, parents, mu, impulses, _, _, incident, diag = _problem(
+                        dofs, support, seeded
                     )
                     expected, expected_impulses = _sweep(
-                        jacobian, response, initial, bias, diag, types, parents, mu, impulses, friction_start
-                    )
-                    delta, actual_impulses = _sweep(
                         rows,
                         rows,
                         np.zeros_like(initial),
@@ -359,24 +423,9 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         parents,
                         mu,
                         impulses,
-                        friction_start,
-                    )
-                    actual = initial + np.linalg.solve(factor.T, delta)
-                    np.testing.assert_allclose(actual, expected, atol=2.0e-6, rtol=2.0e-5)
-                    np.testing.assert_allclose(actual_impulses, expected_impulses, atol=2.0e-6, rtol=2.0e-5)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
-    def test_cuda_sparse_sweeps_match_reference(self):
-        """Match serial reference sweeps, including padding and zero-row worlds."""
-        device = wp.get_device("cuda:0")
-        for dofs, support in ((43, 18), (75, 39)):
-            for seeded in (False, True):
-                with self.subTest(dofs=dofs, support=support, seeded=seeded):
-                    _, indices, rows, initial, bias, types, parents, mu, impulses, _, _, incident, diag = _problem(
-                        dofs, support, seeded
-                    )
-                    expected, expected_impulses = _sweep(
-                        rows, rows, np.zeros_like(initial), incident + bias, diag, types, parents, mu, impulses
+                        friction_start=friction_start,
+                        iteration_offset=iteration_offset,
+                        omega=omega,
                     )
                     worlds, capacity = 3, 10
                     row_dof = np.full((worlds, capacity, support), -1, dtype=np.int32)
@@ -421,9 +470,9 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                             wp.zeros((worlds, 1, 6), device=device),
                             wp.zeros((worlds, 1), device=device),
                             8,
-                            1.0,
-                            0,
-                            0,
+                            omega,
+                            friction_start,
+                            iteration_offset,
                         ],
                         outputs=[delta],
                         block_dim=64,
