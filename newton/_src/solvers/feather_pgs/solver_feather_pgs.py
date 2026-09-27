@@ -202,11 +202,11 @@ from .kernels import (
     vector_add_inplace,
 )
 from .sparse_contact import (
+    _get_sparse_contact_response_kernel,
     apply_sparse_contact_restitution,
     apply_sparse_factor_velocity,
     apply_sparse_free_velocity,
     build_sparse_joint_limit_rows,
-    populate_sparse_contact_response,
 )
 from .sparse_mass_matrix import (
     _get_crba_sparse_factor_kernel,
@@ -4530,6 +4530,10 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_free_factor_dummy = wp.zeros((1, 6, 6), dtype=wp.float32, device=model.device)
         self._crba_sparse_factor_kernel = _get_crba_sparse_factor_kernel(
             size, plan.nonzero_count, warps_per_block=self._sparse_factor_warps_per_block
+        )
+        self._sparse_contact_lanes = 8
+        self._sparse_contact_response_kernel = _get_sparse_contact_response_kernel(
+            size, lanes_per_contact=self._sparse_contact_lanes
         )
         self._pgs_solve_sparse_kernel = _get_pgs_solve_sparse_kernel(
             self.dense_max_constraints,
@@ -11313,12 +11317,15 @@ class SolverFeatherPGS(SolverBase):
                         continue
                     if size == self._sparse_mass_matrix_size:
                         indices = self._sparse_mass_matrix_indices
+                        sparse_contact_workers = min(
+                            contact_build_threads, contact_jacobian_workers * 32 // self._sparse_contact_lanes
+                        )
                         wp.launch(
-                            populate_sparse_contact_response,
-                            dim=(contact_build_threads, 3),
+                            self._sparse_contact_response_kernel,
+                            dim=sparse_contact_workers * self._sparse_contact_lanes,
                             inputs=[
                                 contacts.rigid_contact_count,
-                                contact_build_threads,
+                                sparse_contact_workers,
                                 contacts.rigid_contact_point0,
                                 contacts.rigid_contact_point1,
                                 contacts.rigid_contact_normal,
@@ -11347,7 +11354,6 @@ class SolverFeatherPGS(SolverBase):
                                 int(self.contact_shared_anchor),
                                 indices.permutation,
                                 indices.row_offsets,
-                                indices.columns,
                                 self._sparse_Linv,
                                 self.Linv_by_size[6] if self._has_free_rigid_bodies else self._sparse_free_factor_dummy,
                                 self.v_hat,
@@ -11359,6 +11365,7 @@ class SolverFeatherPGS(SolverBase):
                                 self._sparse_row_incident,
                                 self.diag,
                             ],
+                            block_dim=128,
                             device=model.device,
                         )
                         continue

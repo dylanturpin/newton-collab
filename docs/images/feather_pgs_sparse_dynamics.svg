@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1000" height="848" viewBox="0 0 1000 848" role="img" aria-labelledby="title desc">
   <title id="title">Sparse dynamics inside FPGS: change the representation, preserve the solve</title>
-  <desc id="desc">Before and after comparison of the matrix-free FPGS path. A seven-DOF tree has one root and three two-joint limbs. The current path stores dense mass factors and full-width Jacobian and inverse-mass response rows. The candidate uses leaf-first packed factors and sparse factor-coordinate rows, retaining the shared root coordinates and therefore coupling between limbs. Both use the same serial PGS ordering, paired friction law, iteration budget, collision inputs, integration and state publication. No performance result is claimed.</desc>
+  <desc id="desc">Before and after comparison of the matrix-free FPGS path. A seven-DOF tree has one root and three two-joint limbs. The current path stores dense mass factors and full-width Jacobian and inverse-mass response rows. The candidate uses leaf-first packed factors and sparse factor-coordinate rows, retaining the shared root coordinates and therefore coupling between limbs. Normal and tangent rows share contact geometry and factor loads. Both retain serial PGS sweeps, paired friction law, iteration budget, collision inputs, integration and state publication. No performance result is claimed.</desc>
   <defs>
     <style>
       text { font-family: Inter, "Segoe UI", Arial, sans-serif; fill: #192738; }
@@ -123,14 +123,17 @@
   <text x="349" y="604" class="small">world DOFs</text>
 
   <text x="538" y="550" class="label">Sparse factor rows · Z = JPᵀL⁻ᵀ</text>
+  <text x="551" y="579" class="small" text-anchor="end">N</text>
+  <text x="551" y="594" class="small" text-anchor="end">T₁</text>
+  <text x="551" y="609" class="small" text-anchor="end">T₂</text>
   <use xlink:href="#three-sparse-rows" x="565" y="569"/>
   <text x="686" y="583" class="body muted">Contact limb + shared root.</text>
-  <text x="686" y="608" class="small">No full-width response rows.</text>
+  <text x="686" y="608" class="small">Share geometry and factor loads.</text>
 
   <path d="M261 641 V657 M739 641 V657" class="flow"/>
   <rect x="38" y="666" width="924" height="68" rx="12" fill="#edf5f6" stroke="#bdd9dc"/>
   <text x="500" y="694" class="label center" style="fill:#145f6a">UNCHANGED PGS</text>
-  <text x="500" y="718" class="body center">Same serial row order · same 2×2 friction projection · same iteration budget</text>
+  <text x="500" y="718" class="body center">Serial PGS sweeps · same 2×2 friction projection · same iteration budget</text>
   <path d="M500 735 V771" class="flow"/>
   <text x="524" y="757" class="small">Decode factors once; free-body blocks stay physical.</text>
   <rect x="38" y="780" width="924" height="42" rx="10" fill="#f1f5f9"/>

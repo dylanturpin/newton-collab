@@ -16,11 +16,11 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton._src.solvers.feather_pgs.sparse_contact import (
+    _get_sparse_contact_response_kernel,
     apply_sparse_contact_restitution,
     apply_sparse_factor_velocity,
     apply_sparse_free_velocity,
     build_sparse_joint_limit_rows,
-    populate_sparse_contact_response,
 )
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan
 
@@ -33,74 +33,108 @@ def _full(shape, value, dtype=float):
     return wp.full(shape, value, dtype=dtype, device="cpu")
 
 
-def _fixture():
+def _fixture(device="cpu", joint_dof_count=(3, 2, 1, 0)):
     """Make a two-branch articulation with a multi-DOF root and fixed endpoint."""
-    plan = _SparseMassMatrixPlan.build([-1, 0, 0, 1], [3, 2, 1, 0])
+
+    def array(value, dtype=float):
+        return wp.array(value, dtype=dtype, device=device)
+
+    plan = _SparseMassMatrixPlan.build([-1, 0, 0, 1], joint_dof_count)
+    dofs = plan.dof_count
     rng = np.random.default_rng(916)
-    lower = np.zeros((6, 6))
+    lower = np.zeros((dofs, dofs))
     lower[plan.entry_rows, plan.columns] = rng.normal(scale=0.3, size=plan.nonzero_count)
-    lower[np.diag_indices(6)] = 2.0
+    lower[np.diag_indices(dofs)] = 2.0
     inverse = np.linalg.inv(lower)
     patches = FrictionPatches()
     patches.enabled = 0
-    patches.weight = _array([1.0, 1.0, 0.0])
-    patches.next_contact = _array([-1, -1, -1], int)
-    patches.point_a = _array(rng.normal(size=(3, 3)), wp.vec3)
-    patches.point_b = _array(rng.normal(size=(3, 3)), wp.vec3)
-    patches.phi = _array(np.zeros((3, 2)), wp.vec2)
+    patches.weight = array([1.0, 1.0, 0.0])
+    patches.next_contact = array([-1, -1, -1], int)
+    patches.point_a = array(rng.normal(size=(3, 3)), wp.vec3)
+    patches.point_b = array(rng.normal(size=(3, 3)), wp.vec3)
+    patches.phi = array(np.zeros((3, 2)), wp.vec2)
     normals = rng.normal(size=(3, 3))
     normals /= np.linalg.norm(normals, axis=1)[:, None]
     physical_masks = [sum(1 << int(plan.permutation[i]) for i in plan.endpoint_support(j)) for j in range(4)]
     return {
         "plan": plan,
-        "indices": plan.to_device("cpu"),
+        "indices": plan.to_device(device),
         "inverse": inverse,
-        "packed": _array(inverse[plan.entry_rows, plan.columns][None, :]),
+        "packed": array(inverse[plan.entry_rows, plan.columns][None, :]),
         "patches": patches,
-        "count": _array([3], int),
-        "point0": _array(rng.normal(size=(3, 3)), wp.vec3),
-        "point1": _array(rng.normal(size=(3, 3)), wp.vec3),
-        "normal": _array(normals, wp.vec3),
-        "shape0": _array([0, 0, 2], int),
-        "shape1": _array([3, 1, 3], int),
-        "thickness0": _array([0.01, 0.02, 0.03]),
-        "thickness1": _array([0.03, 0.01, 0.02]),
-        "world": _array([0, 0, 0], int),
-        "slot": _array([0, 3, 6], int),
-        "art_a": _array([0, 0, 0], int),
-        "art_b": _array([-1, 0, -1], int),
-        "path": _array([0, 0, 0], int),
-        "needed": _array([3, 3, 1], int),
-        "group": _array([0], int),
-        "start": _array([0], int),
-        "origin": _array([[0.3, -0.4, 0.7]], wp.vec3),
-        "sparse_mask": _array(plan.joint_ancestor_mask, wp.uint64),
-        "physical_mask": _array(physical_masks, wp.uint32),
-        "motion": _array(rng.normal(size=(6, 6)), wp.spatial_vector),
-        "shape_body": _array([1, 2, 3, -1], int),
-        "body_q": _array(
-            [wp.transform(wp.vec3(*p), wp.quat_identity()) for p in rng.normal(size=(4, 3))], wp.transform
-        ),
-        "velocity": _array(rng.normal(size=6)),
+        "count": array([3], int),
+        "point0": array(rng.normal(size=(3, 3)), wp.vec3),
+        "point1": array(rng.normal(size=(3, 3)), wp.vec3),
+        "normal": array(normals, wp.vec3),
+        "shape0": array([0, 0, 2], int),
+        "shape1": array([3, 1, 3], int),
+        "thickness0": array([0.01, 0.02, 0.03]),
+        "thickness1": array([0.03, 0.01, 0.02]),
+        "world": array([0, 0, 0], int),
+        "slot": array([0, 3, 6], int),
+        "art_a": array([0, 0, 0], int),
+        "art_b": array([-1, 0, -1], int),
+        "path": array([0, 0, 0], int),
+        "needed": array([3, 3, 1], int),
+        "group": array([0], int),
+        "start": array([0], int),
+        "origin": array([[0.3, -0.4, 0.7]], wp.vec3),
+        "sparse_mask": array(plan.joint_ancestor_mask, wp.uint64),
+        "physical_mask": array(physical_masks, wp.uint32 if dofs <= 32 else wp.uint64),
+        "motion": array(rng.normal(size=(dofs, 6)), wp.spatial_vector),
+        "shape_body": array([1, 2, 3, -1], int),
+        "body_q": array([wp.transform(wp.vec3(*p), wp.quat_identity()) for p in rng.normal(size=(4, 3))], wp.transform),
+        "velocity": array(rng.normal(size=dofs)),
     }
 
 
 class TestSparseContacts(unittest.TestCase):
     def test_mixed_contact_response_matches_independent_mass_oracle(self):
+        """Match physical mixed responses with arbitrary offsets and wide ancestry support."""
+        for counts in ((1, 1, 1, 0), (3, 2, 1, 0), (6, 19, 18, 0), (6, 29, 29, 0)):
+            with self.subTest(joint_dof_count=counts):
+                self._check_mixed_contact_response("cpu", 1, counts)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "cooperative contact construction requires CUDA")
+    def test_mixed_contact_response_cuda(self):
+        """Preserve mixed responses across partial warps, group widths and grid strides."""
+        for lanes in (8, 16, 32):
+            counts_to_check = (
+                ((1, 1, 1, 0), (3, 2, 1, 0), (6, 19, 18, 0), (6, 29, 29, 0))
+                if lanes == 8
+                else ((3, 2, 1, 0), (6, 29, 29, 0))
+            )
+            for counts in counts_to_check:
+                for workers in (1, 2, 7) if lanes == 8 else (2,):
+                    with self.subTest(joint_dof_count=counts, workers=workers, lanes=lanes):
+                        self._check_mixed_contact_response("cuda:0", workers, counts, lanes=lanes)
+
+    def _check_mixed_contact_response(self, device, workers, joint_dof_count=(3, 2, 1, 0), *, lanes=8):
         """Match robot/object, object/object, ground and self-contact with arbitrary offsets."""
-        f = _fixture()
+
+        def array(value, dtype=float):
+            return wp.array(value, dtype=dtype, device=device)
+
+        def full(shape, value, dtype=float):
+            return wp.full(shape, value, dtype=dtype, device=device)
+
+        f = _fixture(device, joint_dof_count)
         p, indices = f["plan"], f["indices"]
+        dofs = p.dof_count
         rng = np.random.default_rng(500)
         art_a = np.array([1, 0, 0, 2, 1], dtype=np.int32)
         art_b = np.array([0, 1, 2, -1, 1], dtype=np.int32)
         body_a = np.array([1, 4, 4, 5, 1], dtype=np.int32)
         body_b = np.array([4, 1, 5, -1, 2], dtype=np.int32)
-        start, offset, group = np.array([1, 8, 20]), np.array([0, 6, 12]), np.array([1, 0, 0])
+        start = np.array([1, 8, 8 + dofs + 6])
+        offset, group = np.array([0, 6, 6 + dofs]), np.array([1, 0, 0])
+        world_dofs = dofs + 12
+        global_dofs = int(start[2] + 6)
         free_lower = np.tril(rng.normal(scale=0.1, size=(2, 6, 6))) + 1.4 * np.eye(6)
         free_inverse = np.linalg.inv(free_lower)
         origin = rng.normal(size=(3, 3)).astype(np.float32)
-        motion = rng.normal(size=(26, 6)).astype(np.float32)
-        velocity = rng.normal(size=26).astype(np.float32)
+        motion = rng.normal(size=(global_dofs, 6)).astype(np.float32)
+        velocity = rng.normal(size=global_dofs).astype(np.float32)
         point_a, point_b = rng.normal(size=(2, 5, 3)).astype(np.float32)
         normal = rng.normal(size=(5, 3))
         normal /= np.linalg.norm(normal, axis=1)[:, None]
@@ -112,63 +146,64 @@ class TestSparseContacts(unittest.TestCase):
             for position, angle in zip(rng.normal(size=(6, 3)), np.linspace(-0.6, 0.8, 6), strict=True)
         ]
         masks = np.concatenate((p.joint_ancestor_mask, np.array([63, 63], dtype=np.uint64)))
-        row_dof, row_factor = _full((1, 5, 12), -9, int), _full((1, 5, 12), -9.0)
-        row_free_response = _full((1, 5, 12), -9.0)
-        incident, diagonal = _full((1, 5), -9.0), _full((1, 5), -9.0)
+        row_dof, row_factor = full((1, 5, max(dofs, 12)), -9, int), full((1, 5, max(dofs, 12)), -9.0)
+        row_free_response = full((1, 5, max(dofs, 12)), -9.0)
+        incident, diagonal = full((1, 5), -9.0), full((1, 5), -9.0)
         wp.launch(
-            populate_sparse_contact_response,
-            dim=(1, 1),
+            _get_sparse_contact_response_kernel(dofs, lanes_per_contact=lanes),
+            dim=workers * lanes,
             inputs=[
-                _array([5], int),
-                1,
-                _array(point_a, wp.vec3),
-                _array(point_b, wp.vec3),
-                _array(normal, wp.vec3),
-                _array(body_a, int),
-                _array(np.where(body_b < 0, 6, body_b), int),
-                _full(5, 0.0),
-                _full(5, 0.0),
-                _full(5, 0, int),
-                _array(np.arange(5), int),
-                _array(art_a, int),
-                _array(art_b, int),
-                _full(5, 0, int),
-                _full(5, 1, int),
-                _array(group, int),
-                _array([6, 6, 6], int),
-                _array([1, 0, 1], int),
-                _array(offset, int),
-                _array(start, int),
-                _array(origin, wp.vec3),
-                _array(masks, wp.uint64),
-                _array(motion, wp.spatial_vector),
-                _array([0, 1, 2, 3, 4, 5, -1], int),
-                _array(transforms, wp.transform),
+                array([5], int),
+                workers,
+                array(point_a, wp.vec3),
+                array(point_b, wp.vec3),
+                array(normal, wp.vec3),
+                array(body_a, int),
+                array(np.where(body_b < 0, 6, body_b), int),
+                full(5, 0.0),
+                full(5, 0.0),
+                full(5, 0, int),
+                array(np.arange(5), int),
+                array(art_a, int),
+                array(art_b, int),
+                full(5, 0, int),
+                full(5, 1, int),
+                array(group, int),
+                array([6, dofs, 6], int),
+                array([1, 0, 1], int),
+                array(offset, int),
+                array(start, int),
+                array(origin, wp.vec3),
+                array(masks, wp.uint64),
+                array(motion, wp.spatial_vector),
+                array([0, 1, 2, 3, 4, 5, -1], int),
+                array(transforms, wp.transform),
                 0,
                 f["patches"],
                 0,
                 indices.permutation,
                 indices.row_offsets,
-                indices.columns,
                 f["packed"],
-                _array(free_inverse),
-                _array(velocity),
+                array(free_inverse),
+                array(velocity),
             ],
             outputs=[row_dof, row_factor, row_free_response, incident, diagonal],
-            device="cpu",
+            block_dim=128,
+            device=device,
         )
-        mass, transform = np.zeros((18, 18)), np.zeros((18, 18))
-        compact_velocity = np.zeros(18)
+        mass, transform = np.zeros((world_dofs, world_dofs)), np.zeros((world_dofs, world_dofs))
+        compact_velocity = np.zeros(world_dofs)
         for art in range(3):
-            block = slice(offset[art], offset[art] + 6)
+            width = dofs if art == 1 else 6
+            block = slice(offset[art], offset[art] + width)
             permutation = p.permutation if art == 1 else np.arange(6)
             inverse = f["inverse"] if art == 1 else free_inverse[group[art]]
-            local_transform = inverse @ np.eye(6)[permutation]
+            local_transform = inverse @ np.eye(width)[permutation]
             transform[block, block] = local_transform if art == 1 else np.eye(6)
             local_decode = np.linalg.inv(local_transform)
             mass[block, block] = local_decode @ local_decode.T
-            compact_velocity[block] = velocity[start[art] : start[art] + 6]
-        jacobian = np.zeros((5, 18))
+            compact_velocity[block] = velocity[start[art] : start[art] + width]
+        jacobian = np.zeros((5, world_dofs))
         for row in range(5):
             for body, art, point, sign in (
                 (body_a[row], art_a[row], point_a[row], 1.0),
@@ -184,7 +219,7 @@ class TestSparseContacts(unittest.TestCase):
                     axis = motion[start[art] + physical]
                     point_velocity = axis[:3] + np.cross(axis[3:], position - origin[art])
                     jacobian[row, offset[art] + physical] += sign * (-normal[row] @ point_velocity)
-        actual = np.zeros((5, 18))
+        actual = np.zeros((5, world_dofs))
         actual_response = np.zeros_like(actual)
         for row, support in enumerate(row_dof.numpy()[0]):
             valid = support >= 0
@@ -195,7 +230,7 @@ class TestSparseContacts(unittest.TestCase):
                     continue
                 actual_response[row, coordinate] = (
                     row_free_response.numpy()[0, row, entry]
-                    if coordinate < 6 or coordinate >= 12
+                    if coordinate < 6 or coordinate >= 6 + dofs
                     else row_factor.numpy()[0, row, entry]
                 )
         expected = jacobian @ transform.T
@@ -240,18 +275,37 @@ class TestSparseContacts(unittest.TestCase):
 
     def test_contact_response_matches_dense_jacobian(self):
         """Match dense contact rows for static, same-articulation, and fixed endpoints."""
-        f = _fixture()
+        self._check_contact_response("cpu", 1)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "cooperative contact construction requires CUDA")
+    def test_contact_response_cuda(self):
+        """Preserve anchors, patch tangents and reserved row extents with cooperative writes."""
+        for lanes in (8, 16, 32):
+            for workers in (1, 2, 5) if lanes == 8 else (2,):
+                with self.subTest(workers=workers, lanes=lanes):
+                    self._check_contact_response("cuda:0", workers, lanes=lanes)
+
+    def _check_contact_response(self, device, workers, *, lanes=8):
+        """Match dense contact rows for static, same-articulation, and fixed endpoints."""
+
+        def array(value, dtype=float):
+            return wp.array(value, dtype=dtype, device=device)
+
+        def full(shape, value, dtype=float):
+            return wp.full(shape, value, dtype=dtype, device=device)
+
+        f = _fixture(device)
         p = f["plan"]
         indices = f["indices"]
         geometry = [f[name] for name in ("point0", "point1", "normal", "shape0", "shape1", "thickness0", "thickness1")]
         for shared, friction_shared, patch in [(0, 0, 0), (0, 1, 0), (1, 0, 0), (0, 0, 1), (1, 1, 1)]:
             with self.subTest(shared=shared, friction_shared=friction_shared, patch=patch):
                 f["patches"].enabled = patch
-                dense = _full((1, 9, 6), 0.0)
-                row_dof = _full((1, 9, 6), -9, int)
-                row_factor = _full((1, 9, 6), -9.0)
-                incident = _full((1, 9), -9.0)
-                diagonal = _full((1, 9), -9.0)
+                dense = full((1, 9, 6), 0.0)
+                row_dof = full((1, 9, 6), -9, int)
+                row_factor = full((1, 9, 6), -9.0)
+                incident = full((1, 9), -9.0)
+                diagonal = full((1, 9), -9.0)
                 wp.launch(
                     populate_world_J_for_compact_size,
                     dim=(1, 32),
@@ -265,7 +319,7 @@ class TestSparseContacts(unittest.TestCase):
                         f["path"],
                         f["needed"],
                         6,
-                        _array([6], int),
+                        array([6], int),
                         f["group"],
                         f["start"],
                         f["origin"],
@@ -278,14 +332,14 @@ class TestSparseContacts(unittest.TestCase):
                         shared,
                     ],
                     outputs=[dense],
-                    device="cpu",
+                    device=device,
                 )
                 wp.launch(
-                    populate_sparse_contact_response,
-                    dim=(1, 3),
+                    _get_sparse_contact_response_kernel(6, lanes_per_contact=lanes),
+                    dim=workers * lanes,
                     inputs=[
                         f["count"],
-                        1,
+                        workers,
                         *geometry,
                         f["world"],
                         f["slot"],
@@ -294,9 +348,9 @@ class TestSparseContacts(unittest.TestCase):
                         f["path"],
                         f["needed"],
                         f["group"],
-                        _array([6], int),
-                        _array([0], int),
-                        _array([0], int),
+                        array([6], int),
+                        array([0], int),
+                        array([0], int),
                         f["start"],
                         f["origin"],
                         f["sparse_mask"],
@@ -308,13 +362,13 @@ class TestSparseContacts(unittest.TestCase):
                         shared,
                         indices.permutation,
                         indices.row_offsets,
-                        indices.columns,
                         f["packed"],
-                        _array(np.eye(6)[None]),
+                        array(np.eye(6)[None]),
                         f["velocity"],
                     ],
-                    outputs=[row_dof, row_factor, _full((1, 9, 12), -9.0), incident, diagonal],
-                    device="cpu",
+                    outputs=[row_dof, row_factor, full((1, 9, 12), -9.0), incident, diagonal],
+                    block_dim=128,
+                    device=device,
                 )
                 jacobian = dense.numpy()[0, :7]
                 expected = jacobian[:, p.permutation] @ f["inverse"].T
