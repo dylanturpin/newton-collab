@@ -4,6 +4,7 @@
 """Tests for mimic constraint rows in SolverFeatherPGS (matrix-free mode)."""
 
 import unittest
+import warnings
 
 import warp as wp
 
@@ -11,7 +12,7 @@ import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_MIMIC
 
 
-def _build_two_revolute_chain(coef0: float, coef1: float):
+def _build_two_revolute_chain(coef0: float, coef1: float, legacy: bool = False):
     """Build a fixed-base chain of two revolute Z-joints with a mimic between them.
 
     The leader joint is position-driven; the follower joint has no drive and no spring,
@@ -44,12 +45,19 @@ def _build_two_revolute_chain(coef0: float, coef1: float):
     b.joint_target_kd[0] = 5.0
     b.joint_target_mode[0] = int(newton.JointTargetMode.POSITION)
     # follower: q_follower = coef0 + coef1 * q_leader
-    b.add_constraint_mimic(joint0=j_follower, joint1=j_leader, coef0=coef0, coef1=coef1)
+    if legacy:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            b.add_constraint_mimic(joint0=j_follower, joint1=j_leader, coef0=coef0, coef1=coef1)
+    else:
+        b.set_joint_mimic(j_follower, j_leader, coeffs=(coef0, coef1))
     return b, j_leader, j_follower
 
 
-def _run_chain(coef0: float, coef1: float, leader_target: float, steps: int = 600, **solver_kwargs):
-    builder, _, _ = _build_two_revolute_chain(coef0, coef1)
+def _run_chain(
+    coef0: float, coef1: float, leader_target: float, steps: int = 600, legacy: bool = False, **solver_kwargs
+):
+    builder, _, _ = _build_two_revolute_chain(coef0, coef1, legacy=legacy)
     model = builder.finalize()
     solver = newton.solvers.SolverFeatherPGS(
         model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.1, **solver_kwargs
@@ -74,6 +82,21 @@ class TestFeatherPGSMimic(unittest.TestCase):
         _, q = _run_chain(coef0=0.0, coef1=1.0, leader_target=0.5)
         self.assertAlmostEqual(q[0], 0.5, delta=0.05)
         self.assertAlmostEqual(q[1], q[0], delta=0.02)
+
+    def test_legacy_constraint_mimic_tracks_leader(self):
+        """Verify the deprecated sparse mimic constraints still couple the follower."""
+        _, q = _run_chain(coef0=0.1, coef1=-0.5, leader_target=0.6, legacy=True)
+        self.assertAlmostEqual(q[1], 0.1 - 0.5 * q[0], delta=0.02)
+
+    def test_legacy_constraint_overrides_joint_mimic(self):
+        """Verify a legacy constraint on the same follower replaces its joint-owned mimic, as in SolverMuJoCo."""
+        builder, j_leader, j_follower = _build_two_revolute_chain(coef0=0.0, coef1=1.0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            builder.add_constraint_mimic(joint0=j_follower, joint1=j_leader, coef0=0.1, coef1=-0.5)
+        solver = newton.solvers.SolverFeatherPGS(builder.finalize(), pgs_mode="matrix_free")
+        self.assertEqual(solver._mimic_count, 1)
+        self.assertEqual(solver._mimic_legacy.numpy().tolist(), [0])
 
     def test_scaled_offset_mimic(self):
         """Verify q_follower converges to coef0 + coef1 * q_leader for a scaled, offset mimic."""
@@ -100,8 +123,8 @@ class TestFeatherPGSMimic(unittest.TestCase):
         self.assertEqual(solver._mimic_art_list.numpy().tolist(), [0, 1, 2, 3])
 
     def test_disabled_mimic_is_ignored(self):
-        """Verify a disabled mimic constraint leaves the follower joint uncoupled."""
-        builder, _, _ = _build_two_revolute_chain(0.0, 1.0)
+        """Verify a disabled legacy mimic constraint leaves the follower joint uncoupled."""
+        builder, _, _ = _build_two_revolute_chain(0.0, 1.0, legacy=True)
         builder.constraint_mimic_enabled[0] = False
         model = builder.finalize()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16)
