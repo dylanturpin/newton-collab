@@ -434,8 +434,7 @@ def create_solve_closest_distance(support_func: Any, _support_funcs: Any = None)
             if simplex_usage_mask != wp.uint32(0) and max_dist > 0.0 and wp.dot(v, w_v) > max_dist * wp.sqrt(dist_sq):
                 break
             # Relative duality gap; an absolute cutoff is too loose at millimeter gaps.
-            # The initial center estimate has no surface witnesses. Insert at least
-            # one support vertex before accepting either early exit.
+            # A populated simplex supplies surface witnesses for either early exit.
             delta_dist = wp.dot(v, v - w_v)
             if simplex_usage_mask != wp.uint32(0) and (delta_dist <= 0.0 or delta_dist < COLLIDE_EPSILON * dist_sq):
                 break

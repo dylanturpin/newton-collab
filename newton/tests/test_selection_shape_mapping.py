@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import unittest
+import weakref
 
 import numpy as np
 import warp as wp
@@ -11,6 +13,33 @@ from newton.selection import ArticulationView
 
 
 class TestShapeMapping(unittest.TestCase):
+    def test_gathered_shape_lifetime(self):
+        """Keep gathered values alive while releasing their view and model independently."""
+        for device in wp.get_devices():
+            with self.subTest(device=device):
+                model = make_world().finalize(device=device)
+                view = ArticulationView(model, "robot_*")
+                self.assertFalse(view.shapes_contiguous)
+                expected = model.shape_material_mu.numpy()[selected_shapes(model, view)]
+                values = view.get_attribute("shape_material_mu", model)
+                model_ref, view_ref = weakref.ref(model), weakref.ref(view)
+                source_ref = weakref.ref(model.shape_material_mu)
+                live_model = make_world().finalize(device=device)
+                live_view = ArticulationView(live_model, "robot_*")
+                live_expected = live_view.get_attribute("shape_material_mu", live_model).numpy()
+                del model, view
+                gc.collect()
+                self.assertIsNone(model_ref())
+                self.assertIsNone(view_ref())
+                self.assertIsNotNone(source_ref())
+                np.testing.assert_array_equal(values.numpy(), expected)
+                np.testing.assert_array_equal(
+                    live_view.get_attribute("shape_material_mu", live_model).numpy(), live_expected
+                )
+                del values
+                gc.collect()
+                self.assertIsNone(source_ref())
+
     def test_interleaved_shape_attributes(self):
         """Read and scatter interleaved shapes by ownership with both mask ranks."""
         for device in wp.get_devices():

@@ -6,10 +6,102 @@
 import unittest
 import warnings
 
+import numpy as np
 import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_MIMIC
+from newton.tests.unittest_utils import get_test_devices
+
+
+class TestFeatherPGSMimicLayout(unittest.TestCase):
+    def test_reject_quaternion_mimics_at_construction(self):
+        """Reject joint-owned mimics whose position and velocity layouts differ."""
+        for device in get_test_devices():
+            for joint_type in (newton.JointType.BALL, newton.JointType.FREE, newton.JointType.DISTANCE):
+                with self.subTest(device=device, joint_type=joint_type):
+                    builder, _, follower = _build_mimic_layout(joint_type)
+                    model = builder.finalize(device=device)
+                    q_start = model.joint_q_start.numpy()
+                    qd_start = model.joint_qd_start.numpy()
+                    self.assertNotEqual(
+                        q_start[follower + 1] - q_start[follower], qd_start[follower + 1] - qd_start[follower]
+                    )
+                    with self.assertRaisesRegex(ValueError, "joint-owned mimic.*position and velocity"):
+                        newton.solvers.SolverFeatherPGS(model, pgs_mode="split")
+
+    def test_scalar_and_d6_mimic_coordinate_maps(self):
+        """Preserve componentwise mimic maps after a quaternion-layout free base."""
+        for device in get_test_devices():
+            for joint_type, dimensions in (
+                (newton.JointType.REVOLUTE, 1),
+                (newton.JointType.PRISMATIC, 1),
+                (newton.JointType.D6, 6),
+            ):
+                with self.subTest(device=device, joint_type=joint_type):
+                    builder, leader, follower = _build_mimic_layout(joint_type)
+                    model = builder.finalize(device=device)
+                    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split")
+                    self.assertEqual(solver._mimic_count, dimensions)
+                    for suffix, start, joint in (
+                        ("q0", model.joint_q_start, follower),
+                        ("q1", model.joint_q_start, leader),
+                        ("dof0", model.joint_qd_start, follower),
+                        ("dof1", model.joint_qd_start, leader),
+                    ):
+                        expected = np.arange(int(start.numpy()[joint]), int(start.numpy()[joint]) + dimensions)
+                        np.testing.assert_array_equal(getattr(solver, f"_mimic_{suffix}").numpy(), expected)
+                    np.testing.assert_array_equal(solver._mimic_valid_np, np.ones(dimensions))
+
+    def test_invalid_legacy_mimic_keeps_precedence(self):
+        """Preserve masking of a legacy quaternion mimic over its joint-owned entry."""
+        for device in get_test_devices():
+            with self.subTest(device=device):
+                builder, leader, follower = _build_mimic_layout(newton.JointType.BALL)
+                with self.assertWarns(DeprecationWarning):
+                    builder.add_constraint_mimic(joint0=follower, joint1=leader)
+                model = builder.finalize(device=device)
+                with self.assertWarnsRegex(UserWarning, "references a non-1-DoF"):
+                    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split")
+                self.assertEqual(solver._mimic_count, 1)
+                self.assertEqual(solver._mimic_legacy.numpy().tolist(), [0])
+                self.assertEqual(solver._mimic_valid_np.tolist(), [0])
+
+
+def _build_mimic_layout(joint_type):
+    """Build a joint-owned mimic pair after a free base in one articulation."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    base = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    joints = [builder.add_joint_free(child=base)]
+    parent = base
+    for _ in range(2):
+        child = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        linear = []
+        angular = []
+        if joint_type == newton.JointType.PRISMATIC:
+            linear = [newton.ModelBuilder.JointDofConfig(axis=newton.Axis.X)]
+        elif joint_type == newton.JointType.REVOLUTE:
+            angular = [newton.ModelBuilder.JointDofConfig(axis=newton.Axis.Z)]
+        elif joint_type == newton.JointType.D6:
+            linear = [
+                newton.ModelBuilder.JointDofConfig(axis=axis) for axis in (newton.Axis.X, newton.Axis.Y, newton.Axis.Z)
+            ]
+            angular = [
+                newton.ModelBuilder.JointDofConfig(axis=axis) for axis in (newton.Axis.X, newton.Axis.Y, newton.Axis.Z)
+            ]
+        if joint_type == newton.JointType.BALL:
+            joint = builder.add_joint_ball(parent=parent, child=child)
+        elif joint_type == newton.JointType.FREE:
+            joint = builder.add_joint_free(parent=parent, child=child)
+        elif joint_type == newton.JointType.DISTANCE:
+            joint = builder.add_joint_distance(parent=parent, child=child)
+        else:
+            joint = builder.add_joint(joint_type, parent=parent, child=child, linear_axes=linear, angular_axes=angular)
+        joints.append(joint)
+        parent = child
+    builder.add_articulation(joints)
+    builder.set_joint_mimic(joints[2], joints[1], coeffs=(0.1, -0.5))
+    return builder, joints[1], joints[2]
 
 
 def _build_two_revolute_chain(coef0: float, coef1: float, legacy: bool = False):

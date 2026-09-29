@@ -16,6 +16,120 @@ from newton.usd import SchemaResolverNewton, SchemaResolverPhysx
 
 
 class TestFeatherPGSBodyGravity(unittest.TestCase):
+    def test_parallel_tree_selective_world_gravity(self):
+        """Match analytic axis accelerations with enabled and disabled tree leaves in distinct worlds."""
+        if not wp.get_device().is_cuda:
+            self.skipTest("Parallel tree execution requires CUDA")
+        builder = newton.ModelBuilder(gravity=(2.0, -3.0, 1.0))
+        for gravity in ((0.0, 0.0, -10.0), (4.0, -5.0, 2.0)):
+            builder.add_world(_gravity_tree(gravity))
+        _add_free_body(builder, "global", False)
+        model = builder.finalize(device=wp.get_device())
+        expected = np.zeros((model.body_count, 3), dtype=np.float32)
+        gravity = model.gravity.numpy()[model.body_world.numpy()]
+        for body in range(model.body_count - 1):
+            leaf = body % 4 - 1
+            if leaf >= 0:
+                expected[body, leaf] = gravity[body, leaf] * 0.08
+        expected[-1] = gravity[-1] * 0.08
+        expected[model.body_disable_gravity.numpy()] = 0.0
+        for mode in ("split", "matrix_free"):
+            for parallel in (False, True):
+                with self.subTest(mode=mode, parallel_tree=parallel):
+                    state = _advance(model, SolverFeatherPGS, {"pgs_mode": mode, "parallel_tree": parallel}, steps=8)
+                    np.testing.assert_allclose(state.body_qd.numpy()[:, :3], expected, atol=2.0e-6)
+                    np.testing.assert_allclose(state.body_qd.numpy()[:, 3:], 0.0, atol=1.0e-7)
+
+    def test_parallel_tree_mixed_com_wrench(self):
+        """Match branched selective gravity to external forces at enabled centers of mass."""
+        if not wp.get_device().is_cuda:
+            self.skipTest("Parallel tree execution requires CUDA")
+        gravity = np.array((2.0, -3.0, -10.0), dtype=np.float32)
+        model = _gravity_tree(gravity, floating=True).finalize(device=wp.get_device())
+        reference = _gravity_tree((0.0, 0.0, 0.0), floating=True).finalize(device=wp.get_device())
+        forces = np.zeros((model.body_count, 6), dtype=np.float32)
+        forces[:, :3] = model.body_mass.numpy()[:, None] * gravity
+        forces[model.body_disable_gravity.numpy()] = 0.0
+        for mode in ("split", "matrix_free"):
+            serial = None
+            for parallel in (False, True):
+                with self.subTest(mode=mode, parallel_tree=parallel):
+                    options = {"pgs_mode": mode, "parallel_tree": parallel}
+                    state = _advance(model, SolverFeatherPGS, options, steps=8)
+                    control = _advance(reference, SolverFeatherPGS, options, steps=8, forces=forces)
+                    for name in ("body_q", "body_qd"):
+                        np.testing.assert_allclose(
+                            getattr(state, name).numpy(), getattr(control, name).numpy(), atol=3.0e-6
+                        )
+                        if serial is not None:
+                            np.testing.assert_allclose(
+                                getattr(state, name).numpy(), getattr(serial, name).numpy(), atol=3.0e-6
+                            )
+                    self.assertGreater(float(np.linalg.norm(state.body_qd.numpy()[:, 3:])), 0.01)
+                    serial = state
+
+    def test_parallel_tree_runtime_flags_and_graph(self):
+        """Refresh selective tree gravity and world vectors during notified graph replay."""
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("Parallel tree graph capture requires CUDA")
+        for mode in ("split", "matrix_free"):
+            with self.subTest(mode=mode):
+                builder = newton.ModelBuilder()
+                for gravity in ((1.0, -2.0, -10.0), (4.0, -5.0, 2.0)):
+                    builder.add_world(_gravity_tree(gravity))
+                model = builder.finalize(device=device)
+                solvers, states, graphs, outputs, controls = [], [], [], [], []
+                for parallel in (False, True):
+                    options = {"pgs_mode": mode, "parallel_tree": parallel}
+                    _advance(model, SolverFeatherPGS, options, steps=2)
+                    solver = SolverFeatherPGS(model, angular_damping=0.0, **options)
+                    self.assertEqual(solver._tree_plan is not None, parallel)
+                    self.assertTrue(solver._fk_id_cache_enabled)
+                    state, output = model.state(), model.state()
+                    control = model.control()
+                    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                    with wp.ScopedCapture(device) as capture:
+                        state.clear_forces()
+                        solver.step(state, output, control, None, 0.01)
+                        output.clear_forces()
+                        solver.step(output, state, control, None, 0.01)
+                    solvers.append(solver)
+                    states.append(state)
+                    graphs.append(capture.graph)
+                    # Keep captured state and control allocations alive for replay.
+                    outputs.append(output)
+                    controls.append(control)
+                for phase in range(3):
+                    if phase == 1:
+                        flags = model.body_disable_gravity.numpy()
+                        flags[5:7] = ~flags[5:7]
+                        model.body_disable_gravity.assign(flags)
+                        for solver in solvers:
+                            solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+                    elif phase == 2:
+                        gravity = model.gravity.numpy()
+                        gravity[1] = (3.0, 7.0, -5.0)
+                        model.gravity.assign(gravity)
+                        for solver in solvers:
+                            solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
+                    before = states[0].body_qd.numpy().copy()
+                    for graph in graphs:
+                        wp.capture_launch(graph)
+                    delta = np.zeros((model.body_count, 3), dtype=np.float32)
+                    gravity = model.gravity.numpy()[model.body_world.numpy()]
+                    for body in range(model.body_count):
+                        leaf = body % 4 - 1
+                        if leaf >= 0:
+                            delta[body, leaf] = gravity[body, leaf] * 0.02
+                    delta[model.body_disable_gravity.numpy()] = 0.0
+                    for state in states:
+                        np.testing.assert_allclose(state.body_qd.numpy()[:, :3] - before[:, :3], delta, atol=2.0e-6)
+                    for name in ("body_q", "body_qd"):
+                        np.testing.assert_allclose(
+                            getattr(states[1], name).numpy(), getattr(states[0], name).numpy(), atol=3.0e-6
+                        )
+
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_usd_selective_gravity(self):
         """Keep a gravity-disabled body stationary while its neighbor falls."""
@@ -230,6 +344,9 @@ def _solver_options():
 def _advance(model, solver_type, options, *, steps, forces=None):
     """Step an isolated model with an optional fixed COM wrench."""
     solver = solver_type(model, angular_damping=0.0, **options)
+    if options.get("parallel_tree"):
+        assert solver._tree_plan is not None
+        assert any(group.lanes > 1 for group in solver._tree_plan.groups)
     state, output = model.state(), model.state()
     control = model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -240,6 +357,28 @@ def _advance(model, solver_type, options, *, steps, forces=None):
         solver.step(state, output, control, None, 0.01)
         state, output = output, state
     return state
+
+
+def _gravity_tree(gravity, *, floating=False):
+    """Build three independently scheduled leaves with alternating gravity flags."""
+    builder = newton.ModelBuilder(gravity=gravity)
+    root = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), disable_gravity=True)
+    joints = [builder.add_joint_free(root) if floating else builder.add_joint_fixed(-1, root)]
+    for index, axis in enumerate((newton.Axis.X, newton.Axis.Y, newton.Axis.Z)):
+        child = builder.add_link(
+            mass=2.0 + index,
+            inertia=wp.mat33(np.eye(3)),
+            com=(0.3, 0.2, -0.1) if floating else (0.0, 0.0, 0.0),
+            disable_gravity=index == 1,
+        )
+        anchor = wp.transform((1.0, 0.4 * index, 0.1 * index), wp.quat_identity())
+        if floating:
+            joint = builder.add_joint_fixed(root, child, parent_xform=anchor)
+        else:
+            joint = builder.add_joint_prismatic(root, child, axis=axis, parent_xform=anchor)
+        joints.append(joint)
+    builder.add_articulation(joints)
+    return builder
 
 
 if __name__ == "__main__":
