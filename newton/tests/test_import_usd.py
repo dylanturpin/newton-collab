@@ -3475,6 +3475,49 @@ class TestImportUsdPhysics(unittest.TestCase):
             self.assertEqual(captured["threshold"], 0.5)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_physx_convex_decomposition_limits(self):
+        """Honor PhysX hull count and hull vertex limits on convex decomposition."""
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+        box = newton.Mesh.create_box(
+            1.0, 1.0, 1.0, duplicate_vertices=False, compute_normals=False, compute_uvs=False, compute_inertia=False
+        )
+        for name in ("/Plain", "/Physx"):
+            mesh = UsdGeom.Mesh.Define(stage, name)
+            UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+            mesh.CreateFaceVertexCountsAttr().Set([3] * (len(box.indices) // 3))
+            mesh.CreateFaceVertexIndicesAttr().Set(box.indices.tolist())
+            mesh.CreatePointsAttr().Set([Gf.Vec3f(*point) for point in box.vertices.tolist()])
+            UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim()).GetApproximationAttr().Set(
+                UsdPhysics.Tokens.convexDecomposition
+            )
+        physx = stage.GetPrimAtPath("/Physx")
+        physx.AddAppliedSchema("PhysxConvexDecompositionCollisionAPI")
+        physx.CreateAttribute("physxConvexDecompositionCollision:maxConvexHulls", Sdf.ValueTypeNames.Int).Set(5)
+
+        calls = []
+        fake_coacd = types.ModuleType("coacd")
+        fake_coacd.Mesh = lambda vertices, indices: (vertices, indices)
+
+        def run_coacd(cmesh, **kwargs):
+            calls.append(kwargs)
+            return [cmesh]
+
+        fake_coacd.run_coacd = run_coacd
+        with patch_sys_module("coacd", fake_coacd):
+            newton.ModelBuilder().add_usd(stage)
+        merged = [call for call in calls if call["merge"]]
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["max_convex_hull"], 5)
+        self.assertTrue(merged[0]["decimate"])
+        self.assertEqual(merged[0]["max_ch_vertex"], 64)
+        self.assertEqual(len(calls), 2)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_disabled_mesh_collider_skips_approximation(self):
         """Preserve the authored mesh for a disabled collider."""
         from pxr import Gf, Usd, UsdGeom, UsdPhysics
