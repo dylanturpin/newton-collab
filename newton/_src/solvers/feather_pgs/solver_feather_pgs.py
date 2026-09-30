@@ -6457,17 +6457,8 @@ class SolverFeatherPGS(SolverBase):
             mb = int(getattr(self, "max_propagation_bodies", 0))
             lanes = int(os.environ.get("FEATHER_PGS_COLORED_LANES", "1"))
             wpb = int(os.environ.get("FEATHER_PGS_COLORED_WPB", "2"))
-            # A few large worlds stage each color's payload in shared memory ahead of the
-            # solve, one world per block; many worlds keep the packing for occupancy.
-            staged = (
-                os.environ.get("FEATHER_PGS_COLORED_STAGED", "1") != "0"
-                and lanes == 1
-                and self.world_count <= 16
-                and 2 * 32 * PAYLOAD_LANE_WORDS * 4
-                + 3 * 32 * PROPAGATION_UNIT_META * 4
-                + (PROPAGATION_COLOR_TAIL + 2) * 4
-                + mb * 48
-                <= 45056
+            staged = os.environ.get("FEATHER_PGS_COLORED_STAGED", "1") != "0" and _colored_staging_supported(
+                int(getattr(model.device, "arch", 0)), lanes, self.world_count, mb
             )
             if staged:
                 wpb = 1
@@ -16781,6 +16772,22 @@ PAYLOAD_LANE_WORDS = 100
 """Shared staging words per lane for one unit: 3 rows x 32 words, then its 3 impulses, padded."""
 
 
+def _colored_staging_supported(device_arch: int, lanes: int, world_count: int, max_bodies: int) -> bool:
+    """Whether the colored solve stages each color's payload in shared memory.
+
+    A few large worlds stage, one world per block; many worlds keep the packing for
+    occupancy. Staging needs the lane-per-unit body, compute capability 8.0 or newer
+    for ``cp.async``, and the staging buffers within the static shared-memory budget.
+    """
+    shared_bytes = (
+        2 * 32 * PAYLOAD_LANE_WORDS * 4
+        + 3 * 32 * PROPAGATION_UNIT_META * 4
+        + (PROPAGATION_COLOR_TAIL + 2) * 4
+        + max_bodies * 48
+    )
+    return device_arch >= 80 and lanes == 1 and world_count <= 16 and shared_bytes <= 45056
+
+
 def _colored_payload_copy(P: int = 3) -> str:
     """CUDA issuing ``cp.async`` copies of one unit's static payload into ``s_pay``.
 
@@ -16789,7 +16796,9 @@ def _colored_payload_copy(P: int = 3) -> str:
     effective mass inverse, body a, body b, rhs, regularization weight, friction
     coefficient, parent, then J_a, J_b, MiJt_a, MiJt_b (6 words each, copied as 8-byte
     pairs). The unit's own impulses follow at word 96: only this unit writes them, so
-    they cannot change between the copy and its solve.
+    they cannot change between the copy and its solve. The regularization weight is
+    copied only when ``regularize`` is set: otherwise its buffer is a one-element
+    placeholder.
     """
     scalars = [
         "propagation_row_type",
@@ -16806,7 +16815,8 @@ def _colored_payload_copy(P: int = 3) -> str:
     for r in range(P):
         lines = [f"const int off = world_base + ((cp_slot + {r} < m) ? cp_slot + {r} : cp_slot);"]
         for n, name in enumerate(scalars):
-            lines.append(f"cp_async4(cps + {(r * 32 + n) * 4}u, &{name}.data[off]);")
+            copy = f"cp_async4(cps + {(r * 32 + n) * 4}u, &{name}.data[off]);"
+            lines.append(f"if (regularize) {copy}" if name == "propagation_row_w" else copy)
         for v, name in enumerate(vectors):
             for p in range(3):
                 lines.append(f"cp_async8(cps + {(r * 32 + 8 + 6 * v + 2 * p) * 4}u, &{name}.data[off * 6 + {2 * p}]);")
@@ -16992,7 +17002,8 @@ def _colored_prefetch_unit_body(
                     p_ba[{r}] = __ldg(&propagation_body_a.data[off]);
                     p_bb[{r}] = __ldg(&propagation_body_b.data[off]);
                     p_rhs[{r}] = __ldg(&propagation_rhs.data[off]);
-                    p_w[{r}] = __ldg(&propagation_row_w.data[off]);
+                    // Without regularization the weight buffer is a one-element placeholder.
+                    p_w[{r}] = regularize ? __ldg(&propagation_row_w.data[off]) : 1.0f;
                     p_mu[{r}] = __ldg(&propagation_row_mu.data[off]);
                     p_par[{r}] = __ldg(&propagation_row_parent.data[off]);
                     u_imp[{r}] = propagation_impulses.data[off];
@@ -17016,7 +17027,7 @@ def _colored_prefetch_unit_body(
                         p_ba[{r}] = __float_as_int(sp[{r * 32 + 2}]);
                         p_bb[{r}] = __float_as_int(sp[{r * 32 + 3}]);
                         p_rhs[{r}] = sp[{r * 32 + 4}];
-                        p_w[{r}] = sp[{r * 32 + 5}];
+                        p_w[{r}] = regularize ? sp[{r * 32 + 5}] : 1.0f;
                         p_mu[{r}] = sp[{r * 32 + 6}];
                         p_par[{r}] = __float_as_int(sp[{r * 32 + 7}]);
                         u_imp[{r}] = sp[{3 * 32 + r}];
