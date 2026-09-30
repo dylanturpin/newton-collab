@@ -113,9 +113,16 @@ class TestSleepingProductionProfile(unittest.TestCase):
 
     def test_frozen_patch_carry_matches_rebuild(self):
         """Carrying frozen friction patches matches rebuilding them through sleep, wake and resettle."""
-        trajectories = []
+        self._check_carry(tiles=False)
+
+    def test_frozen_patch_carry_matches_rebuild_for_flooded_pairs(self):
+        """Pairs large enough for the warp flood skip it while frozen and rebuild identically on wake."""
+        self._check_carry(tiles=True)
+
+    def _check_carry(self, tiles):
+        trajectories, flood_pairs = [], []
         for carry in (False, True):
-            model, pipeline, solver, states, control = _articulations()
+            model, pipeline, solver, states, control = _articulations(tiles=tiles)
             solver.sleeping.carry_frozen_patches = carry
             contacts = pipeline.contacts()
             frozen = 0
@@ -130,12 +137,22 @@ class TestSleepingProductionProfile(unittest.TestCase):
                 solver.step(states[0], states[1], control, contacts, 0.005)
                 states.reverse()
                 frozen += int(solver.sleeping.frozen_bodies.numpy().sum())
+                if step == 399:
+                    flood_pairs.append(int(solver._friction_patches._flood_pair_count.numpy()[0]))
                 trajectory.append(np.concatenate((states[0].body_q.numpy().ravel(), states[0].body_qd.numpy().ravel())))
             self.assertGreater(frozen, 0)
+            np.testing.assert_array_equal(solver.sleeping.art_awake.numpy(), [0, 0])
             trajectories.append(np.array(trajectory))
-        np.testing.assert_array_equal(trajectories[1][:400], trajectories[0][:400])
-        # Rebuilding re-derives the carried history each sleeping step, which only differs by roundoff.
-        np.testing.assert_allclose(trajectories[1], trajectories[0], rtol=0.0, atol=1.0e-6)
+        if not tiles:
+            np.testing.assert_array_equal(trajectories[1][:400], trajectories[0][:400])
+            # Rebuilding re-derives the carried history each sleeping step, which only differs by roundoff.
+            np.testing.assert_allclose(trajectories[1], trajectories[0], rtol=0.0, atol=1.0e-6)
+            return
+        # Frozen pairs skip the warp flood; bodies built from many shapes are not bitwise reproducible.
+        self.assertGreater(flood_pairs[0], 0)
+        self.assertEqual(flood_pairs[1], 0)
+        positions = [t[-1][: 7 * 4].reshape(4, 7)[:, :3] for t in trajectories]
+        np.testing.assert_allclose(positions[1], positions[0], rtol=0.0, atol=2.0e-3)
 
     def test_mimic_articulation_stays_awake(self):
         """Keep an articulation with mimic rows awake while an independent box sleeps."""
@@ -166,13 +183,22 @@ class TestSleepingProductionProfile(unittest.TestCase):
         self.assertEqual(int(awake[solver.body_to_articulation.numpy()[box]]), 0)
 
 
-def _articulations():
-    """Two undriven two-link articulations resting on the ground, which route contacts to dense rows."""
+def _articulations(tiles=False):
+    """Two undriven two-link articulations resting on the ground, which route contacts to dense rows.
+
+    With ``tiles``, each base is a grid of small boxes so its ground pair exceeds the warp-flood threshold.
+    """
     builder = newton.ModelBuilder()
     builder.add_ground_plane()
     for x in (0.0, 1.0):
         base = builder.add_link(xform=wp.transform((x, 0.0, 0.1), wp.quat_identity()))
-        builder.add_shape_box(base, hx=0.2, hy=0.1, hz=0.1)
+        if tiles:
+            for i in range(4):
+                for j in range(3):
+                    offset = wp.transform((-0.15 + 0.1 * i, -0.067 + 0.067 * j, 0.0), wp.quat_identity())
+                    builder.add_shape_box(base, xform=offset, hx=0.05, hy=0.033, hz=0.1)
+        else:
+            builder.add_shape_box(base, hx=0.2, hy=0.1, hz=0.1)
         tip = builder.add_link(xform=wp.transform((x + 0.3, 0.0, 0.1), wp.quat_identity()))
         builder.add_shape_box(tip, hx=0.1, hy=0.1, hz=0.1)
         hinge = wp.transform((0.3, 0.0, 0.0), wp.quat_identity())
@@ -183,7 +209,8 @@ def _articulations():
             ]
         )
     model = builder.finalize(device="cuda:0")
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
+    # Deterministic contact order, as in production, so A/B trajectories compare bitwise.
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=512, deterministic=True)
     solver = newton.solvers.SolverFeatherPGS(model, **_PROFILE)
     return model, pipeline, solver, [model.state(), model.state()], model.control()
 
