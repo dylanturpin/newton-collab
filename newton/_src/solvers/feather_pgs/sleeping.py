@@ -38,6 +38,8 @@ class _SleepState:
         self.quiet_time = quiet_time
         self.skip_constraints = skip_constraints
         self.carry_frozen_patches = True
+        # Skip the articulated dynamics of islands that sleep through a step; their outputs are frozen anyway.
+        self.skip_dynamics = skip_constraints
         body_nodes = solver.body_to_articulation.numpy().copy()
         response_counts = solver.articulation_response_dof_count.numpy()
         prescribed = (body_nodes >= 0) & (response_counts[np.maximum(body_nodes, 0)] == 0)
@@ -52,6 +54,7 @@ class _SleepState:
         self.wake_parent = wp.empty(count, dtype=int, device=device)
         self.previous_root = wp.array(np.arange(count, dtype=np.int32), dtype=int, device=device)
         self.art_awake = wp.ones(count, dtype=int, device=device)
+        self.step_asleep = wp.zeros(count, dtype=int, device=device)
         self.quiet_age = wp.zeros(count, dtype=float, device=device)
         self.root_awake = wp.zeros(count, dtype=int, device=device)
         self.root_veto = wp.zeros(count, dtype=int, device=device)
@@ -78,6 +81,19 @@ class _SleepState:
             coord_art[q_start[joint] : q_start[joint + 1]] = art
             dof_art[qd_start[joint] : qd_start[joint + 1]] = art
         self.coord_art = wp.array(coord_art, dtype=int, device=device)
+        # Articulations without response DOFs are prescribed; their kinematics always run.
+        skippable = response_counts > 0
+        self.art_skippable = wp.array(skippable.astype(np.int32), dtype=int, device=device)
+        self.joint_skip_art = wp.array(
+            np.where(np.isin(joint_art, np.flatnonzero(skippable)), joint_art, -1).astype(np.int32),
+            dtype=int,
+            device=device,
+        )
+        self.dof_skip_art = wp.array(
+            np.where(np.isin(dof_art, np.flatnonzero(skippable)), dof_art, -1).astype(np.int32),
+            dtype=int,
+            device=device,
+        )
         self.dof_art = wp.array(dof_art, dtype=int, device=device)
         starts = model.articulation_start.numpy()[:-1]
         root_types = model.joint_type.numpy()[starts]
@@ -123,8 +139,9 @@ class _SleepState:
 
     def wake(self, world_mask=None):
         """Wake every component and invalidate state-change history, or wake only the masked worlds."""
+        requested = self.solver._mass_update_requested
         if world_mask is None:
-            self.art_awake.fill_(1)
+            wp.launch(_wake_all, self.art_awake.size, [self.art_awake, requested], device=self.model.device)
             self.body_awake.fill_(1)
             self.quiet_age.zero_()
             self.valid.zero_()
@@ -132,7 +149,12 @@ class _SleepState:
             return
         device = self.model.device
         world = self.solver.art_to_world
-        wp.launch(_wake_worlds, self.art_awake.size, [world_mask, world, self.art_awake, self.quiet_age], device=device)
+        wp.launch(
+            _wake_worlds,
+            self.art_awake.size,
+            [world_mask, world, self.art_awake, self.quiet_age, requested],
+            device=device,
+        )
         wp.launch(
             _wake_world_bodies,
             self.body_awake.size,
@@ -314,7 +336,50 @@ class _SleepState:
         wp.launch(
             _wake_components,
             self.parent.size,
-            [self.parent, self.root_awake, self.root_veto, self.art_awake, self.quiet_age],
+            [
+                self.parent,
+                self.root_awake,
+                self.root_veto,
+                self.art_awake,
+                self.quiet_age,
+                self.solver._mass_update_requested,
+            ],
+            device=device,
+        )
+        solver = self.solver
+        skip = int(self.skip_constraints and self.skip_dynamics)
+        wp.launch(
+            _articulation_activity,
+            self.parent.size,
+            [
+                self.art_awake,
+                self.art_skippable,
+                int(self.skip_constraints),
+                skip,
+                self.step_asleep,
+                solver._dynamics_art_active,
+                solver._dynamics_art_mask,
+                solver._constraint_art_active,
+                solver._fk_id_cache_valid,
+            ],
+            device=device,
+        )
+        wp.launch(
+            _entity_activity,
+            model.joint_dof_count,
+            [self.dof_skip_art, skip, self.art_awake, solver._dynamics_dof_active],
+            device=device,
+        )
+        wp.launch(
+            _entity_activity,
+            model.joint_count,
+            [self.joint_skip_art, skip, self.art_awake, solver._dynamics_joint_active],
+            device=device,
+        )
+        wp.launch(
+            _entity_activity,
+            model.body_count,
+            [self.body_nodes, skip, self.art_awake, solver._dynamics_body_active],
             device=device,
         )
         if self.skip_constraints:
@@ -349,6 +414,8 @@ class _SleepState:
                 self.parent,
                 self.art_awake,
                 int(self.skip_constraints),
+                int(self.skip_constraints and self.skip_dynamics),
+                self.step_asleep,
                 state_out.body_q,
                 state_out.body_qd,
                 self.linear_threshold,
@@ -360,13 +427,27 @@ class _SleepState:
         wp.launch(
             _output_finite,
             model.joint_coord_count,
-            [self.coord_art, self.parent, state_out.joint_q, self.root_veto],
+            [
+                self.coord_art,
+                self.parent,
+                int(self.skip_constraints and self.skip_dynamics),
+                self.step_asleep,
+                state_out.joint_q,
+                self.root_veto,
+            ],
             device=device,
         )
         wp.launch(
             _output_finite,
             model.joint_dof_count,
-            [self.dof_art, self.parent, state_out.joint_qd, self.root_veto],
+            [
+                self.dof_art,
+                self.parent,
+                int(self.skip_constraints and self.skip_dynamics),
+                self.step_asleep,
+                state_out.joint_qd,
+                self.root_veto,
+            ],
             device=device,
         )
         wp.launch(
@@ -395,13 +476,30 @@ class _SleepState:
         wp.launch(
             _freeze_coords,
             model.joint_coord_count,
-            [self.coord_art, self.art_awake, state_in.joint_q, state_out.joint_q],
+            [
+                self.coord_art,
+                self.parent,
+                self.art_awake,
+                self.step_asleep,
+                self.root_veto,
+                state_in.joint_q,
+                state_out.joint_q,
+            ],
             device=device,
         )
         wp.launch(
             _freeze_dofs,
             model.joint_dof_count,
-            [self.dof_art, self.art_awake, state_out.joint_qd, state_aug.joint_qdd, self.solver.v_out],
+            [
+                self.dof_art,
+                self.parent,
+                self.art_awake,
+                self.step_asleep,
+                self.root_veto,
+                state_out.joint_qd,
+                state_aug.joint_qdd,
+                self.solver.v_out,
+            ],
             device=device,
         )
         wp.launch(
@@ -411,6 +509,8 @@ class _SleepState:
                 self.body_nodes,
                 self.parent,
                 self.art_awake,
+                self.step_asleep,
+                self.root_veto,
                 state_in.body_q,
                 state_out.body_q,
                 state_out.body_qd,
@@ -466,9 +566,21 @@ def _node(body: int, body_nodes: wp.array[int], flags: wp.array[int]):
 
 
 @wp.kernel(enable_backward=False)
-def _wake_worlds(mask: wp.array[wp.bool], world: wp.array[int], awake: wp.array[int], age: wp.array[float]):
+def _wake_all(awake: wp.array[int], requested: wp.array[int]):
+    i = wp.tid()
+    if awake[i] == 0:
+        requested[i] = 1
+    awake[i] = 1
+
+
+@wp.kernel(enable_backward=False)
+def _wake_worlds(
+    mask: wp.array[wp.bool], world: wp.array[int], awake: wp.array[int], age: wp.array[float], requested: wp.array[int]
+):
     i = wp.tid()
     if world[i] >= 0 and mask[world[i]]:
+        if awake[i] == 0:
+            requested[i] = 1
         awake[i] = 1
         age[i] = 0.0
 
@@ -691,12 +803,55 @@ def _propagate_old_wake(parent: wp.array[int], previous: wp.array[int], old_wake
 
 @wp.kernel(enable_backward=False)
 def _wake_components(
-    parent: wp.array[int], root_awake: wp.array[int], veto: wp.array[int], awake: wp.array[int], age: wp.array[float]
+    parent: wp.array[int],
+    root_awake: wp.array[int],
+    veto: wp.array[int],
+    awake: wp.array[int],
+    age: wp.array[float],
+    requested: wp.array[int],
 ):
     i = wp.tid()
     if veto[parent[i]] != 0 or (awake[i] == 0 and root_awake[parent[i]] != 0):
         age[i] = 0.0
+        # A woken articulation's mass matrix may predate its frozen pose; refresh it on this step.
+        if awake[i] == 0:
+            requested[i] = 1
         awake[i] = 1
+
+
+@wp.kernel(enable_backward=False)
+def _articulation_activity(
+    awake: wp.array[int],
+    skippable: wp.array[int],
+    skip_constraints: int,
+    skip: int,
+    step_asleep: wp.array[int],
+    active: wp.array[int],
+    active_mask: wp.array[wp.bool],
+    rows_active: wp.array[int],
+    fk_id_cache_valid: wp.array[int],
+):
+    i = wp.tid()
+    step_asleep[i] = 1 - awake[i]
+    rows_active[i] = 1
+    if skip_constraints != 0 and awake[i] == 0:
+        rows_active[i] = 0
+    active[i] = 1
+    active_mask[i] = True
+    if skip != 0:
+        if awake[i] == 0 and skippable[i] != 0:
+            active[i] = 0
+            active_mask[i] = False
+        # Sleeping articulations keep stale FK/ID terms, which only their discarded dynamics read.
+        fk_id_cache_valid[i] = 1 - active[i]
+
+
+@wp.kernel(enable_backward=False)
+def _entity_activity(nodes: wp.array[int], skip: int, awake: wp.array[int], active: wp.array[int]):
+    i = wp.tid()
+    active[i] = 1
+    if skip != 0 and nodes[i] >= 0 and awake[nodes[i]] == 0:
+        active[i] = 0
 
 
 @wp.kernel(enable_backward=False)
@@ -705,6 +860,8 @@ def _output_motion(
     parent: wp.array[int],
     awake: wp.array[int],
     skip_constraints: int,
+    skip_dynamics: int,
+    step_asleep: wp.array[int],
     q: wp.array[wp.transform],
     qd: wp.array[wp.spatial_vector],
     linear: float,
@@ -712,7 +869,8 @@ def _output_motion(
     veto: wp.array[int],
 ):
     i = wp.tid()
-    if nodes[i] >= 0:
+    # Sleepers whose dynamics were skipped hold stale outputs rather than trial results.
+    if nodes[i] >= 0 and not (skip_dynamics != 0 and step_asleep[nodes[i]] != 0):
         pose = q[i]
         for j in range(7):
             if not wp.isfinite(pose[j]):
@@ -726,9 +884,18 @@ def _output_motion(
 
 
 @wp.kernel(enable_backward=False)
-def _output_finite(nodes: wp.array[int], parent: wp.array[int], value: wp.array[float], veto: wp.array[int]):
+def _output_finite(
+    nodes: wp.array[int],
+    parent: wp.array[int],
+    skip_dynamics: int,
+    step_asleep: wp.array[int],
+    value: wp.array[float],
+    veto: wp.array[int],
+):
     i = wp.tid()
-    if nodes[i] >= 0 and not wp.isfinite(value[i]):
+    if nodes[i] < 0 or (skip_dynamics != 0 and step_asleep[nodes[i]] != 0):
+        return
+    if not wp.isfinite(value[i]):
         wp.atomic_max(veto, parent[nodes[i]], 1)
 
 
@@ -768,19 +935,40 @@ def _publish_components(
         asleep[i] = 0
 
 
+@wp.func
+def _frozen(node: int, parent: wp.array[int], awake: wp.array[int], step_asleep: wp.array[int], veto: wp.array[int]):
+    # A step sleeper keeps its frozen state even if it wakes now, unless its own trial output vetoed it.
+    return awake[node] == 0 or (step_asleep[node] != 0 and veto[parent[node]] == 0)
+
+
 @wp.kernel(enable_backward=False)
-def _freeze_coords(nodes: wp.array[int], awake: wp.array[int], source: wp.array[float], target: wp.array[float]):
+def _freeze_coords(
+    nodes: wp.array[int],
+    parent: wp.array[int],
+    awake: wp.array[int],
+    step_asleep: wp.array[int],
+    veto: wp.array[int],
+    source: wp.array[float],
+    target: wp.array[float],
+):
     i = wp.tid()
-    if nodes[i] >= 0 and awake[nodes[i]] == 0:
+    if nodes[i] >= 0 and _frozen(nodes[i], parent, awake, step_asleep, veto):
         target[i] = source[i]
 
 
 @wp.kernel(enable_backward=False)
 def _freeze_dofs(
-    nodes: wp.array[int], awake: wp.array[int], qd: wp.array[float], qdd: wp.array[float], v: wp.array[float]
+    nodes: wp.array[int],
+    parent: wp.array[int],
+    awake: wp.array[int],
+    step_asleep: wp.array[int],
+    veto: wp.array[int],
+    qd: wp.array[float],
+    qdd: wp.array[float],
+    v: wp.array[float],
 ):
     i = wp.tid()
-    if nodes[i] >= 0 and awake[nodes[i]] == 0:
+    if nodes[i] >= 0 and _frozen(nodes[i], parent, awake, step_asleep, veto):
         qd[i] = 0.0
         qdd[i] = 0.0
         v[i] = 0.0
@@ -791,6 +979,8 @@ def _freeze_bodies(
     nodes: wp.array[int],
     parent: wp.array[int],
     awake: wp.array[int],
+    step_asleep: wp.array[int],
+    veto: wp.array[int],
     source: wp.array[wp.transform],
     target: wp.array[wp.transform],
     qd: wp.array[wp.spatial_vector],
@@ -802,7 +992,7 @@ def _freeze_bodies(
     if node >= 0:
         body_awake[i] = awake[node]
         body_island[i] = parent[node]
-        if awake[node] == 0:
+        if _frozen(node, parent, awake, step_asleep, veto):
             target[i] = source[i]
             qd[i] = wp.spatial_vector()
 
