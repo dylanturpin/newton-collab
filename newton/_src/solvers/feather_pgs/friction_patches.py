@@ -72,6 +72,12 @@ class _PatchFrame:
     eligible: wp.array[int]
     # Scratch indices: patch members in the current frame, valid anchors in the previous frame.
     members: wp.array[int]
+    # Per region, by seed (written by the device flood pass): first friction location,
+    # end of its member list, the member farthest from the first and that squared distance.
+    first: wp.array[int]
+    region_stop: wp.array[int]
+    second: wp.array[int]
+    separation: wp.array[float]
     support_gap_limit: wp.array[float]
     tangent_impulse: wp.array[wp.vec3]
 
@@ -296,6 +302,213 @@ def _carried_displacement(q: wp.array[wp.transform], prev: _PatchFrame, p: int, 
     return error
 
 
+_FLOOD_CUDA = """
+#if defined(__CUDA_ARCH__)
+    const int start = tile;
+    const int lane = threadIdx.x & 31;
+    int end = count.data[0];
+    if (end > capacity) end = capacity;
+    if (start >= end) return;
+    if (start > 0 && keys.data[start - 1] == keys.data[start]) return;
+    const wp::int64 key = keys.data[start];
+    if (key == wp::int64(0x7FFFFFFFFFFFFFFFll)) return;
+    int stop = start + 1;
+    while (stop < end && keys.data[stop] == key) ++stop;
+    int remaining = stop - start;
+    int member_stop = start;
+    for (int index = start; index < stop; ++index) {
+        const int seed = indices.data[index];
+        __syncwarp();
+        if (owner.data[seed] >= 0) continue;
+        __syncwarp();
+        if (lane == 0) owner.data[seed] = seed;
+        remaining -= 1;
+        int tail = seed;
+        int first = (eligible.data[seed] != 0) ? seed : -1;
+        const wp::vec3 seed_center = center.data[seed];
+        const wp::vec3 seed_normal = normal.data[seed];
+        const wp::vec2 seed_mu = mu.data[seed];
+        const float r = radius.data[seed];
+        int cursor = seed;
+        int expanded_a = -2, expanded_b = -2;
+        while (cursor >= 0 && remaining > 0) {
+            const int sa = shape_a.data[cursor];
+            const int sb = shape_b.data[cursor];
+            if (sa != expanded_a || sb != expanded_b) {
+                // The candidates' tests are independent: only an accepted contact changes
+                // its own owner, so lanes test 32 of them at once and lane order applies
+                // the accepted ones exactly as the serial scan would.
+                for (int base = index + 1; base < stop; base += 32) {
+                    const int j = base + lane;
+                    int c = -1;
+                    bool accept = false;
+                    if (j < stop) {
+                        c = indices.data[j];
+                        if (owner.data[c] < 0) {
+                            const wp::vec3 d = wp::sub(center.data[c], seed_center);
+                            const wp::vec2 cmu = mu.data[c];
+                            const bool compatible = wp::dot(seed_normal, normal.data[c]) >= 0.995f
+                                && seed_mu[0] == cmu[0] && seed_mu[1] == cmu[1]
+                                && wp::abs(wp::dot(d, seed_normal)) <= 0.02f * r
+                                && wp::length_sq(d) <= 4.0f * r * r;
+                            if (compatible && shapes_adjacent(sa, shape_a.data[c]) && shapes_adjacent(sb, shape_b.data[c]))
+                                accept = true;
+                        }
+                    }
+                    unsigned ballot = __ballot_sync(0xffffffffu, accept);
+                    while (ballot) {
+                        const int l = __ffs(ballot) - 1;
+                        ballot &= ballot - 1u;
+                        const int cc = __shfl_sync(0xffffffffu, c, l);
+                        if (lane == 0) {
+                            owner.data[cc] = seed;
+                            next_contact.data[tail] = cc;
+                        }
+                        tail = cc;
+                        remaining -= 1;
+                        if (eligible.data[cc] != 0) {
+                            if (first < 0) {
+                                first = cc;
+                            } else {
+                                const wp::vec3 position = center.data[cc];
+                                const wp::vec3 p0 = center.data[first];
+                                if (position[0] < p0[0]
+                                    || (position[0] == p0[0]
+                                        && (position[1] < p0[1] || (position[1] == p0[1] && position[2] < p0[2]))))
+                                    first = cc;
+                            }
+                        }
+                    }
+                }
+                expanded_a = sa;
+                expanded_b = sb;
+            }
+            __syncwarp();
+            cursor = next_contact.data[cursor];
+        }
+        // Members in sorted order with the member farthest from the first location,
+        // as _build collects them: the same independent test, applied in lane order.
+        __syncwarp();
+        const bool carry_only = first < 0;
+        const int anchor = carry_only ? seed : first;
+        const wp::vec3 anchor_center = center.data[anchor];
+        int second = anchor;
+        float separation = 0.0f;
+        for (int base = index; base < stop; base += 32) {
+            const int j = base + lane;
+            const int c = (j < stop) ? indices.data[j] : -1;
+            unsigned ballot = __ballot_sync(0xffffffffu, c >= 0 && owner.data[c] == seed);
+            while (ballot) {
+                const int l = __ffs(ballot) - 1;
+                ballot &= ballot - 1u;
+                const int cc = __shfl_sync(0xffffffffu, c, l);
+                if (lane == 0) members.data[member_stop] = cc;
+                member_stop += 1;
+                if (carry_only || eligible.data[cc] != 0) {
+                    const float distance = wp::length_sq(wp::sub(center.data[cc], anchor_center));
+                    if (distance > separation) {
+                        separation = distance;
+                        second = cc;
+                    }
+                }
+            }
+        }
+        if (lane == 0) {
+            next_contact.data[tail] = seed;
+            first_location.data[seed] = first;
+            region_stop.data[seed] = member_stop;
+            region_second.data[seed] = second;
+            region_separation.data[seed] = separation;
+        }
+    }
+#endif
+"""
+_FLOOD_CUDA = _FLOOD_CUDA.replace(
+    "#if defined(__CUDA_ARCH__)",
+    """#if defined(__CUDA_ARCH__)
+    const auto shapes_adjacent = [&](int a, int b) {
+        if (a == b) return true;
+        if (a < 0 || b < 0) return false;
+        const float rad = shape_radius.data[a] + shape_radius.data[b];
+        const wp::vec3 delta = wp::sub(
+            wp::transform_get_translation(shape_transform.data[a]), wp::transform_get_translation(shape_transform.data[b]));
+        return wp::length_sq(delta) <= (1.0f + 1.0e-5f) * rad * rad;
+    };""",
+    1,
+)
+
+
+@wp.func_native(_FLOOD_CUDA)
+def _flood_native(
+    tile: int,
+    capacity: int,
+    count: wp.array[int],
+    keys: wp.array[wp.int64],
+    indices: wp.array[int],
+    owner: wp.array[int],
+    eligible: wp.array[int],
+    center: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+    mu: wp.array[wp.vec2],
+    radius: wp.array[float],
+    shape_a: wp.array[int],
+    shape_b: wp.array[int],
+    shape_transform: wp.array[wp.transform],
+    shape_radius: wp.array[float],
+    next_contact: wp.array[int],
+    first_location: wp.array[int],
+    members: wp.array[int],
+    region_stop: wp.array[int],
+    region_second: wp.array[int],
+    region_separation: wp.array[float],
+): ...
+
+
+@wp.kernel(enable_backward=False)
+def _flood_regions(
+    capacity: int,
+    count: wp.array[int],
+    shape_transform: wp.array[wp.transform],
+    shape_radius: wp.array[float],
+    frame: _PatchFrame,
+    patches: FrictionPatches,
+):
+    """One warp per sorted body pair: grow its friction regions exactly as ``_build`` would.
+
+    ``_build`` grows a pair's regions on one thread, testing every later contact of the
+    pair for each new convex piece of a region, which is quadratic in the pair's contact
+    count and runs serially for the largest pair. The tests for one scan are independent,
+    so the warp evaluates them 32 at a time and applies the accepted contacts in scan
+    order: owners, region links and each region's first friction location match the
+    serial flood exactly. The same holds for each region's member list, collected right
+    after its flood. CUDA only; ``_build`` floods itself on the CPU.
+    """
+    tile, _lane = wp.tid()
+    _flood_native(
+        tile,
+        capacity,
+        count,
+        frame.keys,
+        frame.indices,
+        frame.owner,
+        frame.eligible,
+        frame.center,
+        frame.normal,
+        frame.mu,
+        frame.radius,
+        frame.shape_a,
+        frame.shape_b,
+        shape_transform,
+        shape_radius,
+        patches.next_contact,
+        frame.first,
+        frame.members,
+        frame.region_stop,
+        frame.second,
+        frame.separation,
+    )
+
+
 @wp.kernel(enable_backward=False)
 def _build(
     count: wp.array[int],
@@ -306,8 +519,13 @@ def _build(
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
+    flooded: int,
 ):
-    """One thread per sorted body pair; writes disjoint current/previous records."""
+    """One thread per sorted body pair; writes disjoint current/previous records.
+
+    With ``flooded`` the pair's regions were grown by :func:`_flood_regions`; seeds are
+    the contacts that own themselves and each region's first location is stored.
+    """
     start = wp.tid()
     end = wp.min(count[0], frame.center.shape[0])
     if start >= end or (start > 0 and frame.keys[start - 1] == frame.keys[start]):
@@ -345,48 +563,53 @@ def _build(
     remaining = stop - start
     for index in range(start, stop):
         seed = frame.indices[index]
-        if frame.owner[seed] >= 0:
-            continue
-        frame.owner[seed] = seed
-        remaining -= 1
-        tail = seed
         first = int(-1)
-        if frame.eligible[seed] != 0:
-            first = seed
-        cursor = seed
-        expanded_a = int(-2)
-        expanded_b = int(-2)
-        # Flood through adjacent convex pieces. The queue is the contact list
-        # itself; no allocation, atomics, or fixed patch-count limit is needed.
-        while cursor >= 0 and remaining > 0:
-            sa = frame.shape_a[cursor]
-            sb = frame.shape_b[cursor]
-            if sa != expanded_a or sb != expanded_b:
-                for j in range(index + 1, stop):
-                    c = frame.indices[j]
-                    if frame.owner[c] < 0 and _compatible(frame, seed, c):
-                        if _geometry_adjacent(
-                            sa, sb, frame.shape_a[c], frame.shape_b[c], shape_transform, shape_radius
-                        ):
-                            frame.owner[c] = seed
-                            remaining -= 1
-                            patches.next_contact[tail] = c
-                            tail = c
-                            if frame.eligible[c] != 0:
-                                if first < 0:
-                                    first = c
-                                else:
-                                    position = frame.center[c]
-                                    p0 = frame.center[first]
-                                    if position[0] < p0[0] or (
-                                        position[0] == p0[0]
-                                        and (position[1] < p0[1] or (position[1] == p0[1] and position[2] < p0[2]))
-                                    ):
+        if flooded != 0:
+            if frame.owner[seed] != seed:
+                continue
+            first = frame.first[seed]
+        else:
+            if frame.owner[seed] >= 0:
+                continue
+            frame.owner[seed] = seed
+            remaining -= 1
+            tail = seed
+            if frame.eligible[seed] != 0:
+                first = seed
+            cursor = seed
+            expanded_a = int(-2)
+            expanded_b = int(-2)
+            # Flood through adjacent convex pieces. The queue is the contact list
+            # itself; no allocation, atomics, or fixed patch-count limit is needed.
+            while cursor >= 0 and remaining > 0:
+                sa = frame.shape_a[cursor]
+                sb = frame.shape_b[cursor]
+                if sa != expanded_a or sb != expanded_b:
+                    for j in range(index + 1, stop):
+                        c = frame.indices[j]
+                        if frame.owner[c] < 0 and _compatible(frame, seed, c):
+                            if _geometry_adjacent(
+                                sa, sb, frame.shape_a[c], frame.shape_b[c], shape_transform, shape_radius
+                            ):
+                                frame.owner[c] = seed
+                                remaining -= 1
+                                patches.next_contact[tail] = c
+                                tail = c
+                                if frame.eligible[c] != 0:
+                                    if first < 0:
                                         first = c
-                expanded_a = sa
-                expanded_b = sb
-            cursor = patches.next_contact[cursor]
-        patches.next_contact[tail] = seed
+                                    else:
+                                        position = frame.center[c]
+                                        p0 = frame.center[first]
+                                        if position[0] < p0[0] or (
+                                            position[0] == p0[0]
+                                            and (position[1] < p0[1] or (position[1] == p0[1] and position[2] < p0[2]))
+                                        ):
+                                            first = c
+                    expanded_a = sa
+                    expanded_b = sb
+                cursor = patches.next_contact[cursor]
+            patches.next_contact[tail] = seed
         carry_only = int(0)
         if first < 0:
             # No member may carry friction rows this step (gap filters). Keep the
@@ -397,19 +620,24 @@ def _build(
         second = first
         separation = float(0.0)
         member_start = member_stop
-        # Preserve sorted contact order for footprint sums and tie breaking.
-        # The collision list follows flood order and must remain unchanged.
-        for j in range(index, stop):
-            c = frame.indices[j]
-            if frame.owner[c] != seed:
-                continue
-            frame.members[member_stop] = c
-            member_stop += 1
-            if carry_only != 0 or frame.eligible[c] != 0:
-                distance = wp.length_sq(frame.center[c] - frame.center[first])
-                if distance > separation:
-                    separation = distance
-                    second = c
+        if flooded != 0:
+            member_stop = frame.region_stop[seed]
+            second = frame.second[seed]
+            separation = frame.separation[seed]
+        else:
+            # Preserve sorted contact order for footprint sums and tie breaking.
+            # The collision list follows flood order and must remain unchanged.
+            for j in range(index, stop):
+                c = frame.indices[j]
+                if frame.owner[c] != seed:
+                    continue
+                frame.members[member_stop] = c
+                member_stop += 1
+                if carry_only != 0 or frame.eligible[c] != 0:
+                    distance = wp.length_sq(frame.center[c] - frame.center[first])
+                    if distance > separation:
+                        separation = distance
+                        second = c
         anchors = int(1)
         if separation > 1.0e-8 * frame.radius[seed] * frame.radius[seed]:
             anchors = 2
@@ -810,6 +1038,7 @@ class _FrictionPatchState:
         frame.mu = wp.zeros(n, dtype=wp.vec2, device=device)
         frame.radius = wp.zeros(n, dtype=float, device=device)
         frame.support_gap_limit = wp.zeros(n, dtype=float, device=device)
+        frame.separation = wp.zeros(n, dtype=float, device=device)
         for field in (
             "body_a",
             "body_b",
@@ -822,6 +1051,9 @@ class _FrictionPatchState:
             "source",
             "eligible",
             "members",
+            "first",
+            "region_stop",
+            "second",
         ):
             setattr(frame, field, wp.zeros(n, dtype=int, device=device))
         return frame
@@ -870,6 +1102,24 @@ class _FrictionPatchState:
             device=model.device,
         )
         wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity)
+        # The warp-per-pair flood matches the serial one exactly; the switch exists so
+        # tests can compare them.
+        flooded = model.device.is_cuda and getattr(self, "device_flood", True)
+        if flooded:
+            wp.launch_tiled(
+                _flood_regions,
+                dim=[self.capacity],
+                inputs=[
+                    self.capacity,
+                    contacts.rigid_contact_count,
+                    model.shape_transform,
+                    model.shape_collision_radius,
+                    self.current,
+                    self.view,
+                ],
+                block_dim=32,
+                device=model.device,
+            )
         wp.launch(
             _build,
             dim=self.capacity,
@@ -882,6 +1132,7 @@ class _FrictionPatchState:
                 self.current,
                 self.previous,
                 self.view,
+                int(flooded),
             ],
             device=model.device,
         )
