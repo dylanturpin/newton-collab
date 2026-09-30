@@ -3518,6 +3518,60 @@ class TestImportUsdPhysics(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_physx_convex_decomposition_budget_spans_components(self):
+        """Cap the hull count of the whole mesh, not of each disconnected component."""
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+        def two_boxes_stage(max_hulls):
+            stage = Usd.Stage.CreateInMemory()
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+            UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+            UsdPhysics.Scene.Define(stage, "/physicsScene")
+            small = newton.Mesh.create_box(0.5, 0.5, 0.5, duplicate_vertices=False, compute_inertia=False)
+            large = newton.Mesh.create_box(2.0, 2.0, 2.0, duplicate_vertices=False, compute_inertia=False)
+            points = np.concatenate((small.vertices, large.vertices + np.array([10.0, 0.0, 0.0])))
+            indices = np.concatenate((small.indices, large.indices + len(small.vertices)))
+            mesh = UsdGeom.Mesh.Define(stage, "/Boxes")
+            UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+            mesh.CreateFaceVertexCountsAttr().Set([3] * (len(indices) // 3))
+            mesh.CreateFaceVertexIndicesAttr().Set(indices.tolist())
+            mesh.CreatePointsAttr().Set([Gf.Vec3f(*point) for point in points.tolist()])
+            UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim()).GetApproximationAttr().Set(
+                UsdPhysics.Tokens.convexDecomposition
+            )
+            prim = mesh.GetPrim()
+            prim.AddAppliedSchema("PhysxConvexDecompositionCollisionAPI")
+            prim.CreateAttribute("physxConvexDecompositionCollision:maxConvexHulls", Sdf.ValueTypeNames.Int).Set(
+                max_hulls
+            )
+            return stage
+
+        budgets = []
+        fake_coacd = types.ModuleType("coacd")
+        fake_coacd.Mesh = lambda vertices, indices: (vertices, indices)
+
+        def run_coacd(cmesh, **kwargs):
+            budgets.append((len(cmesh[0]), kwargs["max_convex_hull"]))
+            return [cmesh]
+
+        fake_coacd.run_coacd = run_coacd
+        with patch_sys_module("coacd", fake_coacd):
+            newton.ModelBuilder().add_usd(two_boxes_stage(10))
+            self.assertEqual(sum(budget for _, budget in budgets), 10)
+            self.assertLess(budgets[0][1], budgets[1][1])
+
+            budgets.clear()
+            builder = newton.ModelBuilder()
+            with self.assertWarns(UserWarning):
+                builder.add_usd(two_boxes_stage(1))
+            self.assertEqual([budget for _, budget in budgets], [1, 1])
+            hulls = [i for i, kind in enumerate(builder.shape_type) if kind == newton.GeoType.CONVEX_MESH]
+            self.assertEqual(len(hulls), 1)
+            extent = builder.shape_source[hulls[0]].vertices[:, 0]
+            self.assertAlmostEqual(float(extent.min()), -0.5, places=5)
+            self.assertAlmostEqual(float(extent.max()), 12.0, places=5)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_disabled_mesh_collider_skips_approximation(self):
         """Preserve the authored mesh for a disabled collider."""
         from pxr import Gf, Usd, UsdGeom, UsdPhysics
