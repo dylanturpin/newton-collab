@@ -20,18 +20,14 @@ class _SleepState:
         if (
             model.requires_grad
             or model.particle_count
-            or solver._has_loop_joints
-            or solver._mimic_count
             or solver.pgs_warmstart
             or solver._mf_warmstart_enabled
             or solver.contact_compliance
             or solver.pgs_velocity_iterations
-            or solver._contact_torsion_enabled
-            or solver._friction_anchors_enabled
             or solver.articulated_contact_response != "immediate"
         ):
             raise ValueError(
-                "Experimental sleeping requires rigid immediate response, friction_anchor_beta=0, no torsion, loops, mimic, warmstart or velocity passes"
+                "Experimental sleeping requires rigid immediate response, no compliance, warmstart or velocity passes"
             )
         if model.articulation_count == 0:
             raise ValueError("Experimental sleeping requires at least one articulation")
@@ -87,6 +83,19 @@ class _SleepState:
         root_parents = model.joint_parent.numpy()[starts]
         fixed = (root_types == int(JointType.FIXED)) & (root_parents < 0)
         self.anchored = wp.array(fixed.astype(np.int32), dtype=int, device=device)
+        # Loop and mimic rows are built for every articulation, so their owners never sleep.
+        pinned = np.zeros(count, dtype=np.int32)
+        body_art = solver.body_to_articulation.numpy()
+        loops = np.flatnonzero(solver._model_plan.loop_joint_articulation >= 0)
+        for body in np.concatenate((model.joint_parent.numpy()[loops], model.joint_child.numpy()[loops])):
+            if body >= 0 and body_art[body] >= 0:
+                pinned[body_art[body]] = 1
+        if solver._mimic_count:
+            pinned[np.flatnonzero(np.diff(solver._mimic_art_start_np))] = 1
+            for dofs in (solver._mimic_dof0.numpy(), solver._mimic_dof1.numpy()):
+                arts = dof_art[dofs[dofs >= 0]]
+                pinned[arts[arts >= 0]] = 1
+        self.pinned = wp.array(pinned, dtype=int, device=device)
 
     def wake(self):
         """Wake every component and invalidate state-change history."""
@@ -175,6 +184,7 @@ class _SleepState:
             ],
             device=device,
         )
+        wp.launch(_veto_pinned, self.parent.size, [self.parent, self.pinned, self.root_veto], device=device)
         wp.launch(
             _gravity_change,
             self.parent.size,
@@ -496,6 +506,13 @@ def _input_dofs(
     if nodes[i] >= 0:
         if force[i] != 0.0 or ke[i] != 0.0 or kd[i] != 0.0 or spring[i] != 0.0 or (valid[0] != 0 and qd[i] != last[i]):
             wp.atomic_max(veto, parent[nodes[i]], 1)
+
+
+@wp.kernel(enable_backward=False)
+def _veto_pinned(parent: wp.array[int], pinned: wp.array[int], veto: wp.array[int]):
+    i = wp.tid()
+    if pinned[i] != 0:
+        wp.atomic_max(veto, parent[i], 1)
 
 
 @wp.kernel(enable_backward=False)

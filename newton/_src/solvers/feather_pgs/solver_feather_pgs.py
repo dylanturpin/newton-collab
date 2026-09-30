@@ -1247,7 +1247,7 @@ class SolverFeatherPGS(SolverBase):
             model (Model): the model to be simulated.
             enable_sleeping: Experimental passive-island sleeping with optional dormant-contact omission.
                 Configure at construction; rebuild captured graphs to change this option. Driven articulations stay awake.
-                Requires explicit friction_anchor_beta=0; persistent anchors, torsion and warmstarting are unsupported.
+                Articulations with mimic or loop constraints stay awake; warmstarting and compliance are unsupported.
             sleep_linear_threshold: Experimental body COM speed threshold [m/s].
             sleep_angular_threshold: Experimental body angular speed threshold [rad/s].
             sleep_quiet_time: Experimental supported quiet interval before sleeping [s].

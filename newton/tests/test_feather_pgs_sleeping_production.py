@@ -1,0 +1,155 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Exercise sleeping with persistent friction anchors, device torsion and mimic constraints."""
+
+import unittest
+
+import numpy as np
+import warp as wp
+
+import newton
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_TORSION
+
+_PROFILE = {
+    "pgs_mode": "matrix_free",
+    "pgs_schedule": "interleaved",
+    "articulated_contact_response": "immediate",
+    "pgs_iterations": 32,
+    "pgs_contact_regularization": 0.01,
+    "contact_shared_anchor": True,
+    "contact_friction_shared_anchor": True,
+    "friction_anchor_beta": 0.2,
+    "contact_friction_gap_threshold": 0.001,
+    "contact_torsion_radius": 0.01,
+    "contact_torsion_device": True,
+    "dense_max_constraints": 512,
+    "mf_max_constraints": 512,
+    "enable_sleeping": True,
+    "sleep_quiet_time": 0.1,
+}
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
+class TestSleepingProductionProfile(unittest.TestCase):
+    def test_anchored_torsion_articulations_sleep_and_wake(self):
+        """Drop every row of a settled scene and restore anchored torsion rows on a force wake."""
+        model, pipeline, solver, states, control = _articulations()
+        _advance(pipeline, solver, states, control, 5)
+        awake_rows = int(solver.constraint_count.numpy()[0])
+        awake_torsion = _torsion_rows(solver)
+        self.assertGreater(awake_torsion, 0)
+        _advance(pipeline, solver, states, control, 400)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0, 0, 0])
+        np.testing.assert_array_equal(solver.constraint_count.numpy(), [0])
+        np.testing.assert_array_equal(solver.mf_constraint_count.numpy(), [0])
+        frozen = states[0].body_q.numpy().copy()
+        _advance(pipeline, solver, states, control, 20)
+        np.testing.assert_array_equal(states[0].body_q.numpy(), frozen)
+
+        # Pushing the first articulation restores its rows and leaves the second asleep.
+        force = np.zeros((model.body_count, 6), dtype=np.float32)
+        force[0, 0] = 20.0
+        for _ in range(5):
+            states[0].body_f.assign(force)
+            _advance(pipeline, solver, states, control, 1, clear=False)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 1, 0, 0])
+        self.assertEqual(int(solver.constraint_count.numpy()[0]), awake_rows // 2)
+        self.assertEqual(_torsion_rows(solver), awake_torsion // 2)
+        self.assertGreater(states[0].body_q.numpy()[0, 0], frozen[0, 0])
+        np.testing.assert_array_equal(states[0].body_q.numpy()[2:], frozen[2:])
+
+        _advance(pipeline, solver, states, control, 600)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0, 0, 0])
+        self.assertFalse(np.any(solver.constraint_overflow.numpy()))
+
+    def test_graph_replay_validates_torsion(self):
+        """Sleep and wake inside a captured graph with mandatory torsion validation."""
+        model, pipeline, solver, states, control = _articulations()
+        contacts = pipeline.contacts()
+        _advance(pipeline, solver, states, control, 2, contacts=contacts)
+        solver.prepare_contact_torsion_capture(states[0], states[1])
+        with wp.ScopedCapture(device=model.device) as capture:
+            solver.seed_double_buffer_events()
+            for _ in range(2):
+                states[0].clear_forces()
+                pipeline.collide(states[0], contacts)
+                solver.step(states[0], states[1], control, contacts, 0.005)
+                states.reverse()
+        for _ in range(200):
+            wp.capture_launch(capture.graph)
+        solver.validate_contact_torsion()
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0, 0, 0])
+        solver.sleeping.wake()
+        wp.capture_launch(capture.graph)
+        solver.validate_contact_torsion()
+        self.assertGreater(_torsion_rows(solver), 0)
+
+    def test_mimic_articulation_stays_awake(self):
+        """Keep an articulation with mimic rows awake while an independent box sleeps."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        base = builder.add_link(xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()))
+        builder.add_shape_box(base, hx=0.2, hy=0.1, hz=0.05)
+        joints = [builder.add_joint_free(child=base)]
+        for side in (-1.0, 1.0):
+            finger = builder.add_link(xform=wp.transform((side * 0.15, 0.0, 0.15), wp.quat_identity()))
+            builder.add_shape_box(finger, hx=0.02, hy=0.02, hz=0.05)
+            joints.append(
+                builder.add_joint_revolute(
+                    parent=base, child=finger, parent_xform=wp.transform((side * 0.15, 0.0, 0.1), wp.quat_identity())
+                )
+            )
+        builder.add_articulation(joints)
+        builder.add_constraint_mimic(joint0=joints[2], joint1=joints[1])
+        box = builder.add_body(xform=wp.transform((2.0, 0.0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device="cuda:0")
+        solver = newton.solvers.SolverFeatherPGS(model, **{**_PROFILE, "contact_torsion_radius": 0.0})
+        self.assertGreater(solver._mimic_count, 0)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
+        _advance(pipeline, solver, [model.state(), model.state()], model.control(), 400)
+        awake = solver.sleeping.art_awake.numpy()
+        self.assertEqual(int(awake[solver.body_to_articulation.numpy()[base]]), 1)
+        self.assertEqual(int(awake[solver.body_to_articulation.numpy()[box]]), 0)
+
+
+def _articulations():
+    """Two undriven two-link articulations resting on the ground, which route contacts to dense rows."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    for x in (0.0, 1.0):
+        base = builder.add_link(xform=wp.transform((x, 0.0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(base, hx=0.2, hy=0.1, hz=0.1)
+        tip = builder.add_link(xform=wp.transform((x + 0.3, 0.0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(tip, hx=0.1, hy=0.1, hz=0.1)
+        hinge = wp.transform((0.3, 0.0, 0.0), wp.quat_identity())
+        builder.add_articulation(
+            [
+                builder.add_joint_free(child=base),
+                builder.add_joint_revolute(parent=base, child=tip, parent_xform=hinge, axis=(0.0, 1.0, 0.0)),
+            ]
+        )
+    model = builder.finalize(device="cuda:0")
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
+    solver = newton.solvers.SolverFeatherPGS(model, **_PROFILE)
+    return model, pipeline, solver, [model.state(), model.state()], model.control()
+
+
+def _torsion_rows(solver):
+    row_types = solver.row_type.numpy()[0, : int(solver.constraint_count.numpy()[0])]
+    return int(np.count_nonzero(row_types == PGS_CONSTRAINT_TYPE_TORSION))
+
+
+def _advance(pipeline, solver, states, control, steps, *, clear=True, contacts=None):
+    contacts = contacts or pipeline.contacts()
+    for _ in range(steps):
+        if clear:
+            states[0].clear_forces()
+        pipeline.collide(states[0], contacts)
+        solver.step(states[0], states[1], control, contacts, 0.005)
+        states.reverse()
+
+
+if __name__ == "__main__":
+    unittest.main()
