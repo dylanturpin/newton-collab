@@ -154,6 +154,22 @@ class TestSleepingProductionProfile(unittest.TestCase):
         positions = [t[-1][: 7 * 4].reshape(4, 7)[:, :3] for t in trajectories]
         np.testing.assert_allclose(positions[1], positions[0], rtol=0.0, atol=2.0e-3)
 
+    def test_successive_notifications_keep_every_wake(self):
+        """A second notification before the next step keeps the first notification's wake."""
+        model, pipeline, solver, states = _two_world_boxes()
+        _advance(pipeline, solver, states, model.control(), 400)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+        mass = model.body_mass.numpy()
+        mass[0] *= 2.0
+        model.body_mass.assign(mass)
+        solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+        mu = model.shape_material_mu.numpy()
+        mu[model.shape_body.numpy() == 1] *= 0.5
+        model.shape_material_mu.assign(mu)
+        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+        _advance(pipeline, solver, states, model.control(), 1)
+        np.testing.assert_array_equal(solver.sleeping.art_awake.numpy(), [1, 1])
+
     def test_mimic_articulation_stays_awake(self):
         """Keep an articulation with mimic rows awake while an independent box sleeps."""
         builder = newton.ModelBuilder()

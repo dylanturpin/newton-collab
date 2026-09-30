@@ -171,7 +171,8 @@ class _SleepState:
         if flags & ~tracked:
             self.wake()
             return
-        changed = np.zeros(self.changed.size, dtype=np.int32)
+        # Several notifications can arrive before the next step consumes the mask; keep every pending wake.
+        changed = self.changed.numpy().copy()
         unowned = False
         for flag, entries in self.property_arrays.items():
             if not flags & int(flag):
