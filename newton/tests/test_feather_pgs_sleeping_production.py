@@ -111,6 +111,32 @@ class TestSleepingProductionProfile(unittest.TestCase):
         _advance(pipeline, solver, states, model.control(), 1)
         np.testing.assert_array_equal(solver.sleeping.art_awake.numpy(), [1, 0])
 
+    def test_frozen_patch_carry_matches_rebuild(self):
+        """Carrying frozen friction patches matches rebuilding them through sleep, wake and resettle."""
+        trajectories = []
+        for carry in (False, True):
+            model, pipeline, solver, states, control = _articulations()
+            solver.sleeping.carry_frozen_patches = carry
+            contacts = pipeline.contacts()
+            frozen = 0
+            trajectory = []
+            for step in range(900):
+                states[0].clear_forces()
+                if 400 <= step < 405:
+                    force = np.zeros((model.body_count, 6), dtype=np.float32)
+                    force[0, 0] = 20.0
+                    states[0].body_f.assign(force)
+                pipeline.collide(states[0], contacts)
+                solver.step(states[0], states[1], control, contacts, 0.005)
+                states.reverse()
+                frozen += int(solver.sleeping.frozen_bodies.numpy().sum())
+                trajectory.append(np.concatenate((states[0].body_q.numpy().ravel(), states[0].body_qd.numpy().ravel())))
+            self.assertGreater(frozen, 0)
+            trajectories.append(np.array(trajectory))
+        np.testing.assert_array_equal(trajectories[1][:400], trajectories[0][:400])
+        # Rebuilding re-derives the carried history each sleeping step, which only differs by roundoff.
+        np.testing.assert_allclose(trajectories[1], trajectories[0], rtol=0.0, atol=1.0e-6)
+
     def test_mimic_articulation_stays_awake(self):
         """Keep an articulation with mimic rows awake while an independent box sleeps."""
         builder = newton.ModelBuilder()

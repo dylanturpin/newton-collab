@@ -37,6 +37,7 @@ class _SleepState:
         self.angular_threshold = angular_threshold
         self.quiet_time = quiet_time
         self.skip_constraints = skip_constraints
+        self.carry_frozen_patches = True
         body_nodes = solver.body_to_articulation.numpy().copy()
         response_counts = solver.articulation_response_dof_count.numpy()
         prescribed = (body_nodes >= 0) & (response_counts[np.maximum(body_nodes, 0)] == 0)
@@ -97,6 +98,8 @@ class _SleepState:
                 pinned[arts[arts >= 0]] = 1
         self.pinned = wp.array(pinned, dtype=int, device=device)
         self.changed = wp.zeros(count, dtype=int, device=device)
+        self.asleep_steps = wp.zeros(count, dtype=int, device=device)
+        self.frozen_bodies = wp.zeros(model.body_count, dtype=int, device=device)
         shape_art = np.full(model.shape_count, -1, dtype=np.int32)
         shape_body = model.shape_body.numpy()
         shape_art[shape_body >= 0] = body_nodes[shape_body[shape_body >= 0]]
@@ -113,6 +116,11 @@ class _SleepState:
             for flag, (size, arts) in entity_arts.items()
         }
 
+    @property
+    def patch_frozen_bodies(self):
+        """Bodies whose friction-patch history can be carried; only row-free sleeping qualifies."""
+        return self.frozen_bodies if self.skip_constraints and self.carry_frozen_patches else None
+
     def wake(self, world_mask=None):
         """Wake every component and invalidate state-change history, or wake only the masked worlds."""
         if world_mask is None:
@@ -120,6 +128,7 @@ class _SleepState:
             self.body_awake.fill_(1)
             self.quiet_age.zero_()
             self.valid.zero_()
+            self.asleep_steps.zero_()
             return
         device = self.model.device
         world = self.solver.art_to_world
@@ -310,6 +319,12 @@ class _SleepState:
         )
         if self.skip_constraints:
             wp.launch(
+                _frozen_bodies,
+                model.body_count,
+                [self.body_nodes, self.art_awake, self.asleep_steps, self.frozen_bodies],
+                device=device,
+            )
+            wp.launch(
                 _contact_response_mask,
                 model.body_count,
                 [self.body_nodes, self.art_awake, self.solver.body_has_response_dofs, self.contact_response_mask],
@@ -374,7 +389,7 @@ class _SleepState:
         wp.launch(
             _publish_components,
             self.parent.size,
-            [self.parent, self.root_ready, self.art_awake, self.previous_root],
+            [self.parent, self.root_ready, self.art_awake, self.previous_root, self.asleep_steps],
             device=device,
         )
         wp.launch(
@@ -741,10 +756,16 @@ def _quiet_components(
 
 
 @wp.kernel(enable_backward=False)
-def _publish_components(parent: wp.array[int], ready: wp.array[int], awake: wp.array[int], previous: wp.array[int]):
+def _publish_components(
+    parent: wp.array[int], ready: wp.array[int], awake: wp.array[int], previous: wp.array[int], asleep: wp.array[int]
+):
     i = wp.tid()
     awake[i] = 1 - ready[parent[i]]
     previous[i] = parent[i]
+    if awake[i] == 0:
+        asleep[i] += 1
+    else:
+        asleep[i] = 0
 
 
 @wp.kernel(enable_backward=False)
@@ -799,6 +820,15 @@ def _veto_unsafe_islands(
     i = wp.tid()
     if supported[parent[i]] == 0 or incomplete[0] != 0 or reduction_overflow[0] != 0 or overflow[world[i]]:
         wp.atomic_max(veto, parent[i], 1)
+
+
+@wp.kernel(enable_backward=False)
+def _frozen_bodies(nodes: wp.array[int], awake: wp.array[int], asleep: wp.array[int], frozen: wp.array[int]):
+    """Bodies whose poses, contacts and friction history repeat: asleep now and through the previous step."""
+    i = wp.tid()
+    frozen[i] = 0
+    if nodes[i] >= 0 and awake[nodes[i]] == 0 and asleep[nodes[i]] >= 1:
+        frozen[i] = 1
 
 
 @wp.kernel(enable_backward=False)

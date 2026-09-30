@@ -11356,6 +11356,7 @@ class SolverFeatherPGS(SolverBase):
                     articulation_pair_gap_gate=self.articulation_pair_contact_gap_gate,
                     friction_gap=self.contact_friction_gap_threshold,
                     friction_articulation_pairs_only=self.contact_friction_articulation_pairs_only,
+                    frozen_bodies=self.sleeping.patch_frozen_bodies if self.sleeping is not None else None,
                 )
 
             wp.launch(
