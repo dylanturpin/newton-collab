@@ -55,6 +55,7 @@ class TestFeatherPGSColoredStagingSelection(unittest.TestCase):
 @unittest.skipUnless(wp.get_device().is_cuda, "propagation-colored requires CUDA")
 class TestFeatherPGSColoredPipeline(unittest.TestCase):
     def test_pipelined_variants_match_the_reference_bitwise(self):
+        """Prefetched and (where supported) staged sweeps match the reference unit body."""
         for regularization in (0.0, 0.01):
             with self.subTest(regularization=regularization):
                 self._check_variants(regularization)
@@ -87,13 +88,21 @@ class TestFeatherPGSColoredPipeline(unittest.TestCase):
         variants = {
             "reference": ({"FEATHER_PGS_COLORED_PREFETCH": "0", "FEATHER_PGS_COLORED_STAGED": "0"}, "_pf0_st0"),
             "prefetch": ({"FEATHER_PGS_COLORED_STAGED": "0"}, "_pf1_st0"),
-            "staged": ({}, "_pf1_st1"),
+            "default": ({}, None),
         }
         results = {}
-        for name, (env, tag) in variants.items():
+        for name, (env, expected) in variants.items():
             solver = _solver(model, env, regularization)
             kernel = solver._pgs_solve_propagation_colored_warp_kernel
             self.assertIsNotNone(kernel)
+            tag = expected
+            if tag is None:
+                # The default stages the payload only where cp.async exists (SM80+); older
+                # devices take the unstaged prefetch kernel, which must match as well.
+                staged = _colored_staging_supported(
+                    int(model.device.arch), 1, solver.world_count, int(solver.max_propagation_bodies)
+                )
+                tag = "_pf1_st1" if staged else "_pf1_st0"
             self.assertIn(tag, kernel.key, f"{name} did not build its kernel variant")
             a, b = model.state(), model.state()
             for field, value in start.items():
@@ -107,7 +116,7 @@ class TestFeatherPGSColoredPipeline(unittest.TestCase):
         ref = results["reference"]
         self.assertTrue(all(np.isfinite(x).all() for x in ref))
         self.assertGreater(np.abs(ref[2]).max(), 0.0, "no contact impulses were solved")
-        for name in ("prefetch", "staged"):
+        for name in ("prefetch", "default"):
             for label, got, want in zip(("body_q", "body_qd", "impulses"), results[name], ref, strict=True):
                 np.testing.assert_array_equal(got, want, err_msg=f"{name} {label} differs from the reference")
 

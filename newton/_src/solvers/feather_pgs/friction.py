@@ -122,57 +122,49 @@ FRICTION_PAIR_CUDA = """
         float a, float c, float d, float r0, float r1,
         float old0, float old1, float radius, float omega) {
         if (radius <= 0.0f) return make_float2(0.0f, 0.0f);
-        // Same eigen-basis solve as the Warp function above, arranged so repeated
-        // divisions by one denominator become one reciprocal: IEEE division and
-        // square root are long dependent chains on the serial colored sweep.
         float scale = fmaxf(fmaxf(a, d), 1.0e-20f);
-        const float inv_scale = 1.0f / scale;
-        a *= inv_scale; c *= inv_scale; d *= inv_scale;
+        a /= scale; c /= scale; d /= scale;
         float largest = 0.5f * (a + d + sqrtf((a-d)*(a-d) + 4.0f*c*c));
-        const float inv_largest = largest > 0.0f ? 1.0f / largest : 0.0f;
-        float smallest = largest > 0.0f ? fmaxf((a*d-c*c) * inv_largest, 0.0f) : 0.0f;
+        float smallest = largest > 0.0f ? fmaxf((a*d-c*c) / largest, 0.0f) : 0.0f;
         float vx = c, vy = largest-a;
         if (a >= d) { vx = largest-d; vy = c; }
-        float norm_sq = vx*vx + vy*vy;
-        if (norm_sq > 0.0f) { const float inv_norm = 1.0f / sqrtf(norm_sq); vx *= inv_norm; vy *= inv_norm; }
+        float norm = sqrtf(vx*vx + vy*vy);
+        if (norm > 0.0f) { vx /= norm; vy /= norm; }
         else { vx = 1.0f; vy = 0.0f; }
-        float r0_rotated = (vx*r0 + vy*r1) * inv_scale;
-        float r1_rotated = (-vy*r0 + vx*r1) * inv_scale;
+        float r0_rotated = (vx*r0 + vy*r1) / scale;
+        float r1_rotated = (-vy*r0 + vx*r1) / scale;
         float result0 = old0, result1 = old1;
         bool sticking = false;
         if (largest > 0.0f && (smallest > 0.0f || r1_rotated == 0.0f)) {
-            float dx = r0_rotated * inv_largest;
+            float dx = r0_rotated / largest;
             float dy = smallest > 0.0f ? r1_rotated / smallest : 0.0f;
             result0 = old0 - (vx*dx - vy*dy);
             result1 = old1 - (vy*dx + vx*dy);
-            sticking = result0*result0 + result1*result1 <= radius*radius;
+            sticking = sqrtf(result0*result0 + result1*result1) <= radius;
         }
         if (!sticking) {
-            if (r0*old0+r1*old1 <= 0.0f) {
-                float old_norm = sqrtf(old0*old0 + old1*old1);
-                if (old_norm > 0.0f && old_norm <= radius && radius-old_norm <= 2.0e-7f*radius) {
-                    float residual_norm = sqrtf(r0*r0 + r1*r1);
-                    if (fabsf(r0*old1-r1*old0) <= 2.0e-7f*old_norm*residual_norm) return make_float2(old0, old1);
-                }
+            float old_norm = sqrtf(old0*old0 + old1*old1);
+            float residual_norm = sqrtf(r0*r0 + r1*r1);
+            if (old_norm > 0.0f && old_norm <= radius
+                && radius-old_norm <= 2.0e-7f*radius
+                && r0*old0+r1*old1 <= 0.0f
+                && fabsf(r0*old1-r1*old0) <= 2.0e-7f*old_norm*residual_norm) {
+                return make_float2(old0, old1);
             }
-            const float inv_radius = 1.0f / radius;
             float old_x = vx*old0 + vy*old1;
             float old_y = -vy*old0 + vx*old1;
             float b0 = largest * old_x - r0_rotated;
             float b1 = smallest * old_y - r1_rotated;
             float x = 0.0f, y = 0.0f;
             float lo = 0.0f;
-            float hi = sqrtf(b0*b0 + b1*b1) * inv_radius;
+            float hi = sqrtf(b0*b0 + b1*b1) / radius;
             if (hi > 0.0f) {
-                lo = fmaxf(fmaxf(hi-largest, fabsf(b1)*inv_radius-smallest), 0.0f);
+                lo = fmaxf(fmaxf(hi-largest, fabsf(b1)/radius-smallest), 0.0f);
                 float alpha = lo;
                 bool converged = false;
                 for (int iteration = 0; iteration < 8; ++iteration) {
-                    // Both diagonal reciprocals from one division.
-                    const float p0 = largest+alpha, p1 = smallest+alpha;
-                    float inv0, inv1;
-                    if (p1 > 0.0f) { const float inv_p = 1.0f / (p0*p1); inv0 = p1*inv_p; inv1 = p0*inv_p; }
-                    else { inv0 = 1.0f / p0; inv1 = 0.0f; }
+                    float inv0 = 1.0f / (largest+alpha);
+                    float inv1 = smallest+alpha > 0.0f ? 1.0f / (smallest+alpha) : 0.0f;
                     float tx = old_x - (r0_rotated + alpha*old_x)*inv0;
                     float ty = old_y - (r1_rotated + alpha*old_y)*inv1;
                     float norm = sqrtf(tx*tx + ty*ty);
@@ -185,7 +177,7 @@ FRICTION_PAIR_CUDA = """
                     else hi = alpha;
                     float slope = tx*tx*inv0 + ty*ty*inv1;
                     float candidate = alpha;
-                    if (slope > 0.0f) candidate = alpha + (norm*inv_radius-1.0f)*norm*norm/slope;
+                    if (slope > 0.0f) candidate = alpha + (norm/radius-1.0f)*norm*norm/slope;
                     alpha = 0.5f * (lo+hi);
                     if (candidate > lo && candidate < hi) alpha = candidate;
                 }
@@ -194,7 +186,7 @@ FRICTION_PAIR_CUDA = """
                         alpha = 0.5f * (lo + hi);
                         float tx = b0 / (largest + alpha);
                         float ty = b1 / (smallest + alpha);
-                        if (tx*tx + ty*ty > radius*radius) lo = alpha;
+                        if (sqrtf(tx*tx + ty*ty) > radius) lo = alpha;
                         else hi = alpha;
                     }
                     x = b0 / (largest + hi);
