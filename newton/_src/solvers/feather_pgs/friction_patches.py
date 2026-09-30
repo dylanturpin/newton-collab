@@ -970,6 +970,7 @@ def _carry_frozen_pair(
     """Carry a frozen pair's history unchanged; its poses and contacts repeat and it has no rows."""
     if prev_stop - prev_start != stop - start or not _pair_frozen(frozen_bodies, frame, start):
         return False
+    a = frame.body_a[frame.indices[start]]
     for k in range(stop - start):
         c = frame.indices[start + k]
         p = prev.indices[prev_start + k]
