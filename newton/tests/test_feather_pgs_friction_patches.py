@@ -758,6 +758,9 @@ class TestFrictionPatchDeviceFlood(unittest.TestCase):
 
         serial = run(False)
         device = run(True)
+        self.assertGreater(
+            int(patches._flood_pair_count.numpy()[0]), 0, "no body pair was large enough for the device flood"
+        )
         count = int(contacts.rigid_contact_count.numpy()[0])
         owner = device["frame.owner"][:count]
         regions, sizes = np.unique(owner[owner >= 0], return_counts=True)

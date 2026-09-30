@@ -6465,9 +6465,17 @@ class SolverFeatherPGS(SolverBase):
                     device_arch,
                 )
             # The coloring keeps a world's used-color masks (16 words per body) in shared
-            # memory when its unit bodies span at most this many indices.
+            # memory when its unit bodies span few enough indices. Size that span from the
+            # bodies a world can touch (its own and the global ones), capped at 256.
             color_words = (PROPAGATION_COLOR_TAIL + 31) // 32
-            max_body_span = min(max(int(model.body_count), 1), 16384 // (color_words * 4))
+            world_start = getattr(model, "body_world_start", None)
+            span = int(model.body_count)
+            if world_start is not None and self.world_count > 1:
+                starts = world_start.numpy()
+                per_world = int(np.max(starts[1 : self.world_count + 1] - starts[: self.world_count]))
+                global_bodies = int(starts[-1] - starts[-2] + starts[0])
+                span = max(per_world, global_bodies)
+            max_body_span = min(max(span, 1), 16384 // (color_words * 4))
             self._color_propagation_prebuild_kernel = _get_color_propagation_prebuild_kernel(
                 self.propagation_max_constraints,
                 PROPAGATION_COLOR_TAIL + 2,
@@ -16572,8 +16580,10 @@ def _get_color_propagation_prebuild_kernel(
     # Span of body indices whose used-color masks fit in shared memory; a world whose
     # unit bodies span more keeps them in global memory. 0 always uses global memory.
     MBW = int(max_body_span)
-    CH = 512  # units staged in shared memory per chunk of the serial passes
-    SORT_CAP = 4096  # units a world may have for the sort to run on packed keys in shared memory
+    # Shared buffers follow the per-world unit capacity: with many small worlds one
+    # block runs per world, and a fixed large footprint would cut occupancy.
+    CH = min(512, OS)  # units staged in shared memory per chunk of the serial passes
+    SORT_CAP = min(4096, OS)  # units a world may have for the sort to run on packed keys in shared memory
     # One raw buffer: the sort's keys first, then the masks and the staged chunks.
     RAW_WORDS = max(2 * SORT_CAP, max(MBW, 1) * WORDS + 4 * CH)
 

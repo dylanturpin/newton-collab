@@ -304,14 +304,13 @@ def _carried_displacement(q: wp.array[wp.transform], prev: _PatchFrame, p: int, 
 
 _FLOOD_CUDA = """
 #if defined(__CUDA_ARCH__)
-    const int start = tile;
     const int lane = threadIdx.x & 31;
     int end = count.data[0];
     if (end > capacity) end = capacity;
-    if (start >= end) return;
-    if (start > 0 && keys.data[start - 1] == keys.data[start]) return;
+    const int n_pairs = min(pair_count.data[0], pair_list.shape[0]);
+    for (int pair = tile; pair < n_pairs; pair += n_tiles) {
+    const int start = pair_list.data[pair];
     const wp::int64 key = keys.data[start];
-    if (key == wp::int64(0x7FFFFFFFFFFFFFFFll)) return;
     int stop = start + 1;
     while (stop < end && keys.data[stop] == key) ++stop;
     int remaining = stop - start;
@@ -421,6 +420,7 @@ _FLOOD_CUDA = """
             region_separation.data[seed] = separation;
         }
     }
+    }
 #endif
 """
 _FLOOD_CUDA = _FLOOD_CUDA.replace(
@@ -441,7 +441,10 @@ _FLOOD_CUDA = _FLOOD_CUDA.replace(
 @wp.func_native(_FLOOD_CUDA)
 def _flood_native(
     tile: int,
+    n_tiles: int,
     capacity: int,
+    pair_list: wp.array[int],
+    pair_count: wp.array[int],
     count: wp.array[int],
     keys: wp.array[wp.int64],
     indices: wp.array[int],
@@ -464,16 +467,47 @@ def _flood_native(
 ): ...
 
 
+_FLOOD_MIN_CONTACTS = 32
+"""Body pairs with more contacts than this grow their regions on a warp; smaller pairs in ``_build``."""
+
+
+@wp.kernel(enable_backward=False)
+def _list_flood_pairs(
+    capacity: int,
+    count: wp.array[int],
+    keys: wp.array[wp.int64],
+    min_contacts: int,
+    pair_list: wp.array[int],
+    pair_count: wp.array[int],
+):
+    """List the sorted body pairs with more than ``min_contacts`` contacts for :func:`_flood_regions`."""
+    start = wp.tid()
+    end = wp.min(count[0], capacity)
+    if start >= end or (start > 0 and keys[start - 1] == keys[start]):
+        return
+    key = keys[start]
+    if key == wp.int64(0x7FFFFFFFFFFFFFFF):
+        return
+    if start + min_contacts >= end or keys[start + min_contacts] != key:
+        return
+    index = wp.atomic_add(pair_count, 0, 1)
+    if index < pair_list.shape[0]:
+        pair_list[index] = start
+
+
 @wp.kernel(enable_backward=False)
 def _flood_regions(
+    n_tiles: int,
     capacity: int,
+    pair_list: wp.array[int],
+    pair_count: wp.array[int],
     count: wp.array[int],
     shape_transform: wp.array[wp.transform],
     shape_radius: wp.array[float],
     frame: _PatchFrame,
     patches: FrictionPatches,
 ):
-    """One warp per sorted body pair: grow its friction regions exactly as ``_build`` would.
+    """Grow the listed body pairs' friction regions exactly as ``_build`` would, one warp each.
 
     ``_build`` grows a pair's regions on one thread, testing every later contact of the
     pair for each new convex piece of a region, which is quadratic in the pair's contact
@@ -481,12 +515,17 @@ def _flood_regions(
     so the warp evaluates them 32 at a time and applies the accepted contacts in scan
     order: owners, region links and each region's first friction location match the
     serial flood exactly. The same holds for each region's member list, collected right
-    after its flood. CUDA only; ``_build`` floods itself on the CPU.
+    after its flood. A fixed grid of warps strides over the pairs listed by
+    :func:`_list_flood_pairs`, so the launch does not scale with contact capacity.
+    CUDA only; ``_build`` floods the other pairs, and all pairs on the CPU.
     """
     tile, _lane = wp.tid()
     _flood_native(
         tile,
+        n_tiles,
         capacity,
+        pair_list,
+        pair_count,
         count,
         frame.keys,
         frame.indices,
@@ -523,8 +562,9 @@ def _build(
 ):
     """One thread per sorted body pair; writes disjoint current/previous records.
 
-    With ``flooded`` the pair's regions were grown by :func:`_flood_regions`; seeds are
-    the contacts that own themselves and each region's first location is stored.
+    With ``flooded``, pairs with more than ``_FLOOD_MIN_CONTACTS`` contacts were grown by
+    :func:`_flood_regions`; their seeds own themselves and each region's first location,
+    member range and farthest member are stored. Other pairs flood here.
     """
     start = wp.tid()
     end = wp.min(count[0], frame.center.shape[0])
@@ -561,10 +601,14 @@ def _build(
 
     member_stop = start
     remaining = stop - start
+    # Pairs with more than _FLOOD_MIN_CONTACTS contacts were grown by _flood_regions.
+    pair_flooded = int(0)
+    if flooded != 0 and remaining > _FLOOD_MIN_CONTACTS:
+        pair_flooded = 1
     for index in range(start, stop):
         seed = frame.indices[index]
         first = int(-1)
-        if flooded != 0:
+        if pair_flooded != 0:
             if frame.owner[seed] != seed:
                 continue
             first = frame.first[seed]
@@ -620,7 +664,7 @@ def _build(
         second = first
         separation = float(0.0)
         member_start = member_stop
-        if flooded != 0:
+        if pair_flooded != 0:
             member_stop = frame.region_stop[seed]
             second = frame.second[seed]
             separation = frame.separation[seed]
@@ -970,6 +1014,12 @@ class _FrictionPatchState:
         self.previous = self._frame(capacity, device)
         self.previous_world = wp.full(capacity, -1, dtype=int, device=device)
         self.previous_q = wp.zeros(model.body_count, dtype=wp.transform, device=device)
+        # Body pairs large enough for the warp flood: at most one per _FLOOD_MIN_CONTACTS + 1
+        # contacts, grown by a fixed grid of warps so the launch does not scale with capacity.
+        pair_capacity = capacity // (_FLOOD_MIN_CONTACTS + 1) + 1
+        self._flood_pair_list = wp.zeros(pair_capacity, dtype=int, device=device)
+        self._flood_pair_count = wp.zeros(1, dtype=int, device=device)
+        self._flood_tiles = min(pair_capacity, 1024)
 
     def update_geometry(self, model):
         """Refresh scales and retire affected history after explicit geometry edits."""
@@ -1106,11 +1156,28 @@ class _FrictionPatchState:
         # tests can compare them.
         flooded = model.device.is_cuda and getattr(self, "device_flood", True)
         if flooded:
-            wp.launch_tiled(
-                _flood_regions,
-                dim=[self.capacity],
+            self._flood_pair_count.zero_()
+            wp.launch(
+                _list_flood_pairs,
+                dim=self.capacity,
                 inputs=[
                     self.capacity,
+                    contacts.rigid_contact_count,
+                    self.current.keys,
+                    _FLOOD_MIN_CONTACTS,
+                    self._flood_pair_list,
+                    self._flood_pair_count,
+                ],
+                device=model.device,
+            )
+            wp.launch_tiled(
+                _flood_regions,
+                dim=[self._flood_tiles],
+                inputs=[
+                    self._flood_tiles,
+                    self.capacity,
+                    self._flood_pair_list,
+                    self._flood_pair_count,
                     contacts.rigid_contact_count,
                     model.shape_transform,
                     model.shape_collision_radius,
