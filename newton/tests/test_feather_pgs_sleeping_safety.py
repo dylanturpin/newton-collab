@@ -192,11 +192,9 @@ class TestFeatherPGSSleepingSafety(unittest.TestCase):
                 self.assertFalse(np.isfinite(getattr(state_out, field).numpy()).all())
                 np.testing.assert_array_equal(solver.sleeping.art_awake.numpy(), [1])
 
-    def test_alias_and_extended_states_are_rejected(self):
-        """Reject aliased state allocations and unsupported extended outputs."""
-        cases = [("same_state", ""), ("alias", "joint_q"), ("alias", "body_q")]
-        cases += [(side, field) for side in ("input", "output") for field in ("body_qdd", "body_parent_f")]
-        for kind, field in cases:
+    def test_aliased_states_are_rejected(self):
+        """Reject aliased state allocations before changing physical state."""
+        for kind, field in (("same_state", ""), ("alias", "joint_q"), ("alias", "body_q")):
             with self.subTest(kind=kind, field=field):
                 model = _boxes(1)
                 pipeline, solver, state_in, state_out, control = _runtime(model)
@@ -204,17 +202,29 @@ class TestFeatherPGSSleepingSafety(unittest.TestCase):
                 pipeline.collide(state_in, contacts)
                 if kind == "same_state":
                     state_out = state_in
-                elif kind == "alias":
-                    setattr(state_out, field, getattr(state_in, field))
                 else:
-                    state = state_in if kind == "input" else state_out
-                    setattr(state, field, wp.zeros(model.body_count, dtype=wp.spatial_vector, device="cpu"))
+                    setattr(state_out, field, getattr(state_in, field))
                 before = state_in.joint_q.numpy().copy()
 
                 with self.assertRaises(ValueError):
                     solver.step(state_in, state_out, control, contacts, 0.001)
 
                 np.testing.assert_array_equal(state_in.joint_q.numpy(), before)
+
+    def test_extended_state_outputs_are_accepted(self):
+        """Sleep with requested acceleration and joint-wrench outputs, which FeatherPGS leaves untouched."""
+        model = _boxes(1)
+        model.request_state_attributes("body_qdd", "body_parent_f")
+        pipeline, solver, state_in, state_out, control = _runtime(model)
+        self.assertIsNotNone(state_in.body_parent_f)
+        contacts = pipeline.contacts()
+        states = [state_in, state_out]
+        for _ in range(400):
+            states[0].clear_forces()
+            pipeline.collide(states[0], contacts)
+            solver.step(states[0], states[1], control, contacts, 0.005)
+            states.reverse()
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0])
 
     def test_invalid_timestep_is_rejected(self):
         """Reject nonpositive and nonfinite timesteps before changing physical state."""

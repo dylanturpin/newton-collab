@@ -8661,8 +8661,6 @@ class SolverFeatherPGS(SolverBase):
                 )
             ):
                 raise ValueError("Experimental sleeping requires distinct input/output states")
-            if any(state.body_qdd is not None or state.body_parent_f is not None for state in (state_in, state_out)):
-                raise ValueError("Experimental sleeping does not support acceleration or reaction-force state outputs")
             if collide_done_event is not None:
                 wp.get_stream(model.device).wait_event(collide_done_event)
                 collide_done_event = None
