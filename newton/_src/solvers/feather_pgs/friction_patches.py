@@ -548,7 +548,10 @@ def _flood_regions(
     )
 
 
-@wp.kernel(enable_backward=False)
+# Capped at the register count of the single-path kernel: the device-flood branch
+# otherwise raises it from 96 to 120, and the lost occupancy costs more than the
+# branch saves when a batch of small worlds floods every pair here.
+@wp.kernel(enable_backward=False, cuda_max_registers=96)
 def _build(
     count: wp.array[int],
     q: wp.array[wp.transform],
