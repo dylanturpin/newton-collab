@@ -97,12 +97,23 @@ class _SleepState:
                 pinned[arts[arts >= 0]] = 1
         self.pinned = wp.array(pinned, dtype=int, device=device)
 
-    def wake(self):
-        """Wake every component and invalidate state-change history."""
-        self.art_awake.fill_(1)
-        self.body_awake.fill_(1)
-        self.quiet_age.zero_()
-        self.valid.zero_()
+    def wake(self, world_mask=None):
+        """Wake every component and invalidate state-change history, or wake only the masked worlds."""
+        if world_mask is None:
+            self.art_awake.fill_(1)
+            self.body_awake.fill_(1)
+            self.quiet_age.zero_()
+            self.valid.zero_()
+            return
+        device = self.model.device
+        world = self.solver.art_to_world
+        wp.launch(_wake_worlds, self.art_awake.size, [world_mask, world, self.art_awake, self.quiet_age], device=device)
+        wp.launch(
+            _wake_world_bodies,
+            self.body_awake.size,
+            [world_mask, world, self.body_nodes, self.body_awake],
+            device=device,
+        )
 
     def begin(self, state, control, contacts):
         """Build conservative islands and propagate input wake events."""
@@ -390,6 +401,22 @@ def _node(body: int, body_nodes: wp.array[int], flags: wp.array[int]):
     if body >= 0 and (flags[body] & int(BodyFlags.KINEMATIC)) == 0:
         node = body_nodes[body]
     return node
+
+
+@wp.kernel(enable_backward=False)
+def _wake_worlds(mask: wp.array[wp.bool], world: wp.array[int], awake: wp.array[int], age: wp.array[float]):
+    i = wp.tid()
+    if world[i] >= 0 and mask[world[i]]:
+        awake[i] = 1
+        age[i] = 0.0
+
+
+@wp.kernel(enable_backward=False)
+def _wake_world_bodies(mask: wp.array[wp.bool], world: wp.array[int], nodes: wp.array[int], awake: wp.array[int]):
+    i = wp.tid()
+    node = nodes[i]
+    if node >= 0 and world[node] >= 0 and mask[world[node]]:
+        awake[i] = 1
 
 
 @wp.kernel(enable_backward=False)

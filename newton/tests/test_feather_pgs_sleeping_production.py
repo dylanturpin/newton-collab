@@ -85,6 +85,26 @@ class TestSleepingProductionProfile(unittest.TestCase):
         solver.validate_contact_torsion()
         self.assertGreater(_torsion_rows(solver), 0)
 
+    def test_masked_reset_wakes_only_selected_worlds(self):
+        """Wake only the worlds a masked reset selects, including none for an empty mask."""
+        box = newton.ModelBuilder()
+        body = box.add_body(xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()))
+        box.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.replicate(box, 2)
+        model = builder.finalize(device="cuda:0")
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
+        solver = newton.solvers.SolverFeatherPGS(model, **_PROFILE)
+        states = [model.state(), model.state()]
+        _advance(pipeline, solver, states, model.control(), 400)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+        for mask, expected in (([False, False], [0, 0]), ([True, False], [1, 0])):
+            solver.reset(states[0], world_mask=wp.array(mask, dtype=wp.bool, device="cuda:0"))
+            np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), expected)
+        _advance(pipeline, solver, states, model.control(), 1)
+        np.testing.assert_array_equal(solver.sleeping.art_awake.numpy(), [1, 0])
+
     def test_mimic_articulation_stays_awake(self):
         """Keep an articulation with mimic rows awake while an independent box sleeps."""
         builder = newton.ModelBuilder()

@@ -3005,8 +3005,6 @@ class SolverFeatherPGS(SolverBase):
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del flags
-        if self.sleeping is not None:
-            self.sleeping.wake()
         if self.contact_compliance:
             self._compliant_contacts = None
             self._compliant_prepared = False
@@ -3016,6 +3014,8 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(
                 f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per world)."
             )
+        if self.sleeping is not None:
+            self.sleeping.wake(world_mask)
         if self.world_count == 0:
             return
 
