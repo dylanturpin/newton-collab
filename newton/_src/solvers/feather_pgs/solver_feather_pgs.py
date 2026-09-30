@@ -6482,9 +6482,6 @@ class SolverFeatherPGS(SolverBase):
                     wpb,
                     device_arch,
                     prefetch=os.environ.get("FEATHER_PGS_COLORED_PREFETCH", "1") != "0",
-                    # Opt-in: approximate division and square root in the friction cone
-                    # projection, which sits on the serial per-color critical path.
-                    fast_math=os.environ.get("FEATHER_PGS_COLORED_FAST_MATH", "0") == "1",
                     staged=staged,
                 )
             self._color_propagation_prebuild_kernel = _get_color_propagation_prebuild_kernel(
@@ -17115,7 +17112,6 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     worlds_per_block: int,
     device_arch: str,
     prefetch: bool = True,
-    fast_math: bool = False,
     staged: bool = False,
 ) -> "wp.Kernel":
     """Build the warp-per-world colored solver with sub-warp unit cooperation.
@@ -17587,12 +17583,10 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
             propagation_body_impulses,
         )
 
-    name = f"pgs_solve_propagation_colored_warp_{M}_{NE}_r{R}_w{W}_mb{MB}_pf{int(_prefetch)}_fm{int(fast_math)}_st{int(staged)}"
+    name = f"pgs_solve_propagation_colored_warp_{M}_{NE}_r{R}_w{W}_mb{MB}_pf{int(_prefetch)}_st{int(staged)}"
     pgs_solve_propagation_colored_warp_template.__name__ = name
     pgs_solve_propagation_colored_warp_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique", module_options={"fast_math": bool(fast_math)})(
-        pgs_solve_propagation_colored_warp_template
-    )
+    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_colored_warp_template)
 
 
 @cache
