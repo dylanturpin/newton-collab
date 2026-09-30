@@ -2940,7 +2940,7 @@ class SolverFeatherPGS(SolverBase):
         an explicit episode reset.
         """
         if self.sleeping is not None:
-            self.sleeping.wake()
+            self.sleeping.notify(flags)
         if self._friction_anchors_enabled and flags & ModelFlags.SHAPE_PROPERTIES:
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.

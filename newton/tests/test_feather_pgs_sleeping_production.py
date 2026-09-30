@@ -87,21 +87,27 @@ class TestSleepingProductionProfile(unittest.TestCase):
 
     def test_masked_reset_wakes_only_selected_worlds(self):
         """Wake only the worlds a masked reset selects, including none for an empty mask."""
-        box = newton.ModelBuilder()
-        body = box.add_body(xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()))
-        box.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
-        builder = newton.ModelBuilder()
-        builder.add_ground_plane()
-        builder.replicate(box, 2)
-        model = builder.finalize(device="cuda:0")
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
-        solver = newton.solvers.SolverFeatherPGS(model, **_PROFILE)
-        states = [model.state(), model.state()]
+        model, pipeline, solver, states = _two_world_boxes()
         _advance(pipeline, solver, states, model.control(), 400)
         np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
         for mask, expected in (([False, False], [0, 0]), ([True, False], [1, 0])):
             solver.reset(states[0], world_mask=wp.array(mask, dtype=wp.bool, device="cuda:0"))
             np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), expected)
+        _advance(pipeline, solver, states, model.control(), 1)
+        np.testing.assert_array_equal(solver.sleeping.art_awake.numpy(), [1, 0])
+
+    def test_property_notification_wakes_only_changed_islands(self):
+        """Wake the island whose mass changed, and nothing for a notification without a change."""
+        model, pipeline, solver, states = _two_world_boxes()
+        _advance(pipeline, solver, states, model.control(), 400)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+        solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+        _advance(pipeline, solver, states, model.control(), 1)
+        np.testing.assert_array_equal(solver.sleeping.art_awake.numpy(), [0, 0])
+        mass = model.body_mass.numpy()
+        mass[0] *= 2.0
+        model.body_mass.assign(mass)
+        solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
         _advance(pipeline, solver, states, model.control(), 1)
         np.testing.assert_array_equal(solver.sleeping.art_awake.numpy(), [1, 0])
 
@@ -154,6 +160,19 @@ def _articulations():
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
     solver = newton.solvers.SolverFeatherPGS(model, **_PROFILE)
     return model, pipeline, solver, [model.state(), model.state()], model.control()
+
+
+def _two_world_boxes():
+    box = newton.ModelBuilder()
+    body = box.add_body(xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()))
+    box.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    builder.replicate(box, 2)
+    model = builder.finalize(device="cuda:0")
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
+    solver = newton.solvers.SolverFeatherPGS(model, **_PROFILE)
+    return model, pipeline, solver, [model.state(), model.state()]
 
 
 def _torsion_rows(solver):

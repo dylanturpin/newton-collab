@@ -8,7 +8,7 @@ import math
 import numpy as np
 import warp as wp
 
-from ...sim.enums import BodyFlags, JointType
+from ...sim.enums import BodyFlags, JointType, ModelFlags
 
 
 class _SleepState:
@@ -96,6 +96,22 @@ class _SleepState:
                 arts = dof_art[dofs[dofs >= 0]]
                 pinned[arts[arts >= 0]] = 1
         self.pinned = wp.array(pinned, dtype=int, device=device)
+        self.changed = wp.zeros(count, dtype=int, device=device)
+        shape_art = np.full(model.shape_count, -1, dtype=np.int32)
+        shape_body = model.shape_body.numpy()
+        shape_art[shape_body >= 0] = body_nodes[shape_body[shape_body >= 0]]
+        entity_arts = {
+            ModelFlags.JOINT_PROPERTIES: (model.joint_count, joint_art),
+            ModelFlags.JOINT_DOF_PROPERTIES: (model.joint_dof_count, dof_art),
+            ModelFlags.BODY_PROPERTIES: (model.body_count, body_nodes),
+            ModelFlags.BODY_INERTIAL_PROPERTIES: (model.body_count, body_nodes),
+            ModelFlags.SHAPE_PROPERTIES: (model.shape_count, shape_art),
+        }
+        # Per-entity model arrays, compared on notification so only islands whose properties changed wake.
+        self.property_arrays = {
+            flag: [(name, value, value.numpy().copy(), arts) for name, value in _entity_arrays(model, size)]
+            for flag, (size, arts) in entity_arts.items()
+        }
 
     def wake(self, world_mask=None):
         """Wake every component and invalidate state-change history, or wake only the masked worlds."""
@@ -114,6 +130,35 @@ class _SleepState:
             [world_mask, world, self.body_nodes, self.body_awake],
             device=device,
         )
+
+    def notify(self, flags):
+        """Wake islands whose per-entity model properties changed, or every island for other changes."""
+        flags = int(flags)
+        tracked = 0
+        for flag in self.property_arrays:
+            tracked |= int(flag)
+        if flags & ~tracked:
+            self.wake()
+            return
+        changed = np.zeros(self.changed.size, dtype=np.int32)
+        unowned = False
+        for flag, entries in self.property_arrays.items():
+            if not flags & int(flag):
+                continue
+            for index, (name, value, snapshot, arts) in enumerate(entries):
+                current = value.numpy()
+                differs = (current != snapshot) & ~(_isnan(current) & _isnan(snapshot))
+                if differs.ndim > 1:
+                    differs = differs.reshape(differs.shape[0], -1).any(axis=1)
+                owners = arts[differs]
+                changed[owners[owners >= 0]] = 1
+                # Static geometry and prescribed bodies support sleeping islands without belonging to one.
+                unowned |= bool(np.any(owners < 0))
+                entries[index] = (name, value, current.copy(), arts)
+        if unowned:
+            self.wake()
+        else:
+            self.changed.assign(changed)
 
     def begin(self, state, control, contacts):
         """Build conservative islands and propagate input wake events."""
@@ -196,6 +241,8 @@ class _SleepState:
             device=device,
         )
         wp.launch(_veto_pinned, self.parent.size, [self.parent, self.pinned, self.root_veto], device=device)
+        wp.launch(_veto_pinned, self.parent.size, [self.parent, self.changed, self.root_veto], device=device)
+        self.changed.zero_()
         wp.launch(
             _gravity_change,
             self.parent.size,
@@ -773,3 +820,16 @@ def _limit_coordinates(nodes: wp.array[int], awake: wp.array[int], source: wp.ar
     target[i] = source[i]
     if nodes[i] >= 0 and awake[nodes[i]] == 0:
         target[i] = -1
+
+
+def _entity_arrays(model, size):
+    """Model arrays with one leading entry per entity of the given count."""
+    arrays = []
+    for name, value in vars(model).items():
+        if isinstance(value, wp.array) and value.ndim >= 1 and value.shape[0] == size and size > 0:
+            arrays.append((name, value))
+    return arrays
+
+
+def _isnan(values):
+    return np.isnan(values) if np.issubdtype(values.dtype, np.floating) else np.zeros(values.shape, dtype=bool)
