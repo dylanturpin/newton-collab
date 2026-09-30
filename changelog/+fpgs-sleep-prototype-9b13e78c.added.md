@@ -1,0 +1,1 @@
+Add experimental opt-in passive-island sleeping to FeatherPGS with device-side connectivity, wake propagation, dormant contact and specialized joint-limit omission, and controlled validation scenes. Retain full collision and dynamics, leave sleeping disabled by default, and explicitly exclude persistent friction anchors, torsion, and other unqualified modes.

@@ -205,6 +205,7 @@ from .kernels import (
     update_qdd_from_velocity,
     vector_add_inplace,
 )
+from .sleeping import _SleepState
 from .sparse_contact import (
     _get_sparse_contact_response_kernel,
     apply_sparse_contact_restitution,
@@ -1235,10 +1236,22 @@ class SolverFeatherPGS(SolverBase):
         contact_torsion_device: bool = False,
         contact_compliance: bool = False,
         parallel_tree: bool = False,
+        enable_sleeping: bool = False,
+        sleep_linear_threshold: float = 0.05,
+        sleep_angular_threshold: float = 0.15,
+        sleep_quiet_time: float = 0.5,
+        sleep_skip_constraints: bool = True,
     ):
         """
         Args:
             model (Model): the model to be simulated.
+            enable_sleeping: Experimental passive-island sleeping with optional dormant-contact omission.
+                Configure at construction; rebuild captured graphs to change this option. Driven articulations stay awake.
+                Requires explicit friction_anchor_beta=0; persistent anchors, torsion and warmstarting are unsupported.
+            sleep_linear_threshold: Experimental body COM speed threshold [m/s].
+            sleep_angular_threshold: Experimental body angular speed threshold [rad/s].
+            sleep_quiet_time: Experimental supported quiet interval before sleeping [s].
+            sleep_skip_constraints: Experimental omission of dormant contacts and specialized joint-limit rows.
             contact_torsion_radius: Experimental effective spin radius [m], zero disables.
                 Explicit material/footprint assumption: for uniform pressure on a disk
                 of radius R, the effective radius is 2*R/3. Does not consume the generic
@@ -2815,6 +2828,12 @@ class SolverFeatherPGS(SolverBase):
 
             enable_device_torsion(self)
 
+        self.sleeping = (
+            _SleepState(self, sleep_linear_threshold, sleep_angular_threshold, sleep_quiet_time, sleep_skip_constraints)
+            if enable_sleeping
+            else None
+        )
+
     def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
         """Prepare experimental torsion rollback buffers before CUDA graph capture.
 
@@ -2920,6 +2939,8 @@ class SolverFeatherPGS(SolverBase):
         body-pair reduction is enabled. Capacity failures remain latched until
         an explicit episode reset.
         """
+        if self.sleeping is not None:
+            self.sleeping.wake()
         if self._friction_anchors_enabled and flags & ModelFlags.SHAPE_PROPERTIES:
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
@@ -2984,6 +3005,8 @@ class SolverFeatherPGS(SolverBase):
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del flags
+        if self.sleeping is not None:
+            self.sleeping.wake()
         if self.contact_compliance:
             self._compliant_contacts = None
             self._compliant_prepared = False
@@ -8625,6 +8648,25 @@ class SolverFeatherPGS(SolverBase):
 
         if control is None:
             control = model.control(clone_variables=False)
+        if self.sleeping is not None:
+            if not math.isfinite(dt) or dt <= 0.0:
+                raise ValueError("Experimental sleeping requires a finite positive timestep")
+            if any(
+                a.size and a.ptr == b.ptr
+                for a, b in (
+                    (state_in.joint_q, state_out.joint_q),
+                    (state_in.joint_qd, state_out.joint_qd),
+                    (state_in.body_q, state_out.body_q),
+                    (state_in.body_qd, state_out.body_qd),
+                )
+            ):
+                raise ValueError("Experimental sleeping requires distinct input/output states")
+            if any(state.body_qdd is not None or state.body_parent_f is not None for state in (state_in, state_out)):
+                raise ValueError("Experimental sleeping does not support acceleration or reaction-force state outputs")
+            if collide_done_event is not None:
+                wp.get_stream(model.device).wait_event(collide_done_event)
+                collide_done_event = None
+            self.sleeping.begin(state_in, control, contacts)
         state_aug = self._prepare_augmented_state(state_in, state_out, control)
 
         if collide_done_event is not None and state_in.particle_count > 0:
@@ -9279,6 +9321,9 @@ class SolverFeatherPGS(SolverBase):
             else:
                 self._stage6_update_qdd(state_in, state_aug, dt)
                 self._stage6_integrate(state_in, state_aug, state_out, dt)
+
+        if self.sleeping is not None:
+            self.sleeping.finish(state_in, state_out, state_aug, dt)
 
         # ── MF warm-start carry: snapshot this step's converged impulses +
         # row-type table + per-(sorted)-contact slot map so step N+1 can seed
@@ -11058,7 +11103,7 @@ class SolverFeatherPGS(SolverBase):
                     self.world_dof_indices,
                     self.max_world_dofs,
                     self._fused_diagonal_limit_dof_mask,
-                    self._joint_limit_q_index,
+                    self.sleeping.limit_q_index if self.sleeping is not None else self._joint_limit_q_index,
                     model.joint_limit_lower,
                     model.joint_limit_upper,
                     state_in.joint_q,
@@ -11094,7 +11139,7 @@ class SolverFeatherPGS(SolverBase):
                             self.art_to_world,
                             self.articulation_world_dof_offset,
                             self.articulation_dof_start,
-                            self._joint_limit_q_index,
+                            self.sleeping.limit_q_index if self.sleeping is not None else self._joint_limit_q_index,
                             model.joint_limit_lower,
                             model.joint_limit_upper,
                             state_in.joint_q,
@@ -11135,7 +11180,7 @@ class SolverFeatherPGS(SolverBase):
                             self.articulation_dof_start,
                             self.art_to_world,
                             self.group_to_art[size],
-                            self._joint_limit_q_index,
+                            self.sleeping.limit_q_index if self.sleeping is not None else self._joint_limit_q_index,
                             model.joint_limit_lower,
                             model.joint_limit_upper,
                             state_in.joint_q,
@@ -11335,7 +11380,7 @@ class SolverFeatherPGS(SolverBase):
                     self.art_to_world,
                     self.articulation_response_dof_count,
                     model.body_flags,
-                    self.body_has_response_dofs,
+                    self.sleeping.contact_response_mask if self.sleeping is not None else self.body_has_response_dofs,
                     is_free_rigid,
                     has_free_rigid_flag,
                     propagation_flag,
