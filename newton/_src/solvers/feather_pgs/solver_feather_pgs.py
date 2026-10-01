@@ -1248,15 +1248,23 @@ class SolverFeatherPGS(SolverBase):
         """
         Args:
             model (Model): the model to be simulated.
-            enable_sleeping: Experimental passive-island sleeping with optional dormant-contact omission.
-                Requires ``articulated_contact_response="immediate"``, so it does not compose with
-                ``propagation-colored``.
-                Configure at construction; rebuild captured graphs to change this option. Driven articulations stay awake.
-                Articulations with mimic or loop constraints stay awake; warmstarting and compliance are unsupported.
+            enable_sleeping: Experimental passive-island sleeping: a supported island that stays below the
+                sleep thresholds for ``sleep_quiet_time`` freezes its published state until a wake event.
+                Configure at construction; rebuild captured graphs to change this option.
+                Driven articulations and articulations with mimic or loop constraints stay awake.
+                Construction raises ``ValueError`` unless ``articulated_contact_response="immediate"``
+                (so it does not compose with ``propagation-colored``), the model has at least one
+                articulation, no particles and ``requires_grad=False``, and warmstarting, contact
+                compliance and velocity post-passes (``pgs_velocity_iterations``) are off.
+                Sleeping settings are runtime-only solver options with no USD schema: they choose how the
+                solver spends work on settled scenes rather than describing the scene.
             sleep_linear_threshold: Experimental body COM speed threshold [m/s].
             sleep_angular_threshold: Experimental body angular speed threshold [rad/s].
             sleep_quiet_time: Experimental supported quiet interval before sleeping [s].
-            sleep_skip_constraints: Experimental omission of dormant contacts and specialized joint-limit rows.
+            sleep_skip_constraints: Experimental work skipping for sleeping islands: omit their contact and
+                specialized joint-limit rows, carry their friction-patch history instead of rebuilding it,
+                and skip their articulated dynamics for steps they sleep through. When False, sleeping
+                islands keep their rows and dynamics and only their published state is frozen.
             contact_torsion_radius: Experimental effective spin radius [m], zero disables.
                 Explicit material/footprint assumption: for uniform pressure on a disk
                 of radius R, the effective radius is 2*R/3. Does not consume the generic

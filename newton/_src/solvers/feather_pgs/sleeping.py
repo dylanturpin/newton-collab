@@ -8,6 +8,7 @@ import math
 import numpy as np
 import warp as wp
 
+from ...sim import Model
 from ...sim.enums import BodyFlags, JointType, ModelFlags
 
 
@@ -119,17 +120,18 @@ class _SleepState:
         shape_art = np.full(model.shape_count, -1, dtype=np.int32)
         shape_body = model.shape_body.numpy()
         shape_art[shape_body >= 0] = body_nodes[shape_body[shape_body >= 0]]
+        frequency = Model.AttributeFrequency
         entity_arts = {
-            ModelFlags.JOINT_PROPERTIES: (model.joint_count, joint_art),
-            ModelFlags.JOINT_DOF_PROPERTIES: (model.joint_dof_count, dof_art),
-            ModelFlags.BODY_PROPERTIES: (model.body_count, body_nodes),
-            ModelFlags.BODY_INERTIAL_PROPERTIES: (model.body_count, body_nodes),
-            ModelFlags.SHAPE_PROPERTIES: (model.shape_count, shape_art),
+            ModelFlags.JOINT_PROPERTIES: (frequency.JOINT, joint_art),
+            ModelFlags.JOINT_DOF_PROPERTIES: (frequency.JOINT_DOF, dof_art),
+            ModelFlags.BODY_PROPERTIES: (frequency.BODY, body_nodes),
+            ModelFlags.BODY_INERTIAL_PROPERTIES: (frequency.BODY, body_nodes),
+            ModelFlags.SHAPE_PROPERTIES: (frequency.SHAPE, shape_art),
         }
         # Per-entity model arrays, compared on notification so only islands whose properties changed wake.
         self.property_arrays = {
-            flag: [(name, value.numpy().copy(), arts) for name, value in _entity_arrays(model, size)]
-            for flag, (size, arts) in entity_arts.items()
+            flag: [(name, value.numpy().copy(), arts) for name, value in _entity_arrays(model, kind, arts.size)]
+            for flag, (kind, arts) in entity_arts.items()
         }
 
     @property
@@ -1052,10 +1054,13 @@ def _limit_coordinates(nodes: wp.array[int], awake: wp.array[int], source: wp.ar
         target[i] = -1
 
 
-def _entity_arrays(model, size):
-    """Model arrays with one leading entry per entity of the given count."""
+def _entity_arrays(model, frequency, size):
+    """Model arrays declared at ``frequency`` with one row per entity, so coincident counts never mix owners."""
     arrays = []
-    for name, value in vars(model).items():
+    for name, spec in model.attribute_specs.items():
+        value = vars(model).get(name)
+        if spec.frequency != frequency or spec.assignment is not None or spec.deprecated:
+            continue
         if isinstance(value, wp.array) and value.ndim >= 1 and value.shape[0] == size and size > 0:
             arrays.append((name, value))
     return arrays

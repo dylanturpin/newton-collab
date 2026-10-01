@@ -190,6 +190,38 @@ class TestSleepingProductionProfile(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "body_mass"):
             solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
 
+    def test_coincident_entity_counts_keep_property_owners(self):
+        """A body array is diffed only as a body property when body and joint counts coincide."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        bodies = []
+        for x in (0.0, 0.5):
+            body = builder.add_link(xform=wp.transform((x, 0.0, 0.1), wp.quat_identity()))
+            builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+            bodies.append(body)
+        # Reversed joint order gives body_to_articulation [1, 0] against joint_articulation [0, 1].
+        for body in reversed(bodies):
+            builder.add_articulation([builder.add_joint_free(child=body)])
+        model = builder.finalize(device="cuda:0")
+        self.assertEqual(model.body_count, model.joint_count)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
+        solver = newton.solvers.SolverFeatherPGS(model, **_PROFILE)
+        states = [model.state(), model.state()]
+        np.testing.assert_array_equal(solver.body_to_articulation.numpy(), [1, 0])
+        _advance(pipeline, solver, states, model.control(), 400)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+        mass = model.body_mass.numpy()
+        mass[0] *= 2.0
+        model.body_mass.assign(mass)
+        solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+        _advance(pipeline, solver, states, model.control(), 1)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 0])
+        _advance(pipeline, solver, states, model.control(), 400)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+        solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+        _advance(pipeline, solver, states, model.control(), 1)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+
     def test_mimic_articulation_stays_awake(self):
         """Keep an articulation with mimic rows awake while an independent box sleeps."""
         builder = newton.ModelBuilder()
