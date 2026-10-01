@@ -222,6 +222,28 @@ class TestSleepingProductionProfile(unittest.TestCase):
         _advance(pipeline, solver, states, model.control(), 1)
         np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
 
+    def test_solver_body_attribute_notification_wakes_its_island(self):
+        """A FeatherPGS custom body attribute assigned to the model is diffed like a core body property."""
+        box = newton.ModelBuilder()
+        body = box.add_body(xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()))
+        box.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder = newton.ModelBuilder()
+        newton.solvers.SolverFeatherPGS.register_custom_attributes(builder)
+        builder.add_ground_plane()
+        builder.replicate(box, 2)
+        model = builder.finalize(device="cuda:0")
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
+        solver = newton.solvers.SolverFeatherPGS(model, **_PROFILE)
+        states = [model.state(), model.state()]
+        _advance(pipeline, solver, states, model.control(), 400)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+        depenetration = model.rigid_body_max_depenetration_velocity.numpy()
+        depenetration[0] = 1.0
+        model.rigid_body_max_depenetration_velocity.assign(depenetration)
+        solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+        _advance(pipeline, solver, states, model.control(), 1)
+        np.testing.assert_array_equal(solver.sleeping.art_awake.numpy(), [1, 0])
+
     def test_mimic_articulation_stays_awake(self):
         """Keep an articulation with mimic rows awake while an independent box sleeps."""
         builder = newton.ModelBuilder()

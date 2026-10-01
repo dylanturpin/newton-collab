@@ -1059,7 +1059,11 @@ def _entity_arrays(model, frequency, size):
     arrays = []
     for name, spec in model.attribute_specs.items():
         value = vars(model).get(name)
-        if spec.frequency != frequency or spec.assignment is not None or spec.deprecated:
+        if (
+            spec.frequency != frequency
+            or spec.assignment not in (None, Model.AttributeAssignment.MODEL)
+            or spec.deprecated
+        ):
             continue
         if isinstance(value, wp.array) and value.ndim >= 1 and value.shape[0] == size and size > 0:
             arrays.append((name, value))
