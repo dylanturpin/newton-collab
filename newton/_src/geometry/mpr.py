@@ -184,6 +184,13 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
     shape_support = create_shape_support_function(support_func, center_ties=True)
     _, mpr_support, _ = create_support_map_function(shape_support)
 
+    # Import here because the simplex solver shares MPR's support-map types.
+    from .simplex_solver import create_solve_closest_distance  # noqa: PLC0415
+
+    solve_gjk = create_solve_closest_distance(
+        support_func, _support_funcs=(_support_map_b, _minkowski_support, geometric_center)
+    ).core
+
     @wp.func
     def solve_mpr_portal(
         geom_a: Any,
@@ -195,7 +202,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         seed: wp.vec3,
         MAX_ITER: int = 30,
         COLLIDE_EPSILON: float = 1e-5,
-    ) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float, wp.vec3]:
+    ) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float, wp.vec3, bool]:
         """
         Core MPR algorithm implementation.
 
@@ -235,6 +242,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         if wp.length_sq(seed) > 0.0:
             v0.BtoA = seed
         next_seed = wp.vec3(0.0)
+        valid = bool(True)
 
         normal = v0.BtoA
         if wp.length_sq(normal) < NUMERIC_EPSILON:
@@ -262,7 +270,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         point_b = v1.B
 
         if wp.dot(v1.BtoA, normal) <= 0.0:
-            return False, point_a, point_b, normal, penetration, next_seed
+            return False, point_a, point_b, normal, penetration, next_seed, valid
 
         normal = wp.cross(v1.BtoA, v0.BtoA)
 
@@ -273,13 +281,13 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             temp1 = v1.BtoA
             penetration = wp.dot(temp1, normal)
 
-            return True, point_a, point_b, normal, penetration, next_seed
+            return True, point_a, point_b, normal, penetration, next_seed, valid
 
         # Second support point
         v2 = mpr_support(geom_a, geom_b, normal, orientation_b, position_b, extend, data_provider)
 
         if wp.dot(v2.BtoA, normal) <= 0.0:
-            return False, point_a, point_b, normal, penetration, next_seed
+            return False, point_a, point_b, normal, penetration, next_seed, valid
 
         # Determine whether origin is on + or - side of plane
         temp1 = v1.BtoA - v0.BtoA
@@ -307,14 +315,14 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         v3 = Vert()
         while True:
             if phase1 > MAX_ITER:
-                return False, point_a, point_b, normal, penetration, next_seed
+                return False, point_a, point_b, normal, penetration, next_seed, valid
 
             phase1 += 1
 
             v3 = mpr_support(geom_a, geom_b, normal, orientation_b, position_b, extend, data_provider)
 
             if wp.dot(v3.BtoA, normal) <= 0.0:
-                return False, point_a, point_b, normal, penetration, next_seed
+                return False, point_a, point_b, normal, penetration, next_seed, valid
 
             # If origin is outside (v1.V(),v0.V(),v3.V()), then eliminate v2.V() and loop
             temp1 = wp.cross(v1.BtoA, v3.BtoA)
@@ -350,7 +358,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
 
             # Can this happen??? Can it be handled more cleanly?
             if normal_sq < NUMERIC_EPSILON * NUMERIC_EPSILON:
-                return False, point_a, point_b, normal, penetration, next_seed
+                return hit, point_a, point_b, normal, penetration, next_seed, False
 
             if not hit:
                 # Compute distance from origin to wedge face
@@ -383,6 +391,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     alpha = 1.0 - gamma - beta
 
                     if alpha < 0.0 or beta < 0.0 or gamma < 0.0:
+                        valid = False
                         # The normal projection can lie outside an MPR portal.
                         # Restart along its normal from inside the enclosing tetrahedron.
                         # Reuse the first tetrahedron's inscribed ball on later retries.
@@ -403,11 +412,17 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                                 if face_length > 0.0:
                                     radius = wp.min(radius, wp.abs(wp.dot(face, v0.BtoA)) / face_length)
                         next_seed = -normal * (0.5 * radius)
+                        return hit, point_a, point_b, normal, penetration, next_seed, False
+
+                    # Positive barycentric weights alone do not certify a
+                    # boundary face when refinement runs out of iterations.
+                    if delta * delta > COLLIDE_EPSILON * COLLIDE_EPSILON * normal_sq:
+                        return hit, point_a, point_b, normal, penetration, next_seed, False
 
                     point_a = alpha * vert_a(v1) + beta * vert_a(v2) + gamma * vert_a(v3)
                     point_b = alpha * v1.B + beta * v2.B + gamma * v3.B
 
-                return hit, point_a, point_b, normal, penetration, next_seed
+                return hit, point_a, point_b, normal, penetration, next_seed, valid
 
             # Determine what region of the wedge the origin is in
             temp1 = wp.cross(v4.BtoA, v0.BtoA)
@@ -429,6 +444,130 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     v1 = v4
 
     @wp.func
+    def solve_mpr_raycast(
+        geom_a: Any,
+        geom_b: Any,
+        orientation_b: wp.quat,
+        position_b: wp.vec3,
+        extend: float,
+        data_provider: Any,
+        normal: wp.vec3,
+    ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float]:
+        """Refine a confirmed overlap with fixed storage and bounded distance queries."""
+        direction = wp.normalize(normal)
+        if wp.length_sq(direction) == 0.0:
+            direction = wp.vec3(1.0, 0.0, 0.0)
+
+        # Genuine support points are a conservative fallback even if every
+        # distance query fails. Never return extrapolated portal witnesses.
+        support = mpr_support(geom_a, geom_b, direction, orientation_b, position_b, 0.0, data_provider)
+        point_a = vert_a(support)
+        point_b = support.B
+        physical_depth = wp.length(support.BtoA)
+        normal = direction
+        if physical_depth > 0.0:
+            normal = support.BtoA / physical_depth
+        penetration = physical_depth + extend
+        point_a += normal * (0.5 * extend)
+        point_b -= normal * (0.5 * extend)
+
+        for _optimization in range(4):
+            support = mpr_support(geom_a, geom_b, direction, orientation_b, position_b, extend, data_provider)
+            translation = wp.dot(support.BtoA, direction) + 1e-5
+            gradient = direction
+            for _ray_step in range(30):
+                separated, pa, pb, separating_normal, gap = solve_gjk(
+                    geom_a,
+                    geom_b,
+                    orientation_b,
+                    position_b + translation * direction,
+                    extend,
+                    data_provider,
+                    30,
+                    1e-7,
+                )
+                if not separated or not wp.isfinite(gap) or gap < 0.0:
+                    break
+                pb = pb - translation * direction
+                # Certify boundary membership independently of GJK's exit
+                # reason (it may stop at an iteration limit or duplicate).
+                certificate = mpr_support(
+                    geom_a, geom_b, separating_normal, orientation_b, position_b, extend, data_provider
+                )
+                support_gap = wp.dot(certificate.BtoA - (pa - pb), separating_normal)
+                # Remove inflation in the certified supporting direction,
+                # then align the contact normal with the physical witnesses.
+                # Writers reconstruct them from midpoint and normal/depth.
+                physical_delta = pa - pb - separating_normal * extend
+                physical_depth = wp.length(physical_delta)
+                depth = physical_depth + extend
+                if (
+                    wp.isfinite(depth)
+                    and depth >= 0.0
+                    and depth <= penetration
+                    and wp.abs(wp.length_sq(separating_normal) - 1.0) <= 1e-4
+                    and wp.abs(support_gap) <= 1e-6
+                    and physical_depth > 0.0
+                ):
+                    normal = physical_delta / physical_depth
+                    correction = (normal - separating_normal) * (0.5 * extend)
+                    point_a = pa + correction
+                    point_b = pb - correction
+                    penetration = depth
+                if gap > 2e-6:
+                    gradient = separating_normal
+                if gap < 5e-7:
+                    break
+                slope = wp.dot(separating_normal, direction)
+                if slope <= 1e-8:
+                    break
+                # Keep a small positive separation; crossing into overlap
+                # would lose the boundary witnesses of the distance query.
+                translation -= wp.max(gap - 2e-7, 0.0) / slope
+            if wp.dot(direction, gradient) > 1.0 - 1e-7:
+                break
+            direction = gradient
+        return point_a, point_b, normal, penetration
+
+    @wp.func
+    def solve_mpr_restarts(
+        geom_a: Any,
+        geom_b: Any,
+        orientation_b: wp.quat,
+        position_b: wp.vec3,
+        extend: float,
+        data_provider: Any,
+        seed: wp.vec3,
+        normal: wp.vec3,
+        MAX_ITER: int = 30,
+        COLLIDE_EPSILON: float = 1e-5,
+    ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float]:
+        """Retry a confirmed overlap, preserving it if a portal restart fails."""
+        valid = bool(False)
+        point_a = wp.vec3(0.0)
+        point_b = wp.vec3(0.0)
+        last_normal = normal
+        penetration = float(0.0)
+        for _attempt in range(3):
+            if wp.length_sq(seed) == 0.0:
+                break
+            retry_collision, point_a, point_b, normal, penetration, seed, valid = solve_mpr_portal(
+                geom_a, geom_b, orientation_b, position_b, extend, data_provider, seed, MAX_ITER, COLLIDE_EPSILON
+            )
+            if not retry_collision:
+                normal = last_normal
+                valid = False
+                break
+            last_normal = normal
+            if valid:
+                break
+        if not valid:
+            point_a, point_b, normal, penetration = solve_mpr_raycast(
+                geom_a, geom_b, orientation_b, position_b, extend, data_provider, normal
+            )
+        return point_a, point_b, normal, penetration
+
+    @wp.func
     def solve_mpr_core(
         geom_a: Any,
         geom_b: Any,
@@ -439,16 +578,22 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         MAX_ITER: int = 30,
         COLLIDE_EPSILON: float = 1e-5,
     ) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float]:
-        """Retry portals whose normal projection lies outside the triangle."""
-        seed = wp.vec3(0.0)
-        collision, point_a, point_b, normal, penetration, seed = solve_mpr_portal(
-            geom_a, geom_b, orientation_b, position_b, extend, data_provider, seed, MAX_ITER, COLLIDE_EPSILON
+        """Refine unresolved portals with bounded four-vertex GJK raycasts."""
+        collision, point_a, point_b, normal, penetration, seed, valid = solve_mpr_portal(
+            geom_a, geom_b, orientation_b, position_b, extend, data_provider, wp.vec3(0.0), MAX_ITER, COLLIDE_EPSILON
         )
-        for _retry in range(3):
-            if wp.length_sq(seed) == 0.0:
-                break
-            collision, point_a, point_b, normal, penetration, seed = solve_mpr_portal(
-                geom_a, geom_b, orientation_b, position_b, extend, data_provider, seed, MAX_ITER, COLLIDE_EPSILON
+        if collision and not valid:
+            point_a, point_b, normal, penetration = solve_mpr_restarts(
+                geom_a,
+                geom_b,
+                orientation_b,
+                position_b,
+                extend,
+                data_provider,
+                seed,
+                normal,
+                MAX_ITER,
+                COLLIDE_EPSILON,
             )
         return collision, point_a, point_b, normal, penetration
 
@@ -517,4 +662,8 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         return collision, signed_distance, point, normal
 
     solve_mpr.core = solve_mpr_core
+    # Split collision kernels refine unresolved portals in their GJK pass so
+    # the common MPR pass does not carry the raycast's register/local storage.
+    solve_mpr.portal_core = solve_mpr_portal
+    solve_mpr.refine_core = solve_mpr_restarts
     return solve_mpr

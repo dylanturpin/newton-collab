@@ -5,11 +5,19 @@
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.geometry.mpr import create_solve_mpr
+from newton._src.geometry.support_function import (
+    GenericShapeData,
+    SupportMapDataProvider,
+    pack_mesh_ptr,
+    support_map_lean,
+)
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
@@ -23,7 +31,76 @@ def _surface_error(vertices, indices, point):
     return float(np.max(np.sum(normals * (point - triangles[:, 0]), axis=1)))
 
 
-def test_convex_contact_witness(test, device, *, swap=False):
+@wp.func
+def _failed_distance_query(
+    geom_a: GenericShapeData,
+    geom_b: GenericShapeData,
+    orientation_b: wp.quat,
+    position_b: wp.vec3,
+    extend: float,
+    data_provider: SupportMapDataProvider,
+    MAX_ITER: int,
+    COLLIDE_EPSILON: float,
+) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float]:
+    """Simulate a distance query that cannot obtain separated witnesses."""
+    return False, wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0), 0.0
+
+
+@wp.func
+def _unconverged_distance_query(
+    geom_a: GenericShapeData,
+    geom_b: GenericShapeData,
+    orientation_b: wp.quat,
+    position_b: wp.vec3,
+    extend: float,
+    data_provider: SupportMapDataProvider,
+    MAX_ITER: int,
+    COLLIDE_EPSILON: float,
+) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float]:
+    """Simulate an early GJK exit with interior witnesses."""
+    return True, wp.vec3(0.0), position_b, wp.normalize(position_b), wp.length(position_b)
+
+
+def _create_witness_kernel(distance_query=None):
+    if distance_query is not None:
+        with patch("newton._src.geometry.simplex_solver.create_solve_closest_distance") as factory:
+            factory.return_value.core = distance_query
+            solve = create_solve_mpr(support_map_lean).core
+    else:
+        solve = create_solve_mpr(support_map_lean).core
+
+    @wp.kernel
+    def kernel(
+        mesh_a: wp.uint64,
+        mesh_b: wp.uint64,
+        rotation: wp.quat,
+        position: wp.vec3,
+        max_iter: int,
+        extend: float,
+        hit: wp.array[int],
+        points: wp.array[wp.vec3],
+        depth: wp.array[float],
+    ):
+        shape_a = GenericShapeData()
+        shape_a.shape_type = int(newton.GeoType.CONVEX_MESH)
+        shape_a.shape_index = -1
+        shape_a.scale = wp.vec3(1.0)
+        shape_a.auxiliary = pack_mesh_ptr(mesh_a)
+        shape_b = shape_a
+        shape_b.auxiliary = pack_mesh_ptr(mesh_b)
+        collision, pa, pb, normal, penetration = solve(
+            shape_a, shape_b, rotation, position, extend, SupportMapDataProvider(), max_iter
+        )
+        hit[0] = int(collision)
+        points[0] = pa - normal * (0.5 * extend)
+        points[1] = pb + normal * (0.5 * extend)
+        points[2] = normal
+        depth[0] = penetration - extend
+
+    return kernel
+
+
+def test_convex_contact_witness(test, device, *, swap=False, margin=0.0, capture=False):
     """Keep zero-margin witnesses on both hulls for the saved pose and nearby poses."""
     # Public two-hull fixture from https://github.com/newton-physics/newton/issues/4414.
     with np.load(Path(__file__).parent / "assets" / "convex_contact_4414.npz", allow_pickle=False) as fixture:
@@ -63,12 +140,15 @@ def test_convex_contact_witness(test, device, *, swap=False):
             body,
             mesh=mesh,
             xform=wp.transform(offset, wp.quat_identity()),
-            cfg=newton.ModelBuilder.ShapeConfig(gap=0.01, margin=0.0),
+            cfg=newton.ModelBuilder.ShapeConfig(gap=0.01, margin=margin),
         )
     model = builder.finalize(device=device)
     state = model.state()
     pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
     contacts = pipeline.contacts()
+    graph = None
+    if capture:
+        test.assertTrue(pipeline.narrow_phase.split_gjk_mpr)
     for pose_index, (shape_position, shape_rotation) in enumerate(poses):
         with test.subTest(pose=pose_index):
             body_transforms = [
@@ -78,12 +158,27 @@ def test_convex_contact_witness(test, device, *, swap=False):
             if swap:
                 body_transforms.reverse()
             state.body_q.assign(np.asarray(body_transforms, dtype=np.float32))
-            pipeline.collide(state, contacts)
+            if capture:
+                if graph is None:
+                    # Load kernels before capturing the reusable work queues.
+                    pipeline.collide(state, contacts)
+                    with wp.ScopedCapture(device=device) as captured:
+                        pipeline.collide(state, contacts)
+                    graph = captured.graph
+                wp.capture_launch(graph)
+            else:
+                pipeline.collide(state, contacts)
             count = int(contacts.rigid_contact_count.numpy()[0])
             test.assertGreater(count, 0)
             shapes = [contacts.rigid_contact_shape0.numpy(), contacts.rigid_contact_shape1.numpy()]
             points = [contacts.rigid_contact_point0.numpy(), contacts.rigid_contact_point1.numpy()]
             normals = contacts.rigid_contact_normal.numpy()
+            if capture and pose_index == 0:
+                original_b = 0 if swap else 1
+                direction = normals[0] if int(shapes[1][0]) == original_b else -normals[0]
+                # Reuse a slot for penetration, then ordinary separated GJK,
+                # then penetration again without rebuilding the captured graph.
+                poses.extend(((position + direction * 0.05354986867157328, rotation), (position, rotation)))
             for contact in range(count):
                 world_points = []
                 for side in range(2):
@@ -96,8 +191,11 @@ def test_convex_contact_witness(test, device, *, swap=False):
                     )
                 test.assertAlmostEqual(float(np.linalg.norm(normals[contact])), 1.0, delta=1.0e-6)
                 depth = -float(np.dot(world_points[1] - world_points[0], normals[contact]))
-                test.assertGreater(depth, 0.0)
-                if pose_index == 0:
+                if capture and pose_index == len(poses) - 2:
+                    test.assertAlmostEqual(depth, -0.001, delta=1.0e-5)
+                else:
+                    test.assertGreater(depth, 0.0)
+                if pose_index == 0 or (capture and pose_index == len(poses) - 1):
                     # Independent FP64 convex Minkowski-difference boundary calculation.
                     test.assertAlmostEqual(depth, 0.05254986867157328, delta=1.0e-5)
 
@@ -106,9 +204,86 @@ class TestConvexContactWitness(unittest.TestCase):
     pass
 
 
+def test_convex_contact_iteration_limit(test, device, *, distance_query=None):
+    """Preserve overlap and boundary witnesses when refinement cannot converge."""
+    with np.load(Path(__file__).parent / "assets" / "convex_contact_4414.npz", allow_pickle=False) as fixture:
+        vertices = [fixture[key + "_vertices"].copy() for key in ("torso", "elbow")]
+        indices = [fixture[key + "_indices"].astype(np.int32) for key in ("torso", "elbow")]
+        position = wp.vec3(fixture["position"])
+        rotation = wp.quat(*fixture["rotation"])
+    meshes = [
+        wp.Mesh(points=wp.array(v, dtype=wp.vec3, device=device), indices=wp.array(i, dtype=int, device=device))
+        for v, i in zip(vertices, indices, strict=True)
+    ]
+    kernel = _create_witness_kernel(distance_query)
+    hit = wp.zeros(1, dtype=int, device=device)
+    points = wp.zeros(3, dtype=wp.vec3, device=device)
+    penetration = wp.zeros(1, dtype=float, device=device)
+    world_b = np.asarray([wp.quat_rotate(rotation, wp.vec3(v)) + position for v in vertices[1]])
+    maximum_distance = float(np.max(np.linalg.norm(vertices[0][:, None] - world_b[None, :], axis=2)))
+    for budget, extend in ((1, 0.0), (2, 0.0), (3, 0.0), (2, 0.0002)):
+        with test.subTest(budget=budget, extend=extend):
+            wp.launch(
+                kernel,
+                dim=1,
+                inputs=[meshes[0].id, meshes[1].id, rotation, position, budget, extend],
+                outputs=[hit, points, penetration],
+                device=device,
+            )
+            test.assertEqual(int(hit.numpy()[0]), 1)
+            witnesses = points.numpy().astype(np.float64)
+            test.assertTrue(np.all(np.isfinite(witnesses)))
+            local_b = np.asarray(wp.quat_rotate_inv(rotation, wp.vec3(witnesses[1]) - position))
+            for side, point in enumerate((witnesses[0], local_b)):
+                test.assertLessEqual(abs(_surface_error(vertices[side], indices[side], point)), 1.0e-5)
+            test.assertAlmostEqual(float(np.linalg.norm(witnesses[2])), 1.0, delta=1.0e-6)
+            depth = float(penetration.numpy()[0])
+            test.assertTrue(np.isfinite(depth))
+            test.assertGreaterEqual(depth, 0.05254986867157328 - 1.0e-5)
+            test.assertLessEqual(depth, maximum_distance + 1.0e-5)
+            test.assertAlmostEqual(float(np.dot(witnesses[0] - witnesses[1], witnesses[2])), depth, delta=1.0e-6)
+            # The contact writer stores a midpoint, not independent witnesses.
+            center = 0.5 * (witnesses[0] + witnesses[1])
+            np.testing.assert_allclose(center + 0.5 * depth * witnesses[2], witnesses[0], atol=1.0e-6)
+            np.testing.assert_allclose(center - 0.5 * depth * witnesses[2], witnesses[1], atol=1.0e-6)
+
+
+def test_convex_contact_failed_distance_query(test, device):
+    """Use genuine support points when the raycast encounters overlap."""
+    test_convex_contact_iteration_limit(test, device, distance_query=_failed_distance_query)
+
+
+def test_convex_contact_unconverged_distance_query(test, device):
+    """Reject interior witnesses even when the distance query reports separation."""
+    test_convex_contact_iteration_limit(test, device, distance_query=_unconverged_distance_query)
+
+
+def test_convex_contact_witness_margin(test, device):
+    """Keep witnesses on physical hull surfaces after removing contact margins."""
+    test_convex_contact_witness(test, device, margin=0.0001)
+
+
+def test_convex_contact_split_witness(test, device):
+    """Refine penetrating portals through captured split queues and reuse their slots."""
+    if not device.is_cuda:
+        test.skipTest("Split collision kernels run only on CUDA")
+    with patch("newton._src.sim.collide._SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD", 0):
+        test_convex_contact_witness(test, device, capture=True)
+        test_convex_contact_witness(test, device, swap=True, capture=True)
+
+
 add_function_test(
     TestConvexContactWitness, "test_convex_contact_witness", test_convex_contact_witness, devices=get_test_devices()
 )
+
+for function in (
+    test_convex_contact_iteration_limit,
+    test_convex_contact_failed_distance_query,
+    test_convex_contact_unconverged_distance_query,
+    test_convex_contact_witness_margin,
+    test_convex_contact_split_witness,
+):
+    add_function_test(TestConvexContactWitness, function.__name__, function, devices=get_test_devices())
 
 
 def test_convex_contact_witness_swapped(test, device):
