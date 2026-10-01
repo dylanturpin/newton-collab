@@ -33,6 +33,18 @@ class TestSleeping(unittest.TestCase):
         np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 0])
         self.assertGreater(states[0].body_qd.numpy()[0, 0], 0)
 
+    def test_nonfinite_force_wakes_and_propagates(self):
+        """A NaN external force on a sleeping body wakes its island instead of publishing a frozen state."""
+        model, pipeline, solver, states, control = _scene()
+        _advance(model, pipeline, solver, states, control, 120)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+        force = np.zeros((2, 6), dtype=np.float32)
+        force[0, 0] = np.nan
+        states[0].body_f.assign(force)
+        _advance(model, pipeline, solver, states, control, 1, clear=False)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [1, 0])
+        self.assertFalse(np.all(np.isfinite(states[0].body_qd.numpy()[0])))
+
     def test_reset_and_gravity_change_wake(self):
         """Wake state after reset and model-property notifications."""
         model, pipeline, solver, states, control = _scene()

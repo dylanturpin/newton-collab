@@ -1249,6 +1249,8 @@ class SolverFeatherPGS(SolverBase):
         Args:
             model (Model): the model to be simulated.
             enable_sleeping: Experimental passive-island sleeping with optional dormant-contact omission.
+                Requires ``articulated_contact_response="immediate"``, so it does not compose with
+                ``propagation-colored``.
                 Configure at construction; rebuild captured graphs to change this option. Driven articulations stay awake.
                 Articulations with mimic or loop constraints stay awake; warmstarting and compliance are unsupported.
             sleep_linear_threshold: Experimental body COM speed threshold [m/s].

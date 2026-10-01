@@ -128,7 +128,7 @@ class _SleepState:
         }
         # Per-entity model arrays, compared on notification so only islands whose properties changed wake.
         self.property_arrays = {
-            flag: [(name, value, value.numpy().copy(), arts) for name, value in _entity_arrays(model, size)]
+            flag: [(name, value.numpy().copy(), arts) for name, value in _entity_arrays(model, size)]
             for flag, (size, arts) in entity_arts.items()
         }
 
@@ -177,8 +177,11 @@ class _SleepState:
         for flag, entries in self.property_arrays.items():
             if not flags & int(flag):
                 continue
-            for index, (name, value, snapshot, arts) in enumerate(entries):
-                current = value.numpy()
+            for index, (name, snapshot, arts) in enumerate(entries):
+                # Read the model's current allocation: callers may replace an array instead of assigning into it.
+                current = getattr(self.model, name).numpy()
+                if current.shape != snapshot.shape:
+                    raise ValueError(f"Model array {name!r} changed shape from {snapshot.shape} to {current.shape}.")
                 differs = (current != snapshot) & ~(_isnan(current) & _isnan(snapshot))
                 if differs.ndim > 1:
                     differs = differs.reshape(differs.shape[0], -1).any(axis=1)
@@ -186,7 +189,7 @@ class _SleepState:
                 changed[owners[owners >= 0]] = 1
                 # Static geometry and prescribed bodies support sleeping islands without belonging to one.
                 unowned |= bool(np.any(owners < 0))
-                entries[index] = (name, value, current.copy(), arts)
+                entries[index] = (name, current.copy(), arts)
         if unowned:
             self.wake()
         else:
@@ -531,6 +534,12 @@ class _SleepState:
 
 
 @wp.func
+def _nonzero(norm: float):
+    """Whether a norm is positive or nonfinite, so invalid inputs wake rather than freeze."""
+    return not wp.isfinite(norm) or norm > 0.0
+
+
+@wp.func
 def _pose_changed(a: wp.transform, b: wp.transform):
     changed = False
     for j in range(7):
@@ -672,8 +681,8 @@ def _input_bodies(
     if node >= 0:
         changed = False
         if valid[0] != 0:
-            changed = _pose_changed(q[i], last_q[i]) or wp.length(qd[i] - last_qd[i]) > 0.0
-        if changed or wp.length(force[i]) > 0.0 or (flags[i] & int(BodyFlags.KINEMATIC)) != 0:
+            changed = _pose_changed(q[i], last_q[i]) or _nonzero(wp.length(qd[i] - last_qd[i]))
+        if changed or _nonzero(wp.length(force[i])) or (flags[i] & int(BodyFlags.KINEMATIC)) != 0:
             wp.atomic_max(veto, parent[node], 1)
 
 
@@ -726,7 +735,7 @@ def _gravity_change(
     veto: wp.array[int],
 ):
     i = wp.tid()
-    if wp.length(gravity[world[i]] - last[world[i]]) > 0.0:
+    if _nonzero(wp.length(gravity[world[i]] - last[world[i]])):
         wp.atomic_max(veto, parent[i], 1)
 
 

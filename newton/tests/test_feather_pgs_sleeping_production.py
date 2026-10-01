@@ -170,6 +170,26 @@ class TestSleepingProductionProfile(unittest.TestCase):
         _advance(pipeline, solver, states, model.control(), 1)
         np.testing.assert_array_equal(solver.sleeping.art_awake.numpy(), [1, 1])
 
+    def test_replaced_property_array_wakes_its_island(self):
+        """A model array replaced rather than assigned in place still wakes the island it changed."""
+        model, pipeline, solver, states = _two_world_boxes()
+        _advance(pipeline, solver, states, model.control(), 400)
+        np.testing.assert_array_equal(solver.sleeping.body_awake.numpy(), [0, 0])
+        com = model.body_com.numpy()
+        com[0, 0] = 0.3
+        model.body_com = wp.array(com, dtype=wp.vec3, device=model.device)
+        solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+        _advance(pipeline, solver, states, model.control(), 1)
+        np.testing.assert_array_equal(solver.sleeping.art_awake.numpy(), [1, 0])
+
+    def test_resized_property_array_is_rejected(self):
+        """A model array replaced with a different entity count cannot be diffed and raises."""
+        model, pipeline, solver, states = _two_world_boxes()
+        _advance(pipeline, solver, states, model.control(), 1)
+        model.body_mass = wp.zeros(model.body_count + 1, dtype=float, device=model.device)
+        with self.assertRaisesRegex(ValueError, "body_mass"):
+            solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+
     def test_mimic_articulation_stays_awake(self):
         """Keep an articulation with mimic rows awake while an independent box sleeps."""
         builder = newton.ModelBuilder()
