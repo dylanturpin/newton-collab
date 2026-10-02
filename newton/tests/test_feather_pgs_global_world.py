@@ -4,6 +4,7 @@
 """Global (world ``-1``) bodies in multi-world SolverFeatherPGS models."""
 
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -47,6 +48,18 @@ def _step_once(model, solver, box_velocity=(-1.0, -1.0), floor_velocity=0.0):
     pipeline.collide(state, contacts)
     solver.step(state, output, model.control(), contacts, _DT)
     return output.body_qd.numpy()[:, 2], contacts
+
+
+def _construct(test, model, expect_warning, **kwargs):
+    """Construct the solver and check whether it warns about unsolvable global contacts."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        solver = SolverFeatherPGS(model, **kwargs)
+    messages = [str(w.message) for w in caught if "cannot be solved" in str(w.message)]
+    test.assertEqual(len(messages), 1 if expect_warning else 0, msg=messages)
+    if expect_warning:
+        test.assertIn("global (world -1) articulations", messages[0])
+    return solver
 
 
 def _modes(device):
@@ -114,6 +127,43 @@ class TestFeatherPGSGlobalWorld(unittest.TestCase):
                 np.testing.assert_array_equal(solver.contact_path.numpy()[:count], -1)
                 # The global body is solved in world 0, so both worlds are flagged.
                 np.testing.assert_array_equal(solver.constraint_overflow.numpy(), [True, True])
+
+    def test_construction_warns_about_unsolvable_global_contacts(self):
+        """The constructor warns once when shapes allow contacts that couple a global articulation with another world."""
+        device = wp.get_device()
+        for mode in _modes(device):
+            with self.subTest(mode=mode):
+                # A dynamic global body always keeps response DOFs in world 0.
+                _construct(self, _floor_model(device, "dynamic"), True, pgs_mode=mode)
+                # A global kinematic free body is prescribed only on the matrix_free/immediate path.
+                _construct(self, _floor_model(device, "kinematic"), mode != "matrix_free", pgs_mode=mode)
+                # World geometry is solvable in every world.
+                _construct(self, _floor_model(device, "static"), False, pgs_mode=mode)
+
+                # One world, or global shapes that cannot collide with the worlds' bodies, never warn.
+                builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+                body = builder.add_body(mass=1.0)
+                builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+                builder.add_ground_plane()
+                _construct(self, builder.finalize(device=device), False, pgs_mode=mode)
+                model = _floor_model(device, "dynamic")
+                groups = model.shape_collision_group.numpy()
+                groups[model.shape_body.numpy() == 2] = 7
+                model.shape_collision_group.assign(groups)
+                _construct(self, model, False, pgs_mode=mode)
+
+        if device.is_cuda:
+            # A kinematic global articulation with joints keeps response DOFs on every path.
+            builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+            for x in (-2.0, 2.0):
+                world = newton.ModelBuilder(gravity=wp.vec3(0.0))
+                body = world.add_body(xform=wp.transform(wp.vec3(x, 0.0, 0.999), wp.quat_identity()), mass=1.0)
+                world.add_shape_box(body, hx=0.5, hy=0.5, hz=0.5)
+                builder.add_world(world)
+            floor = builder.add_link(mass=1.0, is_kinematic=True)
+            builder.add_articulation([builder.add_joint_prismatic(-1, floor, axis=newton.Axis.Z)])
+            builder.add_shape_box(floor, hx=5.0, hy=5.0, hz=0.5)
+            _construct(self, builder.finalize(device=device), True, pgs_mode="matrix_free")
 
 
 if __name__ == "__main__":
