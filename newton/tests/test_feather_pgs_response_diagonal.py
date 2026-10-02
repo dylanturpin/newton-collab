@@ -296,6 +296,16 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     # The sphere starts 0.1 mm deep, so the depenetration bias adds 0.2 %.
                     self.assertAlmostEqual(abs(float(force[2])), expected, delta=5.0e-3 * expected)
                     self.assertAlmostEqual(float(qd[2]), 0.0, delta=5.0e-3)
+            with self.subTest(mode=mode, case="notified"):
+                # An armature change notified after construction reaches the free-body response.
+                model = _armature_sphere_on_ground(device, 0.0, dense=False)
+                solver = SolverFeatherPGS(model, **kwargs)
+                joint_armature = model.joint_armature.numpy()
+                joint_armature[:6] = 9.0
+                model.joint_armature.assign(joint_armature)
+                solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+                _, force = _armature_impact(model, solver, stop)
+                self.assertAlmostEqual(abs(float(force[2])), 1000.0, delta=5.0)
             with self.subTest(mode=mode, case="oblique"):
                 results = {}
                 for dense in (False, True):
