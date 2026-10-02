@@ -16,6 +16,7 @@ from newton._src.geometry.support_function import (
     GenericShapeData,
     SupportMapDataProvider,
     pack_mesh_ptr,
+    support_map,
     support_map_lean,
 )
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -284,6 +285,57 @@ for function in (
     test_convex_contact_split_witness,
 ):
     add_function_test(TestConvexContactWitness, function.__name__, function, devices=get_test_devices())
+
+
+@wp.kernel
+def _resting_box_kernel(
+    half_a: wp.vec3,
+    half_b: wp.vec3,
+    rotation: wp.quat,
+    position: wp.vec3,
+    normal: wp.array[wp.vec3],
+    depth: wp.array[float],
+):
+    shape_a = GenericShapeData()
+    shape_a.shape_type = int(newton.GeoType.BOX)
+    shape_a.scale = half_a
+    shape_a.shape_index = -1
+    shape_b = shape_a
+    shape_b.scale = half_b
+    _collision, _pa, _pb, n, penetration = wp.static(create_solve_mpr(support_map).core)(
+        shape_a, shape_b, rotation, position, 1.0e-4, SupportMapDataProvider()
+    )
+    normal[0] = n
+    depth[0] = penetration - 1.0e-4
+
+
+def test_convex_contact_resting_box(test, device):
+    """Keep a centered face contact on its face instead of a retry's distant side face."""
+    # Pose captured from a box resting on a long slab in the friction-ramp test.
+    normal = wp.zeros(1, dtype=wp.vec3, device=device)
+    depth = wp.zeros(1, dtype=float, device=device)
+    wp.launch(
+        _resting_box_kernel,
+        dim=1,
+        inputs=[
+            wp.vec3(0.5, 2.5, 0.05),
+            wp.vec3(0.2, 0.2, 0.05),
+            wp.quat(3.069639205932617e-06, 5.119977219969485e-10, -4.247564105996915e-12, 1.0),
+            wp.vec3(0.0, -0.00018496252596378326, 0.09996524453163147),
+        ],
+        outputs=[normal, depth],
+        device=device,
+    )
+    np.testing.assert_allclose(normal.numpy()[0], (0.0, 0.0, 1.0), atol=1.0e-4)
+    test.assertAlmostEqual(float(depth.numpy()[0]), 0.1 - 0.09996524453163147, delta=1.0e-5)
+
+
+add_function_test(
+    TestConvexContactWitness,
+    "test_convex_contact_resting_box",
+    test_convex_contact_resting_box,
+    devices=get_test_devices(),
+)
 
 
 def test_convex_contact_witness_swapped(test, device):

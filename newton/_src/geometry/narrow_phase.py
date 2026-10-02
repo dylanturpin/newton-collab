@@ -1472,10 +1472,11 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                     # Queue confirmed overlaps from the back of the same array,
                     # keeping both passes compact without another work buffer.
                     result = ConvexQueryResult()
-                    # The provisional point field carries the retry seed;
-                    # refinement overwrites it before the manifold pass.
+                    # Provisional fields carry the retry seed and depth bound;
+                    # refinement overwrites them before the manifold pass.
                     result.point_a = seed
                     result.normal = normal
+                    result.signed_distance = penetration
                     query_results[pair_index] = result
                     needs_refine = True
                 elif collision:
@@ -1561,6 +1562,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                             provider,
                             pending.point_a,
                             pending.normal,
+                            pending.signed_distance,
                         )
                         point_a -= normal * (0.5 * query.enlarge)
                         point_b += normal * (0.5 * query.enlarge)

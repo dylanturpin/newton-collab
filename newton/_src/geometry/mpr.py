@@ -393,8 +393,15 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     beta = wp.dot(temp3, normal) * inv_normal
                     alpha = 1.0 - gamma - beta
 
-                    if alpha < 0.0 or beta < 0.0 or gamma < 0.0:
-                        valid = False
+                    point_a = alpha * vert_a(v1) + beta * vert_a(v2) + gamma * vert_a(v3)
+                    point_b = alpha * v1.B + beta * v2.B + gamma * v3.B
+                    # Symmetric contacts often project marginally outside the
+                    # portal; only reject extrapolations that move a witness.
+                    clamped = wp.vec3(wp.max(alpha, 0.0), wp.max(beta, 0.0), wp.max(gamma, 0.0))
+                    clamped /= clamped[0] + clamped[1] + clamped[2]
+                    offset_a = point_a - (clamped[0] * vert_a(v1) + clamped[1] * vert_a(v2) + clamped[2] * vert_a(v3))
+                    offset_b = point_b - (clamped[0] * v1.B + clamped[1] * v2.B + clamped[2] * v3.B)
+                    if wp.max(wp.length_sq(offset_a), wp.length_sq(offset_b)) > COLLIDE_EPSILON * COLLIDE_EPSILON:
                         # The normal projection can lie outside an MPR portal.
                         # Restart along its normal from inside the enclosing tetrahedron.
                         # Reuse the first tetrahedron's inscribed ball on later retries.
@@ -421,9 +428,6 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     # boundary face when refinement runs out of iterations.
                     if delta * delta > COLLIDE_EPSILON * COLLIDE_EPSILON * normal_sq:
                         return hit, point_a, point_b, normal, penetration, next_seed, False
-
-                    point_a = alpha * vert_a(v1) + beta * vert_a(v2) + gamma * vert_a(v3)
-                    point_b = alpha * v1.B + beta * v2.B + gamma * v3.B
 
                 return hit, point_a, point_b, normal, penetration, next_seed, valid
 
@@ -544,22 +548,25 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         data_provider: Any,
         seed: wp.vec3,
         normal: wp.vec3,
+        penetration: float,
         MAX_ITER: int = 30,
         COLLIDE_EPSILON: float = 1e-5,
     ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float]:
         """Retry a confirmed overlap, preserving it if a portal restart fails."""
+        # The first portal's support plane bounds the depth; a deeper retry
+        # landed on a worse face (seeds near the boundary are ill-conditioned).
+        bound = penetration + COLLIDE_EPSILON
         valid = bool(False)
         point_a = wp.vec3(0.0)
         point_b = wp.vec3(0.0)
         last_normal = normal
-        penetration = float(0.0)
         for _attempt in range(3):
             if wp.length_sq(seed) == 0.0:
                 break
             retry_collision, point_a, point_b, normal, penetration, seed, valid = solve_mpr_portal(
                 geom_a, geom_b, orientation_b, position_b, extend, data_provider, seed, MAX_ITER, COLLIDE_EPSILON
             )
-            if not retry_collision:
+            if not retry_collision or penetration > bound:
                 normal = last_normal
                 valid = False
                 break
@@ -597,6 +604,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                 data_provider,
                 seed,
                 normal,
+                penetration,
                 MAX_ITER,
                 COLLIDE_EPSILON,
             )
