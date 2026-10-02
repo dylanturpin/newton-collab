@@ -594,11 +594,17 @@ class _FeatherPGSModelPlan:
 
             # Never elide the only response articulation in a world. Such
             # worlds retain the exact large-armature kinematic fallback.
+            retained = (articulation_dof_count > 0) & (candidates == 0)
             for world in range(int(np.max(articulation_world)) + 1 if articulation_count else 0):
                 in_world = articulation_world == world
-                has_retained_response = np.any(in_world & (articulation_dof_count > 0) & (candidates == 0))
+                has_retained_response = np.any(in_world & retained)
                 if has_retained_response:
                     prescribed[in_world & (candidates != 0)] = 1
+            # A global kinematic body touches the bodies of every world, so it is elided
+            # whenever any world keeps a response.
+            if model.articulation_world is not None and np.any(retained):
+                global_articulation = model.articulation_world.numpy() < 0
+                prescribed[global_articulation & (candidates != 0)] = 1
 
         response_dof_count = articulation_dof_count.copy()
         response_dof_count[prescribed != 0] = 0
