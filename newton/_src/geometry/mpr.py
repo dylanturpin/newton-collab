@@ -463,6 +463,8 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         support = mpr_support(geom_a, geom_b, direction, orientation_b, position_b, 0.0, data_provider)
         point_a = vert_a(support)
         point_b = support.B
+        # Float32 resolution follows coordinate magnitude; scale absolute tolerances.
+        tolerance = wp.max(1.0, wp.max(wp.length(point_a), wp.length(point_b)))
         physical_depth = wp.length(support.BtoA)
         normal = direction
         if physical_depth > 0.0:
@@ -473,7 +475,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
 
         for _optimization in range(4):
             support = mpr_support(geom_a, geom_b, direction, orientation_b, position_b, extend, data_provider)
-            translation = wp.dot(support.BtoA, direction) + 1e-5
+            translation = wp.dot(support.BtoA, direction) + 1e-5 * tolerance
             gradient = direction
             for _ray_step in range(30):
                 separated, pa, pb, separating_normal, gap = solve_gjk(
@@ -484,7 +486,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     extend,
                     data_provider,
                     30,
-                    1e-7,
+                    1e-7 * tolerance,
                 )
                 if not separated or not wp.isfinite(gap) or gap < 0.0:
                     break
@@ -506,7 +508,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     and depth >= 0.0
                     and depth <= penetration
                     and wp.abs(wp.length_sq(separating_normal) - 1.0) <= 1e-4
-                    and wp.abs(support_gap) <= 1e-6
+                    and wp.abs(support_gap) <= 1e-6 * tolerance
                     and physical_depth > 0.0
                 ):
                     normal = physical_delta / physical_depth
@@ -514,16 +516,16 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     point_a = pa + correction
                     point_b = pb - correction
                     penetration = depth
-                if gap > 2e-6:
+                if gap > 2e-6 * tolerance:
                     gradient = separating_normal
-                if gap < 5e-7:
+                if gap < 5e-7 * tolerance:
                     break
                 slope = wp.dot(separating_normal, direction)
                 if slope <= 1e-8:
                     break
                 # Keep a small positive separation; crossing into overlap
                 # would lose the boundary witnesses of the distance query.
-                translation -= wp.max(gap - 2e-7, 0.0) / slope
+                translation -= wp.max(gap - 2e-7 * tolerance, 0.0) / slope
             if wp.dot(direction, gradient) > 1.0 - 1e-7:
                 break
             direction = gradient
