@@ -173,7 +173,10 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
     Returns:
         ``solve_mpr`` wrapper function.  The core function is available as
         ``solve_mpr.core`` for callers that want to handle the relative-frame
-        transform themselves (e.g. fused MPR+GJK).
+        transform themselves (e.g. fused MPR+GJK). Split kernels use
+        ``solve_mpr.portal_core`` for the bare portal pass, which also reports
+        whether its witnesses are valid, and ``solve_mpr.refine_core`` to
+        refine overlaps whose witnesses are not.
     """
 
     if _support_funcs is not None:
